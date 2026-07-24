@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
+  "title": "Local review metadata bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "exporterVersion",
+    "bundleId",
+    "participantId",
+    "createdAt",
+    "coveredAt",
+    "consentVersion",
+    "sourceProviders",
+    "clientPlatform",
+    "transportReady",
+    "recordCounts",
+    "records",
+    "diagnostics"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "usage-metadata-bundle-v0.1" },
+    "exporterVersion": { "const": "0.1.0" },
+    "bundleId": { "type": "string", "pattern": "^bundle:v1:[A-Za-z0-9_-]{43}$" },
+    "participantId": { "type": "string", "pattern": "^participant:v1:[A-Za-z0-9_-]{43}$" },
+    "createdAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "coveredAt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startAt", "endAt"],
+      "properties": {
+        "startAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+        "endAt": { "type": "string", "format": "date-time", "maxLength": 32 }
+      }
+    },
+    "consentVersion": { "const": "local-dry-run-v0.1" },
+    "sourceProviders": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": { "enum": ["openai_codex", "anthropic_claude_code"] }
+    },
+    "clientPlatform": { "enum": ["macos", "linux", "windows", "other", "unknown"] },
+    "transportReady": { "const": false },
+    "recordCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usageEvents", "quotaSnapshots", "activityMarkers"],
+      "properties": {
+        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      }
+    },
+    "records": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usageEvents", "quotaSnapshots", "activityMarkers"],
+      "properties": {
+        "usageEvents": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json" }
+        },
+        "quotaSnapshots": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json" }
+        },
+        "activityMarkers": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json" }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceFilesScanned", "codes"],
+      "properties": {
+        "sourceFilesScanned": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "codes": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "count"],
+            "properties": {
+              "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$", "maxLength": 64 },
+              "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

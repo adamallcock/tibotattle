@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
+  "title": "Privacy-safe quota snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "observedTime",
+    "receivedTime",
+    "provider",
+    "planType",
+    "planVariant",
+    "limitId",
+    "slot",
+    "usedPercent",
+    "displayPrecision",
+    "windowDurationMinutes",
+    "resetsAt",
+    "snapshotSource",
+    "providerSurface",
+    "snapshotId",
+    "sessionScopeId",
+    "accountScopeId"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "quota-snapshot-v0.1" },
+    "observedTime": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "receivedTime": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
+    "planType": { "enum": ["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"] },
+    "planVariant": { "enum": ["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"] },
+    "limitId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "maxLength": 64 },
+    "slot": { "enum": ["primary", "secondary", "five_hour", "seven_day", "other", "unknown"] },
+    "usedPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+    "displayPrecision": { "type": "integer", "minimum": 0, "maximum": 6 },
+    "windowDurationMinutes": { "type": "integer", "minimum": 1, "maximum": 525600 },
+    "resetsAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "snapshotSource": { "enum": ["rollout", "app_server_read", "status_line", "ui_declaration", "notification"] },
+    "providerSurface": { "enum": ["account_shared_unallocated", "general_usage", "model_specific", "separate_limit", "unknown"] },
+    "snapshotId": { "type": "string", "pattern": "^snapshot:v1:[A-Za-z0-9_-]{43}$" },
+    "sessionScopeId": { "type": "string", "pattern": "^session:v1:[A-Za-z0-9_-]{43}$" },
+    "accountScopeId": {
+      "type": "string",
+      "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
+    }
+  }
+}

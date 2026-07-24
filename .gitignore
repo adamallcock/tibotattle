@@ -15,6 +15,9 @@ quarantine/
 staging/
 *.log
 *.jsonl
+*.umx
+*.umx.json
+*.privacy-receipt.json
 
 # Credentials and local configuration (commit an explicitly reviewed example only).
 .env

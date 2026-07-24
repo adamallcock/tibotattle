@@ -96,6 +96,10 @@ pnpm --ignore-workspace contamination
 pnpm --ignore-workspace tools --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z
 # Append and resolve the deterministic schema-0.1 replay correction.
 pnpm --ignore-workspace migrate-corrections
+# Preview a bounded metadata-only export. This writes no bundle; first use creates an owner-only identity secret.
+pnpm --ignore-workspace inspect:export -- --since 2026-07-24T18:00:00.000Z --until 2026-07-24T19:00:00.000Z
+# Write an owner-only local-review bundle and separate privacy receipt. No upload exists.
+pnpm --ignore-workspace export:local -- --since 2026-07-24T18:00:00.000Z --until 2026-07-24T19:00:00.000Z --output exports/local-review.umx.json
 ```
 
 `--ignore-workspace` is needed on this machine because the home directory contains an unrelated pnpm workspace. It can be omitted elsewhere.
@@ -118,6 +122,8 @@ Local rollout logs normally retain the last provider-reported `used_percent`, wi
 - `usage-monitor history [--input PATH] [--output PATH] [--report-file PATH]`: compare privacy-safe within-reset slopes over time, deduplicate near-identical reset identities, apply Standard/Fast sensitivity, and refuse a policy-change claim while shared-pool usage is unbounded.
 - `usage-monitor calibrate-weekly [--input PATH] [--output PATH] [--report-file PATH]`: reproduce the frozen baseline; choose a Standard or speed-aware API-price basis; compare no-delay, forecast-window, regime, and online checkpoint candidates chronologically; audit reset-level error concentration; and emit the current ballpark plus empirical error. It never reports an identified provider allowance.
 - `usage-monitor mark-activity --surface SURFACE --state start|end|pulse [--experiment-id ID] [--activity-file PATH]`: append an owner-only low-cardinality marker. Explicit surfaces include ordinary Chat, Work, Workspace Agents, Excel, Codex Cloud/other devices, ordinary or Work Voice, image generation, Spark, dictation, third-party clients, quiet periods, and controlled experiments. Each marker carries a fixed policy classification such as `shared_agentic_pool`, `excluded_ordinary_chat`, `shared_agentic_pool_feature_multiplier`, `separate_demand_adjusted_model_limit`, or `mixed_task_shared_voice_time_separate`; it stores no content, URL, credential, or free text.
+- `usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]`: construct and privacy-check a metadata-only bundle entirely in memory, then print only coverage, counts, check results, and size. It never writes a bundle or contacts a server.
+- `usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]`: write the same validated bundle and its SHA-256 privacy receipt as owner-only local files. The v0.1 bundle is forced to `transportReady: false`; no upload command, endpoint, or network transport is implemented.
 - `usage-monitor crosscheck --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--input LOCAL_HISTORY_PATH] [--allow-stale-cache] [--plan-timeline PATH] [--provider-ui PATH] [--output PATH] [--report-file PATH]`: compare the fixed 69-day replay-safe interval to the current account's official daily token buckets, account-level quota, optional visible-UI observation, and prospective same-scope collector records. Historical local rows stay account-unattributed. Cached input is accepted only for unchanged sources or when every appended complete record is proven later than the fixed end; stale override is explicit and retained in output.
 - `usage-monitor quality [--input TRANSITIONS_PATH] [--collector-file PATH] [--output PATH] [--report-file PATH]`: profile monitorability before interpreting a gradient. It selects the dominant exact reset series, evaluates independent interval coverage dimensions, measures integer-display lag, distinguishes fixed-reset timestamp jitter from moving/high-churn limit families, checks collector freshness, and prioritizes remediation.
 - `usage-monitor register-account --alias LOCAL_ALIAS --default-plan PLAN_VARIANT [--plan-timeline PATH]`: register the currently signed-in account under a low-cardinality local alias and a plan assumption effective from the registration time. It never saves the email or rewrites an existing account's earlier plan history.
@@ -129,6 +135,16 @@ Local rollout logs normally retain the last provider-reported `used_percent`, wi
 - `usage-monitor migrate-corrections [--observations PATH] [--transitions PATH] [--corrections PATH]`: append the deterministic legacy replay correction once, resolve effective derived observations, and emit the visible audit trail without rewriting the source observation.
 
 Use `--offline` on `capture` to keep ccusage and RunCost on their local price caches. Online capture resolves current RunCost price sources and retains source freshness/provenance in the observation.
+
+## Local metadata exporter privacy boundary
+
+The multi-user research path starts with a local-review-only exporter. It constructs a new allowlisted dataset from raw Codex rollouts; it does not redact or copy log records. Versioned JSON Schemas in `schemas/telemetry-v0.1/` set `additionalProperties: false` at every object boundary. Unknown upstream fields are therefore omitted, and unknown model strings become secret-keyed fingerprints rather than exported names.
+
+Allowed data is limited to exact event/snapshot timestamps, disjoint cached/uncached/output/reasoning token counts, recognized model IDs or opaque model fingerprints, fixed subscription speed and API tier enums, fixed surface/agent/lineage classes, coarse tool-class counts, quota percentages/window/reset timing, plan classes, and domain-separated participant/session/event/snapshot/account pseudonyms. Prompt and response content, tool names and arguments, commands, URLs, paths, repositories, filenames, branches, account emails, raw account/session/device identifiers, credentials, hostnames, usernames, arbitrary labels, and unknown fields are excluded.
+
+The separate exporter secret lives in `.usage-monitor/export-participant-secret` with mode `0600` unless `APP_USAGEMONITOR_EXPORT_SECRET` or `--secret-file` supplies one. It is intentionally distinct from the account-observation HMAC key. The export privacy gate validates the complete bundle schema, recursively scans forbidden keys and sensitive string shapes, verifies record counts, and emits a SHA-256 receipt. Any failure stops the export without writing a bundle. `exports/`, `*.umx`, and privacy receipts are ignored by Git as a second local safeguard.
+
+This is not yet a sharing mechanism. There is no upload client, server, enrollment code, encryption envelope, background process, or public dashboard. The full staged design and remaining gates are in [the multi-user privacy expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md).
 
 ## Account switching and local secret handling
 

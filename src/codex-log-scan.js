@@ -472,6 +472,7 @@ async function parseRollout(path, {
   toolObservationsBySource,
   serverBillableUnits,
   surfaceClassification,
+  sourceScopeId,
 }) {
   const tierTimeline = await collectTierTimeline(path, diagnostics);
   const input = createReadStream(path, { encoding: "utf8" });
@@ -542,7 +543,13 @@ async function parseRollout(path, {
         seenToolCalls.add(toolKey);
         for (const observation of observations) {
           addToolObservation(toolCallsByClass, toolObservationsBySource, serverBillableUnits, observation);
-          onToolCall?.({ timestamp: record.timestamp, timestampMs, surfaceClassification, ...observation });
+          onToolCall?.({
+            timestamp: record.timestamp,
+            timestampMs,
+            surfaceClassification,
+            ...(sourceScopeId ? { sourceScopeId } : {}),
+            ...observation,
+          });
         }
       }
       continue;
@@ -583,6 +590,7 @@ async function parseRollout(path, {
         timestampMs,
         window,
         surfaceClassification,
+        ...(sourceScopeId ? { sourceScopeId } : {}),
       });
       diagnostics.rateLimitSnapshots += 1;
     }
@@ -632,6 +640,7 @@ async function parseRollout(path, {
       }),
       surfaceClassification,
       sourceRolloutOrdinal,
+      ...(sourceScopeId ? { sourceScopeId } : {}),
     });
   }
   return { openTasksAtEnd: openTaskIds.size };
@@ -646,6 +655,7 @@ export async function scanCodexLogEvents({
   onToolCall,
   excludeSessionIds = [],
   activeTaskRecencyMs = null,
+  sourceScopeForRollout = null,
 }) {
   const startMs = new Date(startAt).getTime();
   const endMs = new Date(endAt).getTime();
@@ -715,6 +725,12 @@ export async function scanCodexLogEvents({
       : null;
     if (info.lineage.isFork && !inheritedSnapshots) diagnostics.lineageParentsMissing += 1;
     const rolloutSnapshots = createSnapshotLineage(inheritedSnapshots ?? null);
+    const sourceScopeId = typeof sourceScopeForRollout === "function"
+      ? sourceScopeForRollout(info.lineage.sessionId ?? info.rolloutKey)
+      : null;
+    if (sourceScopeId !== null && (typeof sourceScopeId !== "string" || !/^[a-z][a-z0-9-]*:v1:[A-Za-z0-9_-]{43}$/.test(sourceScopeId))) {
+      throw new Error("sourceScopeForRollout must return a versioned privacy-safe pseudonym or null");
+    }
     const parsed = await parseRollout(info.path, {
       forked: info.lineage.isFork,
       inheritedSnapshots: inheritedSnapshots ?? createSnapshotLineage(),
@@ -732,6 +748,7 @@ export async function scanCodexLogEvents({
       toolObservationsBySource,
       serverBillableUnits,
       surfaceClassification: classification,
+      sourceScopeId,
     });
     if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) diagnostics.activeTaskRolloutsAtEnd += 1;
     if (info.lineage.sessionId) snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);

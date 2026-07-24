@@ -2,7 +2,7 @@
 title: Multi-User Privacy-Centric Expansion Plan
 date: 2026-07-24
 type: plan
-status: proposed
+status: active
 ---
 
 # Multi-User Privacy-Centric Expansion Plan
@@ -496,3 +496,18 @@ Only after the prior gates:
 ## Recommended immediate next step
 
 Build Phase 0 and the local-only portion of Phase 1 before asking anyone to upload. The first external request should be: “Run this exporter, inspect the metadata preview, and tell us whether you would consent to sending this bundle.” It should not yet transmit anything.
+
+## Implementation progress on 2026-07-24
+
+The first local-only vertical slice is implemented on `agent/privacy-exporter-phase1`:
+
+- five strict telemetry v0.1 JSON Schemas reject unknown properties at every object boundary;
+- a separate owner-only participant export secret derives domain-separated participant, account, session, event, snapshot, marker, and unknown-model pseudonyms;
+- `inspect-export` builds and verifies a bounded bundle in memory;
+- `export-local` writes an owner-only local-review bundle plus a SHA-256 privacy receipt;
+- the bundle is structurally fixed to `transportReady: false`, and there is no upload implementation;
+- prompt/response fields, source IDs, paths, URLs, commands, tool arguments, arbitrary labels, and unknown source fields have no output mapping;
+- adversarial fixtures, property-based unknown-field injection, schema rejection, canary non-leakage, and file-permission tests pass; and
+- a one-hour real-log dry run produced 463 usage events and 471 quota snapshots with all privacy checks passing while remaining entirely local.
+
+Phase 0 governance details and this slice's validation receipt are recorded in [the telemetry privacy contract](./2026-07-24-telemetry-privacy-contract.md). Phase 1 is not complete: Claude export parity, incremental checkpoints, compression/encryption, signed release artifacts, volunteer dry runs, and any transport remain future gates.

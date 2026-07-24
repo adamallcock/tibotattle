@@ -19,6 +19,8 @@
     "quality": "node ./src/cli.js quality",
     "calibrate:weekly": "node ./src/cli.js calibrate-weekly --input .usage-monitor/transitions-simple-history-2026-06-11-to-2026-07-24-v0.3.2.json --output .usage-monitor/weekly-calibration-v0.2.json --report-file .usage-monitor/2026-07-24-weekly-calibration-v0.2.md",
     "mark:activity": "node ./src/cli.js mark-activity",
+    "inspect:export": "node ./src/cli.js inspect-export",
+    "export:local": "node ./src/cli.js export-local",
     "build:report-data": "node ./src/build-multi-surface-report.js",
     "build:rolling-history": "node ./src/build-rolling-quota-history.js",
     "build:simple-report-data": "node ./src/build-simple-quota-gradient-report.js",
@@ -36,11 +38,15 @@
     "test": "node --test"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
     "ccusage": "20.0.18",
     "runcost": "0.2.0"
   },
   "engines": {
     "node": ">=20"
   },
-  "packageManager": "pnpm@11.9.0"
+  "packageManager": "pnpm@11.9.0",
+  "devDependencies": {
+    "fast-check": "^4.9.0"
+  }
 }

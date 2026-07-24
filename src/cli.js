@@ -19,6 +19,8 @@ import { analyzeMonitoringQuality, renderMonitoringQualityReport } from "./monit
 import { analyzeWeeklyCalibration, renderWeeklyCalibrationReport } from "./weekly-calibration.js";
 import { upsertPlanProfile, validatePlanTimeline } from "./plan-timeline.js";
 import { createActivityMarker } from "./activity-markers.js";
+import { defaultExportSecretFile, loadOrCreateParticipantSecret } from "./export-identity.js";
+import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -76,6 +78,8 @@ function usage() {
   usage-monitor quality [--input TRANSITIONS_PATH] [--collector-file PATH] [--output PATH] [--report-file PATH]
   usage-monitor calibrate-weekly [--input TRANSITIONS_PATH] [--output PATH] [--report-file PATH]
   usage-monitor mark-activity --surface SURFACE --state start|end|pulse [--experiment-id ID] [--activity-file PATH]
+  usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
+  usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -138,6 +142,9 @@ export function parseArgs(argv) {
     activityState: null,
     activityFile: null,
     experimentId: null,
+    codexHome: null,
+    exportSecretFile: null,
+    receiptFile: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -177,6 +184,9 @@ export function parseArgs(argv) {
     else if (arg === "--state") result.activityState = readOptionValue(argv, index++, arg);
     else if (arg === "--activity-file") result.activityFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--experiment-id") result.experimentId = readOptionValue(argv, index++, arg);
+    else if (arg === "--codex-home") result.codexHome = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--secret-file") result.exportSecretFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--receipt") result.receiptFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -293,6 +303,32 @@ async function run() {
     await appendJsonLinesOwnerOnly(activityFile, [marker]);
     console.log(`Activity marker: ${marker.surface} ${marker.state}; account ${marker.accountScope.status}.`);
     console.log(`Data: ${activityFile}`);
+    return;
+  }
+  if (args.command === "inspect-export" || args.command === "export-local") {
+    if (!args.startAt || !args.endAt) throw new Error(`${args.command} requires --since and --until`);
+    if (args.command === "export-local" && !args.outputFile) throw new Error("export-local requires --output");
+    const identity = await loadOrCreateParticipantSecret({
+      secretFile: args.exportSecretFile ?? defaultExportSecretFile(),
+    });
+    const activityMarkers = await readObservations(args.activityFile ?? defaultActivityMarkerFile());
+    const result = await buildLocalMetadataBundle({
+      startAt: args.startAt,
+      endAt: args.endAt,
+      codexHome: args.codexHome ?? undefined,
+      secret: identity.secret,
+      activityMarkers,
+    });
+    console.log(renderMetadataExportPreview(result));
+    if (args.command === "inspect-export") return;
+    args.receiptFile ??= `${args.outputFile}.privacy-receipt.json`;
+    const written = await writeLocalMetadataBundle({
+      ...result,
+      outputFile: args.outputFile,
+      receiptFile: args.receiptFile,
+    });
+    console.log(`Bundle: ${written.outputFile}`);
+    console.log(`Privacy receipt: ${written.receiptFile}`);
     return;
   }
   if (args.command === "doctor") {

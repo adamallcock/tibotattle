@@ -44,3 +44,20 @@ test("activity marker CLI accepts only explicit low-cardinality fields", () => {
   assert.equal(args.activityState, "start");
   assert.equal(args.experimentId, "fast-sol-a");
 });
+
+test("local export CLI requires explicit bounded paths and keeps upload absent", () => {
+  const args = parseArgs([
+    "export-local",
+    "--since", "2026-07-24T12:00:00.000Z",
+    "--until", "2026-07-24T13:00:00.000Z",
+    "--output", "exports/review.umx.json",
+    "--receipt", "exports/review.receipt.json",
+    "--secret-file", ".usage-monitor/export-secret",
+  ]);
+  assert.equal(args.command, "export-local");
+  assert.equal(args.startAt, "2026-07-24T12:00:00.000Z");
+  assert.equal(args.endAt, "2026-07-24T13:00:00.000Z");
+  assert.match(args.outputFile, /exports\/review\.umx\.json$/);
+  assert.match(args.receiptFile, /exports\/review\.receipt\.json$/);
+  assert.throws(() => parseArgs(["upload", "--server", "https://example.invalid"]), /Unknown argument/);
+});

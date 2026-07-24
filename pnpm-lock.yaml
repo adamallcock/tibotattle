@@ -8,12 +8,19 @@ importers:
 
   .:
     dependencies:
+      ajv:
+        specifier: ^8.20.0
+        version: 8.20.0
       ccusage:
         specifier: 20.0.18
         version: 20.0.18
       runcost:
         specifier: 0.2.0
         version: 0.2.0
+    devDependencies:
+      fast-check:
+        specifier: ^4.9.0
+        version: 4.9.0
 
 packages:
 
@@ -47,9 +54,32 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  ajv@8.20.0:
+    resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
+
   ccusage@20.0.18:
     resolution: {integrity: sha512-/81kwSZg487xoHQadEdcP4hqw9GICkaPtVjSM1HHJ4nBplUByX9tSZF7YIaQQWMcWZ5Gzt0cD2yDEFrgcAkrZg==}
     hasBin: true
+
+  fast-check@4.9.0:
+    resolution: {integrity: sha512-7ms6T7SybUev/PQITciI0yLM2pOSFy5zpG8Ty7tQofcVaQUvrMXp6CBwqF6fThLCLOrfBtuHAtwq6Yu4XPCllg==}
+    engines: {node: '>=12.17.0'}
+
+  fast-deep-equal@3.1.3:
+    resolution: {integrity: sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==}
+
+  fast-uri@3.1.4:
+    resolution: {integrity: sha512-8JnbkQ4juDyvYs4mgFGQqg4yCYtFDtUtmp2QIQq11ZZe5CFQ5wcqm1rqDgAh/QdMySuBnPzMUiJUNZG5N/AiQw==}
+
+  json-schema-traverse@1.0.0:
+    resolution: {integrity: sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug==}
+
+  pure-rand@8.4.2:
+    resolution: {integrity: sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng==}
+
+  require-from-string@2.0.2:
+    resolution: {integrity: sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw==}
+    engines: {node: '>=0.10.0'}
 
   runcost@0.2.0:
     resolution: {integrity: sha512-bP/RR1j1HEfkvxLbk2n943ccp0bslwxwycRRdU6PZjHndHv0Nng47Z7xeesjeOBkOD8kafU0K8xB36Nk8Muu/g==}
@@ -76,6 +106,13 @@ snapshots:
   '@ccusage/ccusage-win32-x64@20.0.18':
     optional: true
 
+  ajv@8.20.0:
+    dependencies:
+      fast-deep-equal: 3.1.3
+      fast-uri: 3.1.4
+      json-schema-traverse: 1.0.0
+      require-from-string: 2.0.2
+
   ccusage@20.0.18:
     optionalDependencies:
       '@ccusage/ccusage-darwin-arm64': 20.0.18
@@ -84,5 +121,19 @@ snapshots:
       '@ccusage/ccusage-linux-x64': 20.0.18
       '@ccusage/ccusage-win32-arm64': 20.0.18
       '@ccusage/ccusage-win32-x64': 20.0.18
+
+  fast-check@4.9.0:
+    dependencies:
+      pure-rand: 8.4.2
+
+  fast-deep-equal@3.1.3: {}
+
+  fast-uri@3.1.4: {}
+
+  json-schema-traverse@1.0.0: {}
+
+  pure-rand@8.4.2: {}
+
+  require-from-string@2.0.2: {}
 
   runcost@0.2.0: {}
