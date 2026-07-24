@@ -780,6 +780,25 @@ The next execution cycle should complete the remainder of G0/G1 before cloud wor
 
 Price registry/provenance work begins alongside G0/G2 using frozen fixtures. After G1, parallelize identity/consent, envelope-encryption, infrastructure, and canonical-schema spikes, but do not enable upload until their combined G4 gate passes.
 
+## Progress update: exporter hardening slice (July 24, 2026)
+
+The first G0/G1 hardening slice is implemented on `agent/exporter-hardening-g1`; it is a bounded milestone, not G1 completion:
+
+- usage-event and quota-observation IDs now derive from privacy-safe source scope plus the physical Codex JSONL record ordinal, not interpreted model/token/tool fields;
+- global replay keys are source-scoped, so equal timestamp/model/token records in independent sessions are retained and file traversal order does not select a winner;
+- quota observation identity is separated from provider-state identity, with unattributed state kept session-scoped;
+- marker occurrence identity depends only on a required persisted UUID;
+- model, limit, and diagnostic vocabularies are reviewed closed sets, with unknown model strings fingerprinted and arbitrary safe-looking values rejected by schemas;
+- missing source token components export as `null`, not an observed zero;
+- all tool-count fields are required by schema and their bounded-interval attribution limitation is recorded in the field policy;
+- every one of the 109 properties across the five telemetry schemas has exactly one reviewed, machine-checkable purpose/privacy/retention/publication/Codex/Claude provenance row, and the generated dictionary is bound to schema hashes;
+- the default participant identity moved from the working directory to an OS-stable application-state path, with strict POSIX regular-file/owner/link/mode/length checks and safe legacy copy-forward;
+- telemetry v0.1 is now machine-declared as an unfrozen local-only draft with no compatibility promise; the first volunteer/upload contract must use a new frozen version and preserve frozen predecessors;
+- local bundle/receipt output is distinct-path, same-directory, owner-controlled, no-clobber, receipt-first/bundle-last, with rollback on an ordinary second-link failure; and
+- regressions cover changed export bounds, identical independent sessions, traversal reordering, marker metadata changes, missing components, unreviewed registries, symlink/hardlink/permission attacks, existing output, distinct paths, and injected commit failure.
+
+Still open before G1 can pass: full interrupted-commit recovery and `verify-bundle`; streaming/chunked bounded export; native Keychain/Credential Manager/Secret Service backends and clean-machine platform validation; explicit identity-conflict migration UX; bundle/parser/adapter/registry/schema-hash version tuple; Claude usage and quota exporter parity; prospective account-scoped app-server snapshots; signed packaging; independently shaped fixtures; and two local-only volunteer reviews. No upload or collection has been enabled.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

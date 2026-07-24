@@ -17,6 +17,7 @@ import { defaultContaminationFile, defaultInferenceFile, defaultTransitionFile, 
 import {
   classifyToolCall,
   appendedRolloutSourcesAreAfterEnd,
+  canonicalComponentAvailability,
   createSnapshotLineage,
   extractToolObservations,
   hasForkReplayPrefix,
@@ -267,6 +268,30 @@ test("local usage normalization rejects negative and non-numeric counters", () =
     output_tokens: 2,
     reasoning_output_tokens: 0,
     total_tokens: 0,
+  });
+});
+
+test("inconsistent source token components are unavailable for export rather than silently clamped", () => {
+  const present = {
+    input_tokens: true,
+    cached_input_tokens: true,
+    cache_write_input_tokens: true,
+    output_tokens: true,
+    reasoning_output_tokens: true,
+    total_tokens: true,
+  };
+  assert.deepEqual(canonicalComponentAvailability(present, {
+    input_tokens: 10,
+    cached_input_tokens: 9,
+    cache_write_input_tokens: 2,
+    output_tokens: 5,
+    reasoning_output_tokens: 6,
+  }), {
+    input_uncached_tokens: false,
+    input_cache_read_tokens: false,
+    input_cache_write_tokens: false,
+    output_text_tokens: false,
+    output_reasoning_tokens: false,
   });
 });
 

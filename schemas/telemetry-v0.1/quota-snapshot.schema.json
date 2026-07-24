@@ -20,6 +20,7 @@
     "snapshotSource",
     "providerSurface",
     "snapshotId",
+    "providerStateId",
     "sessionScopeId",
     "accountScopeId"
   ],
@@ -30,7 +31,7 @@
     "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
     "planType": { "enum": ["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"] },
     "planVariant": { "enum": ["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"] },
-    "limitId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "maxLength": 64 },
+    "limitId": { "enum": ["unknown", "codex", "codex-spark"] },
     "slot": { "enum": ["primary", "secondary", "five_hour", "seven_day", "other", "unknown"] },
     "usedPercent": { "type": "number", "minimum": 0, "maximum": 100 },
     "displayPrecision": { "type": "integer", "minimum": 0, "maximum": 6 },
@@ -38,11 +39,18 @@
     "resetsAt": { "type": "string", "format": "date-time", "maxLength": 32 },
     "snapshotSource": { "enum": ["rollout", "app_server_read", "status_line", "ui_declaration", "notification"] },
     "providerSurface": { "enum": ["account_shared_unallocated", "general_usage", "model_specific", "separate_limit", "unknown"] },
-    "snapshotId": { "type": "string", "pattern": "^snapshot:v1:[A-Za-z0-9_-]{43}$" },
+    "snapshotId": { "type": "string", "pattern": "^snapshot:v2:[A-Za-z0-9_-]{43}$" },
+    "providerStateId": { "type": "string", "pattern": "^quota-state:v1:[A-Za-z0-9_-]{43}$" },
     "sessionScopeId": { "type": "string", "pattern": "^session:v1:[A-Za-z0-9_-]{43}$" },
     "accountScopeId": {
       "type": "string",
       "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "provider": { "const": "anthropic_claude_code" } } },
+      "then": { "properties": { "limitId": { "const": "unknown" } } }
+    }
+  ]
 }

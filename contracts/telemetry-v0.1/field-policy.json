@@ -1,0 +1,867 @@
+{
+  "contractVersion": "telemetry-field-dictionary-v0.1",
+  "description": "Reviewed privacy, retention, publication, and provider-provenance policy for every telemetry v0.1 JSON Schema property.",
+  "provenanceStatuses": {
+    "observed": "Read from provider-owned local telemetry or a provider status response.",
+    "derived": "Deterministically computed from observed or declared source metadata.",
+    "declared": "Supplied explicitly by the participant or collector configuration.",
+    "heuristic": "Inferred with uncertainty from indirect evidence.",
+    "mixed": "The field may combine observed, derived, declared, or heuristic inputs.",
+    "unavailable": "The current adapter does not reliably supply this field.",
+    "not_applicable": "The field describes the export protocol rather than provider telemetry."
+  },
+  "policyGroups": [
+    {
+      "targets": [
+        "activity-marker.schema.json#/properties/schemaVersion",
+        "bundle.schema.json#/properties/schemaVersion",
+        "privacy-receipt.schema.json#/properties/schemaVersion",
+        "quota-snapshot.schema.json#/properties/schemaVersion",
+        "usage-event.schema.json#/properties/schemaVersion"
+      ],
+      "purpose": "Pins the record to an explicit telemetry contract version.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Version identifies shape, not semantic compatibility with later contracts."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/observedTime"],
+      "purpose": "Places a participant-declared activity marker on the UTC timeline.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "declared",
+      "claudeProvenance": "declared",
+      "limitation": "Marker time can differ from the actual start or end of activity."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/surface"],
+      "purpose": "Names the product surface associated with manually marked activity.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "declared",
+      "claudeProvenance": "declared",
+      "limitation": "The participant can choose an incorrect or overly broad surface."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/state"],
+      "purpose": "Distinguishes activity interval starts, ends, and point observations.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "declared",
+      "claudeProvenance": "declared",
+      "limitation": "Unpaired start or end markers do not define a complete interval."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/agenticPoolCoupling"],
+      "purpose": "Records the expected relationship between a surface and the shared agentic allowance.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Product accounting rules can change and this classification is not provider attestation."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/planType"],
+      "purpose": "Groups observations by the participant's subscription plan family.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "mixed",
+      "claudeProvenance": "mixed",
+      "limitation": "Plan may be declared, locally observed, stale, or unknown."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/planType"],
+      "purpose": "Groups quota observations by the participant's subscription plan family.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "mixed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Plan may be locally observed, stale, or unknown; no Claude telemetry adapter emits this record yet."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/planVariant"],
+      "purpose": "Separates known allowance multipliers or promotions within a plan family.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "declared",
+      "claudeProvenance": "declared",
+      "limitation": "Variants are participant-supplied and may not match provider-side entitlements."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/planVariant"],
+      "purpose": "Separates known allowance variants within a quota plan family.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "declared",
+      "claudeProvenance": "unavailable",
+      "limitation": "Variants are participant-supplied and Claude telemetry export is not implemented."
+    },
+    {
+      "targets": [
+        "activity-marker.schema.json#/properties/markerId",
+        "bundle.schema.json#/properties/bundleId",
+        "privacy-receipt.schema.json#/properties/bundleId"
+      ],
+      "purpose": "Supports deterministic deduplication or integrity linkage without source identifiers.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Determinism and collision scope depend on the documented identity subject and secret."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/snapshotId"],
+      "purpose": "Deduplicates one physical quota observation without exporting its source identifier.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "The v2 source-occurrence locator is implemented only for Codex rollout records and changes with identity-secret rotation."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/providerStateId"],
+      "purpose": "Compares repeated observations of the same provider quota state without conflating them with observation identity.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Unattributed state is session-scoped and intentionally cannot collapse across unknown accounts."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/eventId"],
+      "purpose": "Deduplicates one physical usage occurrence without exporting its source identifier.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "The v2 source-occurrence locator is implemented only for Codex rollout records and changes with identity-secret rotation."
+    },
+    {
+      "targets": ["activity-marker.schema.json#/properties/accountScopeId"],
+      "purpose": "Links declared activity for one local account without exporting the provider account identifier.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Unattributed markers cannot be split safely, and secret rotation breaks linkage."
+    },
+    {
+      "targets": [
+        "quota-snapshot.schema.json#/properties/accountScopeId",
+        "usage-event.schema.json#/properties/accountScopeId"
+      ],
+      "purpose": "Links records for one local account without exporting the provider account identifier.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Unattributed historical records cannot be split safely, secret rotation breaks linkage, and Claude export is not implemented."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/exporterVersion"],
+      "purpose": "Identifies the exporter implementation that produced the bundle.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Implementation version alone does not prove configuration or binary integrity."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/participantId",
+        "privacy-receipt.schema.json#/properties/participantId"
+      ],
+      "purpose": "Links uploads from one installation using a secret-backed pseudonym.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "participant_lifetime",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "It is linkable within the dataset and changes if the participant secret is lost or rotated."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/createdAt",
+        "privacy-receipt.schema.json#/properties/createdAt"
+      ],
+      "purpose": "Records when the local export artifact was created.",
+      "privacyClass": "operational_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Uses the local system clock and does not prove upload time."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/coveredAt",
+        "privacy-receipt.schema.json#/properties/coveredAt"
+      ],
+      "purpose": "Contains the inclusive time bounds represented by the artifact.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Bounds do not imply continuous observation or complete coverage."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/coveredAt/properties/startAt",
+        "privacy-receipt.schema.json#/properties/coveredAt/properties/startAt"
+      ],
+      "purpose": "Records the earliest time included by the artifact.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Earliest included record may postdate the actual observation start."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/coveredAt/properties/endAt",
+        "privacy-receipt.schema.json#/properties/coveredAt/properties/endAt"
+      ],
+      "purpose": "Records the latest time included by the artifact.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Latest included record may predate export creation or actual observation end."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/consentVersion"],
+      "purpose": "Pins the local review and consent language applied to the bundle.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "A version label is not by itself proof of informed consent."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/sourceProviders"],
+      "purpose": "Declares which provider adapters contributed records to the bundle.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Presence names an adapter, not completeness of its source telemetry."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/clientPlatform"],
+      "purpose": "Supports platform-specific data-quality and exporter compatibility analysis.",
+      "privacyClass": "device_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Coarse platform does not identify exact OS version or collection environment."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/transportReady",
+        "privacy-receipt.schema.json#/properties/transportReady"
+      ],
+      "purpose": "Makes the local-only transport safety gate explicit.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "A false value prevents intended upload but cannot stop unrelated software from copying a file."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/recordCounts",
+        "privacy-receipt.schema.json#/properties/recordCounts"
+      ],
+      "purpose": "Groups per-record-family counts for reconciliation.",
+      "privacyClass": "operational_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Counts show exported records, not provider-side total activity."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/recordCounts/properties/usageEvents",
+        "privacy-receipt.schema.json#/properties/recordCounts/properties/usageEvents"
+      ],
+      "purpose": "Reports the number of exported usage events.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Deduplication and adapter gaps can make the count differ from provider activity."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/recordCounts/properties/quotaSnapshots",
+        "privacy-receipt.schema.json#/properties/recordCounts/properties/quotaSnapshots"
+      ],
+      "purpose": "Reports the number of exported quota observations.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Repeated provider states and polling cadence affect this count."
+    },
+    {
+      "targets": [
+        "bundle.schema.json#/properties/recordCounts/properties/activityMarkers",
+        "privacy-receipt.schema.json#/properties/recordCounts/properties/activityMarkers"
+      ],
+      "purpose": "Reports the number of exported participant activity markers.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Marker count reflects participant behavior and is not automatic coverage."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/records"],
+      "purpose": "Contains the privacy-minimized telemetry record families.",
+      "privacyClass": "telemetry_container",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "mixed",
+      "claudeProvenance": "mixed",
+      "limitation": "Container safety depends on every referenced record schema and exporter check."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/records/properties/usageEvents"],
+      "purpose": "Carries token, tier, surface, tool-class, and outcome observations.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "mixed",
+      "claudeProvenance": "mixed",
+      "limitation": "Provider adapters expose different components and confidence levels."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/records/properties/quotaSnapshots"],
+      "purpose": "Carries observed remaining-allowance state over time.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "observed",
+      "limitation": "Snapshot precision and availability are provider-controlled."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/records/properties/activityMarkers"],
+      "purpose": "Carries participant-declared cross-surface activity annotations.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "declared",
+      "claudeProvenance": "declared",
+      "limitation": "Manual annotations are incomplete and may be inaccurate."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/diagnostics"],
+      "purpose": "Contains bounded collection and normalization quality signals.",
+      "privacyClass": "operational_diagnostic",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Only recognized diagnostic classes are retained; details and content are excluded."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/diagnostics/properties/sourceFilesScanned"],
+      "purpose": "Reports how many local source files were examined.",
+      "privacyClass": "operational_diagnostic",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "File count does not reveal byte coverage, validity, or missing files."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/diagnostics/properties/codes"],
+      "purpose": "Groups bounded diagnostic counters without source text.",
+      "privacyClass": "operational_diagnostic",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "Counters intentionally omit file names, lines, and error content."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/diagnostics/properties/codes/items/properties/code"],
+      "purpose": "Names an allowlisted collection or normalization condition.",
+      "privacyClass": "operational_diagnostic",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "The bounded code cannot explain the specific source record or root cause."
+    },
+    {
+      "targets": ["bundle.schema.json#/properties/diagnostics/properties/codes/items/properties/count"],
+      "purpose": "Counts occurrences of one allowlisted diagnostic condition.",
+      "privacyClass": "operational_diagnostic",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "derived",
+      "limitation": "One source event can contribute to more than one diagnostic counter."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/bundleSha256"],
+      "purpose": "Binds the receipt to the exact serialized bundle bytes.",
+      "privacyClass": "integrity_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Hash proves byte equality, not truth or completeness of the source data."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/bundleBytes"],
+      "purpose": "Records the hashed bundle byte length for integrity checks.",
+      "privacyClass": "integrity_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Size can weakly correlate with activity volume and is not a completeness measure."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/verdict"],
+      "purpose": "Summarizes whether all local privacy checks passed.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Passing covers implemented checks only and is not a general privacy proof."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/checks"],
+      "purpose": "Lists bounded local privacy validations applied to the bundle.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Checks cannot detect sensitive meaning encoded into an otherwise permitted value."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/checks/items/properties/code"],
+      "purpose": "Names a local privacy validation.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Meaning depends on the exporter version implementing the check."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/checks/items/properties/status"],
+      "purpose": "Reports whether one privacy validation passed.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Status is only as reliable as the validation implementation."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/checks/items/properties/violations"],
+      "purpose": "Counts violations found by one privacy validation.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Count omits offending values intentionally and can combine distinct causes."
+    },
+    {
+      "targets": ["privacy-receipt.schema.json#/properties/excludedCategories"],
+      "purpose": "Declares sensitive source categories that the exporter excludes.",
+      "privacyClass": "governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Declaration describes design intent; receipt checks provide bounded enforcement evidence."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/observedTime"],
+      "purpose": "Places the provider quota state on the UTC observation timeline.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Provider timestamp semantics and local clock skew can differ by source; Claude export is not implemented."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/receivedTime"],
+      "purpose": "Records when the local client received or logged the quota observation.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "The rollout exporter currently copies observedTime because no independent receipt timestamp is retained."
+    },
+    {
+      "targets": [
+        "quota-snapshot.schema.json#/properties/provider",
+        "usage-event.schema.json#/properties/provider"
+      ],
+      "purpose": "Identifies the provider adapter responsible for record semantics.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Provider label does not identify an account, endpoint, or billing entity; no Claude telemetry adapter emits this schema yet."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/limitId"],
+      "purpose": "Names the provider limit or model-specific allowance being observed.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Provider identifiers may be absent, renamed, or mapped to unknown; Claude export is not implemented."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/slot"],
+      "purpose": "Maps the observation to a rolling or weekly quota window.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Primary and secondary labels require duration evidence before interpretation; Claude export is not implemented."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/usedPercent"],
+      "purpose": "Records provider-reported quota consumption as a percentage.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Provider rounding obscures smaller changes and percentage need not be linear in API cost; Claude export is not implemented."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/displayPrecision"],
+      "purpose": "Records the known decimal precision of the displayed usage percentage.",
+      "privacyClass": "measurement_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "heuristic",
+      "claudeProvenance": "unavailable",
+      "limitation": "The current parser reconstructs precision after JSON number parsing, so trailing zero precision is lost."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/windowDurationMinutes"],
+      "purpose": "Records the nominal duration of the quota window.",
+      "privacyClass": "measurement_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Nominal duration does not prove whether the implementation is fixed, rolling, or reset-based; Claude export is not implemented."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/resetsAt"],
+      "purpose": "Records the provider-reported quota reset time.",
+      "privacyClass": "account_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Reported reset time can be approximate and propagation may be delayed."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/snapshotSource"],
+      "purpose": "Identifies how the quota snapshot was collected.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Collection source affects timing and precision but not necessarily provider accounting semantics."
+    },
+    {
+      "targets": ["quota-snapshot.schema.json#/properties/providerSurface"],
+      "purpose": "Classifies whether the limit is shared, general, model-specific, or separate.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Classification is based on available product evidence and may change over time."
+    },
+    {
+      "targets": [
+        "quota-snapshot.schema.json#/properties/sessionScopeId",
+        "usage-event.schema.json#/properties/sessionScopeId"
+      ],
+      "purpose": "Links related local records without exporting the raw provider session identifier.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Session boundaries vary by provider and client, and secret rotation breaks linkage."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/eventTime"],
+      "purpose": "Places a usage event on the UTC cost and quota timeline.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Timestamp may represent logging or completion rather than provider billing time."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/modelId"],
+      "purpose": "Names a reviewed model identifier when it is safe to retain verbatim.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Unreviewed names are replaced by unknown and a keyed fingerprint; aliases can still obscure equivalence."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/modelFingerprint"],
+      "purpose": "Groups unreviewed model strings without disclosing their literal value.",
+      "privacyClass": "pseudonymous_identifier",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "restricted_pseudonymous_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Fingerprint is installation-specific and cannot be joined after secret rotation."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/modelRecognition"],
+      "purpose": "Distinguishes reviewed models, unrecognized raw model strings, and absent model evidence.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Recognition is relative to the reviewed registry version used by the exporter."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/billingSurface"],
+      "purpose": "Separates subscription allowance usage from metered API usage.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Local source location may not reveal the provider's ultimate billing route."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/speedMode"],
+      "purpose": "Records standard versus accelerated product execution mode.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "mixed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Historical logs may omit speed mode and provider multipliers can change."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/apiServiceTier"],
+      "purpose": "Records the standard, priority, flex, or batch API execution tier.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "mixed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Product speed mode and API pricing tier are distinct and logs can omit both."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/reasoningEffort"],
+      "purpose": "Records the configured reasoning-effort category for cost stratification.",
+      "privacyClass": "classification_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "unavailable",
+      "limitation": "The current exporter emits unknown because no authoritative effort field is mapped."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/components"],
+      "purpose": "Contains mutually interpretable token accounting components.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Provider token taxonomies differ, missing components remain null, and no Claude usage exporter exists yet."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/components/properties/inputUncachedTokens"],
+      "purpose": "Records input tokens not served from a provider cache.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Codex uncached input is derived by subtraction; missing or internally inconsistent source components produce null."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/components/properties/inputCacheReadTokens"],
+      "purpose": "Records input tokens served from a provider cache.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Cache semantics, duration, and billing multipliers differ by provider."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/components/properties/inputCacheWriteTokens"],
+      "purpose": "Records tokens written into a provider prompt cache.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Current Codex export can preserve an observed cache-write component when present, but historical absence remains null; Claude export is not implemented."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/components/properties/outputTextTokens"],
+      "purpose": "Records non-reasoning output tokens used for API-price estimation.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Codex text output is derived when total and reasoning counts are both available."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/components/properties/outputReasoningTokens"],
+      "purpose": "Records separately reported hidden reasoning output tokens.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Missing source evidence is exported as null; a numeric zero is emitted only when the source component was present."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/totalInputContextTokens"],
+      "purpose": "Retains the full input-context total for independent component reconciliation.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "observed",
+      "claudeProvenance": "unavailable",
+      "limitation": "Total may be cumulative or differently defined across provider log formats."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/surface"],
+      "purpose": "Classifies the local product or execution surface producing usage.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "heuristic",
+      "claudeProvenance": "unavailable",
+      "limitation": "Ambiguous local evidence is intentionally mapped to an unclassified category."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/agentScope"],
+      "purpose": "Separates root, subagent, automation, and unknown agent execution.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "heuristic",
+      "claudeProvenance": "unavailable",
+      "limitation": "Nested agents may not emit independently attributable usage records."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/lineageDisposition"],
+      "purpose": "Distinguishes standalone, forked, and parent-linked session lineage.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Missing parents and replayed history can make lineage incomplete."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/toolClassCounts"],
+      "purpose": "Contains privacy-safe counts of broad tool mechanism classes.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Tool names, arguments, results, and billing units are excluded; attribution can be incomplete."
+    },
+    {
+      "targets": [
+        "usage-event.schema.json#/properties/toolClassCounts/properties/webSearch",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/fileSearch",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/codeInterpreter",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/hostedShell",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/computerUse",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/mcp",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/applyPatch",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/localShell",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/subagent",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/toolGateway",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/other",
+        "usage-event.schema.json#/properties/toolClassCounts/properties/unknown"
+      ],
+      "purpose": "Counts invocations assigned to one broad, allowlisted tool class.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "derived",
+      "claudeProvenance": "unavailable",
+      "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
+    },
+    {
+      "targets": ["usage-event.schema.json#/properties/outcome"],
+      "purpose": "Classifies whether the associated work completed, failed, stopped, or retried.",
+      "privacyClass": "behavioral_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_only",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "unavailable",
+      "limitation": "The current exporter emits unknown because no authoritative task-outcome mapping is implemented."
+    }
+  ]
+}

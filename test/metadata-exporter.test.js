@@ -64,10 +64,26 @@ async function privateFixture() {
   return { home, rawSession, rawPath, rawToolArguments, unknownModel };
 }
 
+async function collidingSessionsFixture({ reverse = false } = {}) {
+  const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-collision-"));
+  await mkdir(join(home, "sessions"), { recursive: true });
+  const sessions = reverse ? ["session-beta", "session-alpha"] : ["session-alpha", "session-beta"];
+  for (const [index, session] of sessions.entries()) {
+    const lines = [
+      JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: session, source: "user" } }),
+      JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+      JSON.stringify({ timestamp: "2026-07-24T12:01:00.000Z", type: "response_item", payload: { type: "function_call", name: "exec_command", call_id: "reused-across-sessions" } }),
+      tokenRecord("2026-07-24T12:02:00.000Z", usage(100, 20, 40, 8), usage(100, 20, 40, 8), 12),
+    ];
+    await writeFile(join(home, "sessions", `rollout-2026-07-24T12-00-0${index}-${session}.jsonl`), `${lines.join("\n")}\n`);
+  }
+  return home;
+}
+
 test("bounded exporter emits only allowlisted metadata and fingerprints unknown models", async () => {
   const fixture = await privateFixture();
   const rawAccountScope = "raw-account-scope-adam@example.com";
-  const rawMarkerId = "private-marker-id";
+  const rawMarkerId = "019f9010-1111-7111-8111-111111111111";
   try {
     const result = await buildLocalMetadataBundle({
       startAt: "2026-07-24T11:59:00.000Z",
@@ -141,5 +157,186 @@ test("local export and receipt are written owner-only", async () => {
   } finally {
     await rm(fixture.home, { recursive: true, force: true });
     await rm(outputDirectory, { recursive: true, force: true });
+  }
+});
+
+test("source-occurrence IDs remain stable when export bounds change", async () => {
+  const fixture = await privateFixture();
+  try {
+    const common = {
+      endAt: "2026-07-24T12:02:00.000Z",
+      codexHome: fixture.home,
+      secret: SECRET,
+      bundleId: BUNDLE_ID,
+      createdAt: CREATED_AT,
+    };
+    const wide = await buildLocalMetadataBundle({ ...common, startAt: "2026-07-24T11:59:00.000Z" });
+    const narrow = await buildLocalMetadataBundle({ ...common, startAt: "2026-07-24T12:02:00.000Z" });
+    assert.equal(wide.bundle.records.usageEvents[0].eventId, narrow.bundle.records.usageEvents[0].eventId);
+    assert.deepEqual(
+      wide.bundle.records.quotaSnapshots.map((row) => row.snapshotId),
+      narrow.bundle.records.quotaSnapshots.map((row) => row.snapshotId),
+    );
+    assert.equal(wide.bundle.records.usageEvents[0].toolClassCounts.localShell, 1);
+    assert.equal(narrow.bundle.records.usageEvents[0].toolClassCounts.localShell, 0);
+  } finally {
+    await rm(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test("identical token records from independent sessions are not collapsed or traversal-dependent", async () => {
+  const firstHome = await collidingSessionsFixture();
+  const secondHome = await collidingSessionsFixture({ reverse: true });
+  try {
+    const common = {
+      startAt: "2026-07-24T11:59:00.000Z",
+      endAt: "2026-07-24T12:03:00.000Z",
+      secret: SECRET,
+      bundleId: BUNDLE_ID,
+      createdAt: CREATED_AT,
+    };
+    const first = await buildLocalMetadataBundle({ ...common, codexHome: firstHome });
+    const second = await buildLocalMetadataBundle({ ...common, codexHome: secondHome });
+    assert.equal(first.bundle.records.usageEvents.length, 2);
+    assert.equal(new Set(first.bundle.records.usageEvents.map((row) => row.eventId)).size, 2);
+    assert.deepEqual(first.bundle.records.usageEvents.map((row) => row.toolClassCounts.localShell), [1, 1]);
+    assert.deepEqual(
+      first.bundle.records.usageEvents.map((row) => row.eventId).sort(),
+      second.bundle.records.usageEvents.map((row) => row.eventId).sort(),
+    );
+    assert.equal(new Set(first.bundle.records.quotaSnapshots.map((row) => row.providerStateId)).size, 4);
+  } finally {
+    await rm(firstHome, { recursive: true, force: true });
+    await rm(secondHome, { recursive: true, force: true });
+  }
+});
+
+test("same-session tool records without provider IDs remain separate physical occurrences", async () => {
+  const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-tool-collision-"));
+  await mkdir(join(home, "sessions"), { recursive: true });
+  const tool = JSON.stringify({
+    timestamp: "2026-07-24T12:01:00.000Z",
+    type: "response_item",
+    payload: { type: "function_call", name: "exec_command" },
+  });
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "session-tools", source: "user" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    tool,
+    tool,
+    tokenRecord("2026-07-24T12:02:00.000Z", usage(100, 20, 40, 8), usage(100, 20, 40, 8), 12),
+  ];
+  await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-00-tools.jsonl"), `${lines.join("\n")}\n`);
+  try {
+    const result = await buildLocalMetadataBundle({
+      startAt: "2026-07-24T11:59:00.000Z",
+      endAt: "2026-07-24T12:03:00.000Z",
+      codexHome: home,
+      secret: SECRET,
+      bundleId: BUNDLE_ID,
+      createdAt: CREATED_AT,
+    });
+    assert.equal(result.bundle.records.usageEvents[0].toolClassCounts.localShell, 2);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("distinct rollout files claiming one session identity fail closed instead of dropping one occurrence", async () => {
+  const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-duplicate-session-"));
+  await mkdir(join(home, "sessions"), { recursive: true });
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "duplicated-session", source: "user" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    tokenRecord("2026-07-24T12:02:00.000Z", usage(100, 20, 40, 8), usage(100, 20, 40, 8), 12),
+  ];
+  await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-00-duplicate-a.jsonl"), `${lines.join("\n")}\n`);
+  await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-01-duplicate-b.jsonl"), `${lines.join("\n")}\n`);
+  try {
+    await assert.rejects(
+      buildLocalMetadataBundle({
+        startAt: "2026-07-24T11:59:00.000Z",
+        endAt: "2026-07-24T12:03:00.000Z",
+        codexHome: home,
+        secret: SECRET,
+        bundleId: BUNDLE_ID,
+        createdAt: CREATED_AT,
+      }),
+      /Ambiguous duplicate Codex session identity/,
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("missing source token components remain unavailable rather than becoming observed zero", async () => {
+  const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-missing-components-"));
+  await mkdir(join(home, "sessions"), { recursive: true });
+  const incomplete = { input_tokens: 100, output_tokens: 20, total_tokens: 120 };
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "session-incomplete", source: "user" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    tokenRecord("2026-07-24T12:02:00.000Z", incomplete, incomplete, 12),
+  ];
+  await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-00-incomplete.jsonl"), `${lines.join("\n")}\n`);
+  try {
+    const result = await buildLocalMetadataBundle({
+      startAt: "2026-07-24T11:59:00.000Z",
+      endAt: "2026-07-24T12:03:00.000Z",
+      codexHome: home,
+      secret: SECRET,
+      bundleId: BUNDLE_ID,
+      createdAt: CREATED_AT,
+    });
+    const [event] = result.bundle.records.usageEvents;
+    assert.equal(event.totalInputContextTokens, 100);
+    assert.deepEqual(event.components, {
+      inputUncachedTokens: null,
+      inputCacheReadTokens: null,
+      inputCacheWriteTokens: null,
+      outputTextTokens: null,
+      outputReasoningTokens: null,
+    });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("activity marker identity depends only on its persisted UUID", async () => {
+  const fixture = await privateFixture();
+  const markerId = "019f9010-2222-7222-8222-222222222222";
+  const marker = {
+    markerId,
+    observedAt: "2026-07-24T12:05:00.000Z",
+    surface: "chatgpt_work",
+    state: "pulse",
+    agenticPoolCoupling: "shared_agentic_pool",
+    planType: "pro",
+    planVariant: "pro-20x",
+  };
+  try {
+    const common = {
+      startAt: "2026-07-24T11:59:00.000Z",
+      endAt: "2026-07-24T12:10:00.000Z",
+      codexHome: fixture.home,
+      secret: SECRET,
+      bundleId: BUNDLE_ID,
+      createdAt: CREATED_AT,
+    };
+    const first = await buildLocalMetadataBundle({ ...common, activityMarkers: [marker] });
+    const changed = await buildLocalMetadataBundle({
+      ...common,
+      activityMarkers: [{ ...marker, planVariant: "pro-5x", state: "start" }],
+    });
+    assert.equal(
+      first.bundle.records.activityMarkers[0].markerId,
+      changed.bundle.records.activityMarkers[0].markerId,
+    );
+    await assert.rejects(
+      buildLocalMetadataBundle({ ...common, activityMarkers: [{ ...marker, markerId: null }] }),
+      /persisted UUID/,
+    );
+  } finally {
+    await rm(fixture.home, { recursive: true, force: true });
   }
 });

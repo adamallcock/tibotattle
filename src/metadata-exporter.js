@@ -4,19 +4,20 @@ import { resolve } from "node:path";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
 import {
   deriveAccountScopeId,
-  deriveEventId,
-  deriveMarkerId,
+  deriveEventOccurrenceId,
+  deriveMarkerOccurrenceId,
   deriveModelFingerprint,
   deriveParticipantId,
   deriveSessionScopeId,
-  deriveSnapshotId,
+  deriveQuotaStateId,
+  deriveSnapshotObservationId,
   randomBundleId,
 } from "./export-identity.js";
 import { verifyPrivacySafeBundle } from "./export-privacy.js";
 import { assertValidExportRecord } from "./export-schema.js";
-import { stableJson, writeJsonOwnerOnlyAtomic } from "./storage.js";
+import { recognizedExportLimitId, recognizedExportModelId } from "./export-registries.js";
+import { stableJson, writeOwnerOnlyPairNoClobber } from "./storage.js";
 
-const KNOWN_MODEL_PATTERN = /^(?:gpt-[a-z0-9][a-z0-9._-]{0,62}|o[0-9][a-z0-9._-]{0,62}|codex-[a-z0-9][a-z0-9._-]{0,62}|claude-[a-z0-9][a-z0-9._-]{0,62})$/;
 const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
 const PLAN_VARIANTS = new Set(["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]);
 const MARKER_SURFACES = new Set([
@@ -79,17 +80,16 @@ function enumOrUnknown(value, allowed) {
   return typeof value === "string" && allowed.has(value.toLowerCase()) ? value.toLowerCase() : "unknown";
 }
 
-function safeLimitId(value) {
-  const normalized = typeof value === "string" ? value.toLowerCase() : "unknown";
-  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(normalized) ? normalized : "unknown";
-}
-
 function modelDeclaration(secret, value) {
-  const normalized = typeof value === "string" ? value.toLowerCase() : "unknown";
-  if (KNOWN_MODEL_PATTERN.test(normalized)) return { modelId: normalized, modelFingerprint: null };
+  const recognized = recognizedExportModelId(value);
+  if (recognized) return { modelId: recognized, modelRecognition: "recognized", modelFingerprint: null };
+  if (typeof value !== "string" || value.length === 0 || value.toLowerCase() === "unknown") {
+    return { modelId: "unknown", modelRecognition: "missing", modelFingerprint: null };
+  }
   return {
     modelId: "unknown",
-    modelFingerprint: deriveModelFingerprint(secret, typeof value === "string" && value.length ? value : "unknown"),
+    modelRecognition: "unrecognized",
+    modelFingerprint: deriveModelFingerprint(secret, value),
   };
 }
 
@@ -114,11 +114,55 @@ function canonicalSubject(value) {
   return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
+export function usageEventIdentitySubject(event) {
+  return {
+    identityVersion: "codex-source-occurrence-v1",
+    provider: "openai_codex",
+    sourceFormat: "codex-rollout-jsonl",
+    sourceScopeId: event.sourceScopeId,
+    sourceRecordOrdinal: event.sourceRecordOrdinal,
+    recordKind: "token_count",
+  };
+}
+
+export function quotaObservationIdentitySubject(event, slot) {
+  return {
+    identityVersion: "codex-source-occurrence-v1",
+    provider: "openai_codex",
+    sourceFormat: "codex-rollout-jsonl",
+    sourceScopeId: event.sourceScopeId,
+    sourceRecordOrdinal: event.sourceRecordOrdinal,
+    recordKind: "rate_limit_snapshot",
+    slot,
+  };
+}
+
+export function quotaStateIdentitySubject(snapshot) {
+  const subject = {
+    provider: snapshot.provider,
+    accountScopeId: snapshot.accountScopeId,
+    planType: snapshot.planType,
+    planVariant: snapshot.planVariant,
+    limitId: snapshot.limitId,
+    slot: snapshot.slot,
+    usedPercent: snapshot.usedPercent,
+    displayPrecision: snapshot.displayPrecision,
+    windowDurationMinutes: snapshot.windowDurationMinutes,
+    resetsAt: snapshot.resetsAt,
+    providerSurface: snapshot.providerSurface,
+  };
+  if (snapshot.accountScopeId === "unattributed") subject.sessionScopeId = snapshot.sessionScopeId;
+  return subject;
+}
+
 function normalizeActivityMarker(secret, marker, bounds) {
   const observedTime = boundedIso(marker?.observedAt, "activity marker observedAt");
   const observedMs = Date.parse(observedTime);
   if (observedMs < bounds.startMs || observedMs > bounds.endMs) return null;
   if (!MARKER_SURFACES.has(marker?.surface) || !MARKER_STATES.has(marker?.state)) return null;
+  if (typeof marker?.markerId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(marker.markerId)) {
+    throw new Error("Activity marker requires a persisted UUID source identifier");
+  }
   const agenticPoolCoupling = POOL_COUPLINGS.has(marker?.agenticPoolCoupling)
     ? marker.agenticPoolCoupling
     : "unknown";
@@ -135,10 +179,7 @@ function normalizeActivityMarker(secret, marker, bounds) {
     planVariant: enumOrUnknown(marker?.planVariant, PLAN_VARIANTS),
     accountScopeId: deriveAccountScopeId(secret, accountSubject),
   };
-  safe.markerId = deriveMarkerId(secret, canonicalSubject({
-    ...safe,
-    sourceMarkerOrdinal: typeof marker?.markerId === "string" ? marker.markerId : "missing",
-  }));
+  safe.markerId = deriveMarkerOccurrenceId(secret, marker.markerId);
   assertValidExportRecord("activityMarker", safe);
   return safe;
 }
@@ -196,13 +237,13 @@ export async function buildLocalMetadataBundle({
         apiServiceTier: event.tierSemantics?.apiServiceTier ?? "unknown",
         reasoningEffort: "unknown",
         components: {
-          inputUncachedTokens: event.components.input_uncached_tokens,
-          inputCacheReadTokens: event.components.input_cache_read_tokens,
-          inputCacheWriteTokens: event.components.input_cache_write_tokens,
-          outputTextTokens: event.components.output_text_tokens,
-          outputReasoningTokens: event.components.output_reasoning_tokens,
+          inputUncachedTokens: event.componentAvailability.input_uncached_tokens ? event.components.input_uncached_tokens : null,
+          inputCacheReadTokens: event.componentAvailability.input_cache_read_tokens ? event.components.input_cache_read_tokens : null,
+          inputCacheWriteTokens: event.componentAvailability.input_cache_write_tokens ? event.components.input_cache_write_tokens : null,
+          outputTextTokens: event.componentAvailability.output_text_tokens ? event.components.output_text_tokens : null,
+          outputReasoningTokens: event.componentAvailability.output_reasoning_tokens ? event.components.output_reasoning_tokens : null,
         },
-        totalInputContextTokens: event.raw.input_tokens,
+        totalInputContextTokens: event.rawAvailability.input_tokens ? event.raw.input_tokens : null,
         surface: event.surfaceClassification.surface,
         agentScope: event.surfaceClassification.agentScope,
         lineageDisposition: event.surfaceClassification.lineageDisposition,
@@ -211,14 +252,14 @@ export async function buildLocalMetadataBundle({
         sessionScopeId: event.sourceScopeId,
         accountScopeId: "unattributed",
       };
-      usage.eventId = deriveEventId(secret, canonicalSubject(usage));
+      usage.eventId = deriveEventOccurrenceId(secret, canonicalSubject(usageEventIdentitySubject(event)));
       assertValidExportRecord("usageEvent", usage);
       usageEvents.push(usage);
     },
     onRateLimitSnapshot(event) {
       if (!event.sourceScopeId) throw new Error("Missing privacy-safe session scope for quota snapshot");
       const observedTime = boundedIso(event.timestamp, "quota snapshot timestamp");
-      const limitId = safeLimitId(event.window.limitId);
+      const limitId = recognizedExportLimitId(event.window.limitId);
       const snapshot = {
         schemaVersion: "quota-snapshot-v0.1",
         observedTime,
@@ -237,7 +278,8 @@ export async function buildLocalMetadataBundle({
         sessionScopeId: event.sourceScopeId,
         accountScopeId: "unattributed",
       };
-      snapshot.snapshotId = deriveSnapshotId(secret, canonicalSubject(snapshot));
+      snapshot.snapshotId = deriveSnapshotObservationId(secret, canonicalSubject(quotaObservationIdentitySubject(event, snapshot.slot)));
+      snapshot.providerStateId = deriveQuotaStateId(secret, canonicalSubject(quotaStateIdentitySubject(snapshot)));
       assertValidExportRecord("quotaSnapshot", snapshot);
       quotaSnapshotsById.set(snapshot.snapshotId, snapshot);
     },
@@ -297,7 +339,11 @@ export async function writeLocalMetadataBundle({ bundle, receipt, outputFile, re
   if (!outputFile || !receiptFile) throw new Error("outputFile and receiptFile are required");
   const output = resolve(outputFile);
   const receiptOutput = resolve(receiptFile);
-  await writeJsonOwnerOnlyAtomic(output, bundle);
-  await writeJsonOwnerOnlyAtomic(receiptOutput, receipt);
+  await writeOwnerOnlyPairNoClobber({
+    firstPath: output,
+    firstContent: stableJson(bundle),
+    secondPath: receiptOutput,
+    secondContent: stableJson(receipt),
+  });
   return { outputFile: output, receiptFile: receiptOutput };
 }

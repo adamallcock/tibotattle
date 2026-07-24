@@ -33,6 +33,17 @@ export function normalizeTokenUsage(value) {
   return normalized;
 }
 
+function tokenComponentPresence(value) {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Boolean(value && Object.hasOwn(value, key))]));
+}
+
+function deltaComponentPresence(current, previous) {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [
+    key,
+    current[key] && (previous === null || previous[key]),
+  ]));
+}
+
 function subtractUsage(current, previous) {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Math.max(0, current[key] - (previous?.[key] ?? 0))]));
 }
@@ -124,7 +135,12 @@ export async function discoverCodexRolloutInfos({ codexHome = process.env.CODEX_
   })));
   const bySessionId = new Map();
   for (const info of all) {
-    if (info.lineage.sessionId) bySessionId.set(info.lineage.sessionId, info);
+    if (!info.lineage.sessionId) continue;
+    const existing = bySessionId.get(info.lineage.sessionId);
+    if (existing && existing.rolloutKey !== info.rolloutKey) {
+      throw new Error("Ambiguous duplicate Codex session identity across distinct rollout files");
+    }
+    bySessionId.set(info.lineage.sessionId, info);
   }
 
   const selected = new Set(all.filter((info) => info.mtimeMs >= cutoffMs));
@@ -271,6 +287,18 @@ export function canonicalComponents(raw) {
     input_cache_write_tokens: cacheWrite,
     output_text_tokens: Math.max(0, raw.output_tokens - reasoning),
     output_reasoning_tokens: reasoning,
+  };
+}
+
+export function canonicalComponentAvailability(presence, raw) {
+  const inputConsistent = raw.cached_input_tokens + raw.cache_write_input_tokens <= raw.input_tokens;
+  const outputConsistent = raw.reasoning_output_tokens <= raw.output_tokens;
+  return {
+    input_uncached_tokens: inputConsistent && presence.input_tokens && presence.cached_input_tokens && presence.cache_write_input_tokens,
+    input_cache_read_tokens: inputConsistent && presence.input_tokens && presence.cached_input_tokens,
+    input_cache_write_tokens: inputConsistent && presence.input_tokens && presence.cached_input_tokens && presence.cache_write_input_tokens,
+    output_text_tokens: outputConsistent && presence.output_tokens && presence.reasoning_output_tokens,
+    output_reasoning_tokens: outputConsistent && presence.output_tokens && presence.reasoning_output_tokens,
   };
 }
 
@@ -473,15 +501,19 @@ async function parseRollout(path, {
   serverBillableUnits,
   surfaceClassification,
   sourceScopeId,
+  sourceDedupeScope,
 }) {
   const tierTimeline = await collectTierTimeline(path, diagnostics);
   const input = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
   let currentModel = null;
   let previousTotals = null;
+  let previousTotalsPresence = null;
   const openTaskIds = new Set();
+  let sourceRecordOrdinal = 0;
 
   for await (const line of lines) {
+    sourceRecordOrdinal += 1;
     if (!line.includes('"turn_context"')
         && !line.includes('"thread_settings_applied"')
         && !line.includes('"token_count"')
@@ -535,7 +567,7 @@ async function parseRollout(path, {
       if (observations.length > 0) {
         if (timestampMs < startMs || timestampMs > endMs) continue;
         const stableId = record.payload?.call_id ?? record.payload?.id;
-        const toolKey = [stableId ?? record.timestamp, record.payload?.type].join("|");
+        const toolKey = [sourceDedupeScope, sourceRecordOrdinal, stableId ?? "no-provider-id", record.payload?.type].join("|");
         if (seenToolCalls.has(toolKey)) {
           diagnostics.replayedToolCallsSkipped += 1;
           continue;
@@ -548,6 +580,7 @@ async function parseRollout(path, {
             timestampMs,
             surfaceClassification,
             ...(sourceScopeId ? { sourceScopeId } : {}),
+            sourceRecordOrdinal,
             ...observation,
           });
         }
@@ -557,6 +590,8 @@ async function parseRollout(path, {
     if (record.type !== "event_msg" || record.payload?.type !== "token_count") continue;
 
     const info = record.payload?.info;
+    const totalPresence = tokenComponentPresence(info?.total_token_usage);
+    const lastPresence = tokenComponentPresence(info?.last_token_usage);
     const total = normalizeTokenUsage(info?.total_token_usage);
     const last = normalizeTokenUsage(info?.last_token_usage);
     if ((info?.total_token_usage && !total) || (info?.last_token_usage && !last)) {
@@ -565,16 +600,25 @@ async function parseRollout(path, {
     const cumulativeKey = cumulativeSnapshotKey(total, last);
     if (cumulativeKey) rolloutSnapshots.add(cumulativeKey);
     if (forked && cumulativeKey && inheritedSnapshots.has(cumulativeKey)) {
-      if (total) previousTotals = total;
+      if (total) {
+        previousTotals = total;
+        previousTotalsPresence = totalPresence;
+      }
       if (timestampMs >= startMs && timestampMs <= endMs) diagnostics.forkReplayEventsSkipped += 1;
       continue;
     }
     if (timestampMs < startMs || timestampMs > endMs) {
-      if (total) previousTotals = total;
+      if (total) {
+        previousTotals = total;
+        previousTotalsPresence = totalPresence;
+      }
       continue;
     }
     if (forked && currentModel === null) {
-      if (total) previousTotals = total;
+      if (total) {
+        previousTotals = total;
+        previousTotalsPresence = totalPresence;
+      }
       diagnostics.unattributedForkReplayEventsSkipped += 1;
       continue;
     }
@@ -591,20 +635,29 @@ async function parseRollout(path, {
         window,
         surfaceClassification,
         ...(sourceScopeId ? { sourceScopeId } : {}),
+        sourceRecordOrdinal,
       });
       diagnostics.rateLimitSnapshots += 1;
     }
     let usage = null;
+    let usagePresence = null;
     if (total) {
       const delta = subtractUsage(total, previousTotals);
+      const deltaPresence = deltaComponentPresence(totalPresence, previousTotalsPresence);
       const firstCumulativeRecord = previousTotals === null;
       previousTotals = total;
+      previousTotalsPresence = totalPresence;
       if (firstCumulativeRecord) {
         usage = last ?? delta;
+        usagePresence = last ? lastPresence : deltaPresence;
       } else if (delta.total_tokens > 0) {
-        if (last && sameUsage(last, delta)) usage = last;
+        if (last && sameUsage(last, delta)) {
+          usage = last;
+          usagePresence = lastPresence;
+        }
         else {
           usage = delta;
+          usagePresence = deltaPresence;
           if (last) diagnostics.lastVsCumulativeMismatches += 1;
         }
       } else if (last && last.total_tokens > 0) {
@@ -612,16 +665,13 @@ async function parseRollout(path, {
       }
     } else {
       usage = last;
+      usagePresence = lastPresence;
       diagnostics.lastOnlyEvents += 1;
     }
     if (!usage || (usage.input_tokens === 0 && usage.output_tokens === 0)) continue;
 
     const model = record.payload?.model ?? info?.model ?? currentModel ?? "unknown";
-    const eventKey = [
-      record.timestamp,
-      model,
-      ...COMPONENT_KEYS.map((key) => usage[key]),
-    ].join("|");
+    const eventKey = [sourceDedupeScope, sourceRecordOrdinal, "token_count"].join("|");
     if (seenEvents.has(eventKey)) {
       diagnostics.replayedEventsSkipped += 1;
       continue;
@@ -632,7 +682,9 @@ async function parseRollout(path, {
       timestamp: record.timestamp,
       model,
       raw: usage,
+      rawAvailability: usagePresence,
       components: canonicalComponents(usage),
+      componentAvailability: canonicalComponentAvailability(usagePresence, usage),
       tierSemantics: normalizeProviderTier(effectiveTier?.rawTier ?? null, {
         billingSurface: "chatgpt_subscription",
         tierSource: effectiveTier ? "rollout_thread_settings" : "unobserved",
@@ -641,6 +693,7 @@ async function parseRollout(path, {
       surfaceClassification,
       sourceRolloutOrdinal,
       ...(sourceScopeId ? { sourceScopeId } : {}),
+      sourceRecordOrdinal,
     });
   }
   return { openTasksAtEnd: openTaskIds.size };
@@ -728,6 +781,7 @@ export async function scanCodexLogEvents({
     const sourceScopeId = typeof sourceScopeForRollout === "function"
       ? sourceScopeForRollout(info.lineage.sessionId ?? info.rolloutKey)
       : null;
+    const sourceDedupeScope = info.lineage.sessionId ?? info.rolloutKey;
     if (sourceScopeId !== null && (typeof sourceScopeId !== "string" || !/^[a-z][a-z0-9-]*:v1:[A-Za-z0-9_-]{43}$/.test(sourceScopeId))) {
       throw new Error("sourceScopeForRollout must return a versioned privacy-safe pseudonym or null");
     }
@@ -749,6 +803,7 @@ export async function scanCodexLogEvents({
       serverBillableUnits,
       surfaceClassification: classification,
       sourceScopeId,
+      sourceDedupeScope,
     });
     if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) diagnostics.activeTaskRolloutsAtEnd += 1;
     if (info.lineage.sessionId) snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);

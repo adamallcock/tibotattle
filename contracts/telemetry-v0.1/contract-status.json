@@ -1,0 +1,8 @@
+{
+  "contractFamily": "telemetry-v0.1",
+  "status": "draft_local_only_unfrozen",
+  "transportReady": false,
+  "backwardCompatibility": "none_regenerate_local_review_artifacts",
+  "externalParticipantsAuthorized": false,
+  "freezeRule": "The first volunteer or upload-capable contract must use a new version and preserve every frozen predecessor unchanged."
+}

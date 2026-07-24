@@ -90,7 +90,15 @@
             "additionalProperties": false,
             "required": ["code", "count"],
             "properties": {
-              "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$", "maxLength": 64 },
+              "code": {
+                "enum": [
+                  "fork_replay_events_skipped", "last_only_events", "lineage_parents_missing",
+                  "malformed_lines", "malformed_rate_limit_records", "malformed_task_events",
+                  "malformed_timestamps", "malformed_usage_records", "missing_rate_limit_records",
+                  "replayed_events_skipped", "replayed_tool_calls_skipped", "unattached_tool_calls",
+                  "unattributed_fork_replay_events_skipped"
+                ]
+              },
               "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
             }
           }

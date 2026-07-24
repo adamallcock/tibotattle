@@ -9,6 +9,7 @@
     "eventTime",
     "provider",
     "modelId",
+    "modelRecognition",
     "modelFingerprint",
     "billingSurface",
     "speedMode",
@@ -30,10 +31,12 @@
     "eventTime": { "type": "string", "format": "date-time", "maxLength": 32 },
     "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
     "modelId": {
-      "type": "string",
-      "maxLength": 64,
-      "pattern": "^(unknown|gpt-[a-z0-9][a-z0-9._-]{0,62}|o[0-9][a-z0-9._-]{0,62}|codex-[a-z0-9][a-z0-9._-]{0,62}|claude-[a-z0-9][a-z0-9._-]{0,62})$"
+      "enum": [
+        "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+        "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"
+      ]
     },
+    "modelRecognition": { "enum": ["recognized", "unrecognized", "missing"] },
     "modelFingerprint": {
       "type": ["string", "null"],
       "pattern": "^model:v1:[A-Za-z0-9_-]{43}$"
@@ -53,14 +56,14 @@
         "outputReasoningTokens"
       ],
       "properties": {
-        "inputUncachedTokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "inputCacheReadTokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "inputCacheWriteTokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "outputTextTokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "outputReasoningTokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+        "inputUncachedTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "inputCacheReadTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "inputCacheWriteTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "outputTextTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "outputReasoningTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 }
       }
     },
-    "totalInputContextTokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "totalInputContextTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
     "surface": {
       "enum": [
         "scheduled_task",
@@ -76,6 +79,10 @@
     "toolClassCounts": {
       "type": "object",
       "additionalProperties": false,
+      "required": [
+        "webSearch", "fileSearch", "codeInterpreter", "hostedShell", "computerUse", "mcp",
+        "applyPatch", "localShell", "subagent", "toolGateway", "other", "unknown"
+      ],
       "properties": {
         "webSearch": { "type": "integer", "minimum": 0, "maximum": 1000000 },
         "fileSearch": { "type": "integer", "minimum": 0, "maximum": 1000000 },
@@ -92,11 +99,44 @@
       }
     },
     "outcome": { "enum": ["completed", "failed", "cancelled", "interrupted", "retry", "unknown"] },
-    "eventId": { "type": "string", "pattern": "^event:v1:[A-Za-z0-9_-]{43}$" },
+    "eventId": { "type": "string", "pattern": "^event:v2:[A-Za-z0-9_-]{43}$" },
     "sessionScopeId": { "type": "string", "pattern": "^session:v1:[A-Za-z0-9_-]{43}$" },
     "accountScopeId": {
       "type": "string",
       "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "modelRecognition": { "const": "recognized" } } },
+      "then": {
+        "properties": {
+          "modelId": { "enum": ["gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] },
+          "modelFingerprint": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "modelRecognition": { "const": "unrecognized" } } },
+      "then": {
+        "properties": {
+          "modelId": { "const": "unknown" },
+          "modelFingerprint": { "type": "string", "pattern": "^model:v1:[A-Za-z0-9_-]{43}$" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "modelRecognition": { "const": "missing" } } },
+      "then": {
+        "properties": {
+          "modelId": { "const": "unknown" },
+          "modelFingerprint": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "anthropic_claude_code" } } },
+      "then": { "properties": { "modelId": { "const": "unknown" } } }
+    }
+  ]
 }

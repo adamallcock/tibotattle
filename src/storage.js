@@ -1,5 +1,6 @@
-import { appendFile, chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { appendFile, chmod, link, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 
 export function defaultDataFile() {
   return resolve(process.cwd(), ".usage-monitor", "observations.jsonl");
@@ -162,6 +163,100 @@ export async function writeOwnerOnlyAtomic(path, content) {
 
 export async function writeJsonOwnerOnlyAtomic(path, value) {
   await writeOwnerOnlyAtomic(path, stableJson(value));
+}
+
+async function assertPathAbsent(path) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("Refusing to overwrite an existing local export artifact");
+}
+
+async function prepareOwnerOnlyFile(path, content) {
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.chmod(0o600);
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.nlink !== 1) throw new Error("Export staging artifact must be a single-link regular file");
+    if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+      throw new Error("Export staging artifact must be owned by the current user");
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertOwnerControlledDirectory(path) {
+  const stats = await lstat(path);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("Export destination must be a real directory");
+  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+    throw new Error("Export destination must be owned by the current user");
+  }
+  if (process.platform !== "win32" && (stats.mode & 0o022) !== 0) {
+    throw new Error("Export destination must not be group- or world-writable");
+  }
+}
+
+export async function writeOwnerOnlyPairNoClobber({
+  firstPath,
+  firstContent,
+  secondPath,
+  secondContent,
+} = {}, {
+  linkFile = link,
+} = {}) {
+  if (typeof firstContent !== "string" || typeof secondContent !== "string") {
+    throw new Error("Paired export contents must be strings");
+  }
+  const first = resolve(firstPath);
+  const second = resolve(secondPath);
+  if (first === second) throw new Error("Bundle and privacy receipt paths must be distinct");
+  const firstDirectory = dirname(first);
+  const secondDirectory = dirname(second);
+  await mkdir(firstDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(secondDirectory, { recursive: true, mode: 0o700 });
+  await assertOwnerControlledDirectory(firstDirectory);
+  await assertOwnerControlledDirectory(secondDirectory);
+  const firstResolved = join(await realpath(firstDirectory), basename(first));
+  const secondResolved = join(await realpath(secondDirectory), basename(second));
+  if (firstResolved === secondResolved) throw new Error("Bundle and privacy receipt paths must be distinct");
+  if (dirname(firstResolved) !== dirname(secondResolved)) {
+    throw new Error("Bundle and privacy receipt must share one canonical destination directory");
+  }
+  await assertPathAbsent(first);
+  await assertPathAbsent(second);
+
+  const transactionId = `${process.pid}.${randomUUID()}`;
+  const firstTemporary = `${first}.${transactionId}.tmp`;
+  const secondTemporary = `${second}.${transactionId}.tmp`;
+  let firstCommitted = false;
+  let secondCommitted = false;
+  try {
+    await prepareOwnerOnlyFile(firstTemporary, firstContent);
+    await prepareOwnerOnlyFile(secondTemporary, secondContent);
+    await linkFile(secondTemporary, second);
+    secondCommitted = true;
+    await linkFile(firstTemporary, first);
+    firstCommitted = true;
+    for (const directory of new Set([firstDirectory, secondDirectory])) await syncDirectory(directory);
+  } catch (error) {
+    if (secondCommitted) await unlink(second).catch(() => {});
+    if (firstCommitted) await unlink(first).catch(() => {});
+    for (const directory of new Set([firstDirectory, secondDirectory])) await syncDirectory(directory).catch(() => {});
+    throw error;
+  } finally {
+    await unlink(firstTemporary).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    await unlink(secondTemporary).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
 }
 
 export async function appendObservation(path, observation) {

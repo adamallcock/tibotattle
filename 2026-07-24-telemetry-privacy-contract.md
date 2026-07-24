@@ -11,6 +11,8 @@ status: active
 
 The first multi-user research artifact is a local-review-only metadata bundle. It is constructed from an empty object using versioned allowlists; it is never a redacted copy of a Codex or Claude log. A valid v0.1 bundle cannot contain arbitrary fields or free-form content, is written mode `0600`, carries a separate privacy receipt, and is structurally marked `transportReady: false`.
 
+The v0.1 contract family is an explicitly unfrozen, local-only draft. It has not been distributed to external participants and has no backward-compatibility promise; local review artifacts must be regenerated whenever its recorded schema hashes change. This exception ends at freeze: the first volunteer or upload-capable contract must use a new version, and every frozen schema version is thereafter immutable. The machine-readable status is `contracts/telemetry-v0.1/contract-status.json`.
+
 No upload, enrollment, server, background collection, notification, or dashboard functionality is authorized by this decision. A later transport design must pass a separate review and cannot weaken these schemas.
 
 ## Data-flow boundary
@@ -58,11 +60,11 @@ The following are prohibited from every valid bundle and receipt:
 - arbitrary labels, experiment text, error text, unknown input fields, or generic metadata maps; and
 - raw unknown model identifiers.
 
-Fields not present in the schema are rejected even if they appear harmless. Adding a field requires a schema-version change, purpose/retention update, adversarial fixture, and privacy review.
+Fields not present in the schema are rejected even if they appear harmless. While v0.1 remains `draft_local_only_unfrozen`, adding a field requires a purpose/retention update, regenerated schema hashes and field dictionary, an adversarial fixture, privacy review, and regeneration of every local review artifact. After freeze, adding a field also requires a new schema version and migration tests; a frozen predecessor is never edited in place.
 
 ## Pseudonym specification
 
-The exporter uses a separate 32-byte random participant secret, not the account-observation key. The default file is `.usage-monitor/export-participant-secret`, created mode `0600`. `APP_USAGEMONITOR_EXPORT_SECRET` or `--secret-file` may supply an alternative.
+The exporter uses a separate 32-byte random participant secret, not the account-observation key. The default file is in the OS application-state directory (`~/Library/Application Support/app-usagemonitor/` on macOS, XDG state on Linux, and local app data on Windows). Safe legacy `.usage-monitor/export-participant-secret` files are copied forward without deleting the original. The POSIX fallback requires a current-user-owned, single-link regular file of the exact expected length with mode `0600` inside an owner-controlled directory. Native Windows credential storage is not implemented and remains a supported-release blocker. `APP_USAGEMONITOR_EXPORT_SECRET` or `--secret-file` may supply an advanced-use alternative.
 
 Each namespace derives its own 32-byte key using HKDF-SHA-256:
 
@@ -73,7 +75,7 @@ namespace_key = HKDF-SHA-256(participant_secret, salt, info)
 pseudonym = namespace + ":v1:" + base64url(HMAC-SHA-256(namespace_key, framed_subject))
 ```
 
-Namespaces are `participant`, `account`, `session`, `event`, `snapshot`, `marker`, and `model`. The same source subject therefore cannot be correlated across namespaces by comparing digests. Rotating or deleting the participant secret breaks future linkability; copying the same secret to another device intentionally preserves the same participant identity.
+Namespaces are `participant`, `account`, `session`, `event`, `snapshot`, `quota-state`, `marker`, and `model`. Participant/account/session/model IDs retain v1 namespace semantics. Event, snapshot-observation, and marker occurrence IDs use domain-separated v2 semantics. Codex event identity depends only on provider, source format, privacy-safe session scope, physical JSONL record ordinal, and record kind; quota observations additionally include the slot. Model, tokens, tools, tier, surface, account enrichment, parser version, and export bounds do not re-key the occurrence. Quota state has a separate fingerprint; when account attribution is unavailable it includes session scope and is not eligible for cross-session collapse. Rotating or deleting the participant secret breaks future linkability; copying the same secret to another device intentionally preserves the same participant identity.
 
 Raw account/session identifiers are never used as exported identifiers. An account with no defensible local attribution is represented as the literal enum `unattributed` rather than being guessed.
 
@@ -115,15 +117,17 @@ Future upload consent must separately name the operator, destination, retention 
 
 1. Stop any exporter process. No background process is currently installed.
 2. Delete the selected local bundle and its matching privacy receipt. Files under `exports/` are generated review artifacts and are not source evidence.
-3. To end longitudinal linkability, delete `.usage-monitor/export-participant-secret`. The next inspect/export creates a new identity. Existing local bundles remain linkable to one another through their embedded old participant pseudonym until they are also deleted.
+3. To end longitudinal linkability, delete the exporter secret in the OS application-state directory (or the explicitly supplied `--secret-file`). The next inspect/export creates a new identity. If a retained legacy `.usage-monitor/export-participant-secret` still exists, move or delete it too before the next run or it can be migrated back. Existing local bundles remain linkable to one another through their embedded old participant pseudonym until they are also deleted.
 4. If a secret may have been exposed, rotate it before creating another bundle and do not share any bundle created with the exposed identity.
 5. Do not delete raw Codex logs as part of this runbook; they belong to the provider application and are outside this tool's data lifecycle.
 
 There is no server-side deletion procedure because no server or upload exists. Phase 2 cannot begin until enrollment, status, export, revocation, and deletion paths are implemented and exercised end to end.
 
-## Validation receipt
+## Superseded baseline validation receipt
 
-The implementation is covered by 182 passing Node tests, including nine exporter-specific identity/schema/privacy/CLI/end-to-end tests plus property-based unknown-field injection. Synthetic fixtures contain prompt/response canaries, email and bearer-shaped values, raw account/session/call/marker IDs, a private path, tool arguments, repository metadata, arbitrary fields, and an unknown model string; none enter the valid output.
+The following records the initial telemetry-v0.1 baseline before the July 24 G1 exporter-hardening milestone. It is preserved as historical evidence and superseded for current validation counts, identity versions, source-file discovery, and bundle size by `2026-07-24-g1-exporter-hardening-receipt.md`.
+
+That baseline implementation was covered by 182 passing Node tests, including nine exporter-specific identity/schema/privacy/CLI/end-to-end tests plus property-based unknown-field injection. Synthetic fixtures contain prompt/response canaries, email and bearer-shaped values, raw account/session/call/marker IDs, a private path, tool arguments, repository metadata, arbitrary fields, and an unknown model string; none enter the valid output.
 
 A real bounded dry run over 2026-07-24 18:10:45–19:10:45 UTC scanned four local rollout files and emitted 463 usage events plus 471 quota snapshots. The canonical bundle was 982,083 bytes, both bundle and receipt were mode `0600`, all five privacy checks passed, 125 fork-replay events were reported as excluded diagnostics, and `transportReady` remained `false`. The generated files are ignored local artifacts under `exports/` and were not transmitted.
 
@@ -132,7 +136,6 @@ A real bounded dry run over 2026-07-24 18:10:45–19:10:45 UTC scanned four loca
 This record does not claim Phase 1 completion. Before soliciting even local dry-run bundles from volunteers, the project still needs:
 
 - several independently shaped fixtures and platform-specific path/credential cases;
-- an inspectable field dictionary generated from the schemas;
 - bounded/incremental processing for very large histories rather than retaining a whole bundle in memory;
 - Claude Code export parity where stable local usage and status-line evidence exists;
 - reproducible signed packaging and installation instructions;
