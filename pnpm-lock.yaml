@@ -1,0 +1,88 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      ccusage:
+        specifier: 20.0.18
+        version: 20.0.18
+      runcost:
+        specifier: 0.2.0
+        version: 0.2.0
+
+packages:
+
+  '@ccusage/ccusage-darwin-arm64@20.0.18':
+    resolution: {integrity: sha512-3Uv3ED3RyepxNyYYU/BGqfzsL+yWkzxb9gETDLn6DR1umMmoLBLz2bzOfHe1tFXpDEBcx75cj70P4Mq4WEJ/Kg==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@ccusage/ccusage-darwin-x64@20.0.18':
+    resolution: {integrity: sha512-Y2NWvCsRkhbakBj0Pn9NReQnaJfsGEQRV+q4moUuVAHe2Hh40IwBjCMv5NVECHNU1TJT73WIxHpfC3mcIDL3Pw==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@ccusage/ccusage-linux-arm64@20.0.18':
+    resolution: {integrity: sha512-55gGCy13tLmPV9sxRBHP5Jf6o/1hrIF4KUk/0BoawSrOPbSOQZG+8qGXTILNxrOZ4YLmPB2srTMd2vq+6K+LcA==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@ccusage/ccusage-linux-x64@20.0.18':
+    resolution: {integrity: sha512-3bF4ZY/JFRc/kZTagriV4Mr1kmItzMM4kZHd+S3eD8Yg7KI2X4j+0n4TMO8yqgJ6aDwdj0QvhSTW7qcp0rXdCw==}
+    cpu: [x64]
+    os: [linux]
+
+  '@ccusage/ccusage-win32-arm64@20.0.18':
+    resolution: {integrity: sha512-Iaxx9Td97M2cVrMpGRrSPTdtpFzw/Ku+lpRYlYlbnFM3AdQ+wlD3xzaYsQ+OdlmPS2DSgHzt3Cob4fgIhvHpbA==}
+    cpu: [arm64]
+    os: [win32]
+
+  '@ccusage/ccusage-win32-x64@20.0.18':
+    resolution: {integrity: sha512-2DaCLgoVsVfxijdrOupR3+x4tbPJTmdIcIVyxkzMRJAa5U6dIWzc/WBtaDruir/CfTrwyZvj1CPdfKVTKDoCDA==}
+    cpu: [x64]
+    os: [win32]
+
+  ccusage@20.0.18:
+    resolution: {integrity: sha512-/81kwSZg487xoHQadEdcP4hqw9GICkaPtVjSM1HHJ4nBplUByX9tSZF7YIaQQWMcWZ5Gzt0cD2yDEFrgcAkrZg==}
+    hasBin: true
+
+  runcost@0.2.0:
+    resolution: {integrity: sha512-bP/RR1j1HEfkvxLbk2n943ccp0bslwxwycRRdU6PZjHndHv0Nng47Z7xeesjeOBkOD8kafU0K8xB36Nk8Muu/g==}
+    engines: {node: '>=20'}
+    hasBin: true
+
+snapshots:
+
+  '@ccusage/ccusage-darwin-arm64@20.0.18':
+    optional: true
+
+  '@ccusage/ccusage-darwin-x64@20.0.18':
+    optional: true
+
+  '@ccusage/ccusage-linux-arm64@20.0.18':
+    optional: true
+
+  '@ccusage/ccusage-linux-x64@20.0.18':
+    optional: true
+
+  '@ccusage/ccusage-win32-arm64@20.0.18':
+    optional: true
+
+  '@ccusage/ccusage-win32-x64@20.0.18':
+    optional: true
+
+  ccusage@20.0.18:
+    optionalDependencies:
+      '@ccusage/ccusage-darwin-arm64': 20.0.18
+      '@ccusage/ccusage-darwin-x64': 20.0.18
+      '@ccusage/ccusage-linux-arm64': 20.0.18
+      '@ccusage/ccusage-linux-x64': 20.0.18
+      '@ccusage/ccusage-win32-arm64': 20.0.18
+      '@ccusage/ccusage-win32-x64': 20.0.18
+
+  runcost@0.2.0: {}

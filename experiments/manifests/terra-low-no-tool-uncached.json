@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "0.3",
+  "experimentId": "terra-low-no-tool-uncached-v1",
+  "hypothesis": "A bounded uncached no-tool turn establishes the local API-price and quota baseline for a later cache-heavy repeat.",
+  "mode": "live",
+  "model": "gpt-5.6-terra",
+  "reasoningEffort": "low",
+  "tierDeclaration": { "billingSurface": "chatgpt_subscription", "codexSpeedMode": "standard", "apiServiceTier": "unknown", "providerTierRaw": "default", "tierSource": "experiment_manifest", "tierObservedAt": null },
+  "workloadId": "no-tool-arithmetic-v1",
+  "contextBand": {
+    "targetInputTokens": 32000,
+    "maximumInputTokens": 64000
+  },
+  "cacheState": "uncached",
+  "permittedToolClass": "none",
+  "projectedUsage": {
+    "inputUncachedTokens": 32000,
+    "inputCacheReadTokens": 0,
+    "inputCacheWriteTokens": 0,
+    "outputTextTokens": 64,
+    "outputReasoningTokens": 128
+  },
+  "budgets": {
+    "maximumTurns": 1,
+    "maximumElapsedMs": 60000,
+    "maximumApiPricedUsd": 0.1,
+    "maximumDisplayedQuotaMovement": 1,
+    "minimumQuotaHeadroomPercent": 10,
+    "minimumQuietPeriodMs": 15000
+  },
+  "requiredCaptures": {
+    "before": true,
+    "after": true
+  },
+  "concurrency": "none"
+}

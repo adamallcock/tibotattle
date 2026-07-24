@@ -1,0 +1,205 @@
+# app-usagemonitor
+
+Local-only proof of concept for comparing provider-reported coding-agent quota with usage reconstructed at standard API prices from local logs.
+
+This is an experiment harness, not another quota dashboard. It records privacy-minimized snapshots, preserves pricing warnings, and estimates a quota capacity only when the observations identify one.
+
+## Current multi-surface and account-aware outcome
+
+The monitor now combines replay-safe local rollout receipts with read-only Codex app-server accounting and privacy-minimized observations from the authenticated **Codex and Work Analytics** page.
+
+The living [coverage gaps register](./2026-07-24-coverage-gaps-register.md) separately tracks unobserved shared-pool surfaces such as ChatGPT Work, Workspace Agents, ChatGPT for Excel, Codex Cloud, other Codex devices, Work Voice task activity, image generation, third-party authenticated apps, and Claude clients. Ordinary Chat conversations and ordinary Chat Voice are explicitly excluded from the Codex/Work shared agentic pool; Spark is tracked as a separate limit.
+
+The log-derived [monitoring quality report](./2026-07-24-monitoring-quality-report.html) and its [source notes](./2026-07-24-monitoring-quality-source-notes.md) add an operational observability layer. The new `quality` command measures collector/app-server freshness, fixed-reset jitter versus moving reset families, integer-display censoring, regressions, account/plan/speed/snapshot-age coverage, and parser loss. It emits owner-only JSON plus a dated Markdown diagnostic rather than silently fitting weak intervals.
+
+The [seven-day calibration report](./2026-07-24-weekly-7-day-calibration-report.html) and [source notes](./2026-07-24-weekly-7-day-calibration-source-notes.md) provide the predictive and reset-level view. The `calibrate-weekly` command selects among Standard and speed-aware API-price ledgers using an earlier-70%/later-30% chronological split, then tests lag, forecast, regime, and within-reset update candidates without look-ahead. Fourteen stable windows imply a median $1,878.75 API-price-equivalent seven-day value and a central 80% reset-to-reset range of $1,640.96–$2,280.38. Conservative captured-speed weighting reduces pooled holdout MAE from 2.25 to 2.16 displayed percentage points (4.1%); the no-look-ahead prior-reset error is 3.95 points and 80% of individual errors are bounded explicitly in the report. All 5–60 point online updates and 5–60 second display-lag corrections are currently rejected because they worsen untouched later-period prediction. These are behavioral calibration values, not a provider-published allowance or cash entitlement.
+
+- The retained May 17–July 24 interval contains 2,366 classified rollouts, 295,681 request-like usage events, 55.68B tokens, and $51,671.51 at Standard OpenAI API-price-equivalent rates. Another 585,778 fork-replay events are excluded.
+- Codex task surfaces are explicit: 33 scheduled-task rollouts contribute 673 usage events and 44.58M tokens; 1,821 subagent rollouts contribute 58,948 events and 7.09B tokens. Provider-side Cloud or Work activity without a local rollout remains unallocated.
+- The current pseudonymous account reports 37.06B lifetime tokens. The account-unattributed local/current-account lifetime ratio is 1.502, which rejects treating the whole local corpus as one current-account history under equal token semantics. The user's known account switching is a likely candidate, but historical metric differences or residual duplication remain possible.
+- On matched provider days, the unmatched-scope local/provider coverage diagnostic is 1.765x for May 29–July 8, 0.901x for July 9–15, and 0.924x for July 16–24. The post–July 9 agreement is much better, but July 9 remains a plausible boundary rather than a proven accounting-effective date.
+- The visible provider page explicitly says Work and Codex share one usage limit and exposes coarse Desktop, CLI, Extension, Cloud, Mobile, Code review, Desktop App, Web, and Exec categories. It does not expose a Work-only allocation. A 1,569-turn gap between its model and surface totals is retained as unclassified, not relabeled as Work.
+- The original conditional weekly ballpark remains $1.9k–$2.3k in Standard-API-equivalent / tier-weighted units. It is still not the actual weekly allowance because the older history cannot be partitioned by account and all shared-pool activity is not observable at per-turn precision.
+
+The current provider `planType: pro` field does not distinguish the $100 5x and $200 20x variants. The owner-only plan timeline records the user's normal 20x state only from the July 24 account registration onward and keeps the brief 5x episode unresolved until its approximate dates and account alias are known. Earlier rows remain `unknown` rather than inheriting today's plan.
+
+OpenAI's April 9 release note described the newly launched $100 option as temporarily up to 10x, increased from its normal 5x level; current pricing again lists $100 as 5x and $200 as 20x. The monitor therefore models `pro-5x` and `pro-10x-promo` separately and will not guess which applied to the unresolved episode.
+
+## Current v0.3 outcome
+
+The seven evidence gates are implemented. The live result is deliberately **non-identifiable**, not a guessed weekly limit:
+
+- 20,195 fixed-window request-like usage events are fully priced at standard OpenAI API rates after 35,181 fork-history replay exclusions;
+- 284 displayed-percentage transitions and 19,977 adjacent snapshot intervals are retained;
+- the provisional robust statistic is `$1,886.70`, but exact constraints conflict, held-out error is 1.918 percentage points, and control state is unknown, so it is not reported as a capacity estimate;
+- two bounded Terra pilots completed but each was contaminated by separate Sol activity;
+- all 19,979 contamination intervals remain unknown, with zero strict controlled references;
+- 17,552 relevant client tool observations contain zero matching provider-billed units, so no separate API tool price or incremental quota effect is inferred; and
+- one append-only correction removes 71,060,499 replayed unknown-model tokens from the effective legacy baseline while preserving the original observation byte-for-byte.
+
+Codex token-count records do not expose a per-request API service tier or Fast-mode marker. Parser `0.3.2` now joins the nearest preceding privacy-safe `thread_settings_applied.service_tier` event within the same rollout. The local protocol persists subscription Standard as `default` and the current Fast UI tier as `priority`; these normalize to `codexSpeedMode` without treating Fast as API Priority. Events before a setting, after a clear, or without a defensible join remain `unknown`.
+
+[Codex Fast mode](https://developers.openai.com/codex/speed) and API Priority processing are separate mechanisms. For ChatGPT-authenticated Codex, the official Fast-mode schedule is 2.5 times Standard credit consumption for GPT-5.6/GPT-5.5 and 2 times for GPT-5.4, while preserving standard API-priced USD as the base comparison series. API Standard, Priority, Flex, and Batch remain explicit taxonomy values, but this subscription monitor does not apply a non-Standard API price unless a future API-billed event actually exposes its billing surface and tier. Historical rows with no observed speed mode remain `unknown` and receive Standard/Fast sensitivity views rather than an imputed multiplier.
+
+The retained June 11–July 23 rollout history contains 1,743 Standard/default and 89 Fast/priority setting events. The parser persists only canonical mode, safe raw classification, source, and timestamp—never thread IDs or log bodies. This is a session-setting timeline, not exact per-turn tier attribution; omitted settings leave prior state unchanged and an explicit clear returns attribution to `unknown`.
+
+New passive-collector records carry the same timestamp-safe, privacy-minimized tier semantics. Direct captures summarize tier coverage across their local usage events: only an all-Standard or all-Fast window receives a known mode; mixed or incomplete windows remain `unknown`. Neither path claims an API service tier for ChatGPT-subscription usage.
+
+The compact historical diagnostic prices 222,525 usage events and 4,177 weekly-window transitions. Fourteen reset groups meet descriptive quality thresholds. Their median Standard API-price-equivalent slope is `$1,890.63`, with a central 80% reset-to-reset spread of `$1,724.09–$2,286.48`. The last three usable groups imply a conditional `$1,871.18` Standard-only ballpark or `$1,892.15–$2,327.06` under captured/unknown tier sensitivity. This is not an identified allowance: all 4,177 transitions have unknown control state and missing shared-pool activity is unbounded.
+
+The missing evidence is a repeated, uncontaminated panel spanning multiple displayed transitions and more than one reset window, with provider-unit telemetry for any hosted tool being tested.
+
+The complete live-tested quota adapter is currently Codex. Claude Code exposes the required plan-limit fields through its official status-line input and has compatible local usage logs. On 2026-07-23, the Keychain-backed Claude.ai Pro OAuth completed a live one-turn smoke and returned `usage.service_tier: standard`, `usage.speed: standard`, and `fast_mode_state: off`. Authentication is therefore no longer blocked; a status-line callback with non-null five-hour/seven-day windows still needs validation.
+
+`src/claude-statusline.js` is a privacy-minimized status-line tap for that next adapter. It stores only model/version plus the five-hour and seven-day percentages/reset times, and deliberately drops session IDs, transcript paths, working directories, and content. It is not installed into `~/.claude/settings.json` automatically.
+
+## Quick start
+
+Requires Node.js 20 or newer and an authenticated Codex CLI/app installation.
+
+```bash
+pnpm install --ignore-workspace
+pnpm --ignore-workspace doctor
+pnpm --ignore-workspace capture --label baseline --controlled
+# Run a declared Codex workload, with other shared-pool activity paused.
+pnpm --ignore-workspace capture --label after-task --controlled
+pnpm --ignore-workspace report # descriptive snapshot summary; never reports a capacity
+# Mine a fixed historical interval reproducibly.
+pnpm --ignore-workspace transitions --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z --offline
+pnpm --ignore-workspace infer
+# Mine weekly history without storing all adjacent snapshots, then diagnose reset-to-reset movement.
+pnpm --ignore-workspace transitions --since 2026-06-11T00:00:00.000Z --until 2026-07-23T23:59:59.000Z --offline --compact --window-minutes 10080 --output .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
+pnpm --ignore-workspace history --input .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
+# Select the best accounting basis on chronological holdout data and emit reset-by-reset seven-day values.
+pnpm --ignore-workspace calibrate:weekly -- --input .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
+# Mark a bounded unlogged surface or quiet period without storing content or URLs.
+pnpm --ignore-workspace mark:activity -- --surface chatgpt_web --state start
+pnpm --ignore-workspace mark:activity -- --surface chatgpt_web --state end
+pnpm --ignore-workspace collect-once
+# Profile monitorability from a full-grain transition dataset and the passive ledger.
+pnpm --ignore-workspace quality -- --input .usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json
+# Reuse the cached replay-safe history for a fast provider/account crosscheck.
+/Users/adamallcock/.codex/bin/secret run app-usagemonitor-account-scope --env APP_USAGEMONITOR_ACCOUNT_HMAC_KEY -- \
+  node ./src/cli.js crosscheck \
+  --since 2026-05-17T00:00:00.000Z \
+  --until 2026-07-24T04:15:00.000Z \
+  --input .usage-monitor/local-history-v0.1.json \
+  --plan-timeline .usage-monitor/account-plan-timeline-v0.1.json \
+  --provider-ui .usage-monitor/provider-ui-observations-v0.1.jsonl
+# Foreground mode remains opt-in and exits cleanly on Ctrl-C.
+pnpm --ignore-workspace collect-foreground
+# Dry-run the first controlled pair; add --execute-live only after preflight headroom is safe.
+pnpm --ignore-workspace experiment --manifest experiments/manifests/terra-low-no-tool-uncached.json --offline
+# Analyze all adjacent intervals, including repeated integer displays.
+pnpm --ignore-workspace contamination
+# Inventory client tool observations versus official provider units.
+pnpm --ignore-workspace tools --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z
+# Append and resolve the deterministic schema-0.1 replay correction.
+pnpm --ignore-workspace migrate-corrections
+```
+
+`--ignore-workspace` is needed on this machine because the home directory contains an unrelated pnpm workspace. It can be omitted elsewhere.
+
+Observations are appended to `.usage-monitor/observations.jsonl`, which is ignored by Git. Override it with `--data-file /absolute/path/observations.jsonl`.
+
+Historical transition mining writes the current parser-`0.3.2`, owner-only dataset to `.usage-monitor/transitions-v0.3.2.json` and a versioned dated audit beside it. Supply an explicit `--since` and `--until`; this prevents a moving “now” boundary from making otherwise unchanged runs incomparable. Use `--compact --window-minutes 10080` for bounded weekly-history research. Parser `0.3.1` and the original frozen `0.3.0` artifact remain untouched; the legacy correction migration explicitly uses `0.3.0`.
+
+The collector does not save prompts, responses, credentials, account identifiers, repository paths, filenames, or tool arguments. It saves aggregate token components, model names, quota window snapshots, official daily token totals, and pricing provenance/warnings. Each Codex capture reports two API-price estimates: a request-aware RunCost ledger as the primary series and the ccusage baseline used by the linked Reddit experiment. It does not use the Codex subscription credit rate card.
+
+Local rollout logs normally retain the last provider-reported `used_percent`, window length, and reset time on token-count events. This is a last-known integer snapshot: it may be stale until another Codex response arrives and it does not contain the absolute allowance. The `doctor` and `capture` commands use the app-server account endpoint to refresh quota without generating a model turn.
+
+## Commands
+
+- `usage-monitor doctor`: verify the local Codex app-server, ccusage, and RunCost integration.
+- `usage-monitor capture [--label TEXT] [--controlled] [--plan-timeline PATH]`: append one aligned observation partitioned by pseudonymous account scope and the dated specific plan variant when known.
+- `usage-monitor report [--json]`: group observations by reset window as a descriptive diagnostic. It always returns `non_identifiable` and suppresses fit/capacity output; use `transitions` plus `infer` for gated capacity inference.
+- `usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--offline] [--compact] [--window-minutes N]`: reconstruct request-priced usage, collapse repeated integer quota displays into transition boundaries, and emit the normalized dataset plus privacy audit. Compact mode omits the large adjacent-snapshot stream.
+- `usage-monitor infer [--input PATH] [--output PATH] [--report-file PATH]`: compare floor, nearest-integer, one-event-delay, and 30-second-delay observation models; compute exact feasible ranges, a robust pairwise estimate, deterministic bootstrap uncertainty, holdout error, residual slices, and identifiability gates.
+- `usage-monitor history [--input PATH] [--output PATH] [--report-file PATH]`: compare privacy-safe within-reset slopes over time, deduplicate near-identical reset identities, apply Standard/Fast sensitivity, and refuse a policy-change claim while shared-pool usage is unbounded.
+- `usage-monitor calibrate-weekly [--input PATH] [--output PATH] [--report-file PATH]`: reproduce the frozen baseline; choose a Standard or speed-aware API-price basis; compare no-delay, forecast-window, regime, and online checkpoint candidates chronologically; audit reset-level error concentration; and emit the current ballpark plus empirical error. It never reports an identified provider allowance.
+- `usage-monitor mark-activity --surface SURFACE --state start|end|pulse [--experiment-id ID] [--activity-file PATH]`: append an owner-only low-cardinality marker. Explicit surfaces include ordinary Chat, Work, Workspace Agents, Excel, Codex Cloud/other devices, ordinary or Work Voice, image generation, Spark, dictation, third-party clients, quiet periods, and controlled experiments. Each marker carries a fixed policy classification such as `shared_agentic_pool`, `excluded_ordinary_chat`, `shared_agentic_pool_feature_multiplier`, `separate_demand_adjusted_model_limit`, or `mixed_task_shared_voice_time_separate`; it stores no content, URL, credential, or free text.
+- `usage-monitor crosscheck --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--input LOCAL_HISTORY_PATH] [--allow-stale-cache] [--plan-timeline PATH] [--provider-ui PATH] [--output PATH] [--report-file PATH]`: compare the fixed 69-day replay-safe interval to the current account's official daily token buckets, account-level quota, optional visible-UI observation, and prospective same-scope collector records. Historical local rows stay account-unattributed. Cached input is accepted only for unchanged sources or when every appended complete record is proven later than the fixed end; stale override is explicit and retained in output.
+- `usage-monitor quality [--input TRANSITIONS_PATH] [--collector-file PATH] [--output PATH] [--report-file PATH]`: profile monitorability before interpreting a gradient. It selects the dominant exact reset series, evaluates independent interval coverage dimensions, measures integer-display lag, distinguishes fixed-reset timestamp jitter from moving/high-churn limit families, checks collector freshness, and prioritizes remediation.
+- `usage-monitor register-account --alias LOCAL_ALIAS --default-plan PLAN_VARIANT [--plan-timeline PATH]`: register the currently signed-in account under a low-cardinality local alias and a plan assumption effective from the registration time. It never saves the email or rewrites an existing account's earlier plan history.
+- `usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill]`: tail complete new rollout lines from atomic byte checkpoints, optionally refresh a stale rate-limit snapshot through the read-only app-server account endpoint, flush owner-only records/checkpoint, and exit.
+- `usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N]`: hold one app-server connection, consume rate-limit notifications, watch active/archive rollout directories, reconcile periodically, reconnect with bounded backoff, and exit cleanly on `SIGINT`/`SIGTERM`.
+- `usage-monitor experiment --manifest PATH [--execute-live] [--offline]`: validate and API-price a content-free experiment manifest. Live execution requires the explicit flag and is refused before spawning Codex when price warnings, projected cost, quota availability, or minimum headroom fail.
+- `usage-monitor contamination [--transitions PATH] [--inference PATH] [--experiments PATH] [--observations PATH]`: preserve every adjacent snapshot interval, classify contamination/control state, calculate sensitivity residuals, and report change-point and lagging daily-bucket signals without forcing local cost to match quota.
+- `usage-monitor tools --since ISO_TIMESTAMP --until ISO_TIMESTAMP`: classify privacy-safe client tool observations separately from typed Responses/provider units and apply standard API tool prices only to an exact provider unit.
+- `usage-monitor migrate-corrections [--observations PATH] [--transitions PATH] [--corrections PATH]`: append the deterministic legacy replay correction once, resolve effective derived observations, and emit the visible audit trail without rewriting the source observation.
+
+Use `--offline` on `capture` to keep ccusage and RunCost on their local price caches. Online capture resolves current RunCost price sources and retains source freshness/provenance in the observation.
+
+## Account switching and local secret handling
+
+Account separation uses an HMAC-SHA-256 pseudonym derived at runtime from the signed-in account email. The HMAC key is stored in macOS Keychain under `codex-secret-app-usagemonitor-account-scope`; the email, provider account ID, HMAC key, credit balance, and reset-credit identifiers are never persisted.
+
+Run account-aware commands through the Keychain wrapper:
+
+```bash
+/Users/adamallcock/.codex/bin/secret run app-usagemonitor-account-scope \
+  --env APP_USAGEMONITOR_ACCOUNT_HMAC_KEY -- \
+  node ./src/cli.js doctor
+```
+
+`doctor` is read-only: it reports the current pseudonymous scope but does not register it. After intentionally switching ChatGPT accounts, register the current account with a non-identifying alias, then force one fresh collection:
+
+```bash
+/Users/adamallcock/.codex/bin/secret run app-usagemonitor-account-scope --env APP_USAGEMONITOR_ACCOUNT_HMAC_KEY -- \
+  node ./src/cli.js register-account --alias account-secondary --default-plan pro-20x
+/Users/adamallcock/.codex/bin/secret run app-usagemonitor-account-scope --env APP_USAGEMONITOR_ACCOUNT_HMAC_KEY -- \
+  node ./src/cli.js collect-once --stale-after-ms 0
+```
+
+This creates a different stable pseudonymous scope for future observations. The collector provisionally assigns the scope only to new rollout receipts within five minutes of a fresh account marker; it does not backfill identity across older rollouts. Historical account attribution therefore remains unavailable rather than silently assigning all old data to whichever account is currently signed in.
+
+Snapshot reports, interval inference, and weekly reset history include pseudonymous account scope and specific plan variant in their grouping keys. Known accounts and plan eras therefore cannot be pooled. Raw historical transition rows explicitly remain `unattributed` / `unknown`; prospective collector crosschecks accept only records matching the current pseudonymous scope and label their partial-marker time coverage.
+
+The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-monitor/provider-ui-observations-v0.1.jsonl`, `.usage-monitor/local-history-v0.1.json`, and `.usage-monitor/provider-crosscheck-v0.1.json` are mode `0600`. No cross-user upload or telemetry is implemented.
+
+`.usage-monitor/local-history-cache-validation-v0.1.json` is an owner-only, cache-digest-bound sidecar containing only hashed source keys and filesystem size/time metadata. It advances after a proven after-end suffix so subsequent cached crosschecks inspect only new bytes; it never stores rollout paths. Collector ingestion likewise streams file growth in 256 KiB chunks, caps one buffered JSONL line at 16 MiB, writes safe output in batches of at most 1,000 records, bounds its recent-key window at 5,000, and uses a path-free digest journal so an appended batch is either retained with its committed checkpoint or truncated and replayed. Transaction payloads and metadata are fsynced in commit order, including parent-directory metadata after atomic rename/removal. Oversized lines remain diagnostic, and idle reconciliation does not rewrite the checkpoint every cycle.
+
+## Rebuilding the portable report
+
+`artifact.json` is extended idempotently from the prior weekly-history artifact, so all earlier sections, data, sources, and caveats remain present.
+
+```bash
+pnpm --ignore-workspace build:report-data
+node /Users/adamallcock/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/build_portable_artifact.mjs \
+  --input artifact.json \
+  --output 2026-07-24-codex-work-account-usage-report.html
+pnpm --ignore-workspace fix:report-width -- 2026-07-24-codex-work-account-usage-report.html
+node /Users/adamallcock/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/verify_portable_artifact.mjs \
+  --html 2026-07-24-codex-work-account-usage-report.html \
+  --artifact artifact.json
+```
+
+The width fix is a narrow packaging workaround for the portable reader's `100vw` header when a classic vertical scrollbar is present; it does not modify report content or embedded artifact data.
+
+## Method boundary
+
+A capacity estimate means only that observed quota changes are consistent with the chosen API price mapping. It does not prove OpenAI's internal quota formula. See [the validation report](./2026-07-23-local-usage-limit-validation.md) for the experiment protocol and stop gate.
+
+Historical transitions preserve regressions, skipped display values, incomplete local-window coverage, unknown models, pricing warnings, and snapshot-age uncertainty as evidence rather than silently cleaning them. Quota snapshots contain only integer percentages; neither rollout logs nor the app-server endpoint currently exposes an absolute remaining allowance or sub-percent precision.
+
+Inference allows a separate hidden-usage offset for every reset window, so its primary capacity slope does not require local cost to begin at exactly zero. This makes floor and nearest-integer rounding observationally equivalent for the slope; origin alignment is reported only as a sensitivity test. A live result remains `non_identifiable` when shared-pool/control state is unknown, exact interval constraints conflict, holdout error is too large, a change point is suspected, or the range is too wide.
+
+The token-count schema still has no per-request tier field. RunCost ledgers set `service_tier: standard` only to answer the counterfactual “what would these components cost at Standard API prices?” Long-context selection remains per event. `codexSpeedMode` and `apiServiceTier` are independent: on the ChatGPT subscription surface the app protocol's raw `priority` currently names Fast, while on the API surface `priority` means the API processing tier. Billing surface is therefore mandatory context. Controlled experiment manifests explicitly declare Standard or Fast and pass the matching provider setting to the spawned workload.
+
+The passive collector does not install a daemon or modify Codex settings. On first start it checkpoints existing rollout files at EOF and obtains a fresh quota snapshot only if no sufficiently fresh observation exists. Use `--backfill` only for an explicit isolated replay test; historical research should normally use `transitions`. Operational checkpoints store byte offsets, cumulative token/model cursor state, filesystem inode/birth-time cursor keys, and hashes of privacy-sanitized events—not rollout paths or session IDs.
+
+Raw privacy-minimized collector records are deliberately append-only during this proof of concept. No automatic retention or deletion is enabled because losing reset/account evidence would be harder to repair than excess local disk use. File size should be monitored and old closed periods should eventually be archived into owner-only monthly partitions with a manifest and digest before any source records are removed.
+
+`quality` treats collector state as operational evidence. Fresh means the newest collector or app-server record is no more than five minutes old, delayed means five to thirty minutes, and stale means more than thirty minutes. A one-time refresh does not establish continuous coverage: long gaps and the absence of live app-server notifications remain P0 findings even when the newest poll is fresh.
+
+Controlled manifests declare the hypothesis, model, effort, context band, cache state, permitted aggregate tool class, one-turn limit, elapsed/API-price/quota budgets, minimum quota headroom, a preflight quiet period, before/after captures, and no-concurrency requirement. A pilot is controlled only when the quiet-period scan finds no recent local use and exactly one rollout contributes measured usage afterward. The stable workload prompt lives in the local implementation and is never copied into experiment result records. Seven dry manifests cover cache, reasoning effort, Terra/Sol/Luna, and below/above-272k context comparisons; live execution remains opt-in and preflight-refused whenever headroom or isolation is unsafe.
+
+Two live Terra pilots were eventually run after reset. They were bounded and aligned, but a separate Sol rollout contributed during each interval, so both remain `controlledState: unknown`. Later attempts were correctly refused when active/recent work made isolation unsafe. No causal model, cache, effort, context, or tool multiplier is claimed.
+
+Tool counts are explanatory client features unless the transcript exposes an exact server unit. A local web wrapper is not automatically a Responses `web_search_call`; local shell and Apply Patch are not Hosted Shell container sessions; MCP and subagent orchestration have no separate standard API per-call price. See [the Milestone 6 decision](./2026-07-23-milestone-6-tool-mechanism-decision.md).
+
+Corrections are append-only derived records. Duplicate records collapse idempotently, while branches, cycles, missing targets, digest mismatches, and incompatible schemas are errors. The legacy correction changes neither provider quota fields nor raw/local evidence. See [the Milestone 7 decision](./2026-07-23-milestone-7-correction-provenance-decision.md).
+
+The collector's first 22 pre-seeding usage records remain `unknown` and total 3,714,307 tokens. They are operational collector provenance, not inputs to `report`, `transitions`, `infer`, contamination, or the observation correction ledger; their model cannot be reconstructed safely from the retained privacy-minimized fields. They are therefore retained—not relabelled or rewritten.
+
+The full implementation goal and all gate receipts are in [the v0.3 goal](./2026-07-23-usage-monitor-v03-goal.md).

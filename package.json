@@ -1,0 +1,46 @@
+{
+  "name": "app-usagemonitor",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Local-only quota and standard API-price usage triangulation experiment.",
+  "bin": {
+    "usage-monitor": "./src/cli.js"
+  },
+  "scripts": {
+    "capture": "node ./src/cli.js capture",
+    "report": "node ./src/cli.js report",
+    "doctor": "node ./src/cli.js doctor",
+    "register-account": "node ./src/cli.js register-account",
+    "transitions": "node ./src/cli.js transitions",
+    "infer": "node ./src/cli.js infer",
+    "history": "node ./src/cli.js history",
+    "crosscheck": "node ./src/cli.js crosscheck",
+    "quality": "node ./src/cli.js quality",
+    "calibrate:weekly": "node ./src/cli.js calibrate-weekly --input .usage-monitor/transitions-simple-history-2026-06-11-to-2026-07-24-v0.3.2.json --output .usage-monitor/weekly-calibration-v0.2.json --report-file .usage-monitor/2026-07-24-weekly-calibration-v0.2.md",
+    "mark:activity": "node ./src/cli.js mark-activity",
+    "build:report-data": "node ./src/build-multi-surface-report.js",
+    "build:rolling-history": "node ./src/build-rolling-quota-history.js",
+    "build:simple-report-data": "node ./src/build-simple-quota-gradient-report.js",
+    "build:quality-report-data": "node ./src/build-monitoring-quality-report.js",
+    "build:weekly-calibration-report-data": "node ./src/build-weekly-calibration-report.js",
+    "build:weekly-calibration-audit": "node ./src/build-weekly-calibration-audit.js",
+    "verify:weekly-calibration": "node ./src/verify-weekly-calibration.js",
+    "fix:report-width": "node ./src/fix-portable-report-width.js",
+    "collect-once": "node ./src/cli.js collect-once",
+    "collect-foreground": "node ./src/cli.js collect-foreground",
+    "experiment": "node ./src/cli.js experiment",
+    "contamination": "node ./src/cli.js contamination",
+    "tools": "node ./src/cli.js tools",
+    "migrate-corrections": "node ./src/cli.js migrate-corrections",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ccusage": "20.0.18",
+    "runcost": "0.2.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.9.0"
+}

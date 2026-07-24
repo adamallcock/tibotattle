@@ -1,0 +1,36 @@
+# Dependencies and editor/OS noise
+node_modules/
+.DS_Store
+
+# Local monitor state and raw evidence.  These files can contain account-scoped
+# observations or data reconstructed from private rollout logs.
+.usage-monitor/
+.app-usagemonitor/
+data/
+raw-data/
+imports/
+uploads/
+exports/
+quarantine/
+staging/
+*.log
+*.jsonl
+
+# Credentials and local configuration (commit an explicitly reviewed example only).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials/
+secrets/
+
+# Derived reports/artifacts and QA captures embed local aggregate observations.
+artifact.json
+*-artifact.json
+*-report.html
+*-verification-failure.png
+*.html.tmp-*
+verify-debug.png

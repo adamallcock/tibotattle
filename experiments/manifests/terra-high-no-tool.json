@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "0.3",
+  "experimentId": "terra-high-no-tool-v1",
+  "hypothesis": "High reasoning on the same bounded no-tool task changes reasoning-output share and quota movement relative to Terra low.",
+  "mode": "dry",
+  "model": "gpt-5.6-terra",
+  "reasoningEffort": "high",
+  "tierDeclaration": { "billingSurface": "chatgpt_subscription", "codexSpeedMode": "standard", "apiServiceTier": "unknown", "providerTierRaw": "default", "tierSource": "experiment_manifest", "tierObservedAt": null },
+  "workloadId": "no-tool-arithmetic-v1",
+  "contextBand": { "targetInputTokens": 32000, "maximumInputTokens": 64000 },
+  "cacheState": "uncached",
+  "permittedToolClass": "none",
+  "projectedUsage": {
+    "inputUncachedTokens": 32000,
+    "inputCacheReadTokens": 0,
+    "inputCacheWriteTokens": 0,
+    "outputTextTokens": 64,
+    "outputReasoningTokens": 1024
+  },
+  "budgets": {
+    "maximumTurns": 1,
+    "maximumElapsedMs": 60000,
+    "maximumApiPricedUsd": 0.2,
+    "maximumDisplayedQuotaMovement": 1,
+    "minimumQuotaHeadroomPercent": 10,
+    "minimumQuietPeriodMs": 15000
+  },
+  "requiredCaptures": { "before": true, "after": true },
+  "concurrency": "none"
+}

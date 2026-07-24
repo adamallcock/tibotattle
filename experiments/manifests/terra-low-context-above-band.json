@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "0.3",
+  "experimentId": "terra-low-context-above-band-v1",
+  "hypothesis": "A request above the 272k API pricing band has a different API-price and possible quota effect from an otherwise similar request below it.",
+  "mode": "dry",
+  "model": "gpt-5.6-terra",
+  "reasoningEffort": "low",
+  "tierDeclaration": { "billingSurface": "chatgpt_subscription", "codexSpeedMode": "standard", "apiServiceTier": "unknown", "providerTierRaw": "default", "tierSource": "experiment_manifest", "tierObservedAt": null },
+  "workloadId": "no-tool-context-above-band-v1",
+  "contextBand": { "targetInputTokens": 300000, "maximumInputTokens": 350000 },
+  "cacheState": "uncached",
+  "permittedToolClass": "none",
+  "projectedUsage": {
+    "inputUncachedTokens": 300000,
+    "inputCacheReadTokens": 0,
+    "inputCacheWriteTokens": 0,
+    "outputTextTokens": 128,
+    "outputReasoningTokens": 256
+  },
+  "budgets": {
+    "maximumTurns": 1,
+    "maximumElapsedMs": 120000,
+    "maximumApiPricedUsd": 2,
+    "maximumDisplayedQuotaMovement": 1,
+    "minimumQuotaHeadroomPercent": 15,
+    "minimumQuietPeriodMs": 30000
+  },
+  "requiredCaptures": { "before": true, "after": true },
+  "concurrency": "none"
+}
