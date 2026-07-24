@@ -13,6 +13,8 @@ Turn the current local-only monitor into an opt-in, privacy-first research syste
 
 The recommended first release is an invite-only CLI exporter plus a small Google Cloud ingestion pipeline. A desktop app, continuous background upload, email notifications, and public cohort filters should come only after the metadata contract and deletion path have survived a small external pilot.
 
+The complete staged execution criteria, critical path, parallel workstreams, service targets, stop conditions, and production definition of done are maintained in [the end-to-end multi-user usage monitor goal](./2026-07-24-end-to-end-multi-user-usage-monitor-goal.md).
+
 ## Hard decisions
 
 1. **Construct a new allowlisted dataset; never upload redacted log files.** The client parses raw Codex or Claude files locally and creates new records containing only explicitly permitted typed fields. Unknown input fields are ignored, not copied.

@@ -144,7 +144,7 @@ Allowed data is limited to exact event/snapshot timestamps, disjoint cached/unca
 
 The separate exporter secret lives in `.usage-monitor/export-participant-secret` with mode `0600` unless `APP_USAGEMONITOR_EXPORT_SECRET` or `--secret-file` supplies one. It is intentionally distinct from the account-observation HMAC key. The export privacy gate validates the complete bundle schema, recursively scans forbidden keys and sensitive string shapes, verifies record counts, and emits a SHA-256 receipt. Any failure stops the export without writing a bundle. `exports/`, `*.umx`, and privacy receipts are ignored by Git as a second local safeguard.
 
-This is not yet a sharing mechanism. There is no upload client, server, enrollment code, encryption envelope, background process, or public dashboard. The full staged design and remaining gates are in [the multi-user privacy expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md).
+This is not yet a sharing mechanism. There is no upload client, server, enrollment code, encryption envelope, background process, or public dashboard. The [complete end-to-end goal](./2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
 
 ## Account switching and local secret handling
 
