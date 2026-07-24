@@ -10,6 +10,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMAS_DIRECTORY = join(REPO_ROOT, "schemas", "telemetry-v0.1");
 const POLICY_FILE = join(REPO_ROOT, "contracts", "telemetry-v0.1", "field-policy.json");
 const OUTPUT_FILE = join(REPO_ROOT, "generated", "telemetry-v0.1-field-dictionary.json");
+const COMPATIBILITY_OUTPUT_FILE = join(REPO_ROOT, "generated", "telemetry-v0.1-compatibility.json");
 
 const REQUIRED_POLICY_FIELDS = [
   "purpose",
@@ -67,7 +68,7 @@ export async function readSchemaInventory(schemasDirectory = SCHEMAS_DIRECTORY) 
   const schemaFiles = (await readdir(schemasDirectory))
     .filter((name) => name.endsWith(".schema.json"))
     .sort();
-  assert.equal(schemaFiles.length, 5, "telemetry v0.1 must contain exactly five JSON Schemas");
+  assert.equal(schemaFiles.length, 6, "telemetry v0.1 must contain exactly six JSON Schemas");
 
   const schemas = [];
   for (const schemaName of schemaFiles) {
@@ -191,6 +192,16 @@ export function serializeTelemetryContract(contract) {
   return `${JSON.stringify(contract, null, 2)}\n`;
 }
 
+function sortJsonValue(value) {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortJsonValue(value[key])]));
+}
+
+function serializeCompatibility(value) {
+  return `${JSON.stringify(sortJsonValue(value), null, 2)}\n`;
+}
+
 async function main() {
   const check = process.argv.slice(2).includes("--check");
   const unexpected = process.argv.slice(2).filter((argument) => argument !== "--check");
@@ -199,11 +210,22 @@ async function main() {
   if (check) {
     const actual = await readFile(OUTPUT_FILE, "utf8");
     assert.equal(actual, expected, `${OUTPUT_FILE} is stale; regenerate it without --check`);
-    process.stdout.write(`telemetry contract is current (${JSON.parse(actual).fields.length} fields)\n`);
+    const { buildExportCompatibilityTuple } = await import("../src/export-contract.js");
+    const expectedCompatibility = serializeCompatibility(buildExportCompatibilityTuple());
+    const actualCompatibility = await readFile(COMPATIBILITY_OUTPUT_FILE, "utf8");
+    assert.equal(
+      actualCompatibility,
+      expectedCompatibility,
+      `${COMPATIBILITY_OUTPUT_FILE} is stale; regenerate it without --check`,
+    );
+    process.stdout.write(`telemetry contract is current (${JSON.parse(actual).fields.length} fields; compatibility current)\n`);
     return;
   }
   await writeFile(OUTPUT_FILE, expected, { encoding: "utf8", flag: "w" });
-  process.stdout.write(`wrote ${OUTPUT_FILE} (${JSON.parse(expected).fields.length} fields)\n`);
+  const { buildExportCompatibilityTuple } = await import("../src/export-contract.js");
+  const compatibility = serializeCompatibility(buildExportCompatibilityTuple());
+  await writeFile(COMPATIBILITY_OUTPUT_FILE, compatibility, { encoding: "utf8", flag: "w" });
+  process.stdout.write(`wrote ${OUTPUT_FILE} (${JSON.parse(expected).fields.length} fields) and compatibility manifest\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

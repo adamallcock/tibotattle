@@ -21,6 +21,7 @@ import { upsertPlanProfile, validatePlanTimeline } from "./plan-timeline.js";
 import { createActivityMarker } from "./activity-markers.js";
 import { defaultExportSecretFile, loadOrCreateParticipantSecret } from "./export-identity.js";
 import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
+import { verifyLocalMetadataBundleFiles } from "./bundle-verifier.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -62,6 +63,7 @@ import {
   readJsonIfExists,
   writeJsonOwnerOnlyAtomic,
   writeOwnerOnlyAtomic,
+  recoverOwnerOnlyPairTransactions,
   withOwnerOnlyFileLock,
 } from "./storage.js";
 
@@ -80,6 +82,8 @@ function usage() {
   usage-monitor mark-activity --surface SURFACE --state start|end|pulse [--experiment-id ID] [--activity-file PATH]
   usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
+  usage-monitor verify-bundle --input PATH [--receipt PATH]
+  usage-monitor recover-exports --directory PATH
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -145,6 +149,7 @@ export function parseArgs(argv) {
     codexHome: null,
     exportSecretFile: null,
     receiptFile: null,
+    directory: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -187,6 +192,7 @@ export function parseArgs(argv) {
     else if (arg === "--codex-home") result.codexHome = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--secret-file") result.exportSecretFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--receipt") result.receiptFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--directory") result.directory = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -303,6 +309,25 @@ async function run() {
     await appendJsonLinesOwnerOnly(activityFile, [marker]);
     console.log(`Activity marker: ${marker.surface} ${marker.state}; account ${marker.accountScope.status}.`);
     console.log(`Data: ${activityFile}`);
+    return;
+  }
+  if (args.command === "verify-bundle") {
+    if (!args.inputFile) throw new Error("verify-bundle requires --input");
+    const verified = await verifyLocalMetadataBundleFiles({
+      bundleFile: args.inputFile,
+      receiptFile: args.receiptFile ?? `${args.inputFile}.privacy-receipt.json`,
+    });
+    console.log("Local metadata bundle verification: passed");
+    console.log(`Contract: ${verified.contractFamily} (${verified.contractStatus}); exporter ${verified.exporterVersion}`);
+    console.log(`Records: ${verified.recordCounts.usageEvents} usage, ${verified.recordCounts.quotaSnapshots} quota, ${verified.recordCounts.activityMarkers} markers`);
+    console.log(`Bundle bytes: ${verified.bundleBytes}; upload disabled: ${verified.transportReady === false}`);
+    return;
+  }
+  if (args.command === "recover-exports") {
+    if (!args.directory) throw new Error("recover-exports requires --directory");
+    const recovery = await recoverOwnerOnlyPairTransactions({ directory: args.directory });
+    console.log(`Local export recovery: ${recovery.recovered} recovered of ${recovery.transactionsFound} transaction(s)`);
+    console.log("Upload remains disabled");
     return;
   }
   if (args.command === "inspect-export" || args.command === "export-local") {

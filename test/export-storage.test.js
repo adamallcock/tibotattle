@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { link, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeOwnerOnlyPairNoClobber } from "../src/storage.js";
+import { recoverOwnerOnlyPairTransactions, writeOwnerOnlyPairNoClobber } from "../src/storage.js";
 
 test("paired exports publish receipt then bundle without overwrite", async () => {
   const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-pair-"));
@@ -53,7 +53,7 @@ test("paired exports reject equal paths, separate parents, and existing destinat
   }
 });
 
-test("a bundle-link failure rolls back the already-published receipt and removes stages", async () => {
+test("a bundle-link failure preserves a durable receipt-first transaction for recovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-pair-rollback-"));
   const bundle = join(directory, "bundle");
   const receipt = join(directory, "receipt");
@@ -73,8 +73,47 @@ test("a bundle-link failure rolls back the already-published receipt and removes
       /injected bundle commit failure/,
     );
     assert.equal(calls, 2);
-    assert.deepEqual(await readdir(directory), []);
+    assert.deepEqual((await readdir(directory)).sort(), [".app-usagemonitor-export-transactions", "receipt"]);
+    assert.equal(await readFile(receipt, "utf8"), "receipt");
+    assert.deepEqual(
+      await recoverOwnerOnlyPairTransactions({ directory }),
+      { recovered: 1, transactionsFound: 1 },
+    );
+    assert.equal(await readFile(bundle, "utf8"), "bundle");
+    assert.equal(await readFile(receipt, "utf8"), "receipt");
+    assert.deepEqual((await readdir(directory)).sort(), ["bundle", "receipt"]);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("paired export commits to the canonical parent after an alias is swapped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-pair-canonical-"));
+  const firstDirectory = join(root, "first");
+  const secondDirectory = join(root, "second");
+  const alias = join(root, "alias");
+  await mkdir(join(firstDirectory, "child"), { recursive: true });
+  await mkdir(join(secondDirectory, "child"), { recursive: true });
+  await symlink(firstDirectory, alias);
+  try {
+    await writeOwnerOnlyPairNoClobber({
+      firstPath: join(alias, "child", "bundle"),
+      firstContent: "bundle",
+      secondPath: join(alias, "child", "receipt"),
+      secondContent: "receipt",
+    }, {
+      async failpoint(name) {
+        if (name === "after_manifest") {
+          await unlink(alias);
+          await symlink(secondDirectory, alias);
+        }
+      },
+    });
+    assert.equal(await readFile(join(firstDirectory, "child", "bundle"), "utf8"), "bundle");
+    assert.equal(await readFile(join(firstDirectory, "child", "receipt"), "utf8"), "receipt");
+    await assert.rejects(stat(join(secondDirectory, "child", "bundle")), { code: "ENOENT" });
+    await assert.rejects(stat(join(secondDirectory, "child", "receipt")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

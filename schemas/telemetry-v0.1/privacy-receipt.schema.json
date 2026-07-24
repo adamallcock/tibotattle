@@ -6,6 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schemaVersion",
+    "compatibility",
     "createdAt",
     "bundleId",
     "participantId",
@@ -20,6 +21,7 @@
   ],
   "properties": {
     "schemaVersion": { "const": "privacy-receipt-v0.1" },
+    "compatibility": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json" },
     "createdAt": { "type": "string", "format": "date-time", "maxLength": 32 },
     "bundleId": { "type": "string", "pattern": "^bundle:v1:[A-Za-z0-9_-]{43}$" },
     "participantId": { "type": "string", "pattern": "^participant:v1:[A-Za-z0-9_-]{43}$" },

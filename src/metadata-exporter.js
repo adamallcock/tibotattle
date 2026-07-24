@@ -16,6 +16,7 @@ import {
 import { verifyPrivacySafeBundle } from "./export-privacy.js";
 import { assertValidExportRecord } from "./export-schema.js";
 import { recognizedExportLimitId, recognizedExportModelId } from "./export-registries.js";
+import { exportCompatibilityTuple } from "./export-contract.js";
 import { stableJson, writeOwnerOnlyPairNoClobber } from "./storage.js";
 
 const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
@@ -285,6 +286,10 @@ export async function buildLocalMetadataBundle({
     },
   });
 
+  const compatibility = exportCompatibilityTuple();
+  if (scan.parserVersion !== compatibility.providerAdapters.openaiCodex.parserVersion) {
+    throw new Error("Codex scanner version does not match the export compatibility contract");
+  }
   const safeMarkers = activityMarkers
     .map((marker) => normalizeActivityMarker(secret, marker, bounds))
     .filter(Boolean)
@@ -301,12 +306,11 @@ export async function buildLocalMetadataBundle({
   };
   const bundle = {
     schemaVersion: "usage-metadata-bundle-v0.1",
-    exporterVersion: "0.1.0",
+    compatibility,
     bundleId,
     participantId: deriveParticipantId(secret),
     createdAt: boundedIso(createdAt, "createdAt"),
     coveredAt: { startAt: bounds.startAt, endAt: bounds.endAt },
-    consentVersion: "local-dry-run-v0.1",
     sourceProviders: ["openai_codex"],
     clientPlatform: platformName(),
     transportReady: false,

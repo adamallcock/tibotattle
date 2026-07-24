@@ -135,6 +135,19 @@ The current local slice is useful, but it is not volunteer-pilot-ready until the
 11. **Transport contract:** compression, encrypted header/payload, wrapping-key discovery/rotation, AEAD associated data, replay, chunking, and expanded-size rules need a separate reviewed version rather than flipping v0.1 `transportReady`.
 12. **Frozen statistical contract:** comparable cohort keys, reset identity, quantization/lag, shared-pool residuals, price/policy epochs, chronological holdouts, participant-level resampling, identifiability refusal, and release thresholds must be specified before pooled analysis.
 
+### Progress update — local artifact verification and recovery
+
+The July 24 local hardening work has now closed or materially narrowed blockers 1, 4, 5, 6, 7, 8, and the POSIX portion of 9. Source-occurrence IDs are export-bound invariant; reviewed vocabularies and a generated 148-field provenance dictionary fail closed; quota observations and provider states have separate identities; missing token components remain unavailable; and the participant secret uses an OS-stable owner-only application-state path with guarded legacy migration.
+
+The next completed slice adds three stronger artifact controls without widening collection:
+
+- one generated compatibility tuple binds the exact six schemas, generated field contract, registry snapshot, consent status, contract status, package/exporter version, and executed Codex parser/adapter versions;
+- Claude remains explicitly `not_implemented`, and provider declarations fail closed unless their bound adapter is implemented;
+- `verify-bundle` independently checks canonical bytes, filesystem controls, compatibility, schemas, semantic record invariants, the privacy receipt, and its exact bundle digest without printing paths, content, or participant pseudonyms; and
+- paired output now uses a synced private transaction manifest, publishes receipt first and bundle last, and can be replayed with `recover-exports` after every simulated crash boundary while refusing foreign destination artifacts.
+
+This is still not G1 completion. Resource-bounded streaming/chunking, Claude parity, prospective account-scoped quota export, native secret-store/platform completion, signed clean-machine distribution, volunteer-local review, identity rotation/deletion UX, and the minimization ablation remain open. Telemetry v0.1 remains an unfrozen local-only format with `transportReady: false`; this progress does not authorize external participants or any network transport.
+
 ## Target architecture
 
 ```mermaid
@@ -771,7 +784,7 @@ The next execution cycle should complete the remainder of G0/G1 before cloud wor
 2. Split the exporter/schema/privacy code into provider-neutral modules without changing output bytes.
 3. Add independently shaped Codex, Claude, Windows, Unix, malicious getter/proxy, archive/fork, huge-history, truncation, and credential fixtures.
 4. Add streaming/bounded bundle construction and canonical compression.
-5. Add `verify-bundle`, deterministic golden hashes, and incomplete-export cleanup.
+5. Extend the landed `verify-bundle` and interrupted-transaction recovery with deterministic golden hashes and broader incomplete-export cleanup fixtures.
 6. Complete Claude usage-plus-status-line export parity.
 7. Add app-server/notification quota snapshot export with prospective account scoping.
 8. Build reproducible signed packages and clean-machine installers.
@@ -780,7 +793,7 @@ The next execution cycle should complete the remainder of G0/G1 before cloud wor
 
 Price registry/provenance work begins alongside G0/G2 using frozen fixtures. After G1, parallelize identity/consent, envelope-encryption, infrastructure, and canonical-schema spikes, but do not enable upload until their combined G4 gate passes.
 
-## Progress update: exporter hardening slice (July 24, 2026)
+## Progress update: exporter hardening and artifact-verification slices (July 24, 2026)
 
 The first G0/G1 hardening slice is implemented on `agent/exporter-hardening-g1`; it is a bounded milestone, not G1 completion:
 
@@ -791,13 +804,15 @@ The first G0/G1 hardening slice is implemented on `agent/exporter-hardening-g1`;
 - model, limit, and diagnostic vocabularies are reviewed closed sets, with unknown model strings fingerprinted and arbitrary safe-looking values rejected by schemas;
 - missing source token components export as `null`, not an observed zero;
 - all tool-count fields are required by schema and their bounded-interval attribution limitation is recorded in the field policy;
-- every one of the 109 properties across the five telemetry schemas has exactly one reviewed, machine-checkable purpose/privacy/retention/publication/Codex/Claude provenance row, and the generated dictionary is bound to schema hashes;
+- every one of the 148 properties across the six telemetry schemas has exactly one reviewed, machine-checkable purpose/privacy/retention/publication/Codex/Claude provenance row, and the generated dictionary is bound to schema hashes;
 - the default participant identity moved from the working directory to an OS-stable application-state path, with strict POSIX regular-file/owner/link/mode/length checks and safe legacy copy-forward;
 - telemetry v0.1 is now machine-declared as an unfrozen local-only draft with no compatibility promise; the first volunteer/upload contract must use a new frozen version and preserve frozen predecessors;
-- local bundle/receipt output is distinct-path, same-directory, owner-controlled, no-clobber, receipt-first/bundle-last, with rollback on an ordinary second-link failure; and
-- regressions cover changed export bounds, identical independent sessions, traversal reordering, marker metadata changes, missing components, unreviewed registries, symlink/hardlink/permission attacks, existing output, distinct paths, and injected commit failure.
+- the generated compatibility tuple binds all schemas, the field contract, registries, consent/contract state, package/exporter version, and the executed Codex parser/adapter while marking Claude `not_implemented`;
+- local bundle/receipt output is distinct-path, same-directory, owner-controlled, no-clobber, receipt-first/bundle-last, and durably recoverable after process interruption;
+- `verify-bundle` independently checks exact canonical bytes, filesystem controls, schemas, compatibility, record semantics, privacy checks, and receipt digest/size without printing paths or pseudonyms; and
+- regressions cover changed export bounds, identical independent sessions, traversal reordering, marker metadata changes, missing components, unreviewed registries, symlink/hardlink/permission attacks, existing output, distinct paths, concurrent destination writers, stale locks, interrupted writer/recovery boundaries, and conflicting destination files.
 
-Still open before G1 can pass: full interrupted-commit recovery and `verify-bundle`; streaming/chunked bounded export; native Keychain/Credential Manager/Secret Service backends and clean-machine platform validation; explicit identity-conflict migration UX; bundle/parser/adapter/registry/schema-hash version tuple; Claude usage and quota exporter parity; prospective account-scoped app-server snapshots; signed packaging; independently shaped fixtures; and two local-only volunteer reviews. No upload or collection has been enabled.
+Still open before G1 can pass: streaming/chunked bounded export; native Keychain/Credential Manager/Secret Service backends and clean-machine platform validation; explicit identity-conflict migration UX; deterministic golden bundle fixtures; Claude usage and quota exporter parity; prospective account-scoped app-server snapshots; signed packaging; independently shaped fixtures; and two local-only volunteer reviews. No upload or collection has been enabled.
 
 ## Open decisions and decision deadlines
 

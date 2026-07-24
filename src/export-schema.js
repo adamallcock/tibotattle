@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const schemas = Object.freeze({
+  compatibility: require("../schemas/telemetry-v0.1/compatibility.schema.json"),
   usageEvent: require("../schemas/telemetry-v0.1/usage-event.schema.json"),
   quotaSnapshot: require("../schemas/telemetry-v0.1/quota-snapshot.schema.json"),
   activityMarker: require("../schemas/telemetry-v0.1/activity-marker.schema.json"),

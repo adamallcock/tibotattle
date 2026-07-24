@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { assertValidExportRecord } from "./export-schema.js";
 import { stableJson } from "./storage.js";
+import { exportCompatibilityTuple } from "./export-contract.js";
 
 const FORBIDDEN_KEYS = new Set([
   "prompt", "response", "content", "text", "message", "messages", "arguments", "command",
@@ -45,7 +46,10 @@ function scanStrings(value, path = "", findings = []) {
     return findings;
   }
   if (!value || typeof value !== "object") return findings;
-  for (const [key, child] of Object.entries(value)) scanStrings(child, `${path}/${key}`, findings);
+  for (const [key, child] of Object.entries(value)) {
+    if (path === "" && key === "compatibility") continue;
+    scanStrings(child, `${path}/${key}`, findings);
+  }
   return findings;
 }
 
@@ -57,6 +61,23 @@ function recordCountsMatch(bundle) {
 
 function canaryViolations(serialized, forbiddenSourceValues) {
   return forbiddenSourceValues.filter((value) => typeof value === "string" && value.length >= 4 && serialized.includes(value)).length;
+}
+
+function providerCompatibilityViolations(bundle) {
+  const declared = new Set(Array.isArray(bundle.sourceProviders) ? bundle.sourceProviders : []);
+  const observed = new Set([
+    ...(bundle.records?.usageEvents ?? []).map((record) => record.provider),
+    ...(bundle.records?.quotaSnapshots ?? []).map((record) => record.provider),
+  ]);
+  const adapters = {
+    openai_codex: bundle.compatibility?.providerAdapters?.openaiCodex,
+    anthropic_claude_code: bundle.compatibility?.providerAdapters?.anthropicClaudeCode,
+  };
+  let violations = 0;
+  for (const provider of observed) if (!declared.has(provider)) violations += 1;
+  for (const provider of declared) if (adapters[provider]?.status !== "implemented") violations += 1;
+  for (const provider of observed) if (adapters[provider]?.status !== "implemented") violations += 1;
+  return violations;
 }
 
 export function verifyPrivacySafeBundle(bundle, {
@@ -72,11 +93,15 @@ export function verifyPrivacySafeBundle(bundle, {
   const keyFindings = scanKeys(bundle);
   const stringFindings = scanStrings(bundle);
   const serialized = stableJson(bundle);
+  const compatibilityMatches = stableJson(bundle.compatibility) === stableJson(exportCompatibilityTuple());
+  const providerViolations = providerCompatibilityViolations(bundle);
   const checks = [
     { code: "schema_allowlist", status: schemaViolations ? "failed" : "passed", violations: schemaViolations },
+    { code: "compatibility_tuple", status: compatibilityMatches ? "passed" : "failed", violations: compatibilityMatches ? 0 : 1 },
     { code: "forbidden_key_scan", status: keyFindings.length ? "failed" : "passed", violations: keyFindings.length },
     { code: "sensitive_string_scan", status: stringFindings.length ? "failed" : "passed", violations: stringFindings.length },
     { code: "record_count_consistency", status: recordCountsMatch(bundle) ? "passed" : "failed", violations: recordCountsMatch(bundle) ? 0 : 1 },
+    { code: "provider_adapter_compatibility", status: providerViolations ? "failed" : "passed", violations: providerViolations },
     {
       code: "source_value_canaries",
       status: canaryViolations(serialized, forbiddenSourceValues) ? "failed" : "passed",
@@ -86,6 +111,7 @@ export function verifyPrivacySafeBundle(bundle, {
   const verdict = checks.every((check) => check.status === "passed") ? "passed" : "failed";
   const receipt = {
     schemaVersion: "privacy-receipt-v0.1",
+    compatibility: structuredClone(bundle.compatibility),
     createdAt: new Date(createdAt).toISOString(),
     bundleId: bundle.bundleId,
     participantId: bundle.participantId,

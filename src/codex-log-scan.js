@@ -11,6 +11,7 @@ import {
 } from "runcost";
 import { normalizeProviderTier, subscriptionSpeedSensitivity, unknownCodexTier } from "./tier-semantics.js";
 import { addOfficialOpenAiPriceSupplements } from "./openai-api-price-supplements.js";
+import { CODEX_LOG_SCAN_VERSION } from "./export-versions.js";
 import { classifySessionSurface } from "./surface-classification.js";
 
 const COMPONENT_KEYS = [
@@ -808,7 +809,13 @@ export async function scanCodexLogEvents({
     if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) diagnostics.activeTaskRolloutsAtEnd += 1;
     if (info.lineage.sessionId) snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
   }
-  return { diagnostics, toolCallsByClass, toolObservationsBySource, serverBillableUnits };
+  return {
+    parserVersion: CODEX_LOG_SCAN_VERSION,
+    diagnostics,
+    toolCallsByClass,
+    toolObservationsBySource,
+    serverBillableUnits,
+  };
 }
 
 export async function scanAndPriceCodexLogs({

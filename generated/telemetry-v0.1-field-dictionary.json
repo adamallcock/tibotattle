@@ -20,14 +20,20 @@
     {
       "schemaName": "bundle.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
-      "schemaSha256": "ec78ef0e052f27939a2ac3dd73c41a1e99423ab1a7a0ea3fbb442a56d8f93520",
-      "propertyCount": 25
+      "schemaSha256": "868b3f23c5990520bbdd70bed015401e3ecb94218734d1fc294bcd297bbee805",
+      "propertyCount": 24
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
+      "schemaSha256": "305a93b221e7a09f21126fe93b19e0ac501108784a5f6b404fe6f17047565753",
+      "propertyCount": 39
     },
     {
       "schemaName": "privacy-receipt.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
-      "schemaSha256": "fbfc1f291a3d7e323da27882b8e0ddaee61519fa822fa332b29a929f9a4d9a9e",
-      "propertyCount": 20
+      "schemaSha256": "121ff9e382849a25ecfa6ef9d1d219633789b105063889885852cf0502296b25",
+      "propertyCount": 21
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -45,6 +51,11 @@
   "resolvedReferences": [
     {
       "fromSchema": "bundle.schema.json",
+      "schemaPointer": "/properties/compatibility",
+      "targetSchema": "compatibility.schema.json"
+    },
+    {
+      "fromSchema": "bundle.schema.json",
       "schemaPointer": "/properties/records/properties/activityMarkers/items",
       "targetSchema": "activity-marker.schema.json"
     },
@@ -57,6 +68,11 @@
       "fromSchema": "bundle.schema.json",
       "schemaPointer": "/properties/records/properties/usageEvents/items",
       "targetSchema": "usage-event.schema.json"
+    },
+    {
+      "fromSchema": "privacy-receipt.schema.json",
+      "schemaPointer": "/properties/compatibility",
+      "targetSchema": "compatibility.schema.json"
     }
   ],
   "fields": [
@@ -194,15 +210,15 @@
     },
     {
       "schemaName": "bundle.schema.json",
-      "schemaPointer": "/properties/consentVersion",
-      "fieldPath": "consentVersion",
-      "purpose": "Pins the local review and consent language applied to the bundle.",
-      "privacyClass": "governance_metadata",
+      "schemaPointer": "/properties/compatibility",
+      "fieldPath": "compatibility",
+      "purpose": "Carries the closed compatibility tuple required to reproduce and verify the artifact.",
+      "privacyClass": "protocol_metadata",
       "retentionClass": "contract_lifetime",
       "publicEligibility": "public_row",
       "codexProvenance": "not_applicable",
       "claudeProvenance": "not_applicable",
-      "limitation": "A version label is not by itself proof of informed consent."
+      "limitation": "Version declarations support traceability but do not prove binary integrity or provider behavior."
     },
     {
       "schemaName": "bundle.schema.json",
@@ -311,18 +327,6 @@
       "codexProvenance": "derived",
       "claudeProvenance": "derived",
       "limitation": "File count does not reveal byte coverage, validity, or missing files."
-    },
-    {
-      "schemaName": "bundle.schema.json",
-      "schemaPointer": "/properties/exporterVersion",
-      "fieldPath": "exporterVersion",
-      "purpose": "Identifies the exporter implementation that produced the bundle.",
-      "privacyClass": "protocol_metadata",
-      "retentionClass": "contract_lifetime",
-      "publicEligibility": "public_row",
-      "codexProvenance": "not_applicable",
-      "claudeProvenance": "not_applicable",
-      "limitation": "Implementation version alone does not prove configuration or binary integrity."
     },
     {
       "schemaName": "bundle.schema.json",
@@ -469,6 +473,474 @@
       "limitation": "A false value prevents intended upload but cannot stop unrelated software from copying a file."
     },
     {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/consent",
+      "fieldPath": "consent",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/consent/properties/status",
+      "fieldPath": "consent.status",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/consent/properties/statusSha256",
+      "fieldPath": "consent.statusSha256",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/consent/properties/version",
+      "fieldPath": "consent.version",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract",
+      "fieldPath": "contract",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract/properties/backwardCompatibility",
+      "fieldPath": "contract.backwardCompatibility",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract/properties/externalParticipantsAuthorized",
+      "fieldPath": "contract.externalParticipantsAuthorized",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract/properties/family",
+      "fieldPath": "contract.family",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract/properties/status",
+      "fieldPath": "contract.status",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract/properties/statusSha256",
+      "fieldPath": "contract.statusSha256",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/contract/properties/transportReady",
+      "fieldPath": "contract.transportReady",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/fieldContract",
+      "fieldPath": "fieldContract",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/fieldContract/properties/sha256",
+      "fieldPath": "fieldContract.sha256",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/fieldContract/properties/version",
+      "fieldPath": "fieldContract.version",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation",
+      "fieldPath": "implementation",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation/properties/exporterVersion",
+      "fieldPath": "implementation.exporterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation/properties/packageName",
+      "fieldPath": "implementation.packageName",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation/properties/packageVersion",
+      "fieldPath": "implementation.packageVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters",
+      "fieldPath": "providerAdapters",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode",
+      "fieldPath": "providerAdapters.anthropicClaudeCode",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/adapterVersion",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.adapterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/parserVersion",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.parserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormat",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormat",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/status",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.status",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex",
+      "fieldPath": "providerAdapters.openaiCodex",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/adapterVersion",
+      "fieldPath": "providerAdapters.openaiCodex.adapterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/parserVersion",
+      "fieldPath": "providerAdapters.openaiCodex.parserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormat",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormat",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/status",
+      "fieldPath": "providerAdapters.openaiCodex.status",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/registry",
+      "fieldPath": "registry",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/registry/properties/sha256",
+      "fieldPath": "registry.sha256",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/registry/properties/version",
+      "fieldPath": "registry.version",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/schemas",
+      "fieldPath": "schemas",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/schemas/properties/members",
+      "fieldPath": "schemas.members",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/schemas/properties/members/items/properties/id",
+      "fieldPath": "schemas.members[].id",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/schemas/properties/members/items/properties/name",
+      "fieldPath": "schemas.members[].name",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/schemas/properties/members/items/properties/sha256",
+      "fieldPath": "schemas.members[].sha256",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/schemas/properties/setSha256",
+      "fieldPath": "schemas.setSha256",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/tupleVersion",
+      "fieldPath": "tupleVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
       "schemaName": "privacy-receipt.schema.json",
       "schemaPointer": "/properties/bundleBytes",
       "fieldPath": "bundleBytes",
@@ -551,6 +1023,18 @@
       "codexProvenance": "not_applicable",
       "claudeProvenance": "not_applicable",
       "limitation": "Count omits offending values intentionally and can combine distinct causes."
+    },
+    {
+      "schemaName": "privacy-receipt.schema.json",
+      "schemaPointer": "/properties/compatibility",
+      "fieldPath": "compatibility",
+      "purpose": "Carries the closed compatibility tuple required to reproduce and verify the artifact.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "Version declarations support traceability but do not prove binary integrity or provider behavior."
     },
     {
       "schemaName": "privacy-receipt.schema.json",

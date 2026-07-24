@@ -1,0 +1,6 @@
+{
+  "consentVersion": "local-dry-run-v0.1",
+  "status": "local_review_only_no_transport",
+  "transportReady": false,
+  "externalParticipantsAuthorized": false
+}

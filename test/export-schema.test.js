@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fc from "fast-check";
 import { exportRegistrySnapshot } from "../src/export-registries.js";
 import { exportSchemas, validateExportRecord } from "../src/export-schema.js";
+import { exportCompatibilityTuple } from "../src/export-contract.js";
 
 function usageEvent() {
   return {
@@ -74,12 +75,11 @@ function quotaSnapshot() {
 function bundleWithDiagnostic(code) {
   return {
     schemaVersion: "usage-metadata-bundle-v0.1",
-    exporterVersion: "0.1.0",
+    compatibility: exportCompatibilityTuple(),
     bundleId: `bundle:v1:${"F".repeat(43)}`,
     participantId: `participant:v1:${"G".repeat(43)}`,
     createdAt: "2026-07-24T12:00:00.000Z",
     coveredAt: { startAt: "2026-07-24T11:00:00.000Z", endAt: "2026-07-24T12:00:00.000Z" },
-    consentVersion: "local-dry-run-v0.1",
     sourceProviders: ["openai_codex"],
     clientPlatform: "macos",
     transportReady: false,

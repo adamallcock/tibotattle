@@ -1,0 +1,78 @@
+{
+  "consent": {
+    "status": "local_review_only_no_transport",
+    "statusSha256": "9a16443e9b193674f9f3aa12d1cd27fcbb33d77fe518ac69ed08a3f64368c27a",
+    "version": "local-dry-run-v0.1"
+  },
+  "contract": {
+    "backwardCompatibility": "none_regenerate_local_review_artifacts",
+    "externalParticipantsAuthorized": false,
+    "family": "telemetry-v0.1",
+    "status": "draft_local_only_unfrozen",
+    "statusSha256": "69952aae23afaaf7e1b9e7ede71559c641da5dabb2364c77754740873f39f8c0",
+    "transportReady": false
+  },
+  "fieldContract": {
+    "sha256": "e5e5fc1145ecae62f333874e1d665a2c7616e11dee172fea4822b0715b7cc145",
+    "version": "telemetry-field-dictionary-v0.1"
+  },
+  "implementation": {
+    "exporterVersion": "0.2.0-draft.1",
+    "packageName": "app-usagemonitor",
+    "packageVersion": "0.0.1"
+  },
+  "providerAdapters": {
+    "anthropicClaudeCode": {
+      "adapterVersion": null,
+      "parserVersion": null,
+      "sourceFormat": null,
+      "status": "not_implemented"
+    },
+    "openaiCodex": {
+      "adapterVersion": "codex-metadata-export-v2",
+      "parserVersion": "codex-log-scan-v1",
+      "sourceFormat": "codex-rollout-jsonl",
+      "status": "implemented"
+    }
+  },
+  "registry": {
+    "sha256": "65dc6c376a6b3e841b5d58deada18d3744997ebcebf78eb39a9484c101e6c597",
+    "version": "telemetry-v0.1-registry-2026-07-24.1"
+  },
+  "schemas": {
+    "members": [
+      {
+        "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json",
+        "name": "activity-marker.schema.json",
+        "sha256": "e4a506ff8f26ecdaf42674877d08ff9dd72e8f26339aa7c45d29b77e4c7dff02"
+      },
+      {
+        "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
+        "name": "bundle.schema.json",
+        "sha256": "868b3f23c5990520bbdd70bed015401e3ecb94218734d1fc294bcd297bbee805"
+      },
+      {
+        "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
+        "name": "compatibility.schema.json",
+        "sha256": "305a93b221e7a09f21126fe93b19e0ac501108784a5f6b404fe6f17047565753"
+      },
+      {
+        "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
+        "name": "privacy-receipt.schema.json",
+        "sha256": "121ff9e382849a25ecfa6ef9d1d219633789b105063889885852cf0502296b25"
+      },
+      {
+        "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
+        "name": "quota-snapshot.schema.json",
+        "sha256": "94de3cb6712259546aeac1d1f474760050fffaa601e5d12ef43dd33a66a9dff0"
+      },
+      {
+        "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
+        "name": "usage-event.schema.json",
+        "sha256": "a9fe4513b91878dab74cb6d4ba7b41f02fc3d685c7b7d3de28a6b29012b00d81"
+      }
+    ],
+    "setSha256": "5d1ca45dd794818eaeb5ed6014fab81aedd13c6b19119d887d5de92b83435cb1"
+  },
+  "tupleVersion": "usage-export-compatibility-v0.1"
+}
