@@ -50,14 +50,14 @@ test("checked-in telemetry field dictionary is deterministic and current", () =>
     [resolve(REPO_ROOT, "scripts", "generate-telemetry-contract.js"), "--check"],
     { cwd: REPO_ROOT, encoding: "utf8" },
   );
-  assert.match(output, /telemetry contract is current \(148 fields; compatibility current\)/);
+  assert.match(output, /telemetry contract is current \(149 fields; compatibility current\)/);
 });
 
 test("generated dictionary gives every schema property a complete policy row", async () => {
   const dictionary = JSON.parse(await readFile(GENERATED_FILE, "utf8"));
   assert.equal(dictionary.contractVersion, "telemetry-field-dictionary-v0.1");
   assert.equal(dictionary.schemas.length, 6);
-  assert.equal(dictionary.fields.length, 148);
+  assert.equal(dictionary.fields.length, 149);
   assert.equal(
     dictionary.schemas.reduce((sum, schema) => sum + schema.propertyCount, 0),
     dictionary.fields.length,

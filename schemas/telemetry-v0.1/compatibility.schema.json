@@ -45,9 +45,10 @@
     "implementation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["exporterVersion", "packageName", "packageVersion"],
+      "required": ["exporterVersion", "resourcePolicyVersion", "packageName", "packageVersion"],
       "properties": {
-        "exporterVersion": { "const": "0.2.0-draft.1" },
+        "exporterVersion": { "const": "0.3.0-draft.2" },
+        "resourcePolicyVersion": { "const": "g1-r3-candidate-0.2" },
         "packageName": { "const": "app-usagemonitor" },
         "packageVersion": { "const": "0.0.1" }
       }
@@ -64,8 +65,8 @@
           "properties": {
             "status": { "const": "implemented" },
             "sourceFormat": { "const": "codex-rollout-jsonl" },
-            "parserVersion": { "const": "codex-log-scan-v1" },
-            "adapterVersion": { "const": "codex-metadata-export-v2" }
+            "parserVersion": { "const": "codex-log-scan-v3" },
+            "adapterVersion": { "const": "codex-metadata-export-v4" }
           }
         },
         "anthropicClaudeCode": {

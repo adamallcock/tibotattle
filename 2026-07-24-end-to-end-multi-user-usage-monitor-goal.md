@@ -814,6 +814,20 @@ The first G0/G1 hardening slice is implemented on `agent/exporter-hardening-g1`;
 
 Still open before G1 can pass: streaming/chunked bounded export; native Keychain/Credential Manager/Secret Service backends and clean-machine platform validation; explicit identity-conflict migration UX; deterministic golden bundle fixtures; Claude usage and quota exporter parity; prospective account-scoped app-server snapshots; signed packaging; independently shaped fixtures; and two local-only volunteer reviews. No upload or collection has been enabled.
 
+## Progress update: G1 resource and identity protection slice (July 24, 2026)
+
+The active `agent/bounded-export-identity-lifecycle` slice adds immediate fail-closed protection and a durable design for the larger export-set refactor; it is not G1-R3 or G1 completion:
+
+- a dated G1-R3 plan records the measured heavy-history baseline (1,384 files, 21.66 GB source, 410,566 usage-plus-quota records, 103.4 seconds, and 1.21 GiB process maximum RSS) and chooses a resumable owner-only disk-backed export-set workspace rather than pretending time-sliced arrays are streaming;
+- Codex JSONL reads used by export discovery/parsing now cap allocation for one line at 16 MiB; a fixed-marker streaming classifier discards an oversized line only when it is provably irrelevant and fails closed on relevant/ambiguous oversize, while lineage discovery concurrency is bounded;
+- a compatibility-bound candidate resource policy limits covered duration, traversed directory entries, discovered files/bytes, activity-marker input, output records, expanded safe-record bytes, canonical bundle bytes, elapsed time, and RSS with fixed content-free errors;
+- bundle schemas, writer, and standalone verifier now converge on 100,000 per-family/total semantic records and a 32 MiB canonical bundle ceiling instead of permitting a schema-valid artifact the verifier would reject later;
+- canonical/legacy participant-secret disagreement fails closed, concurrent migration converges only on the same secret, and a retirement tombstone prevents legacy identity resurrection;
+- `rotate-local-identity` has non-mutating preflight plus explicit-confirmation atomic file rotation, environment-secret refusal, inode/concurrency checks, legacy retirement, content-free output, and an explicit no-secure-erasure/no-network boundary; and
+- the compatibility tuple is bumped to exporter `0.3.0-draft.2`, scanner `codex-log-scan-v3`, adapter `codex-metadata-export-v4`, resource policy `g1-r3-candidate-0.2`, and the 149-field contract.
+
+Still open in G1-R3: the SQLite workspace, frozen source-prefix plan, transactional safe-record checkpoints, deterministic chunk materialization, complete-set manifest/publication/recovery, `verify-export-set`, stable golden set hashes, disk-backed activity-marker processing, and cross-restart resource accounting. `delete-local-export` also remains open until bundle-first crash-recoverable deletion and recovery are implemented. Native secret stores, Claude parity, compression, signed packaging, clean-machine validation, and volunteer-local reviews remain later G1 work. No upload or external collection is enabled.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

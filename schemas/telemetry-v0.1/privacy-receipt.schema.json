@@ -26,7 +26,7 @@
     "bundleId": { "type": "string", "pattern": "^bundle:v1:[A-Za-z0-9_-]{43}$" },
     "participantId": { "type": "string", "pattern": "^participant:v1:[A-Za-z0-9_-]{43}$" },
     "bundleSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-    "bundleBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 },
+    "bundleBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
     "verdict": { "enum": ["passed", "failed"] },
     "transportReady": { "const": false },
     "coveredAt": {
@@ -43,9 +43,9 @@
       "additionalProperties": false,
       "required": ["usageEvents", "quotaSnapshots", "activityMarkers"],
       "properties": {
-        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 100000 }
       }
     },
     "checks": {

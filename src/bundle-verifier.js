@@ -5,8 +5,9 @@ import { basename, dirname, join, resolve } from "node:path";
 import { verifyPrivacySafeBundle } from "./export-privacy.js";
 import { validateExportRecord } from "./export-schema.js";
 import { stableJson } from "./storage.js";
+import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 
-const MAX_BUNDLE_BYTES = 64 * 1024 * 1024;
+const MAX_BUNDLE_BYTES = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumCanonicalBundleBytes;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
 
 export class BundleVerificationError extends Error {
@@ -91,6 +92,10 @@ function assertBundleSemantics(bundle) {
   const start = Date.parse(bundle.coveredAt.startAt);
   const end = Date.parse(bundle.coveredAt.endAt);
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) fail("bundle_time_bounds");
+  const totalRecords = bundle.recordCounts.usageEvents
+    + bundle.recordCounts.quotaSnapshots
+    + bundle.recordCounts.activityMarkers;
+  if (totalRecords > DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords) fail("bundle_record_limit");
   const groups = [
     [bundle.records.usageEvents, "eventTime", "eventId"],
     [bundle.records.quotaSnapshots, "observedTime", "snapshotId"],

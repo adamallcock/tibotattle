@@ -47,9 +47,9 @@
       "additionalProperties": false,
       "required": ["usageEvents", "quotaSnapshots", "activityMarkers"],
       "properties": {
-        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 100000 }
       }
     },
     "records": {
@@ -59,12 +59,12 @@
       "properties": {
         "usageEvents": {
           "type": "array",
-          "maxItems": 1000000,
+          "maxItems": 100000,
           "items": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json" }
         },
         "quotaSnapshots": {
           "type": "array",
-          "maxItems": 1000000,
+          "maxItems": 100000,
           "items": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json" }
         },
         "activityMarkers": {

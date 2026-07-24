@@ -18,6 +18,7 @@ import { assertValidExportRecord } from "./export-schema.js";
 import { recognizedExportLimitId, recognizedExportModelId } from "./export-registries.js";
 import { exportCompatibilityTuple } from "./export-contract.js";
 import { stableJson, writeOwnerOnlyPairNoClobber } from "./storage.js";
+import { createExportResourceGuard, ExportResourceLimitError } from "./export-resource-policy.js";
 
 const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
 const PLAN_VARIANTS = new Set(["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]);
@@ -205,9 +206,22 @@ export async function buildLocalMetadataBundle({
   createdAt = new Date().toISOString(),
   bundleId = randomBundleId(),
   forbiddenSourceValues = [],
+  resourceLimits = {},
+  resourceClock = () => Date.now(),
+  resourceRss = () => process.memoryUsage().rss,
+  resourceGuard: suppliedResourceGuard = null,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
   const bounds = validateBounds(startAt, endAt);
+  if (suppliedResourceGuard && Object.keys(resourceLimits).length > 0) {
+    throw new TypeError("Provide either a resource guard or resource limit overrides, not both");
+  }
+  const resourceGuard = suppliedResourceGuard ?? createExportResourceGuard({
+      limits: resourceLimits,
+      clock: resourceClock,
+      rss: resourceRss,
+    });
+  resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
   const usageEvents = [];
   const quotaSnapshotsById = new Map();
   const toolCountsBySession = new Map();
@@ -255,6 +269,7 @@ export async function buildLocalMetadataBundle({
       };
       usage.eventId = deriveEventOccurrenceId(secret, canonicalSubject(usageEventIdentitySubject(event)));
       assertValidExportRecord("usageEvent", usage);
+      resourceGuard.observeOutputRecord(Buffer.byteLength(stableJson(usage), "utf8"));
       usageEvents.push(usage);
     },
     onRateLimitSnapshot(event) {
@@ -282,17 +297,28 @@ export async function buildLocalMetadataBundle({
       snapshot.snapshotId = deriveSnapshotObservationId(secret, canonicalSubject(quotaObservationIdentitySubject(event, snapshot.slot)));
       snapshot.providerStateId = deriveQuotaStateId(secret, canonicalSubject(quotaStateIdentitySubject(snapshot)));
       assertValidExportRecord("quotaSnapshot", snapshot);
+      resourceGuard.observeOutputRecord(Buffer.byteLength(stableJson(snapshot), "utf8"));
       quotaSnapshotsById.set(snapshot.snapshotId, snapshot);
     },
+    resourceGuard,
   });
 
   const compatibility = exportCompatibilityTuple();
   if (scan.parserVersion !== compatibility.providerAdapters.openaiCodex.parserVersion) {
     throw new Error("Codex scanner version does not match the export compatibility contract");
   }
-  const safeMarkers = activityMarkers
-    .map((marker) => normalizeActivityMarker(secret, marker, bounds))
-    .filter(Boolean)
+  if (!Array.isArray(activityMarkers)) throw new TypeError("Activity markers must be an array");
+  if (activityMarkers.length > resourceGuard.limits.maximumOutputRecords) {
+    throw new ExportResourceLimitError("output_records");
+  }
+  const safeMarkers = [];
+  for (const marker of activityMarkers) {
+    const normalized = normalizeActivityMarker(secret, marker, bounds);
+    if (!normalized) continue;
+    resourceGuard.observeOutputRecord(Buffer.byteLength(stableJson(normalized), "utf8"));
+    safeMarkers.push(normalized);
+  }
+  safeMarkers
     .sort((left, right) => left.observedTime.localeCompare(right.observedTime) || left.markerId.localeCompare(right.markerId));
   usageEvents.sort((left, right) => left.eventTime.localeCompare(right.eventTime) || left.eventId.localeCompare(right.eventId));
   const quotaSnapshots = [...quotaSnapshotsById.values()]
@@ -319,11 +345,12 @@ export async function buildLocalMetadataBundle({
     diagnostics: diagnosticsFromScan(scan, leftoverToolCalls),
   };
   assertValidExportRecord("bundle", bundle);
+  resourceGuard.observeCanonicalBundle(Buffer.byteLength(stableJson(bundle), "utf8"));
   const receipt = verifyPrivacySafeBundle(bundle, { createdAt: bundle.createdAt, forbiddenSourceValues });
-  return { bundle, receipt };
+  return { bundle, receipt, resourceUsage: resourceGuard.snapshot() };
 }
 
-export function renderMetadataExportPreview({ bundle, receipt }) {
+export function renderMetadataExportPreview({ bundle, receipt, resourceUsage = null }) {
   const checks = receipt.checks.map((check) => `  ${check.code}: ${check.status} (${check.violations})`).join("\n");
   return [
     "Local metadata export preview",
@@ -335,6 +362,8 @@ export function renderMetadataExportPreview({ bundle, receipt }) {
     `Privacy verdict: ${receipt.verdict}`,
     checks,
     `Bundle bytes: ${receipt.bundleBytes}`,
+    `Resource policy: ${resourceUsage?.policyVersion ?? "unavailable"}`,
+    `Resource records: ${resourceUsage?.counters.outputRecords ?? bundle.recordCounts.usageEvents + bundle.recordCounts.quotaSnapshots + bundle.recordCounts.activityMarkers}`,
     "Upload: disabled (transportReady=false)",
   ].join("\n");
 }

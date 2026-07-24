@@ -591,12 +591,13 @@ test("foreground consumes a notification, reconnects, and shuts down cleanly", a
       }, 5);
     }
     async readRateLimits() {
+      if (factoryCalls > 1) setTimeout(() => controller.abort(), 30);
       return appPayload(2);
     }
     close() {}
   }
   try {
-    setTimeout(() => controller.abort(), 120);
+    const hardStop = setTimeout(() => controller.abort(), 1_000);
     const result = await runCollectorForeground({
       ...fixture,
       signal: controller.signal,
@@ -609,6 +610,7 @@ test("foreground consumes a notification, reconnects, and shuts down cleanly", a
       },
       clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
     });
+    clearTimeout(hardStop);
     const records = await readLines(fixture.dataFile);
     assert.equal(result.shutdown, "clean");
     assert.ok(result.reconnectAttempts >= 1);
@@ -721,15 +723,23 @@ test("idle reconciliation does not rewrite the full checkpoint every cycle", asy
     close() {}
   }
   try {
-    setTimeout(() => controller.abort(), 100);
+    let ingestionCalls = 0;
+    const hardStop = setTimeout(() => controller.abort(), 1_000);
     const result = await runCollectorForeground({
       ...fixture,
       signal: controller.signal,
       staleAfterMs: 0,
       reconciliationMs: 15,
       appServerFactory: () => new IdleClient(),
+      ingestUpdates: async (options) => {
+        const result = await ingestRolloutUpdates(options);
+        ingestionCalls += 1;
+        if (ingestionCalls >= 4) queueMicrotask(() => controller.abort());
+        return result;
+      },
       clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
     });
+    clearTimeout(hardStop);
     assert.ok(result.resourceActivity.reconciliationCycles >= 3);
     assert.ok(result.resourceActivity.ingestionRuns >= result.resourceActivity.reconciliationCycles);
     assert.ok(result.resourceActivity.checkpointWrites <= 3);

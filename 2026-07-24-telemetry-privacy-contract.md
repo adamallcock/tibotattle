@@ -64,7 +64,7 @@ Fields not present in the schema are rejected even if they appear harmless. Whil
 
 ## Pseudonym specification
 
-The exporter uses a separate 32-byte random participant secret, not the account-observation key. The default file is in the OS application-state directory (`~/Library/Application Support/app-usagemonitor/` on macOS, XDG state on Linux, and local app data on Windows). Safe legacy `.usage-monitor/export-participant-secret` files are copied forward without deleting the original. The POSIX fallback requires a current-user-owned, single-link regular file of the exact expected length with mode `0600` inside an owner-controlled directory. Native Windows credential storage is not implemented and remains a supported-release blocker. `APP_USAGEMONITOR_EXPORT_SECRET` or `--secret-file` may supply an advanced-use alternative.
+The exporter uses a separate 32-byte random participant secret, not the account-observation key. The default file is in the OS application-state directory (`~/Library/Application Support/app-usagemonitor/` on macOS, XDG state on Linux, and local app data on Windows). A safe legacy `.usage-monitor/export-participant-secret` may be migrated once to the canonical location; the exporter then creates an owner-only retirement tombstone and will not read or recreate the legacy secret again. If canonical and legacy secrets coexist before retirement, they must contain the same bytes or export fails closed with a content-free conflict code. The POSIX fallback requires a current-user-owned, single-link regular file of the exact expected length with mode `0600` inside an owner-controlled directory. Native Windows credential storage is not implemented and remains a supported-release blocker. `APP_USAGEMONITOR_EXPORT_SECRET` or `--secret-file` may supply an advanced-use alternative.
 
 Each namespace derives its own 32-byte key using HKDF-SHA-256:
 
@@ -116,9 +116,9 @@ Future upload consent must separately name the operator, destination, retention 
 ## Local deletion and rotation runbook
 
 1. Stop any exporter process. No background process is currently installed.
-2. Delete the selected local bundle and its matching privacy receipt. Files under `exports/` are generated review artifacts and are not source evidence.
-3. To end longitudinal linkability, delete the exporter secret in the OS application-state directory (or the explicitly supplied `--secret-file`). The next inspect/export creates a new identity. If a retained legacy `.usage-monitor/export-participant-secret` still exists, move or delete it too before the next run or it can be migrated back. Existing local bundles remain linkable to one another through their embedded old participant pseudonym until they are also deleted.
-4. If a secret may have been exposed, rotate it before creating another bundle and do not share any bundle created with the exposed identity.
+2. Deletion is currently manual: delete the selected local bundle and its matching privacy receipt. Files under `exports/` are generated review artifacts and are not source evidence. The planned `delete-local-export` command is not yet implemented because it requires bundle-first crash-recoverable deletion; do not treat recursive removal as that completed control.
+3. Run `usage-monitor rotate-local-identity` for a non-mutating preflight. If it reports `ready` and an installation-identity break is intended, rerun with `--confirm`. The command atomically replaces the canonical owner-only secret, installs/validates a legacy-retirement tombstone, changes every future export pseudonym, and performs no network activity. It refuses environment-provided secrets and source conflicts.
+4. Rotation does not modify existing bundles and can make overlapping history re-exports appear as a distinct participant. Existing bundles remain mutually linkable through their old participant pseudonym until they are deleted. The command does not promise secure erasure from SSD/APFS storage, open handles, memory, backups, or synced copies.
 5. Do not delete raw Codex logs as part of this runbook; they belong to the provider application and are outside this tool's data lifecycle.
 
 There is no server-side deletion procedure because no server or upload exists. Phase 2 cannot begin until enrollment, status, export, revocation, and deletion paths are implemented and exercised end to end.

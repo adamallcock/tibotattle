@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { appendFile, chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rmdir, symlink, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 
 export function defaultDataFile() {
   return resolve(process.cwd(), ".usage-monitor", "observations.jsonl");
@@ -207,7 +208,7 @@ const EXPORT_TRANSACTION_DIRECTORY = ".app-usagemonitor-export-transactions";
 const EXPORT_DESTINATION_LOCK = ".app-usagemonitor-export.lock";
 const EXPORT_DESTINATION_CLAIM_PREFIX = ".app-usagemonitor-export.lock.claim.";
 const EXPORT_TRANSACTION_SCHEMA = "owner-only-pair-transaction-v1";
-const MAX_LOCAL_BUNDLE_BYTES = 64 * 1024 * 1024;
+const MAX_LOCAL_BUNDLE_BYTES = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumCanonicalBundleBytes;
 const MAX_LOCAL_RECEIPT_BYTES = 1024 * 1024;
 
 function sha256(value) {

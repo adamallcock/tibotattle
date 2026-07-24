@@ -19,9 +19,16 @@ import { analyzeMonitoringQuality, renderMonitoringQualityReport } from "./monit
 import { analyzeWeeklyCalibration, renderWeeklyCalibrationReport } from "./weekly-calibration.js";
 import { upsertPlanProfile, validatePlanTimeline } from "./plan-timeline.js";
 import { createActivityMarker } from "./activity-markers.js";
-import { defaultExportSecretFile, loadOrCreateParticipantSecret } from "./export-identity.js";
+import {
+  defaultExportSecretFile,
+  inspectParticipantSecret,
+  rotateParticipantSecret,
+  withParticipantSecretLease,
+} from "./export-identity.js";
 import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
 import { verifyLocalMetadataBundleFiles } from "./bundle-verifier.js";
+import { readBoundedJsonLines } from "./bounded-jsonl.js";
+import { createExportResourceGuard, DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -84,6 +91,7 @@ function usage() {
   usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor verify-bundle --input PATH [--receipt PATH]
   usage-monitor recover-exports --directory PATH
+  usage-monitor rotate-local-identity [--secret-file PATH] [--confirm]
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -150,6 +158,7 @@ export function parseArgs(argv) {
     exportSecretFile: null,
     receiptFile: null,
     directory: null,
+    confirm: false,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -161,6 +170,7 @@ export function parseArgs(argv) {
     else if (arg === "--compact") result.compact = true;
     else if (arg === "--allow-stale-cache") result.allowStaleCache = true;
     else if (arg === "--json") result.json = true;
+    else if (arg === "--confirm") result.confirm = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--since") result.startAt = readOptionValue(argv, index++, arg);
@@ -330,30 +340,63 @@ async function run() {
     console.log("Upload remains disabled");
     return;
   }
+  if (args.command === "rotate-local-identity") {
+    const secretFile = args.exportSecretFile ?? defaultExportSecretFile();
+    if (!args.confirm) {
+      const inspection = await inspectParticipantSecret({ secretFile });
+      const state = inspection.conflict
+        ? "conflict"
+        : inspection.source === "environment"
+          ? "external_override"
+          : inspection.status;
+      console.log(`Local export identity rotation preflight: ${state}`);
+      console.log(`Rotatable: ${inspection.rotatable === true}`);
+      console.log("No files changed; rerun with --confirm to break future export linkability");
+      console.log("Network activity: none");
+      return;
+    }
+    const rotated = await rotateParticipantSecret({ secretFile, confirmRotation: true });
+    console.log("Local export identity rotation: completed");
+    console.log(`Legacy fallback retired: ${rotated.legacyRetired}`);
+    console.log("Future export pseudonyms changed: true");
+    console.log("Existing bundles changed: false");
+    console.log(`Secure storage erasure guaranteed: ${rotated.secureErasure}`);
+    console.log("Network activity: none");
+    return;
+  }
   if (args.command === "inspect-export" || args.command === "export-local") {
     if (!args.startAt || !args.endAt) throw new Error(`${args.command} requires --since and --until`);
     if (args.command === "export-local" && !args.outputFile) throw new Error("export-local requires --output");
-    const identity = await loadOrCreateParticipantSecret({
+    const exportResourceGuard = createExportResourceGuard();
+    exportResourceGuard.assertCoveredInterval(Date.parse(args.startAt), Date.parse(args.endAt));
+    const activityMarkers = await readBoundedJsonLines(args.activityFile ?? defaultActivityMarkerFile(), {
+      maximumFileBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExpandedRecordBytes,
+      maximumLineBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumLineBytes,
+      maximumRecords: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
+      resourceGuard: exportResourceGuard,
+    });
+    await withParticipantSecretLease({
       secretFile: args.exportSecretFile ?? defaultExportSecretFile(),
+    }, async (identity) => {
+      const result = await buildLocalMetadataBundle({
+        startAt: args.startAt,
+        endAt: args.endAt,
+        codexHome: args.codexHome ?? undefined,
+        secret: identity.secret,
+        activityMarkers,
+        resourceGuard: exportResourceGuard,
+      });
+      console.log(renderMetadataExportPreview(result));
+      if (args.command === "inspect-export") return;
+      args.receiptFile ??= `${args.outputFile}.privacy-receipt.json`;
+      const written = await writeLocalMetadataBundle({
+        ...result,
+        outputFile: args.outputFile,
+        receiptFile: args.receiptFile,
+      });
+      console.log(`Bundle: ${written.outputFile}`);
+      console.log(`Privacy receipt: ${written.receiptFile}`);
     });
-    const activityMarkers = await readObservations(args.activityFile ?? defaultActivityMarkerFile());
-    const result = await buildLocalMetadataBundle({
-      startAt: args.startAt,
-      endAt: args.endAt,
-      codexHome: args.codexHome ?? undefined,
-      secret: identity.secret,
-      activityMarkers,
-    });
-    console.log(renderMetadataExportPreview(result));
-    if (args.command === "inspect-export") return;
-    args.receiptFile ??= `${args.outputFile}.privacy-receipt.json`;
-    const written = await writeLocalMetadataBundle({
-      ...result,
-      outputFile: args.outputFile,
-      receiptFile: args.receiptFile,
-    });
-    console.log(`Bundle: ${written.outputFile}`);
-    console.log(`Privacy receipt: ${written.receiptFile}`);
     return;
   }
   if (args.command === "doctor") {

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { exportRegistrySnapshot, TELEMETRY_V01_REGISTRY_VERSION } from "./export-registries.js";
 import { stableJson } from "./storage.js";
+import { EXPORT_RESOURCE_POLICY_VERSION } from "./export-resource-policy.js";
 import {
   CODEX_LOG_SCAN_VERSION,
   CODEX_METADATA_ADAPTER_VERSION,
@@ -57,6 +58,7 @@ export function buildExportCompatibilityTuple() {
     },
     implementation: {
       exporterVersion: EXPORTER_VERSION,
+      resourcePolicyVersion: EXPORT_RESOURCE_POLICY_VERSION,
       packageName: packageMetadata.name,
       packageVersion: packageMetadata.version,
     },

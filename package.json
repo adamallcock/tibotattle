@@ -21,6 +21,7 @@
     "mark:activity": "node ./src/cli.js mark-activity",
     "inspect:export": "node ./src/cli.js inspect-export",
     "export:local": "node ./src/cli.js export-local",
+    "rotate:identity": "node ./src/cli.js rotate-local-identity",
     "telemetry:generate": "node ./scripts/generate-telemetry-contract.js",
     "telemetry:check": "node ./scripts/generate-telemetry-contract.js --check && node --test test/telemetry-contract.test.js test/export-schema.test.js",
     "build:report-data": "node ./src/build-multi-surface-report.js",

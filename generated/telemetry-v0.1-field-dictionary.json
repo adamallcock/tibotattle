@@ -20,19 +20,19 @@
     {
       "schemaName": "bundle.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
-      "schemaSha256": "868b3f23c5990520bbdd70bed015401e3ecb94218734d1fc294bcd297bbee805",
+      "schemaSha256": "fb0a7380d406e1252159611afd33189531616d5ee22581a4adf26584f1a75194",
       "propertyCount": 24
     },
     {
       "schemaName": "compatibility.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
-      "schemaSha256": "305a93b221e7a09f21126fe93b19e0ac501108784a5f6b404fe6f17047565753",
-      "propertyCount": 39
+      "schemaSha256": "db95ee13d5f9d00ce05effda09925c32901de442c32becceba92b18f9588a299",
+      "propertyCount": 40
     },
     {
       "schemaName": "privacy-receipt.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
-      "schemaSha256": "121ff9e382849a25ecfa6ef9d1d219633789b105063889885852cf0502296b25",
+      "schemaSha256": "97041641a58aa04bc3b62dd208162b5d5edf253176d5c5b3f6352f7d081d9f90",
       "propertyCount": 21
     },
     {
@@ -680,6 +680,18 @@
       "schemaName": "compatibility.schema.json",
       "schemaPointer": "/properties/implementation/properties/packageVersion",
       "fieldPath": "implementation.packageVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation/properties/resourcePolicyVersion",
+      "fieldPath": "implementation.resourcePolicyVersion",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",

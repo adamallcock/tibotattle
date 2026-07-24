@@ -1,9 +1,10 @@
 import { createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
-import { readdir, stat } from "node:fs/promises";
+import { opendir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { readBoundedUtf8Lines } from "./bounded-jsonl.js";
 import {
   calculateCost,
   compilePriceCatalog,
@@ -22,6 +23,31 @@ const COMPONENT_KEYS = [
   "reasoning_output_tokens",
   "total_tokens",
 ];
+
+const EXPORT_RELEVANT_LINE_NEEDLES = Object.freeze([
+  '"session_meta"',
+  '"turn_context"',
+  '"thread_settings_applied"',
+  '"token_count"',
+  '"task_started"',
+  '"task_complete"',
+  "tool_call",
+  '"function_call"',
+  '"code_interpreter_call"',
+  '"shell_call"',
+  '"computer_call"',
+  '"mcp_call"',
+  '"apply_patch_call"',
+  '"local_shell_call"',
+]);
+
+function boundedScannerLines(path, resourceGuard) {
+  return readBoundedUtf8Lines(path, {
+    maximumLineBytes: resourceGuard?.limits.maximumLineBytes,
+    resourceGuard,
+    oversizedIrrelevantNeedles: EXPORT_RELEVANT_LINE_NEEDLES,
+  });
+}
 
 export function normalizeTokenUsage(value) {
   if (!value || typeof value !== "object") return null;
@@ -53,21 +79,23 @@ function sameUsage(left, right) {
   return COMPONENT_KEYS.every((key) => left[key] === right[key]);
 }
 
-async function collectJsonlFileInfos(root) {
+async function collectJsonlFileInfos(root, resourceGuard = null) {
   const files = [];
   async function walk(directory) {
     let entries;
     try {
-      entries = await readdir(directory, { withFileTypes: true });
+      entries = await opendir(directory);
     } catch {
       return;
     }
-    for (const entry of entries) {
+    for await (const entry of entries) {
+      resourceGuard?.observeDirectoryEntry();
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
         await walk(path);
       } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
         const metadata = await stat(path);
+        resourceGuard?.observeSourceFile(metadata.size);
         files.push({
           path,
           mtimeMs: metadata.mtimeMs,
@@ -82,10 +110,9 @@ async function collectJsonlFileInfos(root) {
   return files;
 }
 
-export async function readRolloutLineage(path) {
-  const input = createReadStream(path, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  for await (const line of lines) {
+export async function readRolloutLineage(path, { resourceGuard = null } = {}) {
+  for await (const line of boundedScannerLines(path, resourceGuard)) {
+    if (line === null) continue;
     if (!line.includes('"session_meta"')) continue;
     try {
       const record = JSON.parse(line);
@@ -97,7 +124,6 @@ export async function readRolloutLineage(path) {
         ? record.payload.forked_from_id
         : (typeof record.payload.parent_thread_id === "string" ? record.payload.parent_thread_id : null);
       const surfaceClassification = classifySessionSurface(record.payload);
-      input.destroy();
       return { sessionId, parentId, isFork: parentId !== null, surfaceClassification };
     } catch {
       // A malformed metadata line is handled by the main parser diagnostics.
@@ -119,21 +145,40 @@ function rolloutKey(path) {
   return path.slice(path.lastIndexOf("rollout-"));
 }
 
-export async function discoverCodexRolloutInfos({ codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex"), startAt }) {
+async function mapWithConcurrency(values, concurrency, callback) {
+  const result = new Array(values.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < values.length) {
+      const index = cursor;
+      cursor += 1;
+      result[index] = await callback(values[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
+  return result;
+}
+
+export async function discoverCodexRolloutInfos({
+  codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+  startAt,
+  endAt = null,
+  resourceGuard = null,
+}) {
   const cutoffMs = new Date(startAt).getTime();
+  const endMs = endAt === null ? Number.POSITIVE_INFINITY : new Date(endAt).getTime();
   const [active, archived] = await Promise.all([
-    collectJsonlFileInfos(join(codexHome, "sessions")),
-    collectJsonlFileInfos(join(codexHome, "archived_sessions")),
+    collectJsonlFileInfos(join(codexHome, "sessions"), resourceGuard),
+    collectJsonlFileInfos(join(codexHome, "archived_sessions"), resourceGuard),
   ]);
   const byName = new Map();
   for (const info of archived) byName.set(rolloutKey(info.path), { ...info, location: "archive" });
   for (const info of active) byName.set(rolloutKey(info.path), { ...info, location: "active" });
-
-  const all = await Promise.all([...byName.entries()].map(async ([key, info]) => ({
+  const all = await mapWithConcurrency([...byName.entries()], 16, async ([key, info]) => ({
     ...info,
     rolloutKey: key,
-    lineage: await readRolloutLineage(info.path),
-  })));
+    lineage: await readRolloutLineage(info.path, { resourceGuard }),
+  }));
   const bySessionId = new Map();
   for (const info of all) {
     if (!info.lineage.sessionId) continue;
@@ -144,7 +189,10 @@ export async function discoverCodexRolloutInfos({ codexHome = process.env.CODEX_
     bySessionId.set(info.lineage.sessionId, info);
   }
 
-  const selected = new Set(all.filter((info) => info.mtimeMs >= cutoffMs));
+  const selected = new Set(all.filter((info) => {
+    const sourceStartMs = rolloutStartMs(info.rolloutKey);
+    return info.mtimeMs >= cutoffMs && (!Number.isFinite(sourceStartMs) || sourceStartMs <= endMs);
+  }));
   function includeAncestors(info, visiting = new Set()) {
     const parentId = info.lineage.parentId;
     if (!parentId || visiting.has(parentId)) return;
@@ -421,10 +469,9 @@ function cumulativeSnapshotKey(total, last) {
   return [...COMPONENT_KEYS.map((key) => total[key]), ...(last ? COMPONENT_KEYS.map((key) => last[key]) : [])].join("|");
 }
 
-async function collectCumulativeSnapshotKeys(path, target) {
-  const input = createReadStream(path, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  for await (const line of lines) {
+async function collectCumulativeSnapshotKeys(path, target, resourceGuard = null) {
+  for await (const line of boundedScannerLines(path, resourceGuard)) {
+    if (line === null) continue;
     if (!line.includes('"token_count"')) continue;
     try {
       const record = JSON.parse(line);
@@ -439,12 +486,11 @@ async function collectCumulativeSnapshotKeys(path, target) {
   }
 }
 
-async function collectTierTimeline(path, diagnostics) {
+async function collectTierTimeline(path, diagnostics, resourceGuard = null) {
   const timeline = [];
-  const input = createReadStream(path, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
   let ordinal = 0;
-  for await (const line of lines) {
+  for await (const line of boundedScannerLines(path, resourceGuard)) {
+    if (line === null) continue;
     ordinal += 1;
     if (!line.includes('"thread_settings_applied"')) continue;
     let record;
@@ -503,18 +549,18 @@ async function parseRollout(path, {
   surfaceClassification,
   sourceScopeId,
   sourceDedupeScope,
+  resourceGuard,
 }) {
-  const tierTimeline = await collectTierTimeline(path, diagnostics);
-  const input = createReadStream(path, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  const tierTimeline = await collectTierTimeline(path, diagnostics, resourceGuard);
   let currentModel = null;
   let previousTotals = null;
   let previousTotalsPresence = null;
   const openTaskIds = new Set();
   let sourceRecordOrdinal = 0;
 
-  for await (const line of lines) {
+  for await (const line of boundedScannerLines(path, resourceGuard)) {
     sourceRecordOrdinal += 1;
+    if (line === null) continue;
     if (!line.includes('"turn_context"')
         && !line.includes('"thread_settings_applied"')
         && !line.includes('"token_count"')
@@ -710,6 +756,7 @@ export async function scanCodexLogEvents({
   excludeSessionIds = [],
   activeTaskRecencyMs = null,
   sourceScopeForRollout = null,
+  resourceGuard = null,
 }) {
   const startMs = new Date(startAt).getTime();
   const endMs = new Date(endAt).getTime();
@@ -723,6 +770,8 @@ export async function scanCodexLogEvents({
   const rolloutInfos = await discoverCodexRolloutInfos({
     codexHome,
     startAt: new Date(Math.min(startMs, activeCutoffMs)).toISOString(),
+    endAt,
+    resourceGuard,
   });
   const excludedSessions = new Set(excludeSessionIds.filter((value) => typeof value === "string" && value.length > 0));
   const seenEvents = new Set();
@@ -769,7 +818,7 @@ export async function scanCodexLogEvents({
         ? snapshotsBySession.get(info.lineage.parentId)
         : null;
       const rolloutSnapshots = createSnapshotLineage(inheritedSnapshots ?? null);
-      await collectCumulativeSnapshotKeys(info.path, rolloutSnapshots);
+      await collectCumulativeSnapshotKeys(info.path, rolloutSnapshots, resourceGuard);
       snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
       diagnostics.excludedRollouts += 1;
       continue;
@@ -805,6 +854,7 @@ export async function scanCodexLogEvents({
       surfaceClassification: classification,
       sourceScopeId,
       sourceDedupeScope,
+      resourceGuard,
     });
     if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) diagnostics.activeTaskRolloutsAtEnd += 1;
     if (info.lineage.sessionId) snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);

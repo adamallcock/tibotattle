@@ -13,13 +13,14 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "e5e5fc1145ecae62f333874e1d665a2c7616e11dee172fea4822b0715b7cc145",
+    "sha256": "79eaa8da447fb47e59a701065d6a9ba877aca89e6c9b97e6ba971b71fb2e5343",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
-    "exporterVersion": "0.2.0-draft.1",
+    "exporterVersion": "0.3.0-draft.2",
     "packageName": "app-usagemonitor",
-    "packageVersion": "0.0.1"
+    "packageVersion": "0.0.1",
+    "resourcePolicyVersion": "g1-r3-candidate-0.2"
   },
   "providerAdapters": {
     "anthropicClaudeCode": {
@@ -29,8 +30,8 @@
       "status": "not_implemented"
     },
     "openaiCodex": {
-      "adapterVersion": "codex-metadata-export-v2",
-      "parserVersion": "codex-log-scan-v1",
+      "adapterVersion": "codex-metadata-export-v4",
+      "parserVersion": "codex-log-scan-v3",
       "sourceFormat": "codex-rollout-jsonl",
       "status": "implemented"
     }
@@ -49,17 +50,17 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
         "name": "bundle.schema.json",
-        "sha256": "868b3f23c5990520bbdd70bed015401e3ecb94218734d1fc294bcd297bbee805"
+        "sha256": "fb0a7380d406e1252159611afd33189531616d5ee22581a4adf26584f1a75194"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "305a93b221e7a09f21126fe93b19e0ac501108784a5f6b404fe6f17047565753"
+        "sha256": "db95ee13d5f9d00ce05effda09925c32901de442c32becceba92b18f9588a299"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
         "name": "privacy-receipt.schema.json",
-        "sha256": "121ff9e382849a25ecfa6ef9d1d219633789b105063889885852cf0502296b25"
+        "sha256": "97041641a58aa04bc3b62dd208162b5d5edf253176d5c5b3f6352f7d081d9f90"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
@@ -72,7 +73,7 @@
         "sha256": "a9fe4513b91878dab74cb6d4ba7b41f02fc3d685c7b7d3de28a6b29012b00d81"
       }
     ],
-    "setSha256": "5d1ca45dd794818eaeb5ed6014fab81aedd13c6b19119d887d5de92b83435cb1"
+    "setSha256": "6c01e42eada68b66b9e35729e5be56bd67a122ce54a6fc38aeb89b826439ca51"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

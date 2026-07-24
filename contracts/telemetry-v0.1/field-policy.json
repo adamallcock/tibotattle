@@ -229,6 +229,7 @@
         "compatibility.schema.json#/properties/fieldContract/properties/version",
         "compatibility.schema.json#/properties/implementation",
         "compatibility.schema.json#/properties/implementation/properties/exporterVersion",
+        "compatibility.schema.json#/properties/implementation/properties/resourcePolicyVersion",
         "compatibility.schema.json#/properties/implementation/properties/packageName",
         "compatibility.schema.json#/properties/implementation/properties/packageVersion",
         "compatibility.schema.json#/properties/providerAdapters",

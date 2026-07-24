@@ -118,6 +118,7 @@ test("CLI options reject missing values with an actionable error", () => {
   assert.throws(() => parseArgs(["capture", "--label"]), /--label requires a value/);
   assert.throws(() => parseArgs(["report", "--data-file", "--json"]), /--data-file requires a value/);
   assert.throws(() => parseArgs(["quality", "--collector-file"]), /--collector-file requires a value/);
+  assert.equal(parseArgs(["rotate-local-identity", "--confirm"]).confirm, true);
 });
 
 test("cached history requires a matching rollout-source fingerprint or explicit stale override", () => {

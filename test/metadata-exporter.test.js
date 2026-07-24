@@ -340,3 +340,115 @@ test("activity marker identity depends only on its persisted UUID", async () => 
     await rm(fixture.home, { recursive: true, force: true });
   }
 });
+
+test("exporter enforces record, line, and covered-duration resource ceilings before writing", async () => {
+  const fixture = await privateFixture();
+  const common = {
+    startAt: "2026-07-24T11:59:00.000Z",
+    endAt: "2026-07-24T12:10:00.000Z",
+    codexHome: fixture.home,
+    secret: SECRET,
+    bundleId: BUNDLE_ID,
+    createdAt: CREATED_AT,
+  };
+  try {
+    await assert.rejects(
+      buildLocalMetadataBundle({ ...common, resourceLimits: { maximumOutputRecords: 1 } }),
+      (error) => error.code === "export_resource_output_records"
+        && !error.message.includes(fixture.rawPath)
+        && !error.message.includes(fixture.rawSession),
+    );
+    await assert.rejects(
+      buildLocalMetadataBundle({ ...common, resourceLimits: { maximumLineBytes: 32 } }),
+      (error) => error.code === "export_resource_line_bytes",
+    );
+    await assert.rejects(
+      buildLocalMetadataBundle({
+        ...common,
+        startAt: "2026-06-01T00:00:00.000Z",
+        endAt: "2026-07-24T12:10:00.000Z",
+      }),
+      (error) => error.code === "export_resource_covered_duration",
+    );
+  } finally {
+    await rm(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test("exporter enforces source, expanded-byte, canonical-byte, elapsed, and RSS ceilings", async () => {
+  const fixture = await privateFixture();
+  const common = {
+    startAt: "2026-07-24T11:59:00.000Z",
+    endAt: "2026-07-24T12:10:00.000Z",
+    codexHome: fixture.home,
+    secret: SECRET,
+    bundleId: BUNDLE_ID,
+    createdAt: CREATED_AT,
+  };
+  try {
+    await assert.rejects(
+      buildLocalMetadataBundle({ ...common, resourceLimits: { maximumSourceBytes: 1 } }),
+      (error) => error.code === "export_resource_source_bytes",
+    );
+    await assert.rejects(
+      buildLocalMetadataBundle({ ...common, resourceLimits: { maximumExpandedRecordBytes: 1 } }),
+      (error) => error.code === "export_resource_expanded_record_bytes",
+    );
+    await assert.rejects(
+      buildLocalMetadataBundle({ ...common, resourceLimits: { maximumCanonicalBundleBytes: 1 } }),
+      (error) => error.code === "export_resource_canonical_bundle_bytes",
+    );
+    let now = 0;
+    await assert.rejects(
+      buildLocalMetadataBundle({
+        ...common,
+        resourceLimits: { maximumElapsedMs: 1 },
+        resourceClock: () => {
+          now += 2;
+          return now;
+        },
+      }),
+      (error) => error.code === "export_resource_elapsed_time",
+    );
+    await assert.rejects(
+      buildLocalMetadataBundle({
+        ...common,
+        resourceLimits: { maximumRssBytes: 1 },
+        resourceRss: () => 2,
+      }),
+      (error) => error.code === "export_resource_rss",
+    );
+  } finally {
+    await rm(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test("oversized irrelevant content is streamed away without changing physical occurrence IDs", async () => {
+  const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-oversized-irrelevant-"));
+  await mkdir(join(home, "sessions"), { recursive: true });
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "oversized-session", source: "user" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:30.000Z", type: "response_item", payload: { type: "message", content: "x".repeat(2_000) } }),
+    tokenRecord("2026-07-24T12:01:00.000Z", usage(100, 20, 40, 8), usage(100, 20, 40, 8), 12),
+  ];
+  await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-00-oversized.jsonl"), `${lines.join("\n")}\n`);
+  const common = {
+    startAt: "2026-07-24T11:59:00.000Z",
+    endAt: "2026-07-24T12:02:00.000Z",
+    codexHome: home,
+    secret: SECRET,
+    bundleId: BUNDLE_ID,
+    createdAt: CREATED_AT,
+  };
+  try {
+    const ordinary = await buildLocalMetadataBundle({ ...common, resourceLimits: { maximumLineBytes: 4_096 } });
+    const streamed = await buildLocalMetadataBundle({ ...common, resourceLimits: { maximumLineBytes: 1_000 } });
+    assert.equal(streamed.resourceUsage.counters.oversizedIrrelevantLines > 0, true);
+    assert.equal(streamed.bundle.records.usageEvents[0].eventId, ordinary.bundle.records.usageEvents[0].eventId);
+    assert.deepEqual(streamed.bundle.records.usageEvents, ordinary.bundle.records.usageEvents);
+    assert.deepEqual(streamed.bundle.records.quotaSnapshots, ordinary.bundle.records.quotaSnapshots);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
