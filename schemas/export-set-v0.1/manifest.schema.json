@@ -1,0 +1,152 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/export-set-v0.1/manifest.schema.json",
+  "title": "Complete local metadata export-set manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "manifestContract",
+    "compatibility",
+    "exportSetId",
+    "participantId",
+    "createdAt",
+    "coveredAt",
+    "sourceProviders",
+    "clientPlatform",
+    "transportReady",
+    "completionStatus",
+    "sourcePlan",
+    "chunking",
+    "totals",
+    "chunks"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "usage-export-set-manifest-v0.1" },
+    "manifestContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "schemaSha256"],
+      "properties": {
+        "version": { "const": "export-set-contract-v0.1" },
+        "schemaSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "compatibility": {
+      "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json"
+    },
+    "exportSetId": { "type": "string", "pattern": "^export-set:v1:[A-Za-z0-9_-]{43}$" },
+    "participantId": { "type": "string", "pattern": "^participant:v1:[A-Za-z0-9_-]{43}$" },
+    "createdAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "coveredAt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startAt", "endAt"],
+      "properties": {
+        "startAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+        "endAt": { "type": "string", "format": "date-time", "maxLength": 32 }
+      }
+    },
+    "sourceProviders": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": { "enum": ["openai_codex", "anthropic_claude_code"] }
+    },
+    "clientPlatform": { "enum": ["macos", "linux", "windows", "other", "unknown"] },
+    "transportReady": { "const": false },
+    "completionStatus": { "const": "complete" },
+    "sourcePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "sourceFiles", "sourceBytes"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "sourceFiles": { "type": "integer", "minimum": 0, "maximum": 5000 },
+        "sourceBytes": { "type": "integer", "minimum": 0, "maximum": 34359738368 }
+      }
+    },
+    "chunking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "orderingVersion",
+        "packingVersion",
+        "maximumRecordsPerChunk",
+        "maximumCanonicalBundleBytes"
+      ],
+      "properties": {
+        "orderingVersion": { "const": "record-family-time-id-v1" },
+        "packingVersion": { "const": "greedy-canonical-bundle-v1" },
+        "maximumRecordsPerChunk": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "maximumCanonicalBundleBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordCounts", "logicalRecordsSha256", "bundleBytes", "receiptBytes"],
+      "properties": {
+        "recordCounts": { "$ref": "#/definitions/aggregateRecordCounts" },
+        "logicalRecordsSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "bundleBytes": { "type": "integer", "minimum": 0, "maximum": 17179869184 },
+        "receiptBytes": { "type": "integer", "minimum": 0, "maximum": 536870912 }
+      }
+    },
+    "chunks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": { "$ref": "#/definitions/chunk" }
+    }
+  },
+  "definitions": {
+    "aggregateRecordCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usageEvents", "quotaSnapshots", "activityMarkers"],
+      "properties": {
+        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 2000000 },
+        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 2000000 },
+        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 2000000 }
+      }
+    },
+    "chunkRecordCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usageEvents", "quotaSnapshots", "activityMarkers"],
+      "properties": {
+        "usageEvents": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "quotaSnapshots": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "activityMarkers": { "type": "integer", "minimum": 0, "maximum": 100000 }
+      }
+    },
+    "chunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "bundleId",
+        "bundleSha256",
+        "bundleBytes",
+        "receiptSha256",
+        "receiptBytes",
+        "recordStart",
+        "recordEndExclusive",
+        "recordCounts"
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0, "maximum": 511 },
+        "bundleId": { "type": "string", "pattern": "^bundle:v1:[A-Za-z0-9_-]{43}$" },
+        "bundleSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "bundleBytes": { "type": "integer", "minimum": 1, "maximum": 33554432 },
+        "receiptSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "receiptBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "recordStart": { "type": "integer", "minimum": 0, "maximum": 1999999 },
+        "recordEndExclusive": { "type": "integer", "minimum": 0, "maximum": 2000000 },
+        "recordCounts": { "$ref": "#/definitions/chunkRecordCounts" }
+      }
+    }
+  }
+}

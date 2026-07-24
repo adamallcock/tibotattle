@@ -47,8 +47,8 @@
       "additionalProperties": false,
       "required": ["exporterVersion", "resourcePolicyVersion", "packageName", "packageVersion"],
       "properties": {
-        "exporterVersion": { "const": "0.3.0-draft.2" },
-        "resourcePolicyVersion": { "const": "g1-r3-candidate-0.2" },
+        "exporterVersion": { "const": "0.3.0-draft.3" },
+        "resourcePolicyVersion": { "const": "g1-r3-candidate-0.3" },
         "packageName": { "const": "app-usagemonitor" },
         "packageVersion": { "const": "0.0.1" }
       }
@@ -65,8 +65,8 @@
           "properties": {
             "status": { "const": "implemented" },
             "sourceFormat": { "const": "codex-rollout-jsonl" },
-            "parserVersion": { "const": "codex-log-scan-v3" },
-            "adapterVersion": { "const": "codex-metadata-export-v4" }
+            "parserVersion": { "const": "codex-log-scan-v4" },
+            "adapterVersion": { "const": "codex-metadata-export-v5" }
           }
         },
         "anthropicClaudeCode": {

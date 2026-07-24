@@ -1,4 +1,4 @@
-export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.2";
+export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.3";
 
 export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
   maximumCoveredDurationMs: 31 * 24 * 60 * 60 * 1_000,
@@ -9,6 +9,12 @@ export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
   maximumOutputRecords: 100_000,
   maximumExpandedRecordBytes: 32 * 1024 * 1024,
   maximumCanonicalBundleBytes: 32 * 1024 * 1024,
+  maximumExportSetRecords: 2_000_000,
+  maximumExportSetExpandedRecordBytes: 2 * 1024 * 1024 * 1024,
+  maximumWorkspaceBytes: 4 * 1024 * 1024 * 1024,
+  maximumSqliteBatchRecords: 1_000,
+  maximumManifestBytes: 1024 * 1024,
+  maximumChunks: 512,
   maximumElapsedMs: 10 * 60 * 1_000,
   maximumRssBytes: Math.floor(1.5 * 1024 * 1024 * 1024),
 });
@@ -21,6 +27,9 @@ const SAFE_CODES = new Set([
   "output_records",
   "expanded_record_bytes",
   "canonical_bundle_bytes",
+  "workspace_bytes",
+  "manifest_bytes",
+  "chunk_count",
   "elapsed_time",
   "rss",
 ]);
@@ -61,7 +70,11 @@ export function createExportResourceGuard({
   limits: limitOverrides = {},
   clock = () => Date.now(),
   rss = () => process.memoryUsage().rss,
+  scope = "single_bundle",
 } = {}) {
+  if (scope !== "single_bundle" && scope !== "export_set") {
+    throw new TypeError("Export resource scope must be single_bundle or export_set");
+  }
   const limits = normalizeExportResourceLimits(limitOverrides);
   const startedAtMs = clock();
   if (!Number.isFinite(startedAtMs)) throw new TypeError("Export resource clock must return a finite timestamp");
@@ -74,6 +87,8 @@ export function createExportResourceGuard({
     outputRecords: 0,
     expandedRecordBytes: 0,
     canonicalBundleBytes: 0,
+    workspaceBytes: 0,
+    manifestBytes: 0,
   };
 
   function checkRuntime() {
@@ -135,12 +150,33 @@ export function createExportResourceGuard({
       boundedInteger(byteCount, "record byte count", { allowZero: true });
       counters.outputRecords += 1;
       counters.expandedRecordBytes += byteCount;
-      if (counters.outputRecords > limits.maximumOutputRecords) {
+      const maximumRecords = scope === "export_set"
+        ? limits.maximumExportSetRecords
+        : limits.maximumOutputRecords;
+      const maximumBytes = scope === "export_set"
+        ? limits.maximumExportSetExpandedRecordBytes
+        : limits.maximumExpandedRecordBytes;
+      if (counters.outputRecords > maximumRecords) {
         throw new ExportResourceLimitError("output_records");
       }
-      if (counters.expandedRecordBytes > limits.maximumExpandedRecordBytes) {
+      if (counters.expandedRecordBytes > maximumBytes) {
         throw new ExportResourceLimitError("expanded_record_bytes");
       }
+      checkRuntime();
+    },
+    observeOutputTotals(recordCount, byteCount) {
+      boundedInteger(recordCount, "record count", { allowZero: true });
+      boundedInteger(byteCount, "record byte count", { allowZero: true });
+      counters.outputRecords = recordCount;
+      counters.expandedRecordBytes = byteCount;
+      const maximumRecords = scope === "export_set"
+        ? limits.maximumExportSetRecords
+        : limits.maximumOutputRecords;
+      const maximumBytes = scope === "export_set"
+        ? limits.maximumExportSetExpandedRecordBytes
+        : limits.maximumExpandedRecordBytes;
+      if (recordCount > maximumRecords) throw new ExportResourceLimitError("output_records");
+      if (byteCount > maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
       checkRuntime();
     },
     observeCanonicalBundle(byteCount) {
@@ -151,11 +187,29 @@ export function createExportResourceGuard({
       }
       checkRuntime();
     },
+    observeWorkspace(byteCount) {
+      boundedInteger(byteCount, "workspace byte count", { allowZero: true });
+      counters.workspaceBytes = byteCount;
+      if (byteCount > limits.maximumWorkspaceBytes) throw new ExportResourceLimitError("workspace_bytes");
+      checkRuntime();
+    },
+    observeManifest(byteCount) {
+      boundedInteger(byteCount, "manifest byte count");
+      counters.manifestBytes = byteCount;
+      if (byteCount > limits.maximumManifestBytes) throw new ExportResourceLimitError("manifest_bytes");
+      checkRuntime();
+    },
+    observeChunkCount(count) {
+      boundedInteger(count, "chunk count", { allowZero: true });
+      if (count > limits.maximumChunks) throw new ExportResourceLimitError("chunk_count");
+      checkRuntime();
+    },
     checkRuntime,
     snapshot() {
       checkRuntime();
       return {
         policyVersion: EXPORT_RESOURCE_POLICY_VERSION,
+        scope,
         limits: { ...limits },
         counters: { ...counters },
         elapsedMs: clock() - startedAtMs,

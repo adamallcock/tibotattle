@@ -19,10 +19,17 @@ export async function* readBoundedUtf8Lines(path, {
     throw new TypeError("highWaterMark must be a positive safe integer");
   }
   if (maximumTotalBytes !== Number.POSITIVE_INFINITY
-      && (!Number.isSafeInteger(maximumTotalBytes) || maximumTotalBytes < 1)) {
-    throw new TypeError("maximumTotalBytes must be a positive safe integer or Infinity");
+      && (!Number.isSafeInteger(maximumTotalBytes) || maximumTotalBytes < 0)) {
+    throw new TypeError("maximumTotalBytes must be a non-negative safe integer or Infinity");
   }
-  const input = createReadStream(path, { highWaterMark });
+  if (maximumTotalBytes === 0) return;
+  const callerOwnedHandle = path && typeof path === "object" && Number.isInteger(path.fd);
+  const input = createReadStream(callerOwnedHandle ? null : path, {
+    highWaterMark,
+    autoClose: !callerOwnedHandle,
+    ...(callerOwnedHandle ? { fd: path.fd } : {}),
+    ...(maximumTotalBytes === Number.POSITIVE_INFINITY ? {} : { start: 0, end: maximumTotalBytes - 1 }),
+  });
   let chunks = [];
   let lineBytes = 0;
   let oversized = false;

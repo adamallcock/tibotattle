@@ -52,9 +52,11 @@ Each chunk remains an ordinary canonical bundle plus its existing privacy receip
 
 Use the runtime's embedded `node:sqlite` store for this local proof of concept, behind a narrow workspace interface. The current development runtime is Node 26.2.0 and exposes `DatabaseSync`. Before a volunteer artifact is built, declare and test the minimum supported Node/macOS combination or replace the backend with a packaged cross-platform equivalent. No subprocess SQL shell or private system path becomes part of the contract.
 
-The store provides atomic cursor-plus-record commits, uniqueness constraints, disk-backed fork/dedupe indexes, ordered chunk queries, and bounded batches without recreating a database poorly in JSON. SQLite files are local implementation state, never upload artifacts.
+The target store provides atomic cursor-plus-record commits, uniqueness constraints, disk-backed fork/dedupe indexes, ordered chunk queries, and bounded batches without recreating a database poorly in JSON. The current foundation provides the record, uniqueness, ordering, chunk, diagnostics, and bounded-batch pieces; parser cursors and fork/dedupe indexes remain open. SQLite files are local implementation state, never upload artifacts.
 
 ## Deterministic source and record rules
+
+The following list is the G1-R3 target contract. The implementation-status section below identifies the subset implemented today; in particular, rules 5–6 still require true per-source parser/cursor checkpoints rather than deterministic replay.
 
 1. Discover active and archived rollouts with bounded directory traversal; active wins only for the same exact rollout key.
 2. Freeze each selected source prefix by privacy-safe source key, inode/birth-time where available, byte length, and SHA-256. Persist no raw path in the public manifest.
@@ -67,7 +69,7 @@ The store provides atomic cursor-plus-record commits, uniqueness constraints, di
 
 ## Resource policy
 
-All limits are versioned, printed by `inspect-export`, persisted in the checkpoint, enforced while reading and materializing, and re-enforced by verification. Restart does not reset cumulative CPU/wall/disk accounting.
+The target state versions, prints, persists, and enforces every limit across creation, restart, materialization, and verification. The current implementation enforces per-invocation scan/workspace/chunk limits, but restart still resets elapsed accounting and verifier/materializer aggregate accounting remains part of this gate.
 
 Initial benchmark candidates, not final volunteer promises:
 
@@ -82,8 +84,8 @@ Initial benchmark candidates, not final volunteer promises:
 | Canonical uncompressed chunk | 32 MiB | Incremental byte accounting and verifier |
 | Canonical manifest | 1 MiB | Writer and verifier |
 | SQLite transaction batch | 1,000 records | Scan checkpoint |
-| Workspace disk | 4 GiB | Before each commit/materialization |
-| Wall time | 10 minutes per invocation, cumulative persisted | Scan loop/checkpoint |
+| Workspace disk | 4 GiB | Post-batch enforcement now; pre-commit SQLite/journal reservation remains a G1-R3 target |
+| Wall time | 10 minutes per invocation now; cumulative persistence is the G1-R3 target | Scan loop/checkpoint |
 | RSS kill switch | 1.5 GiB | Periodic sampling; structural bounds remain primary |
 | Nesting depth | Fixed by strict constructors/schemas | Construction and validation |
 
@@ -91,7 +93,7 @@ The writer and verifier now share a 32 MiB canonical-bundle ceiling until stream
 
 ## Checkpoint binding and resume
 
-The checkpoint binds:
+The target checkpoint binds:
 
 - checkpoint/workspace schema and resource-policy version;
 - exact requested start/end bounds and creation timestamp;
@@ -107,7 +109,7 @@ A mismatch creates no output and never mutates the old workspace. Resume uses an
 ## Failure and recovery contract
 
 - Before final manifest publication, the set is incomplete and cannot pass set verification.
-- Source/resource/privacy failures retain an owner-only inspectable checkpoint with a fixed safe failure code; no partial bundle is called complete.
+- Source-integrity failures permanently poison the owner-only incomplete workspace so restored bytes cannot bless already-committed mutation-derived rows; resource/privacy failures retain an owner-only inspectable checkpoint with a fixed safe failure code. No partial bundle is called complete.
 - Each chunk uses the existing receipt-first, bundle-last pair transaction.
 - Completed chunk pairs are immutable/no-clobber. Resume verifies rather than trusts them.
 - The final manifest is written only after all expected pairs independently verify and aggregate exactly.
@@ -124,7 +126,7 @@ Safe failure codes must be closed enums, including source-file, source-byte, lin
 4. Extract pure Codex safe-record constructors and a provider-neutral async safe-record interface while retaining the old scanner as a parity reference.
 5. Implement the SQLite workspace schema, frozen source plan, transactional checkpoints, safe-record uniqueness, and resume validation.
 6. Materialize deterministic bounded bundle/receipt chunks and a separately versioned export-set manifest.
-7. Add set-level publication, recovery, verification, `inspect-export`, `export-local --resume`, and `verify-export-set` flows.
+7. Add set-level publication, recovery, verification, and dedicated `inspect-export-workspace`, `export-set --resume`, and `verify-export-set` flows. These dedicated commands supersede the earlier draft names `inspect-export` enhancement and `export-local --resume`.
 8. Add deterministic golden hashes, adversarial fixtures, measured p50/seven-day/heavy benchmarks, and a dated receipt.
 9. Only after the uncompressed core passes, add canonical compression plus expanded/decompression limits and bomb tests.
 
@@ -138,6 +140,21 @@ Safe failure codes must be closed enums, including source-file, source-byte, lin
 - Resource failures at writer and verifier boundaries use content-free fixed codes and leave no ambiguous complete artifact.
 - Fixed fixtures produce byte-stable logical/set hashes on two clean runs.
 - Full test suite, telemetry contract generation/check, diff check, focused performance audit, code-quality audit, plan-completeness audit, and tests/docs audit pass.
+
+## Implementation status: disk-backed foundation (July 24, 2026)
+
+The local-only implementation now includes:
+
+- a provider-neutral awaited safe-record sink that is byte-equivalent to the preceding single-bundle builder;
+- exact complete-line source-prefix SHA-256 plans, append exclusion, mutation/truncation/replacement detection, archive-move resolution, and same-handle verification plus parsing;
+- a same-descriptor post-read prefix hash/identity check before scan completion, plus a normalized privacy-safe activity-marker-set digest that rejects changed resume input;
+- an owner-only, strict-schema SQLite workspace with 1,000-record transactions, deterministic uniqueness/order indexes, safe-record conflict detection, diagnostics, disk ceilings, identity/compatibility/source-plan binding, and a crash-recoverable workspace lease;
+- restart-safe replay into the SQLite uniqueness index, so an interrupted record batch can be replayed without duplicate logical records;
+- deterministic HMAC set/chunk identities, greedy record/count/canonical-byte chunking, existing receipt-first chunk publication/recovery, a separately versioned canonical complete-set manifest, and manifest-last publication;
+- `export-set`, `inspect-export-workspace`, and `verify-export-set` local commands; and
+- a standalone set verifier that uses a resource-bounded temporary SQLite uniqueness index and checks every chunk pair, shared contract, ranges/totals, global order/IDs, greedy boundaries, and the chunk-size-independent logical-record digest.
+
+This is meaningful G1-R3 progress, not the full acceptance gate. The current resume path replays frozen sources from their beginning and relies on deterministic occurrence IDs plus SQLite uniqueness; it does not yet persist per-source byte/line cursors, parser/tier/cumulative-token/tool/fork state, or cumulative elapsed-resource accounting across invocations. Activity markers are bounded before retention but are not yet disk-backed. Set-specific crash failpoints do not yet cover every internal manifest publication stage, and heavy-history/golden/clean-runtime audits remain open.
 
 ## Explicitly deferred
 

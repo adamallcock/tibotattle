@@ -1,0 +1,134 @@
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, unlink } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { stableJson } from "./storage.js";
+
+const LOCK_BASENAME = ".app-usagemonitor-export-workspace.lock";
+const LOCK_VERSION = "export-workspace-lock-v1";
+
+export class ExportWorkspaceLockError extends Error {
+  constructor(code) {
+    if (!new Set(["contended", "invalid", "race"]).has(code)) throw new TypeError("Unknown workspace-lock code");
+    super(`Local export workspace lock failed (${code})`);
+    this.name = "ExportWorkspaceLockError";
+    this.code = `export_workspace_lock_${code}`;
+  }
+}
+
+function fail(code) {
+  throw new ExportWorkspaceLockError(code);
+}
+
+function assertDirectory(stats) {
+  if (!stats.isDirectory() || stats.isSymbolicLink()) fail("invalid");
+  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) fail("invalid");
+  if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) fail("invalid");
+}
+
+function assertLock(stats) {
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size < 1 || stats.size > 1024) fail("invalid");
+  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) fail("invalid");
+  if (process.platform !== "win32" && (stats.mode & 0o077) !== 0) fail("invalid");
+}
+
+function processAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
+async function syncDirectory(path) {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function inspectLock(path) {
+  const pathStats = await lstat(path);
+  assertLock(pathStats);
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const stats = await handle.stat();
+    assertLock(stats);
+    if (stats.dev !== pathStats.dev || stats.ino !== pathStats.ino) fail("race");
+    let value;
+    try {
+      value = JSON.parse(await handle.readFile("utf8"));
+    } catch {
+      fail("invalid");
+    }
+    if (value?.version !== LOCK_VERSION || !Number.isSafeInteger(value.pid)
+        || typeof value.token !== "string" || !/^[0-9a-f-]{36}$/.test(value.token)) fail("invalid");
+    return { stats, value };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function removeExactLock(path, expected) {
+  const current = await lstat(path);
+  assertLock(current);
+  if (current.dev !== expected.dev || current.ino !== expected.ino) fail("race");
+  await unlink(path);
+}
+
+export async function withExportWorkspaceLease(directory, callback) {
+  if (typeof callback !== "function") throw new TypeError("Workspace lease callback is required");
+  const target = resolve(directory);
+  await mkdir(target, { recursive: true, mode: 0o700 });
+  const initial = await lstat(target);
+  if (!initial.isDirectory() || initial.isSymbolicLink()
+      || (typeof process.getuid === "function" && initial.uid !== process.getuid())) fail("invalid");
+  if (process.platform !== "win32" && (initial.mode & 0o077) !== 0) await chmod(target, 0o700);
+  assertDirectory(await lstat(target));
+  const lockPath = join(target, LOCK_BASENAME);
+  let owned = null;
+  for (let attempt = 0; attempt < 10 && !owned; attempt += 1) {
+    const token = randomUUID();
+    let handle;
+    try {
+      handle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+      await handle.chmod(0o600);
+      await handle.writeFile(stableJson({ version: LOCK_VERSION, pid: process.pid, token }));
+      await handle.sync();
+      const stats = await handle.stat();
+      assertLock(stats);
+      owned = { stats, token };
+      await handle.close();
+      handle = null;
+      await syncDirectory(target);
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      if (error.code !== "EEXIST") throw error;
+      const existing = await inspectLock(lockPath);
+      if (processAlive(existing.value.pid)) fail("contended");
+      try {
+        await removeExactLock(lockPath, existing.stats);
+        await syncDirectory(target);
+      } catch (cleanupError) {
+        if (cleanupError.code !== "ENOENT" && !(cleanupError instanceof ExportWorkspaceLockError)) throw cleanupError;
+      }
+    }
+  }
+  if (!owned) fail("race");
+  try {
+    return await callback();
+  } finally {
+    try {
+      const current = await inspectLock(lockPath);
+      if (current.value.token !== owned.token) fail("race");
+      await removeExactLock(lockPath, owned.stats);
+      await syncDirectory(target);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}

@@ -41,11 +41,12 @@ const EXPORT_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"local_shell_call"',
 ]);
 
-function boundedScannerLines(path, resourceGuard) {
+function boundedScannerLines(path, resourceGuard, maximumTotalBytes = Number.POSITIVE_INFINITY) {
   return readBoundedUtf8Lines(path, {
     maximumLineBytes: resourceGuard?.limits.maximumLineBytes,
     resourceGuard,
     oversizedIrrelevantNeedles: EXPORT_RELEVANT_LINE_NEEDLES,
+    maximumTotalBytes,
   });
 }
 
@@ -110,8 +111,11 @@ async function collectJsonlFileInfos(root, resourceGuard = null) {
   return files;
 }
 
-export async function readRolloutLineage(path, { resourceGuard = null } = {}) {
-  for await (const line of boundedScannerLines(path, resourceGuard)) {
+export async function readRolloutLineage(path, {
+  resourceGuard = null,
+  maximumTotalBytes = Number.POSITIVE_INFINITY,
+} = {}) {
+  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
     if (line === null) continue;
     if (!line.includes('"session_meta"')) continue;
     try {
@@ -469,8 +473,8 @@ function cumulativeSnapshotKey(total, last) {
   return [...COMPONENT_KEYS.map((key) => total[key]), ...(last ? COMPONENT_KEYS.map((key) => last[key]) : [])].join("|");
 }
 
-async function collectCumulativeSnapshotKeys(path, target, resourceGuard = null) {
-  for await (const line of boundedScannerLines(path, resourceGuard)) {
+async function collectCumulativeSnapshotKeys(path, target, resourceGuard = null, maximumTotalBytes = Number.POSITIVE_INFINITY) {
+  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
     if (line === null) continue;
     if (!line.includes('"token_count"')) continue;
     try {
@@ -486,10 +490,10 @@ async function collectCumulativeSnapshotKeys(path, target, resourceGuard = null)
   }
 }
 
-async function collectTierTimeline(path, diagnostics, resourceGuard = null) {
+async function collectTierTimeline(path, diagnostics, resourceGuard = null, maximumTotalBytes = Number.POSITIVE_INFINITY) {
   const timeline = [];
   let ordinal = 0;
-  for await (const line of boundedScannerLines(path, resourceGuard)) {
+  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
     if (line === null) continue;
     ordinal += 1;
     if (!line.includes('"thread_settings_applied"')) continue;
@@ -550,15 +554,16 @@ async function parseRollout(path, {
   sourceScopeId,
   sourceDedupeScope,
   resourceGuard,
+  maximumTotalBytes = Number.POSITIVE_INFINITY,
 }) {
-  const tierTimeline = await collectTierTimeline(path, diagnostics, resourceGuard);
+  const tierTimeline = await collectTierTimeline(path, diagnostics, resourceGuard, maximumTotalBytes);
   let currentModel = null;
   let previousTotals = null;
   let previousTotalsPresence = null;
   const openTaskIds = new Set();
   let sourceRecordOrdinal = 0;
 
-  for await (const line of boundedScannerLines(path, resourceGuard)) {
+  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
     sourceRecordOrdinal += 1;
     if (line === null) continue;
     if (!line.includes('"turn_context"')
@@ -622,7 +627,7 @@ async function parseRollout(path, {
         seenToolCalls.add(toolKey);
         for (const observation of observations) {
           addToolObservation(toolCallsByClass, toolObservationsBySource, serverBillableUnits, observation);
-          onToolCall?.({
+          await onToolCall?.({
             timestamp: record.timestamp,
             timestampMs,
             surfaceClassification,
@@ -676,7 +681,7 @@ async function parseRollout(path, {
       diagnostics.malformedRateLimitRecords += 1;
     }
     for (const window of rateLimitWindows) {
-      onRateLimitSnapshot?.({
+      await onRateLimitSnapshot?.({
         timestamp: record.timestamp,
         timestampMs,
         window,
@@ -725,7 +730,7 @@ async function parseRollout(path, {
     }
     seenEvents.add(eventKey);
     const effectiveTier = tierAt(tierTimeline, timestampMs);
-    onUsage({
+    await onUsage({
       timestamp: record.timestamp,
       model,
       raw: usage,
@@ -757,6 +762,9 @@ export async function scanCodexLogEvents({
   activeTaskRecencyMs = null,
   sourceScopeForRollout = null,
   resourceGuard = null,
+  rolloutInfos: suppliedRolloutInfos = null,
+  openRolloutSource = null,
+  verifyRolloutSource = null,
 }) {
   const startMs = new Date(startAt).getTime();
   const endMs = new Date(endAt).getTime();
@@ -767,12 +775,15 @@ export async function scanCodexLogEvents({
     ? activeTaskRecencyMs
     : endMs - startMs;
   const activeCutoffMs = endMs - activeRecencyMs;
-  const rolloutInfos = await discoverCodexRolloutInfos({
-    codexHome,
-    startAt: new Date(Math.min(startMs, activeCutoffMs)).toISOString(),
-    endAt,
-    resourceGuard,
-  });
+  if (suppliedRolloutInfos !== null && !Array.isArray(suppliedRolloutInfos)) {
+    throw new TypeError("rolloutInfos must be an array or null");
+  }
+  const rolloutInfos = suppliedRolloutInfos ?? await discoverCodexRolloutInfos({
+      codexHome,
+      startAt: new Date(Math.min(startMs, activeCutoffMs)).toISOString(),
+      endAt,
+      resourceGuard,
+    });
   const excludedSessions = new Set(excludeSessionIds.filter((value) => typeof value === "string" && value.length > 0));
   const seenEvents = new Set();
   const seenToolCalls = new Set();
@@ -809,6 +820,9 @@ export async function scanCodexLogEvents({
   diagnostics.sourceProvenance = summarizeCodexRolloutSources(rolloutInfos, { endAt });
   for (let sourceRolloutOrdinal = 0; sourceRolloutOrdinal < rolloutInfos.length; sourceRolloutOrdinal += 1) {
     const info = rolloutInfos[sourceRolloutOrdinal];
+    const openedSource = typeof openRolloutSource === "function" ? await openRolloutSource(info) : null;
+    const sourceInput = openedSource ?? info.path;
+    try {
     const classification = info.lineage.surfaceClassification ?? classifySessionSurface(null);
     diagnostics.rolloutsBySurface[classification.surface] = (diagnostics.rolloutsBySurface[classification.surface] ?? 0) + 1;
     diagnostics.rolloutsByThreadSource[classification.threadSource] = (diagnostics.rolloutsByThreadSource[classification.threadSource] ?? 0) + 1;
@@ -818,7 +832,7 @@ export async function scanCodexLogEvents({
         ? snapshotsBySession.get(info.lineage.parentId)
         : null;
       const rolloutSnapshots = createSnapshotLineage(inheritedSnapshots ?? null);
-      await collectCumulativeSnapshotKeys(info.path, rolloutSnapshots, resourceGuard);
+      await collectCumulativeSnapshotKeys(sourceInput, rolloutSnapshots, resourceGuard, info.size);
       snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
       diagnostics.excludedRollouts += 1;
       continue;
@@ -835,7 +849,7 @@ export async function scanCodexLogEvents({
     if (sourceScopeId !== null && (typeof sourceScopeId !== "string" || !/^[a-z][a-z0-9-]*:v1:[A-Za-z0-9_-]{43}$/.test(sourceScopeId))) {
       throw new Error("sourceScopeForRollout must return a versioned privacy-safe pseudonym or null");
     }
-    const parsed = await parseRollout(info.path, {
+    const parsed = await parseRollout(sourceInput, {
       forked: info.lineage.isFork,
       inheritedSnapshots: inheritedSnapshots ?? createSnapshotLineage(),
       rolloutSnapshots,
@@ -855,9 +869,19 @@ export async function scanCodexLogEvents({
       sourceScopeId,
       sourceDedupeScope,
       resourceGuard,
+      maximumTotalBytes: info.size,
     });
     if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) diagnostics.activeTaskRolloutsAtEnd += 1;
     if (info.lineage.sessionId) snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
+    } finally {
+      try {
+        if (openedSource && typeof verifyRolloutSource === "function") {
+          await verifyRolloutSource(info, openedSource);
+        }
+      } finally {
+        await openedSource?.close?.().catch(() => {});
+      }
+    }
   }
   return {
     parserVersion: CODEX_LOG_SCAN_VERSION,

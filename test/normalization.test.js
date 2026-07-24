@@ -119,6 +119,13 @@ test("CLI options reject missing values with an actionable error", () => {
   assert.throws(() => parseArgs(["report", "--data-file", "--json"]), /--data-file requires a value/);
   assert.throws(() => parseArgs(["quality", "--collector-file"]), /--collector-file requires a value/);
   assert.equal(parseArgs(["rotate-local-identity", "--confirm"]).confirm, true);
+  const exportSet = parseArgs([
+    "export-set", "--workspace", "./workspace", "--directory", "./set", "--resume",
+    "--max-records-per-chunk", "1000", "--max-bundle-bytes", "1048576",
+  ]);
+  assert.equal(exportSet.resume, true);
+  assert.equal(exportSet.maximumRecordsPerChunk, 1000);
+  assert.equal(exportSet.maximumCanonicalBundleBytes, 1048576);
 });
 
 test("cached history requires a matching rollout-source fingerprint or explicit stale override", () => {

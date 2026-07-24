@@ -13,14 +13,14 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "79eaa8da447fb47e59a701065d6a9ba877aca89e6c9b97e6ba971b71fb2e5343",
+    "sha256": "bbd6fbc4b34f97c898e8ca44d8d901aee40d406e4ee2dcb630da1c62f9c631ff",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
-    "exporterVersion": "0.3.0-draft.2",
+    "exporterVersion": "0.3.0-draft.3",
     "packageName": "app-usagemonitor",
     "packageVersion": "0.0.1",
-    "resourcePolicyVersion": "g1-r3-candidate-0.2"
+    "resourcePolicyVersion": "g1-r3-candidate-0.3"
   },
   "providerAdapters": {
     "anthropicClaudeCode": {
@@ -30,8 +30,8 @@
       "status": "not_implemented"
     },
     "openaiCodex": {
-      "adapterVersion": "codex-metadata-export-v4",
-      "parserVersion": "codex-log-scan-v3",
+      "adapterVersion": "codex-metadata-export-v5",
+      "parserVersion": "codex-log-scan-v4",
       "sourceFormat": "codex-rollout-jsonl",
       "status": "implemented"
     }
@@ -55,7 +55,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "db95ee13d5f9d00ce05effda09925c32901de442c32becceba92b18f9588a299"
+        "sha256": "d00df9ed09c6a5fd52b3162e8b60dacc1c04ab2ece89177f577f5137661f5f99"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -73,7 +73,7 @@
         "sha256": "a9fe4513b91878dab74cb6d4ba7b41f02fc3d685c7b7d3de28a6b29012b00d81"
       }
     ],
-    "setSha256": "6c01e42eada68b66b9e35729e5be56bd67a122ce54a6fc38aeb89b826439ca51"
+    "setSha256": "83c480e202306e22741fefd49dfefc6907701e8e920cbb79c8fde43b6b100be0"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

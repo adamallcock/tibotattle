@@ -79,6 +79,12 @@ Namespaces are `participant`, `account`, `session`, `event`, `snapshot`, `quota-
 
 Raw account/session identifiers are never used as exported identifiers. An account with no defensible local attribution is represented as the literal enum `unattributed` rather than being guessed.
 
+## Local export workspace and set manifest
+
+The resumable export workspace is owner-only local implementation state and is never an upload artifact. It stores strict validated safe-record JSON, pseudonymous occurrence IDs, deterministic diagnostics, source-prefix hashes and byte counts, scan/chunk state, and the exact compatibility/identity/interval binding. It stores local source paths only so the same provider files can be reopened or resolved after an archive move; those paths never enter a bundle, receipt, complete-set manifest, verifier summary, or proposed transport. It stores no raw log lines, prompt/response content, tool arguments, raw account/session identifiers, participant secret, or credentials.
+
+The standalone `usage-export-set-manifest-v0.1` schema is a closed local protocol wrapper around unchanged telemetry bundle pairs. Manifest fields fall into four reviewed purposes: protocol/version/chunk-boundary fields establish completeness and deterministic packing; hashes and byte counts establish artifact integrity; pseudonymous set/bundle/participant IDs bind artifacts without source identifiers; and coarse source/provider/platform/count/time summaries support compatibility and completeness checks. Manifest rows remain restricted local metadata; future public release may expose only explicitly approved aggregates, never participant/set/bundle IDs, exact covered times, source-plan hashes, or per-chunk integrity rows. The manifest contains no filenames or paths: verifiers infer fixed protocol chunk names from zero-based indices.
+
 ## Threat model
 
 | Threat | v0.1 control | Residual risk |

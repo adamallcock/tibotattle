@@ -591,14 +591,13 @@ test("foreground consumes a notification, reconnects, and shuts down cleanly", a
       }, 5);
     }
     async readRateLimits() {
-      if (factoryCalls > 1) setTimeout(() => controller.abort(), 30);
       return appPayload(2);
     }
     close() {}
   }
   try {
-    const hardStop = setTimeout(() => controller.abort(), 1_000);
-    const result = await runCollectorForeground({
+    const hardStop = setTimeout(() => controller.abort(), 10_000);
+    const foreground = runCollectorForeground({
       ...fixture,
       signal: controller.signal,
       staleAfterMs: 0,
@@ -610,6 +609,14 @@ test("foreground consumes a notification, reconnects, and shuts down cleanly", a
       },
       clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
     });
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const pending = await readLines(fixture.dataFile);
+      const sources = new Set(pending.map((record) => record.source));
+      if (sources.has("app_server_notification") && sources.has("app_server_read")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    controller.abort();
+    const result = await foreground;
     clearTimeout(hardStop);
     const records = await readLines(fixture.dataFile);
     assert.equal(result.shutdown, "clean");
@@ -651,8 +658,8 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
     close() {}
   }
   try {
-    setTimeout(() => controller.abort(), 140);
-    await runCollectorForeground({
+    const hardStop = setTimeout(() => controller.abort(), 10_000);
+    const foreground = runCollectorForeground({
       ...fixture,
       signal: controller.signal,
       staleAfterMs: 0,
@@ -660,8 +667,17 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
       appServerFactory: () => new SwitchingClient(),
       clock: () => nowMs,
     });
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const pending = await readLines(fixture.dataFile);
+      if (pending.some((record) => record.kind === "codex_rollout_usage_snapshot")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    controller.abort();
+    await foreground;
+    clearTimeout(hardStop);
     const records = await readLines(fixture.dataFile);
     const rollout = records.find((record) => record.kind === "codex_rollout_usage_snapshot");
+    assert.ok(rollout, "collector should ingest the post-switch rollout before shutdown");
     const expected = deriveOpenAIAccountScope({ account: { email: "second.owner@example.test" } }, { secret, planType: "pro" });
     const prior = deriveOpenAIAccountScope({ account: { email: "first.owner@example.test" } }, { secret, planType: "pro" });
     assert.equal(rollout.accountScope.scopeId, expected.scopeId);

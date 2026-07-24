@@ -123,7 +123,7 @@ function assertBundleSemantics(bundle) {
   if (observed.some((provider) => !declared.has(provider))) fail("bundle_provider_declaration");
 }
 
-export async function verifyLocalMetadataBundleFiles({ bundleFile, receiptFile } = {}) {
+export async function loadVerifiedLocalMetadataBundleFiles({ bundleFile, receiptFile } = {}) {
   if (!bundleFile || !receiptFile) fail("paths_required");
   const bundlePath = resolve(bundleFile);
   const receiptPath = resolve(receiptFile);
@@ -151,6 +151,7 @@ export async function verifyLocalMetadataBundleFiles({ bundleFile, receiptFile }
   const bundle = parseCanonicalJson(bundleBytes, "bundle");
   if (!validateExportRecord("bundle", bundle).valid) fail("bundle_schema");
   assertBundleSemantics(bundle);
+  if (receipt.createdAt !== bundle.createdAt) fail("receipt_created_at");
 
   let expectedReceipt;
   try {
@@ -162,7 +163,7 @@ export async function verifyLocalMetadataBundleFiles({ bundleFile, receiptFile }
   const bundleSha256 = createHash("sha256").update(bundleBytes).digest("hex");
   if (bundleSha256 !== receipt.bundleSha256 || bundleBytes.length !== receipt.bundleBytes) fail("bundle_digest");
 
-  return {
+  const summary = {
     verdict: "passed",
     schemaVersion: bundle.schemaVersion,
     contractFamily: bundle.compatibility.contract.family,
@@ -172,4 +173,17 @@ export async function verifyLocalMetadataBundleFiles({ bundleFile, receiptFile }
     recordCounts: structuredClone(bundle.recordCounts),
     transportReady: bundle.transportReady,
   };
+  return {
+    summary,
+    bundle,
+    receipt,
+    bundleBytes,
+    receiptBytes,
+    bundleSha256,
+    receiptSha256: createHash("sha256").update(receiptBytes).digest("hex"),
+  };
+}
+
+export async function verifyLocalMetadataBundleFiles(files = {}) {
+  return (await loadVerifiedLocalMetadataBundleFiles(files)).summary;
 }

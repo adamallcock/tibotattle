@@ -115,6 +115,21 @@ test("verifier rejects canonical receipt tampering", async () => {
   }
 });
 
+test("verifier requires the receipt and bundle to share one creation time", async () => {
+  const pair = await localPair();
+  try {
+    const receipt = JSON.parse(await readFile(pair.receiptFile, "utf8"));
+    receipt.createdAt = "2026-07-24T13:00:01.000Z";
+    await writeFile(pair.receiptFile, stableJson(receipt), { mode: 0o600 });
+    await assert.rejects(
+      verifyLocalMetadataBundleFiles(pair),
+      (error) => assertSafeFailure(error, "receipt_created_at", pair),
+    );
+  } finally {
+    await rm(pair.directory, { recursive: true, force: true });
+  }
+});
+
 test("verifier rejects a coherent pair carrying a stale compatibility tuple", async () => {
   const pair = await localPair();
   try {

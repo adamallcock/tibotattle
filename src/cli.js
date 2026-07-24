@@ -27,6 +27,13 @@ import {
 } from "./export-identity.js";
 import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
 import { verifyLocalMetadataBundleFiles } from "./bundle-verifier.js";
+import {
+  createLocalExportWorkspace,
+  inspectLocalExportWorkspace,
+  resumeLocalExportWorkspace,
+} from "./export-set-controller.js";
+import { materializeLocalExportSet } from "./export-set-materializer.js";
+import { verifyLocalExportSet } from "./export-set-verifier.js";
 import { readBoundedJsonLines } from "./bounded-jsonl.js";
 import { createExportResourceGuard, DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 import {
@@ -90,6 +97,9 @@ function usage() {
   usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor verify-bundle --input PATH [--receipt PATH]
+  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N]
+  usage-monitor inspect-export-workspace --workspace PATH
+  usage-monitor verify-export-set --directory PATH
   usage-monitor recover-exports --directory PATH
   usage-monitor rotate-local-identity [--secret-file PATH] [--confirm]
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
@@ -159,6 +169,10 @@ export function parseArgs(argv) {
     receiptFile: null,
     directory: null,
     confirm: false,
+    resume: false,
+    workspaceDirectory: null,
+    maximumRecordsPerChunk: null,
+    maximumCanonicalBundleBytes: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -171,6 +185,7 @@ export function parseArgs(argv) {
     else if (arg === "--allow-stale-cache") result.allowStaleCache = true;
     else if (arg === "--json") result.json = true;
     else if (arg === "--confirm") result.confirm = true;
+    else if (arg === "--resume") result.resume = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--since") result.startAt = readOptionValue(argv, index++, arg);
@@ -203,6 +218,9 @@ export function parseArgs(argv) {
     else if (arg === "--secret-file") result.exportSecretFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--receipt") result.receiptFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--directory") result.directory = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--workspace") result.workspaceDirectory = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--max-records-per-chunk") result.maximumRecordsPerChunk = readNonNegativeNumber(argv, index++, arg);
+    else if (arg === "--max-bundle-bytes") result.maximumCanonicalBundleBytes = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -331,6 +349,86 @@ async function run() {
     console.log(`Contract: ${verified.contractFamily} (${verified.contractStatus}); exporter ${verified.exporterVersion}`);
     console.log(`Records: ${verified.recordCounts.usageEvents} usage, ${verified.recordCounts.quotaSnapshots} quota, ${verified.recordCounts.activityMarkers} markers`);
     console.log(`Bundle bytes: ${verified.bundleBytes}; upload disabled: ${verified.transportReady === false}`);
+    return;
+  }
+  if (args.command === "verify-export-set") {
+    if (!args.directory) throw new Error("verify-export-set requires --directory");
+    const verified = await verifyLocalExportSet({ directory: args.directory });
+    console.log("Local metadata export-set verification: passed");
+    console.log(`Contract: ${verified.schemaVersion} (${verified.contractStatus})`);
+    console.log(`Chunks: ${verified.chunkCount}`);
+    console.log(`Records: ${verified.recordCounts.usageEvents} usage, ${verified.recordCounts.quotaSnapshots} quota, ${verified.recordCounts.activityMarkers} markers`);
+    console.log(`Bundle bytes: ${verified.bundleBytes}; upload disabled: ${verified.transportReady === false}`);
+    return;
+  }
+  if (args.command === "inspect-export-workspace") {
+    if (!args.workspaceDirectory) throw new Error("inspect-export-workspace requires --workspace");
+    const inspected = await inspectLocalExportWorkspace({ directory: args.workspaceDirectory });
+    console.log("Local metadata export workspace");
+    console.log(`Status: ${inspected.poisoned
+      ? "poisoned_source_integrity"
+      : inspected.scanComplete ? "scan_complete" : "incomplete"}`);
+    console.log(`Coverage: ${inspected.coveredAt.startAt} to ${inspected.coveredAt.endAt}`);
+    console.log(`Sources: ${inspected.sourcePlan.sourceFiles}; bytes: ${inspected.sourcePlan.sourceBytes}`);
+    console.log(`Records: ${inspected.recordCounts.usageEvents} usage, ${inspected.recordCounts.quotaSnapshots} quota, ${inspected.recordCounts.activityMarkers} markers`);
+    console.log(`Workspace bytes: ${inspected.workspaceBytes}; upload disabled: true`);
+    return;
+  }
+  if (args.command === "export-set") {
+    if (!args.workspaceDirectory || !args.directory) {
+      throw new Error("export-set requires --workspace and --directory");
+    }
+    if (!args.resume && (!args.startAt || !args.endAt)) {
+      throw new Error("export-set creation requires --since and --until");
+    }
+    if (args.resume && (args.startAt || args.endAt)) {
+      throw new Error("export-set --resume uses the workspace interval; omit --since and --until");
+    }
+    if (args.maximumRecordsPerChunk !== null
+        && (!Number.isSafeInteger(args.maximumRecordsPerChunk) || args.maximumRecordsPerChunk < 1)) {
+      throw new Error("--max-records-per-chunk requires a positive integer");
+    }
+    if (args.maximumCanonicalBundleBytes !== null
+        && (!Number.isSafeInteger(args.maximumCanonicalBundleBytes) || args.maximumCanonicalBundleBytes < 1)) {
+      throw new Error("--max-bundle-bytes requires a positive integer");
+    }
+    const activityMarkers = await readBoundedJsonLines(args.activityFile ?? defaultActivityMarkerFile(), {
+      maximumFileBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExpandedRecordBytes,
+      maximumLineBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumLineBytes,
+      maximumRecords: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
+    });
+    await withParticipantSecretLease({
+      secretFile: args.exportSecretFile ?? defaultExportSecretFile(),
+    }, async (identity) => {
+      const workspaceResult = args.resume
+        ? await resumeLocalExportWorkspace({
+            directory: args.workspaceDirectory,
+            codexHome: args.codexHome ?? undefined,
+            secret: identity.secret,
+            activityMarkers,
+          })
+        : await createLocalExportWorkspace({
+            directory: args.workspaceDirectory,
+            startAt: args.startAt,
+            endAt: args.endAt,
+            codexHome: args.codexHome ?? undefined,
+            secret: identity.secret,
+            activityMarkers,
+          });
+      const materialized = await materializeLocalExportSet({
+        workspaceDirectory: args.workspaceDirectory,
+        outputDirectory: args.directory,
+        secret: identity.secret,
+        ...(args.maximumRecordsPerChunk === null ? {} : { maximumRecordsPerChunk: args.maximumRecordsPerChunk }),
+        ...(args.maximumCanonicalBundleBytes === null ? {} : { maximumCanonicalBundleBytes: args.maximumCanonicalBundleBytes }),
+      });
+      console.log("Local metadata export set: complete");
+      console.log(`Workspace status: ${workspaceResult.status.scanComplete ? "scan_complete" : "incomplete"}`);
+      console.log(`Chunks: ${materialized.manifest.chunks.length}`);
+      console.log(`Records: ${materialized.manifest.totals.recordCounts.usageEvents} usage, ${materialized.manifest.totals.recordCounts.quotaSnapshots} quota, ${materialized.manifest.totals.recordCounts.activityMarkers} markers`);
+      console.log(`Manifest bytes: ${materialized.manifestReceipt.manifestBytes}`);
+      console.log("Upload: disabled (transportReady=false)");
+    });
     return;
   }
   if (args.command === "recover-exports") {

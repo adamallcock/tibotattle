@@ -198,7 +198,7 @@ Make the current evidence, privacy boundary, responsibilities, and release proce
 
 ### Deliverables
 
-- Freeze telemetry v0.1 schemas, fixtures, canonical serialization, and golden hashes.
+- Freeze an immutable dated local-baseline snapshot of telemetry v0.1 schemas, fixtures, and canonical serialization for reproducibility, while the working v0.1 contract remains explicitly unfrozen and local-only. Freeze a separately versioned successor contract, fixtures, and golden hashes before any volunteer or upload use.
 - Keep telemetry v0.1 permanently local-only with `transportReady: false`. Any upload uses a separately reviewed telemetry/envelope version plus explicit compatibility and migration tests; v0.1 is never enabled by flipping its constant.
 - Generate a field dictionary directly from the schemas and link every field to purpose, retention, public eligibility, and owner.
 - Convert the threat model into a maintained risk register with severity, control, test, and review date.
@@ -804,7 +804,7 @@ The first G0/G1 hardening slice is implemented on `agent/exporter-hardening-g1`;
 - model, limit, and diagnostic vocabularies are reviewed closed sets, with unknown model strings fingerprinted and arbitrary safe-looking values rejected by schemas;
 - missing source token components export as `null`, not an observed zero;
 - all tool-count fields are required by schema and their bounded-interval attribution limitation is recorded in the field policy;
-- every one of the 148 properties across the six telemetry schemas has exactly one reviewed, machine-checkable purpose/privacy/retention/publication/Codex/Claude provenance row, and the generated dictionary is bound to schema hashes;
+- every one of the 149 properties across the six telemetry schemas has exactly one reviewed, machine-checkable purpose/privacy/retention/publication/Codex/Claude provenance row, and the generated dictionary is bound to schema hashes;
 - the default participant identity moved from the working directory to an OS-stable application-state path, with strict POSIX regular-file/owner/link/mode/length checks and safe legacy copy-forward;
 - telemetry v0.1 is now machine-declared as an unfrozen local-only draft with no compatibility promise; the first volunteer/upload contract must use a new frozen version and preserve frozen predecessors;
 - the generated compatibility tuple binds all schemas, the field contract, registries, consent/contract state, package/exporter version, and the executed Codex parser/adapter while marking Claude `not_implemented`;
@@ -812,7 +812,7 @@ The first G0/G1 hardening slice is implemented on `agent/exporter-hardening-g1`;
 - `verify-bundle` independently checks exact canonical bytes, filesystem controls, schemas, compatibility, record semantics, privacy checks, and receipt digest/size without printing paths or pseudonyms; and
 - regressions cover changed export bounds, identical independent sessions, traversal reordering, marker metadata changes, missing components, unreviewed registries, symlink/hardlink/permission attacks, existing output, distinct paths, concurrent destination writers, stale locks, interrupted writer/recovery boundaries, and conflicting destination files.
 
-Still open before G1 can pass: streaming/chunked bounded export; native Keychain/Credential Manager/Secret Service backends and clean-machine platform validation; explicit identity-conflict migration UX; deterministic golden bundle fixtures; Claude usage and quota exporter parity; prospective account-scoped app-server snapshots; signed packaging; independently shaped fixtures; and two local-only volunteer reviews. No upload or collection has been enabled.
+Still open before G1 can pass: true per-source parser checkpoints and cumulative cross-restart resource accounting; disk-backed/capped fork, replay, lineage, and tool state; reduced heavy-history source-pass amplification; pre-commit SQLite/journal/temp disk reservation; disk-backed activity-marker processing; remaining internal export-set failpoints and deterministic golden fixtures; canonical compression with independent expanded/decompression limits and bomb tests; crash-recoverable `delete-local-export`; pilot-derived resource limits; native Keychain/Credential Manager/Secret Service backends and clean-machine platform validation; explicit identity-conflict migration UX; Claude usage and quota exporter parity; prospective account-scoped app-server snapshots; signed packaging; independently shaped fixtures; and two local-only volunteer reviews. No upload or collection has been enabled.
 
 ## Progress update: G1 resource and identity protection slice (July 24, 2026)
 
@@ -826,7 +826,21 @@ The active `agent/bounded-export-identity-lifecycle` slice adds immediate fail-c
 - `rotate-local-identity` has non-mutating preflight plus explicit-confirmation atomic file rotation, environment-secret refusal, inode/concurrency checks, legacy retirement, content-free output, and an explicit no-secure-erasure/no-network boundary; and
 - the compatibility tuple is bumped to exporter `0.3.0-draft.2`, scanner `codex-log-scan-v3`, adapter `codex-metadata-export-v4`, resource policy `g1-r3-candidate-0.2`, and the 149-field contract.
 
-Still open in G1-R3: the SQLite workspace, frozen source-prefix plan, transactional safe-record checkpoints, deterministic chunk materialization, complete-set manifest/publication/recovery, `verify-export-set`, stable golden set hashes, disk-backed activity-marker processing, and cross-restart resource accounting. `delete-local-export` also remains open until bundle-first crash-recoverable deletion and recovery are implemented. Native secret stores, Claude parity, compression, signed packaging, clean-machine validation, and volunteer-local reviews remain later G1 work. No upload or external collection is enabled.
+At that checkpoint, the SQLite workspace, source-prefix plan, deterministic materialization, complete-set manifest, and set verifier were still open. The following progress section supersedes that implementation status; the earlier resource/identity controls and measurements remain valid historical evidence. No upload or external collection was enabled at that checkpoint or by the later export-set work.
+
+## Progress update: disk-backed deterministic export sets (July 24, 2026)
+
+The next local G1-R3 slice is implemented on top of the earlier resource/identity controls:
+
+- exact complete-line source prefixes are hashed, bound to the workspace, revalidated through an owner-only file descriptor before reading and again on that same descriptor after parsing; post-plan appends are excluded while prefix mutation, truncation, replacement, ambiguity, and identity rotation fail closed;
+- normalized privacy-safe activity markers are digest-bound to the workspace, so interrupted resume cannot silently accept a changed marker set;
+- validated provider-neutral safe records flow through an awaited sink into an owner-only strict SQLite workspace in bounded transactions, without raw content or raw provider identifiers;
+- workspace leases exclude concurrent mutation, reap strict dead-process locks, and retain content-free errors;
+- deterministic set/chunk IDs, total ordering, greedy chunk boundaries, unchanged bundle/privacy-receipt pairs, a standalone strict complete-set manifest, and manifest-last publication make chunking restartable and independently inspectable;
+- the standalone verifier validates every pair, exact manifest hashes/bytes/counts/ranges/shared contract, cross-chunk total order and pseudonymous occurrence-ID uniqueness through a resource-bounded temporary disk-backed index, greedy non-final chunks, and a chunk-boundary-independent logical-record digest; and
+- local CLI flows now create, resume, inspect, recover, and verify export sets while retaining `transportReady: false` and no upload implementation.
+
+This still does not complete G1-R3. Resume currently performs deterministic replay from the beginning of every frozen prefix rather than restoring per-source byte/line/parser/tier/cumulative-token/tool/fork checkpoints. Cumulative resource accounting across restarts, disk-backed activity-marker processing, exhaustive set/manifest failpoint matrices, heavy-history and clean-runtime benchmarks, stable checked-in golden hashes, set-specific deletion/recovery, and the final independent audit gate remain open. All later end-to-end requirements—Claude parity, native secret stores, signed distribution, local participant review, consent/enrollment, encrypted ingestion, validation/quarantine, private results, aggregation, publication, ongoing collection, deletion and incident operations—remain active and unchanged.
 
 ## Open decisions and decision deadlines
 
