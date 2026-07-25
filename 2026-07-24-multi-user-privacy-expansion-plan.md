@@ -21,7 +21,7 @@ The complete staged execution criteria, critical path, parallel workstreams, ser
 2. **No arbitrary strings in telemetry records.** Every string is a bounded enum, a provider-owned model identifier that passes a strict validator, a schema/version identifier, or a cryptographic pseudonym.
 3. **Raw logs never leave the user's computer.** Not even temporarily, not for debugging, and not after an ingestion error.
 4. **Exact timestamps are restricted research data.** They are needed for quota alignment and reset analysis, but public aggregates use coarser time buckets and minimum cohort sizes.
-5. **Identity is pseudonymous and email-free by default.** A high-entropy recovery/upload code provides access to personal results. Optional notifications are stored separately from telemetry.
+5. **Identity is pseudonymous and email-free by default, with one capability per purpose.** Telemetry identity, upload authorization, human recovery, bundle encryption, device pairing, and optional notification linkage use distinct credentials/keys and cannot substitute for one another. Optional notifications are stored separately from telemetry.
 6. **Personal views and public aggregates are different products.** A participant may see their own detailed sanitized data. Public results are precomputed, contribution-bounded, and suppressed for small cohorts.
 7. **Server processing cannot broaden the client schema.** The upload API rejects unknown properties and unsupported schema versions.
 8. **The current conditional-estimate language remains.** More users reduce sampling error and expose policy regimes, but do not magically reveal the provider's private accounting formula.
@@ -148,16 +148,27 @@ It must not contain source paths, filenames, usernames, hostnames, repository na
 
 ### Deterministic pseudonyms and deduplication
 
-Generate a 256-bit installation/participant secret and store it in Keychain, Credential Manager, or an owner-only file on unsupported systems. Derive distinct keys with HKDF for:
+Generate a 256-bit installation-local telemetry secret and store it in Keychain, Credential Manager, or an owner-only file on unsupported systems. Derive distinct telemetry-only keys with HKDF for:
 
 - account pseudonyms;
 - session pseudonyms;
 - event deduplication IDs; and
-- bundle authentication.
+- other telemetry-only namespaces declared by the frozen telemetry contract.
 
-Use domain-separated HMAC inputs. Never upload the source values or reuse the same digest across domains. A single user may deliberately reuse their recovery secret on another machine to join their own data; otherwise installations remain separate.
+Use domain-separated HMAC inputs. Never upload source values or reuse the same digest across domains. The installation telemetry secret must never derive bundle authentication, upload authorization, recovery, device pairing, or notification credentials and must never be copied between devices. Cross-device linking uses an expiring one-time server pairing flow with a separate enrollment-scoped identity. Provider-account pseudonyms remain installation-local unless a later reviewed protocol introduces a distinct safely paired dedupe namespace.
 
-The human-facing recovery code must carry at least 128 bits of entropy. A short memorable identifier can be displayed separately, but it must not authenticate uploads or dashboards.
+The human-facing recovery credential must carry at least 128 bits of entropy. A short memorable identifier can be displayed separately, but it must not authenticate uploads or dashboards.
+
+Keep these capabilities cryptographically and operationally separate:
+
+- the installation-local telemetry identity derives only allowlisted telemetry pseudonyms;
+- a rotatable device-scoped upload credential authorizes only bounded upload registration;
+- a human-held recovery credential restores personal access but cannot upload or derive telemetry pseudonyms;
+- a versioned bundle-encryption identity protects bundle data keys but authenticates neither people nor uploads;
+- an expiring, single-use pairing capability enrolls another device without copying the telemetry seed; and
+- an optional opaque notification reference joins to a segregated notification service but authenticates nothing.
+
+Rotation, revocation, compromise, storage, retention, and deletion tests must cover each capability independently. No combined “recovery/upload code” is permitted.
 
 ### Local privacy gate
 
@@ -187,8 +198,8 @@ This is protection for pseudonymous metadata and exact timestamps; it is not per
 2. **Upload transport:** 15-minute, object-specific Cloud Storage V4 upload URL or server-initiated resumable upload. Signed URLs grant time-limited access to one object and do not require the participant to possess cloud credentials ([Cloud Storage signed URLs](https://cloud.google.com/storage/docs/access-control/signed-urls)).
 3. **Quarantine bucket:** private, uniform bucket-level access, random object names, no participant ID in the object path, no public access.
 4. **Processing trigger:** authenticated Eventarc delivery on `google.cloud.storage.object.v1.finalized` to Cloud Run ([Cloud Storage to Cloud Run via Eventarc](https://cloud.google.com/run/docs/triggering/storage-triggers)).
-5. **Participant/job metadata:** Firestore for participant IDs, credential hashes, bundle state, consent version, deletion state, and status receipts.
-6. **Canonical analytical store:** BigQuery tables partitioned by event/reset date and clustered by provider, plan, model family, and participant pseudonym. Partition pruning limits query cost ([BigQuery partitioned tables](https://cloud.google.com/bigquery/docs/partitioned-tables)).
+5. **Participant/job metadata:** Firestore for participant IDs, independently issued eligibility-unit relations, purpose-specific credential hashes/references, bundle state, consent version, deletion state, and status receipts.
+6. **Canonical analytical store:** BigQuery tables partitioned by event/reset date and clustered by provider, plan, and model family. Participant pseudonyms remain restricted canonical data. A separately access-controlled relation maps an enrollment to opaque `eligibilityUnitId`; that value never appears in client telemetry or public output. Partition pruning limits query cost ([BigQuery partitioned tables](https://cloud.google.com/bigquery/docs/partitioned-tables)).
 7. **Aggregate publication:** scheduled queries write versioned, disclosure-checked aggregate JSON to a public-read bucket or static site. No browser receives BigQuery credentials.
 8. **Secrets and keys:** Secret Manager plus Cloud KMS; separate service accounts for enrollment, quarantine validation, canonical writes, aggregation, and website reads.
 
@@ -245,10 +256,11 @@ The personal dashboard exposes “delete my data.” Deletion must:
 1. revoke upload and dashboard credentials;
 2. delete pending/quarantine objects;
 3. delete or tombstone participant rows in canonical stores;
-4. remove notification data;
-5. rebuild affected aggregate versions;
-6. retain only a non-reversible deletion receipt and legally required security audit event; and
-7. display expected backup/soft-delete completion dates.
+4. remove the enrollment-to-`eligibilityUnitId` relation and recompute contribution, holdout, resampling, and aggregate eligibility state without allowing the deleted unit to be reissued accidentally;
+5. remove notification data;
+6. rebuild affected aggregate versions;
+7. retain only a non-reversible deletion receipt and legally required security audit event; and
+8. display expected backup/soft-delete completion dates.
 
 Test this flow before inviting external users.
 
@@ -262,18 +274,18 @@ Lead with the same simple measurement the local work established:
 - reset-by-reset seven-day API-price-equivalent value;
 - week-over-week median and uncertainty;
 - model, plan, speed, cache, reasoning, and broad surface splits;
-- sample sizes in both participants and reset windows; and
+- sample sizes in independently issued eligibility units and reset windows, using “participants” only where a documented one-to-one relation has been established; and
 - explicit data-quality and policy-regime annotations.
 
 Public filters should initially be limited to provider, plan, model family, speed, broad geography, and calendar period. Country must be user-declared and optional; do not infer or retain location from upload IPs.
 
 ### Disclosure controls
 
-- Suppress any public cohort with fewer than 20 distinct participants or fewer than a predeclared number of qualifying reset windows.
-- Cap each participant's contribution per day/reset before aggregation.
-- Compute intervals by resampling participants, not treating thousands of events from one user as independent people.
+- Suppress any public cohort with fewer than 20 distinct independently issued eligibility units or fewer than a predeclared number of qualifying reset windows. Never substitute self-created participant pseudonym counts.
+- Cap each `eligibilityUnitId` contribution per day/reset before aggregation; participant-level caps may be used only after a documented one-to-one mapping is proven.
+- Compute intervals, holdouts, and influence checks by `eligibilityUnitId` (or reset within that unit), not by events or self-created pseudonyms. Label the public count “independent eligibility units,” using “participants” only when one-to-one identity has been established.
 - Publish day/week buckets, not exact event or upload timestamps.
-- Never expose participant, account, session, bundle, or event pseudonyms publicly.
+- Never expose `eligibilityUnitId` or participant, account, session, bundle, or event pseudonyms publicly.
 - Never permit arbitrary row-level queries from the browser.
 - Add differential privacy only after the cohort/filter design is stable; it is not a substitute for minimization and cohort suppression.
 
@@ -345,8 +357,8 @@ Version the consent text and attach its version to each bundle. A schema expansi
 | Zip/decompression bomb | Streaming decode, compressed and expanded byte limits, record limits, CPU/time budgets. |
 | Malformed or malicious records | Strict schema, no arbitrary HTML/text, parameterized queries, quarantine. |
 | Duplicate uploads or event delivery | Bundle registration plus deterministic event HMAC and idempotent writes. |
-| One user dominates a cohort | Per-participant contribution clipping and participant-level intervals. |
-| Small-filter deanonymization | Minimum participant/reset thresholds and no arbitrary public query endpoint. |
+| One person manufactures many enrollments/devices and dominates a cohort | Independently issued `eligibilityUnitId` relation, per-unit contribution clipping, unit-level resampling/holdouts, and abuse controls; participant is substituted only after one-to-one proof. |
+| Small-filter deanonymization | Minimum independent-eligibility-unit/reset thresholds and no arbitrary public query endpoint. |
 | Insider/cloud compromise | Application-layer encrypted quarantine, least-privilege service accounts, KMS separation, access audit logs. |
 | Optional email links identity to telemetry | Separate encrypted notification store joined only by an opaque reference. |
 | Account switching corrupts gradients | Participant-local account HMACs and account/plan continuity partitions. |
@@ -366,7 +378,7 @@ Version the consent text and attach its version to each bundle. A schema expansi
 ### Build narrowly
 
 - The allowlisted interchange schema and exporter.
-- Participant credential/recovery flow.
+- Separate telemetry-identity, upload-credential, recovery-credential, bundle-encryption, pairing-capability, and notification-reference flows.
 - Quarantine validation and quality-state machine.
 - Deduplication and cohort contribution logic.
 - Personal results API and disclosure-controlled aggregate builder.
@@ -412,9 +424,11 @@ Exit gate: five varied local fixtures and at least two real volunteer dry runs g
 
 ### Phase 2: invite-only ingestion
 
+Mandatory precondition: comprehensive G3 must pass, the pre-pilot portion of G4 must pass, and the targeted external privacy/security review must have no unresolved critical or high finding before any real participant is invited to upload or any real participant bundle is transmitted. Until then, Phase 2 uses only synthetic fixtures and local-only volunteer review.
+
 Deliverables:
 
-- anonymous enrollment/recovery code;
+- anonymous enrollment with distinct telemetry identity, upload credential, recovery credential, bundle-encryption identity, one-time pairing capability, and optional notification reference;
 - short-lived upload registration;
 - encrypted quarantine bucket;
 - event-driven validator;
@@ -422,33 +436,44 @@ Deliverables:
 - lifecycle and deletion automation; and
 - infrastructure-as-code with least-privilege service accounts.
 
-Exit gate: 5–10 invited users complete upload, status, retry, credential rotation, export, and deletion exercises. No public aggregate is released.
+Exit gate: after the mandatory precondition is evidenced in a dated receipt, 5–10 invited users complete upload, status, retry, independent credential rotation/revocation, export, and deletion exercises. No public aggregate is released.
 
 ### Phase 3: canonical analysis pool
 
 Deliverables:
 
 - idempotent canonical tables;
+- a separately access-controlled enrollment-to-`eligibilityUnitId` relation that is absent from telemetry and every public artifact;
 - dedupe, coverage, outlier, and reset-quality pipeline;
 - server-side API price reconstruction with versioned price provenance;
-- per-participant weekly calibration; and
-- aggregate eligibility/contribution flags.
+- private per-participant weekly calibration plus pooled calibration/resampling keyed to `eligibilityUnitId`; and
+- aggregate eligibility/contribution flags and caps keyed to `eligibilityUnitId`, using participant as the independence unit only when a one-to-one relation is proven.
 
-Exit gate: local and server analysis agree on frozen fixtures; one participant cannot materially change a cohort through duplicate or excessive uploads.
+Exit gate: local and server analysis agree on frozen fixtures; duplicate enrollments, devices, or uploads tied to one independently issued eligibility unit cannot materially change a cohort, resampling result, or holdout assignment.
 
-### Phase 4: personal dashboard and aggregate preview
+### Phase 4: private participant results
 
 Deliverables:
 
 - private receipt/status and personal results pages;
-- public static aggregate preview with sample sizes and suppression;
 - week-by-week limit estimates and error bands;
 - no third-party analytics, fonts, or tracking; and
-- aggregate rebuild after participant deletion.
+- participant export, revoke, and deletion controls.
 
-Exit gate: privacy review confirms no identifiers or small cohorts leak through pages, APIs, source maps, logs, caches, or downloads.
+Exit gate: the private lifecycle and cross-tenant security requirements in comprehensive gate G8 pass. No public aggregate is released.
 
-### Phase 5: optional ongoing collection
+### Phase 5: disclosure-controlled aggregate publication
+
+Deliverables:
+
+- precomputed static aggregate cells only;
+- independently reviewed cohort thresholds, contribution bounds, uncertainty, and differencing controls;
+- aggregate rebuild or withdrawal after participant deletion as disclosed; and
+- named human approval of the exact filter lattice and release.
+
+Exit gate: comprehensive gate G9 passes after G7 analysis validity and G8 private lifecycle evidence. A privacy-only page review is insufficient.
+
+### Phase 6: optional ongoing collection
 
 Deliverables:
 
@@ -460,7 +485,7 @@ Deliverables:
 
 Exit gate: 30 days of operation with bounded disk/network use, no raw-data uploads, visible health, and successful revoke/delete drills.
 
-### Phase 6: broader research release
+### Phase 7: broader research release
 
 Only after the prior gates:
 
@@ -475,7 +500,7 @@ Only after the prior gates:
 1. Extract current safe record constructors into a provider-neutral `packages/telemetry-schema` module.
 2. Define schemas with `additionalProperties: false` at every object level.
 3. Add raw-log adversarial fixtures and property-based privacy tests.
-4. Implement local participant secret storage and domain-separated HMAC IDs.
+4. Implement local telemetry-secret storage and domain-separated HMAC IDs without introducing any server authentication capability.
 5. Implement `inspect` and a human-readable privacy receipt.
 6. Implement deterministic bundle serialization, compression, checksum, and encryption spike.
 7. Write Terraform for enrollment API, quarantine bucket, lifecycle, KMS, Eventarc, Firestore, BigQuery, and service accounts.
@@ -499,7 +524,9 @@ Only after the prior gates:
 
 Build Phase 0 and the local-only portion of Phase 1 before asking anyone to upload. The first external request should be: “Run this exporter, inspect the metadata preview, and tell us whether you would consent to sending this bundle.” It should not yet transmit anything.
 
-## Implementation progress on 2026-07-24
+## Historical implementation checkpoint on 2026-07-24
+
+This section records an early local-only milestone and is not the current status tracker. Its open-item list and baseline counts are superseded by the [live G1 local-only release route](./2026-07-24-g1-local-release-route.md); retain the details below only as dated evidence.
 
 The first local-only vertical slice is implemented on `agent/privacy-exporter-phase1`:
 

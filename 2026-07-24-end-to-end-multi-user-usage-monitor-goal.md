@@ -63,13 +63,13 @@ The end-to-end program succeeds when all of the following are true:
 - Fork replay, subagent work, scheduled tasks, Work/Workspace Agents/Excel/Cloud activity, other devices, Voice task work, image generation, separate-limit models, and ordinary Chat exclusions remain explicit coverage dimensions.
 - Unknown models, tiers, surfaces, account attribution, and quota precision remain unknown rather than being silently imputed.
 - Local and server analysis produce exact integer/record equality and predeclared decimal tolerance on the same sanitized frozen fixtures. Live provider crosschecks measure differing observability; they are not a substitute for deterministic parity.
-- Week-by-week estimates include uncertainty, participant/reset sample sizes, model basis, error history, coverage flags, and policy-regime annotations.
+- Week-by-week estimates include uncertainty, independently issued eligibility-unit/reset sample sizes, model basis, error history, coverage flags, and policy-regime annotations. They use “participants” as a sample label only where a documented one-to-one relation with eligibility units has been established.
 
 ### Scientific integrity
 
 - Outputs say “API-price-equivalent quota behavior” or another precisely defined measurement, not “the provider's actual allowance,” unless provider documentation independently establishes that claim.
 - The primary user-facing view remains the simple observed quota movement versus cost-implied movement, with more complex calibration available as explanation rather than jargon-first presentation.
-- Confidence intervals resample participants or reset windows at the correct independence level; thousands of events from one participant are not treated as thousands of independent users.
+- Confidence intervals, holdouts, and influence checks use the independently issued eligibility unit or reset windows at the correct independence level; thousands of events, devices, or self-created participant pseudonyms are not treated as independent users. Participant-level analysis is permitted only where one-to-one identity with the eligibility unit has been established.
 - Policy-change claims require predeclared evidence thresholds and are robust to account mix, plan mix, instrumentation changes, snapshot precision, and shared-pool residuals.
 - Negative, inconclusive, and non-identifiable results are publishable outcomes.
 
@@ -95,13 +95,13 @@ These are not backlog items; they are conditions every phase must preserve.
 8. **Tool calls are explanatory features unless a provider billable unit is independently observed.** Client wrappers are not automatically priced as hosted provider tools.
 9. **Personal and public products use different disclosure rules.** Personal detail does not imply public eligibility.
 10. **The server cannot broaden collection.** It may advertise supported schema versions but cannot instruct clients to scan new directories or send new raw fields.
-11. **Deletion includes derived outputs.** Participant deletion triggers canonical deletion/tombstoning, notification removal, aggregate rebuild, cache invalidation, and a non-reversible receipt.
+11. **Deletion includes identity relations and derived outputs.** Participant deletion triggers canonical deletion/tombstoning, removal of the restricted enrollment-to-`eligibilityUnitId` relation and notification reference, recomputation of contribution/holdout/resampling state, aggregate rebuild, cache invalidation, and a non-reversible receipt.
 12. **Uncertainty remains visible.** Integer quota displays, stale snapshots, reset ambiguity, missing surfaces, pricing gaps, and outliers are evidence, not cleanup targets.
 13. **Material changes require renewed affirmative consent.** New restricted telemetry fields, longer retention, new public uses, scheduled/ongoing collection, notifications, and country collection cannot inherit earlier consent silently.
 
-## Current verified starting point
+## Historical starting point and current checkpoint
 
-As of July 24, 2026, the repository already has a substantial local foundation:
+The program began on July 24, 2026, from a substantial local foundation:
 
 - replay-safe Codex rollout parsing with cumulative-to-marginal usage normalization;
 - disjoint cached/uncached/output/reasoning token components and long-context-aware API pricing;
@@ -114,16 +114,18 @@ As of July 24, 2026, the repository already has a substantial local foundation:
 - domain-separated participant/account/session/event/snapshot/marker/model pseudonyms;
 - `inspect-export` and `export-local`, with `transportReady: false` and no network transport;
 - adversarial and property-based privacy tests; and
-- 182 passing Node tests plus a successful real one-hour local dry run.
+- 182 passing Node tests plus a successful real one-hour local dry run at the original baseline.
 
-The current branch `agent/privacy-exporter-phase1` and commit `8cb6b03` represent the local-exporter starting point. The [multi-user expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md) and [telemetry privacy contract](./2026-07-24-telemetry-privacy-contract.md) remain authoritative supporting documents. This goal organizes them into an execution program and adds finish criteria; it does not weaken their restrictions.
+Branch `agent/privacy-exporter-phase1` at commit `8cb6b03` is the historical local-exporter starting point, not the current branch or test count. The [multi-user expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md) and [telemetry privacy contract](./2026-07-24-telemetry-privacy-contract.md) remain authoritative supporting documents. This goal organizes them into an execution program and adds finish criteria; it does not weaken their restrictions. Where an older identity or phase description conflicts with this goal, the stricter separation and gate ordering here govern: telemetry seeds never authenticate bundles, enrollments, recovery, pairing, or notifications; telemetry seeds are never copied between devices; and public output cannot precede G7, G8, and G9.
+
+The live implementation checkpoint is maintained in the [G1 local-only release route](./2026-07-24-g1-local-release-route.md). Dated progress sections below are append-only milestone evidence and may contain then-current open lists; the live route supersedes those lists without rewriting history.
 
 ### Known current implementation blockers
 
 The current local slice is useful, but it is not volunteer-pilot-ready until these concrete gaps are closed:
 
 1. **Event-ID invariance:** tool counts currently contribute to event identity and can depend on the chosen export boundary. Overlapping, reordered, chunked, restarted, and differently bounded exports must produce the same logical event IDs.
-2. **Identity separation:** the local telemetry pseudonym seed must never double as upload authentication or recovery. Telemetry identity, upload credential, recovery credential, device pairing, and optional notification reference need separate capabilities and keys.
+2. **Identity separation:** the local telemetry pseudonym seed must never double as upload authentication or recovery. Telemetry identity, upload credential, recovery credential, bundle-encryption identity, device-pairing capability, and optional notification reference need separate capabilities and keys.
 3. **Account attribution:** exported Codex usage/quota rows are generally `unattributed`; prospective app-server/account markers must reach the export without retroactive guessing.
 4. **True reviewed registries:** syntactically valid `gpt-*`, limit IDs, diagnostics, and versions are not necessarily approved. Recognized values need registries; surprises become `unknown` plus a keyed fingerprint only where justified.
 5. **Snapshot identity:** distinguish the source observation from the provider account-level quota state so repeated identical quota displays across rollouts can be analyzed/deduplicated intentionally.
@@ -133,7 +135,7 @@ The current local slice is useful, but it is not volunteer-pilot-ready until the
 9. **Stable secret location:** the default identity secret is tied to the current working directory. Use OS application data/Keychain/Credential Manager/libsecret with explicit migration, backup, and device-linking behavior.
 10. **Resource limits:** one million-record/1 GiB schema maxima are inappropriate as invite-pilot limits while the exporter materializes complete bundles. Lower client/server limits and streaming enforcement are required.
 11. **Transport contract:** compression, encrypted header/payload, wrapping-key discovery/rotation, AEAD associated data, replay, chunking, and expanded-size rules need a separate reviewed version rather than flipping v0.1 `transportReady`.
-12. **Frozen statistical contract:** comparable cohort keys, reset identity, quantization/lag, shared-pool residuals, price/policy epochs, chronological holdouts, participant-level resampling, identifiability refusal, and release thresholds must be specified before pooled analysis.
+12. **Frozen statistical contract:** comparable cohort keys, reset identity, quantization/lag, shared-pool residuals, price/policy epochs, chronological holdouts, `eligibilityUnitId`-level resampling, identifiability refusal, and release thresholds must be specified before pooled analysis. Participant-level resampling is allowed only after one-to-one identity is proven.
 
 ### Progress update — local artifact verification and recovery
 
@@ -308,8 +310,8 @@ Create a participant identity and consent flow that supports upload and personal
 
 ### Deliverables
 
-- Generate at least 128 bits of recovery/upload entropy locally using a cryptographically secure generator.
-- Separate the human recovery credential, participant pseudonym, upload credential, bundle encryption identity, and optional short display code.
+- Generate separate high-entropy secrets or key material for each capability using a cryptographically secure generator; the human recovery credential carries at least 128 bits of entropy.
+- Separate the telemetry identity, human recovery credential, server participant pseudonym, device-scoped upload credential, bundle-encryption identity, expiring one-time pairing capability, optional notification reference, and optional short display code. None may authenticate or derive another capability.
 - Keep the telemetry pseudonym seed local and distinct from every server authentication/recovery secret; use expiring one-time pairing rather than copying the telemetry seed when joining devices.
 - Define scopes explicitly: telemetry identity is installation-scoped; server participant identity is enrollment-scoped; device identity/credential is device-scoped; provider account pseudonyms are installation-local and must not be assumed equal across devices.
 - Resolve overlapping multi-device source histories before canonical dedupe: either introduce a safely paired dedupe namespace, prohibit overlapping source exports, or accept that cross-device dedupe is unavailable and contribution-bound the overlap. Rotatable authentication credentials are never canonical dedupe keys.
@@ -318,8 +320,9 @@ Create a participant identity and consent flow that supports upload and personal
 - Version consent and bind enrollment plus each bundle to the accepted consent/schema versions.
 - Present exact operator, storage region, retention, research use, public aggregate use, deletion timing, optional country use, and contact details.
 - Add rate limits, replay protection, CSRF/session protections, brute-force controls, abuse monitoring, and safe fixed-code errors.
+- Define the independence and anti-Sybil unit before enrollment: use bounded one-time invite eligibility, cluster contribution limits, re-enrollment abuse controls, and an explicit rule for when multiple devices/enrollments may count as one research participant. Represent each independently issued unit server-side as opaque `eligibilityUnitId`, never in telemetry, personal downloads, or public output. If human independence cannot be defended, public thresholds count these units and results remain descriptive rather than population-inferential.
 - Use short-lived Secure, HttpOnly, SameSite cookies for personal web access; never put recovery codes in URLs, analytics, logs, or browser storage.
-- Keep optional notification contact in a separate encrypted service joined only through an opaque reference.
+- Keep optional notification contact in a separate encrypted service joined only through an opaque reference that cannot authenticate uploads or personal access.
 - Define the approved pilot jurisdictions, named human operator/data responsibility, processing basis, processor/subprocessor register, cloud region, cross-border transfer position, age/eligibility rule, and jurisdiction-appropriate participant notice.
 - Configure application logs never to retain upload IPs. Document unavoidable cloud-edge IP processing/retention, minimize it, and prohibit deriving geography or joining it to telemetry.
 
@@ -331,6 +334,8 @@ Create a participant identity and consent flow that supports upload and personal
 - A participant can remain entirely email-free.
 - Compromise of upload or recovery credentials cannot reproduce account/session/model pseudonyms from guessed provider values.
 - Automated authorization tests prove participant A cannot read, modify, export, rotate, revoke, or delete participant B's records.
+- Re-enrollment, many-device, invite replay, and colluding-enrollment fixtures cannot manufacture cohort eligibility or exceed one declared independence unit's contribution cap.
+- Independent compromise/rotation/revocation tests prove that telemetry identity, upload credential, recovery credential, bundle-encryption identity, pairing capability, and notification reference cannot substitute for or derive one another.
 - A named human operator approves the final consent, bounded retention schedule, pilot jurisdictions, processors, and residual risks before G4 can begin.
 
 ## Stage 4 — Encrypted invite-only ingestion
@@ -392,6 +397,13 @@ registered -> uploading -> uploaded -> decrypting -> validating
 - Implement quarantine deletion, participant credential revocation, KMS disable/rotation, and isolated canary-content response.
 - Drill canary content, credential compromise, cross-tenant access, unauthorized cloud read, and validator isolation failure before inviting participants.
 
+#### Independent pre-pilot review
+
+- Before inviting any participant to upload, commission a targeted external privacy/security review of consent, identity/recovery, envelope cryptography, tenant authorization, validator isolation, cloud logging, retention, backup/soft-delete behavior, and deletion.
+- Close every critical/high finding or stop the upload pilot. Record lower-severity residuals, owner, mitigation, and named-human acceptance in a dated pre-G4 receipt.
+
+No real participant may be invited to upload and no real participant bundle may be transmitted until G3 has passed, every pre-pilot G4 control and drill above has passed, and the external review has no unresolved critical/high finding. Synthetic and locally retained volunteer fixtures are the only permitted inputs before that combined authorization receipt.
+
 ### Exit gate G4
 
 - Five to ten invited participants complete upload, status, retry, credential rotation, export of every Stage 4 record, and deletion from every Stage 4 system.
@@ -402,6 +414,7 @@ registered -> uploading -> uploaded -> decrypting -> validating
 - The uploaded object reveals only a versioned envelope header, opaque registration reference, ciphertext length, and necessary cryptographic material; no participant pseudonym or covered date is visible outside authenticated ciphertext.
 - Development credentials cannot decrypt production; key-rotation and retired-key rejection drills pass.
 - Pilot jurisdiction/IP-handling controls and minimum incident drills pass, and a named human explicitly authorizes real-user collection.
+- The targeted external pre-pilot review is complete and has no unresolved critical/high finding.
 - Inspect actual Cloud Run, Storage, CDN/edge, audit, trace, and security logs during the pilot fixture run; document unavoidable network metadata, prove it is minimized/short-retained, and verify it is never converted to geography or joined to telemetry.
 
 ## Stage 5 — Canonical metadata and provenance ledger
@@ -413,6 +426,7 @@ Turn accepted bundles into an idempotent, queryable, provenance-complete researc
 ### Deliverables
 
 - Define append-only accepted-bundle manifests and canonical usage, quota, marker, price, policy, account/plan continuity, quality, correction, deletion, and aggregate-eligibility tables.
+- Maintain a separately access-controlled enrollment-to-opaque-`eligibilityUnitId` relation issued by the pilot eligibility process. `eligibilityUnitId` is server-restricted research-control data: it is never accepted from client telemetry and never emitted in personal downloads or public artifacts.
 - Select partitioning, clustering, and serving-store keys from measured query/cost patterns; do not treat warehouse layout as the participant authorization boundary.
 - Keep participant/account/session/event pseudonyms restricted and absent from public build outputs.
 - Deduplicate by the resolved participant/device scope, bundle ID, deterministic event/snapshot/marker IDs, and canonical content hash.
@@ -420,12 +434,12 @@ Turn accepted bundles into an idempotent, queryable, provenance-complete researc
 - Store a canonical fact plus a many-to-many import/provenance ledger for every contributing accepted bundle observation. Overlapping bundles add provenance links without duplicating the fact.
 - Track every source bundle, exporter/parser/schema version, validation result, correction, price-card version, policy epoch, analysis version, and public aggregate version.
 - Implement append-only corrections and supersession rather than editing evidence silently.
-- Apply contribution accounting per participant, provider, account, reset, and day before public aggregation.
+- Apply contribution accounting per `eligibilityUnitId`, provider, account, reset, and day before public aggregation. Use participant as the contribution unit only after the one-to-one relation is proven and recorded.
 - Contribution clipping changes aggregate weight only; it never deletes or alters the participant's canonical/personal record.
 - Define quality states and fixed reason codes for coverage, staleness, precision, replay, attribution, pricing, reset, surface, and outlier conditions.
 - Preserve statistically extreme but plausible records with zero aggregate weight until reviewed; never automatically delete heavy users.
 - Build participant-scoped export from canonical storage in a documented machine-readable format.
-- Extend deletion from Stage 4 systems through canonical rows, derived features, corrections, job/status state, and any materialized analysis written in this stage.
+- Extend deletion from Stage 4 systems through canonical rows, the enrollment-to-`eligibilityUnitId` relation, derived contribution/holdout/resampling features, corrections, job/status state, and any materialized analysis written in this stage. Preserve only a non-reversible anti-reissue tombstone where required by the approved abuse model.
 
 ### Exit gate G5
 
@@ -433,7 +447,7 @@ Turn accepted bundles into an idempotent, queryable, provenance-complete researc
 - Local and canonical record families match frozen fixtures field for field.
 - Every canonical fact traces through the provenance ledger to all contributing accepted bundles and their software/schema versions.
 - Corrections, deletions, and reprocessing are deterministic and auditable.
-- One participant's repeated uploads or many devices cannot exceed contribution bounds.
+- Repeated uploads, enrollments, or devices mapped to one `eligibilityUnitId` cannot exceed contribution bounds; participant-level equivalence is used only where one-to-one identity is proven.
 
 ## Stage 6 — Versioned cost reconstruction and provider crosschecks
 
@@ -481,36 +495,36 @@ Estimate quota behavior as accurately and plainly as the evidence supports, vali
 - Never cross account, plan, provider, limit, or incompatible policy epochs.
 - Model forecast/display lag using bounded, chronologically validated candidates.
 - Compare Standard cost, captured-speed weighting, model-specific sensitivity, cache/reasoning/tool/surface explanatory features, and provider-side crosschecks.
-- Use earlier-period training and later untouched holdouts; do not tune on the future period used to claim improvement.
-- Compute participant/reset-level bootstrap intervals and leave-one-participant-out sensitivity.
-- Bound each participant's influence before cohort estimates.
+- Use earlier-period training and later untouched holdouts assigned by `eligibilityUnitId` so related enrollments/devices cannot cross train/test boundaries; do not tune on the future period used to claim improvement.
+- Compute `eligibilityUnitId`/reset-level bootstrap intervals and leave-one-eligibility-unit-out sensitivity. Participant-level resampling is permitted only where a one-to-one relation is proven.
+- Bound each `eligibilityUnitId`'s influence before cohort estimates.
 - Separate within-reset fit, next-reset prediction, and policy-change detection.
 - Publish calibration error in displayed percentage points and API-price-equivalent units.
 - Preserve residual movement as possibly missing shared-pool activity, stale display, account switching, policy change, parser loss, or unknown mechanism; do not force it into a multiplier.
 - Maintain explicit `identified`, `conditionally_estimated`, `descriptive_only`, and `non_identifiable` result states.
-- Before fitting pooled cohort data, freeze a dated statistical analysis plan defining the estimand, cohort keys, eligibility/missingness policy, smoothing, lag candidates, estimator/model-selection rule, participant contribution cap, bootstrap unit, holdout construction, multiple-comparison handling, interval method, baseline-comparison threshold, protected slices, and refusal rules.
-- Ship a complex model only if it improves untouched participant/reset holdouts over the Standard API-cost baseline without material protected-slice regression; otherwise ship the baseline and measured accuracy floor.
+- Before fitting pooled cohort data, freeze a dated statistical analysis plan defining the estimand, cohort keys, eligibility/missingness policy, smoothing, lag candidates, estimator/model-selection rule, `eligibilityUnitId` contribution cap, bootstrap unit, holdout construction, multiple-comparison handling, interval method, baseline-comparison threshold, protected slices, and refusal rules.
+- Ship a complex model only if it improves untouched eligibility-unit/reset holdouts over the Standard API-cost baseline without material protected-slice regression; otherwise ship the baseline and measured accuracy floor.
 
 ### Policy-change criteria
 
 A claimed change in limits or accounting requires, at minimum:
 
 - a predeclared candidate change window;
-- evidence across multiple independent participants and reset windows;
+- evidence across multiple independently issued eligibility units and reset windows, using “participants” only where one-to-one identity is proven;
 - stability after plan/model/speed/account/instrumentation adjustment;
 - no single participant dominating the effect;
 - consistent direction in held-out data;
 - a documented alternative-explanation audit; and
 - an exact date range and confidence statement.
 
-Before testing a public policy-change hypothesis, write a dated pre-analysis record with the minimum independent participants/resets, minimum detectable shift, false-positive ceiling, power target, persistence duration, candidate-window family, and multiple-testing correction.
+Before testing a public policy-change hypothesis, write a dated pre-analysis record with the minimum independent eligibility units/resets, minimum detectable shift, false-positive ceiling, power target, persistence duration, candidate-window family, and multiple-testing correction.
 
 Global reset reports such as codex-resets.com may annotate candidate epochs but remain approximate external evidence, not authoritative participant reset data.
 
 ### Exit gate G7
 
 - Local and server analyses match on frozen synthetic and real consented reference datasets.
-- Chronological holdout and leave-one-participant-out reports are reproducible.
+- Chronological holdout and leave-one-eligibility-unit-out reports are reproducible and keep all enrollments/devices related to one unit on the same side of each split.
 - Known injected changes are detected at predeclared power/error levels, while unchanged controls stay below false-positive thresholds.
 - The user-facing simple gradient and weekly value can be explained without statistical jargon; expert methodology remains inspectable.
 - No output claims the provider's actual allowance solely from model fit. Even `identified` means identified only within the declared API-price-equivalent observation model; an actual-allowance claim requires independent provider documentation.
@@ -551,10 +565,10 @@ Publish a useful public research view without exposing participant-level records
 - Precompute aggregate cells; never expose an arbitrary row/query interface to browsers.
 - Start with provider, plan, model family, Standard/Fast, broad surface class, limit duration, and calendar period filters.
 - Add optional self-declared country only after consent, legal/privacy review, data-quality checks, and cohort thresholds; never infer or retain location from upload IPs.
-- Require at least 20 distinct eligible participants and a separately declared minimum reset count for every public cell, with stricter thresholds for country or intersected filters.
-- Cap participant contribution per day/reset/cell before aggregation.
-- Use participant- or reset-level intervals and publish both participant and reset sample sizes.
-- Coarsen timestamps to day/week buckets; remove all participant/account/session/bundle/event pseudonyms.
+- Require at least 20 distinct independently issued eligible units—not merely 20 self-created participant pseudonyms—and a separately declared minimum reset count for every public cell, with stricter thresholds for country or intersected filters.
+- Cap `eligibilityUnitId` contribution per day/reset/cell before aggregation; use participant-level caps only where one-to-one identity is proven.
+- Use eligibility-unit- or reset-level intervals. Publish independent eligibility-unit and reset sample sizes; label the former “participants” only where a documented one-to-one relation is established.
+- Coarsen timestamps to day/week buckets; remove `eligibilityUnitId` and all participant/account/session/bundle/event pseudonyms.
 - Run differencing/disclosure tests across neighboring filters and versions; suppress unstable or near-threshold cells.
 - Apply complementary suppression so totals, complements, neighboring periods, permitted filter intersections, and past releases cannot reveal suppressed cells.
 - Publish simple rolling quota-versus-cost charts, week-by-week seven-day values, uncertainty, error history, coverage, policy annotations, methodology, schema dictionary, and changelog.
@@ -569,7 +583,7 @@ Publish a useful public research view without exposing participant-level records
 - Deleting a pilot participant removes their contribution from the next aggregate version and invalidates affected caches.
 - Independent privacy and statistical reviews approve the initial public cells.
 - A named human operator approves the public filter lattice, deletion/public-history policy, residual disclosure risk, and release.
-- Public charts state sample size, basis, uncertainty, coverage, and conditional/non-identifiable status next to the result.
+- Public charts state independent eligibility-unit and reset sample sizes, basis, uncertainty, coverage, and conditional/non-identifiable status next to the result; “participants” appears only when one-to-one identity is proven.
 
 ## Stage 10 — Opt-in ongoing collection and notifications
 
@@ -673,7 +687,7 @@ Own volunteer recruitment, consent feedback, support, pilot cohorts, issue triag
 | Validator | Stream bounds, schema/privacy repetition, semantic rules, quarantine states, fixed safe errors, malicious payloads |
 | Canonical store | Duplicate/reorder/overlap imports, provenance, corrections, participant/account separation, deletion, rebuild |
 | Pricing | Component/tier/context/tool fixtures, source dates, unknown coverage, local/server parity, historical recomputation |
-| Analysis | Synthetic ground truth, unchanged controls, chronological holdout, leave-participant-out, influence clipping, regime changes |
+| Analysis | Synthetic ground truth, unchanged controls, `eligibilityUnitId`-grouped chronological holdout, leave-one-eligibility-unit-out, per-unit influence clipping, regime changes |
 | Personal API/UI | Tenant isolation, session/browser security, accessibility, results/data parity, export/rotation/delete |
 | Public site | Cohort thresholds, contribution caps, differencing, no pseudonyms/exact times, static artifact verification, deletion rebuild |
 | Operations | Load/soak, cost budgets, failover/restore, key compromise, bad release rollback, privacy incident and deletion drills |
@@ -861,6 +875,8 @@ The next local sequence is frozen in the [G1 compression and local export deleti
 
 The complete-set local deletion slice is now implemented and verified. It uses content-free two-step CLI confirmation, existing-only workspace plus destination leases, directory-identity-bound journal/marker controls, monotonic exact inventory, quarantine/revalidation before durable unlink, fixed receipt-only completion checks, and actual multi-boundary `SIGKILL` recovery. The final evidence is in [the G1 local export deletion verification receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md). This does not complete G1: incomplete/poisoned workspace deletion, native secret stores, Claude parity, prospective account-scoped quota evidence, signed clean-machine distribution, local volunteer review, minimization ablation, and pilot-derived ceilings remain open; all network transport and later cloud stages remain disabled.
 
+The [live G1 local-only release route](./2026-07-24-g1-local-release-route.md) now provides the current gate matrix and supersedes old open-item lists as a status tracker without rewriting dated historical receipts. The first declared volunteer platform is macOS arm64. The active hardening checkpoint passes 470 of 470 serial tests under both Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime, and the generated telemetry contract remains current at 151 fields with 9 of 9 schema/contract tests passing. Failed-workspace discard has passed its final independent destructive-boundary re-audit. The remaining critical path is: prospective Codex collector quota export; full Claude usage and authoritative status-line quota parity; native macOS Keychain integration; preregistered minimization; measured release ceilings; frozen signed packaging; clean-machine validation; and two local-only volunteer reviews. No transport is authorized.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |
@@ -873,7 +889,7 @@ The complete-set local deletion slice is now implemented and verified. It uses c
 | Session pseudonym necessity | Before telemetry v1 freeze | Retain restricted session pseudonym |
 | Quarantine and canonical retention | Before G3 consent | No enrollment/upload until every class has a bounded approved retention |
 | Cloud soft-delete/backups | Before G4 pilot | Disclose and measure effective deletion window |
-| Initial participant/reset public thresholds | Before G9 | At least 20 participants plus conservative reset minimum |
+| Initial independent-eligibility/reset public thresholds | Before G9 | At least 20 independently issued eligible units plus conservative reset minimum; raw pseudonym count is insufficient |
 | Country data | Before G9 | Omit entirely |
 | Optional notification channel | After G8 usability study | CLI polling only |
 | Differential privacy | After stable G9 cohort behavior | Do not add |

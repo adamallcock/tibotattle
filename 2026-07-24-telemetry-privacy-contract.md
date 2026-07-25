@@ -75,7 +75,7 @@ namespace_key = HKDF-SHA-256(participant_secret, salt, info)
 pseudonym = namespace + ":v1:" + base64url(HMAC-SHA-256(namespace_key, framed_subject))
 ```
 
-Namespaces are `participant`, `account`, `session`, `event`, `snapshot`, `quota-state`, `marker`, and `model`. Participant/account/session/model IDs retain v1 namespace semantics. Event, snapshot-observation, and marker occurrence IDs use domain-separated v2 semantics. Codex event identity depends only on provider, source format, privacy-safe session scope, physical JSONL record ordinal, and record kind; quota observations additionally include the slot. Model, tokens, tools, tier, surface, account enrichment, parser version, and export bounds do not re-key the occurrence. Quota state has a separate fingerprint; when account attribution is unavailable it includes session scope and is not eligible for cross-session collapse. Rotating or deleting the participant secret breaks future linkability; copying the same secret to another device intentionally preserves the same participant identity.
+Namespaces are `participant`, `account`, `session`, `event`, `snapshot`, `quota-state`, `marker`, and `model`. Participant/account/session/model IDs retain v1 namespace semantics. Event, snapshot-observation, and marker occurrence IDs use domain-separated v2 semantics. Codex event identity depends only on provider, source format, privacy-safe session scope, physical JSONL record ordinal, and record kind; quota observations additionally include the slot. Model, tokens, tools, tier, surface, account enrichment, parser version, and export bounds do not re-key the occurrence. Quota state has a separate fingerprint; when account attribution is unavailable it includes session scope and is not eligible for cross-session collapse. Rotating or deleting the installation telemetry secret breaks future linkability. That secret must never be copied to another device or used for upload authentication, recovery, pairing, or notifications. Cross-device linking, if later enabled, uses a separate expiring one-time pairing capability and enrollment-scoped identity under G3.
 
 Raw account/session identifiers are never used as exported identifiers. An account with no defensible local attribution is represented as the literal enum `unattributed` rather than being guessed.
 
@@ -122,7 +122,7 @@ Future upload consent must separately name the operator, destination, retention 
 ## Local deletion and rotation runbook
 
 1. Stop any exporter process. No background process is currently installed.
-2. Deletion is currently manual: delete the selected local bundle and its matching privacy receipt. Files under `exports/` are generated review artifacts and are not source evidence. The planned `delete-local-export` command is not yet implemented because it requires bundle-first crash-recoverable deletion; do not treat recursive removal as that completed control.
+2. For a complete verified export set, run `usage-monitor delete-local-export --workspace PATH --directory PATH` to preview the exact bounded inventory, then repeat it with the printed `--confirm-deletion TOKEN`. For an incomplete or poisoned workspace that produced no complete set, use the separate `discard-export-workspace --workspace PATH` preview and its `--confirm-discard TOKEN`. Neither command recursively deletes, touches provider source logs or identity state, accepts the other command's token, or claims physical-media erasure. Manual removal remains only an emergency fallback and cannot produce a project verification receipt.
 3. Run `usage-monitor rotate-local-identity` for a non-mutating preflight. If it reports `ready` and an installation-identity break is intended, rerun with `--confirm`. The command atomically replaces the canonical owner-only secret, installs/validates a legacy-retirement tombstone, changes every future export pseudonym, and performs no network activity. It refuses environment-provided secrets and source conflicts.
 4. Rotation does not modify existing bundles and can make overlapping history re-exports appear as a distinct participant. Existing bundles remain mutually linkable through their old participant pseudonym until they are deleted. The command does not promise secure erasure from SSD/APFS storage, open handles, memory, backups, or synced copies.
 5. Do not delete raw Codex logs as part of this runbook; they belong to the provider application and are outside this tool's data lifecycle.
@@ -139,11 +139,12 @@ A real bounded dry run over 2026-07-24 18:10:45–19:10:45 UTC scanned four loca
 
 ## Remaining gates
 
-This record does not claim Phase 1 completion. Before soliciting even local dry-run bundles from volunteers, the project still needs:
+This record does not claim Phase 1 completion. Bounded disk-backed export sets, deterministic compression, complete-set deletion, and failed-workspace discard supersede the earlier whole-bundle-memory/compression/deletion gaps. Before soliciting even local dry-run bundles from volunteers, the project still needs:
 
 - several independently shaped fixtures and platform-specific path/credential cases;
-- bounded/incremental processing for very large histories rather than retaining a whole bundle in memory;
 - Claude Code export parity where stable local usage and status-line evidence exists;
+- prospective Codex collector quota integration and native Keychain migration/rotation integration;
+- execution of the preregistered minimization study and measured release ceilings;
 - reproducible signed packaging and installation instructions;
 - at least two volunteer local-only dry runs with explicit feedback; and
-- a decision on compression and application-layer encryption before any network design.
+- a separately reviewed frozen volunteer contract. Application-layer encryption remains a later pre-upload decision and is not part of the local-only G1 release.
