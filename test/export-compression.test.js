@@ -113,7 +113,27 @@ test("decompression bounds bombs and concatenated gzip members", () => {
       maximumEncodedBytes: concatenated.length,
       maximumDecodedBytes: 1024,
     }),
-    (error) => error.code === "export_compression_decoded_bytes",
+    (error) => error.code === "export_compression_gzip",
+  );
+});
+
+test("decompression rejects an additional empty member even when decoded bytes are unchanged", () => {
+  const decoded = Buffer.from("single semantic payload");
+  const first = compressExportBytes(decoded, {
+    maximumDecodedBytes: decoded.length,
+    maximumEncodedBytes: 1024,
+  });
+  const empty = compressExportBytes(Buffer.alloc(0), {
+    maximumDecodedBytes: 1,
+    maximumEncodedBytes: 1024,
+  });
+  const concatenated = Buffer.concat([first, empty]);
+  assert.throws(
+    () => decompressExportBytes(concatenated, {
+      maximumEncodedBytes: concatenated.length,
+      maximumDecodedBytes: decoded.length,
+    }),
+    (error) => error.code === "export_compression_gzip",
   );
 });
 

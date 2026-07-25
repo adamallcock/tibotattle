@@ -1,9 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadVerifiedLocalMetadataBundleFiles } from "../src/bundle-verifier.js";
+import { loadVerifiedLocalMetadataBundleBytes } from "../src/bundle-verifier.js";
+import {
+  decompressExportBytes,
+  ExportCompressionError,
+  EXPORT_GZIP_PROFILE,
+} from "../src/export-compression.js";
 import { createLocalExportWorkspace } from "../src/export-set-controller.js";
 import {
   EXPORT_SET_MANIFEST_BASENAME,
@@ -17,6 +23,26 @@ import { openExportWorkspace } from "../src/export-workspace.js";
 
 const SECRET = Buffer.alloc(32, 61);
 const PRIVATE_MATERIALIZER_CANARY = "PRIVATE_MATERIALIZER_PROMPT_DO_NOT_EXPORT";
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+async function loadCompressedChunk(output, chunk, names) {
+  const artifactBytes = await readFile(join(output, names.bundle));
+  const receiptBytes = await readFile(join(output, names.receipt));
+  assert.equal(artifactBytes.length, chunk.artifactBytes);
+  assert.equal(sha256(artifactBytes), chunk.artifactSha256);
+  const bundleBytes = decompressExportBytes(artifactBytes, {
+    maximumEncodedBytes: chunk.artifactBytes,
+    maximumDecodedBytes: chunk.bundleBytes,
+  });
+  return {
+    artifactBytes,
+    bundleBytes,
+    verified: loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes }),
+  };
+}
 
 function usage(input, output, cached, reasoning) {
   return {
@@ -120,14 +146,28 @@ test("materializer publishes deterministic independently verifiable chunks and a
       quotaSnapshots: 4,
       activityMarkers: 0,
     });
+    assert.ok(first.manifest.totals.decodedBundleBytes > 0);
+    assert.ok(first.manifest.totals.encodedArtifactBytes > 0);
+    assert.ok(first.manifest.totals.encodedArtifactBytes < first.manifest.totals.decodedBundleBytes);
+    assert.deepEqual(first.manifest.compressionRuntime, {
+      nodeVersion: process.versions.node,
+      zlibVersion: process.versions.zlib,
+    });
+    const firstArtifacts = [];
+    const decodedBundles = [];
     for (const chunk of first.manifest.chunks) {
       const names = exportSetChunkBasenames(chunk.index);
-      const verified = await loadVerifiedLocalMetadataBundleFiles({
-        bundleFile: join(value.output, names.bundle),
-        receiptFile: join(value.output, names.receipt),
-      });
+      assert.match(names.bundle, /\.bundle\.json\.gz$/);
+      assert.equal(chunk.contentEncoding, EXPORT_GZIP_PROFILE.contentEncoding);
+      assert.equal(chunk.compressionProfile, EXPORT_GZIP_PROFILE.profile);
+      assert.ok(chunk.artifactBytes <= first.manifest.chunking.maximumEncodedArtifactBytes);
+      const loaded = await loadCompressedChunk(value.output, chunk, names);
+      const { verified } = loaded;
+      firstArtifacts.push(loaded.artifactBytes);
+      decodedBundles.push(loaded.bundleBytes);
       assert.equal(verified.bundle.bundleId, chunk.bundleId);
       assert.equal(verified.bundleSha256, chunk.bundleSha256);
+      assert.equal(loaded.bundleBytes.length, chunk.bundleBytes);
     }
     assert.equal((await stat(join(value.output, EXPORT_SET_MANIFEST_BASENAME))).mode & 0o777, 0o600);
     const privateArtifacts = [
@@ -141,6 +181,9 @@ test("materializer publishes deterministic independently verifiable chunks and a
     ];
     for (const artifact of privateArtifacts) {
       assert.equal((await readFile(artifact)).includes(Buffer.from(PRIVATE_MATERIALIZER_CANARY)), false);
+    }
+    for (const bundleBytes of decodedBundles) {
+      assert.equal(bundleBytes.includes(Buffer.from(PRIVATE_MATERIALIZER_CANARY)), false);
     }
     const workspace = await openExportWorkspace({ directory: value.workspace });
     try {
@@ -162,6 +205,10 @@ test("materializer publishes deterministic independently verifiable chunks and a
     });
     assert.deepEqual(repeated.manifest, first.manifest);
     assert.deepEqual(repeated.manifestReceipt, first.manifestReceipt);
+    for (const [index, chunk] of repeated.manifest.chunks.entries()) {
+      const names = exportSetChunkBasenames(chunk.index);
+      assert.deepEqual(await readFile(join(value.output, names.bundle)), firstArtifacts[index]);
+    }
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }
@@ -182,6 +229,8 @@ test("materializer adopts an exactly published chunk after interruption", async 
       }),
       /simulated materialization interruption/,
     );
+    const firstChunkNames = exportSetChunkBasenames(0);
+    const interruptedArtifact = await readFile(join(value.output, firstChunkNames.bundle));
     const resumed = await materializeLocalExportSet({
       workspaceDirectory: value.workspace,
       outputDirectory: value.output,
@@ -189,8 +238,74 @@ test("materializer adopts an exactly published chunk after interruption", async 
       maximumRecordsPerChunk: 2,
     });
     assert.equal(resumed.manifest.chunks.length, 3);
+    assert.deepEqual(await readFile(join(value.output, firstChunkNames.bundle)), interruptedArtifact);
+    await loadCompressedChunk(value.output, resumed.manifest.chunks[0], firstChunkNames);
   } finally {
     await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("materializer refuses crash adoption when a gzip artifact digest changed", async () => {
+  const value = await fixture();
+  try {
+    await assert.rejects(
+      materializeLocalExportSet({
+        workspaceDirectory: value.workspace,
+        outputDirectory: value.output,
+        secret: SECRET,
+        maximumRecordsPerChunk: 2,
+        async failpoint(stage, index) {
+          if (stage === "after_chunk_publish" && index === 0) throw new Error("interrupt before adoption");
+        },
+      }),
+      /interrupt before adoption/,
+    );
+    const names = exportSetChunkBasenames(0);
+    const artifactFile = join(value.output, names.bundle);
+    const corrupted = await readFile(artifactFile);
+    corrupted[Math.floor(corrupted.length / 2)] ^= 0x01;
+    await writeFile(artifactFile, corrupted);
+    await assert.rejects(
+      materializeLocalExportSet({
+        workspaceDirectory: value.workspace,
+        outputDirectory: value.output,
+        secret: SECRET,
+        maximumRecordsPerChunk: 2,
+      }),
+      (error) => error instanceof ExportSetError && error.code === "export_set_chunk_conflict",
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("fresh same-runtime materializations produce identical gzip artifacts", async () => {
+  const first = await fixture();
+  const second = await fixture();
+  try {
+    const firstResult = await materializeLocalExportSet({
+      workspaceDirectory: first.workspace,
+      outputDirectory: first.output,
+      secret: SECRET,
+      maximumRecordsPerChunk: 2,
+    });
+    const secondResult = await materializeLocalExportSet({
+      workspaceDirectory: second.workspace,
+      outputDirectory: second.output,
+      secret: SECRET,
+      maximumRecordsPerChunk: 2,
+    });
+    assert.deepEqual(secondResult.manifest, firstResult.manifest);
+    for (const chunk of firstResult.manifest.chunks) {
+      const names = exportSetChunkBasenames(chunk.index);
+      assert.deepEqual(
+        await readFile(join(second.output, names.bundle)),
+        await readFile(join(first.output, names.bundle)),
+      );
+    }
+  } finally {
+    await rm(first.root, { recursive: true, force: true });
+    await rm(second.root, { recursive: true, force: true });
   }
 });
 
@@ -294,6 +409,53 @@ test("materializer enforces the persisted workspace policy before publishing out
       (error) => error instanceof ExportSetError && error.code === "export_set_workspace_incomplete",
     );
     await assert.rejects(stat(value.output), (error) => error.code === "ENOENT");
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("materializer enforces the encoded artifact cap before publishing", async () => {
+  const value = await fixture();
+  try {
+    await assert.rejects(
+      materializeLocalExportSet({
+        workspaceDirectory: value.workspace,
+        outputDirectory: value.output,
+        secret: SECRET,
+        maximumEncodedArtifactBytes: 64,
+      }),
+      (error) => error instanceof ExportCompressionError
+        && error.code === "export_compression_encoded_bytes",
+    );
+    await assert.rejects(stat(value.output), (error) => error.code === "ENOENT");
+    const workspace = await openExportWorkspace({ directory: value.workspace });
+    try {
+      assert.deepEqual(workspace.chunks(), []);
+    } finally {
+      workspace.close();
+    }
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("materializer rejects a destination containing an opposite plain chunk representation", async () => {
+  const value = await fixture();
+  try {
+    await mkdir(value.output, { mode: 0o700 });
+    const opposite = join(value.output, "chunk-000000.bundle.json");
+    await writeFile(opposite, "{}", { mode: 0o600 });
+    await assert.rejects(
+      materializeLocalExportSet({
+        workspaceDirectory: value.workspace,
+        outputDirectory: value.output,
+        secret: SECRET,
+      }),
+      (error) => error instanceof ExportSetError
+        && error.code === "export_set_mixed_representation"
+        && !error.message.includes(value.output),
+    );
+    assert.equal(await readFile(opposite, "utf8"), "{}");
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

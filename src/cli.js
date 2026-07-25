@@ -97,7 +97,7 @@ function usage() {
   usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor verify-bundle --input PATH [--receipt PATH]
-  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N]
+  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
   usage-monitor inspect-export-workspace --workspace PATH
   usage-monitor verify-export-set --directory PATH
   usage-monitor recover-exports --directory PATH
@@ -173,6 +173,7 @@ export function parseArgs(argv) {
     workspaceDirectory: null,
     maximumRecordsPerChunk: null,
     maximumCanonicalBundleBytes: null,
+    maximumEncodedArtifactBytes: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -221,6 +222,7 @@ export function parseArgs(argv) {
     else if (arg === "--workspace") result.workspaceDirectory = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--max-records-per-chunk") result.maximumRecordsPerChunk = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-bundle-bytes") result.maximumCanonicalBundleBytes = readNonNegativeNumber(argv, index++, arg);
+    else if (arg === "--max-artifact-bytes") result.maximumEncodedArtifactBytes = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -392,6 +394,10 @@ async function run() {
         && (!Number.isSafeInteger(args.maximumCanonicalBundleBytes) || args.maximumCanonicalBundleBytes < 1)) {
       throw new Error("--max-bundle-bytes requires a positive integer");
     }
+    if (args.maximumEncodedArtifactBytes !== null
+        && (!Number.isSafeInteger(args.maximumEncodedArtifactBytes) || args.maximumEncodedArtifactBytes < 1)) {
+      throw new Error("--max-artifact-bytes requires a positive integer");
+    }
     const activityMarkers = await readBoundedJsonLines(args.activityFile ?? defaultActivityMarkerFile(), {
       maximumFileBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExpandedRecordBytes,
       maximumLineBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumLineBytes,
@@ -421,12 +427,14 @@ async function run() {
         secret: identity.secret,
         ...(args.maximumRecordsPerChunk === null ? {} : { maximumRecordsPerChunk: args.maximumRecordsPerChunk }),
         ...(args.maximumCanonicalBundleBytes === null ? {} : { maximumCanonicalBundleBytes: args.maximumCanonicalBundleBytes }),
+        ...(args.maximumEncodedArtifactBytes === null ? {} : { maximumEncodedArtifactBytes: args.maximumEncodedArtifactBytes }),
       });
       console.log("Local metadata export set: complete");
       console.log(`Workspace status: ${workspaceResult.status.scanComplete ? "scan_complete" : "incomplete"}`);
       console.log(`Chunks: ${materialized.manifest.chunks.length}`);
       console.log(`Records: ${materialized.manifest.totals.recordCounts.usageEvents} usage, ${materialized.manifest.totals.recordCounts.quotaSnapshots} quota, ${materialized.manifest.totals.recordCounts.activityMarkers} markers`);
       console.log(`Manifest bytes: ${materialized.manifestReceipt.manifestBytes}`);
+      console.log(`Artifact bytes: ${materialized.manifest.totals.encodedArtifactBytes}; decoded bundle bytes: ${materialized.manifest.totals.decodedBundleBytes}`);
       console.log("Upload: disabled (transportReady=false)");
     });
     return;

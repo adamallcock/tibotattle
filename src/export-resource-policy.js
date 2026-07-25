@@ -1,4 +1,4 @@
-export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.3";
+export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.4";
 
 export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
   maximumCoveredDurationMs: 31 * 24 * 60 * 60 * 1_000,
@@ -9,8 +9,11 @@ export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
   maximumOutputRecords: 100_000,
   maximumExpandedRecordBytes: 32 * 1024 * 1024,
   maximumCanonicalBundleBytes: 32 * 1024 * 1024,
+  maximumEncodedArtifactBytes: 34 * 1024 * 1024,
   maximumExportSetRecords: 2_000_000,
   maximumExportSetExpandedRecordBytes: 2 * 1024 * 1024 * 1024,
+  maximumExportSetDecodedBytes: 4 * 1024 * 1024 * 1024,
+  maximumExportSetEncodedBytes: 4 * 1024 * 1024 * 1024,
   maximumWorkspaceBytes: 4 * 1024 * 1024 * 1024,
   maximumSqliteBatchRecords: 1_000,
   maximumManifestBytes: 1024 * 1024,
@@ -27,6 +30,9 @@ const SAFE_CODES = new Set([
   "output_records",
   "expanded_record_bytes",
   "canonical_bundle_bytes",
+  "encoded_artifact_bytes",
+  "export_set_decoded_bytes",
+  "export_set_encoded_bytes",
   "workspace_bytes",
   "manifest_bytes",
   "chunk_count",
@@ -164,6 +170,9 @@ export function createExportResourceGuard({
     outputRecords: initial.outputRecords,
     expandedRecordBytes: initial.expandedRecordBytes,
     canonicalBundleBytes: 0,
+    encodedArtifactBytes: 0,
+    exportSetDecodedBytes: 0,
+    exportSetEncodedBytes: 0,
     workspaceBytes: initial.workspaceHighWaterBytes,
     manifestBytes: 0,
   };
@@ -279,6 +288,27 @@ export function createExportResourceGuard({
       counters.canonicalBundleBytes = byteCount;
       if (byteCount > limits.maximumCanonicalBundleBytes) {
         throw new ExportResourceLimitError("canonical_bundle_bytes");
+      }
+      checkRuntime();
+    },
+    observeEncodedArtifact(byteCount) {
+      boundedInteger(byteCount, "encoded artifact byte count");
+      counters.encodedArtifactBytes = byteCount;
+      if (byteCount > limits.maximumEncodedArtifactBytes) {
+        throw new ExportResourceLimitError("encoded_artifact_bytes");
+      }
+      checkRuntime();
+    },
+    observeExportSetBytes(decodedByteCount, encodedByteCount) {
+      boundedInteger(decodedByteCount, "export-set decoded byte count", { allowZero: true });
+      boundedInteger(encodedByteCount, "export-set encoded byte count", { allowZero: true });
+      counters.exportSetDecodedBytes = decodedByteCount;
+      counters.exportSetEncodedBytes = encodedByteCount;
+      if (decodedByteCount > limits.maximumExportSetDecodedBytes) {
+        throw new ExportResourceLimitError("export_set_decoded_bytes");
+      }
+      if (encodedByteCount > limits.maximumExportSetEncodedBytes) {
+        throw new ExportResourceLimitError("export_set_encoded_bytes");
       }
       checkRuntime();
     },

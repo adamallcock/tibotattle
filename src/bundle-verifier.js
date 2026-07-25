@@ -72,6 +72,16 @@ function parseCanonicalJson(bytes, label) {
   return value;
 }
 
+function assertByteSequence(value, label, maximumBytes) {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) fail(`${label}_input`);
+  if (!Number.isSafeInteger(value.byteLength) || value.byteLength < 1 || value.byteLength > maximumBytes) {
+    fail(`${label}_size`);
+  }
+  return Buffer.isBuffer(value)
+    ? value
+    : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
 function ordered(records, timeField, idField) {
   for (let index = 1; index < records.length; index += 1) {
     const previous = records[index - 1];
@@ -123,6 +133,49 @@ function assertBundleSemantics(bundle) {
   if (observed.some((provider) => !declared.has(provider))) fail("bundle_provider_declaration");
 }
 
+export function loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes } = {}) {
+  const canonicalReceiptBytes = assertByteSequence(receiptBytes, "receipt", MAX_RECEIPT_BYTES);
+  const canonicalBundleBytes = assertByteSequence(bundleBytes, "bundle", MAX_BUNDLE_BYTES);
+  const receipt = parseCanonicalJson(canonicalReceiptBytes, "receipt");
+  if (!validateExportRecord("privacyReceipt", receipt).valid) fail("receipt_schema");
+  if (receipt.bundleBytes > MAX_BUNDLE_BYTES) fail("receipt_bundle_size");
+  if (canonicalBundleBytes.length !== receipt.bundleBytes) fail("bundle_digest");
+  const bundle = parseCanonicalJson(canonicalBundleBytes, "bundle");
+  if (!validateExportRecord("bundle", bundle).valid) fail("bundle_schema");
+  assertBundleSemantics(bundle);
+  if (receipt.createdAt !== bundle.createdAt) fail("receipt_created_at");
+
+  let expectedReceipt;
+  try {
+    expectedReceipt = verifyPrivacySafeBundle(bundle, { createdAt: receipt.createdAt });
+  } catch {
+    fail("privacy_gate");
+  }
+  if (stableJson(expectedReceipt) !== stableJson(receipt)) fail("receipt_mismatch");
+  const bundleSha256 = createHash("sha256").update(canonicalBundleBytes).digest("hex");
+  if (bundleSha256 !== receipt.bundleSha256 || canonicalBundleBytes.length !== receipt.bundleBytes) fail("bundle_digest");
+
+  const summary = {
+    verdict: "passed",
+    schemaVersion: bundle.schemaVersion,
+    contractFamily: bundle.compatibility.contract.family,
+    contractStatus: bundle.compatibility.contract.status,
+    exporterVersion: bundle.compatibility.implementation.exporterVersion,
+    bundleBytes: canonicalBundleBytes.length,
+    recordCounts: structuredClone(bundle.recordCounts),
+    transportReady: bundle.transportReady,
+  };
+  return {
+    summary,
+    bundle,
+    receipt,
+    bundleBytes: canonicalBundleBytes,
+    receiptBytes: canonicalReceiptBytes,
+    bundleSha256,
+    receiptSha256: createHash("sha256").update(canonicalReceiptBytes).digest("hex"),
+  };
+}
+
 export async function loadVerifiedLocalMetadataBundleFiles({ bundleFile, receiptFile } = {}) {
   if (!bundleFile || !receiptFile) fail("paths_required");
   const bundlePath = resolve(bundleFile);
@@ -143,45 +196,8 @@ export async function loadVerifiedLocalMetadataBundleFiles({ bundleFile, receipt
   }
 
   const receiptBytes = await readOwnerOnlyArtifact(canonicalReceiptPath, "receipt", MAX_RECEIPT_BYTES);
-  const receipt = parseCanonicalJson(receiptBytes, "receipt");
-  if (!validateExportRecord("privacyReceipt", receipt).valid) fail("receipt_schema");
-  if (receipt.bundleBytes > MAX_BUNDLE_BYTES) fail("receipt_bundle_size");
   const bundleBytes = await readOwnerOnlyArtifact(canonicalBundlePath, "bundle", MAX_BUNDLE_BYTES);
-  if (bundleBytes.length !== receipt.bundleBytes) fail("bundle_digest");
-  const bundle = parseCanonicalJson(bundleBytes, "bundle");
-  if (!validateExportRecord("bundle", bundle).valid) fail("bundle_schema");
-  assertBundleSemantics(bundle);
-  if (receipt.createdAt !== bundle.createdAt) fail("receipt_created_at");
-
-  let expectedReceipt;
-  try {
-    expectedReceipt = verifyPrivacySafeBundle(bundle, { createdAt: receipt.createdAt });
-  } catch {
-    fail("privacy_gate");
-  }
-  if (stableJson(expectedReceipt) !== stableJson(receipt)) fail("receipt_mismatch");
-  const bundleSha256 = createHash("sha256").update(bundleBytes).digest("hex");
-  if (bundleSha256 !== receipt.bundleSha256 || bundleBytes.length !== receipt.bundleBytes) fail("bundle_digest");
-
-  const summary = {
-    verdict: "passed",
-    schemaVersion: bundle.schemaVersion,
-    contractFamily: bundle.compatibility.contract.family,
-    contractStatus: bundle.compatibility.contract.status,
-    exporterVersion: bundle.compatibility.implementation.exporterVersion,
-    bundleBytes: bundleBytes.length,
-    recordCounts: structuredClone(bundle.recordCounts),
-    transportReady: bundle.transportReady,
-  };
-  return {
-    summary,
-    bundle,
-    receipt,
-    bundleBytes,
-    receiptBytes,
-    bundleSha256,
-    receiptSha256: createHash("sha256").update(receiptBytes).digest("hex"),
-  };
+  return loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes });
 }
 
 export async function verifyLocalMetadataBundleFiles(files = {}) {

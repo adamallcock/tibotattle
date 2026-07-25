@@ -245,6 +245,7 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
       "--secret-file", secretFile,
       "--max-records-per-chunk", "1",
       "--max-bundle-bytes", "33554432",
+      "--max-artifact-bytes", "35651584",
     ];
     const created = spawnSync(process.execPath, [
       "./src/cli.js", "export-set",

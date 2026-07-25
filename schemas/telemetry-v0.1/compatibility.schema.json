@@ -48,7 +48,7 @@
       "required": ["exporterVersion", "resourcePolicyVersion", "checkpointParserVersion", "checkpointScanVersion", "packageName", "packageVersion"],
       "properties": {
         "exporterVersion": { "const": "0.3.0-draft.3" },
-        "resourcePolicyVersion": { "const": "g1-r3-candidate-0.3" },
+        "resourcePolicyVersion": { "const": "g1-r3-candidate-0.4" },
         "checkpointParserVersion": { "const": "codex-checkpoint-state-v0.1" },
         "checkpointScanVersion": { "const": "codex-export-checkpoint-scan-v0.2" },
         "packageName": { "const": "app-usagemonitor" },

@@ -44,6 +44,8 @@ test("resource guard enforces source, record, byte, elapsed, and RSS ceilings wi
   guard.observeOutputRecord(5);
   guard.observeOutputRecord(5);
   guard.observeCanonicalBundle(20);
+  guard.observeEncodedArtifact(20);
+  guard.observeExportSetBytes(20, 20);
   assert.equal(guard.snapshot().counters.outputRecords, 2);
   assert.throws(() => guard.observeOutputRecord(0), (error) => error.code === "export_resource_output_records");
 
@@ -70,6 +72,36 @@ test("resource guard enforces source, record, byte, elapsed, and RSS ceilings wi
   });
   entries.observeDirectoryEntry();
   assert.throws(() => entries.observeDirectoryEntry(), (error) => error.code === "export_resource_source_files");
+});
+
+test("resource guard independently bounds encoded artifacts and decoded and encoded sets", () => {
+  const artifact = createExportResourceGuard({
+    scope: "export_set",
+    limits: { maximumEncodedArtifactBytes: 10 },
+    clock: () => 0,
+    rss: () => 0,
+  });
+  artifact.observeEncodedArtifact(10);
+  assert.throws(
+    () => artifact.observeEncodedArtifact(11),
+    (error) => error.code === "export_resource_encoded_artifact_bytes",
+  );
+
+  const set = createExportResourceGuard({
+    scope: "export_set",
+    limits: { maximumExportSetDecodedBytes: 20, maximumExportSetEncodedBytes: 10 },
+    clock: () => 0,
+    rss: () => 0,
+  });
+  set.observeExportSetBytes(20, 10);
+  assert.throws(
+    () => set.observeExportSetBytes(21, 10),
+    (error) => error.code === "export_resource_export_set_decoded_bytes",
+  );
+  assert.throws(
+    () => set.observeExportSetBytes(20, 11),
+    (error) => error.code === "export_resource_export_set_encoded_bytes",
+  );
 });
 
 test("bounded line reader preserves CRLF/final lines and stops before oversized allocation", async () => {

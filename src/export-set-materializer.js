@@ -1,17 +1,23 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { loadVerifiedLocalMetadataBundleFiles } from "./bundle-verifier.js";
+import { loadVerifiedLocalMetadataBundleBytes } from "./bundle-verifier.js";
+import {
+  compressExportBytes,
+  decompressExportBytes,
+  EXPORT_GZIP_PROFILE,
+} from "./export-compression.js";
 import { deriveExportPseudonym, deriveParticipantId } from "./export-identity.js";
 import { verifyPrivacySafeBundle } from "./export-privacy.js";
-import { DEFAULT_EXPORT_RESOURCE_LIMITS, createExportResourceGuard, ExportResourceLimitError } from "./export-resource-policy.js";
+import { DEFAULT_EXPORT_RESOURCE_LIMITS, createExportResourceGuard } from "./export-resource-policy.js";
 import { assertValidExportRecord } from "./export-schema.js";
 import { openExportWorkspace } from "./export-workspace.js";
 import { withExportWorkspaceLease } from "./export-workspace-lock.js";
 import {
   assertValidExportSetManifest,
   EXPORT_SET_CONTRACT_VERSION,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION,
   EXPORT_SET_MANIFEST_SCHEMA_SHA256,
   EXPORT_SET_MANIFEST_VERSION,
   EXPORT_SET_ORDER_VERSION,
@@ -33,6 +39,7 @@ const SAFE_SET_CODES = new Set([
   "chunk_conflict",
   "manifest_conflict",
   "artifact_read",
+  "mixed_representation",
 ]);
 
 export class ExportSetError extends Error {
@@ -111,6 +118,19 @@ function buildChunkBundle({ rows, descriptor, diagnostics, bundleId }) {
   return { bundle, bundleText, bundleBytes: Buffer.byteLength(bundleText) };
 }
 
+function compressChunkBundle(selected, maximumEncodedArtifactBytes) {
+  const bundleContent = Buffer.from(selected.bundleText, "utf8");
+  const artifactContent = compressExportBytes(bundleContent, {
+    maximumDecodedBytes: selected.bundleBytes,
+    maximumEncodedBytes: maximumEncodedArtifactBytes,
+  });
+  return {
+    ...selected,
+    artifactContent,
+    artifactBytes: artifactContent.length,
+  };
+}
+
 function deterministicSetId(secret, descriptor, logicalRecordsSha256, chunking) {
   const subject = stableJson({
     identityVersion: "usage-export-set-id-v1",
@@ -133,7 +153,14 @@ function deterministicBundleId(secret, exportSetId, index) {
   }));
 }
 
-function chooseLargestFittingPrefix({ pool, descriptor, diagnostics, bundleId, maximumBytes, resourceGuard }) {
+function chooseLargestFittingPrefix({
+  pool,
+  descriptor,
+  diagnostics,
+  bundleId,
+  maximumBytes,
+  resourceGuard,
+}) {
   const empty = buildChunkBundle({ rows: [], descriptor, diagnostics, bundleId });
   const counts = { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 };
   const embeddedBytes = { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 };
@@ -181,6 +208,16 @@ async function exists(path) {
   }
 }
 
+async function assertNoPlainChunkArtifacts(directory) {
+  let entries;
+  try {
+    entries = await readdir(directory);
+  } catch {
+    fail("artifact_read");
+  }
+  if (entries.some((name) => /^chunk-\d{6}\.bundle\.json$/.test(name))) fail("mixed_representation");
+}
+
 function assertVerifiedChunk(verified, expected) {
   if (verified.bundle.bundleId !== expected.bundleId
       || verified.bundle.participantId !== expected.participantId
@@ -193,7 +230,36 @@ function assertVerifiedChunk(verified, expected) {
       || verified.receiptBytes.length !== expected.receiptBytes) fail("chunk_conflict");
 }
 
-async function publishChunk({ outputDirectory, index, bundle, bundleText, receipt, metadata, failpoint }) {
+async function readOwnerOnlyExistingBytes(path, maximumBytes) {
+  let pathStats;
+  try {
+    pathStats = await lstat(path);
+  } catch {
+    fail("artifact_read");
+  }
+  if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.nlink !== 1
+      || pathStats.size < 1 || pathStats.size > maximumBytes
+      || (typeof process.getuid === "function" && pathStats.uid !== process.getuid())
+      || (process.platform !== "win32" && (pathStats.mode & 0o077) !== 0)) fail("artifact_read");
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const descriptorStats = await handle.stat();
+    if (!descriptorStats.isFile() || descriptorStats.nlink !== 1
+        || descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino
+        || descriptorStats.size !== pathStats.size) fail("artifact_read");
+    const bytes = await handle.readFile();
+    if (bytes.length !== descriptorStats.size) fail("artifact_read");
+    return bytes;
+  } catch (error) {
+    if (error instanceof ExportSetError) throw error;
+    fail("artifact_read");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function publishChunk({ outputDirectory, index, artifactContent, receipt, metadata, failpoint }) {
   const bundleFile = join(outputDirectory, exportSetChunkBundleBasename(index));
   const receiptFile = join(outputDirectory, exportSetChunkReceiptBasename(index));
   const bundleExists = await exists(bundleFile);
@@ -202,13 +268,33 @@ async function publishChunk({ outputDirectory, index, bundle, bundleText, receip
   if (!bundleExists) {
     await writeOwnerOnlyPairNoClobber({
       firstPath: bundleFile,
-      firstContent: bundleText,
+      firstContent: artifactContent,
       secondPath: receiptFile,
       secondContent: stableJson(receipt),
     });
     await failpoint("after_chunk_publish", index);
   }
-  const verified = await loadVerifiedLocalMetadataBundleFiles({ bundleFile, receiptFile });
+  const artifactBytes = await readOwnerOnlyExistingBytes(bundleFile, metadata.artifactBytes);
+  const receiptBytes = await readOwnerOnlyExistingBytes(receiptFile, metadata.receiptBytes);
+  if (artifactBytes.length !== metadata.artifactBytes
+      || sha256(artifactBytes) !== metadata.artifactSha256
+      || receiptBytes.length !== metadata.receiptBytes
+      || sha256(receiptBytes) !== metadata.receiptSha256) fail("chunk_conflict");
+  let bundleBytes;
+  let verified;
+  try {
+    bundleBytes = decompressExportBytes(artifactBytes, {
+      maximumEncodedBytes: metadata.artifactBytes,
+      maximumDecodedBytes: metadata.bundleBytes,
+    });
+    if (bundleBytes.length !== metadata.bundleBytes || sha256(bundleBytes) !== metadata.bundleSha256) {
+      fail("chunk_conflict");
+    }
+    verified = loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes });
+  } catch (error) {
+    if (error instanceof ExportSetError) throw error;
+    fail("chunk_conflict");
+  }
   assertVerifiedChunk(verified, metadata);
   return verified;
 }
@@ -245,7 +331,7 @@ async function readCanonicalExisting(path, maximumBytes) {
 
 function manifestReceipt(manifestText) {
   return {
-    schemaVersion: "export-set-manifest-receipt-v0.1",
+    schemaVersion: EXPORT_SET_MANIFEST_RECEIPT_VERSION,
     manifestSha256: sha256(manifestText),
     manifestBytes: Buffer.byteLength(manifestText),
     transportReady: false,
@@ -258,6 +344,7 @@ async function materializeLocalExportSetUnlocked({
   secret,
   maximumRecordsPerChunk = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
   maximumCanonicalBundleBytes = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumCanonicalBundleBytes,
+  maximumEncodedArtifactBytes = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumEncodedArtifactBytes,
   failpoint = async () => {},
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
@@ -269,6 +356,10 @@ async function materializeLocalExportSetUnlocked({
       || maximumCanonicalBundleBytes > DEFAULT_EXPORT_RESOURCE_LIMITS.maximumCanonicalBundleBytes) {
     throw new TypeError("maximumCanonicalBundleBytes exceeds the resource policy");
   }
+  if (!Number.isSafeInteger(maximumEncodedArtifactBytes) || maximumEncodedArtifactBytes < 1
+      || maximumEncodedArtifactBytes > DEFAULT_EXPORT_RESOURCE_LIMITS.maximumEncodedArtifactBytes) {
+    throw new TypeError("maximumEncodedArtifactBytes exceeds the resource policy");
+  }
   const output = resolve(outputDirectory);
   const workspace = await openExportWorkspace({ directory: workspaceDirectory });
   let resourceGuard = null;
@@ -277,10 +368,14 @@ async function materializeLocalExportSetUnlocked({
     const descriptor = workspace.getDescriptor();
     if (descriptor.participantId !== deriveParticipantId(secret)) fail("workspace_incomplete");
     if (maximumRecordsPerChunk > descriptor.resourceLimits.maximumOutputRecords
-        || maximumCanonicalBundleBytes > descriptor.resourceLimits.maximumCanonicalBundleBytes) {
+        || maximumCanonicalBundleBytes > descriptor.resourceLimits.maximumCanonicalBundleBytes
+        || maximumEncodedArtifactBytes > descriptor.resourceLimits.maximumEncodedArtifactBytes) {
       throw new TypeError("Materialization limits exceed the workspace resource policy");
     }
-    if (await exists(output)) await recoverOwnerOnlyPairTransactions({ directory: output });
+    if (await exists(output)) {
+      await recoverOwnerOnlyPairTransactions({ directory: output });
+      await assertNoPlainChunkArtifacts(output);
+    }
     workspace.beginInvocation();
     resourceGuard = createExportResourceGuard({
       scope: "export_set",
@@ -299,6 +394,7 @@ async function materializeLocalExportSetUnlocked({
       packingVersion: EXPORT_SET_PACKING_VERSION,
       maximumRecordsPerChunk,
       maximumCanonicalBundleBytes,
+      maximumEncodedArtifactBytes,
     };
     const exportSetId = deterministicSetId(secret, descriptor, logicalRecordsSha256, chunking);
     const diagnostics = workspace.scanDiagnostics();
@@ -312,7 +408,8 @@ async function materializeLocalExportSetUnlocked({
     const totals = {
       recordCounts: { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 },
       logicalRecordsSha256,
-      bundleBytes: 0,
+      decodedBundleBytes: 0,
+      encodedArtifactBytes: 0,
       receiptBytes: 0,
     };
     const emptySet = next.done;
@@ -324,9 +421,14 @@ async function materializeLocalExportSetUnlocked({
         next = iterator.next();
       }
       const bundleId = deterministicBundleId(secret, exportSetId, chunkIndex);
-      const selected = emptySet && carry.length === 0
-        ? buildChunkBundle({ rows: [], descriptor, diagnostics, bundleId })
-        : chooseLargestFittingPrefix({
+      let selected;
+      if (emptySet && carry.length === 0) {
+        const emptyBundle = buildChunkBundle({ rows: [], descriptor, diagnostics, bundleId });
+        // Preserve the decoded canonical ceiling as the first failure boundary.
+        resourceGuard.observeCanonicalBundle(emptyBundle.bundleBytes);
+        selected = compressChunkBundle(emptyBundle, maximumEncodedArtifactBytes);
+      } else {
+        selected = chooseLargestFittingPrefix({
             pool: carry,
             descriptor,
             diagnostics,
@@ -334,9 +436,15 @@ async function materializeLocalExportSetUnlocked({
             maximumBytes: maximumCanonicalBundleBytes,
             resourceGuard,
           });
-      // Enforce the persisted canonical-bundle ceiling before recording or
-      // publishing even the mandatory zero-record chunk.
-      resourceGuard.observeCanonicalBundle(selected.bundleBytes);
+        resourceGuard.observeCanonicalBundle(selected.bundleBytes);
+        selected = compressChunkBundle(selected, maximumEncodedArtifactBytes);
+      }
+      // Enforce the encoded artifact ceiling before recording or publishing.
+      resourceGuard.observeEncodedArtifact(selected.artifactBytes);
+      resourceGuard.observeExportSetBytes(
+        totals.decodedBundleBytes + selected.bundleBytes,
+        totals.encodedArtifactBytes + selected.artifactBytes,
+      );
       const selectedCount = emptySet && carry.length === 0 ? 0 : selected.count;
       const receipt = verifyPrivacySafeBundle(selected.bundle, { createdAt: descriptor.createdAt });
       const receiptText = stableJson(receipt);
@@ -348,6 +456,10 @@ async function materializeLocalExportSetUnlocked({
         coveredAt: structuredClone(descriptor.coveredAt),
         bundleSha256: sha256(selected.bundleText),
         bundleBytes: selected.bundleBytes,
+        contentEncoding: EXPORT_GZIP_PROFILE.contentEncoding,
+        compressionProfile: EXPORT_GZIP_PROFILE.profile,
+        artifactSha256: sha256(selected.artifactContent),
+        artifactBytes: selected.artifactBytes,
         receiptSha256: sha256(receiptText),
         receiptBytes: Buffer.byteLength(receiptText),
         recordStart: recordOffset,
@@ -355,25 +467,28 @@ async function materializeLocalExportSetUnlocked({
         recordCounts: structuredClone(selected.bundle.recordCounts),
       };
       workspace.recordChunk(chunkIndex, "planned", metadata);
-      resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
+      resourceGuard.observeWorkspace(await workspace.storageBytes());
       await failpoint("after_chunk_plan", chunkIndex);
       await publishChunk({
         outputDirectory: output,
         index: chunkIndex,
-        bundle: selected.bundle,
-        bundleText: selected.bundleText,
+        artifactContent: selected.artifactContent,
         receipt,
         metadata,
         failpoint,
       });
       workspace.recordChunk(chunkIndex, "verified", metadata);
-      resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
+      resourceGuard.observeWorkspace(await workspace.storageBytes());
       await failpoint("after_chunk_verify", chunkIndex);
       chunks.push({
         index: metadata.index,
         bundleId: metadata.bundleId,
         bundleSha256: metadata.bundleSha256,
         bundleBytes: metadata.bundleBytes,
+        contentEncoding: metadata.contentEncoding,
+        compressionProfile: metadata.compressionProfile,
+        artifactSha256: metadata.artifactSha256,
+        artifactBytes: metadata.artifactBytes,
         receiptSha256: metadata.receiptSha256,
         receiptBytes: metadata.receiptBytes,
         recordStart: metadata.recordStart,
@@ -381,7 +496,8 @@ async function materializeLocalExportSetUnlocked({
         recordCounts: metadata.recordCounts,
       });
       addCounts(totals.recordCounts, metadata.recordCounts);
-      totals.bundleBytes += metadata.bundleBytes;
+      totals.decodedBundleBytes += metadata.bundleBytes;
+      totals.encodedArtifactBytes += metadata.artifactBytes;
       totals.receiptBytes += metadata.receiptBytes;
       recordOffset += selectedCount;
       carry = carry.slice(selectedCount);
@@ -404,6 +520,10 @@ async function materializeLocalExportSetUnlocked({
       clientPlatform: descriptor.clientPlatform,
       transportReady: false,
       completionStatus: "complete",
+      compressionRuntime: {
+        nodeVersion: process.versions.node,
+        zlibVersion: process.versions.zlib,
+      },
       sourcePlan: {
         sha256: descriptor.sourcePlan.sourcePlanSha256,
         sourceFiles: descriptor.sourcePlan.sourceFiles,
@@ -442,7 +562,7 @@ async function materializeLocalExportSetUnlocked({
       chunkCount: chunks.length,
     };
     workspace.markManifestComplete(manifestMetadata);
-    resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
+    resourceGuard.observeWorkspace(await workspace.storageBytes());
     return {
       manifest,
       manifestReceipt: receipt,

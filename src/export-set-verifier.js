@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdtemp, open, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadVerifiedLocalMetadataBundleFiles } from "./bundle-verifier.js";
+import {
+  loadVerifiedLocalMetadataBundleBytes,
+  loadVerifiedLocalMetadataBundleFiles,
+} from "./bundle-verifier.js";
+import { decompressExportBytes } from "./export-compression.js";
 import { exportCompatibilityTuple } from "./export-contract.js";
 import {
   createExportResourceGuard,
@@ -16,6 +20,10 @@ import {
 } from "./export-set-materializer.js";
 import {
   assertValidExportSetManifest,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_VERSION_V0_1,
+  EXPORT_SET_MANIFEST_VERSION_V0_2,
   exportSetChunkBasenames,
 } from "./export-set-schema.js";
 import { stableJson } from "./storage.js";
@@ -41,6 +49,24 @@ const SAFE_VERIFY_CODES = new Set([
   "manifest_schema",
   "manifest_receipt",
   "compatibility",
+  "mixed_representation",
+  "chunk_artifact_missing",
+  "chunk_artifact_type",
+  "chunk_artifact_owner",
+  "chunk_artifact_permissions",
+  "chunk_artifact_links",
+  "chunk_artifact_size",
+  "chunk_artifact_changed",
+  "chunk_artifact_read",
+  "chunk_artifact_digest",
+  "chunk_receipt_missing",
+  "chunk_receipt_type",
+  "chunk_receipt_owner",
+  "chunk_receipt_permissions",
+  "chunk_receipt_links",
+  "chunk_receipt_size",
+  "chunk_receipt_changed",
+  "chunk_receipt_read",
   "chunk_metadata",
   "chunk_shared_contract",
   "chunk_diagnostics",
@@ -114,6 +140,35 @@ async function readCanonicalArtifact(path, label, maximumBytes) {
   }
 }
 
+async function readOwnerOnlyBytes(path, label, maximumBytes, expectedBytes) {
+  let pathStats;
+  try {
+    pathStats = await lstat(path);
+  } catch (error) {
+    if (error.code === "ENOENT") fail(`${label}_missing`);
+    fail(`${label}_changed`);
+  }
+  assertArtifactStats(pathStats, label, maximumBytes);
+  if (pathStats.size !== expectedBytes) fail(`${label}_size`);
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const stats = await handle.stat();
+    assertArtifactStats(stats, label, maximumBytes);
+    if (stats.dev !== pathStats.dev || stats.ino !== pathStats.ino || stats.size !== pathStats.size) {
+      fail(`${label}_changed`);
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length !== stats.size) fail(`${label}_changed`);
+    return bytes;
+  } catch (error) {
+    if (error instanceof ExportSetVerificationError) throw error;
+    fail(`${label}_read`);
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
 function frameDigest(digest, family, record) {
   const frame = Buffer.from(stableJson({ family, record }), "utf8");
   const size = Buffer.allocUnsafe(8);
@@ -156,16 +211,17 @@ function manifestSharedContract(manifest) {
   };
 }
 
-function addFirstRecordForPacking(bundle, firstRow) {
-  const total = bundle.recordCounts.usageEvents
-    + bundle.recordCounts.quotaSnapshots
-    + bundle.recordCounts.activityMarkers;
+function firstRecordFitsPriorChunk(manifest, bundle, firstRow) {
   bundle.records[firstRow.family].push(firstRow.record);
   bundle.recordCounts[firstRow.family] += 1;
-  const bytes = Buffer.byteLength(stableJson(bundle));
-  bundle.records[firstRow.family].pop();
-  bundle.recordCounts[firstRow.family] -= 1;
-  return { priorCount: total, bytes };
+  let candidateBytes;
+  try {
+    candidateBytes = Buffer.from(stableJson(bundle), "utf8");
+  } finally {
+    bundle.records[firstRow.family].pop();
+    bundle.recordCounts[firstRow.family] -= 1;
+  }
+  return candidateBytes.length <= manifest.chunking.maximumCanonicalBundleBytes;
 }
 
 async function createUniquenessIndex(resourceGuard, {
@@ -250,14 +306,77 @@ async function createUniquenessIndex(resourceGuard, {
   }
 }
 
-function assertManifestReceipt(receipt, manifestBytes) {
+function assertManifestReceipt(receipt, manifestBytes, manifestVersion) {
+  const receiptVersion = manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+    ? EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2
+    : EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1;
   const expected = {
-    schemaVersion: "export-set-manifest-receipt-v0.1",
+    schemaVersion: receiptVersion,
     manifestSha256: sha256(manifestBytes),
     manifestBytes: manifestBytes.length,
     transportReady: false,
   };
   if (stableJson(receipt) !== stableJson(expected)) fail("manifest_receipt");
+}
+
+function manifestByteTotals(manifest) {
+  if (manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2) {
+    return {
+      decoded: manifest.totals.decodedBundleBytes,
+      encoded: manifest.totals.encodedArtifactBytes,
+    };
+  }
+  return { decoded: manifest.totals.bundleBytes, encoded: 0 };
+}
+
+async function assertNoMixedRepresentation(root, manifestVersion) {
+  let entries;
+  try {
+    entries = await readdir(root);
+  } catch {
+    fail("directory");
+  }
+  const oppositePattern = manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+    ? /^chunk-\d{6}\.bundle\.json$/
+    : /^chunk-\d{6}\.bundle\.json\.gz$/;
+  if (entries.some((name) => oppositePattern.test(name))) fail("mixed_representation");
+}
+
+async function loadVerifiedSetChunk({ root, manifest, entry, resourceGuard }) {
+  const names = exportSetChunkBasenames(entry.index, manifest.schemaVersion);
+  resourceGuard.observeCanonicalBundle(entry.bundleBytes);
+  if (manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_1) {
+    return loadVerifiedLocalMetadataBundleFiles({
+      bundleFile: join(root, names.bundle),
+      receiptFile: join(root, names.receipt),
+    });
+  }
+
+  resourceGuard.observeEncodedArtifact(entry.artifactBytes);
+  const artifactBytes = await readOwnerOnlyBytes(
+    join(root, names.bundle),
+    "chunk_artifact",
+    resourceGuard.limits.maximumEncodedArtifactBytes,
+    entry.artifactBytes,
+  );
+  if (sha256(artifactBytes) !== entry.artifactSha256) fail("chunk_artifact_digest");
+
+  const bundleBytes = decompressExportBytes(artifactBytes, {
+    maximumEncodedBytes: entry.artifactBytes,
+    maximumDecodedBytes: Math.min(entry.bundleBytes, resourceGuard.limits.maximumCanonicalBundleBytes),
+  });
+  if (bundleBytes.length !== entry.bundleBytes || sha256(bundleBytes) !== entry.bundleSha256) {
+    fail("chunk_metadata");
+  }
+
+  const receiptBytes = await readOwnerOnlyBytes(
+    join(root, names.receipt),
+    "chunk_receipt",
+    MAXIMUM_MANIFEST_RECEIPT_BYTES,
+    entry.receiptBytes,
+  );
+  if (sha256(receiptBytes) !== entry.receiptSha256) fail("chunk_metadata");
+  return loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes });
 }
 
 export async function verifyLocalExportSet({
@@ -290,8 +409,9 @@ export async function verifyLocalExportSet({
     fail("manifest_schema");
   }
   const manifest = manifestArtifact.value;
-  assertManifestReceipt(receiptArtifact.value, manifestArtifact.bytes);
+  assertManifestReceipt(receiptArtifact.value, manifestArtifact.bytes, manifest.schemaVersion);
   if (stableJson(manifest.compatibility) !== stableJson(exportCompatibilityTuple())) fail("compatibility");
+  await assertNoMixedRepresentation(root, manifest.schemaVersion);
   const resourceGuard = createExportResourceGuard({ scope: "export_set", limits: resourceLimits });
   const verificationIndexLimit = maximumVerificationIndexBytes ?? resourceGuard.limits.maximumWorkspaceBytes;
   if (!Number.isSafeInteger(verificationIndexLimit) || verificationIndexLimit < 1
@@ -302,9 +422,8 @@ export async function verifyLocalExportSet({
   resourceGuard.observeSourcePlan(manifest.sourcePlan.sourceFiles, manifest.sourcePlan.sourceBytes);
   resourceGuard.observeChunkCount(manifest.chunks.length);
   resourceGuard.observeManifest(manifestArtifact.bytes.length);
-  if (manifest.totals.bundleBytes > resourceGuard.limits.maximumWorkspaceBytes) {
-    resourceGuard.observeWorkspace(manifest.totals.bundleBytes);
-  }
+  const declaredBytes = manifestByteTotals(manifest);
+  resourceGuard.observeExportSetBytes(declaredBytes.decoded, declaredBytes.encoded);
 
   const unique = await createUniquenessIndex(resourceGuard, {
     maximumBytes: verificationIndexLimit,
@@ -316,21 +435,23 @@ export async function verifyLocalExportSet({
   let priorBundle = null;
   let priorCount = 0;
   let diagnostics = null;
+  let actualDecodedBytes = 0;
+  let actualEncodedBytes = 0;
+  let actualReceiptBytes = 0;
   try {
     for (const entry of manifest.chunks) {
-      const names = exportSetChunkBasenames(entry.index);
-      const verified = await loadVerifiedLocalMetadataBundleFiles({
-        bundleFile: join(root, names.bundle),
-        receiptFile: join(root, names.receipt),
-      });
+      const verified = await loadVerifiedSetChunk({ root, manifest, entry, resourceGuard });
       const bundle = verified.bundle;
-      resourceGuard.observeCanonicalBundle(verified.bundleBytes.length);
       if (bundle.bundleId !== entry.bundleId
           || verified.bundleSha256 !== entry.bundleSha256
           || verified.bundleBytes.length !== entry.bundleBytes
           || verified.receiptSha256 !== entry.receiptSha256
           || verified.receiptBytes.length !== entry.receiptBytes
           || stableJson(bundle.recordCounts) !== stableJson(entry.recordCounts)) fail("chunk_metadata");
+      actualDecodedBytes += verified.bundleBytes.length;
+      actualReceiptBytes += verified.receiptBytes.length;
+      if (manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2) actualEncodedBytes += entry.artifactBytes;
+      resourceGuard.observeExportSetBytes(actualDecodedBytes, actualEncodedBytes);
       if (stableJson(sharedChunkContract(bundle)) !== stableJson(manifestSharedContract(manifest))) {
         fail("chunk_shared_contract");
       }
@@ -339,8 +460,7 @@ export async function verifyLocalExportSet({
 
       const rows = chunkRecords(bundle);
       if (priorBundle && rows.length > 0 && priorCount < manifest.chunking.maximumRecordsPerChunk) {
-        const candidate = addFirstRecordForPacking(priorBundle, rows[0]);
-        if (candidate.bytes <= manifest.chunking.maximumCanonicalBundleBytes) fail("chunk_nonmaximal");
+        if (firstRecordFitsPriorChunk(manifest, priorBundle, rows[0])) fail("chunk_nonmaximal");
       }
       for (const row of rows) {
         resourceGuard.observeOutputRecord(Buffer.byteLength(stableJson(row.record)));
@@ -359,6 +479,9 @@ export async function verifyLocalExportSet({
       priorCount = rows.length;
     }
     if (logical.digest("hex") !== manifest.totals.logicalRecordsSha256) fail("logical_digest");
+    if (actualDecodedBytes !== declaredBytes.decoded
+        || actualEncodedBytes !== declaredBytes.encoded
+        || actualReceiptBytes !== manifest.totals.receiptBytes) fail("chunk_metadata");
   } finally {
     await unique.close();
   }
@@ -369,7 +492,9 @@ export async function verifyLocalExportSet({
     contractStatus: manifest.compatibility.contract.status,
     chunkCount: manifest.chunks.length,
     recordCounts: structuredClone(manifest.totals.recordCounts),
-    bundleBytes: manifest.totals.bundleBytes,
+    bundleBytes: declaredBytes.decoded,
+    decodedBundleBytes: declaredBytes.decoded,
+    encodedArtifactBytes: declaredBytes.encoded,
     transportReady: manifest.transportReady,
   };
 }

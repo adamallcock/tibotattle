@@ -208,17 +208,28 @@ const EXPORT_TRANSACTION_DIRECTORY = ".app-usagemonitor-export-transactions";
 const EXPORT_DESTINATION_LOCK = ".app-usagemonitor-export.lock";
 const EXPORT_DESTINATION_CLAIM_PREFIX = ".app-usagemonitor-export.lock.claim.";
 const EXPORT_TRANSACTION_SCHEMA = "owner-only-pair-transaction-v1";
-const MAX_LOCAL_BUNDLE_BYTES = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumCanonicalBundleBytes;
+// The first artifact may be either the decoded canonical JSON bundle (v0.1)
+// or its encoded transport representation (v0.2).  Recovery has to accept the
+// larger of those compatibility-bound ceilings or it can create a transaction
+// that its own recovery path refuses to replay.
+const MAX_LOCAL_FIRST_ARTIFACT_BYTES = Math.max(
+  DEFAULT_EXPORT_RESOURCE_LIMITS.maximumCanonicalBundleBytes,
+  DEFAULT_EXPORT_RESOURCE_LIMITS.maximumEncodedArtifactBytes,
+);
 const MAX_LOCAL_RECEIPT_BYTES = 1024 * 1024;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function normalizePairContent(value) {
-  if (typeof value === "string") return Buffer.from(value, "utf8");
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return Buffer.from(value);
+function pairContentByteLength(value) {
+  if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return value.byteLength;
   throw new Error("Paired export contents must be strings, Buffers, or Uint8Arrays");
+}
+
+function normalizePairContent(value) {
+  return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
 }
 
 function validBasename(value) {
@@ -303,7 +314,7 @@ async function readTransactionManifest(path) {
       || manifest.artifacts.receipt.stageName !== "receipt.stage") {
     throw new Error("Invalid export recovery artifact collision");
   }
-  if (manifest.artifacts.bundle.bytes > MAX_LOCAL_BUNDLE_BYTES
+  if (manifest.artifacts.bundle.bytes > MAX_LOCAL_FIRST_ARTIFACT_BYTES
       || manifest.artifacts.receipt.bytes > MAX_LOCAL_RECEIPT_BYTES) {
     throw new Error("Invalid export recovery artifact size");
   }
@@ -523,14 +534,16 @@ async function writeOwnerOnlyPairNoClobberUnlocked({
   linkFile = link,
   failpoint = async () => {},
 } = {}) {
-  const normalizedFirstContent = normalizePairContent(firstContent);
-  const normalizedSecondContent = normalizePairContent(secondContent);
-  const firstBytes = normalizedFirstContent.length;
-  const secondBytes = normalizedSecondContent.length;
-  if (firstBytes < 1 || firstBytes > MAX_LOCAL_BUNDLE_BYTES
+  const firstBytes = pairContentByteLength(firstContent);
+  const secondBytes = pairContentByteLength(secondContent);
+  if (firstBytes < 1 || firstBytes > MAX_LOCAL_FIRST_ARTIFACT_BYTES
       || secondBytes < 1 || secondBytes > MAX_LOCAL_RECEIPT_BYTES) {
     throw new Error("Paired export contents exceed local artifact bounds");
   }
+  // Snapshot caller-owned binary views only after the no-allocation bounds
+  // check so subsequent mutation cannot invalidate the staged digest.
+  const normalizedFirstContent = normalizePairContent(firstContent);
+  const normalizedSecondContent = normalizePairContent(secondContent);
   const first = resolve(firstPath);
   const second = resolve(secondPath);
   if (first === second) throw new Error("Bundle and privacy receipt paths must be distinct");
@@ -692,7 +705,11 @@ async function recoverOwnerOnlyPairTransactionsUnlocked({ directory } = {}, {
     const receiptStage = join(transactionDirectory, manifest.artifacts.receipt.stageName);
     const bundleFinal = join(destinationResolved, manifest.artifacts.bundle.finalName);
     const receiptFinal = join(destinationResolved, manifest.artifacts.receipt.finalName);
-    const bundleStats = await assertStagedArtifact(bundleStage, manifest.artifacts.bundle, MAX_LOCAL_BUNDLE_BYTES);
+    const bundleStats = await assertStagedArtifact(
+      bundleStage,
+      manifest.artifacts.bundle,
+      MAX_LOCAL_FIRST_ARTIFACT_BYTES,
+    );
     const receiptStats = await assertStagedArtifact(receiptStage, manifest.artifacts.receipt, MAX_LOCAL_RECEIPT_BYTES);
     let bundleState = await finalState(bundleFinal, bundleStats);
     let receiptState = await finalState(receiptFinal, receiptStats);

@@ -20,7 +20,7 @@ Both gates remain local-only. They add no upload, enrollment, server, background
 - Use a single-member gzip stream through built-in `node:zlib`; add no package or subprocess dependency. Signed/release artifacts must pin and record their bundled Node/zlib runtime.
 - Pin an explicit profile: gzip, compression level 6, default strategy, no filename, no comment, and a zero modification-time header.
 - Store chunks as fixed names such as `chunk-000000.bundle.json.gz`; keep chunk receipts and set manifest/control files uncompressed.
-- Treat gzip as a representation, not the logical identity. Bundle IDs, decoded `bundleSha256` and `bundleBytes`, record ordering, packing decisions, chunk-independent logical-record digest, and participant pseudonyms continue to derive from canonical decoded `stableJson` bytes.
+- Treat gzip as a representation, not the logical identity. Bundle IDs, decoded `bundleSha256` and `bundleBytes`, record ordering, packing decisions, chunk-independent logical-record digest, and participant pseudonyms continue to derive from canonical decoded `stableJson` bytes. The encoded ceiling is an independent acceptance gate, not an automatic packing signal; a caller wanting smaller artifacts must lower the decoded canonical chunk ceiling.
 - Add separate manifest and receipt fields for the fixed encoding/profile plus exact stored `artifactSha256` and `artifactBytes`. The stored hash authenticates the emitted representation; recompressing decoded bytes on another zlib version is not required to reproduce that hash. Version-dispatch plain v0.1 and compressed v0.2 artifacts; never permit a mixed set.
 
 ### Binary publication
@@ -48,7 +48,7 @@ Both gates remain local-only. They add no upload, enrollment, server, background
 5. Truncation, checksum corruption, encoded hash/size mismatch, decoded hash/size mismatch, encoding/profile mismatch, and mixed plain/compressed chunks fail closed.
 6. Binary pair publication and recovery pass every existing receipt-first transaction failpoint and concurrent/stale-lock case.
 7. Decoded artifacts and all output/control/error surfaces pass privacy-canary scans.
-8. Plain v0.1 verification remains explicit and isolated; compressed v0.2 is the only format emitted after the compatibility change.
+8. Plain v0.1 format dispatch remains explicit and isolated; compressed v0.2 is the only format emitted after the compatibility change. Because the telemetry contract is an unfrozen local draft with `backwardCompatibility: none_regenerate_local_review_artifacts`, a v0.1 artifact carrying an older compatibility tuple is intentionally rejected and must be regenerated.
 
 ## Gate D — crash-recoverable local export deletion
 
@@ -119,16 +119,19 @@ Leave empty owner-only workspace/output directories in the first slice. Director
 
 ## Implementation checkpoint
 
-The first Gate C prerequisites are implemented but do not yet emit compressed export sets:
+Gate C is implemented and locally verified:
 
-- the durable receipt-first pair writer snapshots and publishes strings, `Buffer`s, and `Uint8Array`s byte-exactly, with binary recovery exercised at all seven existing publication failpoints;
-- the gzip helper pins level 6/default strategy, normalizes timestamp and OS header bytes, copies only after input ceilings pass, and exposes fixed content-free errors;
-- independent encoded/decoded limits, corrupt/truncated input, compressed bombs, and concatenated-member total output are tested;
-- a Node 20.0.0/zlib 1.2.13 fixture decodes exactly on the current Node 26.2.0/zlib 1.3.1 runtime without recompression, proving the semantic/artifact identity split;
-- a focused subagent audit found and closed the pre-limit defensive-copy allocation issue, including a 64 MiB probe with zero additional ArrayBuffer allocation; and
-- the full serial repository suite passes 345 tests, while the 151-field telemetry contract remains current and all 9 contract tests pass.
+- current materialization emits strict `usage-export-set-manifest-v0.2` sets with fixed `.bundle.json.gz` names, decoded semantic hashes and sizes, encoded artifact hashes and sizes, producing Node/zlib provenance, and separate decoded/encoded totals;
+- decoded canonical packing remains deterministic and compression-independent; the encoded limit is checked exactly once after packing and before the workspace records a plan or the destination publishes an artifact;
+- the durable receipt-first pair writer publishes strings, `Buffer`s, and `Uint8Array`s byte-exactly up to the 34 MiB encoded ceiling, with binary recovery exercised at all publication failpoints and a 32 MiB + 1 byte regression;
+- the verifier bounds and hashes the on-disk encoded artifact before decompression, uses `maxOutputLength`, validates exact decoded identity and privacy receipts, rejects mixed representations, and retains explicit current-tuple plain v0.1 dispatch;
+- old-policy v0.1 artifacts are intentionally rejected under the checked-in no-backward-compatibility draft contract and must be regenerated;
+- adversarial coverage includes corrupt/truncated gzip, checksum failure, decoded-output bombs and concatenated members, actual on-disk encoded oversize, decoded hash mismatch, unsafe permissions, privacy canaries, content-free CLI failures, crash adoption, and deterministic same-runtime output;
+- a Node 20.0.0/zlib 1.2.13 fixture decodes exactly on Node 26.2.0/zlib 1.3.1 without recompression, proving the semantic/artifact identity split;
+- the full serial repository suite passes 370 tests, while the 151-field telemetry contract remains current and all 9 contract checks pass; and
+- a real local 3 hour 28 minute export produced 5,066 metadata-only records, 5,643,451 decoded canonical bytes, and one 334,815-byte gzip artifact, then passed independent v0.2 verification with `transportReady=false`.
 
-Manifest/receipt v0.2 fields, compressed materializer output, bounded verifier integration, real-history compression measurements, and deletion remain open. No existing artifact is overwritten or removed, and transport remains absent.
+The detailed evidence is recorded in [the compressed export-set verification receipt](./2026-07-24-g1-compressed-export-set-verification-receipt.md). Gate D deletion remains open. No existing artifact was overwritten or removed, and transport remains absent.
 
 ## Explicit non-completion
 

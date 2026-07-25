@@ -1178,6 +1178,9 @@ function buildWorkspaceApi(database, directory, {
         workspaceBytes: await assertDiskBudget(),
       };
     },
+    async storageBytes() {
+      return assertDiskBudget();
+    },
     close() {
       database.close();
     },

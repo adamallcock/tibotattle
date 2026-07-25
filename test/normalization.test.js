@@ -122,10 +122,12 @@ test("CLI options reject missing values with an actionable error", () => {
   const exportSet = parseArgs([
     "export-set", "--workspace", "./workspace", "--directory", "./set", "--resume",
     "--max-records-per-chunk", "1000", "--max-bundle-bytes", "1048576",
+    "--max-artifact-bytes", "1114112",
   ]);
   assert.equal(exportSet.resume, true);
   assert.equal(exportSet.maximumRecordsPerChunk, 1000);
   assert.equal(exportSet.maximumCanonicalBundleBytes, 1048576);
+  assert.equal(exportSet.maximumEncodedArtifactBytes, 1114112);
 });
 
 test("cached history requires a matching rollout-source fingerprint or explicit stale override", () => {

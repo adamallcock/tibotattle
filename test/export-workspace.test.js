@@ -99,6 +99,7 @@ test("workspace persists strict safe records without bypassing checkpoint comple
     assert.deepEqual(initial.recordCounts, { usageEvents: 1, quotaSnapshots: 0, activityMarkers: 0 });
     assert.equal(initial.scanComplete, false);
     assert.ok(initial.workspaceBytes > 0);
+    assert.equal(await workspace.storageBytes(), initial.workspaceBytes);
     workspace.close();
     workspace = null;
 

@@ -6,15 +6,15 @@ import { exportCompatibilityTuple } from "../src/export-contract.js";
 import { exportSchemas } from "../src/export-schema.js";
 import {
   assertValidExportSetManifest,
-  EXPORT_SET_CONTRACT_VERSION,
-  EXPORT_SET_MANIFEST_SCHEMA_SHA256,
-  EXPORT_SET_MANIFEST_VERSION,
+  EXPORT_SET_CONTRACT_VERSION_V0_1,
+  EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1,
+  EXPORT_SET_MANIFEST_VERSION_V0_1,
   EXPORT_SET_ORDER_VERSION,
-  EXPORT_SET_PACKING_VERSION,
+  EXPORT_SET_PACKING_VERSION_V0_1,
   exportSetChunkBasenames,
   exportSetChunkBundleBasename,
   exportSetChunkReceiptBasename,
-  exportSetManifestSchema,
+  exportSetManifestSchemaV0_1,
   validateExportSetManifest,
 } from "../src/export-set-schema.js";
 
@@ -24,10 +24,10 @@ function recordCounts(usageEvents, quotaSnapshots = 0, activityMarkers = 0) {
 
 function manifest() {
   return {
-    schemaVersion: EXPORT_SET_MANIFEST_VERSION,
+    schemaVersion: EXPORT_SET_MANIFEST_VERSION_V0_1,
     manifestContract: {
-      version: EXPORT_SET_CONTRACT_VERSION,
-      schemaSha256: EXPORT_SET_MANIFEST_SCHEMA_SHA256,
+      version: EXPORT_SET_CONTRACT_VERSION_V0_1,
+      schemaSha256: EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1,
     },
     compatibility: exportCompatibilityTuple(),
     exportSetId: `export-set:v1:${"A".repeat(43)}`,
@@ -41,7 +41,7 @@ function manifest() {
     sourcePlan: { sha256: "c".repeat(64), sourceFiles: 2, sourceBytes: 2000 },
     chunking: {
       orderingVersion: EXPORT_SET_ORDER_VERSION,
-      packingVersion: EXPORT_SET_PACKING_VERSION,
+      packingVersion: EXPORT_SET_PACKING_VERSION_V0_1,
       maximumRecordsPerChunk: 2,
       maximumCanonicalBundleBytes: 4096,
     },
@@ -82,13 +82,13 @@ test("standalone strict export-set manifest accepts an exact complete local set"
   const value = manifest();
   assert.deepEqual(validateExportSetManifest(value), { valid: true, errors: [] });
   assert.equal(assertValidExportSetManifest(value), value);
-  assert.equal(exportSetManifestSchema.$id, "https://app-usagemonitor.local/schemas/export-set-v0.1/manifest.schema.json");
+  assert.equal(exportSetManifestSchemaV0_1.$id, "https://app-usagemonitor.local/schemas/export-set-v0.1/manifest.schema.json");
   assert.equal(Object.hasOwn(exportSchemas, "exportSetManifest"), false);
 });
 
 test("manifest contract binds the exact current standalone schema bytes", async () => {
   const bytes = await readFile(new URL("../schemas/export-set-v0.1/manifest.schema.json", import.meta.url));
-  assert.equal(createHash("sha256").update(bytes).digest("hex"), EXPORT_SET_MANIFEST_SCHEMA_SHA256);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1);
   const stale = manifest();
   stale.manifestContract.schemaSha256 = "0".repeat(64);
   const result = validateExportSetManifest(stale);
@@ -146,14 +146,14 @@ test("an empty complete set still has one independently verifiable zero-record c
 });
 
 test("fixed six-digit basenames are derived only from bounded zero-based indices", () => {
-  assert.equal(exportSetChunkBundleBasename(0), "chunk-000000.bundle.json");
+  assert.equal(exportSetChunkBundleBasename(0, EXPORT_SET_MANIFEST_VERSION_V0_1), "chunk-000000.bundle.json");
   assert.equal(exportSetChunkReceiptBasename(511), "chunk-000511.receipt.json");
-  assert.deepEqual(exportSetChunkBasenames(7), {
+  assert.deepEqual(exportSetChunkBasenames(7, EXPORT_SET_MANIFEST_VERSION_V0_1), {
     bundle: "chunk-000007.bundle.json",
     receipt: "chunk-000007.receipt.json",
   });
   for (const invalid of [-1, 1.5, 512, Number.NaN, "1"]) {
-    assert.throws(() => exportSetChunkBundleBasename(invalid), RangeError);
+    assert.throws(() => exportSetChunkBundleBasename(invalid, EXPORT_SET_MANIFEST_VERSION_V0_1), RangeError);
     assert.throws(() => exportSetChunkReceiptBasename(invalid), RangeError);
   }
 });

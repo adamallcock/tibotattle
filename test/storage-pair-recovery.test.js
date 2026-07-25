@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdtemp, open, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { recoverOwnerOnlyPairTransactions, writeOwnerOnlyPairNoClobber } from "../src/storage.js";
@@ -57,6 +58,70 @@ async function assertRecovered(paths) {
   assert.equal((await lstat(paths.receipt)).nlink, 1);
   await assert.rejects(stat(join(paths.directory, ".app-usagemonitor-export-transactions")), { code: "ENOENT" });
 }
+
+async function sha256File(path) {
+  const handle = await open(path, "r");
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let bytes = 0;
+  try {
+    while (true) {
+      const result = await handle.read(buffer, 0, buffer.length, null);
+      if (result.bytesRead === 0) break;
+      hash.update(buffer.subarray(0, result.bytesRead));
+      bytes += result.bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  return { bytes, sha256: hash.digest("hex") };
+}
+
+test("a binary first artifact above the canonical bound publishes and recovers byte-exactly", async () => {
+  const paths = await workspace();
+  const artifactBytes = (32 * 1024 * 1024) + 1;
+  const artifact = Buffer.alloc(artifactBytes, 0xa5);
+  artifact[0] = 0x00;
+  artifact[Math.floor(artifact.length / 2)] = 0xff;
+  artifact[artifact.length - 1] = 0x7f;
+  const expected = {
+    bytes: artifact.length,
+    sha256: createHash("sha256").update(artifact).digest("hex"),
+  };
+  try {
+    await writeOwnerOnlyPairNoClobber({
+      firstPath: paths.bundle,
+      firstContent: artifact,
+      secondPath: paths.receipt,
+      secondContent: "receipt-content\n",
+    });
+    assert.deepEqual(await sha256File(paths.bundle), expected);
+    await unlink(paths.bundle);
+    await unlink(paths.receipt);
+
+    await assert.rejects(
+      writeOwnerOnlyPairNoClobber({
+        firstPath: paths.bundle,
+        firstContent: artifact,
+        secondPath: paths.receipt,
+        secondContent: "receipt-content\n",
+      }, {
+        failpoint(name) {
+          if (name === "after_manifest") throw new Error("simulated-large-binary-crash");
+        },
+      }),
+      /simulated-large-binary-crash/,
+    );
+    assert.deepEqual(
+      await recoverOwnerOnlyPairTransactions({ directory: paths.directory }),
+      { recovered: 1, transactionsFound: 1 },
+    );
+    assert.deepEqual(await sha256File(paths.bundle), expected);
+    assert.equal(await readFile(paths.receipt, "utf8"), "receipt-content\n");
+  } finally {
+    await rm(paths.directory, { recursive: true, force: true });
+  }
+});
 
 for (const point of ["after_manifest_link", "after_manifest", "after_receipt", "after_bundle", "after_manifest_cleanup"]) {
   test(`recovery completes an interrupted receipt-first pair at ${point}`, async () => {
