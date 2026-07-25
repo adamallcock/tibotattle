@@ -859,6 +859,8 @@ The dated [source-checkpoint verification receipt](./2026-07-24-g1-source-checkp
 
 The next local sequence is frozen in the [G1 compression and local export deletion plan](./2026-07-24-g1-compression-deletion-plan.md): deterministic bounded gzip representation and decompression-bomb gates first, then target-specific-confirmation, exact-inventory, crash-recoverable logical deletion. This order prevents the deletion protocol from being designed around a transient plain-chunk format. Deletion will never recurse, require the participant secret, touch source logs or identity/collector state, claim physical-media erasure, or imply cloud deletion.
 
+The complete-set local deletion slice is now implemented and verified. It uses content-free two-step CLI confirmation, existing-only workspace plus destination leases, directory-identity-bound journal/marker controls, monotonic exact inventory, quarantine/revalidation before durable unlink, fixed receipt-only completion checks, and actual multi-boundary `SIGKILL` recovery. The final evidence is in [the G1 local export deletion verification receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md). This does not complete G1: incomplete/poisoned workspace deletion, native secret stores, Claude parity, prospective account-scoped quota evidence, signed clean-machine distribution, local volunteer review, minimization ablation, and pilot-derived ceilings remain open; all network transport and later cloud stages remain disabled.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

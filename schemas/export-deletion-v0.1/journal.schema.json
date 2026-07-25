@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/export-deletion-v0.1/journal.schema.json",
+  "title": "Usage monitor durable local export deletion journal v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "planVersion",
+    "deletionOrderVersion",
+    "exportSetManifestVersion",
+    "directoryIdentities",
+    "state",
+    "planSha256",
+    "inventoryCounts",
+    "inventory",
+    "transportReady"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "usage-export-deletion-journal-v0.1" },
+    "planVersion": { "const": "local-export-deletion-plan-v0.1" },
+    "deletionOrderVersion": { "const": "manifest-bundles-workspace-receipts-v1" },
+    "exportSetManifestVersion": { "enum": ["usage-export-set-manifest-v0.1", "usage-export-set-manifest-v0.2"] },
+    "directoryIdentities": { "$ref": "#/definitions/directoryIdentities" },
+    "state": { "const": "prepared" },
+    "planSha256": { "$ref": "#/definitions/sha256" },
+    "inventoryCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chunkArtifacts", "chunkReceipts", "controlFiles", "workspaceFiles", "totalFiles", "totalBytes"],
+      "properties": {
+        "chunkArtifacts": { "type": "integer", "minimum": 1, "maximum": 512 },
+        "chunkReceipts": { "type": "integer", "minimum": 1, "maximum": 512 },
+        "controlFiles": { "const": 2 },
+        "workspaceFiles": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "totalFiles": { "type": "integer", "minimum": 5, "maximum": 1030 },
+        "totalBytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "inventory": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 1030,
+      "items": { "$ref": "#/definitions/inventoryRow" }
+    },
+    "transportReady": { "const": false }
+  },
+  "definitions": {
+    "directoryIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "inode"],
+      "properties": {
+        "device": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "inode": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "directoryIdentities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "output"],
+      "properties": {
+        "workspace": { "$ref": "#/definitions/directoryIdentity" },
+        "output": { "$ref": "#/definitions/directoryIdentity" }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "inventoryRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ordinal", "role", "chunkIndex", "device", "inode", "fileType", "linkCount", "byteSize", "sha256"],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0, "maximum": 1029 },
+        "role": {
+          "enum": [
+            "set_manifest",
+            "chunk_artifact",
+            "workspace_sqlite_journal",
+            "workspace_sqlite_wal",
+            "workspace_sqlite_shm",
+            "workspace_database",
+            "chunk_receipt",
+            "set_manifest_receipt"
+          ]
+        },
+        "chunkIndex": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 511 },
+            { "type": "null" }
+          ]
+        },
+        "device": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "inode": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "fileType": { "const": "regular_file" },
+        "linkCount": { "const": 1 },
+        "byteSize": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "sha256": { "$ref": "#/definitions/sha256" }
+      }
+    }
+  }
+}

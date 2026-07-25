@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/export-deletion-v0.1/preflight-summary.schema.json",
+  "title": "Usage monitor local export deletion preflight summary v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "planVersion",
+    "artifactClass",
+    "readiness",
+    "fileCounts",
+    "byteCounts",
+    "confirmationRequired",
+    "confirmationToken",
+    "networkActivity",
+    "secureErasureClaimed",
+    "transportReady"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "usage-export-deletion-preflight-v0.1" },
+    "planVersion": { "const": "local-export-deletion-plan-v0.1" },
+    "artifactClass": { "const": "complete_local_export_set" },
+    "readiness": { "enum": ["ready", "not_ready"] },
+    "fileCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chunkArtifacts", "chunkReceipts", "controlFiles", "workspaceFiles", "totalFiles"],
+      "properties": {
+        "chunkArtifacts": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "chunkReceipts": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "controlFiles": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "workspaceFiles": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "totalFiles": { "type": "integer", "minimum": 0, "maximum": 1030 }
+      }
+    },
+    "byteCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exportSetBytes", "workspaceBytes", "totalBytes"],
+      "properties": {
+        "exportSetBytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "workspaceBytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "totalBytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "confirmationRequired": { "const": true },
+    "confirmationToken": {
+      "anyOf": [
+        { "type": "string", "pattern": "^[A-Z2-7]{12,24}$" },
+        { "type": "null" }
+      ]
+    },
+    "networkActivity": { "const": "absent" },
+    "secureErasureClaimed": { "const": false },
+    "transportReady": { "const": false }
+  }
+}

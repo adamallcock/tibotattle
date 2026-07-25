@@ -13,6 +13,8 @@ Complete deterministic, resource-bounded bundle compression before implementing 
 
 Both gates remain local-only. They add no upload, enrollment, server, background process, analytics, or network destination. Compression must never remove a prior artifact. Deletion must never touch Codex or Claude source logs, the participant identity secret, collector history, account registration state, activity markers, reports, or arbitrary neighboring files.
 
+The local trust boundary is the operating-system user account. This command protects against wrong paths/tokens, corrupt or stale artifacts, crashes, interrupted publication, concurrent usage-monitor processes, and replacements visible at its validation boundaries. It does not claim isolation from malicious code already running as the same OS user: such code can directly read, move, replace, or delete the raw logs, identity state, exports, locks, and journal outside this program, and POSIX does not provide a portable conditional “unlink this pathname only if it still has inode X” primitive. The quarantine/revalidation protocol sharply narrows accidental and cooperative races but is not presented as a sandbox against a hostile same-UID process. Stop the command and investigate the host if that threat is suspected.
+
 ## Gate C — canonical compressed representation
 
 ### Representation
@@ -59,7 +61,7 @@ The first deletion implementation supports a complete, independently verified lo
 CLI surface:
 
 - `delete-local-export --workspace PATH --directory PATH` performs a read-only content-free preflight and changes nothing. It returns a short target-specific confirmation token derived from the canonical deletion-plan digest.
-- `delete-local-export --workspace PATH --directory PATH --confirm-deletion TOKEN` starts or resumes deletion only when the token matches the current exact plan.
+- `delete-local-export --workspace PATH --directory PATH --confirm-deletion TOKEN` starts deletion only when the token matches the current exact plan.
 - `recover-local-export-deletion --workspace PATH --directory PATH` resumes an already committed durable deletion journal without a second destructive confirmation.
 
 Preflight reports only artifact class, state, bounded file/byte counts, and whether deletion is ready. It omits paths, filenames, pseudonyms, hashes, source details, and record values. Every path states that network activity is absent and secure SSD erasure is not claimed.
@@ -71,17 +73,17 @@ Deletion does not read or require the participant secret. A participant must sti
 - Export a narrow destination-lease wrapper from the existing storage lock implementation rather than creating a competing lock protocol.
 - Acquire locks in the existing materialization order: workspace lease first, destination lease second. Verify and delete only while both are held.
 - Resolve and reject equal, nested, root, filesystem-root, symlinked, foreign-owned, group/world-writable, or unstable targets and parents before creating a journal.
-- Recover outstanding publication transactions before inventorying a set.
+- Refuse outstanding publication transactions during the non-mutating preflight and require `recover-exports` first. The confirmed path rechecks and recovers pair-transaction controls under the destination lease before rebuilding the exact plan.
 - Bind the workspace descriptor, manifest, export-set identity, source-plan digest, coverage, compatibility, and chunk rows to each other, then independently verify the complete set. Do not require a current participant secret.
 
 ### Exact inventory and journal
 
-- Build a bounded exact inventory from the versioned set manifest and fixed chunk naming rules: compressed bundle artifacts first, then chunk receipts, set manifest, set manifest receipt, and finally the exact workspace database and approved closed SQLite sidecars.
+- Build a bounded exact inventory from the versioned set manifest and fixed chunk naming rules in the monotonic order below: set manifest, compressed bundle artifacts, approved closed SQLite sidecars and database, chunk receipts, then the set-manifest receipt.
 - Refuse unexpected workspace entries. Preserve every unrelated destination sibling. Never use recursive removal, glob deletion, shell expansion, or unresolved environment variables.
 - Bind each inventory row to a fixed role/name plus device, inode, type, link count, byte size, and SHA-256. Cap rows from the manifest chunk ceiling.
 - Write one canonical owner-only `O_EXCL` deletion journal, sync it, publish a no-clobber commit marker, and sync its directory before the first unlink. The journal contains a fixed schema/version and plan digest over the workspace/output directory identities, workspace descriptor, set manifest identity, and exact inventory; it contains no absolute path, participant/export/bundle/session identifier, source path, content, secret, or raw provider identifier.
 - Before the commit marker, recovery may remove abandoned staging but must delete no target. After commit, recovery may only continue exact journal-listed unlinks.
-- Every resumed unlink requires the current file to match the journal evidence exactly. An absent row is already complete; a changed/replaced/linked row stops recovery without deleting the replacement.
+- Every resumed unlink requires the current file to match the journal evidence exactly. Removal first atomically renames the candidate into a deterministic same-directory quarantine name, syncs the directory, re-verifies the quarantined inode/hash/size/link evidence, and only then unlinks it. An absent row is already complete; a changed/replaced/linked row stops recovery without deleting the replacement.
 
 ### Monotonic deletion order
 
@@ -102,7 +104,7 @@ Leave empty owner-only workspace/output directories in the first slice. Director
 3. Process-death recovery passes after journal durability, first and last bundle unlink, first and last receipt unlink, each manifest unlink, first SQLite-sidecar unlink, database unlink, and journal cleanup.
 4. Recovery is idempotent. It never recreates an artifact and never needs source logs.
 5. Symlink, hardlink, replacement, unsafe permission/owner, unexpected workspace entry, journal mutation, manifest mismatch, active lock, and stale-lock takeover cases are explicit and fail closed.
-6. CLI stdout/stderr, journals, and the deletion receipt contain no paths, participant/export/bundle/session IDs, raw hashes, filenames, content canaries, or secrets.
+6. CLI stdout/stderr and the deletion receipt contain no paths, participant/export/bundle/session IDs, hashes, filenames, content canaries, or secrets. The private owner-only journal contains only the integrity hashes and device/inode evidence required for exact recovery; it contains no paths, source/provider identity hashes, pseudonyms, content, or secrets.
 7. Tests prove no recursive deletion path exists and that source logs, identity secret, collector state, activity markers, reports, and foreign siblings remain byte-identical.
 
 ## Implementation order
@@ -131,7 +133,20 @@ Gate C is implemented and locally verified:
 - the full serial repository suite passes 370 tests, while the 151-field telemetry contract remains current and all 9 contract checks pass; and
 - a real local 3 hour 28 minute export produced 5,066 metadata-only records, 5,643,451 decoded canonical bytes, and one 334,815-byte gzip artifact, then passed independent v0.2 verification with `transportReady=false`.
 
-The detailed evidence is recorded in [the compressed export-set verification receipt](./2026-07-24-g1-compressed-export-set-verification-receipt.md). Gate D deletion remains open. No existing artifact was overwritten or removed, and transport remains absent.
+The detailed Gate C evidence is recorded in [the compressed export-set verification receipt](./2026-07-24-g1-compressed-export-set-verification-receipt.md).
+
+The first Gate D complete-set slice is also implemented and locally verified:
+
+- strict preflight, journal, commit-marker, and final-receipt schemas bind a complete independently verified export set to its valid workspace without requiring the participant secret;
+- the CLI is deliberately two-step, uses a target-specific confirmation token, prints only content-free counts/claims, and has a separate committed-journal recovery command;
+- existing-only workspace and destination leases use canonical paths, journal/marker directory identities prevent recovery through renamed replacements, and mistyped recovery paths are non-creating;
+- exact inventory rows use monotonic manifest/bundle/workspace/receipt order and same-directory quarantine, sync, re-verification, and unlink; no recursive removal primitive exists;
+- process-death recovery covers multi-chunk first/last boundaries, a closed SQLite sidecar, database, receipt publication, quarantine, and both control-cleanup stages;
+- stale token, journal mutation, copied receipt over live export, symlink/hardlink/replacement, directory replacement, unsafe state, privacy-canary, and byte-identical protected-state cases fail closed or preserve the protected target as designed;
+- the final focused suite passes 90 tests, the complete serial repository suite passes 406 tests, and the 151-field telemetry contract passes all 9 checks; and
+- the independent destructive-boundary audit found no remaining material issue under the explicitly documented same-OS-user trust boundary.
+
+The detailed evidence is recorded in [the local export deletion verification receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md). No real user artifact was deleted, transport remains absent, and strict authenticated deletion for incomplete/poisoned workspaces remains a separate future slice.
 
 ## Explicit non-completion
 

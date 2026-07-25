@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/export-deletion-v0.1/receipt.schema.json",
+  "title": "Usage monitor privacy-safe local export deletion receipt v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "planVersion",
+    "artifactClass",
+    "state",
+    "logicalRemovalConfirmed",
+    "deletedFileCount",
+    "deletedBytes",
+    "sourceLogsPreserved",
+    "identityStatePreserved",
+    "directoriesRetained",
+    "networkActivity",
+    "secureErasureClaimed",
+    "transportReady"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "usage-export-deletion-receipt-v0.1" },
+    "planVersion": { "const": "local-export-deletion-plan-v0.1" },
+    "artifactClass": { "const": "complete_local_export_set" },
+    "state": { "const": "complete" },
+    "logicalRemovalConfirmed": { "const": true },
+    "deletedFileCount": { "type": "integer", "minimum": 5, "maximum": 1030 },
+    "deletedBytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "sourceLogsPreserved": { "const": true },
+    "identityStatePreserved": { "const": true },
+    "directoriesRetained": { "const": true },
+    "networkActivity": { "const": "absent" },
+    "secureErasureClaimed": { "const": false },
+    "transportReady": { "const": false }
+  }
+}

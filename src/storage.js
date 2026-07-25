@@ -131,7 +131,7 @@ export function stableJson(value) {
   return `${JSON.stringify(sortJsonValue(value), null, 2)}\n`;
 }
 
-async function syncDirectory(path) {
+export async function syncDirectory(path) {
   const handle = await open(path, "r");
   try {
     await handle.sync();
@@ -201,6 +201,82 @@ async function assertOwnerControlledDirectory(path) {
   }
   if (process.platform !== "win32" && (stats.mode & 0o022) !== 0) {
     throw new Error("Export destination must not be group- or world-writable");
+  }
+}
+
+const MAX_OWNER_ONLY_NO_CLOBBER_BYTES = 1024 * 1024;
+
+/**
+ * Durably publish one bounded owner-only file without creating its parent or
+ * replacing any existing directory entry.
+ */
+export async function writeOwnerOnlyNoClobberDurable(path, content, {
+  maximumBytes = MAX_OWNER_ONLY_NO_CLOBBER_BYTES,
+  failpoint = async () => {},
+} = {}) {
+  if (!path) throw new Error("Owner-only publication path is required");
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1
+      || maximumBytes > MAX_OWNER_ONLY_NO_CLOBBER_BYTES) {
+    throw new TypeError("Owner-only publication bound must be at most 1 MiB");
+  }
+  if (typeof failpoint !== "function") throw new TypeError("Owner-only publication failpoint must be a function");
+  let contentBytes;
+  if (typeof content === "string") contentBytes = Buffer.byteLength(content, "utf8");
+  else if (Buffer.isBuffer(content) || content instanceof Uint8Array) contentBytes = content.byteLength;
+  else throw new TypeError("Owner-only publication content must be a string, Buffer, or Uint8Array");
+  if (contentBytes > maximumBytes) throw new Error("Owner-only publication content exceeds its byte bound");
+
+  // Snapshot caller-owned views only after the allocation-free size check.
+  const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+  const requested = resolve(path);
+  const parent = dirname(requested);
+  await assertOwnerControlledDirectory(parent);
+  const canonicalParent = await realpath(parent);
+  const target = join(canonicalParent, basename(requested));
+  let handle = null;
+  let createdIdentity = null;
+  let durable = false;
+  try {
+    handle = await open(
+      target,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const opened = await handle.stat();
+    createdIdentity = { dev: opened.dev, ino: opened.ino };
+    await handle.chmod(0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await failpoint("after_file_sync");
+    const written = await handle.stat();
+    if (!written.isFile() || written.nlink !== 1 || written.size !== contentBytes
+        || (typeof process.getuid === "function" && written.uid !== process.getuid())
+        || (process.platform !== "win32" && (written.mode & 0o077) !== 0)) {
+      throw new Error("Owner-only publication file failed validation");
+    }
+    const published = await lstat(target);
+    if (!published.isFile() || published.isSymbolicLink()
+        || published.dev !== written.dev || published.ino !== written.ino
+        || published.nlink !== written.nlink || published.size !== written.size
+        || (typeof process.getuid === "function" && published.uid !== process.getuid())
+        || (process.platform !== "win32" && (published.mode & 0o077) !== 0)) {
+      throw new Error("Owner-only publication path changed before durability");
+    }
+    await handle.close();
+    handle = null;
+    await syncDirectory(canonicalParent);
+    durable = true;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (!durable && createdIdentity) {
+      const current = await lstatIfExists(target);
+      if (current && current.isFile() && !current.isSymbolicLink()
+          && current.dev === createdIdentity.dev && current.ino === createdIdentity.ino) {
+        await unlink(target);
+        await syncDirectory(canonicalParent);
+      }
+    }
+    throw error;
   }
 }
 
@@ -516,6 +592,16 @@ async function withExportDestinationLock(destinationDirectory, callback, {
   }
 }
 
+export async function withExportDestinationLease(directory, callback, options = {}) {
+  if (!directory) throw new Error("Export destination directory is required");
+  if (typeof callback !== "function") throw new TypeError("Export destination lease callback is required");
+  const target = resolve(directory);
+  await assertOwnerControlledDirectory(target);
+  const canonicalTarget = await realpath(target);
+  const canonicalStats = await lstat(canonicalTarget);
+  return withExportDestinationLock(canonicalTarget, () => callback(canonicalTarget, canonicalStats), options);
+}
+
 async function unlinkSameInode(path, expectedStats) {
   const current = await lstat(path);
   if (!current.isFile() || current.isSymbolicLink()
@@ -651,6 +737,26 @@ export async function writeOwnerOnlyPairNoClobber(pair = {}, options = {}) {
     writeOwnerOnlyPairNoClobberUnlocked(canonicalPair, options), options);
 }
 
+export async function writeOwnerOnlyPairNoClobberUnderLease(pair = {}, options = {}) {
+  if (!pair.firstPath || !pair.secondPath) throw new Error("Bundle and privacy receipt paths are required");
+  const first = resolve(pair.firstPath);
+  const second = resolve(pair.secondPath);
+  const firstDirectory = dirname(first);
+  const secondDirectory = dirname(second);
+  await assertOwnerControlledDirectory(firstDirectory);
+  await assertOwnerControlledDirectory(secondDirectory);
+  const canonicalFirstDirectory = await realpath(firstDirectory);
+  const canonicalSecondDirectory = await realpath(secondDirectory);
+  if (canonicalFirstDirectory !== canonicalSecondDirectory) {
+    throw new Error("Bundle and privacy receipt must share one canonical destination directory");
+  }
+  return writeOwnerOnlyPairNoClobberUnlocked({
+    ...pair,
+    firstPath: join(canonicalFirstDirectory, basename(first)),
+    secondPath: join(canonicalSecondDirectory, basename(second)),
+  }, options);
+}
+
 async function recoverOwnerOnlyPairTransactionsUnlocked({ directory } = {}, {
   linkFile = link,
   failpoint = async () => {},
@@ -749,6 +855,14 @@ export async function recoverOwnerOnlyPairTransactions({ directory } = {}, optio
   const canonicalDirectory = await realpath(destinationDirectory);
   return withExportDestinationLock(canonicalDirectory, () =>
     recoverOwnerOnlyPairTransactionsUnlocked({ directory: canonicalDirectory }, options), options);
+}
+
+export async function recoverOwnerOnlyPairTransactionsUnderLease({ directory } = {}, options = {}) {
+  if (!directory) throw new Error("Export recovery directory is required");
+  const destinationDirectory = resolve(directory);
+  await assertOwnerControlledDirectory(destinationDirectory);
+  const canonicalDirectory = await realpath(destinationDirectory);
+  return recoverOwnerOnlyPairTransactionsUnlocked({ directory: canonicalDirectory }, options);
 }
 
 export async function appendObservation(path, observation) {

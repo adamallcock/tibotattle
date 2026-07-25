@@ -34,6 +34,8 @@ import {
 } from "./export-set-controller.js";
 import { materializeLocalExportSet } from "./export-set-materializer.js";
 import { verifyLocalExportSet } from "./export-set-verifier.js";
+import { planLocalExportDeletion } from "./export-deletion.js";
+import { deleteLocalExport, recoverLocalExportDeletion } from "./export-deletion-executor.js";
 import { readBoundedJsonLines } from "./bounded-jsonl.js";
 import { createExportResourceGuard, DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 import {
@@ -100,6 +102,8 @@ function usage() {
   usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
   usage-monitor inspect-export-workspace --workspace PATH
   usage-monitor verify-export-set --directory PATH
+  usage-monitor delete-local-export --workspace PATH --directory PATH [--confirm-deletion TOKEN]
+  usage-monitor recover-local-export-deletion --workspace PATH --directory PATH
   usage-monitor recover-exports --directory PATH
   usage-monitor rotate-local-identity [--secret-file PATH] [--confirm]
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
@@ -169,6 +173,7 @@ export function parseArgs(argv) {
     receiptFile: null,
     directory: null,
     confirm: false,
+    confirmDeletionToken: null,
     resume: false,
     workspaceDirectory: null,
     maximumRecordsPerChunk: null,
@@ -186,6 +191,7 @@ export function parseArgs(argv) {
     else if (arg === "--allow-stale-cache") result.allowStaleCache = true;
     else if (arg === "--json") result.json = true;
     else if (arg === "--confirm") result.confirm = true;
+    else if (arg === "--confirm-deletion") result.confirmDeletionToken = readOptionValue(argv, index++, arg);
     else if (arg === "--resume") result.resume = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
@@ -444,6 +450,52 @@ async function run() {
     const recovery = await recoverOwnerOnlyPairTransactions({ directory: args.directory });
     console.log(`Local export recovery: ${recovery.recovered} recovered of ${recovery.transactionsFound} transaction(s)`);
     console.log("Upload remains disabled");
+    return;
+  }
+  if (args.command === "delete-local-export") {
+    if (!args.workspaceDirectory || !args.directory) {
+      throw new Error("delete-local-export requires --workspace and --directory");
+    }
+    if (!args.confirmDeletionToken) {
+      const planned = await planLocalExportDeletion({
+        workspaceDirectory: args.workspaceDirectory,
+        outputDirectory: args.directory,
+      });
+      console.log(`Local export deletion preflight: ${planned.readiness}`);
+      console.log(`Artifact class: ${planned.artifactClass}`);
+      console.log(`Files: ${planned.fileCounts.totalFiles}; bytes: ${planned.byteCounts.totalBytes}`);
+      console.log(`Export-set files: ${planned.fileCounts.chunkArtifacts + planned.fileCounts.chunkReceipts + planned.fileCounts.controlFiles}; workspace files: ${planned.fileCounts.workspaceFiles}`);
+      console.log(`Confirmation token: ${planned.confirmationToken}`);
+      console.log("No files changed; rerun with --confirm-deletion TOKEN to delete this exact inventory");
+      console.log("Source logs and local identity state will be preserved");
+      console.log("Network activity: none; secure erasure: not claimed");
+      return;
+    }
+    const receipt = await deleteLocalExport({
+      workspaceDirectory: args.workspaceDirectory,
+      outputDirectory: args.directory,
+      confirmationToken: args.confirmDeletionToken,
+    });
+    console.log("Local export deletion: complete");
+    console.log(`Files deleted: ${receipt.deletedFileCount}; bytes: ${receipt.deletedBytes}`);
+    console.log(`Source logs preserved: ${receipt.sourceLogsPreserved}; local identity state preserved: ${receipt.identityStatePreserved}`);
+    console.log(`Directories retained: ${receipt.directoriesRetained}`);
+    console.log("Network activity: none; secure erasure: not claimed");
+    return;
+  }
+  if (args.command === "recover-local-export-deletion") {
+    if (!args.workspaceDirectory || !args.directory) {
+      throw new Error("recover-local-export-deletion requires --workspace and --directory");
+    }
+    const receipt = await recoverLocalExportDeletion({
+      workspaceDirectory: args.workspaceDirectory,
+      outputDirectory: args.directory,
+    });
+    console.log("Local export deletion recovery: complete");
+    console.log(`Files in committed inventory: ${receipt.deletedFileCount}; bytes: ${receipt.deletedBytes}`);
+    console.log(`Source logs preserved: ${receipt.sourceLogsPreserved}; local identity state preserved: ${receipt.identityStatePreserved}`);
+    console.log(`Directories retained: ${receipt.directoriesRetained}`);
+    console.log("Network activity: none; secure erasure: not claimed");
     return;
   }
   if (args.command === "rotate-local-identity") {

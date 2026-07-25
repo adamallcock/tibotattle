@@ -128,6 +128,15 @@ test("CLI options reject missing values with an actionable error", () => {
   assert.equal(exportSet.maximumRecordsPerChunk, 1000);
   assert.equal(exportSet.maximumCanonicalBundleBytes, 1048576);
   assert.equal(exportSet.maximumEncodedArtifactBytes, 1114112);
+  const deletion = parseArgs([
+    "delete-local-export", "--workspace", "./workspace", "--directory", "./set",
+    "--confirm-deletion", "ABCDEFGHJKLM2345",
+  ]);
+  assert.equal(deletion.confirmDeletionToken, "ABCDEFGHJKLM2345");
+  assert.throws(
+    () => parseArgs(["delete-local-export", "--confirm-deletion"]),
+    /--confirm-deletion requires a value/,
+  );
 });
 
 test("cached history requires a matching rollout-source fingerprint or explicit stale override", () => {

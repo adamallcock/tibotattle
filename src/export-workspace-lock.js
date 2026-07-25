@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { stableJson } from "./storage.js";
 
@@ -80,16 +80,31 @@ async function removeExactLock(path, expected) {
   await unlink(path);
 }
 
-export async function withExportWorkspaceLease(directory, callback) {
+export async function withExportWorkspaceLease(directory, callback, {
+  create = true,
+  normalizePermissions = true,
+} = {}) {
   if (typeof callback !== "function") throw new TypeError("Workspace lease callback is required");
   const target = resolve(directory);
-  await mkdir(target, { recursive: true, mode: 0o700 });
-  const initial = await lstat(target);
+  if (create) await mkdir(target, { recursive: true, mode: 0o700 });
+  let initial;
+  try {
+    initial = await lstat(target);
+  } catch (error) {
+    if (!create && error.code === "ENOENT") fail("invalid");
+    throw error;
+  }
   if (!initial.isDirectory() || initial.isSymbolicLink()
       || (typeof process.getuid === "function" && initial.uid !== process.getuid())) fail("invalid");
-  if (process.platform !== "win32" && (initial.mode & 0o077) !== 0) await chmod(target, 0o700);
-  assertDirectory(await lstat(target));
-  const lockPath = join(target, LOCK_BASENAME);
+  if (process.platform !== "win32" && (initial.mode & 0o077) !== 0) {
+    if (!normalizePermissions) fail("invalid");
+    await chmod(target, 0o700);
+  }
+  const canonicalTarget = await realpath(target);
+  const canonicalStats = await lstat(canonicalTarget);
+  assertDirectory(canonicalStats);
+  if (canonicalStats.dev !== initial.dev || canonicalStats.ino !== initial.ino) fail("race");
+  const lockPath = join(canonicalTarget, LOCK_BASENAME);
   let owned = null;
   for (let attempt = 0; attempt < 10 && !owned; attempt += 1) {
     const token = randomUUID();
@@ -104,7 +119,7 @@ export async function withExportWorkspaceLease(directory, callback) {
       owned = { stats, token };
       await handle.close();
       handle = null;
-      await syncDirectory(target);
+      await syncDirectory(canonicalTarget);
     } catch (error) {
       await handle?.close().catch(() => {});
       if (error.code !== "EEXIST") throw error;
@@ -112,7 +127,7 @@ export async function withExportWorkspaceLease(directory, callback) {
       if (processAlive(existing.value.pid)) fail("contended");
       try {
         await removeExactLock(lockPath, existing.stats);
-        await syncDirectory(target);
+        await syncDirectory(canonicalTarget);
       } catch (cleanupError) {
         if (cleanupError.code !== "ENOENT" && !(cleanupError instanceof ExportWorkspaceLockError)) throw cleanupError;
       }
@@ -120,15 +135,19 @@ export async function withExportWorkspaceLease(directory, callback) {
   }
   if (!owned) fail("race");
   try {
-    return await callback();
+    return await callback(canonicalTarget, canonicalStats);
   } finally {
     try {
       const current = await inspectLock(lockPath);
       if (current.value.token !== owned.token) fail("race");
       await removeExactLock(lockPath, owned.stats);
-      await syncDirectory(target);
+      await syncDirectory(canonicalTarget);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
   }
+}
+
+export async function withExistingExportWorkspaceLease(directory, callback) {
+  return withExportWorkspaceLease(directory, callback, { create: false, normalizePermissions: false });
 }
