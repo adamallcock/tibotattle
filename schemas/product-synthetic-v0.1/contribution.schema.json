@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/product-synthetic-v0.1/contribution.schema.json",
+  "title": "Synthetic consumer contribution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "synthetic",
+    "fixtureId",
+    "timeRange",
+    "quota",
+    "usage",
+    "accounting"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "synthetic-contribution-v0.1" },
+    "synthetic": { "const": true },
+    "fixtureId": { "const": "codex-weekly-demo-v0.1" },
+    "timeRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "const": "2026-07-14T00:00:00.000Z" },
+        "end": { "const": "2026-07-21T00:00:00.000Z" }
+      }
+    },
+    "quota": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["windowMinutes", "usedPercentBefore", "usedPercentAfter", "displayPrecision"],
+      "properties": {
+        "windowMinutes": { "const": 10080 },
+        "usedPercentBefore": { "const": 26 },
+        "usedPercentAfter": { "const": 31 },
+        "displayPrecision": { "const": 0 }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "modelId",
+        "subscriptionSpeed",
+        "apiTierAssumption",
+        "inputUncachedTokens",
+        "inputCachedTokens",
+        "outputTextTokens",
+        "outputReasoningTokens",
+        "providerToolUnits"
+      ],
+      "properties": {
+        "modelId": { "const": "gpt-5.6-sol" },
+        "subscriptionSpeed": { "const": "standard" },
+        "apiTierAssumption": { "const": "standard" },
+        "inputUncachedTokens": { "const": 150000 },
+        "inputCachedTokens": { "const": 900000 },
+        "outputTextTokens": { "const": 28000 },
+        "outputReasoningTokens": { "const": 16000 },
+        "providerToolUnits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["webSearchCalls", "unknownUnits"],
+          "properties": {
+            "webSearchCalls": { "const": 2 },
+            "unknownUnits": { "const": 1 }
+          }
+        }
+      }
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "estimatedApiCostUsd",
+        "pricedEventCoveragePercent",
+        "unknownBillableUnits",
+        "priceBasis"
+      ],
+      "properties": {
+        "estimatedApiCostUsd": { "const": "12.840000" },
+        "pricedEventCoveragePercent": { "const": 100 },
+        "unknownBillableUnits": { "const": 1 },
+        "priceBasis": { "const": "current-api-price-sensitivity" }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@app-usagemonitor/synthetic-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "npm run types:check && npm run typecheck && npm test && npm run deploy:dry",
+    "deploy:dry": "wrangler deploy --dry-run --outdir .wrangler-dry-run",
+    "dev": "wrangler dev --local",
+    "keys:local": "node ./scripts/generate-dev-keys.mjs",
+    "migrate:local": "wrangler d1 migrations apply USAGE_MONITOR_DB --local",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example",
+    "types:check": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --check"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.8",
+    "@types/node": "^26.1.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.114.0"
+  }
+}

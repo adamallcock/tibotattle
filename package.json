@@ -40,7 +40,12 @@
     "contamination": "node ./src/cli.js contamination",
     "tools": "node ./src/cli.js tools",
     "migrate-corrections": "node ./src/cli.js migrate-corrections",
-    "test": "node --test --test-concurrency=1"
+    "test": "node --test --test-concurrency=1 test/*.test.js apps/web/test/*.test.mjs",
+    "product:ui:test": "node --test apps/web/test/*.test.mjs",
+    "product:worker:check": "npm --prefix apps/worker run check",
+    "product:check": "npm run product:ui:test && npm run product:worker:check",
+    "product:dev": "npm --prefix apps/worker run dev",
+    "product:keys:local": "npm --prefix apps/worker run keys:local"
   },
   "dependencies": {
     "@github/keytar": "7.10.6",

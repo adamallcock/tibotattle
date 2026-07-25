@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local development. Generate an RSA-OAEP 2048-bit key
+# pair; never commit either JSON value.
+ENVELOPE_PRIVATE_JWK=
+ENVELOPE_PUBLIC_JWK=

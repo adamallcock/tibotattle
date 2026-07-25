@@ -24,7 +24,10 @@ import {
 
 test("the supported default suite keeps resource evidence serial", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(packageJson.scripts.test, "node --test --test-concurrency=1");
+  assert.equal(
+    packageJson.scripts.test,
+    "node --test --test-concurrency=1 test/*.test.js apps/web/test/*.test.mjs",
+  );
 });
 
 const EXPECTED_OPERATIONS = [

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "synthetic-contribution-v0.1",
+  "synthetic": true,
+  "fixtureId": "codex-weekly-demo-v0.1",
+  "timeRange": {
+    "start": "2026-07-14T00:00:00.000Z",
+    "end": "2026-07-21T00:00:00.000Z"
+  },
+  "quota": {
+    "windowMinutes": 10080,
+    "usedPercentBefore": 26,
+    "usedPercentAfter": 31,
+    "displayPrecision": 0
+  },
+  "usage": {
+    "modelId": "gpt-5.6-sol",
+    "subscriptionSpeed": "standard",
+    "apiTierAssumption": "standard",
+    "inputUncachedTokens": 150000,
+    "inputCachedTokens": 900000,
+    "outputTextTokens": 28000,
+    "outputReasoningTokens": 16000,
+    "providerToolUnits": {
+      "webSearchCalls": 2,
+      "unknownUnits": 1
+    }
+  },
+  "accounting": {
+    "estimatedApiCostUsd": "12.840000",
+    "pricedEventCoveragePercent": 100,
+    "unknownBillableUnits": 1,
+    "priceBasis": "current-api-price-sensitivity"
+  }
+}

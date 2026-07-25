@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "app-usagemonitor-synthetic",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ENVIRONMENT": "synthetic-development"
+  },
+  "d1_databases": [
+    {
+      "binding": "USAGE_MONITOR_DB",
+      "database_name": "app-usagemonitor-synthetic",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "QUARANTINE",
+      "bucket_name": "app-usagemonitor-synthetic-quarantine"
+    }
+  ],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "../web/public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  }
+}

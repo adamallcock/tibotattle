@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/product-synthetic-v0.1/envelope.schema.json",
+  "title": "Synthetic encrypted contribution envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "synthetic",
+    "keyId",
+    "wrappedKey",
+    "iv",
+    "ciphertext"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "synthetic-envelope-v0.1" },
+    "synthetic": { "const": true },
+    "keyId": {
+      "type": "string",
+      "pattern": "^key:[a-zA-Z0-9._-]{1,64}$",
+      "maxLength": 68
+    },
+    "wrappedKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{342}$",
+      "minLength": 342,
+      "maxLength": 342
+    },
+    "iv": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16}$"
+    },
+    "ciphertext": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "minLength": 16,
+      "maxLength": 32768
+    }
+  }
+}

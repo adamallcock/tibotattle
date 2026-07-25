@@ -152,7 +152,13 @@ This is still not G1 completion. Resource-bounded streaming/chunking, Claude par
 
 ## Current execution checkpoint — July 25, 2026
 
-The live branch is privately checkpointed on GitHub and the integrated local-only implementation passes 632 of 632 tests under both Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime. This is a bounded implementation milestone, not a G1 or end-to-end completion claim.
+The prior local-only checkpoint passed 632 of 632 tests under both Node 26.2.0
+and the pinned-candidate Node 24.14.0 runtime. The current accounting and
+synthetic-product source changes deliberately invalidate the retained R7
+source-bound receipts; those receipts require their full exact-runtime
+regeneration workflow at the next R7 release checkpoint. Product checks and the
+focused changed-path suite are green. This is a bounded implementation
+milestone, not a G1 or end-to-end completion claim.
 
 Evidence now established:
 
@@ -164,14 +170,59 @@ Evidence now established:
 - The minimization study machinery and preregistration exist, but the real study remains correctly inconclusive until at least three qualifying prospective reset windows are observed.
 - R7 now has strict content-free synthetic smoke receipts on exact Node 24.14.0 and Node 26.2.0. All ten lifecycle operations and eight independently captured deterministic comparisons pass, but all producer/verifier boundary identifications remain open; the release profile, real heavy-history cases, per-dimension decisions, and policy promotion are still required.
 
-The next parallel execution wave is ordered as follows:
+The current execution wave is ordered as follows:
 
-1. **Primary critical-path lane — R7 measured release ceilings.** The preregistration, strict receipt contract, synthetic lifecycle smoke, exact-inventory cleanup, and direct guard matrix now exist. Next implement the deliberately refused release profile, complete every near-limit and real heavy-history case, measure filesystem high-water and external RSS stops, establish actual producer/verifier value and plus-one behavior, make a retain/lower decision for every dimension, rerun both exact runtimes, and only then promote a versioned release resource policy. Until multi-machine evidence exists, describe the result as a conservative tested heavy-history envelope, not population p95.
-2. **Provider-accounting lane — G2/G6 preparation.** Add a provider-neutral, versioned API-price-equivalent reducer using official effective-dated price evidence and RunCost where its semantics are sufficient. Preserve cache-read, cache-write-duration, input, combined output, context, tier, and unknown-model coverage. Keep subscription Standard/Fast separate from API Standard/Priority/Flex/Batch and leave hosted tool cost unknown unless an exact provider billable unit is observed.
-3. **Small external-dependency lane — Claude quota proof.** After owner OAuth refresh, collect one ordinary authenticated response and verify that independently optional five-hour and seven-day windows produce non-null canonical observations. This retry must not block credential-independent R7 work.
-4. **Packaging lane — unsigned R8 preparation.** After resource inputs settle, pin or bundle the runtime; create a reproducible macOS arm64 artifact; generate checksums, SBOM, license inventory, provenance, and private-material scans; and exercise the full local lifecycle under measured deny-all egress. Signing, notarization, frozen wording approval, clean-machine execution, and volunteer review remain owner/external gates.
+1. **Primary product lane — synthetic consumer vertical slice.** Complete and
+   verify the browser UI, anonymous consent/enrollment/recovery, encrypted fixed
+   fixture submission, D1/R2 lifecycle, participant status/export/deletion, and
+   loopback QA. Keep the Worker unrouted and synthetic-only.
+2. **Provider-accounting lane — bounded OpenAI/Codex accuracy.** Execute the
+   [G2 provider-neutral pricing and accounting plan](./2026-07-25-g2-provider-neutral-pricing-plan.md):
+   preserve exact cached/uncached input, text/reasoning output, API tier,
+   subscription speed, provider-tool evidence, unknown billable units, price
+   provenance, and account-continuity diagnostics.
+3. **R7 and packaging lanes — later release work.** Rebuild the content-free R7
+   evidence after the source checkpoint settles, then resume measured release
+   ceilings and unsigned R8 preparation.
+4. **Claude quota proof — paused by owner direction.** The existing local
+   machinery remains available, but no OAuth refresh or further Claude
+   integration is part of this wave.
 
-No enrollment, upload, cloud bucket, ongoing transmission, notification collection, or public aggregation is authorized by this checkpoint. Those capabilities remain behind G3 through G11 and their named human approvals.
+Only fixed synthetic enrollment and encrypted submission are authorized by
+this checkpoint. Real-log upload, ongoing transmission, notification
+collection, public deployment, and public aggregation remain behind G3 through
+G11 and their named human approvals.
+
+## Consumer-product checkpoint — July 25, 2026
+
+The first consumer-facing product slice is now implemented with one fixed
+synthetic record. It proves the journey and storage lifecycle without accepting
+real logs or authorizing a public deployment.
+
+| Product capability | Current state |
+|---|---|
+| Local metadata extraction and privacy-minimized records | Implemented and tested for the current local contract |
+| Local verification, recovery, deletion, and generated research reports | Implemented as command-line and static-artifact workflows |
+| Consumer local app or interactive web UI | Synthetic-only browser journey implemented |
+| Enrollment, consent, recovery code, and account portal | Synthetic anonymous enrollment/recovery and participant controls implemented |
+| Upload client, encryption envelope, and background sync | Fixed-fixture browser envelope implemented; real-log upload and background sync explicitly disabled |
+| Web server, upload authorization, and private object storage | Local Cloudflare Worker, bearer capabilities, D1, and R2 implemented; no public route |
+| Server validation, quarantine, deduplication, and canonical database | Exact synthetic validation, replay handling, R2 quarantine, and D1 results implemented |
+| Personal participant dashboard and results API | Synthetic status, export, recovery, and deletion implemented |
+| Privacy-safe aggregate website | Designed in Stage 9; not implemented |
+| Notifications and ongoing collection controls | Designed in Stage 10; not implemented |
+| Server-side export, revocation, and deletion | Synthetic participant export, access rotation, and full D1/R2 deletion implemented |
+
+The completed product checkpoint is a narrow end-to-end vertical slice,
+exercised only with synthetic data:
+
+1. a simple local browser UI that invokes the existing safe-record pipeline, explains exactly what will and will not leave the machine, previews the sanitized contribution, and displays the user's local quota-versus-cost charts;
+2. a development-only enrollment and upload service using anonymous credentials, an encrypted versioned envelope, private quarantine storage, replay protection, and explicit status;
+3. a worker that validates, deduplicates, and writes only canonical synthetic metadata;
+4. a private participant page showing contribution status and synthetic personal results; and
+5. complete synthetic export, revocation, and deletion through every store.
+
+This slice does not authorize real volunteer data. Its purpose is to prove that the proposed consumer journey and server architecture work end to end before selecting a public launch stack. Accounting accuracy and the product vertical slice remain separate lanes sharing the same versioned safe-record and analysis contracts.
 
 ## Target architecture
 
