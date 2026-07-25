@@ -5,12 +5,14 @@ import { ExportResourceLimitError } from "./export-resource-policy.js";
 const DEFAULT_MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_HIGH_WATER_MARK = 256 * 1024;
 
-export async function* readBoundedUtf8Lines(path, {
+export async function* readBoundedUtf8LineEntries(path, {
   maximumLineBytes = DEFAULT_MAXIMUM_LINE_BYTES,
   highWaterMark = DEFAULT_HIGH_WATER_MARK,
   resourceGuard = null,
   oversizedIrrelevantNeedles = [],
   maximumTotalBytes = Number.POSITIVE_INFINITY,
+  startByte = 0,
+  startLineOrdinal = 1,
 } = {}) {
   if (!Number.isSafeInteger(maximumLineBytes) || maximumLineBytes < 1) {
     throw new TypeError("maximumLineBytes must be a positive safe integer");
@@ -22,20 +24,30 @@ export async function* readBoundedUtf8Lines(path, {
       && (!Number.isSafeInteger(maximumTotalBytes) || maximumTotalBytes < 0)) {
     throw new TypeError("maximumTotalBytes must be a non-negative safe integer or Infinity");
   }
-  if (maximumTotalBytes === 0) return;
+  if (!Number.isSafeInteger(startByte) || startByte < 0
+      || !Number.isSafeInteger(startLineOrdinal) || startLineOrdinal < 1
+      || (maximumTotalBytes !== Number.POSITIVE_INFINITY && startByte > maximumTotalBytes)) {
+    throw new TypeError("Line cursor must use a valid byte offset and positive line ordinal");
+  }
+  if (maximumTotalBytes === 0 || startByte === maximumTotalBytes) return;
   const callerOwnedHandle = path && typeof path === "object" && Number.isInteger(path.fd);
   const input = createReadStream(callerOwnedHandle ? null : path, {
     highWaterMark,
     autoClose: !callerOwnedHandle,
     ...(callerOwnedHandle ? { fd: path.fd } : {}),
-    ...(maximumTotalBytes === Number.POSITIVE_INFINITY ? {} : { start: 0, end: maximumTotalBytes - 1 }),
+    // Caller-owned descriptors may already have been consumed by a tier
+    // prepass. Always position them explicitly, including at byte zero.
+    ...(callerOwnedHandle || startByte !== 0 ? { start: startByte } : {}),
+    ...(maximumTotalBytes === Number.POSITIVE_INFINITY ? {} : { end: maximumTotalBytes - 1 }),
   });
   let chunks = [];
   let lineBytes = 0;
   let oversized = false;
   let oversizedRelevant = false;
   let searchTail = Buffer.alloc(0);
-  let totalBytes = 0;
+  let absoluteOffset = startByte;
+  let lineStartByte = startByte;
+  let lineOrdinal = startLineOrdinal;
   const needles = oversizedIrrelevantNeedles.map((needle) => {
     if (typeof needle !== "string" || needle.length === 0 || needle.length > 256) {
       throw new TypeError("Oversized-line relevance needles must be bounded strings");
@@ -73,7 +85,10 @@ export async function* readBoundedUtf8Lines(path, {
     chunks.push(segment);
   }
 
-  function completeLine() {
+  function completeLine(endByteExclusive) {
+    const entry = { startByte: lineStartByte, endByteExclusive, lineOrdinal };
+    lineStartByte = endByteExclusive;
+    lineOrdinal += 1;
     if (oversized) {
       if (oversizedRelevant) throw new ExportResourceLimitError("line_bytes");
       resourceGuard?.observeLine(lineBytes, { oversizedIrrelevant: true });
@@ -82,19 +97,18 @@ export async function* readBoundedUtf8Lines(path, {
       oversized = false;
       oversizedRelevant = false;
       searchTail = Buffer.alloc(0);
-      return null;
+      return { ...entry, line: null };
     }
     resourceGuard?.observeLine(lineBytes);
     const line = Buffer.concat(chunks, lineBytes).toString("utf8");
     chunks = [];
     lineBytes = 0;
-    return line.endsWith("\r") ? line.slice(0, -1) : line;
+    return { ...entry, line: line.endsWith("\r") ? line.slice(0, -1) : line };
   }
 
   for await (const chunk of input) {
     resourceGuard?.checkRuntime();
-    totalBytes += chunk.length;
-    if (totalBytes > maximumTotalBytes) {
+    if (absoluteOffset + chunk.length > maximumTotalBytes) {
       input.destroy();
       throw new ExportResourceLimitError("source_bytes");
     }
@@ -102,12 +116,17 @@ export async function* readBoundedUtf8Lines(path, {
     for (let index = 0; index < chunk.length; index += 1) {
       if (chunk[index] !== 0x0a) continue;
       append(chunk.subarray(start, index));
-      yield completeLine();
+      yield completeLine(absoluteOffset + index + 1);
       start = index + 1;
     }
     append(chunk.subarray(start));
+    absoluteOffset += chunk.length;
   }
-  if (lineBytes > 0) yield completeLine();
+  if (lineBytes > 0) yield completeLine(absoluteOffset);
+}
+
+export async function* readBoundedUtf8Lines(path, options = {}) {
+  for await (const entry of readBoundedUtf8LineEntries(path, options)) yield entry.line;
 }
 
 export async function readBoundedJsonLines(path, {

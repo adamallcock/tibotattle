@@ -270,15 +270,23 @@ async function materializeLocalExportSetUnlocked({
     throw new TypeError("maximumCanonicalBundleBytes exceeds the resource policy");
   }
   const output = resolve(outputDirectory);
-  if (await exists(output)) await recoverOwnerOnlyPairTransactions({ directory: output });
   const workspace = await openExportWorkspace({ directory: workspaceDirectory });
+  let resourceGuard = null;
   try {
     if (!workspace.isScanComplete() || workspace.isPoisoned()) fail("workspace_incomplete");
     const descriptor = workspace.getDescriptor();
-    if (descriptor.participantId !== deriveParticipantId(secret)) {
-      fail("workspace_incomplete");
+    if (descriptor.participantId !== deriveParticipantId(secret)) fail("workspace_incomplete");
+    if (maximumRecordsPerChunk > descriptor.resourceLimits.maximumOutputRecords
+        || maximumCanonicalBundleBytes > descriptor.resourceLimits.maximumCanonicalBundleBytes) {
+      throw new TypeError("Materialization limits exceed the workspace resource policy");
     }
-    const resourceGuard = createExportResourceGuard({ scope: "export_set" });
+    if (await exists(output)) await recoverOwnerOnlyPairTransactions({ directory: output });
+    workspace.beginInvocation();
+    resourceGuard = createExportResourceGuard({
+      scope: "export_set",
+      limits: descriptor.resourceLimits,
+      initialUsage: workspace.resourceUsage(),
+    });
     const workspaceStatus = await workspace.status();
     resourceGuard.observeWorkspace(workspaceStatus.workspaceBytes);
     resourceGuard.observeOutputTotals(
@@ -326,6 +334,9 @@ async function materializeLocalExportSetUnlocked({
             maximumBytes: maximumCanonicalBundleBytes,
             resourceGuard,
           });
+      // Enforce the persisted canonical-bundle ceiling before recording or
+      // publishing even the mandatory zero-record chunk.
+      resourceGuard.observeCanonicalBundle(selected.bundleBytes);
       const selectedCount = emptySet && carry.length === 0 ? 0 : selected.count;
       const receipt = verifyPrivacySafeBundle(selected.bundle, { createdAt: descriptor.createdAt });
       const receiptText = stableJson(receipt);
@@ -344,6 +355,7 @@ async function materializeLocalExportSetUnlocked({
         recordCounts: structuredClone(selected.bundle.recordCounts),
       };
       workspace.recordChunk(chunkIndex, "planned", metadata);
+      resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
       await failpoint("after_chunk_plan", chunkIndex);
       await publishChunk({
         outputDirectory: output,
@@ -355,6 +367,7 @@ async function materializeLocalExportSetUnlocked({
         failpoint,
       });
       workspace.recordChunk(chunkIndex, "verified", metadata);
+      resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
       await failpoint("after_chunk_verify", chunkIndex);
       chunks.push({
         index: metadata.index,
@@ -370,7 +383,6 @@ async function materializeLocalExportSetUnlocked({
       addCounts(totals.recordCounts, metadata.recordCounts);
       totals.bundleBytes += metadata.bundleBytes;
       totals.receiptBytes += metadata.receiptBytes;
-      resourceGuard.observeCanonicalBundle(metadata.bundleBytes);
       recordOffset += selectedCount;
       carry = carry.slice(selectedCount);
       carryBytes = carry.reduce((sum, row) => sum + row.recordBytes, 0);
@@ -430,6 +442,7 @@ async function materializeLocalExportSetUnlocked({
       chunkCount: chunks.length,
     };
     workspace.markManifestComplete(manifestMetadata);
+    resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
     return {
       manifest,
       manifestReceipt: receipt,
@@ -438,6 +451,14 @@ async function materializeLocalExportSetUnlocked({
       resourceUsage: resourceGuard.snapshot(),
     };
   } finally {
+    let durableUsage = null;
+    try {
+      durableUsage = resourceGuard?.durableSnapshot() ?? null;
+    } catch {
+      // Preserve the invocation marker when the guard itself cannot produce a
+      // valid terminal snapshot. The next resume will reserve crash time.
+    }
+    if (resourceGuard && durableUsage) workspace.finishInvocation({ resourceUsage: durableUsage });
     workspace.close();
   }
 }

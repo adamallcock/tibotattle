@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readBoundedJsonLines, readBoundedUtf8Lines } from "../src/bounded-jsonl.js";
+import {
+  readBoundedJsonLines,
+  readBoundedUtf8LineEntries,
+  readBoundedUtf8Lines,
+} from "../src/bounded-jsonl.js";
 import {
   ExportResourceLimitError,
   createExportResourceGuard,
@@ -123,6 +127,38 @@ test("bounded JSONL reader caps input bytes and records before exporter allocati
       readBoundedJsonLines(path, { maximumFileBytes: 32, maximumLineBytes: 16, maximumRecords: 1 }),
       (error) => error.code === "export_resource_output_records",
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("positioned bounded lines resume at an exact completed-line boundary", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-positioned-lines-"));
+  try {
+    const path = join(directory, "resume.jsonl");
+    const text = "one\r\ntwo\nthree\nfour";
+    await writeFile(path, text);
+    const complete = [];
+    for await (const entry of readBoundedUtf8LineEntries(path, {
+      maximumLineBytes: 8,
+      highWaterMark: 3,
+      maximumTotalBytes: Buffer.byteLength(text),
+    })) complete.push(entry);
+    assert.deepEqual(complete, [
+      { line: "one", startByte: 0, endByteExclusive: 5, lineOrdinal: 1 },
+      { line: "two", startByte: 5, endByteExclusive: 9, lineOrdinal: 2 },
+      { line: "three", startByte: 9, endByteExclusive: 15, lineOrdinal: 3 },
+      { line: "four", startByte: 15, endByteExclusive: 19, lineOrdinal: 4 },
+    ]);
+    const resumed = [];
+    for await (const entry of readBoundedUtf8LineEntries(path, {
+      maximumLineBytes: 8,
+      highWaterMark: 2,
+      maximumTotalBytes: Buffer.byteLength(text),
+      startByte: complete[1].endByteExclusive,
+      startLineOrdinal: complete[1].lineOrdinal + 1,
+    })) resumed.push(entry);
+    assert.deepEqual(resumed, complete.slice(2));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -26,8 +26,8 @@
     {
       "schemaName": "compatibility.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
-      "schemaSha256": "d00df9ed09c6a5fd52b3162e8b60dacc1c04ab2ece89177f577f5137661f5f99",
-      "propertyCount": 40
+      "schemaSha256": "855e208c666d0db1ef8d57284cab91e2c0356b3eb9958f97513cc38870d65d55",
+      "propertyCount": 42
     },
     {
       "schemaName": "privacy-receipt.schema.json",
@@ -644,6 +644,30 @@
       "schemaName": "compatibility.schema.json",
       "schemaPointer": "/properties/implementation",
       "fieldPath": "implementation",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation/properties/checkpointParserVersion",
+      "fieldPath": "implementation.checkpointParserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/implementation/properties/checkpointScanVersion",
+      "fieldPath": "implementation.checkpointScanVersion",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",

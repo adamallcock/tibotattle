@@ -13,6 +13,10 @@ import { exportCompatibilityTuple } from "./export-contract.js";
 import { recognizedExportLimitId, recognizedExportModelId } from "./export-registries.js";
 import { createExportResourceGuard, ExportResourceLimitError } from "./export-resource-policy.js";
 import { assertValidExportRecord } from "./export-schema.js";
+import {
+  createEmptyCodexCheckpointState,
+  normalizeCodexCheckpointState,
+} from "./export-checkpoint-state.js";
 import { stableJson } from "./storage.js";
 
 const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
@@ -77,7 +81,11 @@ function enumOrUnknown(value, allowed) {
   return typeof value === "string" && allowed.has(value.toLowerCase()) ? value.toLowerCase() : "unknown";
 }
 
-function modelDeclaration(secret, value) {
+/**
+ * Reduce a raw provider model label to the sole representation allowed in an
+ * export or durable parser checkpoint.  Never return the input label.
+ */
+export function safeExportModelDeclaration(secret, value) {
   const recognized = recognizedExportModelId(value);
   if (recognized) return { modelId: recognized, modelRecognition: "recognized", modelFingerprint: null };
   if (typeof value !== "string" || value.length === 0 || value.toLowerCase() === "unknown") {
@@ -90,8 +98,40 @@ function modelDeclaration(secret, value) {
   };
 }
 
-function emptyToolCounts() {
+/** Return a fresh, closed-shape coarse tool-count accumulator. */
+export function createEmptySafeToolClassCounts() {
   return Object.fromEntries(Object.values(TOOL_FIELD).map((field) => [field, 0]));
+}
+
+/**
+ * Map the scanner's already-classified tool category to a reviewed telemetry
+ * field. Unknown and future scanner categories deliberately collapse to the
+ * coarse `unknown` bucket, so raw tool names cannot cross this boundary.
+ */
+export function safeToolCountFieldForScannerToolClass(toolClass) {
+  return typeof toolClass === "string" ? (TOOL_FIELD[toolClass] ?? "unknown") : "unknown";
+}
+
+function normalizeCheckpointModelDeclaration(value) {
+  try {
+    const checkpoint = createEmptyCodexCheckpointState();
+    checkpoint.currentModel = value;
+    return normalizeCodexCheckpointState(checkpoint).currentModel;
+  } catch {
+    // Do not interpolate a rejected value: it may contain raw log content.
+    throw new TypeError("Invalid privacy-safe model declaration");
+  }
+}
+
+function usageModelDeclaration(secret, event) {
+  if (Object.hasOwn(event, "modelDeclaration")) {
+    // Checkpoint-driven callers must not also pass a raw label.  That keeps
+    // the resume boundary unambiguous and avoids retaining a raw canary in an
+    // otherwise safe parser event object.
+    if (Object.hasOwn(event, "model")) throw new TypeError("Invalid privacy-safe model declaration");
+    return normalizeCheckpointModelDeclaration(event.modelDeclaration);
+  }
+  return safeExportModelDeclaration(secret, event.model);
 }
 
 function displayPrecision(value) {
@@ -145,13 +185,13 @@ export function quotaStateIdentitySubject(snapshot) {
   return subject;
 }
 
-export function normalizeCodexUsageEvent(secret, event, toolClassCounts = emptyToolCounts()) {
+export function normalizeCodexUsageEvent(secret, event, toolClassCounts = createEmptySafeToolClassCounts()) {
   if (!event.sourceScopeId) throw new Error("Missing privacy-safe session scope for usage event");
   const usage = {
     schemaVersion: "usage-event-v0.1",
     eventTime: boundedIso(event.timestamp, "usage event timestamp"),
     provider: "openai_codex",
-    ...modelDeclaration(secret, event.model),
+    ...usageModelDeclaration(secret, event),
     billingSurface: event.tierSemantics?.billingSurface ?? "unknown",
     speedMode: event.tierSemantics?.codexSpeedMode ?? "unknown",
     apiServiceTier: event.tierSemantics?.apiServiceTier ?? "unknown",
@@ -309,12 +349,12 @@ export async function scanCodexSafeRecords({
     sourceScopeForRollout: (rawScope) => deriveSessionScopeId(secret, rawScope),
     onToolCall(event) {
       if (!event.sourceScopeId) throw new Error("Missing privacy-safe session scope for tool event");
-      const counts = toolCountsBySession.get(event.sourceScopeId) ?? emptyToolCounts();
-      counts[TOOL_FIELD[event.toolClass] ?? "unknown"] += 1;
+      const counts = toolCountsBySession.get(event.sourceScopeId) ?? createEmptySafeToolClassCounts();
+      counts[safeToolCountFieldForScannerToolClass(event.toolClass)] += 1;
       toolCountsBySession.set(event.sourceScopeId, counts);
     },
     async onUsage(event) {
-      const toolClassCounts = toolCountsBySession.get(event.sourceScopeId) ?? emptyToolCounts();
+      const toolClassCounts = toolCountsBySession.get(event.sourceScopeId) ?? createEmptySafeToolClassCounts();
       toolCountsBySession.delete(event.sourceScopeId);
       await emitSafeRecord(onRecord, resourceGuard, "usageEvent", normalizeCodexUsageEvent(secret, event, toolClassCounts));
     },

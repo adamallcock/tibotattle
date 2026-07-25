@@ -842,6 +842,19 @@ The next local G1-R3 slice is implemented on top of the earlier resource/identit
 
 This still does not complete G1-R3. Resume currently performs deterministic replay from the beginning of every frozen prefix rather than restoring per-source byte/line/parser/tier/cumulative-token/tool/fork checkpoints. Cumulative resource accounting across restarts, disk-backed activity-marker processing, exhaustive set/manifest failpoint matrices, heavy-history and clean-runtime benchmarks, stable checked-in golden hashes, set-specific deletion/recovery, and the final independent audit gate remain open. All later end-to-end requirements—Claude parity, native secret stores, signed distribution, local participant review, consent/enrollment, encrypted ingestion, validation/quarantine, private results, aggregation, publication, ongoing collection, deletion and incident operations—remain active and unchanged.
 
+## Progress update: disk-backed source checkpoints (July 24, 2026)
+
+The next local G1-R3 candidate replaces export-path parser replay with transactional per-source checkpoints:
+
+- exact byte and physical-line cursors, closed model/token/tier/tool parser state, safe tier rows, fork snapshots, open-task HMACs, reviewed diagnostics, safe records, and resource totals commit atomically;
+- source-plan v2 binds fork lineage, tier transition proves the prepass reached EOF, finalization checks every source checkpoint, and source-integrity failures poison or reject resume;
+- copied parent tools are intentionally excluded from child attribution under a compatibility-bound checkpoint scanner version, correcting the legacy double count;
+- durable resource state survives successful resume and real process death, and materialization reuses the persisted policy before any output side effect;
+- exact SQLite schema hashing rejects altered constraints, hidden columns, indexes, triggers, or views; and
+- a literal output golden, parent-driven `SIGKILL` recovery, populated-artifact privacy canaries, 64 MiB task/snapshot heap gates, 327 repository tests, and a successful 151.7 MB create/resume/materialize/verify smoke support the slice.
+
+The dated [source-checkpoint verification receipt](./2026-07-24-g1-source-checkpoint-verification-receipt.md) records exact evidence and limitations. This remains a bounded slice: the current-code full approximately 21.7 GB multi-source gate, broader fresh-process crash matrix, measured heap slope/near-ceiling cases, source-set deletion, compression, native secrets, Claude parity, signed distribution, and local volunteer reviews remain open. No upload or external collection has been enabled.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

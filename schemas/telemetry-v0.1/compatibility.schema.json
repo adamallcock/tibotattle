@@ -45,10 +45,12 @@
     "implementation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["exporterVersion", "resourcePolicyVersion", "packageName", "packageVersion"],
+      "required": ["exporterVersion", "resourcePolicyVersion", "checkpointParserVersion", "checkpointScanVersion", "packageName", "packageVersion"],
       "properties": {
         "exporterVersion": { "const": "0.3.0-draft.3" },
         "resourcePolicyVersion": { "const": "g1-r3-candidate-0.3" },
+        "checkpointParserVersion": { "const": "codex-checkpoint-state-v0.1" },
+        "checkpointScanVersion": { "const": "codex-export-checkpoint-scan-v0.1" },
         "packageName": { "const": "app-usagemonitor" },
         "packageVersion": { "const": "0.0.1" }
       }

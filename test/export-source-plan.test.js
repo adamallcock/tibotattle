@@ -47,7 +47,7 @@ test("source plan freezes only complete lines and allows later appends", async (
     assert.equal(plan.sources.length, 1);
     assert.equal(plan.sources[0].prefixBytes, Buffer.byteLength(value.complete));
     assert.deepEqual(summarizeExportSourcePlan(plan), {
-      schemaVersion: "codex-export-source-plan-v1",
+      schemaVersion: "codex-export-source-plan-v2",
       sourcePlanSha256: plan.sourcePlanSha256,
       sourceFiles: 1,
       sourceBytes: Buffer.byteLength(value.complete),

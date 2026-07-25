@@ -83,7 +83,7 @@ function usageRecord(id = "A", tokens = 10) {
   };
 }
 
-test("workspace persists strict safe records and resumes with exact descriptor", async () => {
+test("workspace persists strict safe records without bypassing checkpoint completion", async () => {
   const value = await fixture();
   let workspace;
   try {
@@ -95,10 +95,9 @@ test("workspace persists strict safe records and resumes with exact descriptor",
     await workspace.insertRecordBatch([{ recordType: "usageEvent", record: usageRecord() }]);
     await workspace.insertRecordBatch([{ recordType: "usageEvent", record: usageRecord() }]);
     workspace.replaceDiagnostics([{ code: "malformed_lines", count: 2 }]);
-    workspace.markScanComplete({ sourceFilesScanned: 1 });
     const initial = await workspace.status();
     assert.deepEqual(initial.recordCounts, { usageEvents: 1, quotaSnapshots: 0, activityMarkers: 0 });
-    assert.equal(initial.scanComplete, true);
+    assert.equal(initial.scanComplete, false);
     assert.ok(initial.workspaceBytes > 0);
     workspace.close();
     workspace = null;
@@ -107,7 +106,7 @@ test("workspace persists strict safe records and resumes with exact descriptor",
     assert.deepEqual(resumed.counts(), { usageEvents: 1, quotaSnapshots: 0, activityMarkers: 0 });
     assert.deepEqual(resumed.diagnostics(), [{ code: "malformed_lines", count: 2 }]);
     assert.deepEqual(resumed.scanDiagnostics(), {
-      sourceFilesScanned: 1,
+      sourceFilesScanned: 0,
       codes: [{ code: "malformed_lines", count: 2 }],
     });
     assert.equal([...resumed.iterateRecords()][0].record.eventId, usageRecord().eventId);

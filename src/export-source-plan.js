@@ -4,7 +4,7 @@ import { open } from "node:fs/promises";
 import { discoverCodexRolloutInfos } from "./codex-log-scan.js";
 import { stableJson } from "./storage.js";
 
-export const EXPORT_SOURCE_PLAN_VERSION = "codex-export-source-plan-v1";
+export const EXPORT_SOURCE_PLAN_VERSION = "codex-export-source-plan-v2";
 
 const SAFE_SOURCE_PLAN_CODES = new Set([
   "source_missing",
@@ -14,6 +14,7 @@ const SAFE_SOURCE_PLAN_CODES = new Set([
   "source_changed",
   "source_prefix",
   "source_duplicate",
+  "source_lineage",
 ]);
 
 export class ExportSourcePlanError extends Error {
@@ -109,17 +110,23 @@ function publicDigestRows(sources) {
     sourceKey: source.sourceKey,
     prefixBytes: source.prefixBytes,
     prefixSha256: source.prefixSha256,
+    parentSourceKey: source.parentSourceKey ?? null,
+    isFork: Boolean(source.isFork),
+    parentMissing: Boolean(source.parentMissing),
   }));
 }
 
 function planDigest(sources) {
   return createHash("sha256")
-    .update("app-usagemonitor/export-source-plan/v1\0")
+    .update("app-usagemonitor/export-source-plan/v2\0")
     .update(stableJson(publicDigestRows(sources)))
     .digest("hex");
 }
 
 export function summarizeExportSourcePlan(plan) {
+  if (!plan || !Array.isArray(plan.sources) || plan.sourcePlanSha256 !== planDigest(plan.sources)) {
+    fail("source_changed");
+  }
   return {
     schemaVersion: EXPORT_SOURCE_PLAN_VERSION,
     sourcePlanSha256: plan.sourcePlanSha256,
@@ -154,6 +161,30 @@ export async function createCodexExportSourcePlan({
       });
     } finally {
       await handle.close();
+    }
+  }
+  const sourceKeyBySessionId = new Map(sources
+    .filter((source) => typeof source.rolloutInfo?.lineage?.sessionId === "string")
+    .map((source) => [source.rolloutInfo.lineage.sessionId, source.sourceKey]));
+  for (const source of sources) {
+    const parentId = source.rolloutInfo?.lineage?.parentId;
+    source.isFork = Boolean(source.rolloutInfo?.lineage?.isFork);
+    source.parentSourceKey = typeof parentId === "string"
+      ? (sourceKeyBySessionId.get(parentId) ?? null)
+      : null;
+    source.parentMissing = source.isFork && source.parentSourceKey === null;
+  }
+  const sourceByKey = new Map(sources.map((source) => [source.sourceKey, source]));
+  for (const source of sources) {
+    const seen = new Set([source.sourceKey]);
+    let cursor = source;
+    let depth = 0;
+    while (cursor.parentSourceKey !== null) {
+      if (seen.has(cursor.parentSourceKey) || depth >= 1_000) fail("source_lineage");
+      seen.add(cursor.parentSourceKey);
+      cursor = sourceByKey.get(cursor.parentSourceKey);
+      if (!cursor) fail("source_lineage");
+      depth += 1;
     }
   }
   const keys = new Set(sources.map((source) => source.sourceKey));

@@ -61,22 +61,22 @@ export function normalizeTokenUsage(value) {
   return normalized;
 }
 
-function tokenComponentPresence(value) {
+export function tokenComponentPresence(value) {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Boolean(value && Object.hasOwn(value, key))]));
 }
 
-function deltaComponentPresence(current, previous) {
+export function deltaComponentPresence(current, previous) {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [
     key,
     current[key] && (previous === null || previous[key]),
   ]));
 }
 
-function subtractUsage(current, previous) {
+export function subtractUsage(current, previous) {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Math.max(0, current[key] - (previous?.[key] ?? 0))]));
 }
 
-function sameUsage(left, right) {
+export function sameUsage(left, right) {
   return COMPONENT_KEYS.every((key) => left[key] === right[key]);
 }
 
@@ -468,7 +468,7 @@ function addToolObservation(target, bySource, serverUnits, observation) {
   }
 }
 
-function cumulativeSnapshotKey(total, last) {
+export function cumulativeSnapshotKey(total, last) {
   if (!total) return null;
   return [...COMPONENT_KEYS.map((key) => total[key]), ...(last ? COMPONENT_KEYS.map((key) => last[key]) : [])].join("|");
 }

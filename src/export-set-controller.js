@@ -1,16 +1,15 @@
 import { exportCompatibilityTuple } from "./export-contract.js";
 import { deriveParticipantId } from "./export-identity.js";
-import { createExportResourceGuard } from "./export-resource-policy.js";
+import { createExportResourceGuard, normalizeExportResourceLimits } from "./export-resource-policy.js";
 import {
-  scanCodexSafeRecords,
+  normalizeActivityMarker,
   normalizeExportBounds,
   summarizeActivityMarkerPlan,
 } from "./export-safe-records.js";
+import { populateCheckpointedCodexSources } from "./codex-export-checkpoint-scan.js";
 import {
   createCodexExportSourcePlan,
-  openVerifiedCodexExportSource,
   resolveCodexExportSourcePlan,
-  verifyCodexExportSourceHandle,
   ExportSourcePlanError,
 } from "./export-source-plan.js";
 import {
@@ -30,52 +29,51 @@ async function populateWorkspace({
   activityMarkers,
   resourceGuard,
   failpoint = async () => {},
+  checkpointLinesPerBatch,
 } = {}) {
-  const batch = [];
-  async function flush() {
-    if (batch.length === 0) return;
-    const records = batch.splice(0, batch.length);
-    await workspace.insertRecordBatch(records);
-    resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
+  await populateCheckpointedCodexSources({
+    workspace,
+    sourcePlan,
+    secret,
+    resourceGuard,
+    failpoint,
+    ...(checkpointLinesPerBatch === undefined ? {} : { maximumLinesPerBatch: checkpointLinesPerBatch }),
+  });
+  const bounds = {
+    startAt: sourcePlan.startAt,
+    endAt: sourcePlan.endAt,
+    startMs: Date.parse(sourcePlan.startAt),
+    endMs: Date.parse(sourcePlan.endAt),
+  };
+  const pendingMarkerIds = new Set();
+  const markerBatch = [];
+  for (const marker of activityMarkers) {
+    const record = normalizeActivityMarker(secret, marker, bounds);
+    if (!record || pendingMarkerIds.has(record.markerId)
+        || workspace.hasRecord("activityMarker", record.markerId)) continue;
+    resourceGuard.observeOutputRecord(Buffer.byteLength(stableJson(record), "utf8"));
+    markerBatch.push({ recordType: "activityMarker", record });
+    pendingMarkerIds.add(record.markerId);
+    if (markerBatch.length >= DEFAULT_EXPORT_WORKSPACE_BATCH_RECORDS) {
+      await workspace.insertRecordBatch(markerBatch.splice(0, markerBatch.length));
+      pendingMarkerIds.clear();
+      await failpoint("after_record_batch");
+    }
+  }
+  if (markerBatch.length > 0) {
+    await workspace.insertRecordBatch(markerBatch);
     await failpoint("after_record_batch");
   }
-  let scan;
-  try {
-    scan = await scanCodexSafeRecords({
-      startAt: sourcePlan.startAt,
-      endAt: sourcePlan.endAt,
-      secret,
-      activityMarkers,
-      resourceGuard,
-      rolloutInfos: sourcePlan.sources.map((source) => source.rolloutInfo),
-      openRolloutSource(info) {
-        const source = sourcePlan.sources[info.sourcePlanOrdinal];
-        return openVerifiedCodexExportSource(source, { resourceGuard });
-      },
-      verifyRolloutSource(info, handle) {
-        const source = sourcePlan.sources[info.sourcePlanOrdinal];
-        return verifyCodexExportSourceHandle(source, handle, { resourceGuard });
-      },
-      async onRecord(envelope) {
-        batch.push(envelope);
-        if (batch.length >= DEFAULT_EXPORT_WORKSPACE_BATCH_RECORDS) await flush();
-      },
-    });
-  } catch (error) {
-    if (error instanceof ExportSourcePlanError) workspace.markPoisoned("source_integrity");
-    throw error;
-  }
-  await flush();
-  workspace.replaceDiagnostics(scan.diagnostics.codes);
   await failpoint("after_diagnostics");
-  workspace.markScanComplete({ sourceFilesScanned: scan.diagnostics.sourceFilesScanned });
+  workspace.finalizeScan();
   await failpoint("after_scan_complete");
   return workspace.status();
 }
 
-function assertResumeDescriptor(descriptor, secret) {
+function assertResumeDescriptor(descriptor, secret, resourceLimits) {
   if (descriptor.participantId !== deriveParticipantId(secret)
-      || stableJson(descriptor.compatibility) !== stableJson(exportCompatibilityTuple())) {
+      || stableJson(descriptor.compatibility) !== stableJson(exportCompatibilityTuple())
+      || stableJson(descriptor.resourceLimits) !== stableJson(resourceLimits)) {
     throw new ExportWorkspaceError("checkpoint_mismatch");
   }
 }
@@ -92,6 +90,7 @@ async function createLocalExportWorkspaceUnlocked({
   resourceClock,
   resourceRss,
   failpoint,
+  checkpointLinesPerBatch,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
   const bounds = normalizeExportBounds(startAt, endAt);
@@ -117,6 +116,7 @@ async function createLocalExportWorkspaceUnlocked({
     compatibility: exportCompatibilityTuple(),
     sourcePlan,
     activityPlan,
+    resourceLimits: resourceGuard.limits,
   });
   const workspace = await createExportWorkspace({
     directory,
@@ -124,7 +124,11 @@ async function createLocalExportWorkspaceUnlocked({
     sourcePlan,
     maximumWorkspaceBytes: resourceGuard.limits.maximumWorkspaceBytes,
   });
+  let invocationBegun = false;
+  let invocationSucceeded = false;
   try {
+    workspace.beginInvocation();
+    invocationBegun = true;
     const status = await populateWorkspace({
       workspace,
       sourcePlan,
@@ -132,10 +136,25 @@ async function createLocalExportWorkspaceUnlocked({
       activityMarkers,
       resourceGuard,
       failpoint,
+      checkpointLinesPerBatch,
     });
+    invocationSucceeded = true;
     return { descriptor, status, resourceUsage: resourceGuard.snapshot() };
   } finally {
-    workspace.close();
+    try {
+      let durableUsage = null;
+      try {
+        durableUsage = resourceGuard.durableSnapshot();
+      } catch {
+        // Preserve the original failure; the stale-invocation reservation
+        // remains the conservative fallback if this process cannot finish.
+      }
+      if (invocationBegun && (durableUsage !== null || invocationSucceeded)) {
+        workspace.finishInvocation({ resourceUsage: durableUsage });
+      }
+    } finally {
+      workspace.close();
+    }
   }
 }
 
@@ -148,25 +167,40 @@ async function resumeLocalExportWorkspaceUnlocked({
   resourceClock,
   resourceRss,
   failpoint,
+  checkpointLinesPerBatch,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
-  const resourceGuard = createExportResourceGuard({
-    limits: resourceLimits,
-    scope: "export_set",
-    ...(resourceClock ? { clock: resourceClock } : {}),
-    ...(resourceRss ? { rss: resourceRss } : {}),
-  });
+  const normalizedLimits = normalizeExportResourceLimits(resourceLimits);
   const workspace = await openExportWorkspace({
     directory,
-    maximumWorkspaceBytes: resourceGuard.limits.maximumWorkspaceBytes,
+    maximumWorkspaceBytes: normalizedLimits.maximumWorkspaceBytes,
   });
+  let invocationBegun = false;
+  let resourceGuard = null;
+  let invocationSucceeded = false;
   try {
     const descriptor = workspace.getDescriptor();
-    assertResumeDescriptor(descriptor, secret);
+    assertResumeDescriptor(descriptor, secret, normalizedLimits);
     if (workspace.isPoisoned()) throw new ExportWorkspaceError("checkpoint_mismatch");
+    workspace.beginInvocation();
+    invocationBegun = true;
+    resourceGuard = createExportResourceGuard({
+      limits: normalizedLimits,
+      scope: "export_set",
+      initialUsage: workspace.resourceUsage(),
+      ...(resourceClock ? { clock: resourceClock } : {}),
+      ...(resourceRss ? { rss: resourceRss } : {}),
+    });
     const storedPlan = workspace.loadSourcePlan();
     resourceGuard.assertCoveredInterval(Date.parse(storedPlan.startAt), Date.parse(storedPlan.endAt));
-    const sourcePlan = await resolveCodexExportSourcePlan(storedPlan, { codexHome, resourceGuard });
+    let sourcePlan;
+    try {
+      sourcePlan = await resolveCodexExportSourcePlan(storedPlan, { codexHome, resourceGuard });
+    } catch (error) {
+      if (error instanceof ExportSourcePlanError) workspace.markPoisoned("source_integrity");
+      throw error;
+    }
+    workspace.rebindSourcePaths(sourcePlan);
     const activityPlan = summarizeActivityMarkerPlan(secret, activityMarkers, {
       startAt: storedPlan.startAt,
       endAt: storedPlan.endAt,
@@ -179,6 +213,7 @@ async function resumeLocalExportWorkspaceUnlocked({
     for (const source of sourcePlan.sources) source.rolloutInfo.sourcePlanOrdinal = source.ordinal;
     if (workspace.isScanComplete()) {
       resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
+      invocationSucceeded = true;
       return { descriptor, status: await workspace.status(), resourceUsage: resourceGuard.snapshot() };
     }
     const status = await populateWorkspace({
@@ -188,10 +223,24 @@ async function resumeLocalExportWorkspaceUnlocked({
       activityMarkers,
       resourceGuard,
       failpoint,
+      checkpointLinesPerBatch,
     });
+    invocationSucceeded = true;
     return { descriptor, status, resourceUsage: resourceGuard.snapshot() };
   } finally {
-    workspace.close();
+    try {
+      let durableUsage = null;
+      try {
+        durableUsage = resourceGuard?.durableSnapshot() ?? null;
+      } catch {
+        // Preserve the original failure; recovery will charge a reservation.
+      }
+      if (invocationBegun && (durableUsage !== null || invocationSucceeded)) {
+        workspace.finishInvocation({ resourceUsage: durableUsage });
+      }
+    } finally {
+      workspace.close();
+    }
   }
 }
 

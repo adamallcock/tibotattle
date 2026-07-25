@@ -50,6 +50,80 @@ function boundedInteger(value, name, { allowZero = false } = {}) {
   return value;
 }
 
+const DURABLE_USAGE_KEYS = Object.freeze([
+  "policyVersion",
+  "sourceFiles",
+  "sourceBytes",
+  "directoryEntries",
+  "lines",
+  "oversizedIrrelevantLines",
+  "outputRecords",
+  "expandedRecordBytes",
+  "cumulativeElapsedMs",
+  "peakRssBytes",
+  "workspaceHighWaterBytes",
+  "recoveryReservations",
+]);
+
+function exactKeys(value, keys) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function outputLimitsForScope(limits, scope) {
+  return scope === "export_set"
+    ? {
+      maximumRecords: limits.maximumExportSetRecords,
+      maximumBytes: limits.maximumExportSetExpandedRecordBytes,
+    }
+    : {
+      maximumRecords: limits.maximumOutputRecords,
+      maximumBytes: limits.maximumExpandedRecordBytes,
+    };
+}
+
+/**
+ * Validate the compact, privacy-safe resource state persisted by an export
+ * workspace.  This deliberately has the same shape as workspace.resourceUsage().
+ * Stable selection gauges, additive work totals, and high-water values remain
+ * distinct so a resumed run cannot make previous work disappear.
+ */
+function normalizeInitialUsage(value, limits, scope) {
+  if (value === undefined || value === null) {
+    return Object.fromEntries(DURABLE_USAGE_KEYS.map((key) => [
+      key,
+      key === "policyVersion" ? EXPORT_RESOURCE_POLICY_VERSION : 0,
+    ]));
+  }
+  if (!exactKeys(value, DURABLE_USAGE_KEYS)) {
+    throw new TypeError("Initial export resource usage must have the exact durable usage shape");
+  }
+  if (value.policyVersion !== EXPORT_RESOURCE_POLICY_VERSION) {
+    throw new TypeError("Initial export resource usage policy version does not match");
+  }
+  const normalized = { policyVersion: EXPORT_RESOURCE_POLICY_VERSION };
+  for (const key of DURABLE_USAGE_KEYS) {
+    if (key === "policyVersion") continue;
+    normalized[key] = boundedInteger(value[key], `initial usage ${key}`, { allowZero: true });
+  }
+  if (normalized.oversizedIrrelevantLines > normalized.lines) {
+    throw new TypeError("Initial oversized irrelevant line count cannot exceed line count");
+  }
+  const { maximumRecords, maximumBytes } = outputLimitsForScope(limits, scope);
+  if (normalized.sourceFiles > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
+  if (normalized.sourceBytes > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
+  if (normalized.directoryEntries > limits.maximumDirectoryEntries) throw new ExportResourceLimitError("source_files");
+  if (normalized.outputRecords > maximumRecords) throw new ExportResourceLimitError("output_records");
+  if (normalized.expandedRecordBytes > maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
+  if (normalized.cumulativeElapsedMs > limits.maximumElapsedMs) throw new ExportResourceLimitError("elapsed_time");
+  if (normalized.peakRssBytes > limits.maximumRssBytes) throw new ExportResourceLimitError("rss");
+  if (normalized.workspaceHighWaterBytes > limits.maximumWorkspaceBytes) {
+    throw new ExportResourceLimitError("workspace_bytes");
+  }
+  return normalized;
+}
+
 export function normalizeExportResourceLimits(overrides = {}) {
   if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
     throw new TypeError("Export resource limits must be an object");
@@ -71,6 +145,7 @@ export function createExportResourceGuard({
   clock = () => Date.now(),
   rss = () => process.memoryUsage().rss,
   scope = "single_bundle",
+  initialUsage = undefined,
 } = {}) {
   if (scope !== "single_bundle" && scope !== "export_set") {
     throw new TypeError("Export resource scope must be single_bundle or export_set");
@@ -78,28 +153,46 @@ export function createExportResourceGuard({
   const limits = normalizeExportResourceLimits(limitOverrides);
   const startedAtMs = clock();
   if (!Number.isFinite(startedAtMs)) throw new TypeError("Export resource clock must return a finite timestamp");
+  const initial = normalizeInitialUsage(initialUsage, limits, scope);
+  const outputLimits = outputLimitsForScope(limits, scope);
   const counters = {
-    sourceFiles: 0,
-    sourceBytes: 0,
-    directoryEntries: 0,
-    lines: 0,
-    oversizedIrrelevantLines: 0,
-    outputRecords: 0,
-    expandedRecordBytes: 0,
+    sourceFiles: initial.sourceFiles,
+    sourceBytes: initial.sourceBytes,
+    directoryEntries: initial.directoryEntries,
+    lines: initial.lines,
+    oversizedIrrelevantLines: initial.oversizedIrrelevantLines,
+    outputRecords: initial.outputRecords,
+    expandedRecordBytes: initial.expandedRecordBytes,
     canonicalBundleBytes: 0,
-    workspaceBytes: 0,
+    workspaceBytes: initial.workspaceHighWaterBytes,
     manifestBytes: 0,
   };
+  let peakRssBytes = initial.peakRssBytes;
+  let workspaceHighWaterBytes = initial.workspaceHighWaterBytes;
+  let recoveryReservations = initial.recoveryReservations;
+  // A supplied durable snapshot means the selection was already frozen.  A
+  // subsequent source plan must match it exactly rather than being added again.
+  let sourcePlanObserved = initialUsage !== undefined && initialUsage !== null;
+
+  function activeElapsedMs() {
+    const elapsed = clock() - startedAtMs;
+    if (!Number.isFinite(elapsed) || elapsed < 0) throw new ExportResourceLimitError("elapsed_time");
+    return Math.ceil(elapsed);
+  }
+
+  function cumulativeElapsedMs() {
+    return initial.cumulativeElapsedMs + activeElapsedMs();
+  }
 
   function checkRuntime() {
-    const elapsed = clock() - startedAtMs;
-    if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > limits.maximumElapsedMs) {
+    if (cumulativeElapsedMs() > limits.maximumElapsedMs) {
       throw new ExportResourceLimitError("elapsed_time");
     }
     const currentRss = rss();
     if (!Number.isFinite(currentRss) || currentRss < 0 || currentRss > limits.maximumRssBytes) {
       throw new ExportResourceLimitError("rss");
     }
+    peakRssBytes = Math.max(peakRssBytes, Math.ceil(currentRss));
   }
 
   return {
@@ -116,8 +209,12 @@ export function createExportResourceGuard({
     observeSourcePlan(fileCount, byteCount) {
       boundedInteger(fileCount, "source file count", { allowZero: true });
       boundedInteger(byteCount, "source byte count", { allowZero: true });
+      if (sourcePlanObserved && (fileCount !== counters.sourceFiles || byteCount !== counters.sourceBytes)) {
+        throw new TypeError("Export source plan does not match the durable selection totals");
+      }
       counters.sourceFiles = fileCount;
       counters.sourceBytes = byteCount;
+      sourcePlanObserved = true;
       if (fileCount > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
       if (byteCount > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
       checkRuntime();
@@ -131,6 +228,13 @@ export function createExportResourceGuard({
     },
     observeSourceFile(byteCount) {
       boundedInteger(byteCount, "source file byte count", { allowZero: true });
+      // Source discovery is a transient pass.  Once a workspace has a frozen
+      // selection, re-discovery verifies that selection but must not consume it
+      // a second time on every restart.
+      if (sourcePlanObserved) {
+        checkRuntime();
+        return;
+      }
       counters.sourceFiles += 1;
       counters.sourceBytes += byteCount;
       if (counters.sourceFiles > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
@@ -150,16 +254,10 @@ export function createExportResourceGuard({
       boundedInteger(byteCount, "record byte count", { allowZero: true });
       counters.outputRecords += 1;
       counters.expandedRecordBytes += byteCount;
-      const maximumRecords = scope === "export_set"
-        ? limits.maximumExportSetRecords
-        : limits.maximumOutputRecords;
-      const maximumBytes = scope === "export_set"
-        ? limits.maximumExportSetExpandedRecordBytes
-        : limits.maximumExpandedRecordBytes;
-      if (counters.outputRecords > maximumRecords) {
+      if (counters.outputRecords > outputLimits.maximumRecords) {
         throw new ExportResourceLimitError("output_records");
       }
-      if (counters.expandedRecordBytes > maximumBytes) {
+      if (counters.expandedRecordBytes > outputLimits.maximumBytes) {
         throw new ExportResourceLimitError("expanded_record_bytes");
       }
       checkRuntime();
@@ -167,16 +265,13 @@ export function createExportResourceGuard({
     observeOutputTotals(recordCount, byteCount) {
       boundedInteger(recordCount, "record count", { allowZero: true });
       boundedInteger(byteCount, "record byte count", { allowZero: true });
+      if (recordCount < initial.outputRecords || byteCount < initial.expandedRecordBytes) {
+        throw new TypeError("Durable output totals cannot decrease on resume");
+      }
       counters.outputRecords = recordCount;
       counters.expandedRecordBytes = byteCount;
-      const maximumRecords = scope === "export_set"
-        ? limits.maximumExportSetRecords
-        : limits.maximumOutputRecords;
-      const maximumBytes = scope === "export_set"
-        ? limits.maximumExportSetExpandedRecordBytes
-        : limits.maximumExpandedRecordBytes;
-      if (recordCount > maximumRecords) throw new ExportResourceLimitError("output_records");
-      if (byteCount > maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
+      if (recordCount > outputLimits.maximumRecords) throw new ExportResourceLimitError("output_records");
+      if (byteCount > outputLimits.maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
       checkRuntime();
     },
     observeCanonicalBundle(byteCount) {
@@ -189,8 +284,17 @@ export function createExportResourceGuard({
     },
     observeWorkspace(byteCount) {
       boundedInteger(byteCount, "workspace byte count", { allowZero: true });
-      counters.workspaceBytes = byteCount;
-      if (byteCount > limits.maximumWorkspaceBytes) throw new ExportResourceLimitError("workspace_bytes");
+      workspaceHighWaterBytes = Math.max(workspaceHighWaterBytes, byteCount);
+      counters.workspaceBytes = workspaceHighWaterBytes;
+      if (workspaceHighWaterBytes > limits.maximumWorkspaceBytes) throw new ExportResourceLimitError("workspace_bytes");
+      checkRuntime();
+    },
+    reserveRecovery(count = 1) {
+      boundedInteger(count, "recovery reservation count", { allowZero: true });
+      if (recoveryReservations > Number.MAX_SAFE_INTEGER - count) {
+        throw new TypeError("Recovery reservation count exceeds safe integer range");
+      }
+      recoveryReservations += count;
       checkRuntime();
     },
     observeManifest(byteCount) {
@@ -205,14 +309,42 @@ export function createExportResourceGuard({
       checkRuntime();
     },
     checkRuntime,
-    snapshot() {
+    /**
+     * Return the exact durable state for workspace.resourceUsage().  Source
+     * gauges are fixed selection totals; directory/line/output/elapsed and
+     * recovery values are cumulative; RSS and workspace values are high-water
+     * maxima.  It is intentionally an absolute snapshot, never an ambiguous
+     * mixture of deltas and totals.
+     */
+    durableSnapshot() {
       checkRuntime();
+      return {
+        policyVersion: EXPORT_RESOURCE_POLICY_VERSION,
+        sourceFiles: counters.sourceFiles,
+        sourceBytes: counters.sourceBytes,
+        directoryEntries: counters.directoryEntries,
+        lines: counters.lines,
+        oversizedIrrelevantLines: counters.oversizedIrrelevantLines,
+        outputRecords: counters.outputRecords,
+        expandedRecordBytes: counters.expandedRecordBytes,
+        cumulativeElapsedMs: cumulativeElapsedMs(),
+        peakRssBytes,
+        workspaceHighWaterBytes,
+        recoveryReservations,
+      };
+    },
+    snapshot() {
+      const durable = this.durableSnapshot();
       return {
         policyVersion: EXPORT_RESOURCE_POLICY_VERSION,
         scope,
         limits: { ...limits },
         counters: { ...counters },
-        elapsedMs: clock() - startedAtMs,
+        // Preserve the original public meaning: active time in this process.
+        elapsedMs: activeElapsedMs(),
+        cumulativeElapsedMs: durable.cumulativeElapsedMs,
+        peakRssBytes: durable.peakRssBytes,
+        workspaceHighWaterBytes: durable.workspaceHighWaterBytes,
       };
     },
   };
