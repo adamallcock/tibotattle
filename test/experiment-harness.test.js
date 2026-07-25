@@ -42,8 +42,11 @@ function manifest(overrides = {}) {
       inputUncachedTokens: 1000,
       inputCacheReadTokens: 0,
       inputCacheWriteTokens: 0,
+      inputCacheWrite5mTokens: null,
+      inputCacheWrite1hTokens: null,
       outputTextTokens: 10,
       outputReasoningTokens: 10,
+      outputCombinedTokens: null,
     },
     budgets: {
       maximumTurns: 1,

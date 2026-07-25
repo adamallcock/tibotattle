@@ -19,6 +19,10 @@ export const EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES = Object.freeze({
     service: "app-usagemonitor.account-observation.v1",
     account: "installation",
   }),
+  claudeSessionPseudonym: Object.freeze({
+    service: "app-usagemonitor.claude-session-pseudonym.v1",
+    account: "installation",
+  }),
 });
 
 const ERROR_CODES = new Set([
@@ -115,6 +119,9 @@ function capabilityPair(capability) {
   if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation) {
     return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
   }
+  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym) {
+    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
+  }
   fail("invalid_capability");
 }
 
@@ -126,7 +133,10 @@ function copySecret(secret) {
 function decodeStoredSecret(value, errorCode = "stored_value_invalid") {
   if (typeof value !== "string" || !STORED_SECRET_PATTERN.test(value)) fail(errorCode);
   const decoded = Buffer.from(value, "base64url");
-  if (decoded.byteLength !== SECRET_BYTES || decoded.toString("base64url") !== value) fail(errorCode);
+  if (decoded.byteLength !== SECRET_BYTES || decoded.toString("base64url") !== value) {
+    decoded.fill(0);
+    fail(errorCode);
+  }
   return decoded;
 }
 
@@ -219,42 +229,78 @@ export function createExportIdentityKeychainBackend(options = {}) {
   }
 
   async function read(capability) {
-    const secret = await readInternal(capability);
-    return secret === null ? null : Buffer.from(secret);
+    let secret = null;
+    try {
+      secret = await readInternal(capability);
+      return secret === null ? null : Buffer.from(secret);
+    } finally {
+      secret?.fill(0);
+    }
   }
 
   async function createIfMissing(capability, generatedSecret) {
     const pair = capabilityPair(capability);
-    const generated = copySecret(generatedSecret);
-    if (await readInternal(capability) !== null) return "existing";
-    await invoke("setPassword", pair.service, pair.account, generated.toString("base64url"));
-    const readback = await readInternal(capability, "readback_mismatch");
-    if (readback === null || !sameSecret(readback, generated)) fail("readback_mismatch");
-    return "created";
+    let generated = null;
+    let existing = null;
+    let readback = null;
+    try {
+      generated = copySecret(generatedSecret);
+      existing = await readInternal(capability);
+      if (existing !== null) return "existing";
+      await invoke("setPassword", pair.service, pair.account, generated.toString("base64url"));
+      readback = await readInternal(capability, "readback_mismatch");
+      if (readback === null || !sameSecret(readback, generated)) fail("readback_mismatch");
+      return "created";
+    } finally {
+      generated?.fill(0);
+      existing?.fill(0);
+      readback?.fill(0);
+    }
   }
 
   async function replaceExact(capability, expectedSecret, replacementSecret) {
     const pair = capabilityPair(capability);
-    const expected = copySecret(expectedSecret);
-    const replacement = copySecret(replacementSecret);
-    const current = await readInternal(capability);
-    if (current === null) return "missing";
-    if (!sameSecret(current, expected)) return "conflict";
-    await invoke("setPassword", pair.service, pair.account, replacement.toString("base64url"));
-    const readback = await readInternal(capability, "readback_mismatch");
-    if (readback === null || !sameSecret(readback, replacement)) fail("readback_mismatch");
-    return "replaced";
+    let expected = null;
+    let replacement = null;
+    let current = null;
+    let readback = null;
+    try {
+      expected = copySecret(expectedSecret);
+      replacement = copySecret(replacementSecret);
+      current = await readInternal(capability);
+      if (current === null) return "missing";
+      if (!sameSecret(current, expected)) return "conflict";
+      await invoke("setPassword", pair.service, pair.account, replacement.toString("base64url"));
+      readback = await readInternal(capability, "readback_mismatch");
+      if (readback === null || !sameSecret(readback, replacement)) fail("readback_mismatch");
+      return "replaced";
+    } finally {
+      expected?.fill(0);
+      replacement?.fill(0);
+      current?.fill(0);
+      readback?.fill(0);
+    }
   }
 
   async function deleteExact(capability, expectedSecret) {
     const pair = capabilityPair(capability);
-    const expected = copySecret(expectedSecret);
-    const current = await readInternal(capability);
-    if (current === null) return "missing";
-    if (!sameSecret(current, expected)) return "conflict";
-    await invoke("deletePassword", pair.service, pair.account);
-    if (await readInternal(capability, "readback_mismatch") !== null) fail("readback_mismatch");
-    return "deleted";
+    let expected = null;
+    let current = null;
+    let readback = null;
+    try {
+      expected = copySecret(expectedSecret);
+      current = await readInternal(capability);
+      if (current === null) return "missing";
+      if (!sameSecret(current, expected)) return "conflict";
+      await invoke("deletePassword", pair.service, pair.account);
+      readback = await readInternal(capability, "readback_mismatch");
+      if (readback !== null) fail("readback_mismatch");
+      return "deleted";
+    } finally {
+      expected?.fill(0);
+      current?.fill(0);
+      readback?.fill(0);
+    }
   }
 
   return Object.freeze({ read, createIfMissing, replaceExact, deleteExact, describe });

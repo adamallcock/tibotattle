@@ -26,8 +26,8 @@
     {
       "schemaName": "compatibility.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
-      "schemaSha256": "2502280dd711db282b44db0f7767f0ac4440cda1c2d9a943910c40c482e02692",
-      "propertyCount": 61
+      "schemaSha256": "12f9a1633899bf4bc3c2d58a6ba034766556bde14d04e4bdbe156e76c56d9649",
+      "propertyCount": 66
     },
     {
       "schemaName": "privacy-receipt.schema.json",
@@ -44,8 +44,8 @@
     {
       "schemaName": "usage-event.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
-      "schemaSha256": "a9fe4513b91878dab74cb6d4ba7b41f02fc3d685c7b7d3de28a6b29012b00d81",
-      "propertyCount": 37
+      "schemaSha256": "95bea7c449cc21878837b6ad6411b0fbe0b50c8ce85839540c42c308364e4d00",
+      "propertyCount": 40
     }
   ],
   "resolvedReferences": [
@@ -848,6 +848,66 @@
       "schemaName": "compatibility.schema.json",
       "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/status",
       "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.status",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.transcript",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/adapterVersion",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.transcript.adapterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/parserVersion",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.transcript.parserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/sourceFormat",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.transcript.sourceFormat",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/status",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.transcript.status",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -1693,7 +1753,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "heuristic",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Nested agents may not emit independently attributable usage records."
     },
     {
@@ -1717,7 +1777,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Local source location may not reveal the provider's ultimate billing route."
     },
     {
@@ -1729,8 +1789,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Provider token taxonomies differ, missing components remain null, and no Claude usage exporter exists yet."
+      "claudeProvenance": "observed",
+      "limitation": "Provider token taxonomies differ; Claude reports combined output without a visible-versus-reasoning split and may omit a trustworthy cache-duration split, while missing components remain null."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1741,8 +1801,32 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Cache semantics, duration, and billing multipliers differ by provider."
+    },
+    {
+      "schemaName": "usage-event.schema.json",
+      "schemaPointer": "/properties/components/properties/inputCacheWrite1hTokens",
+      "fieldPath": "components.inputCacheWrite1hTokens",
+      "purpose": "Preserves Claude cache-creation input charged at the provider one-hour write rate.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "observed",
+      "limitation": "Null means the source did not provide a trustworthy split; it must not be priced as zero."
+    },
+    {
+      "schemaName": "usage-event.schema.json",
+      "schemaPointer": "/properties/components/properties/inputCacheWrite5mTokens",
+      "fieldPath": "components.inputCacheWrite5mTokens",
+      "purpose": "Preserves Claude cache-creation input charged at the provider five-minute write rate.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "observed",
+      "limitation": "Null means the source did not provide a trustworthy split; it must not be priced as zero."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1753,8 +1837,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Current Codex export can preserve an observed cache-write component when present, but historical absence remains null; Claude usage-event export is not implemented."
+      "claudeProvenance": "observed",
+      "limitation": "Codex and Claude preserve an observed cache-write component when present; historical absence remains null."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1765,8 +1849,20 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Codex uncached input is derived by subtraction; missing or internally inconsistent source components produce null."
+      "claudeProvenance": "observed",
+      "limitation": "Codex uncached input is derived by subtraction; Claude input_tokens is preserved directly and is not reduced by cache components."
+    },
+    {
+      "schemaName": "usage-event.schema.json",
+      "schemaPointer": "/properties/components/properties/outputCombinedTokens",
+      "fieldPath": "components.outputCombinedTokens",
+      "purpose": "Preserves provider-reported output when visible text and hidden reasoning cannot be separated.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "observed",
+      "limitation": "Combined output must not be interpreted as either visible text or hidden reasoning alone."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1778,7 +1874,7 @@
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
       "claudeProvenance": "unavailable",
-      "limitation": "Missing source evidence is exported as null; a numeric zero is emitted only when the source component was present."
+      "limitation": "Missing source evidence is exported as null; Claude combined output is not split into visible and reasoning components."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1790,7 +1886,7 @@
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
       "claudeProvenance": "unavailable",
-      "limitation": "Codex text output is derived when total and reasoning counts are both available."
+      "limitation": "Codex text output is derived when total and reasoning counts are both available; Claude only reports combined output here."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1813,7 +1909,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Timestamp may represent logging or completion rather than provider billing time."
     },
     {
@@ -1825,7 +1921,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Missing parents and replayed history can make lineage incomplete."
     },
     {
@@ -1837,7 +1933,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Fingerprint is installation-specific and cannot be joined after secret rotation."
     },
     {
@@ -1849,7 +1945,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Unreviewed names are replaced by unknown and a keyed fingerprint; aliases can still obscure equivalence."
     },
     {
@@ -1861,7 +1957,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Recognition is relative to the reviewed registry version used by the exporter."
     },
     {
@@ -1921,7 +2017,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Session boundaries vary by provider and client, and secret rotation breaks linkage."
     },
     {
@@ -1933,7 +2029,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "mixed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "mixed",
       "limitation": "Historical logs may omit speed mode and provider multipliers can change."
     },
     {
@@ -1945,7 +2041,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "heuristic",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Ambiguous local evidence is intentionally mapped to an unclassified category."
     },
     {
@@ -1957,7 +2053,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Tool names, arguments, results, and billing units are excluded; attribution can be incomplete."
     },
     {
@@ -1969,7 +2065,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -1981,7 +2077,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -1993,7 +2089,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2005,7 +2101,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2017,7 +2113,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2029,7 +2125,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2041,7 +2137,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2053,7 +2149,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2065,7 +2161,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2077,7 +2173,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2089,7 +2185,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2101,7 +2197,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {
@@ -2113,8 +2209,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Total may be cumulative or differently defined across provider log formats."
+      "claudeProvenance": "derived",
+      "limitation": "Claude total input is derived as uncached input plus cache read plus cache creation; provider totals can still differ in meaning."
     }
   ]
 }

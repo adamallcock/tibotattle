@@ -33,7 +33,9 @@
     "modelId": {
       "enum": [
         "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
-        "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"
+        "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+        "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
+        "claude-sonnet-4-6", "claude-sonnet-5"
       ]
     },
     "modelRecognition": { "enum": ["recognized", "unrecognized", "missing"] },
@@ -52,15 +54,21 @@
         "inputUncachedTokens",
         "inputCacheReadTokens",
         "inputCacheWriteTokens",
+        "inputCacheWrite5mTokens",
+        "inputCacheWrite1hTokens",
         "outputTextTokens",
-        "outputReasoningTokens"
+        "outputReasoningTokens",
+        "outputCombinedTokens"
       ],
       "properties": {
         "inputUncachedTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
         "inputCacheReadTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
         "inputCacheWriteTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "inputCacheWrite5mTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "inputCacheWrite1hTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
         "outputTextTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "outputReasoningTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 }
+        "outputReasoningTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "outputCombinedTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 }
       }
     },
     "totalInputContextTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
@@ -111,7 +119,7 @@
       "if": { "properties": { "modelRecognition": { "const": "recognized" } } },
       "then": {
         "properties": {
-          "modelId": { "enum": ["gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] },
+          "modelId": { "enum": ["gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-4-6", "claude-sonnet-5"] },
           "modelFingerprint": { "type": "null" }
         }
       }
@@ -136,7 +144,67 @@
     },
     {
       "if": { "properties": { "provider": { "const": "anthropic_claude_code" } } },
-      "then": { "properties": { "modelId": { "const": "unknown" } } }
+      "then": {
+        "properties": {
+          "billingSurface": { "const": "claude_subscription" },
+          "apiServiceTier": { "const": "unknown" },
+          "reasoningEffort": { "const": "unknown" },
+          "modelId": {
+            "enum": [
+              "unknown", "claude-fable-5", "claude-haiku-4-5-20251001",
+              "claude-opus-4-8", "claude-sonnet-4-6", "claude-sonnet-5"
+            ]
+          },
+          "components": {
+            "type": "object",
+            "properties": {
+              "inputUncachedTokens": { "type": "integer" },
+              "inputCacheReadTokens": { "type": "integer" },
+              "inputCacheWriteTokens": { "type": "integer" },
+              "inputCacheWrite5mTokens": { "type": ["integer", "null"] },
+              "inputCacheWrite1hTokens": { "type": ["integer", "null"] },
+              "outputTextTokens": { "type": "null" },
+              "outputReasoningTokens": { "type": "null" },
+              "outputCombinedTokens": { "type": "integer" }
+            },
+            "oneOf": [
+              {
+                "properties": {
+                  "inputCacheWrite5mTokens": { "type": "null" },
+                  "inputCacheWrite1hTokens": { "type": "null" }
+                }
+              },
+              {
+                "properties": {
+                  "inputCacheWrite5mTokens": { "type": "integer" },
+                  "inputCacheWrite1hTokens": { "type": "integer" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "openai_codex" } } },
+      "then": {
+        "properties": {
+          "modelId": {
+            "enum": [
+              "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+              "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"
+            ]
+          },
+          "components": {
+            "type": "object",
+            "properties": {
+              "outputCombinedTokens": { "type": "null" },
+              "inputCacheWrite5mTokens": { "type": "null" },
+              "inputCacheWrite1hTokens": { "type": "null" }
+            }
+          }
+        }
+      }
     }
   ]
 }

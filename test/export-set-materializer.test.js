@@ -149,7 +149,7 @@ test("materializer publishes deterministic independently verifiable chunks and a
     // scanner/materializer regression that current-run comparisons do not.
     assert.equal(
       first.manifest.totals.logicalRecordsSha256,
-      "a6055ab192cc894379a1d340a81b00bb6e255cc50c9ec3485cf3b7d0bdf6ed65",
+      "6e38a3d923fb1662b4a2c0372d7ff87b8447d39aa45bb5814a5a9aa899199153",
     );
     assert.equal(first.manifest.chunks.length, 3);
     assert.deepEqual(first.manifest.totals.recordCounts, {

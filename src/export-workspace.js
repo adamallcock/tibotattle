@@ -26,15 +26,15 @@ import {
 } from "./export-supplemental-source-plan.js";
 import { stableJson } from "./storage.js";
 
-export const EXPORT_WORKSPACE_VERSION = "usage-export-workspace-v0.3";
+export const EXPORT_WORKSPACE_VERSION = "usage-export-workspace-v0.4";
 export const DEFAULT_EXPORT_WORKSPACE_MAXIMUM_BYTES = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumWorkspaceBytes;
 export const DEFAULT_EXPORT_WORKSPACE_BATCH_RECORDS = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSqliteBatchRecords;
 
 export const EXPORT_WORKSPACE_DATABASE_BASENAME = "workspace.sqlite3";
 const DATABASE_NAME = EXPORT_WORKSPACE_DATABASE_BASENAME;
-const EXPORT_WORKSPACE_APPLICATION_ID = 0x55534d33;
-const EXPORT_WORKSPACE_USER_VERSION = 3;
-const EXPORT_WORKSPACE_SCHEMA_SHA256 = "b1d43813fb77e64274f1299d58c98b677c1b82a138a64d6c1575f31e208776bf";
+const EXPORT_WORKSPACE_APPLICATION_ID = 0x55534d34;
+const EXPORT_WORKSPACE_USER_VERSION = 4;
+const EXPORT_WORKSPACE_SCHEMA_SHA256 = "48c81568f3da4d9587ed52946b295b0d81a9b2a75b93e1153c19b0eb4032917b";
 const DEFAULT_CRASH_RECOVERY_RESERVATION_MS = 5_000;
 const CHECKPOINT_PHASES = new Set(["tier_scan", "record_scan", "complete"]);
 const OCCURRENCE_KINDS = new Set(["usage_event", "tool_call"]);
@@ -43,7 +43,9 @@ const REVIEWED_DIAGNOSTIC_CODES = new Set(EXPORT_DIAGNOSTIC_CODES);
 const MAX_CHECKPOINT_INDEX_OPERATIONS = 50_000;
 const MAX_CHECKPOINT_OPEN_TASKS = 100_000;
 const MAXIMUM_SUPPLEMENTAL_PRIVATE_PLAN_BYTES = 32 * 1024 * 1024;
-const SUPPLEMENTAL_SOURCE_KINDS = new Set(["codex_collector_ledger", "claude_status_snapshot"]);
+const SUPPLEMENTAL_SOURCE_KINDS = new Set([
+  "codex_collector_ledger", "claude_status_snapshot", "claude_transcript_jsonl",
+]);
 const SUPPLEMENTAL_CHECKPOINT_STATUSES = new Set(["pending", "complete"]);
 const WORKSPACE_TABLES = Object.freeze([
   "chunks", "diagnostics", "resource_invocations", "resource_usage", "safe_records", "seen_occurrences",
@@ -375,7 +377,7 @@ function initializeSchema(database) {
     CREATE TABLE supplemental_source_plan (
       ordinal INTEGER PRIMARY KEY,
       source_key TEXT NOT NULL UNIQUE CHECK(length(source_key) = 64),
-      kind TEXT NOT NULL CHECK(kind IN ('codex_collector_ledger', 'claude_status_snapshot')),
+      kind TEXT NOT NULL CHECK(kind IN ('codex_collector_ledger', 'claude_status_snapshot', 'claude_transcript_jsonl')),
       binding_kind TEXT NOT NULL CHECK(binding_kind IN ('file_prefix', 'frozen_inventory')),
       device INTEGER,
       inode INTEGER,
@@ -490,7 +492,7 @@ function validateWorkspaceSchema(database) {
       sql: row.sql,
     }));
     const schemaSha256 = createHash("sha256")
-      .update("app-usagemonitor/export-workspace-schema/v3\0")
+      .update("app-usagemonitor/export-workspace-schema/v4\0")
       .update(stableJson(schemaRows))
       .digest("hex");
     if (schemaSha256 !== EXPORT_WORKSPACE_SCHEMA_SHA256) fail("schema");
@@ -632,9 +634,11 @@ function supplementalPrivatePlanMetaKey(sourceKey) {
 }
 
 function normalizeSupplementalPrivatePlans(value, supplementalSourcePlan) {
-  const claudeSources = supplementalSourcePlan.sources.filter((source) => source.kind === "claude_status_snapshot");
-  if (!Array.isArray(value) || value.length !== claudeSources.length) fail("schema");
-  const knownSourceKeys = new Set(claudeSources.map((source) => source.sourceKey));
+  const privatePlanSources = supplementalSourcePlan.sources.filter(
+    (source) => source.kind === "claude_status_snapshot" || source.kind === "claude_transcript_jsonl",
+  );
+  if (!Array.isArray(value) || value.length !== privatePlanSources.length) fail("schema");
+  const knownSourceKeys = new Set(privatePlanSources.map((source) => source.sourceKey));
   const seen = new Set();
   return value.map((item) => {
     if (!exactKeys(item, ["sourceKey", "valueJson"])
@@ -811,7 +815,8 @@ function buildWorkspaceApi(database, directory, {
         && (!safeCount(binding.inventoryEntries) || !safeCount(binding.inventoryBytes)
           || !validSha256(binding.inventorySha256)))
       || (row.kind === "codex_collector_ledger" && binding.kind !== "file_prefix")
-      || (row.kind === "claude_status_snapshot" && binding.kind !== "frozen_inventory")) fail("schema");
+      || (row.kind === "claude_status_snapshot" && binding.kind !== "frozen_inventory")
+      || (row.kind === "claude_transcript_jsonl" && binding.kind !== "file_prefix")) fail("schema");
     return {
       ordinal: Number(row.ordinal),
       sourceKey: row.source_key,

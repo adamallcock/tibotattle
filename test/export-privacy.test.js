@@ -110,7 +110,7 @@ test("privacy gate accepts Claude quota records under the partial provider adapt
   assert.equal(verifyPrivacySafeBundle(bundleWithQuota(snapshot)).verdict, "passed");
 });
 
-test("privacy gate still rejects Claude usage events while that family is not implemented", () => {
+test("privacy gate accepts Claude usage events under the implemented transcript adapter", () => {
   const usage = {
     schemaVersion: "usage-event-v0.1",
     eventTime: "2026-07-24T12:02:00.000Z",
@@ -123,13 +123,16 @@ test("privacy gate still rejects Claude usage events while that family is not im
     apiServiceTier: "unknown",
     reasoningEffort: "unknown",
     components: {
-      inputUncachedTokens: null,
-      inputCacheReadTokens: null,
-      inputCacheWriteTokens: null,
+      inputUncachedTokens: 10,
+      inputCacheReadTokens: 20,
+      inputCacheWriteTokens: 30,
+      inputCacheWrite5mTokens: 30,
+      inputCacheWrite1hTokens: 0,
       outputTextTokens: null,
       outputReasoningTokens: null,
+      outputCombinedTokens: 40,
     },
-    totalInputContextTokens: null,
+    totalInputContextTokens: 60,
     surface: "local_rollout_unclassified",
     agentScope: "unknown",
     lineageDisposition: "standalone",
@@ -152,5 +155,5 @@ test("privacy gate still rejects Claude usage events while that family is not im
     sessionScopeId: `session:v1:${"G".repeat(43)}`,
     accountScopeId: "unattributed",
   };
-  assert.throws(() => verifyPrivacySafeBundle(bundleWithUsage(usage)), /provider_adapter_compatibility/);
+  assert.equal(verifyPrivacySafeBundle(bundleWithUsage(usage)).verdict, "passed");
 });

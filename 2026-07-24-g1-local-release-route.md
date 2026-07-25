@@ -17,16 +17,16 @@ This decision narrows platform claims; it does not weaken privacy, determinism, 
 
 | Area | Current state | Evidence | G1 status |
 |---|---|---|---|
-| Serial repository baseline | Active hardening tree passes 558 of 558 under Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime | Fresh serial test receipts on both runtimes | Closed for this checkpoint |
-| Telemetry contract generation | 170 fields current; 10 of 10 contract/schema tests pass | Fresh `pnpm telemetry:check` | Closed for current draft |
+| Serial repository baseline | Active integrated tree passes 610 of 610 under Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime | Fresh post-audit serial test receipts on both runtimes | Closed for this checkpoint |
+| Telemetry contract generation | 178 fields current | Fresh `pnpm telemetry:check` | Closed for current draft |
 | Codex export | Frozen-prefix Codex rollout and explicitly selected passive-collector sources are bound into one deterministic disk-backed workspace, composite source commitment, resumable checkpoint stream, materialized export set, verifier, and deletion preflight | Full matrix, focused source/workspace tests, and a real two-hour local collector export/verify/inspect smoke | Closed for this checkpoint; prospective same-account switch smoke remains open |
 | Compression | Deterministic bounded gzip with independent encoded/decoded limits and bomb rejection | Compression receipt and tests | Closed |
 | Complete-set deletion | Two-step, exact-inventory, crash-recoverable logical deletion | Deletion receipt and SIGKILL matrix | Closed |
 | Failed-workspace discard | Separate workspace-only implementation and schemas pass focused crash/recovery tests; the final independent destructive-boundary re-audit found no blocking defect within the declared same-user threat boundary | Exact-inventory tests, 20 of 20 focused tests, and final audit trail | Closed for this checkpoint |
-| Claude quota | An explicitly selected, interval-bounded frozen inventory of owner-only status-line ledger files now exports canonical independently optional five-hour/seven-day snapshots through the same workspace and composite source contract | Focused source/workspace/mutation/resume tests and full matrix | Export path closed; real non-null subscriber callback and install lifecycle open |
-| Claude usage | Local transcripts contain usage components; no production bounded adapter/checkpoints | Content-free local shape scan | Open |
+| Claude quota | An explicitly selected, interval-bounded frozen inventory of owner-only status-line ledger files exports canonical independently optional five-hour/seven-day snapshots; the audited Keychain-backed managed callback is installed and pre-response behavior is correct | Focused source/workspace/mutation/resume/lifecycle matrices and [real local receipt](./2026-07-25-g1-claude-local-verification-receipt.md) | Export/install paths closed; real non-null window blocked only by revoked provider OAuth |
+| Claude usage | Bounded transcript planning, logical-message canonicalization, iteration expansion, frozen-prefix checkpoints, cross-provider ordering, privacy-safe contract mapping, and CLI selection are implemented; a 21,326-event real local export and independent verification pass | [Semantics decision](./2026-07-25-claude-transcript-usage-semantics-decision.md), [real local receipt](./2026-07-25-g1-claude-local-verification-receipt.md), 610-test dual-runtime matrix, and independent code/plan re-audits | Local adapter closed for this checkpoint |
 | Native secrets | macOS arm64 production identity and account-observation capabilities default to distinct exact-pinned Keychain items; migration, retirement, rotation serialization, replacement retention, locked/unavailable behavior, and prospective account switching are integrated | Focused adversarial tests and full matrix | Code path closed; fresh-user install/rotate/uninstall smoke open |
-| Minimization | Field policy and preregistered utility ablation exist; execution and decision receipt do not | Frozen preregistration | Preregistration closed; execution open |
+| Minimization | Deterministic A1–A7 runner and frozen fixtures now produce an aggregate-only receipt; the first real run is correctly inconclusive with zero qualifying prospective resets and authorizes no retention or public aggregate | [Preregistration](./2026-07-24-g1-data-minimization-ablation-preregistration.md) and [inconclusive decision](./2026-07-25-g1-data-minimization-ablation-decision.md) | Machinery closed; empirical decision remains open pending three eligible resets |
 | Resource limits | Heavy local history succeeds; limits remain candidate single-machine ceilings | Resource/source receipts | Open measured-release decision |
 | Packaging | No pinned distributable runtime, SBOM, signatures, attestations, or installer | Repository inspection | Open |
 | Clean-machine/volunteer gate | Not run | Requires signed artifact | Externally gated |
@@ -38,10 +38,10 @@ G0 is a hard predecessor, not paperwork that can be backfilled after volunteers 
 | G0 requirement | Current evidence | Status |
 |---|---|---|
 | Immutable historical baseline and reproducible golden local artifact | Dated exporter/source/compression/deletion receipts exist; a clean-clone golden rerun remains required | Partial |
-| Generated allowed-field/prohibited-category control map | 170-field telemetry dictionary and privacy tests are current for draft v0.1 | Closed for draft; frozen successor open |
-| Maintained risk register with control, test, owner, review date, and residual decision | Risk summary exists in the comprehensive goal; row-level register does not | Open |
+| Generated allowed-field/prohibited-category control map | 178-field telemetry dictionary and privacy tests are current for draft v0.1 | Closed for draft; frozen successor open |
+| Maintained risk register with control, detection, test/drill, owner, review date, and residual decision | [Live G0 risk register](./2026-07-25-g0-risk-register.md) created; no privacy/security residual is accepted and future cloud rows remain planned hard gates | Register closed; gate-specific human acceptance remains open |
 | ADR set for identity, encryption, cloud, storage, cohort disclosure, and deletion | Keychain and local deletion decisions exist; later-system ADRs remain open | Partial |
-| Invariant/gate-to-code-test-runbook traceability | Receipts provide partial links; one generated or reviewed matrix does not | Open |
+| Invariant/gate-to-code-test-runbook traceability | [Reviewed G0 control traceability matrix](./2026-07-25-g0-control-traceability-matrix.md) maps permanent invariants and R1–R9 to implementation, tests, receipts, and exact gaps | Closed as live mapping; update required on every control move |
 | Repository/release controls, dependency policy, secret scan, SBOM/provenance/signing plan | Private remote verified; remaining controls and release evidence are open | Partial |
 | Named operator, contact, incident owner/backup, controller responsibility, and external-review point | Adam Allcock is accountable project owner; contact/backup/review engagement remain unset | Open |
 | Signed privacy-contract approval | Draft contract exists; owner approval of the frozen volunteer bytes/wording is not recorded | Open |
@@ -96,6 +96,8 @@ Exit: create/resume/reorder/repeat equivalence, mutation/truncation/link/oversiz
 - Preserve uncached input, cache read, cache creation/write, and provider-reported combined output. Do not relabel a combined output total as visible text or separately observed thinking.
 - Add Claude frozen-prefix source plans, incremental checkpoints, resource accounting, restart/process-death equivalence, deterministic cross-provider ordering, reviewed registries, and provider conformance fixtures.
 - Use `ccusage claude` only as an aggregate local cross-check, never as the event-level source or quota authority.
+
+Current evidence: the [G1 Claude local verification receipt](./2026-07-25-g1-claude-local-verification-receipt.md) records a verified 21,326-event real transcript export, exact safe aggregate reconciliation, the callback lifecycle audit, and the provider-authentication blocker. Usage is locally implemented; authoritative quota remains partial until one authenticated post-response callback yields a non-null window.
 
 Exit: compatibility declares Claude implemented only after usage and authoritative quota paths both pass schemas, privacy canaries, malicious fixtures, resume tests, and one real non-null subscriber callback.
 

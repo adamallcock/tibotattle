@@ -94,10 +94,16 @@ export function buildExportCompatibilityTuple() {
       anthropicClaudeCode: {
         status: "partial",
         capabilities: {
-          usageEvents: "not_implemented",
+          usageEvents: "implemented",
           quotaSnapshots: "implemented",
         },
         sourceFormats: {
+          transcript: {
+            status: "implemented",
+            sourceFormat: "claude-code-transcript-jsonl",
+            parserVersion: "claude-transcript-export-cursor-v0.2",
+            adapterVersion: "claude-transcript-usage-candidate-v0.2",
+          },
           statusLine: {
             status: "implemented",
             sourceFormat: "claude-statusline-snapshot-v0.2",

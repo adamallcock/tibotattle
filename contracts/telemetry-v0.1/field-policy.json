@@ -240,6 +240,11 @@
         "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/capabilities/properties/quotaSnapshots",
         "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/capabilities/properties/usageEvents",
         "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats",
+        "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript",
+        "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/adapterVersion",
+        "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/parserVersion",
+        "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/sourceFormat",
+        "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/transcript/properties/status",
         "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine",
         "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/adapterVersion",
         "compatibility.schema.json#/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/parserVersion",
@@ -783,7 +788,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Session boundaries vary by provider and client, and secret rotation breaks linkage."
     },
     {
@@ -807,7 +812,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Timestamp may represent logging or completion rather than provider billing time."
     },
     {
@@ -819,7 +824,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Unreviewed names are replaced by unknown and a keyed fingerprint; aliases can still obscure equivalence."
     },
     {
@@ -831,7 +836,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Fingerprint is installation-specific and cannot be joined after secret rotation."
     },
     {
@@ -843,7 +848,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Recognition is relative to the reviewed registry version used by the exporter."
     },
     {
@@ -855,7 +860,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Local source location may not reveal the provider's ultimate billing route."
     },
     {
@@ -867,7 +872,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "mixed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "mixed",
       "limitation": "Historical logs may omit speed mode and provider multipliers can change."
     },
     {
@@ -903,8 +908,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Provider token taxonomies differ, missing components remain null, and no Claude usage exporter exists yet."
+      "claudeProvenance": "observed",
+      "limitation": "Provider token taxonomies differ; Claude reports combined output without a visible-versus-reasoning split and may omit a trustworthy cache-duration split, while missing components remain null."
     },
     {
       "targets": [
@@ -915,8 +920,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Codex uncached input is derived by subtraction; missing or internally inconsistent source components produce null."
+      "claudeProvenance": "observed",
+      "limitation": "Codex uncached input is derived by subtraction; Claude input_tokens is preserved directly and is not reduced by cache components."
     },
     {
       "targets": [
@@ -927,7 +932,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Cache semantics, duration, and billing multipliers differ by provider."
     },
     {
@@ -939,8 +944,32 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Current Codex export can preserve an observed cache-write component when present, but historical absence remains null; Claude usage-event export is not implemented."
+      "claudeProvenance": "observed",
+      "limitation": "Codex and Claude preserve an observed cache-write component when present; historical absence remains null."
+    },
+    {
+      "targets": [
+        "usage-event.schema.json#/properties/components/properties/inputCacheWrite5mTokens"
+      ],
+      "purpose": "Preserves Claude cache-creation input charged at the provider five-minute write rate.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "observed",
+      "limitation": "Null means the source did not provide a trustworthy split; it must not be priced as zero."
+    },
+    {
+      "targets": [
+        "usage-event.schema.json#/properties/components/properties/inputCacheWrite1hTokens"
+      ],
+      "purpose": "Preserves Claude cache-creation input charged at the provider one-hour write rate.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "observed",
+      "limitation": "Null means the source did not provide a trustworthy split; it must not be priced as zero."
     },
     {
       "targets": [
@@ -952,7 +981,7 @@
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
       "claudeProvenance": "unavailable",
-      "limitation": "Codex text output is derived when total and reasoning counts are both available."
+      "limitation": "Codex text output is derived when total and reasoning counts are both available; Claude only reports combined output here."
     },
     {
       "targets": [
@@ -964,7 +993,19 @@
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
       "claudeProvenance": "unavailable",
-      "limitation": "Missing source evidence is exported as null; a numeric zero is emitted only when the source component was present."
+      "limitation": "Missing source evidence is exported as null; Claude combined output is not split into visible and reasoning components."
+    },
+    {
+      "targets": [
+        "usage-event.schema.json#/properties/components/properties/outputCombinedTokens"
+      ],
+      "purpose": "Preserves provider-reported output when visible text and hidden reasoning cannot be separated.",
+      "privacyClass": "usage_metadata",
+      "retentionClass": "raw_metadata_limited",
+      "publicEligibility": "aggregate_and_row",
+      "codexProvenance": "unavailable",
+      "claudeProvenance": "observed",
+      "limitation": "Combined output must not be interpreted as either visible text or hidden reasoning alone."
     },
     {
       "targets": [
@@ -975,8 +1016,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Total may be cumulative or differently defined across provider log formats."
+      "claudeProvenance": "derived",
+      "limitation": "Claude total input is derived as uncached input plus cache read plus cache creation; provider totals can still differ in meaning."
     },
     {
       "targets": [
@@ -987,7 +1028,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "heuristic",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Ambiguous local evidence is intentionally mapped to an unclassified category."
     },
     {
@@ -999,7 +1040,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "heuristic",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Nested agents may not emit independently attributable usage records."
     },
     {
@@ -1011,7 +1052,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Missing parents and replayed history can make lineage incomplete."
     },
     {
@@ -1023,7 +1064,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Tool names, arguments, results, and billing units are excluded; attribution can be incomplete."
     },
     {
@@ -1046,7 +1087,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Counts do not measure tool duration, arguments, provider billing, or semantic work."
     },
     {

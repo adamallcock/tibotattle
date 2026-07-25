@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "g1-minimization-synthetic-fixture-v0.1",
+  "fixtureId": "claude-shaped-independent-v1",
+  "providerShape": "anthropic_claude",
+  "cases": [
+    "restart",
+    "duplicate",
+    "fork_replay",
+    "account_switch",
+    "reset_boundary",
+    "stale_snapshot",
+    "missing_surface"
+  ],
+  "containsSensitiveData": false
+}

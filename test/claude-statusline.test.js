@@ -136,6 +136,20 @@ test("session pseudonyms are deterministic, domain-separated, secret-scoped, and
   assertSafeError(() => sanitizeClaudeStatusline(input(), CAPTURED_AT, { sessionSecret: Buffer.alloc(31) }), "session_secret");
 });
 
+test("session pseudonym derivation zeroizes only its adapter-owned copy", () => {
+  const callerSecret = Buffer.alloc(32, 29);
+  const expected = Buffer.from(callerSecret);
+  const value = sanitizeClaudeStatusline(input(), CAPTURED_AT, { sessionSecret: callerSecret });
+  assert.match(value.sessionPseudonym, /^claude-session:v1:/);
+  assert.deepEqual(callerSecret, expected);
+  const invalidCallerSecret = Buffer.alloc(31, 30);
+  assertSafeError(
+    () => sanitizeClaudeStatusline(input(), CAPTURED_AT, { sessionSecret: invalidCallerSecret }),
+    "session_secret",
+  );
+  assert.deepEqual(invalidCallerSecret, Buffer.alloc(31, 30));
+});
+
 test("five-hour and seven-day windows are independently optional rather than synthesized as zero", () => {
   const onlyFive = sanitizeClaudeStatusline(input({ rate_limits: {
     five_hour: { used_percentage: 8, resets_at: FIVE_HOUR_RESET },
@@ -266,18 +280,20 @@ test("ledger creates owner-only directories and complete owner-only records", as
 
 test("capture runner stores one normalized record and emits only the short status line", async () => withFixture(async ({ stateDirectory }) => {
   let output = "";
-  const secret = Buffer.alloc(32, 9).toString("base64url");
+  const secret = Buffer.alloc(32, 9);
   const value = await runClaudeStatusline({
     stdin: Readable.from([Buffer.from(JSON.stringify(input()))]),
     stdout: { write(chunk) { output += chunk; } },
     env: {
       USAGEMONITOR_CLAUDE_STATE_DIR: stateDirectory,
-      USAGEMONITOR_CLAUDE_SESSION_SECRET_B64URL: secret,
     },
+    loadSessionSecret: async () => secret,
     capturedAt: CAPTURED_AT,
   });
   assert.equal(output, "Claude 5h 23.6% · 7d 41.2%\n");
   assert.equal(output.includes(CANARY), false);
+  assert.deepEqual(secret, Buffer.alloc(32));
+  assert.match(value.sessionPseudonym, /^claude-session:v1:/);
   assert.deepEqual(await readClaudeStatusSnapshots({ stateDirectory }), [value]);
 }));
 
@@ -318,7 +334,12 @@ test("concurrent writers serialize and publish only complete records", async () 
   const values = Array.from({ length: 48 }, (_, index) => sanitizeClaudeStatusline(input({
     rate_limits: { five_hour: { used_percentage: index, resets_at: FIVE_HOUR_RESET } },
   }), `2026-07-24T12:00:${String(index).padStart(2, "0")}.000Z`));
-  await Promise.all(values.map((value) => writeClaudeStatusSnapshot(value, { stateDirectory })));
+  // The assertion is completion/barrier-driven. A generous bounded acquisition
+  // window avoids coupling correctness to incidental load from other test files.
+  await Promise.all(values.map((value) => writeClaudeStatusSnapshot(value, {
+    stateDirectory,
+    lockRetryMilliseconds: 10_000,
+  })));
   const stored = await readClaudeStatusSnapshots({ stateDirectory });
   assert.equal(stored.length, values.length);
   assert.deepEqual(stored.map((value) => value.limits.fiveHour.usedPercent).sort((a, b) => a - b),

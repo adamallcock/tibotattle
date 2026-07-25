@@ -53,6 +53,19 @@ import {
 import { readBoundedJsonLines } from "./bounded-jsonl.js";
 import { createExportResourceGuard, DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 import {
+  createProductionClaudeCallbackBackend,
+  readClaudeCallbackCapability,
+} from "./claude-callback-capability.js";
+import {
+  inspectClaudeCallbackLifecycle,
+  installClaudeCallback,
+  planManagedClaudeCallbackCapabilityRemoval,
+  recoverClaudeCallbackLifecycle,
+  removeManagedClaudeCallbackCapability,
+  rotateManagedClaudeCallbackCapability,
+  uninstallClaudeCallback,
+} from "./claude-callback-lifecycle.js";
+import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
   defaultCollectorLockFile,
@@ -113,7 +126,7 @@ function usage() {
   usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor verify-bundle --input PATH [--receipt PATH]
-  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
+  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--claude-usage] [--claude-projects-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
   usage-monitor inspect-export-workspace --workspace PATH
   usage-monitor verify-export-set --directory PATH
   usage-monitor delete-local-export --workspace PATH --directory PATH [--confirm-deletion TOKEN]
@@ -122,6 +135,12 @@ function usage() {
   usage-monitor recover-export-workspace-discard --workspace PATH
   usage-monitor recover-exports --directory PATH
   usage-monitor rotate-local-identity [--secret-file PATH] [--confirm]
+  usage-monitor inspect-claude-callback
+  usage-monitor install-claude-callback
+  usage-monitor uninstall-claude-callback
+  usage-monitor recover-claude-callback
+  usage-monitor rotate-claude-callback-identity [--confirm]
+  usage-monitor remove-claude-callback-identity [--confirm-removal TOKEN]
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -182,6 +201,8 @@ export function parseArgs(argv) {
     collectorFile: null,
     claudeStatus: false,
     claudeStateDirectory: null,
+    claudeUsage: false,
+    claudeProjectsDirectory: null,
     activitySurface: null,
     activityState: null,
     activityFile: null,
@@ -193,6 +214,7 @@ export function parseArgs(argv) {
     confirm: false,
     confirmDeletionToken: null,
     confirmDiscardToken: null,
+    confirmRemovalToken: null,
     resume: false,
     workspaceDirectory: null,
     maximumRecordsPerChunk: null,
@@ -212,8 +234,10 @@ export function parseArgs(argv) {
     else if (arg === "--confirm") result.confirm = true;
     else if (arg === "--confirm-deletion") result.confirmDeletionToken = readOptionValue(argv, index++, arg);
     else if (arg === "--confirm-discard") result.confirmDiscardToken = readOptionValue(argv, index++, arg);
+    else if (arg === "--confirm-removal") result.confirmRemovalToken = readOptionValue(argv, index++, arg);
     else if (arg === "--resume") result.resume = true;
     else if (arg === "--claude-status") result.claudeStatus = true;
+    else if (arg === "--claude-usage") result.claudeUsage = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--since") result.startAt = readOptionValue(argv, index++, arg);
@@ -239,6 +263,7 @@ export function parseArgs(argv) {
     else if (arg === "--provider-ui") result.providerUiFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--collector-file") result.collectorFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--claude-state-dir") result.claudeStateDirectory = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--claude-projects-dir") result.claudeProjectsDirectory = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--surface") result.activitySurface = readOptionValue(argv, index++, arg);
     else if (arg === "--state") result.activityState = readOptionValue(argv, index++, arg);
     else if (arg === "--activity-file") result.activityFile = resolve(readOptionValue(argv, index++, arg));
@@ -260,6 +285,12 @@ export function parseArgs(argv) {
   }
   if ((result.claudeStatus || result.claudeStateDirectory !== null) && result.command !== "export-set") {
     throw new Error("--claude-status and --claude-state-dir are available only for export-set");
+  }
+  if ((result.claudeUsage || result.claudeProjectsDirectory !== null) && result.command !== "export-set") {
+    throw new Error("--claude-usage and --claude-projects-dir are available only for export-set");
+  }
+  if (result.confirmRemovalToken !== null && result.command !== "remove-claude-callback-identity") {
+    throw new Error("--confirm-removal is available only for remove-claude-callback-identity");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -365,6 +396,15 @@ export async function run(
     captureObservation = captureCodexObservation,
     runCollectorOnceCommand = runCollectorOnce,
     runCollectorForegroundCommand = runCollectorForeground,
+    createClaudeCallbackBackend = createProductionClaudeCallbackBackend,
+    readClaudeCallbackCredential = readClaudeCallbackCapability,
+    inspectClaudeCallback = inspectClaudeCallbackLifecycle,
+    installClaudeCallbackCommand = installClaudeCallback,
+    uninstallClaudeCallbackCommand = uninstallClaudeCallback,
+    recoverClaudeCallbackCommand = recoverClaudeCallbackLifecycle,
+    rotateClaudeCallbackCommand = rotateManagedClaudeCallbackCapability,
+    planClaudeCallbackRemoval = planManagedClaudeCallbackCapabilityRemoval,
+    removeClaudeCallbackCredential = removeManagedClaudeCallbackCapability,
   } = {},
 ) {
   const args = parseArgs(argv);
@@ -381,6 +421,85 @@ export async function run(
   }
   if (args.command === "help" || args.command === "--help" || args.command === "-h") {
     usage();
+    return;
+  }
+  if (args.command === "inspect-claude-callback") {
+    const inspected = await inspectClaudeCallback();
+    const backend = createClaudeCallbackBackend();
+    let secret = null;
+    try {
+      secret = await readClaudeCallbackCredential({ backend });
+      console.log("Claude callback inspection");
+      console.log(`Lifecycle: ${inspected.status}`);
+      console.log(`Session-pseudonym capability: ${secret === null ? "missing" : "available"}`);
+      console.log("Existing status-line command: private (never displayed)");
+      console.log("Network activity: none");
+    } finally {
+      secret?.fill(0);
+    }
+    return;
+  }
+  if (args.command === "install-claude-callback") {
+    const result = await installClaudeCallbackCommand({ backend: createClaudeCallbackBackend() });
+    console.log(`Claude callback installation: ${result.status}`);
+    console.log(`Session-pseudonym capability: ${result.capability}`);
+    console.log("Existing supported status line: composed and retained privately for exact restoration");
+    console.log("Network activity: none");
+    return;
+  }
+  if (args.command === "uninstall-claude-callback") {
+    const result = await uninstallClaudeCallbackCommand();
+    console.log(`Claude callback uninstallation: ${result.status}`);
+    console.log(`Session-pseudonym capability preserved: ${result.capabilityPreserved}`);
+    console.log("Network activity: none");
+    return;
+  }
+  if (args.command === "recover-claude-callback") {
+    const result = await recoverClaudeCallbackCommand();
+    console.log(`Claude callback recovery: ${result.status}`);
+    console.log(`Lifecycle phase: ${result.recovered}`);
+    console.log("Network activity: none");
+    return;
+  }
+  if (args.command === "rotate-claude-callback-identity") {
+    const backend = createClaudeCallbackBackend();
+    if (!args.confirm) {
+      let secret = null;
+      try {
+        secret = await readClaudeCallbackCredential({ backend });
+        console.log(`Claude callback identity rotation preflight: ${secret === null ? "missing" : "ready"}`);
+        console.log("No state changed; rerun with --confirm to break future Claude-session linkability");
+        console.log("Existing snapshots changed: false; network activity: none");
+      } finally {
+        secret?.fill(0);
+      }
+      return;
+    }
+    const result = await rotateClaudeCallbackCommand({ backend, confirm: true });
+    console.log(`Claude callback identity rotation: ${result.status}`);
+    console.log("Future session pseudonyms changed: true; existing snapshots changed: false");
+    console.log("Network activity: none");
+    return;
+  }
+  if (args.command === "remove-claude-callback-identity") {
+    const backend = createClaudeCallbackBackend();
+    if (args.confirmRemovalToken === null) {
+      const planned = await planClaudeCallbackRemoval({ backend });
+      console.log(`Claude callback identity removal preflight: ${planned.status}`);
+      if (planned.confirmationToken !== null) {
+        console.log(`Confirmation token: ${planned.confirmationToken}`);
+        console.log("No state changed; rerun with --confirm-removal TOKEN for this exact uninstalled target");
+      }
+      console.log("Callback must be uninstalled first; network activity: none");
+      return;
+    }
+    const result = await removeClaudeCallbackCredential({
+      backend,
+      providedToken: args.confirmRemovalToken,
+    });
+    console.log(`Claude callback identity removal: ${result.status}`);
+    console.log(`Secure erasure guaranteed: ${result.secureErasure}`);
+    console.log("Network activity: none");
     return;
   }
   if (args.command === "mark-activity") {
@@ -476,6 +595,8 @@ export async function run(
             collectorPath: args.collectorFile,
             claudeStateDirectory: args.claudeStateDirectory,
             enableClaudeStatus: args.claudeStatus,
+            claudeProjectsDirectory: args.claudeProjectsDirectory,
+            enableClaudeUsage: args.claudeUsage,
           })
         : await createLocalExportWorkspace({
             directory: args.workspaceDirectory,
@@ -487,6 +608,8 @@ export async function run(
             collectorPath: args.collectorFile,
             claudeStateDirectory: args.claudeStateDirectory,
             enableClaudeStatus: args.claudeStatus,
+            claudeProjectsDirectory: args.claudeProjectsDirectory,
+            enableClaudeUsage: args.claudeUsage,
           });
       const materialized = await materializeLocalExportSet({
         workspaceDirectory: args.workspaceDirectory,

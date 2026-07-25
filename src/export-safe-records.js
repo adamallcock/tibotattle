@@ -26,6 +26,7 @@ const PLAN_VARIANTS = new Set(["pro-20x", "pro-10x-promo", "pro-5x", "plus", "un
 const SESSION_SCOPE_PATTERN = /^session:v1:[A-Za-z0-9_-]{43}$/u;
 const ACCOUNT_SCOPE_SUBJECT_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const MODEL_FINGERPRINT_PATTERN = /^model:v1:[A-Za-z0-9_-]{43}$/u;
 const CLAUDE_PHYSICAL_OCCURRENCE_PATTERN = /^claude-ledger-occurrence:v1:[A-Za-z0-9_-]{43}$/u;
 const MARKER_SURFACES = new Set([
   "chatgpt_chat", "chatgpt_web", "chatgpt_work", "workspace_agent", "chatgpt_excel",
@@ -129,6 +130,20 @@ function normalizeCheckpointModelDeclaration(value) {
   }
 }
 
+function normalizeProviderModelDeclaration(value) {
+  const declaration = assertExactDataKeys(value, ["modelId", "modelRecognition", "modelFingerprint"],
+    "Invalid privacy-safe model declaration");
+  const recognized = recognizedExportModelId(declaration.modelId);
+  const valid = (declaration.modelRecognition === "recognized"
+      && recognized === declaration.modelId && declaration.modelFingerprint === null)
+    || (declaration.modelRecognition === "missing"
+      && declaration.modelId === "unknown" && declaration.modelFingerprint === null)
+    || (declaration.modelRecognition === "unrecognized"
+      && declaration.modelId === "unknown" && MODEL_FINGERPRINT_PATTERN.test(declaration.modelFingerprint ?? ""));
+  if (!valid) throw new TypeError("Invalid privacy-safe model declaration");
+  return { ...declaration };
+}
+
 function usageModelDeclaration(secret, event) {
   if (Object.hasOwn(event, "modelDeclaration")) {
     // Checkpoint-driven callers must not also pass a raw label.  That keeps
@@ -206,8 +221,11 @@ export function normalizeCodexUsageEvent(secret, event, toolClassCounts = create
       inputUncachedTokens: event.componentAvailability.input_uncached_tokens ? event.components.input_uncached_tokens : null,
       inputCacheReadTokens: event.componentAvailability.input_cache_read_tokens ? event.components.input_cache_read_tokens : null,
       inputCacheWriteTokens: event.componentAvailability.input_cache_write_tokens ? event.components.input_cache_write_tokens : null,
+      inputCacheWrite5mTokens: null,
+      inputCacheWrite1hTokens: null,
       outputTextTokens: event.componentAvailability.output_text_tokens ? event.components.output_text_tokens : null,
       outputReasoningTokens: event.componentAvailability.output_reasoning_tokens ? event.components.output_reasoning_tokens : null,
+      outputCombinedTokens: null,
     },
     totalInputContextTokens: event.rawAvailability.input_tokens ? event.raw.input_tokens : null,
     surface: event.surfaceClassification.surface,
@@ -354,6 +372,94 @@ export function normalizeCodexCollectorQuotaCandidate(secret, candidate) {
     provider: "openai_codex",
     observationIdentityMaterial: candidate.observationIdentityMaterial,
   }, candidate.observationIdentityMaterial);
+}
+
+/**
+ * Convert an already privacy-reduced Claude transcript candidate into the
+ * canonical usage contract. Claude reports one combined output-token total;
+ * this adapter preserves it without inventing visible-text or reasoning
+ * components.
+ */
+export function normalizeClaudeTranscriptUsageCandidate(secret, candidate) {
+  const keys = [
+    "candidateVersion", "provider", "eventTime", "modelDeclaration", "billingSurface",
+    "speedMode", "components", "totalInputContextTokens", "surface", "agentScope",
+    "lineageDisposition", "toolClassCounts", "sessionScopeId", "occurrenceMaterial",
+  ];
+  candidate = assertExactDataKeys(candidate, keys, "Invalid privacy-safe Claude transcript usage candidate");
+  const components = assertExactDataKeys(candidate.components, [
+    "inputUncachedTokens", "inputCacheReadTokens", "inputCacheWriteTokens", "inputCacheWrite5mTokens",
+    "inputCacheWrite1hTokens", "outputCombinedTokens",
+  ], "Invalid privacy-safe Claude transcript usage candidate");
+  const scannerCounts = assertExactDataKeys(candidate.toolClassCounts, Object.keys(TOOL_FIELD),
+    "Invalid privacy-safe Claude transcript usage candidate");
+  const modelDeclaration = normalizeProviderModelDeclaration(candidate.modelDeclaration);
+  const tokenValues = [
+    components.inputUncachedTokens, components.inputCacheReadTokens,
+    components.inputCacheWriteTokens, components.outputCombinedTokens,
+    candidate.totalInputContextTokens,
+  ];
+  if (candidate.candidateVersion !== "claude-transcript-usage-candidate-v0.2"
+      || candidate.provider !== "anthropic_claude_code"
+      || candidate.billingSurface !== "claude_subscription"
+      || !["standard", "fast", "unknown", "other"].includes(candidate.speedMode)
+      || !["subagent", "local_interactive_unclassified"].includes(candidate.surface)
+      || !["root", "subagent"].includes(candidate.agentScope)
+      || !["standalone", "parent_linked"].includes(candidate.lineageDisposition)
+      || !SESSION_SCOPE_PATTERN.test(candidate.sessionScopeId ?? "")
+      || !SHA256_PATTERN.test(candidate.occurrenceMaterial ?? "")
+      || boundedIso(candidate.eventTime, "Claude transcript usage event time") !== candidate.eventTime
+      || tokenValues.some((value) => !Number.isSafeInteger(value) || value < 0)
+      || (components.inputCacheWrite5mTokens !== null
+        && (!Number.isSafeInteger(components.inputCacheWrite5mTokens)
+          || components.inputCacheWrite5mTokens < 0))
+      || (components.inputCacheWrite1hTokens !== null
+        && (!Number.isSafeInteger(components.inputCacheWrite1hTokens)
+          || components.inputCacheWrite1hTokens < 0))
+      || ((components.inputCacheWrite5mTokens === null) !== (components.inputCacheWrite1hTokens === null))
+      || (components.inputCacheWrite5mTokens !== null
+        && components.inputCacheWrite5mTokens + components.inputCacheWrite1hTokens
+          !== components.inputCacheWriteTokens)
+      || candidate.totalInputContextTokens !== components.inputUncachedTokens
+        + components.inputCacheReadTokens + components.inputCacheWriteTokens
+      || Object.values(scannerCounts).some((value) => !Number.isSafeInteger(value) || value < 0 || value > 1_000_000)) {
+    throw new TypeError("Invalid privacy-safe Claude transcript usage candidate");
+  }
+  const toolClassCounts = createEmptySafeToolClassCounts();
+  for (const [scannerClass, count] of Object.entries(scannerCounts)) {
+    toolClassCounts[safeToolCountFieldForScannerToolClass(scannerClass)] += count;
+  }
+  const usage = {
+    schemaVersion: "usage-event-v0.1",
+    eventTime: candidate.eventTime,
+    provider: "anthropic_claude_code",
+    ...modelDeclaration,
+    billingSurface: "claude_subscription",
+    speedMode: candidate.speedMode,
+    apiServiceTier: "unknown",
+    reasoningEffort: "unknown",
+    components: {
+      inputUncachedTokens: components.inputUncachedTokens,
+      inputCacheReadTokens: components.inputCacheReadTokens,
+      inputCacheWriteTokens: components.inputCacheWriteTokens,
+      inputCacheWrite5mTokens: components.inputCacheWrite5mTokens,
+      inputCacheWrite1hTokens: components.inputCacheWrite1hTokens,
+      outputTextTokens: null,
+      outputReasoningTokens: null,
+      outputCombinedTokens: components.outputCombinedTokens,
+    },
+    totalInputContextTokens: candidate.totalInputContextTokens,
+    surface: candidate.surface,
+    agentScope: candidate.agentScope,
+    lineageDisposition: candidate.lineageDisposition,
+    toolClassCounts,
+    outcome: "unknown",
+    sessionScopeId: candidate.sessionScopeId,
+    accountScopeId: "unattributed",
+  };
+  usage.eventId = deriveEventOccurrenceId(secret, candidate.occurrenceMaterial);
+  assertValidExportRecord("usageEvent", usage);
+  return usage;
 }
 
 /**

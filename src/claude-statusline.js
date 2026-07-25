@@ -90,12 +90,16 @@ function normalizeSessionPseudonym(sessionId, sessionSecret) {
   if (sessionSecret === undefined || sessionSecret === null) return null;
   if (!Buffer.isBuffer(sessionSecret) && !(sessionSecret instanceof Uint8Array)) fail("session_secret");
   const secret = Buffer.from(sessionSecret);
-  if (secret.byteLength !== 32) fail("session_secret");
-  const digest = createHmac("sha256", secret)
-    .update("app-usagemonitor/claude-session/v1\0", "utf8")
-    .update(sessionId, "utf8")
-    .digest("base64url");
-  return `claude-session:v1:${digest}`;
+  try {
+    if (secret.byteLength !== 32) fail("session_secret");
+    const digest = createHmac("sha256", secret)
+      .update("app-usagemonitor/claude-session/v1\0", "utf8")
+      .update(sessionId, "utf8")
+      .digest("base64url");
+    return `claude-session:v1:${digest}`;
+  } finally {
+    secret.fill(0);
+  }
 }
 
 function normalizeWindow(value, windowMinutes) {
@@ -230,7 +234,7 @@ export function formatClaudeStatusline(snapshot) {
   return segments.length ? `Claude ${segments.join(" · ")}` : "Claude limits unavailable";
 }
 
-export async function readBoundedClaudeStatusInput(readable, maxBytes = DEFAULT_MAX_CLAUDE_STATUS_INPUT_BYTES) {
+export async function readBoundedClaudeStatusBytes(readable, maxBytes = DEFAULT_MAX_CLAUDE_STATUS_INPUT_BYTES) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 2 || maxBytes > 1024 * 1024) fail("input_bound");
   const chunks = [];
   let bytes = 0;
@@ -250,22 +254,19 @@ export async function readBoundedClaudeStatusInput(readable, maxBytes = DEFAULT_
     fail("input_read");
   }
   if (bytes === 0) fail("input_empty");
+  return Buffer.concat(chunks, bytes);
+}
+
+export async function readBoundedClaudeStatusInput(readable, maxBytes = DEFAULT_MAX_CLAUDE_STATUS_INPUT_BYTES) {
+  const bytes = await readBoundedClaudeStatusBytes(readable, maxBytes);
   let parsed;
   try {
-    parsed = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+    parsed = JSON.parse(bytes.toString("utf8"));
   } catch {
     fail("input_json");
   }
   if (!isPlainRecord(parsed)) fail("input_shape");
   return parsed;
-}
-
-function decodeInjectedSecret(value) {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) fail("session_secret");
-  const decoded = Buffer.from(value, "base64url");
-  if (decoded.byteLength !== 32) fail("session_secret");
-  return decoded;
 }
 
 export async function runClaudeStatusline({
@@ -274,17 +275,32 @@ export async function runClaudeStatusline({
   env = process.env,
   platform = process.platform,
   homeDirectory,
+  stateDirectory,
+  loadSessionSecret = null,
   capturedAt = new Date().toISOString(),
 } = {}) {
   const input = await readBoundedClaudeStatusInput(stdin);
-  const sessionSecret = decodeInjectedSecret(env.USAGEMONITOR_CLAUDE_SESSION_SECRET_B64URL);
-  const snapshot = sanitizeClaudeStatusline(input, capturedAt, { sessionSecret });
-  const { defaultClaudeStatusStateDirectory, writeClaudeStatusSnapshot } = await import("./claude-statusline-storage.js");
-  const stateDirectory = env.USAGEMONITOR_CLAUDE_STATE_DIR
-    ?? defaultClaudeStatusStateDirectory({ platform, env, homeDirectory });
-  await writeClaudeStatusSnapshot(snapshot, { stateDirectory });
-  stdout.write(`${formatClaudeStatusline(snapshot)}\n`);
-  return snapshot;
+  if (loadSessionSecret !== null && typeof loadSessionSecret !== "function") fail("session_secret");
+  let sessionSecret = null;
+  try {
+    if (loadSessionSecret) {
+      const loaded = await loadSessionSecret();
+      if (!Buffer.isBuffer(loaded) || loaded.byteLength !== 32) {
+        if (Buffer.isBuffer(loaded)) loaded.fill(0);
+        fail("session_secret");
+      }
+      sessionSecret = loaded;
+    }
+    const snapshot = sanitizeClaudeStatusline(input, capturedAt, { sessionSecret });
+    const { defaultClaudeStatusStateDirectory, writeClaudeStatusSnapshot } = await import("./claude-statusline-storage.js");
+    const selectedStateDirectory = stateDirectory ?? env.USAGEMONITOR_CLAUDE_STATE_DIR
+      ?? defaultClaudeStatusStateDirectory({ platform, env, homeDirectory });
+    await writeClaudeStatusSnapshot(snapshot, { stateDirectory: selectedStateDirectory });
+    stdout.write(`${formatClaudeStatusline(snapshot)}\n`);
+    return snapshot;
+  } finally {
+    sessionSecret?.fill(0);
+  }
 }
 
 async function main() {

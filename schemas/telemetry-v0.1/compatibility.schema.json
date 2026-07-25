@@ -125,15 +125,26 @@
               "additionalProperties": false,
               "required": ["usageEvents", "quotaSnapshots"],
               "properties": {
-                "usageEvents": { "const": "not_implemented" },
+                "usageEvents": { "const": "implemented" },
                 "quotaSnapshots": { "const": "implemented" }
               }
             },
             "sourceFormats": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["statusLine"],
+              "required": ["transcript", "statusLine"],
               "properties": {
+                "transcript": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["status", "sourceFormat", "parserVersion", "adapterVersion"],
+                  "properties": {
+                    "status": { "const": "implemented" },
+                    "sourceFormat": { "const": "claude-code-transcript-jsonl" },
+                    "parserVersion": { "const": "claude-transcript-export-cursor-v0.2" },
+                    "adapterVersion": { "const": "claude-transcript-usage-candidate-v0.2" }
+                  }
+                },
                 "statusLine": {
                   "type": "object",
                   "additionalProperties": false,
@@ -156,7 +167,7 @@
       "additionalProperties": false,
       "required": ["version", "sha256"],
       "properties": {
-        "version": { "const": "telemetry-v0.1-registry-2026-07-24.2" },
+        "version": { "const": "telemetry-v0.1-registry-2026-07-25.3" },
         "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
       }
     },

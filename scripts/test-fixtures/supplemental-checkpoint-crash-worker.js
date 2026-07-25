@@ -35,6 +35,13 @@ function selectedSource(kind) {
       checkpointStage: "after_claude_status_checkpoint_batch",
     };
   }
+  if (kind === "claude-transcript") {
+    return {
+      claudeProjectsDirectory: requiredEnvironment("SUPPLEMENTAL_CLAUDE_PROJECTS_DIRECTORY"),
+      claudeTranscriptRecordsPerBatch: 1,
+      checkpointStage: "after_claude_transcript_checkpoint_batch",
+    };
+  }
   throw new Error("Unknown supplemental checkpoint source");
 }
 

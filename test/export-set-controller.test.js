@@ -121,14 +121,21 @@ test("export-set CLI parses explicit supplemental source selections without auto
     "export-set",
     "--collector-file", "./private-collector.jsonl",
     "--claude-state-dir", "./private-claude-state",
+    "--claude-projects-dir", "./private-claude-projects",
   ]);
   assert.equal(selected.collectorFile, resolve("./private-collector.jsonl"));
   assert.equal(selected.claudeStatus, false);
   assert.equal(selected.claudeStateDirectory, resolve("./private-claude-state"));
+  assert.equal(selected.claudeUsage, false);
+  assert.equal(selected.claudeProjectsDirectory, resolve("./private-claude-projects"));
 
   const defaultClaude = parseArgs(["export-set", "--claude-status"]);
   assert.equal(defaultClaude.claudeStatus, true);
   assert.equal(defaultClaude.claudeStateDirectory, null);
+
+  const defaultClaudeUsage = parseArgs(["export-set", "--claude-usage"]);
+  assert.equal(defaultClaudeUsage.claudeUsage, true);
+  assert.equal(defaultClaudeUsage.claudeProjectsDirectory, null);
 
   assert.throws(
     () => parseArgs(["export-set", "--claude-status", "--claude-state-dir", "./private-claude-state"]),
@@ -136,11 +143,15 @@ test("export-set CLI parses explicit supplemental source selections without auto
   );
   assert.throws(() => parseArgs(["doctor", "--claude-status"]), /only for export-set/);
   assert.throws(() => parseArgs(["quality", "--claude-state-dir", "./private-claude-state"]), /only for export-set/);
+  assert.throws(() => parseArgs(["doctor", "--claude-usage"]), /only for export-set/);
+  assert.throws(() => parseArgs(["quality", "--claude-projects-dir", "./private-claude-projects"]), /only for export-set/);
 
   const omitted = parseArgs(["export-set"]);
   assert.equal(omitted.collectorFile, null);
   assert.equal(omitted.claudeStatus, false);
   assert.equal(omitted.claudeStateDirectory, null);
+  assert.equal(omitted.claudeUsage, false);
+  assert.equal(omitted.claudeProjectsDirectory, null);
 });
 
 test("controller creates a complete bounded workspace from frozen source prefixes", async () => {
@@ -331,6 +342,10 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
   const collectorDirectory = join(value.root, "PRIVATE_COLLECTOR_DIRECTORY_CANARY");
   const collectorFile = join(collectorDirectory, "PRIVATE_COLLECTOR_FILENAME_CANARY.jsonl");
   const claudeStateDirectory = join(value.root, "PRIVATE_CLAUDE_STATE_DIRECTORY_CANARY");
+  const claudeProjectsDirectory = join(value.root, "PRIVATE_CLAUDE_PROJECTS_DIRECTORY_CANARY");
+  const claudeTranscriptFile = join(claudeProjectsDirectory, "PRIVATE_CLAUDE_TRANSCRIPT_FILENAME_CANARY.jsonl");
+  const claudeTranscriptContentCanary = "PRIVATE_CLAUDE_TRANSCRIPT_CONTENT_CANARY";
+  const claudeTranscriptSessionCanary = "PRIVATE_CLAUDE_TRANSCRIPT_SESSION_CANARY";
   let claudeRecord;
   try {
     await mkdir(collectorDirectory, { mode: 0o700 });
@@ -339,6 +354,25 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
       stateDirectory: claudeStateDirectory,
       uuid: "90000000-0000-4000-8000-000000000001",
     });
+    await mkdir(claudeProjectsDirectory, { mode: 0o700 });
+    await writeFile(claudeTranscriptFile, `${JSON.stringify({
+      type: "assistant",
+      timestamp: "2026-07-24T12:06:00.000Z",
+      sessionId: claudeTranscriptSessionCanary,
+      message: {
+        id: "msg_cli_claude_usage_1",
+        model: "claude-sonnet-4-6",
+        usage: {
+          input_tokens: 11,
+          cache_read_input_tokens: 12,
+          cache_creation_input_tokens: 13,
+          output_tokens: 14,
+          service_tier: "standard",
+          speed: "standard",
+        },
+        content: [{ type: "text", text: claudeTranscriptContentCanary }],
+      },
+    })}\n`, { mode: 0o600 });
     const common = [
       "--workspace", value.workspace,
       "--directory", output,
@@ -346,6 +380,7 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
       "--secret-file", secretFile,
       "--collector-file", collectorFile,
       "--claude-state-dir", claudeStateDirectory,
+      "--claude-projects-dir", claudeProjectsDirectory,
       "--max-records-per-chunk", "1",
       "--max-bundle-bytes", "33554432",
       "--max-artifact-bytes", "35651584",
@@ -359,7 +394,7 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
     assert.equal(created.status, 0, created.stderr);
     assert.match(created.stdout, /Local metadata export set: complete/);
     assert.match(created.stdout, /Upload: disabled/);
-    assert.match(created.stdout, /Records: 1 usage, 5 quota, 0 markers/);
+    assert.match(created.stdout, /Records: 2 usage, 5 quota, 0 markers/);
 
     const workspace = await openExportWorkspace({ directory: value.workspace });
     let supplementalSourceKeys;
@@ -374,7 +409,7 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
       "./src/cli.js", "inspect-export-workspace", "--workspace", value.workspace,
     ], { cwd: process.cwd(), encoding: "utf8" });
     assert.equal(inspected.status, 0, inspected.stderr);
-    assert.match(inspected.stdout, /Sources: 3; bytes: \d+/);
+    assert.match(inspected.stdout, /Sources: 4; bytes: \d+/);
     assert.match(inspected.stdout, /Providers: openai_codex, anthropic_claude_code/);
 
     const missingSelection = spawnSync(process.execPath, [
@@ -398,7 +433,7 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
     ], { cwd: process.cwd(), encoding: "utf8" });
     assert.equal(verified.status, 0, verified.stderr);
     assert.match(verified.stdout, /Local metadata export-set verification: passed/);
-    assert.match(verified.stdout, /Records: 1 usage, 5 quota, 0 markers/);
+    assert.match(verified.stdout, /Records: 2 usage, 5 quota, 0 markers/);
 
     const artifactText = await readExportArtifactText(output);
     const allOutput = [created.stdout, inspected.stdout, missingSelection.stdout, missingSelection.stderr,
@@ -413,6 +448,11 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
       claudeStateDirectory,
       claudeRecord.recordFile,
       basename(claudeRecord.recordFile),
+      claudeProjectsDirectory,
+      claudeTranscriptFile,
+      basename(claudeTranscriptFile),
+      claudeTranscriptContentCanary,
+      claudeTranscriptSessionCanary,
       ...supplementalSourceKeys,
       CLI_ACCOUNT_SCOPE_CANARY,
       CLI_CONTENT_CANARY,

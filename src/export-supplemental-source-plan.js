@@ -5,6 +5,7 @@ export const EXPORT_SUPPLEMENTAL_SOURCE_PLAN_VERSION = "supplemental-export-sour
 export const SUPPLEMENTAL_SOURCE_KINDS = Object.freeze([
   "codex_collector_ledger",
   "claude_status_snapshot",
+  "claude_transcript_jsonl",
 ]);
 
 const SOURCE_KINDS = new Set(SUPPLEMENTAL_SOURCE_KINDS);
@@ -125,7 +126,8 @@ function normalizeSource(value, ordinal) {
       || !/^[a-z][a-z0-9_.-]{0,63}$/.test(value.parserVersion)) fail();
   const binding = normalizeBinding(value.binding);
   if ((value.kind === "codex_collector_ledger" && binding.kind !== "file_prefix")
-      || (value.kind === "claude_status_snapshot" && binding.kind !== "frozen_inventory")) fail();
+      || (value.kind === "claude_status_snapshot" && binding.kind !== "frozen_inventory")
+      || (value.kind === "claude_transcript_jsonl" && binding.kind !== "file_prefix")) fail();
   return {
     ordinal,
     sourceKey: value.sourceKey,

@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "03e99b7da682f8a23c8d0edde97ee1f4135b797e3e5799e94c2a9ac9f8539721",
+    "sha256": "9672f82fdcc95decaae785d20c8b5209aabdf0960bc5350d800cded48ac8596c",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -28,13 +28,19 @@
     "anthropicClaudeCode": {
       "capabilities": {
         "quotaSnapshots": "implemented",
-        "usageEvents": "not_implemented"
+        "usageEvents": "implemented"
       },
       "sourceFormats": {
         "statusLine": {
           "adapterVersion": "quota-candidate-normalizer-v0.1",
           "parserVersion": "claude-statusline-v0.2",
           "sourceFormat": "claude-statusline-snapshot-v0.2",
+          "status": "implemented"
+        },
+        "transcript": {
+          "adapterVersion": "claude-transcript-usage-candidate-v0.2",
+          "parserVersion": "claude-transcript-export-cursor-v0.2",
+          "sourceFormat": "claude-code-transcript-jsonl",
           "status": "implemented"
         }
       },
@@ -66,8 +72,8 @@
     }
   },
   "registry": {
-    "sha256": "d8b552797c18b19822da011db4fa7f98a620ec0da13d03e152c1b4019d42b387",
-    "version": "telemetry-v0.1-registry-2026-07-24.2"
+    "sha256": "79a20167ed2671bc2773358f966560a870f228f41827b4286036fb9574e63f35",
+    "version": "telemetry-v0.1-registry-2026-07-25.3"
   },
   "schemas": {
     "members": [
@@ -84,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "2502280dd711db282b44db0f7767f0ac4440cda1c2d9a943910c40c482e02692"
+        "sha256": "12f9a1633899bf4bc3c2d58a6ba034766556bde14d04e4bdbe156e76c56d9649"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -99,10 +105,10 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "a9fe4513b91878dab74cb6d4ba7b41f02fc3d685c7b7d3de28a6b29012b00d81"
+        "sha256": "95bea7c449cc21878837b6ad6411b0fbe0b50c8ce85839540c42c308364e4d00"
       }
     ],
-    "setSha256": "d8722f735902f54317c7995e586fb465654b3c855dcbccf1d0630428ec129671"
+    "setSha256": "59f73f9989185a1fc9c9418b81b4e049dedb03d257a04b9e19ef641354e6d671"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

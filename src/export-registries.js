@@ -1,5 +1,5 @@
-export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-07-24.2";
-export const TELEMETRY_V01_REVIEWED_AT = "2026-07-24";
+export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-07-25.3";
+export const TELEMETRY_V01_REVIEWED_AT = "2026-07-25";
 
 export const OPENAI_CODEX_MODEL_IDS = Object.freeze([
   "gpt-4.1",
@@ -16,6 +16,14 @@ export const OPENAI_CODEX_MODEL_IDS = Object.freeze([
 export const OPENAI_CODEX_LIMIT_IDS = Object.freeze([
   "codex",
   "codex-spark",
+]);
+
+export const ANTHROPIC_CLAUDE_MODEL_IDS = Object.freeze([
+  "claude-fable-5",
+  "claude-haiku-4-5-20251001",
+  "claude-opus-4-8",
+  "claude-sonnet-4-6",
+  "claude-sonnet-5",
 ]);
 
 export const EXPORT_DIAGNOSTIC_CODES = Object.freeze([
@@ -40,7 +48,7 @@ export const EXPORT_DIAGNOSTIC_CODES = Object.freeze([
   "unattributed_fork_replay_events_skipped",
 ]);
 
-const modelIds = new Set(OPENAI_CODEX_MODEL_IDS);
+const modelIds = new Set([...OPENAI_CODEX_MODEL_IDS, ...ANTHROPIC_CLAUDE_MODEL_IDS]);
 const limitIds = new Set(OPENAI_CODEX_LIMIT_IDS);
 
 export function recognizedExportModelId(value) {
@@ -65,7 +73,7 @@ export function exportRegistrySnapshot() {
         modelIds: [...OPENAI_CODEX_MODEL_IDS],
         limitIds: [...OPENAI_CODEX_LIMIT_IDS],
       },
-      anthropic_claude_code: { modelIds: [], limitIds: [] },
+      anthropic_claude_code: { modelIds: [...ANTHROPIC_CLAUDE_MODEL_IDS], limitIds: [] },
     },
     diagnosticCodes: [...EXPORT_DIAGNOSTIC_CODES],
   };

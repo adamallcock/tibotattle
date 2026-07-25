@@ -44,9 +44,10 @@ test("generated compatibility manifest exactly matches all live contract inputs"
   assert.equal(generated.providerAdapters.openaiCodex.capabilities.quotaSnapshots.collector, "implemented");
   assert.equal(generated.providerAdapters.openaiCodex.sourceFormats.collectorQuota.status, "implemented");
   assert.equal(generated.providerAdapters.anthropicClaudeCode.status, "partial");
-  assert.equal(generated.providerAdapters.anthropicClaudeCode.capabilities.usageEvents, "not_implemented");
+  assert.equal(generated.providerAdapters.anthropicClaudeCode.capabilities.usageEvents, "implemented");
   assert.equal(generated.providerAdapters.anthropicClaudeCode.capabilities.quotaSnapshots, "implemented");
   assert.equal(generated.providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.status, "implemented");
+  assert.equal(generated.providerAdapters.anthropicClaudeCode.sourceFormats.transcript.status, "implemented");
   assert.equal(generated.contract.transportReady, false);
   assert.equal(generated.contract.externalParticipantsAuthorized, false);
 });

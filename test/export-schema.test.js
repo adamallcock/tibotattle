@@ -21,8 +21,11 @@ function usageEvent() {
       inputUncachedTokens: 10,
       inputCacheReadTokens: 20,
       inputCacheWriteTokens: 0,
+      inputCacheWrite5mTokens: null,
+      inputCacheWrite1hTokens: null,
       outputTextTokens: 5,
       outputReasoningTokens: 3,
+      outputCombinedTokens: null,
     },
     totalInputContextTokens: 30,
     surface: "local_interactive_unclassified",
@@ -114,7 +117,7 @@ test("reviewed registries and schemas expose the same closed model, limit, and d
   const registry = exportRegistrySnapshot();
   assert.deepEqual(
     exportSchemas.usageEvent.properties.modelId.enum,
-    ["unknown", ...registry.providers.openai_codex.modelIds],
+    ["unknown", ...registry.providers.openai_codex.modelIds, ...registry.providers.anthropic_claude_code.modelIds],
   );
   assert.deepEqual(
     exportSchemas.quotaSnapshot.properties.limitId.enum,
@@ -150,6 +153,10 @@ test("unreviewed models, provider-incompatible models, limits, and diagnostics f
   const claudeWithGpt = usageEvent();
   claudeWithGpt.provider = "anthropic_claude_code";
   assert.equal(validateExportRecord("usageEvent", claudeWithGpt).valid, false);
+
+  const codexWithClaude = usageEvent();
+  codexWithClaude.modelId = "claude-sonnet-5";
+  assert.equal(validateExportRecord("usageEvent", codexWithClaude).valid, false);
 
   const arbitraryLimit = quotaSnapshot();
   arbitraryLimit.limitId = "private.safe";

@@ -31,6 +31,7 @@
     "build:weekly-calibration-report-data": "node ./src/build-weekly-calibration-report.js",
     "build:weekly-calibration-audit": "node ./src/build-weekly-calibration-audit.js",
     "verify:weekly-calibration": "node ./src/verify-weekly-calibration.js",
+    "evaluate:minimization": "node ./scripts/minimization-ablation.js --input .usage-monitor/transitions-v0.3.2.json --output .usage-monitor/minimization-ablation-v0.1.json --prospective-after 2026-07-24T00:00:00.000Z --fixture test/fixtures/minimization-codex-shaped-v1.json --fixture test/fixtures/minimization-claude-shaped-v1.json",
     "fix:report-width": "node ./src/fix-portable-report-width.js",
     "collect-once": "node ./src/cli.js collect-once",
     "collect-foreground": "node ./src/cli.js collect-foreground",

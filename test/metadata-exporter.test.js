@@ -120,8 +120,11 @@ test("bounded exporter emits only allowlisted metadata and fingerprints unknown 
       inputUncachedTokens: 60,
       inputCacheReadTokens: 40,
       inputCacheWriteTokens: 0,
+      inputCacheWrite5mTokens: null,
+      inputCacheWrite1hTokens: null,
       outputTextTokens: 12,
       outputReasoningTokens: 8,
+      outputCombinedTokens: null,
     });
     assert.equal(result.bundle.records.usageEvents[1].modelId, "unknown");
     assert.match(result.bundle.records.usageEvents[1].modelFingerprint, /^model:v1:/);
@@ -294,8 +297,11 @@ test("missing source token components remain unavailable rather than becoming ob
       inputUncachedTokens: null,
       inputCacheReadTokens: null,
       inputCacheWriteTokens: null,
+      inputCacheWrite5mTokens: null,
+      inputCacheWrite1hTokens: null,
       outputTextTokens: null,
       outputReasoningTokens: null,
+      outputCombinedTokens: null,
     });
   } finally {
     await rm(home, { recursive: true, force: true });

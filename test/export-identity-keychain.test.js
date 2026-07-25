@@ -12,6 +12,7 @@ import {
 const require = createRequire(import.meta.url);
 const EXPORT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
 const ACCOUNT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
+const CLAUDE_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
 
 function credentialKey(service, account) {
   return `${service}\u0000${account}`;
@@ -59,6 +60,7 @@ test("capabilities are frozen public constants with separate fixed credential pa
   assert.equal(Object.isFrozen(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES), true);
   assert.equal(Object.isFrozen(EXPORT_CAPABILITY), true);
   assert.equal(Object.isFrozen(ACCOUNT_CAPABILITY), true);
+  assert.equal(Object.isFrozen(CLAUDE_CAPABILITY), true);
   assert.deepEqual(EXPORT_CAPABILITY, {
     service: "app-usagemonitor.export-identity.v1",
     account: "installation",
@@ -67,7 +69,13 @@ test("capabilities are frozen public constants with separate fixed credential pa
     service: "app-usagemonitor.account-observation.v1",
     account: "installation",
   });
+  assert.deepEqual(CLAUDE_CAPABILITY, {
+    service: "app-usagemonitor.claude-session-pseudonym.v1",
+    account: "installation",
+  });
   assert.notDeepEqual(EXPORT_CAPABILITY, ACCOUNT_CAPABILITY);
+  assert.notDeepEqual(EXPORT_CAPABILITY, CLAUDE_CAPABILITY);
+  assert.notDeepEqual(ACCOUNT_CAPABILITY, CLAUDE_CAPABILITY);
 });
 
 test("native loader accepts only the exact audited darwin-arm64 prebuild", () => {
@@ -279,6 +287,7 @@ test("createIfMissing stores strict base64url, verifies readback, and preserves 
   assert.deepEqual(set.slice(0, 3), ["setPassword", EXPORT_CAPABILITY.service, EXPORT_CAPABILITY.account]);
   assert.match(set[3], /^[A-Za-z0-9_-]{43}$/);
   assert.equal(set[3], secret.toString("base64url"));
+  assert.deepEqual(secret, Buffer.alloc(32, 5), "backend must zero only its own generated-secret copy");
 
   binding.calls.length = 0;
   assert.equal(await backend.createIfMissing(EXPORT_CAPABILITY, Buffer.alloc(32, 6)), "existing");
@@ -300,6 +309,8 @@ test("replaceExact reports missing and conflict, then replaces only an exact val
   binding.values.set(credentialKey(EXPORT_CAPABILITY.service, EXPORT_CAPABILITY.account), oldSecret.toString("base64url"));
   assert.equal(await backend.replaceExact(EXPORT_CAPABILITY, oldSecret, replacement), "replaced");
   assert.deepEqual(await backend.read(EXPORT_CAPABILITY), replacement);
+  assert.deepEqual(oldSecret, Buffer.alloc(32, 7));
+  assert.deepEqual(replacement, Buffer.alloc(32, 8));
 });
 
 test("deleteExact reports missing and conflict, then deletes only an exact value", async () => {
@@ -315,6 +326,7 @@ test("deleteExact reports missing and conflict, then deletes only an exact value
   binding.values.set(credentialKey(EXPORT_CAPABILITY.service, EXPORT_CAPABILITY.account), expected.toString("base64url"));
   assert.equal(await backend.deleteExact(EXPORT_CAPABILITY, expected), "deleted");
   assert.equal(await backend.read(EXPORT_CAPABILITY), null);
+  assert.deepEqual(expected, Buffer.alloc(32, 10));
 });
 
 test("mutations fail closed when create, replace, or delete readback disagrees", async () => {
@@ -359,13 +371,16 @@ test("capabilities never cross service boundaries", async () => {
   const binding = memoryBinding([
     [EXPORT_CAPABILITY, encoded(15)],
     [ACCOUNT_CAPABILITY, encoded(16)],
+    [CLAUDE_CAPABILITY, encoded(18)],
   ]);
   const backend = createExportIdentityKeychainBackend({ binding });
   assert.deepEqual(await backend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 15));
   assert.deepEqual(await backend.read(ACCOUNT_CAPABILITY), Buffer.alloc(32, 16));
+  assert.deepEqual(await backend.read(CLAUDE_CAPABILITY), Buffer.alloc(32, 18));
   await backend.replaceExact(ACCOUNT_CAPABILITY, Buffer.alloc(32, 16), Buffer.alloc(32, 17));
   assert.deepEqual(await backend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 15));
   assert.deepEqual(await backend.read(ACCOUNT_CAPABILITY), Buffer.alloc(32, 17));
+  assert.deepEqual(await backend.read(CLAUDE_CAPABILITY), Buffer.alloc(32, 18));
   await assert.rejects(
     backend.read({ ...EXPORT_CAPABILITY }),
     assertKeychainError("invalid_capability"),
