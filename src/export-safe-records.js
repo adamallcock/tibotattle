@@ -13,7 +13,11 @@ import {
 } from "./export-identity.js";
 import { exportCompatibilityTuple } from "./export-contract.js";
 import { recognizedExportLimitId, recognizedExportModelId } from "./export-registries.js";
-import { createExportResourceGuard, ExportResourceLimitError } from "./export-resource-policy.js";
+import {
+  createExportResourceGuard,
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
+  ExportResourceLimitError,
+} from "./export-resource-policy.js";
 import { assertValidExportRecord } from "./export-schema.js";
 import {
   createEmptyCodexCheckpointState,
@@ -551,8 +555,19 @@ export function normalizeActivityMarker(secret, marker, bounds) {
   return safe;
 }
 
-export function summarizeActivityMarkerPlan(secret, activityMarkers, bounds) {
+export function summarizeActivityMarkerPlan(secret, activityMarkers, bounds, {
+  maximumRecords = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExportSetRecords,
+} = {}) {
   if (!Array.isArray(activityMarkers)) throw new TypeError("Activity markers must be an array");
+  if (!Number.isSafeInteger(maximumRecords) || maximumRecords < 1
+      || maximumRecords > DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExportSetRecords) {
+    throw new TypeError("Activity marker planning limit exceeds the resource policy");
+  }
+  // Bound the caller-owned sequence before allocating the deduplication Map.
+  // Out-of-window and duplicate markers do not excuse an unbounded input.
+  if (activityMarkers.length > maximumRecords) {
+    throw new ExportResourceLimitError("output_records");
+  }
   const recordsById = new Map();
   for (const marker of activityMarkers) {
     const record = normalizeActivityMarker(secret, marker, bounds);

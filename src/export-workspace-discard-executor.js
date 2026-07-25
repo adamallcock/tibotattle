@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, open, readdir } from "node:fs/promises";
+import { link, lstat, open } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   assertValidExportWorkspaceDiscardCommitMarker,
@@ -23,6 +23,7 @@ import {
   workspaceDiscardDirectoryIdentityToken,
   workspaceDiscardEvidenceToken,
 } from "./export-workspace-discard.js";
+import { readBoundedDirectoryEntries } from "./export-resource-policy.js";
 import { EXPORT_WORKSPACE_DATABASE_BASENAME } from "./export-workspace.js";
 import { withExistingExportWorkspaceLease } from "./export-workspace-lock.js";
 import {
@@ -410,7 +411,7 @@ async function loadControls(directory) {
 
 async function assertReceiptOnlyState(directory) {
   const allowed = new Set([WORKSPACE_LOCK_BASENAME, EXPORT_WORKSPACE_DISCARD_RECEIPT_BASENAME]);
-  const entries = await readdir(directory);
+  const entries = await readBoundedDirectoryEntries(directory);
   if (entries.some((name) => !allowed.has(name))
       || entries.includes(EXPORT_WORKSPACE_DATABASE_BASENAME)
       || entries.includes(TRANSACTION_BASENAME)) fail("receipt_invalid");
@@ -429,7 +430,7 @@ async function assertCommittedDirectoryState(directory, journal) {
     allowed.add(basename(pathForRole(directory, row.role)));
     allowed.add(basename(quarantineForRole(directory, row.ordinal)));
   }
-  const entries = await readdir(directory);
+  const entries = await readBoundedDirectoryEntries(directory);
   if (entries.some((name) => !allowed.has(name)) || entries.includes(TRANSACTION_BASENAME)) {
     fail("receipt_invalid");
   }
@@ -467,7 +468,7 @@ async function assertMarkerReceiptTerminalState(directory, markerPath) {
     EXPORT_WORKSPACE_DISCARD_COMMIT_MARKER_BASENAME,
     MARKER_QUARANTINE,
   ]);
-  const entries = await readdir(directory);
+  const entries = await readBoundedDirectoryEntries(directory);
   const markerNames = [EXPORT_WORKSPACE_DISCARD_COMMIT_MARKER_BASENAME, MARKER_QUARANTINE]
     .filter((name) => entries.includes(name));
   if (!entries.includes(EXPORT_WORKSPACE_DISCARD_RECEIPT_BASENAME)
@@ -483,7 +484,7 @@ async function assertPreparedJournalState(directory, journal) {
     JOURNAL_QUARANTINE,
   ]);
   for (const row of journal.inventory) allowed.add(basename(pathForRole(directory, row.role)));
-  const entries = await readdir(directory);
+  const entries = await readBoundedDirectoryEntries(directory);
   if (entries.some((name) => !allowed.has(name))) fail("journal_invalid");
   await assertDirectoryIdentityToken(directory, journal.planToken, journal.directoryIdentityToken);
   for (const row of journal.inventory) {

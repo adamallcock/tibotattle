@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, join, parse, resolve, sep } from "node:path";
 import {
   assertValidExportDeletionJournal,
@@ -11,7 +11,10 @@ import {
   EXPORT_DELETION_PLAN_VERSION,
   EXPORT_DELETION_PREFLIGHT_VERSION,
 } from "./export-deletion-schema.js";
-import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
+import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
+  readBoundedDirectoryEntries,
+} from "./export-resource-policy.js";
 import {
   combinedSourcePlanCommitment,
   EXPORT_SET_MANIFEST_BASENAME,
@@ -99,7 +102,7 @@ async function inspectDirectory(path) {
     path: canonical,
     stats,
     parent: { path: parentPath, stats: parentStats },
-    entries: (await readdir(canonical)).sort(),
+    entries: await readBoundedDirectoryEntries(canonical, { sort: true }),
   };
 }
 
@@ -280,7 +283,7 @@ async function assertDirectoryStable(directory) {
   if (parentAfter.dev !== directory.parent.stats.dev || parentAfter.ino !== directory.parent.stats.ino) {
     fail("directory_changed");
   }
-  const entries = (await readdir(directory.path)).sort();
+  const entries = await readBoundedDirectoryEntries(directory.path, { sort: true });
   if (stableJson(entries) !== stableJson(directory.entries)) fail("directory_changed");
 }
 

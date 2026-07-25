@@ -1,8 +1,12 @@
 import { createHash, createHmac } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, join, parse, resolve } from "node:path";
-import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
+import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
+  ExportResourceLimitError,
+  readBoundedDirectoryEntries,
+} from "./export-resource-policy.js";
 import {
   EXPORT_WORKSPACE_DATABASE_BASENAME,
   inspectExportWorkspaceDiscardState,
@@ -114,9 +118,14 @@ async function inspectDirectory(path) {
     const parentPath = dirname(canonical);
     const parentStats = await lstat(parentPath);
     assertOwnerDirectory(parentStats);
-    return { path: canonical, stats, parent: { path: parentPath, stats: parentStats }, entries: (await readdir(canonical)).sort() };
+    return {
+      path: canonical,
+      stats,
+      parent: { path: parentPath, stats: parentStats },
+      entries: await readBoundedDirectoryEntries(canonical, { sort: true }),
+    };
   } catch (error) {
-    if (error instanceof ExportWorkspaceDiscardError) throw error;
+    if (error instanceof ExportWorkspaceDiscardError || error instanceof ExportResourceLimitError) throw error;
     fail("directory");
   }
 }
@@ -187,9 +196,10 @@ async function assertStable(directory) {
     assertOwnerDirectory(parent);
     if (current.dev !== directory.stats.dev || current.ino !== directory.stats.ino
         || parent.dev !== directory.parent.stats.dev || parent.ino !== directory.parent.stats.ino
-        || stableJson((await readdir(directory.path)).sort()) !== stableJson(directory.entries)) fail("directory_changed");
+        || stableJson(await readBoundedDirectoryEntries(directory.path, { sort: true }))
+          !== stableJson(directory.entries)) fail("directory_changed");
   } catch (error) {
-    if (error instanceof ExportWorkspaceDiscardError) throw error;
+    if (error instanceof ExportWorkspaceDiscardError || error instanceof ExportResourceLimitError) throw error;
     fail("directory_changed");
   }
 }

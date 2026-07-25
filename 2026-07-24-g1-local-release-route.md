@@ -17,7 +17,7 @@ This decision narrows platform claims; it does not weaken privacy, determinism, 
 
 | Area | Current state | Evidence | G1 status |
 |---|---|---|---|
-| Serial repository baseline | Active integrated tree passes 610 of 610 under Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime | Fresh post-audit serial test receipts on both runtimes | Closed for this checkpoint |
+| Serial repository baseline | Active integrated tree passes 632 of 632 under Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime | Fresh serial executions recorded in the [R7 smoke checkpoint](./2026-07-25-g1-r7-smoke-verification-receipt.md) validation section | Closed for this checkpoint |
 | Telemetry contract generation | 178 fields current | Fresh `pnpm telemetry:check` | Closed for current draft |
 | Codex export | Frozen-prefix Codex rollout and explicitly selected passive-collector sources are bound into one deterministic disk-backed workspace, composite source commitment, resumable checkpoint stream, materialized export set, verifier, and deletion preflight | Full matrix, focused source/workspace tests, and a real two-hour local collector export/verify/inspect smoke | Closed for this checkpoint; prospective same-account switch smoke remains open |
 | Compression | Deterministic bounded gzip with independent encoded/decoded limits and bomb rejection | Compression receipt and tests | Closed |
@@ -27,7 +27,7 @@ This decision narrows platform claims; it does not weaken privacy, determinism, 
 | Claude usage | Bounded transcript planning, logical-message canonicalization, iteration expansion, frozen-prefix checkpoints, cross-provider ordering, privacy-safe contract mapping, and CLI selection are implemented; a 21,326-event real local export and independent verification pass | [Semantics decision](./2026-07-25-claude-transcript-usage-semantics-decision.md), [real local receipt](./2026-07-25-g1-claude-local-verification-receipt.md), 610-test dual-runtime matrix, and independent code/plan re-audits | Local adapter closed for this checkpoint |
 | Native secrets | macOS arm64 production identity and account-observation capabilities default to distinct exact-pinned Keychain items; migration, retirement, rotation serialization, replacement retention, locked/unavailable behavior, and prospective account switching are integrated | Focused adversarial tests and full matrix | Code path closed; fresh-user install/rotate/uninstall smoke open |
 | Minimization | Deterministic A1–A7 runner and frozen fixtures now produce an aggregate-only receipt; the first real run is correctly inconclusive with zero qualifying prospective resets and authorizes no retention or public aggregate | [Preregistration](./2026-07-24-g1-data-minimization-ablation-preregistration.md) and [inconclusive decision](./2026-07-25-g1-data-minimization-ablation-decision.md) | Machinery closed; empirical decision remains open pending three eligible resets |
-| Resource limits | Heavy local history succeeds; limits remain candidate single-machine ceilings | Resource/source receipts | Open measured-release decision |
+| Resource limits | Dual-runtime synthetic lifecycle smoke and direct guard checks pass under candidate policy `g1-r3-candidate-0.5`; no producer/verifier ceiling is yet identified and no release policy is selected | [R7 preregistration](./2026-07-25-g1-r7-measured-release-ceilings-preregistration.md) and [synthetic smoke receipt](./2026-07-25-g1-r7-smoke-verification-receipt.md) | Open: release profile, real heavy history, materialized boundaries, per-dimension decisions, and promotion remain |
 | Packaging | No pinned distributable runtime, SBOM, signatures, attestations, or installer | Repository inspection | Open |
 | Clean-machine/volunteer gate | Not run | Requires signed artifact | Externally gated |
 
@@ -137,6 +137,8 @@ Exit: deterministic analysis, untouched holdout results, and a dated decision re
 - Enforce corresponding producer and verifier limits.
 - Predeclare how ceilings are selected from heavy histories and machine samples.
 - If evidence is not sufficient for a population p95, call it a conservative tested heavy-history envelope.
+
+Current evidence: the [R7 synthetic smoke verification receipt](./2026-07-25-g1-r7-smoke-verification-receipt.md) binds strict content-free receipts from exact Node 24.14.0 and Node 26.2.0 runs. Two passes exercised all ten lifecycle operations, independently matched eight deterministic projections, preserved source/identity/unrelated-output/Claude-settings sentinels, and used exact-inventory temporary cleanup. Eighteen direct resource-guard value/plus-one probes pass, but they are explicitly **not** labeled producer or verifier enforcement. The release profile remains deliberately refused, SQLite batch remains unrun, and no ceiling is promoted.
 
 Exit: selected release ceilings are versioned, enforced, reproducible, and accurately labeled.
 

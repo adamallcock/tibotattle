@@ -157,6 +157,23 @@ test("set verifier accepts a complete deterministic multi-chunk set", async () =
   }
 });
 
+test("set verifier bounds directory enumeration using the requested resource policy", async () => {
+  const value = await localSet();
+  try {
+    await assert.rejects(
+      verifyLocalExportSet({
+        directory: value.output,
+        resourceLimits: { maximumDirectoryEntries: 5 },
+      }),
+      (error) => error instanceof ExportResourceLimitError
+        && error.code === "export_resource_directory_entries"
+        && !error.message.includes(value.output),
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
 test("set verifier accepts a freshly regenerated plain v0.1 representation under the current compatibility tuple", async () => {
   const value = await localSet();
   try {

@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { appendFile, chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rmdir, symlink, unlink } from "node:fs/promises";
+import { appendFile, chmod, link, lstat, mkdir, open, readFile, readlink, realpath, rename, rmdir, symlink, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
+import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
+  readBoundedDirectoryEntries,
+} from "./export-resource-policy.js";
 
 export function defaultDataFile() {
   return resolve(process.cwd(), ".usage-monitor", "observations.jsonl");
@@ -498,7 +501,7 @@ async function withExportDestinationLock(destinationDirectory, callback, {
     ownsClaim = false;
   }
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const claimNames = (await readdir(destinationDirectory))
+    const claimNames = (await readBoundedDirectoryEntries(destinationDirectory))
       .filter((name) => name.startsWith(EXPORT_DESTINATION_CLAIM_PREFIX));
     await lockFailpoint("after_claim_scan");
     if (claimNames.length > 1) throw new Error("Local export destination has conflicting lock claims");
@@ -551,7 +554,7 @@ async function withExportDestinationLock(destinationDirectory, callback, {
       await symlink(target, lockPath);
       lockStats = await lstat(lockPath);
       await syncDirectory(destinationDirectory);
-      const postAcquireClaims = (await readdir(destinationDirectory))
+      const postAcquireClaims = (await readBoundedDirectoryEntries(destinationDirectory))
         .filter((name) => name.startsWith(EXPORT_DESTINATION_CLAIM_PREFIX));
       if (postAcquireClaims.length > 0) {
         const current = await lstat(lockPath);
@@ -769,7 +772,7 @@ async function recoverOwnerOnlyPairTransactionsUnlocked({ directory } = {}, {
   const rootStats = await lstatIfExists(transactionRoot);
   if (!rootStats) return { recovered: 0, transactionsFound: 0 };
   await assertOwnerControlledDirectory(transactionRoot);
-  const transactionNames = (await readdir(transactionRoot)).sort();
+  const transactionNames = await readBoundedDirectoryEntries(transactionRoot, { sort: true });
   let recovered = 0;
   for (const transactionName of transactionNames) {
     if (!/^\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(transactionName)
@@ -778,7 +781,7 @@ async function recoverOwnerOnlyPairTransactionsUnlocked({ directory } = {}, {
     }
     const transactionDirectory = join(transactionRoot, transactionName);
     await assertOwnerControlledDirectory(transactionDirectory);
-    const entries = (await readdir(transactionDirectory)).sort();
+    const entries = await readBoundedDirectoryEntries(transactionDirectory, { sort: true });
     if (!entries.includes("manifest.json")) {
       if (entries.some((name) => !["bundle.stage", "manifest.prepared", "receipt.stage"].includes(name))) {
         throw new Error("Invalid manifestless export recovery transaction");

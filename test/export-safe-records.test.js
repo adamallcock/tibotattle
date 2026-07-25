@@ -7,6 +7,7 @@ import {
   normalizeClaudeStatusQuotaSnapshots,
   normalizeCodexCollectorQuotaCandidate,
   scanCodexSafeRecords,
+  summarizeActivityMarkerPlan,
 } from "../src/export-safe-records.js";
 import { buildLocalMetadataBundle } from "../src/metadata-exporter.js";
 import { createExportResourceGuard } from "../src/export-resource-policy.js";
@@ -229,6 +230,20 @@ test("safe-record adapter awaits asynchronous sinks before continuing extraction
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("activity-marker planning rejects an oversized input before normalization or dedupe", () => {
+  const outOfWindow = {
+    ...marker(),
+    observedAt: "2020-01-01T00:00:00.000Z",
+  };
+  assert.throws(
+    () => summarizeActivityMarkerPlan(SECRET, [outOfWindow, outOfWindow], {
+      startMs: Date.parse(START_AT),
+      endMs: Date.parse(END_AT),
+    }, { maximumRecords: 1 }),
+    (error) => error.code === "export_resource_output_records",
+  );
 });
 
 test("collector candidates normalize deterministically without exporting source identity material", () => {

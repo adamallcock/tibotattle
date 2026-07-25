@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
   ExportResourceLimitError,
   createExportResourceGuard,
   normalizeExportResourceLimits,
+  readBoundedDirectoryEntries,
 } from "../src/export-resource-policy.js";
 
 test("resource policy rejects unknown or invalid limits", () => {
@@ -71,7 +72,45 @@ test("resource guard enforces source, record, byte, elapsed, and RSS ceilings wi
     rss: () => 0,
   });
   entries.observeDirectoryEntry();
-  assert.throws(() => entries.observeDirectoryEntry(), (error) => error.code === "export_resource_source_files");
+  assert.throws(
+    () => entries.observeDirectoryEntry(),
+    (error) => error.code === "export_resource_directory_entries",
+  );
+});
+
+test("streaming directory enumeration stops before retaining entry limit plus one", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-directory-bound-"));
+  try {
+    await writeFile(join(directory, "one"), "1");
+    await writeFile(join(directory, "two"), "2");
+    assert.deepEqual(
+      await readBoundedDirectoryEntries(directory, { maximumEntries: 2, sort: true }),
+      ["one", "two"],
+    );
+    await assert.rejects(
+      readBoundedDirectoryEntries(directory, { maximumEntries: 1 }),
+      (error) => error instanceof ExportResourceLimitError
+        && error.code === "export_resource_directory_entries"
+        && !error.message.includes(directory),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("export-set and destructive paths do not call array-returning readdir directly", async () => {
+  for (const path of [
+    "../src/export-set-materializer.js",
+    "../src/export-set-verifier.js",
+    "../src/export-deletion.js",
+    "../src/export-deletion-executor.js",
+    "../src/export-workspace-discard.js",
+    "../src/export-workspace-discard-executor.js",
+    "../src/storage.js",
+  ]) {
+    const source = await readFile(new URL(path, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /\breaddir\s*\(/u, path);
+  }
 });
 
 test("resource guard independently bounds encoded artifacts and decoded and encoded sets", () => {

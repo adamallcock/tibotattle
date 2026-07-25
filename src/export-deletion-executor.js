@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readdir, rename } from "node:fs/promises";
+import { lstat, open, rename } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   assertValidExportDeletionCommitMarker,
@@ -19,6 +19,7 @@ import {
   EXPORT_DELETION_RECEIPT_BASENAME,
   planLocalExportDeletion,
 } from "./export-deletion.js";
+import { readBoundedDirectoryEntries } from "./export-resource-policy.js";
 import {
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
@@ -169,9 +170,9 @@ async function assertBoundDirectories(workspaceDirectory, outputDirectory, ident
 }
 
 async function assertReceiptOnlyCompletionState(workspaceDirectory, outputDirectory) {
-  const workspaceEntries = await readdir(workspaceDirectory);
+  const workspaceEntries = await readBoundedDirectoryEntries(workspaceDirectory);
   if (workspaceEntries.some((name) => name !== WORKSPACE_LOCK_BASENAME)) fail("receipt_invalid");
-  const outputEntries = await readdir(outputDirectory);
+  const outputEntries = await readBoundedDirectoryEntries(outputDirectory);
   const fixedExportArtifact = /^(?:export-set-manifest(?:\.privacy-receipt)?\.json|chunk-\d{6}\.(?:bundle\.json(?:\.gz)?|receipt\.json))$/;
   if (outputEntries.some((name) => fixedExportArtifact.test(name)
       || name === EXPORT_DELETION_JOURNAL_BASENAME

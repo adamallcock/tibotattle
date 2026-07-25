@@ -152,7 +152,7 @@ This is still not G1 completion. Resource-bounded streaming/chunking, Claude par
 
 ## Current execution checkpoint — July 25, 2026
 
-The live branch is privately checkpointed on GitHub and the integrated local-only implementation passes 610 of 610 tests under both Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime. This is a bounded implementation milestone, not a G1 or end-to-end completion claim.
+The live branch is privately checkpointed on GitHub and the integrated local-only implementation passes 632 of 632 tests under both Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime. This is a bounded implementation milestone, not a G1 or end-to-end completion claim.
 
 Evidence now established:
 
@@ -162,10 +162,11 @@ Evidence now established:
 - Codex and Claude safe-record construction, deterministic bounded export sets, independent verification, recovery, complete-set deletion, capability separation, and current field/provenance contracts are integrated.
 - The G0 risk register and control traceability matrix exist and are live. G0 itself remains open because reproducible clean-clone evidence, release controls, owner/contact/backup decisions, and frozen privacy approval are incomplete.
 - The minimization study machinery and preregistration exist, but the real study remains correctly inconclusive until at least three qualifying prospective reset windows are observed.
+- R7 now has strict content-free synthetic smoke receipts on exact Node 24.14.0 and Node 26.2.0. All ten lifecycle operations and eight independently captured deterministic comparisons pass, but all producer/verifier boundary identifications remain open; the release profile, real heavy-history cases, per-dimension decisions, and policy promotion are still required.
 
 The next parallel execution wave is ordered as follows:
 
-1. **Primary critical-path lane — R7 measured release ceilings.** Predeclare the workload matrix and selection rule; add deterministic content-free near-limit fixtures; measure scan, resume, materialize, verify, deletion/discard, and callback uninstall; produce a machine-readable receipt with wall time, CPU, peak RSS, counts, bytes, hashes, fixed failure codes, and source-preservation evidence; prove boundary success and limit-plus-one rejection; then promote a versioned release resource policy. Until multi-machine evidence exists, describe the result as a conservative tested heavy-history envelope, not population p95.
+1. **Primary critical-path lane — R7 measured release ceilings.** The preregistration, strict receipt contract, synthetic lifecycle smoke, exact-inventory cleanup, and direct guard matrix now exist. Next implement the deliberately refused release profile, complete every near-limit and real heavy-history case, measure filesystem high-water and external RSS stops, establish actual producer/verifier value and plus-one behavior, make a retain/lower decision for every dimension, rerun both exact runtimes, and only then promote a versioned release resource policy. Until multi-machine evidence exists, describe the result as a conservative tested heavy-history envelope, not population p95.
 2. **Provider-accounting lane — G2/G6 preparation.** Add a provider-neutral, versioned API-price-equivalent reducer using official effective-dated price evidence and RunCost where its semantics are sufficient. Preserve cache-read, cache-write-duration, input, combined output, context, tier, and unknown-model coverage. Keep subscription Standard/Fast separate from API Standard/Priority/Flex/Batch and leave hosted tool cost unknown unless an exact provider billable unit is observed.
 3. **Small external-dependency lane — Claude quota proof.** After owner OAuth refresh, collect one ordinary authenticated response and verify that independently optional five-hour and seven-day windows produce non-null canonical observations. This retry must not block credential-independent R7 work.
 4. **Packaging lane — unsigned R8 preparation.** After resource inputs settle, pin or bundle the runtime; create a reproducible macOS arm64 artifact; generate checksums, SBOM, license inventory, provenance, and private-material scans; and exercise the full local lifecycle under measured deny-all egress. Signing, notarization, frozen wording approval, clean-machine execution, and volunteer review remain owner/external gates.

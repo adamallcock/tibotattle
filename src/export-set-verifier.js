@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdtemp, open, readdir, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
   createExportResourceGuard,
   DEFAULT_EXPORT_RESOURCE_LIMITS,
   ExportResourceLimitError,
+  readBoundedDirectoryEntries,
 } from "./export-resource-policy.js";
 import {
   EXPORT_SET_MANIFEST_BASENAME,
@@ -329,11 +330,12 @@ function manifestByteTotals(manifest) {
   return { decoded: manifest.totals.bundleBytes, encoded: 0 };
 }
 
-async function assertNoMixedRepresentation(root, manifestVersion) {
+async function assertNoMixedRepresentation(root, manifestVersion, maximumEntries) {
   let entries;
   try {
-    entries = await readdir(root);
-  } catch {
+    entries = await readBoundedDirectoryEntries(root, { maximumEntries });
+  } catch (error) {
+    if (error instanceof ExportResourceLimitError) throw error;
     fail("directory");
   }
   const oppositePattern = manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
@@ -411,8 +413,12 @@ export async function verifyLocalExportSet({
   const manifest = manifestArtifact.value;
   assertManifestReceipt(receiptArtifact.value, manifestArtifact.bytes, manifest.schemaVersion);
   if (stableJson(manifest.compatibility) !== stableJson(exportCompatibilityTuple())) fail("compatibility");
-  await assertNoMixedRepresentation(root, manifest.schemaVersion);
   const resourceGuard = createExportResourceGuard({ scope: "export_set", limits: resourceLimits });
+  await assertNoMixedRepresentation(
+    root,
+    manifest.schemaVersion,
+    resourceGuard.limits.maximumDirectoryEntries,
+  );
   const verificationIndexLimit = maximumVerificationIndexBytes ?? resourceGuard.limits.maximumWorkspaceBytes;
   if (!Number.isSafeInteger(verificationIndexLimit) || verificationIndexLimit < 1
       || verificationIndexLimit > resourceGuard.limits.maximumWorkspaceBytes) {

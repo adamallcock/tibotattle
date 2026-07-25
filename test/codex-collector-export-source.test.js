@@ -368,7 +368,7 @@ test("bounds oversized lines and enforces source, output, elapsed, and RSS budge
     await assert.rejects(
       scanCodexCollectorExportSource(plan, {
         resourceGuard: createExportResourceGuard({ limits: { maximumOutputRecords: 1 }, initialUsage: {
-          policyVersion: "g1-r3-candidate-0.4",
+          policyVersion: "g1-r3-candidate-0.5",
           sourceFiles: 1,
           sourceBytes: plan.prefixBytes,
           directoryEntries: 0,

@@ -1,4 +1,6 @@
-export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.4";
+import { opendir } from "node:fs/promises";
+
+export const EXPORT_RESOURCE_POLICY_VERSION = "g1-r3-candidate-0.5";
 
 export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
   maximumCoveredDurationMs: 31 * 24 * 60 * 60 * 1_000,
@@ -24,6 +26,7 @@ export const DEFAULT_EXPORT_RESOURCE_LIMITS = Object.freeze({
 
 const SAFE_CODES = new Set([
   "covered_duration",
+  "directory_entries",
   "source_files",
   "source_bytes",
   "line_bytes",
@@ -119,7 +122,9 @@ function normalizeInitialUsage(value, limits, scope) {
   const { maximumRecords, maximumBytes } = outputLimitsForScope(limits, scope);
   if (normalized.sourceFiles > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
   if (normalized.sourceBytes > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
-  if (normalized.directoryEntries > limits.maximumDirectoryEntries) throw new ExportResourceLimitError("source_files");
+  if (normalized.directoryEntries > limits.maximumDirectoryEntries) {
+    throw new ExportResourceLimitError("directory_entries");
+  }
   if (normalized.outputRecords > maximumRecords) throw new ExportResourceLimitError("output_records");
   if (normalized.expandedRecordBytes > maximumBytes) throw new ExportResourceLimitError("expanded_record_bytes");
   if (normalized.cumulativeElapsedMs > limits.maximumElapsedMs) throw new ExportResourceLimitError("elapsed_time");
@@ -231,7 +236,7 @@ export function createExportResourceGuard({
     observeDirectoryEntry() {
       counters.directoryEntries += 1;
       if (counters.directoryEntries > limits.maximumDirectoryEntries) {
-        throw new ExportResourceLimitError("source_files");
+        throw new ExportResourceLimitError("directory_entries");
       }
       checkRuntime();
     },
@@ -378,4 +383,36 @@ export function createExportResourceGuard({
       };
     },
   };
+}
+
+/**
+ * Enumerate a directory without first asking libuv to allocate an array for
+ * every entry. Only basenames are retained in bounded process memory, callers
+ * must not emit them, and the fixed directory_entries resource error is raised
+ * before appending entry N + 1.
+ */
+export async function readBoundedDirectoryEntries(directory, {
+  maximumEntries = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries,
+  sort = false,
+} = {}) {
+  boundedInteger(maximumEntries, "maximum directory entries");
+  if (maximumEntries > DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries) {
+    throw new TypeError("maximum directory entries cannot exceed the compatibility-bound candidate ceiling");
+  }
+  if (typeof sort !== "boolean") throw new TypeError("sort must be boolean");
+  const entries = [];
+  const handle = await opendir(directory);
+  try {
+    for await (const entry of handle) {
+      if (entries.length >= maximumEntries) {
+        throw new ExportResourceLimitError("directory_entries");
+      }
+      entries.push(entry.name);
+    }
+  } finally {
+    await handle.close().catch((error) => {
+      if (error?.code !== "ERR_DIR_CLOSED") throw error;
+    });
+  }
+  return sort ? entries.sort() : entries;
 }

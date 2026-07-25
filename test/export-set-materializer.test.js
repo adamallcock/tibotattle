@@ -560,6 +560,27 @@ test("materializer rejects a destination containing an opposite plain chunk repr
   }
 });
 
+test("materializer bounds destination enumeration before scanning arbitrary entries", async () => {
+  const value = await fixture({ resourceLimits: { maximumDirectoryEntries: 5 } });
+  try {
+    await mkdir(value.output, { mode: 0o700 });
+    for (let index = 0; index < 6; index += 1) {
+      await writeFile(join(value.output, `unrelated-${index}`), "x", { mode: 0o600 });
+    }
+    await assert.rejects(
+      materializeLocalExportSet({
+        workspaceDirectory: value.workspace,
+        outputDirectory: value.output,
+        secret: SECRET,
+      }),
+      (error) => error.code === "export_resource_directory_entries"
+        && !error.message.includes(value.output),
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
 test("empty-set materialization enforces its canonical ceiling before side effects", async () => {
   const value = await fixture({
     empty: true,

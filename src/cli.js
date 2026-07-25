@@ -65,6 +65,7 @@ import {
   rotateManagedClaudeCallbackCapability,
   uninstallClaudeCallback,
 } from "./claude-callback-lifecycle.js";
+import { runR7SmokeBenchmark } from "./r7-resource-benchmark.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -141,6 +142,7 @@ function usage() {
   usage-monitor recover-claude-callback
   usage-monitor rotate-claude-callback-identity [--confirm]
   usage-monitor remove-claude-callback-identity [--confirm-removal TOKEN]
+  usage-monitor benchmark-r7 --profile smoke --output PATH
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -220,6 +222,7 @@ export function parseArgs(argv) {
     maximumRecordsPerChunk: null,
     maximumCanonicalBundleBytes: null,
     maximumEncodedArtifactBytes: null,
+    benchmarkProfile: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -276,6 +279,7 @@ export function parseArgs(argv) {
     else if (arg === "--max-records-per-chunk") result.maximumRecordsPerChunk = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-bundle-bytes") result.maximumCanonicalBundleBytes = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-artifact-bytes") result.maximumEncodedArtifactBytes = readNonNegativeNumber(argv, index++, arg);
+    else if (arg === "--profile") result.benchmarkProfile = readOptionValue(argv, index++, arg);
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -291,6 +295,9 @@ export function parseArgs(argv) {
   }
   if (result.confirmRemovalToken !== null && result.command !== "remove-claude-callback-identity") {
     throw new Error("--confirm-removal is available only for remove-claude-callback-identity");
+  }
+  if (result.benchmarkProfile !== null && result.command !== "benchmark-r7") {
+    throw new Error("--profile is available only for benchmark-r7");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -405,6 +412,7 @@ export async function run(
     rotateClaudeCallbackCommand = rotateManagedClaudeCallbackCapability,
     planClaudeCallbackRemoval = planManagedClaudeCallbackCapabilityRemoval,
     removeClaudeCallbackCredential = removeManagedClaudeCallbackCapability,
+    runR7BenchmarkCommand = runR7SmokeBenchmark,
   } = {},
 ) {
   const args = parseArgs(argv);
@@ -421,6 +429,20 @@ export async function run(
   }
   if (args.command === "help" || args.command === "--help" || args.command === "-h") {
     usage();
+    return;
+  }
+  if (args.command === "benchmark-r7") {
+    if (!args.outputFile) throw new Error("benchmark-r7 requires --output");
+    if ((args.benchmarkProfile ?? "smoke") !== "smoke") {
+      throw new Error("benchmark-r7 supports only the smoke profile until the release workload is implemented");
+    }
+    const receipt = await runR7BenchmarkCommand();
+    await writeJsonOwnerOnlyAtomic(args.outputFile, receipt);
+    console.log("R7 benchmark receipt: written");
+    console.log(`Profile: ${receipt.profile}; classification: ${receipt.classification}`);
+    console.log(`Operations exercised: ${receipt.operations.filter((row) => row.status !== "not_run").length}; recovered after interruption: ${receipt.operations.filter((row) => row.status === "interrupted_recovered").length}; not run: ${receipt.operations.filter((row) => row.status === "not_run").length}`);
+    console.log(`Determinism: ${receipt.determinismEvidence.status}; receipt SHA-256: ${receipt.receiptSha256}`);
+    console.log(`Network activity: ${receipt.networkActivity}; upload disabled: ${receipt.transportReady === false}`);
     return;
   }
   if (args.command === "inspect-claude-callback") {

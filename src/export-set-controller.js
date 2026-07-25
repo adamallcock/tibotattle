@@ -343,7 +343,9 @@ async function createLocalExportWorkspaceUnlocked({
       sourcePlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0) + supplementalSummary.sourceBytes,
     );
   }
-  const activityPlan = summarizeActivityMarkerPlan(secret, activityMarkers, bounds);
+  const activityPlan = summarizeActivityMarkerPlan(secret, activityMarkers, bounds, {
+    maximumRecords: resourceGuard.limits.maximumExportSetRecords,
+  });
   for (const source of sourcePlan.sources) source.rolloutInfo.sourcePlanOrdinal = source.ordinal;
   const descriptor = buildExportWorkspaceDescriptor({
     participantId: deriveParticipantId(secret),
@@ -500,6 +502,8 @@ async function resumeLocalExportWorkspaceUnlocked({
       endAt: storedPlan.endAt,
       startMs: Date.parse(storedPlan.startAt),
       endMs: Date.parse(storedPlan.endAt),
+    }, {
+      maximumRecords: resourceGuard.limits.maximumExportSetRecords,
     });
     if (stableJson(activityPlan) !== stableJson(descriptor.activityPlan)) {
       throw new ExportWorkspaceError("checkpoint_mismatch");

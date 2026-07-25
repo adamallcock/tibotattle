@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readdir } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { loadVerifiedLocalMetadataBundleBytes } from "./bundle-verifier.js";
 import {
@@ -10,7 +10,12 @@ import {
 } from "./export-compression.js";
 import { deriveExportPseudonym, deriveParticipantId } from "./export-identity.js";
 import { verifyPrivacySafeBundle } from "./export-privacy.js";
-import { DEFAULT_EXPORT_RESOURCE_LIMITS, createExportResourceGuard } from "./export-resource-policy.js";
+import {
+  DEFAULT_EXPORT_RESOURCE_LIMITS,
+  createExportResourceGuard,
+  ExportResourceLimitError,
+  readBoundedDirectoryEntries,
+} from "./export-resource-policy.js";
 import { assertValidExportRecord } from "./export-schema.js";
 import { openExportWorkspace } from "./export-workspace.js";
 import { withExportWorkspaceLease } from "./export-workspace-lock.js";
@@ -241,11 +246,12 @@ async function exists(path) {
   }
 }
 
-async function assertNoPlainChunkArtifacts(directory) {
+async function assertNoPlainChunkArtifacts(directory, maximumEntries) {
   let entries;
   try {
-    entries = await readdir(directory);
-  } catch {
+    entries = await readBoundedDirectoryEntries(directory, { maximumEntries });
+  } catch (error) {
+    if (error instanceof ExportResourceLimitError) throw error;
     fail("artifact_read");
   }
   if (entries.some((name) => /^chunk-\d{6}\.bundle\.json$/.test(name))) fail("mixed_representation");
@@ -407,7 +413,7 @@ async function materializeLocalExportSetUnlocked({
     }
     if (await exists(output)) {
       await recoverOwnerOnlyPairTransactions({ directory: output });
-      await assertNoPlainChunkArtifacts(output);
+      await assertNoPlainChunkArtifacts(output, descriptor.resourceLimits.maximumDirectoryEntries);
     }
     workspace.beginInvocation();
     resourceGuard = createExportResourceGuard({

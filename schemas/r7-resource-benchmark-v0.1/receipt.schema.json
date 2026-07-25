@@ -1,0 +1,386 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/r7-resource-benchmark-v0.1/receipt.schema.json",
+  "title": "Usage monitor R7 resource benchmark receipt v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "protocolVersion",
+    "policyVersion",
+    "selectionRuleVersion",
+    "profile",
+    "classification",
+    "runtimeProvenance",
+    "contractProvenance",
+    "operations",
+    "boundaryEvidence",
+    "determinismEvidence",
+    "sourceLogsPreserved",
+    "identityStatePreserved",
+    "independentOutputPreserved",
+    "callbackSettingsPreserved",
+    "prohibitedDataScan",
+    "networkActivity",
+    "secureErasureClaimed",
+    "transportReady",
+    "receiptSha256"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "r7-resource-benchmark-receipt-v0.1" },
+    "protocolVersion": { "const": "g1-r7-resource-benchmark-v0.1" },
+    "policyVersion": { "const": "g1-r3-candidate-0.5" },
+    "selectionRuleVersion": { "const": "g1-r7-ceiling-selection-v0.1" },
+    "profile": { "enum": ["smoke", "release"] },
+    "classification": {
+      "enum": ["synthetic_boundary", "synthetic_lifecycle", "real_local_heavy_history"]
+    },
+    "runtimeProvenance": { "$ref": "#/definitions/runtimeProvenance" },
+    "contractProvenance": { "$ref": "#/definitions/contractProvenance" },
+    "operations": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": { "$ref": "#/definitions/operation" }
+    },
+    "boundaryEvidence": {
+      "type": "array",
+      "minItems": 19,
+      "maxItems": 19,
+      "items": { "$ref": "#/definitions/boundaryEvidence" }
+    },
+    "determinismEvidence": { "$ref": "#/definitions/determinismEvidence" },
+    "sourceLogsPreserved": { "const": true },
+    "identityStatePreserved": { "const": true },
+    "independentOutputPreserved": { "const": true },
+    "callbackSettingsPreserved": { "const": true },
+    "prohibitedDataScan": { "const": true },
+    "networkActivity": { "enum": ["absent", "not_measured"] },
+    "secureErasureClaimed": { "const": false },
+    "transportReady": { "const": false },
+    "receiptSha256": { "$ref": "#/definitions/sha256" }
+  },
+  "definitions": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "safeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "runtimeProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "architecture",
+        "hardwareClass",
+        "runtimeFamily",
+        "runtimeClass",
+        "runtimeVersion",
+        "rssMeasurementMethod",
+        "rssSamplingIntervalMs"
+      ],
+      "properties": {
+        "platform": { "const": "macos" },
+        "architecture": { "const": "arm64" },
+        "hardwareClass": { "const": "apple_silicon" },
+        "runtimeFamily": { "const": "node" },
+        "runtimeClass": { "enum": ["pinned_candidate", "compatibility_crosscheck"] },
+        "runtimeVersion": { "$ref": "#/definitions/runtimeVersion" },
+        "rssMeasurementMethod": {
+          "enum": ["process_resource_usage_maxrss", "external_sampling"]
+        },
+        "rssSamplingIntervalMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        }
+      }
+    },
+    "runtimeVersion": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["major", "minor", "patch"],
+          "properties": {
+            "major": { "const": 24 },
+            "minor": { "const": 14 },
+            "patch": { "const": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["major", "minor", "patch"],
+          "properties": {
+            "major": { "const": 26 },
+            "minor": { "const": 2 },
+            "patch": { "const": 0 }
+          }
+        }
+      ]
+    },
+    "contractProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receiptSchemaSha256",
+        "resourcePolicySourceSha256",
+        "benchmarkSourceSha256",
+        "benchmarkSourceFileCount",
+        "fixtureVersion",
+        "fixtureManifestSha256"
+      ],
+      "properties": {
+        "receiptSchemaSha256": { "$ref": "#/definitions/sha256" },
+        "resourcePolicySourceSha256": { "$ref": "#/definitions/sha256" },
+        "benchmarkSourceSha256": { "$ref": "#/definitions/sha256" },
+        "benchmarkSourceFileCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "fixtureVersion": {
+          "enum": ["g1-r7-structural-fixture-v0.1", "not_applicable"]
+        },
+        "fixtureManifestSha256": {
+          "anyOf": [
+            { "$ref": "#/definitions/sha256" },
+            { "const": "not_applicable" }
+          ]
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "failureCode", "evidenceSha256", "metrics"],
+      "properties": {
+        "name": {
+          "enum": [
+            "source_scan",
+            "checkpoint_resume",
+            "export_set_materialize",
+            "export_set_verify",
+            "complete_set_delete",
+            "complete_set_delete_recovery",
+            "workspace_discard",
+            "workspace_discard_recovery",
+            "claude_callback_uninstall",
+            "claude_callback_recovery"
+          ]
+        },
+        "status": {
+          "enum": ["completed", "rejected_at_limit", "interrupted_recovered", "not_run"]
+        },
+        "failureCode": { "$ref": "#/definitions/failureCode" },
+        "evidenceSha256": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 2,
+          "items": { "$ref": "#/definitions/sha256" }
+        },
+        "metrics": { "$ref": "#/definitions/operationMetrics" }
+      }
+    },
+    "failureCode": {
+      "enum": [
+        "none",
+        "not_run_profile",
+        "interruption_injected",
+        "export_resource_covered_duration",
+        "export_resource_directory_entries",
+        "export_resource_source_files",
+        "export_resource_source_bytes",
+        "export_resource_line_bytes",
+        "export_resource_output_records",
+        "export_resource_expanded_record_bytes",
+        "export_resource_canonical_bundle_bytes",
+        "export_resource_encoded_artifact_bytes",
+        "export_resource_export_set_decoded_bytes",
+        "export_resource_export_set_encoded_bytes",
+        "export_resource_workspace_bytes",
+        "export_workspace_disk",
+        "export_resource_manifest_bytes",
+        "export_resource_chunk_count",
+        "export_resource_elapsed_time",
+        "export_resource_rss",
+        "benchmark_fixture_invalid",
+        "benchmark_operation_failed",
+        "benchmark_verification_failed",
+        "benchmark_recovery_failed",
+        "benchmark_preservation_failed",
+        "benchmark_unexpected_acceptance"
+      ]
+    },
+    "operationMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wallTimeMs",
+        "cpuTimeMs",
+        "peakRssBytes",
+        "directoryEntries",
+        "sourceFiles",
+        "sourceBytes",
+        "physicalLines",
+        "outputRecords",
+        "expandedRecordBytes",
+        "decodedBytes",
+        "encodedBytes",
+        "workspaceHighWaterBytes",
+        "manifestBytes",
+        "chunks",
+        "affectedFiles",
+        "affectedBytes",
+        "durableElapsedMs",
+        "durablePeakRssBytes"
+      ],
+      "properties": {
+        "wallTimeMs": { "$ref": "#/definitions/safeInteger" },
+        "cpuTimeMs": { "$ref": "#/definitions/safeInteger" },
+        "peakRssBytes": { "$ref": "#/definitions/safeInteger" },
+        "directoryEntries": { "$ref": "#/definitions/safeInteger" },
+        "sourceFiles": { "$ref": "#/definitions/safeInteger" },
+        "sourceBytes": { "$ref": "#/definitions/safeInteger" },
+        "physicalLines": { "$ref": "#/definitions/safeInteger" },
+        "outputRecords": { "$ref": "#/definitions/safeInteger" },
+        "expandedRecordBytes": { "$ref": "#/definitions/safeInteger" },
+        "decodedBytes": { "$ref": "#/definitions/safeInteger" },
+        "encodedBytes": { "$ref": "#/definitions/safeInteger" },
+        "workspaceHighWaterBytes": { "$ref": "#/definitions/safeInteger" },
+        "manifestBytes": { "$ref": "#/definitions/safeInteger" },
+        "chunks": { "$ref": "#/definitions/safeInteger" },
+        "affectedFiles": { "$ref": "#/definitions/safeInteger" },
+        "affectedBytes": { "$ref": "#/definitions/safeInteger" },
+        "durableElapsedMs": { "$ref": "#/definitions/safeInteger" },
+        "durablePeakRssBytes": { "$ref": "#/definitions/safeInteger" }
+      }
+    },
+    "boundaryEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dimension",
+        "mode",
+        "unit",
+        "selectedLimit",
+        "atLimit",
+        "plusOne",
+        "producer",
+        "verifier",
+        "identification"
+      ],
+      "properties": {
+        "dimension": {
+          "enum": [
+            "covered_duration",
+            "directory_entries",
+            "source_files",
+            "source_bytes",
+            "line_bytes",
+            "output_records_single_bundle",
+            "expanded_record_bytes_single_bundle",
+            "canonical_bundle_bytes",
+            "encoded_artifact_bytes",
+            "output_records_export_set",
+            "expanded_record_bytes_export_set",
+            "export_set_decoded_bytes",
+            "export_set_encoded_bytes",
+            "workspace_bytes",
+            "sqlite_batch_records",
+            "manifest_bytes",
+            "chunk_count",
+            "elapsed_time",
+            "rss"
+          ]
+        },
+        "mode": {
+          "enum": ["materialized", "synthetic_counter", "not_identified"]
+        },
+        "unit": { "enum": ["milliseconds", "entries", "files", "bytes", "records", "chunks"] },
+        "selectedLimit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740990
+        },
+        "atLimit": { "$ref": "#/definitions/boundaryTrial" },
+        "plusOne": { "$ref": "#/definitions/boundaryTrial" },
+        "producer": { "$ref": "#/definitions/enforcementSurface" },
+        "verifier": { "$ref": "#/definitions/enforcementSurface" },
+        "identification": { "enum": ["identified", "not_identified", "not_run"] }
+      }
+    },
+    "boundaryTrial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "status", "failureCode"],
+      "properties": {
+        "value": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "status": { "enum": ["passed", "rejected", "not_run"] },
+        "failureCode": { "$ref": "#/definitions/failureCode" }
+      }
+    },
+    "enforcementSurface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "failureCode"],
+      "properties": {
+        "status": { "enum": ["enforced", "not_enforced", "not_applicable", "not_run"] },
+        "failureCode": { "$ref": "#/definitions/failureCode" }
+      }
+    },
+    "determinismEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectionVersion", "status", "runCount", "runProjectionSha256es", "checks"],
+      "properties": {
+        "projectionVersion": { "const": "g1-r7-deterministic-projection-v0.1" },
+        "status": { "enum": ["passed", "partial", "failed", "not_run"] },
+        "runCount": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "runProjectionSha256es": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 2,
+          "items": { "$ref": "#/definitions/sha256" }
+        },
+        "checks": { "$ref": "#/definitions/determinismChecks" }
+      }
+    },
+    "determinismChecks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtureManifest",
+        "sourcePlan",
+        "logicalRecords",
+        "chunkBoundaries",
+        "canonicalArtifacts",
+        "lifecycleProjection",
+        "fixedFailureCodes",
+        "cleanupInventories"
+      ],
+      "properties": {
+        "fixtureManifest": { "$ref": "#/definitions/determinismCheck" },
+        "sourcePlan": { "$ref": "#/definitions/determinismCheck" },
+        "logicalRecords": { "$ref": "#/definitions/determinismCheck" },
+        "chunkBoundaries": { "$ref": "#/definitions/determinismCheck" },
+        "canonicalArtifacts": { "$ref": "#/definitions/determinismCheck" },
+        "lifecycleProjection": { "$ref": "#/definitions/determinismCheck" },
+        "fixedFailureCodes": { "$ref": "#/definitions/determinismCheck" },
+        "cleanupInventories": { "$ref": "#/definitions/determinismCheck" }
+      }
+    },
+    "determinismCheck": {
+      "enum": ["matched", "mismatched", "not_run"]
+    }
+  }
+}
