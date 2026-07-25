@@ -31,6 +31,8 @@ const ERROR_CODES = new Set([
   "invalid_secret",
   "stored_value_invalid",
   "operation_failed",
+  "locked",
+  "denied",
   "readback_mismatch",
 ]);
 
@@ -132,6 +134,47 @@ function sameSecret(left, right) {
   return timingSafeEqual(left, right);
 }
 
+const LOCKED_ERROR_CODES = new Set([
+  "ERR_KEYCHAIN_LOCKED",
+  "KEYCHAIN_LOCKED",
+  "errSecInteractionNotAllowed",
+  -25308,
+]);
+const DENIED_ERROR_CODES = new Set([
+  "ERR_KEYCHAIN_DENIED",
+  "KEYCHAIN_DENIED",
+  "errSecAuthFailed",
+  "errSecUserCanceled",
+  -25293,
+  -128,
+]);
+const LOCKED_ERROR_MESSAGES = new Set([
+  "User interaction is not allowed.",
+]);
+const DENIED_ERROR_MESSAGES = new Set([
+  "The user name or passphrase you entered is not correct.",
+  "User canceled the operation.",
+]);
+
+function nativeFailureCode(error) {
+  let code;
+  let message;
+  try {
+    code = error?.code;
+    message = error?.message;
+  } catch {
+    return "operation_failed";
+  }
+  if (LOCKED_ERROR_CODES.has(code)) return "locked";
+  if (DENIED_ERROR_CODES.has(code)) return "denied";
+  // The audited keytar native binding exposes Security.framework failures as
+  // message-only Napi errors. Match only exact platform strings; never include
+  // an upstream message in the public error.
+  if (LOCKED_ERROR_MESSAGES.has(message)) return "locked";
+  if (DENIED_ERROR_MESSAGES.has(message)) return "denied";
+  return "operation_failed";
+}
+
 /**
  * This adapter intentionally does not claim compare-and-swap semantics.
  * Callers must hold the app's installation/export-identity lease around every
@@ -158,9 +201,14 @@ export function createExportIdentityKeychainBackend(options = {}) {
   async function invoke(method, ...args) {
     try {
       return await nativeBinding[method](...args);
-    } catch {
-      fail("operation_failed");
+    } catch (error) {
+      fail(nativeFailureCode(error));
     }
+  }
+
+  async function describe(capability) {
+    capabilityPair(capability);
+    return Object.freeze({ backend: "macos_keychain", status: "available" });
   }
 
   async function readInternal(capability, invalidCode = "stored_value_invalid") {
@@ -209,5 +257,5 @@ export function createExportIdentityKeychainBackend(options = {}) {
     return "deleted";
   }
 
-  return Object.freeze({ read, createIfMissing, replaceExact, deleteExact });
+  return Object.freeze({ read, createIfMissing, replaceExact, deleteExact, describe });
 }

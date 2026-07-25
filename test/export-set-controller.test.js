@@ -1,9 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { gunzipSync } from "node:zlib";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { parseArgs } from "../src/cli.js";
+import { sanitizeClaudeStatusline } from "../src/claude-statusline.js";
+import { writeClaudeStatusSnapshot } from "../src/claude-statusline-storage.js";
 import {
   createLocalExportWorkspace,
   inspectLocalExportWorkspace,
@@ -25,7 +29,7 @@ function usage(input, output, cached, reasoning) {
 }
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "usage-monitor-set-controller-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "usage-monitor-set-controller-")));
   const home = join(root, "codex-home");
   await mkdir(join(home, "sessions"), { recursive: true });
   await mkdir(join(home, "archived_sessions"), { recursive: true });
@@ -51,6 +55,93 @@ async function fixture() {
   await writeFile(source, `${lines.join("\n")}\n`);
   return { root, home, source, workspace: join(root, "workspace") };
 }
+
+const CLI_ACCOUNT_SCOPE_CANARY = `openai-account:v1:${"Z".repeat(43)}`;
+const CLI_CONTENT_CANARY = "PRIVATE_SUPPLEMENTAL_CONTENT_CANARY_account@example.test";
+
+function collectorQuotaRecord() {
+  return {
+    schemaVersion: "0.3",
+    kind: "codex_quota_snapshot",
+    provider: "openai_codex",
+    observedAt: "2026-07-24T12:04:00.000Z",
+    receivedAt: "2026-07-24T12:04:00.000Z",
+    stalenessMs: 0,
+    source: "app_server_notification",
+    windows: [{
+      provider: "openai_codex",
+      planType: "pro",
+      limitId: "codex",
+      slot: "primary",
+      usedPercent: 17,
+      windowDurationMins: 300,
+      resetsAt: 1_784_912_400,
+    }],
+    providerSurface: "account_shared_unallocated",
+    accountScope: {
+      status: "available",
+      reason: null,
+      version: "openai-account-v1",
+      scopeId: CLI_ACCOUNT_SCOPE_CANARY,
+      planType: "pro",
+    },
+    officialDailyTokens: [],
+    officialUsageSummary: null,
+    controlledState: "unknown",
+    eventKey: "f".repeat(64),
+  };
+}
+
+function claudeQuotaStatus() {
+  return sanitizeClaudeStatusline({
+    version: "2.1.176",
+    model: { id: "claude-opus-4-20260701", display_name: CLI_CONTENT_CANARY },
+    session_id: CLI_CONTENT_CANARY,
+    cwd: `/private/${CLI_CONTENT_CANARY}`,
+    prompt: CLI_CONTENT_CANARY,
+    account_id: CLI_CONTENT_CANARY,
+    rate_limits: {
+      five_hour: { used_percentage: 23, resets_at: 1_784_912_400 },
+      seven_day: { used_percentage: 41, resets_at: 1_785_430_800 },
+    },
+  }, "2026-07-24T12:05:00.000Z", { sessionSecret: Buffer.alloc(32, 111) });
+}
+
+async function readExportArtifactText(directory) {
+  const texts = [];
+  for (const name of await readdir(directory)) {
+    const bytes = await readFile(join(directory, name));
+    texts.push(name.endsWith(".gz") ? gunzipSync(bytes).toString("utf8") : bytes.toString("utf8"));
+  }
+  return texts.join("\n");
+}
+
+test("export-set CLI parses explicit supplemental source selections without auto-detection", () => {
+  const selected = parseArgs([
+    "export-set",
+    "--collector-file", "./private-collector.jsonl",
+    "--claude-state-dir", "./private-claude-state",
+  ]);
+  assert.equal(selected.collectorFile, resolve("./private-collector.jsonl"));
+  assert.equal(selected.claudeStatus, false);
+  assert.equal(selected.claudeStateDirectory, resolve("./private-claude-state"));
+
+  const defaultClaude = parseArgs(["export-set", "--claude-status"]);
+  assert.equal(defaultClaude.claudeStatus, true);
+  assert.equal(defaultClaude.claudeStateDirectory, null);
+
+  assert.throws(
+    () => parseArgs(["export-set", "--claude-status", "--claude-state-dir", "./private-claude-state"]),
+    /either --claude-status or --claude-state-dir/,
+  );
+  assert.throws(() => parseArgs(["doctor", "--claude-status"]), /only for export-set/);
+  assert.throws(() => parseArgs(["quality", "--claude-state-dir", "./private-claude-state"]), /only for export-set/);
+
+  const omitted = parseArgs(["export-set"]);
+  assert.equal(omitted.collectorFile, null);
+  assert.equal(omitted.claudeStatus, false);
+  assert.equal(omitted.claudeStateDirectory, null);
+});
 
 test("controller creates a complete bounded workspace from frozen source prefixes", async () => {
   const value = await fixture();
@@ -237,12 +328,24 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
   const value = await fixture();
   const output = join(value.root, "output");
   const secretFile = join(value.root, "participant-secret");
+  const collectorDirectory = join(value.root, "PRIVATE_COLLECTOR_DIRECTORY_CANARY");
+  const collectorFile = join(collectorDirectory, "PRIVATE_COLLECTOR_FILENAME_CANARY.jsonl");
+  const claudeStateDirectory = join(value.root, "PRIVATE_CLAUDE_STATE_DIRECTORY_CANARY");
+  let claudeRecord;
   try {
+    await mkdir(collectorDirectory, { mode: 0o700 });
+    await writeFile(collectorFile, `${JSON.stringify(collectorQuotaRecord())}\n`, { mode: 0o600 });
+    claudeRecord = await writeClaudeStatusSnapshot(claudeQuotaStatus(), {
+      stateDirectory: claudeStateDirectory,
+      uuid: "90000000-0000-4000-8000-000000000001",
+    });
     const common = [
       "--workspace", value.workspace,
       "--directory", output,
       "--codex-home", value.home,
       "--secret-file", secretFile,
+      "--collector-file", collectorFile,
+      "--claude-state-dir", claudeStateDirectory,
       "--max-records-per-chunk", "1",
       "--max-bundle-bytes", "33554432",
       "--max-artifact-bytes", "35651584",
@@ -256,15 +359,68 @@ test("export-set CLI creates and resumes a content-free local set", async () => 
     assert.equal(created.status, 0, created.stderr);
     assert.match(created.stdout, /Local metadata export set: complete/);
     assert.match(created.stdout, /Upload: disabled/);
-    assert.equal(created.stdout.includes(value.root), false);
-    assert.equal(created.stdout.includes("PRIVATE_SESSION"), false);
+    assert.match(created.stdout, /Records: 1 usage, 5 quota, 0 markers/);
+
+    const workspace = await openExportWorkspace({ directory: value.workspace });
+    let supplementalSourceKeys;
+    try {
+      supplementalSourceKeys = workspace.loadSupplementalSourcePlan().sources.map((source) => source.sourceKey);
+      assert.deepEqual(workspace.getDescriptor().sourceProviders, ["openai_codex", "anthropic_claude_code"]);
+    } finally {
+      workspace.close();
+    }
+
+    const inspected = spawnSync(process.execPath, [
+      "./src/cli.js", "inspect-export-workspace", "--workspace", value.workspace,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(inspected.status, 0, inspected.stderr);
+    assert.match(inspected.stdout, /Sources: 3; bytes: \d+/);
+    assert.match(inspected.stdout, /Providers: openai_codex, anthropic_claude_code/);
+
+    const missingSelection = spawnSync(process.execPath, [
+      "./src/cli.js", "export-set", "--resume",
+      "--workspace", value.workspace,
+      "--directory", output,
+      "--codex-home", value.home,
+      "--secret-file", secretFile,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.notEqual(missingSelection.status, 0);
+    assert.match(missingSelection.stderr, /checkpoint_mismatch/);
 
     const resumed = spawnSync(process.execPath, [
       "./src/cli.js", "export-set", "--resume", ...common,
     ], { cwd: process.cwd(), encoding: "utf8" });
     assert.equal(resumed.status, 0, resumed.stderr);
     assert.match(resumed.stdout, /Workspace status: scan_complete/);
-    assert.equal(resumed.stdout.includes(value.root), false);
+
+    const verified = spawnSync(process.execPath, [
+      "./src/cli.js", "verify-export-set", "--directory", output,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(verified.status, 0, verified.stderr);
+    assert.match(verified.stdout, /Local metadata export-set verification: passed/);
+    assert.match(verified.stdout, /Records: 1 usage, 5 quota, 0 markers/);
+
+    const artifactText = await readExportArtifactText(output);
+    const allOutput = [created.stdout, inspected.stdout, missingSelection.stdout, missingSelection.stderr,
+      resumed.stdout, verified.stdout, artifactText].join("\n");
+    for (const forbidden of [
+      value.root,
+      value.home,
+      value.source,
+      collectorDirectory,
+      collectorFile,
+      basename(collectorFile),
+      claudeStateDirectory,
+      claudeRecord.recordFile,
+      basename(claudeRecord.recordFile),
+      ...supplementalSourceKeys,
+      CLI_ACCOUNT_SCOPE_CANARY,
+      CLI_CONTENT_CANARY,
+      "PRIVATE_SESSION",
+      "PRIVATE_PROMPT",
+    ]) {
+      assert.equal(allOutput.includes(forbidden), false, forbidden);
+    }
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

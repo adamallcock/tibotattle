@@ -161,6 +161,16 @@ test("unreviewed models, provider-incompatible models, limits, and diagnostics f
 
   assert.equal(validateExportRecord("bundle", bundleWithDiagnostic("new_unreviewed_code")).valid, false);
   assert.equal(validateExportRecord("bundle", bundleWithDiagnostic("malformed_lines")).valid, true);
+  for (const code of [
+    "collector_empty_lines",
+    "collector_irrelevant_records",
+    "collector_out_of_bounds_records",
+    "collector_oversized_irrelevant_lines",
+    "collector_unsupported_schema_records",
+    "collector_unsupported_source_records",
+  ]) {
+    assert.equal(validateExportRecord("bundle", bundleWithDiagnostic(code)).valid, true, code);
+  }
 });
 
 test("pre-hardening draft v0.1 records fail closed and must be regenerated", () => {
@@ -173,4 +183,42 @@ test("pre-hardening draft v0.1 records fail closed and must be regenerated", () 
   delete legacyQuota.providerStateId;
   legacyQuota.snapshotId = `snapshot:v1:${"C".repeat(43)}`;
   assert.equal(validateExportRecord("quotaSnapshot", legacyQuota).valid, false);
+});
+
+test("sessionless quota snapshots are limited to account-level OpenAI collector observations", () => {
+  const rollout = quotaSnapshot();
+  rollout.sessionScopeId = null;
+  assert.equal(validateExportRecord("quotaSnapshot", rollout).valid, false);
+
+  const declaration = quotaSnapshot();
+  declaration.snapshotSource = "ui_declaration";
+  declaration.sessionScopeId = null;
+  assert.equal(validateExportRecord("quotaSnapshot", declaration).valid, false);
+
+  for (const snapshotSource of ["app_server_read", "notification"]) {
+    const attributed = quotaSnapshot();
+    attributed.snapshotSource = snapshotSource;
+    attributed.sessionScopeId = null;
+    attributed.accountScopeId = `account:v1:${"H".repeat(43)}`;
+    assert.equal(validateExportRecord("quotaSnapshot", attributed).valid, true);
+
+    const unattributed = structuredClone(attributed);
+    unattributed.accountScopeId = "unattributed";
+    assert.equal(validateExportRecord("quotaSnapshot", unattributed).valid, true);
+
+    const sessionScopedCollector = structuredClone(attributed);
+    sessionScopedCollector.sessionScopeId = `session:v1:${"I".repeat(43)}`;
+    assert.equal(validateExportRecord("quotaSnapshot", sessionScopedCollector).valid, false);
+  }
+
+  const claude = quotaSnapshot();
+  claude.provider = "anthropic_claude_code";
+  claude.planType = "unknown";
+  claude.limitId = "unknown";
+  claude.slot = "seven_day";
+  claude.snapshotSource = "status_line";
+  claude.providerSurface = "general_usage";
+  assert.equal(validateExportRecord("quotaSnapshot", claude).valid, true);
+  claude.sessionScopeId = null;
+  assert.equal(validateExportRecord("quotaSnapshot", claude).valid, false);
 });

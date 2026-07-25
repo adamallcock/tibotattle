@@ -3,7 +3,11 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { captureCodexObservation } from "./capture.js";
-import { readCodexAccountSnapshot, sanitizeCodexAccountSnapshot } from "./codex-app-server.js";
+import {
+  readCodexAccountSnapshot,
+  sanitizeCodexAccountSnapshotWithSecretLoader,
+} from "./codex-app-server.js";
+import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
 import { analyzeObservations } from "./analyze.js";
 import { mineCodexTransitions, renderTransitionAudit } from "./codex-transition-miner.js";
 import { inferCapacityFromTransitions, renderInferenceReport } from "./interval-inference.js";
@@ -20,11 +24,16 @@ import { analyzeWeeklyCalibration, renderWeeklyCalibrationReport } from "./weekl
 import { upsertPlanProfile, validatePlanTimeline } from "./plan-timeline.js";
 import { createActivityMarker } from "./activity-markers.js";
 import {
-  defaultExportSecretFile,
   inspectParticipantSecret,
   rotateParticipantSecret,
   withParticipantSecretLease,
 } from "./export-identity.js";
+import {
+  renderParticipantIdentityBackendMode,
+  renderParticipantIdentityFileResidueState,
+  renderParticipantIdentitySourceState,
+  selectProductionParticipantIdentity,
+} from "./export-identity-production.js";
 import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
 import { verifyLocalMetadataBundleFiles } from "./bundle-verifier.js";
 import {
@@ -104,7 +113,7 @@ function usage() {
   usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
   usage-monitor verify-bundle --input PATH [--receipt PATH]
-  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
+  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
   usage-monitor inspect-export-workspace --workspace PATH
   usage-monitor verify-export-set --directory PATH
   usage-monitor delete-local-export --workspace PATH --directory PATH [--confirm-deletion TOKEN]
@@ -171,6 +180,8 @@ export function parseArgs(argv) {
     defaultPlanVariant: null,
     allowStaleCache: false,
     collectorFile: null,
+    claudeStatus: false,
+    claudeStateDirectory: null,
     activitySurface: null,
     activityState: null,
     activityFile: null,
@@ -202,6 +213,7 @@ export function parseArgs(argv) {
     else if (arg === "--confirm-deletion") result.confirmDeletionToken = readOptionValue(argv, index++, arg);
     else if (arg === "--confirm-discard") result.confirmDiscardToken = readOptionValue(argv, index++, arg);
     else if (arg === "--resume") result.resume = true;
+    else if (arg === "--claude-status") result.claudeStatus = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--since") result.startAt = readOptionValue(argv, index++, arg);
@@ -226,6 +238,7 @@ export function parseArgs(argv) {
     else if (arg === "--plan-timeline") result.planTimelineFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--provider-ui") result.providerUiFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--collector-file") result.collectorFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--claude-state-dir") result.claudeStateDirectory = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--surface") result.activitySurface = readOptionValue(argv, index++, arg);
     else if (arg === "--state") result.activityState = readOptionValue(argv, index++, arg);
     else if (arg === "--activity-file") result.activityFile = resolve(readOptionValue(argv, index++, arg));
@@ -241,6 +254,12 @@ export function parseArgs(argv) {
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
+  }
+  if (result.claudeStatus && result.claudeStateDirectory !== null) {
+    throw new Error("export-set accepts either --claude-status or --claude-state-dir, not both");
+  }
+  if ((result.claudeStatus || result.claudeStateDirectory !== null) && result.command !== "export-set") {
+    throw new Error("--claude-status and --claude-state-dir are available only for export-set");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -333,15 +352,40 @@ export function buildCacheValidationSidecar(cached, current, { startAt, endAt, v
   };
 }
 
-async function run() {
-  const args = parseArgs(process.argv.slice(2));
+export async function run(
+  argv = process.argv.slice(2),
+  {
+    selectParticipantIdentity = selectProductionParticipantIdentity,
+    inspectIdentity = inspectParticipantSecret,
+    rotateIdentity = rotateParticipantSecret,
+    withIdentityLease = withParticipantSecretLease,
+    selectAccountObservationSecret = selectProductionAccountObservationSecret,
+    readAccountSnapshot = readCodexAccountSnapshot,
+    sanitizeAccountSnapshot = sanitizeCodexAccountSnapshotWithSecretLoader,
+    captureObservation = captureCodexObservation,
+    runCollectorOnceCommand = runCollectorOnce,
+    runCollectorForegroundCommand = runCollectorForeground,
+  } = {},
+) {
+  const args = parseArgs(argv);
+  let accountObservationSelection = null;
+  function selectedAccountObservation() {
+    accountObservationSelection ??= selectAccountObservationSecret();
+    return accountObservationSelection;
+  }
+  async function readSanitizedAccountSnapshot(capturedAt) {
+    const selection = selectedAccountObservation();
+    return sanitizeAccountSnapshot(await readAccountSnapshot(), capturedAt, {
+      loadAccountObservationSecret: selection.loadAccountObservationSecret,
+    });
+  }
   if (args.command === "help" || args.command === "--help" || args.command === "-h") {
     usage();
     return;
   }
   if (args.command === "mark-activity") {
     const observedAt = new Date().toISOString();
-    const snapshot = sanitizeCodexAccountSnapshot(await readCodexAccountSnapshot(), observedAt);
+    const snapshot = await readSanitizedAccountSnapshot(observedAt);
     const marker = createActivityMarker({
       surface: args.activitySurface,
       state: args.activityState,
@@ -386,7 +430,10 @@ async function run() {
       ? "poisoned_source_integrity"
       : inspected.scanComplete ? "scan_complete" : "incomplete"}`);
     console.log(`Coverage: ${inspected.coveredAt.startAt} to ${inspected.coveredAt.endAt}`);
-    console.log(`Sources: ${inspected.sourcePlan.sourceFiles}; bytes: ${inspected.sourcePlan.sourceBytes}`);
+    const totalSourceFiles = inspected.sourcePlan.sourceFiles + inspected.supplementalSourcePlan.sourceFiles;
+    const totalSourceBytes = inspected.sourcePlan.sourceBytes + inspected.supplementalSourcePlan.sourceBytes;
+    console.log(`Sources: ${totalSourceFiles}; bytes: ${totalSourceBytes}`);
+    console.log(`Providers: ${inspected.sourceProviders.join(", ")}`);
     console.log(`Records: ${inspected.recordCounts.usageEvents} usage, ${inspected.recordCounts.quotaSnapshots} quota, ${inspected.recordCounts.activityMarkers} markers`);
     console.log(`Workspace bytes: ${inspected.workspaceBytes}; upload disabled: true`);
     return;
@@ -418,15 +465,17 @@ async function run() {
       maximumLineBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumLineBytes,
       maximumRecords: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
     });
-    await withParticipantSecretLease({
-      secretFile: args.exportSecretFile ?? defaultExportSecretFile(),
-    }, async (identity) => {
+    const identitySelection = selectParticipantIdentity({ explicitSecretFile: args.exportSecretFile });
+    await withIdentityLease(identitySelection.identityOptions, async (identity) => {
       const workspaceResult = args.resume
         ? await resumeLocalExportWorkspace({
             directory: args.workspaceDirectory,
             codexHome: args.codexHome ?? undefined,
             secret: identity.secret,
             activityMarkers,
+            collectorPath: args.collectorFile,
+            claudeStateDirectory: args.claudeStateDirectory,
+            enableClaudeStatus: args.claudeStatus,
           })
         : await createLocalExportWorkspace({
             directory: args.workspaceDirectory,
@@ -435,6 +484,9 @@ async function run() {
             codexHome: args.codexHome ?? undefined,
             secret: identity.secret,
             activityMarkers,
+            collectorPath: args.collectorFile,
+            claudeStateDirectory: args.claudeStateDirectory,
+            enableClaudeStatus: args.claudeStatus,
           });
       const materialized = await materializeLocalExportSet({
         workspaceDirectory: args.workspaceDirectory,
@@ -545,23 +597,34 @@ async function run() {
     return;
   }
   if (args.command === "rotate-local-identity") {
-    const secretFile = args.exportSecretFile ?? defaultExportSecretFile();
+    const identitySelection = selectParticipantIdentity({ explicitSecretFile: args.exportSecretFile });
     if (!args.confirm) {
-      const inspection = await inspectParticipantSecret({ secretFile });
-      const state = inspection.conflict
+      const inspection = await inspectIdentity(identitySelection.identityOptions);
+      const state = inspection.conflict === true
         ? "conflict"
-        : inspection.source === "environment"
-          ? "external_override"
-          : inspection.status;
+        : ["ready", "missing"].includes(inspection.status)
+          ? inspection.status
+          : "invalid";
       console.log(`Local export identity rotation preflight: ${state}`);
+      console.log(`Storage backend: ${renderParticipantIdentityBackendMode(identitySelection.mode)}`);
+      console.log(`Identity source: ${renderParticipantIdentitySourceState(inspection)}`);
       console.log(`Rotatable: ${inspection.rotatable === true}`);
+      if (identitySelection.mode === "macos_keychain") {
+        console.log(`Owner-file secret residue: ${renderParticipantIdentityFileResidueState(inspection.ownerFileState)}`);
+        console.log(`Legacy-file secret residue: ${renderParticipantIdentityFileResidueState(inspection.legacyState)}`);
+      }
       console.log("No files changed; rerun with --confirm to break future export linkability");
       console.log("Network activity: none");
       return;
     }
-    const rotated = await rotateParticipantSecret({ secretFile, confirmRotation: true });
+    const rotated = await rotateIdentity({ ...identitySelection.identityOptions, confirmRotation: true });
     console.log("Local export identity rotation: completed");
-    console.log(`Legacy fallback retired: ${rotated.legacyRetired}`);
+    console.log(`Storage backend: ${renderParticipantIdentityBackendMode(identitySelection.mode)}`);
+    console.log(`Fallback retirement markers committed: ${rotated.ownerFileRetired === true || rotated.legacyRetired === true}`);
+    if (identitySelection.mode === "macos_keychain") {
+      console.log(`Retired secret files removed this operation: ${Number.isSafeInteger(rotated.secretFilesRemoved) ? rotated.secretFilesRemoved : 0}`);
+      console.log(`Retired secret files retained after operation: ${Number.isSafeInteger(rotated.secretFilesRetained) ? rotated.secretFilesRetained : 0}`);
+    }
     console.log("Future export pseudonyms changed: true");
     console.log("Existing bundles changed: false");
     console.log(`Secure storage erasure guaranteed: ${rotated.secureErasure}`);
@@ -579,9 +642,8 @@ async function run() {
       maximumRecords: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
       resourceGuard: exportResourceGuard,
     });
-    await withParticipantSecretLease({
-      secretFile: args.exportSecretFile ?? defaultExportSecretFile(),
-    }, async (identity) => {
+    const identitySelection = selectParticipantIdentity({ explicitSecretFile: args.exportSecretFile });
+    await withIdentityLease(identitySelection.identityOptions, async (identity) => {
       const result = await buildLocalMetadataBundle({
         startAt: args.startAt,
         endAt: args.endAt,
@@ -605,7 +667,7 @@ async function run() {
   }
   if (args.command === "doctor") {
     const capturedAt = new Date().toISOString();
-    const snapshot = sanitizeCodexAccountSnapshot(await readCodexAccountSnapshot(), capturedAt);
+    const snapshot = await readSanitizedAccountSnapshot(capturedAt);
     console.log("Codex app-server: available");
     console.log(`Plan: ${snapshot.canonical.planType ?? "unknown"}`);
     console.log(`Account scope: ${snapshot.accountScope.status}${snapshot.accountScope.scopeId ? ` (${snapshot.accountScope.scopeId})` : ` (${snapshot.accountScope.reason})`}`);
@@ -622,7 +684,7 @@ async function run() {
       throw new Error("register-account requires --alias and --default-plan");
     }
     const capturedAt = new Date().toISOString();
-    const snapshot = sanitizeCodexAccountSnapshot(await readCodexAccountSnapshot(), capturedAt);
+    const snapshot = await readSanitizedAccountSnapshot(capturedAt);
     if (snapshot.accountScope.status !== "available") {
       throw new Error(`Cannot register account scope: ${snapshot.accountScope.reason}`);
     }
@@ -647,7 +709,14 @@ async function run() {
   }
   if (args.command === "capture") {
     const planTimeline = await readJsonIfExists(args.planTimelineFile ?? defaultPlanTimelineFile(), null);
-    const observation = await captureCodexObservation({ ...args, planTimeline });
+    const selection = selectedAccountObservation();
+    const observation = await captureObservation({
+      ...args,
+      planTimeline,
+      sanitizeSnapshot: (snapshot, capturedAt) => sanitizeAccountSnapshot(snapshot, capturedAt, {
+        loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      }),
+    });
     await appendObservation(args.dataFile, observation);
     console.log(`Captured ${observation.windows.length} quota window(s) to ${args.dataFile}`);
     for (const window of observation.windows) {
@@ -781,7 +850,7 @@ async function run() {
           .then((localScan) => ({ localScan, cacheValidation: { status: "fresh_scan" } }));
     const [localScanResult, accountSnapshot, planTimeline, providerUiObservations, prospectiveCollectorRecords] = await Promise.all([
       localScanPromise,
-      readCodexAccountSnapshot().then((snapshot) => sanitizeCodexAccountSnapshot(snapshot, capturedAt)),
+      readSanitizedAccountSnapshot(capturedAt),
       readJsonIfExists(args.planTimelineFile ?? defaultPlanTimelineFile(), null),
       readObservations(args.providerUiFile ?? defaultProviderUiObservationFile()),
       readObservations(defaultCollectorDataFile()),
@@ -843,13 +912,15 @@ async function run() {
     return;
   }
   if (args.command === "collect-once") {
-    const result = await runCollectorOnce({
+    const selection = selectedAccountObservation();
+    const result = await runCollectorOnceCommand({
       dataFile: args.dataFile === defaultDataFile() ? defaultCollectorDataFile() : args.dataFile,
       checkpointFile: args.checkpointFile ?? defaultCollectorCheckpointFile(),
       lockFile: args.lockFile ?? defaultCollectorLockFile(),
       staleAfterMs: args.staleAfterMs,
       refreshStale: args.refreshStale,
       backfill: args.backfill,
+      loadAccountObservationSecret: selection.loadAccountObservationSecret,
     });
     console.log(`Collector run-once: ${result.rolloutRecordsWritten} rollout record(s); refresh ${result.refresh.attempted ? (result.refresh.errorCode ?? (result.refresh.recordWritten ? "recorded" : "deduplicated")) : "not needed"}.`);
     console.log(`Data: ${result.dataFile}`);
@@ -863,13 +934,15 @@ async function run() {
     process.once("SIGTERM", abort);
     const timer = args.durationMs === null ? null : setTimeout(abort, args.durationMs);
     try {
-      const result = await runCollectorForeground({
+      const selection = selectedAccountObservation();
+      const result = await runCollectorForegroundCommand({
         dataFile: args.dataFile === defaultDataFile() ? defaultCollectorDataFile() : args.dataFile,
         checkpointFile: args.checkpointFile ?? defaultCollectorCheckpointFile(),
         lockFile: args.lockFile ?? defaultCollectorLockFile(),
         staleAfterMs: args.staleAfterMs,
         reconciliationMs: args.reconciliationMs,
         signal: controller.signal,
+        loadAccountObservationSecret: selection.loadAccountObservationSecret,
       });
       console.log(`Collector foreground exited cleanly: ${result.rolloutRecordsWritten} rollout record(s), ${result.appServerRecordsWritten} app-server record(s), ${result.reconnectAttempts} reconnect attempt(s).`);
     } finally {

@@ -20,14 +20,14 @@
     {
       "schemaName": "bundle.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
-      "schemaSha256": "fb0a7380d406e1252159611afd33189531616d5ee22581a4adf26584f1a75194",
+      "schemaSha256": "2acd8d262e75ead03c132f7d08d8c86e5595b820385375953e7694cf1611c629",
       "propertyCount": 24
     },
     {
       "schemaName": "compatibility.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
-      "schemaSha256": "809be563df5c9860a9a8aa9fb1021a82b7f69047aadcde1c7c2a57b55fc57d22",
-      "propertyCount": 42
+      "schemaSha256": "2502280dd711db282b44db0f7767f0ac4440cda1c2d9a943910c40c482e02692",
+      "propertyCount": 61
     },
     {
       "schemaName": "privacy-receipt.schema.json",
@@ -38,7 +38,7 @@
     {
       "schemaName": "quota-snapshot.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
-      "schemaSha256": "94de3cb6712259546aeac1d1f474760050fffaa601e5d12ef43dd33a66a9dff0",
+      "schemaSha256": "527dce6668db480963321493b8becfec161de63a60a044e38773b2dd6e4165ca",
       "propertyCount": 18
     },
     {
@@ -750,8 +750,8 @@
     },
     {
       "schemaName": "compatibility.schema.json",
-      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/adapterVersion",
-      "fieldPath": "providerAdapters.anthropicClaudeCode.adapterVersion",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/capabilities",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.capabilities",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -762,8 +762,8 @@
     },
     {
       "schemaName": "compatibility.schema.json",
-      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/parserVersion",
-      "fieldPath": "providerAdapters.anthropicClaudeCode.parserVersion",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/capabilities/properties/quotaSnapshots",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.capabilities.quotaSnapshots",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -774,8 +774,80 @@
     },
     {
       "schemaName": "compatibility.schema.json",
-      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormat",
-      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormat",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/capabilities/properties/usageEvents",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.capabilities.usageEvents",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.statusLine",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/adapterVersion",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.adapterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/parserVersion",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.parserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/sourceFormat",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.sourceFormat",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/anthropicClaudeCode/properties/sourceFormats/properties/statusLine/properties/status",
+      "fieldPath": "providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.status",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -810,8 +882,8 @@
     },
     {
       "schemaName": "compatibility.schema.json",
-      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/adapterVersion",
-      "fieldPath": "providerAdapters.openaiCodex.adapterVersion",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/capabilities",
+      "fieldPath": "providerAdapters.openaiCodex.capabilities",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -822,8 +894,8 @@
     },
     {
       "schemaName": "compatibility.schema.json",
-      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/parserVersion",
-      "fieldPath": "providerAdapters.openaiCodex.parserVersion",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/capabilities/properties/quotaSnapshots",
+      "fieldPath": "providerAdapters.openaiCodex.capabilities.quotaSnapshots",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -834,8 +906,164 @@
     },
     {
       "schemaName": "compatibility.schema.json",
-      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormat",
-      "fieldPath": "providerAdapters.openaiCodex.sourceFormat",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/capabilities/properties/quotaSnapshots/properties/collector",
+      "fieldPath": "providerAdapters.openaiCodex.capabilities.quotaSnapshots.collector",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/capabilities/properties/quotaSnapshots/properties/rollout",
+      "fieldPath": "providerAdapters.openaiCodex.capabilities.quotaSnapshots.rollout",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/capabilities/properties/usageEvents",
+      "fieldPath": "providerAdapters.openaiCodex.capabilities.usageEvents",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/collectorQuota",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.collectorQuota",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/collectorQuota/properties/adapterVersion",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.collectorQuota.adapterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/collectorQuota/properties/parserVersion",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.collectorQuota.parserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/collectorQuota/properties/sourceFormat",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.collectorQuota.sourceFormat",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/collectorQuota/properties/status",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.collectorQuota.status",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/rollout",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.rollout",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/rollout/properties/adapterVersion",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.rollout.adapterVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/rollout/properties/parserVersion",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/rollout/properties/sourceFormat",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.rollout.sourceFormat",
+      "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
+      "privacyClass": "protocol_and_governance_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "public_row",
+      "codexProvenance": "not_applicable",
+      "claudeProvenance": "not_applicable",
+      "limitation": "These declarations identify local contract inputs but do not attest to provider behavior, binary provenance, source completeness, or future compatibility."
+    },
+    {
+      "schemaName": "compatibility.schema.json",
+      "schemaPointer": "/properties/providerAdapters/properties/openaiCodex/properties/sourceFormats/properties/rollout/properties/status",
+      "fieldPath": "providerAdapters.openaiCodex.sourceFormats.rollout.status",
       "purpose": "Pins the exact schemas, generated field contract, exporter implementation, provider adapters, registries, consent state, and local-only contract state required to reproduce and verify an export.",
       "privacyClass": "protocol_and_governance_metadata",
       "retentionClass": "contract_lifetime",
@@ -1238,7 +1466,7 @@
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
       "claudeProvenance": "unavailable",
-      "limitation": "Unattributed historical records cannot be split safely, secret rotation breaks linkage, and Claude export is not implemented."
+      "limitation": "Unattributed historical records cannot be split safely, secret rotation breaks linkage, and Claude status-line input currently supplies no account identity."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1249,7 +1477,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "heuristic",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "The current parser reconstructs precision after JSON number parsing, so trailing zero precision is lost."
     },
     {
@@ -1262,7 +1490,7 @@
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
       "claudeProvenance": "unavailable",
-      "limitation": "Provider identifiers may be absent, renamed, or mapped to unknown; Claude export is not implemented."
+      "limitation": "Provider identifiers may be absent, renamed, or mapped to unknown; Claude status-line limits currently map to unknown."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1273,8 +1501,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Provider timestamp semantics and local clock skew can differ by source; Claude export is not implemented."
+      "claudeProvenance": "observed",
+      "limitation": "Provider timestamp semantics and local clock skew can differ by source; Claude uses the local capture timestamp."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1286,7 +1514,7 @@
       "publicEligibility": "aggregate_only",
       "codexProvenance": "mixed",
       "claudeProvenance": "unavailable",
-      "limitation": "Plan may be locally observed, stale, or unknown; no Claude telemetry adapter emits this record yet."
+      "limitation": "Plan may be locally observed, stale, or unknown; the Claude status-line quota adapter emits unknown because it has no plan evidence."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1298,7 +1526,7 @@
       "publicEligibility": "aggregate_only",
       "codexProvenance": "declared",
       "claudeProvenance": "unavailable",
-      "limitation": "Variants are participant-supplied and Claude telemetry export is not implemented."
+      "limitation": "Variants are participant-supplied; the Claude status-line quota adapter emits unknown."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1309,8 +1537,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Provider label does not identify an account, endpoint, or billing entity; no Claude telemetry adapter emits this schema yet."
+      "claudeProvenance": "derived",
+      "limitation": "Provider label does not identify an account, endpoint, or billing entity."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1321,8 +1549,8 @@
       "retentionClass": "contract_lifetime",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Unattributed state is session-scoped and intentionally cannot collapse across unknown accounts."
+      "claudeProvenance": "derived",
+      "limitation": "Unattributed state is session-scoped when a session pseudonym exists; sessionless collector state is occurrence-scoped to avoid collapse across unknown accounts."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1333,7 +1561,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Classification is based on available product evidence and may change over time."
     },
     {
@@ -1345,8 +1573,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "The rollout exporter currently copies observedTime because no independent receipt timestamp is retained."
+      "claudeProvenance": "derived",
+      "limitation": "The rollout and Claude status-line quota adapters copy observedTime because no independent receipt timestamp is retained."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1357,7 +1585,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "observed",
       "limitation": "Reported reset time can be approximate and propagation may be delayed."
     },
     {
@@ -1376,13 +1604,13 @@
       "schemaName": "quota-snapshot.schema.json",
       "schemaPointer": "/properties/sessionScopeId",
       "fieldPath": "sessionScopeId",
-      "purpose": "Links related local records without exporting the raw provider session identifier.",
+      "purpose": "Links session-scoped quota observations without exporting the raw provider session identifier.",
       "privacyClass": "pseudonymous_identifier",
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Session boundaries vary by provider and client, and secret rotation breaks linkage."
+      "claudeProvenance": "derived",
+      "limitation": "The value is null only for account-level OpenAI app-server observations; rollout and Claude status-line observations require a session pseudonym. Sessionless unattributed collector states are occurrence-scoped to avoid cross-account collapse."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1393,8 +1621,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Primary and secondary labels require duration evidence before interpretation; Claude export is not implemented."
+      "claudeProvenance": "derived",
+      "limitation": "Primary and secondary labels require duration evidence before interpretation; Claude status-line windows map to explicit five-hour and seven-day slots."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1405,8 +1633,8 @@
       "retentionClass": "contract_lifetime",
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "The v2 source-occurrence locator is implemented only for Codex rollout records and changes with identity-secret rotation."
+      "claudeProvenance": "derived",
+      "limitation": "The v2 source-occurrence locator is implemented for Codex rollout records and the draft-local collector and Claude quota constructors; it changes with identity-secret rotation."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1417,7 +1645,7 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
+      "claudeProvenance": "derived",
       "limitation": "Collection source affects timing and precision but not necessarily provider accounting semantics."
     },
     {
@@ -1429,8 +1657,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_only",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Provider rounding obscures smaller changes and percentage need not be linear in API cost; Claude export is not implemented."
+      "claudeProvenance": "observed",
+      "limitation": "Provider rounding obscures smaller changes and percentage need not be linear in API cost."
     },
     {
       "schemaName": "quota-snapshot.schema.json",
@@ -1441,8 +1669,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
-      "claudeProvenance": "unavailable",
-      "limitation": "Nominal duration does not prove whether the implementation is fixed, rolling, or reset-based; Claude export is not implemented."
+      "claudeProvenance": "observed",
+      "limitation": "Nominal duration does not prove whether the implementation is fixed, rolling, or reset-based."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1454,7 +1682,7 @@
       "publicEligibility": "restricted_pseudonymous_row",
       "codexProvenance": "derived",
       "claudeProvenance": "unavailable",
-      "limitation": "Unattributed historical records cannot be split safely, secret rotation breaks linkage, and Claude export is not implemented."
+      "limitation": "Unattributed historical records cannot be split safely, secret rotation breaks linkage, and Claude status-line input currently supplies no account identity."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1526,7 +1754,7 @@
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "observed",
       "claudeProvenance": "unavailable",
-      "limitation": "Current Codex export can preserve an observed cache-write component when present, but historical absence remains null; Claude export is not implemented."
+      "limitation": "Current Codex export can preserve an observed cache-write component when present, but historical absence remains null; Claude usage-event export is not implemented."
     },
     {
       "schemaName": "usage-event.schema.json",
@@ -1657,8 +1885,8 @@
       "retentionClass": "raw_metadata_limited",
       "publicEligibility": "aggregate_and_row",
       "codexProvenance": "derived",
-      "claudeProvenance": "unavailable",
-      "limitation": "Provider label does not identify an account, endpoint, or billing entity; no Claude telemetry adapter emits this schema yet."
+      "claudeProvenance": "derived",
+      "limitation": "Provider label does not identify an account, endpoint, or billing entity."
     },
     {
       "schemaName": "usage-event.schema.json",

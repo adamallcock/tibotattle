@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "9d65a7cb2cac4ddfc912af964eeebc09b821015c8d59f12f64b614fc69baa709",
+    "sha256": "03e99b7da682f8a23c8d0edde97ee1f4135b797e3e5799e94c2a9ac9f8539721",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -26,21 +26,48 @@
   },
   "providerAdapters": {
     "anthropicClaudeCode": {
-      "adapterVersion": null,
-      "parserVersion": null,
-      "sourceFormat": null,
-      "status": "not_implemented"
+      "capabilities": {
+        "quotaSnapshots": "implemented",
+        "usageEvents": "not_implemented"
+      },
+      "sourceFormats": {
+        "statusLine": {
+          "adapterVersion": "quota-candidate-normalizer-v0.1",
+          "parserVersion": "claude-statusline-v0.2",
+          "sourceFormat": "claude-statusline-snapshot-v0.2",
+          "status": "implemented"
+        }
+      },
+      "status": "partial"
     },
     "openaiCodex": {
-      "adapterVersion": "codex-metadata-export-v5",
-      "parserVersion": "codex-log-scan-v5",
-      "sourceFormat": "codex-rollout-jsonl",
+      "capabilities": {
+        "quotaSnapshots": {
+          "collector": "implemented",
+          "rollout": "implemented"
+        },
+        "usageEvents": "implemented"
+      },
+      "sourceFormats": {
+        "collectorQuota": {
+          "adapterVersion": "quota-candidate-normalizer-v0.1",
+          "parserVersion": "codex-collector-quota-candidate-v0.1",
+          "sourceFormat": "codex-collector-jsonl-v0.3",
+          "status": "implemented"
+        },
+        "rollout": {
+          "adapterVersion": "codex-metadata-export-v5",
+          "parserVersion": "codex-log-scan-v5",
+          "sourceFormat": "codex-rollout-jsonl",
+          "status": "implemented"
+        }
+      },
       "status": "implemented"
     }
   },
   "registry": {
-    "sha256": "65dc6c376a6b3e841b5d58deada18d3744997ebcebf78eb39a9484c101e6c597",
-    "version": "telemetry-v0.1-registry-2026-07-24.1"
+    "sha256": "d8b552797c18b19822da011db4fa7f98a620ec0da13d03e152c1b4019d42b387",
+    "version": "telemetry-v0.1-registry-2026-07-24.2"
   },
   "schemas": {
     "members": [
@@ -52,12 +79,12 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
         "name": "bundle.schema.json",
-        "sha256": "fb0a7380d406e1252159611afd33189531616d5ee22581a4adf26584f1a75194"
+        "sha256": "2acd8d262e75ead03c132f7d08d8c86e5595b820385375953e7694cf1611c629"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "809be563df5c9860a9a8aa9fb1021a82b7f69047aadcde1c7c2a57b55fc57d22"
+        "sha256": "2502280dd711db282b44db0f7767f0ac4440cda1c2d9a943910c40c482e02692"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -67,7 +94,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
         "name": "quota-snapshot.schema.json",
-        "sha256": "94de3cb6712259546aeac1d1f474760050fffaa601e5d12ef43dd33a66a9dff0"
+        "sha256": "527dce6668db480963321493b8becfec161de63a60a044e38773b2dd6e4165ca"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
@@ -75,7 +102,7 @@
         "sha256": "a9fe4513b91878dab74cb6d4ba7b41f02fc3d685c7b7d3de28a6b29012b00d81"
       }
     ],
-    "setSha256": "b8db720d8e537c598969f0190b66f67d32d5ea3cd3cdcbe33104fd084736889f"
+    "setSha256": "d8722f735902f54317c7995e586fb465654b3c855dcbccf1d0630428ec129671"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

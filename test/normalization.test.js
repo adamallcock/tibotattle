@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { codexAppServerChildEnv, sanitizeCodexAccountSnapshot } from "../src/codex-app-server.js";
+import {
+  codexAppServerChildEnv,
+  sanitizeCodexAccountSnapshot,
+  sanitizeCodexAccountSnapshotWithSecretLoader,
+} from "../src/codex-app-server.js";
 import { summarizeCcusage } from "../src/ccusage.js";
 import {
   buildCacheValidationSidecar,
@@ -79,6 +83,53 @@ test("Codex app-server child environment never inherits the account HMAC key", (
     APP_USAGEMONITOR_ACCOUNT_HMAC_KEY: "private-hmac-key",
   });
   assert.deepEqual(environment, { PATH: "/safe/bin" });
+});
+
+test("async account credential loading derives scope in memory and zeroes the disposable copy", async () => {
+  const disposable = Buffer.alloc(32, 76);
+  const result = await sanitizeCodexAccountSnapshotWithSecretLoader({
+    account: { account: { email: "private.owner@example.test", planType: "pro" } },
+    rateLimits: { rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 123 },
+      planType: "pro",
+    } },
+    accountUsage: { dailyUsageBuckets: [] },
+  }, "2026-07-23T00:00:00.000Z", {
+    loadAccountObservationSecret: async () => disposable,
+  });
+  assert.equal(result.accountScope.status, "available");
+  assert.deepEqual(disposable, Buffer.alloc(32));
+  assert.equal(JSON.stringify(result).includes("private.owner"), false);
+});
+
+test("locked, denied, and malformed credential loads remain safely unattributed", async () => {
+  const raw = {
+    account: { account: { email: "private.owner@example.test", planType: "pro" } },
+    rateLimits: { rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 123 },
+      planType: "pro",
+    } },
+    accountUsage: { dailyUsageBuckets: [] },
+  };
+  for (const loadAccountObservationSecret of [
+    async () => { throw new Error("DO-NOT-LEAK-locked"); },
+    async () => { const error = new Error("DO-NOT-LEAK-denied"); error.code = "denied"; throw error; },
+    async () => Buffer.alloc(31, 1),
+  ]) {
+    const result = await sanitizeCodexAccountSnapshotWithSecretLoader(raw, "2026-07-23T00:00:00.000Z", {
+      loadAccountObservationSecret,
+    });
+    assert.deepEqual(result.accountScope, {
+      status: "unavailable",
+      reason: "credential_unavailable",
+      version: "openai-account-v1",
+      scopeId: null,
+      planType: "pro",
+    });
+    assert.equal(JSON.stringify(result).includes("DO-NOT-LEAK"), false);
+  }
 });
 
 test("ccusage summary keeps token categories disjoint", () => {

@@ -71,7 +71,7 @@ export async function captureCodexObservation({
   const startedAtMs = clock();
   const capturedAt = new Date(startedAtMs).toISOString();
   const rawSnapshot = await readSnapshot();
-  const account = sanitizeSnapshot(rawSnapshot, capturedAt);
+  const account = await sanitizeSnapshot(rawSnapshot, capturedAt);
   const planContext = resolvePlanContext({
     timeline: planTimeline,
     scopeId: account.accountScope?.scopeId ?? null,

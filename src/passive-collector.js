@@ -6,7 +6,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   CodexAppServerClient,
   CodexAppServerError,
-  sanitizeCodexAccountSnapshot,
+  deriveOpenAIAccountScopeWithSecretLoader,
+  sanitizeCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
 } from "./codex-app-server.js";
 import {
@@ -16,7 +17,7 @@ import {
   normalizeTokenUsage,
   readRolloutLineage,
 } from "./codex-log-scan.js";
-import { deriveOpenAIAccountScope, sanitizeAccountScope } from "./account-scope.js";
+import { sanitizeAccountScope } from "./account-scope.js";
 import { normalizeProviderTier, unknownCodexTier } from "./tier-semantics.js";
 import {
   appendJsonLinesOwnerOnly,
@@ -76,6 +77,8 @@ function emptyCheckpoint(nowIso, backfill) {
       rolloutRecordsWritten: 0,
       rolloutRecordBatchesWritten: 0,
       appServerRecordsWritten: 0,
+      accountCredentialLocked: 0,
+      accountCredentialUnavailable: 0,
       appServerErrorCounts: {},
       ingestionErrorCounts: {},
       tierSettingEvents: 0,
@@ -690,13 +693,17 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
   return safe;
 }
 
-async function readSanitizedAppServerSnapshot(client, capturedAt) {
+async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret) {
   const rateLimits = await client.readRateLimits();
   const [account, accountUsage] = await Promise.all([
     typeof client.readAccount === "function" ? client.readAccount().catch(() => null) : Promise.resolve(null),
     typeof client.readAccountUsage === "function" ? client.readAccountUsage().catch(() => null) : Promise.resolve(null),
   ]);
-  return sanitizeCodexAccountSnapshot({ account, rateLimits, accountUsage }, capturedAt);
+  return sanitizeCodexAccountSnapshotWithSecretLoader(
+    { account, rateLimits, accountUsage },
+    capturedAt,
+    { loadAccountObservationSecret },
+  );
 }
 
 async function appendAppRecord({ payload, source, checkpoint, dataFile, clock, commitRecord = null }) {
@@ -710,6 +717,12 @@ async function appendAppRecord({ payload, source, checkpoint, dataFile, clock, c
   addRecentKey(checkpoint, record.eventKey, recentSet);
   trimRecentKeys(checkpoint, recentSet, MAX_RECENT_EVENT_KEYS);
   if (Object.hasOwn(payload ?? {}, "accountScope")) {
+    if (record.accountScope.reason === "credential_locked") {
+      checkpoint.diagnostics.accountCredentialLocked = (checkpoint.diagnostics.accountCredentialLocked ?? 0) + 1;
+    }
+    if (record.accountScope.reason === "credential_unavailable") {
+      checkpoint.diagnostics.accountCredentialUnavailable = (checkpoint.diagnostics.accountCredentialUnavailable ?? 0) + 1;
+    }
     if (record.accountScope.status === "available") {
       checkpoint.accountScopeMarker = {
         capturedAt: record.observedAt,
@@ -788,6 +801,7 @@ export async function runCollectorOnce({
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
+  loadAccountObservationSecret = null,
   commitBatch = commitCollectorRecordBatch,
 } = {}) {
   const release = await acquireCollectorLock(lockFile, { clock });
@@ -828,7 +842,7 @@ export async function runCollectorOnce({
         client = appServerFactory();
         await client.start();
         const capturedAt = new Date(clock()).toISOString();
-        const payload = await readSanitizedAppServerSnapshot(client, capturedAt);
+        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
         const record = await appendAppRecord({
           payload,
           source: "app_server_read",
@@ -908,6 +922,7 @@ export async function runCollectorForeground({
   signal,
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
+  loadAccountObservationSecret = null,
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
@@ -936,6 +951,14 @@ export async function runCollectorForeground({
   let operationTail = Promise.resolve();
   let ingestionQueued = false;
   let ingestionDirty = false;
+  let pendingRateLimitNotification = null;
+  let rateLimitNotificationQueued = false;
+  let rateLimitNotificationsPaused = false;
+  let rateLimitNotificationEvents = 0;
+  let rateLimitNotificationOperations = 0;
+  let rateLimitNotificationPayloadsProcessed = 0;
+  let rateLimitNotificationPayloadsCoalesced = 0;
+  let maximumPendingRateLimitNotifications = 0;
   let finalized = false;
   let hasDurableCheckpoint = existing !== null;
   const watchers = [];
@@ -1048,18 +1071,17 @@ export async function runCollectorForeground({
     } while (observed !== operationTail);
   }
 
-  async function notificationPayloadFor(connectedClient, payload) {
-    const canonical = sanitizeRateLimit(payload?.rateLimits ?? payload);
-    if (!canonical) return payload;
+  async function notificationPayloadFor(connectedClient, canonical) {
+    if (!canonical) return canonical;
     let accountScope;
     try {
       const account = typeof connectedClient.readAccount === "function"
         ? await connectedClient.readAccount()
         : null;
-      accountScope = sanitizeAccountScope(deriveOpenAIAccountScope(account, {
-        secret: process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY,
+      accountScope = await deriveOpenAIAccountScopeWithSecretLoader(account, {
+        loadAccountObservationSecret,
         planType: account?.account?.planType ?? canonical.planType,
-      }));
+      });
     } catch {
       accountScope = sanitizeAccountScope(null);
     }
@@ -1072,29 +1094,73 @@ export async function runCollectorForeground({
     };
   }
 
+  function scheduleRateLimitNotificationOperation() {
+    if (rateLimitNotificationsPaused || rateLimitNotificationQueued || pendingRateLimitNotification === null) {
+      return operationTail;
+    }
+    rateLimitNotificationQueued = true;
+    rateLimitNotificationOperations += 1;
+    return enqueueOperation("rate_limit_notification", async () => {
+      try {
+        while (pendingRateLimitNotification !== null) {
+          const pending = pendingRateLimitNotification;
+          pendingRateLimitNotification = null;
+          rateLimitNotificationPayloadsProcessed += 1;
+          const notificationPayload = await notificationPayloadFor(pending.connectedClient, pending.canonical);
+          const record = await appendForegroundAppRecord(notificationPayload, "app_server_notification");
+          if (record) notificationRecords += 1;
+          if (!record) await save();
+        }
+      } finally {
+        rateLimitNotificationQueued = false;
+        if (pendingRateLimitNotification !== null) scheduleRateLimitNotificationOperation();
+      }
+    });
+  }
+
+  function queueRateLimitNotification(connectedClient, payload) {
+    rateLimitNotificationEvents += 1;
+    let canonical = null;
+    try {
+      canonical = sanitizeRateLimit(payload?.rateLimits ?? payload);
+    } catch {
+      // Retain only a fixed invalid sentinel. The queued operation records the
+      // same content-free malformed-output failure as the previous path.
+    }
+    if (pendingRateLimitNotification !== null) rateLimitNotificationPayloadsCoalesced += 1;
+    pendingRateLimitNotification = { connectedClient, canonical };
+    maximumPendingRateLimitNotifications = Math.max(maximumPendingRateLimitNotifications, 1);
+    return scheduleRateLimitNotificationOperation();
+  }
+
   async function connect({ afterReconnect = false } = {}) {
     client?.close();
     client = appServerFactory();
     const connectedClient = client;
+    rateLimitNotificationsPaused = true;
     client.on("rateLimitsUpdated", (payload) => {
-      enqueueOperation("rate_limit_notification", async () => {
-        const notificationPayload = await notificationPayloadFor(connectedClient, payload);
-        const record = await appendForegroundAppRecord(notificationPayload, "app_server_notification");
-        if (record) notificationRecords += 1;
-        if (!record) await save();
-      });
+      queueRateLimitNotification(connectedClient, payload);
     });
     client.on("disconnect", () => {
       client = null;
     });
-    await client.start();
-    reconnectAttempts = 0;
-    const lastObservedMs = checkpoint.lastQuotaObservedAt ? Date.parse(checkpoint.lastQuotaObservedAt) : Number.NEGATIVE_INFINITY;
-    if (afterReconnect || clock() - lastObservedMs > staleAfterMs) {
-      const capturedAt = new Date(clock()).toISOString();
-      const payload = await readSanitizedAppServerSnapshot(client, capturedAt);
-      const record = await appendForegroundAppRecord(payload, "app_server_read");
-      if (record) notificationRecords += 1;
+    try {
+      await client.start();
+      reconnectAttempts = 0;
+      // A client may emit immediately from start(). Keep those snapshots in the
+      // one-slot coalescer and finish any prior queued mutation before the
+      // direct refresh touches the shared checkpoint/journal.
+      await drainOperations();
+      const lastObservedMs = checkpoint.lastQuotaObservedAt ? Date.parse(checkpoint.lastQuotaObservedAt) : Number.NEGATIVE_INFINITY;
+      if (afterReconnect || clock() - lastObservedMs > staleAfterMs) {
+        const capturedAt = new Date(clock()).toISOString();
+        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
+        const record = await appendForegroundAppRecord(payload, "app_server_read");
+        if (record) notificationRecords += 1;
+      }
+    } finally {
+      rateLimitNotificationsPaused = false;
+      scheduleRateLimitNotificationOperation();
     }
   }
 
@@ -1155,6 +1221,11 @@ export async function runCollectorForeground({
         reconciliationMs,
         recordBatchesWritten,
         maximumBufferedRecords,
+        rateLimitNotificationEvents,
+        rateLimitNotificationOperations,
+        rateLimitNotificationPayloadsProcessed,
+        rateLimitNotificationPayloadsCoalesced,
+        maximumPendingRateLimitNotifications,
       },
     };
   } finally {

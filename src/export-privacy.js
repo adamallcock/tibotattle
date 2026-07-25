@@ -75,8 +75,25 @@ function providerCompatibilityViolations(bundle) {
   };
   let violations = 0;
   for (const provider of observed) if (!declared.has(provider)) violations += 1;
-  for (const provider of declared) if (adapters[provider]?.status !== "implemented") violations += 1;
-  for (const provider of observed) if (adapters[provider]?.status !== "implemented") violations += 1;
+  for (const provider of declared) {
+    if (!["implemented", "partial"].includes(adapters[provider]?.status)) violations += 1;
+  }
+  for (const record of bundle.records?.usageEvents ?? []) {
+    if (adapters[record.provider]?.capabilities?.usageEvents !== "implemented") violations += 1;
+  }
+  for (const record of bundle.records?.quotaSnapshots ?? []) {
+    let capability;
+    if (record.provider === "openai_codex") {
+      capability = record.snapshotSource === "rollout"
+        ? adapters.openai_codex?.capabilities?.quotaSnapshots?.rollout
+        : ["app_server_read", "notification"].includes(record.snapshotSource)
+          ? adapters.openai_codex?.capabilities?.quotaSnapshots?.collector
+          : undefined;
+    } else if (record.provider === "anthropic_claude_code" && record.snapshotSource === "status_line") {
+      capability = adapters.anthropic_claude_code?.capabilities?.quotaSnapshots;
+    }
+    if (capability !== "implemented") violations += 1;
+  }
   return violations;
 }
 

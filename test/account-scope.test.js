@@ -69,6 +69,18 @@ test("account scope exposes non-sensitive unavailable states", () => {
   assert.equal(malformedSubject.reason, "malformed_subject");
   assert.equal(missingSecret.status, "unavailable");
   assert.equal(missingSecret.reason, "missing_secret");
+  const unavailableCredential = deriveOpenAIAccountScope(
+    { account: { email: "private.owner@example.test" } },
+    { secret: null, unavailableSecretReason: "credential_unavailable", planType: "pro" },
+  );
+  assert.equal(unavailableCredential.reason, "credential_unavailable");
+  assert.deepEqual(sanitizeAccountScope(unavailableCredential), unavailableCredential);
+  const lockedCredential = deriveOpenAIAccountScope(
+    { account: { email: "private.owner@example.test" } },
+    { secret: null, unavailableSecretReason: "credential_locked", planType: "pro" },
+  );
+  assert.equal(lockedCredential.reason, "credential_locked");
+  assert.deepEqual(sanitizeAccountScope(lockedCredential), lockedCredential);
   assert.equal(JSON.stringify(missingSecret).includes("private.owner@example.test"), false);
 });
 

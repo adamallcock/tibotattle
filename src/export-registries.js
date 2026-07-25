@@ -1,4 +1,4 @@
-export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-07-24.1";
+export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-07-24.2";
 export const TELEMETRY_V01_REVIEWED_AT = "2026-07-24";
 
 export const OPENAI_CODEX_MODEL_IDS = Object.freeze([
@@ -19,6 +19,12 @@ export const OPENAI_CODEX_LIMIT_IDS = Object.freeze([
 ]);
 
 export const EXPORT_DIAGNOSTIC_CODES = Object.freeze([
+  "collector_empty_lines",
+  "collector_irrelevant_records",
+  "collector_out_of_bounds_records",
+  "collector_oversized_irrelevant_lines",
+  "collector_unsupported_schema_records",
+  "collector_unsupported_source_records",
   "fork_replay_events_skipped",
   "last_only_events",
   "lineage_parents_missing",

@@ -17,17 +17,24 @@ import {
   normalizeExportResourceLimits,
 } from "./export-resource-policy.js";
 import { EXPORT_SOURCE_PLAN_VERSION, summarizeExportSourcePlan } from "./export-source-plan.js";
+import {
+  assertCanonicalSupplementalCursorJson,
+  createEmptySupplementalSourcePlan,
+  EXPORT_SUPPLEMENTAL_SOURCE_PLAN_VERSION,
+  normalizeSupplementalSourcePlan,
+  summarizeSupplementalSourcePlan,
+} from "./export-supplemental-source-plan.js";
 import { stableJson } from "./storage.js";
 
-export const EXPORT_WORKSPACE_VERSION = "usage-export-workspace-v0.2";
+export const EXPORT_WORKSPACE_VERSION = "usage-export-workspace-v0.3";
 export const DEFAULT_EXPORT_WORKSPACE_MAXIMUM_BYTES = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumWorkspaceBytes;
 export const DEFAULT_EXPORT_WORKSPACE_BATCH_RECORDS = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSqliteBatchRecords;
 
 export const EXPORT_WORKSPACE_DATABASE_BASENAME = "workspace.sqlite3";
 const DATABASE_NAME = EXPORT_WORKSPACE_DATABASE_BASENAME;
-const EXPORT_WORKSPACE_APPLICATION_ID = 0x55534d32;
-const EXPORT_WORKSPACE_USER_VERSION = 2;
-const EXPORT_WORKSPACE_SCHEMA_SHA256 = "f66ba77a18c92a76f7ad0e09b57c7efe9bf941026b10905aebdfd353b93fa5c2";
+const EXPORT_WORKSPACE_APPLICATION_ID = 0x55534d33;
+const EXPORT_WORKSPACE_USER_VERSION = 3;
+const EXPORT_WORKSPACE_SCHEMA_SHA256 = "b1d43813fb77e64274f1299d58c98b677c1b82a138a64d6c1575f31e208776bf";
 const DEFAULT_CRASH_RECOVERY_RESERVATION_MS = 5_000;
 const CHECKPOINT_PHASES = new Set(["tier_scan", "record_scan", "complete"]);
 const OCCURRENCE_KINDS = new Set(["usage_event", "tool_call"]);
@@ -35,13 +42,18 @@ const SNAPSHOT_KINDS = new Set(["cumulative_usage", "tool_call"]);
 const REVIEWED_DIAGNOSTIC_CODES = new Set(EXPORT_DIAGNOSTIC_CODES);
 const MAX_CHECKPOINT_INDEX_OPERATIONS = 50_000;
 const MAX_CHECKPOINT_OPEN_TASKS = 100_000;
+const MAXIMUM_SUPPLEMENTAL_PRIVATE_PLAN_BYTES = 32 * 1024 * 1024;
+const SUPPLEMENTAL_SOURCE_KINDS = new Set(["codex_collector_ledger", "claude_status_snapshot"]);
+const SUPPLEMENTAL_CHECKPOINT_STATUSES = new Set(["pending", "complete"]);
 const WORKSPACE_TABLES = Object.freeze([
   "chunks", "diagnostics", "resource_invocations", "resource_usage", "safe_records", "seen_occurrences",
   "source_checkpoints", "source_diagnostics", "source_open_tasks", "source_plan",
-  "source_snapshots", "source_tier_events", "workspace_meta",
+  "source_snapshots", "source_tier_events", "supplemental_source_checkpoints",
+  "supplemental_source_diagnostics", "supplemental_source_plan", "workspace_meta",
 ]);
 const WORKSPACE_INDEXES = Object.freeze([
   "safe_records_total_order", "source_plan_pending_order", "source_snapshots_lookup", "source_tier_lookup",
+  "supplemental_source_plan_pending_order",
 ]);
 const WORKSPACE_COLUMNS = Object.freeze({
   chunks: ["chunk_index", "status", "metadata_json"],
@@ -69,6 +81,15 @@ const WORKSPACE_COLUMNS = Object.freeze({
   ],
   source_snapshots: ["source_key", "kind", "snapshot_key"],
   source_tier_events: ["source_key", "tier_index", "event_time_ms", "line_ordinal", "tier_state_json"],
+  supplemental_source_checkpoints: [
+    "source_key", "status", "cursor_json", "checkpoint_seq", "parser_version", "last_batch_sha256",
+  ],
+  supplemental_source_diagnostics: ["source_key", "code", "count"],
+  supplemental_source_plan: [
+    "ordinal", "source_key", "kind", "binding_kind", "device", "inode", "birthtime_ms",
+    "prefix_bytes", "prefix_sha256", "inventory_entries", "inventory_bytes", "inventory_sha256",
+    "parser_version", "initial_cursor_json", "scan_status",
+  ],
   workspace_meta: ["key", "value_json"],
 });
 const RECORD_TYPE = Object.freeze({
@@ -119,6 +140,15 @@ function validDescriptorResourceLimits(value) {
   }
 }
 
+function validSupplementalSourcePlanSummary(value) {
+  return exactKeys(value, [
+    "schemaVersion", "supplementalSourcePlanSha256", "sourceCount", "sourceFiles", "sourceBytes",
+  ])
+    && value.schemaVersion === EXPORT_SUPPLEMENTAL_SOURCE_PLAN_VERSION
+    && validSha256(value.supplementalSourcePlanSha256)
+    && safeCount(value.sourceCount) && safeCount(value.sourceFiles) && safeCount(value.sourceBytes);
+}
+
 function assertDescriptor(descriptor) {
   if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)
       || descriptor.workspaceVersion !== EXPORT_WORKSPACE_VERSION
@@ -134,6 +164,7 @@ function assertDescriptor(descriptor) {
       || !validSha256(descriptor.sourcePlan?.sourcePlanSha256)
       || !Number.isSafeInteger(descriptor.sourcePlan?.sourceFiles) || descriptor.sourcePlan.sourceFiles < 0
       || !Number.isSafeInteger(descriptor.sourcePlan?.sourceBytes) || descriptor.sourcePlan.sourceBytes < 0
+      || !validSupplementalSourcePlanSummary(descriptor.supplementalSourcePlan)
       || !Number.isSafeInteger(descriptor.activityPlan?.recordCount) || descriptor.activityPlan.recordCount < 0
       || !validSha256(descriptor.activityPlan?.recordsSha256)
       || !descriptor.compatibility || typeof descriptor.compatibility !== "object"
@@ -161,6 +192,16 @@ function localPlatformName() {
 function assertSourcePlanMatchesDescriptor(sourcePlan, descriptor) {
   const summary = summarizeExportSourcePlan(sourcePlan);
   if (stableJson(summary) !== stableJson(descriptor.sourcePlan)) fail("checkpoint_mismatch");
+}
+
+function assertSupplementalSourcePlanMatchesDescriptor(supplementalSourcePlan, descriptor) {
+  let summary;
+  try {
+    summary = summarizeSupplementalSourcePlan(supplementalSourcePlan);
+  } catch {
+    fail("schema");
+  }
+  if (stableJson(summary) !== stableJson(descriptor.supplementalSourcePlan)) fail("checkpoint_mismatch");
 }
 
 async function ensureOwnerDirectory(directory, { create = false } = {}) {
@@ -331,6 +372,53 @@ function initializeSchema(database) {
       count INTEGER NOT NULL CHECK(count >= 0),
       PRIMARY KEY(source_key, code)
     ) STRICT, WITHOUT ROWID;
+    CREATE TABLE supplemental_source_plan (
+      ordinal INTEGER PRIMARY KEY,
+      source_key TEXT NOT NULL UNIQUE CHECK(length(source_key) = 64),
+      kind TEXT NOT NULL CHECK(kind IN ('codex_collector_ledger', 'claude_status_snapshot')),
+      binding_kind TEXT NOT NULL CHECK(binding_kind IN ('file_prefix', 'frozen_inventory')),
+      device INTEGER,
+      inode INTEGER,
+      birthtime_ms INTEGER,
+      prefix_bytes INTEGER,
+      prefix_sha256 TEXT,
+      inventory_entries INTEGER,
+      inventory_bytes INTEGER,
+      inventory_sha256 TEXT,
+      parser_version TEXT NOT NULL,
+      initial_cursor_json TEXT NOT NULL,
+      scan_status TEXT NOT NULL DEFAULT 'pending' CHECK(scan_status IN ('pending', 'complete')),
+      CHECK(
+        (binding_kind = 'file_prefix'
+          AND device IS NOT NULL AND inode IS NOT NULL AND birthtime_ms IS NOT NULL
+          AND prefix_bytes IS NOT NULL AND prefix_bytes >= 0
+          AND prefix_sha256 IS NOT NULL AND length(prefix_sha256) = 64
+          AND inventory_entries IS NULL AND inventory_bytes IS NULL AND inventory_sha256 IS NULL)
+        OR
+        (binding_kind = 'frozen_inventory'
+          AND device IS NULL AND inode IS NULL AND birthtime_ms IS NULL
+          AND prefix_bytes IS NULL AND prefix_sha256 IS NULL
+          AND inventory_entries IS NOT NULL AND inventory_entries >= 0
+          AND inventory_bytes IS NOT NULL AND inventory_bytes >= 0
+          AND inventory_sha256 IS NOT NULL AND length(inventory_sha256) = 64)
+      )
+    ) STRICT;
+    CREATE INDEX supplemental_source_plan_pending_order
+      ON supplemental_source_plan(scan_status, ordinal);
+    CREATE TABLE supplemental_source_checkpoints (
+      source_key TEXT PRIMARY KEY REFERENCES supplemental_source_plan(source_key),
+      status TEXT NOT NULL CHECK(status IN ('pending', 'complete')),
+      cursor_json TEXT NOT NULL,
+      checkpoint_seq INTEGER NOT NULL CHECK(checkpoint_seq >= 0),
+      parser_version TEXT NOT NULL,
+      last_batch_sha256 TEXT CHECK(last_batch_sha256 IS NULL OR length(last_batch_sha256) = 64)
+    ) STRICT;
+    CREATE TABLE supplemental_source_diagnostics (
+      source_key TEXT NOT NULL REFERENCES supplemental_source_plan(source_key),
+      code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 64),
+      count INTEGER NOT NULL CHECK(count >= 0),
+      PRIMARY KEY(source_key, code)
+    ) STRICT, WITHOUT ROWID;
     CREATE TABLE resource_usage (
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
       policy_version TEXT NOT NULL,
@@ -402,7 +490,7 @@ function validateWorkspaceSchema(database) {
       sql: row.sql,
     }));
     const schemaSha256 = createHash("sha256")
-      .update("app-usagemonitor/export-workspace-schema/v2\0")
+      .update("app-usagemonitor/export-workspace-schema/v3\0")
       .update(stableJson(schemaRows))
       .digest("hex");
     if (schemaSha256 !== EXPORT_WORKSPACE_SCHEMA_SHA256) fail("schema");
@@ -482,6 +570,24 @@ function assertCheckpointExpected(value) {
   return value;
 }
 
+function normalizeSupplementalCursorJson(value) {
+  try {
+    return assertCanonicalSupplementalCursorJson(value);
+  } catch {
+    fail("schema");
+  }
+}
+
+function assertSupplementalCheckpointExpected(value) {
+  if (!exactKeys(value, ["checkpointSeq", "status", "cursorJson"])
+      || !safeCount(value.checkpointSeq) || !SUPPLEMENTAL_CHECKPOINT_STATUSES.has(value.status)) fail("schema");
+  return {
+    checkpointSeq: value.checkpointSeq,
+    status: value.status,
+    cursorJson: normalizeSupplementalCursorJson(value.cursorJson),
+  };
+}
+
 function normalizeDiagnosticDeltas(value = []) {
   if (!Array.isArray(value) || value.length > 128) fail("schema");
   return value.map((item) => {
@@ -490,6 +596,56 @@ function normalizeDiagnosticDeltas(value = []) {
         || !REVIEWED_DIAGNOSTIC_CODES.has(item.code)
         || !safeCount(item.count)) fail("schema");
     return { code: item.code, count: item.count };
+  });
+}
+
+function normalizeSupplementalRegistryGapDeltas(value = []) {
+  if (!Array.isArray(value) || value.length > 128) fail("schema");
+  return value.map((item) => {
+    if (!exactKeys(item, ["field", "requiredRegistryCode", "count"])
+        || typeof item.field !== "string" || !/^[a-z][A-Za-z0-9_]{0,63}$/.test(item.field)
+        || typeof item.requiredRegistryCode !== "string"
+        || !/^[a-z][a-z0-9_]{0,63}$/.test(item.requiredRegistryCode)
+        || !safeCount(item.count)) fail("schema");
+    return {
+      field: item.field,
+      requiredRegistryCode: item.requiredRegistryCode,
+      count: item.count,
+    };
+  });
+}
+
+function normalizeStoredSupplementalRegistryGaps(value) {
+  if (!Array.isArray(value) || value.length > 16_384) fail("schema");
+  return value.map((item) => {
+    if (!exactKeys(item, ["sourceKey", "field", "requiredRegistryCode", "count"])
+        || !validSha256(item.sourceKey)) fail("schema");
+    const { sourceKey, ...delta } = item;
+    const [normalized] = normalizeSupplementalRegistryGapDeltas([delta]);
+    return { sourceKey: item.sourceKey, ...normalized };
+  });
+}
+
+function supplementalPrivatePlanMetaKey(sourceKey) {
+  if (!validSha256(sourceKey)) fail("schema");
+  return `supplemental_private_plan:${sourceKey}`;
+}
+
+function normalizeSupplementalPrivatePlans(value, supplementalSourcePlan) {
+  const claudeSources = supplementalSourcePlan.sources.filter((source) => source.kind === "claude_status_snapshot");
+  if (!Array.isArray(value) || value.length !== claudeSources.length) fail("schema");
+  const knownSourceKeys = new Set(claudeSources.map((source) => source.sourceKey));
+  const seen = new Set();
+  return value.map((item) => {
+    if (!exactKeys(item, ["sourceKey", "valueJson"])
+        || !validSha256(item.sourceKey) || !knownSourceKeys.has(item.sourceKey)
+        || seen.has(item.sourceKey) || typeof item.valueJson !== "string"
+        || Buffer.byteLength(item.valueJson, "utf8") > MAXIMUM_SUPPLEMENTAL_PRIVATE_PLAN_BYTES) {
+      fail("schema");
+    }
+    parseCanonical(item.valueJson);
+    seen.add(item.sourceKey);
+    return { sourceKey: item.sourceKey, valueJson: item.valueJson };
   });
 }
 
@@ -528,6 +684,16 @@ export function sourceCheckpointBatchSha256(batch) {
     .digest("hex");
 }
 
+export function supplementalSourceCheckpointBatchSha256(batch) {
+  if (!batch || typeof batch !== "object" || Array.isArray(batch)) fail("schema");
+  const subject = structuredClone(batch);
+  delete subject.batchSha256;
+  return createHash("sha256")
+    .update("app-usagemonitor/supplemental-source-checkpoint-batch/v1\0")
+    .update(stableJson(subject))
+    .digest("hex");
+}
+
 function buildWorkspaceApi(database, directory, {
   maximumWorkspaceBytes = DEFAULT_EXPORT_WORKSPACE_MAXIMUM_BYTES,
 } = {}) {
@@ -553,6 +719,16 @@ function buildWorkspaceApi(database, directory, {
            c.parser_version, c.state_json, c.last_batch_sha256,
            p.source_path, p.prefix_bytes, p.parent_source_key, p.is_fork, p.parent_missing
     FROM source_checkpoints c JOIN source_plan p USING(source_key)
+    WHERE c.source_key = ?
+  `);
+  const selectSupplementalCheckpoint = database.prepare(`
+    SELECT c.source_key, c.status, c.cursor_json, c.checkpoint_seq,
+           c.parser_version AS checkpoint_parser_version, c.last_batch_sha256,
+           p.ordinal, p.kind, p.binding_kind, p.device, p.inode, p.birthtime_ms,
+           p.prefix_bytes, p.prefix_sha256, p.inventory_entries, p.inventory_bytes,
+           p.inventory_sha256, p.parser_version
+    FROM supplemental_source_checkpoints c
+    JOIN supplemental_source_plan p USING(source_key)
     WHERE c.source_key = ?
   `);
 
@@ -601,6 +777,54 @@ function buildWorkspaceApi(database, directory, {
     };
   }
 
+  function supplementalCheckpointFromRow(row) {
+    if (!row || !SUPPLEMENTAL_SOURCE_KINDS.has(row.kind)
+        || !SUPPLEMENTAL_CHECKPOINT_STATUSES.has(row.status)
+        || !safeCount(Number(row.ordinal)) || !safeCount(Number(row.checkpoint_seq))
+        || typeof row.parser_version !== "string" || row.checkpoint_parser_version !== row.parser_version
+        || !/^[a-z][a-z0-9_.-]{0,63}$/.test(row.parser_version)) {
+      fail("schema");
+    }
+    const binding = row.binding_kind === "file_prefix"
+      ? {
+        kind: "file_prefix",
+        device: Number(row.device),
+        inode: Number(row.inode),
+        birthtimeMs: Number(row.birthtime_ms),
+        prefixBytes: Number(row.prefix_bytes),
+        prefixSha256: row.prefix_sha256,
+      }
+      : row.binding_kind === "frozen_inventory"
+        ? {
+          kind: "frozen_inventory",
+          inventoryEntries: Number(row.inventory_entries),
+          inventoryBytes: Number(row.inventory_bytes),
+          inventorySha256: row.inventory_sha256,
+        }
+        : null;
+    if (!binding || !validSha256(row.source_key)
+        || (row.last_batch_sha256 !== null && !validSha256(row.last_batch_sha256))) fail("schema");
+    if ((binding.kind === "file_prefix"
+        && (!safeCount(binding.device) || !safeCount(binding.inode) || !safeCount(binding.birthtimeMs)
+          || !safeCount(binding.prefixBytes) || !validSha256(binding.prefixSha256)))
+      || (binding.kind === "frozen_inventory"
+        && (!safeCount(binding.inventoryEntries) || !safeCount(binding.inventoryBytes)
+          || !validSha256(binding.inventorySha256)))
+      || (row.kind === "codex_collector_ledger" && binding.kind !== "file_prefix")
+      || (row.kind === "claude_status_snapshot" && binding.kind !== "frozen_inventory")) fail("schema");
+    return {
+      ordinal: Number(row.ordinal),
+      sourceKey: row.source_key,
+      kind: row.kind,
+      parserVersion: row.parser_version,
+      binding,
+      status: row.status,
+      cursorJson: normalizeSupplementalCursorJson(row.cursor_json),
+      checkpointSeq: Number(row.checkpoint_seq),
+      lastBatchSha256: row.last_batch_sha256,
+    };
+  }
+
   async function assertDiskBudget() {
     const bytes = await workspaceBytes(directory);
     if (!Number.isSafeInteger(maximumWorkspaceBytes) || maximumWorkspaceBytes < 1 || bytes > maximumWorkspaceBytes) fail("disk");
@@ -646,11 +870,66 @@ function buildWorkspaceApi(database, directory, {
       assertSourcePlanMatchesDescriptor(plan, descriptor);
       return plan;
     },
+    loadSupplementalSourcePlan() {
+      const descriptor = this.getDescriptor();
+      const sources = [...database.prepare(`
+        SELECT ordinal, source_key, kind, binding_kind, device, inode, birthtime_ms,
+               prefix_bytes, prefix_sha256, inventory_entries, inventory_bytes, inventory_sha256,
+               parser_version, initial_cursor_json
+        FROM supplemental_source_plan ORDER BY ordinal
+      `).iterate()].map((row) => ({
+        ordinal: Number(row.ordinal),
+        sourceKey: row.source_key,
+        kind: row.kind,
+        parserVersion: row.parser_version,
+        binding: row.binding_kind === "file_prefix" ? {
+          kind: "file_prefix",
+          device: Number(row.device),
+          inode: Number(row.inode),
+          birthtimeMs: Number(row.birthtime_ms),
+          prefixBytes: Number(row.prefix_bytes),
+          prefixSha256: row.prefix_sha256,
+        } : {
+          kind: "frozen_inventory",
+          inventoryEntries: Number(row.inventory_entries),
+          inventoryBytes: Number(row.inventory_bytes),
+          inventorySha256: row.inventory_sha256,
+        },
+        initialCursorJson: row.initial_cursor_json,
+      }));
+      let plan;
+      try {
+        plan = normalizeSupplementalSourcePlan({
+          schemaVersion: EXPORT_SUPPLEMENTAL_SOURCE_PLAN_VERSION,
+          supplementalSourcePlanSha256: descriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
+          sources,
+        });
+      } catch {
+        fail("schema");
+      }
+      assertSupplementalSourcePlanMatchesDescriptor(plan, descriptor);
+      return plan;
+    },
+    loadSupplementalPrivatePlan(sourceKey) {
+      const row = database.prepare("SELECT value_json FROM workspace_meta WHERE key = ?")
+        .get(supplementalPrivatePlanMetaKey(sourceKey));
+      if (!row || typeof row.value_json !== "string"
+          || Buffer.byteLength(row.value_json, "utf8") > MAXIMUM_SUPPLEMENTAL_PRIVATE_PLAN_BYTES) {
+        fail("schema");
+      }
+      return parseCanonical(row.value_json);
+    },
     loadSourceCheckpoint(sourceKey) {
       if (!validSha256(sourceKey)) fail("schema");
       const row = selectCheckpoint.get(sourceKey);
       if (!row) fail("schema");
       return checkpointFromRow(row);
+    },
+    loadSupplementalSourceCheckpoint(sourceKey) {
+      if (!validSha256(sourceKey)) fail("schema");
+      const row = selectSupplementalCheckpoint.get(sourceKey);
+      if (!row) fail("schema");
+      return supplementalCheckpointFromRow(row);
     },
     loadNextSourceCheckpoint() {
       const row = database.prepare(`
@@ -664,6 +943,27 @@ function buildWorkspaceApi(database, directory, {
         ORDER BY p.ordinal LIMIT 1
       `).get();
       return row ? checkpointFromRow(row) : null;
+    },
+    loadNextSupplementalSourceCheckpoint() {
+      const row = database.prepare(`
+        SELECT c.source_key, c.status, c.cursor_json, c.checkpoint_seq, c.last_batch_sha256,
+               c.parser_version AS checkpoint_parser_version,
+               p.ordinal, p.kind, p.binding_kind, p.device, p.inode, p.birthtime_ms,
+               p.prefix_bytes, p.prefix_sha256, p.inventory_entries, p.inventory_bytes,
+               p.inventory_sha256, p.parser_version
+        FROM supplemental_source_checkpoints c
+        JOIN supplemental_source_plan p USING(source_key)
+        WHERE p.scan_status = 'pending' AND c.status = 'pending'
+        ORDER BY p.ordinal LIMIT 1
+      `).get();
+      return row ? supplementalCheckpointFromRow(row) : null;
+    },
+    hasPendingSupplementalSources() {
+      const count = Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM supplemental_source_checkpoints WHERE status != 'complete'
+      `).get().count);
+      if (!safeCount(count)) fail("schema");
+      return count !== 0;
     },
     hasSeenOccurrence(kind, occurrenceKey) {
       if (!OCCURRENCE_KINDS.has(kind) || !validPrivateKey(occurrenceKey)) fail("schema");
@@ -1048,6 +1348,145 @@ function buildWorkspaceApi(database, directory, {
       await assertDiskBudget();
       return result;
     },
+    async commitSupplementalSourceBatch(batch) {
+      const requiredKeys = [
+        "sourceKey", "expected", "next", "batchSha256", "records", "diagnosticDeltas", "registryGapDeltas", "resourceDeltas",
+      ];
+      if (!exactKeys(batch, requiredKeys) || !validSha256(batch.sourceKey)
+          || !validSha256(batch.batchSha256)
+          || batch.batchSha256 !== supplementalSourceCheckpointBatchSha256(batch)
+          || !Array.isArray(batch.records) || batch.records.length > DEFAULT_EXPORT_WORKSPACE_BATCH_RECORDS) {
+        fail("schema");
+      }
+      const expected = assertSupplementalCheckpointExpected(batch.expected);
+      if (!exactKeys(batch.next, ["status", "cursorJson"])
+          || !SUPPLEMENTAL_CHECKPOINT_STATUSES.has(batch.next.status)) fail("schema");
+      const next = {
+        status: batch.next.status,
+        cursorJson: normalizeSupplementalCursorJson(batch.next.cursorJson),
+      };
+      const diagnosticDeltas = normalizeDiagnosticDeltas(batch.diagnosticDeltas);
+      const registryGapDeltas = normalizeSupplementalRegistryGapDeltas(batch.registryGapDeltas);
+      const resourceDeltas = normalizeResourceDeltas(batch.resourceDeltas);
+      const before = selectSupplementalCheckpoint.get(batch.sourceKey);
+      if (!before) fail("schema");
+      const bytesBeforeCommit = await workspaceBytes(directory);
+      const batchBytes = Buffer.byteLength(stableJson(batch), "utf8");
+      const reservedWorkspaceBytes = bytesBeforeCommit + (8 * batchBytes) + (1024 * 1024);
+      if (!Number.isSafeInteger(reservedWorkspaceBytes) || reservedWorkspaceBytes > maximumWorkspaceBytes) fail("disk");
+
+      const result = transaction(database, () => {
+        const current = selectSupplementalCheckpoint.get(batch.sourceKey);
+        if (!current) fail("schema");
+        if (current.last_batch_sha256 === batch.batchSha256) {
+          return { alreadyCommitted: true, checkpoint: supplementalCheckpointFromRow(current) };
+        }
+        const currentCursorJson = normalizeSupplementalCursorJson(current.cursor_json);
+        if (Number(current.checkpoint_seq) !== expected.checkpointSeq || current.status !== expected.status
+            || currentCursorJson !== expected.cursorJson || current.status !== "pending") {
+          fail("checkpoint_mismatch");
+        }
+
+        let insertedRecords = 0;
+        let insertedRecordBytes = 0;
+        for (const envelope of batch.records) {
+          const inserted = insertSafeRecordEnvelope(envelope);
+          if (inserted.inserted) {
+            insertedRecords += 1;
+            insertedRecordBytes += inserted.recordBytes;
+          }
+        }
+        const addDiagnostic = database.prepare(`
+          INSERT INTO supplemental_source_diagnostics(source_key, code, count) VALUES (?, ?, ?)
+          ON CONFLICT(source_key, code) DO UPDATE SET count = count + excluded.count
+        `);
+        const currentDiagnostic = database.prepare(`
+          SELECT count FROM supplemental_source_diagnostics WHERE source_key = ? AND code = ?
+        `);
+        for (const item of diagnosticDeltas) {
+          const existing = Number(currentDiagnostic.get(batch.sourceKey, item.code)?.count ?? 0);
+          if (!safeCount(existing) || existing > Number.MAX_SAFE_INTEGER - item.count) fail("schema");
+          addDiagnostic.run(batch.sourceKey, item.code, item.count);
+        }
+        if (registryGapDeltas.length > 0) {
+          const existingGaps = database.prepare(
+            "SELECT value_json FROM workspace_meta WHERE key = 'supplemental_registry_gaps'",
+          ).get();
+          const rows = normalizeStoredSupplementalRegistryGaps(
+            existingGaps ? parseCanonical(existingGaps.value_json) : [],
+          );
+          const byKey = new Map(rows.map((item) => [
+            `${item.sourceKey}\0${item.field}\0${item.requiredRegistryCode}`,
+            item,
+          ]));
+          for (const item of registryGapDeltas) {
+            const key = `${batch.sourceKey}\0${item.field}\0${item.requiredRegistryCode}`;
+            const prior = byKey.get(key);
+            if (prior) {
+              if (prior.count > Number.MAX_SAFE_INTEGER - item.count) fail("schema");
+              prior.count += item.count;
+            } else {
+              byKey.set(key, { sourceKey: batch.sourceKey, ...item });
+            }
+          }
+          const stored = [...byKey.values()].sort((left, right) => (
+            left.sourceKey.localeCompare(right.sourceKey)
+            || left.field.localeCompare(right.field)
+            || left.requiredRegistryCode.localeCompare(right.requiredRegistryCode)
+          ));
+          database.prepare("INSERT OR REPLACE INTO workspace_meta(key, value_json) VALUES ('supplemental_registry_gaps', ?)")
+            .run(stableJson(stored));
+        }
+        const currentUsage = database.prepare(`
+          SELECT directory_entries, lines, oversized_irrelevant_lines, output_records,
+                 expanded_record_bytes, cumulative_elapsed_ms
+          FROM resource_usage WHERE singleton = 1
+        `).get();
+        const additions = [
+          [Number(currentUsage.directory_entries), resourceDeltas.directoryEntries],
+          [Number(currentUsage.lines), resourceDeltas.lines],
+          [Number(currentUsage.oversized_irrelevant_lines), resourceDeltas.oversizedIrrelevantLines],
+          [Number(currentUsage.output_records), insertedRecords],
+          [Number(currentUsage.expanded_record_bytes), insertedRecordBytes],
+          [Number(currentUsage.cumulative_elapsed_ms), resourceDeltas.cumulativeElapsedMs],
+        ];
+        if (additions.some(([currentValue, addition]) => !safeCount(currentValue)
+          || currentValue > Number.MAX_SAFE_INTEGER - addition)) fail("schema");
+        database.prepare(`
+          UPDATE resource_usage SET
+            directory_entries = directory_entries + ?,
+            lines = lines + ?,
+            oversized_irrelevant_lines = oversized_irrelevant_lines + ?,
+            output_records = output_records + ?,
+            expanded_record_bytes = expanded_record_bytes + ?,
+            cumulative_elapsed_ms = cumulative_elapsed_ms + ?,
+            peak_rss_bytes = MAX(peak_rss_bytes, ?),
+            workspace_high_water_bytes = MAX(workspace_high_water_bytes, ?)
+          WHERE singleton = 1
+        `).run(
+          resourceDeltas.directoryEntries,
+          resourceDeltas.lines,
+          resourceDeltas.oversizedIrrelevantLines,
+          insertedRecords,
+          insertedRecordBytes,
+          resourceDeltas.cumulativeElapsedMs,
+          resourceDeltas.peakRssBytes,
+          reservedWorkspaceBytes,
+        );
+        database.prepare(`
+          UPDATE supplemental_source_checkpoints SET status = ?, cursor_json = ?,
+            checkpoint_seq = checkpoint_seq + 1, last_batch_sha256 = ?
+          WHERE source_key = ?
+        `).run(next.status, next.cursorJson, batch.batchSha256, batch.sourceKey);
+        if (next.status === "complete") {
+          database.prepare("UPDATE supplemental_source_plan SET scan_status = 'complete' WHERE source_key = ?")
+            .run(batch.sourceKey);
+        }
+        return { alreadyCommitted: false, checkpoint: supplementalCheckpointFromRow(selectSupplementalCheckpoint.get(batch.sourceKey)) };
+      });
+      await assertDiskBudget();
+      return result;
+    },
     replaceDiagnostics(diagnostics = []) {
       if (!Array.isArray(diagnostics) || diagnostics.length > 128) fail("schema");
       transaction(database, () => {
@@ -1060,16 +1499,30 @@ function buildWorkspaceApi(database, directory, {
       });
     },
     finalizeScan() {
+      const descriptor = this.getDescriptor();
       transaction(database, () => {
-        const counts = database.prepare(`
+        const codexCounts = database.prepare(`
           SELECT COUNT(*) AS total,
                  SUM(CASE WHEN c.phase = 'complete' THEN 1 ELSE 0 END) AS complete
           FROM source_plan p JOIN source_checkpoints c USING(source_key)
         `).get();
-        const total = Number(counts.total);
-        if (Number(counts.complete ?? 0) !== total) fail("checkpoint_mismatch");
+        const supplementalCounts = database.prepare(`
+          SELECT COUNT(*) AS total,
+                 SUM(CASE WHEN c.status = 'complete' THEN 1 ELSE 0 END) AS complete
+          FROM supplemental_source_plan p JOIN supplemental_source_checkpoints c USING(source_key)
+        `).get();
+        const codexTotal = Number(codexCounts.total);
+        const supplementalTotal = Number(supplementalCounts.total);
+        if (!safeCount(codexTotal) || !safeCount(supplementalTotal)
+            || Number(codexCounts.complete ?? 0) !== codexTotal
+            || Number(supplementalCounts.complete ?? 0) !== supplementalTotal) {
+          fail("checkpoint_mismatch");
+        }
         database.prepare("INSERT OR REPLACE INTO workspace_meta(key, value_json) VALUES ('scan_status', ?)")
-          .run(stableJson({ status: "complete", sourceFilesScanned: total }));
+          .run(stableJson({
+            status: "complete",
+            sourceFilesScanned: codexTotal + descriptor.supplementalSourcePlan.sourceFiles,
+          }));
       });
     },
     markPoisoned(code) {
@@ -1089,7 +1542,10 @@ function buildWorkspaceApi(database, directory, {
       const incomplete = Number(database.prepare(`
         SELECT COUNT(*) AS count FROM source_checkpoints WHERE phase != 'complete'
       `).get().count);
-      return incomplete === 0;
+      const supplementalIncomplete = Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM supplemental_source_checkpoints WHERE status != 'complete'
+      `).get().count);
+      return incomplete === 0 && supplementalIncomplete === 0;
     },
     scanDiagnostics() {
       const row = database.prepare("SELECT value_json FROM workspace_meta WHERE key = 'scan_status'").get();
@@ -1117,9 +1573,21 @@ function buildWorkspaceApi(database, directory, {
           SELECT code, count FROM diagnostics
           UNION ALL
           SELECT code, count FROM source_diagnostics
+          UNION ALL
+          SELECT code, count FROM supplemental_source_diagnostics
         ) GROUP BY code ORDER BY code
       `).iterate()]
         .map((row) => ({ code: row.code, count: Number(row.count) }));
+    },
+    supplementalDiagnosticRegistryGaps(sourceKey = null) {
+      if (sourceKey !== null && !validSha256(sourceKey)) fail("schema");
+      const row = database.prepare(
+        "SELECT value_json FROM workspace_meta WHERE key = 'supplemental_registry_gaps'",
+      ).get();
+      const gaps = normalizeStoredSupplementalRegistryGaps(row ? parseCanonical(row.value_json) : []);
+      return gaps
+        .filter((item) => sourceKey === null || item.sourceKey === sourceKey)
+        .map((item) => structuredClone(item));
     },
     recordChunk(chunkIndex, status, metadata) {
       if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0
@@ -1194,6 +1662,7 @@ export function buildExportWorkspaceDescriptor({
   coveredAt,
   compatibility,
   sourcePlan,
+  supplementalSourcePlan = createEmptySupplementalSourcePlan(),
   activityPlan,
   sourceProviders = ["openai_codex"],
   clientPlatform = localPlatformName(),
@@ -1213,6 +1682,7 @@ export function buildExportWorkspaceDescriptor({
     sourceProviders: [...sourceProviders],
     clientPlatform,
     sourcePlan: summarizeExportSourcePlan(sourcePlan),
+    supplementalSourcePlan: summarizeSupplementalSourcePlan(supplementalSourcePlan),
     activityPlan: structuredClone(activityPlan),
   };
   assertDescriptor(descriptor);
@@ -1223,10 +1693,23 @@ export async function createExportWorkspace({
   directory,
   descriptor,
   sourcePlan,
+  supplementalSourcePlan = createEmptySupplementalSourcePlan(),
+  supplementalPrivatePlans = [],
   maximumWorkspaceBytes,
 } = {}) {
   assertDescriptor(descriptor);
   assertSourcePlanMatchesDescriptor(sourcePlan, descriptor);
+  assertSupplementalSourcePlanMatchesDescriptor(supplementalSourcePlan, descriptor);
+  let normalizedSupplementalSourcePlan;
+  try {
+    normalizedSupplementalSourcePlan = normalizeSupplementalSourcePlan(supplementalSourcePlan);
+  } catch {
+    fail("schema");
+  }
+  const normalizedSupplementalPrivatePlans = normalizeSupplementalPrivatePlans(
+    supplementalPrivatePlans,
+    normalizedSupplementalSourcePlan,
+  );
   const workspaceDirectory = await ensureOwnerDirectory(directory, { create: true });
   if (basename(workspaceDirectory) === DATABASE_NAME) fail("directory");
   const databaseFile = join(workspaceDirectory, DATABASE_NAME);
@@ -1252,6 +1735,18 @@ export async function createExportWorkspace({
           parser_version, state_json, last_batch_sha256
         ) VALUES (?, 'tier_scan', 0, 0, 0, ?, ?, NULL)
       `);
+      const insertSupplementalSource = database.prepare(`
+        INSERT INTO supplemental_source_plan(
+          ordinal, source_key, kind, binding_kind, device, inode, birthtime_ms,
+          prefix_bytes, prefix_sha256, inventory_entries, inventory_bytes, inventory_sha256,
+          parser_version, initial_cursor_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertSupplementalCheckpoint = database.prepare(`
+        INSERT INTO supplemental_source_checkpoints(
+          source_key, status, cursor_json, checkpoint_seq, parser_version, last_batch_sha256
+        ) VALUES (?, 'pending', ?, 0, ?, NULL)
+      `);
       for (const source of sourcePlan.sources) {
         insertSource.run(
           source.ordinal,
@@ -1272,6 +1767,32 @@ export async function createExportWorkspace({
           serializeCodexCheckpointState(createEmptyCodexCheckpointState()),
         );
       }
+      for (const source of normalizedSupplementalSourcePlan.sources) {
+        const isFilePrefix = source.binding.kind === "file_prefix";
+        insertSupplementalSource.run(
+          source.ordinal,
+          source.sourceKey,
+          source.kind,
+          source.binding.kind,
+          isFilePrefix ? source.binding.device : null,
+          isFilePrefix ? source.binding.inode : null,
+          isFilePrefix ? source.binding.birthtimeMs : null,
+          isFilePrefix ? source.binding.prefixBytes : null,
+          isFilePrefix ? source.binding.prefixSha256 : null,
+          isFilePrefix ? null : source.binding.inventoryEntries,
+          isFilePrefix ? null : source.binding.inventoryBytes,
+          isFilePrefix ? null : source.binding.inventorySha256,
+          source.parserVersion,
+          source.initialCursorJson,
+        );
+        insertSupplementalCheckpoint.run(source.sourceKey, source.initialCursorJson, source.parserVersion);
+      }
+      const insertPrivatePlan = database.prepare(
+        "INSERT INTO workspace_meta(key, value_json) VALUES (?, ?)",
+      );
+      for (const privatePlan of normalizedSupplementalPrivatePlans) {
+        insertPrivatePlan.run(supplementalPrivatePlanMetaKey(privatePlan.sourceKey), privatePlan.valueJson);
+      }
       database.prepare(`
         INSERT INTO resource_usage(
           singleton, policy_version, source_files, source_bytes, directory_entries, lines,
@@ -1280,8 +1801,9 @@ export async function createExportWorkspace({
         ) VALUES (1, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0)
       `).run(
         EXPORT_RESOURCE_POLICY_VERSION,
-        sourcePlan.sources.length,
-        sourcePlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0),
+        sourcePlan.sources.length + descriptor.supplementalSourcePlan.sourceFiles,
+        sourcePlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0)
+          + descriptor.supplementalSourcePlan.sourceBytes,
       );
     });
     await chmod(databaseFile, 0o600);
@@ -1321,6 +1843,7 @@ export async function openExportWorkspace({
     });
     if (expectedDescriptor && stableJson(descriptor) !== stableJson(expectedDescriptor)) fail("checkpoint_mismatch");
     api.loadSourcePlan();
+    api.loadSupplementalSourcePlan();
     await api.status();
     return api;
   } catch (error) {
@@ -1353,11 +1876,16 @@ export async function inspectExportWorkspaceDiscardState({ directory } = {}) {
     const incompleteCheckpoints = Number(database.prepare(`
       SELECT COUNT(*) AS count FROM source_checkpoints WHERE phase != 'complete'
     `).get().count);
+    const incompleteSupplementalCheckpoints = Number(database.prepare(`
+      SELECT COUNT(*) AS count FROM supplemental_source_checkpoints WHERE status != 'complete'
+    `).get().count);
     const poisoned = poisonRow ? parseCanonical(poisonRow.value_json).code === "source_integrity" : false;
     const scanComplete = scanRow
-      ? parseCanonical(scanRow.value_json).status === "complete" && incompleteCheckpoints === 0
+      ? parseCanonical(scanRow.value_json).status === "complete"
+        && incompleteCheckpoints === 0 && incompleteSupplementalCheckpoints === 0
       : false;
-    if (![manifestRows, chunkCount, incompleteCheckpoints].every(safeCount) || manifestRows > 1) fail("schema");
+    if (![manifestRows, chunkCount, incompleteCheckpoints, incompleteSupplementalCheckpoints].every(safeCount)
+        || manifestRows > 1) fail("schema");
     return {
       poisoned,
       scanComplete,

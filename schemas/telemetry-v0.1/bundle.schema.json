@@ -90,6 +90,9 @@
             "properties": {
               "code": {
                 "enum": [
+                  "collector_empty_lines", "collector_irrelevant_records", "collector_out_of_bounds_records",
+                  "collector_oversized_irrelevant_lines", "collector_unsupported_schema_records",
+                  "collector_unsupported_source_records",
                   "fork_replay_events_skipped", "last_only_events", "lineage_parents_missing",
                   "malformed_lines", "malformed_rate_limit_records", "malformed_task_events",
                   "malformed_timestamps", "malformed_usage_records", "missing_rate_limit_records",

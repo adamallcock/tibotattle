@@ -41,7 +41,10 @@
     "providerSurface": { "enum": ["account_shared_unallocated", "general_usage", "model_specific", "separate_limit", "unknown"] },
     "snapshotId": { "type": "string", "pattern": "^snapshot:v2:[A-Za-z0-9_-]{43}$" },
     "providerStateId": { "type": "string", "pattern": "^quota-state:v1:[A-Za-z0-9_-]{43}$" },
-    "sessionScopeId": { "type": "string", "pattern": "^session:v1:[A-Za-z0-9_-]{43}$" },
+    "sessionScopeId": {
+      "type": ["string", "null"],
+      "pattern": "^session:v1:[A-Za-z0-9_-]{43}$"
+    },
     "accountScopeId": {
       "type": "string",
       "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
@@ -50,7 +53,56 @@
   "allOf": [
     {
       "if": { "properties": { "provider": { "const": "anthropic_claude_code" } } },
-      "then": { "properties": { "limitId": { "const": "unknown" } } }
+      "then": {
+        "properties": {
+          "limitId": { "const": "unknown" },
+          "snapshotSource": { "const": "status_line" },
+          "providerSurface": { "const": "general_usage" },
+          "sessionScopeId": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "snapshotSource": { "const": "status_line" } } },
+      "then": {
+        "properties": {
+          "provider": { "const": "anthropic_claude_code" },
+          "sessionScopeId": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "snapshotSource": { "const": "rollout" } } },
+      "then": {
+        "properties": {
+          "provider": { "const": "openai_codex" },
+          "sessionScopeId": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "snapshotSource": { "enum": ["app_server_read", "notification"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "provider": { "const": "openai_codex" },
+          "providerSurface": { "const": "account_shared_unallocated" },
+          "sessionScopeId": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "sessionScopeId": { "type": "null" } } },
+      "then": {
+        "properties": {
+          "provider": { "const": "openai_codex" },
+          "snapshotSource": { "enum": ["app_server_read", "notification"] },
+          "providerSurface": { "const": "account_shared_unallocated" }
+        }
+      }
     }
   ]
 }

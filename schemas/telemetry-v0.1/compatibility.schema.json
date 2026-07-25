@@ -63,23 +63,90 @@
         "openaiCodex": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["status", "sourceFormat", "parserVersion", "adapterVersion"],
+          "required": ["status", "capabilities", "sourceFormats"],
           "properties": {
             "status": { "const": "implemented" },
-            "sourceFormat": { "const": "codex-rollout-jsonl" },
-            "parserVersion": { "const": "codex-log-scan-v5" },
-            "adapterVersion": { "const": "codex-metadata-export-v5" }
+            "capabilities": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["usageEvents", "quotaSnapshots"],
+              "properties": {
+                "usageEvents": { "const": "implemented" },
+                "quotaSnapshots": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["rollout", "collector"],
+                  "properties": {
+                    "rollout": { "const": "implemented" },
+                    "collector": { "const": "implemented" }
+                  }
+                }
+              }
+            },
+            "sourceFormats": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rollout", "collectorQuota"],
+              "properties": {
+                "rollout": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["status", "sourceFormat", "parserVersion", "adapterVersion"],
+                  "properties": {
+                    "status": { "const": "implemented" },
+                    "sourceFormat": { "const": "codex-rollout-jsonl" },
+                    "parserVersion": { "const": "codex-log-scan-v5" },
+                    "adapterVersion": { "const": "codex-metadata-export-v5" }
+                  }
+                },
+                "collectorQuota": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["status", "sourceFormat", "parserVersion", "adapterVersion"],
+                  "properties": {
+                    "status": { "const": "implemented" },
+                    "sourceFormat": { "const": "codex-collector-jsonl-v0.3" },
+                    "parserVersion": { "const": "codex-collector-quota-candidate-v0.1" },
+                    "adapterVersion": { "const": "quota-candidate-normalizer-v0.1" }
+                  }
+                }
+              }
+            }
           }
         },
         "anthropicClaudeCode": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["status", "sourceFormat", "parserVersion", "adapterVersion"],
+          "required": ["status", "capabilities", "sourceFormats"],
           "properties": {
-            "status": { "const": "not_implemented" },
-            "sourceFormat": { "type": "null" },
-            "parserVersion": { "type": "null" },
-            "adapterVersion": { "type": "null" }
+            "status": { "const": "partial" },
+            "capabilities": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["usageEvents", "quotaSnapshots"],
+              "properties": {
+                "usageEvents": { "const": "not_implemented" },
+                "quotaSnapshots": { "const": "implemented" }
+              }
+            },
+            "sourceFormats": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["statusLine"],
+              "properties": {
+                "statusLine": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["status", "sourceFormat", "parserVersion", "adapterVersion"],
+                  "properties": {
+                    "status": { "const": "implemented" },
+                    "sourceFormat": { "const": "claude-statusline-snapshot-v0.2" },
+                    "parserVersion": { "const": "claude-statusline-v0.2" },
+                    "adapterVersion": { "const": "quota-candidate-normalizer-v0.1" }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -89,7 +156,7 @@
       "additionalProperties": false,
       "required": ["version", "sha256"],
       "properties": {
-        "version": { "const": "telemetry-v0.1-registry-2026-07-24.1" },
+        "version": { "const": "telemetry-v0.1-registry-2026-07-24.2" },
         "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
       }
     },

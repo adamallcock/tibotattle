@@ -83,13 +83,22 @@ export function sanitizePlanType(planType) {
  * does not fall back to provider IDs, display names, or arbitrary fields.
  * Callers must inject a non-empty secret (for example, from macOS Keychain).
  */
-export function deriveOpenAIAccountScope(accountRead, { secret, planType = null } = {}) {
+export function deriveOpenAIAccountScope(accountRead, {
+  secret,
+  planType = null,
+  unavailableSecretReason = "missing_secret",
+} = {}) {
   const safePlanType = sanitizePlanType(planType);
   const subject = normalizedEmail(accountRead);
   if (subject.state !== "available") return unavailable(subject.state, safePlanType);
 
   const key = usableSecret(secret);
-  if (!key) return unavailable("missing_secret", safePlanType);
+  if (!key) {
+    const reason = ["credential_locked", "credential_unavailable"].includes(unavailableSecretReason)
+      ? unavailableSecretReason
+      : "missing_secret";
+    return unavailable(reason, safePlanType);
+  }
 
   const digest = createHmac("sha256", key)
     .update(HMAC_DOMAIN, "utf8")
@@ -122,7 +131,7 @@ export function sanitizeAccountScope(value) {
     };
   }
 
-  const reason = ["missing_account", "malformed_subject", "missing_secret"].includes(value?.reason)
+  const reason = ["missing_account", "malformed_subject", "missing_secret", "credential_locked", "credential_unavailable"].includes(value?.reason)
     ? value.reason
     : "missing_account";
   return unavailable(reason, planType);

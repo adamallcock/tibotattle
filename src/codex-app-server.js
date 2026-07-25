@@ -243,7 +243,8 @@ function sanitizeUsageSummary(summary) {
 }
 
 export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
-  accountHmacKey = process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY,
+  accountHmacKey = null,
+  accountCredentialUnavailableReason = null,
 } = {}) {
   const raw = snapshot.rateLimits;
   if (!raw?.rateLimits) {
@@ -265,6 +266,7 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
   const accountScope = sanitizeAccountScope(deriveOpenAIAccountScope(snapshot.account, {
     secret: accountHmacKey,
     planType: providerPlanType,
+    unavailableSecretReason: accountCredentialUnavailableReason,
   }));
 
   return {
@@ -275,4 +277,55 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
     officialDailyTokens: dailyUsageBuckets,
     officialUsageSummary: sanitizeUsageSummary(usage?.summary),
   };
+}
+
+async function loadAccountObservationSecretSafely(loadAccountObservationSecret) {
+  if (typeof loadAccountObservationSecret !== "function") {
+    return { secret: null, unavailableReason: "credential_unavailable" };
+  }
+  try {
+    const secret = await loadAccountObservationSecret();
+    if (!Buffer.isBuffer(secret) || secret.byteLength !== 32) {
+      if (Buffer.isBuffer(secret)) secret.fill(0);
+      return { secret: null, unavailableReason: "credential_unavailable" };
+    }
+    return { secret, unavailableReason: null };
+  } catch (error) {
+    return {
+      secret: null,
+      unavailableReason: error?.code === "account_observation_credential_locked"
+        ? "credential_locked"
+        : "credential_unavailable",
+    };
+  }
+}
+
+export async function deriveOpenAIAccountScopeWithSecretLoader(accountRead, {
+  loadAccountObservationSecret,
+  planType = null,
+} = {}) {
+  const loaded = await loadAccountObservationSecretSafely(loadAccountObservationSecret);
+  try {
+    return sanitizeAccountScope(deriveOpenAIAccountScope(accountRead, {
+      secret: loaded.secret,
+      planType,
+      unavailableSecretReason: loaded.unavailableReason,
+    }));
+  } finally {
+    loaded.secret?.fill(0);
+  }
+}
+
+export async function sanitizeCodexAccountSnapshotWithSecretLoader(snapshot, capturedAt, {
+  loadAccountObservationSecret,
+} = {}) {
+  const loaded = await loadAccountObservationSecretSafely(loadAccountObservationSecret);
+  try {
+    return sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
+      accountHmacKey: loaded.secret,
+      accountCredentialUnavailableReason: loaded.unavailableReason,
+    });
+  } finally {
+    loaded.secret?.fill(0);
+  }
 }

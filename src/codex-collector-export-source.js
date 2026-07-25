@@ -18,7 +18,9 @@ const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise
 const LIMIT_IDS = new Set(["codex", "codex-spark"]);
 const SOURCES = new Set(["app_server_read", "app_server_notification"]);
 const SLOTS = new Set(["primary", "secondary"]);
-const ACCOUNT_UNAVAILABLE_REASONS = new Set(["missing_account", "malformed_subject", "missing_secret"]);
+const ACCOUNT_UNAVAILABLE_REASONS = new Set([
+  "missing_account", "malformed_subject", "missing_secret", "credential_locked", "credential_unavailable",
+]);
 const MAXIMUM_WINDOW_MINUTES = 366 * 24 * 60;
 const RECORD_KEYS = Object.freeze([
   "schemaVersion",
@@ -180,22 +182,6 @@ async function completeLinePrefixBytes(handle, size, resourceGuard) {
   return 0;
 }
 
-async function hashPrefix(handle, prefixBytes, resourceGuard) {
-  if (!Number.isSafeInteger(prefixBytes) || prefixBytes < 0) fail("source_prefix");
-  const digest = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(256 * 1024);
-  let offset = 0;
-  while (offset < prefixBytes) {
-    resourceGuard?.checkRuntime();
-    const length = Math.min(buffer.length, prefixBytes - offset);
-    const { bytesRead } = await handle.read(buffer, 0, length, offset);
-    if (bytesRead !== length) fail("source_changed");
-    digest.update(buffer.subarray(0, bytesRead));
-    offset += bytesRead;
-  }
-  return digest.digest("hex");
-}
-
 async function countPrefixLines(handle, prefixBytes, resourceGuard) {
   const buffer = Buffer.allocUnsafe(256 * 1024);
   let offset = 0;
@@ -211,6 +197,27 @@ async function countPrefixLines(handle, prefixBytes, resourceGuard) {
     offset += bytesRead;
   }
   return lines;
+}
+
+async function hashAndCountPrefix(handle, prefixBytes, resourceGuard) {
+  if (!Number.isSafeInteger(prefixBytes) || prefixBytes < 0) fail("source_prefix");
+  const digest = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(256 * 1024);
+  let offset = 0;
+  let lines = 0;
+  while (offset < prefixBytes) {
+    resourceGuard?.checkRuntime();
+    const length = Math.min(buffer.length, prefixBytes - offset);
+    const { bytesRead } = await handle.read(buffer, 0, length, offset);
+    if (bytesRead !== length) fail("source_changed");
+    const chunk = buffer.subarray(0, bytesRead);
+    digest.update(chunk);
+    for (let index = 0; index < bytesRead; index += 1) {
+      if (chunk[index] === 0x0a) lines += 1;
+    }
+    offset += bytesRead;
+  }
+  return { prefixSha256: digest.digest("hex"), prefixLines: lines };
 }
 
 function validatePlan(plan) {
@@ -230,7 +237,7 @@ function validatePlan(plan) {
   return plan;
 }
 
-async function verifyOpenedPrefix(plan, handle, resourceGuard) {
+async function verifyOpenedPrefixBoundary(plan, handle) {
   const descriptorStats = await handle.stat();
   assertSafeSourceStats(descriptorStats);
   if (!sameIdentity(descriptorStats, plan) || descriptorStats.size < plan.prefixBytes) fail("source_changed");
@@ -239,8 +246,9 @@ async function verifyOpenedPrefix(plan, handle, resourceGuard) {
     const { bytesRead } = await handle.read(tail, 0, 1, plan.prefixBytes - 1);
     if (bytesRead !== 1 || tail[0] !== 0x0a) fail("source_prefix");
   }
-  if (await hashPrefix(handle, plan.prefixBytes, resourceGuard) !== plan.prefixSha256) fail("source_changed");
-  if (await countPrefixLines(handle, plan.prefixBytes, resourceGuard) !== plan.prefixLines) fail("source_changed");
+}
+
+async function verifyBoundPath(plan) {
   let pathStats;
   try {
     pathStats = await lstat(plan.path);
@@ -250,6 +258,15 @@ async function verifyOpenedPrefix(plan, handle, resourceGuard) {
   }
   assertSafeSourceStats(pathStats);
   if (!sameIdentity(pathStats, plan)) fail("source_changed");
+}
+
+async function verifyOpenedPrefix(plan, handle, resourceGuard) {
+  await verifyOpenedPrefixBoundary(plan, handle);
+  const measured = await hashAndCountPrefix(handle, plan.prefixBytes, resourceGuard);
+  if (measured.prefixSha256 !== plan.prefixSha256 || measured.prefixLines !== plan.prefixLines) {
+    fail("source_changed");
+  }
+  await verifyBoundPath(plan);
 }
 
 export async function createCodexCollectorExportSourcePlan({
@@ -282,8 +299,7 @@ export async function createCodexCollectorExportSourcePlan({
       inode: stats.ino,
       birthtimeMs: Math.trunc(stats.birthtimeMs),
       prefixBytes,
-      prefixLines: await countPrefixLines(handle, prefixBytes, resourceGuard),
-      prefixSha256: await hashPrefix(handle, prefixBytes, resourceGuard),
+      ...(await hashAndCountPrefix(handle, prefixBytes, resourceGuard)),
     };
     plan.sourcePlanSha256 = sourcePlanDigest(plan);
     resourceGuard.observeSourcePlan(1, prefixBytes);
@@ -341,13 +357,14 @@ function validateCursor(plan, cursor) {
   return { ...value };
 }
 
-async function verifyCursorBoundary(handle, cursor, resourceGuard) {
+async function verifyCursorBoundary(handle, cursor, resourceGuard, { verifyLineOrdinal = true } = {}) {
   if (cursor.nextByte > 0) {
     const preceding = Buffer.allocUnsafe(1);
     const { bytesRead } = await handle.read(preceding, 0, 1, cursor.nextByte - 1);
     if (bytesRead !== 1 || preceding[0] !== 0x0a) fail("cursor_invalid");
   }
-  if (await countPrefixLines(handle, cursor.nextByte, resourceGuard) !== cursor.nextLineOrdinal - 1) {
+  if (verifyLineOrdinal
+      && await countPrefixLines(handle, cursor.nextByte, resourceGuard) !== cursor.nextLineOrdinal - 1) {
     fail("cursor_invalid");
   }
 }
@@ -543,10 +560,14 @@ export async function scanCodexCollectorExportSource(plan, {
   maximumCandidateRecords = 1_000,
   resourceGuard = createExportResourceGuard(),
   highWaterMark = 256 * 1024,
+  verifyWholePrefix = true,
 } = {}) {
   validatePlan(plan);
   if (!Number.isSafeInteger(maximumCandidateRecords) || maximumCandidateRecords < 1) {
     throw new TypeError("maximumCandidateRecords must be a positive safe integer");
+  }
+  if (typeof verifyWholePrefix !== "boolean") {
+    throw new TypeError("verifyWholePrefix must be boolean");
   }
   const next = validateCursor(plan, cursor);
   const bounds = {
@@ -559,7 +580,14 @@ export async function scanCodexCollectorExportSource(plan, {
   const candidates = [];
   const { handle } = await openSafeSource(plan.path, plan);
   try {
-    await verifyCursorBoundary(handle, next, resourceGuard);
+    // Workspace callers checkpoint a descriptor-bound cursor atomically. They can
+    // avoid re-counting every prior line per bounded batch, while the default
+    // standalone scanner retains its independent cursor proof and whole-prefix
+    // verification on every call.
+    await verifyOpenedPrefixBoundary(plan, handle);
+    await verifyCursorBoundary(handle, next, resourceGuard, {
+      verifyLineOrdinal: verifyWholePrefix,
+    });
     if (next.nextByte < plan.prefixBytes) {
       for await (const entry of readBoundedUtf8LineEntries(handle, {
         maximumLineBytes: resourceGuard.limits.maximumLineBytes,
@@ -630,7 +658,16 @@ export async function scanCodexCollectorExportSource(plan, {
         next.nextWindowOrdinal = 0;
       }
     }
-    await verifyOpenedPrefix(plan, handle, resourceGuard);
+    if (verifyWholePrefix) {
+      await verifyOpenedPrefix(plan, handle, resourceGuard);
+    } else {
+      // Cheap per-batch defenses still reject truncation, replacement,
+      // symlinks, hardlinks, permission changes, and a changed prefix boundary.
+      // The workspace performs the expensive content proof once before the
+      // terminal checkpoint is committed.
+      await verifyOpenedPrefixBoundary(plan, handle);
+      await verifyBoundPath(plan);
+    }
   } finally {
     await handle.close();
   }

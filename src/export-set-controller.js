@@ -8,10 +8,26 @@ import {
 } from "./export-safe-records.js";
 import { populateCheckpointedCodexSources } from "./codex-export-checkpoint-scan.js";
 import {
+  appendCodexCollectorWorkspaceSource,
+  collectorPlanningGuard,
+  createCodexCollectorWorkspaceSource,
+  populateCodexCollectorWorkspaceSource,
+} from "./codex-collector-workspace-source.js";
+import {
+  appendClaudeStatusWorkspaceSource,
+  createClaudeStatusWorkspaceSource,
+  populateClaudeStatusWorkspaceSource,
+} from "./claude-statusline-workspace-source.js";
+import { defaultClaudeStatusStateDirectory } from "./claude-statusline-storage.js";
+import {
   createCodexExportSourcePlan,
   resolveCodexExportSourcePlan,
   ExportSourcePlanError,
 } from "./export-source-plan.js";
+import {
+  createEmptySupplementalSourcePlan,
+  summarizeSupplementalSourcePlan,
+} from "./export-supplemental-source-plan.js";
 import {
   buildExportWorkspaceDescriptor,
   createExportWorkspace,
@@ -30,6 +46,10 @@ async function populateWorkspace({
   resourceGuard,
   failpoint = async () => {},
   checkpointLinesPerBatch,
+  collectorPath = null,
+  collectorCandidatesPerBatch,
+  claudeStateDirectory = null,
+  claudeRecordsPerBatch,
 } = {}) {
   await populateCheckpointedCodexSources({
     workspace,
@@ -39,6 +59,29 @@ async function populateWorkspace({
     failpoint,
     ...(checkpointLinesPerBatch === undefined ? {} : { maximumLinesPerBatch: checkpointLinesPerBatch }),
   });
+  let collectorDiagnosticRegistryGaps = [];
+  if (collectorPath !== null) {
+    const collector = await populateCodexCollectorWorkspaceSource({
+      workspace,
+      collectorPath,
+      secret,
+      resourceGuard,
+      failpoint,
+      ...(collectorCandidatesPerBatch === undefined
+        ? {} : { maximumCandidateRecords: collectorCandidatesPerBatch }),
+    });
+    collectorDiagnosticRegistryGaps = collector.missingRegistryRows;
+  }
+  if (claudeStateDirectory !== null) {
+    await populateClaudeStatusWorkspaceSource({
+      workspace,
+      stateDirectory: claudeStateDirectory,
+      secret,
+      resourceGuard,
+      failpoint,
+      ...(claudeRecordsPerBatch === undefined ? {} : { maximumRecords: claudeRecordsPerBatch }),
+    });
+  }
   const bounds = {
     startAt: sourcePlan.startAt,
     endAt: sourcePlan.endAt,
@@ -65,9 +108,77 @@ async function populateWorkspace({
     await failpoint("after_record_batch");
   }
   await failpoint("after_diagnostics");
-  workspace.finalizeScan();
-  await failpoint("after_scan_complete");
-  return workspace.status();
+  if (!workspace.hasPendingSupplementalSources()) {
+    workspace.finalizeScan();
+    await failpoint("after_scan_complete");
+  }
+  return { status: await workspace.status(), collectorDiagnosticRegistryGaps };
+}
+
+function storedCollectorDiagnosticRegistryGaps(workspace) {
+  if (typeof workspace.supplementalDiagnosticRegistryGaps !== "function") return [];
+  const collectorSourceKeys = new Set(workspace.loadSupplementalSourcePlan().sources
+    .filter((source) => source.kind === "codex_collector_ledger")
+    .map((source) => source.sourceKey));
+  return workspace.supplementalDiagnosticRegistryGaps()
+    .filter((item) => collectorSourceKeys.has(item.sourceKey))
+    .map(({ sourceKey, ...item }) => item);
+}
+
+function requestedCollectorPath({ collectorPath = null, enableCollector = false, enableCodexCollector = false } = {}) {
+  if (typeof enableCollector !== "boolean" || typeof enableCodexCollector !== "boolean") {
+    throw new TypeError("Codex collector enable options must be boolean");
+  }
+  if (collectorPath === null || collectorPath === undefined) {
+    if (enableCollector || enableCodexCollector) {
+      throw new Error("A Codex collector path is required when collector export is enabled");
+    }
+    return null;
+  }
+  if (typeof collectorPath !== "string" || collectorPath.length === 0) {
+    throw new TypeError("Codex collector path must be a non-empty string");
+  }
+  return collectorPath;
+}
+
+function requestedClaudeStateDirectory({
+  claudeStateDirectory = null,
+  enableClaudeStatus = false,
+  enableClaudeStatusline = false,
+} = {}) {
+  if (typeof enableClaudeStatus !== "boolean" || typeof enableClaudeStatusline !== "boolean") {
+    throw new TypeError("Claude status enable options must be boolean");
+  }
+  if (claudeStateDirectory === null || claudeStateDirectory === undefined) {
+    return enableClaudeStatus || enableClaudeStatusline ? defaultClaudeStatusStateDirectory() : null;
+  }
+  if (typeof claudeStateDirectory !== "string" || claudeStateDirectory.length === 0) {
+    throw new TypeError("Claude status state directory must be a non-empty string");
+  }
+  return claudeStateDirectory;
+}
+
+function combinedSourcePlanPlanningGuard(resourceGuard) {
+  if (!resourceGuard || !resourceGuard.limits) throw new TypeError("Export resource guard is required");
+  return {
+    limits: resourceGuard.limits,
+    assertCoveredInterval: resourceGuard.assertCoveredInterval.bind(resourceGuard),
+    checkRuntime: resourceGuard.checkRuntime.bind(resourceGuard),
+    // Directory traversal is additive work, not part of the frozen source
+    // selection gauge, so it remains charged while the combined plan is built.
+    observeDirectoryEntry: resourceGuard.observeDirectoryEntry.bind(resourceGuard),
+    observeLine: resourceGuard.observeLine.bind(resourceGuard),
+    // Individual discovered files and the Codex plan total would otherwise
+    // establish a partial gauge before the frozen collector prefix can be
+    // included. Validate runtime now; the exact combined total is charged once
+    // below through observeSourcePlan.
+    observeSourceFile() {
+      resourceGuard.checkRuntime();
+    },
+    observeSourcePlan() {
+      resourceGuard.checkRuntime();
+    },
+  };
 }
 
 function assertResumeDescriptor(descriptor, secret, resourceLimits) {
@@ -91,6 +202,15 @@ async function createLocalExportWorkspaceUnlocked({
   resourceRss,
   failpoint,
   checkpointLinesPerBatch,
+  supplementalSourcePlan = createEmptySupplementalSourcePlan(),
+  collectorPath = null,
+  enableCollector = false,
+  enableCodexCollector = false,
+  collectorCandidatesPerBatch,
+  claudeStateDirectory = null,
+  enableClaudeStatus = false,
+  enableClaudeStatusline = false,
+  claudeRecordsPerBatch,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
   const bounds = normalizeExportBounds(startAt, endAt);
@@ -101,12 +221,54 @@ async function createLocalExportWorkspaceUnlocked({
     ...(resourceRss ? { rss: resourceRss } : {}),
   });
   resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
+  const selectedCollectorPath = requestedCollectorPath({ collectorPath, enableCollector, enableCodexCollector });
+  const selectedClaudeStateDirectory = requestedClaudeStateDirectory({
+    claudeStateDirectory,
+    enableClaudeStatus,
+    enableClaudeStatusline,
+  });
+  let effectiveSupplementalSourcePlan = supplementalSourcePlan;
+  const supplementalPrivatePlans = [];
+  if (selectedCollectorPath !== null) {
+    const collector = await createCodexCollectorWorkspaceSource({
+      collectorPath: selectedCollectorPath,
+      startAt: bounds.startAt,
+      endAt: bounds.endAt,
+      resourceGuard: collectorPlanningGuard(resourceGuard),
+    });
+    effectiveSupplementalSourcePlan = appendCodexCollectorWorkspaceSource(
+      supplementalSourcePlan,
+      collector.collectorPlan,
+    );
+  }
+  if (selectedClaudeStateDirectory !== null) {
+    const claude = await createClaudeStatusWorkspaceSource({
+      stateDirectory: selectedClaudeStateDirectory,
+      startAt: bounds.startAt,
+      endAt: bounds.endAt,
+      secret,
+      resourceGuard: combinedSourcePlanPlanningGuard(resourceGuard),
+    });
+    effectiveSupplementalSourcePlan = appendClaudeStatusWorkspaceSource(
+      effectiveSupplementalSourcePlan,
+      claude.claudePlan,
+    );
+    supplementalPrivatePlans.push(claude.privatePlan);
+  }
+  const supplementalSummary = summarizeSupplementalSourcePlan(effectiveSupplementalSourcePlan);
   const sourcePlan = await createCodexExportSourcePlan({
     codexHome,
     startAt: bounds.startAt,
     endAt: bounds.endAt,
-    resourceGuard,
+    resourceGuard: supplementalSummary.sourceCount === 0
+      ? resourceGuard : combinedSourcePlanPlanningGuard(resourceGuard),
   });
+  if (supplementalSummary.sourceCount > 0) {
+    resourceGuard.observeSourcePlan(
+      sourcePlan.sources.length + supplementalSummary.sourceFiles,
+      sourcePlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0) + supplementalSummary.sourceBytes,
+    );
+  }
   const activityPlan = summarizeActivityMarkerPlan(secret, activityMarkers, bounds);
   for (const source of sourcePlan.sources) source.rolloutInfo.sourcePlanOrdinal = source.ordinal;
   const descriptor = buildExportWorkspaceDescriptor({
@@ -115,13 +277,19 @@ async function createLocalExportWorkspaceUnlocked({
     coveredAt: bounds,
     compatibility: exportCompatibilityTuple(),
     sourcePlan,
+    supplementalSourcePlan: effectiveSupplementalSourcePlan,
     activityPlan,
+    sourceProviders: selectedClaudeStateDirectory === null
+      ? ["openai_codex"]
+      : ["openai_codex", "anthropic_claude_code"],
     resourceLimits: resourceGuard.limits,
   });
   const workspace = await createExportWorkspace({
     directory,
     descriptor,
     sourcePlan,
+    supplementalSourcePlan: effectiveSupplementalSourcePlan,
+    supplementalPrivatePlans,
     maximumWorkspaceBytes: resourceGuard.limits.maximumWorkspaceBytes,
   });
   let invocationBegun = false;
@@ -129,7 +297,7 @@ async function createLocalExportWorkspaceUnlocked({
   try {
     workspace.beginInvocation();
     invocationBegun = true;
-    const status = await populateWorkspace({
+    const populated = await populateWorkspace({
       workspace,
       sourcePlan,
       secret,
@@ -137,13 +305,18 @@ async function createLocalExportWorkspaceUnlocked({
       resourceGuard,
       failpoint,
       checkpointLinesPerBatch,
+      collectorPath: selectedCollectorPath,
+      collectorCandidatesPerBatch,
+      claudeStateDirectory: selectedClaudeStateDirectory,
+      claudeRecordsPerBatch,
     });
+    const { status, collectorDiagnosticRegistryGaps } = populated;
     resourceGuard.observeWorkspace(Math.max(
       status.workspaceBytes,
       workspace.resourceUsage().workspaceHighWaterBytes,
     ));
     invocationSucceeded = true;
-    return { descriptor, status, resourceUsage: resourceGuard.snapshot() };
+    return { descriptor, status, collectorDiagnosticRegistryGaps, resourceUsage: resourceGuard.snapshot() };
   } finally {
     try {
       let durableUsage = null;
@@ -172,6 +345,14 @@ async function resumeLocalExportWorkspaceUnlocked({
   resourceRss,
   failpoint,
   checkpointLinesPerBatch,
+  collectorPath = null,
+  enableCollector = false,
+  enableCodexCollector = false,
+  collectorCandidatesPerBatch,
+  claudeStateDirectory = null,
+  enableClaudeStatus = false,
+  enableClaudeStatusline = false,
+  claudeRecordsPerBatch,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
   const normalizedLimits = normalizeExportResourceLimits(resourceLimits);
@@ -186,6 +367,25 @@ async function resumeLocalExportWorkspaceUnlocked({
     const descriptor = workspace.getDescriptor();
     assertResumeDescriptor(descriptor, secret, normalizedLimits);
     if (workspace.isPoisoned()) throw new ExportWorkspaceError("checkpoint_mismatch");
+    const selectedCollectorPath = requestedCollectorPath({ collectorPath, enableCollector, enableCodexCollector });
+    const selectedClaudeStateDirectory = requestedClaudeStateDirectory({
+      claudeStateDirectory,
+      enableClaudeStatus,
+      enableClaudeStatusline,
+    });
+    const storedSupplementalPlan = workspace.loadSupplementalSourcePlan();
+    const hasCollectorSource = storedSupplementalPlan.sources.some(
+      (source) => source.kind === "codex_collector_ledger",
+    );
+    const hasClaudeStatusSource = storedSupplementalPlan.sources.some(
+      (source) => source.kind === "claude_status_snapshot",
+    );
+    if ((hasCollectorSource && selectedCollectorPath === null)
+        || (!hasCollectorSource && selectedCollectorPath !== null)
+        || (hasClaudeStatusSource && selectedClaudeStateDirectory === null)
+        || (!hasClaudeStatusSource && selectedClaudeStateDirectory !== null)) {
+      throw new ExportWorkspaceError("checkpoint_mismatch");
+    }
     workspace.beginInvocation();
     invocationBegun = true;
     resourceGuard = createExportResourceGuard({
@@ -218,9 +418,14 @@ async function resumeLocalExportWorkspaceUnlocked({
     if (workspace.isScanComplete()) {
       resourceGuard.observeWorkspace((await workspace.status()).workspaceBytes);
       invocationSucceeded = true;
-      return { descriptor, status: await workspace.status(), resourceUsage: resourceGuard.snapshot() };
+      return {
+        descriptor,
+        status: await workspace.status(),
+        collectorDiagnosticRegistryGaps: storedCollectorDiagnosticRegistryGaps(workspace),
+        resourceUsage: resourceGuard.snapshot(),
+      };
     }
-    const status = await populateWorkspace({
+    const populated = await populateWorkspace({
       workspace,
       sourcePlan,
       secret,
@@ -228,13 +433,18 @@ async function resumeLocalExportWorkspaceUnlocked({
       resourceGuard,
       failpoint,
       checkpointLinesPerBatch,
+      collectorPath: selectedCollectorPath,
+      collectorCandidatesPerBatch,
+      claudeStateDirectory: selectedClaudeStateDirectory,
+      claudeRecordsPerBatch,
     });
+    const { status, collectorDiagnosticRegistryGaps } = populated;
     resourceGuard.observeWorkspace(Math.max(
       status.workspaceBytes,
       workspace.resourceUsage().workspaceHighWaterBytes,
     ));
     invocationSucceeded = true;
-    return { descriptor, status, resourceUsage: resourceGuard.snapshot() };
+    return { descriptor, status, collectorDiagnosticRegistryGaps, resourceUsage: resourceGuard.snapshot() };
   } finally {
     try {
       let durableUsage = null;
@@ -260,7 +470,9 @@ async function inspectLocalExportWorkspaceUnlocked({ directory } = {}) {
       workspaceVersion: descriptor.workspaceVersion,
       resourcePolicyVersion: descriptor.resourcePolicyVersion,
       coveredAt: structuredClone(descriptor.coveredAt),
+      sourceProviders: [...descriptor.sourceProviders],
       sourcePlan: structuredClone(descriptor.sourcePlan),
+      supplementalSourcePlan: structuredClone(descriptor.supplementalSourcePlan),
       ...await workspace.status(),
     };
   } finally {

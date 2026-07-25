@@ -132,17 +132,50 @@ function compressChunkBundle(selected, maximumEncodedArtifactBytes) {
 }
 
 function deterministicSetId(secret, descriptor, logicalRecordsSha256, chunking) {
+  const sourcePlan = combinedSourcePlanCommitment(descriptor);
   const subject = stableJson({
-    identityVersion: "usage-export-set-id-v1",
+    identityVersion: "usage-export-set-id-v2",
     participantId: descriptor.participantId,
     createdAt: descriptor.createdAt,
     coveredAt: descriptor.coveredAt,
     compatibility: descriptor.compatibility,
-    sourcePlanSha256: descriptor.sourcePlan.sourcePlanSha256,
+    sourcePlanSha256: sourcePlan.sha256,
     logicalRecordsSha256,
     chunking,
   });
   return deriveExportPseudonym(secret, "export-set", sha256(subject));
+}
+
+/**
+ * Bind every frozen workspace source into one domain-separated commitment.
+ * The two independently hashed plans are framed as named fields, so equal
+ * concatenations cannot collide across the Codex and supplemental domains.
+ */
+export function combinedSourcePlanCommitment(descriptor) {
+  const codex = descriptor?.sourcePlan;
+  const supplemental = descriptor?.supplementalSourcePlan;
+  if (!codex || !supplemental
+      || typeof codex.sourcePlanSha256 !== "string" || !/^[a-f0-9]{64}$/.test(codex.sourcePlanSha256)
+      || typeof supplemental.supplementalSourcePlanSha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(supplemental.supplementalSourcePlanSha256)
+      || !Number.isSafeInteger(codex.sourceFiles) || codex.sourceFiles < 0
+      || !Number.isSafeInteger(codex.sourceBytes) || codex.sourceBytes < 0
+      || !Number.isSafeInteger(supplemental.sourceFiles) || supplemental.sourceFiles < 0
+      || !Number.isSafeInteger(supplemental.sourceBytes) || supplemental.sourceBytes < 0) {
+    fail("workspace_incomplete");
+  }
+  const sourceFiles = codex.sourceFiles + supplemental.sourceFiles;
+  const sourceBytes = codex.sourceBytes + supplemental.sourceBytes;
+  if (!Number.isSafeInteger(sourceFiles) || !Number.isSafeInteger(sourceBytes)) fail("workspace_incomplete");
+  return {
+    sha256: sha256(stableJson({
+      identityVersion: "usage-export-combined-source-plan/v1",
+      codexSourcePlanSha256: codex.sourcePlanSha256,
+      supplementalSourcePlanSha256: supplemental.supplementalSourcePlanSha256,
+    })),
+    sourceFiles,
+    sourceBytes,
+  };
 }
 
 function deterministicBundleId(secret, exportSetId, index) {
@@ -389,6 +422,7 @@ async function materializeLocalExportSetUnlocked({
       workspaceStatus.expandedRecordBytes,
     );
     const logicalRecordsSha256 = computeWorkspaceLogicalRecordsSha256(workspace, resourceGuard);
+    const combinedSourcePlan = combinedSourcePlanCommitment(descriptor);
     const chunking = {
       orderingVersion: EXPORT_SET_ORDERING_VERSION,
       packingVersion: EXPORT_SET_PACKING_VERSION,
@@ -525,9 +559,9 @@ async function materializeLocalExportSetUnlocked({
         zlibVersion: process.versions.zlib,
       },
       sourcePlan: {
-        sha256: descriptor.sourcePlan.sourcePlanSha256,
-        sourceFiles: descriptor.sourcePlan.sourceFiles,
-        sourceBytes: descriptor.sourcePlan.sourceBytes,
+        sha256: combinedSourcePlan.sha256,
+        sourceFiles: combinedSourcePlan.sourceFiles,
+        sourceBytes: combinedSourcePlan.sourceBytes,
       },
       chunking,
       totals,

@@ -13,6 +13,7 @@ import {
 } from "./export-deletion-schema.js";
 import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 import {
+  combinedSourcePlanCommitment,
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
 } from "./export-set-materializer.js";
@@ -201,6 +202,12 @@ function expectedChunkMetadata(manifest, entry) {
 }
 
 function assertWorkspaceBinding(descriptor, chunks, manifestState, manifest, manifestText) {
+  let combinedSourcePlan;
+  try {
+    combinedSourcePlan = combinedSourcePlanCommitment(descriptor);
+  } catch {
+    fail("binding");
+  }
   const descriptorView = {
     compatibility: descriptor.compatibility,
     participantId: descriptor.participantId,
@@ -209,9 +216,9 @@ function assertWorkspaceBinding(descriptor, chunks, manifestState, manifest, man
     sourceProviders: descriptor.sourceProviders,
     clientPlatform: descriptor.clientPlatform,
     sourcePlan: {
-      sha256: descriptor.sourcePlan.sourcePlanSha256,
-      sourceFiles: descriptor.sourcePlan.sourceFiles,
-      sourceBytes: descriptor.sourcePlan.sourceBytes,
+      sha256: combinedSourcePlan.sha256,
+      sourceFiles: combinedSourcePlan.sourceFiles,
+      sourceBytes: combinedSourcePlan.sourceBytes,
     },
   };
   const manifestView = {

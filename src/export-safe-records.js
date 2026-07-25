@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { CODEX_COLLECTOR_CANDIDATE_VERSION } from "./codex-collector-export-source.js";
+import { validateClaudeStatusSnapshot } from "./claude-statusline.js";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
 import {
   deriveAccountScopeId,
@@ -21,6 +23,10 @@ import { stableJson } from "./storage.js";
 
 const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
 const PLAN_VARIANTS = new Set(["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]);
+const SESSION_SCOPE_PATTERN = /^session:v1:[A-Za-z0-9_-]{43}$/u;
+const ACCOUNT_SCOPE_SUBJECT_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const CLAUDE_PHYSICAL_OCCURRENCE_PATTERN = /^claude-ledger-occurrence:v1:[A-Za-z0-9_-]{43}$/u;
 const MARKER_SURFACES = new Set([
   "chatgpt_chat", "chatgpt_web", "chatgpt_work", "workspace_agent", "chatgpt_excel",
   "codex_cloud", "codex_other_machine", "chatgpt_work_voice", "ordinary_chat_voice",
@@ -245,6 +251,171 @@ export function normalizeCodexQuotaSnapshot(secret, event) {
   return snapshot;
 }
 
+function assertExactDataKeys(value, keys, code) {
+  let ownKeys;
+  let prototype;
+  try {
+    ownKeys = Reflect.ownKeys(value);
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    throw new TypeError(code);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || prototype !== Object.prototype
+      || ownKeys.length !== keys.length
+      || ownKeys.some((key) => typeof key !== "string")
+      || keys.some((key) => !ownKeys.includes(key))) throw new TypeError(code);
+  const copy = {};
+  for (const key of keys) {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      throw new TypeError(code);
+    }
+    if (!descriptor || !("value" in descriptor)) throw new TypeError(code);
+    copy[key] = descriptor.value;
+  }
+  return copy;
+}
+
+function finalizeQuotaSnapshot(secret, snapshot, observationSubject, unattributedOccurrenceMaterial = null) {
+  snapshot.snapshotId = deriveSnapshotObservationId(secret, canonicalSubject(observationSubject));
+  const stateSubject = quotaStateIdentitySubject(snapshot);
+  if (snapshot.accountScopeId === "unattributed" && snapshot.sessionScopeId === null) {
+    if (!SHA256_PATTERN.test(unattributedOccurrenceMaterial ?? "")) {
+      throw new TypeError("Sessionless unattributed quota normalization requires occurrence material");
+    }
+    stateSubject.unattributedOccurrenceMaterial = unattributedOccurrenceMaterial;
+  }
+  snapshot.providerStateId = deriveQuotaStateId(secret, canonicalSubject(stateSubject));
+  assertValidExportRecord("quotaSnapshot", snapshot);
+  return snapshot;
+}
+
+/**
+ * Convert one already privacy-reduced collector candidate into the canonical
+ * quota contract. Sessionless unattributed observations are retained, but
+ * their provider-state identity includes occurrence material so observations
+ * from unknown accounts cannot collapse into one apparent shared state.
+ */
+export function normalizeCodexCollectorQuotaCandidate(secret, candidate) {
+  const keys = [
+    "candidateVersion", "kind", "provider", "observedTime", "receivedTime", "source",
+    "planType", "limitId", "slot", "usedPercent", "displayPrecision",
+    "windowDurationMinutes", "resetsAt", "sharedPoolSurface", "accountScopeSubject",
+    "sessionScopeId", "observationIdentityMaterial",
+  ];
+  candidate = assertExactDataKeys(candidate, keys, "Invalid privacy-safe collector quota candidate");
+  if (candidate.candidateVersion !== CODEX_COLLECTOR_CANDIDATE_VERSION
+      || candidate.kind !== "quota_snapshot_candidate"
+      || candidate.provider !== "openai_codex"
+      || !["app_server_read", "app_server_notification"].includes(candidate.source)
+      || candidate.sharedPoolSurface !== "account_shared_unallocated"
+      || candidate.sessionScopeId !== null
+      || (candidate.accountScopeSubject !== "unattributed"
+        && !ACCOUNT_SCOPE_SUBJECT_PATTERN.test(candidate.accountScopeSubject ?? ""))
+      || !SHA256_PATTERN.test(candidate.observationIdentityMaterial ?? "")
+      || !PLAN_TYPES.has(candidate.planType)
+      || !["codex", "codex-spark"].includes(candidate.limitId)
+      || !["primary", "secondary"].includes(candidate.slot)
+      || !Number.isFinite(candidate.usedPercent) || candidate.usedPercent < 0 || candidate.usedPercent > 100
+      || !Number.isSafeInteger(candidate.displayPrecision) || candidate.displayPrecision < 0 || candidate.displayPrecision > 6
+      || candidate.displayPrecision !== displayPrecision(candidate.usedPercent)
+      || !Number.isSafeInteger(candidate.windowDurationMinutes) || candidate.windowDurationMinutes < 1
+      || candidate.windowDurationMinutes > 525_600
+      || boundedIso(candidate.observedTime, "collector quota observedTime") !== candidate.observedTime
+      || boundedIso(candidate.receivedTime, "collector quota receivedTime") !== candidate.receivedTime
+      || Date.parse(candidate.receivedTime) < Date.parse(candidate.observedTime)
+      || boundedIso(candidate.resetsAt, "collector quota resetsAt") !== candidate.resetsAt) {
+    throw new TypeError("Invalid privacy-safe collector quota candidate");
+  }
+  const accountScopeId = deriveAccountScopeId(secret, candidate.accountScopeSubject);
+  const snapshot = {
+    schemaVersion: "quota-snapshot-v0.1",
+    observedTime: candidate.observedTime,
+    receivedTime: candidate.receivedTime,
+    provider: "openai_codex",
+    planType: candidate.planType,
+    planVariant: "unknown",
+    limitId: candidate.limitId,
+    slot: candidate.slot,
+    usedPercent: candidate.usedPercent,
+    displayPrecision: candidate.displayPrecision,
+    windowDurationMinutes: candidate.windowDurationMinutes,
+    resetsAt: candidate.resetsAt,
+    snapshotSource: candidate.source === "app_server_notification" ? "notification" : "app_server_read",
+    providerSurface: "account_shared_unallocated",
+    sessionScopeId: null,
+    accountScopeId,
+  };
+  return finalizeQuotaSnapshot(secret, snapshot, {
+    identityVersion: "codex-collector-safe-occurrence-v0.1",
+    provider: "openai_codex",
+    observationIdentityMaterial: candidate.observationIdentityMaterial,
+  }, candidate.observationIdentityMaterial);
+}
+
+/**
+ * Convert a validated Claude status-line record into zero, one, or two quota
+ * snapshots. A captured session pseudonym is mandatory because Claude status
+ * records currently contain no account identifier that could safely scope an
+ * unattributed provider-state identity.
+ */
+export function normalizeClaudeStatusQuotaSnapshots(secret, value, { physicalOccurrenceMaterial } = {}) {
+  const status = validateClaudeStatusSnapshot(value);
+  const windows = [
+    ["fiveHour", "five_hour"],
+    ["sevenDay", "seven_day"],
+  ];
+  // A valid pre-response status-line record may contain no quota windows. It
+  // contributes no export records and therefore needs neither session scope
+  // nor physical-occurrence identity. Window-bearing records remain
+  // fail-closed when they cannot be scoped safely.
+  if (windows.every(([sourceKey]) => status.limits[sourceKey] === null)) return [];
+  if (status.sessionPseudonym === null) {
+    throw new TypeError("Claude quota normalization requires a privacy-safe session pseudonym");
+  }
+  if (typeof physicalOccurrenceMaterial !== "string"
+      || !CLAUDE_PHYSICAL_OCCURRENCE_PATTERN.test(physicalOccurrenceMaterial)) {
+    throw new TypeError("Claude quota normalization requires privacy-safe physical occurrence material");
+  }
+  const sessionScopeId = deriveSessionScopeId(secret, status.sessionPseudonym);
+  if (!SESSION_SCOPE_PATTERN.test(sessionScopeId)) {
+    throw new TypeError("Claude quota normalization requires a privacy-safe session pseudonym");
+  }
+  return windows.flatMap(([sourceKey, slot]) => {
+    const window = status.limits[sourceKey];
+    if (window === null) return [];
+    const snapshot = {
+      schemaVersion: "quota-snapshot-v0.1",
+      observedTime: status.capturedAt,
+      receivedTime: status.capturedAt,
+      provider: "anthropic_claude_code",
+      planType: "unknown",
+      planVariant: "unknown",
+      limitId: "unknown",
+      slot,
+      usedPercent: window.usedPercent,
+      displayPrecision: displayPrecision(window.usedPercent),
+      windowDurationMinutes: window.windowMinutes,
+      resetsAt: new Date(window.resetsAt * 1000).toISOString(),
+      snapshotSource: "status_line",
+      providerSurface: "general_usage",
+      sessionScopeId,
+      accountScopeId: "unattributed",
+    };
+    return [finalizeQuotaSnapshot(secret, snapshot, {
+      identityVersion: "claude-statusline-safe-occurrence-v0.1",
+      provider: "anthropic_claude_code",
+      capturedAt: status.capturedAt,
+      sessionScopeId,
+      slot,
+      physicalOccurrenceMaterial,
+    })];
+  });
+}
+
 export function normalizeActivityMarker(secret, marker, bounds) {
   const observedTime = boundedIso(marker?.observedAt, "activity marker observedAt");
   const observedMs = Date.parse(observedTime);
@@ -368,7 +539,7 @@ export async function scanCodexSafeRecords({
   });
 
   const compatibility = exportCompatibilityTuple();
-  if (scan.parserVersion !== compatibility.providerAdapters.openaiCodex.parserVersion) {
+  if (scan.parserVersion !== compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion) {
     throw new Error("Codex scanner version does not match the export compatibility contract");
   }
   for (const marker of activityMarkers) {

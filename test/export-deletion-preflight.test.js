@@ -5,13 +5,14 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLocalExportWorkspace } from "../src/export-set-controller.js";
-import { materializeLocalExportSet } from "../src/export-set-materializer.js";
+import { combinedSourcePlanCommitment, materializeLocalExportSet } from "../src/export-set-materializer.js";
 import {
   buildLocalExportDeletionPlan,
   ExportDeletionError,
   planLocalExportDeletion,
 } from "../src/export-deletion.js";
 import { validateExportDeletionJournal, validateExportDeletionPreflight } from "../src/export-deletion-schema.js";
+import { openExportWorkspace } from "../src/export-workspace.js";
 
 function usage(tokens) {
   return {
@@ -24,11 +25,17 @@ function usage(tokens) {
   };
 }
 
-async function fixture({ secret = Buffer.alloc(32, 71), suffix = "one" } = {}) {
+async function fixture({
+  secret = Buffer.alloc(32, 71),
+  suffix = "one",
+  collectorContents = null,
+  codexHome = null,
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-delete-preflight-"));
-  const home = join(root, "codex-home");
+  const home = codexHome ?? join(root, "codex-home");
   const workspace = join(root, "workspace");
   const output = join(root, "output");
+  const collectorPath = collectorContents === null ? null : join(root, "collector-ledger.jsonl");
   await mkdir(join(home, "sessions"), { recursive: true });
   await mkdir(join(home, "archived_sessions"), { recursive: true });
   const first = usage(suffix === "one" ? 10 : 20);
@@ -45,6 +52,7 @@ async function fixture({ secret = Buffer.alloc(32, 71), suffix = "one" } = {}) {
       payload: { type: "token_count", info: { total_token_usage: first, last_token_usage: first } },
     }),
   ].join("\n")}\n`);
+  if (collectorPath !== null) await writeFile(collectorPath, collectorContents, { mode: 0o600 });
   await createLocalExportWorkspace({
     directory: workspace,
     startAt: "2026-07-24T11:00:00.000Z",
@@ -52,9 +60,10 @@ async function fixture({ secret = Buffer.alloc(32, 71), suffix = "one" } = {}) {
     createdAt: "2026-07-24T13:00:00.000Z",
     codexHome: home,
     secret,
+    ...(collectorPath === null ? {} : { collectorPath }),
   });
   await materializeLocalExportSet({ workspaceDirectory: workspace, outputDirectory: output, secret });
-  return { root, home, workspace, output };
+  return { root, home, workspace, output, collectorPath };
 }
 
 async function directorySnapshot(directory) {
@@ -119,6 +128,49 @@ test("deletion preflight binds the workspace to the independently verified set",
         && error.code === "export_deletion_binding"
         && !error.message.includes(first.root)
         && !error.message.includes(second.root),
+    );
+  } finally {
+    await rm(first.root, { recursive: true, force: true });
+    await rm(second.root, { recursive: true, force: true });
+  }
+});
+
+test("deletion preflight authenticates the materialized composite supplemental source commitment", async () => {
+  const secret = Buffer.alloc(32, 74);
+  const first = await fixture({ secret, suffix: "supplemental", collectorContents: "" });
+  const second = await fixture({
+    secret,
+    suffix: "supplemental",
+    collectorContents: "",
+    codexHome: first.home,
+  });
+  try {
+    const plan = await buildLocalExportDeletionPlan({
+      workspaceDirectory: first.workspace,
+      outputDirectory: first.output,
+    });
+    assert.equal(plan.summary.readiness, "ready");
+    const firstWorkspace = await openExportWorkspace({ directory: first.workspace });
+    const secondWorkspace = await openExportWorkspace({ directory: second.workspace });
+    let firstDescriptor;
+    let secondDescriptor;
+    try {
+      firstDescriptor = firstWorkspace.getDescriptor();
+      secondDescriptor = secondWorkspace.getDescriptor();
+    } finally {
+      firstWorkspace.close();
+      secondWorkspace.close();
+    }
+    const manifest = JSON.parse(await readFile(join(first.output, "export-set-manifest.json"), "utf8"));
+    assert.equal(firstDescriptor.sourcePlan.sourcePlanSha256, secondDescriptor.sourcePlan.sourcePlanSha256);
+    assert.notEqual(
+      firstDescriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
+      secondDescriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
+    );
+    assert.deepEqual(manifest.sourcePlan, combinedSourcePlanCommitment(firstDescriptor));
+    await assert.rejects(
+      planLocalExportDeletion({ workspaceDirectory: first.workspace, outputDirectory: second.output }),
+      (error) => error instanceof ExportDeletionError && error.code === "export_deletion_binding",
     );
   } finally {
     await rm(first.root, { recursive: true, force: true });

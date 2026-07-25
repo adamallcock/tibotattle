@@ -424,8 +424,7 @@ test("notification event identity deduplicates repeated snapshots without retain
 
 test("a fresh app-server account marker provisionally scopes only new nearby rollout events", async () => {
   const fixture = await collectorFixture();
-  const previousSecret = process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
-  process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = "test-only-account-marker-secret";
+  const accountSecret = Buffer.alloc(32, 81);
   class ScopedClient {
     async start() {}
     async readRateLimits() { return appPayload(2); }
@@ -438,6 +437,7 @@ test("a fresh app-server account marker provisionally scopes only new nearby rol
       ...fixture,
       staleAfterMs: 0,
       appServerFactory: () => new ScopedClient(),
+      loadAccountObservationSecret: async () => Buffer.from(accountSecret),
       clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
     });
     await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 2)}\n`);
@@ -452,9 +452,9 @@ test("a fresh app-server account marker provisionally scopes only new nearby rol
     assert.equal(rollout.accountScope.status, "available");
     assert.equal(rollout.accountScopeAttribution, "provisional_fresh_app_server_marker");
     assert.equal(JSON.stringify(records).includes("private.owner"), false);
+    assert.equal(JSON.stringify(records).includes(accountSecret.toString("base64url")), false);
+    assert.equal((await readFile(fixture.checkpointFile, "utf8")).includes(accountSecret.toString("base64url")), false);
   } finally {
-    if (previousSecret === undefined) delete process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
-    else process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = previousSecret;
     await rm(fixture.root, { recursive: true });
   }
 });
@@ -478,6 +478,66 @@ test("run-once distinguishes an app-server authentication failure without losing
     assert.equal(result.refresh.errorCode, "authentication_failure");
     assert.equal(result.diagnostics.appServerErrorCounts.authentication_failure, 1);
     assert.equal((await stat(fixture.checkpointFile)).mode & 0o777, 0o600);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("run-once records quota safely without account attribution when the credential is unavailable", async () => {
+  const fixture = await collectorFixture();
+  const canary = "DO-NOT-LEAK-account-credential";
+  class ScopedClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return { account: { email: "private.owner@example.test", planType: "pro" } }; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      staleAfterMs: 0,
+      appServerFactory: () => new ScopedClient(),
+      loadAccountObservationSecret: async () => { throw new Error(canary); },
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].accountScope.status, "unavailable");
+    assert.equal(records[0].accountScope.reason, "credential_unavailable");
+    assert.equal(result.diagnostics.accountCredentialUnavailable, 1);
+    assert.equal(JSON.stringify({ records, diagnostics: result.diagnostics }).includes(canary), false);
+    assert.equal(JSON.stringify(records).includes("private.owner"), false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("run-once distinguishes an active account credential lease from backend unavailability", async () => {
+  const fixture = await collectorFixture();
+  class ScopedClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return { account: { email: "private.owner@example.test", planType: "pro" } }; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      staleAfterMs: 0,
+      appServerFactory: () => new ScopedClient(),
+      loadAccountObservationSecret: async () => {
+        const error = new Error("content-free upstream canary");
+        error.code = "account_observation_credential_locked";
+        throw error;
+      },
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records[0].accountScope.reason, "credential_locked");
+    assert.equal(result.diagnostics.accountCredentialLocked, 1);
+    assert.equal(result.diagnostics.accountCredentialUnavailable, 0);
   } finally {
     await rm(fixture.root, { recursive: true });
   }
@@ -636,10 +696,9 @@ test("foreground consumes a notification, reconnects, and shuts down cleanly", a
 test("foreground re-reads account scope before attributing a rate-limit notification", async () => {
   const fixture = await collectorFixture();
   const controller = new AbortController();
-  const secret = "foreground-account-switch-test-secret";
-  const previousSecret = process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
-  process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = secret;
+  const secret = Buffer.alloc(32, 82);
   let currentEmail = "first.owner@example.test";
+  let credentialLoads = 0;
   let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
   class SwitchingClient extends EventEmitter {
     async start() {
@@ -665,6 +724,10 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
       staleAfterMs: 0,
       reconciliationMs: 20,
       appServerFactory: () => new SwitchingClient(),
+      loadAccountObservationSecret: async () => {
+        credentialLoads += 1;
+        return Buffer.from(secret);
+      },
       clock: () => nowMs,
     });
     for (let attempt = 0; attempt < 500; attempt += 1) {
@@ -682,11 +745,175 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
     const prior = deriveOpenAIAccountScope({ account: { email: "first.owner@example.test" } }, { secret, planType: "pro" });
     assert.equal(rollout.accountScope.scopeId, expected.scopeId);
     assert.notEqual(rollout.accountScope.scopeId, prior.scopeId);
+    assert.ok(credentialLoads >= 2, "initial read and notification must independently reload the account capability");
     assert.equal(JSON.stringify(records).includes("owner@example.test"), false);
   } finally {
-    if (previousSecret === undefined) delete process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
-    else process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = previousSecret;
     await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("foreground coalesces a notification burst to one pending payload and re-reads the switched account", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  const secret = Buffer.alloc(32, 83);
+  let currentEmail = "first.burst@example.test";
+  let accountReads = 0;
+  let credentialLoads = 0;
+  let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+  let releaseFirstNotificationRead;
+  const firstNotificationReadReleased = new Promise((resolve) => { releaseFirstNotificationRead = resolve; });
+  let markFirstNotificationReadStarted;
+  const firstNotificationReadStarted = new Promise((resolve) => { markFirstNotificationReadStarted = resolve; });
+  let activeClient;
+  let foreground;
+
+  class BurstClient extends EventEmitter {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() {
+      accountReads += 1;
+      const observedEmail = currentEmail;
+      if (accountReads === 2) {
+        markFirstNotificationReadStarted();
+        await firstNotificationReadReleased;
+      }
+      return { account: { email: observedEmail, planType: "pro" } };
+    }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+
+  try {
+    const hardStop = setTimeout(() => controller.abort(), 10_000);
+    foreground = runCollectorForeground({
+      ...fixture,
+      signal: controller.signal,
+      staleAfterMs: 0,
+      reconciliationMs: 60_000,
+      appServerFactory: () => {
+        activeClient = new BurstClient();
+        return activeClient;
+      },
+      loadAccountObservationSecret: async () => {
+        credentialLoads += 1;
+        return Buffer.from(secret);
+      },
+      clock: () => nowMs,
+    });
+
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const records = await readLines(fixture.dataFile);
+      if (records.some((record) => record.source === "app_server_read")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await firstNotificationReadStarted;
+    currentEmail = "second.burst@example.test";
+    nowMs = Date.parse("2026-07-23T00:01:02.000Z");
+    for (let percent = 1; percent <= 100; percent += 1) {
+      activeClient.emit("rateLimitsUpdated", appPayload(percent));
+    }
+    releaseFirstNotificationRead();
+
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const records = await readLines(fixture.dataFile);
+      const notifications = records.filter((record) => record.source === "app_server_notification");
+      if (notifications.some((record) => record.windows[0].usedPercent === 100)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 100)}\n`);
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const records = await readLines(fixture.dataFile);
+      if (records.some((record) => record.kind === "codex_rollout_usage_snapshot")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    controller.abort();
+    const result = await foreground;
+    clearTimeout(hardStop);
+
+    const records = await readLines(fixture.dataFile);
+    const notifications = records.filter((record) => record.source === "app_server_notification");
+    assert.deepEqual(notifications.map((record) => record.windows[0].usedPercent), [3, 100]);
+    const rollout = records.find((record) => record.kind === "codex_rollout_usage_snapshot");
+    const expected = deriveOpenAIAccountScope({ account: { email: currentEmail } }, { secret, planType: "pro" });
+    assert.equal(rollout.accountScope.scopeId, expected.scopeId);
+    assert.equal(credentialLoads, 3, "initial read plus two processed notifications load the capability");
+    assert.equal(result.resourceActivity.rateLimitNotificationEvents, 101);
+    assert.equal(result.resourceActivity.rateLimitNotificationOperations, 1);
+    assert.equal(result.resourceActivity.rateLimitNotificationPayloadsProcessed, 2);
+    assert.equal(result.resourceActivity.rateLimitNotificationPayloadsCoalesced, 99);
+    assert.equal(result.resourceActivity.maximumPendingRateLimitNotifications, 1);
+    assert.equal(JSON.stringify(records).includes("burst@example.test"), false);
+  } finally {
+    controller.abort();
+    releaseFirstNotificationRead?.();
+    await foreground?.catch(() => {});
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("foreground notification processing preserves locked and unavailable credential reasons", async () => {
+  for (const [credentialCode, expectedReason, diagnostic] of [
+    ["account_observation_credential_locked", "credential_locked", "accountCredentialLocked"],
+    ["account_observation_credential_unavailable", "credential_unavailable", "accountCredentialUnavailable"],
+  ]) {
+    const fixture = await collectorFixture();
+    const controller = new AbortController();
+    let activeClient;
+    let credentialLoads = 0;
+    let foreground;
+    class CredentialStateClient extends EventEmitter {
+      async start() {}
+      async readRateLimits() { return appPayload(2); }
+      async readAccount() { return { account: { email: "private.state@example.test", planType: "pro" } }; }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      foreground = runCollectorForeground({
+        ...fixture,
+        signal: controller.signal,
+        staleAfterMs: 0,
+        reconciliationMs: 60_000,
+        appServerFactory: () => {
+          activeClient = new CredentialStateClient();
+          return activeClient;
+        },
+        loadAccountObservationSecret: async () => {
+          credentialLoads += 1;
+          if (credentialLoads === 1) return Buffer.alloc(32, 84);
+          const error = new Error("DO-NOT-LEAK-foreground-credential");
+          error.code = credentialCode;
+          throw error;
+        },
+        clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      });
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        const records = await readLines(fixture.dataFile);
+        if (records.some((record) => record.source === "app_server_read")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      activeClient.emit("rateLimitsUpdated", appPayload(4));
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        const records = await readLines(fixture.dataFile);
+        if (records.some((record) => record.source === "app_server_notification")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      controller.abort();
+      const result = await foreground;
+      const notification = (await readLines(fixture.dataFile))
+        .find((record) => record.source === "app_server_notification");
+      assert.equal(notification.accountScope.status, "unavailable");
+      assert.equal(notification.accountScope.reason, expectedReason);
+      assert.equal(result.diagnostics[diagnostic], 1);
+      assert.equal(result.resourceActivity.maximumPendingRateLimitNotifications, 1);
+      assert.equal(JSON.stringify({ notification, diagnostics: result.diagnostics })
+        .includes("DO-NOT-LEAK-foreground-credential"), false);
+    } finally {
+      controller.abort();
+      await foreground?.catch(() => {});
+      await rm(fixture.root, { recursive: true });
+    }
   }
 });
 

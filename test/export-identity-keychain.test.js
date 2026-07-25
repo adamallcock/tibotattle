@@ -209,6 +209,67 @@ test("read returns an exact copied 32-byte Buffer or null and rejects malformed 
   }
 });
 
+test("describe is capability-bound and never reads or returns credential values", async () => {
+  const binding = memoryBinding([[EXPORT_CAPABILITY, encoded(27)]]);
+  const backend = createExportIdentityKeychainBackend({ binding });
+  assert.deepEqual(await backend.describe(EXPORT_CAPABILITY), {
+    backend: "macos_keychain",
+    status: "available",
+  });
+  assert.equal(binding.calls.length, 0);
+  await assert.rejects(
+    backend.describe({ ...EXPORT_CAPABILITY }),
+    assertKeychainError("invalid_capability"),
+  );
+});
+
+test("locked and denied native failures map to distinct fixed content-free codes", async () => {
+  const canary = "DO-NOT-LEAK-keychain-policy";
+  for (const [nativeCode, expectedCode] of [
+    ["ERR_KEYCHAIN_LOCKED", "locked"],
+    ["errSecInteractionNotAllowed", "locked"],
+    [-25308, "locked"],
+    ["ERR_KEYCHAIN_DENIED", "denied"],
+    ["errSecAuthFailed", "denied"],
+    [-25293, "denied"],
+  ]) {
+    const binding = memoryBinding();
+    binding.getPassword = async () => {
+      const error = new Error(canary);
+      error.code = nativeCode;
+      throw error;
+    };
+    await assert.rejects(
+      createExportIdentityKeychainBackend({ binding }).read(EXPORT_CAPABILITY),
+      (error) => {
+        assertKeychainError(expectedCode)(error);
+        const rendered = `${error.stack}\n${JSON.stringify(error)}`;
+        assert.equal(rendered.includes(canary), false);
+        assert.equal(rendered.includes(EXPORT_CAPABILITY.service), false);
+        return true;
+      },
+    );
+  }
+
+
+  for (const [nativeMessage, expectedCode] of [
+    ["User interaction is not allowed.", "locked"],
+    ["The user name or passphrase you entered is not correct.", "denied"],
+    ["User canceled the operation.", "denied"],
+  ]) {
+    const binding = memoryBinding();
+    binding.getPassword = async () => { throw new Error(nativeMessage); };
+    await assert.rejects(
+      createExportIdentityKeychainBackend({ binding }).read(EXPORT_CAPABILITY),
+      (error) => {
+        assertKeychainError(expectedCode)(error);
+        assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes(nativeMessage), false);
+        return true;
+      },
+    );
+  }
+});
+
 test("createIfMissing stores strict base64url, verifies readback, and preserves an existing value", async () => {
   const binding = memoryBinding();
   const backend = createExportIdentityKeychainBackend({ binding });

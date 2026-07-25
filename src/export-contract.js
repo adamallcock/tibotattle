@@ -69,15 +69,42 @@ export function buildExportCompatibilityTuple() {
     providerAdapters: {
       openaiCodex: {
         status: "implemented",
-        sourceFormat: "codex-rollout-jsonl",
-        parserVersion: CODEX_LOG_SCAN_VERSION,
-        adapterVersion: CODEX_METADATA_ADAPTER_VERSION,
+        capabilities: {
+          usageEvents: "implemented",
+          quotaSnapshots: {
+            rollout: "implemented",
+            collector: "implemented",
+          },
+        },
+        sourceFormats: {
+          rollout: {
+            status: "implemented",
+            sourceFormat: "codex-rollout-jsonl",
+            parserVersion: CODEX_LOG_SCAN_VERSION,
+            adapterVersion: CODEX_METADATA_ADAPTER_VERSION,
+          },
+          collectorQuota: {
+            status: "implemented",
+            sourceFormat: "codex-collector-jsonl-v0.3",
+            parserVersion: "codex-collector-quota-candidate-v0.1",
+            adapterVersion: "quota-candidate-normalizer-v0.1",
+          },
+        },
       },
       anthropicClaudeCode: {
-        status: "not_implemented",
-        sourceFormat: null,
-        parserVersion: null,
-        adapterVersion: null,
+        status: "partial",
+        capabilities: {
+          usageEvents: "not_implemented",
+          quotaSnapshots: "implemented",
+        },
+        sourceFormats: {
+          statusLine: {
+            status: "implemented",
+            sourceFormat: "claude-statusline-snapshot-v0.2",
+            parserVersion: "claude-statusline-v0.2",
+            adapterVersion: "quota-candidate-normalizer-v0.1",
+          },
+        },
       },
     },
     registry: {

@@ -39,7 +39,14 @@ test("generated compatibility manifest exactly matches all live contract inputs"
     "usage-event.schema.json",
   ]);
   assert.equal(generated.providerAdapters.openaiCodex.status, "implemented");
-  assert.equal(generated.providerAdapters.anthropicClaudeCode.status, "not_implemented");
+  assert.equal(generated.providerAdapters.openaiCodex.capabilities.usageEvents, "implemented");
+  assert.equal(generated.providerAdapters.openaiCodex.capabilities.quotaSnapshots.rollout, "implemented");
+  assert.equal(generated.providerAdapters.openaiCodex.capabilities.quotaSnapshots.collector, "implemented");
+  assert.equal(generated.providerAdapters.openaiCodex.sourceFormats.collectorQuota.status, "implemented");
+  assert.equal(generated.providerAdapters.anthropicClaudeCode.status, "partial");
+  assert.equal(generated.providerAdapters.anthropicClaudeCode.capabilities.usageEvents, "not_implemented");
+  assert.equal(generated.providerAdapters.anthropicClaudeCode.capabilities.quotaSnapshots, "implemented");
+  assert.equal(generated.providerAdapters.anthropicClaudeCode.sourceFormats.statusLine.status, "implemented");
   assert.equal(generated.contract.transportReady, false);
   assert.equal(generated.contract.externalParticipantsAuthorized, false);
 });
@@ -47,8 +54,8 @@ test("generated compatibility manifest exactly matches all live contract inputs"
 test("executed scanner version is the version embedded in the bundle", async () => {
   const result = await emptyBundle();
   try {
-    assert.equal(result.bundle.compatibility.providerAdapters.openaiCodex.parserVersion, "codex-log-scan-v5");
-    assert.equal(result.receipt.compatibility.providerAdapters.openaiCodex.parserVersion, "codex-log-scan-v5");
+    assert.equal(result.bundle.compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion, "codex-log-scan-v5");
+    assert.equal(result.receipt.compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion, "codex-log-scan-v5");
   } finally {
     await rm(result.home, { recursive: true, force: true });
   }
@@ -66,12 +73,12 @@ test("privacy verification rejects a schema-valid compatibility mutation", async
   }
 });
 
-test("Claude records fail closed until the compatibility tuple declares an implemented adapter", async () => {
+test("a declared partial Claude provider passes when no unsupported record family is observed", async () => {
   const result = await emptyBundle();
   try {
     const mutated = structuredClone(result.bundle);
     mutated.sourceProviders.push("anthropic_claude_code");
-    assert.throws(() => verifyPrivacySafeBundle(mutated), /provider_adapter_compatibility/);
+    assert.equal(verifyPrivacySafeBundle(mutated).verdict, "passed");
   } finally {
     await rm(result.home, { recursive: true, force: true });
   }

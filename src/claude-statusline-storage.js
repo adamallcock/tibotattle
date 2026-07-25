@@ -129,6 +129,92 @@ async function snapshotOwnerDirectory(path) {
   return { dev: stats.dev, ino: stats.ino };
 }
 
+function exportDirectoryIdentity(stats) {
+  return {
+    device: stats.dev,
+    inode: stats.ino,
+    birthtimeMs: Math.trunc(stats.birthtimeMs),
+  };
+}
+
+function matchesExportDirectoryIdentity(stats, expected) {
+  return stats.dev === expected?.device
+    && stats.ino === expected?.inode
+    && Math.trunc(stats.birthtimeMs) === expected?.birthtimeMs;
+}
+
+async function openVerifiedOwnerDirectory(path) {
+  const pathStats = await safeLstat(path, "state_directory_missing");
+  assertOwner(pathStats, "directory", 0o700);
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | NOFOLLOW);
+    const opened = await handle.stat();
+    assertOwner(opened, "directory", 0o700);
+    if (!sameIdentity(pathStats, opened)
+        || Math.trunc(pathStats.birthtimeMs) !== Math.trunc(opened.birthtimeMs)) {
+      fail("state_directory_replaced");
+    }
+    return { handle, stats: opened };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error instanceof ClaudeStatuslineError) throw error;
+    fail("state_directory_replaced");
+  }
+}
+
+/**
+ * Resolve and descriptor-verify the immutable directory boundary used by the
+ * standalone Claude ledger export source. Paths remain local-only source-plan
+ * material and are never returned by the scanner's safe-record batches.
+ */
+export async function inspectClaudeStatusLedgerDirectoriesForExport(stateDirectory) {
+  const root = resolveStateDirectory(stateDirectory);
+  await validateExistingDirectoryChain(root);
+  const recordsDirectory = join(root, "records");
+  await validateExistingDirectoryChain(recordsDirectory);
+  const rootOpened = await openVerifiedOwnerDirectory(root);
+  const recordsOpened = await openVerifiedOwnerDirectory(recordsDirectory);
+  try {
+    const rootStats = await rootOpened.handle.stat();
+    const recordsStats = await recordsOpened.handle.stat();
+    assertOwner(rootStats, "directory", 0o700);
+    assertOwner(recordsStats, "directory", 0o700);
+    const rootPathStats = await safeLstat(root, "state_directory_missing");
+    const recordsPathStats = await safeLstat(recordsDirectory, "state_directory_missing");
+    if (!sameIdentity(rootStats, rootPathStats) || !sameIdentity(recordsStats, recordsPathStats)) {
+      fail("state_directory_replaced");
+    }
+    return {
+      root,
+      recordsDirectory,
+      rootIdentity: exportDirectoryIdentity(rootStats),
+      recordsIdentity: exportDirectoryIdentity(recordsStats),
+    };
+  } finally {
+    await recordsOpened.handle.close().catch(() => {});
+    await rootOpened.handle.close().catch(() => {});
+  }
+}
+
+export async function revalidateClaudeStatusLedgerDirectoriesForExport(boundary) {
+  const current = await inspectClaudeStatusLedgerDirectoriesForExport(boundary?.root);
+  if (current.recordsDirectory !== boundary?.recordsDirectory
+      || !matchesExportDirectoryIdentity({
+        dev: current.rootIdentity.device,
+        ino: current.rootIdentity.inode,
+        birthtimeMs: current.rootIdentity.birthtimeMs,
+      }, boundary?.rootIdentity)
+      || !matchesExportDirectoryIdentity({
+        dev: current.recordsIdentity.device,
+        ino: current.recordsIdentity.inode,
+        birthtimeMs: current.recordsIdentity.birthtimeMs,
+      }, boundary?.recordsIdentity)) {
+    fail("state_directory_replaced");
+  }
+  return current;
+}
+
 async function assertDirectoryIdentity(path, expected) {
   const stats = await safeLstat(path, "state_directory_missing");
   assertOwner(stats, "directory", 0o700);
@@ -222,7 +308,7 @@ function resolveStateDirectory(value) {
   return resolve(value);
 }
 
-async function createLock(stateDirectory, stateIdentity, retryMilliseconds = 2000, failpoint = async () => {}) {
+async function createLock(stateDirectory, stateIdentity, retryMilliseconds = 10_000, failpoint = async () => {}) {
   const lockPath = join(stateDirectory, LOCK_NAME);
   const deadline = Date.now() + retryMilliseconds;
   while (true) {

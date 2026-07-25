@@ -12,6 +12,7 @@ import {
 } from "../src/export-compression.js";
 import { createLocalExportWorkspace } from "../src/export-set-controller.js";
 import {
+  combinedSourcePlanCommitment,
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
   ExportSetError,
@@ -55,11 +56,18 @@ function usage(input, output, cached, reasoning) {
   };
 }
 
-async function fixture({ completeWorkspace = true, empty = false, resourceLimits = {} } = {}) {
+async function fixture({
+  completeWorkspace = true,
+  empty = false,
+  resourceLimits = {},
+  collectorContents = null,
+  codexHome = null,
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-materializer-"));
-  const home = join(root, "codex-home");
+  const home = codexHome ?? join(root, "codex-home");
   const workspace = join(root, "workspace");
   const output = join(root, "output");
+  const collectorPath = collectorContents === null ? null : join(root, "collector.jsonl");
   await mkdir(join(home, "sessions"), { recursive: true });
   await mkdir(join(home, "archived_sessions"), { recursive: true });
   const first = usage(100, 20, 40, 8);
@@ -97,6 +105,7 @@ async function fixture({ completeWorkspace = true, empty = false, resourceLimits
     ]),
   ];
   await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-00-materializer.jsonl"), `${lines.join("\n")}\n`);
+  if (collectorPath !== null) await writeFile(collectorPath, collectorContents, { mode: 0o600 });
   if (completeWorkspace) {
     await createLocalExportWorkspace({
       directory: workspace,
@@ -106,6 +115,7 @@ async function fixture({ completeWorkspace = true, empty = false, resourceLimits
       codexHome: home,
       secret: SECRET,
       resourceLimits,
+      ...(collectorPath === null ? {} : { collectorPath }),
     });
   } else {
     await assert.rejects(createLocalExportWorkspace({
@@ -116,12 +126,13 @@ async function fixture({ completeWorkspace = true, empty = false, resourceLimits
       codexHome: home,
       secret: SECRET,
       resourceLimits,
+      ...(collectorPath === null ? {} : { collectorPath }),
       async failpoint(stage) {
         if (stage === "after_record_batch") throw new Error("leave workspace incomplete");
       },
     }), /leave workspace incomplete/);
   }
-  return { root, home, workspace, output };
+  return { root, home, workspace, output, collectorPath };
 }
 
 test("materializer publishes deterministic independently verifiable chunks and a complete manifest", async () => {
@@ -364,6 +375,94 @@ test("logical records and source-plan digest are invariant to deterministic chun
     assert.deepEqual(one.manifest.totals.recordCounts, three.manifest.totals.recordCounts);
     assert.notEqual(one.manifest.exportSetId, three.manifest.exportSetId);
     assert.notEqual(one.manifest.chunks.length, three.manifest.chunks.length);
+  } finally {
+    await rm(first.root, { recursive: true, force: true });
+    await rm(second.root, { recursive: true, force: true });
+  }
+});
+
+test("combined source-plan commitment frames both digests and totals", () => {
+  const codexDigest = "a".repeat(64);
+  const supplementalDigest = "b".repeat(64);
+  const commitment = combinedSourcePlanCommitment({
+    sourcePlan: {
+      sourcePlanSha256: codexDigest,
+      sourceFiles: 3,
+      sourceBytes: 1_024,
+    },
+    supplementalSourcePlan: {
+      supplementalSourcePlanSha256: supplementalDigest,
+      sourceFiles: 5,
+      sourceBytes: 2_048,
+    },
+  });
+  assert.deepEqual(commitment, {
+    sha256: "5534f26efdb1f4ae693ed569e8c24f16a791953dfde475534fe6fb2bf820451d",
+    sourceFiles: 8,
+    sourceBytes: 3_072,
+  });
+  assert.notEqual(commitment.sha256, combinedSourcePlanCommitment({
+    sourcePlan: {
+      sourcePlanSha256: codexDigest,
+      sourceFiles: 3,
+      sourceBytes: 1_024,
+    },
+    supplementalSourcePlan: {
+      supplementalSourcePlanSha256: "c".repeat(64),
+      sourceFiles: 5,
+      sourceBytes: 2_048,
+    },
+  }).sha256);
+});
+
+test("materializer binds supplemental source commitments into set and bundle identities", async () => {
+  const first = await fixture({ collectorContents: "" });
+  const second = await fixture({ collectorContents: "", codexHome: first.home });
+  try {
+    const firstResult = await materializeLocalExportSet({
+      workspaceDirectory: first.workspace,
+      outputDirectory: first.output,
+      secret: SECRET,
+      maximumRecordsPerChunk: 2,
+    });
+    const secondResult = await materializeLocalExportSet({
+      workspaceDirectory: second.workspace,
+      outputDirectory: second.output,
+      secret: SECRET,
+      maximumRecordsPerChunk: 2,
+    });
+    assert.equal(firstResult.manifest.totals.logicalRecordsSha256, secondResult.manifest.totals.logicalRecordsSha256);
+    const firstWorkspace = await openExportWorkspace({ directory: first.workspace });
+    const secondWorkspace = await openExportWorkspace({ directory: second.workspace });
+    let firstDescriptor;
+    let secondDescriptor;
+    try {
+      firstDescriptor = firstWorkspace.getDescriptor();
+      secondDescriptor = secondWorkspace.getDescriptor();
+    } finally {
+      firstWorkspace.close();
+      secondWorkspace.close();
+    }
+    assert.equal(firstDescriptor.sourcePlan.sourcePlanSha256, secondDescriptor.sourcePlan.sourcePlanSha256);
+    assert.notEqual(
+      firstDescriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
+      secondDescriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
+    );
+    assert.notEqual(firstResult.manifest.sourcePlan.sha256, secondResult.manifest.sourcePlan.sha256);
+    assert.notEqual(firstResult.manifest.exportSetId, secondResult.manifest.exportSetId);
+    assert.notEqual(firstResult.manifest.chunks[0].bundleId, secondResult.manifest.chunks[0].bundleId);
+    for (const [result, descriptor] of [
+      [firstResult, firstDescriptor],
+      [secondResult, secondDescriptor],
+    ]) {
+      assert.deepEqual(result.manifest.sourcePlan, {
+        sha256: combinedSourcePlanCommitment(descriptor).sha256,
+        sourceFiles: descriptor.sourcePlan.sourceFiles + descriptor.supplementalSourcePlan.sourceFiles,
+        sourceBytes: descriptor.sourcePlan.sourceBytes + descriptor.supplementalSourcePlan.sourceBytes,
+      });
+    }
+    assert.equal((await verifyLocalExportSet({ directory: first.output })).verdict, "passed");
+    assert.equal((await verifyLocalExportSet({ directory: second.output })).verdict, "passed");
   } finally {
     await rm(first.root, { recursive: true, force: true });
     await rm(second.root, { recursive: true, force: true });
