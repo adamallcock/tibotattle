@@ -1,0 +1,179 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/provider-accounting-snapshot-v0.1.schema.json",
+  "title": "Local-only provider accounting snapshot",
+  "description": "A content-free, account-scoped local observation of provider-authoritative accounting values. This artifact is not an outbound telemetry record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "artifactScope",
+    "transportReady",
+    "provider",
+    "observedAt",
+    "capturedAt",
+    "captureStatus",
+    "account",
+    "plan",
+    "authority",
+    "periods",
+    "diagnostics"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "provider-accounting-snapshot-v0.1" },
+    "artifactScope": { "const": "local_only" },
+    "transportReady": { "const": false },
+    "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
+    "observedAt": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$", "maxLength": 32 },
+    "capturedAt": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$", "maxLength": 32 },
+    "captureStatus": {
+      "enum": [
+        "accepted",
+        "accepted_partial",
+        "rejected_unsupported_provider_version",
+        "rejected_provider_schema_drift"
+      ]
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "accountScopeId", "reason"],
+      "properties": {
+        "status": { "enum": ["attributed", "unattributed"] },
+        "accountScopeId": {
+          "type": "string",
+          "pattern": "^(unattributed|account:v1:[a-f0-9]{64}|openai-account:v1:[A-Za-z0-9_-]{43})$"
+        },
+        "reason": {
+          "enum": [
+            "stable_observation",
+            "account_switch_boundary",
+            "missing_account_observation",
+            "credential_locked",
+            "credential_unavailable",
+            "provider_did_not_expose_account"
+          ]
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "type", "variant"],
+      "properties": {
+        "availability": { "enum": ["provider_reported", "not_exposed", "unavailable"] },
+        "type": {
+          "enum": ["free", "go", "plus", "pro", "max", "team", "business", "enterprise", "edu", "unknown"]
+        },
+        "variant": {
+          "enum": ["standard", "pro_5x", "pro_10x_promo", "pro_20x", "max_5x", "max_20x", "unknown"]
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "valueAuthority",
+        "source",
+        "sourceSurface",
+        "providerPayloadVersion",
+        "extractionVersion",
+        "contentRetained",
+        "rawPayloadRetained"
+      ],
+      "properties": {
+        "valueAuthority": { "const": "provider_issued" },
+        "source": {
+          "enum": ["provider_api", "provider_account_endpoint", "provider_status_line", "provider_dashboard", "provider_notification", "provider_rollout_metadata"]
+        },
+        "sourceSurface": {
+          "enum": ["codex_app_server", "codex_rollout", "codex_usage_page", "claude_status_line", "claude_api", "claude_usage_page"]
+        },
+        "providerPayloadVersion": {
+          "enum": ["openai_provider_accounting_v1", "anthropic_provider_accounting_v1", "unsupported"]
+        },
+        "extractionVersion": { "const": "provider-accounting-extractor-v0.1" },
+        "contentRetained": { "const": false },
+        "rawPayloadRetained": { "const": false }
+      }
+    },
+    "periods": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "windowKind",
+          "limitId",
+          "providerWindowRef",
+          "durationMinutes",
+          "startedAt",
+          "endsAt",
+          "resetsAt",
+          "measurements"
+        ],
+        "properties": {
+          "windowKind": { "enum": ["five_hour", "seven_day", "daily", "monthly", "lifetime", "rolling", "credit_balance", "unknown"] },
+          "limitId": { "enum": ["codex", "codex_spark", "claude_general", "extra_usage", "provider_total", "unknown"] },
+          "providerWindowRef": {
+            "type": ["string", "null"],
+            "pattern": "^provider-window:v1:[a-f0-9]{64}$"
+          },
+          "durationMinutes": { "type": ["integer", "null"], "minimum": 1, "maximum": 525600 },
+          "startedAt": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$", "maxLength": 32 },
+          "endsAt": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$", "maxLength": 32 },
+          "resetsAt": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$", "maxLength": 32 },
+          "measurements": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["metric", "unit", "value", "availability", "precision"],
+              "properties": {
+                "metric": {
+                  "enum": [
+                    "usage_percent",
+                    "remaining_percent",
+                    "tokens_used",
+                    "tokens_remaining",
+                    "requests_used",
+                    "requests_remaining",
+                    "credits_used",
+                    "credits_remaining",
+                    "spend_usd",
+                    "connected_voice_minutes_used"
+                  ]
+                },
+                "unit": { "enum": ["percent", "tokens", "requests", "credits", "usd", "minutes"] },
+                "value": { "type": ["number", "null"], "minimum": 0, "maximum": 1000000000000000 },
+                "availability": { "enum": ["provider_reported", "not_exposed", "unavailable", "not_applicable"] },
+                "precision": { "enum": ["exact", "provider_rounded_integer", "provider_rounded_decimal_1", "provider_rounded_decimal_2", "unknown"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "account_switch_boundary",
+          "unattributed_gap",
+          "partial_provider_snapshot",
+          "provider_value_unavailable",
+          "provider_window_identifier_unavailable",
+          "unsupported_provider_version",
+          "provider_schema_drift",
+          "no_provider_authoritative_values"
+        ]
+      }
+    }
+  }
+}

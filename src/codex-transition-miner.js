@@ -1,11 +1,11 @@
-import { calculateCost, compilePriceCatalog, resolvePriceCatalog } from "runcost";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
 import { fastQuotaMultiplier, subscriptionSpeedSensitivity, unknownCodexTier } from "./tier-semantics.js";
-import { addOfficialOpenAiPriceSupplements } from "./openai-api-price-supplements.js";
+import { addUsdStrings } from "./cost-ledger.js";
+import { apiPriceResolutionSummary, costWarningCodes, priceCodexUsageEvent } from "./local-api-pricing.js";
 
 const SCHEMA_VERSION = "0.3";
 export const PARSER_VERSION = "0.3.2";
-const ESTIMATOR_VERSION = "runcost-api-price-v0.3";
+const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.1";
 const COMPONENT_NAMES = [
   "input_uncached_tokens",
   "input_cache_read_tokens",
@@ -26,36 +26,23 @@ function roundUsd(value) {
   return Math.round((value + Number.EPSILON) * 1e12) / 1e12;
 }
 
-function priceUsageEvent(event, catalog) {
-  const usageLedger = {
-    schema_version: "0.1",
-    provider: "openai",
-    surface: "openai.responses",
-    model: { requested: event.model },
-    context: {
-      total_input_tokens: event.raw.input_tokens,
-      priced_at: event.timestamp,
-      service_tier: "standard",
-    },
-    components: Object.entries(event.components).filter(([, quantity]) => quantity > 0).map(([name, quantity]) => ({
-      name,
-      quantity: String(quantity),
-      unit: "token",
-    })),
-  };
-  const ledger = calculateCost({ usageLedger, priceCards: catalog, mode: "compatibility" });
-  const costUsd = Number(ledger.total);
+function priceUsageEvent(event, priceCards) {
+  const ledger = priceCodexUsageEvent(event, { priceCards });
+  const costUsd = Number(ledger.totalUsd);
   const multiplier = fastQuotaMultiplier(event.model);
   const fastWeightedEquivalentUsd = multiplier === null ? null : costUsd * multiplier;
   const speedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
   return {
     ...event,
     costUsd,
+    costUsdExact: ledger.totalUsd,
+    pricingCoverageStatus: ledger.coverageStatus,
     fastWeightedEquivalentUsd,
     quotaWeightedLowerUsd: speedMode === "fast" ? fastWeightedEquivalentUsd : costUsd,
     quotaWeightedUpperUsd: speedMode === "standard" ? costUsd : fastWeightedEquivalentUsd,
-    warningCodes: ledger.warnings.map((warning) => warning.code).sort(),
-    priceCardIds: [...new Set(ledger.components.map((component) => component.price_card_id).filter(Boolean))].sort(),
+    warningCodes: costWarningCodes(ledger),
+    coverageWarningCodes: ledger.warnings.coverage.map((warning) => warning.code).sort(),
+    priceCardIds: ledger.selectedPriceCardIds,
   };
 }
 
@@ -83,7 +70,7 @@ function aggregateUsage(events, startExclusiveMs, endInclusiveMs) {
     const event = events[index];
     addComponents(components, event.components);
     costUsd += event.costUsd;
-    for (const warning of event.warningCodes) pricingWarnings.add(warning);
+    for (const warning of event.coverageWarningCodes) pricingWarnings.add(warning);
     for (const id of event.priceCardIds) priceCardIds.add(id);
     const speedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
     tierUsageEventCounts[speedMode] = (tierUsageEventCounts[speedMode] ?? 0) + 1;
@@ -420,16 +407,7 @@ export async function mineCodexTransitions({
   if (!Number.isFinite(scanStartMs) || !Number.isFinite(scanEndMs) || scanEndMs < scanStartMs) {
     throw new Error("startAt and endAt must define a valid chronological interval");
   }
-  const baseResolution = priceCards
-    ? {
-        selected_source: "provided",
-        price_cards: priceCards,
-        sources: [{ name: "provided", status: "selected", card_count: priceCards.length, selected: true }],
-        warnings: [],
-      }
-    : await resolvePriceCatalog({ provider: "openai", offline });
-  const resolution = priceCards ? baseResolution : addOfficialOpenAiPriceSupplements(baseResolution);
-  const catalog = compilePriceCatalog(resolution.price_cards);
+  const priceResolution = apiPriceResolutionSummary({ priceCards });
   const rawUsageEvents = [];
   const snapshots = [];
   const toolEvents = [];
@@ -453,12 +431,14 @@ export async function mineCodexTransitions({
   snapshots.sort((left, right) => left.timestampMs - right.timestampMs || left.sequence - right.sequence);
   toolEvents.sort((left, right) => left.timestampMs - right.timestampMs || left.sequence - right.sequence);
   let cumulativeScanCostUsd = 0;
+  let cumulativeScanCostUsdExact = "0";
   let cumulativeQuotaWeightedLowerUsd = 0;
   let cumulativeQuotaWeightedUpperUsd = 0;
   let quotaWeightedSensitivityComplete = true;
   const usageEvents = rawUsageEvents.map((event) => {
-    const priced = priceUsageEvent(event, catalog);
+    const priced = priceUsageEvent(event, priceCards);
     cumulativeScanCostUsd = roundUsd(cumulativeScanCostUsd + priced.costUsd);
+    cumulativeScanCostUsdExact = addUsdStrings(cumulativeScanCostUsdExact, priced.costUsdExact);
     if (!Number.isFinite(priced.quotaWeightedLowerUsd) || !Number.isFinite(priced.quotaWeightedUpperUsd)) {
       quotaWeightedSensitivityComplete = false;
     } else {
@@ -468,6 +448,7 @@ export async function mineCodexTransitions({
     return {
       ...priced,
       cumulativeScanCostUsd,
+      cumulativeScanCostUsdExact,
       cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete ? cumulativeQuotaWeightedLowerUsd : null,
       cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete ? cumulativeQuotaWeightedUpperUsd : null,
     };
@@ -480,8 +461,9 @@ export async function mineCodexTransitions({
     diagnostics: scanned.diagnostics,
     includeSnapshotIntervals,
   });
-  const pricedEvents = usageEvents.filter((event) => event.warningCodes.length === 0).length;
-  const partiallyPricedEvents = usageEvents.length - pricedEvents;
+  const pricedEvents = usageEvents.filter((event) => event.pricingCoverageStatus === "fully_priced").length;
+  const partiallyPricedEvents = usageEvents.filter((event) => event.pricingCoverageStatus === "partially_priced").length;
+  const unpricedEvents = usageEvents.filter((event) => event.pricingCoverageStatus === "unpriced").length;
   const warningCounts = {};
   for (const event of usageEvents) {
     for (const warning of event.warningCodes) warningCounts[warning] = (warningCounts[warning] ?? 0) + 1;
@@ -496,7 +478,7 @@ export async function mineCodexTransitions({
     costSummary.costUsd += event.costUsd;
     const components = tokenComponentsByModel[event.model] ??= emptyComponents();
     addComponents(components, event.components);
-    if (event.warningCodes.length > 0 || event.priceCardIds.length === 0) unpricedModels.add(event.model);
+    if (event.pricingCoverageStatus !== "fully_priced" || event.priceCardIds.length === 0) unpricedModels.add(event.model);
   }
   for (const summary of Object.values(costByModel)) summary.costUsd = roundUsd(summary.costUsd);
 
@@ -533,16 +515,19 @@ export async function mineCodexTransitions({
         thresholdTokens: 272000,
       },
       estimatorVersion: ESTIMATOR_VERSION,
-      selectedSource: resolution.selected_source,
-      sources: resolution.sources.map((source) => ({
-        name: source.name,
-        status: source.status,
-        url: source.url ?? source.resolved_url ?? null,
-        retrievedAt: source.retrieved_at ?? null,
-        cardCount: source.card_count,
-        selected: source.selected ?? false,
+      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+      currentPriceSensitivityTotalUsdExact: cumulativeScanCostUsdExact,
+      selectedSource: priceResolution.selectedSource,
+      registry: priceResolution.registry,
+      sources: priceResolution.registry.sources.map((source) => ({
+        name: source.evidenceVersion,
+        status: "selected",
+        url: source.url,
+        retrievedAt: source.observedAt,
+        cardCount: null,
+        selected: true,
       })),
-      resolutionWarnings: resolution.warnings.map((warning) => warning.code).sort(),
+      resolutionWarnings: [],
       eventWarningCounts: warningCounts,
     },
     summary: {
@@ -550,6 +535,7 @@ export async function mineCodexTransitions({
       usageEvents: usageEvents.length,
       pricedEvents,
       partiallyPricedEvents,
+      unpricedEvents,
       rawRateLimitSnapshots: scanned.diagnostics.rateLimitSnapshots,
       deduplicatedRateLimitSnapshots: collapsed.deduplicatedSnapshotCount,
       resetGroups: collapsed.windowGroupCount,

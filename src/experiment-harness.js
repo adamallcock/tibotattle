@@ -3,12 +3,11 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { calculateCost, compilePriceCatalog, resolvePriceCatalog } from "runcost";
 import { findCodexBinary, readCodexAccountSnapshot, sanitizeCodexAccountSnapshot } from "./codex-app-server.js";
 import { scanAndPriceCodexLogs, scanCodexLogEvents } from "./codex-log-scan.js";
 import { stableJson } from "./storage.js";
 import { subscriptionSpeedSensitivity, validateTierDeclaration } from "./tier-semantics.js";
-import { addOfficialOpenAiPriceSupplements } from "./openai-api-price-supplements.js";
+import { apiPriceResolutionSummary, costWarningCodes, priceCodexUsageEvent } from "./local-api-pricing.js";
 
 const MANIFEST_SCHEMA_VERSION = "0.3";
 const RESULT_SCHEMA_VERSION = "0.3";
@@ -90,54 +89,31 @@ function projectedComponents(manifest) {
 }
 
 async function priceProjection(manifest, { offline, priceCards }) {
-  const baseResolution = priceCards
-    ? {
-        selected_source: "provided",
-        price_cards: priceCards,
-        sources: [{ name: "provided", status: "selected", card_count: priceCards.length, selected: true }],
-        warnings: [],
-      }
-    : await resolvePriceCatalog({ provider: "openai", offline });
-  const resolution = priceCards ? baseResolution : addOfficialOpenAiPriceSupplements(baseResolution);
   const components = projectedComponents(manifest);
   const inputTotal = components.input_uncached_tokens + components.input_cache_read_tokens + components.input_cache_write_tokens;
-  const ledger = calculateCost({
-    usageLedger: {
-      schema_version: "0.1",
-      provider: "openai",
-      surface: "openai.responses",
-      model: { requested: manifest.model },
-      context: { total_input_tokens: inputTotal, priced_at: new Date().toISOString(), service_tier: "standard" },
-      components: Object.entries(components).filter(([, quantity]) => quantity > 0).map(([name, quantity]) => ({ name, quantity: String(quantity), unit: "token" })),
-    },
-    priceCards: compilePriceCatalog(resolution.price_cards),
-    mode: "compatibility",
-  });
-  return {
-    totalUsd: Number(ledger.total),
+  const priced = priceCodexUsageEvent({
+    timestamp: new Date().toISOString(),
+    model: manifest.model,
+    raw: { input_tokens: inputTotal },
     components,
-    warningCodes: ledger.warnings.map((warning) => warning.code).sort(),
-    priceCardIds: [...new Set(ledger.components.map((component) => component.price_card_id).filter(Boolean))].sort(),
-    priceResolution: {
-      selectedSource: resolution.selected_source,
-      sources: resolution.sources.map((source) => ({
-        name: source.name,
-        status: source.status,
-        url: source.url ?? source.resolved_url ?? null,
-        retrievedAt: source.retrieved_at ?? null,
-        cardCount: source.card_count,
-        selected: source.selected ?? false,
-      })),
-      warnings: resolution.warnings.map((warning) => warning.code).sort(),
-      serviceTier: {
-        observed: null,
-        apiPriceAssumption: "standard",
-        reason: "The controlled Codex manifest does not expose an API service tier; standard is an explicit counterfactual pricing assumption.",
-      },
-    },
+    componentAvailability: Object.fromEntries(Object.keys(components).map((name) => [name, true])),
+  }, {
+    priceCards,
+  });
+  const warningCodes = costWarningCodes(priced);
+  const coverageWarningCodes = priced.warnings.coverage.map((warning) => warning.code).sort();
+  return {
+    totalUsd: Number(priced.totalUsd),
+    totalUsdExact: priced.totalUsd,
+    components,
+    coverageStatus: priced.coverageStatus,
+    warningCodes,
+    coverageWarningCodes,
+    priceCardIds: priced.selectedPriceCardIds,
+    priceResolution: apiPriceResolutionSummary({ priceCards }),
     tierSemantics: manifest.tierDeclaration,
     subscriptionSpeedSensitivity: subscriptionSpeedSensitivity({
-      [manifest.model]: { costUsd: Number(ledger.total) },
+      [manifest.model]: { costUsd: Number(priced.totalUsd) },
     }, manifest.tierDeclaration.codexSpeedMode),
   };
 }
@@ -161,7 +137,7 @@ function canonicalWindows(snapshot, capturedAt) {
 
 function preflightStops(manifest, projection, windows) {
   const stops = [];
-  if (projection.warningCodes.length > 0) stops.push("pricing_warning");
+  if (projection.coverageWarningCodes.length > 0) stops.push("pricing_warning");
   if (projection.totalUsd > manifest.budgets.maximumApiPricedUsd) stops.push("projected_api_price_budget_exceeded");
   if (windows.length === 0) stops.push("quota_window_unavailable");
   for (const window of windows) {

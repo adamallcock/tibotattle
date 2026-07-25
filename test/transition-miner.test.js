@@ -220,7 +220,8 @@ test("unknown model usage remains explicit and unpriced", async () => {
   const home = await fixtureHome(lines);
   try {
     const dataset = await mineCodexTransitions({ ...RANGE, codexHome: home });
-    assert.equal(dataset.summary.partiallyPricedEvents, 2);
+    assert.equal(dataset.summary.partiallyPricedEvents, 0);
+    assert.equal(dataset.summary.unpricedEvents, 2);
     assert.equal(dataset.transitions[0].modelMix["gpt-not-priced"].events, 1);
     assert.ok(dataset.transitions[0].quality.pricingWarnings.length > 0);
     assert.equal(dataset.transitions[0].marginalApiPricedUsd, 0);

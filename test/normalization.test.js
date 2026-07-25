@@ -433,6 +433,11 @@ test("forked cumulative snapshots are excluded while new fork usage is retained"
     const parent = [
       JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "session_meta", payload: { id: "controller-parent-secret" } }),
       JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "turn_context", payload: { model: "gpt-test" } }),
+      JSON.stringify({
+        timestamp: "2026-07-23T00:00:00.500Z",
+        type: "response_item",
+        payload: { type: "web_search_call", id: "provider-web-search-unit" },
+      }),
       record("2026-07-23T00:00:01.000Z", usage(100), usage(100)),
     ].join("\n");
     const fork = [
@@ -462,11 +467,47 @@ test("forked cumulative snapshots are excluded while new fork usage is retained"
           url: "https://example.invalid/pricing",
           retrieved_at: "2026-07-23T00:00:00.000Z",
         },
+      }, {
+        schema_version: "0.1",
+        id: "openai:provider-tools:test",
+        provider: "openai",
+        model: "openai-provider-tools",
+        service_tier: "standard",
+        components: [{
+          usage_component: "web_search_units",
+          unit: "search",
+          price: { amount: "10", currency: "USD", per: "1000" },
+        }],
+        source: {
+          name: "test",
+          url: "https://example.invalid/pricing",
+          retrieved_at: "2026-07-23T00:00:00.000Z",
+        },
       }],
     });
     assert.equal(result.eventCount, 2);
     assert.equal(result.totalTokens, 160);
-    assert.equal(result.runcost.totalUsd, 160);
+    assert.equal(result.runcost.totalUsd, 160.01);
+    assert.equal(result.runcost.totalUsdExact, "160.01");
+    assert.equal(result.runcost.tokenCostUsdExact, "160");
+    assert.equal(result.runcost.providerToolCostUsdExact, "0.01");
+    assert.equal(result.runcost.byModel["gpt-test"].costUsdExact, "160.01");
+    assert.equal(result.runcost.byModel["gpt-test"].providerToolCostUsdExact, "0.01");
+    assert.deepEqual(result.runcost.byModel["gpt-test"].providerToolUnits, {
+      responses_web_search_call: 1,
+    });
+    assert.equal(
+      Object.values(result.bySurface).reduce((sum, row) => sum + row.totalUsd, 0),
+      result.runcost.totalUsd,
+    );
+    assert.equal(Object.values(result.bySurface)[0].totalUsdExact, "160.01");
+    assert.equal(
+      result.daily.reduce((sum, row) => sum + row.totalUsd, 0),
+      result.runcost.totalUsd,
+    );
+    assert.equal(result.daily[0].totalUsdExact, "160.01");
+    assert.equal(result.daily[0].byModel["gpt-test"].costUsdExact, "160.01");
+    assert.equal(result.daily[0].providerToolObservationCount, 1);
     assert.equal(result.runcost.priceResolution.serviceTier.observed, null);
     assert.equal(result.runcost.priceResolution.serviceTier.apiPriceAssumption, "standard");
     assert.equal(result.diagnostics.forkReplayEventsSkipped, 1);
