@@ -26,7 +26,7 @@ This is a verified G1-R3 slice, not G1-R3 completion, G1 completion, or authoriz
 
 ## Automated evidence
 
-- Full serial repository suite: 327 passed, 0 failed.
+- Full serial repository suite after the heavy-history fixes: 329 passed, 0 failed.
 - Telemetry generation and contract suite: current at 151 reviewed fields; 9 passed, 0 failed.
 - Exact checkpoint/legacy parity covers recognized and invalid models, missing token components, out-of-order tiers, malformed input, quota-plus-usage lines, parent/child cumulative replay, tools, tasks, line batches of one and two, and multiple interruption positions.
 - A literal logical-record SHA-256 golden is checked independently of current-run equality.
@@ -53,6 +53,21 @@ A fresh isolated run used one real 151,713,646-byte Codex rollout:
 
 The isolated source matched the earlier legacy/checkpoint record-count comparison. All temporary source copies, workspaces, output chunks, and the earlier incomplete full-history smoke workspace were deleted after inspection; they were never transmitted.
 
+The current scanner was then exercised against the complete bounded 30-day local Codex history, directly from the local Codex source tree without copying raw logs:
+
+- frozen source plan: 1,349 files and 21,558,342,764 source bytes;
+- final safe records: 395,520 total (156,432 usage and 239,088 quota; no activity markers);
+- recovered resume wall time: 253.497 seconds after an earlier interrupted attempt;
+- cumulative durable elapsed work: 418.776 seconds;
+- durable physical-line work: 5,024,384 lines;
+- oversized irrelevant lines streamed away: 382;
+- durable expanded safe-record bytes: 352,910,605;
+- observed peak RSS high water: 571,211,776 bytes;
+- final local workspace size: 970,162,176 bytes; and
+- persisted workspace high water after close: 973,696,200 bytes.
+
+The first attempt revealed two defects rather than a corrupt checkpoint. The bounded line reader handed a caller-owned descriptor to a stream whose exception teardown closed it, so post-read verification replaced the original resource error with `EBADF`. The underlying oversized line was irrelevant metadata, but a broad bare-substring `tool_call` prefilter incorrectly treated arbitrary prose as a relevant tool record. The reader now performs positional reads without taking ownership of caller descriptors, preserves the original exception, and recognizes canonical compact Codex JSONL discriminators such as `"type":"function_call"` rather than value-only substrings. Checkpoint scan v0.2 and legacy Codex scan v5 compatibility-bind this change so incomplete older workspaces cannot mix scanner semantics. The same durable checkpoint then resumed and completed without duplicate records. Focused regressions cover descriptor survival, cross-chunk structural marker detection, unrelated fields with tool-like values, and arbitrary tool-like prose.
+
 ## Independent audit disposition
 
 Three focused subagent passes audited workspace correctness, scanner/resource behavior, and crash/test evidence. Their findings drove copied-tool replay handling, durable final invocation accounting, lineage digest binding, EOF transition proof, exact schema hashing, source poisoning, checkpoint scan compatibility, index/query fixes, transaction ceilings, real `SIGKILL` recovery, populated-state privacy scans, stronger default-batch heap cases, persisted materializer limits, and empty-set pre-publication enforcement.
@@ -61,11 +76,10 @@ The final workspace/materializer audit reported its blockers closed. The scanner
 
 ## Explicit remaining blockers
 
-This receipt deliberately does not claim the full heavy-history gate:
+The full 30-day heavy-history gate has passed, but this receipt deliberately does not claim G1-R3 or G1 completion:
 
-1. An earlier 1,404-source, approximately 21.7 GB smoke under an older 256-line checkpoint default ran for 240.84 seconds and then encountered `EBADF`. The exact failure was not reproduced on the isolated large source and has not been proven resolved across the full current history. A clean current-code multi-source benchmark remains required.
-2. Resume still re-discovers and cryptographically verifies frozen source prefixes. Parsing resumes at the checkpoint, but source-integrity hashing still reads source bytes and its amplification must be measured on the full history.
-3. Fresh-process crash coverage now proves a real record-batch kill, but the complete matrix still needs tier-only, tier-to-record, pending-model/tool/task, parent-child boundary, source-complete-before-finalize, activity-marker, and materializer transaction boundaries.
-4. The heap gates cover substantial fixed scales, not a measured asymptotic slope or every configured maximum. Near-ceiling open-task, maximum relevant-line, deeper fork, and many-source cases remain.
-5. Source-specific deletion/recovery, canonical compression and bomb limits, pilot-derived ceilings, native platform secret stores, Claude parity, prospective account-scoped quota evidence, signed clean-machine distribution, and two local-only volunteer reviews remain open before G1.
-6. Every cloud and multi-user stage—consent, enrollment, encryption, ingestion, quarantine, canonical storage, personal results, disclosure-controlled aggregation, publication, ongoing collection, participant deletion, and incident operations—remains closed and pending.
+1. Resume still re-discovers and cryptographically verifies frozen source prefixes. The full run proves correctness at 21.56 GB, but also confirms that integrity hashing remains a material source-read cost; incremental verification or a measured trust/cache design remains an optimization target and may not weaken mutation detection.
+2. Fresh-process crash coverage proves a real record-batch kill and recovery, but the complete matrix still needs tier-only, tier-to-record, pending-model/tool/task, parent-child boundary, source-complete-before-finalize, activity-marker, and materializer transaction boundaries.
+3. The heap gates cover substantial fixed scales and the full history remained below the configured RSS ceiling, but they do not establish an asymptotic slope or exercise every configured maximum. Near-ceiling open-task, maximum relevant-line, deeper fork, and many-source cases remain.
+4. Source-specific deletion/recovery, canonical compression and bomb limits, pilot-derived ceilings, native platform secret stores, Claude parity, prospective account-scoped quota evidence, signed clean-machine distribution, and two local-only volunteer reviews remain open before G1.
+5. Every cloud and multi-user stage—consent, enrollment, encryption, ingestion, quarantine, canonical storage, personal results, disclosure-controlled aggregation, publication, ongoing collection, participant deletion, and incident operations—remains closed and pending.

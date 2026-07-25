@@ -233,6 +233,55 @@ test("checkpoint lineage excludes copied parent tool calls from child usage", as
   }
 });
 
+test("checkpoint scanner streams oversized message text containing tool-like prose", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-checkpoint-oversized-prose-"));
+  const home = join(root, "codex-home");
+  await mkdir(join(home, "sessions"), { recursive: true });
+  await mkdir(join(home, "archived_sessions"), { recursive: true });
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "PRIVATE_OVERSIZED" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.010Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    JSON.stringify({
+      timestamp: "2026-07-24T12:00:30.000Z",
+      type: "event_msg",
+      payload: {
+        type: "other",
+        unrelatedKind: "function_call",
+        content: `${"x".repeat(2_000)} tool_call and literal \"type\":\"function_call\" prose`,
+      },
+    }),
+    tokenCount(
+      "2026-07-24T12:01:00.000Z",
+      usage({ input: 10, output: 2, total: 12 }),
+      usage({ input: 10, output: 2, total: 12 }),
+      1,
+    ),
+  ];
+  await writeFile(
+    join(home, "sessions", "rollout-2026-07-24T12-00-00-oversized-prose.jsonl"),
+    `${lines.join("\n")}\n`,
+  );
+  try {
+    const result = await createLocalExportWorkspace({
+      directory: join(root, "workspace"),
+      startAt: START_AT,
+      endAt: END_AT,
+      createdAt: "2026-07-24T12:10:00.000Z",
+      codexHome: home,
+      secret: SECRET,
+      resourceLimits: { maximumLineBytes: 1_000 },
+    });
+    assert.deepEqual(result.status.recordCounts, {
+      usageEvents: 1,
+      quotaSnapshots: 2,
+      activityMarkers: 0,
+    });
+    assert.equal(result.resourceUsage.counters.oversizedIrrelevantLines, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("dense token lines flush at the 1,000-record transaction boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-checkpoint-dense-"));
   const home = join(root, "codex-home");

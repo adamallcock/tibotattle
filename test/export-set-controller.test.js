@@ -9,7 +9,7 @@ import {
   inspectLocalExportWorkspace,
   resumeLocalExportWorkspace,
 } from "../src/export-set-controller.js";
-import { ExportWorkspaceError } from "../src/export-workspace.js";
+import { ExportWorkspaceError, openExportWorkspace } from "../src/export-workspace.js";
 
 const SECRET = Buffer.alloc(32, 53);
 
@@ -70,6 +70,17 @@ test("controller creates a complete bounded workspace from frozen source prefixe
     });
     assert.equal(result.status.scanComplete, true);
     assert.equal(result.resourceUsage.scope, "export_set");
+    assert.ok(result.resourceUsage.workspaceHighWaterBytes >= result.status.workspaceBytes);
+    assert.ok(result.resourceUsage.counters.workspaceBytes >= result.status.workspaceBytes);
+    const persisted = await openExportWorkspace({ directory: value.workspace });
+    try {
+      assert.equal(
+        result.resourceUsage.workspaceHighWaterBytes,
+        persisted.resourceUsage().workspaceHighWaterBytes,
+      );
+    } finally {
+      persisted.close();
+    }
     const inspected = await inspectLocalExportWorkspace({ directory: value.workspace });
     assert.equal(inspected.sourcePlan.sourceFiles, 1);
     assert.equal(inspected.scanComplete, true);
@@ -105,6 +116,16 @@ test("controller resumes an interrupted record batch without duplication", async
     });
     assert.equal(resumed.status.scanComplete, true);
     assert.deepEqual(resumed.status.recordCounts, incomplete.recordCounts);
+    assert.ok(resumed.resourceUsage.workspaceHighWaterBytes >= resumed.status.workspaceBytes);
+    const persisted = await openExportWorkspace({ directory: value.workspace });
+    try {
+      assert.equal(
+        resumed.resourceUsage.workspaceHighWaterBytes,
+        persisted.resourceUsage().workspaceHighWaterBytes,
+      );
+    } finally {
+      persisted.close();
+    }
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

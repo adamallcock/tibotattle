@@ -31,15 +31,31 @@ export async function* readBoundedUtf8LineEntries(path, {
   }
   if (maximumTotalBytes === 0 || startByte === maximumTotalBytes) return;
   const callerOwnedHandle = path && typeof path === "object" && Number.isInteger(path.fd);
-  const input = createReadStream(callerOwnedHandle ? null : path, {
+  const input = callerOwnedHandle ? null : createReadStream(path, {
     highWaterMark,
-    autoClose: !callerOwnedHandle,
-    ...(callerOwnedHandle ? { fd: path.fd } : {}),
-    // Caller-owned descriptors may already have been consumed by a tier
-    // prepass. Always position them explicitly, including at byte zero.
-    ...(callerOwnedHandle || startByte !== 0 ? { start: startByte } : {}),
+    ...(startByte !== 0 ? { start: startByte } : {}),
     ...(maximumTotalBytes === Number.POSITIVE_INFINITY ? {} : { end: maximumTotalBytes - 1 }),
   });
+  // A ReadStream can destroy a supplied descriptor when async iteration
+  // unwinds after a parser/resource exception, even when descriptor ownership
+  // was intended to remain with the caller. Read caller-owned FileHandles
+  // positionally so post-read integrity verification always retains its exact
+  // descriptor and the original exception cannot be masked by EBADF.
+  const chunksInput = callerOwnedHandle ? {
+    async *[Symbol.asyncIterator]() {
+      let position = startByte;
+      while (position < maximumTotalBytes) {
+        const remaining = maximumTotalBytes === Number.POSITIVE_INFINITY
+          ? highWaterMark
+          : Math.min(highWaterMark, maximumTotalBytes - position);
+        const buffer = Buffer.allocUnsafe(remaining);
+        const { bytesRead } = await path.read(buffer, 0, remaining, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        yield bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead);
+      }
+    },
+  } : input;
   let chunks = [];
   let lineBytes = 0;
   let oversized = false;
@@ -73,7 +89,7 @@ export async function* readBoundedUtf8LineEntries(path, {
     }
     if (lineBytes > maximumLineBytes) {
       if (needles.length === 0) {
-        input.destroy();
+        input?.destroy();
         throw new ExportResourceLimitError("line_bytes");
       }
       oversized = true;
@@ -106,10 +122,10 @@ export async function* readBoundedUtf8LineEntries(path, {
     return { ...entry, line: line.endsWith("\r") ? line.slice(0, -1) : line };
   }
 
-  for await (const chunk of input) {
+  for await (const chunk of chunksInput) {
     resourceGuard?.checkRuntime();
     if (absoluteOffset + chunk.length > maximumTotalBytes) {
-      input.destroy();
+      input?.destroy();
       throw new ExportResourceLimitError("source_bytes");
     }
     let start = 0;

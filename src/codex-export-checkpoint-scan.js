@@ -35,10 +35,11 @@ export { CODEX_CHECKPOINT_SCAN_VERSION };
 export const DEFAULT_CHECKPOINT_LINES_PER_BATCH = 8_192;
 
 const RELEVANT_NEEDLES = Object.freeze([
-  '"turn_context"', '"thread_settings_applied"', '"token_count"', '"task_started"',
-  '"task_complete"', "tool_call", '"function_call"', '"code_interpreter_call"',
-  '"shell_call"', '"computer_call"', '"mcp_call"', '"apply_patch_call"',
-  '"local_shell_call"',
+  '"type":"turn_context"', '"type":"thread_settings_applied"', '"type":"token_count"',
+  '"type":"task_started"', '"type":"task_complete"', '"type":"custom_tool_call"',
+  '"type":"function_call"', '"type":"web_search_call"', '"type":"file_search_call"',
+  '"type":"code_interpreter_call"', '"type":"shell_call"', '"type":"computer_call"',
+  '"type":"mcp_call"', '"type":"apply_patch_call"', '"type":"local_shell_call"',
 ]);
 
 function safeKey(secret, domain, subject) {
@@ -177,7 +178,7 @@ async function scanTierPhase({ workspace, source, checkpoint, resourceGuard, fai
       cursor.lineOrdinal = entry.lineOrdinal;
       lineCounts.lines += 1;
       if (entry.line === null) lineCounts.oversized += 1;
-      if (entry.line?.includes('"thread_settings_applied"')) {
+      if (entry.line?.includes('"type":"thread_settings_applied"')) {
         try {
           const record = JSON.parse(entry.line);
           if (record.type === "event_msg" && record.payload?.type === "thread_settings_applied") {

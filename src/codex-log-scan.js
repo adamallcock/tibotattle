@@ -25,20 +25,22 @@ const COMPONENT_KEYS = [
 ];
 
 const EXPORT_RELEVANT_LINE_NEEDLES = Object.freeze([
-  '"session_meta"',
-  '"turn_context"',
-  '"thread_settings_applied"',
-  '"token_count"',
-  '"task_started"',
-  '"task_complete"',
-  "tool_call",
-  '"function_call"',
-  '"code_interpreter_call"',
-  '"shell_call"',
-  '"computer_call"',
-  '"mcp_call"',
-  '"apply_patch_call"',
-  '"local_shell_call"',
+  '"type":"session_meta"',
+  '"type":"turn_context"',
+  '"type":"thread_settings_applied"',
+  '"type":"token_count"',
+  '"type":"task_started"',
+  '"type":"task_complete"',
+  '"type":"custom_tool_call"',
+  '"type":"function_call"',
+  '"type":"web_search_call"',
+  '"type":"file_search_call"',
+  '"type":"code_interpreter_call"',
+  '"type":"shell_call"',
+  '"type":"computer_call"',
+  '"type":"mcp_call"',
+  '"type":"apply_patch_call"',
+  '"type":"local_shell_call"',
 ]);
 
 function boundedScannerLines(path, resourceGuard, maximumTotalBytes = Number.POSITIVE_INFINITY) {
@@ -496,7 +498,7 @@ async function collectTierTimeline(path, diagnostics, resourceGuard = null, maxi
   for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
     if (line === null) continue;
     ordinal += 1;
-    if (!line.includes('"thread_settings_applied"')) continue;
+    if (!line.includes('"type":"thread_settings_applied"')) continue;
     let record;
     try {
       record = JSON.parse(line);
@@ -566,19 +568,7 @@ async function parseRollout(path, {
   for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
     sourceRecordOrdinal += 1;
     if (line === null) continue;
-    if (!line.includes('"turn_context"')
-        && !line.includes('"thread_settings_applied"')
-        && !line.includes('"token_count"')
-        && !line.includes('"task_started"')
-        && !line.includes('"task_complete"')
-        && !line.includes("tool_call")
-        && !line.includes('"function_call"')
-        && !line.includes('"code_interpreter_call"')
-        && !line.includes('"shell_call"')
-        && !line.includes('"computer_call"')
-        && !line.includes('"mcp_call"')
-        && !line.includes('"apply_patch_call"')
-        && !line.includes('"local_shell_call"')) continue;
+    if (!EXPORT_RELEVANT_LINE_NEEDLES.some((needle) => line.includes(needle))) continue;
     let record;
     try {
       record = JSON.parse(line);

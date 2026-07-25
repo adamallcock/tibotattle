@@ -119,3 +119,7 @@ The workspace stores monotonically increasing source and export totals. Resume i
 ## Explicit non-completion
 
 This plan does not complete G1, ingestion, aggregation, or the end-to-end objective. Compression, deletion, native secrets, Claude parity, signed distribution, volunteer-local review, consent, encryption, server validation, private results, publication, ongoing upload, and incident operations remain separately gated.
+
+## Verification status
+
+The checkpoint candidate has passed its complete bounded 30-day local-history gate: 1,349 files, 21,558,342,764 source bytes, and 395,520 safe records. A failed attempt exposed descriptor-ownership/error-masking and broad activity-prefilter defects; the corrected scanner resumed the same committed workspace and completed. The marker correction is compatibility-bound as checkpoint scan v0.2 and legacy Codex scan v5, and exact structural/cross-chunk regressions protect the canonical compact JSONL assumption. The dated [verification receipt](./2026-07-24-g1-source-checkpoint-verification-receipt.md) contains the exact resource and recovery evidence. The remaining acceptance work is the broader failpoint/crash matrix, near-ceiling and asymptotic resource evidence, source-set deletion/recovery, compression/bomb bounds, and the other G1 boundaries listed above.

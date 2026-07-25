@@ -429,7 +429,15 @@ test("oversized irrelevant content is streamed away without changing physical oc
   const lines = [
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "oversized-session", source: "user" } }),
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
-    JSON.stringify({ timestamp: "2026-07-24T12:00:30.000Z", type: "response_item", payload: { type: "message", content: "x".repeat(2_000) } }),
+    JSON.stringify({
+      timestamp: "2026-07-24T12:00:30.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        unrelatedKind: "function_call",
+        content: `${"x".repeat(2_000)} arbitrary tool_call prose and literal \"type\":\"function_call\" text`,
+      },
+    }),
     tokenRecord("2026-07-24T12:01:00.000Z", usage(100, 20, 40, 8), usage(100, 20, 40, 8), 12),
   ];
   await writeFile(join(home, "sessions", "rollout-2026-07-24T12-00-00-oversized.jsonl"), `${lines.join("\n")}\n`);

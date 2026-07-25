@@ -138,6 +138,10 @@ async function createLocalExportWorkspaceUnlocked({
       failpoint,
       checkpointLinesPerBatch,
     });
+    resourceGuard.observeWorkspace(Math.max(
+      status.workspaceBytes,
+      workspace.resourceUsage().workspaceHighWaterBytes,
+    ));
     invocationSucceeded = true;
     return { descriptor, status, resourceUsage: resourceGuard.snapshot() };
   } finally {
@@ -225,6 +229,10 @@ async function resumeLocalExportWorkspaceUnlocked({
       failpoint,
       checkpointLinesPerBatch,
     });
+    resourceGuard.observeWorkspace(Math.max(
+      status.workspaceBytes,
+      workspace.resourceUsage().workspaceHighWaterBytes,
+    ));
     invocationSucceeded = true;
     return { descriptor, status, resourceUsage: resourceGuard.snapshot() };
   } finally {

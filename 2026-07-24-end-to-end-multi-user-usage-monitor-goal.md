@@ -851,9 +851,11 @@ The next local G1-R3 candidate replaces export-path parser replay with transacti
 - copied parent tools are intentionally excluded from child attribution under a compatibility-bound checkpoint scanner version, correcting the legacy double count;
 - durable resource state survives successful resume and real process death, and materialization reuses the persisted policy before any output side effect;
 - exact SQLite schema hashing rejects altered constraints, hidden columns, indexes, triggers, or views; and
-- a literal output golden, parent-driven `SIGKILL` recovery, populated-artifact privacy canaries, 64 MiB task/snapshot heap gates, 327 repository tests, and a successful 151.7 MB create/resume/materialize/verify smoke support the slice.
+- a literal output golden, parent-driven `SIGKILL` recovery, populated-artifact privacy canaries, 64 MiB task/snapshot heap gates, 329 post-history-fix repository tests, and a successful 151.7 MB create/resume/materialize/verify smoke support the slice;
+- the complete bounded 30-day local history gate now passes across 1,349 files and 21,558,342,764 source bytes, producing 395,520 safe records while recovering from the committed checkpoint exposed by the initial failure; and
+- that gate found and closed descriptor-ownership/error-masking and value-only tool-marker false-positive defects, with focused regressions and compatibility-bumped scanners preventing mixed-semantics resume.
 
-The dated [source-checkpoint verification receipt](./2026-07-24-g1-source-checkpoint-verification-receipt.md) records exact evidence and limitations. This remains a bounded slice: the current-code full approximately 21.7 GB multi-source gate, broader fresh-process crash matrix, measured heap slope/near-ceiling cases, source-set deletion, compression, native secrets, Claude parity, signed distribution, and local volunteer reviews remain open. No upload or external collection has been enabled.
+The dated [source-checkpoint verification receipt](./2026-07-24-g1-source-checkpoint-verification-receipt.md) records exact evidence and limitations. This remains a bounded slice: broader fresh-process crash matrices, source-integrity hashing optimization, measured heap slope/near-ceiling cases, source-set deletion, compression, native secrets, Claude parity, signed distribution, and local volunteer reviews remain open. No upload or external collection has been enabled.
 
 ## Open decisions and decision deadlines
 

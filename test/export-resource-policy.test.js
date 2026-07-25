@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -96,12 +96,12 @@ test("bounded line reader preserves CRLF/final lines and stops before oversized 
     assert.deepEqual(irrelevant, [null]);
 
     const relevant = join(directory, "relevant.jsonl");
-    await writeFile(relevant, '1234"token_count"5678\n');
+    await writeFile(relevant, '1234"type":"token_count"5678\n');
     await assert.rejects(async () => {
       for await (const line of readBoundedUtf8Lines(relevant, {
         maximumLineBytes: 5,
         highWaterMark: 2,
-        oversizedIrrelevantNeedles: ['"token_count"'],
+        oversizedIrrelevantNeedles: ['"type":"token_count"'],
       })) void line;
     }, (error) => error.code === "export_resource_line_bytes");
   } finally {
@@ -160,6 +160,32 @@ test("positioned bounded lines resume at an exact completed-line boundary", asyn
     })) resumed.push(entry);
     assert.deepEqual(resumed, complete.slice(2));
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("caller-owned positioned handles survive bounded-reader exceptions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-positioned-error-"));
+  let handle;
+  try {
+    const path = join(directory, "relevant-oversized.jsonl");
+    const text = '1234"type":"token_count"5678\n';
+    await writeFile(path, text);
+    handle = await open(path, "r");
+    await assert.rejects(async () => {
+      for await (const entry of readBoundedUtf8LineEntries(handle, {
+        maximumLineBytes: 5,
+        highWaterMark: 2,
+        maximumTotalBytes: Buffer.byteLength(text),
+        oversizedIrrelevantNeedles: ['"type":"token_count"'],
+      })) void entry;
+    }, (error) => error.code === "export_resource_line_bytes");
+    const byte = Buffer.alloc(1);
+    const { bytesRead } = await handle.read(byte, 0, 1, 0);
+    assert.equal(bytesRead, 1);
+    assert.equal(byte.toString("utf8"), "1");
+  } finally {
+    await handle?.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
