@@ -31,6 +31,25 @@ async function crashAt(paths, point) {
   );
 }
 
+const binaryBundle = Buffer.from([0x00, 0xff, 0x80, 0x41, 0x0a]);
+const binaryReceipt = new Uint8Array([0xfe, 0x00, 0x42, 0x81]);
+
+async function crashBinaryAt(paths, point) {
+  await assert.rejects(
+    writeOwnerOnlyPairNoClobber({
+      firstPath: paths.bundle,
+      firstContent: binaryBundle,
+      secondPath: paths.receipt,
+      secondContent: binaryReceipt,
+    }, {
+      failpoint(name) {
+        if (name === point) throw new Error(`simulated-binary-${point}`);
+      },
+    }),
+    new RegExp(`simulated-binary-${point}`),
+  );
+}
+
 async function assertRecovered(paths) {
   assert.equal(await readFile(paths.bundle, "utf8"), "bundle-content\n");
   assert.equal(await readFile(paths.receipt, "utf8"), "receipt-content\n");
@@ -66,6 +85,39 @@ for (const point of ["after_transaction_prepare", "after_manifest_prepare"]) {
       assert.deepEqual(result, { recovered: 1, transactionsFound: 1 });
       await assert.rejects(stat(paths.bundle), { code: "ENOENT" });
       await assert.rejects(stat(paths.receipt), { code: "ENOENT" });
+      await assert.rejects(stat(join(paths.directory, ".app-usagemonitor-export-transactions")), { code: "ENOENT" });
+    } finally {
+      await rm(paths.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const point of [
+  "after_transaction_prepare",
+  "after_manifest_prepare",
+  "after_manifest_link",
+  "after_manifest",
+  "after_receipt",
+  "after_bundle",
+  "after_manifest_cleanup",
+]) {
+  test(`binary recovery is byte-exact after interruption at ${point}`, async () => {
+    const paths = await workspace();
+    try {
+      await crashBinaryAt(paths, point);
+      assert.deepEqual(
+        await recoverOwnerOnlyPairTransactions({ directory: paths.directory }),
+        { recovered: 1, transactionsFound: 1 },
+      );
+      if (["after_transaction_prepare", "after_manifest_prepare"].includes(point)) {
+        await assert.rejects(stat(paths.bundle), { code: "ENOENT" });
+        await assert.rejects(stat(paths.receipt), { code: "ENOENT" });
+      } else {
+        assert.deepEqual(await readFile(paths.bundle), binaryBundle);
+        assert.deepEqual(await readFile(paths.receipt), Buffer.from(binaryReceipt));
+        assert.equal((await lstat(paths.bundle)).nlink, 1);
+        assert.equal((await lstat(paths.receipt)).nlink, 1);
+      }
       await assert.rejects(stat(join(paths.directory, ".app-usagemonitor-export-transactions")), { code: "ENOENT" });
     } finally {
       await rm(paths.directory, { recursive: true, force: true });

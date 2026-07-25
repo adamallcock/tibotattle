@@ -17,11 +17,11 @@ Both gates remain local-only. They add no upload, enrollment, server, background
 
 ### Representation
 
-- Use a single-member gzip stream through built-in `node:zlib`; add no package or subprocess dependency.
+- Use a single-member gzip stream through built-in `node:zlib`; add no package or subprocess dependency. Signed/release artifacts must pin and record their bundled Node/zlib runtime.
 - Pin an explicit profile: gzip, compression level 6, default strategy, no filename, no comment, and a zero modification-time header.
 - Store chunks as fixed names such as `chunk-000000.bundle.json.gz`; keep chunk receipts and set manifest/control files uncompressed.
 - Treat gzip as a representation, not the logical identity. Bundle IDs, decoded `bundleSha256` and `bundleBytes`, record ordering, packing decisions, chunk-independent logical-record digest, and participant pseudonyms continue to derive from canonical decoded `stableJson` bytes.
-- Add separate manifest and receipt fields for the fixed encoding/profile plus exact stored `artifactSha256` and `artifactBytes`. Version-dispatch plain v0.1 and compressed v0.2 artifacts; never permit a mixed set.
+- Add separate manifest and receipt fields for the fixed encoding/profile plus exact stored `artifactSha256` and `artifactBytes`. The stored hash authenticates the emitted representation; recompressing decoded bytes on another zlib version is not required to reproduce that hash. Version-dispatch plain v0.1 and compressed v0.2 artifacts; never permit a mixed set.
 
 ### Binary publication
 
@@ -41,8 +41,8 @@ Both gates remain local-only. They add no upload, enrollment, server, background
 
 ### Compression acceptance
 
-1. Two clean materializations from one workspace produce identical encoded artifacts, receipts, and manifests on the supported runtime matrix.
-2. The decoded canonical-bundle and logical-record goldens remain unchanged.
+1. Two clean materializations from one workspace produce identical encoded artifacts, receipts, and manifests within the same pinned release runtime. Cross-runtime verification consumes and hashes stored artifacts; it does not recompress them.
+2. Decoded canonical-bundle and logical-record goldens remain unchanged across the supported verification runtime matrix. A zlib-version fixture demonstrates that compressed-byte identity is intentionally not the semantic identity.
 3. Compressed single-bundle and complete-set round trips pass independent verification.
 4. Encoded oversize fails before inflation; a tiny bomb and concatenated-member case fail at the decoded ceiling without unbounded allocation or residue.
 5. Truncation, checksum corruption, encoded hash/size mismatch, decoded hash/size mismatch, encoding/profile mismatch, and mixed plain/compressed chunks fail closed.
@@ -117,6 +117,23 @@ Leave empty owner-only workspace/output directories in the first slice. Director
 8. Extend the exact inventory to readable poisoned and incomplete workspaces using only validated durable chunk rows; corrupt or unbound state remains fail closed.
 9. Add CLI/docs, full failpoint/SIGKILL and privacy suites, a real temporary-set deletion drill, and a dated verification receipt.
 
+## Implementation checkpoint
+
+The first Gate C prerequisites are implemented but do not yet emit compressed export sets:
+
+- the durable receipt-first pair writer snapshots and publishes strings, `Buffer`s, and `Uint8Array`s byte-exactly, with binary recovery exercised at all seven existing publication failpoints;
+- the gzip helper pins level 6/default strategy, normalizes timestamp and OS header bytes, copies only after input ceilings pass, and exposes fixed content-free errors;
+- independent encoded/decoded limits, corrupt/truncated input, compressed bombs, and concatenated-member total output are tested;
+- a Node 20.0.0/zlib 1.2.13 fixture decodes exactly on the current Node 26.2.0/zlib 1.3.1 runtime without recompression, proving the semantic/artifact identity split;
+- a focused subagent audit found and closed the pre-limit defensive-copy allocation issue, including a 64 MiB probe with zero additional ArrayBuffer allocation; and
+- the full serial repository suite passes 345 tests, while the 151-field telemetry contract remains current and all 9 contract tests pass.
+
+Manifest/receipt v0.2 fields, compressed materializer output, bounded verifier integration, real-history compression measurements, and deletion remain open. No existing artifact is overwritten or removed, and transport remains absent.
+
 ## Explicit non-completion
 
 Passing these gates will not complete G1. Native secret stores, Claude parity, prospective account-scoped quota evidence, signed clean-machine distribution, two local-only volunteer reviews, and pilot-derived ceilings remain required. Every consent, enrollment, upload, cloud validation, private-results, aggregation, publication, ongoing-collection, participant-server-deletion, and incident-operations stage remains closed.
+
+## Primary runtime reference
+
+- [Node.js zlib API](https://nodejs.org/api/zlib.html): `gzipSync`/`gunzipSync`, binary typed-array support, and bounded convenience-method output through `maxOutputLength` (supported since Node 12.19/14.5, within the declared Node 20+ range).

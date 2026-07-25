@@ -181,7 +181,7 @@ async function prepareOwnerOnlyFile(path, content) {
   const handle = await open(path, "wx", 0o600);
   try {
     await handle.chmod(0o600);
-    await handle.writeFile(content, "utf8");
+    await handle.writeFile(content);
     await handle.sync();
     const stats = await handle.stat();
     if (!stats.isFile() || stats.nlink !== 1) throw new Error("Export staging artifact must be a single-link regular file");
@@ -213,6 +213,12 @@ const MAX_LOCAL_RECEIPT_BYTES = 1024 * 1024;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function normalizePairContent(value) {
+  if (typeof value === "string") return Buffer.from(value, "utf8");
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return Buffer.from(value);
+  throw new Error("Paired export contents must be strings, Buffers, or Uint8Arrays");
 }
 
 function validBasename(value) {
@@ -517,11 +523,10 @@ async function writeOwnerOnlyPairNoClobberUnlocked({
   linkFile = link,
   failpoint = async () => {},
 } = {}) {
-  if (typeof firstContent !== "string" || typeof secondContent !== "string") {
-    throw new Error("Paired export contents must be strings");
-  }
-  const firstBytes = Buffer.byteLength(firstContent, "utf8");
-  const secondBytes = Buffer.byteLength(secondContent, "utf8");
+  const normalizedFirstContent = normalizePairContent(firstContent);
+  const normalizedSecondContent = normalizePairContent(secondContent);
+  const firstBytes = normalizedFirstContent.length;
+  const secondBytes = normalizedSecondContent.length;
   if (firstBytes < 1 || firstBytes > MAX_LOCAL_BUNDLE_BYTES
       || secondBytes < 1 || secondBytes > MAX_LOCAL_RECEIPT_BYTES) {
     throw new Error("Paired export contents exceed local artifact bounds");
@@ -563,8 +568,8 @@ async function writeOwnerOnlyPairNoClobberUnlocked({
   const manifestPrepared = join(transactionDirectory, "manifest.prepared");
   let transactionPrepared = false;
   try {
-    await prepareOwnerOnlyFile(bundleStage, firstContent);
-    await prepareOwnerOnlyFile(receiptStage, secondContent);
+    await prepareOwnerOnlyFile(bundleStage, normalizedFirstContent);
+    await prepareOwnerOnlyFile(receiptStage, normalizedSecondContent);
     await syncDirectory(transactionDirectory);
     transactionPrepared = true;
     await failpoint("after_transaction_prepare");
@@ -576,13 +581,13 @@ async function writeOwnerOnlyPairNoClobberUnlocked({
           finalName: basename(firstResolved),
           stageName: basename(bundleStage),
           bytes: firstBytes,
-          sha256: sha256(firstContent),
+          sha256: sha256(normalizedFirstContent),
         },
         receipt: {
           finalName: basename(secondResolved),
           stageName: basename(receiptStage),
           bytes: secondBytes,
-          sha256: sha256(secondContent),
+          sha256: sha256(normalizedSecondContent),
         },
       },
     };

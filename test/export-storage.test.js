@@ -28,6 +28,62 @@ test("paired exports publish receipt then bundle without overwrite", async () =>
   }
 });
 
+test("paired exports preserve Buffer and Uint8Array bytes exactly", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-pair-binary-"));
+  const bundle = join(directory, "review.umx");
+  const receipt = join(directory, "review.privacy-receipt");
+  const bundleBytes = Buffer.from([0x00, 0xff, 0x80, 0x41, 0x0a]);
+  const receiptBacking = new Uint8Array([0x99, 0xfe, 0x00, 0x42, 0x98]);
+  const receiptBytes = receiptBacking.subarray(1, 4);
+  try {
+    await writeOwnerOnlyPairNoClobber({
+      firstPath: bundle,
+      firstContent: bundleBytes,
+      secondPath: receipt,
+      secondContent: receiptBytes,
+    });
+    assert.deepEqual(await readFile(bundle), bundleBytes);
+    assert.deepEqual(await readFile(receipt), Buffer.from([0xfe, 0x00, 0x42]));
+    assert.equal((await stat(bundle)).mode & 0o777, 0o600);
+    assert.equal((await stat(receipt)).mode & 0o777, 0o600);
+    assert.equal((await stat(bundle)).nlink, 1);
+    assert.equal((await stat(receipt)).nlink, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("paired exports reject unsupported content types without rendering content", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-pair-type-"));
+  const bundle = join(directory, "bundle");
+  const receipt = join(directory, "receipt");
+  const canary = "private-content-canary";
+  try {
+    const unsupported = {
+      toString() {
+        return canary;
+      },
+    };
+    await assert.rejects(
+      writeOwnerOnlyPairNoClobber({
+        firstPath: bundle,
+        firstContent: unsupported,
+        secondPath: receipt,
+        secondContent: "receipt",
+      }),
+      (error) => {
+        assert.match(error.message, /strings, Buffers, or Uint8Arrays/);
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+    await assert.rejects(stat(bundle), { code: "ENOENT" });
+    await assert.rejects(stat(receipt), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("paired exports reject equal paths, separate parents, and existing destinations", async () => {
   const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-pair-policy-"));
   const bundle = join(directory, "bundle");
