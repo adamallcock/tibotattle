@@ -1328,3 +1328,43 @@ export async function openExportWorkspace({
     throw error;
   }
 }
+
+// Deliberately narrower than openExportWorkspace: discard preflight must not
+// materialize descriptors, participant identifiers, or source-log paths.
+export async function inspectExportWorkspaceDiscardState({ directory } = {}) {
+  const workspaceDirectory = await ensureOwnerDirectory(directory);
+  const databaseFile = join(workspaceDirectory, DATABASE_NAME);
+  const before = await inspectExistingDatabase(databaseFile);
+  const DatabaseSync = await loadSqlite();
+  // Read-only SQLite still incorporates a valid WAL and refuses a hot rollback
+  // journal that would require a write. Both outcomes are safer than an
+  // immutable open, which could silently ignore newer manifest/chunk state.
+  const database = new DatabaseSync(databaseFile, { readOnly: true });
+  try {
+    database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON");
+    validateWorkspaceSchema(database);
+    const after = await lstat(databaseFile);
+    assertDatabaseStats(after);
+    if (after.dev !== before.dev || after.ino !== before.ino) fail("database_changed");
+    const poisonRow = database.prepare("SELECT value_json FROM workspace_meta WHERE key = 'poison'").get();
+    const scanRow = database.prepare("SELECT value_json FROM workspace_meta WHERE key = 'scan_status'").get();
+    const manifestRows = Number(database.prepare("SELECT COUNT(*) AS count FROM workspace_meta WHERE key = 'manifest'").get().count);
+    const chunkCount = Number(database.prepare("SELECT COUNT(*) AS count FROM chunks").get().count);
+    const incompleteCheckpoints = Number(database.prepare(`
+      SELECT COUNT(*) AS count FROM source_checkpoints WHERE phase != 'complete'
+    `).get().count);
+    const poisoned = poisonRow ? parseCanonical(poisonRow.value_json).code === "source_integrity" : false;
+    const scanComplete = scanRow
+      ? parseCanonical(scanRow.value_json).status === "complete" && incompleteCheckpoints === 0
+      : false;
+    if (![manifestRows, chunkCount, incompleteCheckpoints].every(safeCount) || manifestRows > 1) fail("schema");
+    return {
+      poisoned,
+      scanComplete,
+      hasManifestState: manifestRows === 1,
+      chunkCount,
+    };
+  } finally {
+    database.close();
+  }
+}

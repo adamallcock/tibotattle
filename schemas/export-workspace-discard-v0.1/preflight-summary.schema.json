@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/export-workspace-discard-v0.1/preflight-summary.schema.json",
+  "title": "Usage monitor local export workspace discard preflight v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "planVersion", "artifactClass", "readiness", "eligibility", "fileCounts", "byteCounts", "confirmationRequired", "confirmationToken", "sourceLogsPreserved", "independentOutputPreserved", "networkActivity", "secureErasureClaimed", "transportReady"],
+  "properties": {
+    "schemaVersion": { "const": "usage-export-workspace-discard-preflight-v0.1" },
+    "planVersion": { "const": "local-export-workspace-discard-plan-v0.1" },
+    "artifactClass": { "const": "incomplete_or_poisoned_export_workspace" },
+    "readiness": { "const": "ready" },
+    "eligibility": { "enum": ["poisoned", "scan_incomplete"] },
+    "fileCounts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sqliteSidecars", "workspaceDatabase", "totalFiles"],
+      "properties": {
+        "sqliteSidecars": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "workspaceDatabase": { "const": 1 },
+        "totalFiles": { "type": "integer", "minimum": 1, "maximum": 4 }
+      }
+    },
+    "byteCounts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["workspaceBytes", "totalBytes"],
+      "properties": {
+        "workspaceBytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "totalBytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "confirmationRequired": { "const": true },
+    "confirmationToken": { "type": "string", "pattern": "^[A-Z2-7]{16}$" },
+    "sourceLogsPreserved": { "const": true },
+    "independentOutputPreserved": { "const": true },
+    "networkActivity": { "const": "absent" },
+    "secureErasureClaimed": { "const": false },
+    "transportReady": { "const": false }
+  }
+}

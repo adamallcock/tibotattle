@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/export-workspace-discard-v0.1/commit-marker.schema.json",
+  "title": "Usage monitor export workspace discard commit marker v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "planVersion", "discardOrderVersion", "state", "planToken", "directoryIdentityToken", "journalToken", "transportReady"],
+  "properties": {
+    "schemaVersion": { "const": "usage-export-workspace-discard-commit-marker-v0.1" },
+    "planVersion": { "const": "local-export-workspace-discard-plan-v0.1" },
+    "discardOrderVersion": { "const": "sqlite-sidecars-then-database-v1" },
+    "state": { "const": "committed" },
+    "planToken": { "type": "string", "pattern": "^[A-Z2-7]{20}$" },
+    "directoryIdentityToken": { "type": "string", "pattern": "^[A-Z2-7]{52}$" },
+    "journalToken": { "type": "string", "pattern": "^[A-Z2-7]{52}$" },
+    "transportReady": { "const": false }
+  }
+}

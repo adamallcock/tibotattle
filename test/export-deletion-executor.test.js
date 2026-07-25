@@ -365,7 +365,15 @@ test("SIGKILL recovery is monotonic across commit, each artifact class, receipt,
         stage,
         role,
         target ? String(target.ordinal) : "",
-      ], { cwd: resolve("."), encoding: "utf8", timeout: 30_000 });
+      ], {
+        cwd: resolve("."),
+        encoding: "utf8",
+        timeout: 30_000,
+        // Node 26 warns that node:sqlite is experimental before the child is
+        // SIGKILLed. Suppress runtime warnings for this crash harness only so
+        // the strict empty-stderr assertion remains a content-leak check.
+        env: { ...process.env, NODE_NO_WARNINGS: "1" },
+      });
       assert.equal(child.signal, "SIGKILL", `${stage}/${role}: ${child.stderr}`);
       assert.equal(child.stdout, "");
       assert.equal(child.stderr, "");
