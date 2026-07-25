@@ -173,6 +173,7 @@ No calendar dates have been committed by the owner yet. An unset date is itself 
 | Clean macOS arm64 machine | Adam Allcock | Not scheduled | Machine provenance plus complete R9 receipt | Set before R8 freeze; without it, G1 stops |
 | Two independent local-only volunteers | Adam Allcock | Not recruited | Approved consent plus two content-free confirmation receipts | Recruit only after signed artifact; fewer than two blocks G1 |
 | Frozen privacy/consent wording | Adam Allcock | Draft only | Approval bound to artifact/schema hashes | Approve before any volunteer receives bytes |
+| Claude OAuth refresh and non-null subscriber callback | Adam Allcock | Provider OAuth revoked; callback lifecycle installed | Successful `/login`, one ordinary authenticated response, independently optional non-null five-hour/seven-day callback evidence, and canonical verify receipt | Retry in parallel with R7; without the real callback evidence, R4 and G1 remain open |
 | External pre-upload privacy/security reviewer | Adam Allcock | Not engaged | Scope, reviewer independence, report, closed critical/high findings | Required before G4 real upload, regardless of G1 timing |
 | Incident owner and backup | Adam Allcock | Owner named; backup unset | Named backup and drill receipt | Required in G0/G4; unset backup blocks upload |
 | G3/G4/G9/G10/G11 human approvals | Adam Allcock | Future | Dated signed gate receipts | Each gate stops without its own approval |

@@ -150,6 +150,28 @@ The next completed slice adds three stronger artifact controls without widening 
 
 This is still not G1 completion. Resource-bounded streaming/chunking, Claude parity, prospective account-scoped quota export, native secret-store/platform completion, signed clean-machine distribution, volunteer-local review, identity rotation/deletion UX, and the minimization ablation remain open. Telemetry v0.1 remains an unfrozen local-only format with `transportReady: false`; this progress does not authorize external participants or any network transport.
 
+## Current execution checkpoint — July 25, 2026
+
+The live branch is privately checkpointed on GitHub and the integrated local-only implementation passes 610 of 610 tests under both Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime. This is a bounded implementation milestone, not a G1 or end-to-end completion claim.
+
+Evidence now established:
+
+- Claude transcript export has provider-neutral usage parity for uncached input, cache reads, five-minute and one-hour cache writes, provider-reported combined output, model, subscription speed evidence, iteration attempts, subagent lineage, and coarse tool classes without exporting content.
+- A real local Claude corpus of 1,139 files produced 21,326 independently verified usage events. Component deltas against `ccusage` are explained by recorded iteration and cache-duration semantics rather than silently normalized away.
+- Claude's Keychain-backed status callback lifecycle is implemented and installed with coexistence, recovery, rotation, and removal behavior. A real non-null quota observation remains externally blocked until the owner refreshes revoked Claude OAuth and sends one authenticated response.
+- Codex and Claude safe-record construction, deterministic bounded export sets, independent verification, recovery, complete-set deletion, capability separation, and current field/provenance contracts are integrated.
+- The G0 risk register and control traceability matrix exist and are live. G0 itself remains open because reproducible clean-clone evidence, release controls, owner/contact/backup decisions, and frozen privacy approval are incomplete.
+- The minimization study machinery and preregistration exist, but the real study remains correctly inconclusive until at least three qualifying prospective reset windows are observed.
+
+The next parallel execution wave is ordered as follows:
+
+1. **Primary critical-path lane — R7 measured release ceilings.** Predeclare the workload matrix and selection rule; add deterministic content-free near-limit fixtures; measure scan, resume, materialize, verify, deletion/discard, and callback uninstall; produce a machine-readable receipt with wall time, CPU, peak RSS, counts, bytes, hashes, fixed failure codes, and source-preservation evidence; prove boundary success and limit-plus-one rejection; then promote a versioned release resource policy. Until multi-machine evidence exists, describe the result as a conservative tested heavy-history envelope, not population p95.
+2. **Provider-accounting lane — G2/G6 preparation.** Add a provider-neutral, versioned API-price-equivalent reducer using official effective-dated price evidence and RunCost where its semantics are sufficient. Preserve cache-read, cache-write-duration, input, combined output, context, tier, and unknown-model coverage. Keep subscription Standard/Fast separate from API Standard/Priority/Flex/Batch and leave hosted tool cost unknown unless an exact provider billable unit is observed.
+3. **Small external-dependency lane — Claude quota proof.** After owner OAuth refresh, collect one ordinary authenticated response and verify that independently optional five-hour and seven-day windows produce non-null canonical observations. This retry must not block credential-independent R7 work.
+4. **Packaging lane — unsigned R8 preparation.** After resource inputs settle, pin or bundle the runtime; create a reproducible macOS arm64 artifact; generate checksums, SBOM, license inventory, provenance, and private-material scans; and exercise the full local lifecycle under measured deny-all egress. Signing, notarization, frozen wording approval, clean-machine execution, and volunteer review remain owner/external gates.
+
+No enrollment, upload, cloud bucket, ongoing transmission, notification collection, or public aggregation is authorized by this checkpoint. Those capabilities remain behind G3 through G11 and their named human approvals.
+
 ## Target architecture
 
 ```mermaid
@@ -204,7 +226,7 @@ Make the current evidence, privacy boundary, responsibilities, and release proce
 - Keep telemetry v0.1 permanently local-only with `transportReady: false`. Any upload uses a separately reviewed telemetry/envelope version plus explicit compatibility and migration tests; v0.1 is never enabled by flipping its constant.
 - Generate a field dictionary directly from the schemas and link every field to purpose, retention, public eligibility, and owner.
 - Convert the threat model into a maintained risk register with severity, control, test, and review date.
-- Establish architectural decision records for cloud choice, encryption, identity/recovery, storage, cohort disclosure, and deletion.
+- Establish an architectural-decision index. Resolve every decision needed by the current local-only stage; record later cloud, encryption, identity/recovery, storage, cohort-disclosure, and server-deletion decisions as explicit `deferred/no-upload` ADRs with owner, deadline, default stop rule, and predecessor gate. G0 does not require premature technology selection, but no later gate may proceed past one of those unresolved decisions.
 - Create a traceability matrix from every invariant and stage gate to code/tests/runbooks.
 - Establish repository environments, protected branches, dependency update policy, secret scanning, provenance/SBOM generation, and release signing plan.
 - Define data controller/operator responsibility, participant contact route, incident owner, and external privacy/legal review point before real collection.
@@ -249,6 +271,7 @@ Turn the successful in-memory proof of concept into a safe, bounded, inspectable
 
 - Provide `doctor`, `inspect-export`, `export-local`, `verify-bundle`, `rotate-local-identity`, and `delete-local-export` flows.
 - Preview counts by provider/record family/model class/time range and every privacy check without displaying private source values.
+- Provide an offline, hash-bound exact-record view and machine-readable download of the sanitized records that the selected export would contain. The view may reveal the participant's own restricted metadata locally, must display no raw source content, must make no network request, and must bind its canonical record digest to the bundle/receipt so the participant can verify that a later upload contains exactly the reviewed records.
 - Explain that inspect may create a local identity secret while creating no bundle or network activity.
 - Produce a standalone privacy receipt that verifies exact bytes and software/schema versions.
 - Store identity in an OS-stable application location, preferring Keychain/Credential Manager/libsecret and clearly warning on owner-file fallback.
@@ -268,6 +291,7 @@ Turn the successful in-memory proof of concept into a safe, bounded, inspectable
 - Overlapping, reordered, chunked, restarted, and repeated exports have stable IDs and identical logical records.
 - Pilot limits are enforced on both sides of serialization and derived from measured p95/heavy histories rather than guessed. Candidate ceilings to benchmark are 31 covered days, 100,000 records per chunk, 32 MiB compressed, 128 MiB expanded, fixed nesting depth, and explicit CPU/RSS/wall-time budgets. Histories exceeding a safe chunk cap are split deterministically without silently shortening the requested period.
 - Bundle/receipt path collision, overwrite, first-write failure, second-write failure, and interrupted-commit tests leave no ambiguous valid artifact.
+- The offline exact-record review/download, privacy receipt, and materialized bundle agree on the same canonical record digest; tampering with any viewed record or substituting another bundle fails verification.
 - Two independent volunteers run signed artifacts locally, review bundles on their own machines, and confirm that no content or raw identity fields are present—only the documented cryptographic pseudonyms. No bundle is sent to the project.
 - A clean-machine installation, inspection, verification, identity rotation, and uninstall succeeds on every declared platform.
 - The privacy contract and consent draft are updated for the exact release artifact.
@@ -289,6 +313,7 @@ Ensure that uploaded metadata can support the useful local analysis without losi
 - Include subagent and scheduled-task work while excluding inherited fork replay.
 - Track coarse tool classes, but attach per-call cost only when an exact provider billable unit is independently present.
 - Partition account and plan continuity prospectively; retain historical `unattributed`/`unknown` partitions.
+- Define prospective account/plan attribution intervals explicitly: account evidence opens or changes a continuity interval; ambiguous gaps, conflicting evidence, identity rotation without a proven link, and records before the first observation remain `unattributed`; plan changes split rather than rewrite intervals. Add a two-account switch fixture covering rapid switches, missing observations, plan changes, and rotations without exporting raw account identity.
 - Add content-free declared markers for otherwise unobserved shared-pool surfaces: Work, Workspace Agents, Excel, Cloud, other devices, Work Voice task activity, image generation, third-party authenticated clients, and controlled quiet periods.
 - Keep ordinary Chat and ordinary Chat Voice excluded from the shared agentic pool where current provider policy says they are excluded; treat Spark or later separate-limit models as separate series.
 - Version provider-policy assumptions with effective dates and evidence links.
@@ -300,6 +325,7 @@ Ensure that uploaded metadata can support the useful local analysis without losi
 - Every unavailable field stays unavailable; no zero/default inference can masquerade as observation.
 - Local cost ledgers reconcile with independent ccusage/RunCost checks using predeclared component-level integer and decimal tolerances; every permitted difference has a fixed reason.
 - The system proves that account, plan, provider, limit, reset, speed, and surface boundaries cannot be pooled accidentally.
+- Two-account switching, missing observation gaps, plan changes, telemetry-identity rotation, paired/unpaired devices, and overlapping histories pass frozen attribution/dedupe fixtures with no retroactive guessing, cross-account merge, or contribution inflation.
 - Provider schema changes fail closed and produce a safe upgrade diagnostic rather than partial silent extraction.
 
 ## Stage 3 — Anonymous enrollment, recovery, and upload authorization
@@ -314,7 +340,7 @@ Create a participant identity and consent flow that supports upload and personal
 - Separate the telemetry identity, human recovery credential, server participant pseudonym, device-scoped upload credential, bundle-encryption identity, expiring one-time pairing capability, optional notification reference, and optional short display code. None may authenticate or derive another capability.
 - Keep the telemetry pseudonym seed local and distinct from every server authentication/recovery secret; use expiring one-time pairing rather than copying the telemetry seed when joining devices.
 - Define scopes explicitly: telemetry identity is installation-scoped; server participant identity is enrollment-scoped; device identity/credential is device-scoped; provider account pseudonyms are installation-local and must not be assumed equal across devices.
-- Resolve overlapping multi-device source histories before canonical dedupe: either introduce a safely paired dedupe namespace, prohibit overlapping source exports, or accept that cross-device dedupe is unavailable and contribution-bound the overlap. Rotatable authentication credentials are never canonical dedupe keys.
+- Resolve overlapping multi-device source histories before canonical dedupe through one frozen G3 decision: either introduce a safely paired dedupe namespace, prohibit overlapping source exports, or accept that cross-device dedupe is unavailable and contribution-bound the overlap. Rotatable authentication credentials are never canonical dedupe keys. The selected decision must define acceptance behavior for same-account and different-account overlap, ambiguous interval boundaries, plan changes, identity rotation, device pairing/revocation, and intentional re-import; fixtures must prove no cross-account merge and no contribution inflation.
 - Choose through the G3 threat model between a public-key protocol, keyed verifier, or password KDF appropriate to a uniformly random high-entropy credential; never store the recovery code itself.
 - Provide recovery code confirmation, offline backup guidance, rotation, revocation, and unrecoverable-loss behavior.
 - Version consent and bind enrollment plus each bundle to the accepted consent/schema versions.
@@ -381,6 +407,8 @@ registered -> uploading -> uploaded -> decrypting -> validating
 #### Server validation
 
 - Verify registration, object identity, size, checksum, ciphertext envelope, associated data, key version, authenticated decryption, schema, record limits, privacy scans, timestamps, numeric ranges, model/tier compatibility, reset consistency, and ID shapes.
+- Classify participant telemetry as self-asserted research evidence, not authenticated provider billing evidence. A valid signature/envelope proves possession of an enrollment capability and payload integrity in transit; it does not prove that local logs or sanitized numbers were not fabricated or modified before export.
+- Add poisoning controls and adversarial fixtures for internally consistent fabrication, duplicated histories under new identities, impossible timing/token/quota relationships, coordinated outliers, replay with altered IDs, and selective omission. Preserve suspicious submissions for restricted review with fixed quality states, exclude or contribution-bound them for aggregate inference, and never describe aggregate results as provider-audited usage unless an independent provider-side source establishes that status.
 - Stream decompression and validation under byte, record, memory, CPU, and wall-clock budgets.
 - Separate impossible/rejected and structurally or semantically inconsistent/quarantined states. A valid Stage 4 bundle ends as `accepted_pending_canonicalization`; statistical extremes and personal/aggregate eligibility are assigned only in Stage 5.
 - Delete successful quarantine objects on the short approved schedule; expose effective soft-delete completion timing.
@@ -501,6 +529,8 @@ Estimate quota behavior as accurately and plainly as the evidence supports, vali
 - Separate within-reset fit, next-reset prediction, and policy-change detection.
 - Publish calibration error in displayed percentage points and API-price-equivalent units.
 - Preserve residual movement as possibly missing shared-pool activity, stale display, account switching, policy change, parser loss, or unknown mechanism; do not force it into a multiplier.
+- Classify reset windows before estimation. Left-censored histories, right-censored histories, observations that begin after nonzero consumption, windows saturated at 100%, reset times with unresolved propagation delay, and windows lacking both usable pre-reset and post-reset anchors are ineligible for a complete seven-day-limit estimate. They may support explicitly labeled partial/descriptive analyses only; they must never be silently rescaled into full-window values.
+- Freeze synthetic acceptance fixtures for complete, left-censored, right-censored, saturated, delayed-reset, missing-anchor, and mixed-account windows. Every estimator and report must share the same eligibility/refusal code and expose excluded-window counts.
 - Maintain explicit `identified`, `conditionally_estimated`, `descriptive_only`, and `non_identifiable` result states.
 - Before fitting pooled cohort data, freeze a dated statistical analysis plan defining the estimand, cohort keys, eligibility/missingness policy, smoothing, lag candidates, estimator/model-selection rule, `eligibilityUnitId` contribution cap, bootstrap unit, holdout construction, multiple-comparison handling, interval method, baseline-comparison threshold, protected slices, and refusal rules.
 - Ship a complex model only if it improves untouched eligibility-unit/reset holdouts over the Standard API-cost baseline without material protected-slice regression; otherwise ship the baseline and measured accuracy floor.
