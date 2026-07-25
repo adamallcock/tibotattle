@@ -857,6 +857,8 @@ The next local G1-R3 candidate replaces export-path parser replay with transacti
 
 The dated [source-checkpoint verification receipt](./2026-07-24-g1-source-checkpoint-verification-receipt.md) records exact evidence and limitations. This remains a bounded slice: broader fresh-process crash matrices, source-integrity hashing optimization, measured heap slope/near-ceiling cases, source-set deletion, compression, native secrets, Claude parity, signed distribution, and local volunteer reviews remain open. No upload or external collection has been enabled.
 
+The next local sequence is frozen in the [G1 compression and local export deletion plan](./2026-07-24-g1-compression-deletion-plan.md): deterministic bounded gzip representation and decompression-bomb gates first, then target-specific-confirmation, exact-inventory, crash-recoverable logical deletion. This order prevents the deletion protocol from being designed around a transient plain-chunk format. Deletion will never recurse, require the participant secret, touch source logs or identity/collector state, claim physical-media erasure, or imply cloud deletion.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |
