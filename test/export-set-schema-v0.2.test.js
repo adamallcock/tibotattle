@@ -36,8 +36,8 @@ function manifest() {
       schemaSha256: EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
     },
     compatibility: exportCompatibilityTuple(),
-    exportSetId: `export-set:v1:${"A".repeat(43)}`,
-    participantId: `participant:v1:${"B".repeat(43)}`,
+    exportSetId: `export-set:v1:${"a".repeat(64)}`,
+    participantId: `participant:v1:${"b".repeat(64)}`,
     createdAt: "2026-07-24T13:00:00.000Z",
     coveredAt: { startAt: "2026-07-24T11:00:00.000Z", endAt: "2026-07-24T13:00:00.000Z" },
     sourceProviders: ["openai_codex"],
@@ -66,7 +66,7 @@ function manifest() {
     chunks: [
       {
         index: 0,
-        bundleId: `bundle:v1:${"E".repeat(43)}`,
+        bundleId: `bundle:v1:${"e".repeat(64)}`,
         bundleSha256: "1".repeat(64),
         bundleBytes: 2000,
         contentEncoding: "gzip",
@@ -81,7 +81,7 @@ function manifest() {
       },
       {
         index: 1,
-        bundleId: `bundle:v1:${"F".repeat(43)}`,
+        bundleId: `bundle:v1:${"f".repeat(64)}`,
         bundleSha256: "3".repeat(64),
         bundleBytes: 1500,
         contentEncoding: "gzip",
@@ -118,6 +118,13 @@ test("v0.2 accepts the exact encoded and decoded artifact contract", () => {
   const value = manifest();
   assert.deepEqual(validateExportSetManifest(value), { valid: true, errors: [] });
   assert.equal(assertValidExportSetManifest(value), value);
+});
+
+test("v0.2 rejects pre-migration base64url-shaped identifiers", () => {
+  const value = manifest();
+  value.participantId = `participant:v1:${"A".repeat(43)}`;
+  value.chunks[0].bundleId = `bundle:v1:${"B".repeat(43)}`;
+  assert.equal(validateExportSetManifest(value).valid, false);
 });
 
 test("v0.2 records but does not require the verifier's compression runtime", () => {

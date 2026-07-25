@@ -2,10 +2,12 @@
 title: G1 R7 Synthetic Smoke Verification Receipt
 date: 2026-07-25
 type: verification-receipt
-status: partial
+status: superseded
 ---
 
 # G1 R7 Synthetic Smoke Verification Receipt
+
+> Superseded by the [measured release verification receipt](./2026-07-25-g1-r7-measured-release-verification-receipt.md). This file preserves the earlier smoke checkpoint; its mutable artifact hashes and open-work list are historical.
 
 ## Verdict
 

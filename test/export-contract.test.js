@@ -9,7 +9,7 @@ import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import { stableJson } from "../src/storage.js";
 
 const SECRET = Buffer.alloc(32, 17);
-const BUNDLE_ID = `bundle:v1:${"K".repeat(43)}`;
+const BUNDLE_ID = `bundle:v1:${"4".repeat(64)}`;
 
 async function emptyBundle() {
   const home = await mkdtemp(join(tmpdir(), "usage-monitor-contract-"));

@@ -6,6 +6,7 @@ import {
   normalizeClaudeStatusQuotaSnapshots,
   normalizeCodexCollectorQuotaCandidate,
 } from "../src/export-safe-records.js";
+import { deriveEventOccurrenceId, deriveSessionScopeId } from "../src/export-identity.js";
 
 const SECRET = Buffer.alloc(32, 51);
 
@@ -13,8 +14,8 @@ function bundleWithQuota(snapshot) {
   return {
     schemaVersion: "usage-metadata-bundle-v0.1",
     compatibility: exportCompatibilityTuple(),
-    bundleId: `bundle:v1:${"A".repeat(43)}`,
-    participantId: `participant:v1:${"B".repeat(43)}`,
+    bundleId: `bundle:v1:${"a".repeat(64)}`,
+    participantId: `participant:v1:${"b".repeat(64)}`,
     createdAt: "2026-07-24T13:00:00.000Z",
     coveredAt: { startAt: "2026-07-24T12:00:00.000Z", endAt: "2026-07-24T13:00:00.000Z" },
     sourceProviders: [snapshot.provider],
@@ -48,8 +49,8 @@ test("sensitive string scanner recognizes common content and credential shapes",
 test("privacy gate fails closed without echoing the sensitive value", () => {
   const sensitive = "canary-private-value";
   const invalidBundle = {
-    bundleId: `bundle:v1:${"A".repeat(43)}`,
-    participantId: `participant:v1:${"B".repeat(43)}`,
+    bundleId: `bundle:v1:${"a".repeat(64)}`,
+    participantId: `participant:v1:${"b".repeat(64)}`,
     coveredAt: {},
     recordCounts: { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 },
     records: { usageEvents: [], quotaSnapshots: [], activityMarkers: [] },
@@ -58,6 +59,23 @@ test("privacy gate fails closed without echoing the sensitive value", () => {
   assert.throws(
     () => verifyPrivacySafeBundle(invalidBundle, { forbiddenSourceValues: [sensitive] }),
     (error) => error.message.includes("failed closed") && !error.message.includes(sensitive),
+  );
+});
+
+test("privacy failures expose only fixed sensitive-pattern codes", () => {
+  const invalidBundle = {
+    bundleId: `bundle:v1:${"a".repeat(64)}`,
+    participantId: `participant:v1:${"b".repeat(64)}`,
+    coveredAt: {},
+    recordCounts: { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 },
+    records: { usageEvents: [], quotaSnapshots: [], activityMarkers: [] },
+    leaked: "https://private.example/path",
+  };
+  assert.throws(
+    () => verifyPrivacySafeBundle(invalidBundle),
+    (error) => error.message.includes("sensitive=web_url")
+      && error.message.includes("private.example") === false
+      && error.message.includes("/records/") === false,
   );
 });
 
@@ -151,9 +169,65 @@ test("privacy gate accepts Claude usage events under the implemented transcript 
       unknown: 0,
     },
     outcome: "unknown",
-    eventId: `event:v2:${"F".repeat(43)}`,
-    sessionScopeId: `session:v1:${"G".repeat(43)}`,
+    eventId: `event:v2:${"f".repeat(64)}`,
+    sessionScopeId: `session:v1:${"0".repeat(64)}`,
     accountScopeId: "unattributed",
   };
   assert.equal(verifyPrivacySafeBundle(bundleWithUsage(usage)).verdict, "passed");
+});
+
+test("hex-derived identifiers pass the scanner and credential-shaped ID values fail closed", () => {
+  const usage = {
+    schemaVersion: "usage-event-v0.1",
+    eventTime: "2026-07-24T12:02:00.000Z",
+    provider: "anthropic_claude_code",
+    modelId: "unknown",
+    modelRecognition: "missing",
+    modelFingerprint: null,
+    billingSurface: "claude_subscription",
+    speedMode: "unknown",
+    apiServiceTier: "unknown",
+    reasoningEffort: "unknown",
+    components: {
+      inputUncachedTokens: 1,
+      inputCacheReadTokens: 0,
+      inputCacheWriteTokens: 0,
+      inputCacheWrite5mTokens: 0,
+      inputCacheWrite1hTokens: 0,
+      outputTextTokens: null,
+      outputReasoningTokens: null,
+      outputCombinedTokens: 1,
+    },
+    totalInputContextTokens: 1,
+    surface: "local_rollout_unclassified",
+    agentScope: "unknown",
+    lineageDisposition: "standalone",
+    toolClassCounts: {
+      webSearch: 0, fileSearch: 0, codeInterpreter: 0, hostedShell: 0,
+      computerUse: 0, mcp: 0, applyPatch: 0, localShell: 0,
+      subagent: 0, toolGateway: 0, other: 0, unknown: 0,
+    },
+    outcome: "unknown",
+    eventId: deriveEventOccurrenceId(SECRET, "privacy-regression-event"),
+    sessionScopeId: deriveSessionScopeId(SECRET, "privacy-regression-session"),
+    accountScopeId: "unattributed",
+  };
+  assert.match(usage.eventId, /^event:v2:[a-f0-9]{64}$/u);
+  assert.equal(inspectSensitiveExportStrings(usage).some(({ code }) => code === "common_api_key"), false);
+  assert.equal(verifyPrivacySafeBundle(bundleWithUsage(usage)).verdict, "passed");
+
+  const credentialShaped = structuredClone(usage);
+  credentialShaped.eventId = `event:v2:sk-${"A".repeat(40)}`;
+  assert.equal(
+    inspectSensitiveExportStrings(credentialShaped).some(({ code, path }) =>
+      code === "common_api_key" && path === "/eventId"),
+    true,
+  );
+  assert.throws(
+    () => verifyPrivacySafeBundle(bundleWithUsage(credentialShaped)),
+    (error) => error.message.includes("schema_allowlist")
+      && error.message.includes("sensitive_string_scan")
+      && error.message.includes("common_api_key")
+      && error.message.includes("sk-") === false,
+  );
 });

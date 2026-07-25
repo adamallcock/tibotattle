@@ -39,15 +39,15 @@
     "resetsAt": { "type": "string", "format": "date-time", "maxLength": 32 },
     "snapshotSource": { "enum": ["rollout", "app_server_read", "status_line", "ui_declaration", "notification"] },
     "providerSurface": { "enum": ["account_shared_unallocated", "general_usage", "model_specific", "separate_limit", "unknown"] },
-    "snapshotId": { "type": "string", "pattern": "^snapshot:v2:[A-Za-z0-9_-]{43}$" },
-    "providerStateId": { "type": "string", "pattern": "^quota-state:v1:[A-Za-z0-9_-]{43}$" },
+    "snapshotId": { "type": "string", "pattern": "^snapshot:v2:[a-f0-9]{64}$" },
+    "providerStateId": { "type": "string", "pattern": "^quota-state:v1:[a-f0-9]{64}$" },
     "sessionScopeId": {
       "type": ["string", "null"],
-      "pattern": "^session:v1:[A-Za-z0-9_-]{43}$"
+      "pattern": "^session:v1:[a-f0-9]{64}$"
     },
     "accountScopeId": {
       "type": "string",
-      "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
+      "pattern": "^(unattributed|account:v1:[a-f0-9]{64})$"
     }
   },
   "allOf": [

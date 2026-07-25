@@ -66,6 +66,8 @@ import {
   uninstallClaudeCallback,
 } from "./claude-callback-lifecycle.js";
 import { runR7SmokeBenchmark } from "./r7-resource-benchmark.js";
+import { runR7ReleaseSyntheticBenchmark } from "./r7-release-synthetic-evidence.js";
+import { runR7MaterializedBoundaryBenchmark } from "./r7-materialized-boundary-benchmark.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -142,7 +144,7 @@ function usage() {
   usage-monitor recover-claude-callback
   usage-monitor rotate-claude-callback-identity [--confirm]
   usage-monitor remove-claude-callback-identity [--confirm-removal TOKEN]
-  usage-monitor benchmark-r7 --profile smoke --output PATH
+  usage-monitor benchmark-r7 --profile smoke|release_synthetic_semantics|release_synthetic_pressure|release_materialized_boundaries --output PATH
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -412,7 +414,16 @@ export async function run(
     rotateClaudeCallbackCommand = rotateManagedClaudeCallbackCapability,
     planClaudeCallbackRemoval = planManagedClaudeCallbackCapabilityRemoval,
     removeClaudeCallbackCredential = removeManagedClaudeCallbackCapability,
-    runR7BenchmarkCommand = runR7SmokeBenchmark,
+    runR7BenchmarkCommand = async ({ profile }) => {
+      if (profile === "smoke") return runR7SmokeBenchmark();
+      if (["release_synthetic_semantics", "release_synthetic_pressure"].includes(profile)) {
+        return runR7ReleaseSyntheticBenchmark({ profile });
+      }
+      if (profile === "release_materialized_boundaries") {
+        return runR7MaterializedBoundaryBenchmark();
+      }
+      throw new Error("benchmark-r7 profile is not implemented");
+    },
   } = {},
 ) {
   const args = parseArgs(argv);
@@ -433,16 +444,22 @@ export async function run(
   }
   if (args.command === "benchmark-r7") {
     if (!args.outputFile) throw new Error("benchmark-r7 requires --output");
-    if ((args.benchmarkProfile ?? "smoke") !== "smoke") {
-      throw new Error("benchmark-r7 supports only the smoke profile until the release workload is implemented");
+    const profile = args.benchmarkProfile ?? "smoke";
+    if (![
+      "smoke",
+      "release_synthetic_semantics",
+      "release_synthetic_pressure",
+      "release_materialized_boundaries",
+    ].includes(profile)) {
+      throw new Error("benchmark-r7 profile is unsupported or not yet implemented");
     }
-    const receipt = await runR7BenchmarkCommand();
+    const receipt = await runR7BenchmarkCommand({ profile });
     await writeJsonOwnerOnlyAtomic(args.outputFile, receipt);
     console.log("R7 benchmark receipt: written");
-    console.log(`Profile: ${receipt.profile}; classification: ${receipt.classification}`);
+    console.log(`Profile: ${receipt.profile}; classification: ${receipt.classification ?? receipt.profile}`);
     console.log(`Operations exercised: ${receipt.operations.filter((row) => row.status !== "not_run").length}; recovered after interruption: ${receipt.operations.filter((row) => row.status === "interrupted_recovered").length}; not run: ${receipt.operations.filter((row) => row.status === "not_run").length}`);
-    console.log(`Determinism: ${receipt.determinismEvidence.status}; receipt SHA-256: ${receipt.receiptSha256}`);
-    console.log(`Network activity: ${receipt.networkActivity}; upload disabled: ${receipt.transportReady === false}`);
+    console.log(`Determinism: ${receipt.determinismEvidence?.status ?? receipt.determinism.status}; receipt SHA-256: ${receipt.receiptSha256}`);
+    console.log(`Network activity: ${receipt.networkActivity ?? receipt.network.activity}; upload disabled: ${(receipt.transportReady ?? receipt.network.transportReady) === false}`);
     return;
   }
   if (args.command === "inspect-claude-callback") {

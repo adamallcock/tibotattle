@@ -57,10 +57,10 @@
     },
     "planType": { "enum": ["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"] },
     "planVariant": { "enum": ["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"] },
-    "markerId": { "type": "string", "pattern": "^marker:v2:[A-Za-z0-9_-]{43}$" },
+    "markerId": { "type": "string", "pattern": "^marker:v2:[a-f0-9]{64}$" },
     "accountScopeId": {
       "type": "string",
-      "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
+      "pattern": "^(unattributed|account:v1:[a-f0-9]{64})$"
     }
   }
 }

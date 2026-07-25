@@ -157,7 +157,7 @@ function assertDescriptor(descriptor) {
       || descriptor.resourcePolicyVersion !== EXPORT_RESOURCE_POLICY_VERSION
       || !validDescriptorResourceLimits(descriptor.resourceLimits)
       || typeof descriptor.participantId !== "string"
-      || !/^participant:v1:[A-Za-z0-9_-]{43}$/.test(descriptor.participantId)
+      || !/^participant:v1:[a-f0-9]{64}$/.test(descriptor.participantId)
       || typeof descriptor.createdAt !== "string" || !Number.isFinite(Date.parse(descriptor.createdAt))
       || !descriptor.coveredAt || !Number.isFinite(Date.parse(descriptor.coveredAt.startAt))
       || !Number.isFinite(Date.parse(descriptor.coveredAt.endAt))

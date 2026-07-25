@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "cab6f708db26561fe4276bcc6cb010b9b01fa9edf250cbface235c1efbfd4fda",
+    "sha256": "43f4ebd267b1eeacc87e16f133507b4f0ea857f097a4bde5c0f791fc558d5cb7",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -80,12 +80,12 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json",
         "name": "activity-marker.schema.json",
-        "sha256": "e4a506ff8f26ecdaf42674877d08ff9dd72e8f26339aa7c45d29b77e4c7dff02"
+        "sha256": "1588f843cad732fa28a65e18be2b2bdd3a050f91b086a7fbebb3ded7bd58364c"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/bundle.schema.json",
         "name": "bundle.schema.json",
-        "sha256": "2acd8d262e75ead03c132f7d08d8c86e5595b820385375953e7694cf1611c629"
+        "sha256": "556e14ebc808d95940ab94946d2f7b72ec59052b0912a38b64f0311805de35cc"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
@@ -95,20 +95,20 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
         "name": "privacy-receipt.schema.json",
-        "sha256": "97041641a58aa04bc3b62dd208162b5d5edf253176d5c5b3f6352f7d081d9f90"
+        "sha256": "a670e4be9d55e509746f56f1f071d07b7c1cb2296bacfeec2e9be928ee56db4d"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
         "name": "quota-snapshot.schema.json",
-        "sha256": "527dce6668db480963321493b8becfec161de63a60a044e38773b2dd6e4165ca"
+        "sha256": "e0827a8cd11eed121ac6bbed325271dd8edd61dfde2b9fe500c617a15cba8c83"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "95bea7c449cc21878837b6ad6411b0fbe0b50c8ce85839540c42c308364e4d00"
+        "sha256": "9b0d572464fe922049cf4a83b9f0e6b0bdc176271a61971ec6b0706ae8aa4edd"
       }
     ],
-    "setSha256": "3857fce159ef400ebeba5539b5e5dd77d8b1f6828210698e48ecc59bab020025"
+    "setSha256": "63959244d2294848e30f9ce43d1b40905d1b8967b6c2bf82553b13c42b3df962"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

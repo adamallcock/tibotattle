@@ -1,0 +1,852 @@
+{
+  "boundaries": [
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 2678400000
+      },
+      "dimension": "covered_duration",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 2678400001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 2678400000,
+      "unit": "milliseconds",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 20000
+      },
+      "dimension": "directory_entries",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 20001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 20000,
+      "unit": "entries",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 5000
+      },
+      "dimension": "source_files",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 5001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 5000,
+      "unit": "files",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 34359738368
+      },
+      "dimension": "source_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 34359738369
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 34359738368,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 16777216
+      },
+      "dimension": "line_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 16777217
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 16777216,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 100000
+      },
+      "dimension": "output_records_single_bundle",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 100001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 100000,
+      "unit": "records",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 33554432
+      },
+      "dimension": "expanded_record_bytes_single_bundle",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 33554433
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 33554432,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 33554432
+      },
+      "dimension": "canonical_bundle_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 33554433
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 33554432,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 35651584
+      },
+      "dimension": "encoded_artifact_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 35651585
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 35651584,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 2000000
+      },
+      "dimension": "output_records_export_set",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 2000001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 2000000,
+      "unit": "records",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 2147483648
+      },
+      "dimension": "expanded_record_bytes_export_set",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 2147483649
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 2147483648,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 4294967296
+      },
+      "dimension": "export_set_decoded_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 4294967297
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 4294967296,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 4294967296
+      },
+      "dimension": "export_set_encoded_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 4294967297
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 4294967296,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 4294967296
+      },
+      "dimension": "workspace_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 4294967297
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 4294967296,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 1000
+      },
+      "dimension": "sqlite_batch_records",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 1001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 1000,
+      "unit": "records",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 1048576
+      },
+      "dimension": "manifest_bytes",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 1048577
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 1048576,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 512
+      },
+      "dimension": "chunk_count",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 513
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 512,
+      "unit": "chunks",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 600000
+      },
+      "dimension": "elapsed_time",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 600001
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 600000,
+      "unit": "milliseconds",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    },
+    {
+      "atLimit": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 1610612736
+      },
+      "dimension": "rss",
+      "identification": "not_run",
+      "mode": "not_identified",
+      "plusOne": {
+        "failureCode": "not_run_profile",
+        "status": "not_run",
+        "value": 1610612737
+      },
+      "producer": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      },
+      "selectedLimit": 1610612736,
+      "unit": "bytes",
+      "verifier": {
+        "failureCode": "not_run_profile",
+        "status": "not_run"
+      }
+    }
+  ],
+  "contractProvenance": {
+    "receiptSchemaSha256": "97d91d943e7c174bb4d2e5b9859d6481acec50d423a0320fd65b8c2035f009ce",
+    "resourcePolicySourceSha256": "0dabc0a62cfb9476aaf2678271f62ab9f5109657421fd77e5d7152f02331efb7",
+    "resourcePolicyValuesSha256": "a3dde0db440015886144b76b88a8a663095c7e5eb08f0a68f062e597e95552f6",
+    "schemaModuleSha256": "96122d26303a683c0212ec57321324c503a8b442b5b0d89d018bbd70f7470e40",
+    "workloadCodeFileCount": 122,
+    "workloadCodeSha256": "4e7a204f6429eb1983b6a52a9218b2b26f2f79b09c177586524be5455ee08a96"
+  },
+  "determinism": {
+    "comparisons": {
+      "canonicalArtifacts": "matched",
+      "chunkBoundaries": "matched",
+      "cleanupInventories": "matched",
+      "fixedFailureCodes": "matched",
+      "fixtureManifest": "matched",
+      "lifecycleProjection": "matched",
+      "logicalRecords": "matched",
+      "preservationResults": "matched",
+      "sourcePlan": "matched",
+      "verifierResults": "matched"
+    },
+    "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
+    "runCount": 2,
+    "runProjectionSha256es": [
+      "3b0622abdaa950d47c8bbce0383cf5493717619b505c67ee9dfb7495966f7b1e",
+      "3b0622abdaa950d47c8bbce0383cf5493717619b505c67ee9dfb7495966f7b1e"
+    ],
+    "status": "passed"
+  },
+  "network": {
+    "activity": "not_measured",
+    "externalParticipants": false,
+    "transportReady": false
+  },
+  "operations": [
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 17294,
+        "childMaxRssBytes": 713211904,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 713211904,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 708739072,
+        "externalRssSampleCount": 289,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 96932000,
+          "beforeBytes": 160,
+          "sampledHighWaterBytes": 96932000
+        },
+        "outputRecords": 29108,
+        "parentElapsedMs": 14680,
+        "runCount": 2,
+        "sourceBytes": 47637907,
+        "sourceFiles": 4096,
+        "stderrBytes": 0,
+        "stdoutBytes": 1098
+      },
+      "name": "source_scan",
+      "projectionSha256": "c70ea4b8c4d71a9ee8b2a1cd72023877e32391e1f2b8fd7bfb355374b28f2395",
+      "status": "completed"
+    },
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 11507,
+        "childMaxRssBytes": 594264064,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 587071488,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 587038720,
+        "externalRssSampleCount": 220,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 193863840,
+          "beforeBytes": 127041696,
+          "sampledHighWaterBytes": 193863951
+        },
+        "outputRecords": 29108,
+        "parentElapsedMs": 11101,
+        "runCount": 2,
+        "sourceBytes": 47637907,
+        "sourceFiles": 4096,
+        "stderrBytes": 0,
+        "stdoutBytes": 1103
+      },
+      "name": "checkpoint_resume",
+      "projectionSha256": "c70ea4b8c4d71a9ee8b2a1cd72023877e32391e1f2b8fd7bfb355374b28f2395",
+      "status": "completed"
+    },
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 3564,
+        "childMaxRssBytes": 204718080,
+        "decodedBytes": 46019237,
+        "durablePeakRssBytes": 713211904,
+        "encodedBytes": 2072524,
+        "externalPeakRssBytes": 203964416,
+        "externalRssSampleCount": 170,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196970944,
+          "beforeBytes": 193863840,
+          "sampledHighWaterBytes": 196970944
+        },
+        "outputRecords": 29108,
+        "parentElapsedMs": 8623,
+        "runCount": 2,
+        "sourceBytes": 47637907,
+        "sourceFiles": 4096,
+        "stderrBytes": 0,
+        "stdoutBytes": 1250
+      },
+      "name": "export_set_materialize",
+      "projectionSha256": "2fa1df171322f047bed7b357ada4f87cf97cf2deb7bfaafeacca483ea68e254b",
+      "status": "completed"
+    },
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 1606,
+        "childMaxRssBytes": 199901184,
+        "decodedBytes": 46019237,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 2072524,
+        "externalPeakRssBytes": 199868416,
+        "externalRssSampleCount": 32,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196970944,
+          "beforeBytes": 196970944,
+          "sampledHighWaterBytes": 204992856
+        },
+        "outputRecords": 29108,
+        "parentElapsedMs": 1630,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 1011
+      },
+      "name": "export_set_verify",
+      "projectionSha256": "af6d9952837fa51634139e8384a33c1d586a6b685f3ab3a178c93f6ba5fa9597",
+      "status": "completed"
+    },
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 5487,
+        "childMaxRssBytes": 233127936,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 233111552,
+        "externalRssSampleCount": 142,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 96934532,
+          "beforeBytes": 196973015,
+          "sampledHighWaterBytes": 197052825
+        },
+        "outputRecords": 0,
+        "parentElapsedMs": 7210,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 1005
+      },
+      "name": "complete_set_delete",
+      "projectionSha256": "8a166608146c4c5f1fec4b816cf1554c2f04eeaa8fd6830c59eb99b3d0ddff30",
+      "status": "completed"
+    },
+    {
+      "failureCode": "interruption_injected",
+      "metrics": {
+        "childCpuMs": 392,
+        "childMaxRssBytes": 130711552,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 130711552,
+        "externalRssSampleCount": 48,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196973015,
+          "beforeBytes": 297091785,
+          "sampledHighWaterBytes": 297091785
+        },
+        "outputRecords": 0,
+        "parentElapsedMs": 2359,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 1012
+      },
+      "name": "complete_set_delete_recovery",
+      "projectionSha256": "8a166608146c4c5f1fec4b816cf1554c2f04eeaa8fd6830c59eb99b3d0ddff30",
+      "status": "interrupted_recovered"
+    },
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 142,
+        "childMaxRssBytes": 121290752,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 121290752,
+        "externalRssSampleCount": 8,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196971479,
+          "beforeBytes": 227080640,
+          "sampledHighWaterBytes": 227081983
+        },
+        "outputRecords": 0,
+        "parentElapsedMs": 317,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 996
+      },
+      "name": "workspace_discard",
+      "projectionSha256": "064fdfeb99edbc148aa8778a62741f99119e5abad545d4e846cb39e835736056",
+      "status": "completed"
+    },
+    {
+      "failureCode": "interruption_injected",
+      "metrics": {
+        "childCpuMs": 98,
+        "childMaxRssBytes": 121602048,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 121159680,
+        "externalRssSampleCount": 6,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196972014,
+          "beforeBytes": 227082407,
+          "sampledHighWaterBytes": 227082518
+        },
+        "outputRecords": 0,
+        "parentElapsedMs": 260,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 1004
+      },
+      "name": "workspace_discard_recovery",
+      "projectionSha256": "064fdfeb99edbc148aa8778a62741f99119e5abad545d4e846cb39e835736056",
+      "status": "interrupted_recovered"
+    },
+    {
+      "failureCode": "none",
+      "metrics": {
+        "childCpuMs": 6,
+        "childMaxRssBytes": 116178944,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 106135552,
+        "externalRssSampleCount": 4,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196972284,
+          "beforeBytes": 196972463,
+          "sampledHighWaterBytes": 196972469
+        },
+        "outputRecords": 0,
+        "parentElapsedMs": 157,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 993
+      },
+      "name": "claude_callback_uninstall",
+      "projectionSha256": "5d38a4aa94abb27b809f1949c8c9cfdc8361453401f51bca076b93b14707316a",
+      "status": "completed"
+    },
+    {
+      "failureCode": "interruption_injected",
+      "metrics": {
+        "childCpuMs": 5,
+        "childMaxRssBytes": 116572160,
+        "decodedBytes": 0,
+        "durablePeakRssBytes": 0,
+        "encodedBytes": 0,
+        "externalPeakRssBytes": 106577920,
+        "externalRssSampleCount": 4,
+        "externalRssSampleFailureCount": 0,
+        "filesystem": {
+          "afterBytes": 196972554,
+          "beforeBytes": 196972742,
+          "sampledHighWaterBytes": 196972742
+        },
+        "outputRecords": 0,
+        "parentElapsedMs": 148,
+        "runCount": 2,
+        "sourceBytes": 0,
+        "sourceFiles": 0,
+        "stderrBytes": 0,
+        "stdoutBytes": 992
+      },
+      "name": "claude_callback_recovery",
+      "projectionSha256": "ac9728b5c17add6e4c1be782fd51e72c0b1a973b1e52d883eaa8ed1dfab55d1a",
+      "status": "interrupted_recovered"
+    }
+  ],
+  "outcome": "partial",
+  "policyVersion": "g1-r3-candidate-0.5",
+  "preservation": {
+    "callbackSettingsPreserved": true,
+    "cleanupExactInventory": "passed",
+    "identityStatePreserved": true,
+    "independentOutputPreserved": true,
+    "secureErasureClaimed": false,
+    "sourceLogsPreserved": true
+  },
+  "privacy": {
+    "arbitraryErrorsRetained": false,
+    "contentFree": true,
+    "identifiersRetained": false,
+    "pathsRetained": false,
+    "privateRssSamplesRetained": false,
+    "prohibitedDataScan": "passed",
+    "rawContentRetained": false,
+    "rowLevelDataRetained": false,
+    "timestampsRetained": false
+  },
+  "profile": "release_synthetic_pressure",
+  "profileEvidence": {
+    "compressiblePayloadBytes": 8388608,
+    "denseRecords": 25000,
+    "fixtureManifestSha256": "dc4aa44876bc4066a46df1364d2ba40cb0e9bdd883b9452c51f2651a1a233972",
+    "incompressiblePayloadBytes": 8388608,
+    "kind": "release_synthetic_pressure",
+    "longLineBytes": 65536,
+    "longLinePlusOneBytes": 65537,
+    "manySmallSourceFiles": 4096,
+    "seed": 1831565813,
+    "targetChunks": 128
+  },
+  "protocolVersion": "g1-r7-release-evidence-v0.1",
+  "receiptSha256": "b06f8a933188aabb2e427a79e6521b2e2a435874fde45fe113ab4bfb94f6519d",
+  "runtimeProvenance": {
+    "architecture": "arm64",
+    "elapsedClock": "parent_monotonic",
+    "environmentClass": "fixed_locale_timezone_only",
+    "hardwareClass": "apple_silicon",
+    "platform": "macos",
+    "ramBucket": "65_to_128_gib",
+    "rssSampler": "parent_external_macos",
+    "rssSamplingIntervalMs": 100,
+    "runtimeClass": "compatibility_crosscheck",
+    "runtimeFamily": "node",
+    "runtimeVersion": {
+      "major": 26,
+      "minor": 2,
+      "patch": 0
+    },
+    "stderrLimitBytes": 262144,
+    "stdoutLimitBytes": 262144
+  },
+  "schemaVersion": "r7-release-evidence-receipt-v0.1",
+  "selectionRuleVersion": "g1-r7-ceiling-selection-v0.1"
+}

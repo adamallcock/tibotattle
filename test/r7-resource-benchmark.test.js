@@ -1,18 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   R7_BENCHMARK_PROTOCOL_VERSION,
   R7_SELECTION_RULE_VERSION,
+  cleanupR7OwnedTree,
+  inventoryR7OwnedTree,
+  runR7BenchmarkWorker,
   runR7SmokeBenchmark,
   runR7SmokeEvidence,
 } from "../src/r7-resource-benchmark.js";
+import { R7_WORKER_MAXIMUM_STDIN_BYTES } from "../src/r7-worker-watchdog.js";
 import { validateR7ResourceBenchmarkReceipt } from "../src/r7-resource-benchmark-schema.js";
 import { R7_FIXTURE_VERSION } from "../src/r7-resource-benchmark-fixture.js";
 import { runR7ResourceBoundaryMatrix } from "../src/r7-resource-boundaries.js";
 import { DEFAULT_EXPORT_RESOURCE_LIMITS, EXPORT_RESOURCE_POLICY_VERSION } from "../src/export-resource-policy.js";
+import {
+  fixedOperationFailureCode,
+  runR7WorkerOperation,
+} from "../scripts/r7-resource-benchmark-worker.js";
+
+test("the supported default suite keeps resource evidence serial", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(packageJson.scripts.test, "node --test --test-concurrency=1");
+});
 
 const EXPECTED_OPERATIONS = [
   "source_scan",
@@ -26,6 +39,35 @@ const EXPECTED_OPERATIONS = [
   "complete_set_delete_recovery",
   "complete_set_delete",
 ];
+
+test("R7 worker retains allow-listed subsystem codes and discards arbitrary errors", async (t) => {
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-fixed-code-"));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const result = await runR7WorkerOperation({
+    operation: "export_set_materialize",
+    secretHex: "11".repeat(32),
+    workspaceDirectory: join(parent, "missing-workspace"),
+    outputDirectory: join(parent, "output"),
+    resourceLimits: {},
+  });
+  assert.equal(result.status, "failed");
+  assert.match(result.failureCode, /^export_workspace_[a-z_]+$/u);
+  assert.equal(JSON.stringify(result).includes(parent), false);
+  assert.equal(
+    fixedOperationFailureCode(new Error("Privacy export-set manifest failed validation (private)")),
+    "internal_export_set_manifest_validation",
+  );
+  assert.equal(
+    fixedOperationFailureCode(new Error(
+      "Privacy verification failed closed (schema_allowlist, provider_adapter_compatibility; sensitive=web_url)",
+    )),
+    "internal_bundle_privacy_schema_allowlist_and_provider_adapter_compatibility_sensitive_web_url",
+  );
+  assert.equal(
+    fixedOperationFailureCode(new Error("PRIVATE_ARBITRARY_FAILURE")),
+    "operation_failed",
+  );
+});
 
 test("R7 boundary matrix proves every guard ceiling or labels the unexercised SQLite batch limit", () => {
   const value = runR7ResourceBoundaryMatrix();
@@ -75,6 +117,11 @@ test("R7 isolated lifecycle smoke is two-pass deterministic and content-free", {
       assert.equal(Number.isSafeInteger(operation.cpuUserMicros), true);
       assert.equal(Number.isSafeInteger(operation.cpuSystemMicros), true);
       assert.equal(Number.isSafeInteger(operation.peakRssBytes), true);
+      assert.equal(Number.isSafeInteger(operation.parentElapsedMs), true);
+      assert.equal(operation.parentElapsedMs >= 0, true);
+      assert.equal(Number.isSafeInteger(operation.externalPeakRssBytes), true);
+      assert.equal(Number.isSafeInteger(operation.rssSampleCount), true);
+      assert.equal(Number.isSafeInteger(operation.rssSampleFailureCount), true);
       assert.match(operation.evidence.operationEvidenceSha256, /^[a-f0-9]{64}$/);
     }
   }
@@ -104,12 +151,60 @@ test("R7 cleanup refuses a replaced task root instead of inventorying the replac
   }
 });
 
+test("R7 exact cleanup rejects same-content file identity replacement", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-file-race-"));
+  const root = join(parent, "task-root");
+  try {
+    await mkdir(root, { mode: 0o700 });
+    const rootStats = await lstat(root);
+    const path = join(root, "large-derived-file");
+    await writeFile(path, Buffer.alloc(2 * 1024 * 1024, 0x5a));
+    const expected = await inventoryR7OwnedTree(root);
+    await rename(path, join(parent, "displaced"));
+    await writeFile(path, Buffer.alloc(2 * 1024 * 1024, 0x5a));
+    await assert.rejects(
+      cleanupR7OwnedTree(root, expected, { dev: rootStats.dev, ino: rootStats.ino }),
+      /inventory changed before cleanup/,
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("extended worker stdin is restricted to frozen real source-plan scans", async () => {
+  for (const config of [
+    { operation: "export_set_verify", sourcePlanBundle: {} },
+    { operation: "source_scan" },
+  ]) {
+    await assert.rejects(
+      runR7BenchmarkWorker(config, { maximumStdinBytes: R7_WORKER_MAXIMUM_STDIN_BYTES }),
+      /restricted to real source-plan scans/,
+    );
+  }
+});
+
+test("R7 benchmark worker enforces its terminal lifetime RSS high-water mark", { timeout: 10_000 }, async () => {
+  await assert.rejects(
+    runR7BenchmarkWorker({
+      operation: "export_set_materialize",
+      secretHex: "11".repeat(32),
+      workspaceDirectory: join(tmpdir(), "usage-monitor-r7-missing-workspace"),
+      outputDirectory: join(tmpdir(), "usage-monitor-r7-unused-output"),
+      resourceLimits: {},
+    }, { maximumRssBytes: 1 }),
+    /R7 operation worker stopped: rss_limit_exceeded/,
+  );
+});
+
 test("R7 smoke benchmark emits a strict self-hashed honest receipt", { timeout: 30_000 }, async () => {
   const receipt = await runR7SmokeBenchmark();
   assert.deepEqual(validateR7ResourceBenchmarkReceipt(receipt), { valid: true, errors: [] });
   assert.equal(receipt.profile, "smoke");
   assert.equal(receipt.classification, "synthetic_lifecycle");
   assert.equal(receipt.networkActivity, "not_measured");
+  assert.equal(receipt.runtimeProvenance.rssMeasurementMethod, "external_sampling");
+  assert.equal(receipt.runtimeProvenance.rssSamplingIntervalMs, 100);
+  assert.equal(receipt.operations.every((row) => row.metrics.parentElapsedMs > 0), true);
   assert.equal(receipt.determinismEvidence.status, "passed");
   assert.equal(receipt.operations.filter((row) => row.status === "completed").length, 7);
   assert.equal(receipt.operations.filter((row) => row.status === "interrupted_recovered").length, 3);

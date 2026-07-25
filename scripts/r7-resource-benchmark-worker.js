@@ -2,20 +2,41 @@
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createLocalExportWorkspace, resumeLocalExportWorkspace } from "../src/export-set-controller.js";
+import { BundleVerificationError } from "../src/bundle-verifier.js";
+import { ClaudeCallbackLifecycleError } from "../src/claude-callback-lifecycle.js";
+import { ExportSourcePlanError } from "../src/export-source-plan.js";
+import { ExportSourcePlanBundleError } from "../src/export-source-plan-bundle.js";
+import { CodexCollectorExportSourceError } from "../src/codex-collector-export-source.js";
+import { ClaudeStatusLedgerExportSourceError } from "../src/claude-statusline-export-source.js";
+import { ClaudeTranscriptExportSourceError } from "../src/claude-transcript-export-source.js";
 import { materializeLocalExportSet } from "../src/export-set-materializer.js";
-import { verifyLocalExportSet } from "../src/export-set-verifier.js";
-import { planLocalExportDeletion } from "../src/export-deletion.js";
-import { deleteLocalExport, recoverLocalExportDeletion } from "../src/export-deletion-executor.js";
-import { planLocalExportWorkspaceDiscard } from "../src/export-workspace-discard.js";
+import { ExportCompressionError } from "../src/export-compression.js";
+import { ExportDeletionError, planLocalExportDeletion } from "../src/export-deletion.js";
+import {
+  deleteLocalExport,
+  ExportDeletionExecutionError,
+  recoverLocalExportDeletion,
+} from "../src/export-deletion-executor.js";
+import { ExportResourceLimitError } from "../src/export-resource-policy.js";
+import { ExportSetError } from "../src/export-set-materializer.js";
+import { ExportSetVerificationError, verifyLocalExportSet } from "../src/export-set-verifier.js";
+import { ExportWorkspaceDiscardError, planLocalExportWorkspaceDiscard } from "../src/export-workspace-discard.js";
 import {
   discardLocalExportWorkspace,
+  ExportWorkspaceDiscardExecutionError,
   recoverLocalExportWorkspaceDiscard,
 } from "../src/export-workspace-discard-executor.js";
+import { ExportWorkspaceLockError } from "../src/export-workspace-lock.js";
+import { ExportWorkspaceError } from "../src/export-workspace.js";
 import {
   recoverClaudeCallbackLifecycle,
   uninstallClaudeCallback,
 } from "../src/claude-callback-lifecycle.js";
 import { stableJson } from "../src/storage.js";
+import {
+  R7_WORKER_DEFAULT_MAXIMUM_STDIN_BYTES,
+  R7_WORKER_MAXIMUM_STDIN_BYTES,
+} from "../src/r7-worker-watchdog.js";
 
 const OPERATIONS = new Set([
   "source_scan",
@@ -38,6 +59,92 @@ function safeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+export function fixedOperationFailureCode(error) {
+  if (error instanceof ExportSourcePlanError
+      || error instanceof ExportSourcePlanBundleError
+      || error instanceof CodexCollectorExportSourceError
+      || error instanceof ClaudeStatusLedgerExportSourceError
+      || error instanceof ClaudeTranscriptExportSourceError) {
+    return "source_integrity";
+  }
+  const systemCode = typeof error?.code === "string" ? error.code : "";
+  if (new Set(["EACCES", "EEXIST", "EIO", "EMFILE", "ENFILE", "ENOENT", "ENOSPC", "EPERM"])
+    .has(systemCode)) {
+    return `system_${systemCode.toLowerCase()}`;
+  }
+  const fixedErrors = [
+    BundleVerificationError,
+    ClaudeCallbackLifecycleError,
+    ExportCompressionError,
+    ExportDeletionError,
+    ExportDeletionExecutionError,
+    ExportResourceLimitError,
+    ExportSetError,
+    ExportSetVerificationError,
+    ExportWorkspaceDiscardError,
+    ExportWorkspaceDiscardExecutionError,
+    ExportWorkspaceError,
+    ExportWorkspaceLockError,
+  ];
+  if (fixedErrors.some((ErrorClass) => error instanceof ErrorClass)
+      && typeof error.code === "string" && /^[a-z0-9_]+$/u.test(error.code)) {
+    return error.code;
+  }
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (message === "Canonical chunk byte accounting mismatch") {
+    return "internal_canonical_chunk_accounting";
+  }
+  if (message === "Generated export compatibility manifest is stale") {
+    return "internal_compatibility_manifest_stale";
+  }
+  const privacyMatch = /^Privacy verification failed closed \(([^;)]*)(?:; sensitive=([a-z_+]+))?\)$/u
+    .exec(message);
+  if (privacyMatch) {
+    const allowed = new Set([
+      "schema_allowlist",
+      "compatibility_tuple",
+      "forbidden_key_scan",
+      "sensitive_string_scan",
+      "record_count_consistency",
+      "provider_adapter_compatibility",
+      "source_value_canaries",
+    ]);
+    const failed = privacyMatch[1].split(", ");
+    if (failed.length >= 1 && failed.every((code) => allowed.has(code))) {
+      const sensitiveAllowed = new Set([
+        "email_address",
+        "web_url",
+        "file_url",
+        "absolute_user_path",
+        "windows_user_path",
+        "private_key",
+        "bearer_token",
+        "common_api_key",
+      ]);
+      const sensitive = privacyMatch[2]?.split("+") ?? [];
+      if (sensitive.every((code) => sensitiveAllowed.has(code))) {
+        const suffix = sensitive.length > 0 ? `_sensitive_${sensitive.join("_and_")}` : "";
+        return `internal_bundle_privacy_${failed.join("_and_")}${suffix}`;
+      }
+    }
+    return "internal_bundle_privacy_validation";
+  }
+  if (message.startsWith("Privacy export-set manifest failed validation (")) {
+    return "internal_export_set_manifest_validation";
+  }
+  if (/^Privacy export [a-zA-Z]+ failed schema validation \(/u.test(message)) {
+    return "internal_export_record_schema_validation";
+  }
+  if (message === "Export-set chunk index must be a zero-based integer below 512"
+      || message === "Unsupported export-set manifest version") {
+    return "internal_export_set_chunk_index";
+  }
+  if (typeof error?.stack === "string" && error.stack.includes("/src/storage.js:")) {
+    return "storage_publication_invariant";
+  }
+  return "operation_failed";
+}
+
 function emptyEvidence() {
   return {
     sourceFiles: 0,
@@ -56,6 +163,7 @@ function emptyEvidence() {
     durableElapsedMs: 0,
     durablePeakRssBytes: 0,
     sourcePlanSha256: null,
+    frozenPlanSha256: null,
     logicalRecordsSha256: null,
     chunkBoundariesSha256: null,
     canonicalArtifactsSha256: null,
@@ -84,6 +192,7 @@ function resourceEvidence(resourceUsage, base = {}) {
     durableElapsedMs: safeInteger(resourceUsage?.cumulativeElapsedMs),
     durablePeakRssBytes: safeInteger(resourceUsage?.peakRssBytes),
     sourcePlanSha256: base.sourcePlanSha256 ?? null,
+    frozenPlanSha256: base.frozenPlanSha256 ?? null,
     logicalRecordsSha256: base.logicalRecordsSha256 ?? null,
     chunkBoundariesSha256: base.chunkBoundariesSha256 ?? null,
     canonicalArtifactsSha256: base.canonicalArtifactsSha256 ?? null,
@@ -95,12 +204,16 @@ function resourceEvidence(resourceUsage, base = {}) {
 }
 
 function workspaceOptions(config, secret) {
-  return {
+  const options = {
     directory: config.workspaceDirectory,
-    codexHome: config.codexHome,
     secret,
     activityMarkers: [],
     resourceLimits: config.resourceLimits ?? {},
+  };
+  if (config.sourcePlanBundle) return { ...options, sourcePlanBundle: config.sourcePlanBundle };
+  return {
+    ...options,
+    codexHome: config.codexHome,
     collectorPath: config.collectorPath,
     claudeStateDirectory: config.claudeStateDirectory,
     claudeProjectsDirectory: config.claudeProjectsDirectory,
@@ -118,8 +231,9 @@ async function perform(config, secret) {
     return resourceEvidence(value.resourceUsage, {
       sourcePlanSha256: sha256(stableJson({
         codex: value.descriptor.sourcePlan.sourcePlanSha256,
-        supplemental: value.descriptor.supplementalSourcePlan.sourcePlanSha256,
+        supplemental: value.descriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
       })),
+      frozenPlanSha256: config.sourcePlanBundle?.sourcePlanBundleSha256 ?? null,
       operationEvidenceSha256: sha256(stableJson({
         recordCounts: value.status.recordCounts,
         scanComplete: value.status.scanComplete,
@@ -132,7 +246,7 @@ async function perform(config, secret) {
     return resourceEvidence(value.resourceUsage, {
       sourcePlanSha256: sha256(stableJson({
         codex: value.descriptor.sourcePlan.sourcePlanSha256,
-        supplemental: value.descriptor.supplementalSourcePlan.sourcePlanSha256,
+        supplemental: value.descriptor.supplementalSourcePlan.supplementalSourcePlanSha256,
       })),
       operationEvidenceSha256: sha256(stableJson({
         recordCounts: value.status.recordCounts,
@@ -180,7 +294,10 @@ async function perform(config, secret) {
     });
   }
   if (config.operation === "export_set_verify") {
-    const value = await verifyLocalExportSet({ directory: config.outputDirectory });
+    const value = await verifyLocalExportSet({
+      directory: config.outputDirectory,
+      verificationTemporaryRoot: config.verificationTemporaryRoot,
+    });
     return {
       ...emptyEvidence(),
       outputRecords: Object.values(value.recordCounts).reduce((sum, count) => sum + count, 0),
@@ -313,13 +430,13 @@ export async function runR7WorkerOperation(config) {
       peakRssBytes: normalizedPeakRssBytes(),
       evidence,
     };
-  } catch {
+  } catch (error) {
     const cpu = process.cpuUsage(cpuStart);
     const wallTimeMicros = Number((process.hrtime.bigint() - startedAt) / 1_000n);
     return {
       operation: config.operation,
       status: "failed",
-      failureCode: "operation_failed",
+      failureCode: fixedOperationFailureCode(error),
       wallTimeMicros: Math.max(0, wallTimeMicros),
       cpuUserMicros: safeInteger(cpu.user),
       cpuSystemMicros: safeInteger(cpu.system),
@@ -333,8 +450,20 @@ export async function runR7WorkerOperation(config) {
 
 async function readStdin() {
   const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    bytes += chunk.length;
+    if (bytes > R7_WORKER_MAXIMUM_STDIN_BYTES) {
+      throw new RangeError("R7 benchmark worker input exceeded its fixed byte limit");
+    }
+    chunks.push(chunk);
+  }
+  const config = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  if (bytes > R7_WORKER_DEFAULT_MAXIMUM_STDIN_BYTES
+      && (config?.operation !== "source_scan" || !config?.sourcePlanBundle)) {
+    throw new RangeError("R7 benchmark worker extended input was not a real source-plan scan");
+  }
+  return config;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

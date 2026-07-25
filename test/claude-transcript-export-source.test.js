@@ -456,7 +456,7 @@ test("Claude unreviewed models remain keyed unknowns through safe-record normali
     const normalized = normalizeClaudeTranscriptUsageCandidate(SECRET, scanned.candidates[0]);
     assert.equal(normalized.modelId, "unknown");
     assert.equal(normalized.modelRecognition, "unrecognized");
-    assert.match(normalized.modelFingerprint, /^model:v1:[A-Za-z0-9_-]{43}$/u);
+    assert.match(normalized.modelFingerprint, /^model:v1:[a-f0-9]{64}$/u);
     assert.equal(JSON.stringify(normalized).includes("claude-unreviewed-model-canary"), false);
   } finally {
     await rm(root, { recursive: true, force: true });

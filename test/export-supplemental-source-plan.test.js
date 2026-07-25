@@ -40,7 +40,7 @@ function activityPlan() {
   };
 }
 
-function usageRecord(id = "A", tokens = 10) {
+function usageRecord(id = "a", tokens = 10) {
   return {
     schemaVersion: "usage-event-v0.1",
     eventTime: "2026-07-24T12:30:00.000Z",
@@ -71,8 +71,8 @@ function usageRecord(id = "A", tokens = 10) {
       mcp: 0, applyPatch: 0, localShell: 0, subagent: 0, toolGateway: 0, other: 0, unknown: 0,
     },
     outcome: "unknown",
-    eventId: `event:v2:${id.repeat(43)}`,
-    sessionScopeId: `session:v1:${"S".repeat(43)}`,
+    eventId: `event:v2:${id.repeat(64)}`,
+    sessionScopeId: `session:v1:${"9".repeat(64)}`,
     accountScopeId: "unattributed",
   };
 }
@@ -356,7 +356,7 @@ test("supplemental commits are atomic, byte-identical replays, and gate completi
       status: "pending",
       cursorJson: stableJson({ batch: 1 }),
     }, {
-      records: [{ recordType: "usageEvent", record: usageRecord("A", 10) }],
+      records: [{ recordType: "usageEvent", record: usageRecord("a", 10) }],
       diagnosticDeltas: [{ code: "malformed_lines", count: 1 }],
       resourceDeltas: { directoryEntries: 1, lines: 1, cumulativeElapsedMs: 4, peakRssBytes: 1024 },
     });
@@ -384,7 +384,7 @@ test("supplemental commits are atomic, byte-identical replays, and gate completi
       status: "pending",
       cursorJson: stableJson({ batch: 2 }),
     }, {
-      records: [{ recordType: "usageEvent", record: usageRecord("A", 99) }],
+      records: [{ recordType: "usageEvent", record: usageRecord("a", 99) }],
       diagnosticDeltas: [{ code: "malformed_lines", count: 9 }],
       resourceDeltas: { lines: 1 },
     });

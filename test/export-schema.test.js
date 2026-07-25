@@ -46,8 +46,8 @@ function usageEvent() {
       unknown: 0,
     },
     outcome: "unknown",
-    eventId: `event:v2:${"A".repeat(43)}`,
-    sessionScopeId: `session:v1:${"B".repeat(43)}`,
+    eventId: `event:v2:${"a".repeat(64)}`,
+    sessionScopeId: `session:v1:${"b".repeat(64)}`,
     accountScopeId: "unattributed",
   };
 }
@@ -68,9 +68,23 @@ function quotaSnapshot() {
     resetsAt: "2026-07-31T12:00:00.000Z",
     snapshotSource: "rollout",
     providerSurface: "account_shared_unallocated",
-    snapshotId: `snapshot:v2:${"C".repeat(43)}`,
-    providerStateId: `quota-state:v1:${"D".repeat(43)}`,
-    sessionScopeId: `session:v1:${"E".repeat(43)}`,
+    snapshotId: `snapshot:v2:${"c".repeat(64)}`,
+    providerStateId: `quota-state:v1:${"d".repeat(64)}`,
+    sessionScopeId: `session:v1:${"e".repeat(64)}`,
+    accountScopeId: "unattributed",
+  };
+}
+
+function activityMarker() {
+  return {
+    schemaVersion: "export-activity-marker-v0.1",
+    observedTime: "2026-07-24T12:00:00.000Z",
+    surface: "controlled_experiment",
+    state: "pulse",
+    agenticPoolCoupling: "depends_on_experiment_surface",
+    planType: "pro",
+    planVariant: "unknown",
+    markerId: `marker:v2:${"4".repeat(64)}`,
     accountScopeId: "unattributed",
   };
 }
@@ -79,8 +93,8 @@ function bundleWithDiagnostic(code) {
   return {
     schemaVersion: "usage-metadata-bundle-v0.1",
     compatibility: exportCompatibilityTuple(),
-    bundleId: `bundle:v1:${"F".repeat(43)}`,
-    participantId: `participant:v1:${"G".repeat(43)}`,
+    bundleId: `bundle:v1:${"f".repeat(64)}`,
+    participantId: `participant:v1:${"0".repeat(64)}`,
     createdAt: "2026-07-24T12:00:00.000Z",
     coveredAt: { startAt: "2026-07-24T11:00:00.000Z", endAt: "2026-07-24T12:00:00.000Z" },
     sourceProviders: ["openai_codex"],
@@ -89,6 +103,25 @@ function bundleWithDiagnostic(code) {
     recordCounts: { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 },
     records: { usageEvents: [], quotaSnapshots: [], activityMarkers: [] },
     diagnostics: { sourceFilesScanned: 1, codes: [{ code, count: 1 }] },
+  };
+}
+
+function privacyReceipt() {
+  return {
+    schemaVersion: "privacy-receipt-v0.1",
+    compatibility: exportCompatibilityTuple(),
+    createdAt: "2026-07-24T12:00:00.000Z",
+    bundleId: `bundle:v1:${"f".repeat(64)}`,
+    participantId: `participant:v1:${"0".repeat(64)}`,
+    bundleSha256: "1".repeat(64),
+    bundleBytes: 1,
+    verdict: "passed",
+    transportReady: false,
+    coveredAt: { startAt: "2026-07-24T11:00:00.000Z", endAt: "2026-07-24T12:00:00.000Z" },
+    recordCounts: { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 },
+    checks: ["schema_allowlist", "sensitive_string_scan", "source_value_canary_scan", "provider_adapter_compatibility"]
+      .map((code) => ({ code, status: "passed", violations: 0 })),
+    excludedCategories: ["prompt_and_response_content"],
   };
 }
 
@@ -135,7 +168,7 @@ test("unreviewed models, provider-incompatible models, limits, and diagnostics f
   assert.equal(validateExportRecord("usageEvent", arbitraryModel).valid, false);
 
   const recognizedWithFingerprint = usageEvent();
-  recognizedWithFingerprint.modelFingerprint = `model:v1:${"H".repeat(43)}`;
+  recognizedWithFingerprint.modelFingerprint = `model:v1:${"1".repeat(64)}`;
   assert.equal(validateExportRecord("usageEvent", recognizedWithFingerprint).valid, false);
 
   const missingModel = usageEvent();
@@ -183,13 +216,52 @@ test("unreviewed models, provider-incompatible models, limits, and diagnostics f
 test("pre-hardening draft v0.1 records fail closed and must be regenerated", () => {
   const legacyUsage = usageEvent();
   delete legacyUsage.modelRecognition;
-  legacyUsage.eventId = `event:v1:${"A".repeat(43)}`;
+  legacyUsage.eventId = `event:v1:${"a".repeat(64)}`;
   assert.equal(validateExportRecord("usageEvent", legacyUsage).valid, false);
 
   const legacyQuota = quotaSnapshot();
   delete legacyQuota.providerStateId;
-  legacyQuota.snapshotId = `snapshot:v1:${"C".repeat(43)}`;
+  legacyQuota.snapshotId = `snapshot:v1:${"c".repeat(64)}`;
   assert.equal(validateExportRecord("quotaSnapshot", legacyQuota).valid, false);
+
+  const oldBase64urlEncoding = usageEvent();
+  oldBase64urlEncoding.eventId = `event:v2:${"A".repeat(43)}`;
+  assert.equal(validateExportRecord("usageEvent", oldBase64urlEncoding).valid, false);
+
+  const oldBundleEncoding = bundleWithDiagnostic("malformed_lines");
+  oldBundleEncoding.participantId = `participant:v1:${"B".repeat(43)}`;
+  assert.equal(validateExportRecord("bundle", oldBundleEncoding).valid, false);
+});
+
+test("every export-facing telemetry identifier rejects the old base64url body shape", () => {
+  const oldBody = "A".repeat(43);
+  const cases = [
+    ["usageEvent", () => usageEvent(), "eventId", `event:v2:${oldBody}`],
+    ["usageEvent", () => usageEvent(), "sessionScopeId", `session:v1:${oldBody}`],
+    ["usageEvent", () => usageEvent(), "accountScopeId", `account:v1:${oldBody}`],
+    ["quotaSnapshot", () => quotaSnapshot(), "snapshotId", `snapshot:v2:${oldBody}`],
+    ["quotaSnapshot", () => quotaSnapshot(), "providerStateId", `quota-state:v1:${oldBody}`],
+    ["quotaSnapshot", () => quotaSnapshot(), "sessionScopeId", `session:v1:${oldBody}`],
+    ["quotaSnapshot", () => quotaSnapshot(), "accountScopeId", `account:v1:${oldBody}`],
+    ["activityMarker", () => activityMarker(), "markerId", `marker:v2:${oldBody}`],
+    ["activityMarker", () => activityMarker(), "accountScopeId", `account:v1:${oldBody}`],
+    ["bundle", () => bundleWithDiagnostic("malformed_lines"), "bundleId", `bundle:v1:${oldBody}`],
+    ["bundle", () => bundleWithDiagnostic("malformed_lines"), "participantId", `participant:v1:${oldBody}`],
+    ["privacyReceipt", () => privacyReceipt(), "bundleId", `bundle:v1:${oldBody}`],
+    ["privacyReceipt", () => privacyReceipt(), "participantId", `participant:v1:${oldBody}`],
+  ];
+
+  for (const [kind, makeRecord, field, value] of cases) {
+    const record = makeRecord();
+    record[field] = value;
+    assert.equal(validateExportRecord(kind, record).valid, false, `${kind}.${field}`);
+  }
+
+  const unrecognizedModel = usageEvent();
+  unrecognizedModel.modelId = "unknown";
+  unrecognizedModel.modelRecognition = "unrecognized";
+  unrecognizedModel.modelFingerprint = `model:v1:${oldBody}`;
+  assert.equal(validateExportRecord("usageEvent", unrecognizedModel).valid, false, "usageEvent.modelFingerprint");
 });
 
 test("sessionless quota snapshots are limited to account-level OpenAI collector observations", () => {
@@ -206,7 +278,7 @@ test("sessionless quota snapshots are limited to account-level OpenAI collector 
     const attributed = quotaSnapshot();
     attributed.snapshotSource = snapshotSource;
     attributed.sessionScopeId = null;
-    attributed.accountScopeId = `account:v1:${"H".repeat(43)}`;
+    attributed.accountScopeId = `account:v1:${"1".repeat(64)}`;
     assert.equal(validateExportRecord("quotaSnapshot", attributed).valid, true);
 
     const unattributed = structuredClone(attributed);
@@ -214,7 +286,7 @@ test("sessionless quota snapshots are limited to account-level OpenAI collector 
     assert.equal(validateExportRecord("quotaSnapshot", unattributed).valid, true);
 
     const sessionScopedCollector = structuredClone(attributed);
-    sessionScopedCollector.sessionScopeId = `session:v1:${"I".repeat(43)}`;
+    sessionScopedCollector.sessionScopeId = `session:v1:${"2".repeat(64)}`;
     assert.equal(validateExportRecord("quotaSnapshot", sessionScopedCollector).valid, false);
   }
 

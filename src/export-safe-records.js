@@ -27,10 +27,10 @@ import { stableJson } from "./storage.js";
 
 const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
 const PLAN_VARIANTS = new Set(["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]);
-const SESSION_SCOPE_PATTERN = /^session:v1:[A-Za-z0-9_-]{43}$/u;
+const SESSION_SCOPE_PATTERN = /^session:v1:[a-f0-9]{64}$/u;
 const ACCOUNT_SCOPE_SUBJECT_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
-const MODEL_FINGERPRINT_PATTERN = /^model:v1:[A-Za-z0-9_-]{43}$/u;
+const MODEL_FINGERPRINT_PATTERN = /^model:v1:[a-f0-9]{64}$/u;
 const CLAUDE_PHYSICAL_OCCURRENCE_PATTERN = /^claude-ledger-occurrence:v1:[A-Za-z0-9_-]{43}$/u;
 const MARKER_SURFACES = new Set([
   "chatgpt_chat", "chatgpt_web", "chatgpt_work", "workspace_agent", "chatgpt_excel",

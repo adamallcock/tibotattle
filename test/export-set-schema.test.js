@@ -30,8 +30,8 @@ function manifest() {
       schemaSha256: EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1,
     },
     compatibility: exportCompatibilityTuple(),
-    exportSetId: `export-set:v1:${"A".repeat(43)}`,
-    participantId: `participant:v1:${"B".repeat(43)}`,
+    exportSetId: `export-set:v1:${"a".repeat(64)}`,
+    participantId: `participant:v1:${"b".repeat(64)}`,
     createdAt: "2026-07-24T13:00:00.000Z",
     coveredAt: { startAt: "2026-07-24T11:00:00.000Z", endAt: "2026-07-24T13:00:00.000Z" },
     sourceProviders: ["openai_codex"],
@@ -54,7 +54,7 @@ function manifest() {
     chunks: [
       {
         index: 0,
-        bundleId: `bundle:v1:${"E".repeat(43)}`,
+        bundleId: `bundle:v1:${"e".repeat(64)}`,
         bundleSha256: "1".repeat(64),
         bundleBytes: 2000,
         receiptSha256: "2".repeat(64),
@@ -65,7 +65,7 @@ function manifest() {
       },
       {
         index: 1,
-        bundleId: `bundle:v1:${"F".repeat(43)}`,
+        bundleId: `bundle:v1:${"f".repeat(64)}`,
         bundleSha256: "3".repeat(64),
         bundleBytes: 1500,
         receiptSha256: "4".repeat(64),
@@ -84,6 +84,13 @@ test("standalone strict export-set manifest accepts an exact complete local set"
   assert.equal(assertValidExportSetManifest(value), value);
   assert.equal(exportSetManifestSchemaV0_1.$id, "https://app-usagemonitor.local/schemas/export-set-v0.1/manifest.schema.json");
   assert.equal(Object.hasOwn(exportSchemas, "exportSetManifest"), false);
+});
+
+test("pre-migration base64url-shaped set identifiers require regeneration", () => {
+  const value = manifest();
+  value.exportSetId = `export-set:v1:${"A".repeat(43)}`;
+  value.chunks[0].bundleId = `bundle:v1:${"B".repeat(43)}`;
+  assert.equal(validateExportSetManifest(value).valid, false);
 });
 
 test("manifest contract binds the exact current standalone schema bytes", async () => {

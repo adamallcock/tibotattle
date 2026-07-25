@@ -21,8 +21,8 @@
   "properties": {
     "schemaVersion": { "const": "usage-metadata-bundle-v0.1" },
     "compatibility": { "$ref": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json" },
-    "bundleId": { "type": "string", "pattern": "^bundle:v1:[A-Za-z0-9_-]{43}$" },
-    "participantId": { "type": "string", "pattern": "^participant:v1:[A-Za-z0-9_-]{43}$" },
+    "bundleId": { "type": "string", "pattern": "^bundle:v1:[a-f0-9]{64}$" },
+    "participantId": { "type": "string", "pattern": "^participant:v1:[a-f0-9]{64}$" },
     "createdAt": { "type": "string", "format": "date-time", "maxLength": 32 },
     "coveredAt": {
       "type": "object",

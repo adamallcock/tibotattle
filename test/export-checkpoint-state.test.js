@@ -13,7 +13,7 @@ function stateWithCumulativeTotals() {
   value.currentModel = {
     modelId: "unknown",
     modelRecognition: "unrecognized",
-    modelFingerprint: `model:v1:${"A".repeat(43)}`,
+    modelFingerprint: `model:v1:${"a".repeat(64)}`,
   };
   value.previousTotals = {
     input_tokens: 100,

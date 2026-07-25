@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { constants as filesystemConstants } from "node:fs";
 import {
   chmod,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   realpath,
   rmdir,
@@ -35,6 +36,12 @@ import {
 } from "./r7-resource-benchmark-fixture.js";
 import { runR7ResourceBoundaryMatrix } from "./r7-resource-boundaries.js";
 import {
+  R7_WORKER_DEFAULT_MAXIMUM_STDIN_BYTES,
+  R7_WORKER_MAXIMUM_STDIN_BYTES,
+  R7_WORKER_RSS_SAMPLE_INTERVAL_MS,
+  runR7WorkerWatchdog,
+} from "./r7-worker-watchdog.js";
+import {
   DEFAULT_EXPORT_RESOURCE_LIMITS,
   readBoundedDirectoryEntries,
 } from "./export-resource-policy.js";
@@ -56,11 +63,45 @@ export const R7_BENCHMARK_PROTOCOL_VERSION = "g1-r7-resource-benchmark-v0.1";
 export const R7_SELECTION_RULE_VERSION = "g1-r7-ceiling-selection-v0.1";
 const WORKER = new URL("../scripts/r7-resource-benchmark-worker.js", import.meta.url);
 const REPOSITORY_ROOT = new URL("../", import.meta.url);
-const MAXIMUM_WORKER_OUTPUT_BYTES = 256 * 1024;
 const INTENTIONAL_CHECKPOINT = Symbol("r7-intentional-checkpoint");
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function sha256OwnedFile(path, expectedStat = null) {
+  const before = expectedStat ?? await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw new Error("R7 temporary inventory contained an unsupported entry");
+  }
+  const handle = await open(
+    path,
+    filesystemConstants.O_RDONLY | (filesystemConstants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.nlink !== 1
+        || opened.dev !== before.dev || opened.ino !== before.ino
+        || opened.size !== before.size) {
+      throw new Error("R7 temporary file changed during inventory");
+    }
+    const digest = createHash("sha256");
+    for await (const chunk of handle.createReadStream({
+      autoClose: false,
+      highWaterMark: 64 * 1024,
+    })) {
+      digest.update(chunk);
+    }
+    const after = await handle.stat();
+    if (!after.isFile() || after.nlink !== 1
+        || after.dev !== opened.dev || after.ino !== opened.ino
+        || after.size !== opened.size) {
+      throw new Error("R7 temporary file changed during inventory");
+    }
+    return digest.digest("hex");
+  } finally {
+    await handle.close();
+  }
 }
 
 async function framedSourceSha256(urls) {
@@ -91,7 +132,7 @@ async function benchmarkImplementationUrls() {
   ];
 }
 
-async function inventoryOwnedTree(root) {
+export async function inventoryR7OwnedTree(root) {
   const rows = [];
   let entryCount = 0;
   async function walk(directory, prefix) {
@@ -116,7 +157,9 @@ async function inventoryOwnedTree(root) {
           kind: "file",
           relativeName,
           bytes: stat.size,
-          sha256: sha256(await readFile(path)),
+          dev: stat.dev,
+          ino: stat.ino,
+          sha256: await sha256OwnedFile(path, stat),
         });
       } else {
         throw new Error("R7 temporary inventory contained an unsupported entry");
@@ -124,10 +167,19 @@ async function inventoryOwnedTree(root) {
     }
   }
   await walk(root, "");
-  const projection = rows.map(({ kind, relativeName, bytes = null, sha256: digest = null }) => ({
+  const projection = rows.map(({
+    kind,
+    relativeName,
+    bytes = null,
+    dev = null,
+    ino = null,
+    sha256: digest = null,
+  }) => ({
     kind,
     relativeName,
     bytes,
+    dev,
+    ino,
     sha256: digest,
   }));
   return {
@@ -149,9 +201,9 @@ async function assertSameOwnedRoot(root, expectedIdentity) {
   }
 }
 
-async function cleanupOwnedTree(root, expected, expectedRootIdentity) {
+export async function cleanupR7OwnedTree(root, expected, expectedRootIdentity) {
   await assertSameOwnedRoot(root, expectedRootIdentity);
-  const current = await inventoryOwnedTree(root);
+  const current = await inventoryR7OwnedTree(root);
   if (current.inventorySha256 !== expected.inventorySha256
       || current.entryCount !== expected.entryCount
       || current.fileCount !== expected.fileCount) {
@@ -163,7 +215,8 @@ async function cleanupOwnedTree(root, expected, expectedRootIdentity) {
     if (row.kind === "file") {
       const stat = await lstat(path);
       if (!stat.isFile() || stat.nlink !== 1 || stat.size !== row.bytes
-          || sha256(await readFile(path)) !== row.sha256) {
+          || stat.dev !== row.dev || stat.ino !== row.ino
+          || await sha256OwnedFile(path, stat) !== row.sha256) {
         throw new Error("R7 temporary file changed before cleanup");
       }
       await unlink(path);
@@ -234,51 +287,52 @@ function workerConfig(operation, fixture, extra = {}) {
   };
 }
 
-async function runWorker(config, { timeoutMs = 60_000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [WORKER.pathname], {
-      cwd: process.cwd(),
-      env: { LANG: "C", LC_ALL: "C", TZ: "UTC" },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const stdout = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let overflow = false;
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-    }, timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes <= MAXIMUM_WORKER_OUTPUT_BYTES) stdout.push(chunk);
-      else overflow = true;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderrBytes += chunk.length;
-      if (stderrBytes > MAXIMUM_WORKER_OUTPUT_BYTES) overflow = true;
-    });
-    child.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-    child.on("close", (code, signal) => {
-      clearTimeout(timeout);
-      if (overflow || code !== 0 || signal !== null) {
-        reject(new Error("R7 operation worker failed"));
-        return;
+export async function runR7BenchmarkWorker(config, {
+  timeoutMs = 60_000,
+  maximumStdinBytes,
+  maximumRssBytes = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumRssBytes,
+  runtimeExecutable = process.execPath,
+} = {}) {
+  if (maximumStdinBytes !== undefined
+      && (maximumStdinBytes !== R7_WORKER_MAXIMUM_STDIN_BYTES
+        || config?.operation !== "source_scan"
+        || !config?.sourcePlanBundle)) {
+    throw new TypeError("R7 extended worker input is restricted to real source-plan scans");
+  }
+  const selectedMaximumStdinBytes = maximumStdinBytes
+    ?? R7_WORKER_DEFAULT_MAXIMUM_STDIN_BYTES;
+  let workerResult = null;
+  const watchdog = await runR7WorkerWatchdog({
+    runtimeExecutable,
+    workerPath: WORKER.pathname,
+    cwd: process.cwd(),
+    input: JSON.stringify(config),
+    timeoutMs,
+    maximumRssBytes,
+    maximumStdinBytes: selectedMaximumStdinBytes,
+    requireLifetimePeakRss: true,
+    consumeStdout(bytes) {
+      const value = JSON.parse(bytes.toString("utf8"));
+      if (value?.operation !== config.operation || !["completed", "failed"].includes(value?.status)
+          || !Number.isSafeInteger(value?.peakRssBytes) || value.peakRssBytes < 1) {
+        throw new TypeError("Invalid R7 operation worker result");
       }
-      try {
-        const value = JSON.parse(Buffer.concat(stdout).toString("utf8"));
-        if (value?.operation !== config.operation || !["completed", "failed"].includes(value?.status)) {
-          throw new TypeError("Invalid R7 operation worker result");
-        }
-        resolve(value);
-      } catch {
-        reject(new Error("R7 operation worker result was invalid"));
-      }
-    });
-    child.stdin.end(JSON.stringify(config));
+      workerResult = value;
+      return value.peakRssBytes;
+    },
   });
+  if (watchdog.outcome !== "completed" || workerResult === null) {
+    throw new Error(`R7 operation worker stopped: ${watchdog.outcome}`);
+  }
+  return {
+    ...workerResult,
+    parentElapsedMs: watchdog.elapsedMs,
+    externalPeakRssBytes: watchdog.peakRssBytes,
+    rssSampleCount: watchdog.rssSampleCount,
+    rssSampleFailureCount: watchdog.rssSampleFailureCount,
+    watchdogStdoutBytes: watchdog.stdoutBytes,
+    watchdogStderrBytes: watchdog.stderrBytes,
+  };
 }
 
 function workspaceOptions(fixture, directory, extra = {}) {
@@ -442,55 +496,55 @@ async function runLifecyclePass(root, fixture, options) {
   const identityStateSha256 = sha256(await readFile(identityStateFile));
   const independentOutputSha256 = sha256(await readFile(independentOutputFile));
 
-  operations.push(await runWorker(workerConfig("source_scan", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("source_scan", fixture, {
     workspaceDirectory: workspace,
   }), options));
 
   await prepareIncompleteWorkspace(fixture, resumeWorkspace);
-  operations.push(await runWorker(workerConfig("checkpoint_resume", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("checkpoint_resume", fixture, {
     workspaceDirectory: resumeWorkspace,
   }), options));
 
-  operations.push(await runWorker(workerConfig("export_set_materialize", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("export_set_materialize", fixture, {
     workspaceDirectory: workspace,
     outputDirectory: output,
     maximumRecordsPerChunk: 3,
   }), options));
-  operations.push(await runWorker(workerConfig("export_set_verify", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("export_set_verify", fixture, {
     outputDirectory: output,
   }), options));
 
   await prepareIncompleteWorkspace(fixture, discardWorkspace);
-  operations.push(await runWorker(workerConfig("workspace_discard", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("workspace_discard", fixture, {
     workspaceDirectory: discardWorkspace,
   }), options));
 
   await prepareInterruptedDiscard(fixture, discardRecoveryWorkspace);
-  operations.push(await runWorker(workerConfig("workspace_discard_recovery", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("workspace_discard_recovery", fixture, {
     workspaceDirectory: discardRecoveryWorkspace,
   }), options));
 
   const callback = await prepareCallbackFixture(root);
-  operations.push(await runWorker(workerConfig("claude_callback_uninstall", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("claude_callback_uninstall", fixture, {
     settingsFile: callback.settingsFile,
     lifecycleDirectory: callback.lifecycleDirectory,
     installedStatusLine: callback.installedStatusLine,
   }), options));
 
   const recoveryCallback = await prepareInterruptedCallback(join(root, "callback-recovery"));
-  operations.push(await runWorker(workerConfig("claude_callback_recovery", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("claude_callback_recovery", fixture, {
     settingsFile: recoveryCallback.settingsFile,
     lifecycleDirectory: recoveryCallback.lifecycleDirectory,
     installedStatusLine: recoveryCallback.installedStatusLine,
   }), options));
 
   await prepareInterruptedDeletion(fixture, deletionRecoveryWorkspace, deletionRecoveryOutput);
-  operations.push(await runWorker(workerConfig("complete_set_delete_recovery", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("complete_set_delete_recovery", fixture, {
     workspaceDirectory: deletionRecoveryWorkspace,
     outputDirectory: deletionRecoveryOutput,
   }), options));
 
-  operations.push(await runWorker(workerConfig("complete_set_delete", fixture, {
+  operations.push(await runR7BenchmarkWorker(workerConfig("complete_set_delete", fixture, {
     workspaceDirectory: workspace,
     outputDirectory: output,
   }), options));
@@ -519,7 +573,7 @@ async function runLifecyclePass(root, fixture, options) {
   if (!identityStatePreserved || !independentOutputPreserved || !callbackSettingsPreserved) {
     throw new Error("R7 lifecycle changed protected synthetic state");
   }
-  const cleanupInventory = await inventoryOwnedTree(root);
+  const cleanupInventory = await inventoryR7OwnedTree(root);
   return {
     fixtureEvidence: fixture.evidence,
     fixturePreserved: true,
@@ -666,8 +720,8 @@ export async function runR7SmokeEvidence({
   } finally {
     await cleanupFailpoint(created);
     await assertSameOwnedRoot(created, createdIdentity);
-    const inventory = await inventoryOwnedTree(created);
-    const cleanup = await cleanupOwnedTree(created, inventory, createdIdentity);
+    const inventory = await inventoryR7OwnedTree(created);
+    const cleanup = await cleanupR7OwnedTree(created, inventory, createdIdentity);
     if (result) result.cleanup = cleanup;
   }
   return result;
@@ -675,8 +729,11 @@ export async function runR7SmokeEvidence({
 
 const ZERO_OPERATION_METRICS = Object.freeze({
   wallTimeMs: 0,
+  parentElapsedMs: 0,
   cpuTimeMs: 0,
   peakRssBytes: 0,
+  rssSampleCount: 0,
+  rssSampleFailureCount: 0,
   directoryEntries: 0,
   sourceFiles: 0,
   sourceBytes: 0,
@@ -701,6 +758,7 @@ function maximumMetric(first, second, key) {
 function operationMetrics(first, second) {
   return {
     wallTimeMs: Math.ceil(Math.max(first.wallTimeMicros, second.wallTimeMicros) / 1_000),
+    parentElapsedMs: Math.max(first.parentElapsedMs, second.parentElapsedMs),
     cpuTimeMs: Math.ceil(Math.max(
       first.cpuUserMicros + first.cpuSystemMicros,
       second.cpuUserMicros + second.cpuSystemMicros,
@@ -708,8 +766,15 @@ function operationMetrics(first, second) {
     peakRssBytes: Math.max(
       first.peakRssBytes,
       second.peakRssBytes,
+      first.externalPeakRssBytes,
+      second.externalPeakRssBytes,
       first.evidence.durablePeakRssBytes ?? 0,
       second.evidence.durablePeakRssBytes ?? 0,
+    ),
+    rssSampleCount: Math.max(first.rssSampleCount, second.rssSampleCount),
+    rssSampleFailureCount: Math.max(
+      first.rssSampleFailureCount,
+      second.rssSampleFailureCount,
     ),
     durableElapsedMs: maximumMetric(first.evidence, second.evidence, "durableElapsedMs"),
     durablePeakRssBytes: maximumMetric(first.evidence, second.evidence, "durablePeakRssBytes"),
@@ -852,8 +917,8 @@ export async function buildR7SmokeReceipt(evidence) {
       runtimeFamily: "node",
       runtimeClass: qualifiedRuntimeClass(version),
       runtimeVersion: version,
-      rssMeasurementMethod: "process_resource_usage_maxrss",
-      rssSamplingIntervalMs: 0,
+      rssMeasurementMethod: "external_sampling",
+      rssSamplingIntervalMs: R7_WORKER_RSS_SAMPLE_INTERVAL_MS,
     },
     contractProvenance: {
       receiptSchemaSha256: R7_RESOURCE_BENCHMARK_RECEIPT_SCHEMA_SHA256,

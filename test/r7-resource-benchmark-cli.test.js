@@ -29,6 +29,29 @@ test("benchmark-r7 parsing keeps its profile scoped and bounded", () => {
   );
 });
 
+test("benchmark-r7 routes implemented release profiles without changing the bounded summary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-r7-cli-release-"));
+  const output = join(root, "receipt.json");
+  let selected = null;
+  try {
+    await run([
+      "benchmark-r7",
+      "--profile",
+      "release_synthetic_semantics",
+      "--output",
+      output,
+    ], {
+      async runR7BenchmarkCommand({ profile }) {
+        selected = profile;
+        return fakeReceipt();
+      },
+    });
+    assert.equal(selected, "release_synthetic_semantics");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("benchmark-r7 writes an injected receipt and prints only a bounded content-free summary", async () => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-r7-cli-"));
   const output = join(root, "PRIVATE_PATH_CANARY.json");
@@ -52,11 +75,11 @@ test("benchmark-r7 writes an injected receipt and prints only a bounded content-
   }
 });
 
-test("benchmark-r7 refuses to label the smoke harness as release evidence", async () => {
+test("benchmark-r7 refuses unknown or not-yet-implemented profiles", async () => {
   await assert.rejects(
     run(["benchmark-r7", "--profile", "release", "--output", "receipt.json"], {
       runR7BenchmarkCommand: async () => fakeReceipt(),
     }),
-    /supports only the smoke profile/,
+    /unsupported or not yet implemented/,
   );
 });

@@ -49,7 +49,7 @@ async function fixture() {
   return { root, home, workspace: join(root, "workspace"), sourcePlan, descriptor };
 }
 
-function usageRecord(id = "A", tokens = 10) {
+function usageRecord(id = "a", tokens = 10) {
   return {
     schemaVersion: "usage-event-v0.1",
     eventTime: "2026-07-24T12:30:00.000Z",
@@ -80,8 +80,8 @@ function usageRecord(id = "A", tokens = 10) {
       mcp: 0, applyPatch: 0, localShell: 0, subagent: 0, toolGateway: 0, other: 0, unknown: 0,
     },
     outcome: "unknown",
-    eventId: `event:v2:${id.repeat(43)}`,
-    sessionScopeId: `session:v1:${"S".repeat(43)}`,
+    eventId: `event:v2:${id.repeat(64)}`,
+    sessionScopeId: `session:v1:${"9".repeat(64)}`,
     accountScopeId: "unattributed",
   };
 }
@@ -132,9 +132,9 @@ test("workspace rejects conflicting occurrence IDs atomically", async () => {
     sourcePlan: value.sourcePlan,
   });
   try {
-    await workspace.insertRecordBatch([{ recordType: "usageEvent", record: usageRecord("A", 10) }]);
+    await workspace.insertRecordBatch([{ recordType: "usageEvent", record: usageRecord("a", 10) }]);
     await assert.rejects(
-      workspace.insertRecordBatch([{ recordType: "usageEvent", record: usageRecord("A", 11) }]),
+      workspace.insertRecordBatch([{ recordType: "usageEvent", record: usageRecord("a", 11) }]),
       (error) => error instanceof ExportWorkspaceError && error.code === "export_workspace_record_conflict",
     );
     assert.equal(workspace.counts().usageEvents, 1);

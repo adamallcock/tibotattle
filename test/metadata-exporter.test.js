@@ -7,7 +7,7 @@ import { buildLocalMetadataBundle, writeLocalMetadataBundle } from "../src/metad
 import { stableJson } from "../src/storage.js";
 
 const SECRET = Buffer.alloc(32, 11);
-const BUNDLE_ID = `bundle:v1:${"C".repeat(43)}`;
+const BUNDLE_ID = `bundle:v1:${"c".repeat(64)}`;
 const CREATED_AT = "2026-07-24T12:30:00.000Z";
 
 function usage(input, output, cached, reasoning) {

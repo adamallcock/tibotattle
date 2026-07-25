@@ -54,7 +54,7 @@ function usageEvent(overrides = {}) {
       agentScope: "root",
       lineageDisposition: "standalone",
     },
-    sourceScopeId: `session:v1:${"S".repeat(43)}`,
+    sourceScopeId: `session:v1:${"9".repeat(64)}`,
     sourceRecordOrdinal: 17,
     ...overrides,
   };

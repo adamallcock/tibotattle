@@ -23,7 +23,7 @@ function privateKey(label) {
   return createHash("sha256").update(`checkpoint-workspace-test:${label}`).digest("hex");
 }
 
-function usageRecord(id = "A", tokens = 10) {
+function usageRecord(id = "a", tokens = 10) {
   return {
     schemaVersion: "usage-event-v0.1",
     eventTime: "2026-07-24T12:30:00.000Z",
@@ -54,8 +54,8 @@ function usageRecord(id = "A", tokens = 10) {
       mcp: 0, applyPatch: 0, localShell: 0, subagent: 0, toolGateway: 0, other: 0, unknown: 0,
     },
     outcome: "unknown",
-    eventId: `event:v2:${id.repeat(43)}`,
-    sessionScopeId: `session:v1:${"S".repeat(43)}`,
+    eventId: `event:v2:${id.repeat(64)}`,
+    sessionScopeId: `session:v1:${"9".repeat(64)}`,
     accountScopeId: "unattributed",
   };
 }
@@ -218,7 +218,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
         phase: "record_scan", byteOffset: 0, lineOrdinal: 0, parserState,
         completedPhaseCursor: { byteOffset: source.prefixBytes, lineOrdinal: 1 },
       },
-      records: [{ recordType: "usageEvent", record: usageRecord("A", 10) }],
+      records: [{ recordType: "usageEvent", record: usageRecord("a", 10) }],
       seenOccurrences: [{ kind: "usage_event", occurrenceKey, lineOrdinal: 1 }],
       localSnapshots: [{ kind: "cumulative_usage", snapshotKey }],
       tierEvents: [{
@@ -329,7 +329,7 @@ test("checkpoint commits roll back conflicts and finalization requires every sou
         parserState: createEmptyCodexCheckpointState(),
         completedPhaseCursor: { byteOffset: source.prefixBytes, lineOrdinal: 1 },
       },
-      records: [{ recordType: "usageEvent", record: usageRecord("B", 10) }],
+      records: [{ recordType: "usageEvent", record: usageRecord("b", 10) }],
       diagnosticDeltas: [{ code: "malformed_lines", count: 1 }],
       resourceDeltas: { lines: 1, cumulativeElapsedMs: 3 },
     });
@@ -349,7 +349,7 @@ test("checkpoint commits roll back conflicts and finalization requires every sou
         lineOrdinal: 1,
         parserState: createEmptyCodexCheckpointState(),
       },
-      records: [{ recordType: "usageEvent", record: usageRecord("B", 99) }],
+      records: [{ recordType: "usageEvent", record: usageRecord("b", 99) }],
       diagnosticDeltas: [{ code: "malformed_lines", count: 99 }],
       resourceDeltas: { lines: 1, cumulativeElapsedMs: 99, peakRssBytes: 99999 },
     });

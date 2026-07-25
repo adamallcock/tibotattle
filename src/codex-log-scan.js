@@ -836,7 +836,7 @@ export async function scanCodexLogEvents({
       ? sourceScopeForRollout(info.lineage.sessionId ?? info.rolloutKey)
       : null;
     const sourceDedupeScope = info.lineage.sessionId ?? info.rolloutKey;
-    if (sourceScopeId !== null && (typeof sourceScopeId !== "string" || !/^[a-z][a-z0-9-]*:v1:[A-Za-z0-9_-]{43}$/.test(sourceScopeId))) {
+    if (sourceScopeId !== null && (typeof sourceScopeId !== "string" || !/^session:v1:[a-f0-9]{64}$/.test(sourceScopeId))) {
       throw new Error("sourceScopeForRollout must return a versioned privacy-safe pseudonym or null");
     }
     const parsed = await parseRollout(sourceInput, {

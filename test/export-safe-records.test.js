@@ -182,7 +182,7 @@ test("safe-record adapter emits validated metadata-only envelopes matching the l
       codexHome: home,
       secret: SECRET,
       activityMarkers: [marker()],
-      bundleId: `bundle:v1:${"A".repeat(43)}`,
+      bundleId: `bundle:v1:${"a".repeat(64)}`,
       createdAt: "2026-07-24T12:30:00.000Z",
     });
 
@@ -252,7 +252,7 @@ test("collector candidates normalize deterministically without exporting source 
   const repeat = normalizeCodexCollectorQuotaCandidate(SECRET, structuredClone(candidate));
   assert.deepEqual(first, repeat);
   assert.equal(first.sessionScopeId, null);
-  assert.match(first.accountScopeId, /^account:v1:[A-Za-z0-9_-]{43}$/);
+  assert.match(first.accountScopeId, /^account:v1:[a-f0-9]{64}$/);
   assert.equal(first.snapshotSource, "app_server_read");
   const serialized = stableJson(first);
   assert.equal(serialized.includes(candidate.accountScopeSubject), false);
@@ -291,7 +291,7 @@ test("collector candidate normalization rejects unknown fields and session-scope
   );
   assert.throws(
     () => normalizeCodexCollectorQuotaCandidate(SECRET, collectorCandidate({
-      sessionScopeId: `session:v1:${"F".repeat(43)}`,
+      sessionScopeId: `session:v1:${"f".repeat(64)}`,
     })),
     /Invalid privacy-safe collector quota candidate/,
   );
@@ -307,7 +307,7 @@ test("Claude status quota normalization is deterministic and requires a session 
   assert.deepEqual(first, repeat);
   assert.deepEqual(first.map((snapshot) => snapshot.slot), ["five_hour", "seven_day"]);
   assert.ok(first.every((snapshot) => snapshot.snapshotSource === "status_line"));
-  assert.ok(first.every((snapshot) => /^session:v1:[A-Za-z0-9_-]{43}$/.test(snapshot.sessionScopeId)));
+  assert.ok(first.every((snapshot) => /^session:v1:[a-f0-9]{64}$/.test(snapshot.sessionScopeId)));
   assert.notEqual(first[0].snapshotId, first[1].snapshotId);
   assert.throws(
     () => normalizeClaudeStatusQuotaSnapshots(SECRET, claudeStatus({ sessionPseudonym: null }), {

@@ -222,8 +222,11 @@
       "additionalProperties": false,
       "required": [
         "wallTimeMs",
+        "parentElapsedMs",
         "cpuTimeMs",
         "peakRssBytes",
+        "rssSampleCount",
+        "rssSampleFailureCount",
         "directoryEntries",
         "sourceFiles",
         "sourceBytes",
@@ -242,8 +245,11 @@
       ],
       "properties": {
         "wallTimeMs": { "$ref": "#/definitions/safeInteger" },
+        "parentElapsedMs": { "$ref": "#/definitions/safeInteger" },
         "cpuTimeMs": { "$ref": "#/definitions/safeInteger" },
         "peakRssBytes": { "$ref": "#/definitions/safeInteger" },
+        "rssSampleCount": { "$ref": "#/definitions/safeInteger" },
+        "rssSampleFailureCount": { "$ref": "#/definitions/safeInteger" },
         "directoryEntries": { "$ref": "#/definitions/safeInteger" },
         "sourceFiles": { "$ref": "#/definitions/safeInteger" },
         "sourceBytes": { "$ref": "#/definitions/safeInteger" },

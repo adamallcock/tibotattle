@@ -23,6 +23,7 @@ import {
   loadOrCreateParticipantSecret,
   participantSecretBackendRetirementFile,
   participantSecretLegacyRetirementFile,
+  randomBundleId,
   rotateParticipantSecret,
   withParticipantSecretLease,
 } from "../src/export-identity.js";
@@ -77,13 +78,14 @@ test("export identity is stable, domain-separated, and does not reveal its subje
   const session = deriveSessionScopeId(secret, raw);
   const event = deriveEventId(secret, raw);
   const account = deriveAccountScopeId(secret, raw);
-  assert.match(participant, /^participant:v1:[A-Za-z0-9_-]{43}$/);
-  assert.match(session, /^session:v1:[A-Za-z0-9_-]{43}$/);
+  assert.match(participant, /^participant:v1:[a-f0-9]{64}$/);
+  assert.match(session, /^session:v1:[a-f0-9]{64}$/);
   assert.notEqual(session.split(":").at(-1), event.split(":").at(-1));
   assert.notEqual(session.split(":").at(-1), account.split(":").at(-1));
   assert.equal(session.includes(raw), false);
   assert.equal(deriveSessionScopeId(secret, raw), session);
   assert.equal(deriveAccountScopeId(secret, "unattributed"), "unattributed");
+  assert.match(randomBundleId(), /^bundle:v1:[a-f0-9]{64}$/);
 });
 
 test("export identity uses stable platform application-state paths", () => {
@@ -288,6 +290,9 @@ test("rotation requires confirmation, refuses environment identity, and changes 
       deriveModelFingerprint(secret, "model"),
     ];
     const beforeIds = identifiers(before.secret);
+    beforeIds.forEach((identifier) => {
+      assert.match(identifier, /^[a-z][a-z0-9-]*:v[12]:[a-f0-9]{64}$/u);
+    });
     const beforeInode = (await stat(canonical)).ino;
     const rotated = await rotateParticipantSecret({ confirmRotation: true, environmentSecret: null, secretFile: canonical, legacySecretFile: null });
     assert.equal(rotated.secureErasure, false);

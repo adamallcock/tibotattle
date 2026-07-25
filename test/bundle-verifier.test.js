@@ -11,7 +11,7 @@ import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import { stableJson } from "../src/storage.js";
 
 const SECRET = Buffer.alloc(32, 23);
-const BUNDLE_ID = `bundle:v1:${"V".repeat(43)}`;
+const BUNDLE_ID = `bundle:v1:${"5".repeat(64)}`;
 
 async function localPair({ marker = false, markerCount = marker ? 1 : 0 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-verify-"));
@@ -236,9 +236,9 @@ test("verifier bounds quota receipt time and rejects receipt before observation"
         resetsAt: "2026-07-31T12:00:00.000Z",
         snapshotSource: "rollout",
         providerSurface: "account_shared_unallocated",
-        snapshotId: `snapshot:v2:${"Q".repeat(43)}`,
-        providerStateId: `quota-state:v1:${"P".repeat(43)}`,
-        sessionScopeId: `session:v1:${"S".repeat(43)}`,
+        snapshotId: `snapshot:v2:${"8".repeat(64)}`,
+        providerStateId: `quota-state:v1:${"7".repeat(64)}`,
+        sessionScopeId: `session:v1:${"9".repeat(64)}`,
         accountScopeId: "unattributed",
       });
       bundle.recordCounts.quotaSnapshots = 1;
@@ -288,8 +288,8 @@ test("verifier rejects an observed provider absent from the bundle declaration",
         subagent: 0, toolGateway: 0, other: 0, unknown: 0,
       },
       outcome: "unknown",
-      eventId: `event:v2:${"E".repeat(43)}`,
-      sessionScopeId: `session:v1:${"S".repeat(43)}`,
+      eventId: `event:v2:${"e".repeat(64)}`,
+      sessionScopeId: `session:v1:${"9".repeat(64)}`,
       accountScopeId: "unattributed",
     });
     bundle.recordCounts.usageEvents = 1;

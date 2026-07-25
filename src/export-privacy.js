@@ -151,7 +151,10 @@ export function verifyPrivacySafeBundle(bundle, {
   };
   if (verdict !== "passed") {
     const failed = checks.filter((check) => check.status === "failed").map((check) => check.code).join(", ");
-    throw new Error(`Privacy verification failed closed (${failed})`);
+    const sensitiveCodes = [...new Set(stringFindings.map(({ code }) => code))].sort();
+    const sensitiveSuffix = sensitiveCodes.length > 0
+      ? `; sensitive=${sensitiveCodes.join("+")}` : "";
+    throw new Error(`Privacy verification failed closed (${failed}${sensitiveSuffix})`);
   }
   assertValidExportRecord("privacyReceipt", receipt);
   return receipt;

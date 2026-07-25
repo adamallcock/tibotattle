@@ -45,6 +45,10 @@ import {
 } from "./export-workspace.js";
 import { stableJson } from "./storage.js";
 import { withExportWorkspaceLease } from "./export-workspace-lock.js";
+import {
+  ExportSourcePlanBundleError,
+  resolveExportSourcePlanBundle,
+} from "./export-source-plan-bundle.js";
 
 async function populateWorkspace({
   workspace,
@@ -262,6 +266,7 @@ async function createLocalExportWorkspaceUnlocked({
   enableClaudeUsage = false,
   enableClaudeTranscripts = false,
   claudeTranscriptRecordsPerBatch,
+  sourcePlanBundle = null,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
   const bounds = normalizeExportBounds(startAt, endAt);
@@ -272,76 +277,97 @@ async function createLocalExportWorkspaceUnlocked({
     ...(resourceRss ? { rss: resourceRss } : {}),
   });
   resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
-  const selectedCollectorPath = requestedCollectorPath({ collectorPath, enableCollector, enableCodexCollector });
-  const selectedClaudeStateDirectory = requestedClaudeStateDirectory({
-    claudeStateDirectory,
-    enableClaudeStatus,
-    enableClaudeStatusline,
-  });
-  const selectedClaudeProjectsDirectory = await requestedClaudeProjectsDirectory({
-    claudeProjectsDirectory,
-    enableClaudeUsage,
-    enableClaudeTranscripts,
-  });
-  let effectiveSupplementalSourcePlan = supplementalSourcePlan;
-  const supplementalPrivatePlans = [];
-  if (selectedCollectorPath !== null) {
-    const collector = await createCodexCollectorWorkspaceSource({
-      collectorPath: selectedCollectorPath,
-      startAt: bounds.startAt,
-      endAt: bounds.endAt,
-      resourceGuard: collectorPlanningGuard(resourceGuard),
-    });
-    effectiveSupplementalSourcePlan = appendCodexCollectorWorkspaceSource(
-      supplementalSourcePlan,
-      collector.collectorPlan,
-    );
-  }
-  if (selectedClaudeStateDirectory !== null) {
-    const claude = await createClaudeStatusWorkspaceSource({
-      stateDirectory: selectedClaudeStateDirectory,
+  let selectedCollectorPath;
+  let selectedClaudeStateDirectory;
+  let selectedClaudeProjectsDirectory;
+  let effectiveSupplementalSourcePlan;
+  let supplementalPrivatePlans;
+  let sourcePlan;
+  if (sourcePlanBundle !== null) {
+    const resolved = await resolveExportSourcePlanBundle(sourcePlanBundle, {
       startAt: bounds.startAt,
       endAt: bounds.endAt,
       secret,
-      resourceGuard: combinedSourcePlanPlanningGuard(resourceGuard),
+      resourceGuard,
     });
-    effectiveSupplementalSourcePlan = appendClaudeStatusWorkspaceSource(
-      effectiveSupplementalSourcePlan,
-      claude.claudePlan,
-    );
-    supplementalPrivatePlans.push(claude.privatePlan);
-  }
-  if (selectedClaudeProjectsDirectory !== null) {
-    const claudeTranscripts = await createClaudeTranscriptWorkspaceSource({
-      projectsDirectory: selectedClaudeProjectsDirectory,
-      startAt: bounds.startAt,
-      endAt: bounds.endAt,
-      secret,
-      resourceGuard: combinedSourcePlanPlanningGuard(resourceGuard),
+    selectedCollectorPath = resolved.collectorPath;
+    selectedClaudeStateDirectory = resolved.claudeStateDirectory;
+    selectedClaudeProjectsDirectory = resolved.claudeProjectsDirectory;
+    effectiveSupplementalSourcePlan = resolved.supplementalSourcePlan;
+    supplementalPrivatePlans = resolved.supplementalPrivatePlans;
+    sourcePlan = resolved.sourcePlan;
+  } else {
+    selectedCollectorPath = requestedCollectorPath({ collectorPath, enableCollector, enableCodexCollector });
+    selectedClaudeStateDirectory = requestedClaudeStateDirectory({
+      claudeStateDirectory,
+      enableClaudeStatus,
+      enableClaudeStatusline,
     });
-    if (claudeTranscripts.sources.length === 0) {
-      throw new Error("Claude transcript export requires at least one frozen JSONL source");
+    selectedClaudeProjectsDirectory = await requestedClaudeProjectsDirectory({
+      claudeProjectsDirectory,
+      enableClaudeUsage,
+      enableClaudeTranscripts,
+    });
+    effectiveSupplementalSourcePlan = supplementalSourcePlan;
+    supplementalPrivatePlans = [];
+    if (selectedCollectorPath !== null) {
+      const collector = await createCodexCollectorWorkspaceSource({
+        collectorPath: selectedCollectorPath,
+        startAt: bounds.startAt,
+        endAt: bounds.endAt,
+        resourceGuard: collectorPlanningGuard(resourceGuard),
+      });
+      effectiveSupplementalSourcePlan = appendCodexCollectorWorkspaceSource(
+        supplementalSourcePlan,
+        collector.collectorPlan,
+      );
     }
-    effectiveSupplementalSourcePlan = appendClaudeTranscriptWorkspaceSources(
-      effectiveSupplementalSourcePlan,
-      claudeTranscripts.transcriptPlan,
-      { secret },
-    );
-    supplementalPrivatePlans.push(...claudeTranscripts.privatePlans);
-  }
-  const supplementalSummary = summarizeSupplementalSourcePlan(effectiveSupplementalSourcePlan);
-  const sourcePlan = await createCodexExportSourcePlan({
-    codexHome,
-    startAt: bounds.startAt,
-    endAt: bounds.endAt,
-    resourceGuard: supplementalSummary.sourceCount === 0
-      ? resourceGuard : combinedSourcePlanPlanningGuard(resourceGuard),
-  });
-  if (supplementalSummary.sourceCount > 0) {
-    resourceGuard.observeSourcePlan(
-      sourcePlan.sources.length + supplementalSummary.sourceFiles,
-      sourcePlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0) + supplementalSummary.sourceBytes,
-    );
+    if (selectedClaudeStateDirectory !== null) {
+      const claude = await createClaudeStatusWorkspaceSource({
+        stateDirectory: selectedClaudeStateDirectory,
+        startAt: bounds.startAt,
+        endAt: bounds.endAt,
+        secret,
+        resourceGuard: combinedSourcePlanPlanningGuard(resourceGuard),
+      });
+      effectiveSupplementalSourcePlan = appendClaudeStatusWorkspaceSource(
+        effectiveSupplementalSourcePlan,
+        claude.claudePlan,
+      );
+      supplementalPrivatePlans.push(claude.privatePlan);
+    }
+    if (selectedClaudeProjectsDirectory !== null) {
+      const claudeTranscripts = await createClaudeTranscriptWorkspaceSource({
+        projectsDirectory: selectedClaudeProjectsDirectory,
+        startAt: bounds.startAt,
+        endAt: bounds.endAt,
+        secret,
+        resourceGuard: combinedSourcePlanPlanningGuard(resourceGuard),
+      });
+      if (claudeTranscripts.sources.length === 0) {
+        throw new Error("Claude transcript export requires at least one frozen JSONL source");
+      }
+      effectiveSupplementalSourcePlan = appendClaudeTranscriptWorkspaceSources(
+        effectiveSupplementalSourcePlan,
+        claudeTranscripts.transcriptPlan,
+        { secret },
+      );
+      supplementalPrivatePlans.push(...claudeTranscripts.privatePlans);
+    }
+    const supplementalSummary = summarizeSupplementalSourcePlan(effectiveSupplementalSourcePlan);
+    sourcePlan = await createCodexExportSourcePlan({
+      codexHome,
+      startAt: bounds.startAt,
+      endAt: bounds.endAt,
+      resourceGuard: supplementalSummary.sourceCount === 0
+        ? resourceGuard : combinedSourcePlanPlanningGuard(resourceGuard),
+    });
+    if (supplementalSummary.sourceCount > 0) {
+      resourceGuard.observeSourcePlan(
+        sourcePlan.sources.length + supplementalSummary.sourceFiles,
+        sourcePlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0) + supplementalSummary.sourceBytes,
+      );
+    }
   }
   const activityPlan = summarizeActivityMarkerPlan(secret, activityMarkers, bounds, {
     maximumRecords: resourceGuard.limits.maximumExportSetRecords,
@@ -578,6 +604,16 @@ async function inspectLocalExportWorkspaceUnlocked({ directory } = {}) {
 
 export async function createLocalExportWorkspace(options = {}) {
   if (!options.directory) throw new Error("Export workspace directory is required");
+  if (options.sourcePlanBundle !== null && options.sourcePlanBundle !== undefined) {
+    const discoveryKeys = [
+      "codexHome", "supplementalSourcePlan", "collectorPath", "enableCollector", "enableCodexCollector",
+      "claudeStateDirectory", "enableClaudeStatus", "enableClaudeStatusline",
+      "claudeProjectsDirectory", "enableClaudeUsage", "enableClaudeTranscripts",
+    ];
+    if (discoveryKeys.some((key) => Object.hasOwn(options, key))) {
+      throw new ExportSourcePlanBundleError("configuration");
+    }
+  }
   return withExportWorkspaceLease(options.directory, () => createLocalExportWorkspaceUnlocked(options));
 }
 

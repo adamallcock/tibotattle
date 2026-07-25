@@ -40,7 +40,7 @@
     "contamination": "node ./src/cli.js contamination",
     "tools": "node ./src/cli.js tools",
     "migrate-corrections": "node ./src/cli.js migrate-corrections",
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1"
   },
   "dependencies": {
     "@github/keytar": "7.10.6",

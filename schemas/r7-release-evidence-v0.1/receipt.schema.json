@@ -1,0 +1,540 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/r7-release-evidence-v0.1/receipt.schema.json",
+  "title": "Usage monitor R7 content-free release evidence receipt v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "protocolVersion", "policyVersion", "selectionRuleVersion",
+    "profile", "outcome", "runtimeProvenance", "contractProvenance", "operations",
+    "boundaries", "determinism", "preservation", "privacy", "network",
+    "profileEvidence", "receiptSha256"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "r7-release-evidence-receipt-v0.1" },
+    "protocolVersion": { "const": "g1-r7-release-evidence-v0.1" },
+    "policyVersion": { "const": "g1-r3-candidate-0.5" },
+    "selectionRuleVersion": { "const": "g1-r7-ceiling-selection-v0.1" },
+    "profile": {
+      "enum": [
+        "release_synthetic_semantics", "release_synthetic_pressure",
+        "release_materialized_boundaries", "release_real_local_history", "release_decision"
+      ]
+    },
+    "outcome": { "enum": ["passed", "failed", "partial", "release_ready", "release_open"] },
+    "runtimeProvenance": { "$ref": "#/definitions/runtimeProvenance" },
+    "contractProvenance": { "$ref": "#/definitions/contractProvenance" },
+    "operations": {
+      "type": "array", "minItems": 10, "maxItems": 10,
+      "items": { "$ref": "#/definitions/operation" }
+    },
+    "boundaries": {
+      "type": "array", "minItems": 19, "maxItems": 19,
+      "items": { "$ref": "#/definitions/boundary" }
+    },
+    "determinism": { "$ref": "#/definitions/determinism" },
+    "preservation": { "$ref": "#/definitions/preservation" },
+    "privacy": { "$ref": "#/definitions/privacy" },
+    "network": { "$ref": "#/definitions/network" },
+    "profileEvidence": {
+      "oneOf": [
+        { "$ref": "#/definitions/semanticEvidence" },
+        { "$ref": "#/definitions/pressureEvidence" },
+        { "$ref": "#/definitions/materializedEvidence" },
+        { "$ref": "#/definitions/realHistoryEvidence" },
+        { "$ref": "#/definitions/decisionEvidence" }
+      ]
+    },
+    "receiptSha256": { "$ref": "#/definitions/sha256" }
+  },
+  "definitions": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "uint": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "positiveInt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "runtimeProvenance": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "platform", "architecture", "hardwareClass", "ramBucket", "runtimeFamily",
+        "runtimeClass", "runtimeVersion", "elapsedClock", "rssSampler",
+        "rssSamplingIntervalMs", "stdoutLimitBytes", "stderrLimitBytes", "environmentClass"
+      ],
+      "properties": {
+        "platform": { "const": "macos" },
+        "architecture": { "const": "arm64" },
+        "hardwareClass": { "const": "apple_silicon" },
+        "ramBucket": { "enum": ["up_to_32_gib", "33_to_64_gib", "65_to_128_gib", "over_128_gib"] },
+        "runtimeFamily": { "const": "node" },
+        "runtimeClass": { "enum": ["pinned_candidate", "compatibility_crosscheck"] },
+        "runtimeVersion": { "$ref": "#/definitions/runtimeVersion" },
+        "elapsedClock": { "const": "parent_monotonic" },
+        "rssSampler": { "const": "parent_external_macos" },
+        "rssSamplingIntervalMs": { "const": 100 },
+        "stdoutLimitBytes": { "const": 262144 },
+        "stderrLimitBytes": { "const": 262144 },
+        "environmentClass": { "const": "fixed_locale_timezone_only" }
+      }
+    },
+    "runtimeVersion": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["major", "minor", "patch"],
+          "properties": { "major": { "const": 24 }, "minor": { "const": 14 }, "patch": { "const": 0 } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["major", "minor", "patch"],
+          "properties": { "major": { "const": 26 }, "minor": { "const": 2 }, "patch": { "const": 0 } }
+        }
+      ]
+    },
+    "contractProvenance": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "receiptSchemaSha256", "schemaModuleSha256", "resourcePolicySourceSha256",
+        "resourcePolicyValuesSha256", "workloadCodeSha256", "workloadCodeFileCount"
+      ],
+      "properties": {
+        "receiptSchemaSha256": { "$ref": "#/definitions/sha256" },
+        "schemaModuleSha256": { "$ref": "#/definitions/sha256" },
+        "resourcePolicySourceSha256": { "$ref": "#/definitions/sha256" },
+        "resourcePolicyValuesSha256": { "$ref": "#/definitions/sha256" },
+        "workloadCodeSha256": { "$ref": "#/definitions/sha256" },
+        "workloadCodeFileCount": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+    "filesystemMetrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["beforeBytes", "sampledHighWaterBytes", "afterBytes"],
+      "properties": {
+        "beforeBytes": { "$ref": "#/definitions/uint" },
+        "sampledHighWaterBytes": {
+          "$ref": "#/definitions/uint",
+          "description": "Largest observed value from 100 ms recursive samples; a lower bound, not an enforced filesystem maximum."
+        },
+        "afterBytes": { "$ref": "#/definitions/uint" }
+      }
+    },
+    "operationMetrics": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "runCount", "parentElapsedMs", "childCpuMs", "externalRssSampleCount",
+        "externalRssSampleFailureCount", "externalPeakRssBytes", "childMaxRssBytes",
+        "durablePeakRssBytes", "stdoutBytes", "stderrBytes", "sourceFiles",
+        "sourceBytes", "outputRecords", "decodedBytes", "encodedBytes", "filesystem"
+      ],
+      "properties": {
+        "runCount": { "$ref": "#/definitions/uint" },
+        "parentElapsedMs": { "$ref": "#/definitions/uint" },
+        "childCpuMs": { "$ref": "#/definitions/uint" },
+        "externalRssSampleCount": { "$ref": "#/definitions/uint" },
+        "externalRssSampleFailureCount": { "$ref": "#/definitions/uint" },
+        "externalPeakRssBytes": { "$ref": "#/definitions/uint" },
+        "childMaxRssBytes": { "$ref": "#/definitions/uint" },
+        "durablePeakRssBytes": { "$ref": "#/definitions/uint" },
+        "stdoutBytes": { "$ref": "#/definitions/uint" },
+        "stderrBytes": { "$ref": "#/definitions/uint" },
+        "sourceFiles": { "$ref": "#/definitions/uint" },
+        "sourceBytes": { "$ref": "#/definitions/uint" },
+        "outputRecords": { "$ref": "#/definitions/uint" },
+        "decodedBytes": { "$ref": "#/definitions/uint" },
+        "encodedBytes": { "$ref": "#/definitions/uint" },
+        "filesystem": { "$ref": "#/definitions/filesystemMetrics" }
+      }
+    },
+    "operation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "status", "failureCode", "projectionSha256", "metrics"],
+      "properties": {
+        "name": {
+          "enum": [
+            "source_scan", "checkpoint_resume", "export_set_materialize", "export_set_verify",
+            "complete_set_delete", "complete_set_delete_recovery", "workspace_discard",
+            "workspace_discard_recovery", "claude_callback_uninstall", "claude_callback_recovery"
+          ]
+        },
+        "status": { "enum": ["completed", "rejected_at_limit", "interrupted_recovered", "not_run"] },
+        "failureCode": { "$ref": "#/definitions/failureCode" },
+        "projectionSha256": {
+          "oneOf": [{ "$ref": "#/definitions/sha256" }, { "const": "not_run" }]
+        },
+        "metrics": { "$ref": "#/definitions/operationMetrics" }
+      }
+    },
+    "failureCode": {
+      "enum": [
+        "none", "not_run_profile", "interruption_injected", "not_applicable",
+        "watchdog_elapsed", "watchdog_rss", "watchdog_spawn", "watchdog_invalid_result",
+        "watchdog_stdout_overflow", "watchdog_stderr_overflow", "source_integrity",
+        "task_root_identity", "cleanup_inventory", "symlink_refused", "hardlink_refused",
+        "operation_failed", "verification_failed", "preservation_failed", "determinism_mismatch",
+        "privacy_scan_failed", "export_workspace_disk",
+        "export_resource_covered_duration", "export_resource_directory_entries",
+        "export_resource_source_files", "export_resource_source_bytes", "export_resource_line_bytes",
+        "export_resource_output_records", "export_resource_expanded_record_bytes",
+        "export_resource_canonical_bundle_bytes", "export_resource_encoded_artifact_bytes",
+        "export_resource_export_set_decoded_bytes", "export_resource_export_set_encoded_bytes",
+        "export_resource_workspace_bytes", "export_resource_manifest_bytes",
+        "export_resource_chunk_count", "export_resource_elapsed_time", "export_resource_rss",
+        "export_compression_decoded_bytes", "export_compression_encoded_bytes"
+      ]
+    },
+    "trial": {
+      "type": "object", "additionalProperties": false,
+      "required": ["value", "status", "failureCode"],
+      "properties": {
+        "value": { "$ref": "#/definitions/uint" },
+        "status": { "enum": ["passed", "rejected", "not_run"] },
+        "failureCode": { "$ref": "#/definitions/failureCode" }
+      }
+    },
+    "surface": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "failureCode"],
+      "properties": {
+        "status": { "enum": ["enforced", "not_enforced", "not_applicable", "not_run"] },
+        "failureCode": { "$ref": "#/definitions/failureCode" }
+      }
+    },
+    "boundary": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "dimension", "unit", "selectedLimit", "mode", "atLimit", "plusOne",
+        "producer", "verifier", "identification"
+      ],
+      "properties": {
+        "dimension": { "$ref": "#/definitions/dimension" },
+        "unit": { "enum": ["milliseconds", "entries", "files", "bytes", "records", "chunks"] },
+        "selectedLimit": { "$ref": "#/definitions/positiveInt" },
+        "mode": { "enum": ["materialized", "synthetic_counter", "not_identified"] },
+        "atLimit": { "$ref": "#/definitions/trial" },
+        "plusOne": { "$ref": "#/definitions/trial" },
+        "producer": { "$ref": "#/definitions/surface" },
+        "verifier": { "$ref": "#/definitions/surface" },
+        "identification": { "enum": ["identified", "not_identified", "not_run"] }
+      }
+    },
+    "dimension": {
+      "enum": [
+        "covered_duration", "directory_entries", "source_files", "source_bytes", "line_bytes",
+        "output_records_single_bundle", "expanded_record_bytes_single_bundle",
+        "canonical_bundle_bytes", "encoded_artifact_bytes", "output_records_export_set",
+        "expanded_record_bytes_export_set", "export_set_decoded_bytes", "export_set_encoded_bytes",
+        "workspace_bytes", "sqlite_batch_records", "manifest_bytes", "chunk_count", "elapsed_time", "rss"
+      ]
+    },
+    "determinism": {
+      "type": "object", "additionalProperties": false,
+      "required": ["projectionVersion", "status", "runCount", "runProjectionSha256es", "comparisons"],
+      "properties": {
+        "projectionVersion": { "const": "g1-r7-release-deterministic-projection-v0.1" },
+        "status": { "enum": ["passed", "failed", "partial", "not_run"] },
+        "runCount": { "type": "integer", "enum": [0, 2] },
+        "runProjectionSha256es": {
+          "type": "array", "minItems": 0, "maxItems": 2,
+          "items": { "$ref": "#/definitions/sha256" }
+        },
+        "comparisons": {
+          "type": "object", "additionalProperties": false,
+          "required": [
+            "fixtureManifest", "sourcePlan", "logicalRecords", "chunkBoundaries",
+            "canonicalArtifacts", "verifierResults", "fixedFailureCodes",
+            "cleanupInventories", "preservationResults", "lifecycleProjection"
+          ],
+          "properties": {
+            "fixtureManifest": { "$ref": "#/definitions/comparison" },
+            "sourcePlan": { "$ref": "#/definitions/comparison" },
+            "logicalRecords": { "$ref": "#/definitions/comparison" },
+            "chunkBoundaries": { "$ref": "#/definitions/comparison" },
+            "canonicalArtifacts": { "$ref": "#/definitions/comparison" },
+            "verifierResults": { "$ref": "#/definitions/comparison" },
+            "fixedFailureCodes": { "$ref": "#/definitions/comparison" },
+            "cleanupInventories": { "$ref": "#/definitions/comparison" },
+            "preservationResults": { "$ref": "#/definitions/comparison" },
+            "lifecycleProjection": { "$ref": "#/definitions/comparison" }
+          }
+        }
+      }
+    },
+    "comparison": { "enum": ["matched", "mismatched", "not_run"] },
+    "preservation": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "sourceLogsPreserved", "identityStatePreserved", "independentOutputPreserved",
+        "callbackSettingsPreserved", "cleanupExactInventory", "secureErasureClaimed"
+      ],
+      "properties": {
+        "sourceLogsPreserved": { "const": true },
+        "identityStatePreserved": { "const": true },
+        "independentOutputPreserved": { "const": true },
+        "callbackSettingsPreserved": { "const": true },
+        "cleanupExactInventory": { "enum": ["passed", "not_run"] },
+        "secureErasureClaimed": { "const": false }
+      }
+    },
+    "privacy": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "contentFree", "rawContentRetained", "pathsRetained", "timestampsRetained",
+        "identifiersRetained", "rowLevelDataRetained", "privateRssSamplesRetained",
+        "arbitraryErrorsRetained", "prohibitedDataScan"
+      ],
+      "properties": {
+        "contentFree": { "const": true },
+        "rawContentRetained": { "const": false },
+        "pathsRetained": { "const": false },
+        "timestampsRetained": { "const": false },
+        "identifiersRetained": { "const": false },
+        "rowLevelDataRetained": { "const": false },
+        "privateRssSamplesRetained": { "const": false },
+        "arbitraryErrorsRetained": { "const": false },
+        "prohibitedDataScan": { "const": "passed" }
+      }
+    },
+    "network": {
+      "type": "object", "additionalProperties": false,
+      "required": ["activity", "transportReady", "externalParticipants"],
+      "properties": {
+        "activity": { "enum": ["absent", "not_measured"] },
+        "transportReady": { "const": false },
+        "externalParticipants": { "const": false }
+      }
+    },
+    "semanticEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "fixtureManifestSha256", "cases"],
+      "properties": {
+        "kind": { "const": "release_synthetic_semantics" },
+        "fixtureManifestSha256": { "$ref": "#/definitions/sha256" },
+        "cases": {
+          "type": "object", "additionalProperties": false,
+          "required": [
+            "codexRoot", "codexForkReplay", "codexSubagentDelta", "accountScoped",
+            "accountUnattributed", "codexPrimaryWindow", "codexSecondaryWindow",
+            "claudeRoot", "claudeSubagent", "claudeFallbackIteration", "claudeUnknownModel",
+            "claudeFiveHourPresent", "claudeFiveHourAbsent", "claudeSevenDayPresent",
+            "claudeSevenDayAbsent"
+          ],
+          "properties": {
+            "codexRoot": { "const": true }, "codexForkReplay": { "const": true },
+            "codexSubagentDelta": { "const": true }, "accountScoped": { "const": true },
+            "accountUnattributed": { "const": true }, "codexPrimaryWindow": { "const": true },
+            "codexSecondaryWindow": { "const": true }, "claudeRoot": { "const": true },
+            "claudeSubagent": { "const": true }, "claudeFallbackIteration": { "const": true },
+            "claudeUnknownModel": { "const": true }, "claudeFiveHourPresent": { "const": true },
+            "claudeFiveHourAbsent": { "const": true }, "claudeSevenDayPresent": { "const": true },
+            "claudeSevenDayAbsent": { "const": true }
+          }
+        }
+      }
+    },
+    "pressureEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "kind", "fixtureManifestSha256", "seed", "manySmallSourceFiles", "denseRecords",
+        "targetChunks", "longLineBytes", "longLinePlusOneBytes",
+        "compressiblePayloadBytes", "incompressiblePayloadBytes"
+      ],
+      "properties": {
+        "kind": { "const": "release_synthetic_pressure" },
+        "fixtureManifestSha256": { "$ref": "#/definitions/sha256" },
+        "seed": { "const": 1831565813 },
+        "manySmallSourceFiles": { "const": 4096 },
+        "denseRecords": { "const": 25000 },
+        "targetChunks": { "const": 128 },
+        "longLineBytes": { "const": 65536 },
+        "longLinePlusOneBytes": { "const": 65537 },
+        "compressiblePayloadBytes": { "const": 8388608 },
+        "incompressiblePayloadBytes": { "const": 8388608 }
+      }
+    },
+    "materializedEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "kind", "fixtureManifestSha256", "literalCandidateAllocationRequired", "harnessMetrics",
+        "materializedCases", "sqliteBatch"
+      ],
+      "properties": {
+        "kind": { "const": "release_materialized_boundaries" },
+        "fixtureManifestSha256": { "$ref": "#/definitions/sha256" },
+        "literalCandidateAllocationRequired": { "const": false },
+        "harnessMetrics": { "$ref": "#/definitions/operationMetrics" },
+        "materializedCases": { "$ref": "#/definitions/materializedCases" },
+        "sqliteBatch": { "$ref": "#/definitions/sqliteBatchEvidence" }
+      }
+    },
+    "materializedCases": {
+      "type": "object", "additionalProperties": false,
+      "required": ["longLine", "compressibleArtifact", "incompressibleArtifact", "workspaceFile"],
+      "properties": {
+        "longLine": { "$ref": "#/definitions/materializedLongLine" },
+        "compressibleArtifact": { "$ref": "#/definitions/materializedArtifact" },
+        "incompressibleArtifact": { "$ref": "#/definitions/materializedArtifact" },
+        "workspaceFile": { "$ref": "#/definitions/materializedWorkspaceFile" }
+      }
+    },
+    "materializedLongLine": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "lineBytes", "linePlusOneBytes", "configuredLimit", "atLimitStatus",
+        "plusOneStatus", "plusOneFailureCode", "producerPathway"
+      ],
+      "properties": {
+        "lineBytes": { "const": 65536 },
+        "linePlusOneBytes": { "const": 65537 },
+        "configuredLimit": { "const": 65536 },
+        "atLimitStatus": { "const": "passed" },
+        "plusOneStatus": { "const": "rejected" },
+        "plusOneFailureCode": { "const": "export_resource_line_bytes" },
+        "producerPathway": { "const": "metadata_bundle_producer" }
+      }
+    },
+    "materializedArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "decodedBytes", "encodedBytes", "producerStatus", "verifierStatus",
+        "decodedPlusOneStatus", "decodedPlusOneFailureCode", "encodedPlusOneStatus",
+        "encodedPlusOneFailureCode", "fileControlStatus"
+      ],
+      "properties": {
+        "decodedBytes": { "const": 8388608 },
+        "encodedBytes": { "$ref": "#/definitions/uint" },
+        "producerStatus": { "const": "passed" },
+        "verifierStatus": { "const": "passed" },
+        "decodedPlusOneStatus": { "const": "rejected" },
+        "decodedPlusOneFailureCode": { "const": "export_compression_decoded_bytes" },
+        "encodedPlusOneStatus": { "const": "rejected" },
+        "encodedPlusOneFailureCode": { "const": "export_compression_encoded_bytes" },
+        "fileControlStatus": { "const": "passed" }
+      }
+    },
+    "materializedWorkspaceFile": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "bytes", "plusOneBytes", "atLimitStatus", "plusOneStatus",
+        "plusOneFailureCode", "pathway"
+      ],
+      "properties": {
+        "bytes": { "const": 8388608 },
+        "plusOneBytes": { "const": 8388609 },
+        "atLimitStatus": { "const": "passed" },
+        "plusOneStatus": { "const": "rejected" },
+        "plusOneFailureCode": { "const": "export_resource_workspace_bytes" },
+        "pathway": { "const": "resource_guard_from_file_stats" }
+      }
+    },
+    "sqliteBatchEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "const": "not_run" },
+        "reason": { "const": "no_injectable_sqlite_batch_seam" }
+      }
+    },
+    "providerAggregate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sourceFiles", "sourceBytes", "completeLinePrefixBytes"],
+      "properties": {
+        "sourceFiles": { "$ref": "#/definitions/uint" },
+        "sourceBytes": { "$ref": "#/definitions/uint" },
+        "completeLinePrefixBytes": { "$ref": "#/definitions/uint" }
+      }
+    },
+    "realHistoryEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "kind", "coveredDurationMs", "frozenPlanPasses", "rawDurableCopyCreated",
+        "prefixMutationResult", "codex", "claude"
+      ],
+      "properties": {
+        "kind": { "const": "release_real_local_history" },
+        "coveredDurationMs": { "type": "integer", "minimum": 1, "maximum": 2678400000 },
+        "frozenPlanPasses": { "const": 2 },
+        "rawDurableCopyCreated": { "const": false },
+        "prefixMutationResult": { "enum": ["passed", "source_integrity"] },
+        "codex": { "$ref": "#/definitions/providerAggregate" },
+        "claude": { "$ref": "#/definitions/providerAggregate" }
+      }
+    },
+    "inputRuntimeReceipts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["node24Sha256", "node26Sha256"],
+      "properties": {
+        "node24Sha256": { "$ref": "#/definitions/sha256" },
+        "node26Sha256": { "$ref": "#/definitions/sha256" }
+      }
+    },
+    "decisionEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "kind", "headroomBasisPoints", "populationPercentileClaimed", "singleMachineLimitation",
+        "promotionGates", "inputReceipts", "decisions"
+      ],
+      "properties": {
+        "kind": { "const": "release_decision" },
+        "headroomBasisPoints": { "const": 2000 },
+        "populationPercentileClaimed": { "const": false },
+        "singleMachineLimitation": { "const": true },
+        "promotionGates": { "$ref": "#/definitions/promotionGates" },
+        "inputReceipts": {
+          "type": "object", "additionalProperties": false,
+          "required": ["syntheticSemantics", "syntheticPressure", "materializedBoundaries", "realLocalHistory"],
+          "properties": {
+            "syntheticSemantics": { "$ref": "#/definitions/inputRuntimeReceipts" },
+            "syntheticPressure": { "$ref": "#/definitions/inputRuntimeReceipts" },
+            "materializedBoundaries": { "$ref": "#/definitions/inputRuntimeReceipts" },
+            "realLocalHistory": { "$ref": "#/definitions/inputRuntimeReceipts" }
+          }
+        },
+        "decisions": {
+          "type": "array", "minItems": 19, "maxItems": 19,
+          "items": { "$ref": "#/definitions/decisionRow" }
+        }
+      }
+    },
+    "promotionGates": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "exactRuntimePairs", "inputOutcomes", "lifecycleOperations", "determinism", "preservation", "privacy",
+        "networkIsolation", "engineeringRounding", "ceilingSelection"
+      ],
+      "properties": {
+        "exactRuntimePairs": { "$ref": "#/definitions/promotionGateStatus" },
+        "inputOutcomes": { "$ref": "#/definitions/promotionGateStatus" },
+        "lifecycleOperations": { "$ref": "#/definitions/promotionGateStatus" },
+        "determinism": { "$ref": "#/definitions/promotionGateStatus" },
+        "preservation": { "$ref": "#/definitions/promotionGateStatus" },
+        "privacy": { "$ref": "#/definitions/promotionGateStatus" },
+        "networkIsolation": { "$ref": "#/definitions/promotionGateStatus" },
+        "engineeringRounding": { "$ref": "#/definitions/promotionGateStatus" },
+        "ceilingSelection": { "$ref": "#/definitions/promotionGateStatus" }
+      }
+    },
+    "promotionGateStatus": { "enum": ["passed", "open"] },
+    "integerOrNotIdentified": {
+      "oneOf": [{ "$ref": "#/definitions/positiveInt" }, { "const": "not_identified" }]
+    },
+    "integerOrNotSet": {
+      "oneOf": [{ "$ref": "#/definitions/positiveInt" }, { "const": "not_set" }]
+    },
+    "decisionRow": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "dimension", "unit", "candidateValue", "exactBoundaryValue", "realHistoryValue",
+        "selectionBasis", "decision", "decidedValue"
+      ],
+      "properties": {
+        "dimension": { "$ref": "#/definitions/dimension" },
+        "unit": { "enum": ["milliseconds", "entries", "files", "bytes", "records", "chunks"] },
+        "candidateValue": { "$ref": "#/definitions/positiveInt" },
+        "exactBoundaryValue": { "$ref": "#/definitions/integerOrNotIdentified" },
+        "realHistoryValue": { "$ref": "#/definitions/integerOrNotIdentified" },
+        "selectionBasis": {
+          "enum": ["candidate", "exact_boundary", "real_history", "conservative_judgment", "not_identified", "deferred"]
+        },
+        "decision": { "enum": ["retain", "lower", "unresolved", "deferred"] },
+        "decidedValue": { "$ref": "#/definitions/integerOrNotSet" }
+      }
+    }
+  }
+}

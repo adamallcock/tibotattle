@@ -41,7 +41,7 @@
     "modelRecognition": { "enum": ["recognized", "unrecognized", "missing"] },
     "modelFingerprint": {
       "type": ["string", "null"],
-      "pattern": "^model:v1:[A-Za-z0-9_-]{43}$"
+      "pattern": "^model:v1:[a-f0-9]{64}$"
     },
     "billingSurface": { "enum": ["chatgpt_subscription", "openai_api", "claude_subscription", "unknown"] },
     "speedMode": { "enum": ["standard", "fast", "unknown", "other"] },
@@ -107,11 +107,11 @@
       }
     },
     "outcome": { "enum": ["completed", "failed", "cancelled", "interrupted", "retry", "unknown"] },
-    "eventId": { "type": "string", "pattern": "^event:v2:[A-Za-z0-9_-]{43}$" },
-    "sessionScopeId": { "type": "string", "pattern": "^session:v1:[A-Za-z0-9_-]{43}$" },
+    "eventId": { "type": "string", "pattern": "^event:v2:[a-f0-9]{64}$" },
+    "sessionScopeId": { "type": "string", "pattern": "^session:v1:[a-f0-9]{64}$" },
     "accountScopeId": {
       "type": "string",
-      "pattern": "^(unattributed|account:v1:[A-Za-z0-9_-]{43})$"
+      "pattern": "^(unattributed|account:v1:[a-f0-9]{64})$"
     }
   },
   "allOf": [
@@ -129,7 +129,7 @@
       "then": {
         "properties": {
           "modelId": { "const": "unknown" },
-          "modelFingerprint": { "type": "string", "pattern": "^model:v1:[A-Za-z0-9_-]{43}$" }
+          "modelFingerprint": { "type": "string", "pattern": "^model:v1:[a-f0-9]{64}$" }
         }
       }
     },

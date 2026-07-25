@@ -36,7 +36,7 @@ const TOOL_FIELDS = Object.freeze([
 const MODEL_IDS = new Set(OPENAI_CODEX_MODEL_IDS);
 const SPEED_MODES = new Set(["standard", "fast", "unknown", "other"]);
 const API_SERVICE_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown", "other"]);
-const FINGERPRINT = /^model:v1:[A-Za-z0-9_-]{43}$/;
+const FINGERPRINT = /^model:v1:[a-f0-9]{64}$/;
 
 const STATE_KEYS = Object.freeze([
   "schemaVersion",

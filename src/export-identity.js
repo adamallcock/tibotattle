@@ -1124,10 +1124,13 @@ export function deriveExportPseudonym(secret, prefix, subject) {
   if (typeof subject !== "string" || subject.length === 0 || subject.length > 4096) {
     throw new Error("Pseudonym subject must be a bounded non-empty string");
   }
+  // The textual identity version remains the domain-separation version. This
+  // contract is still unfrozen; its body uses lowercase hex so an otherwise
+  // valid derived identifier cannot accidentally contain credential syntax.
   const digest = createHmac("sha256", domainKey(secret, prefix))
     .update(`app-usagemonitor/${prefix}/v1\0`, "utf8")
     .update(subject, "utf8")
-    .digest("base64url");
+    .digest("hex");
   return `${prefix}:v1:${digest}`;
 }
 
@@ -1139,7 +1142,7 @@ export function deriveExportPseudonymV2(secret, prefix, subject) {
   const digest = createHmac("sha256", domainKey(secret, `${prefix}-v2`))
     .update(`app-usagemonitor/${prefix}/v2\0`, "utf8")
     .update(subject, "utf8")
-    .digest("base64url");
+    .digest("hex");
   return `${prefix}:v2:${digest}`;
 }
 
@@ -1189,5 +1192,5 @@ export function deriveModelFingerprint(secret, rawModelId) {
 }
 
 export function randomBundleId() {
-  return `bundle:v1:${randomBytes(SECRET_BYTES).toString("base64url")}`;
+  return `bundle:v1:${randomBytes(SECRET_BYTES).toString("hex")}`;
 }

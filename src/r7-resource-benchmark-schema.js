@@ -216,6 +216,17 @@ function operationErrors(receipt) {
         && operation.evidenceSha256[0] !== operation.evidenceSha256[1]) {
       errors.push(invariant(`/operations/${index}/evidenceSha256`, "matched-operation-evidence"));
     }
+    const externalSampling = receipt.runtimeProvenance.rssMeasurementMethod === "external_sampling";
+    if (operation.status !== "not_run" && externalSampling && operation.metrics.rssSampleCount < 1) {
+      errors.push(invariant(`/operations/${index}/metrics/rssSampleCount`, "executed-external-rss-sample"));
+    }
+    if (!externalSampling
+        && (operation.metrics.rssSampleCount !== 0 || operation.metrics.rssSampleFailureCount !== 0)) {
+      errors.push(invariant(`/operations/${index}/metrics/rssSampleCount`, "rss-count-method-consistency"));
+    }
+    if (operation.metrics.peakRssBytes < operation.metrics.durablePeakRssBytes) {
+      errors.push(invariant(`/operations/${index}/metrics/peakRssBytes`, "rss-conservative-maximum"));
+    }
   }
   return errors;
 }

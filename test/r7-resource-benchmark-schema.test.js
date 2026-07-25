@@ -29,8 +29,11 @@ import {
 
 const ZERO_METRICS = Object.freeze({
   wallTimeMs: 0,
+  parentElapsedMs: 0,
   cpuTimeMs: 0,
   peakRssBytes: 0,
+  rssSampleCount: 0,
+  rssSampleFailureCount: 0,
   directoryEntries: 0,
   sourceFiles: 0,
   sourceBytes: 0,
@@ -266,6 +269,25 @@ test("operation status, canonical order, integer metrics, and fixed failure code
   seal(unequalEvidence);
   assert.ok(validateR7ResourceBenchmarkReceipt(unequalEvidence).errors.some(
     (error) => error.schemaPath === "#/x-invariant/matched-operation-evidence",
+  ));
+
+  const missingExternalSample = receipt();
+  missingExternalSample.runtimeProvenance.rssMeasurementMethod = "external_sampling";
+  missingExternalSample.runtimeProvenance.rssSamplingIntervalMs = 100;
+  missingExternalSample.operations[0].status = "completed";
+  missingExternalSample.operations[0].failureCode = "none";
+  missingExternalSample.operations[0].evidenceSha256 = ["d".repeat(64), "d".repeat(64)];
+  seal(missingExternalSample);
+  assert.ok(validateR7ResourceBenchmarkReceipt(missingExternalSample).errors.some(
+    (error) => error.schemaPath === "#/x-invariant/executed-external-rss-sample",
+  ));
+
+  const nonConservativeRss = receipt();
+  nonConservativeRss.operations[0].metrics.peakRssBytes = 1;
+  nonConservativeRss.operations[0].metrics.durablePeakRssBytes = 2;
+  seal(nonConservativeRss);
+  assert.ok(validateR7ResourceBenchmarkReceipt(nonConservativeRss).errors.some(
+    (error) => error.schemaPath === "#/x-invariant/rss-conservative-maximum",
   ));
 });
 
