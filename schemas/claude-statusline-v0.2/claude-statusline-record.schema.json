@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://app-usagemonitor.local/schemas/claude-statusline-v0.2/claude-statusline-record.schema.json",
+  "title": "Privacy-minimized Claude status-line rate-limit snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "provider", "capturedAt", "clientVersion", "modelId", "fastMode", "sessionPseudonym", "limits", "privacy"],
+  "properties": {
+    "schemaVersion": { "const": "0.2" },
+    "kind": { "const": "claude_rate_limit_snapshot" },
+    "provider": { "const": "anthropic_claude_code" },
+    "capturedAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "clientVersion": {
+      "oneOf": [
+        { "const": "unknown" },
+        { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,2})\\.(?:0|[1-9][0-9]{0,2})\\.(?:0|[1-9][0-9]{0,4})$", "maxLength": 16 }
+      ]
+    },
+    "modelId": { "enum": ["claude_opus", "claude_sonnet", "claude_haiku", "unknown"] },
+    "fastMode": { "type": "boolean" },
+    "sessionPseudonym": {
+      "type": ["string", "null"],
+      "pattern": "^claude-session:v1:[A-Za-z0-9_-]{43}$"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fiveHour", "sevenDay"],
+      "properties": {
+        "fiveHour": { "$ref": "#/$defs/fiveHour" },
+        "sevenDay": { "$ref": "#/$defs/sevenDay" }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rawSessionIdentifierStored", "transcriptPathStored", "workspaceStored", "conversationContentStored", "accountIdentifierStored", "repositoryMetadataStored"],
+      "properties": {
+        "rawSessionIdentifierStored": { "const": false },
+        "transcriptPathStored": { "const": false },
+        "workspaceStored": { "const": false },
+        "conversationContentStored": { "const": false },
+        "accountIdentifierStored": { "const": false },
+        "repositoryMetadataStored": { "const": false }
+      }
+    }
+  },
+  "$defs": {
+    "fiveHour": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["windowMinutes", "usedPercent", "resetsAt"],
+          "properties": {
+            "windowMinutes": { "const": 300 },
+            "usedPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+            "resetsAt": { "type": "integer", "minimum": 946684800, "maximum": 7258118400 }
+          }
+        }
+      ]
+    },
+    "sevenDay": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["windowMinutes", "usedPercent", "resetsAt"],
+          "properties": {
+            "windowMinutes": { "const": 10080 },
+            "usedPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+            "resetsAt": { "type": "integer", "minimum": 946684800, "maximum": 7258118400 }
+          }
+        }
+      ]
+    }
+  }
+}

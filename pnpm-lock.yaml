@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@github/keytar':
+        specifier: 7.10.6
+        version: 7.10.6
       ajv:
         specifier: ^8.20.0
         version: 8.20.0
@@ -54,6 +57,9 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@github/keytar@7.10.6':
+    resolution: {integrity: sha512-mRW6cUsSG+nj4jp5gp8e91zPySaT73r+2JM6VyMZfrEgksjPmjSMr+tPGNOK3HUHV+GUU9B1LAiiYy/wmAnIxA==}
+
   ajv@8.20.0:
     resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
 
@@ -73,6 +79,10 @@ packages:
 
   json-schema-traverse@1.0.0:
     resolution: {integrity: sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug==}
+
+  node-addon-api@8.9.0:
+    resolution: {integrity: sha512-ekZMeaaIzSQTSpr7X2X3iJM7lTzgnx8ahAG9pJfT/7+14mlEM8ZYQ9cgCDvSSRbReFK0oHli3WrZdCiRsgAT9Q==}
+    engines: {node: ^18 || ^20 || >= 21}
 
   pure-rand@8.4.2:
     resolution: {integrity: sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng==}
@@ -106,6 +116,10 @@ snapshots:
   '@ccusage/ccusage-win32-x64@20.0.18':
     optional: true
 
+  '@github/keytar@7.10.6':
+    dependencies:
+      node-addon-api: 8.9.0
+
   ajv@8.20.0:
     dependencies:
       fast-deep-equal: 3.1.3
@@ -131,6 +145,8 @@ snapshots:
   fast-uri@3.1.4: {}
 
   json-schema-traverse@1.0.0: {}
+
+  node-addon-api@8.9.0: {}
 
   pure-rand@8.4.2: {}
 
