@@ -195,6 +195,7 @@ function occurrenceLink(
 export async function insertTelemetryContribution(
   db: D1Database,
   participantId: string,
+  uploadAuthorizationId: string,
   contributionId: string,
   r2Key: string,
   envelopeDigest: string,
@@ -213,8 +214,9 @@ export async function insertTelemetryContribution(
         id, participant_id, plaintext_digest, envelope_digest, r2_key, status,
         schema_version, range_start, range_end, client_platform, provider_policy_epoch,
         estimated_api_cost_usd, priced_event_coverage_percent, unknown_model_event_count,
-        unknown_billable_units, price_basis, declared_record_count, created_at
-      ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        unknown_billable_units, price_basis, declared_record_count, created_at,
+        upload_authorization_id
+      ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       contributionId,
       participantId,
@@ -233,11 +235,14 @@ export async function insertTelemetryContribution(
       record.accounting.priceBasis,
       record.usageEvents.length + record.quotaSnapshots.length + record.activityMarkers.length,
       createdAt,
+      uploadAuthorizationId,
     ),
     ...recordPairs.flat(),
   ];
   const results = await db.batch(statements);
-  if (results[0]?.meta.changes !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
+  if ((results[0]?.meta.changes ?? 0) < 1) {
+    throw new ApiError(409, "PARTICIPANT_DELETING");
+  }
   const totalRecords = recordPairs.length;
   const acceptedRecords = recordPairs.reduce(
     (sum, _pair, index) => sum + Number(results[1 + (index * 2)]?.meta.changes ?? 0),
@@ -549,6 +554,7 @@ export async function communityStats(
   if (participantCount < minimumParticipants) {
     return {
       schemaVersion: "community-stats-v0.1",
+      publicationStatus: "development_diagnostic_not_publication_safe",
       suppressed: true,
       participantCount,
       minimumParticipants,
@@ -590,6 +596,7 @@ export async function communityStats(
   const totals = totalRow ?? zeroCounts();
   return {
     schemaVersion: "community-stats-v0.1",
+    publicationStatus: "development_diagnostic_not_publication_safe",
     suppressed: false,
     participantCount,
     minimumParticipants,

@@ -9,6 +9,7 @@ export type ErrorCode =
   | "BODY_TOO_LARGE"
   | "CONTENT_TYPE_INVALID"
   | "CONTRIBUTION_LIMIT_REACHED"
+  | "CSRF_INVALID"
   | "DECRYPTION_FAILED"
   | "ENVELOPE_INVALID"
   | "INTERNAL_ERROR"
@@ -23,7 +24,9 @@ export type ErrorCode =
   | "SYNTHETIC_RECORD_INVALID"
   | "SYNTHETIC_REQUIRED"
   | "TELEMETRY_RECORD_INVALID"
-  | "TELEMETRY_REQUIRED";
+  | "TELEMETRY_REQUIRED"
+  | "UPLOAD_AUTH_INVALID"
+  | "UPLOAD_IN_PROGRESS";
 
 export class ApiError extends Error {
   readonly code: ErrorCode;

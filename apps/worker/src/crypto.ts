@@ -91,17 +91,18 @@ export function randomSecret(byteLength = 32): string {
   return encodeBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)));
 }
 
-export async function sha256(value: string): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
+export async function sha256(value: string | Uint8Array): Promise<Uint8Array> {
+  const bytes = typeof value === "string" ? encoder.encode(value) : value;
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
 }
 
-export async function sha256Hex(value: string): Promise<string> {
+export async function sha256Hex(value: string | Uint8Array): Promise<string> {
   const digest = await sha256(value);
   return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export async function hashCapability(
-  capability: "access" | "recovery",
+  capability: "access" | "recovery" | "session" | "csrf" | "csrf-binding" | "upload",
   tokenId: string,
   secret: string,
 ): Promise<Uint8Array> {

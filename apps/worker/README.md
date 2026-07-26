@@ -2,8 +2,8 @@
 
 This development-only Cloudflare Worker exercises the full central product
 boundary: enrollment, encrypted upload, strict validation, D1 ingest,
-participant-isolated and k-anonymous statistics, export, contribution deletion,
-and participant deletion. It retains the original fixed synthetic walkthrough
+participant-isolated statistics, thresholded development community diagnostics,
+export, contribution deletion, and participant deletion. It retains the original fixed synthetic walkthrough
 and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
 files, prompts, responses, commands, paths, account identifiers, or arbitrary
 keys.
@@ -38,15 +38,23 @@ does not deploy anything.
 ### Invite-only HTTP smoke
 
 Use the invite-only mode to test the production-shaped admission and complete
-backend lifecycle over a real loopback HTTP server. First prepare a closed
-`telemetry-contribution-v0.1` file as described in the root README. Then:
+backend lifecycle over a real loopback HTTP server and isolated local D1/R2
+state. First prepare a closed `telemetry-contribution-v0.1` file as described
+in the root README. Then:
 
 ```sh
-npm run grant:issue -- \
-  --output-file /private/tmp/usage-monitor-invite.secret
+SMOKE_STATE="$(mktemp -d /private/tmp/app-usagemonitor-backend-smoke.XXXXXX)"
+echo "$SMOKE_STATE"
+npm run migrate:local -- --persist-to "$SMOKE_STATE/state"
+for number in 1 2 3; do
+  npm run grant:issue -- \
+    --persist-to "$SMOKE_STATE/state" \
+    --output-file "$SMOKE_STATE/invite-$number.secret"
+done
 npm run dev -- \
   --ip 127.0.0.1 \
   --port 8792 \
+  --persist-to "$SMOKE_STATE/state" \
   --var ENROLLMENT_MODE:invite_only \
   --var ENVIRONMENT:local-development
 ```
@@ -54,20 +62,60 @@ npm run dev -- \
 In another terminal, from the repository root:
 
 ```sh
+# Use the exact directory printed by the first terminal.
+SMOKE_STATE=/private/tmp/app-usagemonitor-backend-smoke.REPLACE_ME
 npm run product:backend:smoke -- \
   --origin http://127.0.0.1:8792 \
   --file /absolute/path/to/telemetry-contribution-000001.json \
-  --invite-file /private/tmp/usage-monitor-invite.secret
+  --invite-file "$SMOKE_STATE/invite-1.secret" \
+  --invite-file "$SMOKE_STATE/invite-2.secret" \
+  --invite-file "$SMOKE_STATE/invite-3.secret"
 ```
 
-The smoke command validates the owner-only file locally, redeems the invitation
-without printing it, encrypts and uploads the contribution, checks replay and
-participant-scoped status/personal/community/export APIs, deletes the test
-participant, and proves the old access capability receives `401`. It attempts
-participant cleanup in a `finally` block if an intermediate assertion fails.
-The command prints only a content-free summary; it never prints the invitation,
-access capability, recovery capability, participant ID, contribution ID, or
-row values. Delete the temporary invitation file after the run.
+The smoke validates owner-only files, redeems three invitations without
+printing them, and proves:
+
+- exact Secure, HttpOnly, SameSite=Strict `__Host-` session cookies;
+- same-origin CSRF and cookie/upload authority isolation;
+- one-use upload registration bound to the encrypted digest and byte size;
+- strict validation, D1 ingest, opaque R2 quarantine, and recomputed personal
+  statistics;
+- idempotent replay using a fresh upload authorization;
+- aggregate diagnostic suppression at one participant and development-only
+  availability at three;
+- bounded participant export with no invitation, session, CSRF, recovery,
+  upload, or eligibility capability;
+- recovery rotation with a bounded lost-response retry, security reset, revoked
+  pending uploads, and logout cookie clearing; and
+- complete deletion of all three participants.
+
+It attempts participant cleanup in a `finally` block if an intermediate
+assertion fails. The command prints only a content-free summary; it never
+prints an invitation, session, CSRF, upload, recovery, participant,
+contribution, or row value.
+
+After the server stops, inspect the isolated D1 counts and R2 blob directory,
+then move the whole isolated state to Trash:
+
+```sh
+npx wrangler d1 execute USAGE_MONITOR_DB \
+  --local \
+  --persist-to "$SMOKE_STATE/state" \
+  --command "SELECT
+    (SELECT COUNT(*) FROM participants) AS participants,
+    (SELECT COUNT(*) FROM telemetry_contributions) AS contributions,
+    (SELECT COUNT(*) FROM telemetry_records) AS records,
+    (SELECT COUNT(*) FROM web_sessions) AS sessions,
+    (SELECT COUNT(*) FROM upload_authorizations) AS uploads,
+    (SELECT COUNT(*) FROM recovery_retry_receipts) AS recovery_receipts;"
+
+find "$SMOKE_STATE/state/v3/r2/app-usagemonitor-synthetic-quarantine/blobs" \
+  -type f -print
+trash "$SMOKE_STATE"
+```
+
+The expected result is zero for every D1 count and no R2 blob path. The final
+`trash` operation is macOS-specific and recoverable.
 
 `grant:issue` is local-only. It prints the invitation once when no output file
 is supplied. `--output-file` first reserves and syncs a new mode-0600 file
@@ -82,6 +130,10 @@ production operator command and approval boundary exist.
 - `GET /api/health`
 - `POST /api/v1/enroll`
 - `POST /api/v1/recover`
+- `GET /api/v1/session`
+- `POST /api/v1/logout`
+- `POST /api/v1/me/security-reset`
+- `POST /api/v1/me/upload-authorizations`
 - `GET /api/v1/envelope-key`
 - `POST /api/v1/contributions`
 - `GET|DELETE /api/v1/contributions/:id`
@@ -91,10 +143,33 @@ production operator command and approval boundary exist.
 - `GET /api/v1/me/export`
 - `DELETE /api/v1/me`
 
-All participant endpoints use bearer capabilities. Recovery rotates the access
-capability. Contributions are encrypted with a fresh AES-GCM key; the data key
-is wrapped with the published RSA-OAEP-256 key. Only the opaque envelope is
-retained in R2 quarantine. Validated closed metadata is stored in D1.
+Personal endpoints accept only a short-lived D1-backed web session delivered
+as a Secure, HttpOnly, SameSite=Strict `__Host-` cookie. Session-authenticated
+mutations also require the exact same origin and a session-bound CSRF value.
+No reusable personal credential is placed in browser storage or returned as an
+access token.
+
+Contribution upload is a separate authority class. A session first registers
+one exact encrypted digest, byte length, and `application/json` content type.
+The returned five-minute `Upload` authorization is hash-only in D1 and can be
+used once for that exact body. The upload request omits the personal cookie,
+and neither authority is accepted in the other's routes.
+
+Recovery rotates the recovery code, revokes every prior web session and unused
+upload authorization, and creates a replacement session. To survive a lost
+successful HTTP response, the old recovery presentation can reproduce the
+same replacement material at most twice for five minutes only when paired
+with the identical independent high-entropy recovery-attempt value. The old
+code alone or a different attempt value cannot replay it. The retry receipt
+stores only hashes, opaque identifiers, and a derivation nonce.
+If deletion has already started and the winning session expires or is lost,
+the latest recovery code creates a `deletion_only` session. That session
+cannot read, export, reset, or upload; it can only finish deletion.
+Security reset preserves only the current session while rotating recovery and
+revoking other sessions/uploads. Logout clears the cookie even when it is
+already stale. Contributions are encrypted with a fresh AES-GCM key; the data
+key is wrapped with the published RSA-OAEP-256 key. Only the opaque envelope
+is retained in R2 quarantine. Validated closed metadata is stored in D1.
 
 The real test contract is:
 
@@ -113,7 +188,11 @@ In `invite_only` mode, only participants admitted with distinct one-time
 invitation grants count toward community statistics. Local-open participants
 cannot unlock the cohort. Community statistics are suppressed below three
 eligible contributing participants, and model/day slices are independently
-suppressed below that same threshold.
+suppressed below that same threshold. These changing cumulative totals remain
+development diagnostics: cohort thresholds do not prevent before/after
+differencing. Public release requires delayed immutable weekly snapshots,
+independent per-cell support, per-participant clipping, coarse rounding, and a
+fixed ingestion cutoff.
 Deleting a contribution removes its opaque R2 object and cascades its D1 rows.
 Deleting a participant removes every R2 object before deleting the participant
 and all dependent D1 rows, including its private eligibility relation.

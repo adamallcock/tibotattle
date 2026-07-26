@@ -439,6 +439,34 @@
               </button>
             </form>
             <div class="upload-status" id="upload-status" role="status" hidden></div>
+            <div class="recovery-once" id="recovery-once" hidden>
+              <strong>Save your anonymous recovery code now</strong>
+              <p>
+                It is shown only once and is not stored by this page. Losing both
+                this code and your signed-in browser session is unrecoverable.
+              </p>
+              <code id="recovery-code-once"></code>
+              <button class="button button-secondary" id="acknowledge-recovery" type="button">
+                I saved this code
+              </button>
+            </div>
+            <details class="recover-access">
+              <summary>Recover an existing anonymous participant</summary>
+              <form class="recover-form" id="recover-form">
+                <label for="recover-code">Latest recovery code</label>
+                <input
+                  id="recover-code"
+                  name="recovery-code"
+                  type="password"
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  required
+                >
+                <button class="button button-secondary" type="submit">Recover access</button>
+              </form>
+              <p class="participant-action-status" id="recover-status" role="status" hidden></p>
+            </details>
           </article>
         </div>
 
@@ -454,14 +482,15 @@
               <p>No accepted contribution is associated with this browser yet.</p>
             </div>
             <div class="participant-controls" id="participant-controls" hidden>
-              <details class="recovery-details">
-                <summary>Anonymous recovery code</summary>
-                <p>Save this once. It restores access without an email address and is replaced after recovery.</p>
-                <code id="recovery-code"></code>
-              </details>
               <div class="result-actions">
                 <button class="button button-secondary" id="download-participant" type="button">
                   Download my safe export
+                </button>
+                <button class="button button-secondary" id="security-reset" type="button">
+                  Revoke other access
+                </button>
+                <button class="button button-secondary" id="logout-participant" type="button">
+                  Sign out
                 </button>
                 <button class="button button-danger" id="delete-participant" type="button">
                   Delete my contributed data

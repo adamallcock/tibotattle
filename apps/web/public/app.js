@@ -9,11 +9,10 @@ import {
   validateTelemetryContribution
 } from "./lib.js";
 
-const SESSION_KEY = "usage-monitor.community-session.v1";
 const localClient = new LocalCompanionClient();
-let communitySession = readSession();
+let communitySession = null;
 const communityClient = new CommunityClient({
-  getAccessToken: () => communitySession?.accessToken ?? null
+  getCsrfToken: () => communitySession?.csrfToken ?? null
 });
 
 let dashboard = null;
@@ -21,19 +20,27 @@ let activeWindowHours = 3;
 
 const $ = (selector) => document.querySelector(selector);
 
-function readSession() {
-  try {
-    const value = JSON.parse(sessionStorage.getItem(SESSION_KEY));
-    return value?.accessToken ? value : null;
-  } catch {
-    return null;
-  }
+function setCommunitySession(value) {
+  communitySession = value;
 }
 
-function saveSession(value) {
-  communitySession = value;
-  if (value) sessionStorage.setItem(SESSION_KEY, JSON.stringify(value));
-  else sessionStorage.removeItem(SESSION_KEY);
+function showRecoveryCodeOnce(value) {
+  const panel = $("#recovery-once");
+  const code = $("#recovery-code-once");
+  if (typeof value !== "string" || value.length === 0) {
+    code.textContent = "";
+    panel.hidden = true;
+    return;
+  }
+  code.textContent = value;
+  panel.hidden = false;
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function finite(value, fallback = null) {
@@ -759,7 +766,7 @@ function parseSafeExport(file) {
 }
 
 async function ensureCommunitySession() {
-  if (communitySession?.accessToken) return communitySession;
+  if (communitySession?.csrfToken) return communitySession;
   const inviteInput = $("#contribution-invite");
   const inviteCode = inviteInput.value.trim();
   let enrollment;
@@ -768,12 +775,14 @@ async function ensureCommunitySession() {
   } finally {
     inviteInput.value = "";
   }
-  if (!enrollment?.accessToken) throw new Error("The contribution service did not return an anonymous access capability.");
-  saveSession({
-    accessToken: enrollment.accessToken,
-    participantId: enrollment.participantId ?? null,
-    recoveryCode: enrollment.recoveryCode ?? null
+  if (typeof enrollment?.csrfToken !== "string") {
+    throw new Error("The contribution service did not establish an anonymous web session.");
+  }
+  setCommunitySession({
+    csrfToken: enrollment.csrfToken,
+    participantId: enrollment.participantId ?? null
   });
+  showRecoveryCodeOnce(enrollment.recoveryCode);
   return communitySession;
 }
 
@@ -797,9 +806,24 @@ async function submitContribution(event) {
       publicJwk: key.publicJwk,
       keyId: key.keyId
     });
+    const serializedEnvelope = JSON.stringify(envelope);
+    const contentLengthBytes = new TextEncoder().encode(serializedEnvelope).byteLength;
+    const envelopeDigest = await sha256Hex(serializedEnvelope);
+    status.textContent = "Registering a one-use authorization for this exact encrypted envelope…";
+    const registration = await communityClient.registerUpload({
+      envelopeDigest,
+      contentLengthBytes,
+      contentType: "application/json"
+    });
+    if (typeof registration?.uploadAuthorization !== "string") {
+      throw new Error("The service did not return a one-use upload authorization.");
+    }
     status.textContent = "Submitting encrypted telemetry for immediate server-side validation…";
-    const receipt = await communityClient.contribute(envelope);
-    saveSession({ ...communitySession, contributionId: receipt.contributionId });
+    const receipt = await communityClient.contributeSerialized(
+      serializedEnvelope,
+      registration.uploadAuthorization
+    );
+    setCommunitySession({ ...communitySession, contributionId: receipt.contributionId });
     status.textContent = `Accepted as ${receipt.contributionId}. The server reported ${compact(receipt.recordCounts?.deduplicated ?? 0)} deduplicated records.`;
     await loadCommunityResults();
   } catch (error) {
@@ -848,18 +872,17 @@ async function loadCommunityResults() {
   try {
     const [healthResult, personalResult, communityResult] = await Promise.allSettled([
       communityClient.health(),
-      communitySession?.accessToken ? communityClient.personalStats() : Promise.resolve(null),
+      communitySession?.csrfToken ? communityClient.personalStats() : Promise.resolve(null),
       communityClient.communityStats()
     ]);
     const serviceReachable = healthResult.status === "fulfilled"
       || communityResult.status === "fulfilled"
-      || (Boolean(communitySession?.accessToken) && personalResult.status === "fulfilled");
+      || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
     service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
     renderStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
     renderStats(community, communityResult.status === "fulfilled" ? communityResult.value : null, { community: true });
-    participantControls.hidden = !(communitySession?.accessToken && personalResult.status === "fulfilled");
-    $("#recovery-code").textContent = communitySession?.recoveryCode ?? "Recovery code was not retained in this browser session.";
+    participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
     const enrollmentMode = healthResult.status === "fulfilled" ? healthResult.value?.enrollmentMode : null;
     $("#invite-help").textContent = enrollmentMode === "invite_only"
       ? "Required for this invite-only service. It is used once and never stored by this page."
@@ -870,6 +893,19 @@ async function loadCommunityResults() {
     service.textContent = "Service unavailable";
     service.className = "evidence-chip neutral";
     participantControls.hidden = true;
+  }
+}
+
+async function restoreCommunitySession() {
+  try {
+    const session = await communityClient.session();
+    if (typeof session?.csrfToken !== "string") return;
+    setCommunitySession({
+      csrfToken: session.csrfToken,
+      participantId: session.participantId ?? null
+    });
+  } catch {
+    setCommunitySession(null);
   }
 }
 
@@ -902,7 +938,8 @@ async function deleteParticipantData() {
   status.textContent = "Deleting your contributed data…";
   try {
     const receipt = await communityClient.deleteParticipant();
-    saveSession(null);
+    setCommunitySession(null);
+    showRecoveryCodeOnce(null);
     $("#contribution-file").value = "";
     $("#contribution-consent").checked = false;
     $("#contribution-submit").disabled = true;
@@ -919,6 +956,77 @@ async function deleteParticipantData() {
     status.className = "participant-action-status error";
     status.textContent = "The contributed data could not be deleted.";
   }
+}
+
+async function recoverParticipant(event) {
+  event.preventDefault();
+  const input = $("#recover-code");
+  const status = $("#recover-status");
+  const recoveryCode = input.value.trim();
+  input.value = "";
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Rotating the anonymous recovery code and prior access…";
+  try {
+    const recovered = await communityClient.recover(recoveryCode);
+    if (typeof recovered?.csrfToken !== "string"
+        || typeof recovered?.recoveryCode !== "string") {
+      throw new Error("Recovery did not establish a replacement session.");
+    }
+    setCommunitySession({
+      csrfToken: recovered.csrfToken,
+      participantId: recovered.participantId ?? null
+    });
+    showRecoveryCodeOnce(recovered.recoveryCode);
+    status.textContent = "Access restored. Save the replacement recovery code shown above.";
+    await loadCommunityResults();
+  } catch {
+    setCommunitySession(null);
+    status.className = "participant-action-status error";
+    status.textContent = "That recovery code was invalid, expired, or already used.";
+  }
+}
+
+async function resetParticipantSecurity() {
+  if (!window.confirm("Revoke every other session and unused upload authorization, and replace your recovery code?")) return;
+  const status = $("#participant-action-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Revoking other access and rotating recovery…";
+  try {
+    const reset = await communityClient.securityReset();
+    if (typeof reset?.csrfToken !== "string"
+        || typeof reset?.recoveryCode !== "string") {
+      throw new Error("Security reset did not return replacement authority.");
+    }
+    setCommunitySession({
+      csrfToken: reset.csrfToken,
+      participantId: reset.participantId ?? communitySession?.participantId ?? null
+    });
+    showRecoveryCodeOnce(reset.recoveryCode);
+    status.textContent = "Other sessions and unused uploads were revoked. Save the new recovery code.";
+  } catch {
+    status.className = "participant-action-status error";
+    status.textContent = "The security reset could not be completed.";
+  }
+}
+
+async function logoutParticipant() {
+  const status = $("#participant-action-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Signing out this browser session…";
+  try {
+    await communityClient.logout();
+  } catch {
+    // The local state is still cleared; the server also clears the cookie on
+    // expired or already-revoked sessions.
+  }
+  setCommunitySession(null);
+  showRecoveryCodeOnce(null);
+  $("#participant-controls").hidden = true;
+  renderStats($("#personal-result"), null);
+  status.textContent = "Signed out. Use the latest recovery code to return.";
 }
 
 $("#refresh-button").addEventListener("click", requestRefresh);
@@ -947,7 +1055,11 @@ $("#contribution-consent").addEventListener("change", () => {
   $("#contribution-submit").disabled = !($("#contribution-consent").checked && $("#contribution-file").files.length);
 });
 $("#contribution-form").addEventListener("submit", submitContribution);
+$("#recover-form").addEventListener("submit", recoverParticipant);
+$("#acknowledge-recovery").addEventListener("click", () => showRecoveryCodeOnce(null));
 $("#download-participant").addEventListener("click", downloadParticipantExport);
+$("#security-reset").addEventListener("click", resetParticipantSecurity);
+$("#logout-participant").addEventListener("click", logoutParticipant);
 $("#delete-participant").addEventListener("click", deleteParticipantData);
 
 const observer = new IntersectionObserver((entries) => {
@@ -960,4 +1072,4 @@ const observer = new IntersectionObserver((entries) => {
 for (const section of document.querySelectorAll(".dashboard-section")) observer.observe(section);
 
 loadLocalDashboard();
-loadCommunityResults();
+restoreCommunitySession().finally(loadCommunityResults);

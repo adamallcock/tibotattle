@@ -256,7 +256,7 @@ test("contribution preview returns counts and accounting only", async () => {
   }
 });
 
-test("optional central proxy forwards only fixed same-origin API requests", async () => {
+test("optional central proxy exposes public reads and blocks every authenticated route", async () => {
   const files = await fixture();
   const forwarded = [];
   const app = await startLocalCompanionServer({
@@ -269,18 +269,19 @@ test("optional central proxy forwards only fixed same-origin API requests", asyn
       forwarded.push({
         url,
         method: options.method,
-        authorization: options.headers.Authorization ?? null,
+        headers: { ...options.headers },
         body: options.body?.toString("utf8") ?? null,
       });
       return new Response(JSON.stringify({
-        participantId: "participant:fixed-upstream-value",
-        accessToken: "token",
+        status: "ok",
+        suppressed: true,
       }), {
-        status: 201,
+        status: 200,
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Replayed": "true",
           "X-Private-Upstream": "must-not-pass",
+          "Set-Cookie": "__Host-um_session=must-not-pass; Secure; HttpOnly",
         },
       });
     },
@@ -291,50 +292,61 @@ test("optional central proxy forwards only fixed same-origin API requests", asyn
     const health = await fetch(`${base}/api/local/health`).then((response) => response.json());
     assert.equal(health.capabilities.centralServiceProxy, true);
 
-    const unauthorized = await fetch(`${base}/api/v1/enroll`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ consentVersion: "real-telemetry-v0.1", syntheticOnly: false }),
-    });
-    assert.equal(unauthorized.status, 403);
-
-    const response = await fetch(`${base}/api/v1/enroll`, {
-      method: "POST",
+    const response = await fetch(`${base}/api/v1/stats/aggregate`, {
       headers: {
-        "Content-Type": "application/json",
         Origin: base,
-        Authorization: "Bearer local-session-token",
+        Authorization: "Bearer must-not-pass",
+        Cookie: "__Host-um_session=must-not-pass",
+        "X-Usage-Monitor-CSRF": "must-not-pass",
       },
-      body: JSON.stringify({ consentVersion: "real-telemetry-v0.1", syntheticOnly: false }),
     });
-    assert.equal(response.status, 201);
+    assert.equal(response.status, 200);
     assert.equal(response.headers.get("idempotency-replayed"), "true");
     assert.equal(response.headers.get("x-private-upstream"), null);
+    assert.equal(response.headers.get("set-cookie"), null);
     assert.equal(forwarded.length, 1);
     assert.deepEqual(forwarded[0], {
-      url: "https://central.example/api/v1/enroll",
-      method: "POST",
-      authorization: "Bearer local-session-token",
-      body: JSON.stringify({ consentVersion: "real-telemetry-v0.1", syntheticOnly: false }),
+      url: "https://central.example/api/v1/stats/aggregate",
+      method: "GET",
+      headers: { Accept: "application/json" },
+      body: null,
     });
 
-    assert.equal((await fetch(`${base}/api/v1/enroll?next=https://attacker.example`)).status, 400);
-    const encodedContribution = await fetch(
-      `${base}/api/v1/contributions/${encodeURIComponent("contribution:00000000-0000-4000-8000-000000000000")}`,
+    const blocked = [
+      { path: "/api/v1/enroll", method: "POST" },
+      { path: "/api/v1/recover", method: "POST" },
+      { path: "/api/v1/session", method: "GET" },
+      { path: "/api/v1/logout", method: "POST" },
+      { path: "/api/v1/me", method: "GET" },
+      { path: "/api/v1/me", method: "DELETE" },
+      { path: "/api/v1/me/stats", method: "GET" },
+      { path: "/api/v1/me/insights", method: "GET" },
+      { path: "/api/v1/me/export", method: "GET" },
+      { path: "/api/v1/me/security-reset", method: "POST" },
+      { path: "/api/v1/me/upload-authorizations", method: "POST" },
+      { path: "/api/v1/contributions", method: "POST" },
       {
-        headers: {
-          Origin: base,
-          Authorization: "Bearer local-session-token",
-        },
+        path: `/api/v1/contributions/${encodeURIComponent("contribution:00000000-0000-4000-8000-000000000000")}`,
+        method: "GET",
       },
-    );
-    assert.equal(encodedContribution.status, 201);
-    assert.equal(
-      forwarded.at(-1).url,
-      "https://central.example/api/v1/contributions/contribution%3A00000000-0000-4000-8000-000000000000",
-    );
+    ];
+    for (const item of blocked) {
+      const blockedResponse = await fetch(`${base}${item.path}`, {
+        method: item.method,
+        headers: {
+          "Content-Type": "application/json",
+          Origin: base,
+          Authorization: "Bearer must-not-pass",
+          Cookie: "__Host-um_session=must-not-pass",
+          "X-Usage-Monitor-CSRF": "must-not-pass",
+        },
+        body: item.method === "POST" ? "{}" : undefined,
+      });
+      assert.equal(blockedResponse.status, 404, `${item.method} ${item.path}`);
+    }
+    assert.equal((await fetch(`${base}/api/v1/stats/aggregate?next=https://attacker.example`)).status, 400);
     assert.equal((await fetch(`${base}/api/v1/admin`)).status, 404);
-    assert.equal(forwarded.length, 2);
+    assert.equal(forwarded.length, 1);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

@@ -4,9 +4,14 @@ import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 // @ts-expect-error The browser helper is intentionally framework-free JavaScript.
 import { createSyntheticEnvelope } from "../../web/public/lib.js";
-import { encodeBase64Url } from "../src/crypto";
+import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { hashInviteGrantSecret } from "../src/admission";
 import { handleRequest } from "../src/index";
+import {
+  createSessionMaterial,
+  sessionCookie,
+  sessionInsert,
+} from "../src/session";
 import { syntheticFixture } from "../src/validation";
 
 interface TestBindings extends Env {
@@ -15,13 +20,18 @@ interface TestBindings extends Env {
 
 interface EnrollmentResponse {
   participantId: string;
-  accessToken: string;
   recoveryCode: string;
+  csrfToken: string;
+  cookie: string;
 }
 
 let publicJwkJson = "";
 let privateJwkJson = "";
 let keyId = "";
+
+function recoveryAttemptId(): string {
+  return `um_recovery_attempt_${encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
+}
 
 function testBindings(overrides: Partial<Env> = {}): Env {
   const bindings = env as TestBindings;
@@ -44,7 +54,36 @@ async function api(
   init: RequestInit = {},
   runtimeEnv = testBindings(),
 ): Promise<Response> {
-  return handleRequest(new Request(`https://example.test${path}`, init), runtimeEnv);
+  const headers = new Headers(init.headers);
+  const method = init.method?.toUpperCase() ?? "GET";
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !headers.has("origin")) {
+    headers.set("origin", "https://example.test");
+  }
+  return handleRequest(
+    new Request(`https://example.test${path}`, { ...init, headers }),
+    runtimeEnv,
+  );
+}
+
+function cookieFrom(response: Response): string {
+  const setCookie = response.headers.get("set-cookie");
+  expect(setCookie).toBeTruthy();
+  return setCookie!.split(";", 1)[0]!;
+}
+
+async function enrollmentFrom(response: Response): Promise<EnrollmentResponse> {
+  const body = await response.json<Omit<EnrollmentResponse, "cookie">>();
+  return { ...body, cookie: cookieFrom(response) };
+}
+
+function personalHeaders(
+  participant: EnrollmentResponse,
+  { csrf = false }: { csrf?: boolean } = {},
+): HeadersInit {
+  return {
+    cookie: participant.cookie,
+    ...(csrf ? { "x-usage-monitor-csrf": participant.csrfToken } : {}),
+  };
 }
 
 async function enroll(): Promise<EnrollmentResponse> {
@@ -57,7 +96,7 @@ async function enroll(): Promise<EnrollmentResponse> {
     }),
   });
   expect(response.status).toBe(201);
-  return response.json<EnrollmentResponse>();
+  return enrollmentFrom(response);
 }
 
 async function enrollTelemetry(): Promise<EnrollmentResponse> {
@@ -70,7 +109,7 @@ async function enrollTelemetry(): Promise<EnrollmentResponse> {
     }),
   });
   expect(response.status).toBe(201);
-  return response.json<EnrollmentResponse>();
+  return enrollmentFrom(response);
 }
 
 async function issueTestGrant({
@@ -147,6 +186,62 @@ async function encrypt(value: unknown, telemetry = false): Promise<object> {
     iv: encodeBase64Url(iv),
     ciphertext: encodeBase64Url(ciphertext),
   };
+}
+
+async function registerUpload(
+  participant: EnrollmentResponse,
+  rawEnvelope: string,
+): Promise<{ uploadAuthorization: string; expiresAt: string }> {
+  const response = await api("/api/v1/me/upload-authorizations", {
+    method: "POST",
+    headers: {
+      ...personalHeaders(participant, { csrf: true }),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      envelopeDigest: await sha256Hex(rawEnvelope),
+      contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
+      contentType: "application/json",
+    }),
+  });
+  expect(response.status).toBe(201);
+  return response.json<{ uploadAuthorization: string; expiresAt: string }>();
+}
+
+async function uploadEnvelope(
+  participant: EnrollmentResponse,
+  envelope: object,
+): Promise<Response> {
+  const rawEnvelope = JSON.stringify(envelope);
+  const authorization = await registerUpload(participant, rawEnvelope);
+  return api("/api/v1/contributions", {
+    method: "POST",
+    headers: {
+      authorization: `Upload ${authorization.uploadAuthorization}`,
+      "content-type": "application/json",
+    },
+    body: rawEnvelope,
+  });
+}
+
+async function uploadRaw(
+  participant: EnrollmentResponse,
+  rawEnvelope: string,
+  {
+    requestContentType = "application/json",
+    cookie,
+  }: { requestContentType?: string; cookie?: string } = {},
+): Promise<Response> {
+  const authorization = await registerUpload(participant, rawEnvelope);
+  return api("/api/v1/contributions", {
+    method: "POST",
+    headers: {
+      authorization: `Upload ${authorization.uploadAuthorization}`,
+      "content-type": requestContentType,
+      ...(cookie ? { cookie } : {}),
+    },
+    body: rawEnvelope,
+  });
 }
 
 function telemetryFixture(suffix = "a"): Record<string, unknown> {
@@ -264,11 +359,468 @@ beforeEach(async () => {
 });
 
 describe("synthetic usage monitor service", () => {
+  it("issues only a hash-backed secure cookie session and resists fixation", async () => {
+    const response = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: {
+        cookie: `${"__Host-usage_monitor_session"}=um_session_${crypto.randomUUID()}.${"A".repeat(43)}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+      }),
+    });
+    expect(response.status).toBe(201);
+    const responseText = await response.clone().text();
+    expect(responseText).not.toContain("accessToken");
+    expect(responseText).not.toContain("um_session_");
+    const participant = await enrollmentFrom(response);
+    const setCookie = response.headers.get("set-cookie")!;
+    expect(setCookie).toMatch(
+      /^__Host-usage_monitor_session=um_session_[^;]+; Path=\/; Max-Age=1800; Secure; HttpOnly; SameSite=Strict$/u,
+    );
+    expect(setCookie).not.toContain("Domain=");
+    expect(setCookie).not.toContain(`${"A".repeat(43)}`);
+
+    const session = await api("/api/v1/session", {
+      headers: personalHeaders(participant),
+    });
+    expect(session.status).toBe(200);
+    expect(session.headers.get("cache-control")).toBe("no-store");
+    expect(session.headers.get("vary")).toBe("Cookie");
+    await expect(session.json()).resolves.toMatchObject({
+      participantId: participant.participantId,
+      csrfToken: participant.csrfToken,
+    });
+
+    const stored = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT length(secret_hash) AS secret_bytes, length(csrf_hash) AS csrf_bytes
+         FROM web_sessions WHERE participant_id = ?`,
+    ).bind(participant.participantId).first<{
+      secret_bytes: number;
+      csrf_bytes: number;
+    }>();
+    expect(stored).toEqual({ secret_bytes: 32, csrf_bytes: 32 });
+
+    const expiredId = participant.cookie.match(/um_session_([^.]+)\./u)?.[1];
+    expect(expiredId).toBeTruthy();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE web_sessions SET expires_at = ? WHERE id = ?",
+    ).bind(new Date(Date.now() - 1_000).toISOString(), expiredId).run();
+    const expired = await api("/api/v1/session", {
+      headers: personalHeaders(participant),
+    });
+    expect(expired.status).toBe(401);
+  });
+
+  it("requires same-origin CSRF for session mutations and issues no authority on failure", async () => {
+    const crossOrigin = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: {
+        origin: "https://attacker.example",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+      }),
+    });
+    expect(crossOrigin.status).toBe(403);
+    expect(crossOrigin.headers.get("set-cookie")).toBeNull();
+    const participantCount = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(participantCount?.total).toBe(0);
+
+    const participant = await enrollTelemetry();
+    const envelope = JSON.stringify(await encrypt(telemetryFixture("a"), true));
+    const registrationBody = JSON.stringify({
+      envelopeDigest: await sha256Hex(envelope),
+      contentLengthBytes: new TextEncoder().encode(envelope).byteLength,
+      contentType: "application/json",
+    });
+    for (const headers of [
+      new Headers({
+        cookie: participant.cookie,
+        "content-type": "application/json",
+      }),
+      new Headers({
+        cookie: participant.cookie,
+        "content-type": "application/json",
+        "x-usage-monitor-csrf": "um_csrf_wrong",
+      }),
+      new Headers({
+        cookie: participant.cookie,
+        origin: "https://attacker.example",
+        "content-type": "application/json",
+        "x-usage-monitor-csrf": participant.csrfToken,
+      }),
+    ]) {
+      const rejected = await api("/api/v1/me/upload-authorizations", {
+        method: "POST",
+        headers,
+        body: registrationBody,
+      });
+      expect(rejected.status).toBe(403);
+    }
+    const authorizationCount = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM upload_authorizations",
+    ).first<{ total: number }>();
+    expect(authorizationCount?.total).toBe(0);
+  });
+
+  it("strictly separates cookie sessions from one-use scoped upload authority", async () => {
+    const participant = await enrollTelemetry();
+    const envelope = await encrypt(telemetryFixture("a"), true);
+    const rawEnvelope = JSON.stringify(envelope);
+    const authorization = await registerUpload(participant, rawEnvelope);
+
+    const cookieUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        cookie: participant.cookie,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(cookieUpload.status).toBe(401);
+
+    const uploadReadsPersonal = await api("/api/v1/me", {
+      headers: { authorization: `Upload ${authorization.uploadAuthorization}` },
+    });
+    expect(uploadReadsPersonal.status).toBe(401);
+
+    const wrongScope = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: `${rawEnvelope} `,
+    });
+    expect(wrongScope.status).toBe(401);
+
+    const bomScope = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: `\uFEFF${rawEnvelope}`,
+    });
+    expect(bomScope.status).toBe(401);
+
+    const accepted = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(accepted.status).toBe(202);
+    const replay = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(replay.status).toBe(401);
+
+    const personal = await api("/api/v1/me/export", {
+      headers: personalHeaders(participant),
+    });
+    const exportText = await personal.text();
+    expect(personal.headers.get("cache-control")).toBe("no-store");
+    for (const secretPrefix of [
+      "um_session_",
+      "um_upload_",
+      "um_recovery_",
+      "um_csrf_",
+      "__Host-usage_monitor_session",
+    ]) {
+      expect(exportText).not.toContain(secretPrefix);
+    }
+  });
+
+  it("enforces upload expiry and exactly one concurrent claimant", async () => {
+    const expiredParticipant = await enrollTelemetry();
+    const expiredRaw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
+    const expiredAuthorization = await registerUpload(expiredParticipant, expiredRaw);
+    const expiredId = expiredAuthorization.uploadAuthorization
+      .match(/^um_upload_([^.]+)\./u)?.[1];
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE upload_authorizations SET expires_at = ? WHERE id = ?",
+    ).bind(new Date(Date.now() - 1_000).toISOString(), expiredId).run();
+    const expired = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${expiredAuthorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: expiredRaw,
+    });
+    expect(expired.status).toBe(401);
+
+    const participant = await enrollTelemetry();
+    const raw = JSON.stringify(await encrypt(telemetryFixture("b"), true));
+    const authorization = await registerUpload(participant, raw);
+    const responses = await Promise.all([
+      api("/api/v1/contributions", {
+        method: "POST",
+        headers: {
+          authorization: `Upload ${authorization.uploadAuthorization}`,
+          "content-type": "application/json",
+        },
+        body: raw,
+      }),
+      api("/api/v1/contributions", {
+        method: "POST",
+        headers: {
+          authorization: `Upload ${authorization.uploadAuthorization}`,
+          "content-type": "application/json",
+        },
+        body: raw,
+      }),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([202, 401]);
+    const state = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state, consumed_contribution_id FROM upload_authorizations WHERE id = ?",
+    ).bind(authorization.uploadAuthorization.match(/^um_upload_([^.]+)\./u)?.[1])
+      .first<{ state: string; consumed_contribution_id: string | null }>();
+    expect(state?.state).toBe("consumed");
+    expect(state?.consumed_contribution_id).toMatch(/^contribution:/u);
+  });
+
+  it("does not revoke a consuming upload and records acceptance atomically", async () => {
+    const participant = await enrollTelemetry();
+    const raw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
+    const authorization = await registerUpload(participant, raw);
+    let reachedPut!: () => void;
+    let releasePut!: () => void;
+    const putReached = new Promise<void>((resolve) => {
+      reachedPut = resolve;
+    });
+    const putReleased = new Promise<void>((resolve) => {
+      releasePut = resolve;
+    });
+    const baseBucket = testBindings().QUARANTINE;
+    const pausedBucket = new Proxy(baseBucket, {
+      get(target, property) {
+        if (property === "put") {
+          return async (...args: Parameters<R2Bucket["put"]>) => {
+            reachedPut();
+            await putReleased;
+            return target.put(...args);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const upload = api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: raw,
+    }, testBindings({ QUARANTINE: pausedBucket }));
+    await putReached;
+
+    const authorizationId = authorization.uploadAuthorization
+      .match(/^um_upload_([^.]+)\./u)?.[1];
+    const inFlight = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM upload_authorizations WHERE id = ?",
+    ).bind(authorizationId).first<{ state: string }>();
+    expect(inFlight?.state).toBe("consuming");
+
+    const reset = await api("/api/v1/me/security-reset", {
+      method: "POST",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(reset.status).toBe(200);
+    const stillConsuming = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM upload_authorizations WHERE id = ?",
+    ).bind(authorizationId).first<{ state: string }>();
+    expect(stillConsuming?.state).toBe("consuming");
+
+    const deletion = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(deletion.status).toBe(409);
+    await expect(deletion.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_IN_PROGRESS" },
+    });
+    const participantState = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first<{ state: string }>();
+    expect(participantState?.state).toBe("active");
+
+    releasePut();
+    const accepted = await upload;
+    expect(accepted.status).toBe(202);
+    const receipt = await accepted.json<{ contributionId: string }>();
+    const audited = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT u.state, u.consumed_contribution_id,
+              t.upload_authorization_id
+         FROM upload_authorizations u
+         JOIN telemetry_contributions t
+           ON t.upload_authorization_id = u.id
+        WHERE u.id = ?`,
+    ).bind(authorizationId).first<{
+      state: string;
+      consumed_contribution_id: string;
+      upload_authorization_id: string;
+    }>();
+    expect(audited).toEqual({
+      state: "consumed",
+      consumed_contribution_id: receipt.contributionId,
+      upload_authorization_id: authorizationId,
+    });
+  });
+
+  it("expires a crashed upload lease without accepting late ingestion or stranding deletion", async () => {
+    const participant = await enrollTelemetry();
+    const raw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
+    const authorization = await registerUpload(participant, raw);
+    let reachedPut!: () => void;
+    let releasePut!: () => void;
+    const putReached = new Promise<void>((resolve) => {
+      reachedPut = resolve;
+    });
+    const putReleased = new Promise<void>((resolve) => {
+      releasePut = resolve;
+    });
+    const baseBucket = testBindings().QUARANTINE;
+    const pausedBucket = new Proxy(baseBucket, {
+      get(target, property) {
+        if (property === "put") {
+          return async (...args: Parameters<R2Bucket["put"]>) => {
+            reachedPut();
+            await putReleased;
+            return target.put(...args);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const upload = api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: raw,
+    }, testBindings({ QUARANTINE: pausedBucket }));
+    await putReached;
+    const authorizationId = authorization.uploadAuthorization
+      .match(/^um_upload_([^.]+)\./u)?.[1];
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE upload_authorizations
+          SET consume_lease_expires_at = ?
+        WHERE id = ? AND state = 'consuming'`,
+    ).bind(new Date(Date.now() - 1_000).toISOString(), authorizationId).run();
+
+    releasePut();
+    const late = await upload;
+    expect(late.status).toBe(500);
+    const persisted = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM telemetry_contributions",
+    ).first<{ total: number }>();
+    expect(persisted?.total).toBe(0);
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+    const state = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state, consumed_contribution_id FROM upload_authorizations WHERE id = ?",
+    ).bind(authorizationId).first<{
+      state: string;
+      consumed_contribution_id: string | null;
+    }>();
+    expect(state).toEqual({ state: "revoked", consumed_contribution_id: null });
+
+    const deletion = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(deletion.status).toBe(200);
+  });
+
+  it("security reset revokes uploads and rotates recovery while logout revokes the session", async () => {
+    const participant = await enrollTelemetry();
+    const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
+    const pending = await registerUpload(participant, pendingRaw);
+    const reset = await api("/api/v1/me/security-reset", {
+      method: "POST",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(reset.status).toBe(200);
+    const resetBody = await reset.json<{
+      recoveryCode: string;
+      csrfToken: string;
+    }>();
+    expect(resetBody.recoveryCode).toMatch(/^um_recovery_/u);
+    expect(resetBody.recoveryCode).not.toBe(participant.recoveryCode);
+    expect(resetBody.csrfToken).toBe(participant.csrfToken);
+
+    const currentSession = await api("/api/v1/session", {
+      headers: personalHeaders(participant),
+    });
+    expect(currentSession.status).toBe(200);
+    const revokedUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${pending.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: pendingRaw,
+    });
+    expect(revokedUpload.status).toBe(401);
+    const oldRecovery = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: recoveryAttemptId() }),
+    });
+    expect(oldRecovery.status).toBe(401);
+
+    const noCsrfLogout = await api("/api/v1/logout", {
+      method: "POST",
+      headers: personalHeaders(participant),
+    });
+    expect(noCsrfLogout.status).toBe(403);
+    const logout = await api("/api/v1/logout", {
+      method: "POST",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(logout.status).toBe(200);
+    expect(logout.headers.get("set-cookie")).toBe(
+      "__Host-usage_monitor_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict",
+    );
+    const afterLogout = await api("/api/v1/session", {
+      headers: personalHeaders(participant),
+    });
+    expect(afterLogout.status).toBe(401);
+    const staleLogout = await api("/api/v1/logout", {
+      method: "POST",
+      headers: { cookie: participant.cookie },
+    });
+    expect(staleLogout.status).toBe(200);
+    expect(staleLogout.headers.get("set-cookie")).toBe(
+      "__Host-usage_monitor_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict",
+    );
+  });
+
   it("enrolls only with exact consent and persists it", async () => {
     const participant = await enroll();
     expect(participant.participantId).toMatch(/^participant:/u);
-    expect(participant.accessToken).toMatch(/^um_access_/u);
+    expect(participant.csrfToken).toMatch(/^um_csrf_/u);
     expect(participant.recoveryCode).toMatch(/^um_recovery_/u);
+    expect(participant.cookie).toMatch(/^__Host-usage_monitor_session=um_session_/u);
 
     const row = await testBindings().USAGE_MONITOR_DB.prepare(
       "SELECT consent_version, consented_at FROM participants WHERE id = ?",
@@ -470,7 +1022,7 @@ describe("synthetic usage monitor service", () => {
           "cf-connecting-ip": "PRIVATE_IP_CANARY",
           "content-type": "application/json",
         },
-        body: JSON.stringify({ recoveryCode: participant.recoveryCode }),
+        body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: recoveryAttemptId() }),
       }, testBindings({
         ENROLLMENT_RATE_LIMIT: allowedLimiter,
         RECOVERY_RATE_LIMIT: blockedLimiter,
@@ -523,14 +1075,7 @@ describe("synthetic usage monitor service", () => {
       keyId,
       cryptoImpl: crypto,
     });
-    const contribution = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(envelope),
-    });
+    const contribution = await uploadEnvelope(participant, envelope);
     expect(contribution.status).toBe(202);
     const accepted = await contribution.json<{
       contributionId: string;
@@ -538,20 +1083,13 @@ describe("synthetic usage monitor service", () => {
     }>();
     expect(accepted.status).toBe("accepted_synthetic");
 
-    const replay = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(envelope),
-    });
+    const replay = await uploadEnvelope(participant, envelope);
     expect(replay.status).toBe(202);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
     await expect(replay.json()).resolves.toEqual(accepted);
 
     const me = await api("/api/v1/me", {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
     });
     expect(me.status).toBe(200);
     await expect(me.json()).resolves.toMatchObject({
@@ -567,7 +1105,7 @@ describe("synthetic usage monitor service", () => {
     });
 
     const exported = await api("/api/v1/me/export", {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
     });
     expect(exported.status).toBe(200);
     await expect(exported.json()).resolves.toMatchObject({
@@ -579,7 +1117,7 @@ describe("synthetic usage monitor service", () => {
 
     const deleted = await api("/api/v1/me", {
       method: "DELETE",
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant, { csrf: true }),
     });
     expect(deleted.status).toBe(200);
     await expect(deleted.json()).resolves.toMatchObject({
@@ -594,12 +1132,12 @@ describe("synthetic usage monitor service", () => {
     expect(participantCount?.total).toBe(0);
 
     const oldAccess = await api("/api/v1/me", {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
     });
     expect(oldAccess.status).toBe(401);
     const repeatedDelete = await api("/api/v1/me", {
       method: "DELETE",
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant, { csrf: true }),
     });
     expect(repeatedDelete.status).toBe(401);
   });
@@ -610,14 +1148,7 @@ describe("synthetic usage monitor service", () => {
       ...(await encrypt(syntheticFixture())),
       synthetic: false,
     };
-    const real = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(realEnvelope),
-    });
+    const real = await uploadEnvelope(participant, realEnvelope);
     expect(real.status).toBe(400);
     await expect(real.json()).resolves.toMatchObject({
       error: { code: "SYNTHETIC_REQUIRED" },
@@ -625,30 +1156,19 @@ describe("synthetic usage monitor service", () => {
 
     const mutatedFixture = syntheticFixture();
     mutatedFixture.accounting.estimatedApiCostUsd = "12.840001";
-    const mutated = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt(mutatedFixture)),
-    });
+    const mutated = await uploadEnvelope(participant, await encrypt(mutatedFixture));
     expect(mutated.status).toBe(400);
     await expect(mutated.json()).resolves.toMatchObject({
       error: { code: "SYNTHETIC_RECORD_INVALID" },
     });
 
-    const extraPlaintext = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt({
+    const extraPlaintext = await uploadEnvelope(
+      participant,
+      await encrypt({
         ...syntheticFixture(),
         prompt: "rejected-after-decryption",
-      })),
-    });
+      }),
+    );
     expect(extraPlaintext.status).toBe(400);
     await expect(extraPlaintext.json()).resolves.toMatchObject({
       error: { code: "SYNTHETIC_RECORD_INVALID" },
@@ -664,7 +1184,7 @@ describe("synthetic usage monitor service", () => {
     const oversized = await api("/api/v1/contributions", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${participant.accessToken}`,
+        authorization: "Upload PRIVATE_UPLOAD_CANARY",
         "content-length": "9999999",
         "content-type": "application/json",
       },
@@ -675,7 +1195,7 @@ describe("synthetic usage monitor service", () => {
     const wrongContentType = await api("/api/v1/contributions", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${participant.accessToken}`,
+        authorization: "Upload PRIVATE_UPLOAD_CANARY",
         "content-type": "text/plain",
       },
       body: "{}",
@@ -685,7 +1205,7 @@ describe("synthetic usage monitor service", () => {
     const malformedJson = await api("/api/v1/contributions", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${participant.accessToken}`,
+        authorization: "Upload PRIVATE_UPLOAD_CANARY",
         "content-type": "application/json",
       },
       body: "{",
@@ -696,14 +1216,7 @@ describe("synthetic usage monitor service", () => {
       ...(await encrypt(syntheticFixture())),
       prompt: "rejected-before-decryption",
     };
-    const extraEnvelopeResponse = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(extraEnvelope),
-    });
+    const extraEnvelopeResponse = await uploadEnvelope(participant, extraEnvelope);
     expect(extraEnvelopeResponse.status).toBe(400);
     await expect(extraEnvelopeResponse.json()).resolves.toMatchObject({
       error: { code: "ENVELOPE_INVALID" },
@@ -713,14 +1226,7 @@ describe("synthetic usage monitor service", () => {
       ...(await encrypt(syntheticFixture())),
       keyId: "key:unknown",
     };
-    const unknownKey = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(unknownKeyEnvelope),
-    });
+    const unknownKey = await uploadEnvelope(participant, unknownKeyEnvelope);
     expect(unknownKey.status).toBe(400);
     await expect(unknownKey.json()).resolves.toMatchObject({
       error: { code: "KEY_ID_INVALID" },
@@ -729,60 +1235,101 @@ describe("synthetic usage monitor service", () => {
 
   it("accepts one contribution only and rejects a distinct valid envelope", async () => {
     const participant = await enroll();
-    const first = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt(syntheticFixture())),
-    });
+    const first = await uploadEnvelope(participant, await encrypt(syntheticFixture()));
     expect(first.status).toBe(202);
 
-    const distinct = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt(syntheticFixture())),
-    });
+    const distinct = await uploadEnvelope(participant, await encrypt(syntheticFixture()));
     expect(distinct.status).toBe(429);
     await expect(distinct.json()).resolves.toMatchObject({
       error: { code: "CONTRIBUTION_LIMIT_REACHED" },
     });
   });
 
-  it("uses the recovery capability once to rotate access", async () => {
+  it("uses recovery once to rotate recovery, sessions, and upload authority", async () => {
     const participant = await enroll();
+    const attemptId = recoveryAttemptId();
+    const pendingRaw = JSON.stringify(await encrypt(syntheticFixture()));
+    const pendingUpload = await registerUpload(participant, pendingRaw);
     const recovered = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
+    });
+    expect(recovered.status).toBe(200);
+    const replacement = await enrollmentFrom(recovered);
+    expect(replacement.participantId).toBe(participant.participantId);
+    expect(replacement.recoveryCode).not.toBe(participant.recoveryCode);
+    expect(replacement.cookie).not.toBe(participant.cookie);
+
+    const oldAccess = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    expect(oldAccess.status).toBe(401);
+    const newAccess = await api("/api/v1/me", {
+      headers: personalHeaders(replacement),
+    });
+    expect(newAccess.status).toBe(200);
+    const revokedUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${pendingUpload.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: pendingRaw,
+    });
+    expect(revokedUpload.status).toBe(401);
+
+    const unboundReplay = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        recoveryCode: participant.recoveryCode,
+        recoveryAttemptId: recoveryAttemptId(),
+      }),
+    });
+    expect(unboundReplay.status).toBe(401);
+    const codeAlone = await api("/api/v1/recover", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ recoveryCode: participant.recoveryCode }),
     });
-    expect(recovered.status).toBe(200);
-    const replacement = await recovered.json<{
-      participantId: string;
-      accessToken: string;
-    }>();
-    expect(replacement.participantId).toBe(participant.participantId);
-    expect(replacement.accessToken).not.toBe(participant.accessToken);
+    expect(codeAlone.status).toBe(400);
 
-    const oldAccess = await api("/api/v1/me", {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+    const replay = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
     });
-    expect(oldAccess.status).toBe(401);
-    const newAccess = await api("/api/v1/me", {
-      headers: { authorization: `Bearer ${replacement.accessToken}` },
+    expect(replay.status).toBe(200);
+    const replayed = await enrollmentFrom(replay);
+    expect(replayed).toEqual(replacement);
+    const secondReplay = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
     });
-    expect(newAccess.status).toBe(200);
+    expect(secondReplay.status).toBe(200);
+    expect(await enrollmentFrom(secondReplay)).toEqual(replacement);
+    const exhausted = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
+    });
+    expect(exhausted.status).toBe(401);
+    const retryReceipt = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT replay_count, length(old_recovery_token_hash) AS hash_bytes
+         FROM recovery_retry_receipts WHERE old_recovery_token_id = ?`,
+    ).bind(participant.recoveryCode.match(/^um_recovery_([^.]+)\./u)?.[1])
+      .first<{ replay_count: number; hash_bytes: number }>();
+    expect(retryReceipt).toEqual({ replay_count: 2, hash_bytes: 32 });
 
     const invalid = await api("/api/v1/recover", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         recoveryCode: `um_recovery_${crypto.randomUUID()}.${"A".repeat(43)}`,
-      }),
+      recoveryAttemptId: recoveryAttemptId(),
+        }),
     });
     expect(invalid.status).toBe(401);
     await expect(invalid.json()).resolves.toMatchObject({
@@ -793,14 +1340,7 @@ describe("synthetic usage monitor service", () => {
   it("ingests closed telemetry, deduplicates overlaps, and isolates participant data", async () => {
     const participant = await enrollTelemetry();
     const firstEnvelope = await encrypt(telemetryFixture("a"), true);
-    const first = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(firstEnvelope),
-    });
+    const first = await uploadEnvelope(participant, firstEnvelope);
     expect(first.status).toBe(202);
     const accepted = await first.json<{
       contributionId: string;
@@ -810,14 +1350,7 @@ describe("synthetic usage monitor service", () => {
     expect(accepted.recordCounts).toMatchObject({ accepted: 2, deduplicated: 0 });
     expect(accepted.accountingVerification).toBe("client_declared_unverified");
 
-    const replay = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(firstEnvelope),
-    });
+    const replay = await uploadEnvelope(participant, firstEnvelope);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
 
     const overlap = telemetryFixture("a");
@@ -832,14 +1365,7 @@ describe("synthetic usage monitor service", () => {
       planVariant: "pro-20x",
       markerId: `marker:v2:${"d".repeat(64)}`,
     }]);
-    const second = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt(overlap, true)),
-    });
+    const second = await uploadEnvelope(participant, await encrypt(overlap, true));
     expect(second.status).toBe(202);
     const secondAccepted = await second.json<{ contributionId: string; recordCounts: object }>();
     expect(secondAccepted).toMatchObject({
@@ -848,7 +1374,7 @@ describe("synthetic usage monitor service", () => {
     expect(secondAccepted.contributionId).not.toBe(accepted.contributionId);
 
     const stats = await api("/api/v1/me/stats", {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
     });
     expect(stats.status).toBe(200);
     const personal = await stats.json<Record<string, unknown>>();
@@ -872,7 +1398,7 @@ describe("synthetic usage monitor service", () => {
     const contribution = await api(
       `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
       {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
       },
     );
     expect(contribution.status).toBe(200);
@@ -883,12 +1409,13 @@ describe("synthetic usage monitor service", () => {
 
     const stranger = await enrollTelemetry();
     const isolated = await api(`/api/v1/contributions/${accepted.contributionId}`, {
-      headers: { authorization: `Bearer ${stranger.accessToken}` },
+      headers: personalHeaders(stranger),
     });
     expect(isolated.status).toBe(404);
 
     const community = await api("/api/v1/community/insights");
     await expect(community.json()).resolves.toMatchObject({
+      publicationStatus: "development_diagnostic_not_publication_safe",
       suppressed: true,
       participantCount: 1,
       minimumParticipants: 3,
@@ -901,17 +1428,17 @@ describe("synthetic usage monitor service", () => {
 
     const deleted = await api(`/api/v1/contributions/${accepted.contributionId}`, {
       method: "DELETE",
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant, { csrf: true }),
     });
     expect(deleted.status).toBe(200);
     const afterDelete = await api("/api/v1/me/stats", {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
     });
     await expect(afterDelete.json()).resolves.toMatchObject({
       totals: { contributions: 1, usageEvents: 1, quotaSnapshots: 1, activityMarkers: 1 },
     });
     const surviving = await api(`/api/v1/contributions/${secondAccepted.contributionId}`, {
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant),
     });
     await expect(surviving.json()).resolves.toMatchObject({
       records: [{ kind: "usage" }, { kind: "quota" }, { kind: "activity" }],
@@ -925,14 +1452,7 @@ describe("synthetic usage monitor service", () => {
       '"keyId":',
       '"keyId":"PRIVATE_PROMPT_CANARY","keyId":',
     );
-    const duplicate = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: duplicateKeyEnvelope,
-    });
+    const duplicate = await uploadRaw(participant, duplicateKeyEnvelope);
     expect(duplicate.status).toBe(400);
     expect(await duplicate.text()).not.toContain("PRIVATE_PROMPT_CANARY");
 
@@ -940,14 +1460,7 @@ describe("synthetic usage monitor service", () => {
       ...telemetryFixture("b"),
       prompt: "PRIVATE USER CONTENT",
     };
-    const privacy = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt(contaminated, true)),
-    });
+    const privacy = await uploadEnvelope(participant, await encrypt(contaminated, true));
     expect(privacy.status).toBe(400);
     await expect(privacy.json()).resolves.toMatchObject({
       error: { code: "PRIVACY_CANARY_DETECTED" },
@@ -956,14 +1469,7 @@ describe("synthetic usage monitor service", () => {
     const inconsistent = telemetryFixture("c");
     const accounting = Reflect.get(inconsistent, "accounting") as Record<string, unknown>;
     accounting.estimatedApiCostUsd = "2.000000";
-    const rejected = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${participant.accessToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(await encrypt(inconsistent, true)),
-    });
+    const rejected = await uploadEnvelope(participant, await encrypt(inconsistent, true));
     expect(rejected.status).toBe(400);
     await expect(rejected.json()).resolves.toMatchObject({
       error: { code: "TELEMETRY_RECORD_INVALID" },
@@ -971,23 +1477,20 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
 
-  it("publishes only k-anonymous community slices", async () => {
+  it("labels thresholded live community slices as development-only diagnostics", async () => {
     for (const suffix of ["a", "b", "c"]) {
       const participant = await enrollTelemetry();
-      const response = await api("/api/v1/contributions", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${participant.accessToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
-      });
+      const response = await uploadEnvelope(
+        participant,
+        await encrypt(telemetryFixture(suffix), true),
+      );
       expect(response.status).toBe(202);
     }
     const response = await api("/api/v1/stats/aggregate");
     expect(response.status).toBe(200);
     const body = await response.json<Record<string, unknown>>();
     expect(body).toMatchObject({
+      publicationStatus: "development_diagnostic_not_publication_safe",
       suppressed: false,
       participantCount: 3,
       totals: { usageEvents: 3, quotaSnapshots: 3 },
@@ -1000,14 +1503,10 @@ describe("synthetic usage monitor service", () => {
   it("does not let local-open participants unlock invite-only community aggregates", async () => {
     for (const suffix of ["a", "b", "c"]) {
       const participant = await enrollTelemetry();
-      const response = await api("/api/v1/contributions", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${participant.accessToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
-      });
+      const response = await uploadEnvelope(
+        participant,
+        await encrypt(telemetryFixture(suffix), true),
+      );
       expect(response.status).toBe(202);
     }
     const suppressed = await api(
@@ -1016,6 +1515,7 @@ describe("synthetic usage monitor service", () => {
       inviteOnlyBindings(),
     );
     await expect(suppressed.json()).resolves.toMatchObject({
+      publicationStatus: "development_diagnostic_not_publication_safe",
       suppressed: true,
       participantCount: 0,
       cohortEligibility: "invite_only",
@@ -1026,16 +1526,12 @@ describe("synthetic usage monitor service", () => {
       const grant = await issueTestGrant();
       const enrolled = await enrollWithGrant(grant);
       expect(enrolled.status).toBe(201);
-      const participant = await enrolled.json<EnrollmentResponse>();
+      const participant = await enrollmentFrom(enrolled);
       invitedParticipant ??= participant;
-      const contribution = await api("/api/v1/contributions", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${participant.accessToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
-      });
+      const contribution = await uploadEnvelope(
+        participant,
+        await encrypt(telemetryFixture(suffix), true),
+      );
       expect(contribution.status).toBe(202);
     }
     const community = await api(
@@ -1045,6 +1541,7 @@ describe("synthetic usage monitor service", () => {
     );
     const communityText = await community.text();
     expect(JSON.parse(communityText)).toMatchObject({
+      publicationStatus: "development_diagnostic_not_publication_safe",
       suppressed: false,
       participantCount: 3,
       cohortEligibility: "invite_only",
@@ -1055,7 +1552,7 @@ describe("synthetic usage monitor service", () => {
     }
 
     const exported = await api("/api/v1/me/export", {
-      headers: { authorization: `Bearer ${invitedParticipant?.accessToken}` },
+      headers: personalHeaders(invitedParticipant!),
     });
     const exportText = await exported.text();
     for (const forbidden of ["eligibility:", "um_invite_", "grant_id"]) {
@@ -1063,23 +1560,144 @@ describe("synthetic usage monitor service", () => {
     }
   });
 
+  it("conditions concurrent deletion loser effects and preserves the winning retry session", async () => {
+    const participant = await enrollTelemetry();
+    const contribution = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    expect(contribution.status).toBe(202);
+    const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("b"), true));
+    const pendingUpload = await registerUpload(participant, pendingRaw);
+
+    const otherSession = await createSessionMaterial(participant.participantId);
+    await sessionInsert(testBindings().USAGE_MONITOR_DB, otherSession).run();
+    const otherParticipant: EnrollmentResponse = {
+      participantId: participant.participantId,
+      recoveryCode: participant.recoveryCode,
+      csrfToken: otherSession.csrfToken,
+      cookie: sessionCookie(otherSession).split(";", 1)[0]!,
+    };
+
+    let deleteCalls = 0;
+    const baseBucket = testBindings().QUARANTINE;
+    const flakyBucket = new Proxy(baseBucket, {
+      get(target, property) {
+        if (property === "delete") {
+          return async (..._keys: Parameters<R2Bucket["delete"]>) => {
+            deleteCalls += 1;
+            throw new Error("injected R2 deletion failure");
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const responses = await Promise.all([
+      api("/api/v1/me", {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      }, testBindings({ QUARANTINE: flakyBucket })),
+      api("/api/v1/me", {
+        method: "DELETE",
+        headers: personalHeaders(otherParticipant, { csrf: true }),
+      }, testBindings({ QUARANTINE: flakyBucket })),
+    ]);
+    expect(responses.filter((response) => response.status === 500)).toHaveLength(1);
+    expect(responses.filter((response) => [401, 409].includes(response.status))).toHaveLength(1);
+    expect(deleteCalls).toBe(1);
+
+    const state = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state, deletion_session_id FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first<{
+      state: string;
+      deletion_session_id: string;
+    }>();
+    expect(state?.state).toBe("deleting");
+    const firstSessionId = participant.cookie.match(/um_session_([^.]+)\./u)?.[1];
+    const winningParticipant = state?.deletion_session_id === firstSessionId
+      ? participant
+      : otherParticipant;
+    const losingParticipant = winningParticipant === participant
+      ? otherParticipant
+      : participant;
+    const otherRejected = await api("/api/v1/me", {
+      headers: personalHeaders(losingParticipant),
+    });
+    expect(otherRejected.status).toBe(401);
+    const uploadRejected = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${pendingUpload.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: pendingRaw,
+    });
+    expect(uploadRejected.status).toBe(401);
+
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE web_sessions SET expires_at = ?
+        WHERE id = ?`,
+    ).bind("2020-01-01T00:00:00.000Z", state?.deletion_session_id).run();
+    const expiredRetry = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(winningParticipant, { csrf: true }),
+    });
+    expect(expiredRetry.status).toBe(401);
+
+    const recoveredResponse = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        recoveryCode: participant.recoveryCode,
+        recoveryAttemptId: recoveryAttemptId(),
+      }),
+    });
+    expect(recoveredResponse.status).toBe(200);
+    const deletionOnly = await enrollmentFrom(recoveredResponse);
+    const personalRead = await api("/api/v1/me/stats", {
+      headers: personalHeaders(deletionOnly),
+    });
+    expect(personalRead.status).toBe(401);
+    const uploadRegistration = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(deletionOnly, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        envelopeDigest: "a".repeat(64),
+        contentLengthBytes: 1,
+        contentType: "application/json",
+      }),
+    });
+    expect(uploadRegistration.status).toBe(401);
+
+    const retried = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(deletionOnly, { csrf: true }),
+    });
+    expect(retried.status).toBe(200);
+    await expect(retried.json()).resolves.toMatchObject({
+      deleted: true,
+      contributionsDeleted: 1,
+    });
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+  });
+
   it("deletes every telemetry object and database row with the participant", async () => {
     const participant = await enrollTelemetry();
     for (const suffix of ["a", "b"]) {
-      const response = await api("/api/v1/contributions", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${participant.accessToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
-      });
+      const response = await uploadEnvelope(
+        participant,
+        await encrypt(telemetryFixture(suffix), true),
+      );
       expect(response.status).toBe(202);
     }
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(2);
     const deleted = await api("/api/v1/me", {
       method: "DELETE",
-      headers: { authorization: `Bearer ${participant.accessToken}` },
+      headers: personalHeaders(participant, { csrf: true }),
     });
     await expect(deleted.json()).resolves.toMatchObject({
       deleted: true,

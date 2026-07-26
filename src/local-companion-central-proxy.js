@@ -7,20 +7,10 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 const EXACT_ROUTES = new Map([
   ["/api/health", new Set(["GET"])],
-  ["/api/v1/enroll", new Set(["POST"])],
-  ["/api/v1/recover", new Set(["POST"])],
   ["/api/v1/envelope-key", new Set(["GET"])],
-  ["/api/v1/contributions", new Set(["POST"])],
-  ["/api/v1/me/export", new Set(["GET"])],
-  ["/api/v1/me/stats", new Set(["GET"])],
-  ["/api/v1/me/insights", new Set(["GET"])],
   ["/api/v1/stats/aggregate", new Set(["GET"])],
   ["/api/v1/community/insights", new Set(["GET"])],
-  ["/api/v1/me", new Set(["GET", "DELETE"])],
 ]);
-
-const CONTRIBUTION_PREFIX = "/api/v1/contributions/";
-const CONTRIBUTION_ID = /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function fixedError(code) {
   const error = new Error(code);
@@ -29,17 +19,7 @@ function fixedError(code) {
 }
 
 export function centralRouteMethods(path) {
-  if (EXACT_ROUTES.has(path)) return EXACT_ROUTES.get(path);
-  if (path.startsWith(CONTRIBUTION_PREFIX)) {
-    let contributionId = "";
-    try {
-      contributionId = decodeURIComponent(path.slice(CONTRIBUTION_PREFIX.length));
-    } catch {
-      return null;
-    }
-    if (CONTRIBUTION_ID.test(contributionId)) return new Set(["GET", "DELETE"]);
-  }
-  return null;
+  return EXACT_ROUTES.get(path) ?? null;
 }
 
 function normalizedCentralOrigin(value) {
@@ -131,10 +111,6 @@ export function createLocalCentralProxy({
       if (!allowedMethods.has(request.method)) throw fixedError("central_method_not_allowed");
       const body = await boundedRequestBody(request);
       const headers = { Accept: "application/json" };
-      const authorization = request.headers.authorization;
-      if (typeof authorization === "string" && authorization.length <= 4_096) {
-        headers.Authorization = authorization;
-      }
       if (body !== null) headers["Content-Type"] = "application/json";
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);

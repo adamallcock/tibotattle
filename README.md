@@ -199,8 +199,9 @@ accepts a fixed host, serves fixed assets/reports, and exposes no source-path
 parameter. Refresh is an explicit same-origin action and remains single-flight
 until the collector finishes.
 
-To exercise the complete local-plus-central flow, start the central Worker on a
-separate port and configure the companion's fixed relay:
+To exercise both product surfaces, start the central Worker on a separate port
+and optionally let the companion read its health and thresholded development
+community diagnostics:
 
 ```bash
 npm --prefix apps/worker run migrate:local
@@ -211,8 +212,22 @@ USAGE_MONITOR_PORT=8791 \
 ```
 
 The relay accepts only the reviewed central API routes and cannot proxy a
-request-selected URL. The central service remains local-development-only and
-is not deployed.
+request-selected URL. Specifically, it forwards only public `GET` requests for
+health, the envelope key, and thresholded aggregate diagnostics. It cannot
+forward enrollment, recovery, uploads, personal sessions, personal statistics,
+exports, security controls, deletion, authorization headers, cookies, CSRF
+values, or upstream cookies.
+
+Open `http://127.0.0.1:8792/` to inspect the Worker-served portal and exercise
+its public central API. The rendered controls make the intended same-origin
+personal journey visible, but a browser cannot complete that Secure-cookie
+journey over this loopback HTTP preview. Use the documented cookie-jar HTTP
+smoke for the complete local backend lifecycle; a staged same-origin HTTPS
+preview must repeat the real browser interaction before any participant pilot.
+The production portal owns enrollment, recovery, one-use upload authorization,
+personal results, export, and deletion. This separation prevents tunneling a
+Secure cookie through plain HTTP loopback. The central service remains
+local-development-only and is not deployed.
 
 ### Preparing a contribution
 
@@ -231,31 +246,40 @@ The converter re-verifies the canonical source and privacy receipt, drops
 participant/account/session scopes from transport rows, normalizes API-price
 components, and writes owner-only no-clobber files of at most 200 rows and
 1.25 MB each. Select those files in the dashboard's Data & privacy section.
-The browser validates the closed shape again, encrypts it, and sends only the
-envelope through the fixed relay. Overlapping batches deduplicate by
-participant-scoped occurrence ID at the server.
+Open the Worker-served portal, select one of those prepared files, and confirm
+the contribution. The browser validates the closed shape again, encrypts it,
+registers that exact envelope digest and byte size, and sends it with a
+separate one-use upload authorization. The upload carries no personal session
+cookie. Overlapping batches deduplicate by participant-scoped occurrence ID at
+the server.
 
 `npm run product:check` runs the functional UI, loopback server, transport
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
 Worker dry deployment. It does not deploy or upload data.
 
 For a real HTTP backend smoke using an actual prepared contribution, run the
-Worker in invite-only mode and then use:
+Worker in invite-only mode. Issue three invitation grants so the smoke can
+prove both suppression at one participant and publication at the three-person
+development threshold, then use:
 
 ```bash
 npm run product:backend:smoke -- \
   --origin http://127.0.0.1:8792 \
   --file /absolute/path/to/telemetry-contribution-000001.json \
-  --invite-file /private/tmp/usage-monitor-invite.secret
+  --invite-file /private/tmp/usage-monitor-invite-1.secret \
+  --invite-file /private/tmp/usage-monitor-invite-2.secret \
+  --invite-file /private/tmp/usage-monitor-invite-3.secret
 ```
 
 The [Worker runbook](./apps/worker/README.md) contains the full migration,
 owner-only invitation, server-start, smoke, and cleanup sequence. The smoke
-exercises enrollment, client encryption, strict server validation, D1 ingest,
-opaque R2 retention, idempotent replay, personal/community statistics,
-participant export, complete deletion, and post-deletion authorization. It
-prints no participant or credential values and leaves external deployment
-disabled.
+exercises Secure/HttpOnly session issuance, CSRF, authority isolation,
+one-use upload registration, client encryption, strict server validation, D1
+ingest, opaque R2 retention, idempotent replay with a new upload
+authorization, personal statistics, suppressed and eligible community
+statistics, recovery rotation, security reset, logout, participant export,
+complete deletion, and post-deletion cleanup. It prints no participant or
+credential values and leaves external deployment disabled.
 
 The [functional end-to-end verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
@@ -285,18 +309,32 @@ concept. The browser accepts only a prepared
 `telemetry-contribution-v0.1` file; the central Worker performs authenticated
 envelope decryption, exact-shape and semantic validation, privacy-canary
 rejection, participant-scoped occurrence deduplication, D1 ingest, opaque R2
-quarantine, personal statistics, k-anonymous community statistics, export,
+quarantine, personal statistics, thresholded development community statistics, export,
 recovery, individual contribution deletion, and complete participant deletion.
+Personal web access uses a short-lived, hash-only D1 session exposed only in a
+Secure, HttpOnly, SameSite=Strict `__Host-` cookie. Browser storage contains no
+reusable personal credential. Uploads use a distinct five-minute, one-use
+authorization bound to the exact encrypted body digest, byte length, and
+content type; that authority cannot read or delete personal data.
 The original fixed synthetic walkthrough remains available for regression
 testing but is no longer the product home.
+
+The live community totals are not publication-safe merely because three
+participants unlock them: a changing total can still expose a participant by
+differencing. They remain local-development diagnostics until replaced by
+delayed immutable weekly snapshots with per-cell support, clipping, rounding,
+and a fixed ingestion cutoff.
 
 There is still no public deployment, production route, background
 transmission, public bucket, or authorized volunteer collection. Production
 requires admission controls and rate limiting, production key rotation,
 consent/version governance, privacy/security review, and a staged release
 decision. See the [local companion and central product plan](./2026-07-25-local-companion-app-plan.md),
-the [Worker runbook](./apps/worker/README.md), and the earlier
-[synthetic vertical-slice plan](./2026-07-25-synthetic-consumer-vertical-slice-plan.md).
+the [G3 session/upload capability plan](./2026-07-25-g3-session-capability-separation-plan.md),
+its [verification receipt](./2026-07-25-g3-session-capability-separation-verification-receipt.md),
+and the [Worker runbook](./apps/worker/README.md). The earlier
+[synthetic vertical-slice plan](./2026-07-25-synthetic-consumer-vertical-slice-plan.md)
+is retained only as a superseded historical record.
 
 The [G1 resource-bounded export-set plan](./2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](./2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](./2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](./2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](./2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](./2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](./2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
 
@@ -321,7 +359,7 @@ This creates a different stable pseudonymous scope for future observations. The 
 
 Snapshot reports, interval inference, and weekly reset history include pseudonymous account scope and specific plan variant in their grouping keys. Known accounts and plan eras therefore cannot be pooled. Raw historical transition rows explicitly remain `unattributed` / `unknown`; prospective collector crosschecks accept only records matching the current pseudonymous scope and label their partial-marker time coverage.
 
-The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-monitor/provider-ui-observations-v0.1.jsonl`, `.usage-monitor/local-history-v0.1.json`, and `.usage-monitor/provider-crosscheck-v0.1.json` are mode `0600`. No cross-user upload or telemetry is implemented.
+The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-monitor/provider-ui-observations-v0.1.jsonl`, `.usage-monitor/local-history-v0.1.json`, and `.usage-monitor/provider-crosscheck-v0.1.json` are mode `0600`. These account-observation commands never upload. The separate central contribution path remains an explicit, local-development-only action using prepared privacy-safe files.
 
 `.usage-monitor/local-history-cache-validation-v0.1.json` is an owner-only, cache-digest-bound sidecar containing only hashed source keys and filesystem size/time metadata. It advances after a proven after-end suffix so subsequent cached crosschecks inspect only new bytes; it never stores rollout paths. Collector ingestion likewise streams file growth in 256 KiB chunks, caps one buffered JSONL line at 16 MiB, writes safe output in batches of at most 1,000 records, bounds its recent-key window at 5,000, and uses a path-free digest journal so an appended batch is either retained with its committed checkpoint or truncated and replayed. Transaction payloads and metadata are fsynced in commit order, including parent-directory metadata after atomic rename/removal. Oversized lines remain diagnostic, and idle reconciliation does not rewrite the checkpoint every cycle.
 

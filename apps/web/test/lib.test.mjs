@@ -370,10 +370,10 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
   assert.equal(calls[1].options.method, undefined);
 });
 
-test("community adapter uses encrypted contribution and current stats paths", async () => {
+test("community adapter separates cookie sessions from one-use upload authority", async () => {
   const calls = [];
   const client = new CommunityClient({
-    getAccessToken: () => "private-capability",
+    getCsrfToken: () => "csrf-confirmation",
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
       return new Response(JSON.stringify({ ok: true }), {
@@ -382,23 +382,46 @@ test("community adapter uses encrypted contribution and current stats paths", as
       });
     }
   });
-  await client.contribute({ schemaVersion: TELEMETRY_ENVELOPE_SCHEMA_VERSION });
+  await client.session();
+  await client.registerUpload({
+    envelopeDigest: "a".repeat(64),
+    contentLengthBytes: 123,
+    contentType: "application/json"
+  });
+  await client.contributeSerialized(
+    JSON.stringify({ schemaVersion: TELEMETRY_ENVELOPE_SCHEMA_VERSION }),
+    "one-use-upload"
+  );
   await client.personalStats();
   await client.communityStats();
   await client.participantExport();
   await client.deleteParticipant();
-  assert.equal(calls[0].url, "/api/v1/contributions");
-  assert.equal(calls[0].options.headers.Authorization, "Bearer private-capability");
-  assert.equal(calls[1].url, "/api/v1/me/stats");
-  assert.equal(calls[2].url, "/api/v1/stats/aggregate");
-  assert.equal(calls[3].url, "/api/v1/me/export");
-  assert.equal(calls[4].url, "/api/v1/me");
-  assert.equal(calls[4].options.method, "DELETE");
+  await client.logout();
+  await client.securityReset();
+  assert.equal(calls[0].url, "/api/v1/session");
+  assert.equal(calls[0].options.credentials, "same-origin");
+  assert.equal(calls[1].url, "/api/v1/me/upload-authorizations");
+  assert.equal(calls[1].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[1].options.credentials, "same-origin");
+  assert.equal(calls[2].url, "/api/v1/contributions");
+  assert.equal(calls[2].options.headers.Authorization, "Upload one-use-upload");
+  assert.equal(calls[2].options.credentials, "omit");
+  assert.equal(calls[3].url, "/api/v1/me/stats");
+  assert.equal(calls[3].options.credentials, "same-origin");
+  assert.equal(calls[4].url, "/api/v1/stats/aggregate");
+  assert.equal(calls[5].url, "/api/v1/me/export");
+  assert.equal(calls[6].url, "/api/v1/me");
+  assert.equal(calls[6].options.method, "DELETE");
+  assert.equal(calls[6].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[7].url, "/api/v1/logout");
+  assert.equal(calls[8].url, "/api/v1/me/security-reset");
   await client.health();
   await client.enroll("um_invite_test");
-  assert.equal(calls[5].url, "/api/health");
-  assert.match(calls[6].options.body, /privacy-safe-telemetry-v0\.1/);
-  assert.match(calls[6].options.body, /um_invite_test/);
+  await client.recover("um_recovery_test");
+  assert.equal(calls[9].url, "/api/health");
+  assert.match(calls[10].options.body, /privacy-safe-telemetry-v0\.1/);
+  assert.match(calls[10].options.body, /um_invite_test/);
+  assert.match(calls[11].options.body, /um_recovery_test/);
 });
 
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
@@ -412,6 +435,9 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
   assert.match(html, /id="download-participant"/);
+  assert.match(html, /id="recover-form"/);
+  assert.match(html, /id="security-reset"/);
+  assert.match(html, /id="logout-participant"/);
   assert.match(html, /id="delete-participant"/);
   assert.match(html, /privacy-safe Usage Monitor export/);
   assert.match(appSource, /demo-button.*addEventListener/s);
@@ -422,11 +448,14 @@ test("public interface is dashboard-first and never substitutes demo data automa
 test("real contribution UI encrypts before sending and distinguishes aggregate suppression", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /createTelemetryEnvelope/);
-  assert.match(appSource, /communityClient\.contribute\(envelope\)/);
+  assert.match(appSource, /communityClient\.registerUpload\(/);
+  assert.match(appSource, /communityClient\.contributeSerialized\(/);
   assert.match(appSource, /communityClient\.participantExport\(\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);
   assert.match(appSource, /inviteInput\.value = ""/);
-  assert.doesNotMatch(appSource, /saveSession\([^)]*invite/i);
+  assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
+  assert.match(appSource, /showRecoveryCodeOnce\(enrollment\.recoveryCode\)/);
+  assert.match(appSource, /showRecoveryCodeOnce\(null\)/);
   assert.match(appSource, /if \(payload\.suppressed\)/);
   assert.match(appSource, /minimumParticipants/);
 });

@@ -2,8 +2,26 @@ import {
   inviteGrantHashMatches,
   type ParsedInviteGrant,
 } from "./admission";
-import { hashCapability, randomSecret, sha256Hex, timingSafeEqual } from "./crypto";
+import {
+  encodeBase64Url,
+  hashCapability,
+  randomSecret,
+  sha256,
+  sha256Hex,
+  timingSafeEqual,
+} from "./crypto";
+import {
+  RECOVERY_RETRY_LIMIT,
+  RECOVERY_RETRY_TTL_MILLISECONDS,
+  SESSION_TTL_MILLISECONDS,
+} from "./constants";
 import { ApiError } from "./errors";
+import {
+  createSessionMaterial,
+  createSessionMaterialFromSecret,
+  sessionInsert,
+  type SessionMaterial,
+} from "./session";
 import type { SyntheticContribution, SyntheticEnvelope } from "./validation";
 
 export interface Participant {
@@ -13,18 +31,32 @@ export interface Participant {
   consentVersion: string;
 }
 
-interface ParticipantAuthRow {
-  id: string;
-  access_token_hash: ArrayBuffer;
-  created_at: string;
-  state: "active" | "deleting";
-  consent_version: string;
-}
-
 interface RecoveryAuthRow {
   id: string;
+  recovery_token_id: string;
   recovery_token_hash: ArrayBuffer;
   state: "active" | "deleting";
+}
+
+interface RecoveryRetryRow {
+  old_recovery_token_hash: ArrayBuffer;
+  recovery_attempt_hash: ArrayBuffer;
+  participant_id: string;
+  derivation_nonce: string;
+  replacement_recovery_token_id: string;
+  replacement_session_id: string;
+  expires_at: string;
+  replay_count: number;
+  current_recovery_token_id: string;
+  current_recovery_token_hash: ArrayBuffer;
+  participant_state: "active" | "deleting";
+  deletion_session_id: string | null;
+  session_secret_hash: ArrayBuffer;
+  session_csrf_hash: ArrayBuffer;
+  session_state: "active" | "revoked";
+  session_scope: "personal" | "deletion_only";
+  session_issued_at: string;
+  session_expires_at: string;
 }
 
 interface InviteGrantRow {
@@ -65,11 +97,12 @@ export interface ContributionRow {
 
 export interface Enrollment {
   participantId: string;
-  accessToken: string;
   recoveryCode: string;
+  csrfToken: string;
+  session: SessionMaterial;
 }
 
-function capability(prefix: "um_access" | "um_recovery"): {
+function capability(prefix: "um_recovery"): {
   id: string;
   secret: string;
   encoded: string;
@@ -79,19 +112,19 @@ function capability(prefix: "um_access" | "um_recovery"): {
   return { id, secret, encoded: `${prefix}_${id}.${secret}` };
 }
 
-function parseAccessToken(header: string | null): { id: string; secret: string } {
-  if (!header?.startsWith("Bearer ")) throw new ApiError(401, "AUTH_REQUIRED");
-  const token = header.slice(7);
-  const match = /^um_access_([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u.exec(token);
-  if (!match?.[1] || !match[2]) throw new ApiError(401, "AUTH_INVALID");
-  return { id: match[1], secret: match[2] };
-}
-
 function parseRecoveryCode(recoveryCode: unknown): { id: string; secret: string } {
   if (typeof recoveryCode !== "string") throw new ApiError(401, "AUTH_INVALID");
   const match = /^um_recovery_([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u.exec(recoveryCode);
   if (!match?.[1] || !match[2]) throw new ApiError(401, "AUTH_INVALID");
   return { id: match[1], secret: match[2] };
+}
+
+async function recoveryAttemptHash(recoveryAttemptId: unknown): Promise<Uint8Array> {
+  if (typeof recoveryAttemptId !== "string"
+      || !/^um_recovery_attempt_[A-Za-z0-9_-]{43}$/u.test(recoveryAttemptId)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return sha256(`app-usagemonitor/recovery-attempt/v1\0${recoveryAttemptId}`);
 }
 
 function bytes(value: ArrayBuffer): Uint8Array {
@@ -111,10 +144,12 @@ export async function enroll(
   inviteGrant: ParsedInviteGrant | null = null,
 ): Promise<Enrollment> {
   const participantId = `participant:${crypto.randomUUID()}`;
-  const access = capability("um_access");
+  const legacyAccessId = crypto.randomUUID();
+  const legacyAccessSecret = randomSecret(32);
   const recovery = capability("um_recovery");
-  const [accessHash, recoveryHash] = await Promise.all([
-    hashCapability("access", access.id, access.secret),
+  const session = await createSessionMaterial(participantId);
+  const [legacyAccessHash, recoveryHash] = await Promise.all([
+    hashCapability("access", legacyAccessId, legacyAccessSecret),
     hashCapability("recovery", recovery.id, recovery.secret),
   ]);
   const participantInsert = db.prepare(
@@ -124,8 +159,8 @@ export async function enroll(
     ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
   ).bind(
     participantId,
-    access.id,
-    accessHash,
+    legacyAccessId,
+    legacyAccessHash,
     recovery.id,
     recoveryHash,
     consentVersion,
@@ -133,7 +168,10 @@ export async function enroll(
     new Date().toISOString(),
   );
   if (!inviteGrant) {
-    await participantInsert.run();
+    const results = await db.batch([participantInsert, sessionInsert(db, session)]);
+    if (results.some((entry) => entry.meta.changes !== 1)) {
+      throw new ApiError(500, "INTERNAL_ERROR");
+    }
   } else {
     const grant = await db.prepare(
       `SELECT id, secret_hash, state, expires_at
@@ -161,6 +199,7 @@ export async function enroll(
             id, participant_id, grant_id, created_at
           ) VALUES (?, ?, ?, ?)`,
         ).bind(eligibilityId, participantId, inviteGrant.id, now),
+        sessionInsert(db, session),
       ]);
       if (result.some((entry) => entry.meta.changes !== 1)) {
         throw new ApiError(400, "INVITE_GRANT_INVALID");
@@ -179,67 +218,345 @@ export async function enroll(
   }
   return {
     participantId,
-    accessToken: access.encoded,
     recoveryCode: recovery.encoded,
+    csrfToken: session.csrfToken,
+    session,
+  };
+}
+
+interface RecoveryResult {
+  participantId: string;
+  recoveryCode: string;
+  csrfToken: string;
+  session: SessionMaterial;
+}
+
+async function derivedRecoverySecret(
+  purpose: "recovery" | "session",
+  oldRecoveryId: string,
+  oldRecoverySecret: string,
+  nonce: string,
+): Promise<string> {
+  return encodeBase64Url(await sha256(
+    `app-usagemonitor/recovery-retry-${purpose}/v1`
+      + `\0${oldRecoveryId}\0${oldRecoverySecret}\0${nonce}`,
+  ));
+}
+
+async function retryRecoveredAccess(
+  db: D1Database,
+  parsed: { id: string; secret: string },
+  attemptHash: Uint8Array,
+): Promise<RecoveryResult | null> {
+  const row = await db.prepare(
+    `SELECT
+      r.old_recovery_token_hash, r.recovery_attempt_hash,
+      r.participant_id, r.derivation_nonce,
+      r.replacement_recovery_token_id, r.replacement_session_id,
+      r.expires_at, r.replay_count,
+      p.recovery_token_id AS current_recovery_token_id,
+      p.recovery_token_hash AS current_recovery_token_hash,
+      p.state AS participant_state, p.deletion_session_id,
+      s.secret_hash AS session_secret_hash, s.csrf_hash AS session_csrf_hash,
+      s.state AS session_state, s.scope AS session_scope,
+      s.issued_at AS session_issued_at,
+      s.expires_at AS session_expires_at
+    FROM recovery_retry_receipts r
+    JOIN participants p ON p.id = r.participant_id
+    JOIN web_sessions s ON s.id = r.replacement_session_id
+    WHERE r.old_recovery_token_id = ?`,
+  ).bind(parsed.id).first<RecoveryRetryRow>();
+  const presentedOldHash = await hashCapability("recovery", parsed.id, parsed.secret);
+  if (!row
+      || !timingSafeEqual(presentedOldHash, bytes(row.old_recovery_token_hash))
+      || !timingSafeEqual(attemptHash, bytes(row.recovery_attempt_hash))
+      || !(
+        (row.session_scope === "personal" && row.participant_state === "active")
+        || (
+          row.session_scope === "deletion_only"
+          && row.participant_state === "deleting"
+          && row.deletion_session_id === row.replacement_session_id
+        )
+      )
+      || row.current_recovery_token_id !== row.replacement_recovery_token_id
+      || row.session_state !== "active"
+      || !canonicalFutureInstant(row.expires_at, Date.now())
+      || !canonicalFutureInstant(row.session_expires_at, Date.now())
+      || row.replay_count >= RECOVERY_RETRY_LIMIT) {
+    return null;
+  }
+  const [replacementRecoverySecret, replacementSessionSecret] = await Promise.all([
+    derivedRecoverySecret("recovery", parsed.id, parsed.secret, row.derivation_nonce),
+    derivedRecoverySecret("session", parsed.id, parsed.secret, row.derivation_nonce),
+  ]);
+  const session = await createSessionMaterialFromSecret(
+    row.participant_id,
+    row.replacement_session_id,
+    replacementSessionSecret,
+    row.session_issued_at,
+    row.session_expires_at,
+    row.session_scope,
+  );
+  const replacementRecoveryHash = await hashCapability(
+    "recovery",
+    row.replacement_recovery_token_id,
+    replacementRecoverySecret,
+  );
+  if (!timingSafeEqual(replacementRecoveryHash, bytes(row.current_recovery_token_hash))
+      || !timingSafeEqual(session.secretHash, bytes(row.session_secret_hash))
+      || !timingSafeEqual(session.csrfHash, bytes(row.session_csrf_hash))) {
+    return null;
+  }
+  const now = new Date().toISOString();
+  const replay = await db.prepare(
+    `UPDATE recovery_retry_receipts
+        SET replay_count = replay_count + 1
+      WHERE old_recovery_token_id = ?
+        AND replay_count < ?
+        AND expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM participants
+           WHERE id = ? AND recovery_token_id = ?
+             AND (
+               (? = 'personal' AND state = 'active')
+               OR (
+                 ? = 'deletion_only' AND state = 'deleting'
+                 AND deletion_session_id = ?
+               )
+             )
+        )`,
+  ).bind(
+    parsed.id,
+    RECOVERY_RETRY_LIMIT,
+    now,
+    row.participant_id,
+    row.replacement_recovery_token_id,
+    row.session_scope,
+    row.session_scope,
+    row.replacement_session_id,
+  ).run();
+  if (replay.meta.changes !== 1) return null;
+  return {
+    participantId: row.participant_id,
+    recoveryCode:
+      `um_recovery_${row.replacement_recovery_token_id}.${replacementRecoverySecret}`,
+    csrfToken: session.csrfToken,
+    session,
   };
 }
 
 export async function recoverAccess(
   db: D1Database,
   recoveryCode: unknown,
-): Promise<{ participantId: string; accessToken: string }> {
+  recoveryAttemptId: unknown,
+): Promise<RecoveryResult> {
   const parsed = parseRecoveryCode(recoveryCode);
+  const attemptHash = await recoveryAttemptHash(recoveryAttemptId);
   const row = await db.prepare(
-    `SELECT id, recovery_token_hash, state
+    `SELECT id, recovery_token_id, recovery_token_hash, state
        FROM participants
       WHERE recovery_token_id = ?`,
   ).bind(parsed.id).first<RecoveryAuthRow>();
   const presentedHash = await hashCapability("recovery", parsed.id, parsed.secret);
   const expectedHash = row ? bytes(row.recovery_token_hash) : new Uint8Array(32);
   if (!timingSafeEqual(presentedHash, expectedHash) || !row) {
+    const retried = await retryRecoveredAccess(db, parsed, attemptHash);
+    if (retried) return retried;
     throw new ApiError(401, "AUTH_INVALID");
   }
-  if (row.state !== "active") throw new ApiError(401, "AUTH_INVALID");
-  const replacement = capability("um_access");
+  const nowEpoch = Date.now();
+  const now = new Date(nowEpoch).toISOString();
+  const nonce = randomSecret(32);
+  const replacementId = crypto.randomUUID();
+  const replacementSecret = await derivedRecoverySecret(
+    "recovery",
+    parsed.id,
+    parsed.secret,
+    nonce,
+  );
+  const replacement = {
+    id: replacementId,
+    secret: replacementSecret,
+    encoded: `um_recovery_${replacementId}.${replacementSecret}`,
+  };
   const replacementHash = await hashCapability(
-    "access",
+    "recovery",
     replacement.id,
     replacement.secret,
   );
-  const result = await db.prepare(
-    `UPDATE participants
-        SET access_token_id = ?, access_token_hash = ?
-      WHERE id = ? AND state = 'active'`,
-  ).bind(replacement.id, replacementHash, row.id).run();
-  if (result.meta.changes !== 1) throw new ApiError(401, "AUTH_INVALID");
-  return { participantId: row.id, accessToken: replacement.encoded };
-}
-
-export async function authenticate(
-  db: D1Database,
-  authorization: string | null,
-  allowDeleting = false,
-): Promise<Participant> {
-  const parsed = parseAccessToken(authorization);
-  const row = await db.prepare(
-    `SELECT id, access_token_hash, created_at, state, consent_version
-       FROM participants
-      WHERE access_token_id = ?`,
-  ).bind(parsed.id).first<ParticipantAuthRow>();
-  const presentedHash = await hashCapability("access", parsed.id, parsed.secret);
-  const expectedHash = row ? bytes(row.access_token_hash) : new Uint8Array(32);
-  if (!timingSafeEqual(presentedHash, expectedHash) || !row) {
+  const sessionId = crypto.randomUUID();
+  const sessionSecret = await derivedRecoverySecret(
+    "session",
+    parsed.id,
+    parsed.secret,
+    nonce,
+  );
+  const session = await createSessionMaterialFromSecret(
+    row.id,
+    sessionId,
+    sessionSecret,
+    now,
+    new Date(nowEpoch + SESSION_TTL_MILLISECONDS).toISOString(),
+    row.state === "deleting" ? "deletion_only" : "personal",
+  );
+  let results: D1Result<unknown>[];
+  try {
+    results = await db.batch([
+      db.prepare(
+        `UPDATE participants
+            SET recovery_token_id = ?, recovery_token_hash = ?,
+                deletion_session_id = CASE
+                  WHEN state = 'deleting' THEN ?
+                  ELSE deletion_session_id
+                END
+          WHERE id = ? AND recovery_token_id = ?
+            AND state IN ('active', 'deleting')`,
+      ).bind(replacement.id, replacementHash, session.id, row.id, parsed.id),
+      db.prepare(
+        `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
+          WHERE participant_id = ? AND state = 'active'
+            AND EXISTS (
+              SELECT 1 FROM participants
+               WHERE id = ? AND recovery_token_id = ?
+            )`,
+      ).bind(now, row.id, row.id, replacement.id),
+      db.prepare(
+        `UPDATE upload_authorizations SET state = 'revoked', revoked_at = ?
+          WHERE participant_id = ? AND state = 'unused'
+            AND EXISTS (
+              SELECT 1 FROM participants
+               WHERE id = ? AND recovery_token_id = ?
+            )`,
+      ).bind(now, row.id, row.id, replacement.id),
+      db.prepare(
+        `INSERT INTO web_sessions (
+          id, participant_id, secret_hash, csrf_hash, scope, state,
+          issued_at, expires_at, last_used_at
+        )
+        SELECT ?, id, ?, ?, ?, 'active', ?, ?, ?
+          FROM participants
+         WHERE id = ? AND recovery_token_id = ?
+           AND (
+             (? = 'personal' AND state = 'active')
+             OR (
+               ? = 'deletion_only' AND state = 'deleting'
+               AND deletion_session_id = ?
+             )
+           )`,
+      ).bind(
+        session.id,
+        session.secretHash,
+        session.csrfHash,
+        session.scope,
+        session.issuedAt,
+        session.expiresAt,
+        session.issuedAt,
+        row.id,
+        replacement.id,
+        session.scope,
+        session.scope,
+        session.id,
+      ),
+      db.prepare(
+        `INSERT INTO recovery_retry_receipts (
+          old_recovery_token_id, old_recovery_token_hash, participant_id,
+          recovery_attempt_hash, derivation_nonce, replacement_recovery_token_id,
+          replacement_session_id, issued_at, expires_at, replay_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      ).bind(
+        parsed.id,
+        presentedHash,
+        row.id,
+        attemptHash,
+        nonce,
+        replacement.id,
+        session.id,
+        now,
+        new Date(nowEpoch + RECOVERY_RETRY_TTL_MILLISECONDS).toISOString(),
+      ),
+    ]);
+  } catch (error) {
+    const retried = await retryRecoveredAccess(db, parsed, attemptHash);
+    if (retried) return retried;
+    throw error;
+  }
+  if (results[0]?.meta.changes !== 1
+      || results[3]?.meta.changes !== 1
+      || results[4]?.meta.changes !== 1) {
+    const retried = await retryRecoveredAccess(db, parsed, attemptHash);
+    if (retried) return retried;
     throw new ApiError(401, "AUTH_INVALID");
   }
-  if (row.state === "deleting" && !allowDeleting) {
-    throw new ApiError(409, "PARTICIPANT_DELETING");
-  }
   return {
-    id: row.id,
-    createdAt: row.created_at,
-    state: row.state,
-    consentVersion: row.consent_version,
+    participantId: row.id,
+    recoveryCode: replacement.encoded,
+    csrfToken: session.csrfToken,
+    session,
   };
+}
+
+export async function revokeSession(
+  db: D1Database,
+  participantId: string,
+  sessionId: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(
+      `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
+        WHERE id = ? AND participant_id = ? AND state = 'active'`,
+    ).bind(now, sessionId, participantId),
+    db.prepare(
+      `UPDATE upload_authorizations SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND issued_by_session_id = ?
+          AND state = 'unused'`,
+    ).bind(now, participantId, sessionId),
+  ]);
+  if (results[0]?.meta.changes !== 1) throw new ApiError(401, "AUTH_INVALID");
+}
+
+export async function securityReset(
+  db: D1Database,
+  participantId: string,
+  currentSessionId: string,
+): Promise<{ recoveryCode: string }> {
+  const row = await db.prepare(
+    `SELECT recovery_token_id FROM participants
+      WHERE id = ? AND state = 'active'`,
+  ).bind(participantId).first<{ recovery_token_id: string }>();
+  if (!row) throw new ApiError(401, "AUTH_INVALID");
+  const replacement = capability("um_recovery");
+  const replacementHash = await hashCapability(
+    "recovery",
+    replacement.id,
+    replacement.secret,
+  );
+  const now = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(
+      `UPDATE participants
+          SET recovery_token_id = ?, recovery_token_hash = ?
+        WHERE id = ? AND recovery_token_id = ? AND state = 'active'`,
+    ).bind(replacement.id, replacementHash, participantId, row.recovery_token_id),
+    db.prepare(
+      `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND id <> ? AND state = 'active'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND recovery_token_id = ?
+          )`,
+    ).bind(now, participantId, currentSessionId, participantId, replacement.id),
+    db.prepare(
+      `UPDATE upload_authorizations SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'unused'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND recovery_token_id = ?
+          )`,
+    ).bind(now, participantId, participantId, replacement.id),
+  ]);
+  if (results[0]?.meta.changes !== 1) throw new ApiError(409, "AUTH_INVALID");
+  return { recoveryCode: replacement.encoded };
 }
 
 export async function envelopeDigest(envelope: SyntheticEnvelope): Promise<string> {
@@ -277,6 +594,7 @@ export async function contributionCount(
 export async function insertContribution(
   db: D1Database,
   participantId: string,
+  uploadAuthorizationId: string,
   contributionId: string,
   r2Key: string,
   digest: string,
@@ -292,12 +610,13 @@ export async function insertContribution(
       model_id, subscription_speed, api_tier_assumption, input_uncached_tokens,
       input_cached_tokens, output_text_tokens, output_reasoning_tokens,
       web_search_calls, unknown_tool_units, estimated_api_cost_usd,
-      priced_event_coverage_percent, unknown_billable_units, price_basis, created_at
+      priced_event_coverage_percent, unknown_billable_units, price_basis, created_at,
+      upload_authorization_id
     ) VALUES (
       ?, ?, ?, ?, ?, ?, 'accepted_synthetic',
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?
     )`,
   ).bind(
     contributionId,
@@ -327,8 +646,9 @@ export async function insertContribution(
     record.accounting.unknownBillableUnits,
     record.accounting.priceBasis,
     createdAt,
+    uploadAuthorizationId,
   ).run();
-  if (result.meta.changes !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
+  if (result.meta.changes < 1) throw new ApiError(409, "PARTICIPANT_DELETING");
 }
 
 export async function listContributions(
@@ -348,10 +668,65 @@ export async function listContributions(
 export async function markParticipantDeleting(
   db: D1Database,
   participantId: string,
+  currentSessionId: string,
 ): Promise<void> {
-  await db.prepare(
-    "UPDATE participants SET state = 'deleting' WHERE id = ?",
-  ).bind(participantId).run();
+  const now = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(
+      `UPDATE upload_authorizations
+          SET state = 'revoked', revoked_at = ?,
+              consume_lease_expires_at = NULL
+        WHERE participant_id = ? AND state = 'consuming'
+          AND consume_lease_expires_at <= ?`,
+    ).bind(now, participantId, now),
+    db.prepare(
+      `UPDATE participants
+          SET state = 'deleting', deletion_session_id = ?
+        WHERE id = ? AND state = 'active'
+          AND NOT EXISTS (
+            SELECT 1 FROM upload_authorizations
+             WHERE participant_id = ? AND state = 'consuming'
+          )`,
+    ).bind(currentSessionId, participantId, participantId),
+    db.prepare(
+      `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND id <> ? AND state = 'active'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND deletion_session_id = ?
+          )`,
+    ).bind(now, participantId, currentSessionId, participantId, currentSessionId),
+    db.prepare(
+      `UPDATE upload_authorizations SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'unused'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND deletion_session_id = ?
+          )`,
+    ).bind(now, participantId, participantId, currentSessionId),
+  ]);
+  if (results[1]?.meta.changes !== 1) {
+    const consuming = await db.prepare(
+      `SELECT COUNT(*) AS total FROM upload_authorizations
+        WHERE participant_id = ? AND state = 'consuming'`,
+    ).bind(participantId).first<{ total: number }>();
+    throw new ApiError(
+      409,
+      (consuming?.total ?? 0) > 0 ? "UPLOAD_IN_PROGRESS" : "PARTICIPANT_DELETING",
+    );
+  }
+}
+
+export async function assertDeletionOwner(
+  db: D1Database,
+  participantId: string,
+  sessionId: string,
+): Promise<void> {
+  const row = await db.prepare(
+    `SELECT 1 AS allowed FROM participants
+      WHERE id = ? AND state = 'deleting' AND deletion_session_id = ?`,
+  ).bind(participantId, sessionId).first<{ allowed: number }>();
+  if (row?.allowed !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
 }
 
 export async function finishParticipantDeletion(

@@ -2,10 +2,17 @@
 title: Synthetic Consumer Vertical Slice Plan
 date: 2026-07-25
 type: plan
-status: implemented
+status: superseded
+superseded_by: 2026-07-25-g3-session-capability-separation-plan.md
 ---
 
 # Synthetic Consumer Vertical Slice Plan
+
+> Superseded by the [G3 session and upload capability separation
+> plan](./2026-07-25-g3-session-capability-separation-plan.md) and its
+> [verification receipt](./2026-07-25-g3-session-capability-separation-verification-receipt.md).
+> This is a historical synthetic-only design record. Its bearer-capability API
+> description is not the current product contract.
 
 ## Outcome
 

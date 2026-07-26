@@ -3,6 +3,12 @@ export const MAX_PLAINTEXT_BYTES = 1536 * 1024;
 export const MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT = 1;
 export const MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT = 100;
 export const AGGREGATE_MINIMUM_PARTICIPANTS = 3;
+export const SESSION_TTL_MILLISECONDS = 30 * 60 * 1000;
+export const UPLOAD_AUTHORIZATION_TTL_MILLISECONDS = 5 * 60 * 1000;
+export const UPLOAD_CONSUME_LEASE_MILLISECONDS = 60 * 1000;
+export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;
+export const RECOVERY_RETRY_LIMIT = 2;
+export const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
 
 export const ENVELOPE_SCHEMA_VERSION = "synthetic-envelope-v0.1";
 export const CONTRIBUTION_SCHEMA_VERSION = "synthetic-contribution-v0.1";

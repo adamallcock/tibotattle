@@ -14,6 +14,7 @@ import {
 import {
   decryptSyntheticEnvelope,
   publicEnvelopeKey,
+  sha256Hex,
 } from "./crypto";
 import {
   ApiError,
@@ -21,7 +22,7 @@ import {
   jsonResponse,
 } from "./errors";
 import {
-  authenticate,
+  assertDeletionOwner,
   contributionCount,
   contributionForResponse,
   enroll,
@@ -32,7 +33,23 @@ import {
   listContributions,
   markParticipantDeleting,
   recoverAccess,
+  revokeSession,
+  securityReset,
 } from "./repository";
+import {
+  assertCsrf,
+  assertSameOrigin,
+  abandonUploadAuthorization,
+  authenticateSession,
+  claimUploadAuthorization,
+  clearedSessionCookie,
+  createUploadAuthorizationMaterial,
+  hasSessionCookie,
+  recordUploadReceipt,
+  sessionCookie,
+  storeUploadAuthorization,
+  type SessionPrincipal,
+} from "./session";
 import {
   communityStats,
   deleteTelemetryContribution,
@@ -56,7 +73,11 @@ import {
   validateSyntheticContribution,
 } from "./validation";
 
-async function readBoundedJson(request: Request): Promise<{ raw: string; value: unknown }> {
+async function readBoundedJson(request: Request): Promise<{
+  bytes: Uint8Array;
+  raw: string;
+  value: unknown;
+}> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
   if (contentType !== "application/json") throw new ApiError(415, "CONTENT_TYPE_INVALID");
   const declared = request.headers.get("content-length");
@@ -94,7 +115,7 @@ async function readBoundedJson(request: Request): Promise<{ raw: string; value: 
   let raw: string;
   try {
     raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined);
-    return { raw, value: JSON.parse(raw) as unknown };
+    return { bytes: combined, raw, value: JSON.parse(raw) as unknown };
   } catch {
     throw new ApiError(400, "BODY_INVALID");
   }
@@ -122,6 +143,7 @@ function hasExactEnvelopeKeyOccurrences(raw: string): boolean {
 
 async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
   const mode = configuredEnrollmentMode(env);
   assertAdmissionBindings(env);
   if (mode === "disabled") throw new ApiError(503, "ENROLLMENT_DISABLED");
@@ -152,14 +174,17 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   const inviteGrant = mode === "invite_only"
     ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
     : null;
-  return jsonResponse(
-    await enroll(env.USAGE_MONITOR_DB, consentVersion, inviteGrant),
-    201,
-  );
+  const enrollment = await enroll(env.USAGE_MONITOR_DB, consentVersion, inviteGrant);
+  return jsonResponse({
+    participantId: enrollment.participantId,
+    csrfToken: enrollment.csrfToken,
+    recoveryCode: enrollment.recoveryCode,
+  }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
 async function handleRecover(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
   configuredEnrollmentMode(env);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(env.RECOVERY_RATE_LIMIT, "recovery");
@@ -167,13 +192,114 @@ async function handleRecover(request: Request, env: Env): Promise<Response> {
   if (typeof body.value !== "object"
     || body.value === null
     || Array.isArray(body.value)
-    || Object.keys(body.value).length !== 1
-    || !Object.hasOwn(body.value, "recoveryCode")) {
+    || Object.keys(body.value).length !== 2
+    || !Object.hasOwn(body.value, "recoveryCode")
+    || !Object.hasOwn(body.value, "recoveryAttemptId")) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  return jsonResponse(
-    await recoverAccess(env.USAGE_MONITOR_DB, Reflect.get(body.value, "recoveryCode")),
+  const recovered = await recoverAccess(
+    env.USAGE_MONITOR_DB,
+    Reflect.get(body.value, "recoveryCode"),
+    Reflect.get(body.value, "recoveryAttemptId"),
   );
+  return jsonResponse({
+    participantId: recovered.participantId,
+    csrfToken: recovered.csrfToken,
+    recoveryCode: recovered.recoveryCode,
+  }, 200, { "set-cookie": sessionCookie(recovered.session) });
+}
+
+async function personalSession(
+  request: Request,
+  env: Env,
+  allowDeleting = false,
+  allowDeletionOnly = false,
+): Promise<SessionPrincipal> {
+  if (request.headers.has("authorization")) throw new ApiError(401, "AUTH_INVALID");
+  return authenticateSession(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("cookie"),
+    { allowDeleting, allowDeletionOnly },
+  );
+}
+
+async function handleSession(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const session = await personalSession(request, env);
+  return jsonResponse({
+    participantId: session.participantId,
+    createdAt: session.participantCreatedAt,
+    expiresAt: session.expiresAt,
+    csrfToken: session.csrfToken,
+  }, 200, { vary: "Cookie" });
+}
+
+async function handleLogout(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  let session: SessionPrincipal;
+  try {
+    session = await personalSession(request, env);
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 401) throw error;
+    return jsonResponse(
+      { loggedOut: true },
+      200,
+      { "set-cookie": clearedSessionCookie(), vary: "Cookie" },
+    );
+  }
+  assertCsrf(request, session);
+  await revokeSession(env.USAGE_MONITOR_DB, session.participantId, session.sessionId);
+  return jsonResponse(
+    { loggedOut: true },
+    200,
+    { "set-cookie": clearedSessionCookie(), vary: "Cookie" },
+  );
+}
+
+async function handleSecurityReset(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  const result = await securityReset(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    session.sessionId,
+  );
+  return jsonResponse({
+    reset: true,
+    recoveryCode: result.recoveryCode,
+    csrfToken: session.csrfToken,
+  }, 200, { vary: "Cookie" });
+}
+
+async function handleUploadAuthorization(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 3
+      || typeof Reflect.get(body.value, "envelopeDigest") !== "string"
+      || !/^[0-9a-f]{64}$/u.test(Reflect.get(body.value, "envelopeDigest") as string)
+      || !Number.isSafeInteger(Reflect.get(body.value, "contentLengthBytes"))
+      || (Reflect.get(body.value, "contentLengthBytes") as number) <= 0
+      || (Reflect.get(body.value, "contentLengthBytes") as number) > MAX_REQUEST_BYTES
+      || Reflect.get(body.value, "contentType") !== "application/json") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const authorization = await createUploadAuthorizationMaterial(
+    session.participantId,
+    session.sessionId,
+    Reflect.get(body.value, "envelopeDigest") as string,
+    Reflect.get(body.value, "contentLengthBytes") as number,
+  );
+  await storeUploadAuthorization(env.USAGE_MONITOR_DB, authorization);
+  return jsonResponse({
+    uploadAuthorization: authorization.encoded,
+    expiresAt: authorization.expiresAt,
+  }, 201, { vary: "Cookie" });
 }
 
 function handleEnvelopeKey(request: Request, env: Env): Response {
@@ -183,7 +309,8 @@ function handleEnvelopeKey(request: Request, env: Env): Response {
 
 async function handleSyntheticContribution(
   body: { raw: string; value: unknown },
-  participant: Awaited<ReturnType<typeof authenticate>>,
+  participant: { id: string; consentVersion: string },
+  uploadAuthorizationId: string,
   env: Env,
 ): Promise<Response> {
   if (participant.consentVersion !== "synthetic-preview-v0.1") {
@@ -226,6 +353,7 @@ async function handleSyntheticContribution(
     await insertContribution(
       env.USAGE_MONITOR_DB,
       participant.id,
+      uploadAuthorizationId,
       contributionId,
       r2Key,
       digest,
@@ -257,7 +385,8 @@ async function handleSyntheticContribution(
 
 async function handleTelemetryContribution(
   body: { raw: string; value: unknown },
-  participant: Awaited<ReturnType<typeof authenticate>>,
+  participant: { id: string; consentVersion: string },
+  uploadAuthorizationId: string,
   env: Env,
 ): Promise<Response> {
   if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
@@ -336,6 +465,7 @@ async function handleTelemetryContribution(
     const result = await insertTelemetryContribution(
       env.USAGE_MONITOR_DB,
       participant.id,
+      uploadAuthorizationId,
       contributionId,
       r2Key,
       envelopeDigestValue,
@@ -388,37 +518,67 @@ async function handleTelemetryContribution(
 
 async function handleContribution(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const participant = await authenticate(
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  const body = await readBoundedJson(request);
+  const contentType = request.headers.get("content-type")?.trim() ?? "";
+  const bodyBytes = body.bytes.byteLength;
+  const scopeDigest = await sha256Hex(body.bytes);
+  const claimed = await claimUploadAuthorization(
     env.USAGE_MONITOR_DB,
     request.headers.get("authorization"),
+    { envelopeDigest: scopeDigest, bodyBytes, contentType },
   );
-  const body = await readBoundedJson(request);
-  if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
-    throw new ApiError(400, "ENVELOPE_INVALID");
+  let completed = false;
+  try {
+    if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
+      throw new ApiError(400, "ENVELOPE_INVALID");
+    }
+    if (typeof body.value !== "object" || body.value === null || Array.isArray(body.value)) {
+      throw new ApiError(400, "ENVELOPE_INVALID");
+    }
+    const participant = await env.USAGE_MONITOR_DB.prepare(
+      `SELECT id, consent_version AS consentVersion
+         FROM participants WHERE id = ? AND state = 'active'`,
+    ).bind(claimed.participantId).first<{ id: string; consentVersion: string }>();
+    if (!participant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
+      ? await handleTelemetryContribution(body, participant, claimed.authorizationId, env)
+      : await handleSyntheticContribution(body, participant, claimed.authorizationId, env);
+    const receipt = await response.clone().json<{ contributionId?: unknown }>();
+    if (typeof receipt.contributionId !== "string") {
+      throw new ApiError(500, "INTERNAL_ERROR");
+    }
+    await recordUploadReceipt(
+      env.USAGE_MONITOR_DB,
+      claimed.authorizationId,
+      receipt.contributionId,
+    );
+    completed = true;
+    return response;
+  } finally {
+    if (!completed) {
+      await abandonUploadAuthorization(
+        env.USAGE_MONITOR_DB,
+        claimed.authorizationId,
+      );
+    }
   }
-  if (typeof body.value !== "object" || body.value === null || Array.isArray(body.value)) {
-    throw new ApiError(400, "ENVELOPE_INVALID");
-  }
-  return Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
-    ? handleTelemetryContribution(body, participant, env)
-    : handleSyntheticContribution(body, participant, env);
 }
 
 async function handleMe(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const participant = await authenticate(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-  );
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, participant.id);
+  const session = await personalSession(request, env);
+  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
   const telemetryContributions = await listTelemetryContributions(
     env.USAGE_MONITOR_DB,
-    participant.id,
+    session.participantId,
   );
   return jsonResponse({
-    participantId: participant.id,
-    createdAt: participant.createdAt,
-    syntheticOnly: participant.consentVersion === "synthetic-preview-v0.1",
+    participantId: session.participantId,
+    createdAt: session.participantCreatedAt,
+    syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
     contributionCount: contributions.length + telemetryContributions.length,
     latestContribution: telemetryContributions.length > 0
       ? telemetryContributionMetadata(telemetryContributions[telemetryContributions.length - 1]!)
@@ -435,25 +595,22 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
       })),
       ...telemetryContributions.map(telemetryContributionMetadata),
     ],
-  });
+  }, 200, { vary: "Cookie" });
 }
 
 async function handleExport(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const participant = await authenticate(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-  );
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, participant.id);
+  const session = await personalSession(request, env);
+  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
   const telemetryContributions = await listTelemetryContributions(
     env.USAGE_MONITOR_DB,
-    participant.id,
+    session.participantId,
   );
   const telemetry = [];
   for (const row of telemetryContributions) {
     const rows = await telemetryRecordsForContribution(
       env.USAGE_MONITOR_DB,
-      participant.id,
+      session.participantId,
       row.id,
     );
     telemetry.push({
@@ -466,33 +623,39 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
   }
   return jsonResponse({
     schemaVersion: "participant-export-v0.2",
-    syntheticOnly: participant.consentVersion === "synthetic-preview-v0.1",
+    syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
     participant: {
-      participantId: participant.id,
-      createdAt: participant.createdAt,
+      participantId: session.participantId,
+      createdAt: session.participantCreatedAt,
     },
     contributions: [
       ...contributions.map(contributionForResponse),
       ...telemetry,
     ],
     generatedAt: new Date().toISOString(),
-  });
+  }, 200, { vary: "Cookie" });
 }
 
 async function handleDelete(request: Request, env: Env): Promise<Response> {
   if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
-  const participant = await authenticate(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-    true,
-  );
-  if (participant.state === "active") {
-    await markParticipantDeleting(env.USAGE_MONITOR_DB, participant.id);
+  const session = await personalSession(request, env, true, true);
+  assertCsrf(request, session);
+  if (session.participantState === "active") {
+    await markParticipantDeleting(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      session.sessionId,
+    );
   }
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, participant.id);
+  await assertDeletionOwner(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    session.sessionId,
+  );
+  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
   const telemetryContributions = await listTelemetryContributions(
     env.USAGE_MONITOR_DB,
-    participant.id,
+    session.participantId,
   );
   if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT
       || telemetryContributions.length > MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
@@ -505,21 +668,22 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
   if (r2Keys.length > 0) {
     await env.QUARANTINE.delete(r2Keys);
   }
-  await finishParticipantDeletion(env.USAGE_MONITOR_DB, participant.id);
+  await finishParticipantDeletion(env.USAGE_MONITOR_DB, session.participantId);
   return jsonResponse({
     deleted: true,
-    participantId: participant.id,
+    participantId: session.participantId,
     contributionsDeleted: contributions.length + telemetryContributions.length,
-  });
+  }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
 }
 
 async function handleStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const participant = await authenticate(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
+  const session = await personalSession(request, env);
+  return jsonResponse(
+    await personalStats(env.USAGE_MONITOR_DB, session.participantId),
+    200,
+    { vary: "Cookie" },
   );
-  return jsonResponse(await personalStats(env.USAGE_MONITOR_DB, participant.id));
 }
 
 async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
@@ -537,20 +701,17 @@ async function handleContributionResource(
   env: Env,
   contributionId: string,
 ): Promise<Response> {
-  const participant = await authenticate(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-  );
+  const session = await personalSession(request, env);
   const row = await telemetryContributionById(
     env.USAGE_MONITOR_DB,
-    participant.id,
+    session.participantId,
     contributionId,
   );
   if (!row) throw new ApiError(404, "NOT_FOUND");
   if (request.method === "GET") {
     const records = await telemetryRecordsForContribution(
       env.USAGE_MONITOR_DB,
-      participant.id,
+      session.participantId,
       contributionId,
     );
     return jsonResponse({
@@ -559,12 +720,17 @@ async function handleContributionResource(
         kind: record.record_kind,
         value: JSON.parse(record.record_json) as unknown,
       })),
-    });
+    }, 200, { vary: "Cookie" });
   }
   if (request.method === "DELETE") {
+    assertCsrf(request, session);
     await env.QUARANTINE.delete(row.r2_key);
-    await deleteTelemetryContribution(env.USAGE_MONITOR_DB, participant.id, contributionId);
-    return jsonResponse({ deleted: true, contributionId });
+    await deleteTelemetryContribution(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      contributionId,
+    );
+    return jsonResponse({ deleted: true, contributionId }, 200, { vary: "Cookie" });
   }
   methodNotAllowed(["GET", "DELETE"]);
 }
@@ -573,6 +739,14 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
   const { pathname } = new URL(request.url);
   if (pathname === "/api/v1/enroll") return handleEnroll(request, env);
   if (pathname === "/api/v1/recover") return handleRecover(request, env);
+  if (pathname === "/api/v1/session") return handleSession(request, env);
+  if (pathname === "/api/v1/logout") return handleLogout(request, env);
+  if (pathname === "/api/v1/me/security-reset") {
+    return handleSecurityReset(request, env);
+  }
+  if (pathname === "/api/v1/me/upload-authorizations") {
+    return handleUploadAuthorization(request, env);
+  }
   if (pathname === "/api/v1/envelope-key") return handleEnvelopeKey(request, env);
   if (pathname === "/api/v1/contributions") return handleContribution(request, env);
   const contributionPrefix = "/api/v1/contributions/";
@@ -608,6 +782,12 @@ function routeClass(pathname: string): string {
   if (pathname === "/api/health") return "health";
   if (pathname === "/api/v1/enroll") return "enroll";
   if (pathname === "/api/v1/recover") return "recover";
+  if (pathname === "/api/v1/session") return "session";
+  if (pathname === "/api/v1/logout") return "logout";
+  if (pathname === "/api/v1/me/security-reset") return "security_reset";
+  if (pathname === "/api/v1/me/upload-authorizations") {
+    return "upload_authorization";
+  }
   if (pathname === "/api/v1/envelope-key") return "envelope_key";
   if (pathname === "/api/v1/contributions") return "contributions";
   if (pathname.startsWith("/api/v1/contributions/")) return "contribution_resource";

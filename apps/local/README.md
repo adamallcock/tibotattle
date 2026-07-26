@@ -13,7 +13,8 @@ USAGE_MONITOR_PORT=8791 node ./apps/local/server.js
 
 Then open `http://127.0.0.1:8791/`.
 
-To exercise the central contribution service through the same origin:
+To read public central-service health and thresholded community results through
+the loopback dashboard:
 
 ```bash
 USAGE_MONITOR_PORT=8791 \
@@ -21,10 +22,17 @@ USAGE_MONITOR_PORT=8791 \
   node ./apps/local/server.js
 ```
 
-`USAGE_MONITOR_CENTRAL_ORIGIN` is fixed at startup. The relay permits only the
-documented enrollment, encryption-key, contribution, participant,
-personal-statistics, community-statistics, export, recovery, and deletion
-routes. It cannot proxy an arbitrary host, path, query, or content type.
+`USAGE_MONITOR_CENTRAL_ORIGIN` is fixed at startup. The relay permits only
+public `GET` requests for health, the public envelope key, and
+privacy-thresholded aggregate results. It cannot proxy an arbitrary host,
+path, query, content type, authorization header, cookie, CSRF value, or
+upstream `Set-Cookie` response.
+
+Enrollment, recovery, uploads, personal statistics, contribution details,
+exports, security controls, and deletion require the central service's
+same-origin HTTPS portal. The loopback server deliberately cannot relay those
+authenticated operations because a Secure personal-session cookie must not be
+tunneled through plain HTTP loopback.
 
 ## Local API
 

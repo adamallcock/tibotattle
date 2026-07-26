@@ -217,9 +217,10 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
 }
 
 async function fetchJson(fetchImpl, url, options = {}) {
+  const { headers = {}, ...requestOptions } = options;
   const response = await fetchImpl(url, {
-    headers: { Accept: "application/json", ...(options.headers ?? {}) },
-    ...options
+    ...requestOptions,
+    headers: { Accept: "application/json", ...headers }
   });
   if (!response.ok) {
     const error = new Error(`Request failed (${response.status}).`);
@@ -272,18 +273,36 @@ export class LocalCompanionClient {
 }
 
 export class CommunityClient {
-  constructor({ fetchImpl = globalThis.fetch, getAccessToken = () => null } = {}) {
+  constructor({ fetchImpl = globalThis.fetch, getCsrfToken = () => null } = {}) {
     this.fetchImpl = fetchImpl;
-    this.getAccessToken = getAccessToken;
+    this.getCsrfToken = getCsrfToken;
+    this.pendingRecovery = null;
   }
 
-  headers() {
-    const token = this.getAccessToken();
-    return token ? { Authorization: `Bearer ${token}` } : {};
+  sessionOptions(options = {}) {
+    return { credentials: "same-origin", ...options };
+  }
+
+  mutationOptions(options = {}) {
+    const csrfToken = this.getCsrfToken();
+    if (typeof csrfToken !== "string" || csrfToken.length === 0) {
+      throw new Error("A current session confirmation is required.");
+    }
+    return this.sessionOptions({
+      ...options,
+      headers: {
+        "X-Usage-Monitor-CSRF": csrfToken,
+        ...(options.headers ?? {})
+      }
+    });
   }
 
   health() {
     return fetchJson(this.fetchImpl, "/api/health");
+  }
+
+  session() {
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/session`, this.sessionOptions());
   }
 
   enroll(inviteCode = null) {
@@ -294,35 +313,98 @@ export class CommunityClient {
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/enroll`, {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
+  }
+
+  async recover(recoveryCode) {
+    if (this.pendingRecovery?.recoveryCode !== recoveryCode) {
+      const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+      const secret = btoa(String.fromCharCode(...bytes))
+        .replaceAll("+", "-")
+        .replaceAll("/", "_")
+        .replace(/=+$/u, "");
+      this.pendingRecovery = {
+        recoveryCode,
+        recoveryAttemptId: `um_recovery_attempt_${secret}`
+      };
+    }
+    try {
+      const result = await fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/recover`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.pendingRecovery)
+      });
+      this.pendingRecovery = null;
+      return result;
+    } catch (error) {
+      if (Number.isInteger(error?.status) && error.status < 500) {
+        this.pendingRecovery = null;
+      }
+      throw error;
+    }
   }
 
   envelopeKey() {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/envelope-key`);
   }
 
-  contribute(envelope) {
+  registerUpload({ envelopeDigest, contentLengthBytes, contentType = "application/json" }) {
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/upload-authorizations`, this.mutationOptions({
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ envelopeDigest, contentLengthBytes, contentType })
+    }));
+  }
+
+  contributeSerialized(serializedEnvelope, uploadAuthorization) {
+    if (typeof uploadAuthorization !== "string" || uploadAuthorization.length === 0) {
+      throw new Error("A one-use upload authorization is required.");
+    }
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/contributions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...this.headers() },
-      body: JSON.stringify(envelope)
+      credentials: "omit",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Upload ${uploadAuthorization}`
+      },
+      body: serializedEnvelope
     });
   }
 
   contribution(contributionId) {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/contributions/${encodeURIComponent(contributionId)}`, {
-      headers: this.headers()
-    });
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/contributions/${encodeURIComponent(contributionId)}`,
+      this.sessionOptions()
+    );
+  }
+
+  deleteContribution(contributionId) {
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/contributions/${encodeURIComponent(contributionId)}`,
+      this.mutationOptions({ method: "DELETE" })
+    );
   }
 
   async personalStats() {
     try {
-      return await fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/stats`, { headers: this.headers() });
+      return await fetchJson(
+        this.fetchImpl,
+        `${CENTRAL_ROOT}/me/stats`,
+        this.sessionOptions()
+      );
     } catch (error) {
       if (error.status !== 404) throw error;
-      return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/insights`, { headers: this.headers() });
+      return fetchJson(
+        this.fetchImpl,
+        `${CENTRAL_ROOT}/me/insights`,
+        this.sessionOptions()
+      );
     }
   }
 
@@ -336,16 +418,35 @@ export class CommunityClient {
   }
 
   participantExport() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/export`, {
-      headers: this.headers()
-    });
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/me/export`,
+      this.sessionOptions()
+    );
   }
 
   deleteParticipant() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me`, {
-      method: "DELETE",
-      headers: this.headers()
-    });
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/me`,
+      this.mutationOptions({ method: "DELETE" })
+    );
+  }
+
+  logout() {
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/logout`, this.mutationOptions({
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }));
+  }
+
+  securityReset() {
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/security-reset`, this.mutationOptions({
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }));
   }
 }
 
