@@ -1162,13 +1162,15 @@ test("participant results fail closed for unverifiable prices and honest not-tes
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  for (const label of ["Overview", "Timeline", "Weekly", "Coverage &amp; gaps", "Data &amp; privacy"]) {
+  for (const label of ["Overview", "Timeline", "Weekly", "Coverage &amp; gaps", "Data &amp; privacy", "Backend"]) {
     assert.match(html, new RegExp(label));
   }
   assert.match(html, /id="timeline-chart"/);
   assert.match(html, /id="weekly-chart"/);
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
+  assert.match(html, /id="central-state"/);
+  assert.match(html, /id="backend"/);
   assert.match(html, /id="backend-state"/);
   assert.match(html, /id="backend-deletion-ledger"/);
   assert.match(html, /id="backend-lifecycle"/);

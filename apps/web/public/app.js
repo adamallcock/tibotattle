@@ -1867,12 +1867,23 @@ function renderBackendHealth(health) {
     degraded: "Collection partially paused",
     contained: "Collection contained"
   };
-  state.textContent = reachable
+  const stateLabel = reachable
     ? stateLabels[collectionState] ?? "Backend status incomplete"
     : "Backend unavailable";
+  state.textContent = stateLabel;
   state.className = reachable && collectionState === "operational"
     ? "evidence-chip"
     : "evidence-chip neutral";
+  const centralState = $("#central-state");
+  centralState.replaceChildren(
+    node("span", "state-dot"),
+    document.createTextNode(stateLabel)
+  );
+  centralState.className = reachable && collectionState === "operational"
+    ? "state-pill"
+    : reachable
+      ? "state-pill state-insufficient"
+      : "state-pill state-offline";
   $("#backend-database").textContent = health?.checks?.database === "ok"
     ? "Connected"
     : "Unavailable";

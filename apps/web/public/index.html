@@ -27,8 +27,13 @@
         <a href="#weekly" data-nav="weekly">Weekly</a>
         <a href="#coverage" data-nav="coverage">Coverage &amp; gaps</a>
         <a href="#data" data-nav="data">Data &amp; privacy</a>
+        <a href="#backend">Backend</a>
       </nav>
       <div class="top-actions">
+        <span class="state-pill state-connecting" id="central-state">
+          <span class="state-dot" aria-hidden="true"></span>
+          Backend checking
+        </span>
         <span class="state-pill state-connecting" id="global-state">
           <span class="state-dot" aria-hidden="true"></span>
           Connecting
@@ -534,7 +539,7 @@
           </p>
         </article>
 
-        <article class="panel backend-panel" aria-labelledby="backend-title">
+        <article class="panel backend-panel" id="backend" aria-labelledby="backend-title">
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Central service</p>

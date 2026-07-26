@@ -147,6 +147,33 @@ The laboratory retains its disposable state on shutdown so the operator can
 inspect it. That exact directory must be moved to Trash after use because it
 contains development credentials and encrypted objects.
 
+## Fresh product rerun
+
+The laboratory was repeated from a new empty state at
+`2026-07-26T23:08:14Z`. The live portal remained available on loopback after
+the following results were independently observed:
+
+- 20 anonymous participants enrolled through the invite-only HTTP path;
+- 20 encrypted contributions accepted;
+- 40 canonical D1 records and 40 contribution-occurrence mappings retained;
+- 20 encrypted R2 quarantine objects retained;
+- one privacy-thresholded weekly snapshot published;
+- the fixed forbidden-`prompt` canary rejected before canonical ingest; and
+- one participant recovered in the browser with private server-repriced
+  statistics, canonical contribution history, quarantine timing, and a
+  private clipped-versus-public-rounded comparison.
+
+The portal header now separates `Backend ready` from `Companion offline` and
+provides a direct Backend navigation target. A missing loopback collector can
+therefore no longer visually imply that the central service, database, or
+participant result APIs are unavailable.
+
+The complete product check passed in the same source state: 28 consumer
+contract tests, 41 loopback companion and foreground-delivery tests, 30
+operator-script tests, 65 Cloudflare-runtime Worker tests, generated type and
+TypeScript checks, and both development and contained-staging deployment dry
+runs. No deployment occurred.
+
 ## Remaining gates
 
 - The Cloudflare account still has no enabled R2 staging resource.
