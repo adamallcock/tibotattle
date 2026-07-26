@@ -132,8 +132,9 @@ privacy gates recorded in `contracts/telemetry-v0.2/`.
 
 Use the invite-only mode to test the production-shaped admission and complete
 backend lifecycle over a real loopback HTTP server and isolated local D1/R2
-state. First prepare a closed `telemetry-contribution-v0.1` file as described
-in the root README. Then:
+state. The smoke can use either a closed `telemetry-contribution-v0.1` file
+prepared as described in the root README, or its generated content-free
+transport fixture. Then:
 
 ```sh
 SMOKE_STATE="$(mktemp -d /private/tmp/app-usagemonitor-backend-smoke.XXXXXX)"
@@ -164,9 +165,13 @@ for number in {1..20}; do
 done
 npm run product:backend:smoke -- \
   --origin http://127.0.0.1:8792 \
-  --file /absolute/path/to/telemetry-contribution-000001.json \
+  --generated-content-free-fixture \
   "${INVITE_ARGS[@]}"
 ```
+
+Replace `--generated-content-free-fixture` with
+`--file /absolute/path/to/telemetry-contribution-000001.json` to exercise an
+actual local export. Exactly one source is required.
 
 The smoke validates owner-only files, redeems twenty invitations without
 printing them, and proves:
@@ -186,7 +191,10 @@ printing them, and proves:
   upload, or eligibility capability;
 - recovery rotation with a bounded lost-response retry, security reset, revoked
   pending uploads, and logout cookie clearing;
-- snapshot withdrawal when deletion starts; and
+- snapshot withdrawal when deletion starts, followed by an immutable second
+  revision rebuilt without the deleted contribution;
+- a final privacy-suppressed third revision after all participants are deleted;
+  and
 - complete deletion of all twenty participants.
 
 It attempts participant cleanup in a `finally` block if an intermediate

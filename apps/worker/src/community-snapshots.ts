@@ -51,20 +51,30 @@ interface SnapshotRow {
   payload_json: string;
   release_state: "published" | "suppressed" | "withdrawn";
   snapshot_id: string;
+  revision: number;
   week_start: string;
   week_end: string;
   ingestion_cutoff_at: string;
+}
+
+interface CommunityWeek {
+  startAt: string;
+  endAt: string;
+  cutoffAt: string;
+}
+
+interface RebuildRow {
+  week_start: string;
+  week_end: string;
+  ingestion_cutoff_at: string;
+  requested_epoch: number;
 }
 
 function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function communityWeekForScheduledTime(scheduledTime: number): {
-  startAt: string;
-  endAt: string;
-  cutoffAt: string;
-} {
+export function communityWeekForScheduledTime(scheduledTime: number): CommunityWeek {
   const cutoffEligible = new Date(scheduledTime - COMMUNITY_WEEKLY_CUTOFF_MILLISECONDS);
   cutoffEligible.setUTCHours(0, 0, 0, 0);
   const daysSinceMonday = (cutoffEligible.getUTCDay() + 6) % 7;
@@ -81,13 +91,16 @@ function basePayload(
   startAt: string,
   endAt: string,
   cutoffAt: string,
+  revision: number,
+  releasedAt: string,
 ): Record<string, unknown> {
   return {
     schemaVersion: "community-weekly-snapshot-v0.1",
     snapshotId,
+    snapshotRevision: revision,
     period: { startAt, endAt },
     ingestionCutoffAt: cutoffAt,
-    releasedAt: cutoffAt,
+    releasedAt,
     immutable: true,
     nonOverlapping: true,
     privacyPolicy: {
@@ -104,7 +117,7 @@ function basePayload(
         toolUnits: 10,
         direction: "down",
       },
-      deletionDisposition: "withdraw_all_snapshots",
+      deletionDisposition: "withdraw_then_rebuild_without_deleted_source",
     },
   };
 }
@@ -124,18 +137,57 @@ export async function buildCommunityWeeklySnapshot(
   db: D1Database,
   scheduledTime: number,
 ): Promise<{ state: "built" | "existing" | "lease_unavailable"; snapshotId: string }> {
-  const { startAt, endAt, cutoffAt } = communityWeekForScheduledTime(scheduledTime);
-  const snapshotId = `community-weekly:${startAt.slice(0, 10)}`;
-  const existing = await db.prepare(
-    "SELECT snapshot_id FROM community_weekly_snapshots WHERE week_start = ?",
-  ).bind(startAt).first<{ snapshot_id: string }>();
-  if (existing) return { state: "existing", snapshotId: existing.snapshot_id };
+  return buildCommunityWeeklySnapshotForPeriod(
+    db,
+    communityWeekForScheduledTime(scheduledTime),
+    scheduledTime,
+  );
+}
 
+function validateCommunityWeek(period: CommunityWeek): void {
+  const start = Date.parse(period.startAt);
+  const end = Date.parse(period.endAt);
+  const cutoff = Date.parse(period.cutoffAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(cutoff)
+      || new Date(start).toISOString() !== period.startAt
+      || new Date(end).toISOString() !== period.endAt
+      || new Date(cutoff).toISOString() !== period.cutoffAt
+      || end - start !== WEEK
+      || cutoff < end) {
+    throw new Error("invalid community snapshot rebuild period");
+  }
+}
+
+async function buildCommunityWeeklySnapshotForPeriod(
+  db: D1Database,
+  period: CommunityWeek,
+  scheduledTime: number,
+): Promise<{ state: "built" | "existing" | "lease_unavailable"; snapshotId: string }> {
+  validateCommunityWeek(period);
+  if (!Number.isFinite(scheduledTime)) throw new Error("invalid scheduled time");
+  const { startAt, endAt, cutoffAt } = period;
   const epochRow = await db.prepare(
     `SELECT mutation_epoch FROM community_snapshot_mutation_control
       WHERE singleton_id = 1`,
   ).first<{ mutation_epoch: number }>();
   if (!epochRow) throw new Error("community snapshot mutation control unavailable");
+  const existing = await db.prepare(
+    `SELECT snapshot_id, source_mutation_epoch
+       FROM community_weekly_snapshots
+      WHERE week_start = ? AND release_state IN ('published', 'suppressed')
+      ORDER BY revision DESC LIMIT 1`,
+  ).bind(startAt).first<{
+    snapshot_id: string;
+    source_mutation_epoch: number;
+  }>();
+  if (existing && existing.source_mutation_epoch >= epochRow.mutation_epoch) {
+    await db.prepare(
+      `DELETE FROM community_weekly_snapshot_rebuilds
+        WHERE week_start = ? AND requested_epoch <= ?`,
+    ).bind(startAt, existing.source_mutation_epoch).run();
+    return { state: "existing", snapshotId: existing.snapshot_id };
+  }
+
   const owner = crypto.randomUUID();
   const now = new Date(scheduledTime).toISOString();
   const leaseExpiresAt = new Date(scheduledTime + COMMUNITY_WEEKLY_LEASE_MILLISECONDS)
@@ -163,8 +215,23 @@ export async function buildCommunityWeeklySnapshot(
       WHERE week_start = ?`,
   ).bind(startAt).first<{ owner_nonce: string; mutation_epoch: number }>();
   if (lease?.owner_nonce !== owner || lease.mutation_epoch !== epochRow.mutation_epoch) {
-    return { state: "lease_unavailable", snapshotId };
+    return {
+      state: "lease_unavailable",
+      snapshotId: existing?.snapshot_id ?? `community-weekly:${startAt.slice(0, 10)}`,
+    };
   }
+
+  const revisionRow = await db.prepare(
+    `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
+       FROM community_weekly_snapshots WHERE week_start = ?`,
+  ).bind(startAt).first<{ revision: number }>();
+  const revision = Number(revisionRow?.revision ?? 1);
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    throw new Error("invalid community snapshot revision");
+  }
+  const snapshotId = revision === 1
+    ? `community-weekly:${startAt.slice(0, 10)}`
+    : `community-weekly:${startAt.slice(0, 10)}:r${revision}`;
 
   const cellRows = await db.prepare(
     `WITH qualified AS (
@@ -178,6 +245,8 @@ export async function buildCommunityWeeklySnapshot(
         r.input_cache_write_tokens, r.output_text_tokens,
         r.output_reasoning_tokens, r.output_combined_tokens, r.tool_units
       FROM telemetry_records r
+      JOIN participants p
+        ON p.id = r.participant_id AND p.state = 'active'
       WHERE r.record_kind = 'usage'
         AND r.observed_at >= ? AND r.observed_at < ?
         AND r.provider IN ('openai_codex', 'anthropic_claude_code')
@@ -240,7 +309,14 @@ export async function buildCommunityWeeklySnapshot(
   ).all<AggregatedCellRow>();
 
   const cohortSupport = Number(cellRows.results[0]?.cohort_support ?? 0);
-  const base = basePayload(snapshotId, startAt, endAt, cutoffAt);
+  const base = basePayload(
+    snapshotId,
+    startAt,
+    endAt,
+    cutoffAt,
+    revision,
+    now,
+  );
   let releaseState: "published" | "suppressed" = "published";
   let payload: object;
   if (cohortSupport < COMMUNITY_WEEKLY_MINIMUM_PARTICIPANTS) {
@@ -281,10 +357,11 @@ export async function buildCommunityWeeklySnapshot(
   const results = await db.batch([
     db.prepare(
       `INSERT INTO community_weekly_snapshots (
-        snapshot_id, week_start, week_end, ingestion_cutoff_at, released_at,
-        policy_version, payload_json, payload_sha256, release_state, sealed_at
+        snapshot_id, week_start, week_end, revision, source_mutation_epoch,
+        ingestion_cutoff_at, released_at, policy_version, payload_json,
+        payload_sha256, release_state, sealed_at
       )
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE EXISTS (
         SELECT 1 FROM community_snapshot_builders
          WHERE week_start = ? AND owner_nonce = ? AND mutation_epoch = ?
@@ -295,14 +372,17 @@ export async function buildCommunityWeeklySnapshot(
          WHERE singleton_id = 1 AND mutation_epoch = ?
       )
       AND NOT EXISTS (
-        SELECT 1 FROM community_weekly_snapshots WHERE week_start = ?
+        SELECT 1 FROM community_weekly_snapshots
+         WHERE week_start = ? AND release_state IN ('published', 'suppressed')
       )`,
     ).bind(
       snapshotId,
       startAt,
       endAt,
+      revision,
+      epochRow.mutation_epoch,
       cutoffAt,
-      cutoffAt,
+      now,
       COMMUNITY_WEEKLY_POLICY_VERSION,
       payloadJson,
       payloadHash,
@@ -319,11 +399,26 @@ export async function buildCommunityWeeklySnapshot(
       `DELETE FROM community_snapshot_builders
         WHERE week_start = ? AND owner_nonce = ?`,
     ).bind(startAt, owner),
+    db.prepare(
+      `DELETE FROM community_weekly_snapshot_rebuilds
+        WHERE week_start = ? AND requested_epoch <= ?
+          AND EXISTS (
+            SELECT 1 FROM community_weekly_snapshots
+             WHERE snapshot_id = ? AND source_mutation_epoch = ?
+               AND release_state IN ('published', 'suppressed')
+          )`,
+    ).bind(
+      startAt,
+      epochRow.mutation_epoch,
+      snapshotId,
+      epochRow.mutation_epoch,
+    ),
   ]);
   if (results[0]?.meta.changes === 1) return { state: "built", snapshotId };
   const raced = await db.prepare(
     `SELECT snapshot_id, payload_sha256 FROM community_weekly_snapshots
-      WHERE week_start = ?`,
+      WHERE week_start = ? AND release_state IN ('published', 'suppressed')
+      ORDER BY revision DESC LIMIT 1`,
   ).bind(startAt).first<{ snapshot_id: string; payload_sha256: string }>();
   if (raced?.payload_sha256 === payloadHash) {
     return { state: "existing", snapshotId: raced.snapshot_id };
@@ -331,14 +426,49 @@ export async function buildCommunityWeeklySnapshot(
   throw new Error("community snapshot finalization cancelled or conflicted");
 }
 
+export async function rebuildPendingCommunityWeeklySnapshots(
+  db: D1Database,
+  scheduledTime: number,
+  maximumRebuilds = 5,
+): Promise<{ processed: number; remaining: boolean; snapshotIds: string[] }> {
+  if (!Number.isFinite(scheduledTime)
+      || !Number.isSafeInteger(maximumRebuilds)
+      || maximumRebuilds < 1
+      || maximumRebuilds > 10) {
+    throw new Error("invalid community snapshot rebuild request");
+  }
+  const rows = await db.prepare(
+    `SELECT week_start, week_end, ingestion_cutoff_at, requested_epoch
+       FROM community_weekly_snapshot_rebuilds
+      ORDER BY requested_epoch, week_start
+      LIMIT ?`,
+  ).bind(maximumRebuilds + 1).all<RebuildRow>();
+  const snapshotIds: string[] = [];
+  let processed = 0;
+  for (const row of rows.results.slice(0, maximumRebuilds)) {
+    const result = await buildCommunityWeeklySnapshotForPeriod(db, {
+      startAt: row.week_start,
+      endAt: row.week_end,
+      cutoffAt: row.ingestion_cutoff_at,
+    }, scheduledTime);
+    if (result.state === "lease_unavailable") break;
+    processed += 1;
+    snapshotIds.push(result.snapshotId);
+  }
+  const pending = await db.prepare(
+    "SELECT 1 AS pending FROM community_weekly_snapshot_rebuilds LIMIT 1",
+  ).first<{ pending: number }>();
+  return { processed, remaining: Boolean(pending), snapshotIds };
+}
+
 export async function readLatestCommunityWeeklySnapshot(
   db: D1Database,
 ): Promise<string> {
   const row = await db.prepare(
-    `SELECT payload_json, release_state, snapshot_id, week_start, week_end,
+    `SELECT payload_json, release_state, snapshot_id, revision, week_start, week_end,
             ingestion_cutoff_at
        FROM community_weekly_snapshots
-      ORDER BY week_end DESC LIMIT 1`,
+      ORDER BY week_end DESC, revision DESC LIMIT 1`,
   ).first<SnapshotRow>();
   if (!row) {
     return stableJson({
@@ -354,6 +484,7 @@ export async function readLatestCommunityWeeklySnapshot(
       schemaVersion: "community-weekly-snapshot-v0.1",
       releaseStatus: "withdrawn",
       snapshotId: row.snapshot_id,
+      snapshotRevision: row.revision,
       period: { startAt: row.week_start, endAt: row.week_end },
       ingestionCutoffAt: row.ingestion_cutoff_at,
       reason: "source_data_withdrawn",

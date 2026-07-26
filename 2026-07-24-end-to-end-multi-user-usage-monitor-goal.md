@@ -1058,6 +1058,40 @@ minimization approval, external consent review, security/privacy review,
 production infrastructure, load/soak, and named-human release approval remain
 open.
 
+## Progress update: deletion-safe aggregate revision rebuilds (July 26, 2026)
+
+The local central backend now updates its disclosure-controlled weekly
+statistics after source deletion instead of leaving every affected week
+withdrawn indefinitely:
+
+- deletion still synchronously withdraws every active published or suppressed
+  revision before contribution or participant removal proceeds;
+- deletion triggers enqueue each affected week at the new source-mutation
+  epoch;
+- historical payload bytes and hashes remain immutable, while replacements
+  use a separately identified `(week_start, revision)` row;
+- builders exclude non-active participants and non-accepted contributions,
+  commit under the existing lease and mutation-epoch guard, and clear only a
+  rebuild request covered by the committed revision;
+- scheduled work processes a maximum of five queued historical weeks per pass
+  and resumes from the persistent D1 queue;
+- public reads select the latest revision of the latest period, never a
+  participant-selectable or arbitrary query;
+- a 20-participant encrypted invite-only HTTP smoke published revision 1,
+  withdrew it after one contribution deletion, rebuilt revision 2 as
+  privacy-suppressed from the 19 remaining contributors, deleted all
+  participants, and rebuilt revision 3 as privacy-suppressed from zero
+  contributors; and
+- final database inspection found zero pending rebuilds, participants,
+  contributions, or telemetry records.
+
+The [revisioned aggregate rebuild verification
+receipt](./2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
+records the commands and evidence. This materially advances the G9 deletion
+and cache-invalidation pathway, but it is not G9 approval: public deployment,
+historical publication policy, disclosure attack review, load/mass-deletion
+testing, infrastructure, and named-human release authorization remain open.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

@@ -94,10 +94,13 @@ class ParticipantSession {
 
 const origin = boundedOrigin(optionValue("--origin", "http://127.0.0.1:8792"));
 const contributionPathValue = optionValue("--file");
-if (!contributionPathValue) {
-  throw new Error("--file is required and must name a prepared telemetry-contribution-v0.1 JSON file.");
+const generatedFixture = process.argv.includes("--generated-content-free-fixture");
+if (Boolean(contributionPathValue) === generatedFixture) {
+  throw new Error(
+    "Choose exactly one of --file or --generated-content-free-fixture.",
+  );
 }
-const contributionPath = resolve(contributionPathValue);
+const contributionPath = contributionPathValue ? resolve(contributionPathValue) : null;
 const invitePaths = optionValues("--invite-file").map((value) => resolve(value));
 const sessions = [];
 const COMMUNITY_SNAPSHOT_PARTICIPANTS = 20;
@@ -170,6 +173,96 @@ function scheduledSnapshotTime(contribution) {
     );
   }
   return cutoff;
+}
+
+function generatedContentFreeContribution() {
+  const createdAt = new Date();
+  const eventTime = new Date(createdAt.getTime() - 5 * 60 * 1000);
+  const observedTime = new Date(createdAt.getTime() - 4 * 60 * 1000);
+  return {
+    schemaVersion: "telemetry-contribution-v0.1",
+    synthetic: false,
+    createdAt: createdAt.toISOString(),
+    coveredAt: {
+      startAt: eventTime.toISOString(),
+      endAt: observedTime.toISOString(),
+    },
+    clientPlatform: "macos",
+    providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+    usageEvents: [{
+      schemaVersion: "usage-event-v0.1",
+      eventTime: eventTime.toISOString(),
+      provider: "openai_codex",
+      modelId: "gpt-5.6-sol",
+      modelRecognition: "recognized",
+      modelFingerprint: null,
+      billingSurface: "chatgpt_subscription",
+      speedMode: "standard",
+      apiServiceTier: "standard",
+      reasoningEffort: "medium",
+      components: {
+        inputUncachedTokens: 100,
+        inputCacheReadTokens: 900,
+        inputCacheWriteTokens: 0,
+        inputCacheWrite5mTokens: null,
+        inputCacheWrite1hTokens: null,
+        outputTextTokens: 50,
+        outputReasoningTokens: 25,
+        outputCombinedTokens: null,
+      },
+      totalInputContextTokens: 1_000,
+      surface: "local_interactive_unclassified",
+      agentScope: "root",
+      lineageDisposition: "standalone",
+      toolClassCounts: {
+        webSearch: 0,
+        fileSearch: 0,
+        codeInterpreter: 0,
+        hostedShell: 0,
+        computerUse: 0,
+        mcp: 0,
+        applyPatch: 0,
+        localShell: 0,
+        subagent: 0,
+        toolGateway: 0,
+        other: 0,
+        unknown: 0,
+      },
+      outcome: "completed",
+      eventId: `event:v2:${"d".repeat(64)}`,
+      accounting: {
+        estimatedApiCostUsd: "0.000100",
+        pricingCoveragePercent: 100,
+        unknownBillableUnits: 0,
+        priceBasis: "current_api_prices",
+      },
+    }],
+    quotaSnapshots: [{
+      schemaVersion: "quota-snapshot-v0.1",
+      observedTime: observedTime.toISOString(),
+      receivedTime: createdAt.toISOString(),
+      provider: "openai_codex",
+      planType: "pro",
+      planVariant: "pro-20x",
+      limitId: "codex",
+      slot: "seven_day",
+      usedPercent: 31,
+      displayPrecision: 0,
+      windowDurationMinutes: 10_080,
+      resetsAt: new Date(createdAt.getTime() + 5 * DAY_MILLISECONDS).toISOString(),
+      snapshotSource: "rollout",
+      providerSurface: "account_shared_unallocated",
+      snapshotId: `snapshot:v2:${"d".repeat(64)}`,
+    }],
+    activityMarkers: [],
+    accounting: {
+      estimatedApiCostUsd: "0.000100",
+      pricedEventCoveragePercent: 100,
+      unknownModelEventCount: 0,
+      unknownBillableUnits: 0,
+      priceBasis: "current_api_prices",
+    },
+  };
 }
 
 async function triggerScheduledSnapshot(scheduledTime) {
@@ -399,8 +492,9 @@ try {
     throw new Error("Do not pass invitation files to a local-open smoke.");
   }
 
-  const contributionText = await ownerOnlyFile(contributionPath, "Contribution file");
-  const contribution = JSON.parse(contributionText);
+  const contribution = generatedFixture
+    ? generatedContentFreeContribution()
+    : JSON.parse(await ownerOnlyFile(contributionPath, "Contribution file"));
   validateTelemetryContribution(contribution);
   const scheduledTime = scheduledSnapshotTime(contribution);
   const inviteCodes = [];
@@ -707,6 +801,26 @@ try {
     throw new Error("Contribution deletion did not withdraw the published snapshot safely.");
   }
 
+  await triggerScheduledSnapshot(scheduledTime + 60 * 60 * 1000);
+  const rebuilt = expectStatus(
+    await request("/api/v1/stats/aggregate"),
+    200,
+    "Rebuilt aggregate snapshot",
+  );
+  const serializedRebuilt = JSON.stringify(rebuilt);
+  if (rebuilt.releaseStatus !== "suppressed"
+      || rebuilt.snapshotRevision !== 2
+      || rebuilt.immutable !== true
+      || rebuilt.nonOverlapping !== true
+      || !Array.isArray(rebuilt.cells)
+      || rebuilt.cells.length !== 0
+      || ["participantCount", "participantId", "modelFingerprint"]
+        .some((forbidden) => serializedRebuilt.includes(forbidden))) {
+    throw new Error(
+      "The deletion rebuild did not publish a privacy-suppressed second revision.",
+    );
+  }
+
   for (const [index, session] of sessions.entries()) {
     const deletion = expectStatus(
       await request("/api/v1/me", {
@@ -725,6 +839,23 @@ try {
     session.deleted = true;
   }
 
+  await triggerScheduledSnapshot(scheduledTime + 2 * 60 * 60 * 1000);
+  const fullyDeletedRebuild = expectStatus(
+    await request("/api/v1/stats/aggregate"),
+    200,
+    "Fully deleted cohort aggregate rebuild",
+  );
+  if (fullyDeletedRebuild.releaseStatus !== "suppressed"
+      || fullyDeletedRebuild.snapshotRevision !== 3
+      || fullyDeletedRebuild.immutable !== true
+      || fullyDeletedRebuild.nonOverlapping !== true
+      || !Array.isArray(fullyDeletedRebuild.cells)
+      || fullyDeletedRebuild.cells.length !== 0) {
+    throw new Error(
+      "Participant deletion did not rebuild the aggregate without deleted sources.",
+    );
+  }
+
   process.stdout.write(`${JSON.stringify({
     status: "passed",
     origin: origin.origin,
@@ -737,6 +868,11 @@ try {
     aggregatePublishedAtTwenty: true,
     aggregateStoredBytesStableAcrossAliases: true,
     aggregateWithdrawnOnContributionDeletion: true,
+    aggregateRebuiltAfterDeletion: true,
+    aggregateRevisionAfterDeletion: 2,
+    aggregateRebuiltAfterParticipantDeletion: true,
+    aggregateFinalRevision: 3,
+    generatedContentFreeFixture: generatedFixture,
     authorityIsolation: true,
     devicePairingAndUpload: true,
     deviceRevocation: true,

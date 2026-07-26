@@ -16,6 +16,7 @@ import { syntheticFixture } from "../src/validation";
 import {
   buildCommunityWeeklySnapshot,
   communityWeekForScheduledTime,
+  rebuildPendingCommunityWeeklySnapshots,
 } from "../src/community-snapshots";
 import {
   participantDeletionDigest,
@@ -2206,6 +2207,61 @@ describe("synthetic usage monitor service", () => {
     expect(snapshots?.total).toBe(0);
   });
 
+  it("processes historical aggregate rebuilds in bounded resumable batches", async () => {
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE community_snapshot_mutation_control
+          SET mutation_epoch = 1 WHERE singleton_id = 1`,
+    ).run();
+    const day = 24 * 60 * 60 * 1000;
+    const initialStart = Date.parse("2026-06-08T00:00:00.000Z");
+    await testBindings().USAGE_MONITOR_DB.batch(
+      Array.from({ length: 6 }, (_, index) => {
+        const start = initialStart + index * 7 * day;
+        return testBindings().USAGE_MONITOR_DB.prepare(
+          `INSERT INTO community_weekly_snapshot_rebuilds (
+            week_start, week_end, ingestion_cutoff_at, requested_epoch,
+            requested_at
+          ) VALUES (?, ?, ?, 1, ?)`,
+        ).bind(
+          new Date(start).toISOString(),
+          new Date(start + 7 * day).toISOString(),
+          new Date(start + 9 * day).toISOString(),
+          "2026-07-29T00:00:00.000Z",
+        );
+      }),
+    );
+    await expect(rebuildPendingCommunityWeeklySnapshots(
+      testBindings().USAGE_MONITOR_DB,
+      Date.parse("2026-07-29T00:00:00.000Z"),
+      0,
+    )).rejects.toThrow("invalid community snapshot rebuild request");
+    const first = await rebuildPendingCommunityWeeklySnapshots(
+      testBindings().USAGE_MONITOR_DB,
+      Date.parse("2026-07-29T00:00:00.000Z"),
+      2,
+    );
+    expect(first).toMatchObject({ processed: 2, remaining: true });
+    const firstCounts = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM community_weekly_snapshots) AS snapshots,
+        (SELECT COUNT(*) FROM community_weekly_snapshot_rebuilds) AS rebuilds`,
+    ).first<{ snapshots: number; rebuilds: number }>();
+    expect(firstCounts).toEqual({ snapshots: 2, rebuilds: 4 });
+
+    const second = await rebuildPendingCommunityWeeklySnapshots(
+      testBindings().USAGE_MONITOR_DB,
+      Date.parse("2026-07-29T01:00:00.000Z"),
+      10,
+    );
+    expect(second).toMatchObject({ processed: 4, remaining: false });
+    const finalCounts = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM community_weekly_snapshots) AS snapshots,
+        (SELECT COUNT(*) FROM community_weekly_snapshot_rebuilds) AS rebuilds`,
+    ).first<{ snapshots: number; rebuilds: number }>();
+    expect(finalCounts).toEqual({ snapshots: 6, rebuilds: 0 });
+  });
+
   it("seals, serves, protects, and withdraws a clipped weekly snapshot", async () => {
     let participantToDelete: EnrollmentResponse | null = null;
     let contributionToDelete = "";
@@ -2310,7 +2366,8 @@ describe("synthetic usage monitor service", () => {
       expect(publishedText).not.toContain(forbidden);
     }
     const sealed = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT snapshot_id, payload_json, payload_sha256, release_state
+      `SELECT snapshot_id, revision, source_mutation_epoch, payload_json,
+              payload_sha256, release_state
          FROM community_weekly_snapshots`,
     ).all();
     expect(sealed.results).toHaveLength(1);
@@ -2350,15 +2407,71 @@ describe("synthetic usage monitor service", () => {
       nonOverlapping: true,
     });
     expect(withdrawnText).not.toContain("\"cells\"");
+    const queued = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT week_start, requested_epoch
+         FROM community_weekly_snapshot_rebuilds`,
+    ).all();
+    expect(queued.results).toHaveLength(1);
     await expect(testBindings().USAGE_MONITOR_DB.prepare(
       `UPDATE community_weekly_snapshots
           SET release_state = 'published',
               withdrawn_at = NULL,
               withdrawal_epoch = NULL`,
     ).run()).rejects.toThrow();
+    const rebuilt = await rebuildPendingCommunityWeeklySnapshots(
+      testBindings().USAGE_MONITOR_DB,
+      scheduledTime + 60 * 60 * 1000,
+    );
+    expect(rebuilt).toMatchObject({
+      processed: 1,
+      remaining: false,
+      snapshotIds: ["community-weekly:2026-07-20:r2"],
+    });
+    const rebuiltResponse = await api("/api/v1/stats/aggregate");
+    const rebuiltText = await rebuiltResponse.text();
+    expect(JSON.parse(rebuiltText)).toMatchObject({
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      snapshotId: "community-weekly:2026-07-20:r2",
+      snapshotRevision: 2,
+      releaseStatus: "suppressed",
+      releasedAt: "2026-07-29T01:00:00.000Z",
+      reason: "privacy_release_policy_not_met",
+      immutable: true,
+      nonOverlapping: true,
+      cells: [],
+    });
+    expect(rebuiltText).not.toContain("participantCount");
+    const revisions = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT snapshot_id, revision, source_mutation_epoch, payload_json,
+              payload_sha256, release_state
+         FROM community_weekly_snapshots
+        ORDER BY revision`,
+    ).all();
+    expect(revisions.results).toHaveLength(2);
+    expect(revisions.results[0]).toEqual({
+      ...sealed.results[0],
+      release_state: "withdrawn",
+    });
+    expect(revisions.results[1]).toMatchObject({
+      snapshot_id: "community-weekly:2026-07-20:r2",
+      revision: 2,
+      release_state: "suppressed",
+    });
+    expect(
+      Number(Reflect.get(revisions.results[1]!, "source_mutation_epoch")),
+    ).toBeGreaterThan(
+      Number(Reflect.get(revisions.results[0]!, "source_mutation_epoch")),
+    );
+    const rebuildQueue = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM community_weekly_snapshot_rebuilds",
+    ).first<{ total: number }>();
+    expect(rebuildQueue?.total).toBe(0);
     await expect(
       buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
-    ).resolves.toMatchObject({ state: "existing" });
+    ).resolves.toMatchObject({
+      state: "existing",
+      snapshotId: "community-weekly:2026-07-20:r2",
+    });
   });
 
   it("withdraws a sealed snapshot before a contribution R2 deletion can fail", async () => {

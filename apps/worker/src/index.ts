@@ -21,6 +21,7 @@ import {
 import {
   buildCommunityWeeklySnapshot,
   readLatestCommunityWeeklySnapshot,
+  rebuildPendingCommunityWeeklySnapshots,
 } from "./community-snapshots";
 import {
   assertCollectionControl,
@@ -1236,6 +1237,10 @@ export default {
       );
       if (!controls.publication) return;
       await buildCommunityWeeklySnapshot(
+        env.USAGE_MONITOR_DB,
+        event.scheduledTime,
+      );
+      await rebuildPendingCommunityWeeklySnapshots(
         env.USAGE_MONITOR_DB,
         event.scheduledTime,
       );

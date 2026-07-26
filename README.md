@@ -327,7 +327,8 @@ For the central service alone, `npm run product:backend:test` is the quickest
 repeatable check. It runs against isolated local Cloudflare Worker, D1, and R2
 test bindings and covers strict validation, server repricing, deduplication,
 participant isolation, private statistics, delayed aggregate publication,
-export, deletion, independent incident containment, seven-day quarantine
+immutable revision rebuild after deletion, export, deletion, independent
+incident containment, seven-day quarantine
 retention, retryable R2 failure, and deletion-safe primary-database restore
 suppression through an independent content-free D1 ledger. The live portal's Data
 & privacy section separately reports whether the running backend can reach D1
@@ -385,17 +386,22 @@ community-field exclusion, exports the participant, deletes it, and confirms
 that external participants were never authorized. Remove the isolated state
 after stopping the Worker.
 
-For a real HTTP backend smoke using an actual prepared contribution, run the
-Worker in invite-only mode. Issue twenty invitation grants so the smoke can
-exercise the production-shaped public support threshold. Build the repeated
-arguments as shown in the Worker runbook, then use:
+For a real HTTP backend smoke, run the Worker in invite-only mode. Issue twenty
+invitation grants so the smoke can exercise the production-shaped public
+support threshold. Build the repeated arguments as shown in the Worker runbook,
+then use either an actual prepared contribution or the generated content-free
+transport fixture:
 
 ```bash
 npm run product:backend:smoke -- \
   --origin http://127.0.0.1:8792 \
-  --file /absolute/path/to/telemetry-contribution-000001.json \
+  --generated-content-free-fixture \
   "${INVITE_ARGS[@]}"
 ```
+
+Replace `--generated-content-free-fixture` with
+`--file /absolute/path/to/telemetry-contribution-000001.json` to exercise an
+actual prepared local export.
 
 The [Worker runbook](./apps/worker/README.md) contains the full migration,
 owner-only invitation, server-start, smoke, and cleanup sequence. The smoke
@@ -405,8 +411,10 @@ ingest, opaque R2 retention, idempotent replay with a new upload
 authorization, personal statistics, scheduled immutable snapshot publication,
 stable public bytes, recovery rotation, security reset, logout, participant
 export, snapshot withdrawal, complete deletion, and post-deletion cleanup. It
-prints no participant or credential values and leaves external deployment
-disabled.
+also rebuilds the affected aggregate as a new immutable privacy-suppressed
+revision after contribution deletion and again after complete participant
+deletion. It prints no participant or credential values and leaves external
+deployment disabled.
 
 The [functional end-to-end verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
@@ -426,6 +434,12 @@ receipt](./2026-07-26-durable-contribution-queue-verification-receipt.md)
 records the crash/restart/retry/privacy tests, a real encrypted queue smoke,
 the fresh 20-participant invite-only D1/R2 lifecycle, fixed-path private
 resource routes, and exact post-deletion storage counts.
+
+The [revisioned aggregate rebuild verification
+receipt](./2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
+records the 20-participant encrypted HTTP proof, synchronous withdrawal,
+immutable revisions rebuilt from 19 and then zero remaining contributors,
+empty rebuild queue, and zero remaining participant data.
 
 ## Local metadata exporter privacy boundary
 
@@ -472,11 +486,14 @@ content type; that authority cannot read or delete personal data.
 The original fixed synthetic walkthrough remains available for regression
 testing but is no longer the product home.
 
-The live community totals are not publication-safe merely because three
-participants unlock them: a changing total can still expose a participant by
-differencing. They remain local-development diagnostics until replaced by
-delayed immutable weekly snapshots with per-cell support, clipping, rounding,
-and a fixed ingestion cutoff.
+Changing live community totals are not publication-safe because differencing
+can expose a participant. The development service therefore publishes only
+delayed immutable weekly revisions with a fixed cutoff, minimum support of 20
+independent grant holders, per-participant clipping, per-metric suppression,
+and rounding down. Deletion synchronously withdraws affected revisions before
+creating a new immutable revision without the deleted source. This mechanism
+has production-shaped local evidence, but external publication remains
+unauthorized pending the G9 disclosure review and release approval.
 
 There is still no public deployment, production route, background
 transmission, public bucket, or authorized volunteer collection. Production
