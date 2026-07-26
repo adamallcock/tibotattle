@@ -1157,6 +1157,37 @@ records the evidence. This advances G8 private results and G9 deletion
 visibility, but does not approve cloud deployment, external enrollment, public
 release, cross-browser HTTPS sessions, or the 1,000-user load gate.
 
+## Progress update: executable backend load profile (July 26, 2026)
+
+The operations pathway now has an executable, privacy-safe capacity contract
+rather than an informal request count:
+
+- the network-free profile proves that the 20-million-expanded-record
+  requirement needs 100,000 current-format maximum-size bundles across 1,000
+  participants;
+- a literal full run requires an explicit opt-in and at least 3.1-second
+  enrollment pacing because the global abuse-control binding permits twenty
+  attempts per sixty seconds;
+- real execution is restricted to loopback HTTP and emits only aggregate
+  counters, fixed failure codes, workload dimensions, and latency summaries;
+- aggregate evidence requires owner-only, independently issued invitations,
+  so local-open development participants cannot be misrepresented as public
+  eligibility units;
+- the passing scaled run processed 160 encrypted maximum-size bundles and
+  32,000 expanded records across twenty invited participants at concurrency
+  ten, including five hot participants and 28,000 deliberate duplicates;
+- private results, publication, withdrawal, two deletion-safe revisions, and
+  complete participant/D1/R2 cleanup passed; and
+- measured upload p95 was 1,017.278 milliseconds and deletion p95 was 761.48
+  milliseconds in the local Miniflare environment.
+
+The [scaled backend load verification
+receipt](./2026-07-26-backend-load-scaled-verification-receipt.md) records the
+exact results and the admission/eligibility findings. This is strong
+implementation evidence, but the literal 1,000-participant/100,000-bundle
+capacity run, platform resource/cost measurement, decompression attacks,
+30-day soak, and named-human release approval remain open.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

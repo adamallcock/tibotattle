@@ -50,6 +50,8 @@
     "product:backend:account-scoped-smoke": "npm --prefix apps/worker run smoke:account-scoped:http --",
     "product:backend:queue-smoke": "npm --prefix apps/worker run smoke:queue:http --",
     "product:backend:incident-smoke": "npm --prefix apps/worker run smoke:incident:http --",
+    "product:backend:load": "npm --prefix apps/worker run load:http --",
+    "product:backend:load-profile": "npm --prefix apps/worker run load:profile",
     "product:check": "npm run product:ui:test && npm run product:local:test && npm run product:worker:check",
     "product:local": "node ./apps/local/server.js",
     "product:prepare-contribution": "node ./scripts/build-telemetry-contributions.js",

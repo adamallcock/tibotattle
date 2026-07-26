@@ -433,6 +433,34 @@ receipt](./2026-07-26-participant-contribution-history-verification-receipt.md)
 records the live encrypted HTTP and browser-driven product passes, including a
 UI lifecycle regression found and fixed during rendered QA.
 
+The backend also has a loopback-only, aggregate-diagnostic load runner:
+
+```bash
+# Inspect the literal 1,000-user workload without making network requests.
+npm run product:backend:load-profile
+
+# Run against an explicitly started disposable local Worker.
+npm run product:backend:load -- \
+  --origin http://127.0.0.1:8792 \
+  --participants 20 \
+  --attempts-per-participant 4 \
+  --records-per-attempt 200 \
+  --concurrency 10 \
+  --hot-participant-count 5 \
+  --hot-attempts-per-participant 20
+```
+
+The full profile is 100,000 maximum-size encrypted bundle attempts, not
+10,000: 1,000 participants × 100 attempts × 200 records produces the required
+20 million expanded records. More than twenty enrollments require explicit
+3.1-second pacing under the current global admission limiter. Aggregate
+exercise additionally requires one owner-only invitation per participant;
+local-open development accounts cannot satisfy independent-eligibility
+thresholds. The [scaled load verification
+receipt](./2026-07-26-backend-load-scaled-verification-receipt.md) records a
+passing 20-participant, 160-bundle, 32,000-expanded-record run and does not
+claim that the literal 1,000-user gate has passed.
+
 The [functional end-to-end verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
 fresh real-data local smoke: two encrypted batches, personal-stat updates,

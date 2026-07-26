@@ -211,6 +211,51 @@ assertion fails. The command prints only a content-free summary; it never
 prints an invitation, session, CSRF, upload, recovery, participant,
 contribution, or row value.
 
+### Capacity profile
+
+Inspect the frozen numerical profile without starting a Worker or making any
+request:
+
+```sh
+npm run load:profile
+```
+
+The profile reports 1,000 participants, 100 attempts per participant, 200
+records per attempt, 100,000 encrypted bundle attempts, and 20 million expanded
+records. The runner refuses to execute that literal profile unless
+`--allow-full-profile` is present.
+
+Against a fresh loopback Worker, run a bounded private-ingestion load with:
+
+```sh
+npm run load:http -- \
+  --origin http://127.0.0.1:8792 \
+  --participants 20 \
+  --attempts-per-participant 4 \
+  --records-per-attempt 200 \
+  --concurrency 10 \
+  --hot-participant-count 5 \
+  --hot-attempts-per-participant 20 \
+  --receipt-file /absolute/owner-only/new-receipt.json
+```
+
+`--exercise-aggregate` additionally requires exactly one repeated
+`--invite-file /absolute/owner-only/invitation.secret` per participant and an
+`invite_only` Worker. Local-open participants deliberately have no independent
+eligibility unit and cannot be used to claim aggregate-threshold evidence.
+
+The runner accepts only loopback HTTP, uses the browser RSA/AES envelope path,
+registers a new object-bound authority for every upload, checks private
+results, records bounded latency summaries and fixed failure codes, and deletes
+every created participant in cleanup. More than twenty participants require
+`--enrollment-spacing-ms 3100` or greater because the configured enrollment
+binding is globally limited to twenty attempts per sixty seconds. The literal
+full run therefore has at least 3,096,900 milliseconds of enrollment setup.
+
+The [scaled verification
+receipt](../../2026-07-26-backend-load-scaled-verification-receipt.md) records
+the current passing evidence and the remaining full-profile limitations.
+
 The Worker runtime suite, rather than this transport smoke, supplies the exact
 assertions for per-participant clipping, independent metric support,
 null-versus-explicit-zero handling, cutoff exclusion, and rounding.
