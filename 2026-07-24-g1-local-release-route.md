@@ -182,7 +182,7 @@ No calendar dates have been committed by the owner yet. An unset date is itself 
 
 | Dependency | Accountable owner | Current status | Required evidence | Deadline/stop rule |
 |---|---|---|---|---|
-| Developer ID signing and notarization | Adam Allcock | Credentials/service readiness unverified | Exact signed/notarized artifact and Apple verification receipt | Set a calendar date before R8; without it, no volunteer artifact |
+| Developer ID signing and notarization | Adam Allcock | Tooling, one unambiguous Developer ID Application identity, exact unsigned parent, upstream Node signature, and Keytar signing requirement verified; owner authorization, Keychain notary-profile verification, signed successor, submission, and acceptance remain open | [Signing readiness receipt](./2026-07-26-macos-signing-readiness-verification-receipt.md), then exact signed/notarized artifact and Apple verification receipt | Explicitly authorize identity/profile use before mutation; without acceptance and final verification, no volunteer artifact |
 | Clean macOS arm64 machine | Adam Allcock | Not scheduled | Machine provenance plus complete R9 receipt | Set before R8 freeze; without it, G1 stops |
 | Two independent local-only volunteers | Adam Allcock | Not recruited | Approved consent plus two content-free confirmation receipts | Recruit only after signed artifact; fewer than two blocks G1 |
 | Frozen privacy/consent wording | Adam Allcock | Draft only | Approval bound to artifact/schema hashes | Approve before any volunteer receives bytes |
