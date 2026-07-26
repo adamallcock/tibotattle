@@ -624,20 +624,66 @@ try {
     200,
     "Personal statistics",
   );
+  const participantProfile = expectStatus(
+    await request("/api/v1/me", { session: primary }),
+    200,
+    "Participant contribution history",
+  );
   const unavailable = expectStatus(
     await request("/api/v1/stats/aggregate"),
     200,
     "Unavailable aggregate snapshot",
   );
+  const historyItem = participantProfile.contributions?.[0];
+  const historyCreatedAt = Date.parse(historyItem?.createdAt);
+  const historyScheduledDeletionAt = Date.parse(
+    historyItem?.quarantine?.scheduledDeletionAt,
+  );
+  const serializedProfile = JSON.stringify(participantProfile);
   if (contributionStatus.recordCounts?.accepted !== expectedTotal
       || personal.totals?.usageEvents !== expected.usageEvents
       || personal.totals?.quotaSnapshots !== expected.quotaSnapshots
       || personal.totals?.activityMarkers !== expected.activityMarkers
+      || participantProfile.schemaVersion !== "participant-profile-v0.2"
+      || participantProfile.contributionCount !== 1
+      || participantProfile.historyPolicy?.maximumItems !== 101
+      || participantProfile.historyPolicy?.quarantineRetentionMilliseconds
+        !== 7 * DAY_MILLISECONDS
+      || participantProfile.historyPolicy?.canonicalMetadataRetainedAfterQuarantine !== true
+      || participantProfile.historyPolicy?.clientSoftwareVersion
+        !== "unavailable_in_transport"
+      || historyItem?.contributionId !== accepted.contributionId
+      || historyItem?.schemaVersion !== "telemetry-contribution-v0.1"
+      || historyItem?.status !== "accepted"
+      || historyItem?.synthetic !== false
+      || historyItem?.recordCounts?.declared !== expectedTotal
+      || historyItem?.recordCounts?.accepted !== expectedTotal
+      || historyItem?.recordCounts?.deduplicated !== 0
+      || historyItem?.quarantine?.state !== "retained"
+      || historyItem?.quarantine?.deletedAt !== null
+      || historyItem?.quarantine?.canonicalMetadataRetained !== true
+      || !Number.isFinite(historyCreatedAt)
+      || historyScheduledDeletionAt !== historyCreatedAt + 7 * DAY_MILLISECONDS
+      || [
+        "r2_key",
+        "plaintext_digest",
+        "envelope_digest",
+        "datasetId",
+        "accountTrackId",
+        "eligibilityUnitId",
+        "recoveryCode",
+        "csrfToken",
+        "\"accounting\"",
+        "registrySha256",
+        "priceBasis",
+      ].some((forbidden) => serializedProfile.includes(forbidden))
       || unavailable.releaseStatus !== "not_yet_published"
       || unavailable.immutable !== true
       || unavailable.nonOverlapping !== true
       || Object.hasOwn(unavailable, "participantCount")) {
-    throw new Error("Initial ingest and recomputed statistics did not match the contribution.");
+    throw new Error(
+      "Initial ingest, private history, and recomputed statistics did not match the contribution.",
+    );
   }
 
   for (let index = 1; index < COMMUNITY_SNAPSHOT_PARTICIPANTS; index += 1) {
@@ -811,6 +857,20 @@ try {
   if (contributionDeletion.deleted !== true) {
     throw new Error("Contribution deletion did not complete.");
   }
+  const historyAfterContributionDeletion = expectStatus(
+    await request("/api/v1/me", { session: primary }),
+    200,
+    "Contribution history after deletion",
+  );
+  if (historyAfterContributionDeletion.schemaVersion !== "participant-profile-v0.2"
+      || historyAfterContributionDeletion.contributionCount !== 0
+      || !Array.isArray(historyAfterContributionDeletion.contributions)
+      || historyAfterContributionDeletion.contributions.length !== 0
+      || historyAfterContributionDeletion.latestContribution !== null) {
+    throw new Error(
+      "Contribution deletion did not remove the batch from private history.",
+    );
+  }
   const withdrawn = expectStatus(
     await request("/api/v1/stats/aggregate"),
     200,
@@ -901,6 +961,8 @@ try {
     acceptedRecordsPerParticipant: expectedTotal,
     idempotentReplay: true,
     personalStatisticsRecomputed: true,
+    authenticatedContributionHistory: true,
+    historyUpdatedAfterContributionDeletion: true,
     aggregateUnavailableBeforeSchedule: true,
     aggregatePublishedAtTwenty: true,
     aggregateStoredBytesStableAcrossAliases: true,

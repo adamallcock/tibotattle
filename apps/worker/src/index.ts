@@ -16,6 +16,7 @@ import {
   MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
+  QUARANTINE_RETENTION_MILLISECONDS,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import {
@@ -53,6 +54,7 @@ import {
   assertDeletionOwner,
   contributionCount,
   contributionForResponse,
+  contributionHistoryMetadata,
   enroll,
   envelopeDigest,
   existingContribution,
@@ -92,6 +94,7 @@ import {
   personalStats,
   telemetryContributionById,
   telemetryContributionCount,
+  telemetryContributionHistoryMetadata,
   telemetryContributionMetadata,
   telemetryEnvelopeDigest,
   telemetryPlaintextDigest,
@@ -833,27 +836,29 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
     env.USAGE_MONITOR_DB,
     session.participantId,
   );
+  const history = ([
+    ...contributions.map(contributionHistoryMetadata),
+    ...telemetryContributions.map(telemetryContributionHistoryMetadata),
+  ] as Array<{ contributionId: string; createdAt: string }>).sort(
+    (left, right) => left.createdAt.localeCompare(right.createdAt)
+      || left.contributionId.localeCompare(right.contributionId),
+  );
   return jsonResponse({
+    schemaVersion: "participant-profile-v0.2",
     participantId: session.participantId,
     createdAt: session.participantCreatedAt,
     consentVersion: session.consentVersion,
     syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
-    contributionCount: contributions.length + telemetryContributions.length,
-    latestContribution: telemetryContributions.length > 0
-      ? telemetryContributionMetadata(telemetryContributions[telemetryContributions.length - 1]!)
-      : contributions.length > 0
-        ? contributionForResponse(contributions[contributions.length - 1]!)
-        : null,
-    contributions: [
-      ...contributions.map((row) => ({
-        contributionId: row.id,
-        status: row.status,
-        fixtureId: row.fixture_id,
-        synthetic: true,
-        createdAt: row.created_at,
-      })),
-      ...telemetryContributions.map(telemetryContributionMetadata),
-    ],
+    contributionCount: history.length,
+    latestContribution: history[history.length - 1] ?? null,
+    contributions: history,
+    historyPolicy: {
+      maximumItems: MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT
+        + MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
+      quarantineRetentionMilliseconds: QUARANTINE_RETENTION_MILLISECONDS,
+      canonicalMetadataRetainedAfterQuarantine: true,
+      clientSoftwareVersion: "unavailable_in_transport",
+    },
   }, 200, { vary: "Cookie" });
 }
 

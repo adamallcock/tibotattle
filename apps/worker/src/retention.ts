@@ -1,9 +1,9 @@
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { finishParticipantDeletion } from "./repository";
+import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
-export const QUARANTINE_RETENTION_MILLISECONDS = 7 * DAY_MILLISECONDS;
 export const DELETION_TOMBSTONE_RETENTION_MILLISECONDS = 400 * DAY_MILLISECONDS;
 
 const SCAN_PAGE_SIZE = 1_000;

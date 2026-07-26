@@ -27,8 +27,10 @@ import {
   normalizeContributionSyncStatus,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
+  normalizeParticipantHistory,
   normalizeParticipantStats,
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
+  PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION
 } from "../public/data-client.js";
 
@@ -884,6 +886,116 @@ test("private community comparison preserves own clipped versus public rounded s
   }).reason, "community_snapshot_not_released");
 });
 
+test("participant history keeps lifecycle and provenance bounded and private", async () => {
+  const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
+  const profile = {
+    schemaVersion: PARTICIPANT_PROFILE_SCHEMA_VERSION,
+    participantId: "private-server-participant-id",
+    createdAt: "2026-07-25T12:00:00.000Z",
+    consentVersion: "privacy-safe-telemetry-v0.1",
+    contributionCount: 1,
+    historyPolicy: {
+      maximumItems: 101,
+      quarantineRetentionMilliseconds: 604_800_000,
+      canonicalMetadataRetainedAfterQuarantine: true,
+      clientSoftwareVersion: "unavailable_in_transport"
+    },
+    contributions: [{
+      contributionId,
+      status: "accepted",
+      synthetic: false,
+      schemaVersion: "telemetry-contribution-v0.1",
+      transportSchemaVersion: "telemetry-contribution-v0.1",
+      coveredAt: {
+        startAt: "2026-07-25T12:00:00.000Z",
+        endAt: "2026-07-25T12:30:00.000Z"
+      },
+      clientPlatform: "macos",
+      providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+      recordCounts: { declared: 3, accepted: 2, deduplicated: 1 },
+      serverAccounting: {
+        apiPriceEquivalentUsd: "0.0032",
+        verification: "server_repriced",
+        registrySha256: "private-projected-away"
+      },
+      quarantine: {
+        state: "retained",
+        scheduledDeletionAt: "2026-08-01T12:00:00.000Z",
+        deletedAt: null,
+        canonicalMetadataRetained: true
+      },
+      createdAt: "2026-07-25T12:00:00.000Z",
+      datasetId: "private-projected-away",
+      accountTrackId: "private-projected-away"
+    }]
+  };
+  const normalized = normalizeParticipantHistory(profile);
+  assert.equal(normalized.state, "ready");
+  assert.equal(normalized.items[0].contributionId, contributionId);
+  assert.equal(normalized.items[0].recordCounts.deduplicated, 1);
+  assert.equal(normalized.items[0].serverAccounting.apiPriceEquivalentUsd, 0.0032);
+  assert.equal(normalized.items[0].quarantine.state, "retained");
+  assert.equal(Object.hasOwn(normalized, "participantId"), false);
+  assert.equal(Object.hasOwn(normalized.items[0], "datasetId"), false);
+  assert.equal(Object.hasOwn(normalized.items[0], "accountTrackId"), false);
+  assert.equal(Object.hasOwn(normalized.items[0].serverAccounting, "registrySha256"), false);
+
+  const badRetention = structuredClone(profile);
+  badRetention.contributions[0].quarantine.scheduledDeletionAt =
+    "2026-08-02T12:00:00.000Z";
+  assert.equal(normalizeParticipantHistory(badRetention).reason, "invalid_contract");
+
+  const badCounts = structuredClone(profile);
+  badCounts.contributions[0].recordCounts.accepted = 3;
+  assert.equal(normalizeParticipantHistory(badCounts).reason, "invalid_contract");
+
+  const duplicateIds = structuredClone(profile);
+  duplicateIds.contributions.push(structuredClone(profile.contributions[0]));
+  duplicateIds.contributionCount = 2;
+  assert.equal(normalizeParticipantHistory(duplicateIds).reason, "invalid_contract");
+
+  const wrongStatus = structuredClone(profile);
+  wrongStatus.contributions[0].status = "accepted_synthetic";
+  assert.equal(normalizeParticipantHistory(wrongStatus).reason, "invalid_contract");
+
+  const impossibleDeletion = structuredClone(profile);
+  impossibleDeletion.contributions[0].quarantine = {
+    state: "deleted",
+    scheduledDeletionAt: "2026-08-01T12:00:00.000Z",
+    deletedAt: "2026-07-25T11:59:59.000Z",
+    canonicalMetadataRetained: true
+  };
+  assert.equal(normalizeParticipantHistory(impossibleDeletion).reason, "invalid_contract");
+
+  const oversized = structuredClone(profile);
+  oversized.contributions = Array.from({ length: 102 }, () => profile.contributions[0]);
+  oversized.contributionCount = 102;
+  assert.equal(normalizeParticipantHistory(oversized).reason, "invalid_contract");
+
+  const calls = [];
+  const client = new CommunityClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify(profile), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+  await client.participantProfile();
+  assert.deepEqual(calls, [{
+    url: "/api/v1/me",
+    options: {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" }
+    }
+  }]);
+  assert.throws(
+    () => client.deleteContribution("not-a-contribution"),
+    /valid contribution/
+  );
+});
+
 test("participant results fail closed for unverifiable prices and honest not-testable movement", () => {
   const result = normalizeParticipantStats({
     schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
@@ -938,6 +1050,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="device-list"/);
   assert.match(html, /id="logout-participant"/);
   assert.match(html, /id="delete-participant"/);
+  assert.match(html, /id="contribution-history"/);
   assert.match(html, /privacy-safe Usage Monitor export/);
   assert.match(appSource, /demo-button.*addEventListener/s);
   const loadBody = appSource.match(/async function loadLocalDashboard\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
@@ -950,7 +1063,10 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /communityClient\.registerUpload\(/);
   assert.match(appSource, /communityClient\.contributeSerialized\(/);
   assert.match(appSource, /communityClient\.participantExport\(\)/);
+  assert.match(appSource, /communityClient\.participantProfile\(\)/);
+  assert.match(appSource, /communityClient\.deleteContribution\(contributionId\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);
+  assert.doesNotMatch(appSource, /\brenderStats\(/);
   assert.match(appSource, /communityClient\.createDevicePairing\(/);
   assert.match(appSource, /communityClient\.devices\(\)/);
   assert.match(appSource, /inviteInput\.value = ""/);
@@ -969,6 +1085,9 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /Account continuity was not transmitted/);
   assert.match(appSource, /Account-scoped quota calibration/);
   assert.match(appSource, /Your contribution in the released week/);
+  assert.match(appSource, /Accepted contribution history/);
+  assert.match(appSource, /Encrypted object scheduled for deletion after/);
+  assert.match(appSource, /does not delete the canonical metadata/);
   assert.match(appSource, /This is not an average, percentile, bill, or provider allowance/);
   assert.match(appSource, /A replacement revision may be pending/);
   assert.match(appSource, /Not testable/);

@@ -181,6 +181,10 @@ printing them, and proves:
 - one-use upload registration bound to the encrypted digest and byte size;
 - strict validation, D1 ingest, opaque R2 quarantine, and recomputed personal
   statistics using server-derived API-price-equivalent costs;
+- an authenticated bounded contribution history with accepted/deduplicated
+  counts, schema/platform provenance, server-pricing status, and the independent
+  seven-day encrypted-quarantine lifecycle, without R2 keys, digests,
+  dataset/account pseudonyms, authorities, paths, or source content;
 - idempotent replay using a fresh upload authorization;
 - a fixed unavailable response before scheduled publication;
 - a production-shaped 20-participant weekly snapshot built through Wrangler's
@@ -196,6 +200,8 @@ printing them, and proves:
   pending uploads, and logout cookie clearing;
 - snapshot withdrawal when deletion starts, followed by an immutable second
   revision rebuilt without the deleted contribution;
+- removal of the exact contribution from authenticated history immediately
+  after its CSRF-scoped deletion;
 - a final privacy-suppressed third revision after all participants are deleted;
   and
 - complete deletion of all twenty participants.

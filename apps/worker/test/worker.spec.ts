@@ -1571,14 +1571,21 @@ describe("synthetic usage monitor service", () => {
     });
     expect(me.status).toBe(200);
     await expect(me.json()).resolves.toMatchObject({
+      schemaVersion: "participant-profile-v0.2",
       participantId: participant.participantId,
       contributionCount: 1,
       latestContribution: {
         contributionId: accepted.contributionId,
-        accounting: {
-          unknownBillableUnits: 1,
-          limitation: expect.stringContaining("no provider allowance formula"),
+        quarantine: {
+          state: "retained",
+          canonicalMetadataRetained: true,
         },
+      },
+      historyPolicy: {
+        maximumItems: 101,
+        quarantineRetentionMilliseconds: 604_800_000,
+        canonicalMetadataRetainedAfterQuarantine: true,
+        clientSoftwareVersion: "unavailable_in_transport",
       },
     });
 
@@ -1906,6 +1913,51 @@ describe("synthetic usage monitor service", () => {
       }],
     });
 
+    const profileResponse = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    const profileText = await profileResponse.text();
+    const profile = JSON.parse(profileText) as {
+      contributionCount: number;
+      contributions: Array<Record<string, unknown>>;
+    };
+    expect(profile).toMatchObject({
+      schemaVersion: "participant-profile-v0.2",
+      contributionCount: 2,
+      contributions: [
+        {
+          contributionId: accepted.contributionId,
+          status: "accepted",
+          synthetic: false,
+          schemaVersion: "telemetry-contribution-v0.1",
+          transportSchemaVersion: "telemetry-contribution-v0.1",
+          coveredAt: {
+            startAt: "2026-07-25T12:00:00.000Z",
+            endAt: "2026-07-25T12:30:00.000Z",
+          },
+          clientPlatform: "macos",
+          recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
+          quarantine: {
+            state: "retained",
+            scheduledDeletionAt: expect.stringMatching(/Z$/u),
+            deletedAt: null,
+            canonicalMetadataRetained: true,
+          },
+        },
+        {
+          contributionId: secondAccepted.contributionId,
+          recordCounts: { declared: 3, accepted: 1, deduplicated: 2 },
+        },
+      ],
+    });
+    for (const forbidden of [
+      "r2_key", "plaintext_digest", "envelope_digest", "datasetId",
+      "accountTrackId", "eligibilityUnitId", "recoveryCode", "csrfToken",
+      "\"accounting\"", "registrySha256", "priceBasis",
+    ]) {
+      expect(profileText).not.toContain(forbidden);
+    }
+
     const contribution = await contributionResource(
       participant,
       accepted.contributionId,
@@ -1944,6 +1996,22 @@ describe("synthetic usage monitor service", () => {
       "read",
     );
     expect(isolated.status).toBe(404);
+    const strangerProfile = await api("/api/v1/me", {
+      headers: personalHeaders(stranger),
+    });
+    const strangerProfileText = await strangerProfile.text();
+    expect(JSON.parse(strangerProfileText)).toMatchObject({
+      schemaVersion: "participant-profile-v0.2",
+      contributionCount: 0,
+      contributions: [],
+    });
+    expect(strangerProfileText).not.toContain(accepted.contributionId);
+    const strangerDelete = await contributionResource(
+      stranger,
+      accepted.contributionId,
+      "delete",
+    );
+    expect(strangerDelete.status).toBe(404);
 
     const community = await api("/api/v1/community/insights");
     await expect(community.json()).resolves.toMatchObject({
@@ -1969,6 +2037,17 @@ describe("synthetic usage monitor service", () => {
     await expect(afterDelete.json()).resolves.toMatchObject({
       totals: { contributions: 1, usageEvents: 1, quotaSnapshots: 1, activityMarkers: 1 },
     });
+    const profileAfterDelete = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    const profileAfterDeleteText = await profileAfterDelete.text();
+    expect(JSON.parse(profileAfterDeleteText)).toMatchObject({
+      contributionCount: 1,
+      contributions: [{
+        contributionId: secondAccepted.contributionId,
+      }],
+    });
+    expect(profileAfterDeleteText).not.toContain(accepted.contributionId);
     const surviving = await contributionResource(
       participant,
       secondAccepted.contributionId,
@@ -3058,6 +3137,22 @@ describe("synthetic usage monitor service", () => {
     expect(stats.status).toBe(200);
     await expect(stats.json()).resolves.toMatchObject({
       totals: { contributions: 1 },
+    });
+    const profile = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    await expect(profile.json()).resolves.toMatchObject({
+      schemaVersion: "participant-profile-v0.2",
+      contributionCount: 1,
+      contributions: [{
+        contributionId: receipt.contributionId,
+        quarantine: {
+          state: "deleted",
+          scheduledDeletionAt: "2026-07-24T00:00:00.000Z",
+          deletedAt: expect.stringMatching(/Z$/u),
+          canonicalMetadataRetained: true,
+        },
+      }],
     });
   });
 

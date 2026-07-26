@@ -3,6 +3,7 @@ import {
   LocalCompanionClient,
   demoDashboard,
   normalizeCommunitySnapshot,
+  normalizeParticipantHistory,
   normalizeParticipantStats
 } from "./data-client.js";
 import {
@@ -1411,6 +1412,117 @@ function renderPrivateCommunityComparison(container, comparison) {
   container.append(section);
 }
 
+const CONTRIBUTION_STATUS_LABELS = Object.freeze({
+  accepted: "Accepted",
+  accepted_synthetic: "Accepted fixture",
+  deleting: "Deletion in progress"
+});
+
+function renderContributionHistory(container, payload) {
+  clear(container);
+  const history = normalizeParticipantHistory(payload);
+  if (!communitySession?.csrfToken) {
+    container.hidden = true;
+    return;
+  }
+  container.hidden = false;
+  const heading = node("div", "participant-detail-heading");
+  const title = node("div");
+  title.append(
+    node("h4", "", "Accepted contribution history"),
+    node(
+      "p",
+      "",
+      "Each row is private to this participant and comes from canonical backend state."
+    )
+  );
+  heading.append(title, node("span", "private-chip", "Private history"));
+  container.append(heading);
+
+  if (history.state !== "ready") {
+    const unavailable = node("div", "not-testable-state");
+    unavailable.append(
+      node("strong", "", "History unavailable"),
+      node(
+        "p",
+        "",
+        history.reason === "unsupported_schema"
+          ? "The service returned an unsupported participant-history contract."
+          : history.reason === "invalid_contract"
+            ? "The service response did not pass the browser's closed history contract."
+            : "The participant-history service could not be reached."
+      )
+    );
+    container.append(unavailable);
+    return;
+  }
+
+  const disclosure = node("p", "history-disclosure");
+  disclosure.textContent = history.items.length === 0
+    ? "No accepted contribution batches remain."
+    : `${compact(history.contributionCount)} accepted or deleting batch${history.contributionCount === 1 ? "" : "es"}. The current transport does not carry a reviewed client software version.`;
+  container.append(disclosure);
+  if (history.items.length === 0) return;
+
+  const list = node("div", "history-list");
+  history.items.forEach((item, index) => {
+    const card = node("article", "history-card");
+    const cardHeading = node("div", "history-card-heading");
+    const label = node("div");
+    label.append(
+      node("strong", "", `Contribution ${history.items.length - index}`),
+      node("small", "", `Received ${formatUtc(item.createdAt)}`)
+    );
+    cardHeading.append(
+      label,
+      node(
+        "span",
+        item.status === "deleting"
+          ? "history-state history-state-deleting"
+          : "history-state",
+        CONTRIBUTION_STATUS_LABELS[item.status]
+      )
+    );
+    card.append(cardHeading);
+
+    const details = node("dl", "history-facts");
+    const recordSummary = item.recordCounts === null
+      ? "Fixture contract"
+      : `${compact(item.recordCounts.accepted)} accepted · ${compact(item.recordCounts.deduplicated)} duplicate`;
+    const pricingSummary = item.serverAccounting.verification === "server_repriced"
+      ? `${formatApiMoney(item.serverAccounting.apiPriceEquivalentUsd)} API-price equivalent`
+      : "Server repricing unavailable";
+    const quarantineSummary = item.quarantine.state === "deleted"
+      ? `Encrypted object deleted ${formatUtc(item.quarantine.deletedAt)}`
+      : `Encrypted object scheduled for deletion after ${formatUtc(item.quarantine.scheduledDeletionAt)}`;
+    for (const [term, description] of [
+      ["Covered period", `${formatUtc(item.coveredAt.startAt)}–${formatUtc(item.coveredAt.endAt)}`],
+      ["Records", recordSummary],
+      ["Contract", `${item.transportSchemaVersion} · ${item.clientPlatform}`],
+      ["Pricing", pricingSummary],
+      ["Quarantine", quarantineSummary]
+    ]) {
+      const fact = node("div");
+      fact.append(node("dt", "", term), node("dd", "", description));
+      details.append(fact);
+    }
+    card.append(details);
+    card.append(node(
+      "p",
+      "history-retention-note",
+      "Deleting the encrypted quarantine object does not delete the canonical metadata used for your private results. Use the button below to delete this contribution from canonical results."
+    ));
+    if (item.status !== "deleting") {
+      const remove = node("button", "button button-danger history-delete", "Delete this contribution");
+      remove.type = "button";
+      remove.dataset.contributionId = item.contributionId;
+      card.append(remove);
+    }
+    list.append(card);
+  });
+  container.append(list);
+}
+
 function renderCommunitySnapshot(container, payload) {
   clear(container);
   const snapshot = normalizeCommunitySnapshot(payload);
@@ -1493,11 +1605,18 @@ async function loadCommunityResults() {
   const community = $("#community-result");
   const participantControls = $("#participant-controls");
   try {
-    const [healthResult, personalResult, communityResult, devicesResult] = await Promise.allSettled([
+    const [
+      healthResult,
+      personalResult,
+      communityResult,
+      devicesResult,
+      profileResult
+    ] = await Promise.allSettled([
       communityClient.health(),
       communitySession?.csrfToken ? communityClient.personalStats() : Promise.resolve(null),
       communityClient.communityStats(),
-      communitySession?.csrfToken ? communityClient.devices() : Promise.resolve(null)
+      communitySession?.csrfToken ? communityClient.devices() : Promise.resolve(null),
+      communitySession?.csrfToken ? communityClient.participantProfile() : Promise.resolve(null)
     ]);
     const serviceReachable = healthResult.status === "fulfilled"
       || communityResult.status === "fulfilled"
@@ -1506,6 +1625,10 @@ async function loadCommunityResults() {
     service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
     renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
+    renderContributionHistory(
+      $("#contribution-history"),
+      profileResult.status === "fulfilled" ? profileResult.value : null
+    );
     renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
     renderDevices(devicesResult.status === "fulfilled" ? devicesResult.value : null);
     participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
@@ -1521,6 +1644,7 @@ async function loadCommunityResults() {
     service.className = "evidence-chip neutral";
     participantControls.hidden = true;
     renderDevices(null);
+    renderContributionHistory($("#contribution-history"), null);
   }
 }
 
@@ -1743,11 +1867,32 @@ async function deleteParticipantData() {
     uploadStatus.className = "upload-status";
     uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the anonymous participant capability.`;
     $("#participant-controls").hidden = true;
-    renderStats($("#personal-result"), null);
+    renderPersonalStats($("#personal-result"), null);
+    renderContributionHistory($("#contribution-history"), null);
     await loadCommunityResults();
   } catch {
     status.className = "participant-action-status error";
     status.textContent = "The contributed data could not be deleted.";
+  }
+}
+
+async function deleteSingleContribution(contributionId) {
+  if (!window.confirm(
+    "Delete this contribution from canonical private results and any current project-controlled aggregate? Other accepted contributions remain."
+  )) return;
+  const status = $("#participant-action-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Deleting this contribution and refreshing derived results…";
+  try {
+    const receipt = await communityClient.deleteContribution(contributionId);
+    status.textContent = receipt?.deleted === true
+      ? "Contribution deleted. Private and community results have been refreshed."
+      : "The service completed the contribution deletion request.";
+    await loadCommunityResults();
+  } catch {
+    status.className = "participant-action-status error";
+    status.textContent = "The contribution could not be deleted.";
   }
 }
 
@@ -1825,7 +1970,8 @@ async function logoutParticipant() {
   showDevicePairingOnce(null);
   renderDevices(null);
   $("#participant-controls").hidden = true;
-  renderStats($("#personal-result"), null);
+  renderPersonalStats($("#personal-result"), null);
+  renderContributionHistory($("#contribution-history"), null);
   status.textContent = "Signed out. Use the latest recovery code to return.";
 }
 
@@ -1889,6 +2035,12 @@ $("#download-participant").addEventListener("click", downloadParticipantExport);
 $("#security-reset").addEventListener("click", resetParticipantSecurity);
 $("#logout-participant").addEventListener("click", logoutParticipant);
 $("#delete-participant").addEventListener("click", deleteParticipantData);
+$("#contribution-history").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-contribution-id]");
+  if (button?.dataset.contributionId) {
+    deleteSingleContribution(button.dataset.contributionId);
+  }
+});
 
 const observer = new IntersectionObserver((entries) => {
   const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];

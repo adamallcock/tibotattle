@@ -15,6 +15,7 @@ import {
   RECOVERY_RETRY_TTL_MILLISECONDS,
   SESSION_TTL_MILLISECONDS,
 } from "./constants";
+import { contributionQuarantineLifecycle } from "./contribution-lifecycle";
 import { ApiError } from "./errors";
 import {
   createSessionMaterial,
@@ -95,6 +96,7 @@ export interface ContributionRow {
   unknown_billable_units: number;
   price_basis: "current-api-price-sensitivity";
   created_at: string;
+  quarantine_deleted_at?: string | null;
 }
 
 export interface Enrollment {
@@ -880,6 +882,33 @@ export function contributionForResponse(row: ContributionRow): object {
       priceBasis: row.price_basis,
       limitation: "API-price sensitivity only; no provider allowance formula is claimed.",
     },
+    quarantine: contributionQuarantineLifecycle(
+      row.created_at,
+      row.quarantine_deleted_at,
+    ),
+    createdAt: row.created_at,
+  };
+}
+
+export function contributionHistoryMetadata(row: ContributionRow): object {
+  return {
+    contributionId: row.id,
+    status: row.status,
+    synthetic: true,
+    schemaVersion: "synthetic-contribution-v0.1",
+    transportSchemaVersion: "synthetic-contribution-v0.1",
+    coveredAt: { startAt: row.range_start, endAt: row.range_end },
+    clientPlatform: "unknown",
+    providerPolicyEpoch: "unknown",
+    serverAccounting: {
+      apiPriceEquivalentUsd: null,
+      verification: "server_repricing_unavailable",
+    },
+    recordCounts: null,
+    quarantine: contributionQuarantineLifecycle(
+      row.created_at,
+      row.quarantine_deleted_at,
+    ),
     createdAt: row.created_at,
   };
 }

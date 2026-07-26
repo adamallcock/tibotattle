@@ -323,6 +323,15 @@ remain separately gated.
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
 Worker dry deployment. It does not deploy or upload data.
 
+After an authenticated upload, the central portal shows a private accepted
+contribution history backed by canonical Worker state. Each bounded row shows
+the covered period, accepted and deduplicated record counts, transport
+contract, platform class, server-repriced API-price equivalent, and the
+encrypted-quarantine deletion schedule. It never shows an R2 key, digest,
+dataset/account pseudonym, authority, path, or source content. The participant
+can delete one contribution without deleting the anonymous participant; the
+portal then reloads private and current project-controlled aggregate results.
+
 For the central service alone, `npm run product:backend:test` is the quickest
 repeatable check. It runs against isolated local Cloudflare Worker, D1, and R2
 test bindings and covers strict validation, server repricing, deduplication,
@@ -411,11 +420,18 @@ ingest, opaque R2 retention, idempotent replay with a new upload
 authorization, personal statistics, scheduled immutable snapshot publication,
 an authenticated same-week clipped-versus-public-rounded comparison, stable
 public bytes, recovery rotation, security reset, logout, participant
-export, snapshot withdrawal, complete deletion, and post-deletion cleanup. It
+export, authenticated contribution history, history removal after exact
+contribution deletion, snapshot withdrawal, complete deletion, and
+post-deletion cleanup. It
 also rebuilds the affected aggregate as a new immutable privacy-suppressed
 revision after contribution deletion and again after complete participant
 deletion. It prints no participant or credential values and leaves external
 deployment disabled.
+
+The [participant contribution history verification
+receipt](./2026-07-26-participant-contribution-history-verification-receipt.md)
+records the live encrypted HTTP and browser-driven product passes, including a
+UI lifecycle regression found and fixed during rendered QA.
 
 The [functional end-to-end verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a

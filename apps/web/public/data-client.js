@@ -13,6 +13,7 @@
  *   POST /api/v1/contributions
  *   POST /api/v1/me/contributions/read
  *   POST /api/v1/me/contributions/delete
+ *   GET  /api/v1/me
  *   GET  /api/v1/me/stats
  *   GET  /api/v1/stats/aggregate
  *   POST /api/v1/me/device-pairings
@@ -27,6 +28,7 @@ const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
 export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
+export const PARTICIPANT_PROFILE_SCHEMA_VERSION = "participant-profile-v0.2";
 export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
   "participant-community-comparison-v0.1";
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION =
@@ -52,6 +54,26 @@ const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
   outputCombinedTokens: "tokens",
   toolUnits: "units"
 });
+const CONTRIBUTION_ID_PATTERN =
+  /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const CONTRIBUTION_SCHEMA_VERSIONS = new Set([
+  "synthetic-contribution-v0.1",
+  "telemetry-contribution-v0.1",
+  "telemetry-contribution-v0.2"
+]);
+const CONTRIBUTION_POLICY_EPOCHS = new Set([
+  "unknown",
+  "openai_pre_agentic_pool_2026_07_09",
+  "openai_agentic_pool_2026_07_09",
+  "anthropic_unknown"
+]);
+const PARTICIPANT_CONSENT_VERSIONS = new Set([
+  "synthetic-preview-v0.1",
+  "privacy-safe-telemetry-v0.1",
+  "privacy-safe-telemetry-v0.2",
+  "ongoing-privacy-safe-telemetry-v0.1",
+  "ongoing-privacy-safe-telemetry-v0.2"
+]);
 
 function array(value) {
   if (Array.isArray(value)) return value;
@@ -448,6 +470,149 @@ export function normalizeParticipantCommunityComparison(payload) {
     status: "ready",
     reason: "",
     cells
+  };
+}
+
+export function normalizeParticipantHistory(payload) {
+  const unavailable = (reason) => ({
+    state: "not_available",
+    reason,
+    consentVersion: "",
+    participantCreatedAt: "",
+    contributionCount: 0,
+    clientSoftwareVersion: "unavailable_in_transport",
+    items: []
+  });
+  if (!payload) return unavailable("service_unavailable");
+  if (payload.schemaVersion !== PARTICIPANT_PROFILE_SCHEMA_VERSION) {
+    return unavailable("unsupported_schema");
+  }
+  if (!PARTICIPANT_CONSENT_VERSIONS.has(payload.consentVersion)
+      || !Number.isFinite(Date.parse(payload.createdAt))
+      || !Array.isArray(payload.contributions)
+      || payload.contributions.length > 101
+      || count(payload.contributionCount, null) !== payload.contributions.length
+      || count(payload.historyPolicy?.maximumItems, null) !== 101
+      || count(payload.historyPolicy?.quarantineRetentionMilliseconds, null)
+        !== 7 * 24 * 60 * 60 * 1000
+      || payload.historyPolicy?.canonicalMetadataRetainedAfterQuarantine !== true
+      || payload.historyPolicy?.clientSoftwareVersion !== "unavailable_in_transport") {
+    return unavailable("invalid_contract");
+  }
+
+  const items = [];
+  const contributionIds = new Set();
+  for (const candidate of payload.contributions) {
+    const contributionId = text(candidate?.contributionId, "");
+    const status = text(candidate?.status, "");
+    const schemaVersion = text(candidate?.schemaVersion, "");
+    const transportSchemaVersion = text(candidate?.transportSchemaVersion, "");
+    const createdAt = text(candidate?.createdAt, "");
+    const startAt = text(candidate?.coveredAt?.startAt, "");
+    const endAt = text(candidate?.coveredAt?.endAt, "");
+    const clientPlatform = text(candidate?.clientPlatform, "");
+    const providerPolicyEpoch = text(candidate?.providerPolicyEpoch, "");
+    const quarantineState = text(candidate?.quarantine?.state, "");
+    const scheduledDeletionAt = text(candidate?.quarantine?.scheduledDeletionAt, "");
+    const deletedAt = candidate?.quarantine?.deletedAt === null
+      ? null
+      : text(candidate?.quarantine?.deletedAt, "");
+    const createdEpoch = Date.parse(createdAt);
+    const startEpoch = Date.parse(startAt);
+    const endEpoch = Date.parse(endAt);
+    const scheduledEpoch = Date.parse(scheduledDeletionAt);
+    const deletedEpoch = deletedAt === null ? null : Date.parse(deletedAt);
+    if (!CONTRIBUTION_ID_PATTERN.test(contributionId)
+        || contributionIds.has(contributionId)
+        || !["accepted", "accepted_synthetic", "deleting"].includes(status)
+        || typeof candidate?.synthetic !== "boolean"
+        || !CONTRIBUTION_SCHEMA_VERSIONS.has(schemaVersion)
+        || !CONTRIBUTION_SCHEMA_VERSIONS.has(transportSchemaVersion)
+        || (candidate.synthetic
+          && (schemaVersion !== "synthetic-contribution-v0.1"
+            || transportSchemaVersion !== "synthetic-contribution-v0.1"
+            || !["accepted_synthetic", "deleting"].includes(status)))
+        || (!candidate.synthetic
+          && (schemaVersion === "synthetic-contribution-v0.1"
+            || transportSchemaVersion === "synthetic-contribution-v0.1"
+            || !["accepted", "deleting"].includes(status)))
+        || !["macos", "linux", "windows", "other", "unknown"].includes(clientPlatform)
+        || !CONTRIBUTION_POLICY_EPOCHS.has(providerPolicyEpoch)
+        || !Number.isFinite(createdEpoch)
+        || !Number.isFinite(startEpoch)
+        || !Number.isFinite(endEpoch)
+        || endEpoch < startEpoch
+        || !Number.isFinite(scheduledEpoch)
+        || scheduledEpoch !== createdEpoch + (7 * 24 * 60 * 60 * 1000)
+        || !["retained", "deleted"].includes(quarantineState)
+        || (quarantineState === "retained" && deletedAt !== null)
+        || (quarantineState === "deleted"
+          && (deletedAt === null
+            || !Number.isFinite(deletedEpoch)
+            || deletedEpoch < createdEpoch))
+        || candidate?.quarantine?.canonicalMetadataRetained !== true) {
+      return unavailable("invalid_contract");
+    }
+    contributionIds.add(contributionId);
+
+    let recordCounts = null;
+    if (candidate.recordCounts !== null) {
+      const declared = count(candidate?.recordCounts?.declared, null);
+      const accepted = count(candidate?.recordCounts?.accepted, null);
+      const deduplicated = count(candidate?.recordCounts?.deduplicated, null);
+      if (declared === null || accepted === null || deduplicated === null
+          || accepted + deduplicated !== declared) {
+        return unavailable("invalid_contract");
+      }
+      recordCounts = { declared, accepted, deduplicated };
+    }
+
+    const priceVerification = text(candidate?.serverAccounting?.verification, "");
+    const serverPrice = priceVerification === "server_repriced"
+      ? nonNegative(candidate?.serverAccounting?.apiPriceEquivalentUsd, null)
+      : null;
+    if (!["server_repriced", "server_repricing_unavailable"].includes(priceVerification)
+        || (priceVerification === "server_repriced" && serverPrice === null)
+        || (priceVerification === "server_repricing_unavailable"
+          && candidate?.serverAccounting?.apiPriceEquivalentUsd !== null)) {
+      return unavailable("invalid_contract");
+    }
+
+    items.push({
+      contributionId,
+      status,
+      synthetic: candidate?.synthetic === true,
+      schemaVersion,
+      transportSchemaVersion,
+      createdAt,
+      coveredAt: { startAt, endAt },
+      clientPlatform,
+      providerPolicyEpoch,
+      recordCounts,
+      serverAccounting: {
+        apiPriceEquivalentUsd: serverPrice,
+        verification: priceVerification
+      },
+      quarantine: {
+        state: quarantineState,
+        scheduledDeletionAt,
+        deletedAt,
+        canonicalMetadataRetained: true
+      }
+    });
+  }
+  items.sort((left, right) => (
+    right.createdAt.localeCompare(left.createdAt)
+      || right.contributionId.localeCompare(left.contributionId)
+  ));
+  return {
+    state: "ready",
+    reason: "",
+    consentVersion: payload.consentVersion,
+    participantCreatedAt: payload.createdAt,
+    contributionCount: items.length,
+    clientSoftwareVersion: "unavailable_in_transport",
+    items
   };
 }
 
@@ -954,6 +1119,10 @@ export class CommunityClient {
   }
 
   deleteContribution(contributionId) {
+    if (typeof contributionId !== "string"
+        || !CONTRIBUTION_ID_PATTERN.test(contributionId)) {
+      throw new Error("Choose a valid contribution.");
+    }
     return fetchJson(
       this.fetchImpl,
       `${CENTRAL_ROOT}/me/contributions/delete`,
@@ -980,6 +1149,14 @@ export class CommunityClient {
         this.sessionOptions()
       );
     }
+  }
+
+  participantProfile() {
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/me`,
+      this.sessionOptions()
+    );
   }
 
   async communityStats() {

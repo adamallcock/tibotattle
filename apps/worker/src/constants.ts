@@ -15,6 +15,7 @@ export const DEVICE_PAIRING_TTL_MILLISECONDS = 10 * 60 * 1000;
 export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;
 export const RECOVERY_RETRY_LIMIT = 2;
+export const QUARANTINE_RETENTION_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
 export const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
 
 export const ENVELOPE_SCHEMA_VERSION = "synthetic-envelope-v0.1";

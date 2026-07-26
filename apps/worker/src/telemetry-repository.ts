@@ -5,6 +5,7 @@ import {
   type ServerPricingResult,
 } from "./server-pricing";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
+import { contributionQuarantineLifecycle } from "./contribution-lifecycle";
 import type {
   TelemetryActivityMarker,
   TelemetryContribution,
@@ -40,6 +41,7 @@ export interface TelemetryContributionRow {
   declared_record_count: number;
   accepted_record_count?: number;
   created_at: string;
+  quarantine_deleted_at?: string | null;
   server_cost_nanousd?: number;
   server_priced_event_count?: number;
   server_partially_priced_event_count?: number;
@@ -598,6 +600,46 @@ export function telemetryContributionMetadata(row: TelemetryContributionRow): ob
       accepted: row.accepted_record_count ?? 0,
       deduplicated: row.declared_record_count - (row.accepted_record_count ?? 0),
     },
+    quarantine: contributionQuarantineLifecycle(
+      row.created_at,
+      row.quarantine_deleted_at,
+    ),
+    createdAt: row.created_at,
+  };
+}
+
+export function telemetryContributionHistoryMetadata(
+  row: TelemetryContributionRow,
+): object {
+  const serverVerified = Boolean(
+    row.server_pricing_method_version
+      && row.server_price_registry_version
+      && row.server_price_registry_sha256,
+  );
+  return {
+    contributionId: row.id,
+    status: row.status,
+    synthetic: false,
+    schemaVersion: row.schema_version,
+    transportSchemaVersion: row.transport_schema_version ?? row.schema_version,
+    coveredAt: { startAt: row.range_start, endAt: row.range_end },
+    clientPlatform: row.client_platform,
+    providerPolicyEpoch: row.provider_policy_epoch,
+    serverAccounting: {
+      apiPriceEquivalentUsd: serverVerified
+        ? formatNanousd(row.server_cost_nanousd ?? 0)
+        : null,
+      verification: serverVerified ? "server_repriced" : "server_repricing_unavailable",
+    },
+    recordCounts: {
+      declared: row.declared_record_count,
+      accepted: row.accepted_record_count ?? 0,
+      deduplicated: row.declared_record_count - (row.accepted_record_count ?? 0),
+    },
+    quarantine: contributionQuarantineLifecycle(
+      row.created_at,
+      row.quarantine_deleted_at,
+    ),
     createdAt: row.created_at,
   };
 }

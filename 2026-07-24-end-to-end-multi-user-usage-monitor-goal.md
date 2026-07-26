@@ -1125,6 +1125,38 @@ rendered proof. This advances the G8 private-results product, but external
 participant enrollment, cloud deployment, G9 public release approval,
 cross-browser HTTPS session QA, disclosure review, and load/soak remain open.
 
+## Progress update: private contribution history (July 26, 2026)
+
+The G8 participant portal now exposes the backend work that produced a
+participant's private results:
+
+- `GET /api/v1/me` is versioned as `participant-profile-v0.2` and returns at
+  most 101 participant-scoped contribution summaries;
+- the summaries include the covered period, accepted/deduplicated counts,
+  schema/platform provenance, server-repricing state, and the separate
+  seven-day encrypted-quarantine lifecycle;
+- browser normalization rejects malformed, oversized, duplicate-ID, invalid
+  timestamp, invalid count, and invalid lifecycle responses while projecting
+  unknown fields away;
+- R2 keys, envelope/plaintext digests, dataset/account pseudonyms, eligibility,
+  authorities, paths, and source content are omitted;
+- the portal supports confirmed, CSRF-scoped exact contribution deletion and
+  refreshes private and current project-controlled aggregate results;
+- Worker tests prove owner access, cross-tenant read/delete isolation,
+  deduplication counts, and retained-to-deleted quarantine transitions;
+- the encrypted invite-only HTTP smoke passed with twenty participants and
+  verified that history appears after ingest and disappears after deletion;
+  and
+- a browser-driven live portal pass used real client-side encryption and
+  backend ingest, then found and fixed a stale-history UI bug after complete
+  participant deletion.
+
+The [participant contribution history verification
+receipt](./2026-07-26-participant-contribution-history-verification-receipt.md)
+records the evidence. This advances G8 private results and G9 deletion
+visibility, but does not approve cloud deployment, external enrollment, public
+release, cross-browser HTTPS sessions, or the 1,000-user load gate.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |
