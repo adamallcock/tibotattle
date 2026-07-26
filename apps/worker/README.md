@@ -41,6 +41,68 @@ That command verifies generated Worker types, runs TypeScript and the
 Cloudflare-runtime integration tests, and performs a deployment dry run. It
 does not deploy anything.
 
+## Inspectable local backend laboratory
+
+The regular HTTP smoke proves the complete lifecycle and deletes its cohort at
+the end. The inspectable laboratory instead creates fresh disposable state,
+seeds twenty privacy-safe participants through the real encrypted HTTP path,
+publishes the thresholded weekly snapshot, directly inspects bounded D1
+counts, restarts the Worker against the same state, and leaves the portal
+running:
+
+```sh
+# Run once if apps/worker/.dev.vars does not exist.
+npm run keys:local
+
+# From the repository root.
+npm run product:backend:lab
+```
+
+The command prints:
+
+- the loopback portal URL;
+- the exact disposable state directory;
+- an owner-only `participant-access.json` path;
+- a content-free `lab-receipt.json` path; and
+- bounded participant, contribution, canonical-record, and published-snapshot
+  counts.
+
+The recovery capability is never printed. To inspect the seeded participant,
+read that owner-only file locally and enter its `recoveryCode` in the portal's
+“Recover an existing anonymous participant” control. The same page can then
+read authenticated individual statistics, contribution history, community
+comparison, and participant export. The public community panel reads the
+released clipped and rounded aggregate without authentication.
+
+The Codex in-app browser completed this loopback recovery and private-results
+journey on July 26, 2026. A real staged HTTPS deployment must repeat it across
+target browsers; localhost behavior is not a substitute for that release gate.
+
+Press `Ctrl-C` to stop the Worker. Shutdown deliberately retains the exact
+state directory; after inspection, move only the printed laboratory directory
+to Trash. It contains disposable credentials and encrypted development
+objects.
+
+Inspect an already stopped laboratory without reading identifiers, secrets, or
+record contents:
+
+```sh
+npm run product:backend:inspect -- \
+  --persist-to /exact/lab/directory/state
+```
+
+The stopped-state inspector reports canonical D1 counts and accepted quarantine
+references. During startup, the laboratory also counts the live local R2
+objects through Wrangler's fixed explorer route, discards all object keys, and
+fails unless that count matches the accepted contributions. R2 deletion is
+separately exercised through the Worker integration and destructive HTTP smoke
+tests.
+
+The laboratory additionally encrypts a fixed payload containing a forbidden
+`prompt` canary, proves the server returns `PRIVACY_CANARY_DETECTED`, and then
+proves the rejected upload did not alter the primary participant's accepted
+history. No raw provider log file is accepted by this route.
+
 ## Disabled staging gate
 
 The checked-in `staging` environment is intentionally safe but incomplete:

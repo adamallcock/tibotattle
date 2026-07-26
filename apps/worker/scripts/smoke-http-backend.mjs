@@ -59,6 +59,45 @@ function sha256Hex(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function base64Url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+async function createServerValidationProbe({ payload, publicJwk, keyId }) {
+  const wrappingKey = await crypto.subtle.importKey(
+    "jwk",
+    publicJwk,
+    { name: "RSA-OAEP", hash: "SHA-256" },
+    false,
+    ["encrypt"],
+  );
+  const payloadKey = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt"],
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    payloadKey,
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  const rawPayloadKey = await crypto.subtle.exportKey("raw", payloadKey);
+  const wrappedKey = await crypto.subtle.encrypt(
+    { name: "RSA-OAEP" },
+    wrappingKey,
+    rawPayloadKey,
+  );
+  return {
+    schemaVersion: "telemetry-envelope-v0.1",
+    synthetic: false,
+    keyId,
+    wrappedKey: base64Url(wrappedKey),
+    iv: base64Url(iv),
+    ciphertext: base64Url(ciphertext),
+  };
+}
+
 function cookiePair(setCookie) {
   if (typeof setCookie !== "string") return null;
   return setCookie.split(";", 1)[0] ?? null;
@@ -95,6 +134,16 @@ class ParticipantSession {
 const origin = boundedOrigin(optionValue("--origin", "http://127.0.0.1:8792"));
 const contributionPathValue = optionValue("--file");
 const generatedFixture = process.argv.includes("--generated-content-free-fixture");
+const retainInspectionState = process.argv.includes("--retain-inspection-state");
+const participantAccessFileValue = optionValue("--participant-access-file");
+if (retainInspectionState !== Boolean(participantAccessFileValue)) {
+  throw new Error(
+    "--retain-inspection-state and --participant-access-file must be used together.",
+  );
+}
+const participantAccessFile = participantAccessFileValue
+  ? resolve(participantAccessFileValue)
+  : null;
 if (Boolean(contributionPathValue) === generatedFixture) {
   throw new Error(
     "Choose exactly one of --file or --generated-content-free-fixture.",
@@ -103,8 +152,32 @@ if (Boolean(contributionPathValue) === generatedFixture) {
 const contributionPath = contributionPathValue ? resolve(contributionPathValue) : null;
 const invitePaths = optionValues("--invite-file").map((value) => resolve(value));
 const sessions = [];
+let preserveParticipants = false;
 const COMMUNITY_SNAPSHOT_PARTICIPANTS = 20;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
+
+async function writeParticipantAccessFile(path, recoveryCode) {
+  if (typeof recoveryCode !== "string" || !recoveryCode.startsWith("um_recovery_")) {
+    throw new Error("The retained participant did not have a valid recovery capability.");
+  }
+  const flags = process.platform === "win32"
+    ? constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+    : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+  let handle;
+  try {
+    handle = await open(path, flags, 0o600);
+    await handle.writeFile(`${JSON.stringify({
+      schemaVersion: "local-backend-lab-access-v0.1",
+      origin: origin.origin,
+      recoveryCode,
+      createdAt: new Date().toISOString(),
+      warning: "Owner-only disposable local-development capability. Do not share.",
+    }, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle?.close();
+  }
+}
 
 async function request(path, {
   method = "GET",
@@ -553,6 +626,25 @@ try {
     throw new Error("A fresh upload authority did not produce an idempotent replay.");
   }
 
+  const contaminatedEnvelope = await createServerValidationProbe({
+    payload: {
+      ...contribution,
+      prompt: "FIXED_PRIVACY_CANARY",
+    },
+    publicJwk: envelopeKey.publicJwk,
+    keyId: envelopeKey.keyId,
+  });
+  const contaminatedSerialized = JSON.stringify(contaminatedEnvelope);
+  const contaminatedResult = (await upload(primary, contaminatedSerialized)).result;
+  const contaminatedResponse = expectStatus(
+    contaminatedResult,
+    400,
+    "Privacy-canary contribution",
+  );
+  if (contaminatedResponse?.error?.code !== "PRIVACY_CANARY_DETECTED") {
+    throw new Error("The privacy-canary upload did not fail at the expected boundary.");
+  }
+
   const uploadOnlyPersonal = await request("/api/v1/me/stats", {
     authorization: `Upload ${await registerUpload(primary, serializedEnvelope)}`,
   });
@@ -761,6 +853,35 @@ try {
     throw new Error("The participant export was incomplete or exposed private authority.");
   }
 
+  if (retainInspectionState) {
+    await writeParticipantAccessFile(participantAccessFile, primary.recoveryCode);
+    preserveParticipants = true;
+    process.stdout.write(`${JSON.stringify({
+      status: "passed_inspectable",
+      origin: origin.origin,
+      enrollmentMode: health.enrollmentMode,
+      participants: COMMUNITY_SNAPSHOT_PARTICIPANTS,
+      acceptedRecordsPerParticipant: expectedTotal,
+      idempotentReplay: true,
+      privacyCanaryRejected: true,
+      serverValidation: true,
+      personalStatisticsRecomputed: true,
+      authenticatedContributionHistory: true,
+      aggregateUnavailableBeforeSchedule: true,
+      aggregatePublishedAtTwenty: true,
+      aggregateStoredBytesStableAcrossAliases: true,
+      authenticatedWeeklyComparison: true,
+      comparisonAvoidsAverageAndPercentile: true,
+      participantExportVerified: true,
+      generatedContentFreeFixture: generatedFixture,
+      authorityIsolation: true,
+      devicePairingAndUpload: true,
+      deviceRevocation: true,
+      participantAccessFile,
+      participantAccessFileContainsSecret: true,
+      participantsRetainedForInspection: COMMUNITY_SNAPSHOT_PARTICIPANTS,
+    }, null, 2)}\n`);
+  } else {
   const oldCookie = primary.cookie;
   const oldRecoveryCode = await recover(primary);
   const replacementCookie = primary.cookie;
@@ -960,6 +1081,7 @@ try {
     participants: COMMUNITY_SNAPSHOT_PARTICIPANTS,
     acceptedRecordsPerParticipant: expectedTotal,
     idempotentReplay: true,
+    privacyCanaryRejected: true,
     personalStatisticsRecomputed: true,
     authenticatedContributionHistory: true,
     historyUpdatedAfterContributionDeletion: true,
@@ -982,9 +1104,13 @@ try {
     logoutClearedCookie: true,
     participantsDeleted: COMMUNITY_SNAPSHOT_PARTICIPANTS,
   }, null, 2)}\n`);
+  }
 } finally {
-  for (const session of sessions) await cleanupParticipant(session);
-  if (sessions.some((session) => session.created && !session.deleted)) {
+  if (!preserveParticipants) {
+    for (const session of sessions) await cleanupParticipant(session);
+  }
+  if (!preserveParticipants
+      && sessions.some((session) => session.created && !session.deleted)) {
     process.stderr.write("Backend smoke cleanup was incomplete; inspect the isolated local D1/R2 state before reuse.\n");
   }
 }

@@ -223,15 +223,36 @@ exports, security controls, deletion, authorization headers, cookies, CSRF
 values, or upstream cookies.
 
 Open `http://127.0.0.1:8792/` to inspect the Worker-served portal and exercise
-its public central API. The rendered controls make the intended same-origin
-personal journey visible, but a browser cannot complete that Secure-cookie
-journey over this loopback HTTP preview. Use the documented cookie-jar HTTP
-smoke for the complete local backend lifecycle; a staged same-origin HTTPS
-preview must repeat the real browser interaction before any participant pilot.
-The production portal owns enrollment, recovery, one-use upload authorization,
-personal results, export, and deletion. This separation prevents tunneling a
-Secure cookie through plain HTTP loopback. The central service remains
-local-development-only and is not deployed.
+its public central API. The Codex in-app browser completed the same-origin
+loopback recovery and private-result journey on July 26, 2026, including its
+`Secure`, `HttpOnly`, `SameSite=Strict`, `__Host-` session cookie. This is a
+local browser-development exception, not production evidence. A staged
+same-origin HTTPS preview must repeat enrollment, recovery, upload, personal
+results, export, and deletion across target browsers before any participant
+pilot. The loopback companion still does not relay authenticated routes or
+tunnel cookies. The central service remains local-development-only and is not
+deployed.
+
+For an inspectable central backend with real local D1/R2 emulation and seeded
+individual plus community results, use:
+
+```bash
+npm run product:backend:lab
+```
+
+This is different from the fixed local-analysis dashboard on port 8791. The
+laboratory starts the production-shaped Worker portal on port 8792, uploads a
+generated content-free contribution for twenty isolated participants through
+the encrypted API, rejects a fixed privacy canary, writes a content-free
+verification receipt, restarts against the same durable state, and leaves the
+portal running. Its printed owner-only participant-access file contains the
+recovery capability needed to open the seeded participant's private results.
+The value is not printed by the command.
+
+The corresponding plan is
+[2026-07-26-inspectable-backend-laboratory-plan.md](./2026-07-26-inspectable-backend-laboratory-plan.md).
+The backend remains loopback-only and disposable; this command neither
+provisions Cloudflare resources nor authorizes outside participants.
 
 ### Preparing a contribution
 
