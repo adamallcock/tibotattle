@@ -439,6 +439,9 @@ test("community adapter separates cookie sessions from one-use upload authority"
   await client.communityStats();
   await client.participantExport();
   await client.deleteParticipant();
+  await client.createDevicePairing();
+  await client.devices();
+  await client.revokeDevice("00000000-0000-4000-8000-000000000001");
   await client.logout();
   await client.securityReset();
   assert.equal(calls[0].url, "/api/v1/session");
@@ -456,15 +459,22 @@ test("community adapter separates cookie sessions from one-use upload authority"
   assert.equal(calls[6].url, "/api/v1/me");
   assert.equal(calls[6].options.method, "DELETE");
   assert.equal(calls[6].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.equal(calls[7].url, "/api/v1/logout");
-  assert.equal(calls[8].url, "/api/v1/me/security-reset");
+  assert.equal(calls[7].url, "/api/v1/me/device-pairings");
+  assert.equal(calls[7].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.match(calls[7].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
+  assert.equal(calls[8].url, "/api/v1/me/devices");
+  assert.equal(calls[9].url, "/api/v1/me/devices/00000000-0000-4000-8000-000000000001");
+  assert.equal(calls[9].options.method, "DELETE");
+  assert.equal(calls[9].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[10].url, "/api/v1/logout");
+  assert.equal(calls[11].url, "/api/v1/me/security-reset");
   await client.health();
   await client.enroll("um_invite_test");
   await client.recover("um_recovery_test");
-  assert.equal(calls[9].url, "/api/health");
-  assert.match(calls[10].options.body, /privacy-safe-telemetry-v0\.1/);
-  assert.match(calls[10].options.body, /um_invite_test/);
-  assert.match(calls[11].options.body, /um_recovery_test/);
+  assert.equal(calls[12].url, "/api/health");
+  assert.match(calls[13].options.body, /privacy-safe-telemetry-v0\.1/);
+  assert.match(calls[13].options.body, /um_invite_test/);
+  assert.match(calls[14].options.body, /um_recovery_test/);
 });
 
 test("community snapshots fail closed and never disclose threshold distance", () => {
@@ -603,6 +613,8 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="download-participant"/);
   assert.match(html, /id="recover-form"/);
   assert.match(html, /id="security-reset"/);
+  assert.match(html, /id="create-device-pairing"/);
+  assert.match(html, /id="device-list"/);
   assert.match(html, /id="logout-participant"/);
   assert.match(html, /id="delete-participant"/);
   assert.match(html, /privacy-safe Usage Monitor export/);
@@ -618,6 +630,8 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /communityClient\.contributeSerialized\(/);
   assert.match(appSource, /communityClient\.participantExport\(\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);
+  assert.match(appSource, /communityClient\.createDevicePairing\(\)/);
+  assert.match(appSource, /communityClient\.devices\(\)/);
   assert.match(appSource, /inviteInput\.value = ""/);
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
   assert.match(appSource, /showRecoveryCodeOnce\(enrollment\.recoveryCode\)/);

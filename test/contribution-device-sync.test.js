@@ -1,0 +1,102 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { syncPreparedContributionSetOnce } from "../src/contribution-device-sync.js";
+
+const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
+const AUTH_ID = "22222222-2222-4222-8222-222222222222";
+const CONTRIBUTION_ID = "33333333-3333-4333-8333-333333333333";
+
+function response(value, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+test("foreground sync verifies a committed set and uses device authority only to register uploads", async () => {
+  const calls = [];
+  const manifest = {
+    eligibleSchemaVersion: "telemetry-contribution-v0.1",
+    files: [{
+      basename: "telemetry-contribution-000001.json",
+      sha256: "a".repeat(64),
+      bytes: 123,
+      recordCounts: { usageEvents: 1, quotaSnapshots: 0, activityMarkers: 0 },
+    }],
+  };
+  const result = await syncPreparedContributionSetOnce({
+    directory: "/private/prepared",
+    origin: "https://usage.example/",
+    backend: {},
+    verifySet: async () => manifest,
+    loadContribution: async () => ({
+      schemaVersion: "telemetry-contribution-v0.1",
+      synthetic: false,
+    }),
+    createEnvelope: async () => ({
+      schemaVersion: "telemetry-envelope-v0.1",
+      ciphertext: "safe",
+    }),
+    withDeviceSecret: async ({ expectedOrigin, operation }) => {
+      assert.equal(expectedOrigin, "https://usage.example");
+      return operation(Buffer.alloc(32, 7), {
+        origin: expectedOrigin,
+        deviceId: DEVICE_ID,
+      });
+    },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      if (String(url).endsWith("/envelope-key")) {
+        return response({
+          algorithm: "RSA-OAEP-256",
+          keyId: "key:test",
+          publicJwk: { kty: "RSA" },
+        });
+      }
+      if (String(url).endsWith("/device/upload-authorizations")) {
+        return response({
+          uploadAuthorization: `um_device_upload_${AUTH_ID}.${"B".repeat(43)}`,
+          expiresAt: "2026-07-26T13:00:00.000Z",
+        }, 201);
+      }
+      return response({
+        contributionId: `contribution:${CONTRIBUTION_ID}`,
+        status: "accepted",
+      }, 202);
+    },
+  });
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.preparedSetBatches, 1);
+  assert.equal(result.accepted[0].contributionId, `contribution:${CONTRIBUTION_ID}`);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].options.credentials, "omit");
+  assert.match(calls[1].options.headers.Authorization, /^Device um_device_/u);
+  assert.equal(calls[1].options.body.includes("telemetry-contribution"), false);
+  assert.match(calls[2].options.headers.Authorization, /^Upload um_device_upload_/u);
+  assert.equal(calls.some(({ options }) => "Cookie" in (options.headers ?? {})), false);
+});
+
+test("disabled or uncommitted prepared sets cause zero network activity", async () => {
+  let networkCalls = 0;
+  await assert.rejects(
+    syncPreparedContributionSetOnce({
+      directory: "/private/prepared",
+      origin: "https://usage.example",
+      backend: {},
+      verifySet: async () => {
+        const error = new Error("not committed");
+        error.code = "prepared_contribution_set_manifest_missing";
+        throw error;
+      },
+      fetchImpl: async () => {
+        networkCalls += 1;
+      },
+    }),
+    (error) => error.code === "prepared_contribution_set_manifest_missing",
+  );
+  assert.equal(networkCalls, 0);
+});

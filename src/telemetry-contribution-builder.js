@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import {
   loadVerifiedLocalMetadataBundleFiles,
@@ -9,6 +9,16 @@ import {
 } from "./local-api-pricing.js";
 import { addUsdStrings } from "./cost-ledger.js";
 import { stableJson } from "./storage.js";
+import {
+  MAX_PREPARED_CONTRIBUTION_BATCHES,
+  PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA,
+  PREPARED_CONTRIBUTION_SET_MANIFEST,
+  PREPARED_CONTRIBUTION_SET_VERSION,
+  publishPreparedContributionFile,
+  publishPreparedContributionManifest,
+  verifyPreparedContributionFiles,
+  verifyPreparedContributionSet,
+} from "./telemetry-prepared-set.js";
 
 export const TELEMETRY_CONTRIBUTION_VERSION = "telemetry-contribution-v0.1";
 export const TELEMETRY_CONTRIBUTION_BUILDER_VERSION =
@@ -309,37 +319,79 @@ export async function materializeTelemetryContributions({
   bundleFile,
   receiptFile,
   outputDirectory,
+  failpoint = async () => {},
 } = {}) {
   if (!outputDirectory) throw fixedError("output_required");
+  if (typeof failpoint !== "function") throw fixedError("failpoint_invalid");
   const verified = await loadVerifiedLocalMetadataBundleFiles({
     bundleFile,
     receiptFile,
   });
   const contributions = buildTelemetryContributionsFromBundle(verified.bundle);
+  if (contributions.length > MAX_PREPARED_CONTRIBUTION_BATCHES) {
+    throw fixedError("batch_count_invalid");
+  }
   const directory = resolve(outputDirectory);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const files = [];
   for (const [index, contribution] of contributions.entries()) {
+    const content = stableJson(contribution);
     const file = join(
       directory,
       `telemetry-contribution-${String(index + 1).padStart(6, "0")}.json`,
     );
-    await writeFile(file, stableJson(contribution), {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
+    const published = await publishPreparedContributionFile({
+      directory,
+      name: basename(file),
+      content,
     });
+    const counts = {
+      usageEvents: contribution.usageEvents.length,
+      quotaSnapshots: contribution.quotaSnapshots.length,
+      activityMarkers: contribution.activityMarkers.length,
+    };
     files.push({
       file,
-      basename: basename(file),
-      bytes: Buffer.byteLength(stableJson(contribution), "utf8"),
-      counts: {
-        usageEvents: contribution.usageEvents.length,
-        quotaSnapshots: contribution.quotaSnapshots.length,
-        activityMarkers: contribution.activityMarkers.length,
-      },
+      basename: published.basename,
+      sha256: published.sha256,
+      bytes: published.bytes,
+      counts,
+    });
+    await failpoint("after_contribution_file", {
+      index: index + 1,
+      batchCount: contributions.length,
     });
   }
+  const manifestFiles = await verifyPreparedContributionFiles({
+    directory,
+    files: files.map((file) => ({
+      basename: file.basename,
+      sha256: file.sha256,
+      bytes: file.bytes,
+      recordCounts: file.counts,
+    })),
+  });
+  const manifest = {
+    schemaVersion: PREPARED_CONTRIBUTION_SET_VERSION,
+    builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    eligibleSchemaVersion: PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA,
+    batchCount: manifestFiles.length,
+    files: manifestFiles,
+  };
+  await failpoint("before_manifest", { batchCount: contributions.length });
+  const publishedManifest = await publishPreparedContributionManifest({
+    directory,
+    manifest,
+    builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    failpoint: (name) => failpoint(name, {
+      batchCount: contributions.length,
+    }),
+  });
+  await failpoint("after_manifest", { batchCount: contributions.length });
+  await verifyPreparedContributionSet({
+    directory,
+    builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+  });
   return {
     schemaVersion: "telemetry-contribution-build-receipt-v0.1",
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
@@ -348,5 +400,12 @@ export async function materializeTelemetryContributions({
     outputDirectory: directory,
     batchCount: contributions.length,
     files,
+    preparedSet: {
+      schemaVersion: PREPARED_CONTRIBUTION_SET_VERSION,
+      eligibleSchemaVersion: PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA,
+      manifestBasename: PREPARED_CONTRIBUTION_SET_MANIFEST,
+      manifestSha256: publishedManifest.sha256,
+      manifestBytes: publishedManifest.bytes,
+    },
   };
 }

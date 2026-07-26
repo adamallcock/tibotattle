@@ -143,7 +143,10 @@ export async function insertTelemetryContributionV02Shadow(
   const result = await insertTelemetryContribution(
     db,
     input.participantId,
-    input.uploadAuthorizationId,
+    {
+      authorizationId: input.uploadAuthorizationId,
+      authorizationKind: "session",
+    },
     input.contributionId,
     input.r2Key,
     input.envelopeDigest,

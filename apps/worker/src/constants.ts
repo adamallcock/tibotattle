@@ -11,6 +11,8 @@ export const COMMUNITY_WEEKLY_MAX_CELLS = 100;
 export const SESSION_TTL_MILLISECONDS = 30 * 60 * 1000;
 export const UPLOAD_AUTHORIZATION_TTL_MILLISECONDS = 5 * 60 * 1000;
 export const UPLOAD_CONSUME_LEASE_MILLISECONDS = 60 * 1000;
+export const DEVICE_PAIRING_TTL_MILLISECONDS = 10 * 60 * 1000;
+export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;
 export const RECOVERY_RETRY_LIMIT = 2;
 export const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
@@ -21,6 +23,8 @@ export const FIXTURE_ID = "codex-weekly-demo-v0.1";
 export const TELEMETRY_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
 export const TELEMETRY_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v0.1";
 export const TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.1";
+export const ONGOING_TELEMETRY_CONSENT_VERSION =
+  "ongoing-privacy-safe-telemetry-v0.1";
 export const ENROLLMENT_MODES = ["local_open", "invite_only", "disabled"] as const;
 
 export const JSON_HEADERS = {

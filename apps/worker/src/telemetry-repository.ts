@@ -320,7 +320,10 @@ function occurrenceLink(
 export async function insertTelemetryContribution(
   db: D1Database,
   participantId: string,
-  uploadAuthorizationId: string,
+  uploadAuthorization: {
+    authorizationId: string;
+    authorizationKind: "session" | "device";
+  },
   contributionId: string,
   r2Key: string,
   envelopeDigest: string,
@@ -376,11 +379,12 @@ export async function insertTelemetryContribution(
         schema_version, range_start, range_end, client_platform, provider_policy_epoch,
         estimated_api_cost_usd, priced_event_coverage_percent, unknown_model_event_count,
         unknown_billable_units, price_basis, declared_record_count, created_at,
-        upload_authorization_id, transport_schema_version, dataset_id,
+        upload_authorization_id, device_upload_authorization_id,
+        transport_schema_version, dataset_id,
         dataset_part_index, dataset_part_count, dataset_completeness,
         dataset_range_start, dataset_range_end
       ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?)`,
+        ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       contributionId,
       participantId,
@@ -399,7 +403,12 @@ export async function insertTelemetryContribution(
       record.accounting.priceBasis,
       record.usageEvents.length + record.quotaSnapshots.length + record.activityMarkers.length,
       createdAt,
-      uploadAuthorizationId,
+      uploadAuthorization.authorizationKind === "session"
+        ? uploadAuthorization.authorizationId
+        : null,
+      uploadAuthorization.authorizationKind === "device"
+        ? uploadAuthorization.authorizationId
+        : null,
       transport?.transportSchemaVersion ?? "telemetry-contribution-v0.1",
       transport?.datasetId ?? null,
       transport?.partIndex ?? null,

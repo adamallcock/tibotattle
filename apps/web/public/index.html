@@ -517,6 +517,43 @@
               <p>No accepted contribution is associated with this browser yet.</p>
             </div>
             <div class="participant-controls" id="participant-controls" hidden>
+              <section class="device-controls" aria-labelledby="device-controls-title">
+                <div class="device-controls-heading">
+                  <div>
+                    <h4 id="device-controls-title">Ongoing contribution devices</h4>
+                    <p>
+                      Pair a foreground local client without sharing your browser
+                      session, recovery code, or access to private results.
+                    </p>
+                  </div>
+                  <span class="evidence-chip neutral" id="device-count">No devices</span>
+                </div>
+                <label class="consent-row device-consent">
+                  <input id="device-consent" type="checkbox">
+                  <span>
+                    <strong>Allow this pairing to register privacy-safe v0.1 uploads.</strong>
+                    <small>The device cannot read, export, recover, reset, or delete participant data.</small>
+                  </span>
+                </label>
+                <button class="button button-secondary" id="create-device-pairing" type="button" disabled>
+                  Create one-time pairing code
+                </button>
+                <div class="recovery-once" id="device-pairing-once" hidden>
+                  <strong>Use this code once in the local client</strong>
+                  <p>
+                    It expires shortly. The local client creates its own secret;
+                    the service stores only a hash and never returns that secret.
+                  </p>
+                  <code id="device-pairing-code"></code>
+                  <button class="button button-secondary" id="acknowledge-device-pairing" type="button">
+                    Hide pairing code
+                  </button>
+                </div>
+                <p class="participant-action-status" id="device-action-status" role="status" hidden></p>
+                <div class="device-list" id="device-list">
+                  <p>No upload-only devices are paired.</p>
+                </div>
+              </section>
               <div class="result-actions">
                 <button class="button button-secondary" id="download-participant" type="button">
                   Download my safe export

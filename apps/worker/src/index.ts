@@ -9,6 +9,7 @@ import {
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
   MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
+  ONGOING_TELEMETRY_CONSENT_VERSION,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import {
@@ -20,6 +21,17 @@ import {
   publicEnvelopeKey,
   sha256Hex,
 } from "./crypto";
+import {
+  abandonDeviceUploadAuthorization,
+  authenticateDevice,
+  claimDevicePairing,
+  claimDeviceUploadAuthorization,
+  createDevicePairing,
+  createDeviceUploadAuthorization,
+  listParticipantDevices,
+  recordDeviceUploadReceipt,
+  revokeParticipantDevice,
+} from "./device-auth";
 import {
   ApiError,
   errorResponse,
@@ -306,6 +318,114 @@ async function handleUploadAuthorization(request: Request, env: Env): Promise<Re
   }, 201, { vary: "Cookie" });
 }
 
+async function handleDevicePairing(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  if (session.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 2
+      || Reflect.get(body.value, "consentVersion")
+        !== ONGOING_TELEMETRY_CONSENT_VERSION
+      || Reflect.get(body.value, "ongoingUpload") !== true) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return jsonResponse(
+    await createDevicePairing(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      session.sessionId,
+    ),
+    201,
+    { vary: "Cookie" },
+  );
+}
+
+async function handleDevicePairingClaim(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (request.headers.has("cookie")) throw new ApiError(401, "PAIRING_AUTH_INVALID");
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 2
+      || typeof Reflect.get(body.value, "deviceId") !== "string"
+      || typeof Reflect.get(body.value, "deviceSecretHash") !== "string") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return jsonResponse(await claimDevicePairing(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    Reflect.get(body.value, "deviceId") as string,
+    Reflect.get(body.value, "deviceSecretHash") as string,
+  ), 201);
+}
+
+async function handleDeviceUploadAuthorization(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (request.headers.has("cookie")) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  const device = await authenticateDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 3
+      || typeof Reflect.get(body.value, "envelopeDigest") !== "string"
+      || !/^[0-9a-f]{64}$/u.test(Reflect.get(body.value, "envelopeDigest") as string)
+      || !Number.isSafeInteger(Reflect.get(body.value, "contentLengthBytes"))
+      || (Reflect.get(body.value, "contentLengthBytes") as number) <= 0
+      || (Reflect.get(body.value, "contentLengthBytes") as number) > MAX_REQUEST_BYTES
+      || Reflect.get(body.value, "contentType") !== "application/json") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return jsonResponse(await createDeviceUploadAuthorization(
+    env.USAGE_MONITOR_DB,
+    device,
+    Reflect.get(body.value, "envelopeDigest") as string,
+    Reflect.get(body.value, "contentLengthBytes") as number,
+  ), 201);
+}
+
+async function handleDevices(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const session = await personalSession(request, env);
+  return jsonResponse({
+    devices: await listParticipantDevices(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+    ),
+  }, 200, { vary: "Cookie" });
+}
+
+async function handleDeviceResource(
+  request: Request,
+  env: Env,
+  deviceId: string,
+): Promise<Response> {
+  if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
+  const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  if (!await revokeParticipantDevice(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    deviceId,
+  )) {
+    throw new ApiError(404, "DEVICE_NOT_FOUND");
+  }
+  return jsonResponse({ revoked: true, deviceId }, 200, { vary: "Cookie" });
+}
+
 function handleEnvelopeKey(request: Request, env: Env): Response {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   return jsonResponse(publicEnvelopeKey(env.ENVELOPE_PUBLIC_JWK));
@@ -314,7 +434,10 @@ function handleEnvelopeKey(request: Request, env: Env): Response {
 async function handleSyntheticContribution(
   body: { raw: string; value: unknown },
   participant: { id: string; consentVersion: string },
-  uploadAuthorizationId: string,
+  uploadAuthorization: {
+    authorizationId: string;
+    authorizationKind: "session" | "device";
+  },
   env: Env,
 ): Promise<Response> {
   if (participant.consentVersion !== "synthetic-preview-v0.1") {
@@ -357,7 +480,7 @@ async function handleSyntheticContribution(
     await insertContribution(
       env.USAGE_MONITOR_DB,
       participant.id,
-      uploadAuthorizationId,
+      uploadAuthorization,
       contributionId,
       r2Key,
       digest,
@@ -390,7 +513,10 @@ async function handleSyntheticContribution(
 async function handleTelemetryContribution(
   body: { raw: string; value: unknown },
   participant: { id: string; consentVersion: string },
-  uploadAuthorizationId: string,
+  uploadAuthorization: {
+    authorizationId: string;
+    authorizationKind: "session" | "device";
+  },
   env: Env,
 ): Promise<Response> {
   if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
@@ -469,7 +595,7 @@ async function handleTelemetryContribution(
     const result = await insertTelemetryContribution(
       env.USAGE_MONITOR_DB,
       participant.id,
-      uploadAuthorizationId,
+      uploadAuthorization,
       contributionId,
       r2Key,
       envelopeDigestValue,
@@ -529,11 +655,18 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   const contentType = request.headers.get("content-type")?.trim() ?? "";
   const bodyBytes = body.bytes.byteLength;
   const scopeDigest = await sha256Hex(body.bytes);
-  const claimed = await claimUploadAuthorization(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-    { envelopeDigest: scopeDigest, bodyBytes, contentType },
-  );
+  const authorizationHeader = request.headers.get("authorization");
+  const claimed = authorizationHeader?.startsWith("Upload um_device_upload_")
+    ? await claimDeviceUploadAuthorization(
+      env.USAGE_MONITOR_DB,
+      authorizationHeader,
+      { envelopeDigest: scopeDigest, bodyBytes, contentType },
+    )
+    : await claimUploadAuthorization(
+      env.USAGE_MONITOR_DB,
+      authorizationHeader,
+      { envelopeDigest: scopeDigest, bodyBytes, contentType },
+    );
   let completed = false;
   try {
     if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
@@ -548,25 +681,40 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     ).bind(claimed.participantId).first<{ id: string; consentVersion: string }>();
     if (!participant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
-      ? await handleTelemetryContribution(body, participant, claimed.authorizationId, env)
-      : await handleSyntheticContribution(body, participant, claimed.authorizationId, env);
+      ? await handleTelemetryContribution(body, participant, claimed, env)
+      : await handleSyntheticContribution(body, participant, claimed, env);
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
       throw new ApiError(500, "INTERNAL_ERROR");
     }
-    await recordUploadReceipt(
-      env.USAGE_MONITOR_DB,
-      claimed.authorizationId,
-      receipt.contributionId,
-    );
+    if (claimed.authorizationKind === "device") {
+      await recordDeviceUploadReceipt(
+        env.USAGE_MONITOR_DB,
+        claimed.authorizationId,
+        receipt.contributionId,
+      );
+    } else {
+      await recordUploadReceipt(
+        env.USAGE_MONITOR_DB,
+        claimed.authorizationId,
+        receipt.contributionId,
+      );
+    }
     completed = true;
     return response;
   } finally {
     if (!completed) {
-      await abandonUploadAuthorization(
-        env.USAGE_MONITOR_DB,
-        claimed.authorizationId,
-      );
+      if (claimed.authorizationKind === "device") {
+        await abandonDeviceUploadAuthorization(
+          env.USAGE_MONITOR_DB,
+          claimed.authorizationId,
+        );
+      } else {
+        await abandonUploadAuthorization(
+          env.USAGE_MONITOR_DB,
+          claimed.authorizationId,
+        );
+      }
     }
   }
 }
@@ -756,6 +904,26 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
   if (pathname === "/api/v1/me/upload-authorizations") {
     return handleUploadAuthorization(request, env);
   }
+  if (pathname === "/api/v1/me/device-pairings") {
+    return handleDevicePairing(request, env);
+  }
+  if (pathname === "/api/v1/device-pairings/claim") {
+    return handleDevicePairingClaim(request, env);
+  }
+  if (pathname === "/api/v1/device/upload-authorizations") {
+    return handleDeviceUploadAuthorization(request, env);
+  }
+  if (pathname === "/api/v1/me/devices") return handleDevices(request, env);
+  const devicePrefix = "/api/v1/me/devices/";
+  if (pathname.startsWith(devicePrefix)) {
+    let deviceId = "";
+    try {
+      deviceId = decodeURIComponent(pathname.slice(devicePrefix.length));
+    } catch {
+      throw new ApiError(404, "DEVICE_NOT_FOUND");
+    }
+    return handleDeviceResource(request, env, deviceId);
+  }
   if (pathname === "/api/v1/envelope-key") return handleEnvelopeKey(request, env);
   if (pathname === "/api/v1/contributions") return handleContribution(request, env);
   const contributionPrefix = "/api/v1/contributions/";
@@ -797,6 +965,13 @@ function routeClass(pathname: string): string {
   if (pathname === "/api/v1/me/upload-authorizations") {
     return "upload_authorization";
   }
+  if (pathname === "/api/v1/me/device-pairings") return "device_pairing";
+  if (pathname === "/api/v1/device-pairings/claim") return "device_pairing_claim";
+  if (pathname === "/api/v1/device/upload-authorizations") {
+    return "device_upload_authorization";
+  }
+  if (pathname === "/api/v1/me/devices") return "participant_devices";
+  if (pathname.startsWith("/api/v1/me/devices/")) return "participant_device";
   if (pathname === "/api/v1/envelope-key") return "envelope_key";
   if (pathname === "/api/v1/contributions") return "contributions";
   if (pathname.startsWith("/api/v1/contributions/")) return "contribution_resource";
@@ -852,6 +1027,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           delayedAggregateStats: true,
           participantExport: true,
           participantDeletion: true,
+          ongoingDeviceUploadRegistration: true,
         },
       });
     }

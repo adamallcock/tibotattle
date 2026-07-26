@@ -14,6 +14,9 @@
  *   GET  /api/v1/contributions/:id
  *   GET  /api/v1/me/stats
  *   GET  /api/v1/stats/aggregate
+ *   POST /api/v1/me/device-pairings
+ *   GET  /api/v1/me/devices
+ *   DELETE /api/v1/me/devices/:id
  *
  * The normalizers below accept complete, partial, stale, and insufficient
  * responses, but never silently turn a failure into real-looking data.
@@ -726,6 +729,36 @@ export class CommunityClient {
     return fetchJson(
       this.fetchImpl,
       `${CENTRAL_ROOT}/me`,
+      this.mutationOptions({ method: "DELETE" })
+    );
+  }
+
+  createDevicePairing() {
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-pairings`, this.mutationOptions({
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        ongoingUpload: true
+      })
+    }));
+  }
+
+  devices() {
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/me/devices`,
+      this.sessionOptions()
+    );
+  }
+
+  revokeDevice(deviceId) {
+    if (typeof deviceId !== "string" || !/^[0-9a-f-]{36}$/u.test(deviceId)) {
+      throw new Error("Choose a valid paired device.");
+    }
+    return fetchJson(
+      this.fetchImpl,
+      `${CENTRAL_ROOT}/me/devices/${encodeURIComponent(deviceId)}`,
       this.mutationOptions({ method: "DELETE" })
     );
   }

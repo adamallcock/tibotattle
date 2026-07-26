@@ -346,7 +346,11 @@ export async function claimUploadAuthorization(
     bodyBytes: number;
     contentType: string;
   },
-): Promise<{ authorizationId: string; participantId: string }> {
+): Promise<{
+  authorizationId: string;
+  participantId: string;
+  authorizationKind: "session";
+}> {
   const parsed = parseUploadAuthorization(authorizationHeader);
   const row = await db.prepare(
     `SELECT u.*, p.state AS participant_state,
@@ -383,7 +387,11 @@ export async function claimUploadAuthorization(
       WHERE id = ? AND state = 'unused' AND expires_at > ?`,
   ).bind(leaseExpiresAt, parsed.id, now).run();
   if (result.meta.changes !== 1) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
-  return { authorizationId: parsed.id, participantId: row.participant_id };
+  return {
+    authorizationId: parsed.id,
+    participantId: row.participant_id,
+    authorizationKind: "session" as const,
+  };
 }
 
 export async function recordUploadReceipt(

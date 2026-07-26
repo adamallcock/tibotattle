@@ -7,8 +7,9 @@ import { APP_PRICE_REGISTRY_MANIFEST } from "./price-registry.js";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
-const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
+const MAX_LEDGER_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_LEDGER_LINE_BYTES = 1024 * 1024;
+const MAX_LEDGER_RECORDS = 5_000_000;
 const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024;
 const MAX_DATASET_ROWS = 2_500;
 const MAX_SAFE_TEXT_LENGTH = 2_000;
@@ -427,17 +428,37 @@ function validObservedAt(record) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
-async function readCollectorRecords(path) {
+async function readCollectorProjection(path, nowMs) {
   let metadata;
   try {
     metadata = await stat(path);
   } catch (error) {
-    if (error.code === "ENOENT") return { status: "missing", records: [], malformedLines: 0 };
+    if (error.code === "ENOENT") {
+      return {
+        status: "missing",
+        recordCount: 0,
+        malformedLines: 0,
+        latestRecordAt: null,
+        usage: summarizeUsage([], nowMs),
+        quota: latestQuotaProjection([]),
+        tools: summarizeToolClasses([]),
+      };
+    }
     throw fixedError("collector_unavailable");
   }
   if (!metadata.isFile() || metadata.size > MAX_LEDGER_BYTES) throw fixedError("collector_invalid_size");
-  const records = [];
+  const periods = [
+    { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
+    { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
+    { summary: newUsagePeriod("30d", "Last 30 days"), start: nowMs - 30 * 24 * 60 * 60 * 1_000 },
+    { summary: newUsagePeriod("all", "All retained evidence"), start: Number.NEGATIVE_INFINITY },
+  ];
+  const toolCounts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
+  let toolTotal = 0;
+  let recordCount = 0;
   let malformedLines = 0;
+  let latestRecordAt = null;
+  let latestQuotaRecord = null;
   const lines = createInterface({
     input: createReadStream(path, { encoding: "utf8", highWaterMark: 64 * 1024 }),
     crlfDelay: Infinity,
@@ -447,15 +468,49 @@ async function readCollectorRecords(path) {
       malformedLines += 1;
       continue;
     }
+    let value;
     try {
-      const value = JSON.parse(line);
-      if (value && typeof value === "object" && !Array.isArray(value)) records.push(value);
-      else malformedLines += 1;
+      value = JSON.parse(line);
     } catch {
       malformedLines += 1;
+      continue;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      malformedLines += 1;
+      continue;
+    }
+    recordCount += 1;
+    if (recordCount > MAX_LEDGER_RECORDS) throw fixedError("collector_invalid_size");
+    const observedMs = validObservedAt(value);
+    if (observedMs !== null && (latestRecordAt === null || observedMs > latestRecordAt)) {
+      latestRecordAt = observedMs;
+    }
+    if (value.kind === "codex_quota_snapshot" && observedMs !== null
+        && (latestQuotaRecord === null
+          || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0)) {
+      latestQuotaRecord = value;
+    }
+    if (value.kind === "codex_rollout_usage_snapshot"
+        && observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
+      for (const period of periods) {
+        if (observedMs >= period.start) addUsageToPeriod(period.summary, value);
+      }
+    }
+    if (value.kind === "codex_tool_class_event") {
+      const toolClass = KNOWN_TOOL_CLASSES.has(value.toolClass) ? value.toolClass : "other";
+      toolCounts[toolClass] += 1;
+      toolTotal += 1;
     }
   }
-  return { status: "available", records, malformedLines };
+  return {
+    status: "available",
+    recordCount,
+    malformedLines,
+    latestRecordAt,
+    usage: periods.map((period) => finalizeUsagePeriod(period.summary)),
+    quota: latestQuotaProjection(latestQuotaRecord === null ? [] : [latestQuotaRecord]),
+    tools: { total: toolTotal, counts: toolCounts },
+  };
 }
 
 function latestQuotaProjection(records) {
@@ -541,25 +596,20 @@ export async function buildLocalCompanionSnapshot({
     projectArtifact(root, "gradient"),
     projectArtifact(root, "weekly"),
     projectArtifact(root, "quality"),
-    readCollectorRecords(collectorFile),
+    readCollectorProjection(collectorFile, nowMs),
     reportProjection(root),
   ]);
-  const records = collector.records;
-  const latestRecordAt = records
-    .map(validObservedAt)
-    .filter((value) => value !== null)
-    .sort((left, right) => left - right)
-    .at(-1) ?? null;
+  const latestRecordAt = collector.latestRecordAt;
   const latestEvidenceAt = latestRecordAt === null ? null : new Date(latestRecordAt).toISOString();
   const evidenceAgeSeconds = latestRecordAt === null ? null : Math.max(0, Math.round((nowMs - latestRecordAt) / 1_000));
   const freshnessStatus = evidenceAgeSeconds === null
     ? "unavailable"
     : evidenceAgeSeconds <= 5 * 60 ? "live" : "stale";
-  const usage = summarizeUsage(records, nowMs);
+  const usage = collector.usage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
     ?? usage.find((period) => period.id === "all");
-  const quota = latestQuotaProjection(records);
-  const tools = summarizeToolClasses(records);
+  const quota = collector.quota;
+  const tools = collector.tools;
   const pricedEvents = (displayUsage?.pricingCoverage.fullyPricedEvents ?? 0)
     + (displayUsage?.pricingCoverage.partiallyPricedEvents ?? 0);
   const pricingCoveragePercent = (displayUsage?.events ?? 0) === 0
@@ -576,7 +626,7 @@ export async function buildLocalCompanionSnapshot({
     generatedAt: new Date(nowMs).toISOString(),
     overview: {
       status: freshnessStatus,
-      evidenceStatus: records.length > 0 ? "available" : "unavailable",
+      evidenceStatus: collector.recordCount > 0 ? "available" : "unavailable",
       latestEvidenceAt,
       latestObservedAt: latestEvidenceAt,
       freshness: {
@@ -587,10 +637,10 @@ export async function buildLocalCompanionSnapshot({
       },
       collector: {
         status: collector.status,
-        records: records.length,
+        records: collector.recordCount,
         malformedLines: collector.malformedLines,
         lastScanAt: latestEvidenceAt,
-        safeRecordCount: records.length,
+        safeRecordCount: collector.recordCount,
         identityMode: "prospective_pseudonymous_not_exposed",
       },
       quota,
@@ -602,7 +652,7 @@ export async function buildLocalCompanionSnapshot({
       usage,
       tools,
       activity: {
-        safeRecordCount: records.length,
+        safeRecordCount: collector.recordCount,
         usageEvents: displayUsage?.events ?? 0,
         toolEvents: tools.total,
         lastScanAt: latestEvidenceAt,

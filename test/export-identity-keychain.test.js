@@ -13,6 +13,7 @@ const require = createRequire(import.meta.url);
 const EXPORT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
 const ACCOUNT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
 const CLAUDE_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
+const DEVICE_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
 
 function credentialKey(service, account) {
   return `${service}\u0000${account}`;
@@ -61,6 +62,7 @@ test("capabilities are frozen public constants with separate fixed credential pa
   assert.equal(Object.isFrozen(EXPORT_CAPABILITY), true);
   assert.equal(Object.isFrozen(ACCOUNT_CAPABILITY), true);
   assert.equal(Object.isFrozen(CLAUDE_CAPABILITY), true);
+  assert.equal(Object.isFrozen(DEVICE_CAPABILITY), true);
   assert.deepEqual(EXPORT_CAPABILITY, {
     service: "app-usagemonitor.export-identity.v1",
     account: "installation",
@@ -73,9 +75,16 @@ test("capabilities are frozen public constants with separate fixed credential pa
     service: "app-usagemonitor.claude-session-pseudonym.v1",
     account: "installation",
   });
+  assert.deepEqual(DEVICE_CAPABILITY, {
+    service: "app-usagemonitor.contribution-device.v1",
+    account: "installation",
+  });
   assert.notDeepEqual(EXPORT_CAPABILITY, ACCOUNT_CAPABILITY);
   assert.notDeepEqual(EXPORT_CAPABILITY, CLAUDE_CAPABILITY);
   assert.notDeepEqual(ACCOUNT_CAPABILITY, CLAUDE_CAPABILITY);
+  assert.notDeepEqual(EXPORT_CAPABILITY, DEVICE_CAPABILITY);
+  assert.notDeepEqual(ACCOUNT_CAPABILITY, DEVICE_CAPABILITY);
+  assert.notDeepEqual(CLAUDE_CAPABILITY, DEVICE_CAPABILITY);
 });
 
 test("native loader accepts only the exact audited darwin-arm64 prebuild", () => {
@@ -372,15 +381,18 @@ test("capabilities never cross service boundaries", async () => {
     [EXPORT_CAPABILITY, encoded(15)],
     [ACCOUNT_CAPABILITY, encoded(16)],
     [CLAUDE_CAPABILITY, encoded(18)],
+    [DEVICE_CAPABILITY, encoded(19)],
   ]);
   const backend = createExportIdentityKeychainBackend({ binding });
   assert.deepEqual(await backend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 15));
   assert.deepEqual(await backend.read(ACCOUNT_CAPABILITY), Buffer.alloc(32, 16));
   assert.deepEqual(await backend.read(CLAUDE_CAPABILITY), Buffer.alloc(32, 18));
+  assert.deepEqual(await backend.read(DEVICE_CAPABILITY), Buffer.alloc(32, 19));
   await backend.replaceExact(ACCOUNT_CAPABILITY, Buffer.alloc(32, 16), Buffer.alloc(32, 17));
   assert.deepEqual(await backend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 15));
   assert.deepEqual(await backend.read(ACCOUNT_CAPABILITY), Buffer.alloc(32, 17));
   assert.deepEqual(await backend.read(CLAUDE_CAPABILITY), Buffer.alloc(32, 18));
+  assert.deepEqual(await backend.read(DEVICE_CAPABILITY), Buffer.alloc(32, 19));
   await assert.rejects(
     backend.read({ ...EXPORT_CAPABILITY }),
     assertKeychainError("invalid_capability"),

@@ -23,6 +23,10 @@ export const EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES = Object.freeze({
     service: "app-usagemonitor.claude-session-pseudonym.v1",
     account: "installation",
   }),
+  contributionDevice: Object.freeze({
+    service: "app-usagemonitor.contribution-device.v1",
+    account: "installation",
+  }),
 });
 
 const ERROR_CODES = new Set([
@@ -121,6 +125,9 @@ function capabilityPair(capability) {
   }
   if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym) {
     return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
+  }
+  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice) {
+    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
   }
   fail("invalid_capability");
 }

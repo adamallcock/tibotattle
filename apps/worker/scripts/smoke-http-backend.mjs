@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -244,6 +244,92 @@ async function registerUpload(session, serializedEnvelope) {
   return registration.uploadAuthorization;
 }
 
+async function pairDevice(session) {
+  const pairing = expectStatus(
+    await request("/api/v1/me/device-pairings", {
+      method: "POST",
+      session,
+      csrf: true,
+      body: JSON.stringify({
+        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        ongoingUpload: true,
+      }),
+    }),
+    201,
+    "Device pairing",
+  );
+  if (typeof pairing?.pairingCode !== "string"
+      || !pairing.pairingCode.startsWith("um_pair_")
+      || typeof pairing.expiresAt !== "string") {
+    throw new Error("Device pairing did not return the bounded one-use contract.");
+  }
+  const deviceId = randomUUID();
+  const rawSecret = randomBytes(32);
+  const encodedSecret = rawSecret.toString("base64url");
+  let deviceSecretHash;
+  try {
+    deviceSecretHash = createHash("sha256")
+      .update("app-usagemonitor/device/v1\0")
+      .update(deviceId)
+      .update("\0")
+      .update(rawSecret)
+      .digest("hex");
+  } finally {
+    rawSecret.fill(0);
+  }
+  const claim = expectStatus(
+    await request("/api/v1/device-pairings/claim", {
+      method: "POST",
+      authorization: `Pairing ${pairing.pairingCode}`,
+      body: JSON.stringify({ deviceId, deviceSecretHash }),
+    }),
+    201,
+    "Device pairing claim",
+  );
+  if (Object.keys(claim ?? {}).sort().join("\0")
+        !== "deviceId\0expiresAt\0scope\0state"
+      || claim.deviceId !== deviceId
+      || claim.state !== "active"
+      || claim.scope !== "upload_registration") {
+    throw new Error("Device pairing claim returned an unexpected authority contract.");
+  }
+  return {
+    deviceId,
+    authorization: `um_device_${deviceId}.${encodedSecret}`,
+  };
+}
+
+async function registerDeviceUpload(device, serializedEnvelope) {
+  const registration = expectStatus(
+    await request("/api/v1/device/upload-authorizations", {
+      method: "POST",
+      authorization: `Device ${device.authorization}`,
+      body: JSON.stringify({
+        envelopeDigest: sha256Hex(serializedEnvelope),
+        contentLengthBytes: Buffer.byteLength(serializedEnvelope, "utf8"),
+        contentType: "application/json",
+      }),
+    }),
+    201,
+    "Device upload registration",
+  );
+  if (typeof registration?.uploadAuthorization !== "string"
+      || !registration.uploadAuthorization.startsWith("um_device_upload_")) {
+    throw new Error("Device registration did not return a one-use upload authority.");
+  }
+  return registration.uploadAuthorization;
+}
+
+async function uploadFromDevice(device, serializedEnvelope) {
+  const authorization = await registerDeviceUpload(device, serializedEnvelope);
+  const result = await request("/api/v1/contributions", {
+    method: "POST",
+    body: serializedEnvelope,
+    authorization: `Upload ${authorization}`,
+  });
+  return { authorization, result };
+}
+
 async function upload(session, serializedEnvelope) {
   const authorization = await registerUpload(session, serializedEnvelope);
   const result = await request("/api/v1/contributions", {
@@ -354,7 +440,8 @@ try {
   });
   expectStatus(sessionOnlyUpload, 401, "Session-only upload");
 
-  const first = await upload(primary, serializedEnvelope);
+  const device = await pairDevice(primary);
+  const first = await uploadFromDevice(device, serializedEnvelope);
   const accepted = expectStatus(first.result, 202, "Contribution upload");
   const reusedUpload = await request("/api/v1/contributions", {
     method: "POST",
@@ -364,7 +451,7 @@ try {
   expectStatus(reusedUpload, 401, "Reused upload authority");
 
   const replay = expectStatus(
-    (await upload(primary, serializedEnvelope)).result,
+    (await uploadFromDevice(device, serializedEnvelope)).result,
     202,
     "Idempotent contribution replay",
   );
@@ -376,6 +463,50 @@ try {
     authorization: `Upload ${await registerUpload(primary, serializedEnvelope)}`,
   });
   expectStatus(uploadOnlyPersonal, 401, "Upload-only personal read");
+
+  const devices = expectStatus(
+    await request("/api/v1/me/devices", { session: primary }),
+    200,
+    "Device list",
+  );
+  if (!Array.isArray(devices?.devices)
+      || devices.devices.length !== 1
+      || devices.devices[0]?.deviceId !== device.deviceId
+      || devices.devices[0]?.state !== "active") {
+    throw new Error("The personal device list did not expose the paired device.");
+  }
+  const pendingDeviceUpload = await registerDeviceUpload(device, serializedEnvelope);
+  expectStatus(
+    await request(`/api/v1/me/devices/${device.deviceId}`, {
+      method: "DELETE",
+      session: primary,
+      csrf: true,
+    }),
+    200,
+    "Device revocation",
+  );
+  expectStatus(
+    await request("/api/v1/device/upload-authorizations", {
+      method: "POST",
+      authorization: `Device ${device.authorization}`,
+      body: JSON.stringify({
+        envelopeDigest: sha256Hex(serializedEnvelope),
+        contentLengthBytes: Buffer.byteLength(serializedEnvelope, "utf8"),
+        contentType: "application/json",
+      }),
+    }),
+    401,
+    "Revoked device",
+  );
+  expectStatus(
+    await request("/api/v1/contributions", {
+      method: "POST",
+      authorization: `Upload ${pendingDeviceUpload}`,
+      body: serializedEnvelope,
+    }),
+    401,
+    "Revoked device upload",
+  );
 
   const expected = {
     usageEvents: contribution.usageEvents.length,
@@ -606,6 +737,8 @@ try {
     aggregateStoredBytesStableAcrossAliases: true,
     aggregateWithdrawnOnContributionDeletion: true,
     authorityIsolation: true,
+    devicePairingAndUpload: true,
+    deviceRevocation: true,
     recoveryRotated: true,
     securityResetRevokedUpload: true,
     logoutClearedCookie: true,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { captureCodexObservation } from "./capture.js";
 import {
@@ -68,6 +69,11 @@ import {
 import { runR7SmokeBenchmark } from "./r7-resource-benchmark.js";
 import { runR7ReleaseSyntheticBenchmark } from "./r7-release-synthetic-evidence.js";
 import { runR7MaterializedBoundaryBenchmark } from "./r7-materialized-boundary-benchmark.js";
+import {
+  createProductionContributionDeviceBackend,
+} from "./contribution-device-capability.js";
+import { claimContributionDevicePairing } from "./contribution-device-client.js";
+import { syncPreparedContributionSetOnce } from "./contribution-device-sync.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -145,6 +151,8 @@ function usage() {
   usage-monitor rotate-claude-callback-identity [--confirm]
   usage-monitor remove-claude-callback-identity [--confirm-removal TOKEN]
   usage-monitor benchmark-r7 --profile smoke|release_synthetic_semantics|release_synthetic_pressure|release_materialized_boundaries --output PATH
+  usage-monitor pair-contribution-device --origin HTTPS_OR_LOOPBACK_ORIGIN
+  usage-monitor sync-contributions-once --directory PREPARED_DIRECTORY --origin HTTPS_OR_LOOPBACK_ORIGIN
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -225,6 +233,7 @@ export function parseArgs(argv) {
     maximumCanonicalBundleBytes: null,
     maximumEncodedArtifactBytes: null,
     benchmarkProfile: null,
+    serviceOrigin: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -282,6 +291,7 @@ export function parseArgs(argv) {
     else if (arg === "--max-bundle-bytes") result.maximumCanonicalBundleBytes = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--max-artifact-bytes") result.maximumEncodedArtifactBytes = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--profile") result.benchmarkProfile = readOptionValue(argv, index++, arg);
+    else if (arg === "--origin") result.serviceOrigin = readOptionValue(argv, index++, arg);
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -300,6 +310,10 @@ export function parseArgs(argv) {
   }
   if (result.benchmarkProfile !== null && result.command !== "benchmark-r7") {
     throw new Error("--profile is available only for benchmark-r7");
+  }
+  if (result.serviceOrigin !== null
+      && !["pair-contribution-device", "sync-contributions-once"].includes(result.command)) {
+    throw new Error("--origin is available only for contribution-device commands");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -414,6 +428,21 @@ export async function run(
     rotateClaudeCallbackCommand = rotateManagedClaudeCallbackCapability,
     planClaudeCallbackRemoval = planManagedClaudeCallbackCapabilityRemoval,
     removeClaudeCallbackCredential = removeManagedClaudeCallbackCapability,
+    createContributionDeviceBackend = createProductionContributionDeviceBackend,
+    claimContributionDevicePairingCommand = claimContributionDevicePairing,
+    syncPreparedContributionSetOnceCommand = syncPreparedContributionSetOnce,
+    readPairingCode = async () => {
+      const terminal = createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      });
+      try {
+        return (await terminal.question("Paste the short-lived pairing code: ")).trim();
+      } finally {
+        terminal.close();
+      }
+    },
     runR7BenchmarkCommand = async ({ profile }) => {
       if (profile === "smoke") return runR7SmokeBenchmark();
       if (["release_synthetic_semantics", "release_synthetic_pressure"].includes(profile)) {
@@ -460,6 +489,35 @@ export async function run(
     console.log(`Operations exercised: ${receipt.operations.filter((row) => row.status !== "not_run").length}; recovered after interruption: ${receipt.operations.filter((row) => row.status === "interrupted_recovered").length}; not run: ${receipt.operations.filter((row) => row.status === "not_run").length}`);
     console.log(`Determinism: ${receipt.determinismEvidence?.status ?? receipt.determinism.status}; receipt SHA-256: ${receipt.receiptSha256}`);
     console.log(`Network activity: ${receipt.networkActivity ?? receipt.network.activity}; upload disabled: ${(receipt.transportReady ?? receipt.network.transportReady) === false}`);
+    return;
+  }
+  if (args.command === "pair-contribution-device") {
+    if (!args.serviceOrigin) throw new Error("pair-contribution-device requires --origin");
+    const pairingCode = await readPairingCode();
+    const paired = await claimContributionDevicePairingCommand({
+      origin: args.serviceOrigin,
+      pairingCode,
+      capabilityOptions: { backend: createContributionDeviceBackend() },
+    });
+    console.log("Contribution device pairing: active");
+    console.log(`Upload-only scope: ${paired.scope}`);
+    console.log(`Expires: ${paired.expiresAt}`);
+    console.log("Browser session, recovery, personal reads, export, and deletion access: none");
+    return;
+  }
+  if (args.command === "sync-contributions-once") {
+    if (!args.serviceOrigin || !args.directory) {
+      throw new Error("sync-contributions-once requires --directory and --origin");
+    }
+    const result = await syncPreparedContributionSetOnceCommand({
+      directory: args.directory,
+      origin: args.serviceOrigin,
+      backend: createContributionDeviceBackend(),
+    });
+    console.log(`Contribution sync: ${result.status}`);
+    console.log(`Committed privacy-safe batches: ${result.preparedSetBatches}`);
+    console.log(`Accepted or replayed: ${result.accepted.length}`);
+    console.log("Payload content, local paths, device identity, and credentials printed: none");
     return;
   }
   if (args.command === "inspect-claude-callback") {

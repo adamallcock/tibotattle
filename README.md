@@ -245,13 +245,45 @@ npm run product:prepare-contribution -- \
 The converter re-verifies the canonical source and privacy receipt, drops
 participant/account/session scopes from transport rows, normalizes API-price
 components, and writes owner-only no-clobber files of at most 200 rows and
-1.25 MB each. Select those files in the dashboard's Data & privacy section.
+1.25 MB each. It publishes `prepared-contribution-set-v0.1.json` last, only
+after securely reopening every member and confirming its schema, canonical
+bytes, digest, size, and record counts. An interrupted build therefore leaves
+no committed set for automatic sync.
+
+Select one prepared file in the dashboard's Data & privacy section.
 Open the Worker-served portal, select one of those prepared files, and confirm
 the contribution. The browser validates the closed shape again, encrypts it,
 registers that exact envelope digest and byte size, and sends it with a
 separate one-use upload authorization. The upload carries no personal session
 cookie. Overlapping batches deduplicate by participant-scoped occurrence ID at
 the server.
+
+For a foreground local client, the authenticated portal can instead create a
+ten-minute, one-use pairing capability. Pairing generates the device UUID and
+32-byte secret locally, stores only that secret in the dedicated
+`app-usagemonitor.contribution-device.v1` macOS Keychain item, and sends only a
+domain-separated hash to the service:
+
+```bash
+node ./src/cli.js pair-contribution-device \
+  --origin http://127.0.0.1:8792
+```
+
+The command prompts for the pairing capability so it is not placed in shell
+history. Once paired, one foreground pass securely re-verifies the committed
+manifest and each file immediately before encrypting it in memory:
+
+```bash
+node ./src/cli.js sync-contributions-once \
+  --directory /absolute/path/to/contribution-batches \
+  --origin http://127.0.0.1:8792
+```
+
+The device credential can only mint an exact five-minute, one-use authorization
+for one v0.1 encrypted envelope. It cannot use browser sessions, read private
+statistics, export or delete data, recover access, rotate consent, pair another
+device, or select the disabled v0.2 contract. This slice is foreground-only;
+durable retry/watch state and background installation remain separately gated.
 
 `npm run product:check` runs the functional UI, loopback server, transport
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a

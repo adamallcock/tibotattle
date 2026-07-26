@@ -474,6 +474,30 @@ export async function recoverAccess(
         now,
         new Date(nowEpoch + RECOVERY_RETRY_TTL_MILLISECONDS).toISOString(),
       ),
+      db.prepare(
+        `UPDATE device_pairings SET state = 'revoked', revoked_at = ?
+          WHERE participant_id = ? AND state = 'unused'
+            AND EXISTS (
+              SELECT 1 FROM participants
+               WHERE id = ? AND recovery_token_id = ?
+            )`,
+      ).bind(now, row.id, row.id, replacement.id),
+      db.prepare(
+        `UPDATE device_credentials SET state = 'revoked', revoked_at = ?
+          WHERE participant_id = ? AND state = 'active'
+            AND EXISTS (
+              SELECT 1 FROM participants
+               WHERE id = ? AND recovery_token_id = ?
+            )`,
+      ).bind(now, row.id, row.id, replacement.id),
+      db.prepare(
+        `UPDATE device_upload_authorizations SET state = 'revoked', revoked_at = ?
+          WHERE participant_id = ? AND state = 'unused'
+            AND EXISTS (
+              SELECT 1 FROM participants
+               WHERE id = ? AND recovery_token_id = ?
+            )`,
+      ).bind(now, row.id, row.id, replacement.id),
     ]);
   } catch (error) {
     const retried = await retryRecoveredAccess(db, parsed, attemptHash);
@@ -508,6 +532,11 @@ export async function revokeSession(
     ).bind(now, sessionId, participantId),
     db.prepare(
       `UPDATE upload_authorizations SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND issued_by_session_id = ?
+          AND state = 'unused'`,
+    ).bind(now, participantId, sessionId),
+    db.prepare(
+      `UPDATE device_pairings SET state = 'revoked', revoked_at = ?
         WHERE participant_id = ? AND issued_by_session_id = ?
           AND state = 'unused'`,
     ).bind(now, participantId, sessionId),
@@ -554,6 +583,30 @@ export async function securityReset(
              WHERE id = ? AND recovery_token_id = ?
           )`,
     ).bind(now, participantId, participantId, replacement.id),
+    db.prepare(
+      `UPDATE device_pairings SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'unused'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND recovery_token_id = ?
+          )`,
+    ).bind(now, participantId, participantId, replacement.id),
+    db.prepare(
+      `UPDATE device_credentials SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'active'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND recovery_token_id = ?
+          )`,
+    ).bind(now, participantId, participantId, replacement.id),
+    db.prepare(
+      `UPDATE device_upload_authorizations SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'unused'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND recovery_token_id = ?
+          )`,
+    ).bind(now, participantId, participantId, replacement.id),
   ]);
   if (results[0]?.meta.changes !== 1) throw new ApiError(409, "AUTH_INVALID");
   return { recoveryCode: replacement.encoded };
@@ -594,7 +647,10 @@ export async function contributionCount(
 export async function insertContribution(
   db: D1Database,
   participantId: string,
-  uploadAuthorizationId: string,
+  uploadAuthorization: {
+    authorizationId: string;
+    authorizationKind: "session" | "device";
+  },
   contributionId: string,
   r2Key: string,
   digest: string,
@@ -611,12 +667,12 @@ export async function insertContribution(
       input_cached_tokens, output_text_tokens, output_reasoning_tokens,
       web_search_calls, unknown_tool_units, estimated_api_cost_usd,
       priced_event_coverage_percent, unknown_billable_units, price_basis, created_at,
-      upload_authorization_id
+      upload_authorization_id, device_upload_authorization_id
     ) VALUES (
       ?, ?, ?, ?, ?, ?, 'accepted_synthetic',
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?
     )`,
   ).bind(
     contributionId,
@@ -646,7 +702,12 @@ export async function insertContribution(
     record.accounting.unknownBillableUnits,
     record.accounting.priceBasis,
     createdAt,
-    uploadAuthorizationId,
+    uploadAuthorization.authorizationKind === "session"
+      ? uploadAuthorization.authorizationId
+      : null,
+    uploadAuthorization.authorizationKind === "device"
+      ? uploadAuthorization.authorizationId
+      : null,
   ).run();
   if (result.meta.changes < 1) throw new ApiError(409, "PARTICIPANT_DELETING");
 }
@@ -680,14 +741,25 @@ export async function markParticipantDeleting(
           AND consume_lease_expires_at <= ?`,
     ).bind(now, participantId, now),
     db.prepare(
+      `UPDATE device_upload_authorizations
+          SET state = 'revoked', revoked_at = ?,
+              consume_lease_expires_at = NULL
+        WHERE participant_id = ? AND state = 'consuming'
+          AND consume_lease_expires_at <= ?`,
+    ).bind(now, participantId, now),
+    db.prepare(
       `UPDATE participants
           SET state = 'deleting', deletion_session_id = ?
         WHERE id = ? AND state = 'active'
           AND NOT EXISTS (
             SELECT 1 FROM upload_authorizations
              WHERE participant_id = ? AND state = 'consuming'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM device_upload_authorizations
+             WHERE participant_id = ? AND state = 'consuming'
           )`,
-    ).bind(currentSessionId, participantId, participantId),
+    ).bind(currentSessionId, participantId, participantId, participantId),
     db.prepare(
       `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
         WHERE participant_id = ? AND id <> ? AND state = 'active'
@@ -704,12 +776,41 @@ export async function markParticipantDeleting(
              WHERE id = ? AND deletion_session_id = ?
           )`,
     ).bind(now, participantId, participantId, currentSessionId),
+    db.prepare(
+      `UPDATE device_pairings SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'unused'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND deletion_session_id = ?
+          )`,
+    ).bind(now, participantId, participantId, currentSessionId),
+    db.prepare(
+      `UPDATE device_credentials SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'active'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND deletion_session_id = ?
+          )`,
+    ).bind(now, participantId, participantId, currentSessionId),
+    db.prepare(
+      `UPDATE device_upload_authorizations SET state = 'revoked', revoked_at = ?
+        WHERE participant_id = ? AND state = 'unused'
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND deletion_session_id = ?
+          )`,
+    ).bind(now, participantId, participantId, currentSessionId),
   ]);
-  if ((results[1]?.meta.changes ?? 0) < 1) {
+  if ((results[2]?.meta.changes ?? 0) < 1) {
     const consuming = await db.prepare(
-      `SELECT COUNT(*) AS total FROM upload_authorizations
-        WHERE participant_id = ? AND state = 'consuming'`,
-    ).bind(participantId).first<{ total: number }>();
+      `SELECT (
+          (SELECT COUNT(*) FROM upload_authorizations
+            WHERE participant_id = ? AND state = 'consuming')
+          +
+          (SELECT COUNT(*) FROM device_upload_authorizations
+            WHERE participant_id = ? AND state = 'consuming')
+        ) AS total`,
+    ).bind(participantId, participantId).first<{ total: number }>();
     throw new ApiError(
       409,
       (consuming?.total ?? 0) > 0 ? "UPLOAD_IN_PROGRESS" : "PARTICIPANT_DELETING",

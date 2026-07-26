@@ -194,6 +194,11 @@ production operator command and approval boundary exist.
 - `POST /api/v1/logout`
 - `POST /api/v1/me/security-reset`
 - `POST /api/v1/me/upload-authorizations`
+- `POST /api/v1/me/device-pairings`
+- `POST /api/v1/device-pairings/claim`
+- `GET /api/v1/me/devices`
+- `DELETE /api/v1/me/devices/:id`
+- `POST /api/v1/device/upload-authorizations`
 - `GET /api/v1/envelope-key`
 - `POST /api/v1/contributions`
 - `GET|DELETE /api/v1/contributions/:id`
@@ -214,6 +219,17 @@ one exact encrypted digest, byte length, and `application/json` content type.
 The returned five-minute `Upload` authorization is hash-only in D1 and can be
 used once for that exact body. The upload request omits the personal cookie,
 and neither authority is accepted in the other's routes.
+
+An enrolled participant can also create a short-lived, one-use pairing code for
+a local collector. The collector generates its device UUID and 32-byte secret
+locally, stores the secret in macOS Keychain, and sends only the
+domain-separated credential hash while claiming the pairing. The resulting
+device authority can register only an exact digest-and-byte-bound one-use
+upload authorization. It cannot read participant statistics, export data,
+create another device, revoke devices, reset security, recover a participant,
+or delete anything. The participant portal lists and revokes devices; recovery,
+security reset, and deletion revoke device upload authority as part of their
+normal lifecycle.
 
 Recovery rotates the recovery code, revokes every prior web session and unused
 upload authorization, and creates a replacement session. To survive a lost

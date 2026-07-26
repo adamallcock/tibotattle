@@ -212,6 +212,97 @@ async function registerUpload(
   return response.json<{ uploadAuthorization: string; expiresAt: string }>();
 }
 
+interface PairedDevice {
+  deviceId: string;
+  deviceSecret: string;
+  authorization: string;
+}
+
+async function deviceSecretHash(
+  deviceId: string,
+  rawSecret: Uint8Array,
+): Promise<string> {
+  const prefix = new TextEncoder().encode(
+    `app-usagemonitor/device/v1\0${deviceId}\0`,
+  );
+  const input = new Uint8Array(prefix.byteLength + rawSecret.byteLength);
+  input.set(prefix);
+  input.set(rawSecret, prefix.byteLength);
+  try {
+    return await sha256Hex(input);
+  } finally {
+    input.fill(0);
+  }
+}
+
+async function pairDevice(
+  participant: EnrollmentResponse,
+): Promise<PairedDevice> {
+  const pairingResponse = await api("/api/v1/me/device-pairings", {
+    method: "POST",
+    headers: {
+      ...personalHeaders(participant, { csrf: true }),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+      ongoingUpload: true,
+    }),
+  });
+  expect(pairingResponse.status).toBe(201);
+  const pairing = await pairingResponse.json<{
+    pairingCode: string;
+    expiresAt: string;
+  }>();
+  expect(pairing.pairingCode).toMatch(/^um_pair_/u);
+
+  const deviceId = crypto.randomUUID();
+  const rawDeviceSecret = crypto.getRandomValues(new Uint8Array(32));
+  const deviceSecret = encodeBase64Url(rawDeviceSecret);
+  const hashedDeviceSecret = await deviceSecretHash(deviceId, rawDeviceSecret);
+  rawDeviceSecret.fill(0);
+  const claimed = await api("/api/v1/device-pairings/claim", {
+    method: "POST",
+    headers: {
+      authorization: `Pairing ${pairing.pairingCode}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
+  });
+  expect(claimed.status).toBe(201);
+  await expect(claimed.json()).resolves.toEqual({
+    deviceId,
+    state: "active",
+    scope: "upload_registration",
+    expiresAt: expect.any(String),
+  });
+  return {
+    deviceId,
+    deviceSecret,
+    authorization: `um_device_${deviceId}.${deviceSecret}`,
+  };
+}
+
+async function registerDeviceUpload(
+  device: PairedDevice,
+  rawEnvelope: string,
+): Promise<{ uploadAuthorization: string; expiresAt: string }> {
+  const response = await api("/api/v1/device/upload-authorizations", {
+    method: "POST",
+    headers: {
+      authorization: `Device ${device.authorization}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      envelopeDigest: await sha256Hex(rawEnvelope),
+      contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
+      contentType: "application/json",
+    }),
+  });
+  expect(response.status).toBe(201);
+  return response.json<{ uploadAuthorization: string; expiresAt: string }>();
+}
+
 async function uploadEnvelope(
   participant: EnrollmentResponse,
   envelope: object,
@@ -786,6 +877,9 @@ describe("synthetic usage monitor service", () => {
     const participant = await enrollTelemetry();
     const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
     const pending = await registerUpload(participant, pendingRaw);
+    const device = await pairDevice(participant);
+    const devicePendingRaw = JSON.stringify(await encrypt(telemetryFixture("c"), true));
+    const devicePending = await registerDeviceUpload(device, devicePendingRaw);
     const reset = await api("/api/v1/me/security-reset", {
       method: "POST",
       headers: personalHeaders(participant, { csrf: true }),
@@ -812,6 +906,28 @@ describe("synthetic usage monitor service", () => {
       body: pendingRaw,
     });
     expect(revokedUpload.status).toBe(401);
+    const revokedDevice = await api("/api/v1/device/upload-authorizations", {
+      method: "POST",
+      headers: {
+        authorization: `Device ${device.authorization}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        envelopeDigest: "a".repeat(64),
+        contentLengthBytes: 1,
+        contentType: "application/json",
+      }),
+    });
+    expect(revokedDevice.status).toBe(401);
+    const revokedDeviceUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${devicePending.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: devicePendingRaw,
+    });
+    expect(revokedDeviceUpload.status).toBe(401);
     const oldRecovery = await api("/api/v1/recover", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1115,6 +1231,7 @@ describe("synthetic usage monitor service", () => {
         delayedAggregateStats: true,
         participantExport: true,
         participantDeletion: true,
+        ongoingDeviceUploadRegistration: true,
       },
     });
   });
@@ -2129,6 +2246,187 @@ describe("synthetic usage monitor service", () => {
       contributionsDeleted: 1,
     });
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+  });
+
+  it("pairs a client-secret device and confines it to one-use v0.1 uploads", async () => {
+    const participant = await enrollTelemetry();
+    const device = await pairDevice(participant);
+
+    const personalRead = await api("/api/v1/me", {
+      headers: { authorization: `Device ${device.authorization}` },
+    });
+    expect(personalRead.status).toBe(401);
+
+    const listed = await api("/api/v1/me/devices", {
+      headers: personalHeaders(participant),
+    });
+    expect(listed.status).toBe(200);
+    await expect(listed.json()).resolves.toMatchObject({
+      devices: [{
+        deviceId: device.deviceId,
+        state: "active",
+        createdAt: expect.any(String),
+        expiresAt: expect.any(String),
+        lastUsedAt: expect.any(String),
+      }],
+    });
+
+    const raw = JSON.stringify(await encrypt(telemetryFixture("d"), true));
+    const scoped = await registerDeviceUpload(device, raw);
+    expect(scoped.uploadAuthorization).toMatch(/^um_device_upload_/u);
+    const accepted = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${scoped.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: raw,
+    });
+    expect(accepted.status).toBe(202);
+    const acceptedBody = await accepted.json<{ contributionId: string }>();
+    expect(acceptedBody.contributionId).toMatch(/^contribution:/u);
+    const reused = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${scoped.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: raw,
+    });
+    expect(reused.status).toBe(401);
+
+    const stats = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    expect(stats.status).toBe(200);
+    await expect(stats.json()).resolves.toMatchObject({
+      totals: { contributions: 1 },
+    });
+
+    const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("e"), true));
+    const pending = await registerDeviceUpload(device, pendingRaw);
+    const revoked = await api(`/api/v1/me/devices/${device.deviceId}`, {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(revoked.status).toBe(200);
+    const deniedRegistration = await api("/api/v1/device/upload-authorizations", {
+      method: "POST",
+      headers: {
+        authorization: `Device ${device.authorization}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        envelopeDigest: await sha256Hex(pendingRaw),
+        contentLengthBytes: new TextEncoder().encode(pendingRaw).byteLength,
+        contentType: "application/json",
+      }),
+    });
+    expect(deniedRegistration.status).toBe(401);
+    const deniedPending = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${pending.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: pendingRaw,
+    });
+    expect(deniedPending.status).toBe(401);
+
+    const deleted = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(deleted.status).toBe(200);
+    for (const table of [
+      "device_pairings",
+      "device_credentials",
+      "device_upload_authorizations",
+    ]) {
+      const row = await testBindings().USAGE_MONITOR_DB.prepare(
+        `SELECT COUNT(*) AS total FROM ${table}`,
+      ).first<{ total: number }>();
+      expect(row?.total).toBe(0);
+    }
+  });
+
+  it("rejects cookie-bearing pairing claims and revokes device authority on recovery", async () => {
+    const participant = await enrollTelemetry();
+    const pairingResponse = await api("/api/v1/me/device-pairings", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        ongoingUpload: true,
+      }),
+    });
+    const pairing = await pairingResponse.json<{ pairingCode: string }>();
+    const deviceId = "11111111-1111-4111-8111-111111111111";
+    const rawDeviceSecret = new Uint8Array(32).fill(37);
+    const deviceSecret = encodeBase64Url(rawDeviceSecret);
+    const hashedDeviceSecret = await deviceSecretHash(deviceId, rawDeviceSecret);
+    expect(hashedDeviceSecret).toBe(
+      "1ec2f641ad37bc1446708db769a3f6d86911bc17240912bc2f60a5b1113d66ec",
+    );
+    rawDeviceSecret.fill(0);
+    const cookieClaim = await api("/api/v1/device-pairings/claim", {
+      method: "POST",
+      headers: {
+        authorization: `Pairing ${pairing.pairingCode}`,
+        cookie: participant.cookie,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
+    });
+    expect(cookieClaim.status).toBe(401);
+    const claim = await api("/api/v1/device-pairings/claim", {
+      method: "POST",
+      headers: {
+        authorization: `Pairing ${pairing.pairingCode}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
+    });
+    expect(claim.status).toBe(201);
+    const replay = await api("/api/v1/device-pairings/claim", {
+      method: "POST",
+      headers: {
+        authorization: `Pairing ${pairing.pairingCode}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
+    });
+    expect(replay.status).toBe(201);
+
+    const recovered = await api("/api/v1/recover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        recoveryCode: participant.recoveryCode,
+        recoveryAttemptId: recoveryAttemptId(),
+      }),
+    });
+    expect(recovered.status).toBe(200);
+    const denied = await api("/api/v1/device/upload-authorizations", {
+      method: "POST",
+      headers: {
+        authorization: `Device um_device_${deviceId}.${deviceSecret}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        envelopeDigest: "a".repeat(64),
+        contentLengthBytes: 1,
+        contentType: "application/json",
+      }),
+    });
+    expect(denied.status).toBe(401);
+    const state = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM device_credentials WHERE id = ?",
+    ).bind(deviceId).first<{ state: string }>();
+    expect(state?.state).toBe("revoked");
   });
 
   it("deletes every telemetry object and database row with the participant", async () => {

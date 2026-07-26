@@ -38,6 +38,18 @@ function showRecoveryCodeOnce(value) {
   panel.hidden = false;
 }
 
+function showDevicePairingOnce(value) {
+  const panel = $("#device-pairing-once");
+  const code = $("#device-pairing-code");
+  if (typeof value !== "string" || !value.startsWith("um_pair_") || value.length > 180) {
+    code.textContent = "";
+    panel.hidden = true;
+    return;
+  }
+  code.textContent = value;
+  panel.hidden = false;
+}
+
 async function sha256Hex(value) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)]
@@ -1182,10 +1194,11 @@ async function loadCommunityResults() {
   const community = $("#community-result");
   const participantControls = $("#participant-controls");
   try {
-    const [healthResult, personalResult, communityResult] = await Promise.allSettled([
+    const [healthResult, personalResult, communityResult, devicesResult] = await Promise.allSettled([
       communityClient.health(),
       communitySession?.csrfToken ? communityClient.personalStats() : Promise.resolve(null),
-      communityClient.communityStats()
+      communityClient.communityStats(),
+      communitySession?.csrfToken ? communityClient.devices() : Promise.resolve(null)
     ]);
     const serviceReachable = healthResult.status === "fulfilled"
       || communityResult.status === "fulfilled"
@@ -1195,6 +1208,7 @@ async function loadCommunityResults() {
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
     renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
     renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
+    renderDevices(devicesResult.status === "fulfilled" ? devicesResult.value : null);
     participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
     const enrollmentMode = healthResult.status === "fulfilled" ? healthResult.value?.enrollmentMode : null;
     $("#invite-help").textContent = enrollmentMode === "invite_only"
@@ -1207,6 +1221,88 @@ async function loadCommunityResults() {
     service.textContent = "Service unavailable";
     service.className = "evidence-chip neutral";
     participantControls.hidden = true;
+    renderDevices(null);
+  }
+}
+
+function renderDevices(payload) {
+  const container = $("#device-list");
+  const count = $("#device-count");
+  const devices = Array.isArray(payload) ? payload : Array.isArray(payload?.devices) ? payload.devices : [];
+  const safeDevices = devices.filter((device) => (
+    typeof device?.deviceId === "string"
+    && /^[0-9a-f-]{36}$/u.test(device.deviceId)
+    && ["active", "revoked", "expired"].includes(device.state)
+  )).slice(0, 20);
+  count.textContent = safeDevices.length === 0
+    ? "No devices"
+    : `${safeDevices.length} device${safeDevices.length === 1 ? "" : "s"}`;
+  count.className = safeDevices.some((device) => device.state === "active")
+    ? "evidence-chip"
+    : "evidence-chip neutral";
+  clear(container);
+  if (safeDevices.length === 0) {
+    container.append(node("p", "", "No upload-only devices are paired."));
+    return;
+  }
+  for (const device of safeDevices) {
+    const row = node("div", "device-row");
+    const detail = node("div");
+    detail.append(
+      node("strong", "", `Device …${device.deviceId.slice(-8)} · ${device.state}`),
+      node(
+        "small",
+        "",
+        `Paired ${formatUtc(device.createdAt ?? device.issuedAt)} · expires ${formatUtc(device.expiresAt)}`
+      )
+    );
+    row.append(detail);
+    if (device.state === "active") {
+      const revoke = node("button", "button button-danger", "Revoke");
+      revoke.type = "button";
+      revoke.dataset.deviceId = device.deviceId;
+      row.append(revoke);
+    }
+    container.append(row);
+  }
+}
+
+async function createDevicePairing() {
+  const status = $("#device-action-status");
+  const button = $("#create-device-pairing");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Creating a short-lived upload-only pairing capability…";
+  button.disabled = true;
+  try {
+    const pairing = await communityClient.createDevicePairing();
+    if (typeof pairing?.pairingCode !== "string") {
+      throw new Error("The service did not return a pairing capability.");
+    }
+    showDevicePairingOnce(pairing.pairingCode);
+    $("#device-consent").checked = false;
+    status.textContent = `Pairing ready until ${formatUtc(pairing.expiresAt)}. It can be claimed once.`;
+  } catch (error) {
+    status.className = "participant-action-status error";
+    status.textContent = safeApiError(error, "The device pairing could not be created.");
+  } finally {
+    button.disabled = !$("#device-consent").checked;
+  }
+}
+
+async function revokeDevice(deviceId) {
+  const status = $("#device-action-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Revoking this upload-only device and its pending authorizations…";
+  try {
+    await communityClient.revokeDevice(deviceId);
+    showDevicePairingOnce(null);
+    status.textContent = "Device revoked. It can no longer register uploads.";
+    renderDevices(await communityClient.devices());
+  } catch (error) {
+    status.className = "participant-action-status error";
+    status.textContent = safeApiError(error, "The device could not be revoked.");
   }
 }
 
@@ -1281,6 +1377,7 @@ async function deleteParticipantData() {
     const receipt = await communityClient.deleteParticipant();
     setCommunitySession(null);
     showRecoveryCodeOnce(null);
+    showDevicePairingOnce(null);
     $("#contribution-file").value = "";
     $("#contribution-consent").checked = false;
     $("#contribution-submit").disabled = true;
@@ -1319,6 +1416,7 @@ async function recoverParticipant(event) {
       participantId: recovered.participantId ?? null
     });
     showRecoveryCodeOnce(recovered.recoveryCode);
+    showDevicePairingOnce(null);
     status.textContent = "Access restored. Save the replacement recovery code shown above.";
     await loadCommunityResults();
   } catch {
@@ -1345,6 +1443,8 @@ async function resetParticipantSecurity() {
       participantId: reset.participantId ?? communitySession?.participantId ?? null
     });
     showRecoveryCodeOnce(reset.recoveryCode);
+    showDevicePairingOnce(null);
+    renderDevices(null);
     status.textContent = "Other sessions and unused uploads were revoked. Save the new recovery code.";
   } catch {
     status.className = "participant-action-status error";
@@ -1365,6 +1465,8 @@ async function logoutParticipant() {
   }
   setCommunitySession(null);
   showRecoveryCodeOnce(null);
+  showDevicePairingOnce(null);
+  renderDevices(null);
   $("#participant-controls").hidden = true;
   renderStats($("#personal-result"), null);
   status.textContent = "Signed out. Use the latest recovery code to return.";
@@ -1398,6 +1500,15 @@ $("#contribution-consent").addEventListener("change", () => {
 $("#contribution-form").addEventListener("submit", submitContribution);
 $("#recover-form").addEventListener("submit", recoverParticipant);
 $("#acknowledge-recovery").addEventListener("click", () => showRecoveryCodeOnce(null));
+$("#device-consent").addEventListener("change", () => {
+  $("#create-device-pairing").disabled = !$("#device-consent").checked;
+});
+$("#create-device-pairing").addEventListener("click", createDevicePairing);
+$("#acknowledge-device-pairing").addEventListener("click", () => showDevicePairingOnce(null));
+$("#device-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-device-id]");
+  if (button?.dataset.deviceId) revokeDevice(button.dataset.deviceId);
+});
 $("#download-participant").addEventListener("click", downloadParticipantExport);
 $("#security-reset").addEventListener("click", resetParticipantSecurity);
 $("#logout-participant").addEventListener("click", logoutParticipant);
