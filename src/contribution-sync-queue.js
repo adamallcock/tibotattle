@@ -25,6 +25,8 @@ export const CONTRIBUTION_SYNC_QUEUE_SCHEMA =
   "contribution-sync-queue-v0.1";
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA =
   "contribution-sync-status-v0.1";
+export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA =
+  "contribution-sync-preview-v0.1";
 
 const SQLITE_USER_VERSION = 1;
 const MAX_QUEUE_BYTES = 128 * 1024 * 1024;
@@ -33,6 +35,11 @@ const MAX_DISCOVERED_SETS = 256;
 const DEFAULT_MAXIMUM_ATTEMPTS = 8;
 const DEFAULT_LEASE_MILLISECONDS = 10 * 60 * 1000;
 const DEFAULT_MAXIMUM_JOBS_PER_PASS = 25;
+const MAXIMUM_JOBS_PER_PASS = 100;
+const MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024;
+const DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024 * 1024;
+const MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 256 * 1024 * 1024;
+const RESERVED_UPLOAD_ENVELOPE_OVERHEAD_BYTES = 8 * 1024;
 const MINIMUM_WATCH_INTERVAL_SECONDS = 30;
 const MAXIMUM_WATCH_INTERVAL_SECONDS = 3600;
 const SET_NAME =
@@ -91,6 +98,16 @@ function queueTimestamp(milliseconds) {
 
 function integer(value, minimum, maximum) {
   return Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+
+export function conservativeUploadReservationBytes(preparedBytes) {
+  if (!integer(preparedBytes, 0, Number.MAX_SAFE_INTEGER)) {
+    fail("configuration_invalid");
+  }
+  const reservation = (preparedBytes * 2)
+    + RESERVED_UPLOAD_ENVELOPE_OVERHEAD_BYTES;
+  if (!Number.isSafeInteger(reservation)) fail("configuration_invalid");
+  return reservation;
 }
 
 function assertOwnerOnlyDirectory(stats) {
@@ -656,6 +673,170 @@ function entryForJob(set, job) {
   return entry;
 }
 
+function safeContributionProjection(payload) {
+  if (payload?.schemaVersion !== "telemetry-contribution-v0.1"
+      || ![
+        "macos",
+        "linux",
+        "windows",
+        "other",
+        "unknown",
+      ].includes(payload.clientPlatform)
+      || ![
+        "unknown",
+        "openai_pre_agentic_pool_2026_07_09",
+        "openai_agentic_pool_2026_07_09",
+        "anthropic_unknown",
+      ].includes(payload.providerPolicyEpoch)
+      || !Array.isArray(payload.usageEvents)
+      || !Array.isArray(payload.quotaSnapshots)
+      || !Array.isArray(payload.activityMarkers)
+      || !payload.accounting || typeof payload.accounting !== "object") {
+    fail("queue_invalid");
+  }
+  const coveredAt = validateCoveredAt(payload);
+  const recordCounts = {
+    usageEvents: payload.usageEvents.length,
+    quotaSnapshots: payload.quotaSnapshots.length,
+    activityMarkers: payload.activityMarkers.length,
+  };
+  const total = Object.values(recordCounts).reduce(
+    (sum, count) => sum + count,
+    0,
+  );
+  if (!Object.values(recordCounts).every(
+    (count) => integer(count, 0, 200),
+  ) || !integer(total, 1, 200)) {
+    fail("queue_invalid");
+  }
+  const accounting = payload.accounting;
+  const {
+    estimatedApiCostUsd,
+    pricedEventCoveragePercent,
+    unknownModelEventCount,
+    unknownBillableUnits,
+    priceBasis,
+  } = accounting;
+  if ((estimatedApiCostUsd !== null
+        && (typeof estimatedApiCostUsd !== "string"
+          || !/^(?:0|[1-9]\d*)\.\d{6}$/u.test(estimatedApiCostUsd)))
+      || !Number.isFinite(pricedEventCoveragePercent)
+      || pricedEventCoveragePercent < 0
+      || pricedEventCoveragePercent > 100
+      || !integer(unknownModelEventCount, 0, recordCounts.usageEvents)
+      || !integer(unknownBillableUnits, 0, Number.MAX_SAFE_INTEGER)
+      || ![
+        "current_api_prices",
+        "historical_api_prices",
+        "unpriced",
+      ].includes(priceBasis)) {
+    fail("queue_invalid");
+  }
+  return {
+    schemaVersion: payload.schemaVersion,
+    clientPlatform: payload.clientPlatform,
+    providerPolicyEpoch: payload.providerPolicyEpoch,
+    coveredAt,
+    recordCounts: { ...recordCounts, total },
+    accounting: {
+      estimatedApiCostUsd,
+      pricedEventCoveragePercent,
+      unknownModelEventCount,
+      unknownBillableUnits,
+      priceBasis,
+      verification: "client_declared_unverified",
+    },
+  };
+}
+
+export async function inspectNextContributionSyncUpload({
+  directory,
+  queueFile = defaultContributionSyncQueueFile(),
+  now = () => new Date(),
+  maximumQueuedJobs = MAX_QUEUE_JOBS,
+  discoverSets = discoverCommittedPreparedSets,
+  loadContribution = loadVerifiedPreparedContribution,
+} = {}) {
+  if (typeof discoverSets !== "function"
+      || typeof loadContribution !== "function"
+      || !integer(maximumQueuedJobs, 1, MAX_QUEUE_JOBS)) {
+    fail("configuration_invalid");
+  }
+  const sets = await discoverSets({ directory });
+  const database = await openQueueDatabase(queueFile, now);
+  try {
+    const timestamp = iso(now());
+    recoverExpiredLeases(database, timestamp);
+    const enqueued = await enqueueDiscoveredSets({
+      database,
+      sets,
+      now,
+      loadContribution,
+      maximumQueuedJobs,
+    });
+    const queue = statusFromDatabase(database, timestamp);
+    const job = database.prepare(`
+      SELECT job_id, prepared_set_id, set_name, contribution_basename,
+             contribution_sha256, contribution_bytes, schema_version,
+             covered_start_at, covered_end_at, attempt_count, next_attempt_at
+        FROM contribution_jobs
+       WHERE state IN ('pending', 'retryable')
+       ORDER BY created_at, job_id
+       LIMIT 1
+    `).get();
+    if (!job) {
+      return Object.freeze({
+        schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA,
+        state: "empty",
+        networkActivity: false,
+        discoveredSets: sets.length,
+        enqueued: enqueued.inserted,
+        queue,
+        item: null,
+      });
+    }
+    const set = sets.find(
+      (candidate) => candidate.preparedSetId === job.prepared_set_id,
+    );
+    const entry = entryForJob(set, job);
+    if (!set || !entry) fail("queue_invalid");
+    const payload = await loadContribution({
+      directory: set.directory,
+      entry,
+    });
+    const projection = safeContributionProjection(payload);
+    if (projection.coveredAt.startAt !== job.covered_start_at
+        || projection.coveredAt.endAt !== job.covered_end_at
+        || job.schema_version !== projection.schemaVersion) {
+      fail("queue_invalid");
+    }
+    const retryWaiting = job.next_attempt_at > timestamp;
+    return Object.freeze({
+      schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA,
+      state: queue.paused
+        ? "paused"
+        : retryWaiting
+          ? "retry_wait"
+          : "ready",
+      networkActivity: false,
+      discoveredSets: sets.length,
+      enqueued: enqueued.inserted,
+      queue,
+      item: Object.freeze({
+        ...projection,
+        preparedBytes: job.contribution_bytes,
+        reservedUploadBytes: conservativeUploadReservationBytes(
+          job.contribution_bytes,
+        ),
+        attemptCount: job.attempt_count,
+        nextAttemptAt: job.next_attempt_at,
+      }),
+    });
+  } finally {
+    database.close();
+  }
+}
+
 export async function runContributionSyncQueueOnce({
   directory,
   origin,
@@ -669,6 +850,8 @@ export async function runContributionSyncQueueOnce({
   maximumQueuedJobs = MAX_QUEUE_JOBS,
   leaseMilliseconds = DEFAULT_LEASE_MILLISECONDS,
   maximumJobs = DEFAULT_MAXIMUM_JOBS_PER_PASS,
+  maximumReservedUploadBytes =
+    DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
   discoverSets = discoverCommittedPreparedSets,
   loadContribution = loadVerifiedPreparedContribution,
   syncEntry = syncPreparedContributionEntryOnce,
@@ -681,7 +864,12 @@ export async function runContributionSyncQueueOnce({
       || !integer(maximumAttempts, 1, 32)
       || !integer(maximumQueuedJobs, 1, MAX_QUEUE_JOBS)
       || !integer(leaseMilliseconds, 60_000, 60 * 60 * 1000)
-      || !integer(maximumJobs, 1, 100)
+      || !integer(maximumJobs, 1, MAXIMUM_JOBS_PER_PASS)
+      || !integer(
+        maximumReservedUploadBytes,
+        MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
+        MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
+      )
       || (signal !== undefined && !(signal instanceof AbortSignal))) {
     fail("configuration_invalid");
   }
@@ -709,6 +897,8 @@ export async function runContributionSyncQueueOnce({
         accepted: 0,
         retryable: 0,
         rejected: 0,
+        reservedUploadBytes: 0,
+        bandwidthLimited: false,
         queue: initialStatus,
       });
     }
@@ -717,7 +907,7 @@ export async function runContributionSyncQueueOnce({
       sets.map((set) => [set.preparedSetId, set]),
     );
     const candidates = database.prepare(`
-      SELECT job_id, prepared_set_id
+      SELECT job_id, prepared_set_id, contribution_bytes
         FROM contribution_jobs
        WHERE state IN ('pending', 'retryable')
          AND next_attempt_at <= ?
@@ -729,11 +919,21 @@ export async function runContributionSyncQueueOnce({
       accepted: 0,
       retryable: 0,
       rejected: 0,
+      reservedUploadBytes: 0,
+      bandwidthLimited: false,
     };
     for (const candidate of candidates) {
       if (signal?.aborted) break;
       const set = availableSets.get(candidate.prepared_set_id);
       if (!set) continue;
+      const reservation = conservativeUploadReservationBytes(
+        candidate.contribution_bytes,
+      );
+      if (result.reservedUploadBytes + reservation
+          > maximumReservedUploadBytes) {
+        result.bandwidthLimited = true;
+        break;
+      }
       const claimedAtMs = nowMilliseconds(now);
       const claimedAt = queueTimestamp(claimedAtMs);
       const job = claimJob(
@@ -757,6 +957,7 @@ export async function runContributionSyncQueueOnce({
         continue;
       }
       try {
+        result.reservedUploadBytes += reservation;
         const receipt = await syncEntry({
           directory: set.directory,
           entry,
@@ -856,6 +1057,8 @@ export async function runContributionSyncQueueWatch({
     accepted: 0,
     retryable: 0,
     rejected: 0,
+    reservedUploadBytes: 0,
+    bandwidthLimitedPasses: 0,
   };
   let latest = null;
   while (!signal?.aborted) {
@@ -870,9 +1073,11 @@ export async function runContributionSyncQueueWatch({
       "accepted",
       "retryable",
       "rejected",
+      "reservedUploadBytes",
     ]) {
       totals[key] += latest[key];
     }
+    if (latest.bandwidthLimited) totals.bandwidthLimitedPasses += 1;
     if (latest.status === "paused") break;
     const elapsed = clock() - startedAt;
     if (durationMilliseconds !== null && elapsed >= durationMilliseconds) break;
@@ -902,6 +1107,15 @@ export const CONTRIBUTION_SYNC_QUEUE_LIMITS = Object.freeze({
   maximumAttempts: DEFAULT_MAXIMUM_ATTEMPTS,
   leaseMilliseconds: DEFAULT_LEASE_MILLISECONDS,
   maximumJobsPerPass: DEFAULT_MAXIMUM_JOBS_PER_PASS,
+  maximumJobsPerPassAllowed: MAXIMUM_JOBS_PER_PASS,
+  minimumReservedUploadBytesPerPass:
+    MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
+  maximumReservedUploadBytesPerPass:
+    MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
+  defaultMaximumReservedUploadBytesPerPass:
+    DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
+  reservedUploadEnvelopeOverheadBytes:
+    RESERVED_UPLOAD_ENVELOPE_OVERHEAD_BYTES,
   minimumWatchIntervalSeconds: MINIMUM_WATCH_INTERVAL_SECONDS,
   maximumWatchIntervalSeconds: MAXIMUM_WATCH_INTERVAL_SECONDS,
 });

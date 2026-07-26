@@ -74,8 +74,10 @@ import {
 } from "./contribution-device-capability.js";
 import { claimContributionDevicePairing } from "./contribution-device-client.js";
 import {
+  CONTRIBUTION_SYNC_QUEUE_LIMITS,
   defaultContributionSyncQueueFile,
   inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
   runContributionSyncQueueOnce,
   runContributionSyncQueueWatch,
   setContributionSyncPaused,
@@ -158,8 +160,9 @@ function usage() {
   usage-monitor remove-claude-callback-identity [--confirm-removal TOKEN]
   usage-monitor benchmark-r7 --profile smoke|release_synthetic_semantics|release_synthetic_pressure|release_materialized_boundaries --output PATH
   usage-monitor pair-contribution-device --origin HTTPS_OR_LOOPBACK_ORIGIN
-  usage-monitor sync-contributions-once --directory PREPARED_DIRECTORY_OR_SPOOL --origin HTTPS_OR_LOOPBACK_ORIGIN [--queue-file PATH]
-  usage-monitor sync-contributions-watch --directory PREPARED_SPOOL --origin HTTPS_OR_LOOPBACK_ORIGIN [--queue-file PATH] [--interval-seconds N] [--duration-ms N]
+  usage-monitor sync-contributions-inspect-next --directory PREPARED_DIRECTORY_OR_SPOOL [--queue-file PATH]
+  usage-monitor sync-contributions-once --directory PREPARED_DIRECTORY_OR_SPOOL --origin HTTPS_OR_LOOPBACK_ORIGIN [--queue-file PATH] [--max-uploads-per-pass N] [--max-upload-bytes-per-pass N]
+  usage-monitor sync-contributions-watch --directory PREPARED_SPOOL --origin HTTPS_OR_LOOPBACK_ORIGIN [--queue-file PATH] [--interval-seconds N] [--duration-ms N] [--max-uploads-per-pass N] [--max-upload-bytes-per-pass N]
   usage-monitor sync-contributions-status [--queue-file PATH]
   usage-monitor sync-contributions-pause [--queue-file PATH]
   usage-monitor sync-contributions-resume [--queue-file PATH]
@@ -246,6 +249,8 @@ export function parseArgs(argv) {
     serviceOrigin: null,
     queueFile: null,
     intervalSeconds: null,
+    maximumUploadsPerPass: null,
+    maximumUploadBytesPerPass: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -306,6 +311,8 @@ export function parseArgs(argv) {
     else if (arg === "--origin") result.serviceOrigin = readOptionValue(argv, index++, arg);
     else if (arg === "--queue-file") result.queueFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--interval-seconds") result.intervalSeconds = readNonNegativeNumber(argv, index++, arg);
+    else if (arg === "--max-uploads-per-pass") result.maximumUploadsPerPass = readNonNegativeNumber(argv, index++, arg);
+    else if (arg === "--max-upload-bytes-per-pass") result.maximumUploadBytesPerPass = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -337,6 +344,7 @@ export function parseArgs(argv) {
       && ![
         "sync-contributions-once",
         "sync-contributions-watch",
+        "sync-contributions-inspect-next",
         "sync-contributions-status",
         "sync-contributions-pause",
         "sync-contributions-resume",
@@ -346,6 +354,29 @@ export function parseArgs(argv) {
   if (result.intervalSeconds !== null
       && result.command !== "sync-contributions-watch") {
     throw new Error("--interval-seconds is available only for sync-contributions-watch");
+  }
+  if ((result.maximumUploadsPerPass !== null
+        || result.maximumUploadBytesPerPass !== null)
+      && ![
+        "sync-contributions-once",
+        "sync-contributions-watch",
+      ].includes(result.command)) {
+    throw new Error("upload caps are available only for contribution sync delivery commands");
+  }
+  if (result.maximumUploadsPerPass !== null
+      && (!Number.isSafeInteger(result.maximumUploadsPerPass)
+        || result.maximumUploadsPerPass < 1
+        || result.maximumUploadsPerPass
+          > CONTRIBUTION_SYNC_QUEUE_LIMITS.maximumJobsPerPassAllowed)) {
+    throw new Error("--max-uploads-per-pass requires an integer from 1 to 100");
+  }
+  if (result.maximumUploadBytesPerPass !== null
+      && (!Number.isSafeInteger(result.maximumUploadBytesPerPass)
+        || result.maximumUploadBytesPerPass
+          < CONTRIBUTION_SYNC_QUEUE_LIMITS.minimumReservedUploadBytesPerPass
+        || result.maximumUploadBytesPerPass
+          > CONTRIBUTION_SYNC_QUEUE_LIMITS.maximumReservedUploadBytesPerPass)) {
+    throw new Error("--max-upload-bytes-per-pass requires an integer from 16384 to 268435456");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -465,6 +496,8 @@ export async function run(
     runContributionSyncQueueOnceCommand = runContributionSyncQueueOnce,
     runContributionSyncQueueWatchCommand = runContributionSyncQueueWatch,
     inspectContributionSyncQueueCommand = inspectContributionSyncQueue,
+    inspectNextContributionSyncUploadCommand =
+      inspectNextContributionSyncUpload,
     setContributionSyncPausedCommand = setContributionSyncPaused,
     readPairingCode = async () => {
       const terminal = createInterface({
@@ -540,6 +573,27 @@ export async function run(
     console.log("Browser session, recovery, personal reads, export, and deletion access: none");
     return;
   }
+  if (args.command === "sync-contributions-inspect-next") {
+    if (!args.directory) {
+      throw new Error("sync-contributions-inspect-next requires --directory");
+    }
+    const result = await inspectNextContributionSyncUploadCommand({
+      directory: args.directory,
+      queueFile: args.queueFile ?? defaultContributionSyncQueueFile(),
+    });
+    console.log(`Next contribution upload: ${result.state}`);
+    console.log(`Committed sets discovered: ${result.discoveredSets}; newly queued: ${result.enqueued}`);
+    if (result.item) {
+      console.log(`Coverage: ${result.item.coveredAt.startAt} through ${result.item.coveredAt.endAt}`);
+      console.log(`Records: ${result.item.recordCounts.total} (${result.item.recordCounts.usageEvents} usage, ${result.item.recordCounts.quotaSnapshots} quota, ${result.item.recordCounts.activityMarkers} activity)`);
+      console.log(`Estimated API cost: ${result.item.accounting.estimatedApiCostUsd ?? "unpriced"}; priced-event coverage: ${result.item.accounting.pricedEventCoveragePercent}%`);
+      console.log(`Unknown models: ${result.item.accounting.unknownModelEventCount}; unknown billable units: ${result.item.accounting.unknownBillableUnits}`);
+      console.log(`Prepared bytes: ${result.item.preparedBytes}; conservative upload reservation: ${result.item.reservedUploadBytes}`);
+      console.log(`Prior attempts: ${result.item.attemptCount}; next attempt: ${result.item.nextAttemptAt}`);
+    }
+    console.log("Network activity: none; content, paths, filenames, digests, identities, origins, and credentials printed: none");
+    return;
+  }
   if (args.command === "sync-contributions-once") {
     if (!args.serviceOrigin || !args.directory) {
       throw new Error("sync-contributions-once requires --directory and --origin");
@@ -549,10 +603,17 @@ export async function run(
       origin: args.serviceOrigin,
       backend: createContributionDeviceBackend(),
       queueFile: args.queueFile ?? defaultContributionSyncQueueFile(),
+      ...(args.maximumUploadsPerPass === null
+        ? {}
+        : { maximumJobs: args.maximumUploadsPerPass }),
+      ...(args.maximumUploadBytesPerPass === null
+        ? {}
+        : { maximumReservedUploadBytes: args.maximumUploadBytesPerPass }),
     });
     console.log(`Contribution queue pass: ${result.status}`);
     console.log(`Committed sets discovered: ${result.discoveredSets}; newly queued: ${result.enqueued}`);
     console.log(`Processed: ${result.processed}; accepted or replayed: ${result.accepted}`);
+    console.log(`Conservative upload bytes reserved: ${result.reservedUploadBytes}; byte-cap stopped pass: ${result.bandwidthLimited}`);
     console.log(`Waiting to retry: ${result.queue.counts.retryable}; permanently rejected: ${result.queue.counts.rejected}`);
     console.log(`Queue paused: ${result.queue.paused}`);
     console.log("Payload content, local paths, server origin, device identity, and credentials printed: none");
@@ -576,6 +637,12 @@ export async function run(
         intervalSeconds: args.intervalSeconds ?? 60,
         durationMilliseconds: args.durationMs,
         signal: controller.signal,
+        ...(args.maximumUploadsPerPass === null
+          ? {}
+          : { maximumJobs: args.maximumUploadsPerPass }),
+        ...(args.maximumUploadBytesPerPass === null
+          ? {}
+          : { maximumReservedUploadBytes: args.maximumUploadBytesPerPass }),
       });
     } finally {
       process.removeListener("SIGINT", stop);
@@ -584,6 +651,7 @@ export async function run(
     console.log(`Foreground contribution watch: ${result.status}`);
     console.log(`Passes: ${result.passes}; newly queued: ${result.enqueued}`);
     console.log(`Processed: ${result.processed}; accepted or replayed: ${result.accepted}`);
+    console.log(`Conservative upload bytes reserved: ${result.reservedUploadBytes}; byte-cap-limited passes: ${result.bandwidthLimitedPasses}`);
     console.log(`Waiting to retry: ${result.queue.counts.retryable}; permanently rejected: ${result.queue.counts.rejected}`);
     console.log(`Queue paused: ${result.queue.paused}`);
     console.log("Installed background service: false; content, paths, identities, origins, and credentials printed: none");

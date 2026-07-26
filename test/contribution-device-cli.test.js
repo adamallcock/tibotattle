@@ -31,6 +31,10 @@ test("device pairing origin is command-specific", () => {
       "./prepared",
       "--origin",
       "https://usage.example",
+      "--max-uploads-per-pass",
+      "7",
+      "--max-upload-bytes-per-pass",
+      "65536",
     ]).serviceOrigin,
     "https://usage.example",
   );
@@ -50,6 +54,22 @@ test("device pairing origin is command-specific", () => {
     () => parseArgs(["doctor", "--queue-file", "./private.sqlite3"]),
     /available only for contribution-sync commands/,
   );
+  assert.throws(
+    () => parseArgs([
+      "sync-contributions-once",
+      "--max-uploads-per-pass",
+      "0",
+    ]),
+    /integer from 1 to 100/,
+  );
+  assert.throws(
+    () => parseArgs([
+      "sync-contributions-watch",
+      "--max-upload-bytes-per-pass",
+      "16383",
+    ]),
+    /integer from 16384 to 268435456/,
+  );
 });
 
 test("queue-backed one-shot sync prints only bounded aggregate status", async () => {
@@ -65,12 +85,16 @@ test("queue-backed one-shot sync prints only bounded aggregate status", async ()
     runContributionSyncQueueOnceCommand: async (options) => {
       assert.equal(options.backend, backend);
       assert.equal(options.origin, "https://usage.example");
+      assert.equal(options.maximumJobs, undefined);
+      assert.equal(options.maximumReservedUploadBytes, undefined);
       return {
         status: "completed",
         discoveredSets: 1,
         enqueued: 2,
         processed: 2,
         accepted: 2,
+        reservedUploadBytes: 24_000,
+        bandwidthLimited: false,
         queue: {
           paused: false,
           counts: { retryable: 0, rejected: 0 },
@@ -81,6 +105,58 @@ test("queue-backed one-shot sync prints only bounded aggregate status", async ()
   assert.match(output, /Committed sets discovered: 1; newly queued: 2/);
   assert.match(output, /accepted or replayed: 2/i);
   assert.doesNotMatch(output, /usage\.example|prepared/);
+});
+
+test("inspect-next prints only a bounded local projection", async () => {
+  const privateDirectory = "/private/canary/prepared-spool";
+  const privateQueue = "/private/canary/queue.sqlite3";
+  const output = await captureLogs(() => run([
+    "sync-contributions-inspect-next",
+    "--directory",
+    privateDirectory,
+    "--queue-file",
+    privateQueue,
+  ], {
+    inspectNextContributionSyncUploadCommand: async (options) => {
+      assert.equal(options.directory, privateDirectory);
+      assert.equal(options.queueFile, privateQueue);
+      return {
+        state: "ready",
+        discoveredSets: 2,
+        enqueued: 1,
+        item: {
+          coveredAt: {
+            startAt: "2026-07-26T10:00:00.000Z",
+            endAt: "2026-07-26T10:10:00.000Z",
+          },
+          recordCounts: {
+            usageEvents: 3,
+            quotaSnapshots: 2,
+            activityMarkers: 1,
+            total: 6,
+          },
+          accounting: {
+            estimatedApiCostUsd: "1.250000",
+            pricedEventCoveragePercent: 80,
+            unknownModelEventCount: 1,
+            unknownBillableUnits: 2,
+          },
+          preparedBytes: 4096,
+          reservedUploadBytes: 16_384,
+          attemptCount: 0,
+          nextAttemptAt: "2026-07-26T10:10:00.000Z",
+        },
+      };
+    },
+  }));
+  assert.match(output, /Next contribution upload: ready/);
+  assert.match(output, /Records: 6 \(3 usage, 2 quota, 1 activity\)/);
+  assert.match(output, /conservative upload reservation: 16384/i);
+  assert.match(output, /Network activity: none/);
+  assert.doesNotMatch(
+    output,
+    /\/private\/|canary|prepared-spool|queue\.sqlite3|contribution:/,
+  );
 });
 
 test("status and pause lifecycle remain local and content-free", async () => {
@@ -138,12 +214,18 @@ test("foreground watch reports bounded totals and never claims installation", as
     "30",
     "--duration-ms",
     "1000",
+    "--max-uploads-per-pass",
+    "7",
+    "--max-upload-bytes-per-pass",
+    "65536",
   ], {
     createContributionDeviceBackend: () => backend,
     runContributionSyncQueueWatchCommand: async (options) => {
       assert.equal(options.backend, backend);
       assert.equal(options.intervalSeconds, 30);
       assert.equal(options.durationMilliseconds, 1000);
+      assert.equal(options.maximumJobs, 7);
+      assert.equal(options.maximumReservedUploadBytes, 65_536);
       assert.equal(options.signal instanceof AbortSignal, true);
       return {
         status: "completed",
@@ -151,6 +233,8 @@ test("foreground watch reports bounded totals and never claims installation", as
         enqueued: 1,
         processed: 1,
         accepted: 1,
+        reservedUploadBytes: 12_000,
+        bandwidthLimitedPasses: 0,
         queue: {
           paused: false,
           counts: { retryable: 0, rejected: 0 },

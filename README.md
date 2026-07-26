@@ -290,19 +290,44 @@ account/session identifiers, service origins, or credentials. It can scan one
 committed prepared set or a spool containing only
 `prepared-set-<uuid>` children. Loose files and incomplete sets are ignored.
 
-Use the same queue for an explicit foreground watch, or inspect and control it
-without contacting the service:
+Inspect the next verified contribution before pairing or delivery. This
+locally discovers and queues committed files, but performs no key fetch,
+authorization, or upload and prints no filename, digest, identity, path,
+origin, or content:
+
+```bash
+node ./src/cli.js sync-contributions-inspect-next \
+  --directory /absolute/path/to/prepared-spool
+```
+
+Use the same queue for an explicit foreground watch, or inspect and control its
+aggregate status without contacting the service:
 
 ```bash
 node ./src/cli.js sync-contributions-watch \
   --directory /absolute/path/to/prepared-spool \
   --origin http://127.0.0.1:8792 \
-  --interval-seconds 60
+  --interval-seconds 60 \
+  --max-uploads-per-pass 10 \
+  --max-upload-bytes-per-pass 16777216
 
 node ./src/cli.js sync-contributions-status
 node ./src/cli.js sync-contributions-pause
 node ./src/cli.js sync-contributions-resume
 ```
+
+One-shot and watch passes accept 1–100 upload attempts and a 16 KiB–256 MiB
+conservative upload reservation. Before claiming a job, the queue reserves
+twice its verified prepared JSON bytes plus 8 KiB for the encrypted envelope.
+A job that would exceed the remaining pass budget stays pending and
+unattempted. The default reservation is 16 MiB per pass. This bounds encrypted
+upload bodies; it is not a claim about DNS, TCP/TLS, or the small key-fetch and
+authorization responses. Watch applies both caps independently on every
+visible foreground pass.
+
+The [ongoing sync controls plan](./2026-07-26-ongoing-sync-controls-plan.md)
+and [development verification receipt](./2026-07-26-ongoing-sync-controls-verification-receipt.md)
+record the privacy contract, exact test evidence, and remaining release gates.
 
 Transient network, 408, 429, and 5xx failures use bounded retry with backoff.
 Privacy/schema rejection is terminal. An expired or revoked device pauses the

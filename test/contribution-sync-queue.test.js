@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -14,8 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
+  conservativeUploadReservationBytes,
   discoverCommittedPreparedSets,
   inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
   runContributionSyncQueueOnce,
   runContributionSyncQueueWatch,
   setContributionSyncPaused,
@@ -33,6 +35,7 @@ import {
   publishPreparedContributionManifest,
 } from "../src/telemetry-prepared-set.js";
 import { stableJson } from "../src/storage.js";
+import { createTelemetryEnvelope } from "../apps/web/public/lib.js";
 
 const ORIGIN = "https://usage.example";
 const ACCEPTED_ID =
@@ -82,7 +85,7 @@ function usage(index = 1) {
   };
 }
 
-function sourceBundle(index = 1) {
+function sourceBundle(index = 1, usageCount = 1) {
   return {
     schemaVersion: "usage-metadata-bundle-v0.1",
     createdAt: "2026-07-26T10:10:00.000Z",
@@ -92,7 +95,10 @@ function sourceBundle(index = 1) {
     },
     clientPlatform: "macos",
     records: {
-      usageEvents: [usage(index)],
+      usageEvents: Array.from(
+        { length: usageCount },
+        (_, offset) => usage(index + offset),
+      ),
       quotaSnapshots: [],
       activityMarkers: [],
     },
@@ -102,11 +108,12 @@ function sourceBundle(index = 1) {
 async function createPreparedSet(parent, {
   setName = null,
   index = 1,
+  usageCount = 1,
 } = {}) {
   const directory = setName === null ? parent : join(parent, setName);
   if (setName !== null) await mkdir(directory, { mode: 0o700 });
   const [contribution] =
-    buildTelemetryContributionsFromBundle(sourceBundle(index));
+    buildTelemetryContributionsFromBundle(sourceBundle(index, usageCount));
   const content = stableJson(contribution);
   const published = await publishPreparedContributionFile({
     directory,
@@ -123,7 +130,7 @@ async function createPreparedSet(parent, {
       sha256: published.sha256,
       bytes: published.bytes,
       recordCounts: {
-        usageEvents: 1,
+        usageEvents: usageCount,
         quotaSnapshots: 0,
         activityMarkers: 0,
       },
@@ -160,6 +167,106 @@ function acceptedReceipt() {
     status: "accepted",
   };
 }
+
+test("upload reservations conservatively bound prepared bytes", () => {
+  assert.equal(conservativeUploadReservationBytes(0), 8192);
+  assert.equal(conservativeUploadReservationBytes(4096), 16_384);
+  assert.throws(
+    () => conservativeUploadReservationBytes(-1),
+    (error) => error.code
+      === "contribution_sync_queue_configuration_invalid",
+  );
+});
+
+test("upload reservation exceeds a real maximum-record encrypted envelope", async () => {
+  const [payload] =
+    buildTelemetryContributionsFromBundle(sourceBundle(1, 200));
+  const preparedBytes = Buffer.byteLength(stableJson(payload), "utf8");
+  const { publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicExponent: 0x10001,
+  });
+  const envelope = await createTelemetryEnvelope({
+    payload,
+    publicJwk: publicKey.export({ format: "jwk" }),
+    keyId: `key:${"a".repeat(200)}`,
+  });
+  const envelopeBytes = Buffer.byteLength(
+    JSON.stringify(envelope),
+    "utf8",
+  );
+  assert.ok(envelopeBytes < conservativeUploadReservationBytes(preparedBytes));
+});
+
+test("inspect-next verifies and projects one queued payload without identifiers", async () => {
+  const value = await fixture();
+  const result = await inspectNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+  });
+  assert.equal(result.schemaVersion, "contribution-sync-preview-v0.1");
+  assert.equal(result.state, "ready");
+  assert.equal(result.networkActivity, false);
+  assert.equal(result.enqueued, 1);
+  assert.deepEqual(result.item.recordCounts, {
+    usageEvents: 1,
+    quotaSnapshots: 0,
+    activityMarkers: 0,
+    total: 1,
+  });
+  assert.equal(result.item.clientPlatform, "macos");
+  assert.equal(
+    result.item.accounting.verification,
+    "client_declared_unverified",
+  );
+  assert.equal(
+    result.item.reservedUploadBytes,
+    conservativeUploadReservationBytes(result.item.preparedBytes),
+  );
+  assert.equal(result.queue.counts.pending, 1);
+  const serialized = JSON.stringify(result);
+  for (const privateValue of [
+    value.root,
+    "telemetry-contribution-000001.json",
+    "event:v2:",
+    "session:v1:",
+    "usage.example",
+    "contribution:",
+  ]) {
+    assert.equal(serialized.includes(privateValue), false);
+  }
+});
+
+test("inspect-next rejects arbitrary text in projected classification fields", async () => {
+  const value = await fixture();
+  await assert.rejects(
+    inspectNextContributionSyncUpload({
+      directory: value.preparedRoot,
+      queueFile: value.queueFile,
+      loadContribution: async () => ({
+        schemaVersion: "telemetry-contribution-v0.1",
+        clientPlatform: "/private/content-canary",
+        providerPolicyEpoch: "unknown",
+        coveredAt: {
+          startAt: "2026-07-26T10:00:00.000Z",
+          endAt: "2026-07-26T10:10:00.000Z",
+        },
+        usageEvents: [],
+        quotaSnapshots: [{}],
+        activityMarkers: [],
+        accounting: {
+          estimatedApiCostUsd: null,
+          pricedEventCoveragePercent: 0,
+          unknownModelEventCount: 0,
+          unknownBillableUnits: 0,
+          priceBasis: "unpriced",
+        },
+      }),
+    }),
+    (error) => error.code === "contribution_sync_queue_queue_invalid",
+  );
+});
 
 test("queue persists one path-free job and deduplicates subsequent scans", async () => {
   const value = await fixture();
@@ -464,6 +571,85 @@ test("post-enqueue file substitution fails before any sync network boundary", as
       || error.code === "prepared_contribution_set_file_digest",
   );
   assert.equal(syncCalls, 0);
+});
+
+test("byte cap stops before claiming the next job", async () => {
+  const value = await fixture({ spool: true });
+  const second = await createPreparedSet(value.preparedRoot, {
+    setName: `prepared-set-${randomUUID()}`,
+    index: 2,
+  });
+  const reservations = [
+    value.prepared.manifest.files[0].bytes,
+    second.manifest.files[0].bytes,
+  ].map(conservativeUploadReservationBytes);
+  const cap = Math.max(16 * 1024, ...reservations);
+  assert.ok(reservations.every((reservation) => reservation <= cap));
+  assert.ok(reservations[0] + reservations[1] > cap);
+  let calls = 0;
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    maximumReservedUploadBytes: cap,
+    syncEntry: async () => {
+      calls += 1;
+      return acceptedReceipt();
+    },
+  });
+  assert.equal(result.processed, 1);
+  assert.equal(result.accepted, 1);
+  assert.equal(result.bandwidthLimited, true);
+  assert.equal(result.reservedUploadBytes <= cap, true);
+  assert.equal(calls, 1);
+  assert.equal(result.queue.counts.pending, 1);
+
+  const database = new DatabaseSync(value.queueFile, { readOnly: true });
+  const attempts = database.prepare(`
+    SELECT attempt_count FROM contribution_jobs ORDER BY attempt_count
+  `).all().map((row) => row.attempt_count);
+  database.close();
+  assert.deepEqual(attempts, [0, 1]);
+});
+
+test("oversized first job remains pending and unattempted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-sync-large-"));
+  const preparedRoot = join(root, "prepared");
+  const privateRoot = join(root, "private");
+  await mkdir(preparedRoot, { mode: 0o700 });
+  await mkdir(privateRoot, { mode: 0o700 });
+  const prepared = await createPreparedSet(preparedRoot, {
+    usageCount: 200,
+  });
+  assert.ok(
+    conservativeUploadReservationBytes(prepared.manifest.files[0].bytes)
+      > 16 * 1024,
+  );
+  let calls = 0;
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  const result = await runContributionSyncQueueOnce({
+    directory: preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile,
+    maximumReservedUploadBytes: 16 * 1024,
+    syncEntry: async () => {
+      calls += 1;
+      return acceptedReceipt();
+    },
+  });
+  assert.equal(result.processed, 0);
+  assert.equal(result.reservedUploadBytes, 0);
+  assert.equal(result.bandwidthLimited, true);
+  assert.equal(result.queue.counts.pending, 1);
+  assert.equal(calls, 0);
+  const database = new DatabaseSync(queueFile, { readOnly: true });
+  const job = database.prepare(`
+    SELECT state, attempt_count FROM contribution_jobs
+  `).get();
+  database.close();
+  assert.deepEqual({ ...job }, { state: "pending", attempt_count: 0 });
 });
 
 test("queue refuses symlinked or non-owner-only database locations", async () => {
