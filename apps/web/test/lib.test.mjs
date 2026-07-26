@@ -26,7 +26,9 @@ import {
   normalizeCommunitySnapshot,
   normalizeContributionSyncStatus,
   normalizeDashboardPayload,
+  normalizeParticipantCommunityComparison,
   normalizeParticipantStats,
+  PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION
 } from "../public/data-client.js";
 
@@ -803,6 +805,85 @@ test("participant stats normalize private account-scoped capacity and sensitivit
   assert.equal(track.rollingComparisonCount, 2);
 });
 
+test("private community comparison preserves own clipped versus public rounded semantics", () => {
+  const metrics = Object.fromEntries([
+    ["usageEvents", "events"],
+    ["inputUncachedTokens", "tokens"],
+    ["inputCacheReadTokens", "tokens"],
+    ["inputCacheWriteTokens", "tokens"],
+    ["outputTextTokens", "tokens"],
+    ["outputReasoningTokens", "tokens"],
+    ["outputCombinedTokens", "tokens"],
+    ["toolUnits", "units"]
+  ].map(([name, unit]) => [
+    name,
+    name === "outputReasoningTokens"
+      ? { status: "community_not_released" }
+      : {
+          status: "comparable",
+          participantClippedValue: name === "usageEvents" ? 1 : 900,
+          communityRoundedValue: name === "usageEvents" ? 20 : 0,
+          unit
+        }
+  ]));
+  const normalized = normalizeParticipantCommunityComparison({
+    schemaVersion: PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
+    status: "ready",
+    snapshotId: "community-weekly:2026-07-20",
+    snapshotRevision: 2,
+    period: {
+      startAt: "2026-07-20T00:00:00.000Z",
+      endAt: "2026-07-27T00:00:00.000Z"
+    },
+    interpretation: "own_clipped_contribution_vs_public_rounded_total",
+    cells: [{
+      provider: "openai_codex",
+      modelId: "gpt-5.6-sol",
+      participantHasActivity: true,
+      metrics,
+      participantCount: 20,
+      accountTrackId: "must-not-survive"
+    }]
+  });
+  assert.equal(normalized.status, "ready");
+  assert.equal(normalized.snapshotRevision, 2);
+  assert.equal(normalized.cells[0].metrics.inputCacheReadTokens.participantClippedValue, 900);
+  assert.equal(normalized.cells[0].metrics.inputCacheReadTokens.communityRoundedValue, 0);
+  assert.equal(normalized.cells[0].metrics.outputReasoningTokens.status, "community_not_released");
+  assert.equal(Object.hasOwn(normalized.cells[0], "participantCount"), false);
+  assert.equal(Object.hasOwn(normalized.cells[0], "accountTrackId"), false);
+
+  const malformed = structuredClone({
+    schemaVersion: PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
+    status: "ready",
+    snapshotId: "community-weekly:2026-07-20",
+    snapshotRevision: 2,
+    period: {
+      startAt: "2026-07-20T00:00:00.000Z",
+      endAt: "2026-07-27T00:00:00.000Z"
+    },
+    interpretation: "own_clipped_contribution_vs_public_rounded_total",
+    cells: [{
+      provider: "openai_codex",
+      modelId: "gpt-5.6-sol",
+      participantHasActivity: true,
+      metrics
+    }]
+  });
+  malformed.cells[0].metrics.inputCacheReadTokens.status = "comparable";
+  malformed.cells[0].metrics.inputCacheReadTokens.participantClippedValue = -1;
+  assert.equal(
+    normalizeParticipantCommunityComparison(malformed).reason,
+    "comparison_contract_invalid"
+  );
+  assert.equal(normalizeParticipantCommunityComparison({
+    schemaVersion: PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
+    status: "not_testable",
+    reason: "community_snapshot_not_released",
+    cells: []
+  }).reason, "community_snapshot_not_released");
+});
+
 test("participant results fail closed for unverifiable prices and honest not-testable movement", () => {
   const result = normalizeParticipantStats({
     schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
@@ -887,6 +968,9 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /Codex Fast observations/);
   assert.match(appSource, /Account continuity was not transmitted/);
   assert.match(appSource, /Account-scoped quota calibration/);
+  assert.match(appSource, /Your contribution in the released week/);
+  assert.match(appSource, /This is not an average, percentile, bill, or provider allowance/);
+  assert.match(appSource, /A replacement revision may be pending/);
   assert.match(appSource, /Not testable/);
   assert.match(appSource, /for \(const smoothingHours of \[1, 2, 3\]\)/);
   assert.match(appSource, /published_partial/);

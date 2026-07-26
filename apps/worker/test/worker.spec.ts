@@ -2365,6 +2365,61 @@ describe("synthetic usage monitor service", () => {
     ]) {
       expect(publishedText).not.toContain(forbidden);
     }
+    const privateStatsResponse = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participantToDelete!),
+    });
+    expect(privateStatsResponse.status).toBe(200);
+    const privateStatsText = await privateStatsResponse.text();
+    const privateStats = JSON.parse(privateStatsText) as Record<string, unknown>;
+    expect(privateStats).toMatchObject({
+      communityComparison: {
+        schemaVersion: "participant-community-comparison-v0.1",
+        status: "ready",
+        snapshotId: "community-weekly:2026-07-20",
+        snapshotRevision: 1,
+        interpretation: "own_clipped_contribution_vs_public_rounded_total",
+        cells: [{
+          provider: "openai_codex",
+          modelId: "gpt-5.6-sol",
+          participantHasActivity: true,
+          metrics: {
+            usageEvents: {
+              status: "comparable",
+              participantClippedValue: 1,
+              communityRoundedValue: 20,
+              unit: "events",
+            },
+            inputUncachedTokens: {
+              status: "comparable",
+              participantClippedValue: 5_000_000,
+              communityRoundedValue: 5_000_000,
+              unit: "tokens",
+            },
+            inputCacheReadTokens: {
+              status: "comparable",
+              participantClippedValue: 900,
+              communityRoundedValue: 0,
+              unit: "tokens",
+            },
+            outputReasoningTokens: {
+              status: "community_not_released",
+            },
+            toolUnits: {
+              status: "comparable",
+              participantClippedValue: 1_000,
+              communityRoundedValue: 1_090,
+              unit: "units",
+            },
+          },
+        }],
+      },
+    });
+    for (const forbidden of [
+      "participantCount", "eligibilityUnitId", "eligibility:",
+      "average", "percentile", "accountTrackId",
+    ]) {
+      expect(privateStatsText).not.toContain(forbidden);
+    }
     const sealed = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT snapshot_id, revision, source_mutation_epoch, payload_json,
               payload_sha256, release_state
@@ -2407,6 +2462,20 @@ describe("synthetic usage monitor service", () => {
       nonOverlapping: true,
     });
     expect(withdrawnText).not.toContain("\"cells\"");
+    const withdrawnPrivateStats = await (
+      await api("/api/v1/me/stats", {
+        headers: personalHeaders(participantToDelete!),
+      })
+    ).json<Record<string, unknown>>();
+    expect(withdrawnPrivateStats).toMatchObject({
+      communityComparison: {
+        schemaVersion: "participant-community-comparison-v0.1",
+        status: "not_testable",
+        reason: "community_snapshot_not_released",
+        snapshotRevision: 1,
+        cells: [],
+      },
+    });
     const queued = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT week_start, requested_epoch
          FROM community_weekly_snapshot_rebuilds`,

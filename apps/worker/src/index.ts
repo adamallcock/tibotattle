@@ -21,6 +21,7 @@ import {
 import {
   buildCommunityWeeklySnapshot,
   readLatestCommunityWeeklySnapshot,
+  readParticipantCommunityComparison,
   rebuildPendingCommunityWeeklySnapshots,
 } from "./community-snapshots";
 import {
@@ -941,8 +942,15 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
 async function handleStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   const session = await personalSession(request, env);
+  const [stats, communityComparison] = await Promise.all([
+    personalStats(env.USAGE_MONITOR_DB, session.participantId),
+    readParticipantCommunityComparison(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+    ),
+  ]);
   return jsonResponse(
-    await personalStats(env.USAGE_MONITOR_DB, session.participantId),
+    { ...stats, communityComparison },
     200,
     { vary: "Cookie" },
   );

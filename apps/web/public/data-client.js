@@ -27,6 +27,8 @@ const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
 export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
+export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
+  "participant-community-comparison-v0.1";
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION =
   "contribution-sync-status-v0.1";
 
@@ -39,6 +41,16 @@ const COMMUNITY_METRIC_UNITS = Object.freeze({
   outputReasoningTokens: "tokens_rounded_down",
   outputCombinedTokens: "tokens_rounded_down",
   toolUnits: "tool_units_rounded_down"
+});
+const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
+  usageEvents: "events",
+  inputUncachedTokens: "tokens",
+  inputCacheReadTokens: "tokens",
+  inputCacheWriteTokens: "tokens",
+  outputTextTokens: "tokens",
+  outputReasoningTokens: "tokens",
+  outputCombinedTokens: "tokens",
+  toolUnits: "units"
 });
 
 function array(value) {
@@ -344,6 +356,101 @@ function normalizeAccountScopedQuotaAnalysis(payload) {
   };
 }
 
+export function normalizeParticipantCommunityComparison(payload) {
+  const unavailable = {
+    status: "not_testable",
+    reason: text(payload?.reason, "stable_snapshot_unavailable"),
+    snapshotId: text(payload?.snapshotId, ""),
+    snapshotRevision: count(payload?.snapshotRevision, null),
+    period: {
+      startAt: text(payload?.period?.startAt, ""),
+      endAt: text(payload?.period?.endAt, "")
+    },
+    cells: []
+  };
+  if (payload?.schemaVersion !== PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION) {
+    return unavailable;
+  }
+  if (payload.status === "not_testable") return unavailable;
+  if (payload.status !== "ready"
+      || payload.interpretation !== "own_clipped_contribution_vs_public_rounded_total"
+      || !unavailable.snapshotId
+      || unavailable.snapshotRevision === null
+      || unavailable.snapshotRevision < 1
+      || !Number.isFinite(Date.parse(unavailable.period.startAt))
+      || !Number.isFinite(Date.parse(unavailable.period.endAt))
+      || !Array.isArray(payload.cells)
+      || payload.cells.length > 100) {
+    return { ...unavailable, reason: "comparison_contract_invalid" };
+  }
+  const cells = [];
+  for (const candidate of payload.cells) {
+    const provider = text(candidate?.provider, "");
+    const modelId = text(candidate?.modelId, "");
+    if (!["openai_codex", "anthropic_claude_code"].includes(provider)
+        || !modelId
+        || typeof candidate?.participantHasActivity !== "boolean"
+        || !candidate?.metrics
+        || typeof candidate.metrics !== "object"
+        || Array.isArray(candidate.metrics)) {
+      return { ...unavailable, reason: "comparison_contract_invalid" };
+    }
+    const metrics = {};
+    for (const [metricName, expectedUnit] of Object.entries(
+      PARTICIPANT_COMPARISON_METRIC_UNITS
+    )) {
+      const source = candidate.metrics[metricName];
+      if (!source || typeof source !== "object" || Array.isArray(source)) {
+        return { ...unavailable, reason: "comparison_contract_invalid" };
+      }
+      if (source.status === "community_not_released") {
+        metrics[metricName] = {
+          status: "community_not_released",
+          participantClippedValue: null,
+          communityRoundedValue: null,
+          unit: expectedUnit
+        };
+        continue;
+      }
+      const communityRoundedValue = count(source.communityRoundedValue, null);
+      if (source.unit !== expectedUnit || communityRoundedValue === null) {
+        return { ...unavailable, reason: "comparison_contract_invalid" };
+      }
+      if (source.status === "participant_component_unavailable") {
+        metrics[metricName] = {
+          status: "participant_component_unavailable",
+          participantClippedValue: null,
+          communityRoundedValue,
+          unit: expectedUnit
+        };
+        continue;
+      }
+      const participantClippedValue = count(source.participantClippedValue, null);
+      if (source.status !== "comparable" || participantClippedValue === null) {
+        return { ...unavailable, reason: "comparison_contract_invalid" };
+      }
+      metrics[metricName] = {
+        status: "comparable",
+        participantClippedValue,
+        communityRoundedValue,
+        unit: expectedUnit
+      };
+    }
+    cells.push({
+      provider,
+      modelId,
+      participantHasActivity: candidate.participantHasActivity,
+      metrics
+    });
+  }
+  return {
+    ...unavailable,
+    status: "ready",
+    reason: "",
+    cells
+  };
+}
+
 export function normalizeParticipantStats(payload) {
   if (!payload) {
     return {
@@ -354,7 +461,8 @@ export function normalizeParticipantStats(payload) {
       standardApiCounterfactual: { state: "not_testable", apiPriceEquivalentUsd: null },
       codexFastObservations: { state: "not_testable", eventShare: null, eventCount: null },
       rollingQuotaMovement: normalizeQuotaMovement(null),
-      accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(null)
+      accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(null),
+      communityComparison: normalizeParticipantCommunityComparison(null)
     };
   }
   if (payload.schemaVersion !== PARTICIPANT_STATS_SCHEMA_VERSION) {
@@ -366,7 +474,8 @@ export function normalizeParticipantStats(payload) {
       standardApiCounterfactual: { state: "not_testable", apiPriceEquivalentUsd: null },
       codexFastObservations: { state: "not_testable", eventShare: null, eventCount: null },
       rollingQuotaMovement: normalizeQuotaMovement(null),
-      accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(null)
+      accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(null),
+      communityComparison: normalizeParticipantCommunityComparison(null)
     };
   }
 
@@ -472,6 +581,9 @@ export function normalizeParticipantStats(payload) {
     rollingQuotaMovement: normalizeQuotaMovement(payload.rollingQuotaMovement),
     accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(
       payload.accountScopedQuotaAnalysis
+    ),
+    communityComparison: normalizeParticipantCommunityComparison(
+      payload.communityComparison
     )
   };
 }

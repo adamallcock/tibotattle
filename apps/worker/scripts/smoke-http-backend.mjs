@@ -677,6 +677,30 @@ try {
       + " a stable privacy-safe snapshot.",
     );
   }
+  const comparisonStats = expectStatus(
+    await request("/api/v1/me/stats", { session: primary }),
+    200,
+    "Private community comparison",
+  );
+  const comparison = comparisonStats.communityComparison;
+  const comparisonCell = comparison?.cells?.find(
+    (cell) => cell.provider === "openai_codex" && cell.modelId === "gpt-5.6-sol",
+  );
+  const serializedComparison = JSON.stringify(comparison);
+  if (comparison?.schemaVersion !== "participant-community-comparison-v0.1"
+      || comparison.status !== "ready"
+      || comparison.snapshotRevision !== 1
+      || comparisonCell?.participantHasActivity !== true
+      || comparisonCell?.metrics?.usageEvents?.participantClippedValue !== 1
+      || comparisonCell?.metrics?.usageEvents?.communityRoundedValue !== 20
+      || comparisonCell?.metrics?.inputCacheReadTokens?.participantClippedValue !== 900
+      || comparisonCell?.metrics?.inputCacheReadTokens?.communityRoundedValue !== 0
+      || ["participantCount", "eligibilityUnitId", "accountTrackId", "percentile", "average"]
+        .some((forbidden) => serializedComparison.includes(forbidden))) {
+    throw new Error(
+      "The authenticated same-week comparison did not preserve clipped-versus-rounded privacy semantics.",
+    );
+  }
 
   const participantExport = expectStatus(
     await request("/api/v1/me/export", { session: primary }),
@@ -800,6 +824,19 @@ try {
         .some((forbidden) => serializedWithdrawn.includes(forbidden))) {
     throw new Error("Contribution deletion did not withdraw the published snapshot safely.");
   }
+  const withdrawnComparisonStats = expectStatus(
+    await request("/api/v1/me/stats", { session: primary }),
+    200,
+    "Withdrawn private comparison",
+  );
+  if (withdrawnComparisonStats.communityComparison?.status !== "not_testable"
+      || withdrawnComparisonStats.communityComparison?.reason
+        !== "community_snapshot_not_released"
+      || withdrawnComparisonStats.communityComparison?.cells?.length !== 0) {
+    throw new Error(
+      "The private comparison did not fail closed after snapshot withdrawal.",
+    );
+  }
 
   await triggerScheduledSnapshot(scheduledTime + 60 * 60 * 1000);
   const rebuilt = expectStatus(
@@ -867,6 +904,8 @@ try {
     aggregateUnavailableBeforeSchedule: true,
     aggregatePublishedAtTwenty: true,
     aggregateStoredBytesStableAcrossAliases: true,
+    authenticatedWeeklyComparison: true,
+    comparisonAvoidsAverageAndPercentile: true,
     aggregateWithdrawnOnContributionDeletion: true,
     aggregateRebuiltAfterDeletion: true,
     aggregateRevisionAfterDeletion: 2,

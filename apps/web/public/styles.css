@@ -522,6 +522,17 @@ tbody tr:last-child td { border-bottom: 0; }
 .snapshot-table table { min-width: 920px; }
 .snapshot-table th, .snapshot-table td { white-space: nowrap; }
 .snapshot-table .suppressed-value { color: var(--muted); font-style: italic; }
+.community-comparison .participant-detail-heading { margin-top: 0; }
+.comparison-table { margin-top: 14px; }
+.comparison-table table { min-width: 760px; table-layout: fixed; }
+.comparison-table th, .comparison-table td { white-space: normal; overflow-wrap: anywhere; }
+.comparison-table th:nth-child(1), .comparison-table td:nth-child(1) { width: 23%; }
+.comparison-table th:nth-child(2), .comparison-table td:nth-child(2) { width: 15%; }
+.comparison-table th:nth-child(3), .comparison-table td:nth-child(3),
+.comparison-table th:nth-child(4), .comparison-table td:nth-child(4) { width: 15%; }
+.comparison-table th:nth-child(5), .comparison-table td:nth-child(5) { width: 32%; }
+.comparison-table td:nth-child(3), .comparison-table td:nth-child(4) { white-space: nowrap; }
+.comparison-table .suppressed-value { color: var(--muted); font-style: italic; }
 .participant-controls { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .device-controls { margin-bottom: 18px; padding: 15px; border: 1px solid var(--line); border-radius: .4rem; background: rgba(255, 254, 249, .62); }
 .device-controls-heading { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }

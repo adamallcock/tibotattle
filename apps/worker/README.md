@@ -185,6 +185,9 @@ printing them, and proves:
 - a fixed unavailable response before scheduled publication;
 - a production-shaped 20-participant weekly snapshot built through Wrangler's
   scheduled-handler test route;
+- an authenticated same-week comparison between one participant's clipped
+  contribution and the already-public rounded total, without an average,
+  percentile, cohort count, account track, or inferred allowance conversion;
 - byte-identical reads through both public aliases without participant counts,
   model fingerprints, or client-declared cost;
 - bounded participant export with no invitation, session, CSRF, recovery,
@@ -389,6 +392,16 @@ available. The current transport intentionally omits account scope, so
 participant-wide conversion. Client tool-class counts are never priced as
 provider tool calls because the transport does not contain an exact
 provider-billable tool-unit field.
+
+When a weekly community revision is published, the same authenticated response
+also includes `participant-community-comparison-v0.1`. It recomputes only that
+participant's accepted, eligible records inside the snapshot's fixed period and
+cutoff, applies the same per-cell clipping caps, and pairs those private values
+only with metrics already released in the immutable public payload. Suppressed
+community metrics do not expose a participant value. A withdrawn, suppressed,
+malformed, or unavailable revision returns a fixed not-testable state. The
+projection contains no cohort count, eligibility identifier, account track,
+average, percentile, threshold distance, or share calculation.
 
 In `invite_only` mode, only participants admitted with distinct one-time
 invitation grants count toward community snapshots. Local-open participants

@@ -70,8 +70,39 @@ interface RebuildRow {
   requested_epoch: number;
 }
 
+interface ParticipantCellRow {
+  provider: string;
+  model_id: string;
+  usage_events: number;
+  input_uncached_tokens: number | null;
+  input_cache_read_tokens: number | null;
+  input_cache_write_tokens: number | null;
+  output_text_tokens: number | null;
+  output_reasoning_tokens: number | null;
+  output_combined_tokens: number | null;
+  tool_units: number | null;
+}
+
 function stableJson(value: unknown): string {
   return JSON.stringify(value);
+}
+
+function participantComparisonUnavailable(
+  reason: string,
+  row?: SnapshotRow,
+): object {
+  return {
+    schemaVersion: "participant-community-comparison-v0.1",
+    status: "not_testable",
+    reason,
+    ...(row ? {
+      snapshotId: row.snapshot_id,
+      snapshotRevision: row.revision,
+      period: { startAt: row.week_start, endAt: row.week_end },
+      ingestionCutoffAt: row.ingestion_cutoff_at,
+    } : {}),
+    cells: [],
+  };
 }
 
 export function communityWeekForScheduledTime(scheduledTime: number): CommunityWeek {
@@ -493,4 +524,176 @@ export async function readLatestCommunityWeeklySnapshot(
     });
   }
   return row.payload_json;
+}
+
+export async function readParticipantCommunityComparison(
+  db: D1Database,
+  participantId: string,
+): Promise<object> {
+  const row = await db.prepare(
+    `SELECT payload_json, release_state, snapshot_id, revision, week_start,
+            week_end, ingestion_cutoff_at
+       FROM community_weekly_snapshots
+      ORDER BY week_end DESC, revision DESC LIMIT 1`,
+  ).first<SnapshotRow>();
+  if (!row) return participantComparisonUnavailable("stable_snapshot_unavailable");
+  if (row.release_state !== "published") {
+    return participantComparisonUnavailable("community_snapshot_not_released", row);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json) as unknown;
+  } catch {
+    return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
+  }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)
+      || Reflect.get(payload, "schemaVersion") !== "community-weekly-snapshot-v0.1"
+      || Reflect.get(payload, "releaseStatus") !== "published"
+      || Reflect.get(payload, "snapshotId") !== row.snapshot_id
+      || Reflect.get(payload, "snapshotRevision") !== row.revision
+      || Reflect.get(payload, "immutable") !== true
+      || !Array.isArray(Reflect.get(payload, "cells"))
+      || (Reflect.get(payload, "cells") as unknown[]).length > COMMUNITY_WEEKLY_MAX_CELLS) {
+    return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
+  }
+
+  const participantRows = await db.prepare(
+    `SELECT
+      r.provider,
+      CASE
+        WHEN r.model_id IN (${PUBLIC_MODEL_IDS_SQL})
+        THEN r.model_id ELSE 'unknown' END AS model_id,
+      COUNT(*) AS usage_events,
+      SUM(r.input_uncached_tokens) AS input_uncached_tokens,
+      SUM(r.input_cache_read_tokens) AS input_cache_read_tokens,
+      SUM(r.input_cache_write_tokens) AS input_cache_write_tokens,
+      SUM(r.output_text_tokens) AS output_text_tokens,
+      SUM(r.output_reasoning_tokens) AS output_reasoning_tokens,
+      SUM(r.output_combined_tokens) AS output_combined_tokens,
+      SUM(r.tool_units) AS tool_units
+    FROM telemetry_records r
+    JOIN participants p
+      ON p.id = r.participant_id AND p.state = 'active'
+    WHERE r.participant_id = ?
+      AND r.record_kind = 'usage'
+      AND r.observed_at >= ? AND r.observed_at < ?
+      AND r.provider IN ('openai_codex', 'anthropic_claude_code')
+      AND EXISTS (
+        SELECT 1 FROM participant_community_eligibility e
+         WHERE e.participant_id = r.participant_id
+      )
+      AND EXISTS (
+        SELECT 1
+          FROM telemetry_contribution_occurrences o
+          JOIN telemetry_contributions c ON c.id = o.contribution_id
+         WHERE o.participant_id = r.participant_id
+           AND o.record_kind = r.record_kind
+           AND o.occurrence_id = r.occurrence_id
+           AND c.status = 'accepted'
+           AND c.created_at < ?
+      )
+    GROUP BY r.provider, model_id
+    ORDER BY r.provider, model_id
+    LIMIT ?`,
+  ).bind(
+    participantId,
+    row.week_start,
+    row.week_end,
+    row.ingestion_cutoff_at,
+    COMMUNITY_WEEKLY_MAX_CELLS + 1,
+  ).all<ParticipantCellRow>();
+  if (participantRows.results.length > COMMUNITY_WEEKLY_MAX_CELLS) {
+    return participantComparisonUnavailable("participant_comparison_too_large", row);
+  }
+  const participantByCell = new Map(
+    participantRows.results.map((item) => [
+      `${item.provider}\0${item.model_id}`,
+      item,
+    ]),
+  );
+  const cells: object[] = [];
+  for (const sourceCell of Reflect.get(payload, "cells") as unknown[]) {
+    if (typeof sourceCell !== "object" || sourceCell === null || Array.isArray(sourceCell)) {
+      return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
+    }
+    const provider = Reflect.get(sourceCell, "provider");
+    const modelId = Reflect.get(sourceCell, "modelId");
+    const sourceMetrics = Reflect.get(sourceCell, "metrics");
+    if (!["openai_codex", "anthropic_claude_code"].includes(String(provider))
+        || ![...TELEMETRY_MODEL_IDS, "unknown"].includes(String(modelId))
+        || typeof sourceMetrics !== "object"
+        || sourceMetrics === null
+        || Array.isArray(sourceMetrics)) {
+      return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
+    }
+    const participant = participantByCell.get(`${provider}\0${modelId}`);
+    const metrics: Record<string, object> = {};
+    for (const [publicName, column, cap, _quantum, unit] of METRICS) {
+      const communityMetric = Reflect.get(sourceMetrics, publicName);
+      if (typeof communityMetric !== "object"
+          || communityMetric === null
+          || Array.isArray(communityMetric)
+          || !["released", "suppressed"].includes(
+            String(Reflect.get(communityMetric, "status")),
+          )) {
+        return participantComparisonUnavailable(
+          "community_snapshot_contract_invalid",
+          row,
+        );
+      }
+      if (Reflect.get(communityMetric, "status") === "suppressed") {
+        metrics[publicName] = { status: "community_not_released" };
+        continue;
+      }
+      const communityRoundedValue = Number(Reflect.get(communityMetric, "value"));
+      if (!Number.isSafeInteger(communityRoundedValue)
+          || communityRoundedValue < 0) {
+        return participantComparisonUnavailable(
+          "community_snapshot_contract_invalid",
+          row,
+        );
+      }
+      const participantSourceValue = participant
+        ? participant[column as keyof ParticipantCellRow]
+        : 0;
+      if (participantSourceValue === null) {
+        metrics[publicName] = {
+          status: "participant_component_unavailable",
+          communityRoundedValue,
+          unit,
+        };
+        continue;
+      }
+      const participantValue = Number(participantSourceValue);
+      if (!Number.isSafeInteger(participantValue) || participantValue < 0) {
+        return participantComparisonUnavailable(
+          "participant_comparison_contract_invalid",
+          row,
+        );
+      }
+      metrics[publicName] = {
+        status: "comparable",
+        participantClippedValue: Math.min(participantValue, cap),
+        communityRoundedValue,
+        unit,
+      };
+    }
+    cells.push({
+      provider,
+      modelId,
+      participantHasActivity: Boolean(participant?.usage_events),
+      metrics,
+    });
+  }
+  return {
+    schemaVersion: "participant-community-comparison-v0.1",
+    status: "ready",
+    snapshotId: row.snapshot_id,
+    snapshotRevision: row.revision,
+    period: { startAt: row.week_start, endAt: row.week_end },
+    ingestionCutoffAt: row.ingestion_cutoff_at,
+    interpretation: "own_clipped_contribution_vs_public_rounded_total",
+    cells,
+  };
 }

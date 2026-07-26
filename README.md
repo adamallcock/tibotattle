@@ -409,7 +409,8 @@ exercises Secure/HttpOnly session issuance, CSRF, authority isolation,
 one-use upload registration, client encryption, strict server validation, D1
 ingest, opaque R2 retention, idempotent replay with a new upload
 authorization, personal statistics, scheduled immutable snapshot publication,
-stable public bytes, recovery rotation, security reset, logout, participant
+an authenticated same-week clipped-versus-public-rounded comparison, stable
+public bytes, recovery rotation, security reset, logout, participant
 export, snapshot withdrawal, complete deletion, and post-deletion cleanup. It
 also rebuilds the affected aggregate as a new immutable privacy-suppressed
 revision after contribution deletion and again after complete participant
@@ -440,6 +441,13 @@ receipt](./2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
 records the 20-participant encrypted HTTP proof, synchronous withdrawal,
 immutable revisions rebuilt from 19 and then zero remaining contributors,
 empty rebuild queue, and zero remaining participant data.
+
+The [private community comparison verification
+receipt](./2026-07-26-private-community-comparison-verification-receipt.md)
+records the authenticated 20-participant HTTP comparison, post-deletion
+not-testable transition, closed browser projection, and rendered portal check.
+It deliberately does not derive an average, percentile, cohort size, share,
+bill, or provider allowance from rounded public data.
 
 ## Local metadata exporter privacy boundary
 

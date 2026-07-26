@@ -1092,6 +1092,39 @@ and cache-invalidation pathway, but it is not G9 approval: public deployment,
 historical publication policy, disclosure attack review, load/mass-deletion
 testing, infrastructure, and named-human release authorization remain open.
 
+## Progress update: private same-week community comparison (July 26, 2026)
+
+The local central portal now turns the delayed weekly aggregate into a useful
+participant result without pretending rounded public values reveal more than
+they do:
+
+- `GET /api/v1/me/stats` returns the participant's own contribution for the
+  exact active snapshot period and ingestion cutoff;
+- only active, accepted, invitation-eligible records are included, with the
+  same model normalization and per-cell clipping as publication;
+- the paired community number is copied from the immutable public payload and
+  is therefore already thresholded and rounded;
+- suppressed metrics expose neither a community total nor a derived
+  participant value;
+- no participant count, average, percentile, threshold distance, account
+  track, eligibility identifier, share, bill, or provider allowance is
+  returned or inferred;
+- deletion-driven snapshot withdrawal changes the comparison immediately to a
+  fixed not-testable state;
+- a real invite-only, encrypted, 20-participant loopback smoke exercised the
+  complete HTTP path and finished with zero participant/contribution/record
+  rows and an empty rebuild queue; and
+- rendered browser QA found and fixed comparison-table viewport overflow,
+  while confirming the full interpretation column and suppression language are
+  visible.
+
+The [private community comparison verification
+receipt](./2026-07-26-private-community-comparison-verification-receipt.md)
+records the implementation, live HTTP evidence, final database state, and
+rendered proof. This advances the G8 private-results product, but external
+participant enrollment, cloud deployment, G9 public release approval,
+cross-browser HTTPS session QA, disclosure review, and load/soak remain open.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

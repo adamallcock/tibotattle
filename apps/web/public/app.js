@@ -1060,6 +1060,7 @@ function renderPersonalStats(container, payload) {
   if (!accountScoped) {
     renderParticipantQuotaMovement(container, stats.rollingQuotaMovement);
   }
+  renderPrivateCommunityComparison(container, stats.communityComparison);
 }
 
 const ACCOUNT_CALIBRATION_REASONS = Object.freeze({
@@ -1284,6 +1285,132 @@ const COMMUNITY_METRIC_LABELS = Object.freeze({
   toolUnits: "Tool units"
 });
 
+const COMMUNITY_COMPARISON_REASONS = Object.freeze({
+  stable_snapshot_unavailable: "No stable released community week is available yet.",
+  community_snapshot_not_released: "The latest community week is withdrawn or privacy-suppressed, so no personal comparison is shown.",
+  community_snapshot_contract_invalid: "The released community week could not be compared safely.",
+  participant_comparison_too_large: "The comparison exceeded its fixed safe size.",
+  participant_comparison_contract_invalid: "The participant comparison could not be constructed safely.",
+  comparison_contract_invalid: "The comparison response did not pass browser validation."
+});
+
+function renderPrivateCommunityComparison(container, comparison) {
+  const section = node("section", "participant-detail community-comparison");
+  const heading = node("div", "participant-detail-heading");
+  const title = node("div");
+  title.append(
+    node("h4", "", "Your contribution in the released week"),
+    node(
+      "p",
+      "",
+      "Your value uses the publication clipping cap. The community value is the already-public total rounded down."
+    )
+  );
+  heading.append(title, node("span", "private-chip", "Private comparison"));
+  section.append(heading);
+
+  if (comparison?.status !== "ready") {
+    const state = node("div", "not-testable-state");
+    state.append(
+      node("strong", "", "Not testable"),
+      node(
+        "p",
+        "",
+        COMMUNITY_COMPARISON_REASONS[comparison?.reason]
+          ?? "A disclosure-safe released week is required before this comparison can be shown."
+      )
+    );
+    section.append(state);
+    container.append(section);
+    return;
+  }
+
+  section.append(node(
+    "p",
+    "snapshot-disclosure",
+    `${formatUtc(comparison.period.startAt, { dateOnly: true })}–${formatUtc(comparison.period.endAt, { dateOnly: true })} · revision ${compact(comparison.snapshotRevision)}. This is not an average, percentile, bill, or provider allowance. A rounded-down public total can be lower than your own clipped value.`
+  ));
+  const activeCells = comparison.cells.filter((cell) => cell.participantHasActivity);
+  if (!activeCells.length) {
+    const state = node("div", "not-testable-state");
+    state.append(
+      node("strong", "", "No matched released cell"),
+      node(
+        "p",
+        "",
+        "Your accepted activity did not contribute to a provider/model cell released for this fixed week."
+      )
+    );
+    section.append(state);
+    container.append(section);
+    return;
+  }
+
+  const wrap = node("div", "table-wrap comparison-table");
+  const table = document.createElement("table");
+  const caption = node(
+    "caption",
+    "sr-only",
+    "Private clipped contribution compared with public rounded community total"
+  );
+  const thead = document.createElement("thead");
+  const header = document.createElement("tr");
+  for (const label of [
+    "Provider / model",
+    "Metric",
+    "Your clipped contribution",
+    "Public rounded total",
+    "Interpretation"
+  ]) {
+    const th = document.createElement("th");
+    th.scope = "col";
+    th.textContent = label;
+    header.append(th);
+  }
+  thead.append(header);
+  const tbody = document.createElement("tbody");
+  for (const cell of activeCells) {
+    for (const [metricName, label] of Object.entries(COMMUNITY_METRIC_LABELS)) {
+      const metric = cell.metrics[metricName];
+      const row = document.createElement("tr");
+      const identity = document.createElement("th");
+      identity.scope = "row";
+      identity.textContent = `${cell.provider} · ${cell.modelId}`;
+      row.append(identity, node("td", "", label));
+      if (metric.status === "community_not_released") {
+        row.append(
+          node("td", "suppressed-value", "Not shown"),
+          node("td", "suppressed-value", "Not released"),
+          node("td", "", "Community support did not pass the fixed release rule.")
+        );
+      } else if (metric.status === "participant_component_unavailable") {
+        row.append(
+          node("td", "suppressed-value", "Not observed"),
+          node("td", "", compact(metric.communityRoundedValue)),
+          node("td", "", "Your source did not report this component.")
+        );
+      } else {
+        row.append(
+          node("td", "", compact(metric.participantClippedValue)),
+          node("td", "", compact(metric.communityRoundedValue)),
+          node(
+            "td",
+            "",
+            metric.participantClippedValue > metric.communityRoundedValue
+              ? "Public rounding makes a share calculation invalid."
+              : "Same fixed week; no average or percentile is inferred."
+          )
+        );
+      }
+      tbody.append(row);
+    }
+  }
+  table.append(caption, thead, tbody);
+  wrap.append(table);
+  section.append(wrap);
+  container.append(section);
+}
+
 function renderCommunitySnapshot(container, payload) {
   clear(container);
   const snapshot = normalizeCommunitySnapshot(payload);
@@ -1304,7 +1431,7 @@ function renderCommunitySnapshot(container, payload) {
     return;
   }
   if (snapshot.state === "withdrawn") {
-    container.append(node("p", "", "This weekly snapshot was withdrawn for privacy or quality reasons. It was not recomputed."));
+    container.append(node("p", "", "This weekly revision was withdrawn for privacy or quality reasons. A replacement revision may be pending."));
     return;
   }
   if (snapshot.state === "suppressed") {
@@ -1321,7 +1448,7 @@ function renderCommunitySnapshot(container, payload) {
   container.append(node(
     "p",
     "snapshot-disclosure",
-    `Each value is clipped per participant, independently support-gated at ${compact(snapshot.minimumIndependentParticipants)} or more participants, rounded down, and never recalculated after publication.`
+    `Each value is clipped per participant, independently support-gated at ${compact(snapshot.minimumIndependentParticipants)} or more participants, and rounded down. A sealed revision is never rewritten; deletion creates a replacement revision.`
   ));
   if (snapshot.state === "published_partial") {
     container.append(node("p", "snapshot-partial", "Some metrics were not released because their independent support was insufficient."));
