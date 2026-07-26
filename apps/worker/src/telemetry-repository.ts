@@ -536,9 +536,14 @@ export async function personalStats(db: D1Database, participantId: string): Prom
 export async function communityStats(
   db: D1Database,
   minimumParticipants: number,
+  { eligibleOnly = false }: { eligibleOnly?: boolean } = {},
 ): Promise<object> {
+  const eligibilityPredicate = eligibleOnly
+    ? "participant_id IN (SELECT participant_id FROM participant_community_eligibility)"
+    : "1 = 1";
   const participantRow = await db.prepare(
-    "SELECT COUNT(DISTINCT participant_id) AS total FROM telemetry_records",
+    `SELECT COUNT(DISTINCT participant_id) AS total FROM telemetry_records
+      WHERE ${eligibilityPredicate}`,
   ).first<{ total: number }>();
   const participantCount = participantRow?.total ?? 0;
   if (participantCount < minimumParticipants) {
@@ -547,11 +552,12 @@ export async function communityStats(
       suppressed: true,
       participantCount,
       minimumParticipants,
+      cohortEligibility: eligibleOnly ? "invite_only" : "local_open_development",
       reason: "minimum_cohort_not_met",
     };
   }
   const [totalRow, breakdown, daily, speedRow] = await Promise.all([
-    db.prepare(TOTALS_SQL).first<CountsRow>(),
+    db.prepare(`${TOTALS_SQL} WHERE ${eligibilityPredicate}`).first<CountsRow>(),
     db.prepare(
       `SELECT provider, model_id AS modelId, COUNT(*) AS events,
         COUNT(DISTINCT participant_id) AS participants,
@@ -559,7 +565,7 @@ export async function communityStats(
         COALESCE(SUM(input_cache_read_tokens), 0) AS inputCacheReadTokens,
         COALESCE(SUM(output_text_tokens), 0) AS outputTextTokens,
         COALESCE(SUM(output_reasoning_tokens), 0) AS outputReasoningTokens
-       FROM telemetry_records WHERE record_kind = 'usage'
+       FROM telemetry_records WHERE record_kind = 'usage' AND ${eligibilityPredicate}
        GROUP BY provider, model_id HAVING COUNT(DISTINCT participant_id) >= ?
        ORDER BY events DESC, provider, model_id LIMIT 50`,
     ).bind(minimumParticipants).all(),
@@ -570,7 +576,7 @@ export async function communityStats(
           + COALESCE(input_cache_read_tokens, 0) + COALESCE(input_cache_write_tokens, 0)
           + COALESCE(output_text_tokens, 0) + COALESCE(output_reasoning_tokens, 0)
           + COALESCE(output_combined_tokens, 0)), 0) AS tokens
-       FROM telemetry_records WHERE record_kind = 'usage'
+       FROM telemetry_records WHERE record_kind = 'usage' AND ${eligibilityPredicate}
        GROUP BY day HAVING COUNT(DISTINCT participant_id) >= ?
        ORDER BY day DESC LIMIT 180`,
     ).bind(minimumParticipants).all(),
@@ -578,7 +584,7 @@ export async function communityStats(
       `SELECT
         SUM(CASE WHEN speed_mode = 'fast' THEN 1 ELSE 0 END) AS fast,
         SUM(CASE WHEN estimated_api_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced
-       FROM telemetry_records WHERE record_kind = 'usage'`,
+       FROM telemetry_records WHERE record_kind = 'usage' AND ${eligibilityPredicate}`,
     ).first<{ fast: number; priced: number }>(),
   ]);
   const totals = totalRow ?? zeroCounts();
@@ -587,6 +593,7 @@ export async function communityStats(
     suppressed: false,
     participantCount,
     minimumParticipants,
+    cohortEligibility: eligibleOnly ? "invite_only" : "local_open_development",
     totals: {
       usageEvents: totals.usage_events,
       quotaSnapshots: totals.quota_snapshots,

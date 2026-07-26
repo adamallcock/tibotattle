@@ -282,11 +282,20 @@ export class CommunityClient {
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
-  enroll() {
+  health() {
+    return fetchJson(this.fetchImpl, "/api/health");
+  }
+
+  enroll(inviteCode = null) {
+    const body = {
+      consentVersion: "privacy-safe-telemetry-v0.1",
+      syntheticOnly: false
+    };
+    if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/enroll`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ consentVersion: "privacy-safe-telemetry-v0.1", syntheticOnly: false })
+      body: JSON.stringify(body)
     });
   }
 

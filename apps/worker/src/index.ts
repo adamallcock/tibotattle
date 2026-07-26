@@ -1,4 +1,10 @@
 import {
+  assertAdmissionBindings,
+  assertAttemptAllowed,
+  configuredEnrollmentMode,
+  parseInviteGrant,
+} from "./admission";
+import {
   AGGREGATE_MINIMUM_PARTICIPANTS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
@@ -116,11 +122,14 @@ function hasExactEnvelopeKeyOccurrences(raw: string): boolean {
 
 async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const mode = configuredEnrollmentMode(env);
+  assertAdmissionBindings(env);
+  if (mode === "disabled") throw new ApiError(503, "ENROLLMENT_DISABLED");
+  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
     || body.value === null
     || Array.isArray(body.value)
-    || Object.keys(body.value).length !== 2
     || !Object.hasOwn(body.value, "consentVersion")
     || !Object.hasOwn(body.value, "syntheticOnly")
     || !(
@@ -131,15 +140,29 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     )) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const keys = Object.keys(body.value);
+  const allowedKeys = mode === "invite_only"
+    ? ["consentVersion", "syntheticOnly", "inviteCode"]
+    : ["consentVersion", "syntheticOnly"];
+  if (keys.some((key) => !allowedKeys.includes(key))
+      || (mode === "local_open" && keys.length !== 2)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
   const consentVersion = Reflect.get(body.value, "consentVersion") as string;
+  const inviteGrant = mode === "invite_only"
+    ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
+    : null;
   return jsonResponse(
-    await enroll(env.USAGE_MONITOR_DB, consentVersion),
+    await enroll(env.USAGE_MONITOR_DB, consentVersion, inviteGrant),
     201,
   );
 }
 
 async function handleRecover(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  configuredEnrollmentMode(env);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(env.RECOVERY_RATE_LIMIT, "recovery");
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
     || body.value === null
@@ -501,9 +524,11 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 
 async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const mode = configuredEnrollmentMode(env);
   return jsonResponse(await communityStats(
     env.USAGE_MONITOR_DB,
     AGGREGATE_MINIMUM_PARTICIPANTS,
+    { eligibleOnly: mode !== "local_open" },
   ));
 }
 
@@ -550,10 +575,19 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
   if (pathname === "/api/v1/recover") return handleRecover(request, env);
   if (pathname === "/api/v1/envelope-key") return handleEnvelopeKey(request, env);
   if (pathname === "/api/v1/contributions") return handleContribution(request, env);
-  const contributionMatch = /^\/api\/v1\/contributions\/(contribution:[0-9a-f-]{36})$/u
-    .exec(pathname);
-  if (contributionMatch?.[1]) {
-    return handleContributionResource(request, env, contributionMatch[1]);
+  const contributionPrefix = "/api/v1/contributions/";
+  if (pathname.startsWith(contributionPrefix)) {
+    let contributionId = "";
+    try {
+      contributionId = decodeURIComponent(pathname.slice(contributionPrefix.length));
+    } catch {
+      throw new ApiError(404, "NOT_FOUND");
+    }
+    if (!/^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
+      .test(contributionId)) {
+      throw new ApiError(404, "NOT_FOUND");
+    }
+    return handleContributionResource(request, env, contributionId);
   }
   if (pathname === "/api/v1/me/export") return handleExport(request, env);
   if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
@@ -570,14 +604,40 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
   throw new ApiError(404, "NOT_FOUND");
 }
 
+function routeClass(pathname: string): string {
+  if (pathname === "/api/health") return "health";
+  if (pathname === "/api/v1/enroll") return "enroll";
+  if (pathname === "/api/v1/recover") return "recover";
+  if (pathname === "/api/v1/envelope-key") return "envelope_key";
+  if (pathname === "/api/v1/contributions") return "contributions";
+  if (pathname.startsWith("/api/v1/contributions/")) return "contribution_resource";
+  if (pathname === "/api/v1/me/export") return "participant_export";
+  if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
+    return "participant_stats";
+  }
+  if (pathname === "/api/v1/stats/aggregate"
+      || pathname === "/api/v1/community/insights") {
+    return "community_stats";
+  }
+  if (pathname === "/api/v1/me") return "participant";
+  if (pathname.startsWith("/api/")) return "unknown_api";
+  return "asset";
+}
+
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   try {
     if (url.pathname === "/api/health") {
       if (request.method !== "GET") methodNotAllowed(["GET"]);
+      const enrollmentMode = configuredEnrollmentMode(env);
+      assertAdmissionBindings(env);
       await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
-      return jsonResponse({ status: "ok", mode: "synthetic-and-private-telemetry" });
+      return jsonResponse({
+        status: "ok",
+        mode: "synthetic-and-private-telemetry",
+        enrollmentMode,
+      });
     }
     if (url.pathname.startsWith("/api/")) return await routeApi(request, env);
     const asset = await env.ASSETS.fetch(request);
@@ -599,7 +659,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       event: "request_failed",
       requestId,
       method: request.method,
-      path: url.pathname,
+      routeClass: routeClass(url.pathname),
       code: apiError.code,
       status: apiError.status,
     };

@@ -19,7 +19,8 @@ const EXACT_ROUTES = new Map([
   ["/api/v1/me", new Set(["GET", "DELETE"])],
 ]);
 
-const CONTRIBUTION_ROUTE = /^\/api\/v1\/contributions\/contribution:[0-9a-f-]{36}$/u;
+const CONTRIBUTION_PREFIX = "/api/v1/contributions/";
+const CONTRIBUTION_ID = /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function fixedError(code) {
   const error = new Error(code);
@@ -29,7 +30,15 @@ function fixedError(code) {
 
 export function centralRouteMethods(path) {
   if (EXACT_ROUTES.has(path)) return EXACT_ROUTES.get(path);
-  if (CONTRIBUTION_ROUTE.test(path)) return new Set(["GET", "DELETE"]);
+  if (path.startsWith(CONTRIBUTION_PREFIX)) {
+    let contributionId = "";
+    try {
+      contributionId = decodeURIComponent(path.slice(CONTRIBUTION_PREFIX.length));
+    } catch {
+      return null;
+    }
+    if (CONTRIBUTION_ID.test(contributionId)) return new Set(["GET", "DELETE"]);
+  }
   return null;
 }
 

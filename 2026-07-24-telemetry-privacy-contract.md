@@ -13,7 +13,13 @@ The first multi-user research artifact is a local-review-only metadata bundle. I
 
 The v0.1 contract family is an explicitly unfrozen, local-only draft. It has not been distributed to external participants and has no backward-compatibility promise; local review artifacts must be regenerated whenever its recorded schema hashes change. This exception ends at freeze: the first volunteer or upload-capable contract must use a new version, and every frozen schema version is thereafter immutable. The machine-readable status is `contracts/telemetry-v0.1/contract-status.json`.
 
-No upload, enrollment, server, background collection, notification, or dashboard functionality is authorized by this decision. A later transport design must pass a separate review and cannot weaken these schemas.
+No upload, enrollment, server, background collection, notification, or
+dashboard functionality is authorized **by this telemetry-v0.1 decision**.
+A separate local-development contribution contract, loopback dashboard, and
+unrouted Worker now exercise encrypted manual upload using a newly constructed,
+reverified content-free projection. That development proof does not make
+telemetry v0.1 transport-ready, authorize external participants, or replace the
+required frozen successor contract and review.
 
 ## Data-flow boundary
 
@@ -25,7 +31,7 @@ flowchart LR
     D --> E["Forbidden-key and sensitive-string scan"]
     E --> F["In-memory preview"]
     E --> G["Owner-only local bundle and receipt"]
-    G -. "not implemented" .-> H["Network transport"]
+    G -. "separate development contract only" .-> H["Unrouted encrypted transport proof"]
 ```
 
 Raw source values exist only while the local parser examines the source. They are not written to an intermediate redacted file. The constructors receive normalized numeric values and fixed classifications; source IDs needed for grouping are immediately converted to domain-separated HMAC pseudonyms.
@@ -94,9 +100,9 @@ The standalone `usage-export-set-manifest-v0.1` schema is a closed local protoco
 | Raw IDs become correlatable hashes | Secret-keyed, domain-separated HMACs | Anyone holding the participant secret can reproduce pseudonyms |
 | Credentials/content appear in an unexpected value | Defense-in-depth email, URL, path, credential, private-key, and bearer scanners | Pattern scanning cannot detect every semantic secret; schema allowlisting is the primary boundary |
 | Malicious source adds getters/nested values | Existing safe classifiers use own data descriptors; export schema copies only normalized fields | Parser/library regressions require continued fuzz/property testing |
-| Replayed/forked histories inflate contribution | Existing replay-safe scanner and deterministic event IDs | Server-side cross-bundle dedupe is not implemented yet |
+| Replayed/forked histories inflate contribution | Existing replay-safe scanner and deterministic event IDs; development Worker participant-scoped replay/overlap dedupe | Cross-device scope resolution and full G5 canonical provenance remain open |
 | Local files are exposed to another user | Secret, bundle, and receipt are mode `0600`; export patterns are Git-ignored | Malware or the same OS user remains outside this control |
-| Accidental network disclosure | No upload code or destination exists; `transportReady` is schema-constant `false` | Another application could manually copy a local bundle |
+| Accidental network disclosure | `transportReady` remains schema-constant `false`; the development browser accepts only a separately prepared closed contribution after explicit selection and has no public route | Packaged no-egress proof, frozen successor consent, production admission, and independent review remain open |
 | Exact timestamps enable behavioral inference | Restricted bundle only; planned public output must bucket/suppress | The local bundle itself remains sensitive research metadata |
 | Small cohorts identify a participant | No public aggregate system exists | Later server/site work must implement minimum cohort and contribution bounds |
 
@@ -127,7 +133,14 @@ Future upload consent must separately name the operator, destination, retention 
 4. Rotation does not modify existing bundles and can make overlapping history re-exports appear as a distinct participant. Existing bundles remain mutually linkable through their old participant pseudonym until they are deleted. The command does not promise secure erasure from SSD/APFS storage, open handles, memory, backups, or synced copies.
 5. Do not delete raw Codex logs as part of this runbook; they belong to the provider application and are outside this tool's data lifecycle.
 
-There is no server-side deletion procedure because no server or upload exists. Phase 2 cannot begin until enrollment, status, export, revocation, and deletion paths are implemented and exercised end to end.
+A development server-side deletion procedure now removes individual
+contributions or an entire anonymous participant from local D1/R2 emulation,
+and the functional E2E receipt verifies zero retained rows/objects afterward.
+Production retention, eligibility relations, deletion tombstones,
+backup/soft-delete windows, restore suppression, derived aggregate rebuild,
+notification identity, and incident drills remain unresolved. Phase 2 remains
+unauthorized until those controls plus enrollment/recovery hardening,
+revocation, frozen consent, and external review pass.
 
 ## Superseded baseline validation receipt
 

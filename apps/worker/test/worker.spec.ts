@@ -5,6 +5,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 // @ts-expect-error The browser helper is intentionally framework-free JavaScript.
 import { createSyntheticEnvelope } from "../../web/public/lib.js";
 import { encodeBase64Url } from "../src/crypto";
+import { hashInviteGrantSecret } from "../src/admission";
 import { handleRequest } from "../src/index";
 import { syntheticFixture } from "../src/validation";
 
@@ -22,15 +23,19 @@ let publicJwkJson = "";
 let privateJwkJson = "";
 let keyId = "";
 
-function testBindings(): Env {
+function testBindings(overrides: Partial<Env> = {}): Env {
   const bindings = env as TestBindings;
   return {
     ASSETS: bindings.ASSETS,
+    ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
+    ENROLLMENT_RATE_LIMIT: bindings.ENROLLMENT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: privateJwkJson,
     ENVELOPE_PUBLIC_JWK: publicJwkJson,
     ENVIRONMENT: "synthetic-development",
     QUARANTINE: bindings.QUARANTINE,
+    RECOVERY_RATE_LIMIT: bindings.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
+    ...overrides,
   };
 }
 
@@ -66,6 +71,42 @@ async function enrollTelemetry(): Promise<EnrollmentResponse> {
   });
   expect(response.status).toBe(201);
   return response.json<EnrollmentResponse>();
+}
+
+async function issueTestGrant({
+  expiresAt = new Date(Date.now() + 60 * 60_000).toISOString(),
+} = {}): Promise<string> {
+  const id = crypto.randomUUID();
+  const secret = encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const secretHash = await hashInviteGrantSecret(id, secret);
+  await testBindings().USAGE_MONITOR_DB.prepare(
+    `INSERT INTO enrollment_grants (
+      id, secret_hash, state, issued_at, expires_at
+    ) VALUES (?, ?, 'issued', ?, ?)`,
+  ).bind(id, secretHash, new Date().toISOString(), expiresAt).run();
+  return `um_invite_${id}.${secret}`;
+}
+
+function inviteOnlyBindings(overrides: Partial<Env> = {}): Env {
+  return testBindings({
+    ENROLLMENT_MODE: "invite_only" as Env["ENROLLMENT_MODE"],
+    ...overrides,
+  });
+}
+
+async function enrollWithGrant(
+  inviteGrant: unknown,
+  runtimeEnv = inviteOnlyBindings(),
+): Promise<Response> {
+  return api("/api/v1/enroll", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      consentVersion: "privacy-safe-telemetry-v0.1",
+      syntheticOnly: false,
+      ...(inviteGrant === undefined ? {} : { inviteCode: inviteGrant }),
+    }),
+  }, runtimeEnv);
 }
 
 async function encrypt(value: unknown, telemetry = false): Promise<object> {
@@ -250,6 +291,213 @@ describe("synthetic usage monitor service", () => {
     expect(malformed.status).toBe(400);
   });
 
+  it("fails closed for disabled, missing, invalid, and production-local enrollment modes", async () => {
+    const cases = [
+      {
+        env: testBindings({
+          ENROLLMENT_MODE: "disabled" as Env["ENROLLMENT_MODE"],
+        }),
+        code: "ENROLLMENT_DISABLED",
+      },
+      {
+        env: testBindings({
+          ENROLLMENT_MODE: undefined,
+        } as unknown as Partial<Env>),
+        code: "ADMISSION_CONFIGURATION_INVALID",
+      },
+      {
+        env: testBindings({
+          ENROLLMENT_MODE: "unreviewed" as Env["ENROLLMENT_MODE"],
+        }),
+        code: "ADMISSION_CONFIGURATION_INVALID",
+      },
+      {
+        env: testBindings({
+          ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+          ENROLLMENT_MODE: "local_open",
+        }),
+        code: "ADMISSION_CONFIGURATION_INVALID",
+      },
+      {
+        env: testBindings({
+          ENROLLMENT_RATE_LIMIT: undefined,
+        } as unknown as Partial<Env>),
+        code: "ADMISSION_CONFIGURATION_INVALID",
+      },
+    ];
+    for (const testCase of cases) {
+      const response = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+        }),
+      }, testCase.env);
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: testCase.code },
+      });
+    }
+    const count = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(count?.total).toBe(0);
+  });
+
+  it("rejects missing, malformed, expired, and replayed grants without reflecting values", async () => {
+    const expired = await issueTestGrant({
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => {
+      warnings.push(values.map(String).join(" "));
+    };
+    try {
+      for (const value of [
+        undefined,
+        "PRIVATE_INVITE_CANARY",
+        expired,
+      ]) {
+        const response = await enrollWithGrant(value);
+        expect(response.status).toBe(400);
+        const text = await response.text();
+        expect(JSON.parse(text)).toMatchObject({
+          error: { code: "INVITE_GRANT_INVALID" },
+        });
+        expect(text).not.toContain(String(value));
+      }
+    } finally {
+      console.warn = originalWarn;
+    }
+    expect(warnings.join("\n")).not.toContain("PRIVATE_INVITE_CANARY");
+    let count = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(count?.total).toBe(0);
+
+    const grant = await issueTestGrant();
+    const accepted = await enrollWithGrant(grant);
+    expect(accepted.status).toBe(201);
+    const replay = await enrollWithGrant(grant);
+    expect(replay.status).toBe(400);
+    const replayText = await replay.text();
+    expect(JSON.parse(replayText)).toMatchObject({
+      error: { code: "INVITE_GRANT_INVALID" },
+    });
+    expect(replayText).not.toContain(grant);
+    count = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(count?.total).toBe(1);
+  });
+
+  it("rejects a matching grant whose stored expiry is not a canonical instant", async () => {
+    const grant = await issueTestGrant();
+    const id = grant.slice("um_invite_".length, grant.indexOf("."));
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE enrollment_grants SET expires_at = ? WHERE id = ?",
+    ).bind("not-a-canonical-instant", id).run();
+    const response = await enrollWithGrant(grant);
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "INVITE_GRANT_INVALID" },
+    });
+    const count = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(count?.total).toBe(0);
+  });
+
+  it("atomically redeems an invite grant only once under concurrency", async () => {
+    const grant = await issueTestGrant();
+    const responses = await Promise.all([
+      enrollWithGrant(grant),
+      enrollWithGrant(grant),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([201, 400]);
+    const participants = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    const eligible = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participant_community_eligibility",
+    ).first<{ total: number }>();
+    expect(participants?.total).toBe(1);
+    expect(eligible?.total).toBe(1);
+  });
+
+  it("bounds enrollment and recovery without persisting or logging client identifiers", async () => {
+    const limiterKeys: string[] = [];
+    const blockedLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: false };
+      },
+    } satisfies RateLimit;
+    const allowedLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: true };
+      },
+    } satisfies RateLimit;
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values: unknown[]) => {
+      warnings.push(values.map(String).join(" "));
+    };
+    try {
+      const enrollment = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": "PRIVATE_IP_CANARY",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+        }),
+      }, testBindings({
+        ENROLLMENT_RATE_LIMIT: blockedLimiter,
+        RECOVERY_RATE_LIMIT: allowedLimiter,
+      }));
+      expect(enrollment.status).toBe(429);
+
+      const participant = await enroll();
+      const recovery = await api("/api/v1/recover", {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": "PRIVATE_IP_CANARY",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ recoveryCode: participant.recoveryCode }),
+      }, testBindings({
+        ENROLLMENT_RATE_LIMIT: allowedLimiter,
+        RECOVERY_RATE_LIMIT: blockedLimiter,
+      }));
+      expect(recovery.status).toBe(429);
+      const malformedPath = await api(
+        "/api/v1/contributions/PRIVATE_PATH_CANARY",
+        { headers: { authorization: "Bearer PRIVATE_CAPABILITY_CANARY" } },
+      );
+      expect(malformedPath.status).toBe(404);
+    } finally {
+      console.warn = originalWarn;
+    }
+    expect(warnings.join("\n")).not.toContain("PRIVATE_IP_CANARY");
+    expect(limiterKeys).toEqual([
+      "usage-monitor:enrollment:global",
+      "usage-monitor:recovery:global",
+    ]);
+    expect(warnings.join("\n")).not.toContain("PRIVATE_PATH_CANARY");
+    expect(warnings.join("\n")).not.toContain("PRIVATE_CAPABILITY_CANARY");
+    const attemptsTable = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(*) AS total FROM sqlite_master
+        WHERE type = 'table' AND name LIKE '%attempt%'`,
+    ).first<{ total: number }>();
+    expect(attemptsTable?.total).toBe(0);
+  });
+
   it("publishes the configured public key and a non-sensitive health result", async () => {
     const key = await api("/api/v1/envelope-key");
     expect(key.status).toBe(200);
@@ -264,6 +512,7 @@ describe("synthetic usage monitor service", () => {
     await expect(health.json()).resolves.toEqual({
       status: "ok",
       mode: "synthetic-and-private-telemetry",
+      enrollmentMode: "local_open",
     });
   });
 
@@ -620,9 +869,12 @@ describe("synthetic usage monitor service", () => {
       }],
     });
 
-    const contribution = await api(`/api/v1/contributions/${accepted.contributionId}`, {
+    const contribution = await api(
+      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
+      {
       headers: { authorization: `Bearer ${participant.accessToken}` },
-    });
+      },
+    );
     expect(contribution.status).toBe(200);
     await expect(contribution.json()).resolves.toMatchObject({
       contributionId: accepted.contributionId,
@@ -743,6 +995,72 @@ describe("synthetic usage monitor service", () => {
     });
     expect(JSON.stringify(body)).not.toContain("participant:");
     expect(JSON.stringify(body)).not.toContain("model:v1:");
+  });
+
+  it("does not let local-open participants unlock invite-only community aggregates", async () => {
+    for (const suffix of ["a", "b", "c"]) {
+      const participant = await enrollTelemetry();
+      const response = await api("/api/v1/contributions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${participant.accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
+      });
+      expect(response.status).toBe(202);
+    }
+    const suppressed = await api(
+      "/api/v1/community/insights",
+      {},
+      inviteOnlyBindings(),
+    );
+    await expect(suppressed.json()).resolves.toMatchObject({
+      suppressed: true,
+      participantCount: 0,
+      cohortEligibility: "invite_only",
+    });
+
+    let invitedParticipant: EnrollmentResponse | null = null;
+    for (const suffix of ["d", "e", "f"]) {
+      const grant = await issueTestGrant();
+      const enrolled = await enrollWithGrant(grant);
+      expect(enrolled.status).toBe(201);
+      const participant = await enrolled.json<EnrollmentResponse>();
+      invitedParticipant ??= participant;
+      const contribution = await api("/api/v1/contributions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${participant.accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
+      });
+      expect(contribution.status).toBe(202);
+    }
+    const community = await api(
+      "/api/v1/community/insights",
+      {},
+      inviteOnlyBindings(),
+    );
+    const communityText = await community.text();
+    expect(JSON.parse(communityText)).toMatchObject({
+      suppressed: false,
+      participantCount: 3,
+      cohortEligibility: "invite_only",
+      totals: { usageEvents: 3, quotaSnapshots: 3 },
+    });
+    for (const forbidden of ["eligibility:", "um_invite_", "grant_id"]) {
+      expect(communityText).not.toContain(forbidden);
+    }
+
+    const exported = await api("/api/v1/me/export", {
+      headers: { authorization: `Bearer ${invitedParticipant?.accessToken}` },
+    });
+    const exportText = await exported.text();
+    for (const forbidden of ["eligibility:", "um_invite_", "grant_id"]) {
+      expect(exportText).not.toContain(forbidden);
+    }
   });
 
   it("deletes every telemetry object and database row with the participant", async () => {

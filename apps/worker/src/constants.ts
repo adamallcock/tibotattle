@@ -10,6 +10,7 @@ export const FIXTURE_ID = "codex-weekly-demo-v0.1";
 export const TELEMETRY_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
 export const TELEMETRY_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v0.1";
 export const TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.1";
+export const ENROLLMENT_MODES = ["local_open", "invite_only", "disabled"] as const;
 
 export const JSON_HEADERS = {
   "cache-control": "no-store",

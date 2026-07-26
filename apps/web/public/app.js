@@ -760,7 +760,14 @@ function parseSafeExport(file) {
 
 async function ensureCommunitySession() {
   if (communitySession?.accessToken) return communitySession;
-  const enrollment = await communityClient.enroll();
+  const inviteInput = $("#contribution-invite");
+  const inviteCode = inviteInput.value.trim();
+  let enrollment;
+  try {
+    enrollment = await communityClient.enroll(inviteCode || null);
+  } finally {
+    inviteInput.value = "";
+  }
   if (!enrollment?.accessToken) throw new Error("The contribution service did not return an anonymous access capability.");
   saveSession({
     accessToken: enrollment.accessToken,
@@ -810,7 +817,7 @@ function renderStats(container, payload, { community = false } = {}) {
     return;
   }
   if (payload.suppressed) {
-    container.append(node("p", "", `Community results remain hidden until at least ${payload.minimumParticipants ?? 3} independent participants contribute. Current eligible count: ${payload.participantCount ?? 0}.`));
+    container.append(node("p", "", `Community results remain hidden until at least ${payload.minimumParticipants ?? 3} eligible participants contribute. Current eligible count: ${payload.participantCount ?? 0}.`));
     return;
   }
   const source = payload.totals ?? payload.lifetime ?? payload;
@@ -839,11 +846,13 @@ async function loadCommunityResults() {
   const community = $("#community-result");
   const participantControls = $("#participant-controls");
   try {
-    const [personalResult, communityResult] = await Promise.allSettled([
+    const [healthResult, personalResult, communityResult] = await Promise.allSettled([
+      communityClient.health(),
       communitySession?.accessToken ? communityClient.personalStats() : Promise.resolve(null),
       communityClient.communityStats()
     ]);
-    const serviceReachable = communityResult.status === "fulfilled"
+    const serviceReachable = healthResult.status === "fulfilled"
+      || communityResult.status === "fulfilled"
       || (Boolean(communitySession?.accessToken) && personalResult.status === "fulfilled");
     service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
@@ -851,6 +860,12 @@ async function loadCommunityResults() {
     renderStats(community, communityResult.status === "fulfilled" ? communityResult.value : null, { community: true });
     participantControls.hidden = !(communitySession?.accessToken && personalResult.status === "fulfilled");
     $("#recovery-code").textContent = communitySession?.recoveryCode ?? "Recovery code was not retained in this browser session.";
+    const enrollmentMode = healthResult.status === "fulfilled" ? healthResult.value?.enrollmentMode : null;
+    $("#invite-help").textContent = enrollmentMode === "invite_only"
+      ? "Required for this invite-only service. It is used once and never stored by this page."
+      : enrollmentMode === "disabled"
+        ? "New enrollment is currently paused. Existing participants can still manage their data."
+        : "Required only for an invite-only pilot. It is used once and never stored by this page.";
   } catch {
     service.textContent = "Service unavailable";
     service.className = "evidence-chip neutral";

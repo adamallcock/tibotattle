@@ -394,8 +394,11 @@ test("community adapter uses encrypted contribution and current stats paths", as
   assert.equal(calls[3].url, "/api/v1/me/export");
   assert.equal(calls[4].url, "/api/v1/me");
   assert.equal(calls[4].options.method, "DELETE");
-  await client.enroll();
-  assert.match(calls[5].options.body, /privacy-safe-telemetry-v0\.1/);
+  await client.health();
+  await client.enroll("um_invite_test");
+  assert.equal(calls[5].url, "/api/health");
+  assert.match(calls[6].options.body, /privacy-safe-telemetry-v0\.1/);
+  assert.match(calls[6].options.body, /um_invite_test/);
 });
 
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
@@ -407,6 +410,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="timeline-chart"/);
   assert.match(html, /id="weekly-chart"/);
   assert.match(html, /id="contribution-file"/);
+  assert.match(html, /id="contribution-invite"/);
   assert.match(html, /id="download-participant"/);
   assert.match(html, /id="delete-participant"/);
   assert.match(html, /privacy-safe Usage Monitor export/);
@@ -421,6 +425,8 @@ test("real contribution UI encrypts before sending and distinguishes aggregate s
   assert.match(appSource, /communityClient\.contribute\(envelope\)/);
   assert.match(appSource, /communityClient\.participantExport\(\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);
+  assert.match(appSource, /inviteInput\.value = ""/);
+  assert.doesNotMatch(appSource, /saveSession\([^)]*invite/i);
   assert.match(appSource, /if \(payload\.suppressed\)/);
   assert.match(appSource, /minimumParticipants/);
 });

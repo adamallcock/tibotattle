@@ -239,6 +239,24 @@ participant-scoped occurrence ID at the server.
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
 Worker dry deployment. It does not deploy or upload data.
 
+For a real HTTP backend smoke using an actual prepared contribution, run the
+Worker in invite-only mode and then use:
+
+```bash
+npm run product:backend:smoke -- \
+  --origin http://127.0.0.1:8792 \
+  --file /absolute/path/to/telemetry-contribution-000001.json \
+  --invite-file /private/tmp/usage-monitor-invite.secret
+```
+
+The [Worker runbook](./apps/worker/README.md) contains the full migration,
+owner-only invitation, server-start, smoke, and cleanup sequence. The smoke
+exercises enrollment, client encryption, strict server validation, D1 ingest,
+opaque R2 retention, idempotent replay, personal/community statistics,
+participant export, complete deletion, and post-deletion authorization. It
+prints no participant or credential values and leaves external deployment
+disabled.
+
 The [functional end-to-end verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
 fresh real-data local smoke: two encrypted batches, personal-stat updates,

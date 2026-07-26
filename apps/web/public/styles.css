@@ -441,6 +441,10 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .file-drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .file-drop > span { display: grid; place-items: center; width: 34px; height: 34px; margin-bottom: 8px; color: white; background: var(--green); border-radius: 50%; }
+.invite-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .8fr); gap: 16px; align-items: center; margin-bottom: 14px; padding: 14px; border: 1px solid var(--line); border-radius: .35rem; background: rgba(255, 254, 249, .6); }
+.invite-row strong, .invite-row small { display: block; }
+.invite-row small { margin-top: 3px; color: var(--muted); font-size: .69rem; }
+.invite-row input { min-width: 0; width: 100%; padding: .7rem .8rem; border: 1px solid var(--line); border-radius: .3rem; color: var(--ink); background: var(--white); font-size: .76rem; }
 .file-drop strong { font-size: .82rem; }
 .file-drop small { margin-top: 4px; color: var(--muted); font-size: .68rem; }
 .file-drop.selected { border-style: solid; background: var(--green-soft); }
@@ -503,6 +507,7 @@ footer {
   .comparison-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
   .chart-summary-grid { grid-template-columns: 1fr 1fr; }
   .boundary-diagram { grid-template-columns: 1fr; }
+  .invite-row { grid-template-columns: 1fr; }
   .boundary-arrow { transform: rotate(90deg); justify-self: center; }
   .definition-grid { grid-template-columns: 1fr; }
   .definition-grid > div, .definition-grid > div:nth-child(odd), .definition-grid > div:nth-last-child(-n+2) { border-right: 0; border-bottom: 1px solid var(--line); }

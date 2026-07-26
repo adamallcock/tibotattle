@@ -173,8 +173,8 @@ Evidence now established:
 The current execution wave is ordered as follows:
 
 1. **Primary product lane — functional local and central development app.**
-   The loopback dashboard, real privacy-safe contribution batches, anonymous
-   consent/enrollment/recovery, encrypted submission, strict validation,
+   The loopback dashboard, real privacy-safe contribution batches, one-time
+   invite admission, consent/enrollment/recovery, encrypted submission, strict validation,
    overlap deduplication, D1/R2 lifecycle, personal/community statistics,
    participant export/deletion, and fixed same-origin relay are implemented and
    tested locally. Keep the Worker unrouted and collection unauthorized.
@@ -208,12 +208,12 @@ public deployment.
 | Local metadata extraction and privacy-minimized records | Implemented and tested for the current local contract |
 | Local verification, recovery, deletion, and generated research reports | Implemented as command-line and static-artifact workflows |
 | Consumer local app or interactive web UI | Functional loopback dashboard implemented with real retained quota, cost, gradient, weekly, and quality evidence |
-| Enrollment, consent, recovery code, and account portal | Separate synthetic/real consent modes, anonymous enrollment, recovery, and participant controls implemented locally |
+| Enrollment, consent, recovery code, and account portal | Separate synthetic/real consent modes, fail-closed local/open/invite/disabled admission, one-time hashed invitations, recovery, and participant controls implemented locally |
 | Upload client, encryption envelope, and background sync | Explicit prepared-batch browser encryption/upload implemented; raw-log and background upload disabled |
 | Web server, upload authorization, and private object storage | Local Cloudflare Worker, bearer capabilities, D1, and R2 implemented; no public route |
 | Server validation, quarantine, deduplication, and canonical database | Exact real/synthetic validation, privacy-canary rejection, overlap dedupe, R2 quarantine, and D1 rows implemented |
 | Personal participant dashboard and results API | Personal totals, quota-gradient diagnostics, contribution status, export, recovery, individual/full deletion implemented |
-| Privacy-safe aggregate website | K-anonymous development aggregate API and UI implemented; public publication not authorized |
+| Privacy-safe aggregate website | Grant-eligibility-aware, thresholded development aggregate API and UI implemented; clipping/disclosure review and public publication not authorized |
 | Notifications and ongoing collection controls | Designed in Stage 10; not implemented |
 | Server-side export, revocation, and deletion | Real/synthetic participant export, access rotation, individual contribution deletion, and full D1/R2 deletion implemented |
 
@@ -243,6 +243,17 @@ content canary was rejected, and the consumer deletion control left zero D1
 rows and zero R2 objects. The [verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) is the
 durable evidence for this checkpoint.
+
+The next development hardening checkpoint added one-time, hash-only invite
+admission, atomic grant redemption, opaque cohort eligibility, shared
+privacy-preserving enrollment/recovery attempt bounds, and eligibility-aware
+community statistics. A new repeatable HTTP smoke accepted a real 200-record
+prepared file, verified replay/personal/community/export behavior, deleted the
+participant, rejected the old capability, and left zero D1/R2 participant
+state. It also found and fixed a percent-encoded contribution-ID integration
+bug. The [G3 invite-admission verification
+receipt](./2026-07-25-g3-invite-admission-verification-receipt.md) records that
+evidence and the still-blocking production controls.
 
 ## Target architecture
 

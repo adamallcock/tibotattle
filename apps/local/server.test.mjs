@@ -319,8 +319,22 @@ test("optional central proxy forwards only fixed same-origin API requests", asyn
     });
 
     assert.equal((await fetch(`${base}/api/v1/enroll?next=https://attacker.example`)).status, 400);
+    const encodedContribution = await fetch(
+      `${base}/api/v1/contributions/${encodeURIComponent("contribution:00000000-0000-4000-8000-000000000000")}`,
+      {
+        headers: {
+          Origin: base,
+          Authorization: "Bearer local-session-token",
+        },
+      },
+    );
+    assert.equal(encodedContribution.status, 201);
+    assert.equal(
+      forwarded.at(-1).url,
+      "https://central.example/api/v1/contributions/contribution%3A00000000-0000-4000-8000-000000000000",
+    );
     assert.equal((await fetch(`${base}/api/v1/admin`)).status, 404);
-    assert.equal(forwarded.length, 1);
+    assert.equal(forwarded.length, 2);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

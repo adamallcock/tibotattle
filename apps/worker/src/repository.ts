@@ -1,3 +1,7 @@
+import {
+  inviteGrantHashMatches,
+  type ParsedInviteGrant,
+} from "./admission";
 import { hashCapability, randomSecret, sha256Hex, timingSafeEqual } from "./crypto";
 import { ApiError } from "./errors";
 import type { SyntheticContribution, SyntheticEnvelope } from "./validation";
@@ -21,6 +25,13 @@ interface RecoveryAuthRow {
   id: string;
   recovery_token_hash: ArrayBuffer;
   state: "active" | "deleting";
+}
+
+interface InviteGrantRow {
+  id: string;
+  secret_hash: ArrayBuffer;
+  state: "issued" | "redeemed";
+  expires_at: string;
 }
 
 export interface ContributionRow {
@@ -87,7 +98,18 @@ function bytes(value: ArrayBuffer): Uint8Array {
   return new Uint8Array(value);
 }
 
-export async function enroll(db: D1Database, consentVersion: string): Promise<Enrollment> {
+function canonicalFutureInstant(value: string, nowEpoch: number): boolean {
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch)
+    && new Date(epoch).toISOString() === value
+    && epoch > nowEpoch;
+}
+
+export async function enroll(
+  db: D1Database,
+  consentVersion: string,
+  inviteGrant: ParsedInviteGrant | null = null,
+): Promise<Enrollment> {
   const participantId = `participant:${crypto.randomUUID()}`;
   const access = capability("um_access");
   const recovery = capability("um_recovery");
@@ -95,7 +117,7 @@ export async function enroll(db: D1Database, consentVersion: string): Promise<En
     hashCapability("access", access.id, access.secret),
     hashCapability("recovery", recovery.id, recovery.secret),
   ]);
-  await db.prepare(
+  const participantInsert = db.prepare(
     `INSERT INTO participants (
       id, access_token_id, access_token_hash, recovery_token_id,
       recovery_token_hash, state, consent_version, consented_at, created_at
@@ -109,7 +131,52 @@ export async function enroll(db: D1Database, consentVersion: string): Promise<En
     consentVersion,
     new Date().toISOString(),
     new Date().toISOString(),
-  ).run();
+  );
+  if (!inviteGrant) {
+    await participantInsert.run();
+  } else {
+    const grant = await db.prepare(
+      `SELECT id, secret_hash, state, expires_at
+         FROM enrollment_grants WHERE id = ?`,
+    ).bind(inviteGrant.id).first<InviteGrantRow>();
+    const nowEpoch = Date.now();
+    const now = new Date(nowEpoch).toISOString();
+    if (!inviteGrantHashMatches(inviteGrant.secretHash, grant?.secret_hash ?? null)
+        || !grant
+        || grant.state !== "issued"
+        || !canonicalFutureInstant(grant.expires_at, nowEpoch)) {
+      throw new ApiError(400, "INVITE_GRANT_INVALID");
+    }
+    const eligibilityId = `eligibility:${crypto.randomUUID()}`;
+    try {
+      const result = await db.batch([
+        participantInsert,
+        db.prepare(
+          `UPDATE enrollment_grants
+              SET state = 'redeemed', redeemed_at = ?, redeemed_participant_id = ?
+            WHERE id = ? AND state = 'issued' AND expires_at > ?`,
+        ).bind(now, participantId, inviteGrant.id, now),
+        db.prepare(
+          `INSERT INTO participant_community_eligibility (
+            id, participant_id, grant_id, created_at
+          ) VALUES (?, ?, ?, ?)`,
+        ).bind(eligibilityId, participantId, inviteGrant.id, now),
+      ]);
+      if (result.some((entry) => entry.meta.changes !== 1)) {
+        throw new ApiError(400, "INVITE_GRANT_INVALID");
+      }
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      const current = await db.prepare(
+        "SELECT state, expires_at FROM enrollment_grants WHERE id = ?",
+      ).bind(inviteGrant.id).first<{ state: string; expires_at: string }>();
+      if (!current || current.state !== "issued"
+          || !canonicalFutureInstant(current.expires_at, Date.now())) {
+        throw new ApiError(400, "INVITE_GRANT_INVALID");
+      }
+      throw error;
+    }
+  }
   return {
     participantId,
     accessToken: access.encoded,

@@ -406,6 +406,21 @@
               and quarantine outliers before aggregation.
             </p>
             <form id="contribution-form">
+              <label class="invite-row" for="contribution-invite">
+                <span>
+                  <strong>Invitation code</strong>
+                  <small id="invite-help">Required only for an invite-only pilot. It is used once and never stored by this page.</small>
+                </span>
+                <input
+                  id="contribution-invite"
+                  name="invite"
+                  type="password"
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  placeholder="Optional in local development"
+                >
+              </label>
               <label class="file-drop" for="contribution-file">
                 <input id="contribution-file" name="export" type="file" accept=".json,application/json" required>
                 <span aria-hidden="true">＋</span>

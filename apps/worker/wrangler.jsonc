@@ -11,8 +11,21 @@
     "head_sampling_rate": 1
   },
   "vars": {
-    "ENVIRONMENT": "synthetic-development"
+    "ENVIRONMENT": "synthetic-development",
+    "ENROLLMENT_MODE": "local_open"
   },
+  "ratelimits": [
+    {
+      "name": "ENROLLMENT_RATE_LIMIT",
+      "namespace_id": "1001",
+      "simple": { "limit": 20, "period": 60 }
+    },
+    {
+      "name": "RECOVERY_RATE_LIMIT",
+      "namespace_id": "1002",
+      "simple": { "limit": 20, "period": 60 }
+    }
+  ],
   "d1_databases": [
     {
       "binding": "USAGE_MONITOR_DB",
