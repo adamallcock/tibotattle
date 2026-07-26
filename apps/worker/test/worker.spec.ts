@@ -1098,7 +1098,7 @@ describe("synthetic usage monitor service", () => {
       enrollmentMode: "local_open",
       checks: {
         database: "ok",
-        encryptedObjectStore: "bound",
+        encryptedObjectStore: "reachable",
       },
       contracts: {
         acceptedContribution: "telemetry-contribution-v0.1",

@@ -115,7 +115,7 @@ Data & privacy section reported:
 
 - backend state: `Backend ready`;
 - database: `Connected`;
-- encrypted quarantine: `Bound`;
+- encrypted quarantine: `Reachable`;
 - enrollment: `Open for local testing`;
 - accepted upload contract: `telemetry-contribution-v0.1`; and
 - `telemetry-contribution-v0.2` account-scoped ingest: implemented and testable
@@ -135,7 +135,7 @@ analysis, delayed aggregation, and user-controlled export/reset/deletion.
   plain loopback HTTP. The cookie-jar HTTP smoke covers that lifecycle now; a
   same-origin HTTPS staging environment must repeat real browser interaction
   before a pilot.
-- The live health check proves D1 reachability and R2 binding presence, not the
+- The live health check proves D1 reachability and a read-only R2 probe, not the
   complete ingest lifecycle. The test suite and HTTP smoke are the deeper
   evidence.
 - Production key rotation, retention operations, abuse controls, alerting,

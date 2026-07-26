@@ -1218,8 +1218,8 @@ function renderBackendHealth(health) {
   $("#backend-database").textContent = health?.checks?.database === "ok"
     ? "Connected"
     : "Unavailable";
-  $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "bound"
-    ? "Bound"
+  $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "reachable"
+    ? "Reachable"
     : "Unavailable";
   const enrollmentLabels = {
     local_open: "Open for local testing",

@@ -821,17 +821,21 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
       assertAdmissionBindings(env);
+      if (!env.QUARANTINE
+          || typeof Reflect.get(env.QUARANTINE, "head") !== "function"
+          || typeof Reflect.get(env.QUARANTINE, "put") !== "function"
+          || typeof Reflect.get(env.QUARANTINE, "delete") !== "function") {
+        throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      }
       await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
+      await env.QUARANTINE.head("__usage_monitor_health_probe__");
       return jsonResponse({
         status: "ok",
         mode: "synthetic-and-private-telemetry",
         enrollmentMode,
         checks: {
           database: "ok",
-          encryptedObjectStore: env.QUARANTINE
-            && typeof Reflect.get(env.QUARANTINE, "put") === "function"
-            ? "bound"
-            : "unavailable",
+          encryptedObjectStore: "reachable",
         },
         contracts: {
           acceptedContribution: "telemetry-contribution-v0.1",
