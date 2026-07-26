@@ -366,7 +366,33 @@ remain separately gated.
 
 `npm run product:check` runs the functional UI, loopback server, transport
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
-Worker dry deployment. It does not deploy or upload data.
+Worker dry deployment. It now also compiles the named, collection-disabled
+staging environment and validates its fail-closed configuration. It does not
+deploy or upload data.
+
+The central backend now has a production-shaped HTTPS staging gate without
+authorizing collection. From the repository root:
+
+```bash
+npm run product:staging:check
+npm run product:staging:ready
+```
+
+The first command validates configuration and performs a staging dry deploy.
+The second makes only bounded, read-only Cloudflare capability checks. The live
+July 26 check reports authenticated D1 access but `R2_NOT_ENABLED`, so the
+staging service remains safely unprovisioned and undeployed. Once the account
+owner explicitly enables R2, the exact resource creation, migration,
+containment, isolated-key, and confirmed deployment sequence is in the
+[Worker runbook](./apps/worker/README.md). The deployment wrapper cannot run
+until both D1 migration streams are current, the remote collection-control row
+is fully contained, and the post-deploy HTTPS health response proves every
+collection path remains disabled. No remote resume command exists.
+
+The [disabled staging deployment gate
+plan](./2026-07-26-disabled-staging-deployment-gate-plan.md) distinguishes the
+verified dry gate from unproven provisioning, deployment, external review, and
+pilot authorization.
 
 After an authenticated upload, the central portal shows a private accepted
 contribution history backed by canonical Worker state. Each bounded row shows

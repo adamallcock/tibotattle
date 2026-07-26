@@ -12,10 +12,12 @@ and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
 files, prompts, responses, commands, paths, account identifiers, or arbitrary
 keys.
 
-The Worker is deliberately not configured or authorized for a public
-production deployment. Real telemetry support is for local backend and
-end-to-end product testing until the separate consent, admission-control,
-security, and privacy review gates are complete.
+The Worker is deliberately not authorized for a public production deployment.
+A named staging environment is now configured as an HTTPS-capable but
+collection-disabled target. It remains unprovisioned and undeployed. Real
+telemetry support is for local backend and end-to-end product testing until the
+separate consent, admission-control, security, and privacy review gates are
+complete.
 
 ## Local run
 
@@ -38,6 +40,101 @@ npm run check
 That command verifies generated Worker types, runs TypeScript and the
 Cloudflare-runtime integration tests, and performs a deployment dry run. It
 does not deploy anything.
+
+## Disabled staging gate
+
+The checked-in `staging` environment is intentionally safe but incomplete:
+
+- `ENROLLMENT_MODE=disabled`;
+- `ACCOUNT_SCOPED_INGEST_MODE=disabled`;
+- all four D1 collection controls must be `contained`;
+- version preview URLs are disabled;
+- required envelope-key names are declared without values;
+- two D1 bindings, one private R2 binding, two independent rate limiters,
+  static assets, hourly lifecycle work, and Worker observability are explicit
+  environment configuration; and
+- D1 resource IDs are schema-valid sentinels that the strict readiness command
+  rejects.
+
+Run the non-mutating configuration and dry-deployment gate:
+
+```sh
+npm run staging:check
+```
+
+Run the live, non-mutating account and resource probe:
+
+```sh
+npm run staging:ready
+```
+
+The command suppresses raw Wrangler output and emits only bounded booleans and
+fixed blocker codes. On July 26, 2026, the authenticated account could reach
+D1, but Cloudflare returned `R2_NOT_ENABLED`. No staging resource was created
+and nothing was deployed.
+
+Cloudflare documents named Wrangler environments as independent Workers whose
+variables and bindings must be restated per environment:
+<https://developers.cloudflare.com/workers/wrangler/environments/>.
+Cloudflare also documents that R2 buckets are private by default:
+<https://developers.cloudflare.com/r2/buckets/create-buckets/>.
+
+After the account owner explicitly enables R2 and accepts any resulting terms
+or billing, create exactly these isolated resources:
+
+```sh
+npx wrangler d1 create app-usagemonitor-staging
+npx wrangler d1 create app-usagemonitor-staging-deletion-ledger
+npx wrangler r2 bucket create app-usagemonitor-staging-quarantine
+```
+
+Put the two returned D1 UUIDs into the matching `env.staging.d1_databases`
+entries. Do not change enrollment or account-scoped modes. Generate a distinct
+owner-only staging key file:
+
+```sh
+npm run keys:staging
+```
+
+This creates ignored mode-0600 `.dev.vars.staging`, refuses overwrite, and
+never prints a key. It must not reuse `.dev.vars`.
+
+Prepare remote D1 only after `staging:ready` proves that the configured
+resources exist:
+
+```sh
+npm run staging:prepare -- --confirm PREPARE_DISABLED_STAGING
+```
+
+This applies both migration streams and immediately forces enrollment, upload
+registration, processing, and publication into `contained`. It has no restore
+action. It performs no deployment and authorizes no collection.
+
+Finally deploy the contained build to its exact HTTPS origin:
+
+```sh
+npm run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST \
+  --confirm DEPLOY_DISABLED_STAGING
+```
+
+The wrapper refuses unless configuration, authentication, resources,
+migrations, and containment are proven. On the first deploy, it accepts only
+the fixed owner-only `.dev.vars.staging` file and supplies those secrets to
+Wrangler without printing them. It then checks `/api/health` over HTTPS and
+fails unless enrollment, upload registration, processing, publication,
+encrypted upload, aggregate publication, ongoing device upload, and external
+account-scoped participation all remain disabled.
+
+This route follows Cloudflare's documented required-secret validation and
+first-deploy `--secrets-file` support:
+<https://developers.cloudflare.com/workers/configuration/secrets/>.
+It is a contained infrastructure check, not pilot authorization. There is
+deliberately no remote “resume” command in this repository.
+
+The [disabled staging deployment gate
+plan](../../2026-07-26-disabled-staging-deployment-gate-plan.md) records the
+trust boundary and remaining live blockers.
 
 From the repository root, the shorter backend-only command is:
 

@@ -1,0 +1,151 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  PREPARE_CONFIRMATION,
+  prepareDisabledStaging,
+} from "./prepare-disabled-staging.mjs";
+import {
+  checkedInConfig,
+  provisionedConfig,
+  workerDirectory,
+} from "./staging-test-fixtures.mjs";
+
+test("preparation requires exact confirmation before inspection or mutation", () => {
+  const calls = [];
+  const result = prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: "yes",
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: (_command, args) => {
+      calls.push(args);
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, { ok: false, code: "CONFIRMATION_REQUIRED" });
+  assert.deepEqual(calls, []);
+});
+
+test("preparation will not mutate unprovisioned infrastructure", () => {
+  const calls = [];
+  const spawn = (_command, args) => {
+    calls.push(args);
+    const joined = args.join(" ");
+    if (joined === "whoami") return { status: 0, stdout: "", stderr: "" };
+    if (joined === "d1 list --json") {
+      return { status: 0, stdout: "[]", stderr: "" };
+    }
+    if (joined === "r2 bucket list") {
+      return { status: 1, stdout: "", stderr: "code: 10042" };
+    }
+    throw new Error(`Unexpected command: ${joined}`);
+  };
+  const result = prepareDisabledStaging({
+    config: checkedInConfig,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "STAGING_INFRASTRUCTURE_BLOCKED");
+  assert.equal(result.blockers.includes("R2_NOT_ENABLED"), true);
+  assert.equal(calls.some((args) => args.includes("apply")), false);
+  assert.equal(calls.some((args) => args.includes("execute")), false);
+});
+
+test("preparation applies both migrations, contains collection, and rechecks", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  let migrationsApplied = false;
+  let containmentApplied = false;
+  let applyCount = 0;
+  const spawn = (_command, args) => {
+    calls.push(args);
+    const joined = args.join(" ");
+    if (joined === "whoami") return { status: 0, stdout: "", stderr: "" };
+    if (joined === "d1 list --json") {
+      return {
+        status: 0,
+        stdout: JSON.stringify(config.env.staging.d1_databases.map((entry) => ({
+          uuid: entry.database_id,
+          name: entry.database_name,
+        }))),
+        stderr: "",
+      };
+    }
+    if (joined === "r2 bucket list") {
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("r2 bucket info ")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          name: config.env.staging.r2_buckets[0].bucket_name,
+        }),
+        stderr: "",
+      };
+    }
+    if (joined === "secret list --env staging --format json") {
+      return {
+        status: 0,
+        stdout: JSON.stringify([
+          { name: "ENVELOPE_PRIVATE_JWK" },
+          { name: "ENVELOPE_PUBLIC_JWK" },
+        ]),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 migrations list ")) {
+      return {
+        status: 0,
+        stdout: migrationsApplied
+          ? "No migrations to apply!"
+          : "Migrations to be applied",
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 migrations apply ")) {
+      applyCount += 1;
+      if (applyCount === 2) migrationsApplied = true;
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
+        && args.includes("--json")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: [{
+            schema_version: "collection-controls-v0.1",
+            control_state: containmentApplied ? "contained" : "operational",
+            enrollment_enabled: containmentApplied ? 0 : 1,
+            upload_registration_enabled: containmentApplied ? 0 : 1,
+            processing_enabled: containmentApplied ? 0 : 1,
+            publication_enabled: containmentApplied ? 0 : 1,
+          }],
+        }]),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")) {
+      containmentApplied = true;
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    throw new Error(`Unexpected command: ${joined}`);
+  };
+  const result = prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn,
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    code: "DISABLED_STAGING_PREPARED",
+    collectionAuthorized: false,
+    secretsInstalled: true,
+  });
+  assert.equal(applyCount, 2);
+  assert.equal(containmentApplied, true);
+});
