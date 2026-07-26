@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "usage-monitor-local-review-release-contract-v0.1",
+  "status": "frozen_unsigned_engineering_candidate",
+  "platform": {
+    "os": "darwin",
+    "architecture": "arm64"
+  },
+  "runtime": {
+    "name": "node",
+    "version": "26.2.0",
+    "binarySha256": "b276251704734604aad4ab2dc4a07892565baea39400f6422abeb1fe39637440"
+  },
+  "nativeDependencies": [
+    {
+      "name": "@github/keytar",
+      "version": "7.10.6",
+      "binding": "prebuilds/darwin-arm64/keytar.node",
+      "bindingSha256": "855c21e1e702967230bd87f600d04c311b77f29150f3372d547e72882c58de6a"
+    }
+  ],
+  "localOnly": true,
+  "transportReady": false,
+  "externalParticipantsAuthorized": false,
+  "automaticUpdates": false,
+  "backgroundService": false,
+  "ordinaryUninstallPreservesParticipantIdentity": true,
+  "secureErasureClaimed": false,
+  "permittedCommands": [
+    "doctor",
+    "inspect-artifact",
+    "inspect-export",
+    "export-local",
+    "verify-bundle",
+    "export-set",
+    "inspect-export-workspace",
+    "verify-export-set",
+    "recover-exports",
+    "delete-local-export",
+    "recover-local-export-deletion",
+    "discard-export-workspace",
+    "recover-export-workspace-discard",
+    "rotate-local-identity",
+    "inspect-claude-callback",
+    "install-claude-callback",
+    "uninstall-claude-callback",
+    "recover-claude-callback",
+    "rotate-claude-callback-identity",
+    "remove-claude-callback-identity",
+    "install",
+    "uninstall"
+  ],
+  "prohibitedCapabilities": [
+    "enrollment",
+    "device_pairing",
+    "upload",
+    "upload_queue",
+    "remote_configuration",
+    "notification_delivery",
+    "http_server",
+    "cloud_storage",
+    "automatic_update"
+  ]
+}

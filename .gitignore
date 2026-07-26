@@ -18,6 +18,8 @@ staging/
 *.umx
 *.umx.json
 *.privacy-receipt.json
+.release-build/
+.release-repro/
 
 # Credentials and local configuration (commit an explicitly reviewed example only).
 .env
