@@ -28,7 +28,7 @@ This decision narrows platform claims; it does not weaken privacy, determinism, 
 | Native secrets | macOS arm64 production identity and account-observation capabilities default to distinct exact-pinned Keychain items; migration, retirement, rotation serialization, replacement retention, locked/unavailable behavior, and prospective account switching are integrated | Focused adversarial tests and full matrix | Code path closed; fresh-user install/rotate/uninstall smoke open |
 | Minimization | Deterministic A1–A7 runner and frozen fixtures now produce an aggregate-only receipt; the first real run is correctly inconclusive with zero qualifying prospective resets and authorizes no retention or public aggregate | [Preregistration](./2026-07-24-g1-data-minimization-ablation-preregistration.md) and [inconclusive decision](./2026-07-25-g1-data-minimization-ablation-decision.md) | Machinery closed; empirical decision remains open pending three eligible resets |
 | Resource limits | Dual-runtime synthetic lifecycle smoke and direct guard checks pass under candidate policy `g1-r3-candidate-0.5`; no producer/verifier ceiling is yet identified and no release policy is selected | [R7 preregistration](./2026-07-25-g1-r7-measured-release-ceilings-preregistration.md) and [synthetic smoke receipt](./2026-07-25-g1-r7-smoke-verification-receipt.md) | Open: release profile, real heavy history, materialized boundaries, per-dimension decisions, and promotion remain |
-| Packaging | No pinned distributable runtime, SBOM, signatures, attestations, or installer | Repository inspection | Open |
+| Packaging | A clean-source, reproducible unsigned macOS arm64 engineering candidate now bundles Node 26.2.0, the audited Keychain binding, offline pricing dependencies, closed manifest, checksums, CycloneDX SBOM, licenses, provenance, explicit-target installer, and exact-receipt uninstaller | [Unsigned artifact verification receipt](./2026-07-26-unsigned-local-review-artifact-verification-receipt.md) | Partial: unsigned build closed; direct attempt telemetry, signing, and notarization open |
 | Clean-machine/volunteer gate | Not run | Requires signed artifact | Externally gated |
 
 ## G0 prerequisite matrix
@@ -151,6 +151,15 @@ Exit: selected release ceilings are versioned, enforced, reproducible, and accur
 - Document install, doctor, inspect, export, verify, rotate, delete/discard, identity preservation/removal, and uninstall.
 - Update the exact privacy contract and local-review consent text for the built bytes.
 - Developer ID signing and notarization remain externally dependent on owner credentials and Apple services.
+
+Current evidence: the [unsigned local-review artifact verification receipt](./2026-07-26-unsigned-local-review-artifact-verification-receipt.md)
+binds a clean-source candidate to byte-identical two-build archives, a closed
+72-file first-party graph with no network builtins or transport modules, a
+245-entry extractable archive, nine focused lifecycle tests, and a 12-stage
+isolated-home smoke under macOS deny-network. The result is intentionally still
+an engineering candidate: direct socket-attempt telemetry, signing,
+notarization, clean-machine execution, and owner/volunteer approvals remain
+open.
 
 Exit: unsigned reproducibility passes first; then the exact signed/notarized bytes and checksums pass verification.
 
