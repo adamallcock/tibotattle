@@ -491,6 +491,42 @@
             <div><dt>Next attempt</dt><dd id="sync-next-attempt">—</dd></div>
             <div><dt>Last accepted</dt><dd id="sync-last-accepted">—</dd></div>
           </dl>
+          <div class="sync-next-card" id="sync-next-card">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="panel-kicker">Next verified upload</p>
+                <h4 id="sync-next-title">Inspect before sending</h4>
+              </div>
+              <span class="evidence-chip neutral" id="sync-next-state">Not inspected</span>
+            </div>
+            <dl class="backend-facts sync-next-facts">
+              <div><dt>Covered period</dt><dd id="sync-next-coverage">—</dd></div>
+              <div><dt>Safe records</dt><dd id="sync-next-records">—</dd></div>
+              <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
+              <div><dt>Upload reservation</dt><dd id="sync-next-bytes">—</dd></div>
+            </dl>
+            <div class="sync-actions" aria-label="Foreground contribution controls">
+              <button class="button button-secondary" id="sync-inspect" type="button">
+                Inspect next
+              </button>
+              <button class="button button-primary" id="sync-run-once" type="button">
+                Send one bounded pass
+              </button>
+              <button class="button button-secondary" id="sync-pause" type="button">
+                Pause
+              </button>
+              <button class="button button-secondary" id="sync-resume" type="button">
+                Resume
+              </button>
+            </div>
+            <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
+            <p class="backend-contract-note">
+              Inspection uses loopback only: it performs no service request,
+              key fetch, authorization, or upload. A send action is capped at
+              10 queue jobs and a 16 MiB conservative encrypted upload-body
+              reservation.
+            </p>
+          </div>
           <p class="backend-contract-note">
             This development slice runs only when you explicitly invoke the
             foreground sync command. It has not installed a login item,

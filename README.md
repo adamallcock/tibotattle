@@ -329,6 +329,26 @@ The [ongoing sync controls plan](./2026-07-26-ongoing-sync-controls-plan.md)
 and [development verification receipt](./2026-07-26-ongoing-sync-controls-verification-receipt.md)
 record the privacy contract, exact test evidence, and remaining release gates.
 
+The loopback dashboard can expose the same inspection, one-pass, pause, and
+resume controls without exposing its privileged configuration to browser code.
+Select the prepared spool and central origin when starting the companion:
+
+```bash
+USAGE_MONITOR_PREPARED_DIRECTORY=/absolute/path/to/prepared-spool \
+USAGE_MONITOR_CENTRAL_ORIGIN=https://usage-monitor.example \
+npm run product:local
+```
+
+An optional `USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE` selects a separate
+owner-only queue at launch, which is useful for isolated testing. Browser
+requests never contain that path, the prepared directory, the service origin,
+or the Keychain credential. The dashboard's send button is enabled only when
+both the verified spool and delivery service are configured.
+
+The [local sync controls UI plan](./2026-07-26-local-sync-controls-ui-plan.md)
+and [rendered verification receipt](./2026-07-26-local-sync-controls-ui-verification-receipt.md)
+record the loopback threat boundary, action tests, and visual QA.
+
 Transient network, 408, 429, and 5xx failures use bounded retry with backoff.
 Privacy/schema rejection is terminal. An expired or revoked device pauses the
 queue and preserves pending work. A process restart recovers expired leases

@@ -20,6 +20,9 @@ const communityClient = new CommunityClient({
 
 let dashboard = null;
 let activeWindowHours = 3;
+let contributionSyncStatus = null;
+let contributionSyncPreview = null;
+let contributionSyncBusy = false;
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -766,6 +769,123 @@ function renderContributionSyncStatus(status) {
   };
   $("#sync-description").textContent = descriptions[value.state]
     ?? descriptions.unavailable;
+  contributionSyncStatus = value;
+  updateContributionSyncButtons();
+}
+
+function renderContributionSyncPreview(preview) {
+  const value = preview ?? {
+    status: "unavailable",
+    state: "unavailable",
+    item: null
+  };
+  contributionSyncPreview = value;
+  const labels = {
+    ready: "Ready",
+    retry_wait: "Waiting to retry",
+    paused: "Paused",
+    empty: "Nothing queued",
+    not_configured: "Not configured",
+    unavailable: "Unavailable"
+  };
+  const chip = $("#sync-next-state");
+  const state = value.status === "available"
+    ? value.state
+    : value.status;
+  chip.textContent = labels[state] ?? "Unavailable";
+  chip.className = state === "ready"
+    ? "evidence-chip"
+    : "evidence-chip neutral";
+  if (!value.item) {
+    $("#sync-next-coverage").textContent = value.status === "not_configured"
+      ? "Set prepared directory at launch"
+      : "—";
+    $("#sync-next-records").textContent = "—";
+    $("#sync-next-cost").textContent = "—";
+    $("#sync-next-bytes").textContent = "—";
+    updateContributionSyncButtons();
+    return;
+  }
+  const item = value.item;
+  $("#sync-next-coverage").textContent =
+    `${formatUtc(item.coveredAt.startAt)} – ${formatUtc(item.coveredAt.endAt)}`;
+  $("#sync-next-records").textContent =
+    `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`;
+  $("#sync-next-cost").textContent =
+    `${item.accounting.estimatedApiCostUsd === null ? "Unpriced" : `$${item.accounting.estimatedApiCostUsd}`} · ${item.accounting.pricedEventCoveragePercent}% priced`;
+  $("#sync-next-bytes").textContent =
+    `${compact(item.reservedUploadBytes)} bytes reserved (${compact(item.preparedBytes)} prepared)`;
+  updateContributionSyncButtons();
+}
+
+function updateContributionSyncButtons() {
+  const available = contributionSyncPreview?.status === "available";
+  const paused = contributionSyncStatus?.paused === true;
+  $("#sync-inspect").disabled = contributionSyncBusy;
+  $("#sync-run-once").disabled = contributionSyncBusy
+    || !available
+    || contributionSyncPreview?.deliveryConfigured !== true
+    || contributionSyncPreview?.state !== "ready"
+    || paused;
+  $("#sync-pause").disabled = contributionSyncBusy
+    || !available
+    || contributionSyncStatus?.state === "unavailable"
+    || paused;
+  $("#sync-resume").disabled = contributionSyncBusy
+    || !available
+    || contributionSyncStatus?.state === "unavailable"
+    || !paused;
+}
+
+function showContributionSyncAction(message, error = false) {
+  const status = $("#sync-action-status");
+  status.hidden = false;
+  status.textContent = message;
+  status.classList.toggle("error", error);
+}
+
+async function refreshContributionSyncControls() {
+  const [status, preview] = await Promise.all([
+    localClient.contributionSyncStatus(),
+    localClient.contributionSyncPreview()
+  ]);
+  renderContributionSyncStatus(status);
+  renderContributionSyncPreview(preview);
+}
+
+async function runContributionSyncAction(action) {
+  if (contributionSyncBusy) return;
+  contributionSyncBusy = true;
+  updateContributionSyncButtons();
+  showContributionSyncAction(
+    action === "run"
+      ? "Running one bounded foreground pass…"
+      : action === "pause" ? "Pausing local delivery…" : "Resuming local delivery…"
+  );
+  try {
+    if (action === "run") {
+      const result = await localClient.runContributionSyncOnce();
+      if (result.status === "unavailable") throw new Error("sync unavailable");
+      showContributionSyncAction(
+        `Pass ${result.status}: ${compact(result.processed)} processed, ${compact(result.accepted)} accepted, ${compact(result.reservedUploadBytes)} upload bytes reserved${result.bandwidthLimited ? "; stopped at byte cap" : ""}.`
+      );
+    } else {
+      const status = await localClient.setContributionSyncPaused(action === "pause");
+      if (status.state === "unavailable") throw new Error("control unavailable");
+      showContributionSyncAction(
+        action === "pause" ? "Local delivery is paused." : "Local delivery is resumed."
+      );
+    }
+    await refreshContributionSyncControls();
+  } catch {
+    showContributionSyncAction(
+      "The local companion rejected or could not complete this action. Durable queue state was retained.",
+      true
+    );
+  } finally {
+    contributionSyncBusy = false;
+    updateContributionSyncButtons();
+  }
 }
 
 async function loadLocalDashboard() {
@@ -773,15 +893,18 @@ async function loadLocalDashboard() {
   button.disabled = true;
   button.textContent = "Connecting…";
   try {
-    const [data, syncStatus] = await Promise.all([
+    const [data, syncStatus, syncPreview] = await Promise.all([
       localClient.load(),
-      localClient.contributionSyncStatus()
+      localClient.contributionSyncStatus(),
+      localClient.contributionSyncPreview()
     ]);
     renderDashboard(data);
     renderContributionSyncStatus(syncStatus);
+    renderContributionSyncPreview(syncPreview);
   } catch {
     dashboard = null;
     renderContributionSyncStatus(null);
+    renderContributionSyncPreview(null);
     setGlobalState("offline");
     $("#latest-observation").textContent = "Companion unavailable";
     $("#data-source").textContent = "No real usage is displayed";
@@ -1977,6 +2100,23 @@ async function logoutParticipant() {
 
 $("#refresh-button").addEventListener("click", requestRefresh);
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
+$("#sync-inspect").addEventListener("click", async () => {
+  contributionSyncBusy = true;
+  updateContributionSyncButtons();
+  showContributionSyncAction("Inspecting locally verified metadata through loopback; no service request or upload is performed.");
+  try {
+    await refreshContributionSyncControls();
+    showContributionSyncAction("Inspection complete. No service request or upload was performed.");
+  } catch {
+    showContributionSyncAction("The next contribution could not be inspected.", true);
+  } finally {
+    contributionSyncBusy = false;
+    updateContributionSyncButtons();
+  }
+});
+$("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
+$("#sync-pause").addEventListener("click", () => runContributionSyncAction("pause"));
+$("#sync-resume").addEventListener("click", () => runContributionSyncAction("resume"));
 $("#window-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-hours]");
   if (!button || !dashboard) return;

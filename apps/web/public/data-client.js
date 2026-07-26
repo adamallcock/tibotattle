@@ -33,6 +33,10 @@ export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
   "participant-community-comparison-v0.1";
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION =
   "contribution-sync-status-v0.1";
+export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
+  "contribution-sync-preview-v0.1";
+export const CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION =
+  "contribution-sync-run-v0.1";
 
 const COMMUNITY_METRIC_UNITS = Object.freeze({
   usageEvents: "events_rounded_down",
@@ -151,6 +155,158 @@ export function normalizeContributionSyncStatus(payload) {
     dueNow: count(payload.dueNow, 0),
     nextAttemptAt,
     lastAcceptedAt
+  };
+}
+
+export function normalizeContributionSyncPreview(payload) {
+  const unavailable = {
+    status: "unavailable",
+    state: "unavailable",
+    discoveredSets: 0,
+    newlyQueued: 0,
+    deliveryConfigured: false,
+    item: null
+  };
+  if (payload?.schemaVersion !== CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION
+      || !["available", "not_configured", "unavailable"].includes(payload?.status)
+      || payload?.networkActivity !== false
+      || payload?.includesContent !== false
+      || payload?.includesPaths !== false
+      || payload?.includesIdentifiers !== false
+      || payload?.includesCredentials !== false
+      || typeof payload?.deliveryConfigured !== "boolean") {
+    return unavailable;
+  }
+  if (payload.status !== "available") {
+    return { ...unavailable, status: payload.status };
+  }
+  if (!["empty", "ready", "retry_wait", "paused"].includes(payload.state)) {
+    return unavailable;
+  }
+  const discoveredSets = count(payload.discoveredSets, null);
+  const newlyQueued = count(payload.newlyQueued, null);
+  if (discoveredSets === null || newlyQueued === null) return unavailable;
+  if (payload.state === "empty") {
+    return payload.item === null
+      ? {
+        status: "available",
+        state: "empty",
+        discoveredSets,
+        newlyQueued,
+        deliveryConfigured: payload.deliveryConfigured,
+        item: null
+      }
+      : unavailable;
+  }
+  const item = payload.item;
+  const names = ["usageEvents", "quotaSnapshots", "activityMarkers", "total"];
+  const recordCounts = Object.fromEntries(names.map((name) => [
+    name,
+    count(item?.recordCounts?.[name], null)
+  ]));
+  const coveredStart = text(item?.coveredAt?.startAt, "");
+  const coveredEnd = text(item?.coveredAt?.endAt, "");
+  const estimatedCost = item?.accounting?.estimatedApiCostUsd;
+  const coverage = finite(item?.accounting?.pricedEventCoveragePercent, null);
+  const unknownModels = count(item?.accounting?.unknownModelEventCount, null);
+  const unknownUnits = count(item?.accounting?.unknownBillableUnits, null);
+  const preparedBytes = count(item?.preparedBytes, null);
+  const reservedUploadBytes = count(item?.reservedUploadBytes, null);
+  const attemptCount = count(item?.attemptCount, null);
+  const nextAttemptAt = text(item?.nextAttemptAt, "");
+  const valid = item?.schemaVersion === "telemetry-contribution-v0.1"
+    && ["macos", "linux", "windows", "other", "unknown"]
+      .includes(item?.clientPlatform)
+    && [
+      "unknown",
+      "openai_pre_agentic_pool_2026_07_09",
+      "openai_agentic_pool_2026_07_09",
+      "anthropic_unknown"
+    ].includes(item?.providerPolicyEpoch)
+    && coveredStart && coveredEnd
+    && Number.isFinite(Date.parse(coveredStart))
+    && Number.isFinite(Date.parse(coveredEnd))
+    && Object.values(recordCounts).every((value) => value !== null)
+    && recordCounts.total === recordCounts.usageEvents
+      + recordCounts.quotaSnapshots + recordCounts.activityMarkers
+    && (estimatedCost === null
+      || (typeof estimatedCost === "string"
+        && /^(?:0|[1-9]\d*)\.\d{6}$/.test(estimatedCost)))
+    && coverage !== null && coverage >= 0 && coverage <= 100
+    && unknownModels !== null && unknownUnits !== null
+    && ["current_api_prices", "historical_api_prices", "unpriced"]
+      .includes(item?.accounting?.priceBasis)
+    && item?.accounting?.verification === "client_declared_unverified"
+    && preparedBytes !== null && reservedUploadBytes !== null
+    && reservedUploadBytes >= preparedBytes
+    && attemptCount !== null
+    && nextAttemptAt && Number.isFinite(Date.parse(nextAttemptAt));
+  if (!valid) return unavailable;
+  return {
+    status: "available",
+    state: payload.state,
+    discoveredSets,
+    newlyQueued,
+    deliveryConfigured: payload.deliveryConfigured,
+    item: {
+      clientPlatform: item.clientPlatform,
+      providerPolicyEpoch: item.providerPolicyEpoch,
+      coveredAt: { startAt: coveredStart, endAt: coveredEnd },
+      recordCounts,
+      accounting: {
+        estimatedApiCostUsd: estimatedCost,
+        pricedEventCoveragePercent: coverage,
+        unknownModelEventCount: unknownModels,
+        unknownBillableUnits: unknownUnits,
+        priceBasis: item.accounting.priceBasis
+      },
+      preparedBytes,
+      reservedUploadBytes,
+      attemptCount,
+      nextAttemptAt
+    }
+  };
+}
+
+export function normalizeContributionSyncRun(payload) {
+  const unavailable = {
+    status: "unavailable",
+    discoveredSets: 0,
+    newlyQueued: 0,
+    processed: 0,
+    accepted: 0,
+    retryable: 0,
+    rejected: 0,
+    reservedUploadBytes: 0,
+    bandwidthLimited: false
+  };
+  if (payload?.schemaVersion !== CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION
+      || !["completed", "paused", "interrupted"].includes(payload?.status)
+      || typeof payload?.bandwidthLimited !== "boolean"
+      || payload?.includesContent !== false
+      || payload?.includesPaths !== false
+      || payload?.includesIdentifiers !== false
+      || payload?.includesCredentials !== false) {
+    return unavailable;
+  }
+  const names = [
+    "discoveredSets",
+    "newlyQueued",
+    "processed",
+    "accepted",
+    "retryable",
+    "rejected",
+    "reservedUploadBytes"
+  ];
+  const values = Object.fromEntries(names.map((name) => [
+    name,
+    count(payload[name], null)
+  ]));
+  if (Object.values(values).some((value) => value === null)) return unavailable;
+  return {
+    status: payload.status,
+    ...values,
+    bandwidthLimited: payload.bandwidthLimited
   };
 }
 
@@ -997,6 +1153,44 @@ export class LocalCompanionClient {
     } catch {
       return normalizeContributionSyncStatus(null);
     }
+  }
+
+  async contributionSyncPreview() {
+    try {
+      return normalizeContributionSyncPreview(
+        await fetchJson(
+          this.fetchImpl,
+          `${LOCAL_ROOT}/contribution/sync-next`
+        )
+      );
+    } catch {
+      return normalizeContributionSyncPreview(null);
+    }
+  }
+
+  localContributionMutation(path) {
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1"
+      },
+      body: JSON.stringify({})
+    });
+  }
+
+  async runContributionSyncOnce() {
+    return normalizeContributionSyncRun(
+      await this.localContributionMutation("sync-once")
+    );
+  }
+
+  async setContributionSyncPaused(paused) {
+    return normalizeContributionSyncStatus(
+      await this.localContributionMutation(
+        paused ? "sync-pause" : "sync-resume"
+      )
+    );
   }
 }
 

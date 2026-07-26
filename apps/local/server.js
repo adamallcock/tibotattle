@@ -15,12 +15,20 @@ import {
 } from "../../src/local-companion-refresh.js";
 import {
   inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
+  runContributionSyncQueueOnce,
+  setContributionSyncPaused,
 } from "../../src/contribution-sync-queue.js";
+import {
+  createProductionContributionDeviceBackend,
+} from "../../src/contribution-device-capability.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BODY_BYTES = 1_024;
 const MAX_STATIC_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
+const LOCAL_SYNC_MAXIMUM_JOBS = 10;
+const LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES = 16 * 1024 * 1024;
 
 const STATIC_FILES = Object.freeze({
   "/": Object.freeze({ file: "index.html", type: "text/html; charset=utf-8" }),
@@ -48,6 +56,10 @@ const API_ROUTES = new Set([
   "/api/local/refresh",
   "/api/local/contribution/preview",
   "/api/local/contribution/sync-status",
+  "/api/local/contribution/sync-next",
+  "/api/local/contribution/sync-once",
+  "/api/local/contribution/sync-pause",
+  "/api/local/contribution/sync-resume",
 ]);
 
 function jsonBody(value) {
@@ -152,6 +164,24 @@ async function readEmptyJsonObject(request) {
   }
 }
 
+async function authorizeLocalMutation(request, response, errorCode) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, errorCode);
+    return false;
+  }
+  try {
+    await readEmptyJsonObject(request);
+    return true;
+  } catch (error) {
+    const status = error.code === "unsupported_media_type"
+      ? 415
+      : error.code === "request_too_large" ? 413 : 400;
+    sendError(response, status, error.code ?? "invalid_request");
+    return false;
+  }
+}
+
 async function readFixedFile(root, file, maximumBytes) {
   const path = resolve(root, file);
   let metadata;
@@ -172,6 +202,10 @@ async function readFixedFile(root, file, maximumBytes) {
 
 function finiteNonNegativeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function isNonNegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function previewProjection(value) {
@@ -234,6 +268,154 @@ function syncStatusProjection(value) {
   };
 }
 
+function syncNextProjection(value, {
+  previewConfigured = false,
+  deliveryConfigured = false,
+} = {}) {
+  const allowedStates = new Set(["empty", "ready", "retry_wait", "paused"]);
+  const item = value?.item;
+  const valid = value?.schemaVersion === "contribution-sync-preview-v0.1"
+    && value?.networkActivity === false
+    && allowedStates.has(value?.state)
+    && isNonNegativeInteger(value?.discoveredSets)
+    && isNonNegativeInteger(value?.enqueued)
+    && (value.state === "empty" ? item === null : item && typeof item === "object");
+  const projected = {
+    schemaVersion: "contribution-sync-preview-v0.1",
+    status: valid
+      ? "available"
+      : previewConfigured ? "unavailable" : "not_configured",
+    state: valid ? value.state : "unavailable",
+    discoveredSets: valid ? value.discoveredSets : 0,
+    newlyQueued: valid ? value.enqueued : 0,
+    deliveryConfigured,
+    item: null,
+    networkActivity: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+  if (!valid || item === null) return projected;
+  const allowedPlatforms = new Set([
+    "macos",
+    "linux",
+    "windows",
+    "other",
+    "unknown",
+  ]);
+  const allowedEpochs = new Set([
+    "unknown",
+    "openai_pre_agentic_pool_2026_07_09",
+    "openai_agentic_pool_2026_07_09",
+    "anthropic_unknown",
+  ]);
+  const allowedPriceBases = new Set([
+    "current_api_prices",
+    "historical_api_prices",
+    "unpriced",
+  ]);
+  const counts = {
+    usageEvents: item.recordCounts?.usageEvents,
+    quotaSnapshots: item.recordCounts?.quotaSnapshots,
+    activityMarkers: item.recordCounts?.activityMarkers,
+  };
+  const total = counts.usageEvents + counts.quotaSnapshots
+    + counts.activityMarkers;
+  const estimatedCost = item.accounting?.estimatedApiCostUsd;
+  const coverage = item.accounting?.pricedEventCoveragePercent;
+  const itemValid = item.schemaVersion === "telemetry-contribution-v0.1"
+    && allowedPlatforms.has(item.clientPlatform)
+    && allowedEpochs.has(item.providerPolicyEpoch)
+    && nullableInstant(item.coveredAt?.startAt) !== null
+    && nullableInstant(item.coveredAt?.endAt) !== null
+    && Object.values(counts).every(isNonNegativeInteger)
+    && total > 0 && total <= 200
+    && item.recordCounts?.total === total
+    && (estimatedCost === null
+      || (typeof estimatedCost === "string"
+        && /^(?:0|[1-9]\d*)\.\d{6}$/u.test(estimatedCost)))
+    && Number.isFinite(coverage) && coverage >= 0 && coverage <= 100
+    && Number.isSafeInteger(item.accounting?.unknownModelEventCount)
+    && item.accounting.unknownModelEventCount >= 0
+    && item.accounting.unknownModelEventCount <= counts.usageEvents
+    && Number.isSafeInteger(item.accounting?.unknownBillableUnits)
+    && item.accounting.unknownBillableUnits >= 0
+    && item.accounting.unknownBillableUnits <= 1_000_000_000
+    && allowedPriceBases.has(item.accounting?.priceBasis)
+    && item.accounting?.verification === "client_declared_unverified"
+    && Number.isSafeInteger(item.preparedBytes) && item.preparedBytes >= 0
+    && Number.isSafeInteger(item.reservedUploadBytes)
+    && item.reservedUploadBytes >= item.preparedBytes
+    && Number.isSafeInteger(item.attemptCount) && item.attemptCount >= 0
+    && nullableInstant(item.nextAttemptAt) !== null;
+  if (!itemValid) {
+    return {
+      ...projected,
+      status: "unavailable",
+      state: "unavailable",
+    };
+  }
+  return {
+    ...projected,
+    item: {
+      schemaVersion: item.schemaVersion,
+      clientPlatform: item.clientPlatform,
+      providerPolicyEpoch: item.providerPolicyEpoch,
+      coveredAt: {
+        startAt: nullableInstant(item.coveredAt.startAt),
+        endAt: nullableInstant(item.coveredAt.endAt),
+      },
+      recordCounts: { ...counts, total },
+      accounting: {
+        estimatedApiCostUsd: estimatedCost,
+        pricedEventCoveragePercent: coverage,
+        unknownModelEventCount: item.accounting.unknownModelEventCount,
+        unknownBillableUnits: item.accounting.unknownBillableUnits,
+        priceBasis: item.accounting.priceBasis,
+        verification: "client_declared_unverified",
+      },
+      preparedBytes: item.preparedBytes,
+      reservedUploadBytes: item.reservedUploadBytes,
+      attemptCount: item.attemptCount,
+      nextAttemptAt: nullableInstant(item.nextAttemptAt),
+    },
+  };
+}
+
+function syncRunProjection(value) {
+  const allowedStates = new Set(["completed", "paused", "interrupted"]);
+  const numericFields = [
+    "discoveredSets",
+    "enqueued",
+    "processed",
+    "accepted",
+    "retryable",
+    "rejected",
+    "reservedUploadBytes",
+  ];
+  const valid = allowedStates.has(value?.status)
+    && typeof value?.bandwidthLimited === "boolean"
+    && numericFields.every((name) => isNonNegativeInteger(value?.[name]));
+  return {
+    schemaVersion: "contribution-sync-run-v0.1",
+    status: valid ? value.status : "unavailable",
+    discoveredSets: valid ? value.discoveredSets : 0,
+    newlyQueued: valid ? value.enqueued : 0,
+    processed: valid ? value.processed : 0,
+    accepted: valid ? value.accepted : 0,
+    retryable: valid ? value.retryable : 0,
+    rejected: valid ? value.rejected : 0,
+    reservedUploadBytes: valid ? value.reservedUploadBytes : 0,
+    bandwidthLimited: valid ? value.bandwidthLimited : false,
+    queue: syncStatusProjection(value?.queue),
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+}
+
 export function createLocalCompanionServer({
   root = process.cwd(),
   staticRoot = resolve(root, "apps", "web", "public"),
@@ -245,14 +427,26 @@ export function createLocalCompanionServer({
   centralOrigin = process.env.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),
-  contributionSyncStatusProvider = () => inspectContributionSyncQueue({
-    queueFile: resolve(
+  contributionQueueFile =
+    process.env.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
+    ?? resolve(
       root,
       ".usage-monitor",
       "private",
       "contribution-sync-v0.1.sqlite3",
     ),
+  contributionSyncStatusProvider = () => inspectContributionSyncQueue({
+    queueFile: contributionQueueFile,
   }),
+  preparedContributionDirectory =
+    process.env.USAGE_MONITOR_PREPARED_DIRECTORY ?? null,
+  contributionServiceOrigin = centralOrigin,
+  contributionDeviceBackendFactory =
+    createProductionContributionDeviceBackend,
+  contributionSyncNextProvider = null,
+  contributionSyncOnceRunner = null,
+  contributionSyncPauseSetter = null,
+  contributionSyncTimeoutMs = 60_000,
   onError = () => {},
 } = {}) {
   if (!dataStore || typeof dataStore.initialize !== "function") {
@@ -264,6 +458,63 @@ export function createLocalCompanionServer({
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
+  if (typeof contributionQueueFile !== "string"
+      || contributionQueueFile.length < 1) {
+    throw new TypeError("contributionQueueFile must be a non-empty string");
+  }
+  if (preparedContributionDirectory !== null
+      && typeof preparedContributionDirectory !== "string") {
+    throw new TypeError("preparedContributionDirectory must be a string or null");
+  }
+  if (contributionServiceOrigin !== null
+      && typeof contributionServiceOrigin !== "string") {
+    throw new TypeError("contributionServiceOrigin must be a string or null");
+  }
+  if (typeof contributionDeviceBackendFactory !== "function"
+      || (contributionSyncNextProvider !== null
+        && typeof contributionSyncNextProvider !== "function")
+      || (contributionSyncOnceRunner !== null
+        && typeof contributionSyncOnceRunner !== "function")
+      || (contributionSyncPauseSetter !== null
+        && typeof contributionSyncPauseSetter !== "function")
+      || !Number.isSafeInteger(contributionSyncTimeoutMs)
+      || contributionSyncTimeoutMs < 1_000
+      || contributionSyncTimeoutMs > 5 * 60_000) {
+    throw new TypeError("contribution sync controls are invalid");
+  }
+  const nextContribution = contributionSyncNextProvider
+    ?? (preparedContributionDirectory === null
+      ? async () => null
+      : () => inspectNextContributionSyncUpload({
+        directory: preparedContributionDirectory,
+        queueFile: contributionQueueFile,
+      }));
+  const runContributionPass = contributionSyncOnceRunner
+    ?? (preparedContributionDirectory === null
+        || contributionServiceOrigin === null
+      ? async () => null
+      : ({ signal }) => runContributionSyncQueueOnce({
+        directory: preparedContributionDirectory,
+        origin: contributionServiceOrigin,
+        backend: contributionDeviceBackendFactory(),
+        queueFile: contributionQueueFile,
+        maximumJobs: LOCAL_SYNC_MAXIMUM_JOBS,
+        maximumReservedUploadBytes:
+          LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
+        signal,
+      }));
+  const setContributionPaused = contributionSyncPauseSetter
+    ?? (({ paused }) => setContributionSyncPaused({
+      paused,
+      queueFile: contributionQueueFile,
+    }));
+  const syncPreviewConfigured = preparedContributionDirectory !== null
+    || contributionSyncNextProvider !== null;
+  const syncDeliveryConfigured =
+    (preparedContributionDirectory !== null
+      && contributionServiceOrigin !== null)
+    || contributionSyncOnceRunner !== null;
+  let contributionSyncInProgress = false;
   const refresh = new LocalCompanionRefreshController({
     runner: refreshRunner,
     dataStore,
@@ -338,6 +589,8 @@ export function createLocalCompanionServer({
             explicitRefresh: true,
             contributionPreview: true,
             contributionSyncStatus: true,
+            contributionSyncNext: syncPreviewConfigured,
+            contributionSyncActions: syncDeliveryConfigured,
             centralServiceProxy: centralProxy.enabled,
             arbitraryPathAccess: false,
             remoteProxy: false,
@@ -422,6 +675,89 @@ export function createLocalCompanionServer({
         send(response, 200, syncStatusProjection(status));
         return;
       }
+      if (path === "/api/local/contribution/sync-next") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        let preview;
+        try {
+          preview = await nextContribution();
+        } catch {
+          preview = null;
+        }
+        send(response, 200, syncNextProjection(preview, {
+          previewConfigured: syncPreviewConfigured,
+          deliveryConfigured: syncDeliveryConfigured,
+        }));
+        return;
+      }
+      if (path === "/api/local/contribution/sync-once") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "sync_not_authorized",
+        )) return;
+        if (contributionSyncInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
+        contributionSyncInProgress = true;
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          contributionSyncTimeoutMs,
+        );
+        let result;
+        try {
+          result = await runContributionPass({
+            signal: controller.signal,
+          });
+        } catch {
+          sendError(response, 502, "sync_failed");
+          return;
+        } finally {
+          clearTimeout(timeout);
+          contributionSyncInProgress = false;
+        }
+        if (result === null) {
+          sendError(response, 503, "sync_not_configured");
+          return;
+        }
+        send(response, 200, syncRunProjection(result));
+        return;
+      }
+      if (path === "/api/local/contribution/sync-pause"
+          || path === "/api/local/contribution/sync-resume") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "sync_control_not_authorized",
+        )) return;
+        if (contributionSyncInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
+        let status;
+        try {
+          status = await setContributionPaused({
+            paused: path.endsWith("sync-pause"),
+          });
+        } catch {
+          sendError(response, 500, "sync_control_failed");
+          return;
+        }
+        send(response, 200, syncStatusProjection(status));
+        return;
+      }
       if (path === "/api/local/refresh") {
         if (request.method === "GET") {
           send(response, 200, {
@@ -434,19 +770,11 @@ export function createLocalCompanionServer({
           sendError(response, 405, "method_not_allowed");
           return;
         }
-        if (!sameOrigin(request) || request.headers["x-usage-monitor-local"] !== "1") {
-          sendError(response, 403, "refresh_not_authorized");
-          return;
-        }
-        try {
-          await readEmptyJsonObject(request);
-        } catch (error) {
-          const status = error.code === "unsupported_media_type"
-            ? 415
-            : error.code === "request_too_large" ? 413 : 400;
-          sendError(response, status, error.code ?? "invalid_request");
-          return;
-        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "refresh_not_authorized",
+        )) return;
         if (!refresh.start()) {
           sendError(response, 409, "refresh_in_progress");
           return;

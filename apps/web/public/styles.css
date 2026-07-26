@@ -456,6 +456,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .upload-status.error { color: var(--rust); background: var(--rust-soft); }
 .backend-panel { margin-top: 18px; }
 .sync-status-panel { margin-top: 18px; }
+.sync-next-card { margin-top: 18px; padding: 16px; border: 1px solid var(--line); border-radius: .4rem; background: rgba(255, 254, 249, .6); }
+.compact-heading h4 { margin: 0; font-family: var(--serif); font-size: 1rem; font-weight: 500; }
+.sync-next-facts { grid-template-columns: repeat(4, 1fr); margin-bottom: 12px; }
+.sync-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.sync-actions .button { min-height: 38px; }
 .backend-facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 18px 0; }
 .sync-facts { grid-template-columns: repeat(3, 1fr); }
 .backend-facts > div { min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: .35rem; background: rgba(255, 254, 249, .6); }

@@ -19,12 +19,16 @@ import {
 } from "../public/lib.js";
 import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+  CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
+  CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION,
   CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
   CommunityClient,
   demoDashboard,
   LocalCompanionClient,
   normalizeCommunitySnapshot,
   normalizeContributionSyncStatus,
+  normalizeContributionSyncPreview,
+  normalizeContributionSyncRun,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
   normalizeParticipantHistory,
@@ -561,6 +565,138 @@ test("local contribution queue status remains bounded and fails closed", async (
   });
   assert.equal((await client.contributionSyncStatus()).state, "paused");
   assert.deepEqual(calls, ["/api/local/contribution/sync-status"]);
+});
+
+test("local sync preview and actions keep privileged values behind loopback", async () => {
+  const privateCanary = "/Users/private/telemetry-secret.json";
+  const previewPayload = {
+    schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
+    status: "available",
+    state: "ready",
+    discoveredSets: 1,
+    newlyQueued: 1,
+    deliveryConfigured: true,
+    networkActivity: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+    item: {
+      schemaVersion: "telemetry-contribution-v0.1",
+      clientPlatform: "macos",
+      providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+      coveredAt: {
+        startAt: "2026-07-26T12:00:00.000Z",
+        endAt: "2026-07-26T12:30:00.000Z"
+      },
+      recordCounts: {
+        usageEvents: 2,
+        quotaSnapshots: 1,
+        activityMarkers: 0,
+        total: 3
+      },
+      accounting: {
+        estimatedApiCostUsd: "1.250000",
+        pricedEventCoveragePercent: 100,
+        unknownModelEventCount: 0,
+        unknownBillableUnits: 0,
+        priceBasis: "current_api_prices",
+        verification: "client_declared_unverified"
+      },
+      preparedBytes: 4096,
+      reservedUploadBytes: 16384,
+      attemptCount: 0,
+      nextAttemptAt: "2026-07-26T13:00:00.000Z",
+      privatePath: privateCanary,
+      contributionId: "contribution:private"
+    }
+  };
+  const normalizedPreview = normalizeContributionSyncPreview(previewPayload);
+  assert.equal(normalizedPreview.state, "ready");
+  assert.equal(normalizedPreview.item.recordCounts.total, 3);
+  assert.equal(JSON.stringify(normalizedPreview).includes(privateCanary), false);
+  assert.equal(JSON.stringify(normalizedPreview).includes("contribution:"), false);
+  assert.equal(
+    normalizeContributionSyncPreview({
+      ...previewPayload,
+      includesIdentifiers: true
+    }).status,
+    "unavailable"
+  );
+
+  const runPayload = {
+    schemaVersion: CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION,
+    status: "completed",
+    discoveredSets: 1,
+    newlyQueued: 0,
+    processed: 1,
+    accepted: 1,
+    retryable: 0,
+    rejected: 0,
+    reservedUploadBytes: 16384,
+    bandwidthLimited: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+    privatePath: privateCanary
+  };
+  assert.deepEqual(normalizeContributionSyncRun(runPayload), {
+    status: "completed",
+    discoveredSets: 1,
+    newlyQueued: 0,
+    processed: 1,
+    accepted: 1,
+    retryable: 0,
+    rejected: 0,
+    reservedUploadBytes: 16384,
+    bandwidthLimited: false
+  });
+
+  const calls = [];
+  const statusPayload = {
+    schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
+    status: "available",
+    paused: true,
+    counts: {
+      pending: 1,
+      inFlight: 0,
+      accepted: 0,
+      retryable: 0,
+      rejected: 0
+    },
+    dueNow: 1,
+    nextAttemptAt: "2026-07-26T13:00:00.000Z",
+    lastAcceptedAt: null,
+    includesContent: false,
+    includesPaths: false,
+    includesCredentials: false
+  };
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      const body = url.endsWith("sync-next")
+        ? previewPayload
+        : url.endsWith("sync-once") ? runPayload : statusPayload;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+  assert.equal((await client.contributionSyncPreview()).state, "ready");
+  assert.equal((await client.runContributionSyncOnce()).accepted, 1);
+  assert.equal((await client.setContributionSyncPaused(true)).state, "paused");
+  assert.deepEqual(calls.map((call) => call.url), [
+    "/api/local/contribution/sync-next",
+    "/api/local/contribution/sync-once",
+    "/api/local/contribution/sync-pause"
+  ]);
+  for (const call of calls.slice(1)) {
+    assert.equal(call.options.method, "POST");
+    assert.equal(call.options.body, "{}");
+    assert.equal(call.options.headers["X-Usage-Monitor-Local"], "1");
+  }
 });
 
 test("community adapter separates cookie sessions from one-use upload authority", async () => {

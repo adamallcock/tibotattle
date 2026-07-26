@@ -107,6 +107,8 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       explicitRefresh: true,
       contributionPreview: true,
       contributionSyncStatus: true,
+      contributionSyncNext: false,
+      contributionSyncActions: false,
       centralServiceProxy: false,
       arbitraryPathAccess: false,
       remoteProxy: false,
@@ -306,6 +308,183 @@ test("contribution sync status exposes bounded queue counts only", async () => {
         `http://127.0.0.1:${app.port}/api/local/contribution/sync-status`,
         { method: "POST" },
       )).status,
+      405,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("next inspection and foreground actions use fixed same-origin routes", async () => {
+  const files = await fixture();
+  const privateCanary = "/Users/private/prepared/telemetry-secret.json";
+  const queueStatus = (paused = false) => ({
+    schemaVersion: "contribution-sync-status-v0.1",
+    paused,
+    counts: {
+      pending: paused ? 1 : 0,
+      in_flight: 0,
+      accepted: paused ? 0 : 1,
+      retryable: 0,
+      rejected: 0,
+    },
+    dueNow: paused ? 1 : 0,
+    nextAttemptAt: paused ? "2026-07-26T13:00:00.000Z" : null,
+    lastAcceptedAt: paused ? null : "2026-07-26T13:00:00.000Z",
+  });
+  let previewCalls = 0;
+  let previewValid = true;
+  let runCalls = 0;
+  let pausedState = false;
+  let releaseRun;
+  const runGate = new Promise((resolve) => {
+    releaseRun = resolve;
+  });
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionSyncStatusProvider: async () => queueStatus(pausedState),
+    contributionSyncNextProvider: async () => {
+      previewCalls += 1;
+      if (!previewValid) throw new Error("prepared set invalid");
+      return {
+        schemaVersion: "contribution-sync-preview-v0.1",
+        state: "ready",
+        networkActivity: false,
+        discoveredSets: 1,
+        enqueued: 1,
+        item: {
+          schemaVersion: "telemetry-contribution-v0.1",
+          clientPlatform: "macos",
+          providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+          coveredAt: {
+            startAt: "2026-07-26T12:00:00.000Z",
+            endAt: "2026-07-26T12:30:00.000Z",
+          },
+          recordCounts: {
+            usageEvents: 2,
+            quotaSnapshots: 1,
+            activityMarkers: 0,
+            total: 3,
+          },
+          accounting: {
+            estimatedApiCostUsd: "1.250000",
+            pricedEventCoveragePercent: 100,
+            unknownModelEventCount: 0,
+            unknownBillableUnits: 0,
+            priceBasis: "current_api_prices",
+            verification: "client_declared_unverified",
+          },
+          preparedBytes: 4_096,
+          reservedUploadBytes: 16_384,
+          attemptCount: 0,
+          nextAttemptAt: "2026-07-26T13:00:00.000Z",
+          privatePath: privateCanary,
+        },
+      };
+    },
+    contributionSyncOnceRunner: async ({ signal }) => {
+      runCalls += 1;
+      assert.equal(signal instanceof AbortSignal, true);
+      await runGate;
+      return {
+        status: "completed",
+        discoveredSets: 1,
+        enqueued: 0,
+        processed: 1,
+        accepted: 1,
+        retryable: 0,
+        rejected: 0,
+        reservedUploadBytes: 16_384,
+        bandwidthLimited: false,
+        queue: queueStatus(false),
+        privatePath: privateCanary,
+      };
+    },
+    contributionSyncPauseSetter: async ({ paused }) => {
+      pausedState = paused;
+      return queueStatus(paused);
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.equal(health.capabilities.contributionSyncNext, true);
+    assert.equal(health.capabilities.contributionSyncActions, true);
+
+    const inspected = await fetch(
+      `${base}/api/local/contribution/sync-next`,
+    ).then((response) => response.json());
+    assert.equal(previewCalls, 1);
+    assert.equal(runCalls, 0);
+    assert.equal(inspected.status, "available");
+    assert.equal(inspected.deliveryConfigured, true);
+    assert.equal(inspected.item.recordCounts.total, 3);
+    assert.equal(inspected.networkActivity, false);
+    assert.equal(JSON.stringify(inspected).includes(privateCanary), false);
+    previewValid = false;
+    const invalidPreview = await fetch(
+      `${base}/api/local/contribution/sync-next`,
+    ).then((response) => response.json());
+    assert.equal(invalidPreview.status, "unavailable");
+    previewValid = true;
+
+    const unauthorized = await fetch(
+      `${base}/api/local/contribution/sync-once`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    assert.equal(unauthorized.status, 403);
+    assert.equal(runCalls, 0);
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const firstRun = fetch(`${base}/api/local/contribution/sync-once`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    await waitFor(() => runCalls === 1);
+    const overlap = await fetch(
+      `${base}/api/local/contribution/sync-once`,
+      { method: "POST", headers, body: "{}" },
+    );
+    assert.equal(overlap.status, 409);
+    releaseRun();
+    const runResponse = await firstRun;
+    assert.equal(runResponse.status, 200);
+    const runResult = await runResponse.json();
+    assert.equal(runResult.accepted, 1);
+    assert.equal(runResult.reservedUploadBytes, 16_384);
+    assert.equal(JSON.stringify(runResult).includes(privateCanary), false);
+
+    const paused = await fetch(
+      `${base}/api/local/contribution/sync-pause`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    assert.equal(paused.paused, true);
+    const resumed = await fetch(
+      `${base}/api/local/contribution/sync-resume`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    assert.equal(resumed.paused, false);
+    assert.equal(
+      (await fetch(`${base}/api/local/contribution/sync-next`, {
+        method: "POST",
+        headers,
+        body: "{}",
+      })).status,
       405,
     );
   } finally {
