@@ -22,6 +22,7 @@
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
+export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
 
 const COMMUNITY_METRIC_UNITS = Object.freeze({
   usageEvents: "events_rounded_down",
@@ -48,6 +49,16 @@ function finite(value, fallback = null) {
 
 function text(value, fallback = "") {
   return typeof value === "string" && value.length <= 500 ? value : fallback;
+}
+
+function count(value, fallback = null) {
+  const number = finite(value, fallback);
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+
+function nonNegative(value, fallback = null) {
+  const number = finite(value, fallback);
+  return number !== null && number >= 0 ? number : fallback;
 }
 
 function snapshotMetric(value, expectedUnit) {
@@ -141,6 +152,191 @@ export function normalizeCommunitySnapshot(payload) {
     ...base,
     state: partial ? "published_partial" : "published",
     cells
+  };
+}
+
+function normalizeQuotaMovement(payload) {
+  const status = text(payload?.status, "not_testable");
+  const base = {
+    schemaVersion: text(payload?.schemaVersion, ""),
+    status: status === "conditional_estimate" ? status : "not_testable",
+    reason: text(payload?.reason, status === "conditional_estimate" ? "" : "insufficient_quota_observations"),
+    interpretation: text(payload?.interpretation, ""),
+    accountContinuity: text(payload?.accountContinuity, "not_transmitted"),
+    provider: text(payload?.provider, ""),
+    planType: text(payload?.planType, ""),
+    planVariant: text(payload?.planVariant, ""),
+    limitId: text(payload?.limitId, ""),
+    slot: text(payload?.slot, ""),
+    resetsAt: text(payload?.resetsAt, ""),
+    apiPriceEquivalentCapacityUsd: nonNegative(payload?.apiPriceEquivalentCapacityUsd, null),
+    observedUsedPercentSpan: finite(payload?.observedUsedPercentSpan, null),
+    pricedUsageUsd: nonNegative(payload?.pricedUsageUsd, null),
+    rows: []
+  };
+  if (base.status !== "conditional_estimate") return base;
+
+  base.rows = array(payload?.rows).slice(0, 6000).flatMap((row) => {
+    const smoothingHours = count(row?.smoothingHours, null);
+    const timestamp = text(row?.timestamp ?? row?.windowEndUtc, "");
+    const windowStartUtc = text(row?.windowStartUtc, "");
+    const windowEndUtc = text(row?.windowEndUtc ?? row?.timestamp, "");
+    const observedQuotaChangePp = finite(row?.observedQuotaChangePp, null);
+    const expectedQuotaChangePp = finite(row?.expectedQuotaChangePp, null);
+    const apiPriceEquivalentUsd = nonNegative(row?.apiPriceEquivalentUsd, null);
+    const usageEvents = count(row?.usageEvents, null);
+    if (![1, 2, 3].includes(smoothingHours)
+        || !Number.isFinite(Date.parse(timestamp))
+        || !Number.isFinite(Date.parse(windowStartUtc))
+        || !Number.isFinite(Date.parse(windowEndUtc))
+        || observedQuotaChangePp === null
+        || expectedQuotaChangePp === null
+        || apiPriceEquivalentUsd === null
+        || usageEvents === null) {
+      return [];
+    }
+    return [{
+      smoothingHours,
+      timestamp,
+      windowStartUtc,
+      windowEndUtc,
+      observedQuotaChangePp,
+      expectedQuotaChangePp,
+      apiPriceEquivalentUsd,
+      usageEvents
+    }];
+  });
+  if (!base.rows.length) {
+    base.status = "not_testable";
+    base.reason = "no_valid_rolling_rows";
+  }
+  return base;
+}
+
+export function normalizeParticipantStats(payload) {
+  if (!payload) {
+    return {
+      state: "service_unavailable",
+      schemaVersion: "",
+      totals: {},
+      pricingCoverage: { state: "not_testable" },
+      standardApiCounterfactual: { state: "not_testable", apiPriceEquivalentUsd: null },
+      codexFastObservations: { state: "not_testable", eventShare: null, eventCount: null },
+      rollingQuotaMovement: normalizeQuotaMovement(null)
+    };
+  }
+  if (payload.schemaVersion !== PARTICIPANT_STATS_SCHEMA_VERSION) {
+    return {
+      state: "unsupported_schema",
+      schemaVersion: text(payload?.schemaVersion, ""),
+      totals: {},
+      pricingCoverage: { state: "not_testable" },
+      standardApiCounterfactual: { state: "not_testable", apiPriceEquivalentUsd: null },
+      codexFastObservations: { state: "not_testable", eventShare: null, eventCount: null },
+      rollingQuotaMovement: normalizeQuotaMovement(null)
+    };
+  }
+
+  const source = payload.totals ?? {};
+  const usageEvents = count(source.usageEvents, null);
+  const fullyPricedEvents = count(source.fullyPricedEvents, null);
+  const partiallyPricedEvents = count(source.partiallyPricedEvents, null);
+  const unpricedEvents = count(source.unpricedEvents, null);
+  const classifiedEvents = [fullyPricedEvents, partiallyPricedEvents, unpricedEvents]
+    .every((value) => value !== null)
+    ? fullyPricedEvents + partiallyPricedEvents + unpricedEvents
+    : null;
+  const classifiedWithinTotal = usageEvents !== null
+    && classifiedEvents !== null
+    && classifiedEvents <= usageEvents;
+  const pricedEvents = classifiedWithinTotal
+    ? fullyPricedEvents + partiallyPricedEvents
+    : null;
+  const pricingCoveragePercent = usageEvents > 0 && pricedEvents !== null
+    ? Number((pricedEvents * 100 / usageEvents).toFixed(6))
+    : null;
+  let pricingCoverageState = "unknown";
+  if (usageEvents === 0) pricingCoverageState = "not_testable";
+  else if (classifiedWithinTotal && pricedEvents === 0) pricingCoverageState = "unpriced";
+  else if (classifiedWithinTotal
+      && fullyPricedEvents === usageEvents
+      && partiallyPricedEvents === 0
+      && unpricedEvents === 0) {
+    pricingCoverageState = "fully_priced";
+  } else if (classifiedWithinTotal && pricedEvents > 0) {
+    pricingCoverageState = "partially_priced";
+  }
+
+  const priceVerification = text(source.priceVerification, "");
+  const apiPriceEquivalentUsd = priceVerification === "server_repriced"
+    ? nonNegative(source.apiPriceEquivalentUsd, null)
+    : null;
+  const standardSource = payload.standardApiCounterfactual
+    ?? source.standardApiCounterfactual
+    ?? {};
+  const standardApiPriceEquivalentUsd = nonNegative(
+    source.standardApiCounterfactualUsd
+      ?? standardSource.apiPriceEquivalentUsd,
+    null
+  );
+  const standardEvents = count(
+    source.standardApiCounterfactualEvents
+      ?? standardSource.events,
+    null
+  );
+  const fastInsight = array(payload.insights).find((item) => item?.code === "fast_event_share");
+  const fastEventShare = finite(
+    source.fastEventShare
+      ?? payload.codexFastObservations?.eventShare
+      ?? fastInsight?.value,
+    null
+  );
+  const safeFastEventShare = fastEventShare !== null && fastEventShare >= 0 && fastEventShare <= 1
+    ? fastEventShare
+    : null;
+  const fastEventCount = count(
+    source.fastEvents
+      ?? payload.codexFastObservations?.eventCount,
+    null
+  );
+
+  return {
+    state: "ready",
+    schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
+    generatedAt: text(payload.generatedAt, ""),
+    totals: {
+      contributions: count(source.contributions, null),
+      usageEvents,
+      quotaSnapshots: count(source.quotaSnapshots, null),
+      activityMarkers: count(source.activityMarkers, null),
+      apiPriceEquivalentUsd,
+      priceVerification,
+      serverUnknownBillableUnits: count(source.serverUnknownBillableUnits, null)
+    },
+    pricingCoverage: {
+      state: pricingCoverageState,
+      percent: pricingCoveragePercent,
+      fullyPricedEvents,
+      partiallyPricedEvents,
+      unpricedEvents,
+      unclassifiedEvents: classifiedWithinTotal ? usageEvents - classifiedEvents : null
+    },
+    standardApiCounterfactual: {
+      state: standardApiPriceEquivalentUsd === null ? "not_separately_returned" : "server_repriced",
+      apiPriceEquivalentUsd: standardApiPriceEquivalentUsd,
+      events: standardEvents,
+      basis: text(
+        source.standardApiCounterfactualBasis
+          ?? standardSource.basis,
+        "subscription_standard_counterfactual"
+      )
+    },
+    codexFastObservations: {
+      state: safeFastEventShare === null && fastEventCount === null ? "not_testable" : "observed",
+      eventShare: safeFastEventShare,
+      eventCount: fastEventCount
+    },
+    rollingQuotaMovement: normalizeQuotaMovement(payload.rollingQuotaMovement)
   };
 }
 
@@ -554,11 +750,27 @@ export class CommunityClient {
 export function demoDashboard() {
   const now = "2026-07-25T14:00:00.000Z";
   const rolling = [];
-  for (let index = 0; index < 36; index += 1) {
-    const timestamp = new Date(Date.parse(now) - (35 - index) * 3_600_000).toISOString();
-    const observed = Math.max(0, 4.8 + Math.sin(index / 3) * 2.5 + (index > 20 && index < 25 ? 3.2 : 0));
-    rolling.push({ timestamp, series: "Observed quota change", quota_change_pp: Number(observed.toFixed(2)), smoothing_hours: 3 });
-    rolling.push({ timestamp, series: "Expected from API cost", quota_change_pp: Number((observed * .82 + Math.cos(index / 4) * .8).toFixed(2)), smoothing_hours: 3 });
+  for (const smoothingHours of [1, 2, 3]) {
+    for (let index = 0; index < 36; index += 1) {
+      const timestamp = new Date(Date.parse(now) - (35 - index) * 3_600_000).toISOString();
+      const scale = smoothingHours / 3;
+      const observed = Math.max(
+        0,
+        (4.8 + Math.sin(index / 3) * 2.5 + (index > 20 && index < 25 ? 3.2 : 0)) * scale
+      );
+      rolling.push({
+        timestamp,
+        series: "Observed quota change",
+        quota_change_pp: Number(observed.toFixed(2)),
+        smoothing_hours: smoothingHours
+      });
+      rolling.push({
+        timestamp,
+        series: "Expected from API cost",
+        quota_change_pp: Number((observed * .82 + Math.cos(index / 4) * .8 * scale).toFixed(2)),
+        smoothing_hours: smoothingHours
+      });
+    }
   }
   const weeklyValues = Array.from({ length: 7 }, (_, index) => ({
     sequence: index + 1,

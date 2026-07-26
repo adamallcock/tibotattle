@@ -1379,7 +1379,39 @@ describe("synthetic usage monitor service", () => {
       accountingVerification: string;
     }>();
     expect(accepted.recordCounts).toMatchObject({ accepted: 2, deduplicated: 0 });
-    expect(accepted.accountingVerification).toBe("client_declared_unverified");
+    expect(accepted.accountingVerification).toBe("server_repriced");
+    const repriced = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT server_cost_usd, server_cost_nanousd, server_pricing_status,
+              server_pricing_method_version, server_price_registry_sha256,
+              server_price_card_ids, server_tier_basis, server_api_service_tier,
+              speed_mode, api_service_tier
+         FROM telemetry_records
+        WHERE participant_id = ? AND record_kind = 'usage'`,
+    ).bind(participant.participantId).first<{
+      server_cost_usd: string;
+      server_cost_nanousd: number;
+      server_pricing_status: string;
+      server_pricing_method_version: string;
+      server_price_registry_sha256: string;
+      server_price_card_ids: string;
+      server_tier_basis: string;
+      server_api_service_tier: string;
+      speed_mode: string;
+      api_service_tier: string;
+    }>();
+    expect(repriced).toMatchObject({
+      server_cost_usd: "0.0032",
+      server_cost_nanousd: 3_200_000,
+      server_pricing_status: "fully_priced",
+      server_pricing_method_version: "server-api-price-equivalent-v0.1",
+      server_tier_basis: "subscription_standard_counterfactual",
+      server_api_service_tier: "standard",
+      speed_mode: "fast",
+      api_service_tier: "priority",
+    });
+    expect(repriced?.server_price_registry_sha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(repriced?.server_price_card_ids).toContain(":standard:");
+    expect(repriced?.server_price_card_ids).not.toContain(":priority:");
 
     const replay = await uploadEnvelope(participant, firstEnvelope);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
@@ -1417,12 +1449,13 @@ describe("synthetic usage monitor service", () => {
         quotaSnapshots: 1,
         activityMarkers: 1,
         inputCacheReadTokens: 900,
-        priceVerification: "client_declared_unverified",
+        apiPriceEquivalentUsd: "0.0032",
+        priceVerification: "server_repriced",
       },
       quotaGradients: [{
         status: "not_testable",
-        reason: "insufficient_quota_observations",
-        verification: "client_declared_unverified",
+        reason: "account_continuity_not_transmitted",
+        verification: "server_repriced",
       }],
     });
 
@@ -1472,6 +1505,114 @@ describe("synthetic usage monitor service", () => {
     });
     await expect(surviving.json()).resolves.toMatchObject({
       records: [{ kind: "usage" }, { kind: "quota" }, { kind: "activity" }],
+    });
+  });
+
+  it("refuses a rolling quota conversion when account continuity was not transmitted", async () => {
+    const participant = await enrollTelemetry();
+    const first = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    expect(first.status).toBe(202);
+
+    const second = telemetryFixture("b");
+    Reflect.set(second, "createdAt", "2026-07-25T14:00:00.000Z");
+    Reflect.set(second, "coveredAt", {
+      startAt: "2026-07-25T13:00:00.000Z",
+      endAt: "2026-07-25T13:30:00.000Z",
+    });
+    const usage = Reflect.get(second, "usageEvents") as Array<Record<string, unknown>>;
+    usage[0]!.eventTime = "2026-07-25T13:05:00.000Z";
+    const quota = Reflect.get(second, "quotaSnapshots") as Array<Record<string, unknown>>;
+    quota[0]!.observedTime = "2026-07-25T13:10:00.000Z";
+    quota[0]!.receivedTime = "2026-07-25T13:10:01.000Z";
+    quota[0]!.usedPercent = 33;
+    const uploaded = await uploadEnvelope(
+      participant,
+      await encrypt(second, true),
+    );
+    expect(uploaded.status).toBe(202);
+
+    const response = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    expect(response.status).toBe(200);
+    const stats = await response.json<{
+      totals: { apiPriceEquivalentUsd: string };
+      rollingQuotaMovement: {
+        status: string;
+        reason: string;
+        accountContinuity: string;
+        rows: unknown[];
+      };
+    }>();
+    expect(stats.totals.apiPriceEquivalentUsd).toBe("0.0064");
+    expect(stats.rollingQuotaMovement).toMatchObject({
+      status: "not_testable",
+      reason: "account_continuity_not_transmitted",
+      accountContinuity: "not_transmitted",
+      rows: [],
+    });
+  });
+
+  it("does not label unbackfilled legacy rows as server repriced", async () => {
+    const participant = await enrollTelemetry();
+    const uploaded = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    expect(uploaded.status).toBe(202);
+    const accepted = await uploaded.json<{ contributionId: string }>();
+    await testBindings().USAGE_MONITOR_DB.batch([
+      testBindings().USAGE_MONITOR_DB.prepare(
+        `UPDATE telemetry_records
+            SET server_cost_usd = NULL,
+                server_cost_nanousd = NULL,
+                server_pricing_status = NULL,
+                server_pricing_method_version = NULL,
+                server_price_registry_version = NULL,
+                server_price_registry_sha256 = NULL
+          WHERE participant_id = ? AND record_kind = 'usage'`,
+      ).bind(participant.participantId),
+      testBindings().USAGE_MONITOR_DB.prepare(
+        `UPDATE telemetry_contributions
+            SET server_cost_nanousd = 0,
+                server_pricing_method_version = NULL,
+                server_price_registry_version = NULL,
+                server_price_registry_sha256 = NULL
+          WHERE id = ? AND participant_id = ?`,
+      ).bind(accepted.contributionId, participant.participantId),
+    ]);
+
+    const stats = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    await expect(stats.json()).resolves.toMatchObject({
+      totals: {
+        usageEvents: 1,
+        apiPriceEquivalentUsd: null,
+        priceVerification: "server_repricing_unavailable_for_legacy_records",
+      },
+      byModel: [{
+        apiPriceEquivalentUsd: null,
+        priceVerification: "server_repricing_unavailable_for_legacy_records",
+      }],
+      daily: [{
+        apiPriceEquivalentUsd: null,
+        priceVerification: "server_repricing_unavailable_for_legacy_records",
+      }],
+    });
+
+    const contribution = await api(
+      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
+      { headers: personalHeaders(participant) },
+    );
+    await expect(contribution.json()).resolves.toMatchObject({
+      serverAccounting: {
+        apiPriceEquivalentUsd: null,
+        verification: "server_repricing_unavailable",
+      },
     });
   });
 

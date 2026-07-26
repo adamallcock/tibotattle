@@ -67,7 +67,7 @@ export function priceCodexUsageEvent(event, {
     apiTier: apiServiceTier,
     pricedAt: epoch.pricedAt,
     ...(region ? { region } : {}),
-    totalInputTokens: event.raw?.input_tokens,
+    totalInputContextTokens: event.totalInputContextTokens ?? event.raw?.input_tokens,
     components: event.components,
     componentAvailability: event.componentAvailability,
   }, {

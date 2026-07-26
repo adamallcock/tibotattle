@@ -1,17 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { calculateCost, compilePriceCatalog } from "runcost";
+import { calculateCost, compilePriceCatalog } from "runcost/browser";
 import {
   ANTHROPIC_OFFICIAL_PRICE_CARDS,
   APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
   APP_PRICE_REGISTRY_SHA256,
+  NORMALIZED_PRICE_EVIDENCE_ROWS,
   OPENAI_OFFICIAL_PRICE_CARDS,
   addOfficialPriceRegistry,
   validateOfficialPriceRegistry,
 } from "../src/price-registry.js";
+import { sha256Json } from "./helpers/pricing-hash.js";
 
-function price({ provider, model, tier = "standard", pricedAt = "2026-07-25", components, totalInputTokens }) {
+function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", components, totalInputTokens }) {
   return calculateCost({
     usageLedger: {
       schema_version: "0.1",
@@ -40,7 +42,7 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-25", co
 
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
-  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 31);
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 46);
   assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
@@ -49,7 +51,20 @@ test("registry validates and preserves exact decimal strings and provenance", ()
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sha256, APP_PRICE_REGISTRY_SHA256);
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 2);
   assert.equal(batch54.metadata.provenance.vendor_effective_from, null);
-  assert.equal(batch54.effective.from, "2026-07-25");
+  assert.equal(batch54.effective.from, "2026-07-26");
+  assert.equal(
+    batch54.metadata.provenance.evidence_urls.some((url) => url.endsWith("/models/gpt-5.4")),
+    true,
+  );
+  assert.equal(
+    sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.openai),
+    APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.provider === "openai").evidenceSha256,
+  );
+  assert.equal(
+    sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.anthropic),
+    APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.provider === "anthropic").evidenceSha256,
+  );
+  assert.equal(sha256Json(APP_OFFICIAL_PRICE_CARDS), APP_PRICE_REGISTRY_SHA256);
 });
 
 test("exact provider tool units use official call prices without pricing client wrappers", () => {
@@ -59,7 +74,7 @@ test("exact provider tool units use official call prices without pricing client 
       provider: "openai",
       surface: "openai.responses",
       model: { requested: "gpt-5.6-luna" },
-      context: { service_tier: "standard", priced_at: "2026-07-25" },
+      context: { service_tier: "standard", priced_at: "2026-07-26" },
       components: [
         { name: "web_search_units", quantity: "1000", unit: "search" },
         { name: "file_search_units", quantity: "1000", unit: "call" },
@@ -77,7 +92,7 @@ test("exact provider tool units use official call prices without pricing client 
       provider: "anthropic",
       surface: "anthropic.messages",
       model: { requested: "claude-sonnet-4-6" },
-      context: { service_tier: "standard", priced_at: "2026-07-25" },
+      context: { service_tier: "standard", priced_at: "2026-07-26" },
       components: [{ name: "web_search_units", quantity: "1000", unit: "search" }],
     },
     priceCards: compilePriceCatalog(APP_OFFICIAL_PRICE_CARDS),
@@ -121,6 +136,7 @@ test("OpenAI official Standard, Batch, Flex, and Priority rows price exact compo
           provider: "openai",
           model,
           tier,
+          totalInputTokens: 271_999,
           components: { [names[index]]: 1_000_000 },
         });
         assert.equal(single.total, values[index], `${model}/${tier}/${names[index]}`);
@@ -130,6 +146,7 @@ test("OpenAI official Standard, Batch, Flex, and Priority rows price exact compo
         provider: "openai",
         model,
         tier,
+        totalInputTokens: 271_999,
         components: Object.fromEntries(names.map((name) => [name, 1_000_000])),
       });
       assert.equal(result.total, values[4], `${model}/${tier}/combined`);
@@ -138,8 +155,8 @@ test("OpenAI official Standard, Batch, Flex, and Priority rows price exact compo
   }
 });
 
-test("OpenAI short-context rows enforce every tier at the 272K threshold", () => {
-  const expected = {
+test("OpenAI short and long context rows meet the exact 272K boundary without inventing Priority long rates", () => {
+  const expectedShort = {
     "gpt-5.5": {
       standard: "35.5",
       batch: "17.75",
@@ -153,8 +170,22 @@ test("OpenAI short-context rows enforce every tier at the 272K threshold", () =>
       priority: "35.5",
     },
   };
-  for (const [model, tiers] of Object.entries(expected)) {
-    for (const [tier, total] of Object.entries(tiers)) {
+  const expectedLong = {
+    "gpt-5.5": {
+      standard: "56",
+      batch: "28",
+      flex: "28",
+      priority: null,
+    },
+    "gpt-5.4": {
+      standard: "28",
+      batch: "14.01",
+      flex: "14.01",
+      priority: null,
+    },
+  };
+  for (const [model, tiers] of Object.entries(expectedShort)) {
+    for (const [tier, shortTotal] of Object.entries(tiers)) {
       const below = price({
         provider: "openai",
         model,
@@ -166,7 +197,7 @@ test("OpenAI short-context rows enforce every tier at the 272K threshold", () =>
           output_text_tokens: 1_000_000,
         },
       });
-      assert.equal(below.total, total, `${model}/${tier}/below-threshold`);
+      assert.equal(below.total, shortTotal, `${model}/${tier}/below-threshold`);
       assert.equal(below.warnings.length, 0);
 
       const atThreshold = price({
@@ -180,11 +211,50 @@ test("OpenAI short-context rows enforce every tier at the 272K threshold", () =>
           output_text_tokens: 1_000_000,
         },
       });
-      assert.equal(atThreshold.total, "0", `${model}/${tier}/at-threshold`);
-      assert.ok(atThreshold.warnings.some((warning) => (
-        warning.code === "long_context_rule_missing"
-      )));
+      const longTotal = expectedLong[model][tier];
+      assert.equal(atThreshold.total, longTotal ?? "0", `${model}/${tier}/at-threshold`);
+      if (longTotal === null) {
+        assert.ok(atThreshold.warnings.some((warning) => (
+          warning.code === "long_context_rule_missing"
+        )));
+      } else {
+        assert.equal(atThreshold.warnings.length, 0);
+      }
     }
+  }
+});
+
+test("GPT-5.6 context bands apply exact official long multipliers and fail closed for Priority long context", () => {
+  const expected = {
+    "gpt-5.6-sol": { standard: "56", batch: "28", flex: "28" },
+    "gpt-5.6-terra": { standard: "28", batch: "14", flex: "14" },
+    "gpt-5.6-luna": { standard: "11.2", batch: "5.6", flex: "5.6" },
+  };
+  for (const [model, tiers] of Object.entries(expected)) {
+    for (const [tier, total] of Object.entries(tiers)) {
+      const result = price({
+        provider: "openai",
+        model,
+        tier,
+        totalInputTokens: 272_000,
+        components: {
+          input_uncached_tokens: 1_000_000,
+          input_cache_read_tokens: 1_000_000,
+          output_text_tokens: 1_000_000,
+        },
+      });
+      assert.equal(result.total, total, `${model}/${tier}/long`);
+      assert.equal(result.warnings.length, 0);
+    }
+    const priority = price({
+      provider: "openai",
+      model,
+      tier: "priority",
+      totalInputTokens: 272_000,
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    assert.equal(priority.total, "0", `${model}/priority/long`);
+    assert.ok(priority.warnings.some((warning) => warning.code === "long_context_rule_missing"));
   }
 });
 
@@ -235,10 +305,11 @@ test("missing official components and unsupported tiers fail closed", () => {
   assert.ok(unsupportedFlex.warnings.some((warning) => warning.code === "service_tier_unsupported"));
 });
 
-test("OpenAI rows marked below 272K do not invent long-context prices", () => {
+test("OpenAI Priority rows do not invent long-context prices", () => {
   const result = price({
     provider: "openai",
     model: "gpt-5.5",
+    tier: "priority",
     components: { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 },
     totalInputTokens: 272000,
   });
@@ -323,6 +394,13 @@ test("validation rejects unsupported tiers, absent provenance, overlaps, and des
   const overlap = structuredClone(base);
   overlap.id = `${base.id}:duplicate`;
   assert.throws(() => validateOfficialPriceRegistry([base, overlap]), /overlap in the same pricing context/);
+
+  const malformedContextBand = structuredClone(base);
+  malformedContextBand.components[0].conditions.max_total_input_tokens = "272000";
+  assert.throws(
+    () => validateOfficialPriceRegistry([malformedContextBand]),
+    /malformed short-context component boundary/,
+  );
 
   const destructiveAlias = structuredClone(base);
   destructiveAlias.id = `${base.id}:alias-collision`;

@@ -1,4 +1,4 @@
-import { aggregateCostLedgers, calculateCost, compilePriceCatalog } from "runcost";
+import { aggregateCostLedgers, calculateCost, compilePriceCatalog } from "runcost/browser";
 
 const SCHEMA_VERSION = "0.1";
 const BASIS = "api_price_equivalent_not_subscription_allowance";

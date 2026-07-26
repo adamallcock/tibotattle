@@ -13,7 +13,9 @@ test("Codex current-price sensitivity prices current cards without backdating th
   const event = {
     timestamp: "2026-07-13T12:00:00.000Z",
     model: "gpt-5.6-luna",
-    raw: { input_tokens: 1_000_000 },
+    // Keep this current-vs-historical test in the short-context band; long
+    // selection is covered separately with totalInputContextTokens below.
+    raw: { input_tokens: 1_000 },
     components: {
       input_uncached_tokens: 1_000_000,
       input_cache_read_tokens: 0,
@@ -61,6 +63,35 @@ test("Codex component availability reaches the ledger and never becomes observed
   });
   assert.equal(result.coverageStatus, "partially_priced");
   assert.equal(result.coverageCounts.unavailableComponents, 3);
+});
+
+test("Codex pricing prefers canonical totalInputContextTokens for the exact long-context band", () => {
+  const event = {
+    timestamp: "2026-07-26T08:00:00.000Z",
+    model: "gpt-5.6-luna",
+    totalInputContextTokens: 272_000,
+    // Deliberately smaller than the canonical context total so this test catches
+    // adapters that accidentally select the band from the raw component again.
+    raw: { input_tokens: 10 },
+    components: {
+      input_uncached_tokens: 1_000_000,
+      input_cache_read_tokens: 0,
+      input_cache_write_tokens: 0,
+      output_text_tokens: 1_000_000,
+      output_reasoning_tokens: 0,
+    },
+    componentAvailability: {
+      input_uncached_tokens: true,
+      input_cache_read_tokens: true,
+      input_cache_write_tokens: true,
+      output_text_tokens: true,
+      output_reasoning_tokens: true,
+    },
+  };
+  const result = priceCodexUsageEvent(event);
+  assert.equal(result.coverageStatus, "fully_priced");
+  assert.equal(result.totalUsd, "11");
+  assert.match(result.selectedPriceCardId, /:long:/);
 });
 
 test("Claude canonical records retain cache TTL and combined-output semantics", () => {

@@ -21,7 +21,9 @@ import {
   demoDashboard,
   LocalCompanionClient,
   normalizeCommunitySnapshot,
-  normalizeDashboardPayload
+  normalizeDashboardPayload,
+  normalizeParticipantStats,
+  PARTICIPANT_STATS_SCHEMA_VERSION
 } from "../public/data-client.js";
 
 function communitySnapshot() {
@@ -352,6 +354,10 @@ test("demo data is labeled demo at the contract root and has multiple useful sec
   assert.equal(result.state, "demo");
   assert.ok(result.quotaWindows.length >= 2);
   assert.ok(result.gradient.rolling.length > 20);
+  assert.deepEqual(
+    [...new Set(result.gradient.rolling.map((row) => row.smoothing_hours))].sort(),
+    [1, 2, 3]
+  );
   assert.ok(result.weekly.weeklyValues.length > 5);
   assert.ok(result.quality.opportunities.length > 2);
 });
@@ -503,6 +509,84 @@ test("community snapshots fail closed and never disclose threshold distance", ()
   }).state, "not_yet_published");
 });
 
+test("participant v0.2 stats preserve server repricing, coverage states, and speed separation", () => {
+  const result = normalizeParticipantStats({
+    schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
+    totals: {
+      contributions: 2,
+      usageEvents: 10,
+      quotaSnapshots: 4,
+      activityMarkers: 1,
+      apiPriceEquivalentUsd: "12.345678",
+      serverUnknownBillableUnits: 90,
+      fullyPricedEvents: 7,
+      partiallyPricedEvents: 2,
+      unpricedEvents: 1,
+      priceVerification: "server_repriced",
+      standardApiCounterfactualUsd: "11.100000",
+      standardApiCounterfactualEvents: 8
+    },
+    insights: [{ code: "fast_event_share", value: 0.3 }],
+    rollingQuotaMovement: {
+      schemaVersion: "participant-quota-movement-v0.1",
+      status: "conditional_estimate",
+      accountContinuity: "not_transmitted",
+      apiPriceEquivalentCapacityUsd: 617.2839,
+      rows: [{
+        timestamp: "2026-07-25T14:00:00.000Z",
+        windowStartUtc: "2026-07-25T13:00:00.000Z",
+        windowEndUtc: "2026-07-25T14:00:00.000Z",
+        smoothingHours: 1,
+        observedQuotaChangePp: 2,
+        expectedQuotaChangePp: 1.8,
+        apiPriceEquivalentUsd: "11.100000",
+        usageEvents: 8
+      }]
+    }
+  });
+  assert.equal(result.state, "ready");
+  assert.equal(result.totals.apiPriceEquivalentUsd, 12.345678);
+  assert.deepEqual(result.pricingCoverage, {
+    state: "partially_priced",
+    percent: 90,
+    fullyPricedEvents: 7,
+    partiallyPricedEvents: 2,
+    unpricedEvents: 1,
+    unclassifiedEvents: 0
+  });
+  assert.equal(result.standardApiCounterfactual.apiPriceEquivalentUsd, 11.1);
+  assert.equal(result.codexFastObservations.eventShare, 0.3);
+  assert.equal(result.rollingQuotaMovement.rows[0].smoothingHours, 1);
+  assert.equal(result.rollingQuotaMovement.accountContinuity, "not_transmitted");
+});
+
+test("participant results fail closed for unverifiable prices and honest not-testable movement", () => {
+  const result = normalizeParticipantStats({
+    schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
+    totals: {
+      usageEvents: 0,
+      apiPriceEquivalentUsd: "999.000000",
+      priceVerification: "client_declared_unverified",
+      fullyPricedEvents: 0,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0
+    },
+    rollingQuotaMovement: {
+      status: "not_testable",
+      reason: "no_observed_quota_movement",
+      rows: [],
+      accountContinuity: "not_transmitted"
+    }
+  });
+  assert.equal(result.totals.apiPriceEquivalentUsd, null);
+  assert.equal(result.pricingCoverage.state, "not_testable");
+  assert.equal(result.standardApiCounterfactual.state, "not_separately_returned");
+  assert.equal(result.codexFastObservations.state, "not_testable");
+  assert.equal(result.rollingQuotaMovement.status, "not_testable");
+  assert.equal(result.rollingQuotaMovement.reason, "no_observed_quota_movement");
+  assert.equal(normalizeParticipantStats({ schemaVersion: "participant-stats-v0.1" }).state, "unsupported_schema");
+});
+
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -536,6 +620,13 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /showRecoveryCodeOnce\(enrollment\.recoveryCode\)/);
   assert.match(appSource, /showRecoveryCodeOnce\(null\)/);
   assert.match(appSource, /normalizeCommunitySnapshot\(payload\)/);
+  assert.match(appSource, /normalizeParticipantStats\(payload\)/);
+  assert.match(appSource, /Server-repriced API equivalent/);
+  assert.match(appSource, /Standard API counterfactual/);
+  assert.match(appSource, /Codex Fast observations/);
+  assert.match(appSource, /Account continuity was not transmitted/);
+  assert.match(appSource, /Not testable/);
+  assert.match(appSource, /for \(const smoothingHours of \[1, 2, 3\]\)/);
   assert.match(appSource, /published_partial/);
   assert.match(appSource, /We do not disclose why or how close the cohort was/);
   assert.doesNotMatch(appSource, /Current eligible count|payload\.participantCount/);

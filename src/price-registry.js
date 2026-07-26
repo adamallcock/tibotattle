@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
-
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-07-25T14:18:33Z";
-const OBSERVED_DATE = APP_PRICE_REGISTRY_OBSERVED_AT.slice(0, 10);
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-07-26T07:21:54Z";
+const OPENAI_OBSERVED_DATE = APP_PRICE_REGISTRY_OBSERVED_AT.slice(0, 10);
+const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
+const ANTHROPIC_OBSERVED_DATE = ANTHROPIC_OBSERVED_AT.slice(0, 10);
 const PER_MILLION = "1000000";
 export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.1";
 
@@ -10,44 +10,74 @@ export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   anthropic: "https://platform.claude.com/docs/en/about-claude/pricing",
 });
 
+export const OPENAI_LONG_CONTEXT_SOURCE_URLS = Object.freeze([
+  "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+  "https://developers.openai.com/api/docs/models/gpt-5.5",
+  "https://developers.openai.com/api/docs/models/gpt-5.4",
+]);
+
 const SOURCE_DEFINITIONS = Object.freeze({
   openai: Object.freeze({
     provider: "openai",
     name: "openai-official-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.openai,
     observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
-    evidenceVersion: "openai-api-pricing-reviewed-2026-07-25",
+    evidenceVersion: "openai-api-pricing-reviewed-2026-07-26",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      ...OPENAI_LONG_CONTEXT_SOURCE_URLS,
+    ]),
   }),
   anthropic: Object.freeze({
     provider: "anthropic",
     name: "anthropic-official-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.anthropic,
-    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    observedAt: ANTHROPIC_OBSERVED_AT,
     evidenceVersion: "anthropic-api-pricing-reviewed-2026-07-25",
+    evidenceUrls: Object.freeze([OFFICIAL_PRICE_SOURCE_URLS.anthropic]),
   }),
 });
 
 const OPENAI_ROWS = Object.freeze([
-  // The four values are input, cache read, cache write, and output USD/MTok.
-  ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30"],
-  ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15"],
-  ["gpt-5.6-sol", "flex", "2.5", "0.25", "3.125", "15"],
-  ["gpt-5.6-sol", "priority", "10", "1", "12.5", "60"],
-  ["gpt-5.6-terra", "standard", "2.5", "0.25", "3.125", "15"],
-  ["gpt-5.6-terra", "batch", "1.25", "0.125", "1.5625", "7.5"],
-  ["gpt-5.6-terra", "flex", "1.25", "0.125", "1.5625", "7.5"],
-  ["gpt-5.6-terra", "priority", "5", "0.5", "6.25", "30"],
-  ["gpt-5.6-luna", "standard", "1", "0.1", "1.25", "6"],
-  ["gpt-5.6-luna", "batch", "0.5", "0.05", "0.625", "3"],
-  ["gpt-5.6-luna", "flex", "0.5", "0.05", "0.625", "3"],
-  ["gpt-5.6-luna", "priority", "2", "0.2", "2.5", "12"],
+  // Values are model, API tier, input, cache read, cache write, output
+  // USD/MTok, and optional context band. The 272K boundary is inclusive on
+  // the long side to preserve the monitor's established threshold contract.
+  ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short"],
+  ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long"],
+  ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short"],
+  ["gpt-5.6-sol", "batch", "5", "0.5", "6.25", "22.5", "long"],
+  ["gpt-5.6-sol", "flex", "2.5", "0.25", "3.125", "15", "short"],
+  ["gpt-5.6-sol", "flex", "5", "0.5", "6.25", "22.5", "long"],
+  ["gpt-5.6-sol", "priority", "10", "1", "12.5", "60", "short"],
+  ["gpt-5.6-terra", "standard", "2.5", "0.25", "3.125", "15", "short"],
+  ["gpt-5.6-terra", "standard", "5", "0.5", "6.25", "22.5", "long"],
+  ["gpt-5.6-terra", "batch", "1.25", "0.125", "1.5625", "7.5", "short"],
+  ["gpt-5.6-terra", "batch", "2.5", "0.25", "3.125", "11.25", "long"],
+  ["gpt-5.6-terra", "flex", "1.25", "0.125", "1.5625", "7.5", "short"],
+  ["gpt-5.6-terra", "flex", "2.5", "0.25", "3.125", "11.25", "long"],
+  ["gpt-5.6-terra", "priority", "5", "0.5", "6.25", "30", "short"],
+  ["gpt-5.6-luna", "standard", "1", "0.1", "1.25", "6", "short"],
+  ["gpt-5.6-luna", "standard", "2", "0.2", "2.5", "9", "long"],
+  ["gpt-5.6-luna", "batch", "0.5", "0.05", "0.625", "3", "short"],
+  ["gpt-5.6-luna", "batch", "1", "0.1", "1.25", "4.5", "long"],
+  ["gpt-5.6-luna", "flex", "0.5", "0.05", "0.625", "3", "short"],
+  ["gpt-5.6-luna", "flex", "1", "0.1", "1.25", "4.5", "long"],
+  ["gpt-5.6-luna", "priority", "2", "0.2", "2.5", "12", "short"],
   ["gpt-5.5", "standard", "5", "0.5", null, "30", "short"],
+  ["gpt-5.5", "standard", "10", "1", null, "45", "long"],
   ["gpt-5.5", "batch", "2.5", "0.25", null, "15", "short"],
+  ["gpt-5.5", "batch", "5", "0.5", null, "22.5", "long"],
   ["gpt-5.5", "flex", "2.5", "0.25", null, "15", "short"],
+  ["gpt-5.5", "flex", "5", "0.5", null, "22.5", "long"],
   ["gpt-5.5", "priority", "12.5", "1.25", null, "75", "short"],
   ["gpt-5.4", "standard", "2.5", "0.25", null, "15", "short"],
+  ["gpt-5.4", "standard", "5", "0.5", null, "22.5", "long"],
   ["gpt-5.4", "batch", "1.25", "0.13", null, "7.5", "short"],
+  ["gpt-5.4", "batch", "2.5", "0.26", null, "11.25", "long"],
   ["gpt-5.4", "flex", "1.25", "0.13", null, "7.5", "short"],
+  ["gpt-5.4", "flex", "2.5", "0.26", null, "11.25", "long"],
   ["gpt-5.4", "priority", "5", "0.5", null, "30", "short"],
   ["gpt-5.4-mini", "standard", "0.75", "0.075", null, "4.5"],
   ["gpt-5.4-mini", "batch", "0.375", "0.0375", null, "2.25"],
@@ -89,13 +119,17 @@ const ANTHROPIC_TOOL_ROWS = Object.freeze([
   ["web_search_units", "10", "search", "1000"],
 ]);
 
-function evidenceHash(rows) {
-  return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
-}
+export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
+  openai: [OPENAI_ROWS, OPENAI_TOOL_ROWS],
+  anthropic: [ANTHROPIC_ROWS, ANTHROPIC_TOOL_ROWS],
+});
 
+// These hashes are generated from the normalized reviewed rows during an
+// evidence refresh and checked independently in Node-side registry tests. They
+// are constants here so the production registry has no Node crypto dependency.
 const EVIDENCE_HASHES = Object.freeze({
-  openai: evidenceHash([OPENAI_ROWS, OPENAI_TOOL_ROWS]),
-  anthropic: evidenceHash([ANTHROPIC_ROWS, ANTHROPIC_TOOL_ROWS]),
+  openai: "86c0dfaa64094cf69c8c94af25f9cce8869a8bf482bac2a21c0ee3592c34927d",
+  anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
 });
 
 function component(usageComponent, amount, conditions) {
@@ -108,11 +142,12 @@ function component(usageComponent, amount, conditions) {
   };
 }
 
-function providerUnitComponent(usageComponent, amount, unit, per) {
+function providerUnitComponent(usageComponent, amount, unit, per, conditions) {
   return {
     usage_component: usageComponent,
     unit,
     price: { amount, currency: "USD", per },
+    ...(conditions ? { conditions } : {}),
   };
 }
 
@@ -123,6 +158,7 @@ function provenance(provider, { vendorEffectiveFrom = null, vendorEffectiveTo = 
     evidence_version: source.evidenceVersion,
     evidence_sha256: EVIDENCE_HASHES[provider],
     evidence_hash_scope: "normalized_reviewed_price_rows",
+    evidence_urls: source.evidenceUrls,
     vendor_effective_from: vendorEffectiveFrom,
     vendor_effective_to: vendorEffectiveTo,
     historical_validity: vendorEffectiveFrom
@@ -148,44 +184,50 @@ function source(provider) {
 }
 
 function cardId(provider, model, tier, suffix = "current") {
-  return `${provider}:${model}:${tier}:${suffix}:official-observed-2026-07-25`;
+  const observedDate = SOURCE_DEFINITIONS[provider].observedAt.slice(0, 10);
+  return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null]) {
-  const shortContext = contextBand === "short"
+  const contextConditions = contextBand === "short"
     ? { max_total_input_tokens: "271999" }
-    : null;
+    : contextBand === "long"
+      ? { min_total_input_tokens: "272000" }
+      : null;
   const aliases = model === "gpt-5.5" ? ["gpt-5.5-codex"] : undefined;
   return {
     schema_version: "0.1",
-    id: cardId("openai", model, tier),
+    id: cardId("openai", model, tier, contextBand ?? "current"),
     provider: "openai",
     model,
     ...(aliases ? { aliases } : {}),
     service_tier: tier,
     region: "global",
-    effective: { from: OBSERVED_DATE },
+    effective: { from: OPENAI_OBSERVED_DATE },
     components: [
-      component("input_uncached_tokens", input, shortContext),
-      component("input_cache_read_tokens", cacheRead, shortContext),
-      component("input_cache_write_tokens", cacheWrite, shortContext),
-      component("output_text_tokens", output, shortContext),
-      providerUnitComponent("web_search_units", "10", "search", "1000"),
-      providerUnitComponent("file_search_units", "2.5", "call", "1000"),
+      component("input_uncached_tokens", input, contextConditions),
+      component("input_cache_read_tokens", cacheRead, contextConditions),
+      component("input_cache_write_tokens", cacheWrite, contextConditions),
+      component("output_text_tokens", output, contextConditions),
+      providerUnitComponent("web_search_units", "10", "search", "1000", contextConditions),
+      providerUnitComponent("file_search_units", "2.5", "call", "1000", contextConditions),
     ].filter(Boolean),
     source: source("openai"),
     metadata: {
       pricing_basis: "official_api_price_not_subscription_allowance",
       api_service_tier: tier,
       subscription_speed_tier: null,
+      total_input_context_band: contextBand,
       provenance: provenance("openai"),
       ...(aliases ? {
         alias_assumptions: {
           "gpt-5.5-codex": "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
         },
       } : {}),
-      ...(shortContext ? {
-        coverage_note: "The official row is explicitly limited to context lengths below 272K; longer-context rates are not inferred.",
+      ...(contextBand ? {
+        coverage_note: contextBand === "short"
+          ? "Short-context prices apply through 271,999 total input tokens; the long band begins at 272,000."
+          : "Long-context prices apply from 272,000 total input tokens using the official 2x input and 1.5x output rule.",
       } : {}),
     },
   };
@@ -194,7 +236,7 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
 function anthropicEffective(period) {
   if (period === "introductory") {
     return {
-      effective: { from: OBSERVED_DATE, to: "2026-08-31" },
+      effective: { from: ANTHROPIC_OBSERVED_DATE, to: "2026-08-31" },
       vendorEffectiveFrom: null,
       vendorEffectiveTo: "2026-08-31",
       suffix: "through-2026-08-31",
@@ -209,7 +251,7 @@ function anthropicEffective(period) {
     };
   }
   return {
-    effective: { from: OBSERVED_DATE },
+    effective: { from: ANTHROPIC_OBSERVED_DATE },
     vendorEffectiveFrom: null,
     vendorEffectiveTo: null,
     suffix: "current",
@@ -255,7 +297,7 @@ function providerToolCard(provider, model, rows) {
     model,
     service_tier: "standard",
     region: "global",
-    effective: { from: OBSERVED_DATE },
+    effective: { from: SOURCE_DEFINITIONS[provider].observedAt.slice(0, 10) },
     components: rows.map(([name, amount, unit, per]) => (
       providerUnitComponent(name, amount, unit, per)
     )),
@@ -283,9 +325,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...PROVIDER_TOOL_PRICE_CARDS,
 ]);
 
-export const APP_PRICE_REGISTRY_SHA256 = createHash("sha256")
-  .update(JSON.stringify(APP_OFFICIAL_PRICE_CARDS))
-  .digest("hex");
+export const APP_PRICE_REGISTRY_SHA256 = "c9961d3d0d5de61b7471f1322ed7ce3b75be184a8dddb59450746ed6eb30f71f";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
@@ -298,6 +338,7 @@ export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
     url: definition.url,
     observedAt: definition.observedAt,
     evidenceVersion: definition.evidenceVersion,
+    evidenceUrls: definition.evidenceUrls,
     evidenceSha256: EVIDENCE_HASHES[definition.provider],
   })),
 });
@@ -326,6 +367,12 @@ function sameContext(left, right) {
     && (left.service_tier || "standard") === (right.service_tier || "standard")
     && (left.region || null) === (right.region || null)
     && (left.pricing_period || null) === (right.pricing_period || null);
+}
+
+function contextBandsOverlap(left, right) {
+  const leftBand = left.metadata?.total_input_context_band ?? null;
+  const rightBand = right.metadata?.total_input_context_band ?? null;
+  return leftBand === null || rightBand === null || leftBand === rightBand;
 }
 
 function assertDecimalString(value, label) {
@@ -362,9 +409,23 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
     if (!Array.isArray(card.components) || card.components.length === 0) {
       throw new TypeError(`${card.id} must include at least one price component.`);
     }
+    const contextBand = card.metadata?.total_input_context_band ?? null;
+    if (![null, "short", "long"].includes(contextBand)) {
+      throw new TypeError(`${card.id} has an invalid total-input context band.`);
+    }
     for (const priceComponent of card.components) {
       assertDecimalString(priceComponent.price?.amount, `${card.id} component price amount`);
       assertDecimalString(priceComponent.price?.per, `${card.id} component price divisor`);
+      if (contextBand === "short"
+        && (priceComponent.conditions?.max_total_input_tokens !== "271999"
+          || priceComponent.conditions?.min_total_input_tokens !== undefined)) {
+        throw new TypeError(`${card.id} has a malformed short-context component boundary.`);
+      }
+      if (contextBand === "long"
+        && (priceComponent.conditions?.min_total_input_tokens !== "272000"
+          || priceComponent.conditions?.max_total_input_tokens !== undefined)) {
+        throw new TypeError(`${card.id} has a malformed long-context component boundary.`);
+      }
     }
 
     for (const name of [card.model, ...(card.aliases || [])]) {
@@ -380,7 +441,7 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
     for (let rightIndex = leftIndex + 1; rightIndex < cards.length; rightIndex += 1) {
       const left = cards[leftIndex];
       const right = cards[rightIndex];
-      if (sameContext(left, right) && rangesOverlap(left, right)) {
+      if (sameContext(left, right) && rangesOverlap(left, right) && contextBandsOverlap(left, right)) {
         throw new TypeError(`${left.id} and ${right.id} overlap in the same pricing context.`);
       }
     }
@@ -400,6 +461,7 @@ export function addOfficialPriceRegistry(resolution, cards = APP_OFFICIAL_PRICE_
     url: definition.url,
     retrieved_at: definition.observedAt,
     version: definition.evidenceVersion,
+    evidence_urls: definition.evidenceUrls,
     card_count: cards.filter((card) => card.provider === definition.provider).length,
     selected: true,
   }));

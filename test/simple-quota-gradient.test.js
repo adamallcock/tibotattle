@@ -11,7 +11,9 @@ function fixture() {
   const otherReset = reset + 10_000;
   const intervals = Array.from({ length: 6 }, (_, index) => ({
     provider: "openai_codex",
+    accountScopeId: "account-a",
     planType: "pro",
+    planVariant: "pro-20x",
     limitId: "codex",
     slot: "primary",
     windowDurationMins: 10_080,
@@ -73,6 +75,26 @@ test("selects the dominant reset and never mixes a different reset into rolling 
   assert.equal(result.selectedReset.transitions, 6);
   assert.equal(result.gradient.capacityUsd, 600);
   assert.equal(result.datasets.rolling[0].rolling_api_cost_usd, 18);
+  assert.ok(result.datasets.rolling.every((row) => row.rolling_api_cost_usd < 999));
+});
+
+test("never mixes two accounts or plan variants sharing the same reset timestamp", () => {
+  const value = fixture();
+  const foreignAccount = value.recent.snapshotIntervals.slice(0, 2).map((row, index) => ({
+    ...row,
+    accountScopeId: "account-b",
+    marginalApiPricedUsd: 999,
+    eventTime: new Date(Date.UTC(2026, 6, 1, 12 + index)).toISOString(),
+  }));
+  const foreignPlan = value.recent.snapshotIntervals.slice(0, 2).map((row, index) => ({
+    ...row,
+    planVariant: "pro-5x",
+    marginalApiPricedUsd: 999,
+    eventTime: new Date(Date.UTC(2026, 6, 1, 14 + index)).toISOString(),
+  }));
+  value.recent.snapshotIntervals.push(...foreignAccount, ...foreignPlan);
+  const result = analyzeSimpleQuotaGradient(value.recent, value.history);
+  assert.equal(result.selectedReset.snapshotIntervals, 6);
   assert.ok(result.datasets.rolling.every((row) => row.rolling_api_cost_usd < 999));
 });
 

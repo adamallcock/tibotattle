@@ -414,7 +414,7 @@ async function handleTelemetryContribution(
         status: envelopeReplay.status,
         replayed: true,
         recordCounts: metadata.recordCounts,
-        accountingVerification: "client_declared_unverified",
+        accountingVerification: "server_repriced",
       },
       202,
       { "idempotency-replayed": "true" },
@@ -447,7 +447,7 @@ async function handleTelemetryContribution(
         status: contentReplay.status,
         replayed: true,
         recordCounts: metadata.recordCounts,
-        accountingVerification: "client_declared_unverified",
+        accountingVerification: "server_repriced",
       },
       202,
       { "idempotency-replayed": "true" },
@@ -487,7 +487,7 @@ async function handleTelemetryContribution(
         accepted: result.acceptedRecords,
         deduplicated: result.deduplicatedRecords,
       },
-      accountingVerification: "client_declared_unverified",
+      accountingVerification: "server_repriced",
     }, 202);
   } catch (error) {
     await env.QUARANTINE.delete(r2Key);
@@ -506,7 +506,7 @@ async function handleTelemetryContribution(
           status: replay.status,
           replayed: true,
           recordCounts: metadata.recordCounts,
-          accountingVerification: "client_declared_unverified",
+          accountingVerification: "server_repriced",
         },
         202,
         { "idempotency-replayed": "true" },

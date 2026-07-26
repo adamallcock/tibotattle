@@ -1,8 +1,9 @@
 # Central contribution service
 
 This development-only Cloudflare Worker exercises the full central product
-boundary: enrollment, encrypted upload, strict validation, D1 ingest,
-participant-isolated statistics, delayed immutable weekly community snapshots,
+boundary: enrollment, encrypted upload, strict validation, deterministic
+server-side API repricing, D1 ingest, participant-isolated statistics and
+rolling quota comparison, delayed immutable weekly community snapshots,
 export, contribution deletion, and participant deletion. It retains the
 original fixed synthetic walkthrough
 and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
@@ -83,7 +84,7 @@ printing them, and proves:
 - same-origin CSRF and cookie/upload authority isolation;
 - one-use upload registration bound to the encrypted digest and byte size;
 - strict validation, D1 ingest, opaque R2 quarantine, and recomputed personal
-  statistics;
+  statistics using server-derived API-price-equivalent costs;
 - idempotent replay using a fresh upload authorization;
 - a fixed unavailable response before scheduled publication;
 - a production-shaped 20-participant weekly snapshot built through Wrangler's
@@ -205,8 +206,25 @@ The real test contract is:
 - occurrence IDs are used only for participant-scoped overlap deduplication;
 - model fingerprints remain participant-scoped and are never emitted from
   community APIs;
-- API-cost values are explicitly labelled
-  `client_declared_unverified` until server-side repricing is implemented.
+- uploaded API-cost values remain `client_declared_unverified` diagnostics;
+- canonical personal cost is recalculated by the Worker from validated token
+  metadata and stored with price-card, method, registry-version, registry-hash,
+  coverage, and unpriced-reason provenance; and
+- Codex subscription Fast remains separate and never selects API Priority.
+  Subscription usage uses a labeled Standard API counterfactual, while an exact
+  Standard, Batch, Flex, or Priority tier is honored only for an API-billed
+  surface.
+
+`GET /api/v1/me/stats` returns `participant-stats-v0.2`. Its
+`apiPriceEquivalentUsd` is server-repriced. The private analysis machinery can
+build bounded one-, two-, and three-hour UTC windows only after account
+continuity, monotonic fresh quota observations, and complete server pricing are
+available. The current transport intentionally omits account scope, so
+`rollingQuotaMovement` fails closed with
+`reason: account_continuity_not_transmitted` rather than publishing a
+participant-wide conversion. Client tool-class counts are never priced as
+provider tool calls because the transport does not contain an exact
+provider-billable tool-unit field.
 
 In `invite_only` mode, only participants admitted with distinct one-time
 invitation grants count toward community snapshots. Local-open participants

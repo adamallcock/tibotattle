@@ -47,6 +47,8 @@ function mainWeeklyReset(intervals) {
   for (const interval of intervals) {
     if (interval.windowDurationMins !== WEEKLY_WINDOW_MINS || !Number.isFinite(interval.resetsAt)) continue;
     const key = [
+      interval.accountScopeId ?? "unattributed",
+      interval.planVariant ?? "unknown",
       interval.provider,
       interval.planType,
       interval.limitId,
@@ -62,7 +64,9 @@ function mainWeeklyReset(intervals) {
 }
 
 function sameReset(row, selected) {
-  return row.provider === selected.provider
+  return (row.accountScopeId ?? "unattributed") === (selected.accountScopeId ?? "unattributed")
+    && (row.planVariant ?? "unknown") === (selected.planVariant ?? "unknown")
+    && row.provider === selected.provider
     && row.planType === selected.planType
     && row.limitId === selected.limitId
     && row.slot === selected.slot

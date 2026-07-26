@@ -313,9 +313,23 @@ Real-data transport is implemented only as a local development proof of
 concept. The browser accepts only a prepared
 `telemetry-contribution-v0.1` file; the central Worker performs authenticated
 envelope decryption, exact-shape and semantic validation, privacy-canary
-rejection, participant-scoped occurrence deduplication, D1 ingest, opaque R2
-quarantine, personal statistics, thresholded development community statistics, export,
+rejection, participant-scoped occurrence deduplication, deterministic
+server-side API repricing, D1 ingest, opaque R2 quarantine, personal statistics,
+thresholded development community statistics, export,
 recovery, individual contribution deletion, and complete participant deletion.
+The canonical personal cost ignores the uploaded cost declaration and is
+derived from validated token components using the reviewed, versioned API price
+registry. Exact price-card IDs, method/registry versions and hashes, coverage,
+and unpriced reason codes are retained. Standard, Batch, Flex, and Priority are
+API tiers; Codex Standard/Fast is a separate subscription-speed observation and
+never silently selects Priority. GPT-5.6, GPT-5.5, and GPT-5.4 use the exact
+272,000-token long-context boundary where official rates exist.
+Personal results also expose bounded one-, two-, and three-hour UTC
+observed-versus-cost-implied machinery. Because the v0.1 contribution
+projection deliberately removes account scope, the server currently fails
+that conversion closed with `account_continuity_not_transmitted` rather than
+publishing a participant-wide estimate. The local analyzer retains
+account-partitioned rolling views.
 Personal web access uses a short-lived, hash-only D1 session exposed only in a
 Secure, HttpOnly, SameSite=Strict `__Host-` cookie. Browser storage contains no
 reusable personal credential. Uploads use a distinct five-minute, one-use

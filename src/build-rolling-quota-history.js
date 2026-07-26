@@ -14,7 +14,16 @@ const weeklyWindowMins = 10_080;
 const july13Reset = 1_784_487_650;
 
 function seriesKey(row) {
-  return [row.provider, row.planType, row.limitId, row.slot, row.windowDurationMins, row.resetsAt].join("|");
+  return [
+    row.accountScopeId ?? "unattributed",
+    row.planVariant ?? "unknown",
+    row.provider,
+    row.planType,
+    row.limitId,
+    row.slot,
+    row.windowDurationMins,
+    row.resetsAt,
+  ].join("|");
 }
 
 function timeLabels(timestamp) {

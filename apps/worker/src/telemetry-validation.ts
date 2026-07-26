@@ -165,8 +165,11 @@ function bounded(value: unknown, minimum: number, maximum: number): value is num
   return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum;
 }
 
-function nullableInteger(value: unknown): value is number | null {
-  return value === null || integer(value);
+function nullableInteger(
+  value: unknown,
+  maximum = Number.MAX_SAFE_INTEGER,
+): value is number | null {
+  return value === null || integer(value, maximum);
 }
 
 function money(value: unknown): value is string | null {
@@ -230,8 +233,10 @@ function validateUsage(value: unknown): value is TelemetryUsageEvent {
         "inputCacheWrite5mTokens", "inputCacheWrite1hTokens", "outputTextTokens",
         "outputReasoningTokens", "outputCombinedTokens",
       ])
-      || !Object.values(value.components).every(nullableInteger)
-      || !nullableInteger(value.totalInputContextTokens)
+      || !Object.values(value.components).every((component) => (
+        nullableInteger(component, 1_000_000_000)
+      ))
+      || !nullableInteger(value.totalInputContextTokens, 1_000_000_000)
       || !member(value.surface, [
         "scheduled_task", "subagent", "extension_or_ide", "cli_exec",
         "local_interactive_unclassified", "local_rollout_unclassified",

@@ -2,7 +2,8 @@ import {
   CommunityClient,
   LocalCompanionClient,
   demoDashboard,
-  normalizeCommunitySnapshot
+  normalizeCommunitySnapshot,
+  normalizeParticipantStats
 } from "./data-client.js";
 import {
   createTelemetryEnvelope,
@@ -59,6 +60,18 @@ function formatMoney(value, digits = 0) {
         currency: "USD",
         minimumFractionDigits: digits,
         maximumFractionDigits: digits
+      }).format(number);
+}
+
+function formatApiMoney(value) {
+  const number = finite(value);
+  return number === null
+    ? "—"
+    : new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 6
       }).format(number);
 }
 
@@ -837,27 +850,243 @@ async function submitContribution(event) {
 
 function renderPersonalStats(container, payload) {
   clear(container);
-  if (!payload) {
+  const stats = normalizeParticipantStats(payload);
+  if (stats.state === "service_unavailable") {
     container.append(node("p", "", "No personal result is available."));
     return;
   }
-  const source = payload.totals ?? payload.lifetime ?? payload;
-  const metrics = [
-    ["Safe events", finite(source.eventCount ?? source.usageEvents ?? payload.recordCount)],
-    ["API equivalent", finite(source.estimatedApiCostUsd ?? source.clientEstimatedApiCostUsd ?? source.costUsd)],
-    ["Weekly estimate", finite(payload.insights?.weeklyLimitUsd ?? payload.weeklyEstimateUsd)]
-  ].filter(([, value]) => value !== null);
-  if (!metrics.length) {
-    container.append(node("p", "", "The service returned a partial result without displayable aggregate metrics."));
+  if (stats.state === "unsupported_schema") {
+    container.append(node(
+      "p",
+      "result-state result-state-warning",
+      `The service returned ${stats.schemaVersion || "an unknown schema"}, not participant-stats-v0.2. No personal values were displayed.`
+    ));
     return;
   }
+
+  const source = stats.totals;
   const grid = node("div", "result-metrics");
-  for (const [label, value] of metrics.slice(0, 3)) {
+  const metrics = [
+    ["Safe usage events", source.usageEvents, compact],
+    ["Server-repriced API equivalent", source.apiPriceEquivalentUsd, formatApiMoney],
+    ["Quota snapshots", source.quotaSnapshots, compact]
+  ];
+  for (const [label, value, formatter] of metrics) {
     const card = node("div");
-    card.append(node("span", "", label), node("strong", "", label.includes("equivalent") || label.includes("estimate") ? formatMoney(value) : compact(value)));
+    card.append(
+      node("span", "", label),
+      node("strong", "", value === null ? "Not available" : formatter(value))
+    );
     grid.append(card);
   }
   container.append(grid);
+
+  const verification = node("p", "result-verification");
+  verification.append(
+    node("strong", "", "Server-repriced API equivalent. "),
+    document.createTextNode(
+      "This is a current public API price-card comparison calculated by the server, not a subscription charge or OpenAI’s internal quota unit."
+    )
+  );
+  container.append(verification);
+
+  const coverage = stats.pricingCoverage;
+  const coveragePanel = node("section", "participant-detail");
+  coveragePanel.append(node("h4", "", "Server pricing coverage"));
+  const coverageState = node("span", `coverage-state coverage-${coverage.state}`, coverage.state.replaceAll("_", " "));
+  const coverageHeading = node("div", "participant-detail-heading");
+  coverageHeading.append(
+    coverageState,
+    node(
+      "strong",
+      "",
+      coverage.percent === null ? "Coverage not testable" : `${formatPercent(coverage.percent, 1)} of events at least partly priced`
+    )
+  );
+  coveragePanel.append(coverageHeading);
+  const coverageGrid = node("div", "coverage-counts");
+  for (const [label, value] of [
+    ["Fully priced", coverage.fullyPricedEvents],
+    ["Partly priced", coverage.partiallyPricedEvents],
+    ["Unpriced", coverage.unpricedEvents],
+    ["Unclassified", coverage.unclassifiedEvents]
+  ]) {
+    const item = node("div");
+    item.append(node("span", "", label), node("strong", "", value === null ? "Unknown" : compact(value)));
+    coverageGrid.append(item);
+  }
+  coveragePanel.append(coverageGrid);
+  if (source.serverUnknownBillableUnits > 0) {
+    coveragePanel.append(node(
+      "p",
+      "result-state result-state-warning",
+      `${compact(source.serverUnknownBillableUnits)} observed billable units were not assigned a server price.`
+    ));
+  }
+  container.append(coveragePanel);
+
+  const pricingBasis = node("section", "participant-detail");
+  pricingBasis.append(node("h4", "", "Keep subscription speed separate from API pricing"));
+  const basisGrid = node("div", "pricing-basis-grid");
+  const standard = node("article", "basis-card");
+  standard.append(
+    node("span", "basis-label", "Standard API counterfactual"),
+    node(
+      "strong",
+      "",
+      stats.standardApiCounterfactual.apiPriceEquivalentUsd === null
+        ? "Not separately returned"
+        : formatApiMoney(stats.standardApiCounterfactual.apiPriceEquivalentUsd)
+    ),
+    node(
+      "p",
+      "",
+      stats.standardApiCounterfactual.apiPriceEquivalentUsd === null
+        ? "This response does not isolate a Standard-only subtotal. The total above remains the verified server-repriced API equivalent."
+        : `${stats.standardApiCounterfactual.events === null ? "Eligible subscription events" : compact(stats.standardApiCounterfactual.events) + " events"} repriced against the Standard API card.`
+    )
+  );
+  const fast = node("article", "basis-card basis-fast");
+  const fastValue = stats.codexFastObservations.eventShare === null
+    ? stats.codexFastObservations.eventCount === null
+      ? "Not testable"
+      : `${compact(stats.codexFastObservations.eventCount)} events`
+    : `${formatPercent(stats.codexFastObservations.eventShare * 100, 1)} of events`;
+  fast.append(
+    node("span", "basis-label", "Codex Fast observations"),
+    node("strong", "", fastValue),
+    node(
+      "p",
+      "",
+      "Fast is a subscription speed observation. It is not API Priority tier, and no invented Fast price multiplier is applied here."
+    )
+  );
+  basisGrid.append(standard, fast);
+  pricingBasis.append(basisGrid);
+  container.append(pricingBasis);
+
+  renderParticipantQuotaMovement(container, stats.rollingQuotaMovement);
+}
+
+const QUOTA_MOVEMENT_REASONS = Object.freeze({
+  account_continuity_not_transmitted: "Account continuity is deliberately absent from this privacy-safe contribution, so the server will not calculate an account-specific quota conversion.",
+  insufficient_quota_observations: "There are not yet two usable quota observations in one reset window.",
+  analysis_record_limit_exceeded: "The private analysis exceeded its bounded record limit.",
+  stale_quota_observation: "At least one provider quota observation arrived too late to support this comparison.",
+  backward_quota_observation: "The quota percentage moved backwards inside one reset window, so this track was rejected as ambiguous.",
+  incomplete_server_pricing_in_interval: "At least one overlapping usage event was not fully priced by the server.",
+  no_observed_quota_movement: "The recorded quota percentage did not move in this window.",
+  no_server_priced_usage_in_interval: "No server-priced usage overlaps this quota interval.",
+  no_usage_in_interval: "No usage events overlap this quota interval.",
+  no_valid_rolling_rows: "The response contained no valid 1-, 2-, or 3-hour comparison rows."
+});
+
+function renderParticipantQuotaMovement(container, movement) {
+  const section = node("section", "participant-detail quota-movement");
+  const heading = node("div", "participant-detail-heading");
+  const title = node("div");
+  title.append(
+    node("h4", "", "Private rolling quota movement"),
+    node("p", "", "Observed quota decrease versus movement implied by server-repriced API equivalent, bucketed in UTC.")
+  );
+  heading.append(title, node("span", "private-chip", "Private result"));
+  section.append(heading);
+
+  if (movement.accountContinuity === "not_transmitted") {
+    section.append(node(
+      "p",
+      "result-state result-state-warning",
+      "Account continuity was not transmitted. Participant-wide usage may span accounts, so this comparison must not be treated as an account-specific quota conversion."
+    ));
+  }
+
+  if (movement.status !== "conditional_estimate") {
+    const copy = QUOTA_MOVEMENT_REASONS[movement.reason]
+      ?? "The available private evidence cannot support this comparison yet.";
+    const state = node("div", "not-testable-state");
+    state.append(
+      node("strong", "", "Not testable"),
+      node("p", "", copy)
+    );
+    section.append(state);
+  } else {
+    const metadata = node("div", "movement-metadata");
+    const resetLabel = movement.resetsAt ? `Reset ${formatUtc(movement.resetsAt)}` : "Reset time unavailable";
+    const capacityLabel = movement.apiPriceEquivalentCapacityUsd === null
+      ? "Capacity estimate unavailable"
+      : `${formatApiMoney(movement.apiPriceEquivalentCapacityUsd)} per 100 percentage points`;
+    metadata.append(
+      node("span", "", [movement.planType, movement.planVariant, movement.limitId, movement.slot].filter(Boolean).join(" · ") || "Quota track"),
+      node("span", "", resetLabel),
+      node("span", "", capacityLabel)
+    );
+    section.append(metadata);
+    section.append(node(
+      "p",
+      "snapshot-disclosure",
+      "The capacity figure is a conditional API-price-equivalent gradient, not a provider-reported allowance. Tables show the latest 12 valid points for each smoothing window."
+    ));
+
+    for (const smoothingHours of [1, 2, 3]) {
+      const rows = movement.rows
+        .filter((row) => row.smoothingHours === smoothingHours)
+        .sort((left, right) => Date.parse(left.windowEndUtc) - Date.parse(right.windowEndUtc))
+        .slice(-12);
+      const group = node("section", "movement-window");
+      const groupHeading = node("div", "movement-window-heading");
+      groupHeading.append(
+        node("h5", "", `${smoothingHours}-hour rolling window`),
+        node("span", "", rows.length ? `${rows.length} latest points` : "Not testable")
+      );
+      group.append(groupHeading);
+      if (!rows.length) {
+        group.append(node(
+          "p",
+          "empty-inline",
+          `Not testable: the response does not yet contain a valid ${smoothingHours}-hour rolling point.`
+        ));
+        section.append(group);
+        continue;
+      }
+      const wrap = node("div", "table-wrap movement-table");
+      const table = document.createElement("table");
+      const caption = node(
+        "caption",
+        "sr-only",
+        `${smoothingHours}-hour private rolling quota movement in UTC`
+      );
+      const thead = document.createElement("thead");
+      const header = document.createElement("tr");
+      for (const label of ["Window ending (UTC)", "Observed", "Expected", "Difference", "API equivalent", "Events"]) {
+        const th = document.createElement("th");
+        th.scope = "col";
+        th.textContent = label;
+        header.append(th);
+      }
+      thead.append(header);
+      const tbody = document.createElement("tbody");
+      for (const row of rows) {
+        const tr = document.createElement("tr");
+        const difference = row.observedQuotaChangePp - row.expectedQuotaChangePp;
+        for (const value of [
+          formatUtc(row.windowEndUtc),
+          formatPp(row.observedQuotaChangePp, 2),
+          formatPp(row.expectedQuotaChangePp, 2),
+          formatPp(difference, 2),
+          formatApiMoney(row.apiPriceEquivalentUsd),
+          compact(row.usageEvents)
+        ]) {
+          tr.append(node("td", "", value));
+        }
+        tbody.append(tr);
+      }
+      table.append(caption, thead, tbody);
+      wrap.append(table);
+      group.append(wrap);
+      section.append(group);
+    }
+  }
+  container.append(section);
 }
 
 const COMMUNITY_METRIC_LABELS = Object.freeze({
