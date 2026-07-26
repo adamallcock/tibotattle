@@ -1363,22 +1363,58 @@ async function revokeDevice(deviceId) {
 
 function renderBackendHealth(health) {
   const reachable = health?.status === "ok";
+  const controls = health?.collectionControls;
+  const collectionState = reachable
+    && ["operational", "degraded", "contained"].includes(controls?.state)
+    ? controls.state
+    : null;
   const state = $("#backend-state");
-  state.textContent = reachable ? "Backend ready" : "Backend unavailable";
-  state.className = reachable ? "evidence-chip" : "evidence-chip neutral";
+  const stateLabels = {
+    operational: "Backend ready",
+    degraded: "Collection partially paused",
+    contained: "Collection contained"
+  };
+  state.textContent = reachable
+    ? stateLabels[collectionState] ?? "Backend status incomplete"
+    : "Backend unavailable";
+  state.className = reachable && collectionState === "operational"
+    ? "evidence-chip"
+    : "evidence-chip neutral";
   $("#backend-database").textContent = health?.checks?.database === "ok"
     ? "Connected"
     : "Unavailable";
   $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "reachable"
     ? "Reachable"
     : "Unavailable";
+  $("#backend-collection-state").textContent = {
+    operational: "Operational",
+    degraded: "One or more intake stages paused",
+    contained: "All collection and publication paused"
+  }[collectionState] ?? "Unavailable";
   const enrollmentLabels = {
     local_open: "Open for local testing",
     invite_only: "Private invite pilot",
     disabled: "New enrollment paused"
   };
-  $("#backend-enrollment").textContent = enrollmentLabels[health?.enrollmentMode]
-    ?? "Unavailable";
+  $("#backend-enrollment").textContent = controls?.enrollment === false
+    ? "Paused"
+    : enrollmentLabels[health?.enrollmentMode] ?? "Unavailable";
+  const controlLabel = (value) => value === true
+    ? "Enabled"
+    : value === false
+      ? "Paused"
+      : "Unavailable";
+  $("#backend-upload-registration").textContent = controlLabel(
+    controls?.uploadRegistration
+  );
+  $("#backend-processing").textContent = controlLabel(controls?.processing);
+  $("#backend-publication").textContent = controlLabel(controls?.publication);
+  $("#backend-participant-rights").textContent = reachable
+    && health?.capabilities?.participantStats === true
+    && health?.capabilities?.participantExport === true
+    && health?.capabilities?.participantDeletion === true
+    ? "View, export, and delete remain available"
+    : "Unavailable";
   $("#backend-contract").textContent = health?.contracts?.acceptedContribution
     ?? "Unavailable";
 

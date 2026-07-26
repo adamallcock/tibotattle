@@ -4,7 +4,8 @@ This development-only Cloudflare Worker exercises the full central product
 boundary: enrollment, encrypted upload, strict validation, deterministic
 server-side API repricing, D1 ingest, participant-isolated statistics and
 rolling quota comparison, delayed immutable weekly community snapshots,
-export, contribution deletion, and participant deletion. It retains the
+independent incident containment, export, contribution deletion, and
+participant deletion. It retains the
 original fixed synthetic walkthrough
 and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
 files, prompts, responses, commands, paths, account identifiers, or arbitrary
@@ -141,6 +142,54 @@ contribution, or row value.
 The Worker runtime suite, rather than this transport smoke, supplies the exact
 assertions for per-participant clipping, independent metric support,
 null-versus-explicit-zero handling, cutoff exclusion, and rounding.
+
+### Local incident-containment drill
+
+Migration `0009_collection_controls.sql` adds independent fail-closed controls
+for enrollment, upload registration, ingestion processing, and aggregate
+publication. The control is a strict singleton D1 row; no administrator HTTP
+route exists, and the operator deliberately rejects `--remote`.
+
+With a fresh migrated local state and the Worker still running against that
+same `--persist-to` directory, inspect or contain collection from another
+terminal:
+
+```sh
+npm run control:collection -- \
+  --action inspect \
+  --persist-to /absolute/path/to/isolated-state
+
+npm run control:collection -- \
+  --action contain-all \
+  --persist-to /absolute/path/to/isolated-state
+```
+
+Restoration is deliberately separate and confirmed:
+
+```sh
+npm run control:collection -- \
+  --action restore-all \
+  --confirm RESTORE_COLLECTION \
+  --persist-to /absolute/path/to/isolated-state
+```
+
+The repeatable live HTTP drill accepts an owner-only prepared v0.1
+contribution:
+
+```sh
+npm run smoke:incident:http -- \
+  --origin http://127.0.0.1:8792 \
+  --persist-to /absolute/path/to/isolated-state \
+  --file /absolute/path/to/telemetry-contribution-000001.json
+```
+
+It creates two local participants, changes D1 while the Worker remains running,
+proves all four controlled paths stop, proves private stats/export/deletion
+remain available, restores explicitly, submits the same previously blocked
+one-use upload, verifies private statistics, and deletes both participants. The
+command attempts restoration and deletion in `finally` on failure. Stop the
+Worker, inspect D1/R2 for zeros, and discard the isolated state after the drill.
+This local control is development evidence, not a production operator design.
 
 After the server stops, inspect the isolated D1 counts and R2 blob directory,
 then move the whole isolated state to Trash:

@@ -90,6 +90,65 @@ function personalHeaders(
   };
 }
 
+interface CollectionControlFlags {
+  enrollment: boolean;
+  uploadRegistration: boolean;
+  processing: boolean;
+  publication: boolean;
+}
+
+async function setCollectionControls(
+  overrides: Partial<CollectionControlFlags>,
+): Promise<CollectionControlFlags> {
+  const current = await testBindings().USAGE_MONITOR_DB.prepare(`
+    SELECT enrollment_enabled,
+           upload_registration_enabled,
+           processing_enabled,
+           publication_enabled
+      FROM collection_controls
+     WHERE singleton = 1
+  `).first<{
+    enrollment_enabled: number;
+    upload_registration_enabled: number;
+    processing_enabled: number;
+    publication_enabled: number;
+  }>();
+  if (!current) throw new Error("collection controls were not initialized");
+  const flags = {
+    enrollment: overrides.enrollment ?? current.enrollment_enabled === 1,
+    uploadRegistration:
+      overrides.uploadRegistration ?? current.upload_registration_enabled === 1,
+    processing: overrides.processing ?? current.processing_enabled === 1,
+    publication: overrides.publication ?? current.publication_enabled === 1,
+  };
+  const enabled = Object.values(flags).filter(Boolean).length;
+  const state = enabled === 4
+    ? "operational"
+    : enabled === 0
+      ? "contained"
+      : "degraded";
+  await testBindings().USAGE_MONITOR_DB.prepare(`
+    UPDATE collection_controls
+       SET enrollment_enabled = ?,
+           upload_registration_enabled = ?,
+           processing_enabled = ?,
+           publication_enabled = ?,
+           control_state = ?,
+           revision = revision + 1,
+           reason_code = 'maintenance',
+           updated_at = ?
+     WHERE singleton = 1
+  `).bind(
+    Number(flags.enrollment),
+    Number(flags.uploadRegistration),
+    Number(flags.processing),
+    Number(flags.publication),
+    state,
+    new Date().toISOString(),
+  ).run();
+  return flags;
+}
+
 function contributionResource(
   participant: EnrollmentResponse,
   contributionId: string,
@@ -1228,6 +1287,13 @@ describe("synthetic usage monitor service", () => {
       status: "ok",
       mode: "synthetic-and-private-telemetry",
       enrollmentMode: "local_open",
+      collectionControls: {
+        state: "operational",
+        enrollment: true,
+        uploadRegistration: true,
+        processing: true,
+        publication: true,
+      },
       checks: {
         database: "ok",
         encryptedObjectStore: "reachable",
@@ -1250,6 +1316,214 @@ describe("synthetic usage monitor service", () => {
         ongoingDeviceUploadRegistration: true,
       },
     });
+  });
+
+  it("independently contains collection while preserving participant rights", async () => {
+    const participant = await enrollTelemetry();
+    const device = await pairDevice(participant);
+    const rawEnvelope = JSON.stringify(
+      await encrypt(telemetryFixture("d"), true),
+    );
+
+    await setCollectionControls({ uploadRegistration: false });
+    const blockedPairing = await api("/api/v1/me/device-pairings", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        ongoingUpload: true,
+      }),
+    });
+    expect(blockedPairing.status).toBe(503);
+    await expect(blockedPairing.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_REGISTRATION_DISABLED" },
+    });
+
+    const registrationBody = JSON.stringify({
+      envelopeDigest: await sha256Hex(rawEnvelope),
+      contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
+      contentType: "application/json",
+    });
+    for (const [path, headers] of [
+      [
+        "/api/v1/me/upload-authorizations",
+        {
+          ...personalHeaders(participant, { csrf: true }),
+          "content-type": "application/json",
+        },
+      ],
+      [
+        "/api/v1/device/upload-authorizations",
+        {
+          authorization: `Device ${device.authorization}`,
+          "content-type": "application/json",
+        },
+      ],
+    ] as const) {
+      const response = await api(path, {
+        method: "POST",
+        headers,
+        body: registrationBody,
+      });
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "UPLOAD_REGISTRATION_DISABLED" },
+      });
+    }
+
+    await setCollectionControls({ uploadRegistration: true });
+    const authorization = await registerUpload(participant, rawEnvelope);
+    await setCollectionControls({ processing: false });
+    const blockedUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(blockedUpload.status).toBe(503);
+    await expect(blockedUpload.json()).resolves.toMatchObject({
+      error: { code: "PROCESSING_DISABLED" },
+    });
+
+    await setCollectionControls({ processing: true });
+    const resumedUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(resumedUpload.status).toBe(202);
+
+    await setCollectionControls({ enrollment: false });
+    const blockedEnrollment = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+      }),
+    });
+    expect(blockedEnrollment.status).toBe(503);
+    await expect(blockedEnrollment.json()).resolves.toMatchObject({
+      error: { code: "COLLECTION_ENROLLMENT_DISABLED" },
+    });
+
+    for (const path of ["/api/v1/me/stats", "/api/v1/me/export"]) {
+      const response = await api(path, {
+        headers: personalHeaders(participant),
+      });
+      expect(response.status).toBe(200);
+    }
+
+    await setCollectionControls({ publication: false });
+    for (const path of [
+      "/api/v1/stats/aggregate",
+      "/api/v1/community/insights",
+    ]) {
+      const response = await api(path);
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "PUBLICATION_DISABLED" },
+      });
+    }
+
+    await setCollectionControls({
+      enrollment: false,
+      uploadRegistration: false,
+      processing: false,
+      publication: false,
+    });
+    const health = await api("/api/health");
+    expect(health.status).toBe(200);
+    await expect(health.json()).resolves.toMatchObject({
+      status: "ok",
+      collectionControls: {
+        state: "contained",
+        enrollment: false,
+        uploadRegistration: false,
+        processing: false,
+        publication: false,
+      },
+      capabilities: {
+        encryptedUpload: false,
+        participantStats: true,
+        participantExport: true,
+        participantDeletion: true,
+        ongoingDeviceUploadRegistration: false,
+      },
+    });
+
+    const deleted = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(deleted.status).toBe(200);
+    await expect(deleted.json()).resolves.toMatchObject({
+      deleted: true,
+      contributionsDeleted: 1,
+    });
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+  });
+
+  it("fails collection closed when the control record is unavailable", async () => {
+    const participant = await enrollTelemetry();
+    const rawEnvelope = JSON.stringify(
+      await encrypt(telemetryFixture("e"), true),
+    );
+    const authorization = await registerUpload(participant, rawEnvelope);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "DELETE FROM collection_controls WHERE singleton = 1",
+    ).run();
+
+    for (const [path, init] of [
+      [
+        "/api/v1/enroll",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            consentVersion: "privacy-safe-telemetry-v0.1",
+            syntheticOnly: false,
+          }),
+        },
+      ],
+      [
+        "/api/v1/contributions",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Upload ${authorization.uploadAuthorization}`,
+            "content-type": "application/json",
+          },
+          body: rawEnvelope,
+        },
+      ],
+      ["/api/v1/stats/aggregate", {}],
+    ] as const) {
+      const response = await api(path, init);
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "COLLECTION_CONTROL_UNAVAILABLE" },
+      });
+    }
+
+    const personalStats = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    expect(personalStats.status).toBe(200);
+    const deleted = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(deleted.status).toBe(200);
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
 
   it("accepts the real browser envelope, replays, exports, and deletes it", async () => {
@@ -1887,6 +2161,30 @@ describe("synthetic usage monitor service", () => {
       week_end: "2026-07-27T00:00:00.000Z",
       release_state: "suppressed",
     });
+  });
+
+  it("prevents scheduled aggregate publication while publication is paused", async () => {
+    await setCollectionControls({ publication: false });
+    const waits: Promise<unknown>[] = [];
+    worker.scheduled?.(
+      {
+        cron: "",
+        scheduledTime: Date.parse("2026-07-29T00:00:00.000Z"),
+        noRetry() {},
+      },
+      testBindings(),
+      {
+        waitUntil(promise) {
+          waits.push(promise);
+        },
+      } as ExecutionContext,
+    );
+    expect(waits).toHaveLength(1);
+    await Promise.all(waits);
+    const snapshots = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM community_weekly_snapshots",
+    ).first<{ total: number }>();
+    expect(snapshots?.total).toBe(0);
   });
 
   it("seals, serves, protects, and withdraws a clipped weekly snapshot", async () => {

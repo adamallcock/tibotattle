@@ -3,6 +3,7 @@ title: G4 Privacy and Security Incident Response Runbook
 date: 2026-07-25
 type: runbook
 status: draft-blocking
+updated: 2026-07-26
 ---
 
 # G4 Privacy and Security Incident Response Runbook
@@ -10,8 +11,9 @@ status: draft-blocking
 ## Release status
 
 This runbook is deliberately pre-production. The central Worker has no public
-route, external participants are unauthorized, and the fastest safe containment
-action is therefore to keep it undeployed.
+deployment or public route, external participants are unauthorized, and the
+fastest safe production containment action is therefore still to keep it
+undeployed.
 
 Primary incident owner: Adam Allcock.
 
@@ -43,20 +45,27 @@ following occurs:
 
 The current development checkpoint has:
 
-- no Worker route and `workers_dev: false`;
+- no public Worker route and `workers_dev: false`;
 - an enrollment mode that can be set to `disabled`;
+- strict D1-backed enrollment, upload-registration, processing, and publication
+  controls that fail closed when their singleton state is unavailable;
+- a local-only fixed-vocabulary operator command with explicit restoration
+  confirmation and no administrator HTTP endpoint;
+- a live loopback drill proving that a running Worker observes containment
+  without restart or redeployment;
 - fixed closed central routes;
 - strict request/plaintext/record limits;
 - privacy-canary rejection;
 - opaque R2 object names;
 - participant-scoped D1 reads, export, and deletion;
-- individual contribution and full participant deletion; and
+- personal results, export, revocation, individual contribution deletion, and
+  full participant deletion that remain available during containment; and
 - fixed error codes without payload reflection.
 
 The following production controls are still missing and block a pilot:
 
-- independent enrollment, upload-registration, processing, and publication
-  kill switches;
+- authenticated and audited production operation of the independent switches,
+  including dual approval, rollback, and alert integration;
 - edge admission and abuse-rate limiting;
 - production KMS/keyring rotation and retired-key rejection;
 - isolated validator identity/runtime;
@@ -65,6 +74,25 @@ The following production controls are still missing and block a pilot:
 - cloud audit/log field and retention inspection;
 - alerts, budgets, queue controls, and safe operator dashboards; and
 - a participant notification decision tree and contact channel.
+
+## Development containment command
+
+The current command is deliberately local-only. It rejects `--remote`.
+
+```bash
+npm --prefix apps/worker run control:collection -- \
+  --action contain-all \
+  --persist-to <isolated-local-state>
+
+npm --prefix apps/worker run control:collection -- \
+  --action restore-all \
+  --confirm RESTORE_COLLECTION \
+  --persist-to <isolated-local-state>
+```
+
+Independent `pause-*` and confirmed `resume-*` actions exist for `enrollment`,
+`upload-registration`, `processing`, and `publication`. Do not reinterpret this
+development command as a production administrator interface.
 
 ## Severity
 
@@ -121,6 +149,7 @@ chat, email, screenshots, or postmortems.
 
 | Drill | Pass evidence |
 |---|---|
+| Global collection containment | A running loopback Worker observes all four D1 switches without redeploy; intake/publication stop; personal stats/export/deletion remain available; explicit restore resumes the pending upload; all personal D1 and R2 objects are removed |
 | Canary content | Encrypted nested canary is rejected; no canonical row, log content, response value, or retained object remains |
 | Stolen access capability | Rotation/revocation stops personal access without granting upload or recovery powers |
 | Stolen recovery capability | Attempt limits engage; recovery rotates credentials; old capabilities fail; no enumeration signal |
@@ -135,6 +164,10 @@ chat, email, screenshots, or postmortems.
 Each drill produces a dated receipt with code/config hashes, fixed outcomes,
 store counts, elapsed time, residual risks, and the human decision. Passing unit
 tests alone is not a drill receipt.
+
+The development global-containment drill has a dated
+[verification receipt](./2026-07-26-g4-incident-containment-verification-receipt.md).
+It is one required drill, not G4 approval.
 
 ## Restoration gate
 

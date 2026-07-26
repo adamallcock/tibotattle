@@ -242,11 +242,13 @@ test("spool discovery queues only fixed prepared-set child names", async () => {
   });
   assert.equal(sets.length, 1);
   assert.match(sets[0].setName, /^prepared-set-/u);
+  let clock = Date.parse("2026-07-26T12:00:00.000Z");
   const result = await runContributionSyncQueueOnce({
     directory: value.preparedRoot,
     origin: ORIGIN,
     backend: {},
     queueFile: value.queueFile,
+    now: () => new Date(clock++),
     syncEntry: async () => acceptedReceipt(),
   });
   assert.equal(result.discoveredSets, 1);

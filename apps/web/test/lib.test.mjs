@@ -717,6 +717,11 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
   assert.match(html, /id="backend-state"/);
+  assert.match(html, /id="backend-collection-state"/);
+  assert.match(html, /id="backend-upload-registration"/);
+  assert.match(html, /id="backend-processing"/);
+  assert.match(html, /id="backend-publication"/);
+  assert.match(html, /id="backend-participant-rights"/);
   assert.match(html, /Backend readiness and data lifecycle/);
   assert.match(html, /Transactional ingest/);
   assert.match(html, /id="download-participant"/);
@@ -748,6 +753,8 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /normalizeCommunitySnapshot\(payload\)/);
   assert.match(appSource, /normalizeParticipantStats\(payload\)/);
   assert.match(appSource, /function renderBackendHealth\(health\)/);
+  assert.match(appSource, /Collection contained/);
+  assert.match(appSource, /View, export, and delete remain available/);
   assert.match(appSource, /implementation_disabled/);
   assert.match(appSource, /Server-repriced API equivalent/);
   assert.match(appSource, /Standard API counterfactual/);

@@ -17,6 +17,10 @@ import {
   readLatestCommunityWeeklySnapshot,
 } from "./community-snapshots";
 import {
+  assertCollectionControl,
+  readCollectionControls,
+} from "./collection-controls";
+import {
   decryptSyntheticEnvelope,
   publicEnvelopeKey,
   sha256Hex,
@@ -163,6 +167,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   const mode = configuredEnrollmentMode(env);
   assertAdmissionBindings(env);
   if (mode === "disabled") throw new ApiError(503, "ENROLLMENT_DISABLED");
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
   await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
@@ -290,6 +295,10 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
 
 async function handleUploadAuthorization(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  await assertCollectionControl(
+    env.USAGE_MONITOR_DB,
+    "uploadRegistration",
+  );
   const session = await personalSession(request, env);
   assertCsrf(request, session);
   const body = await readBoundedJson(request);
@@ -320,6 +329,10 @@ async function handleUploadAuthorization(request: Request, env: Env): Promise<Re
 
 async function handleDevicePairing(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  await assertCollectionControl(
+    env.USAGE_MONITOR_DB,
+    "uploadRegistration",
+  );
   const session = await personalSession(request, env);
   assertCsrf(request, session);
   if (session.consentVersion !== TELEMETRY_CONSENT_VERSION) {
@@ -348,6 +361,10 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
 
 async function handleDevicePairingClaim(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  await assertCollectionControl(
+    env.USAGE_MONITOR_DB,
+    "uploadRegistration",
+  );
   if (request.headers.has("cookie")) throw new ApiError(401, "PAIRING_AUTH_INVALID");
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
@@ -371,6 +388,10 @@ async function handleDeviceUploadAuthorization(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  await assertCollectionControl(
+    env.USAGE_MONITOR_DB,
+    "uploadRegistration",
+  );
   if (request.headers.has("cookie")) throw new ApiError(401, "DEVICE_AUTH_INVALID");
   const device = await authenticateDevice(
     env.USAGE_MONITOR_DB,
@@ -656,6 +677,7 @@ async function handleTelemetryContribution(
 
 async function handleContribution(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
   if (hasSessionCookie(request.headers.get("cookie"))) {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }
@@ -848,6 +870,7 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 
 async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
   return new Response(
     await readLatestCommunityWeeklySnapshot(env.USAGE_MONITOR_DB),
     { headers: JSON_HEADERS },
@@ -1005,6 +1028,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
       assertAdmissionBindings(env);
+      const collectionControls = await readCollectionControls(
+        env.USAGE_MONITOR_DB,
+      );
       if (!env.QUARANTINE
           || typeof Reflect.get(env.QUARANTINE, "head") !== "function"
           || typeof Reflect.get(env.QUARANTINE, "put") !== "function"
@@ -1017,6 +1043,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         status: "ok",
         mode: "synthetic-and-private-telemetry",
         enrollmentMode,
+        collectionControls: {
+          state: collectionControls.state,
+          enrollment: collectionControls.enrollment
+            && enrollmentMode !== "disabled",
+          uploadRegistration: collectionControls.uploadRegistration,
+          processing: collectionControls.processing,
+          publication: collectionControls.publication,
+        },
         checks: {
           database: "ok",
           encryptedObjectStore: "reachable",
@@ -1029,14 +1063,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           },
         },
         capabilities: {
-          encryptedUpload: true,
+          encryptedUpload: collectionControls.processing,
           serverValidation: true,
           idempotentDeduplication: true,
           participantStats: true,
-          delayedAggregateStats: true,
+          delayedAggregateStats: collectionControls.publication,
           participantExport: true,
           participantDeletion: true,
-          ongoingDeviceUploadRegistration: true,
+          ongoingDeviceUploadRegistration:
+            collectionControls.uploadRegistration,
         },
       });
     }
@@ -1055,8 +1090,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const apiError = error instanceof ApiError
       ? error
       : new ApiError(500, "INTERNAL_ERROR");
+    const expectedContainment = [
+      "COLLECTION_ENROLLMENT_DISABLED",
+      "UPLOAD_REGISTRATION_DISABLED",
+      "PROCESSING_DISABLED",
+      "PUBLICATION_DISABLED",
+    ].includes(apiError.code);
     const log = {
-      level: apiError.status >= 500 ? "error" : "warn",
+      level: apiError.status >= 500 && !expectedContainment ? "error" : "warn",
       event: "request_failed",
       requestId,
       method: request.method,
@@ -1064,7 +1105,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       code: apiError.code,
       status: apiError.status,
     };
-    if (apiError.status >= 500) console.error(JSON.stringify(log));
+    if (log.level === "error") console.error(JSON.stringify(log));
     else console.warn(JSON.stringify(log));
     const response = errorResponse(apiError, requestId);
     const allow = allowedHeader(apiError);
@@ -1080,9 +1121,15 @@ export default {
     return handleRequest(request, env);
   },
   scheduled(event, env, context): void {
-    context.waitUntil(buildCommunityWeeklySnapshot(
-      env.USAGE_MONITOR_DB,
-      event.scheduledTime,
-    ).then(() => undefined));
+    context.waitUntil((async () => {
+      const controls = await readCollectionControls(
+        env.USAGE_MONITOR_DB,
+      );
+      if (!controls.publication) return;
+      await buildCommunityWeeklySnapshot(
+        env.USAGE_MONITOR_DB,
+        event.scheduledTime,
+      );
+    })());
   },
 } satisfies ExportedHandler<Env>;

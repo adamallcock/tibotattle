@@ -48,6 +48,7 @@
     "product:worker:check": "npm --prefix apps/worker run check",
     "product:backend:smoke": "npm --prefix apps/worker run smoke:http --",
     "product:backend:queue-smoke": "npm --prefix apps/worker run smoke:queue:http --",
+    "product:backend:incident-smoke": "npm --prefix apps/worker run smoke:incident:http --",
     "product:check": "npm run product:ui:test && npm run product:local:test && npm run product:worker:check",
     "product:local": "node ./apps/local/server.js",
     "product:prepare-contribution": "node ./scripts/build-telemetry-contributions.js",

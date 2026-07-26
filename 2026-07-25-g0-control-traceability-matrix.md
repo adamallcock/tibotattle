@@ -3,6 +3,7 @@ title: G0 Control Traceability Matrix
 date: 2026-07-25
 type: reference
 status: active
+updated: 2026-07-26
 ---
 
 # G0 Control Traceability Matrix
@@ -30,6 +31,7 @@ Update this matrix whenever a control moves, a schema or contract version change
 | C-11 | Deletion covers relations and derived outputs | Exact local set deletion/discard plus development contribution/participant deletion across D1 and R2 | `test/export-deletion-*.test.js`, `test/export-workspace-discard*.test.js`, `test/supplemental-source-lifecycle.test.js`, `apps/worker/test/worker.spec.ts` | [Local deletion receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md), [functional E2E receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) | Local and development stores implemented; tombstones, backups, eligibility relation, canonical/public rebuild, and retention lifecycle remain open |
 | C-12 | Uncertainty remains visible | Quota precision, staleness, reset identity, unknown tier/model, residuals retained | `test/interval-inference.test.js`, `test/monitoring-quality.test.js`, `test/simple-quota-gradient.test.js`, `test/weekly-calibration.test.js` | [Usage accuracy floor](./2026-07-24-usage-accuracy-floor-decision.md) | Implemented for local reports |
 | C-13 | Material change requires renewed consent | Contract and consent status are hash-bound compatibility inputs | `test/export-contract.test.js`, `test/telemetry-contract.test.js` | [Telemetry privacy contract](./2026-07-24-telemetry-privacy-contract.md) | Draft machinery implemented; real consent/version migration future |
+| C-14 | Incident containment stops collection/publication without removing participant rights | Strict singleton D1 controls, fail-closed route guards, scheduled-publication guard, local-only fixed-action operator, participant-visible health | `apps/worker/test/worker.spec.ts`, `apps/worker/scripts/collection-control.check.mjs`, `apps/worker/scripts/smoke-incident-containment-http.mjs` | [Incident runbook](./2026-07-25-g4-incident-response-runbook.md), [development drill receipt](./2026-07-26-g4-incident-containment-verification-receipt.md) | Development controls and live loopback drill implemented; production operator authentication/audit/alerts and remaining G4 drills are blocking |
 
 ## G1 route mapping
 

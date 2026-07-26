@@ -326,10 +326,31 @@ For the central service alone, `npm run product:backend:test` is the quickest
 repeatable check. It runs against isolated local Cloudflare Worker, D1, and R2
 test bindings and covers strict validation, server repricing, deduplication,
 participant isolation, private statistics, delayed aggregate publication,
-export, and deletion. The live portal's Data & privacy section separately
-reports whether the running backend can reach D1 and its encrypted quarantine
-binding, so a working central service is not confused with an offline local
-collector.
+export, deletion, and independent incident containment. The live portal's Data
+& privacy section separately reports whether the running backend can reach D1
+and its encrypted quarantine binding, whether collection is operational,
+partially paused, or fully contained, and which of enrollment, upload
+registration, ingestion, and publication is enabled. It also confirms that
+private view/export/delete rights remain available, so a working central
+service is not confused with an offline local collector.
+
+To exercise no-redeploy containment against a running loopback Worker and an
+owner-only prepared contribution:
+
+```bash
+npm run product:backend:incident-smoke -- \
+  --origin http://127.0.0.1:8792 \
+  --persist-to /absolute/path/to/isolated-state \
+  --file /absolute/path/to/telemetry-contribution-000001.json
+```
+
+The Worker must have been started with that exact isolated `--persist-to`
+directory. The drill stops all four controlled paths through D1 without
+restarting the Worker, preserves private stats/export/deletion, explicitly
+restores collection, proves the previously blocked one-use upload still works,
+and deletes both drill participants. The
+[incident-containment receipt](./2026-07-26-g4-incident-containment-verification-receipt.md)
+records the first live pass and the remaining production blockers.
 
 The next account-scoped transport, `telemetry-contribution-v0.2`, is implemented
 as a disabled repository shadow lane only. Its focused backend tests exercise

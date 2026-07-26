@@ -687,11 +687,10 @@ export async function runContributionSyncQueueOnce({
   }
   const sets = await discoverSets({ directory });
   const database = await openQueueDatabase(queueFile, now);
-  const startedAtMs = nowMilliseconds(now);
-  const timestamp = queueTimestamp(startedAtMs);
+  const openedAt = queueTimestamp(nowMilliseconds(now));
   let enqueued;
   try {
-    recoverExpiredLeases(database, timestamp);
+    recoverExpiredLeases(database, openedAt);
     enqueued = await enqueueDiscoveredSets({
       database,
       sets,
@@ -699,7 +698,8 @@ export async function runContributionSyncQueueOnce({
       loadContribution,
       maximumQueuedJobs,
     });
-    const initialStatus = statusFromDatabase(database, timestamp);
+    const readyAt = queueTimestamp(nowMilliseconds(now));
+    const initialStatus = statusFromDatabase(database, readyAt);
     if (initialStatus.paused || signal?.aborted) {
       return Object.freeze({
         status: initialStatus.paused ? "paused" : "interrupted",
@@ -723,7 +723,7 @@ export async function runContributionSyncQueueOnce({
          AND next_attempt_at <= ?
        ORDER BY created_at, job_id
        LIMIT ?
-    `).all(timestamp, maximumJobs);
+    `).all(readyAt, maximumJobs);
     const result = {
       processed: 0,
       accepted: 0,
