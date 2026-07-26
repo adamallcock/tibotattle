@@ -91,7 +91,7 @@ digests.
 | Artifact integrity | Every shipped file verified against manifest | Tamper detection before use/install |
 | Isolated install | Explicit absent target, exact receipt, no overwrite | Bounded installation |
 | Local workflows | Doctor, inspect, export, verify, rotation preflight, deletion/discard preflights | Command surface works from artifact |
-| Deny-network | Workflows succeed under `sandbox-exec` network denial | No network required; direct attempt telemetry remains a separate measurement gap |
+| Network isolation | Every process emits a positive-control-tested JavaScript API-attempt receipt and the complete workflow also succeeds under `sandbox-exec` network denial | Covered Node APIs record zero attempts and native egress is denied; native syscall, QUIC, and non-Node child attempts remain unmeasured |
 | Uninstall | Exact receipt, modified-file refusal, identity preserved | Bounded removal without overclaiming identity erasure |
 | Private-data scan | No prohibited path, credential, email, source-map, or fixture hit | Built tree is distribution-minimized |
 
@@ -100,9 +100,12 @@ digests.
 - Freeze a successor telemetry/receipt compatibility contract only after the
   local-review artifact is proven; the current export contract remains draft
   and transport-disabled.
-- Add an OS-level attempt recorder that distinguishes zero attempted sockets
-  from successful execution under deny-network. Static absence plus sandbox
-  denial is strong evidence but is not the full R8 zero-attempt receipt.
+- The external audit preload now records and blocks standard Node TCP, server,
+  TLS, DNS, HTTP/1, HTTP/2, UDP, fetch, WebSocket, and EventSource entrypoints
+  and binds zero attempts across 12 processes to the archive and manifest
+  digests. Add native syscall-level attempt telemetry if R8 requires a literal
+  OS-level zero-attempt claim; QUIC and non-Node child attempts remain
+  explicitly unmeasured.
 - Implement separately confirmed participant Keychain identity removal if the
   owner decides that is required for G1. Ordinary uninstall intentionally
   preserves it.
