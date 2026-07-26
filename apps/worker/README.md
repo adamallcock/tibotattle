@@ -3,7 +3,8 @@
 This development-only Cloudflare Worker exercises the full central product
 boundary: enrollment, encrypted upload, strict validation, D1 ingest,
 participant-isolated statistics, thresholded development community diagnostics,
-export, contribution deletion, and participant deletion. It retains the original fixed synthetic walkthrough
+export, contribution deletion, and participant deletion. It retains the
+original fixed synthetic walkthrough
 and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
 files, prompts, responses, commands, paths, account identifiers, or arbitrary
 keys.

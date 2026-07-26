@@ -212,8 +212,8 @@ USAGE_MONITOR_PORT=8791 \
 ```
 
 The relay accepts only the reviewed central API routes and cannot proxy a
-request-selected URL. Specifically, it forwards only public `GET` requests for
-health, the envelope key, and thresholded aggregate diagnostics. It cannot
+request-selected URL. Specifically, it forwards only unauthenticated `GET`
+requests for health, the envelope key, and thresholded aggregate diagnostics. It cannot
 forward enrollment, recovery, uploads, personal sessions, personal statistics,
 exports, security controls, deletion, authorization headers, cookies, CSRF
 values, or upstream cookies.
@@ -259,8 +259,8 @@ Worker dry deployment. It does not deploy or upload data.
 
 For a real HTTP backend smoke using an actual prepared contribution, run the
 Worker in invite-only mode. Issue three invitation grants so the smoke can
-prove both suppression at one participant and publication at the three-person
-development threshold, then use:
+prove both suppression at one participant and development-only availability
+at the three-person threshold, then use:
 
 ```bash
 npm run product:backend:smoke -- \
