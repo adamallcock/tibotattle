@@ -1,7 +1,9 @@
 import {
+  ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   DEVICE_CREDENTIAL_TTL_MILLISECONDS,
   DEVICE_PAIRING_TTL_MILLISECONDS,
   ONGOING_TELEMETRY_CONSENT_VERSION,
+  ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   TELEMETRY_CONSENT_VERSION,
   UPLOAD_AUTHORIZATION_TTL_MILLISECONDS,
   UPLOAD_CONSUME_LEASE_MILLISECONDS,
@@ -26,6 +28,7 @@ interface PairingRow {
   claimed_device_id: string | null;
   participant_state: "active" | "deleting";
   participant_consent_version: string;
+  transport_consent_version: string;
 }
 
 interface DeviceRow {
@@ -67,6 +70,16 @@ export interface DeviceUploadClaim {
   authorizationId: string;
   participantId: string;
   authorizationKind: "device";
+}
+
+function ongoingConsentForParticipant(consentVersion: string): string | null {
+  if (consentVersion === TELEMETRY_CONSENT_VERSION) {
+    return ONGOING_TELEMETRY_CONSENT_VERSION;
+  }
+  if (consentVersion === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION) {
+    return ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
+  }
+  return null;
 }
 
 function bytes(value: ArrayBuffer): Uint8Array {
@@ -171,8 +184,13 @@ export async function createDevicePairing(
   db: D1Database,
   participantId: string,
   sessionId: string,
+  participantConsentVersion: string,
   nowEpoch = Date.now(),
 ): Promise<{ pairingCode: string; expiresAt: string }> {
+  const ongoingConsentVersion = ongoingConsentForParticipant(
+    participantConsentVersion,
+  );
+  if (!ongoingConsentVersion) throw new ApiError(400, "TELEMETRY_REQUIRED");
   const id = crypto.randomUUID();
   const secret = randomSecret(32);
   const issuedAt = new Date(nowEpoch).toISOString();
@@ -181,10 +199,10 @@ export async function createDevicePairing(
   const result = await db.prepare(
     `INSERT INTO device_pairings (
       id, participant_id, issued_by_session_id, secret_hash, consent_version,
-      state, issued_at, expires_at
+      transport_consent_version, state, issued_at, expires_at
     )
     SELECT ?, participant.id, session.id, ?,
-           ?, 'unused', ?, ?
+           ?, ?, 'unused', ?, ?
       FROM participants participant
       JOIN web_sessions session ON session.participant_id = participant.id
      WHERE participant.id = ?
@@ -198,10 +216,11 @@ export async function createDevicePairing(
     id,
     secretHash,
     ONGOING_TELEMETRY_CONSENT_VERSION,
+    ongoingConsentVersion,
     issuedAt,
     expiresAt,
     participantId,
-    TELEMETRY_CONSENT_VERSION,
+    participantConsentVersion,
     sessionId,
     issuedAt,
   ).run();
@@ -262,6 +281,7 @@ export async function claimDevicePairing(
   const row = await db.prepare(
     `SELECT pairing.id, pairing.participant_id, pairing.secret_hash,
             pairing.state, pairing.expires_at, pairing.claimed_device_id,
+            pairing.transport_consent_version,
             participant.state AS participant_state,
             participant.consent_version AS participant_consent_version
        FROM device_pairings pairing
@@ -275,7 +295,8 @@ export async function claimDevicePairing(
   )
       || !row
       || row.participant_state !== "active"
-      || row.participant_consent_version !== TELEMETRY_CONSENT_VERSION
+      || ongoingConsentForParticipant(row.participant_consent_version)
+        !== row.transport_consent_version
       || !futureInstant(row.expires_at, nowEpoch)) {
     throw new ApiError(401, "PAIRING_AUTH_INVALID");
   }
@@ -316,7 +337,7 @@ export async function claimDevicePairing(
         issuedAt,
         parsed.id,
         issuedAt,
-        TELEMETRY_CONSENT_VERSION,
+        row.participant_consent_version,
       ),
       db.prepare(
         `UPDATE device_pairings
@@ -376,7 +397,7 @@ export async function authenticateDevice(
       || !row
       || row.state !== "active"
       || row.participant_state !== "active"
-      || row.participant_consent_version !== TELEMETRY_CONSENT_VERSION
+      || ongoingConsentForParticipant(row.participant_consent_version) === null
       || !futureInstant(row.expires_at)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
@@ -395,7 +416,7 @@ export async function authenticateDevice(
     row.id,
     now,
     row.participant_id,
-    TELEMETRY_CONSENT_VERSION,
+    row.participant_consent_version,
   ).run();
   if (used.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
   return {
@@ -443,7 +464,7 @@ export async function createDeviceUploadAuthorization(
     device.deviceId,
     device.participantId,
     issuedAt,
-    TELEMETRY_CONSENT_VERSION,
+    device.participantConsentVersion,
   ).run();
   if (result.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
   return {

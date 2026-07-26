@@ -272,6 +272,78 @@ function normalizeQuotaMovement(payload) {
   return base;
 }
 
+function normalizeAccountScopedQuotaAnalysis(payload) {
+  const unavailable = {
+    status: "not_testable",
+    reason: text(payload?.reason, "account_scoped_dataset_unavailable"),
+    tracks: []
+  };
+  if (payload?.schemaVersion !== "account-scoped-quota-analysis-v0.1") {
+    return unavailable;
+  }
+  if (payload.status !== "ready" || !Array.isArray(payload.tracks)) {
+    return unavailable;
+  }
+  const tracks = payload.tracks.slice(0, 20).flatMap((source, index) => {
+    const continuity = source?.continuity ?? {};
+    const windowDurationMinutes = count(continuity.windowDurationMinutes, null);
+    if (
+      !["openai_codex", "anthropic_claude_code"].includes(continuity.provider)
+      || ![300, 10_080].includes(windowDurationMinutes)
+    ) {
+      return [];
+    }
+    const calibrationTrack = array(source?.calibration?.tracks)[0] ?? {};
+    const resetRows = array(calibrationTrack.resets);
+    const estimates = resetRows.filter((row) => (
+      row?.status === "conditional_estimate"
+      && nonNegative(row?.capacityNanousd, null) !== null
+    ));
+    const latestEstimate = estimates.at(-1) ?? null;
+    const range = latestEstimate?.sensitivityRangeNanousd;
+    const rollingComparisons = source?.rolling?.status === "conditional_comparison"
+      ? array(source?.rolling?.comparisons)
+      : [];
+    return [{
+      index: index + 1,
+      provider: text(continuity.provider, ""),
+      planType: text(continuity.planType, "unknown"),
+      planVariant: text(continuity.planVariant, "unknown"),
+      limitId: text(continuity.limitId, "unknown"),
+      windowDurationMinutes,
+      policyEpoch: text(continuity.policyEpoch, "unknown"),
+      totalResets: count(calibrationTrack.totalResetCount, resetRows.length),
+      estimatedResets: count(calibrationTrack.estimatedResetCount, estimates.length),
+      latestCapacityUsd: latestEstimate
+        ? nonNegative(latestEstimate.capacityNanousd, null) / 1_000_000_000
+        : null,
+      sensitivityLowerUsd: nonNegative(range?.lower, null) === null
+        ? null
+        : range.lower / 1_000_000_000,
+      sensitivityUpperUsd: nonNegative(range?.upper, null) === null
+        ? null
+        : range.upper / 1_000_000_000,
+      boundaryCount: count(latestEstimate?.boundaryCount, null),
+      displayedSpanPp: finite(latestEstimate?.displayedSpanPp, null),
+      refusalCodes: [...new Set(resetRows.flatMap((row) => (
+        Array.isArray(row?.refusalCodes)
+          ? row.refusalCodes.filter((code) => typeof code === "string").slice(0, 10)
+          : []
+      )))].slice(0, 10),
+      rollingStatus: text(source?.rolling?.status, "not_testable"),
+      rollingRefusalCodes: array(source?.rolling?.refusalCodes)
+        .filter((code) => typeof code === "string")
+        .slice(0, 10),
+      rollingComparisonCount: rollingComparisons.length
+    }];
+  });
+  return {
+    status: tracks.length > 0 ? "ready" : "not_testable",
+    reason: tracks.length > 0 ? "" : "supported_quota_track_unavailable",
+    tracks
+  };
+}
+
 export function normalizeParticipantStats(payload) {
   if (!payload) {
     return {
@@ -281,7 +353,8 @@ export function normalizeParticipantStats(payload) {
       pricingCoverage: { state: "not_testable" },
       standardApiCounterfactual: { state: "not_testable", apiPriceEquivalentUsd: null },
       codexFastObservations: { state: "not_testable", eventShare: null, eventCount: null },
-      rollingQuotaMovement: normalizeQuotaMovement(null)
+      rollingQuotaMovement: normalizeQuotaMovement(null),
+      accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(null)
     };
   }
   if (payload.schemaVersion !== PARTICIPANT_STATS_SCHEMA_VERSION) {
@@ -292,7 +365,8 @@ export function normalizeParticipantStats(payload) {
       pricingCoverage: { state: "not_testable" },
       standardApiCounterfactual: { state: "not_testable", apiPriceEquivalentUsd: null },
       codexFastObservations: { state: "not_testable", eventShare: null, eventCount: null },
-      rollingQuotaMovement: normalizeQuotaMovement(null)
+      rollingQuotaMovement: normalizeQuotaMovement(null),
+      accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(null)
     };
   }
 
@@ -395,7 +469,10 @@ export function normalizeParticipantStats(payload) {
       eventShare: safeFastEventShare,
       eventCount: fastEventCount
     },
-    rollingQuotaMovement: normalizeQuotaMovement(payload.rollingQuotaMovement)
+    rollingQuotaMovement: normalizeQuotaMovement(payload.rollingQuotaMovement),
+    accountScopedQuotaAnalysis: normalizeAccountScopedQuotaAnalysis(
+      payload.accountScopedQuotaAnalysis
+    )
   };
 }
 
@@ -679,9 +756,12 @@ export class CommunityClient {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/session`, this.sessionOptions());
   }
 
-  enroll(inviteCode = null) {
+  enroll(inviteCode = null, contributionSchemaVersion = "telemetry-contribution-v0.1") {
+    const accountScoped = contributionSchemaVersion === "telemetry-contribution-v0.2";
     const body = {
-      consentVersion: "privacy-safe-telemetry-v0.1",
+      consentVersion: accountScoped
+        ? "privacy-safe-telemetry-v0.2"
+        : "privacy-safe-telemetry-v0.1",
       syntheticOnly: false
     };
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
@@ -810,12 +890,14 @@ export class CommunityClient {
     );
   }
 
-  createDevicePairing() {
+  createDevicePairing(accountScoped = false) {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-pairings`, this.mutationOptions({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        consentVersion: accountScoped
+          ? "ongoing-privacy-safe-telemetry-v0.2"
+          : "ongoing-privacy-safe-telemetry-v0.1",
         ongoingUpload: true
       })
     }));

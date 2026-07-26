@@ -8,10 +8,12 @@ import {
   bytesToBase64Url,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
+  ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
   ENVELOPE_SCHEMA_VERSION,
   safeApiError,
   safeFilename,
   TELEMETRY_ENVELOPE_SCHEMA_VERSION,
+  validateAccountScopedTelemetryContribution,
   validateSyntheticFixture,
   validateTelemetryContribution
 } from "../public/lib.js";
@@ -135,6 +137,41 @@ function safeTelemetry() {
   };
 }
 
+function safeAccountScopedTelemetry() {
+  const source = safeTelemetry();
+  return {
+    schemaVersion: ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
+    consentVersion: "privacy-safe-telemetry-v0.2",
+    status: "implementation_disabled",
+    synthetic: false,
+    datasetId: `dataset:v1:${"d".repeat(64)}`,
+    partIndex: 1,
+    partCount: 1,
+    completeness: "complete",
+    createdAt: source.createdAt,
+    coveredAt: source.coveredAt,
+    clientPlatform: source.clientPlatform,
+    providerPolicyEpoch: source.providerPolicyEpoch,
+    usageEvents: source.usageEvents.map(({ accounting, ...row }) => ({
+      ...row,
+      schemaVersion: "usage-event-v0.2",
+      accountTrackId: `account-track:v1:${"a".repeat(64)}`,
+      accountingDiagnostic: {
+        ...accounting,
+        status: "untrusted_diagnostic",
+        sourceSchemaVersion: "telemetry-contribution-v0.1"
+      }
+    })),
+    quotaSnapshots: [],
+    activityMarkers: [],
+    accountingDiagnostic: {
+      ...source.accounting,
+      status: "untrusted_diagnostic",
+      sourceSchemaVersion: "telemetry-contribution-v0.1"
+    }
+  };
+}
+
 async function rsaPair() {
   return webcrypto.subtle.generateKey(
     {
@@ -211,6 +248,36 @@ test("real privacy-safe telemetry is validated and encrypted without changing it
   assert.equal(envelope.synthetic, false);
   assert.equal("payload" in envelope, false);
   assert.deepEqual(await decryptEnvelope(envelope, pair.privateKey), payload);
+});
+
+test("account-scoped local-preview telemetry is preflighted and encrypted unchanged", async () => {
+  const payload = safeAccountScopedTelemetry();
+  assert.equal(validateAccountScopedTelemetryContribution(payload), true);
+  const pair = await rsaPair();
+  const publicJwk = await webcrypto.subtle.exportKey("jwk", pair.publicKey);
+  const envelope = await createTelemetryEnvelope({
+    payload,
+    publicJwk,
+    keyId: "key:account-scoped-test",
+    cryptoImpl: webcrypto
+  });
+  assert.equal(envelope.schemaVersion, TELEMETRY_ENVELOPE_SCHEMA_VERSION);
+  assert.deepEqual(await decryptEnvelope(envelope, pair.privateKey), payload);
+});
+
+test("account-scoped browser preflight rejects direct account scopes and content fields", () => {
+  const directScope = safeAccountScopedTelemetry();
+  directScope.usageEvents[0].accountTrackId = `account:v1:${"a".repeat(64)}`;
+  assert.throws(
+    () => validateAccountScopedTelemetryContribution(directScope),
+    /invalid usageEvents record/
+  );
+  const content = safeAccountScopedTelemetry();
+  content.usageEvents[0].prompt = "private";
+  assert.throws(
+    () => validateAccountScopedTelemetryContribution(content),
+    /forbidden content field/
+  );
 });
 
 test("browser telemetry validation rejects raw-content-shaped and identity fields", () => {
@@ -679,6 +746,63 @@ test("participant v0.2 stats preserve server repricing, coverage states, and spe
   assert.equal(result.rollingQuotaMovement.accountContinuity, "not_transmitted");
 });
 
+test("participant stats normalize private account-scoped capacity and sensitivity", () => {
+  const result = normalizeParticipantStats({
+    schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
+    totals: {
+      usageEvents: 20,
+      quotaSnapshots: 24,
+      apiPriceEquivalentUsd: "45.000000",
+      priceVerification: "server_repriced",
+      fullyPricedEvents: 20,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0
+    },
+    accountScopedQuotaAnalysis: {
+      schemaVersion: "account-scoped-quota-analysis-v0.1",
+      status: "ready",
+      tracks: [{
+        continuity: {
+          provider: "openai_codex",
+          planType: "pro",
+          planVariant: "pro-20x",
+          limitId: "codex",
+          windowDurationMinutes: 10_080,
+          policyEpoch: "openai_agentic_pool_2026_07_09"
+        },
+        calibration: {
+          tracks: [{
+            totalResetCount: 3,
+            estimatedResetCount: 1,
+            resets: [{
+              status: "conditional_estimate",
+              refusalCodes: [],
+              capacityNanousd: 600_000_000_000,
+              sensitivityRangeNanousd: {
+                lower: 500_000_000_000,
+                upper: 700_000_000_000
+              },
+              boundaryCount: 10,
+              displayedSpanPp: 12
+            }]
+          }]
+        },
+        rolling: {
+          status: "conditional_comparison",
+          refusalCodes: [],
+          comparisons: [{ smoothingHours: 1 }, { smoothingHours: 2 }]
+        }
+      }]
+    }
+  });
+  const track = result.accountScopedQuotaAnalysis.tracks[0];
+  assert.equal(result.accountScopedQuotaAnalysis.status, "ready");
+  assert.equal(track.latestCapacityUsd, 600);
+  assert.equal(track.sensitivityLowerUsd, 500);
+  assert.equal(track.sensitivityUpperUsd, 700);
+  assert.equal(track.rollingComparisonCount, 2);
+});
+
 test("participant results fail closed for unverifiable prices and honest not-testable movement", () => {
   const result = normalizeParticipantStats({
     schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
@@ -746,7 +870,7 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /communityClient\.contributeSerialized\(/);
   assert.match(appSource, /communityClient\.participantExport\(\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);
-  assert.match(appSource, /communityClient\.createDevicePairing\(\)/);
+  assert.match(appSource, /communityClient\.createDevicePairing\(/);
   assert.match(appSource, /communityClient\.devices\(\)/);
   assert.match(appSource, /inviteInput\.value = ""/);
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
@@ -762,6 +886,7 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /Standard API counterfactual/);
   assert.match(appSource, /Codex Fast observations/);
   assert.match(appSource, /Account continuity was not transmitted/);
+  assert.match(appSource, /Account-scoped quota calibration/);
   assert.match(appSource, /Not testable/);
   assert.match(appSource, /for \(const smoothingHours of \[1, 2, 3\]\)/);
   assert.match(appSource, /published_partial/);

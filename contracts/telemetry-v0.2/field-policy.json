@@ -1,6 +1,6 @@
 {
-  "contractVersion": "telemetry-contribution-field-policy-v0.2-disabled-draft",
-  "status": "implementation_disabled",
+  "contractVersion": "telemetry-contribution-field-policy-v0.2-local-preview",
+  "status": "local_preview_http_verified_external_disabled",
   "fields": [
     {
       "field": "accountTrackId",
@@ -55,7 +55,7 @@
       "retentionClass": "contract_lifetime",
       "publicEligibility": "never",
       "provenance": "client_declared_server_enforced",
-      "limitations": "The disabled draft is not presentable for acceptance."
+      "limitations": "Fresh consent is accepted only by the verified loopback local preview; it does not authorize external collection."
     }
   ]
 }

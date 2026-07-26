@@ -1023,6 +1023,41 @@ horizons, a stopped-service restore operator, the final tombstone duration,
 external review, load/soak, and named-human release approval remain open. No
 external collection or deployment is authorized.
 
+## Progress update: account-scoped local HTTP proof (July 26, 2026)
+
+The first account-scoped central path is now executable through the real
+encrypted HTTP boundary, while remaining unavailable to external participants:
+
+- fresh `privacy-safe-telemetry-v0.2` consent is enforced at enrollment and
+  preserved on browser sessions and upload-only devices;
+- the route fails closed unless the Worker is a recognized development
+  environment, uses local-open enrollment, is explicitly started in
+  `local_preview` mode, and receives a loopback-host request;
+- closed-schema and privacy-canary validation precede canonical writes;
+- accepted ciphertext is quarantined in R2 and canonical account/dataset rows
+  are written to D1 with server-side API repricing;
+- occurrence replay is idempotent while conflicting occurrence reuse is
+  rejected without partial writes;
+- private participant statistics expose account-scoped five-hour/seven-day
+  calibration and plain-language refusal reasons without exposing the account
+  pseudonym;
+- account tracks remain excluded from community output;
+- contribution and participant export/deletion operate through the HTTP path;
+  and
+- the browser portal renders the server-produced account-scoped result without
+  console errors.
+
+The [account-scoped local ingest verification
+receipt](./2026-07-26-account-scoped-local-ingest-verification-receipt.md)
+records the focused tests, four-contribution live smoke, database/object
+inspection, deletion result, and rendered QA. This is a local backend proof,
+not a pilot or deployment authorization. Checked-in mode remains disabled,
+`workers_dev` remains false, no route exists, and
+`externalParticipantsAuthorized` remains false. Prospective reset evidence,
+minimization approval, external consent review, security/privacy review,
+production infrastructure, load/soak, and named-human release approval remain
+open.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

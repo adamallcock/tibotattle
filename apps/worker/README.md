@@ -79,18 +79,21 @@ The development tombstone has a 400-day `retain_until`. This is a bounded test
 value, not an approved production policy. A production backup/soft-delete
 horizon and longer tombstone margin remain release gates.
 
-### Disabled account-scoped shadow lane
+### Loopback-only account-scoped preview
 
 `telemetry-contribution-v0.2` adds participant-bound account tracks, dataset
 parts, completeness semantics, provider-policy epochs, five-hour/seven-day
-calibration, and rolling quota comparison. It is deliberately a repository-only
-shadow lane with fresh consent version `privacy-safe-telemetry-v0.2` and status
-`implementation_disabled`. No HTTP route imports or accepts it.
+calibration, and rolling quota comparison. It now has a verified encrypted HTTP
+path with fresh consent version `privacy-safe-telemetry-v0.2`, but only for an
+explicit loopback development preview. Checked-in configuration sets
+`ACCOUNT_SCOPED_INGEST_MODE=disabled`; public routes and external participants
+remain unauthorized.
 
 Run its focused contract and backend tests with:
 
 ```sh
 npm test -- --run \
+  test/account-scoped-http.spec.ts \
   test/telemetry-v0.2.spec.ts \
   test/telemetry-v0.2-backend.spec.ts
 ```
@@ -99,8 +102,31 @@ Those tests prove server repricing overrides client diagnostics, complete
 multi-part datasets are required for calibration, tracks remain scoped to one
 participant, conflicting occurrence reuse fails without partial writes, and
 deletion removes the account-scoped evidence before statistics are recomputed.
-Activation still requires the prospective reset, renewed-consent, security,
-and privacy gates recorded in `contracts/telemetry-v0.2/`.
+The HTTP suite also proves fail-closed configuration and host checks, fresh
+consent, encrypted acceptance, replay behavior, export/deletion, and a
+v0.2 upload-only device that cannot read private results.
+
+For a live isolated local smoke:
+
+```sh
+ACCOUNT_STATE="$(mktemp -d /private/tmp/app-usagemonitor-account-v02.XXXXXX)"
+npm run migrate:local -- --persist-to "$ACCOUNT_STATE"
+npm run dev:account-scoped -- --port 8794 --persist-to "$ACCOUNT_STATE"
+```
+
+In another terminal:
+
+```sh
+npm run smoke:account-scoped:http -- \
+  --origin http://127.0.0.1:8794
+```
+
+The smoke posts four generated, content-free contributions through the real
+encrypted route, verifies server repricing, private account-scoped calibration,
+community-field exclusion, participant export, and full participant deletion.
+It must be run only against disposable local state. External activation still
+requires the prospective reset, minimization, renewed-consent, security, and
+privacy gates recorded in `contracts/telemetry-v0.2/`.
 
 ### Invite-only HTTP smoke
 

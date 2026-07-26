@@ -36,6 +36,7 @@ interface RecoveryAuthRow {
   recovery_token_id: string;
   recovery_token_hash: ArrayBuffer;
   state: "active" | "deleting";
+  consent_version: string;
 }
 
 interface RecoveryRetryRow {
@@ -50,6 +51,7 @@ interface RecoveryRetryRow {
   current_recovery_token_id: string;
   current_recovery_token_hash: ArrayBuffer;
   participant_state: "active" | "deleting";
+  participant_consent_version: string;
   deletion_session_id: string | null;
   session_secret_hash: ArrayBuffer;
   session_csrf_hash: ArrayBuffer;
@@ -228,6 +230,7 @@ interface RecoveryResult {
   participantId: string;
   recoveryCode: string;
   csrfToken: string;
+  consentVersion: string;
   session: SessionMaterial;
 }
 
@@ -256,7 +259,9 @@ async function retryRecoveredAccess(
       r.expires_at, r.replay_count,
       p.recovery_token_id AS current_recovery_token_id,
       p.recovery_token_hash AS current_recovery_token_hash,
-      p.state AS participant_state, p.deletion_session_id,
+      p.state AS participant_state,
+      p.consent_version AS participant_consent_version,
+      p.deletion_session_id,
       s.secret_hash AS session_secret_hash, s.csrf_hash AS session_csrf_hash,
       s.state AS session_state, s.scope AS session_scope,
       s.issued_at AS session_issued_at,
@@ -341,6 +346,7 @@ async function retryRecoveredAccess(
     recoveryCode:
       `um_recovery_${row.replacement_recovery_token_id}.${replacementRecoverySecret}`,
     csrfToken: session.csrfToken,
+    consentVersion: row.participant_consent_version,
     session,
   };
 }
@@ -353,7 +359,7 @@ export async function recoverAccess(
   const parsed = parseRecoveryCode(recoveryCode);
   const attemptHash = await recoveryAttemptHash(recoveryAttemptId);
   const row = await db.prepare(
-    `SELECT id, recovery_token_id, recovery_token_hash, state
+    `SELECT id, recovery_token_id, recovery_token_hash, state, consent_version
        FROM participants
       WHERE recovery_token_id = ?`,
   ).bind(parsed.id).first<RecoveryAuthRow>();
@@ -515,6 +521,7 @@ export async function recoverAccess(
     participantId: row.id,
     recoveryCode: replacement.encoded,
     csrfToken: session.csrfToken,
+    consentVersion: row.consent_version,
     session,
   };
 }

@@ -53,11 +53,12 @@ function testBindings(overrides: Partial<Env> = {}): Env {
     ENVELOPE_PRIVATE_JWK: privateJwkJson,
     ENVELOPE_PUBLIC_JWK: publicJwkJson,
     ENVIRONMENT: "synthetic-development",
+    ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: bindings.QUARANTINE,
     RECOVERY_RATE_LIMIT: bindings.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
     ...overrides,
-  };
+  } as Env;
 }
 
 async function api(
@@ -1318,6 +1319,7 @@ describe("synthetic usage monitor service", () => {
         accountScopedContribution: {
           schemaVersion: "telemetry-contribution-v0.2",
           status: "implementation_disabled",
+          externalParticipantsAuthorized: false,
         },
       },
       capabilities: {

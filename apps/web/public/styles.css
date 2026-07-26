@@ -468,6 +468,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .backend-flow span { font-size: .7rem; font-weight: 800; }
 .backend-flow small { margin-top: 5px; color: var(--muted); font-size: .61rem; line-height: 1.45; }
 .backend-contract-note { margin-top: 14px; padding: 12px 14px; border-left: 3px solid var(--amber); color: #6f5011; background: var(--amber-soft); font-size: .7rem; }
+.calibration-reasons { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: .7rem; line-height: 1.45; }
+.calibration-reasons li + li { margin-top: 4px; }
 .result-panels { margin-top: 18px; }
 .personal-result-panel, .community-result-panel { grid-column: 1 / -1; }
 .result-summary > p { margin-bottom: 0; color: var(--muted); font-size: .78rem; }

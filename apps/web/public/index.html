@@ -430,8 +430,8 @@
               <label class="consent-row">
                 <input id="contribution-consent" type="checkbox" required>
                 <span>
-                  <strong>I reviewed this as a privacy-safe Usage Monitor export.</strong>
-                  <small>Uploading is optional and can be tested against a local backend.</small>
+                  <strong id="contribution-consent-title">I reviewed this as a privacy-safe Usage Monitor export.</strong>
+                  <small id="contribution-consent-detail">Uploading is optional and can be tested against a local backend.</small>
                 </span>
               </label>
               <button class="button button-primary" id="contribution-submit" type="submit" disabled>
@@ -536,8 +536,9 @@
             <li><strong>8</strong><span>Lifecycle enforcement</span><small>Seven-day quarantine cleanup and deletion-safe restore replay</small></li>
           </ol>
           <div class="backend-contract-note" id="backend-contract-note">
-            Account-scoped v0.2 ingest is implemented behind a disabled contract and is
-            not accepted by the public HTTP route yet.
+            Account-scoped v0.2 ingest is disabled by default. A separately
+            configured loopback-only preview can exercise the complete HTTP path;
+            external participants remain unauthorized.
           </div>
         </article>
 
@@ -567,7 +568,7 @@
                 <label class="consent-row device-consent">
                   <input id="device-consent" type="checkbox">
                   <span>
-                    <strong>Allow this pairing to register privacy-safe v0.1 uploads.</strong>
+                    <strong id="device-consent-title">Allow this pairing to register privacy-safe v0.1 uploads.</strong>
                     <small>The device cannot read, export, recover, reset, or delete participant data.</small>
                   </span>
                 </label>

@@ -25,6 +25,10 @@ export const TELEMETRY_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v0.
 export const TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.1";
 export const ONGOING_TELEMETRY_CONSENT_VERSION =
   "ongoing-privacy-safe-telemetry-v0.1";
+export const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
+  "privacy-safe-telemetry-v0.2";
+export const ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
+  "ongoing-privacy-safe-telemetry-v0.2";
 export const ENROLLMENT_MODES = ["local_open", "invite_only", "disabled"] as const;
 
 export const JSON_HEADERS = {

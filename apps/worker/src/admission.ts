@@ -16,15 +16,19 @@ const DEVELOPMENT_ENVIRONMENTS = new Set([
   "test",
 ]);
 
+export function isDevelopmentEnvironment(env: Env): boolean {
+  const environment = Reflect.get(env, "ENVIRONMENT");
+  return typeof environment === "string"
+    && DEVELOPMENT_ENVIRONMENTS.has(environment);
+}
+
 export function configuredEnrollmentMode(env: Env): EnrollmentMode {
   const mode = Reflect.get(env, "ENROLLMENT_MODE");
   if (typeof mode !== "string"
       || !(ENROLLMENT_MODES as readonly string[]).includes(mode)) {
     throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
   }
-  const environment = Reflect.get(env, "ENVIRONMENT");
-  if (mode === "local_open"
-      && (typeof environment !== "string" || !DEVELOPMENT_ENVIRONMENTS.has(environment))) {
+  if (mode === "local_open" && !isDevelopmentEnvironment(env)) {
     throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
   }
   return mode as EnrollmentMode;

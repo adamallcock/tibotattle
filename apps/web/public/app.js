@@ -8,7 +8,7 @@ import {
 import {
   createTelemetryEnvelope,
   safeApiError,
-  validateTelemetryContribution
+  validateContributionForUpload
 } from "./lib.js";
 
 const localClient = new LocalCompanionClient();
@@ -24,6 +24,13 @@ const $ = (selector) => document.querySelector(selector);
 
 function setCommunitySession(value) {
   communitySession = value;
+  const deviceConsentTitle = $("#device-consent-title");
+  if (deviceConsentTitle) {
+    deviceConsentTitle.textContent = value?.consentVersion
+      === "privacy-safe-telemetry-v0.2"
+      ? "Allow this pairing to register privacy-safe account-scoped v0.2 uploads."
+      : "Allow this pairing to register privacy-safe v0.1 uploads.";
+  }
 }
 
 function showRecoveryCodeOnce(value) {
@@ -841,18 +848,31 @@ function parseSafeExport(file) {
     } catch {
       throw new Error("The selected file is not valid JSON.");
     }
-    validateTelemetryContribution(payload);
+    validateContributionForUpload(payload);
     return payload;
   });
 }
 
-async function ensureCommunitySession() {
-  if (communitySession?.csrfToken) return communitySession;
+async function ensureCommunitySession(contributionSchemaVersion) {
+  const requiredConsent = contributionSchemaVersion === "telemetry-contribution-v0.2"
+    ? "privacy-safe-telemetry-v0.2"
+    : "privacy-safe-telemetry-v0.1";
+  if (communitySession?.csrfToken) {
+    if (communitySession.consentVersion !== requiredConsent) {
+      throw new Error(
+        `This browser session accepted ${communitySession.consentVersion || "an older consent contract"}. Sign out and enroll with this export, or recover the matching anonymous participant.`
+      );
+    }
+    return communitySession;
+  }
   const inviteInput = $("#contribution-invite");
   const inviteCode = inviteInput.value.trim();
   let enrollment;
   try {
-    enrollment = await communityClient.enroll(inviteCode || null);
+    enrollment = await communityClient.enroll(
+      inviteCode || null,
+      contributionSchemaVersion
+    );
   } finally {
     inviteInput.value = "";
   }
@@ -861,7 +881,8 @@ async function ensureCommunitySession() {
   }
   setCommunitySession({
     csrfToken: enrollment.csrfToken,
-    participantId: enrollment.participantId ?? null
+    participantId: enrollment.participantId ?? null,
+    consentVersion: requiredConsent
   });
   showRecoveryCodeOnce(enrollment.recoveryCode);
   return communitySession;
@@ -878,7 +899,7 @@ async function submitContribution(event) {
   button.disabled = true;
   try {
     const payload = await parseSafeExport(file);
-    await ensureCommunitySession();
+    await ensureCommunitySession(payload.schemaVersion);
     status.textContent = "Encrypting the validated export in this browser…";
     const key = await communityClient.envelopeKey();
     if (key?.algorithm && key.algorithm !== "RSA-OAEP-256") throw new Error("The server offered an unsupported envelope algorithm.");
@@ -1032,7 +1053,103 @@ function renderPersonalStats(container, payload) {
   pricingBasis.append(basisGrid);
   container.append(pricingBasis);
 
-  renderParticipantQuotaMovement(container, stats.rollingQuotaMovement);
+  const accountScoped = renderAccountScopedQuotaAnalysis(
+    container,
+    stats.accountScopedQuotaAnalysis
+  );
+  if (!accountScoped) {
+    renderParticipantQuotaMovement(container, stats.rollingQuotaMovement);
+  }
+}
+
+const ACCOUNT_CALIBRATION_REASONS = Object.freeze({
+  account_scoped_dataset_unavailable: "No complete account-scoped dataset has been contributed yet.",
+  supported_quota_track_unavailable: "No five-hour or seven-day quota track is available in the contributed data.",
+  source_evidence_refused: "The source dataset is partial or otherwise ineligible for calibration.",
+  too_few_boundaries: "At least eight useful quota boundaries are required inside a reset window.",
+  insufficient_displayed_span: "The visible quota movement covers less than five percentage points.",
+  insufficient_training_boundaries: "There are too few earlier points to train this reset estimate.",
+  insufficient_holdout_boundaries: "There are too few later points to test the estimate out of sample.",
+  capacity_not_estimable: "Cost and quota movement do not yet form an estimable positive gradient.",
+  sensitivity_too_wide: "The plausible capacity range is still too wide to report as a useful estimate.",
+  prior_reset_forecast_unavailable: "At least two completed prior reset estimates are needed before a rolling comparison is honest.",
+  endpoint_brackets_unavailable: "Quota observations do not bracket the exact rolling-hour endpoints closely enough."
+});
+
+function renderAccountScopedQuotaAnalysis(container, analysis) {
+  if (analysis?.status !== "ready" || !analysis.tracks?.length) return false;
+  const section = node("section", "participant-detail quota-movement");
+  const heading = node("div", "participant-detail-heading");
+  const title = node("div");
+  title.append(
+    node("h4", "", "Account-scoped quota calibration"),
+    node(
+      "p",
+      "",
+      "Usage and quota evidence are partitioned by a participant-scoped pseudonym. These results are private and are never copied into community output."
+    )
+  );
+  heading.append(title, node("span", "private-chip", "Private result"));
+  section.append(heading);
+
+  const grid = node("div", "pricing-basis-grid");
+  for (const track of analysis.tracks) {
+    const card = node("article", "basis-card");
+    const windowLabel = track.windowDurationMinutes === 10_080
+      ? "Seven-day allowance"
+      : "Five-hour allowance";
+    const estimate = track.latestCapacityUsd === null
+      ? "Collecting evidence"
+      : formatApiMoney(track.latestCapacityUsd);
+    card.append(
+      node(
+        "span",
+        "basis-label",
+        `${windowLabel} · ${track.planVariant || track.planType}`
+      ),
+      node("strong", "", estimate)
+    );
+    if (track.latestCapacityUsd !== null) {
+      const range = track.sensitivityLowerUsd !== null
+        && track.sensitivityUpperUsd !== null
+        ? ` Plausible sensitivity range: ${formatApiMoney(track.sensitivityLowerUsd)}–${formatApiMoney(track.sensitivityUpperUsd)}.`
+        : "";
+      card.append(node(
+        "p",
+        "",
+        `API-price-equivalent capacity from ${compact(track.estimatedResets)} qualified reset${track.estimatedResets === 1 ? "" : "s"}.${range}`
+      ));
+    } else {
+      card.append(node(
+        "p",
+        "",
+        `${compact(track.totalResets)} reset window${track.totalResets === 1 ? "" : "s"} observed; none yet passes every calibration gate.`
+      ));
+    }
+    const rolling = track.rollingStatus === "conditional_comparison"
+      ? `${compact(track.rollingComparisonCount)} honest 1–3 hour rolling comparisons available.`
+      : "Rolling observed-versus-expected comparison is not testable yet.";
+    card.append(node("p", "", rolling));
+    const reasons = [...new Set([
+      ...track.refusalCodes,
+      ...track.rollingRefusalCodes
+    ])].slice(0, 3);
+    if (reasons.length) {
+      const list = node("ul", "calibration-reasons");
+      for (const reason of reasons) {
+        list.append(node(
+          "li",
+          "",
+          ACCOUNT_CALIBRATION_REASONS[reason] ?? reason.replaceAll("_", " ")
+        ));
+      }
+      card.append(list);
+    }
+    grid.append(card);
+  }
+  section.append(grid);
+  container.append(section);
+  return true;
 }
 
 const QUOTA_MOVEMENT_REASONS = Object.freeze({
@@ -1330,7 +1447,9 @@ async function createDevicePairing() {
   status.textContent = "Creating a short-lived upload-only pairing capability…";
   button.disabled = true;
   try {
-    const pairing = await communityClient.createDevicePairing();
+    const pairing = await communityClient.createDevicePairing(
+      communitySession?.consentVersion === "privacy-safe-telemetry-v0.2"
+    );
     if (typeof pairing?.pairingCode !== "string") {
       throw new Error("The service did not return a pairing capability.");
     }
@@ -1433,9 +1552,12 @@ function renderBackendHealth(health) {
     ?? "Unavailable";
 
   const accountContract = health?.contracts?.accountScopedContribution;
-  $("#backend-contract-note").textContent = accountContract?.status === "implementation_disabled"
-    ? `${accountContract.schemaVersion} account-scoped ingest is implemented and testable in the repository, but deliberately disabled on the HTTP route.`
-    : "No account-scoped experimental contract was advertised by this backend.";
+  $("#backend-contract-note").textContent =
+    accountContract?.status === "local_preview_loopback_only"
+      ? `${accountContract.schemaVersion} account-scoped ingest is active only on this loopback development server. It remains unauthorized for external participants.`
+      : accountContract?.status === "implementation_disabled"
+        ? `${accountContract.schemaVersion} account-scoped ingest is implemented and testable, but disabled on this HTTP route.`
+        : "No account-scoped experimental contract was advertised by this backend.";
 }
 
 async function restoreCommunitySession() {
@@ -1444,7 +1566,8 @@ async function restoreCommunitySession() {
     if (typeof session?.csrfToken !== "string") return;
     setCommunitySession({
       csrfToken: session.csrfToken,
-      participantId: session.participantId ?? null
+      participantId: session.participantId ?? null,
+      consentVersion: session.consentVersion ?? null
     });
   } catch {
     setCommunitySession(null);
@@ -1518,7 +1641,8 @@ async function recoverParticipant(event) {
     }
     setCommunitySession({
       csrfToken: recovered.csrfToken,
-      participantId: recovered.participantId ?? null
+      participantId: recovered.participantId ?? null,
+      consentVersion: recovered.consentVersion ?? null
     });
     showRecoveryCodeOnce(recovered.recoveryCode);
     showDevicePairingOnce(null);
@@ -1545,7 +1669,8 @@ async function resetParticipantSecurity() {
     }
     setCommunitySession({
       csrfToken: reset.csrfToken,
-      participantId: reset.participantId ?? communitySession?.participantId ?? null
+      participantId: reset.participantId ?? communitySession?.participantId ?? null,
+      consentVersion: reset.consentVersion ?? communitySession?.consentVersion ?? null
     });
     showRecoveryCodeOnce(reset.recoveryCode);
     showDevicePairingOnce(null);
@@ -1592,12 +1717,31 @@ $("#window-controls").addEventListener("click", (event) => {
   renderComparison(dashboard);
 });
 
-$("#contribution-file").addEventListener("change", () => {
+$("#contribution-file").addEventListener("change", async () => {
   const file = $("#contribution-file").files[0];
   const drop = $(".file-drop");
   drop.classList.toggle("selected", Boolean(file));
   $("#file-help").textContent = file ? `${file.name} · ${compact(file.size)} bytes` : "Privacy-safe JSON export · 1.25 MB browser validation limit";
-  $("#contribution-submit").disabled = !($("#contribution-consent").checked && file);
+  $("#contribution-consent").checked = false;
+  $("#contribution-consent-title").textContent =
+    "I reviewed this as a privacy-safe Usage Monitor export.";
+  $("#contribution-consent-detail").textContent =
+    "Uploading is optional and can be tested against a local backend.";
+  if (file && file.size <= 1_310_720) {
+    try {
+      const payload = JSON.parse(await file.text());
+      if (payload?.schemaVersion === "telemetry-contribution-v0.2") {
+        $("#contribution-consent-title").textContent =
+          "I consent to upload participant-scoped pseudonymous account tracks.";
+        $("#contribution-consent-detail").textContent =
+          "They link usage and quota rows only within this anonymous participant for private calibration; they are never published in community output and are deleted with the participant.";
+      }
+    } catch {
+      // Submission performs the authoritative browser preflight and presents
+      // the exact validation error.
+    }
+  }
+  $("#contribution-submit").disabled = true;
 });
 $("#contribution-consent").addEventListener("change", () => {
   $("#contribution-submit").disabled = !($("#contribution-consent").checked && $("#contribution-file").files.length);

@@ -174,6 +174,7 @@ async function insert(
   await insertTelemetryContributionV02Shadow(db, {
     participantId: participant.participantId,
     uploadAuthorizationId: claimed.authorizationId,
+    uploadAuthorizationKind: claimed.authorizationKind,
     contributionId,
     r2Key: `telemetry-v0.2-shadow/${crypto.randomUUID()}`,
     envelopeDigest,

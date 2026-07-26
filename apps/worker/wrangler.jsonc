@@ -15,7 +15,8 @@
   },
   "vars": {
     "ENVIRONMENT": "synthetic-development",
-    "ENROLLMENT_MODE": "local_open"
+    "ENROLLMENT_MODE": "local_open",
+    "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
   },
   "ratelimits": [
     {

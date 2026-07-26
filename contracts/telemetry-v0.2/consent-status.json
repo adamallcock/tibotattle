@@ -1,15 +1,16 @@
 {
   "consentVersion": "privacy-safe-telemetry-v0.2",
-  "status": "draft_disabled_not_presentable_for_acceptance",
+  "status": "local_preview_presentable_external_disabled",
   "transportReady": false,
+  "localPreviewTransportReady": true,
   "externalParticipantsAuthorized": false,
   "requiresFreshConsent": true,
   "accountTrackDisclosure": {
-    "uploaded": "A device-derived pseudonymous account track would be included with each usage and quota record.",
-    "purpose": "It would link records only for the same provider account inside this anonymous participant for private calibration and integrity checks.",
-    "lifecycle": "It would survive logout, account recovery, and security reset, and change after central re-enrollment or local export-identity rotation.",
-    "limitations": "It would not provide cross-device continuity, provider-account ownership proof, unique-person proof, eligibility, or anti-Sybil evidence.",
-    "publication": "It would never be included in community output.",
-    "deletion": "It would be deleted with the participant's central data. Deleting a local export alone would not rotate the local export identity."
+    "uploaded": "A device-derived pseudonymous account track is included with each usage and quota record in the loopback-only local preview.",
+    "purpose": "It links records only for the same provider account inside this anonymous participant for private calibration and integrity checks.",
+    "lifecycle": "It survives logout, account recovery, and security reset, and changes after central re-enrollment or local export-identity rotation.",
+    "limitations": "It does not provide cross-device continuity, provider-account ownership proof, unique-person proof, eligibility, or anti-Sybil evidence.",
+    "publication": "It is never included in community output.",
+    "deletion": "It is deleted with the participant's central data. Deleting a local export alone does not rotate the local export identity."
   }
 }

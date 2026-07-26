@@ -5,11 +5,17 @@ import {
   parseInviteGrant,
 } from "./admission";
 import {
+  assertAccountScopedLocalPreview,
+  configuredAccountScopedIngestMode,
+} from "./account-scoped-ingest";
+import {
+  ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   JSON_HEADERS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
   MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
   ONGOING_TELEMETRY_CONSENT_VERSION,
+  ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import {
@@ -89,6 +95,12 @@ import {
   telemetryPlaintextDigest,
   telemetryRecordsForContribution,
 } from "./telemetry-repository";
+import {
+  insertTelemetryContributionV02,
+} from "./telemetry-v0.2-repository";
+import {
+  validateTelemetryContributionV02,
+} from "./telemetry-v0.2";
 import {
   validateTelemetryContribution,
   validateTelemetryEnvelope,
@@ -175,6 +187,12 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
   await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
   const body = await readBoundedJson(request);
+  const accountScopedEnrollment = typeof body.value === "object"
+    && body.value !== null
+    && !Array.isArray(body.value)
+    && Reflect.get(body.value, "consentVersion")
+      === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
+    && Reflect.get(body.value, "syntheticOnly") === false;
   if (typeof body.value !== "object"
     || body.value === null
     || Array.isArray(body.value)
@@ -185,8 +203,12 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
         && Reflect.get(body.value, "syntheticOnly") === true)
       || (Reflect.get(body.value, "consentVersion") === TELEMETRY_CONSENT_VERSION
         && Reflect.get(body.value, "syntheticOnly") === false)
+      || accountScopedEnrollment
     )) {
     throw new ApiError(400, "BODY_INVALID");
+  }
+  if (accountScopedEnrollment) {
+    assertAccountScopedLocalPreview(request, env);
   }
   const keys = Object.keys(body.value);
   const allowedKeys = mode === "invite_only"
@@ -205,6 +227,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     participantId: enrollment.participantId,
     csrfToken: enrollment.csrfToken,
     recoveryCode: enrollment.recoveryCode,
+    consentVersion,
   }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
@@ -232,6 +255,7 @@ async function handleRecover(request: Request, env: Env): Promise<Response> {
     participantId: recovered.participantId,
     csrfToken: recovered.csrfToken,
     recoveryCode: recovered.recoveryCode,
+    consentVersion: recovered.consentVersion,
   }, 200, { "set-cookie": sessionCookie(recovered.session) });
 }
 
@@ -262,6 +286,7 @@ async function handleSession(request: Request, env: Env): Promise<Response> {
     createdAt: session.participantCreatedAt,
     expiresAt: session.expiresAt,
     csrfToken: session.csrfToken,
+    consentVersion: session.consentVersion,
   }, 200, { vary: "Cookie" });
 }
 
@@ -300,6 +325,7 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
     reset: true,
     recoveryCode: result.recoveryCode,
     csrfToken: session.csrfToken,
+    consentVersion: session.consentVersion,
   }, 200, { vary: "Cookie" });
 }
 
@@ -345,7 +371,11 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
   );
   const session = await personalSession(request, env);
   assertCsrf(request, session);
-  if (session.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+  const accountScoped = session.consentVersion
+    === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
+  if (accountScoped) {
+    assertAccountScopedLocalPreview(request, env);
+  } else if (session.consentVersion !== TELEMETRY_CONSENT_VERSION) {
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const body = await readBoundedJson(request);
@@ -353,8 +383,11 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
       || body.value === null
       || Array.isArray(body.value)
       || Object.keys(body.value).length !== 2
-      || Reflect.get(body.value, "consentVersion")
-        !== ONGOING_TELEMETRY_CONSENT_VERSION
+      || Reflect.get(body.value, "consentVersion") !== (
+        accountScoped
+          ? ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
+          : ONGOING_TELEMETRY_CONSENT_VERSION
+      )
       || Reflect.get(body.value, "ongoingUpload") !== true) {
     throw new ApiError(400, "BODY_INVALID");
   }
@@ -363,6 +396,7 @@ async function handleDevicePairing(request: Request, env: Env): Promise<Response
       env.USAGE_MONITOR_DB,
       session.participantId,
       session.sessionId,
+      session.consentVersion,
     ),
     201,
     { vary: "Cookie" },
@@ -553,6 +587,7 @@ async function handleSyntheticContribution(
 }
 
 async function handleTelemetryContribution(
+  request: Request,
   body: { raw: string; value: unknown },
   participant: { id: string; consentVersion: string },
   uploadAuthorization: {
@@ -561,7 +596,11 @@ async function handleTelemetryContribution(
   },
   env: Env,
 ): Promise<Response> {
-  if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+  const accountScoped = participant.consentVersion
+    === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
+  if (accountScoped) {
+    assertAccountScopedLocalPreview(request, env);
+  } else if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const envelope = validateTelemetryEnvelope(body.value);
@@ -598,7 +637,9 @@ async function handleTelemetryContribution(
     env.ENVELOPE_PUBLIC_JWK,
     env.ENVELOPE_PRIVATE_JWK,
   );
-  const record = validateTelemetryContribution(plaintext);
+  const record = accountScoped
+    ? validateTelemetryContributionV02(plaintext)
+    : validateTelemetryContribution(plaintext);
   const plaintextDigest = await telemetryPlaintextDigest(record);
   const contentReplay = await existingTelemetryContribution(
     env.USAGE_MONITOR_DB,
@@ -630,24 +671,41 @@ async function handleTelemetryContribution(
     customMetadata: {
       contributionId,
       schemaVersion: envelope.schemaVersion,
+      plaintextSchemaVersion: record.schemaVersion,
       synthetic: "false",
     },
   });
   try {
-    const result = await insertTelemetryContribution(
-      env.USAGE_MONITOR_DB,
-      participant.id,
-      uploadAuthorization,
-      contributionId,
-      r2Key,
-      envelopeDigestValue,
-      plaintextDigest,
-      record,
-      createdAt,
-    );
+    const result = accountScoped
+      ? await insertTelemetryContributionV02(
+        env.USAGE_MONITOR_DB,
+        {
+          participantId: participant.id,
+          uploadAuthorizationId: uploadAuthorization.authorizationId,
+          uploadAuthorizationKind: uploadAuthorization.authorizationKind,
+          contributionId,
+          r2Key,
+          envelopeDigest: envelopeDigestValue,
+          receivedAt: createdAt,
+          plaintext: record,
+        },
+      )
+      : await insertTelemetryContribution(
+        env.USAGE_MONITOR_DB,
+        participant.id,
+        uploadAuthorization,
+        contributionId,
+        r2Key,
+        envelopeDigestValue,
+        plaintextDigest,
+        record as ReturnType<typeof validateTelemetryContribution>,
+        createdAt,
+      );
     return jsonResponse({
       contributionId,
-      status: "accepted",
+      status: accountScoped
+        ? "accepted_account_scoped_local_preview"
+        : "accepted",
       recordCounts: {
         usageEvents: record.usageEvents.length,
         quotaSnapshots: record.quotaSnapshots.length,
@@ -727,7 +785,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     }
     const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
-      ? await handleTelemetryContribution(body, participant, claimed, env)
+      ? await handleTelemetryContribution(request, body, participant, claimed, env)
       : await handleSyntheticContribution(body, participant, claimed, env);
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
@@ -776,6 +834,7 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
   return jsonResponse({
     participantId: session.participantId,
     createdAt: session.participantCreatedAt,
+    consentVersion: session.consentVersion,
     syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
     contributionCount: contributions.length + telemetryContributions.length,
     latestContribution: telemetryContributions.length > 0
@@ -1096,7 +1155,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           acceptedContribution: "telemetry-contribution-v0.1",
           accountScopedContribution: {
             schemaVersion: "telemetry-contribution-v0.2",
-            status: "implementation_disabled",
+            status: configuredAccountScopedIngestMode(env) === "local_preview"
+              ? "local_preview_loopback_only"
+              : "implementation_disabled",
+            externalParticipantsAuthorized: false,
           },
         },
         capabilities: {

@@ -10,9 +10,10 @@ import {
 } from "./telemetry-v0.2";
 import { ApiError } from "./errors";
 
-export interface TelemetryV02ShadowInsert {
+export interface TelemetryV02Insert {
   participantId: string;
   uploadAuthorizationId: string;
+  uploadAuthorizationKind: "session" | "device";
   contributionId: string;
   r2Key: string;
   envelopeDigest: string;
@@ -123,14 +124,12 @@ async function assertOccurrenceCompatibility(
  * Persist a validated v0.2 contribution through the same canonical pricing,
  * deduplication, deletion, and participant-isolation tables as v0.1.
  *
- * This is deliberately a repository-only shadow lane. No HTTP route imports
- * it, and the transport contract continues to declare implementation_disabled.
- * The function exists so local D1/R2 tests can prove the future storage and
- * analysis semantics before renewed consent or external collection.
+ * The HTTP route may call this only after the local-preview activation guard
+ * and renewed v0.2 consent checks pass. External collection remains disabled.
  */
-export async function insertTelemetryContributionV02Shadow(
+export async function insertTelemetryContributionV02(
   db: D1Database,
-  input: TelemetryV02ShadowInsert,
+  input: TelemetryV02Insert,
 ): Promise<{
   acceptedRecords: number;
   deduplicatedRecords: number;
@@ -145,7 +144,7 @@ export async function insertTelemetryContributionV02Shadow(
     input.participantId,
     {
       authorizationId: input.uploadAuthorizationId,
-      authorizationKind: "session",
+      authorizationKind: input.uploadAuthorizationKind,
     },
     input.contributionId,
     input.r2Key,
@@ -157,3 +156,7 @@ export async function insertTelemetryContributionV02Shadow(
   );
   return { ...result, plaintextDigest };
 }
+
+/** @deprecated Compatibility alias for the original repository-only tests. */
+export const insertTelemetryContributionV02Shadow =
+  insertTelemetryContributionV02;

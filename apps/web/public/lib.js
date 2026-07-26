@@ -3,6 +3,10 @@ const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 export const SYNTHETIC_SCHEMA_VERSION = "synthetic-contribution-v0.1";
 export const ENVELOPE_SCHEMA_VERSION = "synthetic-envelope-v0.1";
 export const TELEMETRY_SCHEMA_VERSION = "telemetry-contribution-v0.1";
+export const ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION =
+  "telemetry-contribution-v0.2";
+export const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
+  "privacy-safe-telemetry-v0.2";
 export const TELEMETRY_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
 export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 
@@ -93,7 +97,7 @@ export async function createSyntheticEnvelope({ publicJwk, keyId, cryptoImpl = g
  * decompression limits, deduplication, quarantine, or aggregate privacy gates.
  */
 export async function createTelemetryEnvelope({ payload, publicJwk, keyId, cryptoImpl = globalThis.crypto } = {}) {
-  validateTelemetryContribution(payload);
+  validateContributionForUpload(payload);
   return createEncryptedEnvelope({
     payload,
     publicJwk,
@@ -265,6 +269,126 @@ export function validateTelemetryContribution(payload, {
   };
   visit(payload, 0);
   return true;
+}
+
+/**
+ * Conservative browser preflight for the account-scoped local-preview
+ * contract. The Worker remains the authoritative closed-schema validator.
+ */
+export function validateAccountScopedTelemetryContribution(payload, {
+  maxSerializedBytes = MAX_TELEMETRY_BROWSER_BYTES,
+  maxDepth = 12,
+  maxArrayItems = 200
+} = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("The export must be one JSON object.");
+  }
+  if (
+    payload.schemaVersion !== ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION
+    || payload.consentVersion !== ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
+    || payload.status !== "implementation_disabled"
+    || payload.synthetic !== false
+  ) {
+    throw new TypeError("Choose a privacy-safe account-scoped Usage Monitor export.");
+  }
+  const topLevelKeys = [
+    "schemaVersion", "consentVersion", "status", "synthetic", "datasetId",
+    "partIndex", "partCount", "completeness", "createdAt", "coveredAt",
+    "clientPlatform", "providerPolicyEpoch", "usageEvents", "quotaSnapshots",
+    "activityMarkers", "accountingDiagnostic"
+  ];
+  if (
+    Object.keys(payload).length !== topLevelKeys.length
+    || topLevelKeys.some((key) => !Object.hasOwn(payload, key))
+    || typeof payload.datasetId !== "string"
+    || !/^dataset:v1:[a-f0-9]{64}$/u.test(payload.datasetId)
+    || !Number.isSafeInteger(payload.partIndex)
+    || !Number.isSafeInteger(payload.partCount)
+    || payload.partIndex < 1
+    || payload.partCount < 1
+    || payload.partCount > 100
+    || payload.partIndex > payload.partCount
+    || !["complete", "partial"].includes(payload.completeness)
+  ) {
+    throw new TypeError("The export does not match the account-scoped contribution contract.");
+  }
+  if (
+    !payload.coveredAt
+    || typeof payload.coveredAt !== "object"
+    || Array.isArray(payload.coveredAt)
+    || Object.keys(payload.coveredAt).length !== 2
+    || typeof payload.coveredAt.startAt !== "string"
+    || typeof payload.coveredAt.endAt !== "string"
+    || !Number.isFinite(Date.parse(payload.coveredAt.startAt))
+    || !Number.isFinite(Date.parse(payload.coveredAt.endAt))
+    || Date.parse(payload.coveredAt.endAt) < Date.parse(payload.coveredAt.startAt)
+  ) {
+    throw new TypeError("The export has an invalid coveredAt interval.");
+  }
+  for (const [key, maximum, schemaVersion] of [
+    ["usageEvents", 200, "usage-event-v0.2"],
+    ["quotaSnapshots", 200, "quota-snapshot-v0.2"],
+    ["activityMarkers", 100, "activity-marker-v0.2"]
+  ]) {
+    if (!Array.isArray(payload[key]) || payload[key].length > maximum) {
+      throw new RangeError(`The export has an invalid ${key} array.`);
+    }
+    for (const row of payload[key]) {
+      if (
+        !row
+        || typeof row !== "object"
+        || Array.isArray(row)
+        || row.schemaVersion !== schemaVersion
+        || !(
+          row.accountTrackId === "unattributed"
+          || /^account-track:v1:[a-f0-9]{64}$/u.test(row.accountTrackId)
+        )
+      ) {
+        throw new TypeError(`The export contains an invalid ${key} record.`);
+      }
+    }
+  }
+  const totalRecords = payload.usageEvents.length
+    + payload.quotaSnapshots.length
+    + payload.activityMarkers.length;
+  if (totalRecords < 1 || totalRecords > 200) {
+    throw new RangeError("The export must contain between 1 and 200 telemetry records.");
+  }
+  const serialized = JSON.stringify(payload);
+  if (new TextEncoder().encode(serialized).byteLength > maxSerializedBytes) {
+    throw new RangeError("The export is larger than the browser validation limit.");
+  }
+  if (
+    /(?:openai-)?account:v1:[a-f0-9]{64}/iu.test(serialized)
+    || /(?:\/Users\/|\/home\/|[A-Z]:\\|@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/u.test(serialized)
+  ) {
+    throw new TypeError("The export contains a direct identity or local-path canary.");
+  }
+  const visit = (value, depth) => {
+    if (depth > maxDepth) throw new RangeError("The export is nested too deeply.");
+    if (Array.isArray(value)) {
+      if (value.length > maxArrayItems) throw new RangeError("The export contains too many records.");
+      value.forEach((entry) => visit(entry, depth + 1));
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (FORBIDDEN_CONTENT_KEYS.has(normalized)) {
+        throw new TypeError(`The export contains a forbidden content field: ${key}.`);
+      }
+      visit(child, depth + 1);
+    }
+  };
+  visit(payload, 0);
+  return true;
+}
+
+export function validateContributionForUpload(payload, options = {}) {
+  if (payload?.schemaVersion === ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION) {
+    return validateAccountScopedTelemetryContribution(payload, options);
+  }
+  return validateTelemetryContribution(payload, options);
 }
 
 export function formatTokenTotal(usage) {

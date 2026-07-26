@@ -312,9 +312,10 @@ shows only bounded queue counts and timestamps; it cannot reveal a prepared
 file, path, identity, origin, or secret.
 
 The device credential can only mint an exact five-minute, one-use authorization
-for one v0.1 encrypted envelope. It cannot use browser sessions, read private
+for one encrypted envelope matching the device's consent version. It cannot use browser sessions, read private
 statistics, export or delete data, recover access, rotate consent, pair another
-device, or select the disabled v0.2 contract. This slice is foreground-only;
+device, or change its consent version. Account-scoped v0.2 devices can be paired
+only through the explicitly enabled loopback preview. This slice is foreground-only;
 login-item, LaunchAgent, daemon, signed-app, and silent background installation
 remain separately gated.
 
@@ -354,12 +355,35 @@ and deletes both drill participants. The
 [incident-containment receipt](./2026-07-26-g4-incident-containment-verification-receipt.md)
 records the first live pass and the remaining production blockers.
 
-The next account-scoped transport, `telemetry-contribution-v0.2`, is implemented
-as a disabled repository shadow lane only. Its focused backend tests exercise
-participant-bound account tracks, complete dataset parts, five-hour/seven-day
-calibration, rolling quota comparison, conflict-safe deduplication, and
-deletion-driven recomputation. The public HTTP route continues to accept only
-v0.1 until renewed consent and the prospective release gates are satisfied.
+The account-scoped transport, `telemetry-contribution-v0.2`, now has a verified
+loopback-only HTTP preview. It exercises fresh consent, encrypted upload,
+participant-bound account tracks, complete dataset parts, server repricing,
+five-hour/seven-day calibration, rolling quota comparison, conflict-safe
+deduplication, private results, export, and deletion. It fails closed unless a
+development Worker is started with `ACCOUNT_SCOPED_INGEST_MODE=local_preview`,
+local-open enrollment, and a loopback request host. Checked-in configuration,
+production, preview URLs, external participants, and public account-scoped
+output remain disabled.
+
+To exercise the account-scoped backend against isolated local D1/R2 state:
+
+```bash
+ACCOUNT_STATE="$(mktemp -d /private/tmp/app-usagemonitor-account-v02.XXXXXX)"
+npm --prefix apps/worker run migrate:local -- --persist-to "$ACCOUNT_STATE"
+npm run product:dev:account-scoped -- --port 8794 --persist-to "$ACCOUNT_STATE"
+```
+
+In another terminal:
+
+```bash
+npm run product:backend:account-scoped-smoke -- \
+  --origin http://127.0.0.1:8794
+```
+
+The smoke uses generated content-free records, verifies private calibration and
+community-field exclusion, exports the participant, deletes it, and confirms
+that external participants were never authorized. Remove the isolated state
+after stopping the Worker.
 
 For a real HTTP backend smoke using an actual prepared contribution, run the
 Worker in invite-only mode. Issue twenty invitation grants so the smoke can

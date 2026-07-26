@@ -1,9 +1,19 @@
 {
   "contractFamily": "telemetry-contribution-v0.2",
-  "status": "implementation_disabled_pending_minimization_and_security_review",
+  "status": "local_preview_http_verified_external_disabled",
   "transportReady": false,
+  "localPreviewTransportReady": true,
   "backwardCompatibility": "v0.1_remains_readable_exportable_and_deletable_but_cannot_be_upgraded_in_place",
   "externalParticipantsAuthorized": false,
+  "localPreview": {
+    "mode": "ACCOUNT_SCOPED_INGEST_MODE=local_preview",
+    "requirements": [
+      "development_environment",
+      "local_open_enrollment",
+      "loopback_request_host"
+    ],
+    "verifiedAt": "2026-07-26"
+  },
   "activationGates": [
     "three_completed_prospective_provider_account_plan_scoped_resets",
     "accepted_preregistered_minimization_receipt",
@@ -12,5 +22,5 @@
     "security_and_privacy_review",
     "complete_http_deletion_and_rendered_ui_verification"
   ],
-  "freezeRule": "Activation requires a dated decision receipt. This disabled implementation cannot be accepted by the upload route."
+  "freezeRule": "External activation requires a dated decision receipt. The verified loopback preview does not authorize production or external participants."
 }
