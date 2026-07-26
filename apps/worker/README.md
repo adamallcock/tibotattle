@@ -4,8 +4,9 @@ This development-only Cloudflare Worker exercises the full central product
 boundary: enrollment, encrypted upload, strict validation, deterministic
 server-side API repricing, D1 ingest, participant-isolated statistics and
 rolling quota comparison, delayed immutable weekly community snapshots,
-independent incident containment, export, contribution deletion, and
-participant deletion. It retains the
+independent incident containment, seven-day encrypted-quarantine retention,
+deletion-safe restore replay, export, contribution deletion, and participant
+deletion. It retains the
 original fixed synthetic walkthrough
 and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
 files, prompts, responses, commands, paths, account identifiers, or arbitrary
@@ -47,8 +48,36 @@ npm run product:backend:test
 It creates isolated Cloudflare test bindings, applies the real D1 migrations,
 and tests validation, canonical server repricing, transactional ingest,
 overlap deduplication, participant isolation, private statistics, delayed
-aggregation, export, recovery, and deletion. No server or external account is
+aggregation, export, recovery, deletion, quarantine retention, R2 failure
+retries, and deletion-safe restore suppression. The deletion ledger is a
+second independent D1 binding whose rows contain only a domain-separated
+participant digest and fixed retention times. No server or external account is
 required.
+
+### Retention and restore safety
+
+Migration `0010_retention_lifecycle.sql` records successful removal of accepted
+encrypted quarantine objects. The hourly scheduled handler removes objects
+seven days after accepted processing but preserves the separately governed
+canonical metadata used for private results and calibration.
+
+`DELETION_LEDGER` has its own migration directory and must be backed up and
+restored independently from `USAGE_MONITOR_DB`. Participant deletion first
+withdraws derived snapshots, then writes a content-free deletion tombstone,
+then removes R2 and primary D1 data. If the independent ledger is unavailable,
+deletion fails closed with the primary participant left in a retryable,
+non-serving `deleting` state.
+
+Before a restored primary D1 database serves traffic, invoke the same
+`runBackendLifecycle` replay path in an isolated stopped-service restore
+procedure. It compares domain-separated participant digests, withdraws any
+restored derived snapshot, removes R2 objects, and deletes restored primary
+rows. The hourly pass is defense in depth, not permission to serve a restored
+database before replay.
+
+The development tombstone has a 400-day `retain_until`. This is a bounded test
+value, not an approved production policy. A production backup/soft-delete
+horizon and longer tombstone margin remain release gates.
 
 ### Disabled account-scoped shadow lane
 

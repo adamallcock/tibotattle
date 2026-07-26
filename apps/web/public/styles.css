@@ -461,7 +461,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .backend-facts > div { min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: .35rem; background: rgba(255, 254, 249, .6); }
 .backend-facts dt { color: var(--muted); font-size: .58rem; text-transform: uppercase; }
 .backend-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: .76rem; font-weight: 750; }
-.backend-flow { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.backend-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
 .backend-flow li { min-width: 0; padding: 12px; border: 1px solid var(--line); border-top: 3px solid var(--green-2); border-radius: .35rem; background: var(--white); }
 .backend-flow li > strong { display: grid; place-items: center; width: 24px; height: 24px; margin-bottom: 12px; color: var(--green); background: var(--green-soft); border-radius: 50%; font-size: .64rem; }
 .backend-flow span, .backend-flow small { display: block; }

@@ -990,6 +990,39 @@ The complete-set local deletion slice is now implemented and verified. It uses c
 
 The [live G1 local-only release route](./2026-07-24-g1-local-release-route.md) now provides the current gate matrix and supersedes old open-item lists as a status tracker without rewriting dated historical receipts. The first declared volunteer platform is macOS arm64. The active hardening checkpoint passes 470 of 470 serial tests under both Node 26.2.0 and the pinned-candidate Node 24.14.0 runtime, and the generated telemetry contract remains current at 151 fields with 9 of 9 schema/contract tests passing. Failed-workspace discard has passed its final independent destructive-boundary re-audit. The remaining critical path is: prospective Codex collector quota export; full Claude usage and authoritative status-line quota parity; native macOS Keychain integration; preregistered minimization; measured release ceilings; frozen signed packaging; clean-machine validation; and two local-only volunteer reviews. No transport is authorized.
 
+## Progress update: executable central retention and restore suppression (July 26, 2026)
+
+The development-only central service now has an executable privacy lifecycle
+rather than retention policy text alone:
+
+- accepted encrypted quarantine objects are removed from R2 seven days after
+  successful processing while governed canonical metadata remains available;
+- cleanup marks completion only after R2 deletion succeeds and remains
+  retryable after failure;
+- participant deletion writes a content-free, domain-separated digest to a
+  second independent D1 database before removing R2 or primary D1 rows;
+- a failed independent-ledger write leaves the participant in a non-serving,
+  retryable `deleting` state;
+- request-time browser/device/upload checks deny a tombstoned participant;
+- the hourly lifecycle pass suppresses a participant resurrected by an older
+  primary D1 restore, withdraws derived snapshots, removes R2, and cascades all
+  primary rows;
+- local migration now applies the same explicitly resolved state directory to
+  both D1 bindings and rejects remote operation; and
+- content-free health reports the deletion ledger and lifecycle capabilities.
+
+The [backend retention and restore verification
+receipt](./2026-07-26-backend-retention-and-restore-verification-receipt.md)
+records 60 passing Worker tests, a bounded 101-participant restore replay, a
+fresh 20-participant real HTTP D1/R2 smoke,
+zero active primary rows/R2 blobs after deletion, 20 independent digest-only
+tombstones, and a live cross-D1 suppression of one synthetic restored
+participant. This is a bounded local gate only. Production backup/soft-delete
+horizons, a stopped-service restore operator, the final tombstone duration,
+180-day canonical coarsening, 24-month feature retirement, infrastructure,
+external review, load/soak, and named-human release approval remain open. No
+external collection or deployment is authorized.
+
 ## Open decisions and decision deadlines
 
 | Decision | Must be resolved by | Default if unresolved |

@@ -10,6 +10,9 @@
     "enabled": true,
     "head_sampling_rate": 1
   },
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
   "vars": {
     "ENVIRONMENT": "synthetic-development",
     "ENROLLMENT_MODE": "local_open"
@@ -32,6 +35,12 @@
       "database_name": "app-usagemonitor-synthetic",
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
+    },
+    {
+      "binding": "DELETION_LEDGER",
+      "database_name": "app-usagemonitor-synthetic-deletion-ledger",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "deletion-ledger-migrations"
     }
   ],
   "r2_buckets": [

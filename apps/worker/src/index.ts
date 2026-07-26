@@ -57,6 +57,11 @@ import {
   securityReset,
 } from "./repository";
 import {
+  hasDeletionTombstone,
+  recordDeletionTombstone,
+  runBackendLifecycle,
+} from "./retention";
+import {
   assertCsrf,
   assertSameOrigin,
   abandonUploadAuthorization,
@@ -237,11 +242,16 @@ async function personalSession(
   allowDeletionOnly = false,
 ): Promise<SessionPrincipal> {
   if (request.headers.has("authorization")) throw new ApiError(401, "AUTH_INVALID");
-  return authenticateSession(
+  const session = await authenticateSession(
     env.USAGE_MONITOR_DB,
     request.headers.get("cookie"),
     { allowDeleting, allowDeletionOnly },
   );
+  if (!allowDeleting
+      && await hasDeletionTombstone(env.DELETION_LEDGER, session.participantId)) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  return session;
 }
 
 async function handleSession(request: Request, env: Env): Promise<Response> {
@@ -397,6 +407,9 @@ async function handleDeviceUploadAuthorization(
     env.USAGE_MONITOR_DB,
     request.headers.get("authorization"),
   );
+  if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
       || body.value === null
@@ -710,6 +723,9 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
          FROM participants WHERE id = ? AND state = 'active'`,
     ).bind(claimed.participantId).first<{ id: string; consentVersion: string }>();
     if (!participant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    if (await hasDeletionTombstone(env.DELETION_LEDGER, participant.id)) {
+      throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+    }
     const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(body, participant, claimed, env)
       : await handleSyntheticContribution(body, participant, claimed, env);
@@ -833,6 +849,10 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     env.USAGE_MONITOR_DB,
     session.participantId,
     session.sessionId,
+  );
+  await recordDeletionTombstone(
+    env.DELETION_LEDGER,
+    session.participantId,
   );
   const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
   const telemetryContributions = await listTelemetryContributions(
@@ -1031,6 +1051,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const collectionControls = await readCollectionControls(
         env.USAGE_MONITOR_DB,
       );
+      const retention = await env.USAGE_MONITOR_DB.prepare(
+        `SELECT state, quarantine_retention_complete, restore_replay_complete
+           FROM retention_state WHERE singleton = 1`,
+      ).first<{
+        state: "never_run" | "running" | "completed" | "failed";
+        quarantine_retention_complete: number;
+        restore_replay_complete: number;
+      }>();
+      if (!retention) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
       if (!env.QUARANTINE
           || typeof Reflect.get(env.QUARANTINE, "head") !== "function"
           || typeof Reflect.get(env.QUARANTINE, "put") !== "function"
@@ -1038,6 +1067,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
       }
       await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
+      await env.DELETION_LEDGER.prepare(
+        "SELECT schema_version FROM deletion_tombstones LIMIT 1",
+      ).first();
       await env.QUARANTINE.head("__usage_monitor_health_probe__");
       return jsonResponse({
         status: "ok",
@@ -1053,7 +1085,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         },
         checks: {
           database: "ok",
+          deletionLedger: "ok",
           encryptedObjectStore: "reachable",
+          lifecycle: retention.state,
+          quarantineRetentionComplete:
+            retention.quarantine_retention_complete === 1,
+          restoreReplayComplete: retention.restore_replay_complete === 1,
         },
         contracts: {
           acceptedContribution: "telemetry-contribution-v0.1",
@@ -1070,6 +1107,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           delayedAggregateStats: collectionControls.publication,
           participantExport: true,
           participantDeletion: true,
+          boundedQuarantineRetention: true,
+          deletionSafeRestoreReplay: true,
           ongoingDeviceUploadRegistration:
             collectionControls.uploadRegistration,
         },
@@ -1122,6 +1161,14 @@ export default {
   },
   scheduled(event, env, context): void {
     context.waitUntil((async () => {
+      const lifecycle = await runBackendLifecycle(
+        env.USAGE_MONITOR_DB,
+        env.DELETION_LEDGER,
+        env.QUARANTINE,
+        event.scheduledTime,
+      );
+      if (!lifecycle.restoreReplayComplete
+          || !lifecycle.quarantineRetentionComplete) return;
       const controls = await readCollectionControls(
         env.USAGE_MONITOR_DB,
       );

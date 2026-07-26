@@ -717,6 +717,8 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
   assert.match(html, /id="backend-state"/);
+  assert.match(html, /id="backend-deletion-ledger"/);
+  assert.match(html, /id="backend-lifecycle"/);
   assert.match(html, /id="backend-collection-state"/);
   assert.match(html, /id="backend-upload-registration"/);
   assert.match(html, /id="backend-processing"/);

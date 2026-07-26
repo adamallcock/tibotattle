@@ -17,9 +17,15 @@ import {
   buildCommunityWeeklySnapshot,
   communityWeekForScheduledTime,
 } from "../src/community-snapshots";
+import {
+  participantDeletionDigest,
+  recordDeletionTombstone,
+  runBackendLifecycle,
+} from "../src/retention";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
+  TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
 }
 
 interface EnrollmentResponse {
@@ -41,6 +47,7 @@ function testBindings(overrides: Partial<Env> = {}): Env {
   const bindings = env as TestBindings;
   return {
     ASSETS: bindings.ASSETS,
+    DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
     ENROLLMENT_RATE_LIMIT: bindings.ENROLLMENT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: privateJwkJson,
@@ -553,6 +560,10 @@ beforeEach(async () => {
   await reset();
   const bindings = env as TestBindings;
   await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_MIGRATIONS);
+  await applyD1Migrations(
+    bindings.DELETION_LEDGER,
+    bindings.TEST_DELETION_LEDGER_MIGRATIONS,
+  );
 });
 
 describe("synthetic usage monitor service", () => {
@@ -1296,7 +1307,11 @@ describe("synthetic usage monitor service", () => {
       },
       checks: {
         database: "ok",
+        deletionLedger: "ok",
         encryptedObjectStore: "reachable",
+        lifecycle: "never_run",
+        quarantineRetentionComplete: true,
+        restoreReplayComplete: true,
       },
       contracts: {
         acceptedContribution: "telemetry-contribution-v0.1",
@@ -1313,6 +1328,8 @@ describe("synthetic usage monitor service", () => {
         delayedAggregateStats: true,
         participantExport: true,
         participantDeletion: true,
+        boundedQuarantineRetention: true,
+        deletionSafeRestoreReplay: true,
         ongoingDeviceUploadRegistration: true,
       },
     });
@@ -2809,5 +2826,277 @@ describe("synthetic usage monitor service", () => {
       "SELECT COUNT(*) AS total FROM telemetry_records",
     ).first<{ total: number }>();
     expect(rows?.total).toBe(0);
+  });
+
+  it("removes seven-day quarantine objects without removing canonical results", async () => {
+    const participant = await enrollTelemetry();
+    const accepted = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    const receipt = await accepted.json<{ contributionId: string }>();
+    const stored = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT r2_key FROM telemetry_contributions
+        WHERE id = ? AND participant_id = ?`,
+    ).bind(receipt.contributionId, participant.participantId)
+      .first<{ r2_key: string }>();
+    expect(stored?.r2_key).toBeTruthy();
+    expect(await testBindings().QUARANTINE.head(stored!.r2_key)).not.toBeNull();
+
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE telemetry_contributions
+          SET created_at = '2026-07-17T00:00:00.000Z'
+        WHERE id = ?`,
+    ).bind(receipt.contributionId).run();
+    const result = await runBackendLifecycle(
+      testBindings().USAGE_MONITOR_DB,
+      testBindings().DELETION_LEDGER,
+      testBindings().QUARANTINE,
+      Date.parse("2026-07-25T00:00:00.000Z"),
+    );
+    expect(result).toEqual({
+      quarantineCutoffAt: "2026-07-18T00:00:00.000Z",
+      quarantineObjectsDeleted: 1,
+      quarantineRetentionComplete: true,
+      restoredParticipantsSuppressed: 0,
+      restoreReplayComplete: true,
+    });
+    expect(await testBindings().QUARANTINE.head(stored!.r2_key)).toBeNull();
+    const retained = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT quarantine_deleted_at FROM telemetry_contributions
+        WHERE id = ? AND participant_id = ?`,
+    ).bind(receipt.contributionId, participant.participantId)
+      .first<{ quarantine_deleted_at: string }>();
+    expect(retained?.quarantine_deleted_at).toMatch(/Z$/u);
+    const stats = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    expect(stats.status).toBe(200);
+    await expect(stats.json()).resolves.toMatchObject({
+      totals: { contributions: 1 },
+    });
+  });
+
+  it("does not mark quarantine retention complete when R2 deletion fails", async () => {
+    const participant = await enrollTelemetry();
+    const accepted = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("b"), true),
+    );
+    const receipt = await accepted.json<{ contributionId: string }>();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE telemetry_contributions
+          SET created_at = '2026-07-17T00:00:00.000Z'
+        WHERE id = ?`,
+    ).bind(receipt.contributionId).run();
+    const failingBucket = new Proxy(testBindings().QUARANTINE, {
+      get(target, property) {
+        if (property === "delete") {
+          return async () => {
+            throw new Error("injected retention R2 deletion failure");
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(runBackendLifecycle(
+      testBindings().USAGE_MONITOR_DB,
+      testBindings().DELETION_LEDGER,
+      failingBucket,
+      Date.parse("2026-07-25T00:00:00.000Z"),
+    )).rejects.toThrow("injected retention R2 deletion failure");
+    const failed = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT state, failure_code FROM retention_state WHERE singleton = 1`,
+    ).first<{ state: string; failure_code: string }>();
+    expect(failed).toEqual({
+      state: "failed",
+      failure_code: "LIFECYCLE_PASS_FAILED",
+    });
+    const contribution = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT quarantine_deleted_at FROM telemetry_contributions WHERE id = ?`,
+    ).bind(receipt.contributionId)
+      .first<{ quarantine_deleted_at: string | null }>();
+    expect(contribution?.quarantine_deleted_at).toBeNull();
+
+    await expect(runBackendLifecycle(
+      testBindings().USAGE_MONITOR_DB,
+      testBindings().DELETION_LEDGER,
+      testBindings().QUARANTINE,
+      Date.parse("2026-07-25T00:00:00.000Z"),
+    )).resolves.toMatchObject({ quarantineObjectsDeleted: 1 });
+  });
+
+  it("fails participant deletion closed when its independent ledger is unavailable", async () => {
+    const participant = await enrollTelemetry();
+    await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("c"), true),
+    );
+    const unavailableLedger = new Proxy(testBindings().DELETION_LEDGER, {
+      get(target, property) {
+        if (property === "prepare") {
+          return () => {
+            throw new Error("injected deletion ledger failure");
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const failed = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    }, testBindings({ DELETION_LEDGER: unavailableLedger }));
+    expect(failed.status).toBe(500);
+    const primary = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first<{ state: string }>();
+    expect(primary?.state).toBe("deleting");
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(1);
+    const tombstones = await testBindings().DELETION_LEDGER.prepare(
+      "SELECT COUNT(*) AS total FROM deletion_tombstones",
+    ).first<{ total: number }>();
+    expect(tombstones?.total).toBe(0);
+
+    const retried = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(retried.status).toBe(200);
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+  });
+
+  it("suppresses a pre-deletion primary restore using only the independent digest", async () => {
+    const participant = await enrollTelemetry();
+    await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("d"), true),
+    );
+    await seedSealedSuppressedSnapshot();
+    await recordDeletionTombstone(
+      testBindings().DELETION_LEDGER,
+      participant.participantId,
+      Date.parse("2026-07-25T00:00:00.000Z"),
+    );
+
+    const deniedBeforeReplay = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    expect(deniedBeforeReplay.status).toBe(401);
+    const result = await runBackendLifecycle(
+      testBindings().USAGE_MONITOR_DB,
+      testBindings().DELETION_LEDGER,
+      testBindings().QUARANTINE,
+      Date.parse("2026-07-25T01:00:00.000Z"),
+    );
+    expect(result.restoredParticipantsSuppressed).toBe(1);
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+    for (const table of [
+      "participants",
+      "web_sessions",
+      "upload_authorizations",
+      "telemetry_contributions",
+      "telemetry_contribution_occurrences",
+      "telemetry_records",
+    ]) {
+      const row = await testBindings().USAGE_MONITOR_DB.prepare(
+        `SELECT COUNT(*) AS total FROM ${table}`,
+      ).first<{ total: number }>();
+      expect(row?.total).toBe(0);
+    }
+    const snapshot = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT release_state FROM community_weekly_snapshots",
+    ).first<{ release_state: string }>();
+    expect(snapshot?.release_state).toBe("withdrawn");
+    const ledgerRow = await testBindings().DELETION_LEDGER.prepare(
+      `SELECT schema_version, participant_digest, retain_until
+         FROM deletion_tombstones`,
+    ).first<{
+      schema_version: string;
+      participant_digest: string;
+      retain_until: string;
+    }>();
+    expect(ledgerRow?.schema_version).toBe(
+      "participant-deletion-tombstone-v0.1",
+    );
+    expect(ledgerRow?.participant_digest).toMatch(/^[0-9a-f]{64}$/u);
+    expect(JSON.stringify(ledgerRow)).not.toContain(participant.participantId);
+    expect(ledgerRow?.retain_until).toBe("2027-08-29T00:00:00.000Z");
+  });
+
+  it("bounds a mass restore replay and reports incomplete until the next pass", async () => {
+    const participantIds = Array.from(
+      { length: 101 },
+      () => `participant:${crypto.randomUUID()}`,
+    );
+    for (let offset = 0; offset < participantIds.length; offset += 50) {
+      const statements = participantIds.slice(offset, offset + 50).map(
+        (participantId) => testBindings().USAGE_MONITOR_DB.prepare(
+          `INSERT INTO participants (
+            id, access_token_id, access_token_hash, recovery_token_id,
+            recovery_token_hash, state, consent_version, consented_at,
+            created_at, deletion_session_id
+          ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL)`,
+        ).bind(
+          participantId,
+          crypto.randomUUID(),
+          new Uint8Array(32),
+          crypto.randomUUID(),
+          new Uint8Array(32),
+          "privacy-safe-telemetry-v0.1",
+          "2026-07-25T00:00:00.000Z",
+          "2026-07-25T00:00:00.000Z",
+        ),
+      );
+      await testBindings().USAGE_MONITOR_DB.batch(statements);
+    }
+    const digests = await Promise.all(
+      participantIds.map(participantDeletionDigest),
+    );
+    for (let offset = 0; offset < digests.length; offset += 50) {
+      const statements = digests.slice(offset, offset + 50).map(
+        (digest) => testBindings().DELETION_LEDGER.prepare(
+          `INSERT INTO deletion_tombstones (
+            participant_digest, schema_version, deleted_at, retain_until
+          ) VALUES (?, 'participant-deletion-tombstone-v0.1', ?, ?)`,
+        ).bind(
+          digest,
+          "2026-07-25T00:00:00.000Z",
+          "2027-08-29T00:00:00.000Z",
+        ),
+      );
+      await testBindings().DELETION_LEDGER.batch(statements);
+    }
+
+    const first = await runBackendLifecycle(
+      testBindings().USAGE_MONITOR_DB,
+      testBindings().DELETION_LEDGER,
+      testBindings().QUARANTINE,
+      Date.parse("2026-07-26T00:00:00.000Z"),
+    );
+    expect(first).toMatchObject({
+      restoredParticipantsSuppressed: 100,
+      restoreReplayComplete: false,
+    });
+    const afterFirst = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(afterFirst?.total).toBe(1);
+
+    const second = await runBackendLifecycle(
+      testBindings().USAGE_MONITOR_DB,
+      testBindings().DELETION_LEDGER,
+      testBindings().QUARANTINE,
+      Date.parse("2026-07-26T01:00:00.000Z"),
+    );
+    expect(second).toMatchObject({
+      restoredParticipantsSuppressed: 1,
+      restoreReplayComplete: true,
+    });
+    const afterSecond = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(afterSecond?.total).toBe(0);
   });
 });

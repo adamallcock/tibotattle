@@ -5,6 +5,9 @@ import {
 import { defineConfig } from "vitest/config";
 
 const migrations = await readD1Migrations("./migrations");
+const deletionLedgerMigrations = await readD1Migrations(
+  "./deletion-ledger-migrations",
+);
 
 export default defineConfig({
   plugins: [
@@ -15,6 +18,7 @@ export default defineConfig({
           ENVELOPE_PRIVATE_JWK: "",
           ENVELOPE_PUBLIC_JWK: "",
           TEST_MIGRATIONS: migrations,
+          TEST_DELETION_LEDGER_MIGRATIONS: deletionLedgerMigrations,
         },
       },
     }),

@@ -326,7 +326,9 @@ For the central service alone, `npm run product:backend:test` is the quickest
 repeatable check. It runs against isolated local Cloudflare Worker, D1, and R2
 test bindings and covers strict validation, server repricing, deduplication,
 participant isolation, private statistics, delayed aggregate publication,
-export, deletion, and independent incident containment. The live portal's Data
+export, deletion, independent incident containment, seven-day quarantine
+retention, retryable R2 failure, and deletion-safe primary-database restore
+suppression through an independent content-free D1 ledger. The live portal's Data
 & privacy section separately reports whether the running backend can reach D1
 and its encrypted quarantine binding, whether collection is operational,
 partially paused, or fully contained, and which of enrollment, upload

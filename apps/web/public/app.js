@@ -1383,9 +1383,23 @@ function renderBackendHealth(health) {
   $("#backend-database").textContent = health?.checks?.database === "ok"
     ? "Connected"
     : "Unavailable";
+  $("#backend-deletion-ledger").textContent = health?.checks?.deletionLedger === "ok"
+    ? "Independent digest-only store reachable"
+    : "Unavailable";
   $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "reachable"
     ? "Reachable"
     : "Unavailable";
+  const lifecycleLabels = {
+    never_run: "Awaiting first scheduled pass",
+    running: "Lifecycle pass running",
+    completed: health?.checks?.quarantineRetentionComplete === true
+      && health?.checks?.restoreReplayComplete === true
+      ? "Retention and restore replay current"
+      : "Catching up; publication held",
+    failed: "Lifecycle pass failed; operator review required"
+  };
+  $("#backend-lifecycle").textContent = lifecycleLabels[health?.checks?.lifecycle]
+    ?? "Unavailable";
   $("#backend-collection-state").textContent = {
     operational: "Operational",
     degraded: "One or more intake stages paused",
