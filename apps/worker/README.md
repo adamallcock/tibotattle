@@ -2,7 +2,7 @@
 
 This development-only Cloudflare Worker exercises the full central product
 boundary: enrollment, encrypted upload, strict validation, D1 ingest,
-participant-isolated statistics, thresholded development community diagnostics,
+participant-isolated statistics, delayed immutable weekly community snapshots,
 export, contribution deletion, and participant deletion. It retains the
 original fixed synthetic walkthrough
 and also accepts a closed privacy-safe telemetry batch. It never accepts raw log
@@ -47,7 +47,7 @@ in the root README. Then:
 SMOKE_STATE="$(mktemp -d /private/tmp/app-usagemonitor-backend-smoke.XXXXXX)"
 echo "$SMOKE_STATE"
 npm run migrate:local -- --persist-to "$SMOKE_STATE/state"
-for number in 1 2 3; do
+for number in {1..20}; do
   npm run grant:issue -- \
     --persist-to "$SMOKE_STATE/state" \
     --output-file "$SMOKE_STATE/invite-$number.secret"
@@ -55,6 +55,7 @@ done
 npm run dev -- \
   --ip 127.0.0.1 \
   --port 8792 \
+  --test-scheduled \
   --persist-to "$SMOKE_STATE/state" \
   --var ENROLLMENT_MODE:invite_only \
   --var ENVIRONMENT:local-development
@@ -65,15 +66,17 @@ In another terminal, from the repository root:
 ```sh
 # Use the exact directory printed by the first terminal.
 SMOKE_STATE=/private/tmp/app-usagemonitor-backend-smoke.REPLACE_ME
+INVITE_ARGS=()
+for number in {1..20}; do
+  INVITE_ARGS+=(--invite-file "$SMOKE_STATE/invite-$number.secret")
+done
 npm run product:backend:smoke -- \
   --origin http://127.0.0.1:8792 \
   --file /absolute/path/to/telemetry-contribution-000001.json \
-  --invite-file "$SMOKE_STATE/invite-1.secret" \
-  --invite-file "$SMOKE_STATE/invite-2.secret" \
-  --invite-file "$SMOKE_STATE/invite-3.secret"
+  "${INVITE_ARGS[@]}"
 ```
 
-The smoke validates owner-only files, redeems three invitations without
+The smoke validates owner-only files, redeems twenty invitations without
 printing them, and proves:
 
 - exact Secure, HttpOnly, SameSite=Strict `__Host-` session cookies;
@@ -82,18 +85,26 @@ printing them, and proves:
 - strict validation, D1 ingest, opaque R2 quarantine, and recomputed personal
   statistics;
 - idempotent replay using a fresh upload authorization;
-- aggregate diagnostic suppression at one participant and development-only
-  availability at three;
+- a fixed unavailable response before scheduled publication;
+- a production-shaped 20-participant weekly snapshot built through Wrangler's
+  scheduled-handler test route;
+- byte-identical reads through both public aliases without participant counts,
+  model fingerprints, or client-declared cost;
 - bounded participant export with no invitation, session, CSRF, recovery,
   upload, or eligibility capability;
 - recovery rotation with a bounded lost-response retry, security reset, revoked
-  pending uploads, and logout cookie clearing; and
-- complete deletion of all three participants.
+  pending uploads, and logout cookie clearing;
+- snapshot withdrawal when deletion starts; and
+- complete deletion of all twenty participants.
 
 It attempts participant cleanup in a `finally` block if an intermediate
 assertion fails. The command prints only a content-free summary; it never
 prints an invitation, session, CSRF, upload, recovery, participant,
 contribution, or row value.
+
+The Worker runtime suite, rather than this transport smoke, supplies the exact
+assertions for per-participant clipping, independent metric support,
+null-versus-explicit-zero handling, cutoff exclusion, and rounding.
 
 After the server stops, inspect the isolated D1 counts and R2 blob directory,
 then move the whole isolated state to Trash:
@@ -110,13 +121,25 @@ npx wrangler d1 execute USAGE_MONITOR_DB \
     (SELECT COUNT(*) FROM upload_authorizations) AS uploads,
     (SELECT COUNT(*) FROM recovery_retry_receipts) AS recovery_receipts;"
 
+npx wrangler d1 execute USAGE_MONITOR_DB \
+  --local \
+  --persist-to "$SMOKE_STATE/state" \
+  --command "SELECT
+    (SELECT COUNT(*) FROM community_snapshot_builders) AS builders,
+    (SELECT COUNT(*) FROM community_weekly_snapshots) AS snapshots,
+    (SELECT COUNT(*) FROM community_weekly_snapshots
+      WHERE release_state = 'withdrawn') AS withdrawn_snapshots;"
+
 find "$SMOKE_STATE/state/v3/r2/app-usagemonitor-synthetic-quarantine/blobs" \
   -type f -print
 trash "$SMOKE_STATE"
 ```
 
-The expected result is zero for every D1 count and no R2 blob path. The final
-`trash` operation is macOS-specific and recoverable.
+The expected result is zero for every participant/session/upload/contribution/
+record/recovery count, zero builders, one retained immutable snapshot row in
+the `withdrawn` state, and no R2 blob path. The snapshot tombstone is retained
+deliberately so a deleted historical week cannot be rebuilt and compared. The
+final `trash` operation is macOS-specific and recoverable.
 
 `grant:issue` is local-only. It prints the invitation once when no output file
 is supplied. `--output-file` first reserves and syncs a new mode-0600 file
@@ -186,17 +209,21 @@ The real test contract is:
   `client_declared_unverified` until server-side repricing is implemented.
 
 In `invite_only` mode, only participants admitted with distinct one-time
-invitation grants count toward community statistics. Local-open participants
-cannot unlock the cohort. Community statistics are suppressed below three
-eligible contributing participants, and model/day slices are independently
-suppressed below that same threshold. These changing cumulative totals remain
-development diagnostics: cohort thresholds do not prevent before/after
-differencing. Public release requires delayed immutable weekly snapshots,
-independent per-cell support, per-participant clipping, coarse rounding, and a
-fixed ingestion cutoff.
-Deleting a contribution removes its opaque R2 object and cascades its D1 rows.
+invitation grants count toward community snapshots. Local-open participants
+cannot unlock a public cell. Each snapshot covers one non-overlapping UTC week,
+uses a fixed 48-hour ingestion cutoff, and requires at least twenty independent
+eligible participants in every released provider/model cell. Metrics are
+clipped per participant before summation, rounded down, and independently
+suppressed when they lack support. No exact cohort count, exact metric support,
+model fingerprint, or client-declared cost is released. Public reads return
+only sealed stored bytes; they never compute live aggregate totals.
+Deleting a contribution first marks its D1 row as `deleting`, atomically
+withdraws snapshots, and only then removes its opaque R2 object and cascades
+its D1 rows. A failed object deletion is retryable without restoring public
+snapshot access.
 Deleting a participant removes every R2 object before deleting the participant
-and all dependent D1 rows, including its private eligibility relation.
+and all dependent D1 rows, including its private eligibility relation. Either
+deletion first withdraws all sealed snapshots and cancels active builders.
 
 ## Production gate
 

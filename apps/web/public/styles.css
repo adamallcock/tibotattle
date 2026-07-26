@@ -460,6 +460,14 @@ tbody tr:last-child td { border-bottom: 0; }
 .result-metrics > div { padding: 12px; border: 1px solid var(--line); border-radius: .35rem; }
 .result-metrics span { display: block; color: var(--muted); font-size: .6rem; text-transform: uppercase; }
 .result-metrics strong { font-family: var(--serif); font-size: 1.2rem; font-weight: 500; }
+.snapshot-heading { display: grid; gap: 4px; margin-bottom: 12px; }
+.snapshot-heading strong { font-family: var(--serif); font-size: 1rem; font-weight: 500; }
+.snapshot-heading span, .snapshot-disclosure, .snapshot-partial { color: var(--muted); font-size: .68rem; }
+.snapshot-partial { color: var(--rust); }
+.snapshot-table { margin-top: 14px; }
+.snapshot-table table { min-width: 920px; }
+.snapshot-table th, .snapshot-table td { white-space: nowrap; }
+.snapshot-table .suppressed-value { color: var(--muted); font-style: italic; }
 .participant-controls { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .recovery-once { margin-top: 14px; padding: 15px; border: 1px solid var(--amber); border-radius: .35rem; background: var(--amber-soft); }
 .recovery-once strong, .recovery-once p, .recovery-once code { display: block; }

@@ -6,13 +6,17 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createSyntheticEnvelope } from "../../web/public/lib.js";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { hashInviteGrantSecret } from "../src/admission";
-import { handleRequest } from "../src/index";
+import worker, { handleRequest } from "../src/index";
 import {
   createSessionMaterial,
   sessionCookie,
   sessionInsert,
 } from "../src/session";
 import { syntheticFixture } from "../src/validation";
+import {
+  buildCommunityWeeklySnapshot,
+  communityWeekForScheduledTime,
+} from "../src/community-snapshots";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -330,6 +334,33 @@ function telemetryFixture(suffix = "a"): Record<string, unknown> {
       priceBasis: "current_api_prices",
     },
   };
+}
+
+async function seedSealedSuppressedSnapshot(): Promise<void> {
+  const payload = JSON.stringify({
+    schemaVersion: "community-weekly-snapshot-v0.1",
+    releaseStatus: "suppressed",
+    immutable: true,
+    nonOverlapping: true,
+    cells: [],
+    reason: "privacy_release_policy_not_met",
+  });
+  await testBindings().USAGE_MONITOR_DB.prepare(
+    `INSERT INTO community_weekly_snapshots (
+      snapshot_id, week_start, week_end, ingestion_cutoff_at, released_at,
+      policy_version, payload_json, payload_sha256, release_state, sealed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'suppressed', ?)`,
+  ).bind(
+    "community-weekly:2026-07-20",
+    "2026-07-20T00:00:00.000Z",
+    "2026-07-27T00:00:00.000Z",
+    "2026-07-29T00:00:00.000Z",
+    "2026-07-29T00:00:00.000Z",
+    "community-weekly-v0.1",
+    payload,
+    await sha256Hex(payload),
+    "2026-07-29T00:00:00.000Z",
+  ).run();
 }
 
 beforeAll(async () => {
@@ -1415,10 +1446,9 @@ describe("synthetic usage monitor service", () => {
 
     const community = await api("/api/v1/community/insights");
     await expect(community.json()).resolves.toMatchObject({
-      publicationStatus: "development_diagnostic_not_publication_safe",
-      suppressed: true,
-      participantCount: 1,
-      minimumParticipants: 3,
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      releaseStatus: "not_yet_published",
+      reason: "stable_snapshot_unavailable",
     });
 
     const stored = await testBindings().USAGE_MONITOR_DB.prepare(
@@ -1477,7 +1507,7 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
 
-  it("labels thresholded live community slices as development-only diagnostics", async () => {
+  it("never serves the old live aggregate when no stable snapshot exists", async () => {
     for (const suffix of ["a", "b", "c"]) {
       const participant = await enrollTelemetry();
       const response = await uploadEnvelope(
@@ -1490,14 +1520,265 @@ describe("synthetic usage monitor service", () => {
     expect(response.status).toBe(200);
     const body = await response.json<Record<string, unknown>>();
     expect(body).toMatchObject({
-      publicationStatus: "development_diagnostic_not_publication_safe",
-      suppressed: false,
-      participantCount: 3,
-      totals: { usageEvents: 3, quotaSnapshots: 3 },
-      byModel: [{ modelId: "gpt-5.6-sol", participants: 3 }],
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      releaseStatus: "not_yet_published",
+      reason: "stable_snapshot_unavailable",
     });
-    expect(JSON.stringify(body)).not.toContain("participant:");
-    expect(JSON.stringify(body)).not.toContain("model:v1:");
+    expect(JSON.stringify(body)).not.toContain("participantCount");
+    expect(JSON.stringify(body)).not.toContain("totals");
+    await expect(buildCommunityWeeklySnapshot(
+      testBindings().USAGE_MONITOR_DB,
+      Date.parse("2026-07-29T00:00:00.000Z"),
+    )).resolves.toMatchObject({ state: "built" });
+    const sealedSuppressionText = await (
+      await api("/api/v1/stats/aggregate")
+    ).text();
+    expect(JSON.parse(sealedSuppressionText)).toMatchObject({
+      releaseStatus: "suppressed",
+      reason: "privacy_release_policy_not_met",
+      immutable: true,
+      nonOverlapping: true,
+      cells: [],
+    });
+    expect(sealedSuppressionText).not.toContain("participantCount");
+  });
+
+  it("uses the scheduled event time and waitUntil to seal a weekly snapshot", async () => {
+    const waits: Promise<unknown>[] = [];
+    worker.scheduled?.(
+      {
+        cron: "",
+        scheduledTime: Date.parse("2026-07-29T00:00:00.000Z"),
+        noRetry() {},
+      },
+      testBindings(),
+      {
+        waitUntil(promise) {
+          waits.push(promise);
+        },
+      } as ExecutionContext,
+    );
+    expect(waits).toHaveLength(1);
+    await Promise.all(waits);
+    const sealed = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT week_start, week_end, release_state FROM community_weekly_snapshots",
+    ).first<{ week_start: string; week_end: string; release_state: string }>();
+    expect(sealed).toEqual({
+      week_start: "2026-07-20T00:00:00.000Z",
+      week_end: "2026-07-27T00:00:00.000Z",
+      release_state: "suppressed",
+    });
+  });
+
+  it("seals, serves, protects, and withdraws a clipped weekly snapshot", async () => {
+    let participantToDelete: EnrollmentResponse | null = null;
+    let contributionToDelete = "";
+    const cohort: EnrollmentResponse[] = [];
+    for (let index = 0; index < 20; index += 1) {
+      const grant = await issueTestGrant();
+      const enrolled = await enrollWithGrant(grant);
+      expect(enrolled.status).toBe(201);
+      const participant = await enrollmentFrom(enrolled);
+      cohort.push(participant);
+      participantToDelete ??= participant;
+      const contribution = await uploadEnvelope(
+        participant,
+        await encrypt(telemetryFixture("a"), true),
+      );
+      expect(contribution.status).toBe(202);
+      const contributionBody = await contribution.json<{ contributionId: string }>();
+      if (index === 0) contributionToDelete = contributionBody.contributionId;
+    }
+    const cutoffContribution = await uploadEnvelope(
+      cohort[0]!,
+      await encrypt(telemetryFixture("b"), true),
+    );
+    expect(cutoffContribution.status).toBe(202);
+    const cutoffContributionBody = await cutoffContribution.json<{
+      contributionId: string;
+    }>();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+    ).bind(
+      "2026-07-29T00:00:00.000Z",
+      cutoffContributionBody.contributionId,
+    ).run();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE telemetry_records
+          SET input_uncached_tokens = 9000000,
+              output_reasoning_tokens = NULL,
+              tool_units = 2000
+        WHERE participant_id = ? AND record_kind = 'usage'`,
+    ).bind(cohort[0]!.participantId).run();
+    const scheduledTime = Date.parse("2026-07-29T00:00:00.000Z");
+    expect(communityWeekForScheduledTime(scheduledTime)).toEqual({
+      startAt: "2026-07-20T00:00:00.000Z",
+      endAt: "2026-07-27T00:00:00.000Z",
+      cutoffAt: "2026-07-29T00:00:00.000Z",
+    });
+    const built = await Promise.all([
+      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
+      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
+    ]);
+    expect(built.filter((result) => result.state === "built")).toHaveLength(1);
+    expect(built.every((result) => [
+      "built", "existing", "lease_unavailable",
+    ].includes(result.state))).toBe(true);
+    const response = await api("/api/v1/stats/aggregate");
+    const publishedText = await response.text();
+    const published = JSON.parse(publishedText) as Record<string, unknown>;
+    expect(published).toMatchObject({
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      releaseStatus: "published",
+      immutable: true,
+      nonOverlapping: true,
+      period: {
+        startAt: "2026-07-20T00:00:00.000Z",
+        endAt: "2026-07-27T00:00:00.000Z",
+      },
+      ingestionCutoffAt: "2026-07-29T00:00:00.000Z",
+      releasedAt: "2026-07-29T00:00:00.000Z",
+      cells: [{
+        provider: "openai_codex",
+        modelId: "gpt-5.6-sol",
+        metrics: {
+          usageEvents: {
+            status: "released",
+            value: 20,
+            unit: "events_rounded_down",
+          },
+          inputUncachedTokens: {
+            status: "released",
+            value: 5_000_000,
+            unit: "tokens_rounded_down",
+          },
+          inputCacheWriteTokens: {
+            status: "released",
+            value: 0,
+            unit: "tokens_rounded_down",
+          },
+          outputCombinedTokens: { status: "suppressed" },
+          outputReasoningTokens: { status: "suppressed" },
+          toolUnits: {
+            status: "released",
+            value: 1_090,
+            unit: "tool_units_rounded_down",
+          },
+        },
+      }],
+    });
+    for (const forbidden of [
+      "participantCount", "participant_id", "estimatedApiCost", "eligibility:",
+      "occurrence_id", "model:v1:", "record_json",
+    ]) {
+      expect(publishedText).not.toContain(forbidden);
+    }
+    const sealed = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT snapshot_id, payload_json, payload_sha256, release_state
+         FROM community_weekly_snapshots`,
+    ).all();
+    expect(sealed.results).toHaveLength(1);
+    expect(Reflect.get(sealed.results[0]!, "payload_json")).toBe(publishedText);
+    expect(Reflect.get(sealed.results[0]!, "payload_sha256")).toBe(
+      await sha256Hex(publishedText),
+    );
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE telemetry_records
+          SET input_uncached_tokens = input_uncached_tokens + 99999
+        WHERE participant_id = ? AND occurrence_id = ?`,
+    ).bind(cohort[0]!.participantId, `event:v2:${"b".repeat(64)}`).run();
+    await expect(
+      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
+    ).resolves.toMatchObject({ state: "existing" });
+    expect(await (await api("/api/v1/stats/aggregate")).text()).toBe(publishedText);
+    await expect(testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE community_weekly_snapshots SET payload_json = '{}'`,
+    ).run()).rejects.toThrow();
+    await expect(testBindings().USAGE_MONITOR_DB.prepare(
+      "DELETE FROM community_weekly_snapshots",
+    ).run()).rejects.toThrow();
+
+    const deleted = await api(
+      `/api/v1/contributions/${encodeURIComponent(contributionToDelete)}`,
+      {
+      method: "DELETE",
+      headers: personalHeaders(participantToDelete!, { csrf: true }),
+      },
+    );
+    expect(deleted.status).toBe(200);
+    const withdrawn = await api("/api/v1/stats/aggregate");
+    const withdrawnText = await withdrawn.text();
+    expect(JSON.parse(withdrawnText)).toMatchObject({
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      releaseStatus: "withdrawn",
+      reason: "source_data_withdrawn",
+      immutable: true,
+      nonOverlapping: true,
+    });
+    expect(withdrawnText).not.toContain("\"cells\"");
+    await expect(testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE community_weekly_snapshots
+          SET release_state = 'published',
+              withdrawn_at = NULL,
+              withdrawal_epoch = NULL`,
+    ).run()).rejects.toThrow();
+    await expect(
+      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
+    ).resolves.toMatchObject({ state: "existing" });
+  });
+
+  it("withdraws a sealed snapshot before a contribution R2 deletion can fail", async () => {
+    const participant = await enrollTelemetry();
+    const uploaded = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    expect(uploaded.status).toBe(202);
+    const { contributionId } = await uploaded.json<{ contributionId: string }>();
+    await seedSealedSuppressedSnapshot();
+
+    const baseBucket = testBindings().QUARANTINE;
+    const failingBucket = new Proxy(baseBucket, {
+      get(target, property) {
+        if (property === "delete") {
+          return async (..._keys: Parameters<R2Bucket["delete"]>) => {
+            throw new Error("injected contribution R2 deletion failure");
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const failed = await api(
+      `/api/v1/contributions/${encodeURIComponent(contributionId)}`,
+      {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      },
+      testBindings({ QUARANTINE: failingBucket }),
+    );
+    expect(failed.status).toBe(500);
+    const row = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT status FROM telemetry_contributions WHERE id = ?",
+    ).bind(contributionId).first<{ status: string }>();
+    expect(row?.status).toBe("deleting");
+    const withdrawn = await api("/api/v1/stats/aggregate");
+    const withdrawnText = await withdrawn.text();
+    expect(JSON.parse(withdrawnText)).toMatchObject({
+      releaseStatus: "withdrawn",
+      immutable: true,
+      nonOverlapping: true,
+    });
+    expect(withdrawnText).not.toContain("\"cells\"");
+
+    const retried = await api(
+      `/api/v1/contributions/${encodeURIComponent(contributionId)}`,
+      {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      },
+    );
+    expect(retried.status).toBe(200);
   });
 
   it("does not let local-open participants unlock invite-only community aggregates", async () => {
@@ -1515,10 +1796,9 @@ describe("synthetic usage monitor service", () => {
       inviteOnlyBindings(),
     );
     await expect(suppressed.json()).resolves.toMatchObject({
-      publicationStatus: "development_diagnostic_not_publication_safe",
-      suppressed: true,
-      participantCount: 0,
-      cohortEligibility: "invite_only",
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      releaseStatus: "not_yet_published",
+      reason: "stable_snapshot_unavailable",
     });
 
     let invitedParticipant: EnrollmentResponse | null = null;
@@ -1541,11 +1821,9 @@ describe("synthetic usage monitor service", () => {
     );
     const communityText = await community.text();
     expect(JSON.parse(communityText)).toMatchObject({
-      publicationStatus: "development_diagnostic_not_publication_safe",
-      suppressed: false,
-      participantCount: 3,
-      cohortEligibility: "invite_only",
-      totals: { usageEvents: 3, quotaSnapshots: 3 },
+      schemaVersion: "community-weekly-snapshot-v0.1",
+      releaseStatus: "not_yet_published",
+      reason: "stable_snapshot_unavailable",
     });
     for (const forbidden of ["eligibility:", "um_invite_", "grant_id"]) {
       expect(communityText).not.toContain(forbidden);
@@ -1569,6 +1847,7 @@ describe("synthetic usage monitor service", () => {
     expect(contribution.status).toBe(202);
     const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("b"), true));
     const pendingUpload = await registerUpload(participant, pendingRaw);
+    await seedSealedSuppressedSnapshot();
 
     const otherSession = await createSessionMaterial(participant.participantId);
     await sessionInsert(testBindings().USAGE_MONITOR_DB, otherSession).run();
@@ -1606,6 +1885,12 @@ describe("synthetic usage monitor service", () => {
     expect(responses.filter((response) => response.status === 500)).toHaveLength(1);
     expect(responses.filter((response) => [401, 409].includes(response.status))).toHaveLength(1);
     expect(deleteCalls).toBe(1);
+    const withdrawnSnapshot = await api("/api/v1/stats/aggregate");
+    await expect(withdrawnSnapshot.json()).resolves.toMatchObject({
+      releaseStatus: "withdrawn",
+      immutable: true,
+      nonOverlapping: true,
+    });
 
     const state = await testBindings().USAGE_MONITOR_DB.prepare(
       "SELECT state, deletion_session_id FROM participants WHERE id = ?",

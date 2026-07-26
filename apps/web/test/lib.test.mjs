@@ -16,11 +16,48 @@ import {
   validateTelemetryContribution
 } from "../public/lib.js";
 import {
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   CommunityClient,
   demoDashboard,
   LocalCompanionClient,
+  normalizeCommunitySnapshot,
   normalizeDashboardPayload
 } from "../public/data-client.js";
+
+function communitySnapshot() {
+  const releasedTokens = { status: "released", value: 100_000, unit: "tokens_rounded_down" };
+  return {
+    schemaVersion: COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+    releaseStatus: "published",
+    snapshotId: "community-week:2026-07-13",
+    period: {
+      startAt: "2026-07-13T00:00:00.000Z",
+      endAt: "2026-07-20T00:00:00.000Z"
+    },
+    ingestionCutoffAt: "2026-07-22T00:00:00.000Z",
+    releasedAt: "2026-07-22T00:00:00.000Z",
+    immutable: true,
+    nonOverlapping: true,
+    privacyPolicy: {
+      version: "community-weekly-v0.1",
+      minimumIndependentParticipants: 20
+    },
+    cells: [{
+      provider: "openai_codex",
+      modelId: "gpt-5.6-sol",
+      metrics: {
+        usageEvents: { status: "released", value: 30, unit: "events_rounded_down" },
+        inputUncachedTokens: releasedTokens,
+        inputCacheReadTokens: releasedTokens,
+        inputCacheWriteTokens: releasedTokens,
+        outputTextTokens: releasedTokens,
+        outputReasoningTokens: releasedTokens,
+        outputCombinedTokens: releasedTokens,
+        toolUnits: { status: "released", value: 10, unit: "tool_units_rounded_down" }
+      }
+    }]
+  };
+}
 
 function safeTelemetry() {
   const toolClassCounts = {
@@ -424,6 +461,48 @@ test("community adapter separates cookie sessions from one-use upload authority"
   assert.match(calls[11].options.body, /um_recovery_test/);
 });
 
+test("community snapshots fail closed and never disclose threshold distance", () => {
+  const published = normalizeCommunitySnapshot(communitySnapshot());
+  assert.equal(published.state, "published");
+  assert.equal(published.minimumIndependentParticipants, 20);
+  assert.equal(published.cells[0].metrics.usageEvents.value, 30);
+
+  const partialPayload = structuredClone(communitySnapshot());
+  partialPayload.cells[0].metrics.outputReasoningTokens = { status: "suppressed" };
+  assert.equal(normalizeCommunitySnapshot(partialPayload).state, "published_partial");
+  delete partialPayload.cells[0].metrics.outputReasoningTokens;
+  assert.equal(normalizeCommunitySnapshot(partialPayload).state, "unsupported_schema");
+
+  const suppressedPayload = {
+    ...communitySnapshot(),
+    releaseStatus: "suppressed",
+    reason: "minimum_cell_support_not_met",
+    participantCount: 19,
+    cells: []
+  };
+  const suppressed = normalizeCommunitySnapshot(suppressedPayload);
+  assert.equal(suppressed.state, "suppressed");
+  assert.equal(Object.hasOwn(suppressed, "participantCount"), false);
+
+  assert.equal(normalizeCommunitySnapshot({
+    publicationStatus: "development_diagnostic_not_publication_safe"
+  }).state, "development_unsafe");
+  assert.equal(normalizeCommunitySnapshot({
+    ...communitySnapshot(),
+    immutable: false
+  }).state, "unsupported_schema");
+  assert.equal(normalizeCommunitySnapshot({
+    ...communitySnapshot(),
+    releaseStatus: "withdrawn",
+    cells: []
+  }).state, "withdrawn");
+  assert.equal(normalizeCommunitySnapshot({
+    ...communitySnapshot(),
+    releaseStatus: "not_yet_published",
+    cells: []
+  }).state, "not_yet_published");
+});
+
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -445,7 +524,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });
 
-test("real contribution UI encrypts before sending and distinguishes aggregate suppression", async () => {
+test("real contribution UI encrypts before sending and renders delayed snapshots", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /createTelemetryEnvelope/);
   assert.match(appSource, /communityClient\.registerUpload\(/);
@@ -456,8 +535,10 @@ test("real contribution UI encrypts before sending and distinguishes aggregate s
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
   assert.match(appSource, /showRecoveryCodeOnce\(enrollment\.recoveryCode\)/);
   assert.match(appSource, /showRecoveryCodeOnce\(null\)/);
-  assert.match(appSource, /if \(payload\.suppressed\)/);
-  assert.match(appSource, /minimumParticipants/);
+  assert.match(appSource, /normalizeCommunitySnapshot\(payload\)/);
+  assert.match(appSource, /published_partial/);
+  assert.match(appSource, /We do not disclose why or how close the cohort was/);
+  assert.doesNotMatch(appSource, /Current eligible count|payload\.participantCount/);
 });
 
 test("export filenames and reflected API errors remain bounded", () => {

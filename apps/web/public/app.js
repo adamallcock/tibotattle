@@ -1,7 +1,8 @@
 import {
   CommunityClient,
   LocalCompanionClient,
-  demoDashboard
+  demoDashboard,
+  normalizeCommunitySnapshot
 } from "./data-client.js";
 import {
   createTelemetryEnvelope,
@@ -834,19 +835,14 @@ async function submitContribution(event) {
   }
 }
 
-function renderStats(container, payload, { community = false } = {}) {
+function renderPersonalStats(container, payload) {
   clear(container);
   if (!payload) {
-    container.append(node("p", "", community ? "No aggregate result is available from the service." : "No personal result is available."));
-    return;
-  }
-  if (payload.suppressed) {
-    container.append(node("p", "", `Community results remain hidden until at least ${payload.minimumParticipants ?? 3} eligible participants contribute. Current eligible count: ${payload.participantCount ?? 0}.`));
+    container.append(node("p", "", "No personal result is available."));
     return;
   }
   const source = payload.totals ?? payload.lifetime ?? payload;
   const metrics = [
-    ["Participants", community ? finite(payload.participantCount) : null],
     ["Safe events", finite(source.eventCount ?? source.usageEvents ?? payload.recordCount)],
     ["API equivalent", finite(source.estimatedApiCostUsd ?? source.clientEstimatedApiCostUsd ?? source.costUsd)],
     ["Weekly estimate", finite(payload.insights?.weeklyLimitUsd ?? payload.weeklyEstimateUsd)]
@@ -862,6 +858,93 @@ function renderStats(container, payload, { community = false } = {}) {
     grid.append(card);
   }
   container.append(grid);
+}
+
+const COMMUNITY_METRIC_LABELS = Object.freeze({
+  usageEvents: "Usage events",
+  inputUncachedTokens: "Input uncached",
+  inputCacheReadTokens: "Cache read",
+  inputCacheWriteTokens: "Cache write",
+  outputTextTokens: "Output text",
+  outputReasoningTokens: "Reasoning output",
+  outputCombinedTokens: "Combined output",
+  toolUnits: "Tool units"
+});
+
+function renderCommunitySnapshot(container, payload) {
+  clear(container);
+  const snapshot = normalizeCommunitySnapshot(payload);
+  if (snapshot.state === "service_unavailable") {
+    container.append(node("p", "", "The central service is unavailable. This is separate from whether a weekly snapshot exists."));
+    return;
+  }
+  if (snapshot.state === "development_unsafe") {
+    container.append(node("p", "", "Live cumulative community totals are development-only and are not displayed."));
+    return;
+  }
+  if (snapshot.state === "unsupported_schema") {
+    container.append(node("p", "", "The service returned an unsupported community-snapshot contract. No values were displayed."));
+    return;
+  }
+  if (snapshot.state === "not_yet_published") {
+    container.append(node("p", "", "No stable weekly snapshot is available yet."));
+    return;
+  }
+  if (snapshot.state === "withdrawn") {
+    container.append(node("p", "", "This weekly snapshot was withdrawn for privacy or quality reasons. It was not recomputed."));
+    return;
+  }
+  if (snapshot.state === "suppressed") {
+    container.append(node("p", "", "This week did not pass the fixed privacy release policy. We do not disclose why or how close the cohort was."));
+    return;
+  }
+
+  const heading = node("div", "snapshot-heading");
+  heading.append(
+    node("strong", "", `${formatUtc(snapshot.period.startAt, { dateOnly: true })} – ${formatUtc(snapshot.period.endAt, { dateOnly: true })}`),
+    node("span", "", `Ingestion cutoff ${formatUtc(snapshot.ingestionCutoffAt)} · released ${formatUtc(snapshot.releasedAt)}`)
+  );
+  container.append(heading);
+  container.append(node(
+    "p",
+    "snapshot-disclosure",
+    `Each value is clipped per participant, independently support-gated at ${compact(snapshot.minimumIndependentParticipants)} or more participants, rounded down, and never recalculated after publication.`
+  ));
+  if (snapshot.state === "published_partial") {
+    container.append(node("p", "snapshot-partial", "Some metrics were not released because their independent support was insufficient."));
+  }
+
+  const wrap = node("div", "table-wrap snapshot-table");
+  const table = document.createElement("table");
+  const caption = node("caption", "sr-only", "Privacy-safe delayed weekly community metrics");
+  const thead = document.createElement("thead");
+  const header = document.createElement("tr");
+  for (const label of ["Provider / model", ...Object.values(COMMUNITY_METRIC_LABELS)]) {
+    const th = document.createElement("th");
+    th.scope = "col";
+    th.textContent = label;
+    header.append(th);
+  }
+  thead.append(header);
+  const tbody = document.createElement("tbody");
+  for (const cell of snapshot.cells) {
+    const row = document.createElement("tr");
+    const identity = document.createElement("th");
+    identity.scope = "row";
+    identity.textContent = `${cell.provider} · ${cell.modelId}`;
+    row.append(identity);
+    for (const metricName of Object.keys(COMMUNITY_METRIC_LABELS)) {
+      const td = document.createElement("td");
+      const metric = cell.metrics[metricName];
+      td.textContent = metric.status === "released" ? compact(metric.value) : "Not released";
+      if (metric.status !== "released") td.className = "suppressed-value";
+      row.append(td);
+    }
+    tbody.append(row);
+  }
+  table.append(caption, thead, tbody);
+  wrap.append(table);
+  container.append(wrap);
 }
 
 async function loadCommunityResults() {
@@ -880,8 +963,8 @@ async function loadCommunityResults() {
       || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
     service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
-    renderStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
-    renderStats(community, communityResult.status === "fulfilled" ? communityResult.value : null, { community: true });
+    renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
+    renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
     participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
     const enrollmentMode = healthResult.status === "fulfilled" ? healthResult.value?.enrollmentMode : null;
     $("#invite-help").textContent = enrollmentMode === "invite_only"

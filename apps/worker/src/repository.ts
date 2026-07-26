@@ -705,7 +705,7 @@ export async function markParticipantDeleting(
           )`,
     ).bind(now, participantId, participantId, currentSessionId),
   ]);
-  if (results[1]?.meta.changes !== 1) {
+  if ((results[1]?.meta.changes ?? 0) < 1) {
     const consuming = await db.prepare(
       `SELECT COUNT(*) AS total FROM upload_authorizations
         WHERE participant_id = ? AND state = 'consuming'`,

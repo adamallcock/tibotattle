@@ -5,12 +5,16 @@ import {
   parseInviteGrant,
 } from "./admission";
 import {
-  AGGREGATE_MINIMUM_PARTICIPANTS,
+  JSON_HEADERS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
   MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
+import {
+  buildCommunityWeeklySnapshot,
+  readLatestCommunityWeeklySnapshot,
+} from "./community-snapshots";
 import {
   decryptSyntheticEnvelope,
   publicEnvelopeKey,
@@ -51,11 +55,11 @@ import {
   type SessionPrincipal,
 } from "./session";
 import {
-  communityStats,
   deleteTelemetryContribution,
   existingTelemetryContribution,
   insertTelemetryContribution,
   listTelemetryContributions,
+  markTelemetryContributionDeleting,
   personalStats,
   telemetryContributionById,
   telemetryContributionCount,
@@ -688,12 +692,10 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 
 async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const mode = configuredEnrollmentMode(env);
-  return jsonResponse(await communityStats(
-    env.USAGE_MONITOR_DB,
-    AGGREGATE_MINIMUM_PARTICIPANTS,
-    { eligibleOnly: mode !== "local_open" },
-  ));
+  return new Response(
+    await readLatestCommunityWeeklySnapshot(env.USAGE_MONITOR_DB),
+    { headers: JSON_HEADERS },
+  );
 }
 
 async function handleContributionResource(
@@ -724,6 +726,13 @@ async function handleContributionResource(
   }
   if (request.method === "DELETE") {
     assertCsrf(request, session);
+    if (!await markTelemetryContributionDeleting(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      contributionId,
+    )) {
+      throw new ApiError(409, "CONTRIBUTION_DELETE_CONFLICT");
+    }
     await env.QUARANTINE.delete(row.r2_key);
     await deleteTelemetryContribution(
       env.USAGE_MONITOR_DB,
@@ -857,5 +866,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 export default {
   fetch(request, env): Promise<Response> {
     return handleRequest(request, env);
+  },
+  scheduled(event, env, context): void {
+    context.waitUntil(buildCommunityWeeklySnapshot(
+      env.USAGE_MONITOR_DB,
+      event.scheduledTime,
+    ).then(() => undefined));
   },
 } satisfies ExportedHandler<Env>;

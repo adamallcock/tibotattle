@@ -100,6 +100,8 @@ if (!contributionPathValue) {
 const contributionPath = resolve(contributionPathValue);
 const invitePaths = optionValues("--invite-file").map((value) => resolve(value));
 const sessions = [];
+const COMMUNITY_SNAPSHOT_PARTICIPANTS = 20;
+const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
 
 async function request(path, {
   method = "GET",
@@ -138,7 +140,7 @@ async function request(path, {
       throw new Error(`The backend returned non-JSON for ${method} ${path}.`);
     }
   }
-  return { response, value };
+  return { response, value, text };
 }
 
 function expectStatus(result, status, label) {
@@ -146,6 +148,42 @@ function expectStatus(result, status, label) {
     throw new Error(`${label} returned ${result.response.status}; expected ${status}.`);
   }
   return result.value;
+}
+
+function scheduledSnapshotTime(contribution) {
+  const usageTimes = contribution.usageEvents.map((event) => Date.parse(event.eventTime));
+  if (usageTimes.length === 0 || usageTimes.some((time) => !Number.isFinite(time))) {
+    throw new Error("The backend smoke contribution must contain dated usage events.");
+  }
+  const first = new Date(Math.min(...usageTimes));
+  first.setUTCHours(0, 0, 0, 0);
+  const daysSinceMonday = (first.getUTCDay() + 6) % 7;
+  const weekStart = first.getTime() - daysSinceMonday * DAY_MILLISECONDS;
+  const weekEnd = weekStart + 7 * DAY_MILLISECONDS;
+  if (usageTimes.some((time) => time < weekStart || time >= weekEnd)) {
+    throw new Error("The backend smoke usage events must fit within one Monday-to-Monday UTC week.");
+  }
+  const cutoff = weekEnd + 2 * DAY_MILLISECONDS;
+  if (Date.now() >= cutoff) {
+    throw new Error(
+      "The contribution week is already past its ingestion cutoff; prepare a current-week contribution.",
+    );
+  }
+  return cutoff;
+}
+
+async function triggerScheduledSnapshot(scheduledTime) {
+  const url = new URL("/cdn-cgi/handler/scheduled", origin);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("time", String(scheduledTime));
+  const response = await fetch(url, { redirect: "error" });
+  if (!response.ok) {
+    throw new Error(`Scheduled snapshot trigger returned ${response.status}.`);
+  }
+  const result = await response.json();
+  if (result?.outcome !== "ok") {
+    throw new Error("Scheduled snapshot trigger did not complete successfully.");
+  }
 }
 
 async function enrollParticipant(inviteCode = null) {
@@ -264,8 +302,12 @@ try {
   if (!["local_open", "invite_only"].includes(health?.enrollmentMode)) {
     throw new Error("Enrollment is disabled or the service returned an invalid enrollment mode.");
   }
-  if (health.enrollmentMode === "invite_only" && invitePaths.length !== 3) {
-    throw new Error("Invite-only aggregate smoke requires exactly three repeated --invite-file arguments.");
+  if (health.enrollmentMode === "invite_only"
+      && invitePaths.length !== COMMUNITY_SNAPSHOT_PARTICIPANTS) {
+    throw new Error(
+      `Invite-only snapshot smoke requires exactly ${COMMUNITY_SNAPSHOT_PARTICIPANTS}`
+      + " repeated --invite-file arguments.",
+    );
   }
   if (health.enrollmentMode === "local_open" && invitePaths.length !== 0) {
     throw new Error("Do not pass invitation files to a local-open smoke.");
@@ -274,6 +316,7 @@ try {
   const contributionText = await ownerOnlyFile(contributionPath, "Contribution file");
   const contribution = JSON.parse(contributionText);
   validateTelemetryContribution(contribution);
+  const scheduledTime = scheduledSnapshotTime(contribution);
   const inviteCodes = [];
   for (const path of invitePaths) {
     inviteCodes.push((await ownerOnlyFile(path, "Invitation file")).trim());
@@ -353,21 +396,23 @@ try {
     200,
     "Personal statistics",
   );
-  const suppressed = expectStatus(
+  const unavailable = expectStatus(
     await request("/api/v1/stats/aggregate"),
     200,
-    "Suppressed aggregate statistics",
+    "Unavailable aggregate snapshot",
   );
   if (contributionStatus.recordCounts?.accepted !== expectedTotal
       || personal.totals?.usageEvents !== expected.usageEvents
       || personal.totals?.quotaSnapshots !== expected.quotaSnapshots
       || personal.totals?.activityMarkers !== expected.activityMarkers
-      || suppressed.suppressed !== true
-      || suppressed.participantCount !== 1) {
+      || unavailable.releaseStatus !== "not_yet_published"
+      || unavailable.immutable !== true
+      || unavailable.nonOverlapping !== true
+      || Object.hasOwn(unavailable, "participantCount")) {
     throw new Error("Initial ingest and recomputed statistics did not match the contribution.");
   }
 
-  for (let index = 1; index < 3; index += 1) {
+  for (let index = 1; index < COMMUNITY_SNAPSHOT_PARTICIPANTS; index += 1) {
     const cohortSession = await enrollParticipant(inviteCodes[index] ?? null);
     expectStatus(
       (await upload(cohortSession, serializedEnvelope)).result,
@@ -376,13 +421,33 @@ try {
     );
   }
 
+  await triggerScheduledSnapshot(scheduledTime);
+  const aggregateResult = await request("/api/v1/stats/aggregate");
   const aggregate = expectStatus(
-    await request("/api/v1/stats/aggregate"),
+    aggregateResult,
     200,
-    "Eligible aggregate statistics",
+    "Published aggregate snapshot",
   );
-  if (aggregate.suppressed !== false || aggregate.participantCount !== 3) {
-    throw new Error("Three distinct participants did not unlock the aggregate result.");
+  const aggregateAliasResult = await request("/api/v1/community/insights");
+  const aggregateAlias = expectStatus(
+    aggregateAliasResult,
+    200,
+    "Published aggregate snapshot alias",
+  );
+  const serializedAggregate = JSON.stringify(aggregate);
+  if (aggregate.releaseStatus !== "published"
+      || aggregate.immutable !== true
+      || aggregate.nonOverlapping !== true
+      || !Array.isArray(aggregate.cells)
+      || aggregate.cells.length < 1
+      || aggregateResult.text !== aggregateAliasResult.text
+      || JSON.stringify(aggregateAlias) !== serializedAggregate
+      || ["participantCount", "participantId", "modelFingerprint", "estimatedApiCostUsd"]
+        .some((forbidden) => serializedAggregate.includes(forbidden))) {
+    throw new Error(
+      `${COMMUNITY_SNAPSHOT_PARTICIPANTS} distinct participants did not produce`
+      + " a stable privacy-safe snapshot.",
+    );
   }
 
   const participantExport = expectStatus(
@@ -481,7 +546,36 @@ try {
   if (primary.cookie !== null) throw new Error("Logout did not clear the local cookie jar.");
   await recover(primary);
 
-  for (const session of sessions) {
+  const contributionDeletion = expectStatus(
+    await request(
+      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
+      {
+        method: "DELETE",
+        session: primary,
+        csrf: true,
+      },
+    ),
+    200,
+    "Contribution deletion",
+  );
+  if (contributionDeletion.deleted !== true) {
+    throw new Error("Contribution deletion did not complete.");
+  }
+  const withdrawn = expectStatus(
+    await request("/api/v1/stats/aggregate"),
+    200,
+    "Withdrawn aggregate snapshot",
+  );
+  const serializedWithdrawn = JSON.stringify(withdrawn);
+  if (withdrawn.releaseStatus !== "withdrawn"
+      || withdrawn.immutable !== true
+      || withdrawn.nonOverlapping !== true
+      || ["cells", "participantCount", "participantId", "modelFingerprint"]
+        .some((forbidden) => serializedWithdrawn.includes(forbidden))) {
+    throw new Error("Contribution deletion did not withdraw the published snapshot safely.");
+  }
+
+  for (const [index, session] of sessions.entries()) {
     const deletion = expectStatus(
       await request("/api/v1/me", {
         method: "DELETE",
@@ -491,7 +585,9 @@ try {
       200,
       "Participant deletion",
     );
-    if (deletion.deleted !== true || deletion.contributionsDeleted !== 1) {
+    const expectedDeletedContributions = index === 0 ? 0 : 1;
+    if (deletion.deleted !== true
+        || deletion.contributionsDeleted !== expectedDeletedContributions) {
       throw new Error("Participant deletion did not remove the expected contribution.");
     }
     session.deleted = true;
@@ -501,17 +597,19 @@ try {
     status: "passed",
     origin: origin.origin,
     enrollmentMode: health.enrollmentMode,
-    participants: 3,
+    participants: COMMUNITY_SNAPSHOT_PARTICIPANTS,
     acceptedRecordsPerParticipant: expectedTotal,
     idempotentReplay: true,
     personalStatisticsRecomputed: true,
-    aggregateSuppressedAtOne: true,
-    aggregateDevelopmentAvailableAtThree: true,
+    aggregateUnavailableBeforeSchedule: true,
+    aggregatePublishedAtTwenty: true,
+    aggregateStoredBytesStableAcrossAliases: true,
+    aggregateWithdrawnOnContributionDeletion: true,
     authorityIsolation: true,
     recoveryRotated: true,
     securityResetRevokedUpload: true,
     logoutClearedCookie: true,
-    participantsDeleted: 3,
+    participantsDeleted: COMMUNITY_SNAPSHOT_PARTICIPANTS,
   }, null, 2)}\n`);
 } finally {
   for (const session of sessions) await cleanupParticipant(session);

@@ -109,12 +109,13 @@ const TOOL_CLASSES = [
 ] as const;
 type ToolClass = typeof TOOL_CLASSES[number];
 
-const MODEL_IDS = new Set([
+export const TELEMETRY_MODEL_IDS = [
   "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
   "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
   "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
   "claude-sonnet-4-6", "claude-sonnet-5",
-]);
+] as const;
+const MODEL_IDS = new Set<string>(TELEMETRY_MODEL_IDS);
 const OPENAI_MODELS = new Set([...MODEL_IDS].filter((value) => value === "unknown" || value.startsWith("gpt-")));
 const CLAUDE_MODELS = new Set([...MODEL_IDS].filter((value) => value === "unknown" || value.startsWith("claude-")));
 const ACTIVITY_SURFACES = new Set([

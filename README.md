@@ -200,8 +200,8 @@ parameter. Refresh is an explicit same-origin action and remains single-flight
 until the collector finishes.
 
 To exercise both product surfaces, start the central Worker on a separate port
-and optionally let the companion read its health and thresholded development
-community diagnostics:
+and optionally let the companion read its health and delayed weekly community
+snapshot:
 
 ```bash
 npm --prefix apps/worker run migrate:local
@@ -213,7 +213,7 @@ USAGE_MONITOR_PORT=8791 \
 
 The relay accepts only the reviewed central API routes and cannot proxy a
 request-selected URL. Specifically, it forwards only unauthenticated `GET`
-requests for health, the envelope key, and thresholded aggregate diagnostics. It cannot
+requests for health, the envelope key, and stored aggregate snapshots. It cannot
 forward enrollment, recovery, uploads, personal sessions, personal statistics,
 exports, security controls, deletion, authorization headers, cookies, CSRF
 values, or upstream cookies.
@@ -258,17 +258,15 @@ builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
 Worker dry deployment. It does not deploy or upload data.
 
 For a real HTTP backend smoke using an actual prepared contribution, run the
-Worker in invite-only mode. Issue three invitation grants so the smoke can
-prove both suppression at one participant and development-only availability
-at the three-person threshold, then use:
+Worker in invite-only mode. Issue twenty invitation grants so the smoke can
+exercise the production-shaped public support threshold. Build the repeated
+arguments as shown in the Worker runbook, then use:
 
 ```bash
 npm run product:backend:smoke -- \
   --origin http://127.0.0.1:8792 \
   --file /absolute/path/to/telemetry-contribution-000001.json \
-  --invite-file /private/tmp/usage-monitor-invite-1.secret \
-  --invite-file /private/tmp/usage-monitor-invite-2.secret \
-  --invite-file /private/tmp/usage-monitor-invite-3.secret
+  "${INVITE_ARGS[@]}"
 ```
 
 The [Worker runbook](./apps/worker/README.md) contains the full migration,
@@ -276,10 +274,11 @@ owner-only invitation, server-start, smoke, and cleanup sequence. The smoke
 exercises Secure/HttpOnly session issuance, CSRF, authority isolation,
 one-use upload registration, client encryption, strict server validation, D1
 ingest, opaque R2 retention, idempotent replay with a new upload
-authorization, personal statistics, suppressed and eligible community
-statistics, recovery rotation, security reset, logout, participant export,
-complete deletion, and post-deletion cleanup. It prints no participant or
-credential values and leaves external deployment disabled.
+authorization, personal statistics, scheduled immutable snapshot publication,
+stable public bytes, recovery rotation, security reset, logout, participant
+export, snapshot withdrawal, complete deletion, and post-deletion cleanup. It
+prints no participant or credential values and leaves external deployment
+disabled.
 
 The [functional end-to-end verification
 receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
@@ -287,6 +286,12 @@ fresh real-data local smoke: two encrypted batches, personal-stat updates,
 idempotent replay, aggregate suppression, server-side privacy-canary rejection,
 participant export, browser-driven complete deletion, and zero retained local
 D1/R2 records afterward.
+
+The [privacy-safe weekly aggregate verification
+receipt](./2026-07-26-g4-privacy-safe-weekly-aggregate-verification-receipt.md)
+records the current 20-participant scheduled-publication smoke, immutable
+snapshot/deletion lifecycle, post-cleanup D1/R2 counts, and rendered
+published/withdrawn UI checks.
 
 ## Local metadata exporter privacy boundary
 

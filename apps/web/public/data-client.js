@@ -21,6 +21,18 @@
 
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
+export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
+
+const COMMUNITY_METRIC_UNITS = Object.freeze({
+  usageEvents: "events_rounded_down",
+  inputUncachedTokens: "tokens_rounded_down",
+  inputCacheReadTokens: "tokens_rounded_down",
+  inputCacheWriteTokens: "tokens_rounded_down",
+  outputTextTokens: "tokens_rounded_down",
+  outputReasoningTokens: "tokens_rounded_down",
+  outputCombinedTokens: "tokens_rounded_down",
+  toolUnits: "tool_units_rounded_down"
+});
 
 function array(value) {
   if (Array.isArray(value)) return value;
@@ -36,6 +48,100 @@ function finite(value, fallback = null) {
 
 function text(value, fallback = "") {
   return typeof value === "string" && value.length <= 500 ? value : fallback;
+}
+
+function snapshotMetric(value, expectedUnit) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  if (value.status === "suppressed") {
+    return { status: "suppressed", value: null, unit: expectedUnit };
+  }
+  const numeric = finite(value.value, null);
+  if (value.status !== "released"
+      || value.unit !== expectedUnit
+      || numeric === null
+      || !Number.isSafeInteger(numeric)
+      || numeric < 0) {
+    return null;
+  }
+  return { status: "released", value: numeric, unit: expectedUnit };
+}
+
+export function normalizeCommunitySnapshot(payload) {
+  if (!payload) return { state: "service_unavailable", cells: [] };
+  if (payload.publicationStatus === "development_diagnostic_not_publication_safe") {
+    return { state: "development_unsafe", cells: [] };
+  }
+  if (payload.schemaVersion !== COMMUNITY_SNAPSHOT_SCHEMA_VERSION
+      || payload.immutable !== true
+      || payload.nonOverlapping !== true) {
+    return { state: "unsupported_schema", cells: [] };
+  }
+
+  const base = {
+    snapshotId: text(payload.snapshotId, ""),
+    period: {
+      startAt: text(payload.period?.startAt, ""),
+      endAt: text(payload.period?.endAt, "")
+    },
+    ingestionCutoffAt: text(payload.ingestionCutoffAt, ""),
+    releasedAt: text(payload.releasedAt, ""),
+    policyVersion: text(payload.privacyPolicy?.version, ""),
+    minimumIndependentParticipants: finite(
+      payload.privacyPolicy?.minimumIndependentParticipants,
+      null
+    ),
+    cells: []
+  };
+
+  if (payload.releaseStatus === "not_yet_published") {
+    return { ...base, state: "not_yet_published" };
+  }
+  if (payload.releaseStatus === "withdrawn") {
+    return { ...base, state: "withdrawn" };
+  }
+  if (payload.releaseStatus === "suppressed") {
+    return { ...base, state: "suppressed" };
+  }
+  if (payload.releaseStatus !== "published"
+      || !base.snapshotId
+      || !base.period.startAt
+      || !base.period.endAt
+      || !base.ingestionCutoffAt
+      || !base.releasedAt
+      || !base.policyVersion
+      || !Number.isSafeInteger(base.minimumIndependentParticipants)
+      || base.minimumIndependentParticipants < 3
+      || !Array.isArray(payload.cells)
+      || payload.cells.length > 100) {
+    return { ...base, state: "unsupported_schema" };
+  }
+
+  const cells = [];
+  let partial = false;
+  for (const candidate of payload.cells) {
+    const provider = text(candidate?.provider, "");
+    const modelId = text(candidate?.modelId, "");
+    if (!provider || !modelId || !candidate.metrics
+        || typeof candidate.metrics !== "object"
+        || Array.isArray(candidate.metrics)) {
+      return { ...base, state: "unsupported_schema" };
+    }
+    const metrics = {};
+    for (const [metricName, expectedUnit] of Object.entries(COMMUNITY_METRIC_UNITS)) {
+      const metric = snapshotMetric(candidate.metrics[metricName], expectedUnit);
+      if (!metric) return { ...base, state: "unsupported_schema" };
+      metrics[metricName] = metric;
+      partial ||= metric.status === "suppressed";
+    }
+    cells.push({ provider, modelId, metrics });
+  }
+  return {
+    ...base,
+    state: partial ? "published_partial" : "published",
+    cells
+  };
 }
 
 function artifactData(payload) {
@@ -409,12 +515,7 @@ export class CommunityClient {
   }
 
   async communityStats() {
-    try {
-      return await fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/stats/aggregate`);
-    } catch (error) {
-      if (error.status !== 404) throw error;
-      return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/community/insights`);
-    }
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/stats/aggregate`);
   }
 
   participantExport() {

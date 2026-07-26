@@ -319,6 +319,23 @@ export async function deleteTelemetryContribution(
   ]);
 }
 
+export async function markTelemetryContributionDeleting(
+  db: D1Database,
+  participantId: string,
+  contributionId: string,
+): Promise<boolean> {
+  await db.prepare(
+    `UPDATE telemetry_contributions
+        SET status = 'deleting'
+      WHERE participant_id = ? AND id = ? AND status = 'accepted'`,
+  ).bind(participantId, contributionId).run();
+  const row = await db.prepare(
+    `SELECT 1 AS present FROM telemetry_contributions
+      WHERE participant_id = ? AND id = ? AND status = 'deleting'`,
+  ).bind(participantId, contributionId).first<{ present: number }>();
+  return row?.present === 1;
+}
+
 export function telemetryContributionMetadata(row: TelemetryContributionRow): object {
   return {
     contributionId: row.id,
