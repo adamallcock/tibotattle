@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  createReadStream,
+  lstatSync,
+  readFileSync,
+} from "node:fs";
 import {
   access,
   chmod,
@@ -12,6 +18,30 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const NETWORK_AUDIT_PRELOAD = fileURLToPath(
+  new URL("./local-review-network-audit-preload.cjs", import.meta.url),
+);
+const NETWORK_AUDIT_SCHEMA =
+  "usage-monitor-local-review-network-attempt-process-v0.1";
+const NETWORK_AUDIT_INSTRUMENTATION = "node-api-interposition-v0.1";
+const NETWORK_AUDIT_COVERAGE = Object.freeze({
+  tcpClient: true,
+  tcpServer: true,
+  tls: true,
+  dnsCallback: true,
+  dnsPromise: true,
+  http1: true,
+  http2: true,
+  udp: true,
+  fetch: true,
+  webSocket: true,
+  eventSource: true,
+  quic: false,
+  nativeSyscalls: false,
+  nonNodeChildProcesses: false,
+});
 
 function fail(message) {
   throw new Error(message);
@@ -27,6 +57,12 @@ function stableValue(value) {
 
 function stableJson(value) {
   return `${JSON.stringify(stableValue(value), null, 2)}\n`;
+}
+
+async function sha256File(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 function usage(input, output, cached, reasoning) {
@@ -103,6 +139,7 @@ function runArtifact({
   home,
   temporaryDirectory,
   denyNetwork,
+  auditFile,
 }) {
   const command = denyNetwork ? "/usr/bin/sandbox-exec" : launcher;
   const commandArgs = denyNetwork
@@ -119,16 +156,84 @@ function runArtifact({
       HOME: home,
       TMPDIR: temporaryDirectory,
       PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      NODE_OPTIONS: `--require=${NETWORK_AUDIT_PRELOAD}`,
+      USAGE_MONITOR_NETWORK_AUDIT_FILE: auditFile,
     },
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });
+  const audit = readNetworkAuditReceipt(auditFile);
   if (result.status !== 0) {
     fail(
       `Artifact command failed (${args[0]}): ${result.stderr || result.stdout}`,
     );
   }
-  return result.stdout;
+  if (audit.totalAttempts !== 0) {
+    fail(
+      `Artifact command attempted a JavaScript networking API (${args[0]}): `
+      + Object.keys(audit.byCategory).join(", "),
+    );
+  }
+  return { stdout: result.stdout, audit };
+}
+
+function readNetworkAuditReceipt(path) {
+  let metadata;
+  let value;
+  try {
+    metadata = lstatSync(path);
+    if (metadata.size > 32 * 1024) {
+      fail("Artifact network audit receipt exceeded its fixed size limit");
+    }
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    fail(`Artifact process did not produce a valid network audit receipt: ${error.message}`);
+  }
+  if (!metadata.isFile()
+      || metadata.isSymbolicLink()
+      || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+    fail("Artifact network audit receipt was not an owner-only regular file");
+  }
+  if (value?.schemaVersion !== NETWORK_AUDIT_SCHEMA
+      || value?.instrumentation !== NETWORK_AUDIT_INSTRUMENTATION
+      || !Number.isSafeInteger(value?.totalAttempts)
+      || value.totalAttempts < 0
+      || value?.truncated !== false
+      || value?.maximumRecordedAttempts !== 128
+      || value?.byCategory === null
+      || typeof value?.byCategory !== "object"
+      || Array.isArray(value.byCategory)) {
+    fail("Artifact network audit receipt did not match its closed process contract");
+  }
+  const categoryTotal = Object.entries(value.byCategory).reduce(
+    (sum, [category, count]) => {
+      if (!/^[a-z][a-z0-9.]*$/u.test(category)
+          || !Number.isSafeInteger(count)
+          || count <= 0) {
+        fail("Artifact network audit receipt contained an invalid category count");
+      }
+      return sum + count;
+    },
+    0,
+  );
+  if (Object.keys(value.byCategory).length > 32) {
+    fail("Artifact network audit receipt contained too many categories");
+  }
+  if (categoryTotal !== value.totalAttempts) {
+    fail("Artifact network audit receipt category counts did not match its total");
+  }
+  const coverageKeys = Object.keys(NETWORK_AUDIT_COVERAGE);
+  if (value?.coverage === null
+      || typeof value?.coverage !== "object"
+      || Array.isArray(value.coverage)
+      || Object.keys(value.coverage).sort().join("\n")
+        !== [...coverageKeys].sort().join("\n")
+      || coverageKeys.some(
+        (key) => value.coverage[key] !== NETWORK_AUDIT_COVERAGE[key],
+      )) {
+    fail("Artifact network audit receipt coverage did not match the smoke contract");
+  }
+  return value;
 }
 
 function confirmation(output, label) {
@@ -149,12 +254,15 @@ async function missing(path) {
 
 async function main(argv) {
   let artifactRoot = null;
+  let archive = null;
   let output = null;
   let denyNetwork = true;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--artifact-root") {
       artifactRoot = resolve(argv[++index] ?? "");
+    } else if (arg === "--archive") {
+      archive = resolve(argv[++index] ?? "");
     } else if (arg === "--output") {
       output = resolve(argv[++index] ?? "");
     } else if (arg === "--allow-network") {
@@ -163,8 +271,19 @@ async function main(argv) {
       fail(`Unknown argument: ${arg}`);
     }
   }
-  if (!artifactRoot || !output) {
-    fail("--artifact-root and --output are required");
+  if (!artifactRoot || !archive || !output) {
+    fail("--artifact-root, --archive, and --output are required");
+  }
+  if (dirname(artifactRoot) !== dirname(archive)
+      || basename(archive) !== `${basename(artifactRoot)}.tar`) {
+    fail("--archive must be the artifact root's sibling deterministic tar");
+  }
+  const archiveMetadata = lstatSync(archive);
+  if (!archiveMetadata.isFile()
+      || archiveMetadata.isSymbolicLink()
+      || archiveMetadata.size <= 0
+      || archiveMetadata.size > 512 * 1024 * 1024) {
+    fail("--archive must be a bounded regular file");
   }
 
   const root = await realpath(await mkdtemp(join(tmpdir(), "usage-monitor-artifact-smoke-")));
@@ -179,6 +298,7 @@ async function main(argv) {
   const workspace = join(home, "set-workspace");
   const exportSet = join(home, "export-set");
   const installed = join(home, "installed");
+  const networkAudits = join(root, "network-audits");
   const launcher = join(artifactRoot, "bin", "usage-monitor-local");
   const canaries = [
     "PRIVATE_SESSION_CANARY",
@@ -186,12 +306,15 @@ async function main(argv) {
     "/private/path/canary",
   ];
   const commands = [];
+  const audits = [];
+  let auditSequence = 0;
   try {
     await mkdir(home, { mode: 0o700 });
     await chmod(home, 0o700);
     await mkdir(sessions, { recursive: true });
     await mkdir(temporaryDirectory, { recursive: true });
     await chmod(temporaryDirectory, 0o700);
+    await mkdir(networkAudits, { mode: 0o700 });
     await mkdir(dirname(activityFile), { recursive: true });
     await writeFile(
       join(sessions, "rollout-2026-07-24T12-00-00-smoke.jsonl"),
@@ -200,49 +323,37 @@ async function main(argv) {
     );
     await writeFile(activityFile, "", { mode: 0o600 });
 
-    const run = (args) => {
-      const stdout = runArtifact({
-        launcher,
+    const invoke = (activeLauncher, args, label = args[0]) => {
+      auditSequence += 1;
+      const result = runArtifact({
+        launcher: activeLauncher,
         args,
         home,
         temporaryDirectory,
         denyNetwork,
+        auditFile: join(
+          networkAudits,
+          `process-${String(auditSequence).padStart(3, "0")}.json`,
+        ),
       });
-      commands.push(args[0]);
-      return stdout;
+      commands.push(label);
+      audits.push(result.audit);
+      return result.stdout;
     };
 
-    run(["inspect-artifact"]);
-    run(["install", "--target", installed]);
+    invoke(launcher, ["inspect-artifact"]);
+    invoke(launcher, ["install", "--target", installed]);
     const installedLauncher = join(installed, "bin", "usage-monitor-local");
-    const originalLauncher = launcher;
-    void originalLauncher;
-    runArtifact({
-      launcher: installedLauncher,
-      args: ["doctor", "--secret-file", secretFile],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("doctor");
-    runArtifact({
-      launcher: installedLauncher,
-      args: [
+    invoke(installedLauncher, ["doctor", "--secret-file", secretFile]);
+    invoke(installedLauncher, [
         "inspect-export",
         "--since", "2026-07-24T11:59:00.000Z",
         "--until", "2026-07-24T12:10:00.000Z",
         "--codex-home", codexHome,
         "--activity-file", activityFile,
         "--secret-file", secretFile,
-      ],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("inspect-export");
-    runArtifact({
-      launcher: installedLauncher,
-      args: [
+    ]);
+    invoke(installedLauncher, [
         "export-local",
         "--since", "2026-07-24T11:59:00.000Z",
         "--until", "2026-07-24T12:10:00.000Z",
@@ -251,23 +362,12 @@ async function main(argv) {
         "--secret-file", secretFile,
         "--output", bundle,
         "--receipt", receipt,
-      ],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("export-local");
-    runArtifact({
-      launcher: installedLauncher,
-      args: ["verify-bundle", "--input", bundle, "--receipt", receipt],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("verify-bundle");
-    runArtifact({
-      launcher: installedLauncher,
-      args: [
+    ]);
+    invoke(
+      installedLauncher,
+      ["verify-bundle", "--input", bundle, "--receipt", receipt],
+    );
+    invoke(installedLauncher, [
         "export-set",
         "--workspace", workspace,
         "--directory", exportSet,
@@ -276,45 +376,22 @@ async function main(argv) {
         "--codex-home", codexHome,
         "--activity-file", activityFile,
         "--secret-file", secretFile,
-      ],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("export-set");
-    runArtifact({
-      launcher: installedLauncher,
-      args: ["verify-export-set", "--directory", exportSet],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("verify-export-set");
-    const deletionPreflight = runArtifact({
-      launcher: installedLauncher,
-      args: [
+    ]);
+    invoke(
+      installedLauncher,
+      ["verify-export-set", "--directory", exportSet],
+    );
+    const deletionPreflight = invoke(installedLauncher, [
         "delete-local-export",
         "--workspace", workspace,
         "--directory", exportSet,
-      ],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("delete-local-export-preflight");
-    runArtifact({
-      launcher: installedLauncher,
-      args: [
+    ], "delete-local-export-preflight");
+    invoke(installedLauncher, [
         "delete-local-export",
         "--workspace", workspace,
         "--directory", exportSet,
         "--confirm-deletion", confirmation(deletionPreflight, "Deletion preflight"),
-      ],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("delete-local-export-confirmed");
+    ], "delete-local-export-confirmed");
 
     const bundleBytes = await readFile(bundle);
     const receiptBytes = await readFile(receipt);
@@ -322,36 +399,41 @@ async function main(argv) {
     if (canaries.some((value) => serialized.includes(value))) {
       fail("Private source canary escaped into a local export");
     }
-    const uninstallPreflight = runArtifact({
-      launcher: installedLauncher,
-      args: ["uninstall", "--target", installed],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("uninstall-preflight");
-    runArtifact({
-      launcher: installedLauncher,
-      args: [
+    const uninstallPreflight = invoke(
+      installedLauncher,
+      ["uninstall", "--target", installed],
+      "uninstall-preflight",
+    );
+    invoke(installedLauncher, [
         "uninstall",
         "--target", installed,
         "--confirm-uninstall", confirmation(uninstallPreflight, "Uninstall preflight"),
-      ],
-      home,
-      temporaryDirectory,
-      denyNetwork,
-    });
-    commands.push("uninstall-confirmed");
+    ], "uninstall-confirmed");
     if (!await missing(installed)) fail("Installed target remained after uninstall");
     if (await missing(secretFile)) fail("Participant identity was removed by uninstall");
 
     const result = {
       schemaVersion: "usage-monitor-local-review-artifact-smoke-v0.1",
       artifact: basename(artifactRoot),
+      artifactArchiveBytes: archiveMetadata.size,
+      artifactArchiveSha256: await sha256File(archive),
+      artifactManifestSha256: await sha256File(
+        join(artifactRoot, "artifact-manifest.json"),
+      ),
       platform: `${process.platform}-${process.arch}`,
       runtime: process.version,
       denyNetwork,
-      networkAttemptTelemetry: "not_measured",
+      auditedProcessCount: audits.length,
+      javascriptNetworkAttempts: audits.reduce(
+        (sum, audit) => sum + audit.totalAttempts,
+        0,
+      ),
+      networkAttemptTelemetry: "node_api_interposition_v0.1",
+      networkAttemptCoverage: NETWORK_AUDIT_COVERAGE,
+      nativeNetworkEnforcement: denyNetwork
+        ? "sandbox-exec_deny_network"
+        : "not_enabled",
+      nativeSyscallAttemptTelemetry: "not_measured",
       commandCount: commands.length,
       commands,
       localBundleVerified: true,
@@ -368,7 +450,14 @@ async function main(argv) {
     await writeFile(output, stableJson(result), { mode: 0o600 });
     console.log(`Artifact smoke: ${result.result}`);
     console.log(`Commands: ${result.commandCount}`);
-    console.log(`Deny network: ${result.denyNetwork}; attempt telemetry: ${result.networkAttemptTelemetry}`);
+    console.log(
+      `JavaScript network API attempts: ${result.javascriptNetworkAttempts} `
+      + `across ${result.auditedProcessCount} processes`,
+    );
+    console.log(
+      `Native network enforcement: ${result.nativeNetworkEnforcement}; `
+      + `native syscall attempt telemetry: ${result.nativeSyscallAttemptTelemetry}`,
+    );
     console.log("Private canary hits: 0");
     console.log("Identity preserved after uninstall: true");
   } finally {
