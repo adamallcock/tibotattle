@@ -257,6 +257,22 @@ the server.
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
 Worker dry deployment. It does not deploy or upload data.
 
+For the central service alone, `npm run product:backend:test` is the quickest
+repeatable check. It runs against isolated local Cloudflare Worker, D1, and R2
+test bindings and covers strict validation, server repricing, deduplication,
+participant isolation, private statistics, delayed aggregate publication,
+export, and deletion. The live portal's Data & privacy section separately
+reports whether the running backend can reach D1 and its encrypted quarantine
+binding, so a working central service is not confused with an offline local
+collector.
+
+The next account-scoped transport, `telemetry-contribution-v0.2`, is implemented
+as a disabled repository shadow lane only. Its focused backend tests exercise
+participant-bound account tracks, complete dataset parts, five-hour/seven-day
+calibration, rolling quota comparison, conflict-safe deduplication, and
+deletion-driven recomputation. The public HTTP route continues to accept only
+v0.1 until renewed consent and the prospective release gates are satisfied.
+
 For a real HTTP backend smoke using an actual prepared contribution, run the
 Worker in invite-only mode. Issue twenty invitation grants so the smoke can
 exercise the production-shaped public support threshold. Build the repeated

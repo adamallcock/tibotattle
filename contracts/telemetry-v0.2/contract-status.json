@@ -1,0 +1,16 @@
+{
+  "contractFamily": "telemetry-contribution-v0.2",
+  "status": "implementation_disabled_pending_minimization_and_security_review",
+  "transportReady": false,
+  "backwardCompatibility": "v0.1_remains_readable_exportable_and_deletable_but_cannot_be_upgraded_in_place",
+  "externalParticipantsAuthorized": false,
+  "activationGates": [
+    "three_completed_prospective_provider_account_plan_scoped_resets",
+    "accepted_preregistered_minimization_receipt",
+    "account_scope_on_usage_and_quota_rows",
+    "renewed_consent",
+    "security_and_privacy_review",
+    "complete_http_deletion_and_rendered_ui_verification"
+  ],
+  "freezeRule": "Activation requires a dated decision receipt. This disabled implementation cannot be accepted by the upload route."
+}

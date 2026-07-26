@@ -37,6 +37,41 @@ That command verifies generated Worker types, runs TypeScript and the
 Cloudflare-runtime integration tests, and performs a deployment dry run. It
 does not deploy anything.
 
+From the repository root, the shorter backend-only command is:
+
+```sh
+npm run product:backend:test
+```
+
+It creates isolated Cloudflare test bindings, applies the real D1 migrations,
+and tests validation, canonical server repricing, transactional ingest,
+overlap deduplication, participant isolation, private statistics, delayed
+aggregation, export, recovery, and deletion. No server or external account is
+required.
+
+### Disabled account-scoped shadow lane
+
+`telemetry-contribution-v0.2` adds participant-bound account tracks, dataset
+parts, completeness semantics, provider-policy epochs, five-hour/seven-day
+calibration, and rolling quota comparison. It is deliberately a repository-only
+shadow lane with fresh consent version `privacy-safe-telemetry-v0.2` and status
+`implementation_disabled`. No HTTP route imports or accepts it.
+
+Run its focused contract and backend tests with:
+
+```sh
+npm test -- --run \
+  test/telemetry-v0.2.spec.ts \
+  test/telemetry-v0.2-backend.spec.ts
+```
+
+Those tests prove server repricing overrides client diagnostics, complete
+multi-part datasets are required for calibration, tracks remain scoped to one
+participant, conflicting occurrence reuse fails without partial writes, and
+deletion removes the account-scoped evidence before statistics are recomputed.
+Activation still requires the prospective reset, renewed-consent, security,
+and privacy gates recorded in `contracts/telemetry-v0.2/`.
+
 ### Invite-only HTTP smoke
 
 Use the invite-only mode to test the production-shaped admission and complete

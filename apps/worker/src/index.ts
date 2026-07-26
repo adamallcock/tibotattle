@@ -826,6 +826,29 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         status: "ok",
         mode: "synthetic-and-private-telemetry",
         enrollmentMode,
+        checks: {
+          database: "ok",
+          encryptedObjectStore: env.QUARANTINE
+            && typeof Reflect.get(env.QUARANTINE, "put") === "function"
+            ? "bound"
+            : "unavailable",
+        },
+        contracts: {
+          acceptedContribution: "telemetry-contribution-v0.1",
+          accountScopedContribution: {
+            schemaVersion: "telemetry-contribution-v0.2",
+            status: "implementation_disabled",
+          },
+        },
+        capabilities: {
+          encryptedUpload: true,
+          serverValidation: true,
+          idempotentDeduplication: true,
+          participantStats: true,
+          delayedAggregateStats: true,
+          participantExport: true,
+          participantDeletion: true,
+        },
       });
     }
     if (url.pathname.startsWith("/api/")) return await routeApi(request, env);

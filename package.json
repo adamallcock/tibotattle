@@ -44,6 +44,7 @@
     "test": "node --test --test-concurrency=1 test/*.test.js apps/web/test/*.test.mjs",
     "product:ui:test": "node --test apps/web/test/*.test.mjs",
     "product:local:test": "node --test test/local-companion-data.test.js test/telemetry-contribution-builder.test.js apps/local/*.test.mjs",
+    "product:backend:test": "npm --prefix apps/worker test",
     "product:worker:check": "npm --prefix apps/worker run check",
     "product:backend:smoke": "npm --prefix apps/worker run smoke:http --",
     "product:check": "npm run product:ui:test && npm run product:local:test && npm run product:worker:check",

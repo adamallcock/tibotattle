@@ -470,6 +470,41 @@
           </article>
         </div>
 
+        <article class="panel backend-panel" aria-labelledby="backend-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Central service</p>
+              <h3 id="backend-title">Backend readiness and data lifecycle</h3>
+            </div>
+            <span class="evidence-chip neutral" id="backend-state">Checking backend</span>
+          </div>
+          <p class="annotation">
+            This is separate from the local collector above. The live check verifies
+            that the HTTP service can reach its database and encrypted-object binding;
+            deeper ingestion, isolation, aggregation, export, and deletion behavior is
+            covered by the repository's repeatable backend test suite.
+          </p>
+          <dl class="backend-facts" id="backend-facts">
+            <div><dt>Database</dt><dd id="backend-database">Checking</dd></div>
+            <div><dt>Encrypted quarantine</dt><dd id="backend-storage">Checking</dd></div>
+            <div><dt>Enrollment</dt><dd id="backend-enrollment">Checking</dd></div>
+            <div><dt>Accepted upload contract</dt><dd id="backend-contract">Checking</dd></div>
+          </dl>
+          <ol class="backend-flow" aria-label="Contribution backend lifecycle">
+            <li><strong>1</strong><span>Browser validation</span><small>Reject raw or oversized files before upload</small></li>
+            <li><strong>2</strong><span>Encrypted transport</span><small>One-use upload authorization and envelope encryption</small></li>
+            <li><strong>3</strong><span>Server validation</span><small>Closed schema, content-field rejection, and canonical repricing</small></li>
+            <li><strong>4</strong><span>Transactional ingest</span><small>Idempotent deduplication into participant-isolated records</small></li>
+            <li><strong>5</strong><span>Private analysis</span><small>Personal cost, quota movement, and calibration results</small></li>
+            <li><strong>6</strong><span>Delayed aggregate</span><small>Thresholded, clipped, rounded community snapshots</small></li>
+            <li><strong>7</strong><span>User control</span><small>Safe export, access reset, and verified deletion</small></li>
+          </ol>
+          <div class="backend-contract-note" id="backend-contract-note">
+            Account-scoped v0.2 ingest is implemented behind a disabled contract and is
+            not accepted by the public HTTP route yet.
+          </div>
+        </article>
+
         <div class="two-column result-panels">
           <article class="panel personal-result-panel">
             <div class="panel-heading">

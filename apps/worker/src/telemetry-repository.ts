@@ -4,6 +4,7 @@ import {
   priceTelemetryUsageEvent,
   type ServerPricingResult,
 } from "./server-pricing";
+import { accountScopedQuotaAnalysis } from "./quota-analysis";
 import type {
   TelemetryActivityMarker,
   TelemetryContribution,
@@ -20,6 +21,13 @@ export interface TelemetryContributionRow {
   r2_key: string;
   status: "accepted" | "deleting";
   schema_version: "telemetry-contribution-v0.1";
+  transport_schema_version?: "telemetry-contribution-v0.1" | "telemetry-contribution-v0.2";
+  dataset_id?: string | null;
+  dataset_part_index?: number | null;
+  dataset_part_count?: number | null;
+  dataset_completeness?: "complete" | "partial" | null;
+  dataset_range_start?: string | null;
+  dataset_range_end?: string | null;
   range_start: string;
   range_end: string;
   client_platform: string;
@@ -41,6 +49,20 @@ export interface TelemetryContributionRow {
   server_price_registry_sha256?: string | null;
 }
 
+export interface TelemetryTransportMetadata {
+  transportSchemaVersion: "telemetry-contribution-v0.2";
+  datasetId: string;
+  partIndex: number;
+  partCount: number;
+  completeness: "complete" | "partial";
+  rangeStart: string;
+  rangeEnd: string;
+  policyEpoch: string;
+  usage: Map<string, { accountTrackId: string; recordJson: string }>;
+  quota: Map<string, { accountTrackId: string; recordJson: string }>;
+  activity: Map<string, { accountTrackId: string; recordJson: string }>;
+}
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (typeof value === "object" && value !== null) {
@@ -60,7 +82,7 @@ export async function telemetryEnvelopeDigest(envelope: TelemetryEnvelope): Prom
   ].join("\0"));
 }
 
-export async function telemetryPlaintextDigest(record: TelemetryContribution): Promise<string> {
+export async function telemetryPlaintextDigest(record: unknown): Promise<string> {
   return sha256Hex(stableJson(record));
 }
 
@@ -104,6 +126,12 @@ function usageStatement(
   contributionId: string,
   row: TelemetryUsageEvent,
   serverPricing: ServerPricingResult,
+  transport?: {
+    datasetId: string;
+    accountTrackId: string;
+    policyEpoch: string;
+    recordJson: string;
+  },
 ): [D1PreparedStatement, D1PreparedStatement] {
   return [db.prepare(
     `INSERT OR IGNORE INTO telemetry_records (
@@ -117,11 +145,11 @@ function usageStatement(
       server_unknown_billable_units, server_pricing_status, server_pricing_method_version,
       server_price_registry_version, server_price_registry_sha256, server_price_card_ids,
       server_unpriced_reason_codes, server_price_epoch_basis, server_tier_basis,
-      server_api_service_tier, record_json
+      server_api_service_tier, dataset_id, account_track_id, policy_epoch, record_json
     ) VALUES (
       ?1, ?2, 'usage', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-      ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
+      ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
     )`,
   ).bind(
     contributionId,
@@ -161,8 +189,18 @@ function usageStatement(
     serverPricing.priceEpochBasis,
     serverPricing.tierBasis,
     serverPricing.apiServiceTier,
-    stableJson(row),
-  ), occurrenceLink(db, participantId, contributionId, "usage", row.eventId)];
+    transport?.datasetId ?? null,
+    transport?.accountTrackId ?? "unattributed",
+    transport?.policyEpoch ?? null,
+    transport?.recordJson ?? stableJson(row),
+  ), occurrenceLink(
+    db,
+    participantId,
+    contributionId,
+    "usage",
+    row.eventId,
+    transport,
+  )];
 }
 
 function quotaStatement(
@@ -170,13 +208,20 @@ function quotaStatement(
   participantId: string,
   contributionId: string,
   row: TelemetryQuotaSnapshot,
+  transport?: {
+    datasetId: string;
+    accountTrackId: string;
+    policyEpoch: string;
+    recordJson: string;
+  },
 ): [D1PreparedStatement, D1PreparedStatement] {
   return [db.prepare(
     `INSERT OR IGNORE INTO telemetry_records (
       origin_contribution_id, participant_id, record_kind, occurrence_id, observed_at,
       provider, plan_type, plan_variant, limit_id, slot, used_percent,
-      window_duration_minutes, resets_at, record_json
-    ) VALUES (?, ?, 'quota', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      window_duration_minutes, resets_at, dataset_id, account_track_id, policy_epoch,
+      record_json
+    ) VALUES (?, ?, 'quota', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(
     contributionId,
     participantId,
@@ -190,8 +235,18 @@ function quotaStatement(
     row.usedPercent,
     row.windowDurationMinutes,
     row.resetsAt,
-    stableJson(row),
-  ), occurrenceLink(db, participantId, contributionId, "quota", row.snapshotId)];
+    transport?.datasetId ?? null,
+    transport?.accountTrackId ?? "unattributed",
+    transport?.policyEpoch ?? null,
+    transport?.recordJson ?? stableJson(row),
+  ), occurrenceLink(
+    db,
+    participantId,
+    contributionId,
+    "quota",
+    row.snapshotId,
+    transport,
+  )];
 }
 
 function markerStatement(
@@ -199,12 +254,19 @@ function markerStatement(
   participantId: string,
   contributionId: string,
   row: TelemetryActivityMarker,
+  transport?: {
+    datasetId: string;
+    accountTrackId: string;
+    policyEpoch: string;
+    recordJson: string;
+  },
 ): [D1PreparedStatement, D1PreparedStatement] {
   return [db.prepare(
     `INSERT OR IGNORE INTO telemetry_records (
       origin_contribution_id, participant_id, record_kind, occurrence_id, observed_at,
-      surface, plan_type, plan_variant, record_json
-    ) VALUES (?, ?, 'activity', ?, ?, ?, ?, ?, ?)`,
+      surface, plan_type, plan_variant, dataset_id, account_track_id, policy_epoch,
+      record_json
+    ) VALUES (?, ?, 'activity', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(
     contributionId,
     participantId,
@@ -213,8 +275,18 @@ function markerStatement(
     row.surface,
     row.planType,
     row.planVariant,
-    stableJson(row),
-  ), occurrenceLink(db, participantId, contributionId, "activity", row.markerId)];
+    transport?.datasetId ?? null,
+    transport?.accountTrackId ?? "unattributed",
+    transport?.policyEpoch ?? null,
+    transport?.recordJson ?? stableJson(row),
+  ), occurrenceLink(
+    db,
+    participantId,
+    contributionId,
+    "activity",
+    row.markerId,
+    transport,
+  )];
 }
 
 function occurrenceLink(
@@ -223,12 +295,26 @@ function occurrenceLink(
   contributionId: string,
   kind: "usage" | "quota" | "activity",
   occurrenceId: string,
+  transport?: {
+    datasetId: string;
+    accountTrackId: string;
+    policyEpoch: string;
+  },
 ): D1PreparedStatement {
   return db.prepare(
     `INSERT INTO telemetry_contribution_occurrences (
-      contribution_id, participant_id, record_kind, occurrence_id
-    ) VALUES (?, ?, ?, ?)`,
-  ).bind(contributionId, participantId, kind, occurrenceId);
+      contribution_id, participant_id, record_kind, occurrence_id,
+      dataset_id, account_track_id, policy_epoch
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    contributionId,
+    participantId,
+    kind,
+    occurrenceId,
+    transport?.datasetId ?? null,
+    transport?.accountTrackId ?? "unattributed",
+    transport?.policyEpoch ?? null,
+  );
 }
 
 export async function insertTelemetryContribution(
@@ -241,6 +327,7 @@ export async function insertTelemetryContribution(
   plaintextDigest: string,
   record: TelemetryContribution,
   createdAt: string,
+  transport?: TelemetryTransportMetadata,
 ): Promise<{ acceptedRecords: number; deduplicatedRecords: number }> {
   const serverPricing = record.usageEvents.map(priceTelemetryUsageEvent);
   const recordPairs = [
@@ -250,9 +337,37 @@ export async function insertTelemetryContribution(
       contributionId,
       row,
       serverPricing[index]!,
+      transport ? {
+        datasetId: transport.datasetId,
+        policyEpoch: transport.policyEpoch,
+        ...(transport.usage.get(row.eventId)
+          ?? { accountTrackId: "unattributed", recordJson: stableJson(row) }),
+      } : undefined,
     )),
-    ...record.quotaSnapshots.map((row) => quotaStatement(db, participantId, contributionId, row)),
-    ...record.activityMarkers.map((row) => markerStatement(db, participantId, contributionId, row)),
+    ...record.quotaSnapshots.map((row) => quotaStatement(
+      db,
+      participantId,
+      contributionId,
+      row,
+      transport ? {
+        datasetId: transport.datasetId,
+        policyEpoch: transport.policyEpoch,
+        ...(transport.quota.get(row.snapshotId)
+          ?? { accountTrackId: "unattributed", recordJson: stableJson(row) }),
+      } : undefined,
+    )),
+    ...record.activityMarkers.map((row) => markerStatement(
+      db,
+      participantId,
+      contributionId,
+      row,
+      transport ? {
+        datasetId: transport.datasetId,
+        policyEpoch: transport.policyEpoch,
+        ...(transport.activity.get(row.markerId)
+          ?? { accountTrackId: "unattributed", recordJson: stableJson(row) }),
+      } : undefined,
+    )),
   ];
   const statements: D1PreparedStatement[] = [
     db.prepare(
@@ -261,8 +376,11 @@ export async function insertTelemetryContribution(
         schema_version, range_start, range_end, client_platform, provider_policy_epoch,
         estimated_api_cost_usd, priced_event_coverage_percent, unknown_model_event_count,
         unknown_billable_units, price_basis, declared_record_count, created_at,
-        upload_authorization_id
-      ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        upload_authorization_id, transport_schema_version, dataset_id,
+        dataset_part_index, dataset_part_count, dataset_completeness,
+        dataset_range_start, dataset_range_end
+      ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       contributionId,
       participantId,
@@ -282,6 +400,13 @@ export async function insertTelemetryContribution(
       record.usageEvents.length + record.quotaSnapshots.length + record.activityMarkers.length,
       createdAt,
       uploadAuthorizationId,
+      transport?.transportSchemaVersion ?? "telemetry-contribution-v0.1",
+      transport?.datasetId ?? null,
+      transport?.partIndex ?? null,
+      transport?.partCount ?? null,
+      transport?.completeness ?? null,
+      transport?.rangeStart ?? null,
+      transport?.rangeEnd ?? null,
     ),
     ...recordPairs.flat(),
     db.prepare(
@@ -425,6 +550,17 @@ export function telemetryContributionMetadata(row: TelemetryContributionRow): ob
     contributionId: row.id,
     status: row.status,
     schemaVersion: row.schema_version,
+    transportSchemaVersion: row.transport_schema_version ?? row.schema_version,
+    dataset: row.dataset_id ? {
+      datasetId: row.dataset_id,
+      partIndex: row.dataset_part_index,
+      partCount: row.dataset_part_count,
+      completeness: row.dataset_completeness,
+      coveredAt: {
+        startAt: row.dataset_range_start,
+        endAt: row.dataset_range_end,
+      },
+    } : null,
     coveredAt: { startAt: row.range_start, endAt: row.range_end },
     clientPlatform: row.client_platform,
     providerPolicyEpoch: row.provider_policy_epoch,
@@ -874,6 +1010,7 @@ export async function personalStats(db: D1Database, participantId: string): Prom
     movementGroup as CalibrationGroupRow | undefined,
     "not_transmitted",
   );
+  const quotaAnalysis = await accountScopedQuotaAnalysis(db, participantId);
   const classifiedServerEvents = (speedRow?.fullyPriced ?? 0)
     + (speedRow?.partiallyPriced ?? 0)
     + (speedRow?.unpriced ?? 0);
@@ -933,6 +1070,7 @@ export async function personalStats(db: D1Database, participantId: string): Prom
     })),
     latestQuota: latestQuota.results.map((row) => JSON.parse(row.record_json) as unknown),
     rollingQuotaMovement: quotaMovement,
+    accountScopedQuotaAnalysis: quotaAnalysis,
     quotaGradients: gradientRows.results.map((row) => {
       const snapshots = Number(Reflect.get(row, "snapshots") ?? 0);
       const minimum = Number(Reflect.get(row, "minimumUsedPercent") ?? 0);

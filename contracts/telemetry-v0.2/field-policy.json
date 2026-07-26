@@ -1,0 +1,61 @@
+{
+  "contractVersion": "telemetry-contribution-field-policy-v0.2-disabled-draft",
+  "status": "implementation_disabled",
+  "fields": [
+    {
+      "field": "accountTrackId",
+      "purpose": "Partition private usage and quota evidence for one provider account inside one anonymous central participant.",
+      "privacyClass": "restricted_participant_scoped_pseudonym",
+      "retentionClass": "participant_lifetime_or_earlier_contribution_deletion",
+      "publicEligibility": "never",
+      "allowedValues": "unattributed or account-track:v1 followed by 64 lowercase hexadecimal characters",
+      "provenance": "client_derived_from_local_keyed_scope_central_participant_and_provider",
+      "limitations": "Not cross-device continuity, authentication, ownership proof, unique-person proof, eligibility, or anti-Sybil evidence."
+    },
+    {
+      "field": "datasetId",
+      "purpose": "Bind contribution parts to one immutable locally reviewed dataset without authenticating a participant.",
+      "privacyClass": "restricted_participant_scoped_pseudonym",
+      "retentionClass": "participant_lifetime_or_earlier_contribution_deletion",
+      "publicEligibility": "never",
+      "provenance": "client_derived",
+      "limitations": "Completeness still requires exact part-count and covered-interval validation."
+    },
+    {
+      "field": "partIndex",
+      "purpose": "Order a bounded contribution inside one complete dataset.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "participant_lifetime_or_earlier_contribution_deletion",
+      "publicEligibility": "never",
+      "provenance": "client_derived",
+      "limitations": "An index cannot establish completeness without the matching immutable dataset contract."
+    },
+    {
+      "field": "partCount",
+      "purpose": "Declare the exact number of bounded contributions in one dataset.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "participant_lifetime_or_earlier_contribution_deletion",
+      "publicEligibility": "never",
+      "provenance": "client_derived",
+      "limitations": "The server must observe every unique part before treating the dataset as complete."
+    },
+    {
+      "field": "completeness",
+      "purpose": "Prevent partial uploads from producing calibrated allowance estimates.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "participant_lifetime_or_earlier_contribution_deletion",
+      "publicEligibility": "never",
+      "provenance": "client_declared_and_server_verified",
+      "limitations": "Client complete is a claim until server set reconciliation passes."
+    },
+    {
+      "field": "consentVersion",
+      "purpose": "Require an explicit renewed account-track disclosure before any future v0.2 upload.",
+      "privacyClass": "protocol_metadata",
+      "retentionClass": "contract_lifetime",
+      "publicEligibility": "never",
+      "provenance": "client_declared_server_enforced",
+      "limitations": "The disabled draft is not presentable for acceptance."
+    }
+  ]
+}

@@ -1096,6 +1096,26 @@ describe("synthetic usage monitor service", () => {
       status: "ok",
       mode: "synthetic-and-private-telemetry",
       enrollmentMode: "local_open",
+      checks: {
+        database: "ok",
+        encryptedObjectStore: "bound",
+      },
+      contracts: {
+        acceptedContribution: "telemetry-contribution-v0.1",
+        accountScopedContribution: {
+          schemaVersion: "telemetry-contribution-v0.2",
+          status: "implementation_disabled",
+        },
+      },
+      capabilities: {
+        encryptedUpload: true,
+        serverValidation: true,
+        idempotentDeduplication: true,
+        participantStats: true,
+        delayedAggregateStats: true,
+        participantExport: true,
+        participantDeletion: true,
+      },
     });
   });
 

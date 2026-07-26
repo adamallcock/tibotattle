@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://app-usagemonitor.local/schemas/telemetry-contribution-v0.2/activity-marker.schema.json",
+  "title": "Disabled plaintext telemetry activity marker v0.2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "observedTime",
+    "provider",
+    "surface",
+    "state",
+    "agenticPoolCoupling",
+    "planType",
+    "planVariant",
+    "markerId",
+    "accountTrackId"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "activity-marker-v0.2" },
+    "observedTime": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "provider": { "const": "openai_codex" },
+    "surface": {
+      "enum": [
+        "chatgpt_chat",
+        "chatgpt_web",
+        "chatgpt_work",
+        "workspace_agent",
+        "chatgpt_excel",
+        "codex_cloud",
+        "codex_other_machine",
+        "chatgpt_work_voice",
+        "ordinary_chat_voice",
+        "image_generation",
+        "codex_spark",
+        "other_machine",
+        "voice_mode",
+        "voice_dictation",
+        "third_party_client",
+        "quiet_period",
+        "controlled_experiment"
+      ]
+    },
+    "state": { "enum": ["start", "end", "pulse"] },
+    "agenticPoolCoupling": {
+      "enum": [
+        "excluded_ordinary_chat",
+        "shared_agentic_pool",
+        "mixed_task_shared_voice_time_separate",
+        "shared_agentic_pool_feature_multiplier",
+        "separate_demand_adjusted_model_limit",
+        "unknown_client_surface",
+        "unknown_legacy_voice_marker",
+        "depends_on_destination_surface",
+        "not_applicable",
+        "depends_on_experiment_surface",
+        "unknown"
+      ]
+    },
+    "planType": {
+      "enum": ["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]
+    },
+    "planVariant": {
+      "enum": ["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]
+    },
+    "markerId": { "type": "string", "pattern": "^marker:v2:[a-f0-9]{64}$" },
+    "accountTrackId": {
+      "type": "string",
+      "pattern": "^(unattributed|account-track:v1:[a-f0-9]{64})$"
+    }
+  }
+}

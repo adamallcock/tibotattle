@@ -1190,6 +1190,7 @@ async function loadCommunityResults() {
     const serviceReachable = healthResult.status === "fulfilled"
       || communityResult.status === "fulfilled"
       || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
+    renderBackendHealth(healthResult.status === "fulfilled" ? healthResult.value : null);
     service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
     renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
@@ -1202,10 +1203,38 @@ async function loadCommunityResults() {
         ? "New enrollment is currently paused. Existing participants can still manage their data."
         : "Required only for an invite-only pilot. It is used once and never stored by this page.";
   } catch {
+    renderBackendHealth(null);
     service.textContent = "Service unavailable";
     service.className = "evidence-chip neutral";
     participantControls.hidden = true;
   }
+}
+
+function renderBackendHealth(health) {
+  const reachable = health?.status === "ok";
+  const state = $("#backend-state");
+  state.textContent = reachable ? "Backend ready" : "Backend unavailable";
+  state.className = reachable ? "evidence-chip" : "evidence-chip neutral";
+  $("#backend-database").textContent = health?.checks?.database === "ok"
+    ? "Connected"
+    : "Unavailable";
+  $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "bound"
+    ? "Bound"
+    : "Unavailable";
+  const enrollmentLabels = {
+    local_open: "Open for local testing",
+    invite_only: "Private invite pilot",
+    disabled: "New enrollment paused"
+  };
+  $("#backend-enrollment").textContent = enrollmentLabels[health?.enrollmentMode]
+    ?? "Unavailable";
+  $("#backend-contract").textContent = health?.contracts?.acceptedContribution
+    ?? "Unavailable";
+
+  const accountContract = health?.contracts?.accountScopedContribution;
+  $("#backend-contract-note").textContent = accountContract?.status === "implementation_disabled"
+    ? `${accountContract.schemaVersion} account-scoped ingest is implemented and testable in the repository, but deliberately disabled on the HTTP route.`
+    : "No account-scoped experimental contract was advertised by this backend.";
 }
 
 async function restoreCommunitySession() {
