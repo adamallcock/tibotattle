@@ -60,6 +60,7 @@
     "product:staging:deploy": "npm --prefix apps/worker run staging:deploy --",
     "product:check": "npm run product:ui:test && npm run product:local:test && npm run product:worker:check",
     "product:local": "node ./apps/local/server.js",
+    "product:native-network-audit:build": "node ./scripts/build-native-network-audit.js",
     "product:prepare-contribution": "node ./scripts/build-telemetry-contributions.js",
     "product:dev": "npm --prefix apps/worker run dev",
     "product:dev:account-scoped": "npm --prefix apps/worker run dev:account-scoped",

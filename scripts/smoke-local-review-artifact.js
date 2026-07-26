@@ -42,6 +42,35 @@ const NETWORK_AUDIT_COVERAGE = Object.freeze({
   nativeSyscalls: false,
   nonNodeChildProcesses: false,
 });
+const NATIVE_NETWORK_AUDIT_SCHEMA =
+  "usage-monitor-native-network-attempt-process-v0.1";
+const NATIVE_NETWORK_AUDIT_INSTRUMENTATION =
+  "macos-dyld-libc-interposition-v0.1";
+const NATIVE_NETWORK_AUDIT_CATEGORIES = Object.freeze([
+  "accept",
+  "bind",
+  "connect",
+  "getaddrinfo",
+  "gethostbyname",
+  "gethostbyname2",
+  "getnameinfo",
+  "listen",
+  "recv",
+  "recvfrom",
+  "recvmsg",
+  "send",
+  "sendmsg",
+  "sendto",
+  "socketInet",
+  "socketInet6",
+]);
+const NATIVE_NETWORK_AUDIT_COVERAGE = Object.freeze({
+  ipSocketLibc: true,
+  dnsLibc: true,
+  directSyscallInstruction: false,
+  quicFramework: false,
+  nonNodeChildProcesses: false,
+});
 
 function fail(message) {
   throw new Error(message);
@@ -140,16 +169,36 @@ function runArtifact({
   temporaryDirectory,
   denyNetwork,
   auditFile,
+  nativeAuditFile = null,
+  nativeAuditLibrary = null,
+  directRuntime = false,
 }) {
-  const command = denyNetwork ? "/usr/bin/sandbox-exec" : launcher;
+  const artifactRoot = dirname(dirname(launcher));
+  const runtimeCommand = directRuntime
+    ? join(artifactRoot, "runtime", "bin", "node")
+    : launcher;
+  const runtimeArgs = directRuntime
+    ? [join(artifactRoot, "local-review", "cli.js"), ...args]
+    : args;
+  if (Boolean(nativeAuditFile) !== Boolean(nativeAuditLibrary)) {
+    fail("Native audit file and library must be configured together");
+  }
+  const command = denyNetwork ? "/usr/bin/sandbox-exec" : runtimeCommand;
   const commandArgs = denyNetwork
     ? [
         "-p",
         "(version 1) (allow default) (deny network*)",
-        launcher,
-        ...args,
+        ...(nativeAuditLibrary
+          ? [
+            "/usr/bin/env",
+            `DYLD_INSERT_LIBRARIES=${nativeAuditLibrary}`,
+            `USAGE_MONITOR_NATIVE_NETWORK_AUDIT_FILE=${nativeAuditFile}`,
+          ]
+          : []),
+        runtimeCommand,
+        ...runtimeArgs,
       ]
-    : args;
+    : runtimeArgs;
   const result = spawnSync(command, commandArgs, {
     encoding: "utf8",
     env: {
@@ -158,11 +207,20 @@ function runArtifact({
       PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
       NODE_OPTIONS: `--require=${NETWORK_AUDIT_PRELOAD}`,
       USAGE_MONITOR_NETWORK_AUDIT_FILE: auditFile,
+      ...(nativeAuditLibrary && !denyNetwork
+        ? {
+          DYLD_INSERT_LIBRARIES: nativeAuditLibrary,
+          USAGE_MONITOR_NATIVE_NETWORK_AUDIT_FILE: nativeAuditFile,
+        }
+        : {}),
     },
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });
   const audit = readNetworkAuditReceipt(auditFile);
+  const nativeAudit = nativeAuditFile
+    ? readNativeNetworkAuditReceipt(nativeAuditFile)
+    : null;
   if (result.status !== 0) {
     fail(
       `Artifact command failed (${args[0]}): ${result.stderr || result.stdout}`,
@@ -174,7 +232,16 @@ function runArtifact({
       + Object.keys(audit.byCategory).join(", "),
     );
   }
-  return { stdout: result.stdout, audit };
+  if (nativeAudit && nativeAudit.totalAttempts !== 0) {
+    fail(
+      `Artifact command attempted a native libc networking API (${args[0]}): `
+      + Object.entries(nativeAudit.byCategory)
+        .filter(([, count]) => count > 0)
+        .map(([category]) => category)
+        .join(", "),
+    );
+  }
+  return { stdout: result.stdout, audit, nativeAudit };
 }
 
 function readNetworkAuditReceipt(path) {
@@ -236,6 +303,61 @@ function readNetworkAuditReceipt(path) {
   return value;
 }
 
+function readNativeNetworkAuditReceipt(path) {
+  let metadata;
+  let value;
+  try {
+    metadata = lstatSync(path);
+    if (metadata.size > 32 * 1024) {
+      fail("Native network audit receipt exceeded its fixed size limit");
+    }
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    fail(`Artifact process did not produce a valid native audit receipt: ${error.message}`);
+  }
+  if (!metadata.isFile()
+      || metadata.isSymbolicLink()
+      || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+    fail("Native network audit receipt was not an owner-only regular file");
+  }
+  if (value?.schemaVersion !== NATIVE_NETWORK_AUDIT_SCHEMA
+      || value?.instrumentation !== NATIVE_NETWORK_AUDIT_INSTRUMENTATION
+      || !Number.isSafeInteger(value?.totalAttempts)
+      || value.totalAttempts < 0
+      || value?.byCategory === null
+      || typeof value?.byCategory !== "object"
+      || Array.isArray(value.byCategory)
+      || Object.keys(value.byCategory).sort().join("\n")
+        !== [...NATIVE_NETWORK_AUDIT_CATEGORIES].sort().join("\n")) {
+    fail("Native network audit receipt did not match its closed process contract");
+  }
+  const categoryTotal = NATIVE_NETWORK_AUDIT_CATEGORIES.reduce(
+    (sum, category) => {
+      const count = value.byCategory[category];
+      if (!Number.isSafeInteger(count) || count < 0) {
+        fail("Native network audit receipt contained an invalid category count");
+      }
+      return sum + count;
+    },
+    0,
+  );
+  if (categoryTotal !== value.totalAttempts) {
+    fail("Native network audit receipt category counts did not match its total");
+  }
+  const coverageKeys = Object.keys(NATIVE_NETWORK_AUDIT_COVERAGE);
+  if (value?.coverage === null
+      || typeof value?.coverage !== "object"
+      || Array.isArray(value.coverage)
+      || Object.keys(value.coverage).sort().join("\n")
+        !== [...coverageKeys].sort().join("\n")
+      || coverageKeys.some(
+        (key) => value.coverage[key] !== NATIVE_NETWORK_AUDIT_COVERAGE[key],
+      )) {
+    fail("Native network audit receipt coverage did not match the smoke contract");
+  }
+  return value;
+}
+
 function confirmation(output, label) {
   const match = output.match(/^Confirmation token: ([A-Z0-9]+)$/m);
   if (!match) fail(`${label} did not return a confirmation token`);
@@ -255,6 +377,7 @@ async function missing(path) {
 async function main(argv) {
   let artifactRoot = null;
   let archive = null;
+  let nativeAuditLibrary = null;
   let output = null;
   let denyNetwork = true;
   for (let index = 0; index < argv.length; index += 1) {
@@ -263,6 +386,8 @@ async function main(argv) {
       artifactRoot = resolve(argv[++index] ?? "");
     } else if (arg === "--archive") {
       archive = resolve(argv[++index] ?? "");
+    } else if (arg === "--native-audit-library") {
+      nativeAuditLibrary = resolve(argv[++index] ?? "");
     } else if (arg === "--output") {
       output = resolve(argv[++index] ?? "");
     } else if (arg === "--allow-network") {
@@ -271,8 +396,10 @@ async function main(argv) {
       fail(`Unknown argument: ${arg}`);
     }
   }
-  if (!artifactRoot || !archive || !output) {
-    fail("--artifact-root, --archive, and --output are required");
+  if (!artifactRoot || !archive || !nativeAuditLibrary || !output) {
+    fail(
+      "--artifact-root, --archive, --native-audit-library, and --output are required",
+    );
   }
   if (dirname(artifactRoot) !== dirname(archive)
       || basename(archive) !== `${basename(artifactRoot)}.tar`) {
@@ -284,6 +411,14 @@ async function main(argv) {
       || archiveMetadata.size <= 0
       || archiveMetadata.size > 512 * 1024 * 1024) {
     fail("--archive must be a bounded regular file");
+  }
+  const nativeAuditMetadata = lstatSync(nativeAuditLibrary);
+  if (!nativeAuditMetadata.isFile()
+      || nativeAuditMetadata.isSymbolicLink()
+      || nativeAuditMetadata.size <= 0
+      || nativeAuditMetadata.size > 4 * 1024 * 1024
+      || (process.platform !== "win32" && (nativeAuditMetadata.mode & 0o077) !== 0)) {
+    fail("--native-audit-library must be a bounded owner-only regular file");
   }
 
   const root = await realpath(await mkdtemp(join(tmpdir(), "usage-monitor-artifact-smoke-")));
@@ -307,6 +442,7 @@ async function main(argv) {
   ];
   const commands = [];
   const audits = [];
+  const nativeAudits = [];
   let auditSequence = 0;
   try {
     await mkdir(home, { mode: 0o700 });
@@ -325,21 +461,35 @@ async function main(argv) {
 
     const invoke = (activeLauncher, args, label = args[0]) => {
       auditSequence += 1;
+      const sequence = String(auditSequence).padStart(3, "0");
       const result = runArtifact({
         launcher: activeLauncher,
         args,
         home,
         temporaryDirectory,
         denyNetwork,
-        auditFile: join(
-          networkAudits,
-          `process-${String(auditSequence).padStart(3, "0")}.json`,
-        ),
+        auditFile: join(networkAudits, `process-${sequence}.json`),
+        nativeAuditFile: join(networkAudits, `native-process-${sequence}.json`),
+        nativeAuditLibrary,
+        directRuntime: true,
       });
       commands.push(label);
       audits.push(result.audit);
+      nativeAudits.push(result.nativeAudit);
       return result.stdout;
     };
+
+    const launcherParity = runArtifact({
+      launcher,
+      args: ["inspect-artifact"],
+      home,
+      temporaryDirectory,
+      denyNetwork,
+      auditFile: join(networkAudits, "launcher-parity.json"),
+    });
+    if (launcherParity.audit.totalAttempts !== 0) {
+      fail("Artifact launcher parity process attempted a JavaScript networking API");
+    }
 
     invoke(launcher, ["inspect-artifact"]);
     invoke(launcher, ["install", "--target", installed]);
@@ -420,6 +570,7 @@ async function main(argv) {
       artifactManifestSha256: await sha256File(
         join(artifactRoot, "artifact-manifest.json"),
       ),
+      nativeAuditLibrarySha256: await sha256File(nativeAuditLibrary),
       platform: `${process.platform}-${process.arch}`,
       runtime: process.version,
       denyNetwork,
@@ -430,10 +581,18 @@ async function main(argv) {
       ),
       networkAttemptTelemetry: "node_api_interposition_v0.1",
       networkAttemptCoverage: NETWORK_AUDIT_COVERAGE,
+      nativeAuditedProcessCount: nativeAudits.length,
+      nativeNetworkLibcAttempts: nativeAudits.reduce(
+        (sum, audit) => sum + audit.totalAttempts,
+        0,
+      ),
+      nativeAttemptTelemetry: "macos_dyld_libc_interposition_v0.1",
+      nativeAttemptCoverage: NATIVE_NETWORK_AUDIT_COVERAGE,
       nativeNetworkEnforcement: denyNetwork
         ? "sandbox-exec_deny_network"
         : "not_enabled",
-      nativeSyscallAttemptTelemetry: "not_measured",
+      directSyscallInstructionTelemetry: "not_measured",
+      launcherParityVerified: true,
       commandCount: commands.length,
       commands,
       localBundleVerified: true,
@@ -447,7 +606,7 @@ async function main(argv) {
       result: "passed",
     };
     await mkdir(dirname(output), { recursive: true });
-    await writeFile(output, stableJson(result), { mode: 0o600 });
+    await writeFile(output, stableJson(result), { mode: 0o600, flag: "wx" });
     console.log(`Artifact smoke: ${result.result}`);
     console.log(`Commands: ${result.commandCount}`);
     console.log(
@@ -455,8 +614,13 @@ async function main(argv) {
       + `across ${result.auditedProcessCount} processes`,
     );
     console.log(
+      `Native libc network attempts: ${result.nativeNetworkLibcAttempts} `
+      + `across ${result.nativeAuditedProcessCount} processes`,
+    );
+    console.log(
       `Native network enforcement: ${result.nativeNetworkEnforcement}; `
-      + `native syscall attempt telemetry: ${result.nativeSyscallAttemptTelemetry}`,
+      + `direct syscall instruction telemetry: `
+      + result.directSyscallInstructionTelemetry,
     );
     console.log("Private canary hits: 0");
     console.log("Identity preserved after uninstall: true");
