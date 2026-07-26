@@ -15,8 +15,11 @@ export type ErrorCode =
   | "METHOD_NOT_ALLOWED"
   | "NOT_FOUND"
   | "PARTICIPANT_DELETING"
+  | "PRIVACY_CANARY_DETECTED"
   | "SYNTHETIC_RECORD_INVALID"
-  | "SYNTHETIC_REQUIRED";
+  | "SYNTHETIC_REQUIRED"
+  | "TELEMETRY_RECORD_INVALID"
+  | "TELEMETRY_REQUIRED";
 
 export class ApiError extends Error {
   readonly code: ErrorCode;

@@ -4,351 +4,479 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
-    <meta name="theme-color" content="#f4f1e8">
+    <meta name="theme-color" content="#f5f1e8">
     <meta
       name="description"
-      content="A synthetic-only preview of private, metadata-based AI usage monitoring."
+      content="Private, local-first monitoring for AI usage, quota movement, calibration quality, and safe community contributions."
     >
-    <title>Usage Monitor — Private contribution preview</title>
+    <title>Usage Monitor</title>
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
   </head>
   <body>
-    <a class="skip-link" href="#main">Skip to main content</a>
+    <a class="skip-link" href="#main">Skip to monitoring dashboard</a>
 
-    <header class="site-header">
-      <a class="brand" href="#top" aria-label="Usage Monitor home">
-        <span class="brand-mark" aria-hidden="true">
-          <span></span><span></span><span></span>
-        </span>
+    <header class="topbar">
+      <a class="brand" href="#overview" aria-label="Usage Monitor dashboard">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span>Usage Monitor</span>
       </a>
-      <div class="environment-badge">
-        <span class="pulse-dot" aria-hidden="true"></span>
-        Synthetic preview
+      <nav class="primary-nav" aria-label="Dashboard sections">
+        <a href="#overview" data-nav="overview">Overview</a>
+        <a href="#timeline" data-nav="timeline">Timeline</a>
+        <a href="#weekly" data-nav="weekly">Weekly</a>
+        <a href="#coverage" data-nav="coverage">Coverage &amp; gaps</a>
+        <a href="#data" data-nav="data">Data &amp; privacy</a>
+      </nav>
+      <div class="top-actions">
+        <span class="state-pill state-connecting" id="global-state">
+          <span class="state-dot" aria-hidden="true"></span>
+          Connecting
+        </span>
+        <button class="button button-secondary compact" id="refresh-button" type="button">
+          Refresh local data
+        </button>
       </div>
     </header>
 
     <main id="main">
-      <section class="hero" id="top" aria-labelledby="hero-title">
-        <div class="eyebrow">Community intelligence, without conversation content</div>
-        <h1 id="hero-title">Understand your AI allowance.<br><em>Keep your work private.</em></h1>
-        <p class="hero-copy">
-          Usage Monitor turns safe, content-free metadata into a clear view of how
-          model choice, speed, and time affect your allowance.
-        </p>
-        <div class="hero-actions">
-          <a class="button button-primary" href="#contribute">Try the synthetic flow</a>
-          <a class="text-link" href="#privacy">See exactly what stays private <span aria-hidden="true">↓</span></a>
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">Local evidence dashboard</p>
+          <h1>Your usage, measured against your allowance.</h1>
+          <p class="lede">
+            Compare content-free token metadata with observed quota movement, see
+            what the model can and cannot explain, and improve the estimate over time.
+          </p>
         </div>
-
-        <div class="signal-card" aria-label="Illustrative usage chart">
-          <div class="signal-card-header">
-            <div>
-              <span class="signal-label">Illustrative seven-day allowance</span>
-              <strong>72% remaining</strong>
-            </div>
-            <span class="trend-pill">Synthetic data</span>
-          </div>
-          <div class="chart" aria-hidden="true">
-            <div class="grid-line grid-line-a"></div>
-            <div class="grid-line grid-line-b"></div>
-            <svg viewBox="0 0 760 220" preserveAspectRatio="none">
-              <defs>
-                <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#174f45" stop-opacity=".22"></stop>
-                  <stop offset="100%" stop-color="#174f45" stop-opacity="0"></stop>
-                </linearGradient>
-              </defs>
-              <path class="chart-area" d="M0,40 C80,42 90,56 150,60 S250,75 310,100 S410,106 480,130 S590,152 650,160 S720,180 760,178 L760,220 L0,220 Z"></path>
-              <path class="chart-line" d="M0,40 C80,42 90,56 150,60 S250,75 310,100 S410,106 480,130 S590,152 650,160 S720,180 760,178"></path>
-            </svg>
-            <span class="chart-point" aria-hidden="true"></span>
-          </div>
-          <div class="chart-axis" aria-hidden="true">
-            <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
-          </div>
+        <div class="freshness-card" aria-live="polite">
+          <span>Latest observation</span>
+          <strong id="latest-observation">Checking…</strong>
+          <small id="data-source">Local companion</small>
         </div>
-      </section>
+      </div>
 
-      <section class="privacy-section" id="privacy" aria-labelledby="privacy-title">
+      <div class="notice notice-warning" id="connection-notice" role="status" hidden>
+        <div>
+          <strong id="connection-title">Local companion unavailable</strong>
+          <p id="connection-copy">
+            Start the local companion to read your content-free monitoring artifacts.
+            Nothing has been presented as your real usage.
+          </p>
+        </div>
+        <button class="button button-quiet" id="demo-button" type="button">Explore labeled demo</button>
+      </div>
+
+      <section class="dashboard-section" id="overview" aria-labelledby="overview-title">
         <div class="section-heading">
-          <span class="section-number">01</span>
           <div>
-            <div class="eyebrow">The privacy boundary</div>
-            <h2 id="privacy-title">Useful signals in.<br>Private content stays out.</h2>
+            <p class="eyebrow">01 · Overview</p>
+            <h2 id="overview-title">Where your allowance stands</h2>
           </div>
+          <p id="overview-context">
+            Current quota observations and API-price-equivalent usage from your local evidence.
+          </p>
         </div>
 
-        <div class="privacy-grid">
-          <article class="privacy-card safe">
-            <div class="privacy-icon" aria-hidden="true">✓</div>
-            <h3>Included metadata</h3>
-            <p>Only the measurements needed to study allowance behavior.</p>
-            <ul>
-              <li>Timestamps and duration</li>
-              <li>Model and speed tier</li>
-              <li>Input, cached, output, and reasoning token counts</li>
-              <li>Remaining allowance observations</li>
-              <li>Tool categories and anonymized surface</li>
-            </ul>
-          </article>
-          <article class="privacy-card blocked">
-            <div class="privacy-icon" aria-hidden="true">×</div>
-            <h3>Never included</h3>
-            <p>The collector is designed to reject these fields locally.</p>
-            <ul>
-              <li>Prompts or assistant responses</li>
-              <li>File names, paths, or file contents</li>
-              <li>Commands or tool arguments</li>
-              <li>Email addresses or account names</li>
-              <li>Repository names or working directories</li>
-            </ul>
-          </article>
+        <div class="metric-grid quota-grid" id="quota-cards" aria-live="polite">
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
         </div>
 
-        <aside class="privacy-note">
-          <span class="lock" aria-hidden="true">⌁</span>
-          <div>
-            <strong>Review before anything leaves your computer</strong>
-            <p>
-              The intended product shows the complete safe record first, then encrypts
-              it in your browser. This preview uses a fixed synthetic fixture—never
-              your actual logs.
-            </p>
-          </div>
-        </aside>
-      </section>
-
-      <section class="contribution-section" id="contribute" aria-labelledby="contribute-title">
-        <div class="section-heading">
-          <span class="section-number">02</span>
-          <div>
-            <div class="eyebrow">Interactive development preview</div>
-            <h2 id="contribute-title">Walk through a safe contribution.</h2>
-            <p class="section-copy">
-              This vertical slice sends only the synthetic record shown below. There
-              is no file picker, paste box, log scanner, or real-data upload control.
-            </p>
-          </div>
-        </div>
-
-        <div class="dev-warning" role="note">
-          <strong>Development environment</strong>
-          <span>Fixed synthetic records only. Do not use this preview for real usage data.</span>
-        </div>
-
-        <div class="flow-shell">
-          <nav class="stepper" aria-label="Contribution steps">
-            <button class="step active" type="button" data-step-target="review" aria-current="step">
-              <span>1</span> Review
-            </button>
-            <span class="step-line" aria-hidden="true"></span>
-            <button class="step" type="button" data-step-target="enroll">
-              <span>2</span> Enroll
-            </button>
-            <span class="step-line" aria-hidden="true"></span>
-            <button class="step" type="button" data-step-target="results">
-              <span>3</span> Results
-            </button>
-          </nav>
-
-          <div class="flow-panel" id="panel-review" data-panel="review">
-            <div class="panel-header">
+        <div class="two-column overview-panels">
+          <article class="panel">
+            <div class="panel-heading">
               <div>
-                <span class="panel-kicker">Safe record preview</span>
-                <h3>One fixed synthetic contribution</h3>
+                <p class="panel-kicker">API-price equivalent</p>
+                <h3>What the recorded usage would cost</h3>
               </div>
-              <span class="verified-pill"><span aria-hidden="true">✓</span> Content-free</span>
+              <button class="info-button" type="button" aria-describedby="pricing-note">?</button>
             </div>
-            <div class="record-summary">
-              <div><span>Provider</span><strong>OpenAI</strong></div>
-              <div><span>Window</span><strong>7 days</strong></div>
-              <div><span>Model</span><strong>GPT-5.6 Sol</strong></div>
-              <div><span>Records</span><strong id="record-count">1</strong></div>
+            <p class="annotation" id="pricing-note">
+              This uses the public API price card as a common measuring stick. It
+              is not a subscription charge and does not assume the quota is dollar-denominated.
+            </p>
+            <div class="cost-total">
+              <span id="cost-period">Recorded period</span>
+              <strong id="cost-total">—</strong>
+              <small id="cost-coverage">Awaiting local evidence</small>
             </div>
-            <div class="record-table-wrap">
+            <div class="component-list" id="cost-components"></div>
+          </article>
+
+          <article class="panel comparison-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Measured versus calculated</p>
+                <h3>Does token cost explain the quota change?</h3>
+              </div>
+              <span class="evidence-chip" id="fit-chip">No evidence</span>
+            </div>
+            <div class="comparison-visual" id="comparison-visual">
+              <div class="comparison-row">
+                <span>Observed quota movement</span>
+                <div class="bar-track"><i style="width:0%"></i></div>
+                <strong>—</strong>
+              </div>
+              <div class="comparison-row calculated">
+                <span>Cost-implied movement</span>
+                <div class="bar-track"><i style="width:0%"></i></div>
+                <strong>—</strong>
+              </div>
+            </div>
+            <p class="plain-result" id="comparison-result">
+              More observations are required before a useful comparison can be made.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="dashboard-section" id="timeline" aria-labelledby="timeline-title">
+        <div class="section-heading split">
+          <div>
+            <p class="eyebrow">02 · Timeline</p>
+            <h2 id="timeline-title">Quota movement over time</h2>
+          </div>
+          <div class="segmented-control" id="window-controls" aria-label="Rolling comparison window">
+            <button type="button" data-hours="1">1 hour</button>
+            <button type="button" data-hours="2">2 hours</button>
+            <button type="button" data-hours="3" class="active" aria-pressed="true">3 hours</button>
+          </div>
+        </div>
+
+        <article class="panel chart-panel">
+          <div class="chart-heading">
+            <div>
+              <h3 id="timeline-chart-title">Observed quota change versus cost-implied change</h3>
+              <p id="timeline-chart-copy">UTC timestamps · drag or scroll horizontally on smaller screens</p>
+            </div>
+            <div class="legend" aria-label="Chart legend">
+              <span><i class="legend-dot observed"></i>Observed quota</span>
+              <span><i class="legend-dot expected"></i>Expected from API cost</span>
+            </div>
+          </div>
+          <div class="chart-empty" id="timeline-empty">
+            <strong>No timeline loaded</strong>
+            <p>Connect the local companion or choose the labeled demo.</p>
+          </div>
+          <div class="chart-shell" id="timeline-chart" hidden></div>
+          <div class="chart-summary-grid" id="timeline-summary"></div>
+        </article>
+
+        <div class="two-column lower-charts">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Residuals</p>
+                <h3>Where the estimate misses</h3>
+              </div>
+            </div>
+            <p class="annotation">
+              Residual = observed quota change minus cost-implied change. Positive
+              values mean the allowance fell faster than the token model predicted.
+            </p>
+            <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
+            <div class="chart-shell compact-chart" id="residual-chart" hidden></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Inspect exact periods</p>
+                <h3>Largest unexplained windows</h3>
+              </div>
+            </div>
+            <div class="table-wrap">
               <table>
-                <caption class="sr-only">Synthetic metadata that will be encrypted and contributed</caption>
+                <caption class="sr-only">Largest unexplained quota movement periods</caption>
                 <thead>
                   <tr>
                     <th scope="col">UTC period</th>
-                    <th scope="col">Model</th>
-                    <th scope="col">Speed</th>
-                    <th scope="col">Tokens</th>
-                    <th scope="col">Quota change</th>
+                    <th scope="col">Observed</th>
+                    <th scope="col">Expected</th>
+                    <th scope="col">Difference</th>
                   </tr>
                 </thead>
-                <tbody id="record-table-body"></tbody>
+                <tbody id="residual-table">
+                  <tr><td colspan="4" class="empty-cell">No periods loaded.</td></tr>
+                </tbody>
               </table>
             </div>
-            <details class="raw-preview">
-              <summary>Inspect exact synthetic JSON</summary>
-              <pre id="fixture-json" tabindex="0"></pre>
-            </details>
-            <div class="panel-actions">
-              <p><span class="tiny-lock" aria-hidden="true">●</span> No account or payment information required</p>
-              <button class="button button-primary" id="continue-to-enroll" type="button">
-                Continue with synthetic data <span aria-hidden="true">→</span>
-              </button>
-            </div>
-          </div>
-
-          <div class="flow-panel" id="panel-enroll" data-panel="enroll" hidden>
-            <div class="panel-header">
-              <div>
-                <span class="panel-kicker">Anonymous enrollment</span>
-                <h3>Create a private participant identity</h3>
-              </div>
-              <span class="verified-pill"><span aria-hidden="true">⌁</span> No email</span>
-            </div>
-            <div class="enroll-explainer">
-              <div class="explain-step">
-                <span>1</span>
-                <div><strong>Anonymous identity</strong><p>The server returns a random participant ID and recovery code.</p></div>
-              </div>
-              <div class="explain-step">
-                <span>2</span>
-                <div><strong>Browser encryption</strong><p>A new AES key encrypts this fixture. The ciphertext, IV, and wrapped key are sent—never the plaintext or raw AES key.</p></div>
-              </div>
-              <div class="explain-step">
-                <span>3</span>
-                <div><strong>Your control</strong><p>Export your record or permanently delete it whenever you choose.</p></div>
-              </div>
-            </div>
-            <label class="consent-row">
-              <input type="checkbox" id="consent-checkbox">
-              <span>
-                <strong>I understand this preview contributes synthetic metadata.</strong>
-                <small>No real logs or conversation content are collected by this interface.</small>
-              </span>
-            </label>
-            <div class="panel-actions">
-              <button class="button button-quiet" type="button" data-back-to="review">Back</button>
-              <button class="button button-primary" id="enroll-button" type="button" disabled>
-                Enroll and contribute securely
-              </button>
-            </div>
-            <form class="recovery-access" id="recovery-access">
-              <div>
-                <span class="panel-kicker">Returning participant</span>
-                <h4>Recover this synthetic participant</h4>
-                <p>Enter the recovery code shown when you enrolled. Recovery rotates the browser access token.</p>
-              </div>
-              <label>
-                <span>Recovery code</span>
-                <input
-                  id="recovery-input"
-                  type="password"
-                  autocomplete="off"
-                  spellcheck="false"
-                  placeholder="um_recovery_…"
-                  required
-                >
-              </label>
-              <button class="button button-secondary" id="recover-button" type="submit">Recover access</button>
-            </form>
-          </div>
-
-          <div class="flow-panel" id="panel-results" data-panel="results" hidden>
-            <div class="panel-header">
-              <div>
-                <span class="panel-kicker">Contribution status</span>
-                <h3 id="result-title">Your private result</h3>
-              </div>
-              <span class="status-pill" id="status-pill"><span aria-hidden="true">●</span> Not enrolled</span>
-            </div>
-
-            <div id="result-empty" class="empty-state">
-              <span aria-hidden="true">↗</span>
-              <h4>Complete the synthetic contribution first</h4>
-              <p>Your contribution receipt and controls will appear here.</p>
-              <button class="button button-primary" type="button" data-back-to="enroll">Go to enrollment</button>
-            </div>
-
-            <div id="result-content" hidden>
-              <div class="receipt-grid">
-                <div>
-                  <span>Participant</span>
-                  <strong id="participant-id">—</strong>
-                </div>
-                <div>
-                  <span>Contribution</span>
-                  <strong id="contribution-id">—</strong>
-                </div>
-                <div>
-                  <span>Processing state</span>
-                  <strong id="processing-status">—</strong>
-                </div>
-              </div>
-
-              <div class="recovery-card" id="recovery-card">
-                <div>
-                  <span class="panel-kicker">Shown once</span>
-                  <h4>Save your recovery code</h4>
-                  <p>Use it from the enrollment step to recover access. It cannot be displayed again after you leave.</p>
-                </div>
-                <code id="recovery-code">—</code>
-                <button class="button button-quiet" id="copy-recovery" type="button">Copy code</button>
-              </div>
-
-              <div class="result-insight">
-                <span class="insight-mark" aria-hidden="true">≈</span>
-                <div>
-                  <span class="panel-kicker">Synthetic result</span>
-                  <h4>API-price equivalent and allowance movement are ready to compare.</h4>
-                  <p>This preview verifies the product path; it does not estimate your real allowance.</p>
-                </div>
-              </div>
-
-              <div class="account-actions">
-                <button class="button button-secondary" id="refresh-status" type="button">Refresh status</button>
-                <button class="button button-secondary" id="export-button" type="button">Export my data</button>
-                <button class="danger-link" id="show-delete" type="button">Delete participant and data</button>
-              </div>
-
-              <form class="delete-confirmation" id="delete-confirmation" hidden>
-                <h4>Permanently delete this participant?</h4>
-                <p>This removes the synthetic contribution and invalidates this browser session. Type <strong>DELETE</strong> to confirm.</p>
-                <label>
-                  <span>Confirmation</span>
-                  <input id="delete-phrase" type="text" autocomplete="off" spellcheck="false" placeholder="DELETE">
-                </label>
-                <div>
-                  <button class="button button-quiet" id="cancel-delete" type="button">Cancel</button>
-                  <button class="button button-danger" id="delete-button" type="submit" disabled>Delete permanently</button>
-                </div>
-              </form>
-            </div>
-          </div>
-
-          <div class="notice" id="app-notice" role="status" aria-live="polite" hidden></div>
+          </article>
         </div>
       </section>
 
-      <section class="principles" aria-labelledby="principles-title">
+      <section class="dashboard-section" id="weekly" aria-labelledby="weekly-title">
         <div class="section-heading">
-          <span class="section-number">03</span>
           <div>
-            <div class="eyebrow">Product principles</div>
-            <h2 id="principles-title">A monitor people can trust.</h2>
+            <p class="eyebrow">03 · Weekly allowance</p>
+            <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
+          </div>
+          <p>
+            A week-by-week calibration, with uncertainty kept visible rather than
+            collapsed into a single false-precision number.
+          </p>
+        </div>
+
+        <div class="weekly-hero">
+          <div>
+            <span>Current central estimate</span>
+            <strong id="weekly-estimate">—</strong>
+            <small id="weekly-range">No evidence interval available</small>
+          </div>
+          <div class="confidence-meter">
+            <div class="confidence-label"><span>Evidence strength</span><strong id="evidence-label">Insufficient</strong></div>
+            <div class="meter-track"><i id="evidence-meter" style="width:0%"></i></div>
+            <p id="weekly-explanation">
+              The estimate will appear when enough quota transitions can be matched to priced usage.
+            </p>
           </div>
         </div>
-        <div class="principle-grid">
-          <article><span>01</span><h3>Local first</h3><p>Inspect and minimize on-device before considering a contribution.</p></article>
-          <article><span>02</span><h3>Explainable</h3><p>Every estimate identifies its source, assumptions, and uncertainty.</p></article>
-          <article><span>03</span><h3>Reversible</h3><p>Download your record or remove your participant identity and data.</p></article>
+
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">History</p>
+                <h3>Estimated limit by week</h3>
+              </div>
+            </div>
+            <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
+            <div class="chart-shell compact-chart" id="weekly-chart" hidden></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Validation</p>
+                <h3>How wrong was the estimate?</h3>
+              </div>
+            </div>
+            <div class="weekly-stats" id="weekly-stats"></div>
+            <p class="annotation" id="weekly-caveat">
+              Error is measured on held-out observations when available.
+            </p>
+          </article>
+        </div>
+
+        <article class="panel weekly-table-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Week-by-week evidence</p>
+              <h3>What changed, and how certain are we?</h3>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">Weekly allowance estimates and uncertainty</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Week / epoch</th>
+                  <th scope="col">Estimate</th>
+                  <th scope="col">Range</th>
+                  <th scope="col">Evidence</th>
+                  <th scope="col">Interpretation</th>
+                </tr>
+              </thead>
+              <tbody id="weekly-table">
+                <tr><td colspan="5" class="empty-cell">No weekly evidence loaded.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="dashboard-section" id="coverage" aria-labelledby="coverage-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">04 · Coverage &amp; gaps</p>
+            <h2 id="coverage-title">What this monitor can actually see</h2>
+          </div>
+          <p>
+            Honest coverage is part of the result. Blind spots, unknown models,
+            missing prices, resets, and unobserved surfaces remain explicit.
+          </p>
+        </div>
+
+        <div class="coverage-layout">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Signal coverage</p>
+                <h3>Evidence we can match</h3>
+              </div>
+              <strong class="coverage-total" id="coverage-total">—</strong>
+            </div>
+            <div class="coverage-list" id="coverage-list"></div>
+          </article>
+          <article class="panel blind-spots">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Needs investigation</p>
+                <h3>Known blind spots</h3>
+              </div>
+            </div>
+            <div id="blind-spot-list" class="issue-list">
+              <div class="empty-inline">No quality artifact loaded.</div>
+            </div>
+          </article>
+        </div>
+
+        <article class="panel report-panel">
+          <div>
+            <p class="panel-kicker">Detailed evidence</p>
+            <h3>Open the full local reports</h3>
+            <p class="annotation">Reports stay on this machine and expose the deeper diagnostic views.</p>
+          </div>
+          <div class="report-links" id="report-links">
+            <span class="empty-inline">No reports advertised by the local companion.</span>
+          </div>
+        </article>
+      </section>
+
+      <section class="dashboard-section" id="data" aria-labelledby="data-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">05 · Data &amp; privacy</p>
+            <h2 id="data-title">Local by default. Contribute by choice.</h2>
+          </div>
+          <p>
+            Raw logs are read by the loopback companion, not the webpage. A contribution
+            must be a privacy-stripped export and is validated again by the server.
+          </p>
+        </div>
+
+        <div class="boundary-diagram" role="img" aria-label="Raw logs remain local. The local companion extracts content-free metadata for the dashboard. Only a reviewed safe export can be sent to the contribution service.">
+          <div class="boundary-node private">
+            <span>On your computer</span>
+            <strong>Raw Codex logs</strong>
+            <small>Prompts, responses, paths never enter this page</small>
+          </div>
+          <span class="boundary-arrow" aria-hidden="true">→</span>
+          <div class="boundary-node local">
+            <span>Loopback only</span>
+            <strong>Local companion</strong>
+            <small>Reads logs, prices usage, builds safe summaries</small>
+          </div>
+          <span class="boundary-arrow optional" aria-hidden="true">⇢</span>
+          <div class="boundary-node community">
+            <span>Optional</span>
+            <strong>Validated contribution</strong>
+            <small>Content-free schema, bounded size, explicit consent</small>
+          </div>
+        </div>
+
+        <div class="two-column data-panels">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Local collector</p>
+                <h3>Source and refresh status</h3>
+              </div>
+              <span class="evidence-chip" id="collector-state">Unknown</span>
+            </div>
+            <dl class="definition-grid" id="collector-details">
+              <div><dt>Last scan</dt><dd>—</dd></div>
+              <div><dt>Safe records</dt><dd>—</dd></div>
+              <div><dt>Source bytes</dt><dd>Not exposed to browser</dd></div>
+              <div><dt>Identity</dt><dd>Pseudonymous</dd></div>
+            </dl>
+            <div class="privacy-lists">
+              <div>
+                <strong>Included</strong>
+                <ul><li>Timestamps and models</li><li>Token components and quota observations</li><li>Coarse tool and surface categories</li></ul>
+              </div>
+              <div class="excluded">
+                <strong>Excluded</strong>
+                <ul><li>Prompts and responses</li><li>Files, paths, commands and arguments</li><li>Email and account names</li></ul>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel contribution-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Optional community contribution</p>
+                <h3>Submit a privacy-safe export</h3>
+              </div>
+              <span class="evidence-chip neutral" id="service-state">Checking service</span>
+            </div>
+            <p class="annotation">
+              Select only an export produced by Usage Monitor—not a raw Codex log.
+              The server must schema-validate, reject content-like fields, deduplicate,
+              and quarantine outliers before aggregation.
+            </p>
+            <form id="contribution-form">
+              <label class="file-drop" for="contribution-file">
+                <input id="contribution-file" name="export" type="file" accept=".json,application/json" required>
+                <span aria-hidden="true">＋</span>
+                <strong>Choose a safe export</strong>
+                <small id="file-help">Privacy-safe JSON export · 1.25 MB browser validation limit</small>
+              </label>
+              <label class="consent-row">
+                <input id="contribution-consent" type="checkbox" required>
+                <span>
+                  <strong>I reviewed this as a privacy-safe Usage Monitor export.</strong>
+                  <small>Uploading is optional and can be tested against a local backend.</small>
+                </span>
+              </label>
+              <button class="button button-primary" id="contribution-submit" type="submit" disabled>
+                Validate and contribute
+              </button>
+            </form>
+            <div class="upload-status" id="upload-status" role="status" hidden></div>
+          </article>
+        </div>
+
+        <div class="two-column result-panels">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Your contributed evidence</p>
+                <h3>Personal result</h3>
+              </div>
+            </div>
+            <div class="result-summary" id="personal-result">
+              <p>No accepted contribution is associated with this browser yet.</p>
+            </div>
+            <div class="participant-controls" id="participant-controls" hidden>
+              <details class="recovery-details">
+                <summary>Anonymous recovery code</summary>
+                <p>Save this once. It restores access without an email address and is replaced after recovery.</p>
+                <code id="recovery-code"></code>
+              </details>
+              <div class="result-actions">
+                <button class="button button-secondary" id="download-participant" type="button">
+                  Download my safe export
+                </button>
+                <button class="button button-danger" id="delete-participant" type="button">
+                  Delete my contributed data
+                </button>
+              </div>
+              <p class="participant-action-status" id="participant-action-status" role="status" hidden></p>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Anonymized pool</p>
+                <h3>Community result</h3>
+              </div>
+            </div>
+            <div class="result-summary" id="community-result">
+              <p>No aggregate result is available from the service.</p>
+            </div>
+          </article>
         </div>
       </section>
     </main>
 
     <footer>
-      <a class="brand footer-brand" href="#top">
-        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
-        <span>Usage Monitor</span>
-      </a>
-      <p>Private by design. Synthetic by default.</p>
-      <span>Development preview · 2026</span>
+      <p>Usage Monitor · evidence, uncertainty, and privacy boundaries kept visible.</p>
+      <p id="schema-version">Dashboard contract: waiting</p>
     </footer>
+
+    <noscript>
+      <div class="noscript">JavaScript is required to render local monitoring evidence.</div>
+    </noscript>
   </body>
 </html>

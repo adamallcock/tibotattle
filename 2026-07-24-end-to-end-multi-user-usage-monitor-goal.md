@@ -172,10 +172,12 @@ Evidence now established:
 
 The current execution wave is ordered as follows:
 
-1. **Primary product lane — synthetic consumer vertical slice.** Complete and
-   verify the browser UI, anonymous consent/enrollment/recovery, encrypted fixed
-   fixture submission, D1/R2 lifecycle, participant status/export/deletion, and
-   loopback QA. Keep the Worker unrouted and synthetic-only.
+1. **Primary product lane — functional local and central development app.**
+   The loopback dashboard, real privacy-safe contribution batches, anonymous
+   consent/enrollment/recovery, encrypted submission, strict validation,
+   overlap deduplication, D1/R2 lifecycle, personal/community statistics,
+   participant export/deletion, and fixed same-origin relay are implemented and
+   tested locally. Keep the Worker unrouted and collection unauthorized.
 2. **Provider-accounting lane — bounded OpenAI/Codex accuracy.** Execute the
    [G2 provider-neutral pricing and accounting plan](./2026-07-25-g2-provider-neutral-pricing-plan.md):
    preserve exact cached/uncached input, text/reasoning output, API tier,
@@ -188,41 +190,59 @@ The current execution wave is ordered as follows:
    machinery remains available, but no OAuth refresh or further Claude
    integration is part of this wave.
 
-Only fixed synthetic enrollment and encrypted submission are authorized by
-this checkpoint. Real-log upload, ongoing transmission, notification
-collection, public deployment, and public aggregation remain behind G3 through
-G11 and their named human approvals.
+The local development environment now accepts only explicitly prepared,
+privacy-verified telemetry batches in addition to the fixed synthetic fixture.
+It does not accept raw logs. Real volunteer collection, ongoing/background
+transmission, notification collection, public deployment, and public
+aggregation remain behind G3 through G11 and their named human approvals.
 
 ## Consumer-product checkpoint — July 25, 2026
 
-The first consumer-facing product slice is now implemented with one fixed
-synthetic record. It proves the journey and storage lifecycle without accepting
-real logs or authorizing a public deployment.
+The consumer-facing product slice now includes a real local evidence dashboard
+and a closed development transport. It proves local extraction, contribution,
+storage, results, and deletion without accepting raw logs or authorizing a
+public deployment.
 
 | Product capability | Current state |
 |---|---|
 | Local metadata extraction and privacy-minimized records | Implemented and tested for the current local contract |
 | Local verification, recovery, deletion, and generated research reports | Implemented as command-line and static-artifact workflows |
-| Consumer local app or interactive web UI | Synthetic-only browser journey implemented |
-| Enrollment, consent, recovery code, and account portal | Synthetic anonymous enrollment/recovery and participant controls implemented |
-| Upload client, encryption envelope, and background sync | Fixed-fixture browser envelope implemented; real-log upload and background sync explicitly disabled |
+| Consumer local app or interactive web UI | Functional loopback dashboard implemented with real retained quota, cost, gradient, weekly, and quality evidence |
+| Enrollment, consent, recovery code, and account portal | Separate synthetic/real consent modes, anonymous enrollment, recovery, and participant controls implemented locally |
+| Upload client, encryption envelope, and background sync | Explicit prepared-batch browser encryption/upload implemented; raw-log and background upload disabled |
 | Web server, upload authorization, and private object storage | Local Cloudflare Worker, bearer capabilities, D1, and R2 implemented; no public route |
-| Server validation, quarantine, deduplication, and canonical database | Exact synthetic validation, replay handling, R2 quarantine, and D1 results implemented |
-| Personal participant dashboard and results API | Synthetic status, export, recovery, and deletion implemented |
-| Privacy-safe aggregate website | Designed in Stage 9; not implemented |
+| Server validation, quarantine, deduplication, and canonical database | Exact real/synthetic validation, privacy-canary rejection, overlap dedupe, R2 quarantine, and D1 rows implemented |
+| Personal participant dashboard and results API | Personal totals, quota-gradient diagnostics, contribution status, export, recovery, individual/full deletion implemented |
+| Privacy-safe aggregate website | K-anonymous development aggregate API and UI implemented; public publication not authorized |
 | Notifications and ongoing collection controls | Designed in Stage 10; not implemented |
-| Server-side export, revocation, and deletion | Synthetic participant export, access rotation, and full D1/R2 deletion implemented |
+| Server-side export, revocation, and deletion | Real/synthetic participant export, access rotation, individual contribution deletion, and full D1/R2 deletion implemented |
 
-The completed product checkpoint is a narrow end-to-end vertical slice,
-exercised only with synthetic data:
+The completed product checkpoint is a narrow end-to-end development slice,
+exercised with synthetic fixtures and a locally prepared real safe bundle:
 
 1. a simple local browser UI that invokes the existing safe-record pipeline, explains exactly what will and will not leave the machine, previews the sanitized contribution, and displays the user's local quota-versus-cost charts;
 2. a development-only enrollment and upload service using anonymous credentials, an encrypted versioned envelope, private quarantine storage, replay protection, and explicit status;
-3. a worker that validates, deduplicates, and writes only canonical synthetic metadata;
-4. a private participant page showing contribution status and synthetic personal results; and
-5. complete synthetic export, revocation, and deletion through every store.
+3. a worker that validates, privacy-checks, deduplicates, and writes only
+   canonical closed metadata;
+4. a private participant page showing contribution status, personal totals,
+   quota-gradient diagnostics, and thresholded community results; and
+5. complete export, contribution deletion, and participant deletion through
+   every store.
 
-This slice does not authorize real volunteer data. Its purpose is to prove that the proposed consumer journey and server architecture work end to end before selecting a public launch stack. Accounting accuracy and the product vertical slice remain separate lanes sharing the same versioned safe-record and analysis contracts.
+This slice does not authorize real volunteer data. Its purpose is to prove that
+the proposed consumer journey and server architecture work end to end before a
+public launch decision. API-price values remain client-declared and explicitly
+unverified by the server until independent server-side repricing is
+implemented.
+
+The July 25 browser/server verification used a fresh real privacy-safe export:
+158 usage events and 164 quota snapshots became two encrypted transport
+batches. Personal totals updated after each batch, exact replay was idempotent,
+the community result remained suppressed below three participants, a nested
+content canary was rejected, and the consumer deletion control left zero D1
+rows and zero R2 objects. The [verification
+receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) is the
+durable evidence for this checkpoint.
 
 ## Target architecture
 

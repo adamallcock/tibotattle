@@ -55,7 +55,20 @@ async function enroll(): Promise<EnrollmentResponse> {
   return response.json<EnrollmentResponse>();
 }
 
-async function encrypt(value: unknown): Promise<object> {
+async function enrollTelemetry(): Promise<EnrollmentResponse> {
+  const response = await api("/api/v1/enroll", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      consentVersion: "privacy-safe-telemetry-v0.1",
+      syntheticOnly: false,
+    }),
+  });
+  expect(response.status).toBe(201);
+  return response.json<EnrollmentResponse>();
+}
+
+async function encrypt(value: unknown, telemetry = false): Promise<object> {
   const publicJwk = JSON.parse(publicJwkJson) as JsonWebKey;
   const rsaKey = await crypto.subtle.importKey(
     "jwk",
@@ -86,12 +99,100 @@ async function encrypt(value: unknown): Promise<object> {
     new TextEncoder().encode(JSON.stringify(value)),
   ));
   return {
-    schemaVersion: "synthetic-envelope-v0.1",
-    synthetic: true,
+    schemaVersion: telemetry ? "telemetry-envelope-v0.1" : "synthetic-envelope-v0.1",
+    synthetic: !telemetry,
     keyId,
     wrappedKey: encodeBase64Url(wrappedKey),
     iv: encodeBase64Url(iv),
     ciphertext: encodeBase64Url(ciphertext),
+  };
+}
+
+function telemetryFixture(suffix = "a"): Record<string, unknown> {
+  const toolClassCounts = {
+    webSearch: 1,
+    fileSearch: 0,
+    codeInterpreter: 0,
+    hostedShell: 0,
+    computerUse: 0,
+    mcp: 0,
+    applyPatch: 1,
+    localShell: 2,
+    subagent: 0,
+    toolGateway: 1,
+    other: 0,
+    unknown: 0,
+  };
+  return {
+    schemaVersion: "telemetry-contribution-v0.1",
+    synthetic: false,
+    createdAt: "2026-07-25T13:00:00.000Z",
+    coveredAt: {
+      startAt: "2026-07-25T12:00:00.000Z",
+      endAt: "2026-07-25T12:30:00.000Z",
+    },
+    clientPlatform: "macos",
+    providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+    usageEvents: [{
+      schemaVersion: "usage-event-v0.1",
+      eventTime: "2026-07-25T12:05:00.000Z",
+      provider: "openai_codex",
+      modelId: "gpt-5.6-sol",
+      modelRecognition: "recognized",
+      modelFingerprint: null,
+      billingSurface: "chatgpt_subscription",
+      speedMode: "fast",
+      apiServiceTier: "priority",
+      reasoningEffort: "xhigh",
+      components: {
+        inputUncachedTokens: 100,
+        inputCacheReadTokens: 900,
+        inputCacheWriteTokens: 0,
+        inputCacheWrite5mTokens: null,
+        inputCacheWrite1hTokens: null,
+        outputTextTokens: 50,
+        outputReasoningTokens: 25,
+        outputCombinedTokens: null,
+      },
+      totalInputContextTokens: 1000,
+      surface: "local_interactive_unclassified",
+      agentScope: "root",
+      lineageDisposition: "standalone",
+      toolClassCounts,
+      outcome: "completed",
+      eventId: `event:v2:${suffix.repeat(64)}`,
+      accounting: {
+        estimatedApiCostUsd: "1.000000",
+        pricingCoveragePercent: 100,
+        unknownBillableUnits: 0,
+        priceBasis: "current_api_prices",
+      },
+    }],
+    quotaSnapshots: [{
+      schemaVersion: "quota-snapshot-v0.1",
+      observedTime: "2026-07-25T12:10:00.000Z",
+      receivedTime: "2026-07-25T12:10:01.000Z",
+      provider: "openai_codex",
+      planType: "pro",
+      planVariant: "pro-20x",
+      limitId: "codex",
+      slot: "seven_day",
+      usedPercent: 31,
+      displayPrecision: 0,
+      windowDurationMinutes: 10080,
+      resetsAt: "2026-07-31T12:00:00.000Z",
+      snapshotSource: "rollout",
+      providerSurface: "account_shared_unallocated",
+      snapshotId: `snapshot:v2:${suffix.repeat(64)}`,
+    }],
+    activityMarkers: [],
+    accounting: {
+      estimatedApiCostUsd: "1.000000",
+      pricedEventCoveragePercent: 100,
+      unknownModelEventCount: 0,
+      unknownBillableUnits: 0,
+      priceBasis: "current_api_prices",
+    },
   };
 }
 
@@ -162,7 +263,7 @@ describe("synthetic usage monitor service", () => {
     expect(health.status).toBe(200);
     await expect(health.json()).resolves.toEqual({
       status: "ok",
-      mode: "synthetic-only",
+      mode: "synthetic-and-private-telemetry",
     });
   });
 
@@ -221,7 +322,7 @@ describe("synthetic usage monitor service", () => {
     });
     expect(exported.status).toBe(200);
     await expect(exported.json()).resolves.toMatchObject({
-      schemaVersion: "synthetic-participant-export-v0.1",
+      schemaVersion: "participant-export-v0.2",
       syntheticOnly: true,
       contributions: [{ fixtureId: "codex-weekly-demo-v0.1" }],
     });
@@ -315,7 +416,7 @@ describe("synthetic usage monitor service", () => {
       method: "POST",
       headers: {
         authorization: `Bearer ${participant.accessToken}`,
-        "content-length": "999999",
+        "content-length": "9999999",
         "content-type": "application/json",
       },
       body: "{}",
@@ -438,5 +539,238 @@ describe("synthetic usage monitor service", () => {
     await expect(invalid.json()).resolves.toMatchObject({
       error: { code: "AUTH_INVALID" },
     });
+  });
+
+  it("ingests closed telemetry, deduplicates overlaps, and isolates participant data", async () => {
+    const participant = await enrollTelemetry();
+    const firstEnvelope = await encrypt(telemetryFixture("a"), true);
+    const first = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${participant.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(firstEnvelope),
+    });
+    expect(first.status).toBe(202);
+    const accepted = await first.json<{
+      contributionId: string;
+      recordCounts: { accepted: number; deduplicated: number };
+      accountingVerification: string;
+    }>();
+    expect(accepted.recordCounts).toMatchObject({ accepted: 2, deduplicated: 0 });
+    expect(accepted.accountingVerification).toBe("client_declared_unverified");
+
+    const replay = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${participant.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(firstEnvelope),
+    });
+    expect(replay.headers.get("idempotency-replayed")).toBe("true");
+
+    const overlap = telemetryFixture("a");
+    Reflect.set(overlap, "createdAt", "2026-07-25T13:01:00.000Z");
+    Reflect.set(overlap, "activityMarkers", [{
+      schemaVersion: "export-activity-marker-v0.1",
+      observedTime: "2026-07-25T12:20:00.000Z",
+      surface: "controlled_experiment",
+      state: "pulse",
+      agenticPoolCoupling: "depends_on_experiment_surface",
+      planType: "pro",
+      planVariant: "pro-20x",
+      markerId: `marker:v2:${"d".repeat(64)}`,
+    }]);
+    const second = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${participant.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(await encrypt(overlap, true)),
+    });
+    expect(second.status).toBe(202);
+    const secondAccepted = await second.json<{ contributionId: string; recordCounts: object }>();
+    expect(secondAccepted).toMatchObject({
+      recordCounts: { accepted: 1, deduplicated: 2 },
+    });
+    expect(secondAccepted.contributionId).not.toBe(accepted.contributionId);
+
+    const stats = await api("/api/v1/me/stats", {
+      headers: { authorization: `Bearer ${participant.accessToken}` },
+    });
+    expect(stats.status).toBe(200);
+    const personal = await stats.json<Record<string, unknown>>();
+    expect(personal).toMatchObject({
+      participantId: participant.participantId,
+      totals: {
+        contributions: 2,
+        usageEvents: 1,
+        quotaSnapshots: 1,
+        activityMarkers: 1,
+        inputCacheReadTokens: 900,
+        priceVerification: "client_declared_unverified",
+      },
+      quotaGradients: [{
+        status: "not_testable",
+        reason: "insufficient_quota_observations",
+        verification: "client_declared_unverified",
+      }],
+    });
+
+    const contribution = await api(`/api/v1/contributions/${accepted.contributionId}`, {
+      headers: { authorization: `Bearer ${participant.accessToken}` },
+    });
+    expect(contribution.status).toBe(200);
+    await expect(contribution.json()).resolves.toMatchObject({
+      contributionId: accepted.contributionId,
+      records: [{ kind: "usage" }, { kind: "quota" }],
+    });
+
+    const stranger = await enrollTelemetry();
+    const isolated = await api(`/api/v1/contributions/${accepted.contributionId}`, {
+      headers: { authorization: `Bearer ${stranger.accessToken}` },
+    });
+    expect(isolated.status).toBe(404);
+
+    const community = await api("/api/v1/community/insights");
+    await expect(community.json()).resolves.toMatchObject({
+      suppressed: true,
+      participantCount: 1,
+      minimumParticipants: 3,
+    });
+
+    const stored = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT id FROM telemetry_contributions WHERE participant_id = ? ORDER BY created_at, id",
+    ).bind(participant.participantId).all<{ id: string }>();
+    expect(stored.results.map((row) => row.id)).toContain(secondAccepted.contributionId);
+
+    const deleted = await api(`/api/v1/contributions/${accepted.contributionId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${participant.accessToken}` },
+    });
+    expect(deleted.status).toBe(200);
+    const afterDelete = await api("/api/v1/me/stats", {
+      headers: { authorization: `Bearer ${participant.accessToken}` },
+    });
+    await expect(afterDelete.json()).resolves.toMatchObject({
+      totals: { contributions: 1, usageEvents: 1, quotaSnapshots: 1, activityMarkers: 1 },
+    });
+    const surviving = await api(`/api/v1/contributions/${secondAccepted.contributionId}`, {
+      headers: { authorization: `Bearer ${participant.accessToken}` },
+    });
+    await expect(surviving.json()).resolves.toMatchObject({
+      records: [{ kind: "usage" }, { kind: "quota" }, { kind: "activity" }],
+    });
+  });
+
+  it("rejects privacy canaries and inconsistent accounting after decryption", async () => {
+    const participant = await enrollTelemetry();
+    const otherwiseValidEnvelope = JSON.stringify(await encrypt(telemetryFixture("d"), true));
+    const duplicateKeyEnvelope = otherwiseValidEnvelope.replace(
+      '"keyId":',
+      '"keyId":"PRIVATE_PROMPT_CANARY","keyId":',
+    );
+    const duplicate = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${participant.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: duplicateKeyEnvelope,
+    });
+    expect(duplicate.status).toBe(400);
+    expect(await duplicate.text()).not.toContain("PRIVATE_PROMPT_CANARY");
+
+    const contaminated = {
+      ...telemetryFixture("b"),
+      prompt: "PRIVATE USER CONTENT",
+    };
+    const privacy = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${participant.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(await encrypt(contaminated, true)),
+    });
+    expect(privacy.status).toBe(400);
+    await expect(privacy.json()).resolves.toMatchObject({
+      error: { code: "PRIVACY_CANARY_DETECTED" },
+    });
+
+    const inconsistent = telemetryFixture("c");
+    const accounting = Reflect.get(inconsistent, "accounting") as Record<string, unknown>;
+    accounting.estimatedApiCostUsd = "2.000000";
+    const rejected = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${participant.accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(await encrypt(inconsistent, true)),
+    });
+    expect(rejected.status).toBe(400);
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: { code: "TELEMETRY_RECORD_INVALID" },
+    });
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+  });
+
+  it("publishes only k-anonymous community slices", async () => {
+    for (const suffix of ["a", "b", "c"]) {
+      const participant = await enrollTelemetry();
+      const response = await api("/api/v1/contributions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${participant.accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
+      });
+      expect(response.status).toBe(202);
+    }
+    const response = await api("/api/v1/stats/aggregate");
+    expect(response.status).toBe(200);
+    const body = await response.json<Record<string, unknown>>();
+    expect(body).toMatchObject({
+      suppressed: false,
+      participantCount: 3,
+      totals: { usageEvents: 3, quotaSnapshots: 3 },
+      byModel: [{ modelId: "gpt-5.6-sol", participants: 3 }],
+    });
+    expect(JSON.stringify(body)).not.toContain("participant:");
+    expect(JSON.stringify(body)).not.toContain("model:v1:");
+  });
+
+  it("deletes every telemetry object and database row with the participant", async () => {
+    const participant = await enrollTelemetry();
+    for (const suffix of ["a", "b"]) {
+      const response = await api("/api/v1/contributions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${participant.accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(await encrypt(telemetryFixture(suffix), true)),
+      });
+      expect(response.status).toBe(202);
+    }
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(2);
+    const deleted = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${participant.accessToken}` },
+    });
+    await expect(deleted.json()).resolves.toMatchObject({
+      deleted: true,
+      contributionsDeleted: 2,
+    });
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+    const rows = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM telemetry_records",
+    ).first<{ total: number }>();
+    expect(rows?.total).toBe(0);
   });
 });

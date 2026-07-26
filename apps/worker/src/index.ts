@@ -1,6 +1,9 @@
 import {
-  MAX_CONTRIBUTIONS_PER_PARTICIPANT,
+  AGGREGATE_MINIMUM_PARTICIPANTS,
   MAX_REQUEST_BYTES,
+  MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
+  MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
+  TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import {
   decryptSyntheticEnvelope,
@@ -24,6 +27,24 @@ import {
   markParticipantDeleting,
   recoverAccess,
 } from "./repository";
+import {
+  communityStats,
+  deleteTelemetryContribution,
+  existingTelemetryContribution,
+  insertTelemetryContribution,
+  listTelemetryContributions,
+  personalStats,
+  telemetryContributionById,
+  telemetryContributionCount,
+  telemetryContributionMetadata,
+  telemetryEnvelopeDigest,
+  telemetryPlaintextDigest,
+  telemetryRecordsForContribution,
+} from "./telemetry-repository";
+import {
+  validateTelemetryContribution,
+  validateTelemetryEnvelope,
+} from "./telemetry-validation";
 import {
   validateEnvelope,
   validateSyntheticContribution,
@@ -84,6 +105,15 @@ function allowedHeader(error: ApiError): HeadersInit | undefined {
   return Array.isArray(value) ? { allow: value.join(", ") } : undefined;
 }
 
+function hasExactEnvelopeKeyOccurrences(raw: string): boolean {
+  const keys = [...raw.matchAll(/"([^"\\]+)"\s*:/gu)].map((match) => match[1]);
+  const expected = [
+    "schemaVersion", "synthetic", "keyId", "wrappedKey", "iv", "ciphertext",
+  ].sort();
+  return keys.length === expected.length
+    && keys.sort().every((key, index) => key === expected[index]);
+}
+
 async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   const body = await readBoundedJson(request);
@@ -93,12 +123,17 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     || Object.keys(body.value).length !== 2
     || !Object.hasOwn(body.value, "consentVersion")
     || !Object.hasOwn(body.value, "syntheticOnly")
-    || Reflect.get(body.value, "consentVersion") !== "synthetic-preview-v0.1"
-    || Reflect.get(body.value, "syntheticOnly") !== true) {
+    || !(
+      (Reflect.get(body.value, "consentVersion") === "synthetic-preview-v0.1"
+        && Reflect.get(body.value, "syntheticOnly") === true)
+      || (Reflect.get(body.value, "consentVersion") === TELEMETRY_CONSENT_VERSION
+        && Reflect.get(body.value, "syntheticOnly") === false)
+    )) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const consentVersion = Reflect.get(body.value, "consentVersion") as string;
   return jsonResponse(
-    await enroll(env.USAGE_MONITOR_DB, "synthetic-preview-v0.1"),
+    await enroll(env.USAGE_MONITOR_DB, consentVersion),
     201,
   );
 }
@@ -123,13 +158,14 @@ function handleEnvelopeKey(request: Request, env: Env): Response {
   return jsonResponse(publicEnvelopeKey(env.ENVELOPE_PUBLIC_JWK));
 }
 
-async function handleContribution(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const participant = await authenticate(
-    env.USAGE_MONITOR_DB,
-    request.headers.get("authorization"),
-  );
-  const body = await readBoundedJson(request);
+async function handleSyntheticContribution(
+  body: { raw: string; value: unknown },
+  participant: Awaited<ReturnType<typeof authenticate>>,
+  env: Env,
+): Promise<Response> {
+  if (participant.consentVersion !== "synthetic-preview-v0.1") {
+    throw new ApiError(400, "SYNTHETIC_REQUIRED");
+  }
   const envelope = validateEnvelope(body.value);
   const digest = await envelopeDigest(envelope);
   const existing = await existingContribution(env.USAGE_MONITOR_DB, participant.id, digest);
@@ -141,7 +177,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     );
   }
   if (await contributionCount(env.USAGE_MONITOR_DB, participant.id)
-      >= MAX_CONTRIBUTIONS_PER_PARTICIPANT) {
+      >= MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
     throw new ApiError(429, "CONTRIBUTION_LIMIT_REACHED");
   }
 
@@ -155,7 +191,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   const r2Key = `synthetic/${crypto.randomUUID()}`;
   const createdAt = new Date().toISOString();
 
-  await env.QUARANTINE.put(r2Key, body.raw, {
+  await env.QUARANTINE.put(r2Key, JSON.stringify(envelope), {
     httpMetadata: { contentType: "application/json" },
     customMetadata: {
       contributionId,
@@ -185,7 +221,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       );
     }
     if (await contributionCount(env.USAGE_MONITOR_DB, participant.id)
-        >= MAX_CONTRIBUTIONS_PER_PARTICIPANT) {
+        >= MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
       throw new ApiError(429, "CONTRIBUTION_LIMIT_REACHED");
     }
     throw error;
@@ -196,6 +232,155 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   );
 }
 
+async function handleTelemetryContribution(
+  body: { raw: string; value: unknown },
+  participant: Awaited<ReturnType<typeof authenticate>>,
+  env: Env,
+): Promise<Response> {
+  if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  const envelope = validateTelemetryEnvelope(body.value);
+  const envelopeDigestValue = await telemetryEnvelopeDigest(envelope);
+  const envelopeReplay = await existingTelemetryContribution(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    envelopeDigestValue,
+    "envelope",
+  );
+  if (envelopeReplay) {
+    const metadata = telemetryContributionMetadata(envelopeReplay) as {
+      recordCounts: unknown;
+    };
+    return jsonResponse(
+      {
+        contributionId: envelopeReplay.id,
+        status: envelopeReplay.status,
+        replayed: true,
+        recordCounts: metadata.recordCounts,
+        accountingVerification: "client_declared_unverified",
+      },
+      202,
+      { "idempotency-replayed": "true" },
+    );
+  }
+  if (await telemetryContributionCount(env.USAGE_MONITOR_DB, participant.id)
+      >= MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
+    throw new ApiError(429, "CONTRIBUTION_LIMIT_REACHED");
+  }
+
+  const plaintext = await decryptSyntheticEnvelope(
+    envelope,
+    env.ENVELOPE_PUBLIC_JWK,
+    env.ENVELOPE_PRIVATE_JWK,
+  );
+  const record = validateTelemetryContribution(plaintext);
+  const plaintextDigest = await telemetryPlaintextDigest(record);
+  const contentReplay = await existingTelemetryContribution(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    plaintextDigest,
+  );
+  if (contentReplay) {
+    const metadata = telemetryContributionMetadata(contentReplay) as {
+      recordCounts: unknown;
+    };
+    return jsonResponse(
+      {
+        contributionId: contentReplay.id,
+        status: contentReplay.status,
+        replayed: true,
+        recordCounts: metadata.recordCounts,
+        accountingVerification: "client_declared_unverified",
+      },
+      202,
+      { "idempotency-replayed": "true" },
+    );
+  }
+
+  const contributionId = `contribution:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/${crypto.randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  await env.QUARANTINE.put(r2Key, JSON.stringify(envelope), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      contributionId,
+      schemaVersion: envelope.schemaVersion,
+      synthetic: "false",
+    },
+  });
+  try {
+    const result = await insertTelemetryContribution(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      contributionId,
+      r2Key,
+      envelopeDigestValue,
+      plaintextDigest,
+      record,
+      createdAt,
+    );
+    return jsonResponse({
+      contributionId,
+      status: "accepted",
+      recordCounts: {
+        usageEvents: record.usageEvents.length,
+        quotaSnapshots: record.quotaSnapshots.length,
+        activityMarkers: record.activityMarkers.length,
+        accepted: result.acceptedRecords,
+        deduplicated: result.deduplicatedRecords,
+      },
+      accountingVerification: "client_declared_unverified",
+    }, 202);
+  } catch (error) {
+    await env.QUARANTINE.delete(r2Key);
+    const replay = await existingTelemetryContribution(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      plaintextDigest,
+    );
+    if (replay) {
+      const metadata = telemetryContributionMetadata(replay) as {
+        recordCounts: unknown;
+      };
+      return jsonResponse(
+        {
+          contributionId: replay.id,
+          status: replay.status,
+          replayed: true,
+          recordCounts: metadata.recordCounts,
+          accountingVerification: "client_declared_unverified",
+        },
+        202,
+        { "idempotency-replayed": "true" },
+      );
+    }
+    if (await telemetryContributionCount(env.USAGE_MONITOR_DB, participant.id)
+        >= MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
+      throw new ApiError(429, "CONTRIBUTION_LIMIT_REACHED");
+    }
+    throw error;
+  }
+}
+
+async function handleContribution(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const participant = await authenticate(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  const body = await readBoundedJson(request);
+  if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
+    throw new ApiError(400, "ENVELOPE_INVALID");
+  }
+  if (typeof body.value !== "object" || body.value === null || Array.isArray(body.value)) {
+    throw new ApiError(400, "ENVELOPE_INVALID");
+  }
+  return Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
+    ? handleTelemetryContribution(body, participant, env)
+    : handleSyntheticContribution(body, participant, env);
+}
+
 async function handleMe(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   const participant = await authenticate(
@@ -203,20 +388,30 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
     request.headers.get("authorization"),
   );
   const contributions = await listContributions(env.USAGE_MONITOR_DB, participant.id);
+  const telemetryContributions = await listTelemetryContributions(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+  );
   return jsonResponse({
     participantId: participant.id,
     createdAt: participant.createdAt,
-    syntheticOnly: true,
-    contributionCount: contributions.length,
-    latestContribution: contributions.length > 0
-      ? contributionForResponse(contributions[contributions.length - 1]!)
-      : null,
-    contributions: contributions.map((row) => ({
-      contributionId: row.id,
-      status: row.status,
-      fixtureId: row.fixture_id,
-      createdAt: row.created_at,
-    })),
+    syntheticOnly: participant.consentVersion === "synthetic-preview-v0.1",
+    contributionCount: contributions.length + telemetryContributions.length,
+    latestContribution: telemetryContributions.length > 0
+      ? telemetryContributionMetadata(telemetryContributions[telemetryContributions.length - 1]!)
+      : contributions.length > 0
+        ? contributionForResponse(contributions[contributions.length - 1]!)
+        : null,
+    contributions: [
+      ...contributions.map((row) => ({
+        contributionId: row.id,
+        status: row.status,
+        fixtureId: row.fixture_id,
+        synthetic: true,
+        createdAt: row.created_at,
+      })),
+      ...telemetryContributions.map(telemetryContributionMetadata),
+    ],
   });
 }
 
@@ -227,14 +422,36 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
     request.headers.get("authorization"),
   );
   const contributions = await listContributions(env.USAGE_MONITOR_DB, participant.id);
+  const telemetryContributions = await listTelemetryContributions(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+  );
+  const telemetry = [];
+  for (const row of telemetryContributions) {
+    const rows = await telemetryRecordsForContribution(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      row.id,
+    );
+    telemetry.push({
+      ...telemetryContributionMetadata(row),
+      records: rows.map((record) => ({
+        kind: record.record_kind,
+        value: JSON.parse(record.record_json) as unknown,
+      })),
+    });
+  }
   return jsonResponse({
-    schemaVersion: "synthetic-participant-export-v0.1",
-    syntheticOnly: true,
+    schemaVersion: "participant-export-v0.2",
+    syntheticOnly: participant.consentVersion === "synthetic-preview-v0.1",
     participant: {
       participantId: participant.id,
       createdAt: participant.createdAt,
     },
-    contributions: contributions.map(contributionForResponse),
+    contributions: [
+      ...contributions.map(contributionForResponse),
+      ...telemetry,
+    ],
     generatedAt: new Date().toISOString(),
   });
 }
@@ -250,18 +467,81 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     await markParticipantDeleting(env.USAGE_MONITOR_DB, participant.id);
   }
   const contributions = await listContributions(env.USAGE_MONITOR_DB, participant.id);
-  if (contributions.length > MAX_CONTRIBUTIONS_PER_PARTICIPANT) {
+  const telemetryContributions = await listTelemetryContributions(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+  );
+  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT
+      || telemetryContributions.length > MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
     throw new ApiError(500, "INTERNAL_ERROR");
   }
-  if (contributions.length > 0) {
-    await env.QUARANTINE.delete(contributions.map((row) => row.r2_key));
+  const r2Keys = [
+    ...contributions.map((row) => row.r2_key),
+    ...telemetryContributions.map((row) => row.r2_key),
+  ];
+  if (r2Keys.length > 0) {
+    await env.QUARANTINE.delete(r2Keys);
   }
   await finishParticipantDeletion(env.USAGE_MONITOR_DB, participant.id);
   return jsonResponse({
     deleted: true,
     participantId: participant.id,
-    contributionsDeleted: contributions.length,
+    contributionsDeleted: contributions.length + telemetryContributions.length,
   });
+}
+
+async function handleStats(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const participant = await authenticate(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  return jsonResponse(await personalStats(env.USAGE_MONITOR_DB, participant.id));
+}
+
+async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  return jsonResponse(await communityStats(
+    env.USAGE_MONITOR_DB,
+    AGGREGATE_MINIMUM_PARTICIPANTS,
+  ));
+}
+
+async function handleContributionResource(
+  request: Request,
+  env: Env,
+  contributionId: string,
+): Promise<Response> {
+  const participant = await authenticate(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  const row = await telemetryContributionById(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+    contributionId,
+  );
+  if (!row) throw new ApiError(404, "NOT_FOUND");
+  if (request.method === "GET") {
+    const records = await telemetryRecordsForContribution(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+      contributionId,
+    );
+    return jsonResponse({
+      ...telemetryContributionMetadata(row),
+      records: records.map((record) => ({
+        kind: record.record_kind,
+        value: JSON.parse(record.record_json) as unknown,
+      })),
+    });
+  }
+  if (request.method === "DELETE") {
+    await env.QUARANTINE.delete(row.r2_key);
+    await deleteTelemetryContribution(env.USAGE_MONITOR_DB, participant.id, contributionId);
+    return jsonResponse({ deleted: true, contributionId });
+  }
+  methodNotAllowed(["GET", "DELETE"]);
 }
 
 async function routeApi(request: Request, env: Env): Promise<Response> {
@@ -270,7 +550,19 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
   if (pathname === "/api/v1/recover") return handleRecover(request, env);
   if (pathname === "/api/v1/envelope-key") return handleEnvelopeKey(request, env);
   if (pathname === "/api/v1/contributions") return handleContribution(request, env);
+  const contributionMatch = /^\/api\/v1\/contributions\/(contribution:[0-9a-f-]{36})$/u
+    .exec(pathname);
+  if (contributionMatch?.[1]) {
+    return handleContributionResource(request, env, contributionMatch[1]);
+  }
   if (pathname === "/api/v1/me/export") return handleExport(request, env);
+  if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
+    return handleStats(request, env);
+  }
+  if (pathname === "/api/v1/stats/aggregate"
+      || pathname === "/api/v1/community/insights") {
+    return handleCommunityStats(request, env);
+  }
   if (pathname === "/api/v1/me") {
     if (request.method === "DELETE") return handleDelete(request, env);
     return handleMe(request, env);
@@ -285,7 +577,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (url.pathname === "/api/health") {
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
-      return jsonResponse({ status: "ok", mode: "synthetic-only" });
+      return jsonResponse({ status: "ok", mode: "synthetic-and-private-telemetry" });
     }
     if (url.pathname.startsWith("/api/")) return await routeApi(request, env);
     const asset = await env.ASSETS.fetch(request);

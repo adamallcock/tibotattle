@@ -6,6 +6,7 @@ export interface Participant {
   id: string;
   createdAt: string;
   state: "active" | "deleting";
+  consentVersion: string;
 }
 
 interface ParticipantAuthRow {
@@ -13,6 +14,7 @@ interface ParticipantAuthRow {
   access_token_hash: ArrayBuffer;
   created_at: string;
   state: "active" | "deleting";
+  consent_version: string;
 }
 
 interface RecoveryAuthRow {
@@ -153,7 +155,7 @@ export async function authenticate(
 ): Promise<Participant> {
   const parsed = parseAccessToken(authorization);
   const row = await db.prepare(
-    `SELECT id, access_token_hash, created_at, state
+    `SELECT id, access_token_hash, created_at, state, consent_version
        FROM participants
       WHERE access_token_id = ?`,
   ).bind(parsed.id).first<ParticipantAuthRow>();
@@ -165,7 +167,12 @@ export async function authenticate(
   if (row.state === "deleting" && !allowDeleting) {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
-  return { id: row.id, createdAt: row.created_at, state: row.state };
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    state: row.state,
+    consentVersion: row.consent_version,
+  };
 }
 
 export async function envelopeDigest(envelope: SyntheticEnvelope): Promise<string> {

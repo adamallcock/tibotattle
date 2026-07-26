@@ -178,6 +178,74 @@ Local rollout logs normally retain the last provider-reported `used_percent`, wi
 
 Use `--offline` on `capture` to keep ccusage and RunCost on their local price caches. Online capture resolves current RunCost price sources and retains source freshness/provenance in the observation.
 
+## Functional local product
+
+The loopback companion is now the default product preview. It reads the
+privacy-minimized collector ledger and verified report artifacts locally, then
+serves only a closed dashboard projection:
+
+```bash
+USAGE_MONITOR_PORT=8791 npm run product:local
+```
+
+Open `http://127.0.0.1:8791/`. The dashboard shows current retained quota
+windows, API-price-equivalent activity, one/two/three-hour observed-versus-
+expected movement, residuals, weekly calibration and error, monitoring
+coverage, blind spots, and links to the detailed reports. Values are labelled
+with their observation age; stale evidence is not presented as live.
+
+Raw Codex logs never enter the browser. The server binds only to loopback,
+accepts a fixed host, serves fixed assets/reports, and exposes no source-path
+parameter. Refresh is an explicit same-origin action and remains single-flight
+until the collector finishes.
+
+To exercise the complete local-plus-central flow, start the central Worker on a
+separate port and configure the companion's fixed relay:
+
+```bash
+npm --prefix apps/worker run migrate:local
+npm --prefix apps/worker run dev -- --port 8792
+USAGE_MONITOR_PORT=8791 \
+  USAGE_MONITOR_CENTRAL_ORIGIN=http://127.0.0.1:8792 \
+  npm run product:local
+```
+
+The relay accepts only the reviewed central API routes and cannot proxy a
+request-selected URL. The central service remains local-development-only and
+is not deployed.
+
+### Preparing a contribution
+
+The hosted service does not read a user's log directory. First produce a
+current privacy-verified local bundle and receipt. Then convert that reviewed
+bundle into bounded `telemetry-contribution-v0.1` files:
+
+```bash
+npm run product:prepare-contribution -- \
+  --bundle /absolute/path/to/review.umx.json \
+  --receipt /absolute/path/to/review.umx.json.privacy-receipt.json \
+  --output /absolute/path/to/contribution-batches
+```
+
+The converter re-verifies the canonical source and privacy receipt, drops
+participant/account/session scopes from transport rows, normalizes API-price
+components, and writes owner-only no-clobber files of at most 200 rows and
+1.25 MB each. Select those files in the dashboard's Data & privacy section.
+The browser validates the closed shape again, encrypts it, and sends only the
+envelope through the fixed relay. Overlapping batches deduplicate by
+participant-scoped occurrence ID at the server.
+
+`npm run product:check` runs the functional UI, loopback server, transport
+builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
+Worker dry deployment. It does not deploy or upload data.
+
+The [functional end-to-end verification
+receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
+fresh real-data local smoke: two encrypted batches, personal-stat updates,
+idempotent replay, aggregate suppression, server-side privacy-canary rejection,
+participant export, browser-driven complete deletion, and zero retained local
+D1/R2 records afterward.
+
 ## Local metadata exporter privacy boundary
 
 The multi-user research path starts with a local-review-only exporter. It constructs a new allowlisted dataset from raw Codex rollouts and explicitly selected Claude Code transcripts; it does not redact or copy log records. Claude transcript rows are canonicalized by logical provider message before export so streaming partials and cross-file copies are counted once. When Claude supplies an iteration ledger, each provider attempt becomes one cost event and the top-level total is not emitted again; this preserves mixed-model fallback attempts without double counting. Versioned JSON Schemas in `schemas/telemetry-v0.1/` set `additionalProperties: false` at every object boundary. Unknown upstream fields are therefore omitted, and unknown model strings become secret-keyed fingerprints rather than exported names.
@@ -194,7 +262,23 @@ The export privacy gate validates the complete bundle schema, requires the live 
 
 The export-set path requires a Node runtime exposing `node:sqlite`; current qualification covers Node 24.14.0 and Node 26.2.0. Compressed manifests record the producing Node and zlib versions as representation provenance, while verification authenticates stored artifact bytes and never requires runtime equality or recompression. Plain v0.1 filename/manifest dispatch remains isolated, but this unfrozen telemetry contract explicitly has no backward compatibility: local artifacts carrying an earlier resource-policy tuple are rejected and must be regenerated. Other older supported runtimes can continue using the legacy local commands, but are not release-qualified for export sets.
 
-Real-user sharing is still not implemented or authorized: there is no real-log upload client, background process, public deployment, or public aggregate dashboard. A separate **synthetic-only development vertical slice** now exists in [`apps/web`](./apps/web) and [`apps/worker`](./apps/worker). It proves anonymous enrollment and recovery, browser encryption, an authenticated versioned envelope, D1 status/results, R2 quarantine, participant export, and complete deletion using one fixed checked-in synthetic record. It has no file picker, paste box, arbitrary contribution editor, production route, or real-data transport. Run `npm run product:check` for its focused validation; see the [synthetic consumer vertical-slice plan](./2026-07-25-synthetic-consumer-vertical-slice-plan.md) and [Worker runbook](./apps/worker/README.md).
+Real-data transport is implemented only as a local development proof of
+concept. The browser accepts only a prepared
+`telemetry-contribution-v0.1` file; the central Worker performs authenticated
+envelope decryption, exact-shape and semantic validation, privacy-canary
+rejection, participant-scoped occurrence deduplication, D1 ingest, opaque R2
+quarantine, personal statistics, k-anonymous community statistics, export,
+recovery, individual contribution deletion, and complete participant deletion.
+The original fixed synthetic walkthrough remains available for regression
+testing but is no longer the product home.
+
+There is still no public deployment, production route, background
+transmission, public bucket, or authorized volunteer collection. Production
+requires admission controls and rate limiting, production key rotation,
+consent/version governance, privacy/security review, and a staged release
+decision. See the [local companion and central product plan](./2026-07-25-local-companion-app-plan.md),
+the [Worker runbook](./apps/worker/README.md), and the earlier
+[synthetic vertical-slice plan](./2026-07-25-synthetic-consumer-vertical-slice-plan.md).
 
 The [G1 resource-bounded export-set plan](./2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](./2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](./2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](./2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](./2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](./2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](./2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
 

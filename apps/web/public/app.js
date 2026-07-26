@@ -1,33 +1,25 @@
 import {
-  buildSyntheticFixture,
-  createSyntheticEnvelope,
-  formatTokenTotal,
+  CommunityClient,
+  LocalCompanionClient,
+  demoDashboard
+} from "./data-client.js";
+import {
+  createTelemetryEnvelope,
   safeApiError,
-  safeFilename
+  validateTelemetryContribution
 } from "./lib.js";
 
-const API_ROOT = "/api/v1";
-const SESSION_KEY = "usage-monitor.synthetic-session.v1";
+const SESSION_KEY = "usage-monitor.community-session.v1";
+const localClient = new LocalCompanionClient();
+let communitySession = readSession();
+const communityClient = new CommunityClient({
+  getAccessToken: () => communitySession?.accessToken ?? null
+});
 
-const elements = {
-  panels: [...document.querySelectorAll("[data-panel]")],
-  steps: [...document.querySelectorAll("[data-step-target]")],
-  notice: document.querySelector("#app-notice"),
-  consent: document.querySelector("#consent-checkbox"),
-  enroll: document.querySelector("#enroll-button"),
-  empty: document.querySelector("#result-empty"),
-  result: document.querySelector("#result-content"),
-  statusPill: document.querySelector("#status-pill"),
-  recoveryCard: document.querySelector("#recovery-card"),
-  recoveryForm: document.querySelector("#recovery-access"),
-  recoveryInput: document.querySelector("#recovery-input"),
-  recoverButton: document.querySelector("#recover-button"),
-  deleteForm: document.querySelector("#delete-confirmation"),
-  deletePhrase: document.querySelector("#delete-phrase"),
-  deleteButton: document.querySelector("#delete-button")
-};
+let dashboard = null;
+let activeWindowHours = 3;
 
-let session = readSession();
+const $ = (selector) => document.querySelector(selector);
 
 function readSession() {
   try {
@@ -39,321 +31,918 @@ function readSession() {
 }
 
 function saveSession(value) {
-  session = value;
-  if (value) {
-    sessionStorage.setItem(SESSION_KEY, JSON.stringify(value));
+  communitySession = value;
+  if (value) sessionStorage.setItem(SESSION_KEY, JSON.stringify(value));
+  else sessionStorage.removeItem(SESSION_KEY);
+}
+
+function finite(value, fallback = null) {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function formatMoney(value, digits = 0) {
+  const number = finite(value);
+  return number === null
+    ? "—"
+    : new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
+      }).format(number);
+}
+
+function formatPercent(value, digits = 0) {
+  const number = finite(value);
+  return number === null ? "—" : `${number.toFixed(digits)}%`;
+}
+
+function formatPp(value, digits = 1) {
+  const number = finite(value);
+  return number === null ? "—" : `${number.toFixed(digits)} pp`;
+}
+
+function compact(value) {
+  const number = finite(value);
+  return number === null
+    ? "—"
+    : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(number);
+}
+
+function formatUtc(value, { dateOnly = false } = {}) {
+  if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
+  return new Intl.DateTimeFormat("en-US", dateOnly
+    ? { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }
+    : { timeZone: "UTC", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
+  ).format(new Date(value));
+}
+
+function formatAge(value) {
+  const seconds = finite(value);
+  if (seconds === null) return "Unknown age";
+  if (seconds < 90) return "Less than 2 minutes ago";
+  if (seconds < 7200) return `${Math.round(seconds / 60)} minutes ago`;
+  if (seconds < 172800) return `${(seconds / 3600).toFixed(1)} hours ago`;
+  return `${(seconds / 86400).toFixed(1)} days ago`;
+}
+
+function clear(element) {
+  element.replaceChildren();
+}
+
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = String(text);
+  return element;
+}
+
+function setGlobalState(state) {
+  const labels = {
+    live: "Live local evidence",
+    stale: "Stale local evidence",
+    insufficient: "Insufficient evidence",
+    offline: "Companion offline",
+    demo: "Labeled demo data"
+  };
+  const pill = $("#global-state");
+  pill.className = `state-pill state-${state}`;
+  pill.replaceChildren(node("span", "state-dot"), document.createTextNode(labels[state] ?? "Unknown state"));
+}
+
+function showConnectionNotice({ title, copy, kind = "warning", showDemo = false }) {
+  const notice = $("#connection-notice");
+  notice.className = `notice notice-${kind}`;
+  $("#connection-title").textContent = title;
+  $("#connection-copy").textContent = copy;
+  $("#demo-button").hidden = !showDemo;
+  notice.hidden = false;
+}
+
+function hideConnectionNotice() {
+  $("#connection-notice").hidden = true;
+}
+
+function renderDashboard(data) {
+  dashboard = data;
+  setGlobalState(data.state);
+  $("#latest-observation").textContent = data.freshness.latestObservedAt
+    ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
+    : "No timestamp";
+  $("#data-source").textContent = data.mode === "demo"
+    ? "Illustrative fixture — not your usage"
+    : `${formatUtc(data.freshness.latestObservedAt)} · local companion`;
+  $("#schema-version").textContent = `Dashboard contract: ${data.schemaVersion}`;
+
+  if (data.mode === "demo") {
+    showConnectionNotice({
+      title: "You are exploring a labeled demonstration",
+      copy: "Every number on this page is illustrative. Start the local companion and refresh to load your own evidence.",
+      kind: "demo"
+    });
+  } else if (data.state === "stale") {
+    showConnectionNotice({
+      title: "The local evidence is stale",
+      copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
+      kind: "warning"
+    });
+  } else if (data.state === "insufficient") {
+    showConnectionNotice({
+      title: "The companion is connected, but evidence is incomplete",
+      copy: "Available measurements are shown below. Missing estimates remain blank rather than being filled with demo values.",
+      kind: "warning"
+    });
   } else {
-    sessionStorage.removeItem(SESSION_KEY);
+    hideConnectionNotice();
   }
+
+  renderQuotaCards(data);
+  renderPricing(data);
+  renderComparison(data);
+  renderTimeline(data);
+  renderWeekly(data);
+  renderQuality(data);
+  renderCollector(data);
+  renderReports(data);
 }
 
-function showPanel(name) {
-  elements.panels.forEach((panel) => {
-    panel.hidden = panel.dataset.panel !== name;
-  });
-  const order = ["review", "enroll", "results"];
-  const activeIndex = order.indexOf(name);
-  elements.steps.forEach((step) => {
-    const index = order.indexOf(step.dataset.stepTarget);
-    step.classList.toggle("active", index === activeIndex);
-    step.classList.toggle("complete", index < activeIndex);
-    if (index === activeIndex) step.setAttribute("aria-current", "step");
-    else step.removeAttribute("aria-current");
-  });
-}
-
-function showNotice(message, { error = false } = {}) {
-  elements.notice.textContent = message;
-  elements.notice.classList.toggle("error", error);
-  elements.notice.hidden = false;
-  elements.notice.scrollIntoView({ block: "nearest", behavior: "smooth" });
-}
-
-function clearNotice() {
-  elements.notice.hidden = true;
-  elements.notice.textContent = "";
-  elements.notice.classList.remove("error");
-}
-
-async function api(path, { method = "GET", body, auth = false } = {}) {
-  const headers = { Accept: "application/json" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (auth) {
-    if (!session?.accessToken) throw new Error("This browser session is not enrolled.");
-    headers.Authorization = `Bearer ${session.accessToken}`;
-  }
-  const response = await fetch(`${API_ROOT}${path}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      const payload = await response.json();
-      detail = safeApiError(payload, "");
-    } catch {
-      // Response bodies are intentionally not reflected into the interface.
-    }
-    throw new Error(detail || `Request failed (${response.status}).`);
-  }
-  if (response.status === 204) return null;
-  return response.json();
-}
-
-function renderFixture() {
-  const fixture = buildSyntheticFixture();
-  document.querySelector("#record-count").textContent = "1";
-  document.querySelector("#fixture-json").textContent = JSON.stringify(fixture, null, 2);
-  const row = document.createElement("tr");
-  const values = [
-    "Jul 14–21, 2026",
-    fixture.usage.modelId,
-    fixture.usage.subscriptionSpeed,
-    formatTokenTotal(fixture.usage),
-    `${fixture.quota.usedPercentAfter - fixture.quota.usedPercentBefore} pp`
-  ];
-  row.replaceChildren(...values.map((value) => {
-    const cell = document.createElement("td");
-    cell.textContent = value;
-    return cell;
-  }));
-  document.querySelector("#record-table-body").replaceChildren(row);
-}
-
-function renderSession() {
-  const hasSession = Boolean(session?.accessToken);
-  elements.empty.hidden = hasSession;
-  elements.result.hidden = !hasSession;
-  if (!hasSession) {
-    elements.statusPill.className = "status-pill";
-    elements.statusPill.innerHTML = '<span aria-hidden="true">●</span> Not enrolled';
+function renderQuotaCards(data) {
+  const container = $("#quota-cards");
+  clear(container);
+  const windows = data.quotaWindows;
+  if (!windows.length) {
+    const card = node("article", "metric-card insufficient");
+    card.innerHTML = `
+      <div class="metric-card-header"><span class="metric-name">Quota observations</span><span class="evidence-chip">Insufficient</span></div>
+      <strong class="metric-value">—</strong>
+      <p>The local companion has not exposed a current allowance window.</p>
+    `;
+    container.append(card);
     return;
   }
-  document.querySelector("#participant-id").textContent = session.participantId || "Anonymous";
-  document.querySelector("#contribution-id").textContent = session.contributionId || "Pending";
-  document.querySelector("#processing-status").textContent = session.status || "accepted";
-  document.querySelector("#recovery-code").textContent = session.recoveryCode || "Already acknowledged";
-  elements.recoveryCard.hidden = !session.recoveryCode;
-  elements.statusPill.className = "status-pill accepted";
-  elements.statusPill.innerHTML = `<span aria-hidden="true">●</span> ${escapeText(session.status || "Accepted")}`;
-}
-
-function escapeText(value) {
-  const span = document.createElement("span");
-  span.textContent = String(value);
-  return span.innerHTML;
-}
-
-function setBusy(button, busy, busyText) {
-  if (busy) {
-    button.dataset.previousLabel = button.textContent;
-    button.textContent = busyText;
-    button.disabled = true;
-  } else {
-    button.textContent = button.dataset.previousLabel || button.textContent;
-    button.disabled = false;
+  for (const window of windows) {
+    const remaining = finite(window.remainingPercent);
+    const card = node("article", `metric-card ${window.status === "stale" ? "stale" : ""}`);
+    const header = node("div", "metric-card-header");
+    header.append(
+      node("span", "metric-name", window.label),
+      node("span", "evidence-chip", window.planType || (data.mode === "demo" ? "Demo" : "Observed"))
+    );
+    const value = node("strong", "metric-value");
+    value.textContent = remaining === null ? "—" : `${remaining.toFixed(window.precision ?? 0)}%`;
+    value.append(node("small", "", " remaining"));
+    const progress = node("div", "mini-progress");
+    const fill = node("i");
+    fill.style.width = `${Math.max(0, Math.min(100, remaining ?? 0))}%`;
+    progress.append(fill);
+    const meta = node("div", "metric-meta");
+    meta.append(
+      node("span", "", window.usedPercent === null ? "Used unknown" : `${formatPercent(window.usedPercent)} used`),
+      node("span", "", window.resetAt ? `Resets ${formatUtc(window.resetAt)}` : "Reset unknown")
+    );
+    card.append(header, value, progress, meta);
+    if (window.observedAt) card.append(node("p", "", `Observed ${formatUtc(window.observedAt)}`));
+    container.append(card);
   }
 }
 
-async function enrollAndContribute() {
-  clearNotice();
-  setBusy(elements.enroll, true, "Encrypting synthetic fixture…");
-  try {
-    const enrollment = await api("/enroll", {
-      method: "POST",
-      body: {
-        consentVersion: "synthetic-preview-v0.1",
-        syntheticOnly: true
-      }
-    });
-    saveSession({
-      participantId: enrollment.participantId,
-      accessToken: enrollment.accessToken,
-      recoveryCode: enrollment.recoveryCode,
-      status: "enrolling"
-    });
+function renderPricing(data) {
+  const pricing = data.pricing;
+  $("#cost-period").textContent = pricing.periodLabel;
+  $("#cost-total").textContent = formatMoney(pricing.totalCostUsd, 2);
+  $("#cost-coverage").textContent = pricing.coveragePercent === null
+    ? "Price coverage is not available"
+    : `${formatPercent(pricing.coveragePercent, 1)} of recorded usage priced · API tier: ${pricing.apiTier}`;
+  const list = $("#cost-components");
+  clear(list);
+  if (!pricing.components.length) {
+    list.append(node("p", "empty-inline", "No token-component accounting was returned."));
+    return;
+  }
+  const max = Math.max(...pricing.components.map((row) => row.costUsd ?? row.tokens ?? 0), 1);
+  for (const component of pricing.components) {
+    const row = node("div", "component-row");
+    row.append(node("span", "", humanize(component.name)));
+    const track = node("div", "component-track");
+    const fill = node("i");
+    fill.style.width = `${Math.max(1, ((component.costUsd ?? component.tokens ?? 0) / max) * 100)}%`;
+    track.append(fill);
+    row.append(track, node("strong", "", component.costUsd === null ? `${compact(component.tokens)} tok` : formatMoney(component.costUsd, 2)));
+    list.append(row);
+  }
+}
 
-    const key = await api("/envelope-key");
-    if (key.algorithm !== "RSA-OAEP-256") {
-      throw new Error("The server offered an unsupported envelope algorithm.");
+function humanize(value) {
+  return String(value ?? "")
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function latestRollingPair(data) {
+  if (data.gradient.rollingDetail.length) {
+    const row = data.gradient.rollingDetail.at(-1);
+    return {
+      observed: finite(row.observed_quota_change_pp ?? row.observedQuotaChangePp),
+      expected: finite(row.expected_quota_change_pp ?? row.expectedQuotaChangePp),
+      residual: finite(row.residual_pp ?? row.residualPp)
+    };
+  }
+  const groups = groupRolling(data.gradient.rolling, activeWindowHours);
+  const last = groups.at(-1);
+  return last ? { observed: last.observed, expected: last.expected, residual: last.observed - last.expected } : null;
+}
+
+function renderComparison(data) {
+  const pair = latestRollingPair(data);
+  const summary = data.gradient.summary ?? {};
+  const mae = finite(summary.mean_absolute_error_pp ?? summary.meanAbsoluteErrorPp);
+  const within = finite(summary.points_within_80_band_fraction ?? summary.pointsWithin80BandFraction);
+  const chip = $("#fit-chip");
+  if (!pair || pair.observed === null || pair.expected === null) {
+    chip.textContent = "Insufficient";
+    $("#comparison-result").textContent = "There is not yet a matched quota-and-cost window to compare.";
+    return;
+  }
+  const max = Math.max(Math.abs(pair.observed), Math.abs(pair.expected), 1);
+  const rows = $("#comparison-visual").querySelectorAll(".comparison-row");
+  const values = [pair.observed, pair.expected];
+  rows.forEach((row, index) => {
+    row.querySelector("i").style.width = `${Math.min(100, Math.abs(values[index]) / max * 100)}%`;
+    row.querySelector("strong").textContent = formatPp(values[index]);
+  });
+  const residual = pair.residual ?? pair.observed - pair.expected;
+  chip.textContent = mae === null ? "Matched window" : `MAE ${mae.toFixed(1)} pp`;
+  $("#comparison-result").textContent = `${formatPp(Math.abs(residual))} separates the observed and cost-implied movement in the latest matched window.${within === null ? "" : ` Across the series, ${formatPercent(within * 100)} of points fall inside the modeled 80% band.`}`;
+}
+
+function groupRolling(rows, hours) {
+  const groups = new Map();
+  for (const row of rows) {
+    const rowHours = finite(row.smoothing_hours ?? row.smoothingHours, hours);
+    if (rowHours !== hours) continue;
+    const timestamp = row.timestamp ?? row.window_end_utc ?? row.observed_at;
+    if (!timestamp || !Number.isFinite(Date.parse(timestamp))) continue;
+    const group = groups.get(timestamp) ?? { timestamp, observed: null, expected: null };
+    const series = String(row.series ?? "").toLowerCase();
+    const value = finite(row.quota_change_pp ?? row.quotaChangePp);
+    if (series.includes("observ")) group.observed = value;
+    else if (series.includes("expect") || series.includes("cost")) group.expected = value;
+    else {
+      group.observed ??= finite(row.observed_quota_change_pp);
+      group.expected ??= finite(row.expected_quota_change_pp);
     }
-    const envelope = await createSyntheticEnvelope({
+    groups.set(timestamp, group);
+  }
+  return [...groups.values()]
+    .filter((row) => row.observed !== null || row.expected !== null)
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+}
+
+function renderTimeline(data) {
+  const points = groupRolling([...data.gradient.rollingHistory, ...data.gradient.rolling], activeWindowHours);
+  $("#timeline-chart-title").textContent = `${activeWindowHours}-hour rolling quota change versus cost-implied change`;
+  $("#timeline-chart-copy").textContent = "UTC timestamps · observed and API-cost-equivalent movement";
+  const empty = $("#timeline-empty");
+  const shell = $("#timeline-chart");
+  if (!points.length) {
+    shell.hidden = true;
+    empty.hidden = false;
+    empty.querySelector("strong").textContent = `No ${activeWindowHours}-hour series loaded`;
+    empty.querySelector("p").textContent = "This is a missing-data state, not a zero-usage period.";
+  } else {
+    empty.hidden = true;
+    shell.hidden = false;
+    shell.replaceChildren(lineChart({
+      points,
+      series: [
+        { key: "observed", className: "chart-line-observed", label: "Observed quota change" },
+        { key: "expected", className: "chart-line-expected", label: "Expected from API cost" }
+      ],
+      yLabel: "Percentage points",
+      title: `${activeWindowHours}-hour rolling quota movement`,
+      description: "Observed quota movement compared with movement implied by priced token usage."
+    }));
+  }
+  renderTimelineSummary(data, points);
+  renderResiduals(data, points);
+}
+
+function renderTimelineSummary(data, points) {
+  const summary = data.gradient.summary ?? {};
+  const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === activeWindowHours);
+  const values = [
+    ["Matched windows", compact(points.filter((row) => row.observed !== null && row.expected !== null).length)],
+    ["Mean absolute error", formatPp(sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp)],
+    ["Peak residual", formatPp(summary.rolling_peak_absolute_residual_pp)],
+    ["Coverage band", summary.points_within_80_band_fraction === undefined ? "—" : formatPercent(summary.points_within_80_band_fraction * 100)]
+  ];
+  const container = $("#timeline-summary");
+  clear(container);
+  for (const [label, value] of values) {
+    const item = node("div");
+    item.append(node("span", "", label), node("strong", "", value));
+    container.append(item);
+  }
+}
+
+function residualRows(data, points) {
+  const source = data.gradient.residual.length
+    ? data.gradient.residual.map((row) => ({
+        timestamp: row.timestamp ?? row.window_end_utc,
+        observed: finite(row.observed_quota_change_pp),
+        expected: finite(row.expected_quota_change_pp),
+        residual: finite(row.residual_pp)
+      }))
+    : points.map((row) => ({ ...row, residual: row.observed === null || row.expected === null ? null : row.observed - row.expected }));
+  return source.filter((row) => row.residual !== null && row.timestamp).sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+}
+
+function renderResiduals(data, points) {
+  const residuals = residualRows(data, points);
+  const empty = $("#residual-empty");
+  const shell = $("#residual-chart");
+  if (!residuals.length) {
+    empty.hidden = false;
+    shell.hidden = true;
+  } else {
+    empty.hidden = true;
+    shell.hidden = false;
+    shell.replaceChildren(lineChart({
+      points: residuals,
+      series: [{ key: "residual", className: "chart-line-value", label: "Residual" }],
+      yLabel: "Percentage points",
+      title: "Quota movement residuals",
+      description: "Observed quota change minus the API-cost-implied change.",
+      includeZero: true
+    }));
+  }
+  const table = $("#residual-table");
+  clear(table);
+  const largest = [...residuals].sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual)).slice(0, 8);
+  if (!largest.length) {
+    const row = node("tr");
+    const cell = node("td", "empty-cell", "No periods loaded.");
+    cell.colSpan = 4;
+    row.append(cell);
+    table.append(row);
+    return;
+  }
+  for (const item of largest) {
+    const row = node("tr");
+    row.append(
+      node("td", "", formatUtc(item.timestamp)),
+      node("td", "", formatPp(item.observed)),
+      node("td", "", formatPp(item.expected)),
+      node("td", item.residual >= 0 ? "positive" : "negative", `${item.residual >= 0 ? "+" : ""}${formatPp(item.residual)}`)
+    );
+    table.append(row);
+  }
+}
+
+function lineChart({ points, series, yLabel, title, description, includeZero = false, confidence = null }) {
+  const width = 900;
+  const height = 330;
+  const margin = { top: 24, right: 22, bottom: 50, left: 58 };
+  const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
+  if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
+  if (includeZero) values.push(0);
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
+  if (min === max) { min -= 1; max += 1; }
+  const pad = (max - min) * .1;
+  min -= pad;
+  max += pad;
+  const x = (index) => margin.left + index / Math.max(1, points.length - 1) * (width - margin.left - margin.right);
+  const y = (value) => margin.top + (max - value) / (max - min) * (height - margin.top - margin.bottom);
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("role", "img");
+  const titleNode = document.createElementNS(svg.namespaceURI, "title");
+  titleNode.textContent = title;
+  const descNode = document.createElementNS(svg.namespaceURI, "desc");
+  descNode.textContent = description;
+  svg.append(titleNode, descNode);
+
+  for (let index = 0; index < 5; index += 1) {
+    const value = max - index / 4 * (max - min);
+    const yPosition = y(value);
+    svg.append(svgLine(margin.left, yPosition, width - margin.right, yPosition, "chart-grid"));
+    svg.append(svgText(margin.left - 8, yPosition + 3, value.toFixed(Math.abs(max - min) < 10 ? 1 : 0), "chart-axis-label", "end"));
+  }
+
+  if (includeZero && min <= 0 && max >= 0) {
+    svg.append(svgLine(margin.left, y(0), width - margin.right, y(0), "chart-zero"));
+  }
+
+  const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
+  for (const index of labelIndexes) {
+    const timestamp = points[index]?.timestamp ?? points[index]?.date;
+    svg.append(svgText(x(index), height - 22, formatUtc(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
+  }
+  const yAxisLabel = svgText(15, height / 2, yLabel, "chart-axis-label", "middle");
+  yAxisLabel.setAttribute("transform", `rotate(-90 15 ${height / 2})`);
+  svg.append(yAxisLabel);
+
+  if (confidence) {
+    const upper = points.map((point, index) => [x(index), y(finite(point[confidence.high], 0))]);
+    const lower = points.map((point, index) => [x(index), y(finite(point[confidence.low], 0))]).reverse();
+    const polygon = document.createElementNS(svg.namespaceURI, "polygon");
+    polygon.setAttribute("points", [...upper, ...lower].map(([a, b]) => `${a},${b}`).join(" "));
+    polygon.setAttribute("class", "chart-area-confidence");
+    svg.append(polygon);
+  }
+
+  for (const item of series) {
+    const segments = [];
+    let segment = [];
+    points.forEach((point, index) => {
+      const value = finite(point[item.key]);
+      if (value === null) {
+        if (segment.length) segments.push(segment);
+        segment = [];
+      } else segment.push([x(index), y(value)]);
+    });
+    if (segment.length) segments.push(segment);
+    for (const pathPoints of segments) {
+      const path = document.createElementNS(svg.namespaceURI, "polyline");
+      path.setAttribute("points", pathPoints.map(([a, b]) => `${a},${b}`).join(" "));
+      path.setAttribute("class", item.className);
+      svg.append(path);
+    }
+  }
+  return svg;
+}
+
+function svgLine(x1, y1, x2, y2, className) {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  element.setAttribute("x1", x1);
+  element.setAttribute("y1", y1);
+  element.setAttribute("x2", x2);
+  element.setAttribute("y2", y2);
+  element.setAttribute("class", className);
+  return element;
+}
+
+function svgText(x, y, value, className, anchor = "start") {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  element.setAttribute("x", x);
+  element.setAttribute("y", y);
+  element.setAttribute("class", className);
+  element.setAttribute("text-anchor", anchor);
+  element.textContent = value;
+  return element;
+}
+
+function renderWeekly(data) {
+  const summary = data.weekly.summary ?? {};
+  const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
+  const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
+  const upper = finite(summary.upper_80_across_resets_usd ?? summary.upper80Usd);
+  const qualifying = finite(summary.qualifying_resets ?? summary.qualifyingResets, 0);
+  const strength = Math.min(100, Math.round(qualifying / 14 * 100));
+  $("#weekly-estimate").textContent = estimate === null ? "Insufficient evidence" : `${formatMoney(estimate)} API equivalent`;
+  $("#weekly-range").textContent = lower === null || upper === null
+    ? "No evidence interval available"
+    : `80% across-reset range: ${formatMoney(lower)}–${formatMoney(upper)}`;
+  $("#evidence-meter").style.width = `${strength}%`;
+  $("#evidence-label").textContent = qualifying < 3 ? "Insufficient" : qualifying < 8 ? "Developing" : qualifying < 14 ? "Moderate" : "Substantial";
+  $("#weekly-explanation").textContent = qualifying
+    ? `Based on ${qualifying} qualifying reset series. This is an API-price-equivalent calibration, not a published dollar cap.`
+    : "The estimate will appear when enough quota transitions can be matched to priced usage.";
+
+  const values = data.weekly.weeklyValues.map((row, index) => ({
+    ...row,
+    timestamp: row.reset_due_at ?? row.resetAt ?? row.first_observed_at,
+    value: finite(row.value_usd ?? row.value),
+    low: finite(row.pairwise_p10_usd ?? row.lower),
+    high: finite(row.pairwise_p90_usd ?? row.upper),
+    index
+  })).filter((row) => row.timestamp && row.value !== null);
+  const empty = $("#weekly-empty");
+  const shell = $("#weekly-chart");
+  if (!values.length) {
+    empty.hidden = false;
+    shell.hidden = true;
+  } else {
+    empty.hidden = true;
+    shell.hidden = false;
+    shell.replaceChildren(lineChart({
+      points: values,
+      series: [{ key: "value", className: "chart-line-value", label: "Weekly estimate" }],
+      confidence: { low: "low", high: "high" },
+      yLabel: "API-equivalent USD",
+      title: "Weekly allowance estimate history",
+      description: "Central weekly estimate with the 10th to 90th percentile across-reset range."
+    }));
+  }
+  renderWeeklyStats(summary, values);
+  renderWeeklyTable(values);
+}
+
+function renderWeeklyStats(summary, values) {
+  const stats = [
+    ["Qualifying resets", finite(summary.qualifying_resets, values.length)],
+    ["Held-out MAE", formatPp(summary.selected_holdout_mae_pp)],
+    ["Prior-reset MAE", formatPp(summary.prior_reset_mae_pp)],
+    ["80th pct error", formatPp(summary.prior_reset_p80_absolute_error_pp)]
+  ];
+  const container = $("#weekly-stats");
+  clear(container);
+  for (const [label, value] of stats) {
+    const card = node("div", "weekly-stat");
+    card.append(node("span", "", label), node("strong", "", value));
+    container.append(card);
+  }
+}
+
+function renderWeeklyTable(values) {
+  const table = $("#weekly-table");
+  clear(table);
+  if (!values.length) {
+    const row = node("tr");
+    const cell = node("td", "empty-cell", "No weekly evidence loaded.");
+    cell.colSpan = 5;
+    row.append(cell);
+    table.append(row);
+    return;
+  }
+  for (const row of values.slice(-14).reverse()) {
+    const transitions = finite(row.eligible_transitions, 0);
+    const evidence = transitions < 25 ? "Low" : transitions < 75 ? "Moderate" : "Higher";
+    const prior = finite(row.prior_prediction_mae_pp);
+    const interpretation = prior === null
+      ? "First estimate; no prior forecast"
+      : prior < 3 ? "Prior forecast tracked closely" : prior < 7 ? "Meaningful model error" : "High-error period";
+    const tr = node("tr");
+    tr.append(
+      node("td", "", formatUtc(row.timestamp, { dateOnly: true })),
+      node("td", "", formatMoney(row.value)),
+      node("td", "", row.low === null || row.high === null ? "—" : `${formatMoney(row.low)}–${formatMoney(row.high)}`),
+      node("td", "", `${evidence} · ${transitions} transitions`),
+      node("td", "", interpretation)
+    );
+    table.append(tr);
+  }
+}
+
+function renderQuality(data) {
+  const coverage = data.quality.coverage;
+  const summary = data.quality.summary ?? {};
+  const overall = finite(data.coverage?.overallPercent ?? data.coverage?.percent, null);
+  $("#coverage-total").textContent = overall === null ? `${coverage.length} signals` : formatPercent(overall, 1);
+  const list = $("#coverage-list");
+  clear(list);
+  const rows = coverage.length ? coverage : [
+    { dimension: "Fit-eligible transitions", coverage_fraction: summary.fit_eligible_fraction },
+    { dimension: "Known speed tier", coverage_fraction: summary.known_speed_fraction }
+  ].filter((row) => finite(row.coverage_fraction) !== null);
+  if (!rows.length) {
+    list.append(node("p", "empty-inline", "No coverage dimensions were returned."));
+  } else {
+    for (const item of rows) {
+      const fraction = Math.max(0, Math.min(1, finite(item.coverage_fraction ?? item.coverageFraction, 0)));
+      const row = node("div", "coverage-row");
+      row.append(node("span", "", item.dimension ?? item.label ?? "Coverage"));
+      const track = node("div", "coverage-track");
+      const fill = node("i");
+      fill.style.width = `${fraction * 100}%`;
+      track.append(fill);
+      row.append(track, node("strong", "", formatPercent(fraction * 100)));
+      list.append(row);
+    }
+  }
+
+  const issues = [...data.quality.opportunities, ...data.quality.blindSpots].slice(0, 10);
+  const issueList = $("#blind-spot-list");
+  clear(issueList);
+  if (!issues.length) {
+    issueList.append(node("div", "empty-inline", "No blind-spot inventory was returned."));
+  } else {
+    for (const item of issues) {
+      const issue = node("div", "issue");
+      issue.append(node("span", "issue-icon", "!"));
+      const copy = node("div");
+      copy.append(
+        node("strong", "", item.title ?? item.dimension ?? "Unresolved coverage gap"),
+        node("p", "", item.evidence ?? item.description ?? item.action ?? "Additional evidence is required.")
+      );
+      issue.append(copy, node("span", "issue-priority", item.priority ?? "Open"));
+      issueList.append(issue);
+    }
+  }
+}
+
+function renderReports(data) {
+  const container = $("#report-links");
+  clear(container);
+  if (!data.reports.length) {
+    container.append(node("span", "empty-inline", "No reports advertised by the local companion."));
+    return;
+  }
+  for (const report of data.reports) {
+    if (data.mode === "demo") {
+      container.append(node("span", "report-link", `${report.title} · demo only`));
+      continue;
+    }
+    const link = node("a", "report-link", report.title);
+    link.href = report.href;
+    link.target = "_blank";
+    link.rel = "noopener";
+    container.append(link);
+  }
+}
+
+function renderCollector(data) {
+  const collector = data.collector ?? {};
+  const state = $("#collector-state");
+  state.textContent = data.state === "live" ? "Current" : humanize(data.state);
+  state.className = `evidence-chip ${data.state === "live" ? "" : "neutral"}`;
+  const rows = [
+    ["Last scan", formatUtc(collector.lastScanAt ?? data.activity?.lastScanAt ?? data.freshness.latestObservedAt)],
+    ["Safe records", compact(collector.safeRecordCount ?? data.activity?.safeRecordCount ?? data.activity?.recordCount)],
+    ["Source bytes", "Not exposed to browser"],
+    ["Identity", collector.identityMode ?? "Pseudonymous"]
+  ];
+  const dl = $("#collector-details");
+  clear(dl);
+  for (const [term, value] of rows) {
+    const wrapper = node("div");
+    wrapper.append(node("dt", "", term), node("dd", "", value));
+    dl.append(wrapper);
+  }
+}
+
+async function loadLocalDashboard() {
+  const button = $("#refresh-button");
+  button.disabled = true;
+  button.textContent = "Connecting…";
+  try {
+    const data = await localClient.load();
+    renderDashboard(data);
+  } catch {
+    dashboard = null;
+    setGlobalState("offline");
+    $("#latest-observation").textContent = "Companion unavailable";
+    $("#data-source").textContent = "No real usage is displayed";
+    showConnectionNotice({
+      title: "The local companion is not available",
+      copy: "Start the loopback server, then refresh. You can explore a clearly labeled demonstration in the meantime.",
+      kind: "error",
+      showDemo: true
+    });
+    renderDashboardSkeleton();
+  } finally {
+    button.disabled = false;
+    button.textContent = "Refresh local data";
+  }
+}
+
+function renderDashboardSkeleton() {
+  const container = $("#quota-cards");
+  clear(container);
+  const card = node("article", "metric-card insufficient");
+  const header = node("div", "metric-card-header");
+  header.append(node("span", "metric-name", "No local evidence"), node("span", "evidence-chip", "Offline"));
+  card.append(header, node("strong", "metric-value", "—"), node("p", "", "This empty state is intentional. Demo values are never substituted automatically."));
+  container.append(card);
+}
+
+async function requestRefresh() {
+  const button = $("#refresh-button");
+  button.disabled = true;
+  button.textContent = "Starting scan…";
+  try {
+    await localClient.refresh();
+    let outcome = "running";
+    for (let attempt = 0; attempt < 80 && outcome === "running"; attempt += 1) {
+      button.textContent = attempt < 2 ? "Scanning local evidence…" : `Scanning… ${attempt + 1}s`;
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      const status = await localClient.refreshStatus();
+      outcome = status?.refresh?.status ?? "failed";
+    }
+    if (outcome !== "succeeded") throw new Error("The local refresh did not complete successfully.");
+    button.textContent = "Loading updated evidence…";
+    await loadLocalDashboard();
+  } catch {
+    showConnectionNotice({
+      title: "Refresh could not be started",
+      copy: "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
+      kind: "error",
+      showDemo: !dashboard
+    });
+  } finally {
+    button.disabled = false;
+    button.textContent = "Refresh local data";
+  }
+}
+
+function parseSafeExport(file) {
+  if (!file || file.size > 1_310_720) throw new Error("Choose a JSON export no larger than 1.25 MB.");
+  if (!file.name.toLowerCase().endsWith(".json") && file.type !== "application/json") {
+    throw new Error("Choose the JSON export produced by Usage Monitor.");
+  }
+  return file.text().then((content) => {
+    let payload;
+    try {
+      payload = JSON.parse(content);
+    } catch {
+      throw new Error("The selected file is not valid JSON.");
+    }
+    validateTelemetryContribution(payload);
+    return payload;
+  });
+}
+
+async function ensureCommunitySession() {
+  if (communitySession?.accessToken) return communitySession;
+  const enrollment = await communityClient.enroll();
+  if (!enrollment?.accessToken) throw new Error("The contribution service did not return an anonymous access capability.");
+  saveSession({
+    accessToken: enrollment.accessToken,
+    participantId: enrollment.participantId ?? null,
+    recoveryCode: enrollment.recoveryCode ?? null
+  });
+  return communitySession;
+}
+
+async function submitContribution(event) {
+  event.preventDefault();
+  const file = $("#contribution-file").files[0];
+  const status = $("#upload-status");
+  const button = $("#contribution-submit");
+  status.hidden = false;
+  status.className = "upload-status";
+  status.textContent = "Validating the privacy-safe export in this browser…";
+  button.disabled = true;
+  try {
+    const payload = await parseSafeExport(file);
+    await ensureCommunitySession();
+    status.textContent = "Encrypting the validated export in this browser…";
+    const key = await communityClient.envelopeKey();
+    if (key?.algorithm && key.algorithm !== "RSA-OAEP-256") throw new Error("The server offered an unsupported envelope algorithm.");
+    const envelope = await createTelemetryEnvelope({
+      payload,
       publicJwk: key.publicJwk,
       keyId: key.keyId
     });
-    const receipt = await api("/contributions", {
-      method: "POST",
-      auth: true,
-      body: envelope
-    });
-    saveSession({
-      ...session,
-      contributionId: receipt.contributionId,
-      status: receipt.status || "accepted"
-    });
-    renderSession();
-    showPanel("results");
-    showNotice("Synthetic metadata encrypted in this browser and accepted by the development service.");
+    status.textContent = "Submitting encrypted telemetry for immediate server-side validation…";
+    const receipt = await communityClient.contribute(envelope);
+    saveSession({ ...communitySession, contributionId: receipt.contributionId });
+    status.textContent = `Accepted as ${receipt.contributionId}. The server reported ${compact(receipt.recordCounts?.deduplicated ?? 0)} deduplicated records.`;
+    await loadCommunityResults();
   } catch (error) {
-    if (session?.status === "enrolling") {
-      try {
-        await api("/me", { method: "DELETE", auth: true });
-      } catch {
-        // Best-effort cleanup; the original failure remains the useful error.
-      }
-      saveSession(null);
-    }
-    showNotice(error.message, { error: true });
+    status.className = "upload-status error";
+    status.textContent = error instanceof Error ? error.message : safeApiError(error, "The contribution was rejected.");
   } finally {
-    setBusy(elements.enroll, false);
-    elements.enroll.disabled = !elements.consent.checked;
+    button.disabled = !($("#contribution-consent").checked && $("#contribution-file").files.length);
   }
 }
 
-async function refreshStatus() {
-  const button = document.querySelector("#refresh-status");
-  clearNotice();
-  setBusy(button, true, "Refreshing…");
-  try {
-    const result = await api("/me", { auth: true });
-    const latestContribution = Array.isArray(result.contributions)
-      ? result.contributions.at(-1)
-      : result.latestContribution;
-    saveSession({
-      ...session,
-      participantId: result.participantId || session.participantId,
-      contributionId: result.contributionId || latestContribution?.contributionId || session.contributionId,
-      status: result.status || latestContribution?.status || session.status
-    });
-    renderSession();
-    showNotice("Status refreshed.");
-  } catch (error) {
-    showNotice(error.message, { error: true });
-  } finally {
-    setBusy(button, false);
+function renderStats(container, payload, { community = false } = {}) {
+  clear(container);
+  if (!payload) {
+    container.append(node("p", "", community ? "No aggregate result is available from the service." : "No personal result is available."));
+    return;
   }
+  if (payload.suppressed) {
+    container.append(node("p", "", `Community results remain hidden until at least ${payload.minimumParticipants ?? 3} independent participants contribute. Current eligible count: ${payload.participantCount ?? 0}.`));
+    return;
+  }
+  const source = payload.totals ?? payload.lifetime ?? payload;
+  const metrics = [
+    ["Participants", community ? finite(payload.participantCount) : null],
+    ["Safe events", finite(source.eventCount ?? source.usageEvents ?? payload.recordCount)],
+    ["API equivalent", finite(source.estimatedApiCostUsd ?? source.clientEstimatedApiCostUsd ?? source.costUsd)],
+    ["Weekly estimate", finite(payload.insights?.weeklyLimitUsd ?? payload.weeklyEstimateUsd)]
+  ].filter(([, value]) => value !== null);
+  if (!metrics.length) {
+    container.append(node("p", "", "The service returned a partial result without displayable aggregate metrics."));
+    return;
+  }
+  const grid = node("div", "result-metrics");
+  for (const [label, value] of metrics.slice(0, 3)) {
+    const card = node("div");
+    card.append(node("span", "", label), node("strong", "", label.includes("equivalent") || label.includes("estimate") ? formatMoney(value) : compact(value)));
+    grid.append(card);
+  }
+  container.append(grid);
 }
 
-async function recoverParticipant(event) {
-  event.preventDefault();
-  clearNotice();
-  const recoveryCode = elements.recoveryInput.value.trim();
-  if (!recoveryCode) return;
-  setBusy(elements.recoverButton, true, "Recovering…");
+async function loadCommunityResults() {
+  const service = $("#service-state");
+  const personal = $("#personal-result");
+  const community = $("#community-result");
+  const participantControls = $("#participant-controls");
   try {
-    const recovered = await api("/recover", {
-      method: "POST",
-      body: { recoveryCode }
-    });
-    saveSession({
-      participantId: recovered.participantId,
-      accessToken: recovered.accessToken,
-      status: "recovered"
-    });
-    const result = await api("/me", { auth: true });
-    const latestContribution = Array.isArray(result.contributions)
-      ? result.contributions.at(-1)
-      : result.latestContribution;
-    saveSession({
-      ...session,
-      participantId: result.participantId || session.participantId,
-      contributionId: latestContribution?.contributionId,
-      status: latestContribution?.status || "recovered"
-    });
-    elements.recoveryInput.value = "";
-    renderSession();
-    showPanel("results");
-    showNotice("Access recovered. The previous browser access token is now invalid.");
-  } catch (error) {
-    saveSession(null);
-    showNotice(error.message, { error: true });
-  } finally {
-    setBusy(elements.recoverButton, false);
-  }
-}
-
-async function exportParticipant() {
-  const button = document.querySelector("#export-button");
-  clearNotice();
-  setBusy(button, true, "Preparing export…");
-  try {
-    const payload = await api("/me/export", { auth: true });
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = safeFilename(session.participantId);
-    link.hidden = true;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
-    showNotice("Your synthetic participant export was downloaded.");
-  } catch (error) {
-    showNotice(error.message, { error: true });
-  } finally {
-    setBusy(button, false);
-  }
-}
-
-async function deleteParticipant(event) {
-  event.preventDefault();
-  if (elements.deletePhrase.value !== "DELETE") return;
-  clearNotice();
-  setBusy(elements.deleteButton, true, "Deleting…");
-  try {
-    await api("/me", { method: "DELETE", auth: true });
-    saveSession(null);
-    elements.deletePhrase.value = "";
-    elements.deleteForm.hidden = true;
-    elements.consent.checked = false;
-    elements.enroll.disabled = true;
-    renderSession();
-    showPanel("review");
-    showNotice("The synthetic participant and contribution were permanently deleted.");
-  } catch (error) {
-    showNotice(error.message, { error: true });
-    setBusy(elements.deleteButton, false);
-  }
-}
-
-document.querySelector("#continue-to-enroll").addEventListener("click", () => showPanel("enroll"));
-document.querySelectorAll("[data-back-to]").forEach((button) => {
-  button.addEventListener("click", () => showPanel(button.dataset.backTo));
-});
-elements.steps.forEach((step) => {
-  step.addEventListener("click", () => showPanel(step.dataset.stepTarget));
-});
-elements.consent.addEventListener("change", () => {
-  elements.enroll.disabled = !elements.consent.checked;
-});
-elements.enroll.addEventListener("click", enrollAndContribute);
-elements.recoveryForm.addEventListener("submit", recoverParticipant);
-document.querySelector("#refresh-status").addEventListener("click", refreshStatus);
-document.querySelector("#export-button").addEventListener("click", exportParticipant);
-document.querySelector("#copy-recovery").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(session?.recoveryCode || "");
-    showNotice("Recovery code copied. Store it somewhere private.");
+    const [personalResult, communityResult] = await Promise.allSettled([
+      communitySession?.accessToken ? communityClient.personalStats() : Promise.resolve(null),
+      communityClient.communityStats()
+    ]);
+    const serviceReachable = communityResult.status === "fulfilled"
+      || (Boolean(communitySession?.accessToken) && personalResult.status === "fulfilled");
+    service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
+    service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
+    renderStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
+    renderStats(community, communityResult.status === "fulfilled" ? communityResult.value : null, { community: true });
+    participantControls.hidden = !(communitySession?.accessToken && personalResult.status === "fulfilled");
+    $("#recovery-code").textContent = communitySession?.recoveryCode ?? "Recovery code was not retained in this browser session.";
   } catch {
-    showNotice("Copy was blocked by the browser. Select and copy the displayed code instead.", { error: true });
+    service.textContent = "Service unavailable";
+    service.className = "evidence-chip neutral";
+    participantControls.hidden = true;
   }
-});
-document.querySelector("#show-delete").addEventListener("click", () => {
-  elements.deleteForm.hidden = false;
-  elements.deletePhrase.focus();
-});
-document.querySelector("#cancel-delete").addEventListener("click", () => {
-  elements.deleteForm.hidden = true;
-  elements.deletePhrase.value = "";
-  elements.deleteButton.disabled = true;
-});
-elements.deletePhrase.addEventListener("input", () => {
-  elements.deleteButton.disabled = elements.deletePhrase.value !== "DELETE";
-});
-elements.deleteForm.addEventListener("submit", deleteParticipant);
+}
 
-renderFixture();
-renderSession();
-if (session) showPanel("results");
+async function downloadParticipantExport() {
+  const status = $("#participant-action-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Preparing your content-free participant export…";
+  try {
+    const payload = await communityClient.participantExport();
+    const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
+    const href = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = href;
+    anchor.download = "usage-monitor-participant-export.json";
+    anchor.click();
+    URL.revokeObjectURL(href);
+    status.textContent = "Your content-free participant export is ready.";
+  } catch {
+    status.className = "participant-action-status error";
+    status.textContent = "The participant export could not be prepared.";
+  }
+}
+
+async function deleteParticipantData() {
+  if (!window.confirm("Delete every contribution and personal statistic associated with this anonymous participant? This cannot be undone.")) return;
+  const status = $("#participant-action-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Deleting your contributed data…";
+  try {
+    const receipt = await communityClient.deleteParticipant();
+    saveSession(null);
+    $("#contribution-file").value = "";
+    $("#contribution-consent").checked = false;
+    $("#contribution-submit").disabled = true;
+    $(".file-drop").classList.remove("selected");
+    $("#file-help").textContent = "Privacy-safe JSON export · 1.25 MB browser validation limit";
+    const uploadStatus = $("#upload-status");
+    uploadStatus.hidden = false;
+    uploadStatus.className = "upload-status";
+    uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the anonymous participant capability.`;
+    $("#participant-controls").hidden = true;
+    renderStats($("#personal-result"), null);
+    await loadCommunityResults();
+  } catch {
+    status.className = "participant-action-status error";
+    status.textContent = "The contributed data could not be deleted.";
+  }
+}
+
+$("#refresh-button").addEventListener("click", requestRefresh);
+$("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
+$("#window-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-hours]");
+  if (!button || !dashboard) return;
+  activeWindowHours = Number(button.dataset.hours);
+  for (const control of $("#window-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderTimeline(dashboard);
+  renderComparison(dashboard);
+});
+
+$("#contribution-file").addEventListener("change", () => {
+  const file = $("#contribution-file").files[0];
+  const drop = $(".file-drop");
+  drop.classList.toggle("selected", Boolean(file));
+  $("#file-help").textContent = file ? `${file.name} · ${compact(file.size)} bytes` : "Privacy-safe JSON export · 1.25 MB browser validation limit";
+  $("#contribution-submit").disabled = !($("#contribution-consent").checked && file);
+});
+$("#contribution-consent").addEventListener("change", () => {
+  $("#contribution-submit").disabled = !($("#contribution-consent").checked && $("#contribution-file").files.length);
+});
+$("#contribution-form").addEventListener("submit", submitContribution);
+$("#download-participant").addEventListener("click", downloadParticipantExport);
+$("#delete-participant").addEventListener("click", deleteParticipantData);
+
+const observer = new IntersectionObserver((entries) => {
+  const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+  if (!visible) return;
+  for (const link of document.querySelectorAll("[data-nav]")) {
+    link.classList.toggle("active", link.dataset.nav === visible.target.id);
+  }
+}, { rootMargin: "-25% 0px -65% 0px", threshold: [0, .2, .7] });
+for (const section of document.querySelectorAll(".dashboard-section")) observer.observe(section);
+
+loadLocalDashboard();
+loadCommunityResults();
