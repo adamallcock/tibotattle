@@ -1,0 +1,510 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import {
+  discoverCommittedPreparedSets,
+  inspectContributionSyncQueue,
+  runContributionSyncQueueOnce,
+  runContributionSyncQueueWatch,
+  setContributionSyncPaused,
+} from "../src/contribution-sync-queue.js";
+import {
+  ContributionDeviceSyncError,
+} from "../src/contribution-device-sync.js";
+import {
+  buildTelemetryContributionsFromBundle,
+  TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+} from "../src/telemetry-contribution-builder.js";
+import {
+  PREPARED_CONTRIBUTION_SET_VERSION,
+  publishPreparedContributionFile,
+  publishPreparedContributionManifest,
+} from "../src/telemetry-prepared-set.js";
+import { stableJson } from "../src/storage.js";
+
+const ORIGIN = "https://usage.example";
+const ACCEPTED_ID =
+  "contribution:11111111-1111-4111-8111-111111111111";
+
+function usage(index = 1) {
+  return {
+    schemaVersion: "usage-event-v0.1",
+    eventTime: "2026-07-26T10:05:00.000Z",
+    provider: "openai_codex",
+    modelId: "gpt-5.6-sol",
+    modelRecognition: "recognized",
+    modelFingerprint: null,
+    billingSurface: "chatgpt_subscription",
+    speedMode: "standard",
+    apiServiceTier: "unknown",
+    reasoningEffort: "unknown",
+    components: {
+      inputUncachedTokens: 100 + index,
+      inputCacheReadTokens: 200,
+      inputCacheWriteTokens: 0,
+      outputTextTokens: 5,
+      outputReasoningTokens: 2,
+    },
+    totalInputContextTokens: 300 + index,
+    surface: "extension_or_ide",
+    agentScope: "root",
+    lineageDisposition: "standalone",
+    toolClassCounts: {
+      webSearch: 0,
+      fileSearch: 0,
+      codeInterpreter: 0,
+      hostedShell: 0,
+      computerUse: 0,
+      mcp: 0,
+      applyPatch: 0,
+      localShell: 0,
+      subagent: 0,
+      toolGateway: 0,
+      other: 0,
+      unknown: 0,
+    },
+    outcome: "unknown",
+    eventId: `event:v2:${String(index).padStart(64, "a")}`,
+    sessionScopeId: `session:v1:${"b".repeat(64)}`,
+    accountScopeId: "unattributed",
+  };
+}
+
+function sourceBundle(index = 1) {
+  return {
+    schemaVersion: "usage-metadata-bundle-v0.1",
+    createdAt: "2026-07-26T10:10:00.000Z",
+    coveredAt: {
+      startAt: "2026-07-26T10:00:00.000Z",
+      endAt: "2026-07-26T10:10:00.000Z",
+    },
+    clientPlatform: "macos",
+    records: {
+      usageEvents: [usage(index)],
+      quotaSnapshots: [],
+      activityMarkers: [],
+    },
+  };
+}
+
+async function createPreparedSet(parent, {
+  setName = null,
+  index = 1,
+} = {}) {
+  const directory = setName === null ? parent : join(parent, setName);
+  if (setName !== null) await mkdir(directory, { mode: 0o700 });
+  const [contribution] =
+    buildTelemetryContributionsFromBundle(sourceBundle(index));
+  const content = stableJson(contribution);
+  const published = await publishPreparedContributionFile({
+    directory,
+    name: "telemetry-contribution-000001.json",
+    content,
+  });
+  const manifest = {
+    schemaVersion: PREPARED_CONTRIBUTION_SET_VERSION,
+    builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    eligibleSchemaVersion: "telemetry-contribution-v0.1",
+    batchCount: 1,
+    files: [{
+      basename: published.basename,
+      sha256: published.sha256,
+      bytes: published.bytes,
+      recordCounts: {
+        usageEvents: 1,
+        quotaSnapshots: 0,
+        activityMarkers: 0,
+      },
+    }],
+  };
+  await publishPreparedContributionManifest({
+    directory,
+    manifest,
+    builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+  });
+  return { directory, manifest };
+}
+
+async function fixture({ spool = false } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-sync-queue-"));
+  const preparedRoot = join(root, "prepared");
+  const privateRoot = join(root, "private");
+  await mkdir(preparedRoot, { mode: 0o700 });
+  await mkdir(privateRoot, { mode: 0o700 });
+  const setName = spool ? `prepared-set-${randomUUID()}` : null;
+  const prepared = await createPreparedSet(preparedRoot, { setName });
+  return {
+    root,
+    preparedRoot,
+    prepared,
+    queueFile: join(privateRoot, "sync.sqlite3"),
+  };
+}
+
+function acceptedReceipt() {
+  return {
+    basename: "telemetry-contribution-000001.json",
+    contributionId: ACCEPTED_ID,
+    status: "accepted",
+  };
+}
+
+test("queue persists one path-free job and deduplicates subsequent scans", async () => {
+  const value = await fixture();
+  const calls = [];
+  const first = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    syncEntry: async (options) => {
+      calls.push(options);
+      return acceptedReceipt();
+    },
+  });
+  assert.equal(first.status, "completed");
+  assert.equal(first.enqueued, 1);
+  assert.equal(first.accepted, 1);
+  assert.equal(first.queue.counts.accepted, 1);
+  assert.equal(calls.length, 1);
+
+  const second = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:01:00.000Z"),
+    maximumQueuedJobs: 1,
+    syncEntry: async () => {
+      throw new Error("accepted rows must not be replayed");
+    },
+  });
+  assert.equal(second.enqueued, 0);
+  assert.equal(second.processed, 0);
+  assert.equal(second.queue.counts.accepted, 1);
+
+  const stats = await lstat(value.queueFile);
+  assert.equal(stats.isFile(), true);
+  assert.equal(stats.nlink, 1);
+  assert.equal(stats.mode & 0o077, 0);
+  const database = new DatabaseSync(value.queueFile, { readOnly: true });
+  const columns = database.prepare(
+    "PRAGMA table_info(contribution_jobs)",
+  ).all().map((row) => row.name);
+  const row = database.prepare(`
+    SELECT set_name, contribution_basename, contribution_sha256,
+           contribution_bytes, schema_version, covered_start_at,
+           covered_end_at, state, attempt_count, last_error_code,
+           contribution_id
+      FROM contribution_jobs
+  `).get();
+  database.close();
+  assert.equal(columns.some((name) => (
+    /path|directory|origin|secret|account|session/u.test(name)
+  )), false);
+  assert.equal(row.set_name, ".");
+  assert.equal(row.state, "accepted");
+  assert.equal(row.attempt_count, 1);
+  assert.equal(row.contribution_id, ACCEPTED_ID);
+  const raw = await readFile(value.queueFile);
+  for (const forbidden of [
+    value.root,
+    "usage.example",
+    "um_device_",
+    "accountScopeId",
+    "sessionScopeId",
+  ]) {
+    assert.equal(raw.includes(Buffer.from(forbidden)), false);
+  }
+});
+
+test("spool discovery queues only fixed prepared-set child names", async () => {
+  const value = await fixture({ spool: true });
+  await writeFile(join(value.preparedRoot, "loose.json"), "{\"raw\":true}\n", {
+    mode: 0o600,
+  });
+  await mkdir(join(value.preparedRoot, "arbitrary-directory"), { mode: 0o700 });
+  const sets = await discoverCommittedPreparedSets({
+    directory: value.preparedRoot,
+  });
+  assert.equal(sets.length, 1);
+  assert.match(sets[0].setName, /^prepared-set-/u);
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    syncEntry: async () => acceptedReceipt(),
+  });
+  assert.equal(result.discoveredSets, 1);
+  assert.equal(result.accepted, 1);
+});
+
+test("retryable failures use bounded backoff and later produce one accepted row", async () => {
+  const value = await fixture();
+  let clock = Date.parse("2026-07-26T12:00:00.000Z");
+  let calls = 0;
+  const syncEntry = async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new ContributionDeviceSyncError("service_unavailable", {
+        retryable: true,
+      });
+    }
+    return acceptedReceipt();
+  };
+  const first = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date(clock),
+    random: () => 0.5,
+    syncEntry,
+  });
+  assert.equal(first.retryable, 1);
+  assert.equal(first.queue.counts.retryable, 1);
+  assert.equal(
+    first.queue.nextAttemptAt,
+    "2026-07-26T12:00:05.000Z",
+  );
+
+  clock += 4000;
+  const tooSoon = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date(clock),
+    random: () => 0.5,
+    syncEntry,
+  });
+  assert.equal(tooSoon.processed, 0);
+  clock += 1000;
+  const retried = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date(clock),
+    random: () => 0.5,
+    syncEntry,
+  });
+  assert.equal(retried.accepted, 1);
+  assert.equal(retried.queue.counts.accepted, 1);
+  assert.equal(calls, 2);
+
+  const database = new DatabaseSync(value.queueFile, { readOnly: true });
+  const row = database.prepare(
+    "SELECT state, attempt_count, contribution_id FROM contribution_jobs",
+  ).get();
+  database.close();
+  assert.deepEqual({ ...row }, {
+    state: "accepted",
+    attempt_count: 2,
+    contribution_id: ACCEPTED_ID,
+  });
+});
+
+test("terminal validation failures are rejected without automatic replay", async () => {
+  const value = await fixture();
+  let calls = 0;
+  const syncEntry = async () => {
+    calls += 1;
+    throw new ContributionDeviceSyncError("upload_rejected");
+  };
+  const first = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    syncEntry,
+  });
+  assert.equal(first.rejected, 1);
+  assert.equal(first.queue.counts.rejected, 1);
+  const second = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    syncEntry,
+  });
+  assert.equal(second.processed, 0);
+  assert.equal(calls, 1);
+});
+
+test("revoked device pauses the queue while preserving a retryable job", async () => {
+  const value = await fixture();
+  const unavailable = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    syncEntry: async () => {
+      throw new ContributionDeviceSyncError("device_unavailable", {
+        deviceUnavailable: true,
+      });
+    },
+  });
+  assert.equal(unavailable.status, "paused");
+  assert.equal(unavailable.queue.paused, true);
+  assert.equal(unavailable.queue.counts.retryable, 1);
+
+  await setContributionSyncPaused({
+    paused: false,
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:01:00.000Z"),
+  });
+  const resumed = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:01:00.000Z"),
+    syncEntry: async () => acceptedReceipt(),
+  });
+  assert.equal(resumed.accepted, 1);
+  assert.equal(resumed.queue.paused, false);
+});
+
+test("expired in-flight lease is recovered after an interrupted process", async () => {
+  const value = await fixture();
+  await setContributionSyncPaused({
+    paused: true,
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+  });
+  await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    syncEntry: async () => acceptedReceipt(),
+  });
+  const database = new DatabaseSync(value.queueFile);
+  database.prepare(`
+    UPDATE contribution_jobs
+       SET state = 'in_flight',
+           attempt_count = 1,
+           next_attempt_at = NULL,
+           lease_token = ?,
+           lease_expires_at = ?
+  `).run(
+    randomUUID(),
+    "2026-07-26T12:05:00.000Z",
+  );
+  database.close();
+
+  const before = await inspectContributionSyncQueue({
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:04:59.000Z"),
+  });
+  assert.equal(before.counts.in_flight, 1);
+  const after = await inspectContributionSyncQueue({
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:05:00.000Z"),
+  });
+  assert.equal(after.counts.in_flight, 0);
+  assert.equal(after.counts.retryable, 1);
+  assert.equal(after.nextAttemptAt, "2026-07-26T12:05:00.000Z");
+});
+
+test("post-enqueue file substitution fails before any sync network boundary", async () => {
+  const value = await fixture();
+  await setContributionSyncPaused({
+    paused: true,
+    queueFile: value.queueFile,
+  });
+  await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    syncEntry: async () => acceptedReceipt(),
+  });
+  await writeFile(
+    join(value.preparedRoot, "telemetry-contribution-000001.json"),
+    "{\"tampered\":true}\n",
+    { mode: 0o600 },
+  );
+  await setContributionSyncPaused({
+    paused: false,
+    queueFile: value.queueFile,
+  });
+  let syncCalls = 0;
+  await assert.rejects(
+    runContributionSyncQueueOnce({
+      directory: value.preparedRoot,
+      origin: ORIGIN,
+      backend: {},
+      queueFile: value.queueFile,
+      syncEntry: async () => {
+        syncCalls += 1;
+        return acceptedReceipt();
+      },
+    }),
+    (error) => error.code === "prepared_contribution_set_file_invalid"
+      || error.code === "prepared_contribution_set_file_digest",
+  );
+  assert.equal(syncCalls, 0);
+});
+
+test("queue refuses symlinked or non-owner-only database locations", async () => {
+  const value = await fixture();
+  const target = join(value.root, "target.sqlite3");
+  await writeFile(target, "", { mode: 0o600 });
+  await symlink(target, value.queueFile);
+  await assert.rejects(
+    inspectContributionSyncQueue({ queueFile: value.queueFile }),
+    (error) => error.code === "contribution_sync_queue_queue_invalid",
+  );
+
+  const openParent = join(value.root, "open-parent");
+  await mkdir(openParent, { mode: 0o755 });
+  await chmod(openParent, 0o755);
+  await assert.rejects(
+    inspectContributionSyncQueue({
+      queueFile: join(openParent, "queue.sqlite3"),
+    }),
+    (error) => error.code === "contribution_sync_queue_queue_invalid",
+  );
+});
+
+test("foreground watch repeats explicitly and exits without installing persistence", async () => {
+  const value = await fixture();
+  const sleeps = [];
+  let elapsed = 0;
+  const result = await runContributionSyncQueueWatch({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    intervalSeconds: 30,
+    durationMilliseconds: 60_000,
+    clock: () => elapsed,
+    sleep: async (milliseconds) => {
+      sleeps.push(milliseconds);
+      elapsed += milliseconds;
+    },
+    syncEntry: async () => acceptedReceipt(),
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.passes, 3);
+  assert.equal(result.accepted, 1);
+  assert.deepEqual(sleeps, [30_000, 30_000]);
+});

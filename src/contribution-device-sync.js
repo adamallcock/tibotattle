@@ -20,25 +20,35 @@ const DEVICE_UPLOAD =
 const ERROR_CODES = new Set([
   "invalid_configuration",
   "service_unavailable",
+  "device_unavailable",
   "authorization_rejected",
   "upload_rejected",
   "response_invalid",
 ]);
 
 export class ContributionDeviceSyncError extends Error {
-  constructor(code) {
-    if (!ERROR_CODES.has(code)) throw new TypeError("Unknown contribution device sync error code");
+  constructor(code, {
+    retryable = false,
+    deviceUnavailable = false,
+  } = {}) {
+    if (!ERROR_CODES.has(code)) {
+      throw new TypeError("Unknown contribution device sync error code");
+    }
     super("Contribution device sync failed");
     this.name = "ContributionDeviceSyncError";
     this.code = `contribution_device_sync_${code}`;
+    this.retryable = retryable;
+    this.deviceUnavailable = deviceUnavailable;
   }
 }
 
-function fail(code) {
-  throw new ContributionDeviceSyncError(code);
+function fail(code, options = {}) {
+  throw new ContributionDeviceSyncError(code, options);
 }
 
-async function readJson(response, rejectionCode) {
+async function readJson(response, rejectionCode, {
+  deviceAuthorization = false,
+} = {}) {
   if (!(response instanceof Response)) fail("response_invalid");
   if (response.headers.get("cache-control") !== "no-store"
       || !(response.headers.get("content-type") ?? "")
@@ -49,7 +59,7 @@ async function readJson(response, rejectionCode) {
   try {
     text = await response.text();
   } catch {
-    fail("service_unavailable");
+    fail("service_unavailable", { retryable: true });
   }
   if (Buffer.byteLength(text, "utf8") > MAXIMUM_RESPONSE_BYTES) {
     fail("response_invalid");
@@ -61,12 +71,27 @@ async function readJson(response, rejectionCode) {
     fail("response_invalid");
   }
   if (!response.ok) {
-    fail(response.status >= 500 ? "service_unavailable" : rejectionCode);
+    if (response.status === 408 || response.status === 429
+        || response.status >= 500) {
+      fail("service_unavailable", { retryable: true });
+    }
+    const backendCode = payload?.error?.code;
+    if (deviceAuthorization
+        && ["DEVICE_AUTH_INVALID", "PARTICIPANT_DELETING"].includes(backendCode)) {
+      fail("device_unavailable", { deviceUnavailable: true });
+    }
+    fail(rejectionCode);
   }
   return payload;
 }
 
-async function requestJson(fetchImpl, url, options, rejectionCode) {
+async function requestJson(
+  fetchImpl,
+  url,
+  options,
+  rejectionCode,
+  classification = {},
+) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -75,9 +100,9 @@ async function requestJson(fetchImpl, url, options, rejectionCode) {
       ...options,
     });
   } catch {
-    fail("service_unavailable");
+    fail("service_unavailable", { retryable: true });
   }
-  return readJson(response, rejectionCode);
+  return readJson(response, rejectionCode, classification);
 }
 
 function canonicalOrigin(value) {
@@ -97,11 +122,151 @@ function canonicalOrigin(value) {
   return parsed.origin;
 }
 
+/**
+ * Upload exactly one already-manifested v0.1 batch. The local file is reopened
+ * and fully verified before the first network request.
+ */
+export async function syncPreparedContributionEntryOnce({
+  directory,
+  entry,
+  origin,
+  backend,
+  stateFile = undefined,
+  signal = undefined,
+  fetchImpl = globalThis.fetch,
+  cryptoImpl = globalThis.crypto,
+  loadContribution = loadVerifiedPreparedContribution,
+  withDeviceSecret = withContributionDeviceSecret,
+  createEnvelope = createTelemetryEnvelope,
+} = {}) {
+  if (typeof directory !== "string" || !entry || typeof entry !== "object"
+      || typeof fetchImpl !== "function" || typeof loadContribution !== "function"
+      || typeof withDeviceSecret !== "function" || typeof createEnvelope !== "function"
+      || !backend || typeof backend !== "object"
+      || (signal !== undefined && !(signal instanceof AbortSignal))) {
+    fail("invalid_configuration");
+  }
+  const selectedOrigin = canonicalOrigin(origin);
+
+  const payload = await loadContribution({ directory, entry });
+  const envelopeKey = await requestJson(
+    fetchImpl,
+    new URL("/api/v1/envelope-key", selectedOrigin),
+    {
+      headers: { Accept: "application/json" },
+      ...(signal === undefined ? {} : { signal }),
+    },
+    "authorization_rejected",
+  );
+  if (envelopeKey?.algorithm !== "RSA-OAEP-256"
+      || typeof envelopeKey.keyId !== "string"
+      || envelopeKey.keyId.length < 1
+      || envelopeKey.keyId.length > 200
+      || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") {
+    fail("response_invalid");
+  }
+
+  const envelope = await createEnvelope({
+    payload,
+    publicJwk: envelopeKey.publicJwk,
+    keyId: envelopeKey.keyId,
+    cryptoImpl,
+  });
+  const serializedEnvelope = JSON.stringify(envelope);
+  const contentLengthBytes = Buffer.byteLength(serializedEnvelope, "utf8");
+  const envelopeDigest = createHash("sha256")
+    .update(serializedEnvelope, "utf8")
+    .digest("hex");
+  const registrationOutcome = await withDeviceSecret({
+    backend,
+    ...(stateFile === undefined ? {} : { stateFile }),
+    expectedOrigin: selectedOrigin,
+    operation: async (secret, binding) => {
+      const deviceAuthorization =
+        `um_device_${binding.deviceId}.${secret.toString("base64url")}`;
+      try {
+        const registration = await requestJson(
+          fetchImpl,
+          new URL("/api/v1/device/upload-authorizations", selectedOrigin),
+          {
+            method: "POST",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Device ${deviceAuthorization}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              envelopeDigest,
+              contentLengthBytes,
+              contentType: "application/json",
+            }),
+            ...(signal === undefined ? {} : { signal }),
+          },
+          "authorization_rejected",
+          { deviceAuthorization: true },
+        );
+        if (typeof registration?.uploadAuthorization !== "string"
+            || !DEVICE_UPLOAD.test(registration.uploadAuthorization)
+            || !Number.isFinite(Date.parse(registration.expiresAt))) {
+          fail("response_invalid");
+        }
+        return Object.freeze({
+          ok: true,
+          uploadAuthorization: registration.uploadAuthorization,
+        });
+      } catch (error) {
+        if (!(error instanceof ContributionDeviceSyncError)) throw error;
+        return Object.freeze({
+          ok: false,
+          code: error.code.replace("contribution_device_sync_", ""),
+          retryable: error.retryable,
+          deviceUnavailable: error.deviceUnavailable,
+        });
+      }
+    },
+  });
+  if (registrationOutcome?.ok !== true) {
+    if (!ERROR_CODES.has(registrationOutcome?.code)) fail("response_invalid");
+    fail(registrationOutcome.code, {
+      retryable: registrationOutcome.retryable === true,
+      deviceUnavailable: registrationOutcome.deviceUnavailable === true,
+    });
+  }
+  const uploadAuthorization = registrationOutcome.uploadAuthorization;
+  const receipt = await requestJson(
+    fetchImpl,
+    new URL("/api/v1/contributions", selectedOrigin),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Upload ${uploadAuthorization}`,
+        "Content-Type": "application/json",
+      },
+      body: serializedEnvelope,
+      ...(signal === undefined ? {} : { signal }),
+    },
+    "upload_rejected",
+  );
+  if (typeof receipt?.contributionId !== "string"
+      || !CONTRIBUTION_ID.test(receipt.contributionId)
+      || typeof receipt.status !== "string"
+      || receipt.status.length > 80) {
+    fail("response_invalid");
+  }
+  return Object.freeze({
+    basename: entry.basename,
+    contributionId: receipt.contributionId,
+    status: receipt.status,
+  });
+}
+
 export async function syncPreparedContributionSetOnce({
   directory,
   origin,
   backend,
   stateFile = undefined,
+  signal = undefined,
   fetchImpl = globalThis.fetch,
   cryptoImpl = globalThis.crypto,
   verifySet = verifyPreparedContributionSet,
@@ -125,91 +290,20 @@ export async function syncPreparedContributionSetOnce({
     fail("invalid_configuration");
   }
 
-  const envelopeKey = await requestJson(
-    fetchImpl,
-    new URL("/api/v1/envelope-key", selectedOrigin),
-    { headers: { Accept: "application/json" } },
-    "authorization_rejected",
-  );
-  if (envelopeKey?.algorithm !== "RSA-OAEP-256"
-      || typeof envelopeKey.keyId !== "string"
-      || envelopeKey.keyId.length < 1
-      || envelopeKey.keyId.length > 200
-      || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") {
-    fail("response_invalid");
-  }
-
   const accepted = [];
   for (const entry of manifest.files) {
-    const payload = await loadContribution({ directory, entry });
-    const envelope = await createEnvelope({
-      payload,
-      publicJwk: envelopeKey.publicJwk,
-      keyId: envelopeKey.keyId,
-      cryptoImpl,
-    });
-    const serializedEnvelope = JSON.stringify(envelope);
-    const contentLengthBytes = Buffer.byteLength(serializedEnvelope, "utf8");
-    const envelopeDigest = createHash("sha256")
-      .update(serializedEnvelope, "utf8")
-      .digest("hex");
-    const uploadAuthorization = await withDeviceSecret({
+    accepted.push(await syncPreparedContributionEntryOnce({
+      directory,
+      entry,
+      origin: selectedOrigin,
       backend,
-      ...(stateFile === undefined ? {} : { stateFile }),
-      expectedOrigin: selectedOrigin,
-      operation: async (secret, binding) => {
-        const deviceAuthorization =
-          `um_device_${binding.deviceId}.${secret.toString("base64url")}`;
-        const registration = await requestJson(
-          fetchImpl,
-          new URL("/api/v1/device/upload-authorizations", selectedOrigin),
-          {
-            method: "POST",
-            headers: {
-              Accept: "application/json",
-              Authorization: `Device ${deviceAuthorization}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              envelopeDigest,
-              contentLengthBytes,
-              contentType: "application/json",
-            }),
-          },
-          "authorization_rejected",
-        );
-        if (typeof registration?.uploadAuthorization !== "string"
-            || !DEVICE_UPLOAD.test(registration.uploadAuthorization)
-            || !Number.isFinite(Date.parse(registration.expiresAt))) {
-          fail("response_invalid");
-        }
-        return registration.uploadAuthorization;
-      },
-    });
-    const receipt = await requestJson(
+      stateFile,
+      signal,
       fetchImpl,
-      new URL("/api/v1/contributions", selectedOrigin),
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Upload ${uploadAuthorization}`,
-          "Content-Type": "application/json",
-        },
-        body: serializedEnvelope,
-      },
-      "upload_rejected",
-    );
-    if (typeof receipt?.contributionId !== "string"
-        || !CONTRIBUTION_ID.test(receipt.contributionId)
-        || typeof receipt.status !== "string"
-        || receipt.status.length > 80) {
-      fail("response_invalid");
-    }
-    accepted.push(Object.freeze({
-      basename: entry.basename,
-      contributionId: receipt.contributionId,
-      status: receipt.status,
+      cryptoImpl,
+      loadContribution,
+      withDeviceSecret,
+      createEnvelope,
     }));
   }
   return Object.freeze({

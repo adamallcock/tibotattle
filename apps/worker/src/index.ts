@@ -408,14 +408,22 @@ async function handleDevices(request: Request, env: Env): Promise<Response> {
   }, 200, { vary: "Cookie" });
 }
 
-async function handleDeviceResource(
+async function handleDeviceRevocation(
   request: Request,
   env: Env,
-  deviceId: string,
 ): Promise<Response> {
-  if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
   const session = await personalSession(request, env);
   assertCsrf(request, session);
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 1
+      || typeof Reflect.get(body.value, "deviceId") !== "string") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const deviceId = Reflect.get(body.value, "deviceId") as string;
   if (!await revokeParticipantDevice(
     env.USAGE_MONITOR_DB,
     session.participantId,
@@ -846,19 +854,36 @@ async function handleCommunityStats(request: Request, env: Env): Promise<Respons
   );
 }
 
+const CONTRIBUTION_ID_PATTERN =
+  /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
 async function handleContributionResource(
   request: Request,
   env: Env,
-  contributionId: string,
+  operation: "read" | "delete",
 ): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
   const session = await personalSession(request, env);
+  assertCsrf(request, session);
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || Object.keys(body.value).length !== 1
+      || typeof Reflect.get(body.value, "contributionId") !== "string"
+      || !CONTRIBUTION_ID_PATTERN.test(
+        Reflect.get(body.value, "contributionId") as string,
+      )) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const contributionId = Reflect.get(body.value, "contributionId") as string;
   const row = await telemetryContributionById(
     env.USAGE_MONITOR_DB,
     session.participantId,
     contributionId,
   );
   if (!row) throw new ApiError(404, "NOT_FOUND");
-  if (request.method === "GET") {
+  if (operation === "read") {
     const records = await telemetryRecordsForContribution(
       env.USAGE_MONITOR_DB,
       session.participantId,
@@ -872,24 +897,20 @@ async function handleContributionResource(
       })),
     }, 200, { vary: "Cookie" });
   }
-  if (request.method === "DELETE") {
-    assertCsrf(request, session);
-    if (!await markTelemetryContributionDeleting(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      contributionId,
-    )) {
-      throw new ApiError(409, "CONTRIBUTION_DELETE_CONFLICT");
-    }
-    await env.QUARANTINE.delete(row.r2_key);
-    await deleteTelemetryContribution(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      contributionId,
-    );
-    return jsonResponse({ deleted: true, contributionId }, 200, { vary: "Cookie" });
+  if (!await markTelemetryContributionDeleting(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    contributionId,
+  )) {
+    throw new ApiError(409, "CONTRIBUTION_DELETE_CONFLICT");
   }
-  methodNotAllowed(["GET", "DELETE"]);
+  await env.QUARANTINE.delete(row.r2_key);
+  await deleteTelemetryContribution(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    contributionId,
+  );
+  return jsonResponse({ deleted: true, contributionId }, 200, { vary: "Cookie" });
 }
 
 async function routeApi(request: Request, env: Env): Promise<Response> {
@@ -914,31 +935,16 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
     return handleDeviceUploadAuthorization(request, env);
   }
   if (pathname === "/api/v1/me/devices") return handleDevices(request, env);
-  const devicePrefix = "/api/v1/me/devices/";
-  if (pathname.startsWith(devicePrefix)) {
-    let deviceId = "";
-    try {
-      deviceId = decodeURIComponent(pathname.slice(devicePrefix.length));
-    } catch {
-      throw new ApiError(404, "DEVICE_NOT_FOUND");
-    }
-    return handleDeviceResource(request, env, deviceId);
+  if (pathname === "/api/v1/me/devices/revoke") {
+    return handleDeviceRevocation(request, env);
   }
   if (pathname === "/api/v1/envelope-key") return handleEnvelopeKey(request, env);
   if (pathname === "/api/v1/contributions") return handleContribution(request, env);
-  const contributionPrefix = "/api/v1/contributions/";
-  if (pathname.startsWith(contributionPrefix)) {
-    let contributionId = "";
-    try {
-      contributionId = decodeURIComponent(pathname.slice(contributionPrefix.length));
-    } catch {
-      throw new ApiError(404, "NOT_FOUND");
-    }
-    if (!/^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
-      .test(contributionId)) {
-      throw new ApiError(404, "NOT_FOUND");
-    }
-    return handleContributionResource(request, env, contributionId);
+  if (pathname === "/api/v1/me/contributions/read") {
+    return handleContributionResource(request, env, "read");
+  }
+  if (pathname === "/api/v1/me/contributions/delete") {
+    return handleContributionResource(request, env, "delete");
   }
   if (pathname === "/api/v1/me/export") return handleExport(request, env);
   if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
@@ -971,10 +977,13 @@ function routeClass(pathname: string): string {
     return "device_upload_authorization";
   }
   if (pathname === "/api/v1/me/devices") return "participant_devices";
-  if (pathname.startsWith("/api/v1/me/devices/")) return "participant_device";
+  if (pathname === "/api/v1/me/devices/revoke") {
+    return "participant_device_revocation";
+  }
   if (pathname === "/api/v1/envelope-key") return "envelope_key";
   if (pathname === "/api/v1/contributions") return "contributions";
-  if (pathname.startsWith("/api/v1/contributions/")) return "contribution_resource";
+  if (pathname === "/api/v1/me/contributions/read") return "contribution_read";
+  if (pathname === "/api/v1/me/contributions/delete") return "contribution_delete";
   if (pathname === "/api/v1/me/export") return "participant_export";
   if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
     return "participant_stats";

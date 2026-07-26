@@ -43,10 +43,11 @@
     "migrate-corrections": "node ./src/cli.js migrate-corrections",
     "test": "node --test --test-concurrency=1 test/*.test.js apps/web/test/*.test.mjs",
     "product:ui:test": "node --test apps/web/test/*.test.mjs",
-    "product:local:test": "node --test test/local-companion-data.test.js test/telemetry-contribution-builder.test.js apps/local/*.test.mjs",
+    "product:local:test": "node --test test/local-companion-data.test.js test/telemetry-contribution-builder.test.js test/contribution-device-sync.test.js test/contribution-sync-queue.test.js test/contribution-device-cli.test.js apps/local/*.test.mjs",
     "product:backend:test": "npm --prefix apps/worker test",
     "product:worker:check": "npm --prefix apps/worker run check",
     "product:backend:smoke": "npm --prefix apps/worker run smoke:http --",
+    "product:backend:queue-smoke": "npm --prefix apps/worker run smoke:queue:http --",
     "product:check": "npm run product:ui:test && npm run product:local:test && npm run product:worker:check",
     "product:local": "node ./apps/local/server.js",
     "product:prepare-contribution": "node ./scripts/build-telemetry-contributions.js",
@@ -60,7 +61,7 @@
     "runcost": "0.2.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
   "packageManager": "pnpm@11.9.0",
   "devDependencies": {

@@ -57,7 +57,11 @@ The callback lifecycle is local-only and preserves an existing supported Claude 
 
 ## Quick start
 
-The legacy monitoring commands require Node.js 20 or newer and an authenticated Codex CLI/app installation. The SQLite-backed `export-set` path is release-qualified only on Node.js 24.14.0 and 26.2.0.
+The CLI requires Node.js 22.13.0 or newer and an authenticated Codex CLI/app
+installation. Node 22.13 is the first LTS-line release where the built-in
+SQLite module used by the durable local queue no longer requires a runtime
+flag. The SQLite-backed `export-set` path is release-qualified only on Node.js
+24.14.0 and 26.2.0.
 
 ```bash
 pnpm install --ignore-workspace
@@ -279,11 +283,40 @@ node ./src/cli.js sync-contributions-once \
   --origin http://127.0.0.1:8792
 ```
 
+That pass is backed by a durable, crash-safe, owner-only SQLite queue. The
+queue stores fixed basenames, digests, sizes, covered-time bounds, bounded
+attempt state, and accepted receipts—never source paths, prompts, responses,
+account/session identifiers, service origins, or credentials. It can scan one
+committed prepared set or a spool containing only
+`prepared-set-<uuid>` children. Loose files and incomplete sets are ignored.
+
+Use the same queue for an explicit foreground watch, or inspect and control it
+without contacting the service:
+
+```bash
+node ./src/cli.js sync-contributions-watch \
+  --directory /absolute/path/to/prepared-spool \
+  --origin http://127.0.0.1:8792 \
+  --interval-seconds 60
+
+node ./src/cli.js sync-contributions-status
+node ./src/cli.js sync-contributions-pause
+node ./src/cli.js sync-contributions-resume
+```
+
+Transient network, 408, 429, and 5xx failures use bounded retry with backoff.
+Privacy/schema rejection is terminal. An expired or revoked device pauses the
+queue and preserves pending work. A process restart recovers expired leases
+and never replays an accepted row. The local dashboard's Data & privacy section
+shows only bounded queue counts and timestamps; it cannot reveal a prepared
+file, path, identity, origin, or secret.
+
 The device credential can only mint an exact five-minute, one-use authorization
 for one v0.1 encrypted envelope. It cannot use browser sessions, read private
 statistics, export or delete data, recover access, rotate consent, pair another
 device, or select the disabled v0.2 contract. This slice is foreground-only;
-durable retry/watch state and background installation remain separately gated.
+login-item, LaunchAgent, daemon, signed-app, and silent background installation
+remain separately gated.
 
 `npm run product:check` runs the functional UI, loopback server, transport
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a
@@ -340,6 +373,12 @@ receipt](./2026-07-26-g4-privacy-safe-weekly-aggregate-verification-receipt.md)
 records the current 20-participant scheduled-publication smoke, immutable
 snapshot/deletion lifecycle, post-cleanup D1/R2 counts, and rendered
 published/withdrawn UI checks.
+
+The [durable queue and backend verification
+receipt](./2026-07-26-durable-contribution-queue-verification-receipt.md)
+records the crash/restart/retry/privacy tests, a real encrypted queue smoke,
+the fresh 20-participant invite-only D1/R2 lifecycle, fixed-path private
+resource routes, and exact post-deletion storage counts.
 
 ## Local metadata exporter privacy boundary
 

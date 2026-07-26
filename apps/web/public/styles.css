@@ -455,7 +455,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .upload-status { margin-top: 13px; padding: 13px; border-radius: .35rem; color: var(--green); background: var(--green-soft); font-size: .75rem; }
 .upload-status.error { color: var(--rust); background: var(--rust-soft); }
 .backend-panel { margin-top: 18px; }
+.sync-status-panel { margin-top: 18px; }
 .backend-facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 18px 0; }
+.sync-facts { grid-template-columns: repeat(3, 1fr); }
 .backend-facts > div { min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: .35rem; background: rgba(255, 254, 249, .6); }
 .backend-facts dt { color: var(--muted); font-size: .58rem; text-transform: uppercase; }
 .backend-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: .76rem; font-weight: 750; }

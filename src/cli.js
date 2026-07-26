@@ -73,7 +73,13 @@ import {
   createProductionContributionDeviceBackend,
 } from "./contribution-device-capability.js";
 import { claimContributionDevicePairing } from "./contribution-device-client.js";
-import { syncPreparedContributionSetOnce } from "./contribution-device-sync.js";
+import {
+  defaultContributionSyncQueueFile,
+  inspectContributionSyncQueue,
+  runContributionSyncQueueOnce,
+  runContributionSyncQueueWatch,
+  setContributionSyncPaused,
+} from "./contribution-sync-queue.js";
 import {
   defaultCollectorCheckpointFile,
   defaultCollectorDataFile,
@@ -152,7 +158,11 @@ function usage() {
   usage-monitor remove-claude-callback-identity [--confirm-removal TOKEN]
   usage-monitor benchmark-r7 --profile smoke|release_synthetic_semantics|release_synthetic_pressure|release_materialized_boundaries --output PATH
   usage-monitor pair-contribution-device --origin HTTPS_OR_LOOPBACK_ORIGIN
-  usage-monitor sync-contributions-once --directory PREPARED_DIRECTORY --origin HTTPS_OR_LOOPBACK_ORIGIN
+  usage-monitor sync-contributions-once --directory PREPARED_DIRECTORY_OR_SPOOL --origin HTTPS_OR_LOOPBACK_ORIGIN [--queue-file PATH]
+  usage-monitor sync-contributions-watch --directory PREPARED_SPOOL --origin HTTPS_OR_LOOPBACK_ORIGIN [--queue-file PATH] [--interval-seconds N] [--duration-ms N]
+  usage-monitor sync-contributions-status [--queue-file PATH]
+  usage-monitor sync-contributions-pause [--queue-file PATH]
+  usage-monitor sync-contributions-resume [--queue-file PATH]
   usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
@@ -234,6 +244,8 @@ export function parseArgs(argv) {
     maximumEncodedArtifactBytes: null,
     benchmarkProfile: null,
     serviceOrigin: null,
+    queueFile: null,
+    intervalSeconds: null,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -292,6 +304,8 @@ export function parseArgs(argv) {
     else if (arg === "--max-artifact-bytes") result.maximumEncodedArtifactBytes = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--profile") result.benchmarkProfile = readOptionValue(argv, index++, arg);
     else if (arg === "--origin") result.serviceOrigin = readOptionValue(argv, index++, arg);
+    else if (arg === "--queue-file") result.queueFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--interval-seconds") result.intervalSeconds = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--alias") result.accountAlias = readOptionValue(argv, index++, arg);
     else if (arg === "--default-plan") result.defaultPlanVariant = readOptionValue(argv, index++, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -312,8 +326,26 @@ export function parseArgs(argv) {
     throw new Error("--profile is available only for benchmark-r7");
   }
   if (result.serviceOrigin !== null
-      && !["pair-contribution-device", "sync-contributions-once"].includes(result.command)) {
+      && ![
+        "pair-contribution-device",
+        "sync-contributions-once",
+        "sync-contributions-watch",
+      ].includes(result.command)) {
     throw new Error("--origin is available only for contribution-device commands");
+  }
+  if (result.queueFile !== null
+      && ![
+        "sync-contributions-once",
+        "sync-contributions-watch",
+        "sync-contributions-status",
+        "sync-contributions-pause",
+        "sync-contributions-resume",
+      ].includes(result.command)) {
+    throw new Error("--queue-file is available only for contribution-sync commands");
+  }
+  if (result.intervalSeconds !== null
+      && result.command !== "sync-contributions-watch") {
+    throw new Error("--interval-seconds is available only for sync-contributions-watch");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -430,7 +462,10 @@ export async function run(
     removeClaudeCallbackCredential = removeManagedClaudeCallbackCapability,
     createContributionDeviceBackend = createProductionContributionDeviceBackend,
     claimContributionDevicePairingCommand = claimContributionDevicePairing,
-    syncPreparedContributionSetOnceCommand = syncPreparedContributionSetOnce,
+    runContributionSyncQueueOnceCommand = runContributionSyncQueueOnce,
+    runContributionSyncQueueWatchCommand = runContributionSyncQueueWatch,
+    inspectContributionSyncQueueCommand = inspectContributionSyncQueue,
+    setContributionSyncPausedCommand = setContributionSyncPaused,
     readPairingCode = async () => {
       const terminal = createInterface({
         input: process.stdin,
@@ -509,15 +544,72 @@ export async function run(
     if (!args.serviceOrigin || !args.directory) {
       throw new Error("sync-contributions-once requires --directory and --origin");
     }
-    const result = await syncPreparedContributionSetOnceCommand({
+    const result = await runContributionSyncQueueOnceCommand({
       directory: args.directory,
       origin: args.serviceOrigin,
       backend: createContributionDeviceBackend(),
+      queueFile: args.queueFile ?? defaultContributionSyncQueueFile(),
     });
-    console.log(`Contribution sync: ${result.status}`);
-    console.log(`Committed privacy-safe batches: ${result.preparedSetBatches}`);
-    console.log(`Accepted or replayed: ${result.accepted.length}`);
-    console.log("Payload content, local paths, device identity, and credentials printed: none");
+    console.log(`Contribution queue pass: ${result.status}`);
+    console.log(`Committed sets discovered: ${result.discoveredSets}; newly queued: ${result.enqueued}`);
+    console.log(`Processed: ${result.processed}; accepted or replayed: ${result.accepted}`);
+    console.log(`Waiting to retry: ${result.queue.counts.retryable}; permanently rejected: ${result.queue.counts.rejected}`);
+    console.log(`Queue paused: ${result.queue.paused}`);
+    console.log("Payload content, local paths, server origin, device identity, and credentials printed: none");
+    return;
+  }
+  if (args.command === "sync-contributions-watch") {
+    if (!args.serviceOrigin || !args.directory) {
+      throw new Error("sync-contributions-watch requires --directory and --origin");
+    }
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    let result;
+    try {
+      result = await runContributionSyncQueueWatchCommand({
+        directory: args.directory,
+        origin: args.serviceOrigin,
+        backend: createContributionDeviceBackend(),
+        queueFile: args.queueFile ?? defaultContributionSyncQueueFile(),
+        intervalSeconds: args.intervalSeconds ?? 60,
+        durationMilliseconds: args.durationMs,
+        signal: controller.signal,
+      });
+    } finally {
+      process.removeListener("SIGINT", stop);
+      process.removeListener("SIGTERM", stop);
+    }
+    console.log(`Foreground contribution watch: ${result.status}`);
+    console.log(`Passes: ${result.passes}; newly queued: ${result.enqueued}`);
+    console.log(`Processed: ${result.processed}; accepted or replayed: ${result.accepted}`);
+    console.log(`Waiting to retry: ${result.queue.counts.retryable}; permanently rejected: ${result.queue.counts.rejected}`);
+    console.log(`Queue paused: ${result.queue.paused}`);
+    console.log("Installed background service: false; content, paths, identities, origins, and credentials printed: none");
+    return;
+  }
+  if (args.command === "sync-contributions-status") {
+    const result = await inspectContributionSyncQueueCommand({
+      queueFile: args.queueFile ?? defaultContributionSyncQueueFile(),
+    });
+    console.log("Contribution queue status");
+    console.log(`Paused: ${result.paused}; due now: ${result.dueNow}`);
+    console.log(`Pending: ${result.counts.pending}; in flight: ${result.counts.in_flight}; retryable: ${result.counts.retryable}`);
+    console.log(`Accepted: ${result.counts.accepted}; rejected: ${result.counts.rejected}`);
+    console.log("Content, paths, identities, origins, contribution IDs, and credentials printed: none");
+    return;
+  }
+  if (args.command === "sync-contributions-pause"
+      || args.command === "sync-contributions-resume") {
+    const paused = args.command === "sync-contributions-pause";
+    const result = await setContributionSyncPausedCommand({
+      paused,
+      queueFile: args.queueFile ?? defaultContributionSyncQueueFile(),
+    });
+    console.log(`Contribution queue: ${paused ? "paused" : "resumed"}`);
+    console.log(`Waiting: ${result.counts.pending + result.counts.retryable}; accepted: ${result.counts.accepted}; rejected: ${result.counts.rejected}`);
+    console.log("Network activity: none; content, paths, identities, origins, and credentials printed: none");
     return;
   }
   if (args.command === "inspect-claude-callback") {

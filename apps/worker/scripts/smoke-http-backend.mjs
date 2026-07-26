@@ -477,10 +477,11 @@ try {
   }
   const pendingDeviceUpload = await registerDeviceUpload(device, serializedEnvelope);
   expectStatus(
-    await request(`/api/v1/me/devices/${device.deviceId}`, {
-      method: "DELETE",
+    await request("/api/v1/me/devices/revoke", {
+      method: "POST",
       session: primary,
       csrf: true,
+      body: JSON.stringify({ deviceId: device.deviceId }),
     }),
     200,
     "Device revocation",
@@ -515,10 +516,12 @@ try {
   };
   const expectedTotal = expected.usageEvents + expected.quotaSnapshots + expected.activityMarkers;
   const contributionStatus = expectStatus(
-    await request(
-      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
-      { session: primary },
-    ),
+    await request("/api/v1/me/contributions/read", {
+      method: "POST",
+      session: primary,
+      csrf: true,
+      body: JSON.stringify({ contributionId: accepted.contributionId }),
+    }),
     200,
     "Contribution status",
   );
@@ -678,14 +681,12 @@ try {
   await recover(primary);
 
   const contributionDeletion = expectStatus(
-    await request(
-      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
-      {
-        method: "DELETE",
-        session: primary,
-        csrf: true,
-      },
-    ),
+    await request("/api/v1/me/contributions/delete", {
+      method: "POST",
+      session: primary,
+      csrf: true,
+      body: JSON.stringify({ contributionId: accepted.contributionId }),
+    }),
     200,
     "Contribution deletion",
   );

@@ -197,11 +197,12 @@ production operator command and approval boundary exist.
 - `POST /api/v1/me/device-pairings`
 - `POST /api/v1/device-pairings/claim`
 - `GET /api/v1/me/devices`
-- `DELETE /api/v1/me/devices/:id`
+- `POST /api/v1/me/devices/revoke`
 - `POST /api/v1/device/upload-authorizations`
 - `GET /api/v1/envelope-key`
 - `POST /api/v1/contributions`
-- `GET|DELETE /api/v1/contributions/:id`
+- `POST /api/v1/me/contributions/read`
+- `POST /api/v1/me/contributions/delete`
 - `GET /api/v1/me`
 - `GET /api/v1/me/stats` (alias: `/api/v1/me/insights`)
 - `GET /api/v1/community/insights` (alias: `/api/v1/stats/aggregate`)

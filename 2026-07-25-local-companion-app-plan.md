@@ -146,11 +146,11 @@ available for full inspection.
 | `POST` | `/api/v1/recover` | Rotate access using the recovery capability |
 | `GET` | `/api/v1/envelope-key` | Fetch the active contribution-encryption key |
 | `POST` | `/api/v1/contributions` | Accept one encrypted, closed contribution export |
-| `GET` | `/api/v1/contributions/:id` | Read validation/processing status owned by the participant |
+| `POST` | `/api/v1/me/contributions/read` | Read participant-owned validation/processing status with the identifier in a closed body |
 | `GET` | `/api/v1/me/insights` | Read participant-only trends and coverage diagnostics |
 | `GET` | `/api/v1/community/insights` | Read privacy-thresholded aggregate results |
 | `GET` | `/api/v1/me/export` | Export all retained participant data |
-| `DELETE` | `/api/v1/contributions/:id` | Delete one contribution and its quarantine object |
+| `POST` | `/api/v1/me/contributions/delete` | Delete one contribution and its quarantine object with the identifier in a closed body |
 | `DELETE` | `/api/v1/me` | Delete the participant, contributions, and stored objects |
 
 The API may compute insights synchronously for the local proof of concept, but

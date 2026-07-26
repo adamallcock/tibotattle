@@ -17,10 +17,12 @@ import {
 } from "../public/lib.js";
 import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+  CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
   CommunityClient,
   demoDashboard,
   LocalCompanionClient,
   normalizeCommunitySnapshot,
+  normalizeContributionSyncStatus,
   normalizeDashboardPayload,
   normalizeParticipantStats,
   PARTICIPANT_STATS_SCHEMA_VERSION
@@ -413,6 +415,83 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
   assert.equal(calls[1].options.method, undefined);
 });
 
+test("local contribution queue status remains bounded and fails closed", async () => {
+  const normalized = normalizeContributionSyncStatus({
+    schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
+    status: "available",
+    paused: false,
+    counts: {
+      pending: 2,
+      inFlight: 1,
+      accepted: 8,
+      retryable: 3,
+      rejected: 1
+    },
+    dueNow: 2,
+    nextAttemptAt: "2026-07-26T13:00:00.000Z",
+    lastAcceptedAt: "2026-07-26T12:00:00.000Z",
+    includesContent: false,
+    includesPaths: false,
+    includesCredentials: false,
+    privatePath: "/Users/private",
+    deviceSecret: "must-not-survive"
+  });
+  assert.equal(normalized.state, "attention");
+  assert.equal(normalized.counts.accepted, 8);
+  assert.equal(Object.hasOwn(normalized, "privatePath"), false);
+  assert.equal(Object.hasOwn(normalized, "deviceSecret"), false);
+
+  assert.deepEqual(
+    normalizeContributionSyncStatus({
+      schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
+      status: "available",
+      paused: false,
+      counts: {
+        pending: 0,
+        inFlight: 0,
+        accepted: 1,
+        retryable: 0,
+        rejected: 0
+      },
+      dueNow: 0,
+      includesContent: true,
+      includesPaths: false,
+      includesCredentials: false
+    }).state,
+    "unavailable"
+  );
+
+  const calls = [];
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return new Response(JSON.stringify({
+        schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
+        status: "available",
+        paused: true,
+        counts: {
+          pending: 1,
+          inFlight: 0,
+          accepted: 0,
+          retryable: 0,
+          rejected: 0
+        },
+        dueNow: 1,
+        nextAttemptAt: null,
+        lastAcceptedAt: null,
+        includesContent: false,
+        includesPaths: false,
+        includesCredentials: false
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+  assert.equal((await client.contributionSyncStatus()).state, "paused");
+  assert.deepEqual(calls, ["/api/local/contribution/sync-status"]);
+});
+
 test("community adapter separates cookie sessions from one-use upload authority", async () => {
   const calls = [];
   const client = new CommunityClient({
@@ -463,9 +542,10 @@ test("community adapter separates cookie sessions from one-use upload authority"
   assert.equal(calls[7].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   assert.match(calls[7].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
   assert.equal(calls[8].url, "/api/v1/me/devices");
-  assert.equal(calls[9].url, "/api/v1/me/devices/00000000-0000-4000-8000-000000000001");
-  assert.equal(calls[9].options.method, "DELETE");
+  assert.equal(calls[9].url, "/api/v1/me/devices/revoke");
+  assert.equal(calls[9].options.method, "POST");
   assert.equal(calls[9].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.match(calls[9].options.body, /00000000-0000-4000-8000-000000000001/);
   assert.equal(calls[10].url, "/api/v1/logout");
   assert.equal(calls[11].url, "/api/v1/me/security-reset");
   await client.health();
@@ -475,6 +555,35 @@ test("community adapter separates cookie sessions from one-use upload authority"
   assert.match(calls[13].options.body, /privacy-safe-telemetry-v0\.1/);
   assert.match(calls[13].options.body, /um_invite_test/);
   assert.match(calls[14].options.body, /um_recovery_test/);
+});
+
+test("contribution read and deletion keep identifiers out of request URLs", async () => {
+  const calls = [];
+  const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
+  const client = new CommunityClient({
+    getCsrfToken: () => "csrf-confirmation",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+
+  await client.contribution(contributionId);
+  await client.deleteContribution(contributionId);
+
+  assert.deepEqual(calls.map((call) => call.url), [
+    "/api/v1/me/contributions/read",
+    "/api/v1/me/contributions/delete"
+  ]);
+  for (const call of calls) {
+    assert.equal(call.options.method, "POST");
+    assert.equal(call.options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+    assert.equal(JSON.parse(call.options.body).contributionId, contributionId);
+    assert.equal(call.url.includes(contributionId), false);
+  }
 });
 
 test("community snapshots fail closed and never disclose threshold distance", () => {

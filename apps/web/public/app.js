@@ -710,15 +710,70 @@ function renderCollector(data) {
   }
 }
 
+function renderContributionSyncStatus(status) {
+  const value = status ?? {
+    state: "unavailable",
+    paused: null,
+    counts: {
+      pending: 0,
+      inFlight: 0,
+      accepted: 0,
+      retryable: 0,
+      rejected: 0
+    },
+    nextAttemptAt: "",
+    lastAcceptedAt: ""
+  };
+  const labels = {
+    unavailable: "Queue unavailable",
+    paused: "Queue paused",
+    attention: "Needs attention",
+    active: "Delivery active",
+    idle: "Up to date",
+    empty: "Nothing queued"
+  };
+  const chip = $("#sync-state");
+  chip.textContent = labels[value.state] ?? "Queue unavailable";
+  chip.className = ["active", "idle"].includes(value.state)
+    ? "evidence-chip"
+    : "evidence-chip neutral";
+  const counts = value.counts;
+  $("#sync-waiting").textContent = compact(counts.pending + counts.retryable);
+  $("#sync-in-flight").textContent = compact(counts.inFlight);
+  $("#sync-accepted").textContent = compact(counts.accepted);
+  $("#sync-attention").textContent = compact(counts.retryable + counts.rejected);
+  $("#sync-next-attempt").textContent = value.nextAttemptAt
+    ? formatUtc(value.nextAttemptAt)
+    : "None scheduled";
+  $("#sync-last-accepted").textContent = value.lastAcceptedAt
+    ? formatUtc(value.lastAcceptedAt)
+    : "No accepted batch yet";
+  const descriptions = {
+    unavailable: "No verified local queue state is available. Nothing about a file, path, identity, origin, or credential is inferred.",
+    paused: "Delivery is paused locally. Prepared batches remain content-free and will not be sent until you explicitly resume.",
+    attention: "At least one batch is waiting for a retry or was rejected. Use the local status command for bounded counts; it does not print paths or identifiers.",
+    active: "Committed privacy-safe batches are waiting, retrying, or currently leased to the foreground sender.",
+    idle: "Every discovered committed batch has been accepted or replayed, and no retry is due.",
+    empty: "No committed privacy-safe prepared set has entered this queue yet."
+  };
+  $("#sync-description").textContent = descriptions[value.state]
+    ?? descriptions.unavailable;
+}
+
 async function loadLocalDashboard() {
   const button = $("#refresh-button");
   button.disabled = true;
   button.textContent = "Connecting…";
   try {
-    const data = await localClient.load();
+    const [data, syncStatus] = await Promise.all([
+      localClient.load(),
+      localClient.contributionSyncStatus()
+    ]);
     renderDashboard(data);
+    renderContributionSyncStatus(syncStatus);
   } catch {
     dashboard = null;
+    renderContributionSyncStatus(null);
     setGlobalState("offline");
     $("#latest-observation").textContent = "Companion unavailable";
     $("#data-source").textContent = "No real usage is displayed";

@@ -125,10 +125,11 @@ rows remain unchanged.
   - personal session only;
   - returns device UUID, fixed scope, state, issued/expiry/last-used times;
   - never returns credential hashes or secrets.
-- `DELETE /api/v1/me/devices/:id`
+- `POST /api/v1/me/devices/revoke`
   - personal session, same-origin, CSRF;
-  - revokes the exact participant-owned device and its unused upload
-    authorizations.
+  - closed body contains the exact participant-owned device UUID;
+  - the fixed route keeps that pseudonym out of platform access-log paths;
+  - revokes the device and its unused upload authorizations.
 - `POST /api/v1/device/upload-authorizations`
   - `Authorization: Device ...`;
   - exact digest, length, and content type;
@@ -173,14 +174,13 @@ Retry rules:
 
 # Commands
 
-- `usage-monitor contribution pair --origin ORIGIN`
-- `usage-monitor sync-status`
-- `usage-monitor sync-once --directory PREPARED_DIRECTORY --origin ORIGIN`
-- `usage-monitor sync-watch --directory PREPARED_DIRECTORY --origin ORIGIN
+- `usage-monitor pair-contribution-device --origin ORIGIN`
+- `usage-monitor sync-contributions-status`
+- `usage-monitor sync-contributions-once --directory PREPARED_DIRECTORY --origin ORIGIN`
+- `usage-monitor sync-contributions-watch --directory PREPARED_DIRECTORY --origin ORIGIN
   [--interval-seconds N]`
-- `usage-monitor sync-pause`
-- `usage-monitor sync-resume`
-- `usage-monitor sync-revoke --confirm TOKEN`
+- `usage-monitor sync-contributions-pause`
+- `usage-monitor sync-contributions-resume`
 
 Origins are configured locally, must be HTTPS outside explicit loopback
 development, and can never be supplied by the server. Command output is a
@@ -237,3 +237,15 @@ This development slice remains unrouted. A participant pilot still requires:
 - retention and incident drills including device compromise;
 - renewed review before v0.2 account tracks are accepted; and
 - a staged real-browser HTTPS lifecycle test.
+
+# Implemented checkpoint
+
+As of 2026-07-26, the foreground queue, explicit watch, status, pause/resume,
+device pairing/revocation, fixed-path private resource routes, local dashboard
+status projection, and isolated Worker/D1/R2 lifecycle smoke are implemented
+and verified. The default queue is local owner-only SQLite; no scheduler or
+background persistence is installed.
+
+The production and participant-pilot gates above remain open. In particular,
+this checkpoint does not authorize external collection, daemon installation,
+unsigned distribution, production secrets, or v0.2 account-track transport.

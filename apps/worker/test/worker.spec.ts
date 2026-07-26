@@ -90,6 +90,22 @@ function personalHeaders(
   };
 }
 
+function contributionResource(
+  participant: EnrollmentResponse,
+  contributionId: string,
+  operation: "read" | "delete",
+  runtimeEnv = testBindings(),
+): Promise<Response> {
+  return api(`/api/v1/me/contributions/${operation}`, {
+    method: "POST",
+    headers: {
+      ...personalHeaders(participant, { csrf: true }),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ contributionId }),
+  }, runtimeEnv);
+}
+
 async function enroll(): Promise<EnrollmentResponse> {
   const response = await api("/api/v1/enroll", {
     method: "POST",
@@ -1596,22 +1612,43 @@ describe("synthetic usage monitor service", () => {
       }],
     });
 
-    const contribution = await api(
-      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
-      {
-      headers: personalHeaders(participant),
-      },
+    const contribution = await contributionResource(
+      participant,
+      accepted.contributionId,
+      "read",
     );
     expect(contribution.status).toBe(200);
     await expect(contribution.json()).resolves.toMatchObject({
       contributionId: accepted.contributionId,
       records: [{ kind: "usage" }, { kind: "quota" }],
     });
+    const invalidContributionRead = await api(
+      "/api/v1/me/contributions/read",
+      {
+        method: "POST",
+        headers: {
+          ...personalHeaders(participant, { csrf: true }),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          contributionId: accepted.contributionId,
+          unexpected: true,
+        }),
+      },
+    );
+    expect(invalidContributionRead.status).toBe(400);
+    const identifierBearingLegacyRoute = await api(
+      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
+      { headers: personalHeaders(participant) },
+    );
+    expect(identifierBearingLegacyRoute.status).toBe(404);
 
     const stranger = await enrollTelemetry();
-    const isolated = await api(`/api/v1/contributions/${accepted.contributionId}`, {
-      headers: personalHeaders(stranger),
-    });
+    const isolated = await contributionResource(
+      stranger,
+      accepted.contributionId,
+      "read",
+    );
     expect(isolated.status).toBe(404);
 
     const community = await api("/api/v1/community/insights");
@@ -1626,10 +1663,11 @@ describe("synthetic usage monitor service", () => {
     ).bind(participant.participantId).all<{ id: string }>();
     expect(stored.results.map((row) => row.id)).toContain(secondAccepted.contributionId);
 
-    const deleted = await api(`/api/v1/contributions/${accepted.contributionId}`, {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deleted = await contributionResource(
+      participant,
+      accepted.contributionId,
+      "delete",
+    );
     expect(deleted.status).toBe(200);
     const afterDelete = await api("/api/v1/me/stats", {
       headers: personalHeaders(participant),
@@ -1637,9 +1675,11 @@ describe("synthetic usage monitor service", () => {
     await expect(afterDelete.json()).resolves.toMatchObject({
       totals: { contributions: 1, usageEvents: 1, quotaSnapshots: 1, activityMarkers: 1 },
     });
-    const surviving = await api(`/api/v1/contributions/${secondAccepted.contributionId}`, {
-      headers: personalHeaders(participant),
-    });
+    const surviving = await contributionResource(
+      participant,
+      secondAccepted.contributionId,
+      "read",
+    );
     await expect(surviving.json()).resolves.toMatchObject({
       records: [{ kind: "usage" }, { kind: "quota" }, { kind: "activity" }],
     });
@@ -1741,9 +1781,10 @@ describe("synthetic usage monitor service", () => {
       }],
     });
 
-    const contribution = await api(
-      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
-      { headers: personalHeaders(participant) },
+    const contribution = await contributionResource(
+      participant,
+      accepted.contributionId,
+      "read",
     );
     await expect(contribution.json()).resolves.toMatchObject({
       serverAccounting: {
@@ -1976,12 +2017,10 @@ describe("synthetic usage monitor service", () => {
       "DELETE FROM community_weekly_snapshots",
     ).run()).rejects.toThrow();
 
-    const deleted = await api(
-      `/api/v1/contributions/${encodeURIComponent(contributionToDelete)}`,
-      {
-      method: "DELETE",
-      headers: personalHeaders(participantToDelete!, { csrf: true }),
-      },
+    const deleted = await contributionResource(
+      participantToDelete!,
+      contributionToDelete,
+      "delete",
     );
     expect(deleted.status).toBe(200);
     const withdrawn = await api("/api/v1/stats/aggregate");
@@ -2027,12 +2066,10 @@ describe("synthetic usage monitor service", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const failed = await api(
-      `/api/v1/contributions/${encodeURIComponent(contributionId)}`,
-      {
-        method: "DELETE",
-        headers: personalHeaders(participant, { csrf: true }),
-      },
+    const failed = await contributionResource(
+      participant,
+      contributionId,
+      "delete",
       testBindings({ QUARANTINE: failingBucket }),
     );
     expect(failed.status).toBe(500);
@@ -2049,12 +2086,10 @@ describe("synthetic usage monitor service", () => {
     });
     expect(withdrawnText).not.toContain("\"cells\"");
 
-    const retried = await api(
-      `/api/v1/contributions/${encodeURIComponent(contributionId)}`,
-      {
-        method: "DELETE",
-        headers: personalHeaders(participant, { csrf: true }),
-      },
+    const retried = await contributionResource(
+      participant,
+      contributionId,
+      "delete",
     );
     expect(retried.status).toBe(200);
   });
@@ -2305,11 +2340,35 @@ describe("synthetic usage monitor service", () => {
 
     const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("e"), true));
     const pending = await registerDeviceUpload(device, pendingRaw);
-    const revoked = await api(`/api/v1/me/devices/${device.deviceId}`, {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
+    const invalidRevocation = await api("/api/v1/me/devices/revoke", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        deviceId: device.deviceId,
+        unexpected: true,
+      }),
+    });
+    expect(invalidRevocation.status).toBe(400);
+    const revoked = await api("/api/v1/me/devices/revoke", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ deviceId: device.deviceId }),
     });
     expect(revoked.status).toBe(200);
+    const identifierBearingLegacyRoute = await api(
+      `/api/v1/me/devices/${device.deviceId}`,
+      {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      },
+    );
+    expect(identifierBearingLegacyRoute.status).toBe(404);
     const deniedRegistration = await api("/api/v1/device/upload-authorizations", {
       method: "POST",
       headers: {

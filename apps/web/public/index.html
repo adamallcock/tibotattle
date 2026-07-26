@@ -470,6 +470,34 @@
           </article>
         </div>
 
+        <article class="panel sync-status-panel" aria-labelledby="sync-status-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Foreground ongoing delivery</p>
+              <h3 id="sync-status-title">Privacy-safe contribution queue</h3>
+            </div>
+            <span class="evidence-chip neutral" id="sync-state">Checking queue</span>
+          </div>
+          <p class="annotation" id="sync-description">
+            The local queue contains metadata about committed, privacy-verified
+            batches only. It never contains prompts, responses, source paths,
+            account names, browser sessions, or device secrets.
+          </p>
+          <dl class="backend-facts sync-facts">
+            <div><dt>Waiting</dt><dd id="sync-waiting">—</dd></div>
+            <div><dt>In flight</dt><dd id="sync-in-flight">—</dd></div>
+            <div><dt>Accepted</dt><dd id="sync-accepted">—</dd></div>
+            <div><dt>Needs attention</dt><dd id="sync-attention">—</dd></div>
+            <div><dt>Next attempt</dt><dd id="sync-next-attempt">—</dd></div>
+            <div><dt>Last accepted</dt><dd id="sync-last-accepted">—</dd></div>
+          </dl>
+          <p class="backend-contract-note">
+            This development slice runs only when you explicitly invoke the
+            foreground sync command. It has not installed a login item,
+            LaunchAgent, daemon, or silent background process.
+          </p>
+        </article>
+
         <article class="panel backend-panel" aria-labelledby="backend-title">
           <div class="panel-heading">
             <div>

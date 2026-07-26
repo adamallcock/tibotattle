@@ -11,12 +11,13 @@
  *
  * Central contribution contract:
  *   POST /api/v1/contributions
- *   GET  /api/v1/contributions/:id
+ *   POST /api/v1/me/contributions/read
+ *   POST /api/v1/me/contributions/delete
  *   GET  /api/v1/me/stats
  *   GET  /api/v1/stats/aggregate
  *   POST /api/v1/me/device-pairings
  *   GET  /api/v1/me/devices
- *   DELETE /api/v1/me/devices/:id
+ *   POST /api/v1/me/devices/revoke
  *
  * The normalizers below accept complete, partial, stale, and insufficient
  * responses, but never silently turn a failure into real-looking data.
@@ -26,6 +27,8 @@ const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
 export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
+export const CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION =
+  "contribution-sync-status-v0.1";
 
 const COMMUNITY_METRIC_UNITS = Object.freeze({
   usageEvents: "events_rounded_down",
@@ -62,6 +65,59 @@ function count(value, fallback = null) {
 function nonNegative(value, fallback = null) {
   const number = finite(value, fallback);
   return number !== null && number >= 0 ? number : fallback;
+}
+
+export function normalizeContributionSyncStatus(payload) {
+  const unavailable = {
+    state: "unavailable",
+    paused: null,
+    counts: {
+      pending: 0,
+      inFlight: 0,
+      accepted: 0,
+      retryable: 0,
+      rejected: 0
+    },
+    dueNow: 0,
+    nextAttemptAt: "",
+    lastAcceptedAt: ""
+  };
+  if (payload?.schemaVersion !== CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION
+      || payload?.status !== "available"
+      || typeof payload?.paused !== "boolean"
+      || payload?.includesContent !== false
+      || payload?.includesPaths !== false
+      || payload?.includesCredentials !== false) {
+    return unavailable;
+  }
+  const names = ["pending", "inFlight", "accepted", "retryable", "rejected"];
+  const counts = Object.fromEntries(names.map((name) => [
+    name,
+    count(payload?.counts?.[name], null)
+  ]));
+  if (Object.values(counts).some((value) => value === null)) return unavailable;
+  const nextAttemptAt = text(payload.nextAttemptAt, "");
+  const lastAcceptedAt = text(payload.lastAcceptedAt, "");
+  if ((nextAttemptAt && !Number.isFinite(Date.parse(nextAttemptAt)))
+      || (lastAcceptedAt && !Number.isFinite(Date.parse(lastAcceptedAt)))) {
+    return unavailable;
+  }
+  return {
+    state: payload.paused
+      ? "paused"
+      : counts.rejected > 0
+        ? "attention"
+        : counts.pending + counts.retryable + counts.inFlight > 0
+          ? "active"
+          : counts.accepted > 0
+            ? "idle"
+            : "empty",
+    paused: payload.paused,
+    counts,
+    dueNow: count(payload.dueNow, 0),
+    nextAttemptAt,
+    lastAcceptedAt
+  };
 }
 
 function snapshotMetric(value, expectedUnit) {
@@ -575,6 +631,19 @@ export class LocalCompanionClient {
   refreshStatus() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`);
   }
+
+  async contributionSyncStatus() {
+    try {
+      return normalizeContributionSyncStatus(
+        await fetchJson(
+          this.fetchImpl,
+          `${LOCAL_ROOT}/contribution/sync-status`
+        )
+      );
+    } catch {
+      return normalizeContributionSyncStatus(null);
+    }
+  }
 }
 
 export class CommunityClient {
@@ -683,16 +752,24 @@ export class CommunityClient {
   contribution(contributionId) {
     return fetchJson(
       this.fetchImpl,
-      `${CENTRAL_ROOT}/contributions/${encodeURIComponent(contributionId)}`,
-      this.sessionOptions()
+      `${CENTRAL_ROOT}/me/contributions/read`,
+      this.mutationOptions({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contributionId })
+      })
     );
   }
 
   deleteContribution(contributionId) {
     return fetchJson(
       this.fetchImpl,
-      `${CENTRAL_ROOT}/contributions/${encodeURIComponent(contributionId)}`,
-      this.mutationOptions({ method: "DELETE" })
+      `${CENTRAL_ROOT}/me/contributions/delete`,
+      this.mutationOptions({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contributionId })
+      })
     );
   }
 
@@ -758,8 +835,12 @@ export class CommunityClient {
     }
     return fetchJson(
       this.fetchImpl,
-      `${CENTRAL_ROOT}/me/devices/${encodeURIComponent(deviceId)}`,
-      this.mutationOptions({ method: "DELETE" })
+      `${CENTRAL_ROOT}/me/devices/revoke`,
+      this.mutationOptions({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceId })
+      })
     );
   }
 

@@ -13,6 +13,9 @@ import {
   LocalCompanionRefreshController,
   createLocalCollectorRefreshRunner,
 } from "../../src/local-companion-refresh.js";
+import {
+  inspectContributionSyncQueue,
+} from "../../src/contribution-sync-queue.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BODY_BYTES = 1_024;
@@ -44,6 +47,7 @@ const API_ROUTES = new Set([
   "/api/local/reports",
   "/api/local/refresh",
   "/api/local/contribution/preview",
+  "/api/local/contribution/sync-status",
 ]);
 
 function jsonBody(value) {
@@ -200,6 +204,36 @@ function previewProjection(value) {
   };
 }
 
+function nullableInstant(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
+    ? new Date(value).toISOString()
+    : null;
+}
+
+function syncStatusProjection(value) {
+  const counts = value?.counts ?? {};
+  const valid = value?.schemaVersion === "contribution-sync-status-v0.1"
+    && typeof value?.paused === "boolean";
+  return {
+    schemaVersion: "contribution-sync-status-v0.1",
+    status: valid ? "available" : "unavailable",
+    paused: valid ? value.paused : null,
+    counts: {
+      pending: finiteNonNegativeInteger(counts.pending),
+      inFlight: finiteNonNegativeInteger(counts.in_flight),
+      accepted: finiteNonNegativeInteger(counts.accepted),
+      retryable: finiteNonNegativeInteger(counts.retryable),
+      rejected: finiteNonNegativeInteger(counts.rejected),
+    },
+    dueNow: valid ? finiteNonNegativeInteger(value.dueNow) : 0,
+    nextAttemptAt: valid ? nullableInstant(value.nextAttemptAt) : null,
+    lastAcceptedAt: valid ? nullableInstant(value.lastAcceptedAt) : null,
+    includesContent: false,
+    includesPaths: false,
+    includesCredentials: false,
+  };
+}
+
 export function createLocalCompanionServer({
   root = process.cwd(),
   staticRoot = resolve(root, "apps", "web", "public"),
@@ -211,6 +245,14 @@ export function createLocalCompanionServer({
   centralOrigin = process.env.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),
+  contributionSyncStatusProvider = () => inspectContributionSyncQueue({
+    queueFile: resolve(
+      root,
+      ".usage-monitor",
+      "private",
+      "contribution-sync-v0.1.sqlite3",
+    ),
+  }),
   onError = () => {},
 } = {}) {
   if (!dataStore || typeof dataStore.initialize !== "function") {
@@ -218,6 +260,9 @@ export function createLocalCompanionServer({
   }
   if (typeof contributionPreviewProvider !== "function") {
     throw new TypeError("contributionPreviewProvider must be a function");
+  }
+  if (typeof contributionSyncStatusProvider !== "function") {
+    throw new TypeError("contributionSyncStatusProvider must be a function");
   }
   const refresh = new LocalCompanionRefreshController({
     runner: refreshRunner,
@@ -292,6 +337,7 @@ export function createLocalCompanionServer({
             localDashboard: true,
             explicitRefresh: true,
             contributionPreview: true,
+            contributionSyncStatus: true,
             centralServiceProxy: centralProxy.enabled,
             arbitraryPathAccess: false,
             remoteProxy: false,
@@ -360,6 +406,20 @@ export function createLocalCompanionServer({
           preview = { status: "not_configured" };
         }
         send(response, 200, previewProjection(preview));
+        return;
+      }
+      if (path === "/api/local/contribution/sync-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        let status;
+        try {
+          status = await contributionSyncStatusProvider();
+        } catch {
+          status = null;
+        }
+        send(response, 200, syncStatusProjection(status));
         return;
       }
       if (path === "/api/local/refresh") {

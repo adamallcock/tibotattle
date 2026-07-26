@@ -106,6 +106,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       localDashboard: true,
       explicitRefresh: true,
       contributionPreview: true,
+      contributionSyncStatus: true,
       centralServiceProxy: false,
       arbitraryPathAccess: false,
       remoteProxy: false,
@@ -256,6 +257,63 @@ test("contribution preview returns counts and accounting only", async () => {
   }
 });
 
+test("contribution sync status exposes bounded queue counts only", async () => {
+  const files = await fixture();
+  const privatePath = "/Users/private/prepared-set";
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionSyncStatusProvider: async () => ({
+      schemaVersion: "contribution-sync-status-v0.1",
+      paused: false,
+      counts: {
+        pending: 2,
+        in_flight: 1,
+        accepted: 9,
+        retryable: 3,
+        rejected: 4,
+      },
+      dueNow: 2,
+      nextAttemptAt: "2026-07-26T13:00:00.000Z",
+      lastAcceptedAt: "2026-07-26T12:00:00.000Z",
+      queuePath: privatePath,
+      credential: "um_device_private",
+    }),
+    port: 0,
+  });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${app.port}/api/local/contribution/sync-status`,
+    );
+    assert.equal(response.status, 200);
+    const value = await response.json();
+    assert.deepEqual(value.counts, {
+      pending: 2,
+      inFlight: 1,
+      accepted: 9,
+      retryable: 3,
+      rejected: 4,
+    });
+    assert.equal(value.includesContent, false);
+    assert.equal(value.includesPaths, false);
+    assert.equal(value.includesCredentials, false);
+    assert.equal(JSON.stringify(value).includes(privatePath), false);
+    assert.equal(JSON.stringify(value).includes("um_device_"), false);
+    assert.equal(
+      (await fetch(
+        `http://127.0.0.1:${app.port}/api/local/contribution/sync-status`,
+        { method: "POST" },
+      )).status,
+      405,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("optional central proxy exposes public reads and blocks every authenticated route", async () => {
   const files = await fixture();
   const forwarded = [];
@@ -324,6 +382,9 @@ test("optional central proxy exposes public reads and blocks every authenticated
       { path: "/api/v1/me/export", method: "GET" },
       { path: "/api/v1/me/security-reset", method: "POST" },
       { path: "/api/v1/me/upload-authorizations", method: "POST" },
+      { path: "/api/v1/me/devices/revoke", method: "POST" },
+      { path: "/api/v1/me/contributions/read", method: "POST" },
+      { path: "/api/v1/me/contributions/delete", method: "POST" },
       { path: "/api/v1/contributions", method: "POST" },
       {
         path: `/api/v1/contributions/${encodeURIComponent("contribution:00000000-0000-4000-8000-000000000000")}`,
