@@ -105,6 +105,16 @@ by the ordinary 4 MiB API-response ceiling.
 | Public service deployment | Disabled-by-default staging configuration only | Configuration and dry-deploy checks | Deferred |
 | R7 corpus/runtime qualification | Kept outside the consumer path | Existing unrelated work preserved | Deferred hardening |
 
+The final repository-wide `npm test` run executed 928 tests: 926 passed and
+two failed in the preserved, uncommitted R7 hardening lane. Both failures are in
+`test/r7-generated-release-evidence.test.js`: retained decision receipts no
+longer match the currently dirty R7 schema/workload provenance hashes and file
+count, and the exact eight-runtime-input rebuild stops on that same stale
+provenance. No consumer, local companion, contribution, privacy-boundary, or
+backend test failed. The focused consumer product gate is fully green; the R7
+receipt regeneration remains intentionally deferred rather than being
+overwritten during this MVP work.
+
 ## Backend acceptance matrix
 
 | Capability | Verification | Result |
