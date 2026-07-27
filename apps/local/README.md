@@ -129,4 +129,6 @@ npm run product:backend:acceptance
 ```
 
 Use `npm run product:backend:lab` instead when you want the verified state and
-portal to remain available for inspection.
+portal to remain available for inspection. That command now starts this local
+companion on `http://127.0.0.1:8791/` and the backend Worker on
+`http://127.0.0.1:8792/` together. Open 8791; 8792 is backend-only.

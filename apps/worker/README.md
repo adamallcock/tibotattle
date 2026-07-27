@@ -51,7 +51,8 @@ the end. The inspectable laboratory instead creates fresh disposable state,
 seeds twenty privacy-safe participants through the real encrypted HTTP path,
 publishes the thresholded weekly snapshot, directly inspects bounded D1
 counts, restarts the Worker against the same state, and leaves the portal
-running:
+running. The normal laboratory command starts both the backend Worker on 8792
+and the real local companion on 8791:
 
 ```sh
 # Run once if apps/worker/.dev.vars does not exist.
@@ -63,12 +64,17 @@ npm run product:backend:lab
 
 The command prints:
 
-- the loopback portal URL;
+- the unified loopback portal URL (`http://127.0.0.1:8791/` by default);
+- the backend-only origin (`http://127.0.0.1:8792/` by default);
 - the exact disposable state directory;
 - an owner-only `participant-access.json` path;
 - a content-free `lab-receipt.json` path; and
 - bounded participant, contribution, canonical-record, and published-snapshot
   counts.
+
+Open the printed portal URL, not the backend-only origin. The backend origin
+does not implement `/api/local/*`; it is reached through the companion's
+strict relay.
 
 The recovery capability is never printed. To inspect the seeded participant,
 read that owner-only file locally and enter its `recoveryCode` in the portal's
@@ -81,10 +87,14 @@ The Codex in-app browser completed this loopback recovery and private-results
 journey on July 26, 2026. A real staged HTTPS deployment must repeat it across
 target browsers; localhost behavior is not a substitute for that release gate.
 
-Press `Ctrl-C` to stop the Worker. Shutdown deliberately retains the exact
+Press `Ctrl-C` to stop both processes. Shutdown deliberately retains the exact
 state directory; after inspection, move only the printed laboratory directory
 to Trash. It contains disposable credentials and encrypted development
 objects.
+
+For backend diagnostics without the local companion, use
+`npm run product:backend:only`. That mode intentionally has no dashboard
+portal.
 
 Inspect an already stopped laboratory without reading identifiers, secrets, or
 record contents:

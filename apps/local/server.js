@@ -1617,8 +1617,12 @@ if (process.argv[1] && resolve(process.argv[1]) === currentFile) {
   const requestedPort = Number(process.env.USAGE_MONITOR_PORT ?? 8787);
   const app = await startLocalCompanionServer({ port: requestedPort });
   process.stdout.write(`Usage Monitor is available at http://${app.host}:${app.port}/\n`);
-  const close = async () => {
-    await app.close();
+  let closing = false;
+  const close = () => {
+    if (closing) process.exit(0);
+    closing = true;
+    app.server.close();
+    app.server.closeAllConnections?.();
     process.exit(0);
   };
   process.once("SIGINT", close);

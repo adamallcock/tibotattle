@@ -243,9 +243,9 @@ Usage Monitor session cookie, expected CSRF value, or correctly shaped one-use
 upload authorization on its specific route. Arbitrary hosts, paths, queries,
 headers, cookies, upstream responses, and redirects are rejected.
 
-Open `http://127.0.0.1:8791/` for the unified local journey. The Worker portal
-at `http://127.0.0.1:8792/` remains useful for direct backend inspection. On
-July 27, 2026 the browser journey enrolled a fresh anonymous participant,
+Open `http://127.0.0.1:8791/` for the unified local journey. Port 8792 is the
+backend-only Worker origin: it intentionally does not expose `/api/local/*`.
+On July 27, 2026 the browser journey enrolled a fresh anonymous participant,
 validated a real content-free contribution, encrypted it in the browser,
 uploaded it with one-use authorization, displayed private server-repriced
 results and history, and generated the participant export through the local
@@ -265,12 +265,13 @@ npm run product:backend:lab
 ```
 
 The laboratory first runs a destructive HTTP acceptance pass, then starts the
-production-shaped Worker portal on port 8792, uploads a generated content-free
-contribution for twenty isolated participants through the encrypted API,
+production-shaped Worker on port 8792 and the real local companion on port
+8791. Open the printed 8791 portal URL. The command uploads a generated
+content-free contribution for twenty isolated participants through the encrypted API,
 rejects malformed, oversized, over-count, out-of-range, and privacy-canary
 inputs, verifies deduplication and canonical server repricing, exercises both
-deletion scopes, restarts against the same durable state, and leaves the
-inspectable portal running. Its mode-0600 receipt records D1, R2, aggregate,
+deletion scopes, restarts against the same durable state, and leaves both
+processes running until Ctrl-C. Its mode-0600 receipt records D1, R2, aggregate,
 private-statistics, export, deletion, and restart results. Its owner-only
 participant-access file contains the recovery capability needed to open the
 seeded participant's private results; the capability value is never printed.

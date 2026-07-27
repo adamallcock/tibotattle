@@ -53,13 +53,16 @@ confirmation, exact UTC start/end, Codex home, owner-only identity file, new
 workspace, new receipt destination, and `--cleanup recoverable-trash`. This is
 separate from ordinary startup and never becomes an automatic log scan.
 
-To keep the verified backend running:
+To keep the complete verified product laboratory running:
 
 ```bash
 npm run product:backend:lab
 ```
 
-The default portal is `http://127.0.0.1:8792/`. The recovery capability is
+This one command starts the real local companion and the seeded central
+backend. Open the unified portal at `http://127.0.0.1:8791/`. Port 8792 is the
+backend-only Worker origin and intentionally does not expose `/api/local/*`.
+The recovery capability is
 written only to the mode-`0600` participant-access file and is not printed.
 The laboratory receipt prints the exact path to that file. To inspect the
 seeded participant safely, open that specific owner-only file locally, copy
@@ -69,9 +72,10 @@ Recovery rotates the capability; do not paste it into chat, shell history,
 logs, screenshots, or a committed file. The entire laboratory directory is
 disposable and should be moved to Trash after inspection.
 
-## Start the unified consumer experience
+## Start only the local consumer experience
 
-With the backend laboratory running:
+The lab command above already starts the unified experience. For local-only
+development against a separately running backend, use:
 
 ```bash
 USAGE_MONITOR_PORT=8791 \

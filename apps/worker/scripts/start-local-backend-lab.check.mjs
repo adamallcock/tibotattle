@@ -13,7 +13,9 @@ test("backend laboratory defaults to its generated content-free fixture", () => 
     "8793",
   ]);
   assert.equal(parsed.port, 8793);
+  assert.equal(parsed.companionPort, 8791);
   assert.equal(parsed.exitAfterReceipt, true);
+  assert.equal(parsed.startCompanion, false);
   assert.deepEqual(
     backendSmokeSourceArguments(parsed.source),
     ["--generated-content-free-fixture"],
@@ -28,6 +30,8 @@ test("backend laboratory accepts exactly one explicit prepared contribution", ()
     "./state",
   ]);
   assert.equal(parsed.source.mode, "prepared_contribution");
+  assert.equal(parsed.startCompanion, true);
+  assert.equal(parsed.companionPort, 8791);
   assert.deepEqual(
     backendSmokeSourceArguments(parsed.source),
     ["--file", parsed.source.contributionFile],
@@ -44,6 +48,27 @@ test("backend laboratory accepts exactly one explicit prepared contribution", ()
     () => parseLocalBackendLabArguments(["--file", "one", "--file", "two"]),
     /Duplicate option/u,
   );
+  assert.throws(
+    () => parseLocalBackendLabArguments([
+      "--port",
+      "8792",
+      "--companion-port",
+      "8792",
+    ]),
+    /must differ/u,
+  );
+});
+
+test("backend-only laboratory leaves the local companion stopped", () => {
+  const parsed = parseLocalBackendLabArguments([
+    "--backend-only",
+    "--port",
+    "8892",
+    "--companion-port",
+    "8891",
+  ]);
+  assert.equal(parsed.backendOnly, true);
+  assert.equal(parsed.startCompanion, false);
 });
 
 test("real-file laboratory receipt projection excludes private locations", () => {

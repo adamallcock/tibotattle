@@ -21,8 +21,14 @@ export function parseLocalBackendLabArguments(args) {
   if (!Array.isArray(args) || args.some((argument) => typeof argument !== "string")) {
     throw new TypeError("Backend laboratory arguments must be strings");
   }
-  const valueOptions = new Set(["--port", "--state-directory", "--file"]);
+  const valueOptions = new Set([
+    "--port",
+    "--companion-port",
+    "--state-directory",
+    "--file",
+  ]);
   const flagOptions = new Set([
+    "--backend-only",
     "--exit-after-receipt",
     "--generated-content-free-fixture",
   ]);
@@ -57,10 +63,22 @@ export function parseLocalBackendLabArguments(args) {
         mode: "generated_content_free_fixture",
         contributionFile: null,
       });
+  const port = boundedPort(optionValue(args, "--port", "8792"));
+  const companionPort = boundedPort(
+    optionValue(args, "--companion-port", "8791"),
+  );
+  const exitAfterReceipt = args.includes("--exit-after-receipt");
+  const backendOnly = args.includes("--backend-only");
+  if (!exitAfterReceipt && !backendOnly && companionPort === port) {
+    throw new Error("--companion-port must differ from --port");
+  }
   return Object.freeze({
-    port: boundedPort(optionValue(args, "--port", "8792")),
+    port,
+    companionPort,
     stateDirectory: optionValue(args, "--state-directory"),
-    exitAfterReceipt: args.includes("--exit-after-receipt"),
+    exitAfterReceipt,
+    backendOnly,
+    startCompanion: !exitAfterReceipt && !backendOnly,
     source,
   });
 }

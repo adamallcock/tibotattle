@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { request as httpRequest } from "node:http";
 import {
   chmod,
@@ -10,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
@@ -1396,5 +1398,41 @@ test("optional central proxy exposes public reads and blocks every authenticated
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
+  }
+});
+
+test("CLI shutdown does not hang on loopback connections", async () => {
+  const childEnvironment = {
+    ...process.env,
+    USAGE_MONITOR_PORT: "0",
+  };
+  delete childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
+  const child = spawn(process.execPath, [resolve("apps/local/server.js")], {
+    cwd: process.cwd(),
+    env: childEnvironment,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+  });
+  try {
+    await waitFor(() => output.includes("Usage Monitor is available"), 15_000);
+    child.kill("SIGINT");
+    const [code, signal] = await Promise.race([
+      once(child, "exit"),
+      new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error("local companion did not exit after SIGINT")),
+          2_000,
+        );
+      }),
+    ]);
+    assert.ok(code === 0 || signal === "SIGINT");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
   }
 });

@@ -1436,6 +1436,11 @@ test("public interface is dashboard-first and never substitutes demo data automa
     appSource,
     /Your contributed data and anonymous participant capability were deleted/,
   );
+  assert.match(appSource, /This address is the backend-only service/);
+  assert.match(
+    appSource,
+    /Open the unified portal URL printed by the product laboratory/,
+  );
   const loadBody = appSource.match(/async function loadLocalDashboard\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });

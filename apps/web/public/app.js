@@ -1725,16 +1725,32 @@ async function loadLocalDashboard() {
     renderContributionSyncStatus(syncStatus);
     renderContributionSyncPreview(syncPreview);
   } catch {
+    const [localHealth, backendHealth] = await Promise.all([
+      localClient.health().catch(() => null),
+      communityClient.health().catch(() => null)
+    ]);
+    const backendOnly = localHealth === null
+      && backendHealth?.checks?.database === "ok";
     dashboard = null;
     renderContributionSyncStatus(null);
     renderContributionSyncPreview(null);
     renderPreparationIdentity(null);
     setGlobalState("offline");
-    $("#latest-observation").textContent = "Companion unavailable";
+    $("#latest-observation").textContent = backendOnly
+      ? "Backend-only origin"
+      : "Companion unavailable";
     $("#data-source").textContent = "No real usage is displayed";
     showConnectionNotice({
-      title: "The local companion is not available",
-      copy: "Start the loopback server, then refresh. You can explore a clearly labeled demonstration in the meantime.",
+      title: backendOnly
+        ? "This address is the backend-only service"
+        : localHealth
+          ? "The companion could not load the local dashboard"
+          : "The local companion is not available",
+      copy: backendOnly
+        ? "Open the unified portal URL printed by the product laboratory. Local usage APIs are intentionally unavailable on the backend origin."
+        : localHealth
+          ? "The loopback server is running, but its local evidence contract could not be loaded. Existing evidence remains on this machine."
+          : "Start the product laboratory, then open its printed portal URL. You can explore a clearly labeled demonstration in the meantime.",
       kind: "error",
       showDemo: true
     });
