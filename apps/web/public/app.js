@@ -2973,6 +2973,7 @@ async function deleteParticipantData() {
     uploadStatus.hidden = false;
     uploadStatus.className = "upload-status";
     uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the anonymous participant capability.`;
+    status.textContent = "Your contributed data and anonymous participant capability were deleted.";
     $("#participant-controls").hidden = true;
     renderPersonalStats($("#personal-result"), null);
     renderContributionHistory($("#contribution-history"), null);

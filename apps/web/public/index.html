@@ -742,7 +742,7 @@
                 Inspect next
               </button>
               <button class="button button-primary" id="sync-run-once" type="button">
-                Send one bounded pass
+                Send reviewed upload
               </button>
               <button class="button button-secondary" id="sync-pause" type="button">
                 Pause
@@ -772,9 +772,10 @@
             </section>
             <p class="backend-contract-note">
               Inspection uses loopback only: it performs no service request,
-              key fetch, authorization, or upload. A send action is capped at
-              10 queue jobs and a 16 MiB conservative encrypted upload-body
-              reservation.
+              key fetch, authorization, or upload. The send action consumes a
+              ten-minute, single-use local authorization and can claim only the
+              exact reviewed queue job. The broader foreground CLI retains its
+              independent bounded multi-job and upload-byte limits.
             </p>
           </div>
           <p class="backend-contract-note">

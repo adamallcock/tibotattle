@@ -101,8 +101,8 @@ by the ordinary 4 MiB API-response ceiling.
 | Encrypted R2 quarantine | Binding reachability and zero-orphan deletion/restart state checked; accepted objects may be processed before inspection | Verified lifecycle; positive retention not directly observed |
 | Private participant results | Statistics, insights, profile/history rendered and asserted | Verified |
 | Community aggregation | Twenty isolated participants publish thresholded snapshot | Verified |
-| Deletion rebuild/withdrawal | Individual and complete deletion acceptance | Verified |
-| Participant export | Content-free export verified and rendered UI action exercised | Verified |
+| Deletion rebuild/withdrawal | Individual and complete deletion exercised in the rendered UI and destructive HTTP acceptance | Verified |
+| Participant export | Rendered UI download plus content-free artifact inspection | Verified |
 | Persisted restart | Recovery and private statistics restored from the same state | Verified |
 | Final storage state | Destructive pass reaches zero live D1/R2 participant data with tombstones retained | Verified |
 
@@ -127,11 +127,12 @@ Trash. The durable
 receipt is content-free and contains no paths, credentials, account or
 participant identifiers, or source content.
 
-The automated destructive acceptance pass is authoritative for deletion
-storage assertions. Browser QA stopped before clicking irreversible deletion
-controls; the rendered controls and non-destructive export journey were
-inspected, while deletion was proven against isolated disposable state by the
-HTTP acceptance test.
+The automated destructive acceptance pass remains authoritative for the
+all-participant zero-state assertions. A separate browser pass used one
+disposable seeded participant and exercised recovery, private results,
+participant export, individual-contribution deletion, and complete-participant
+deletion through the rendered controls. The same run then inspected D1 and R2
+directly.
 
 ## Rendered browser evidence
 
@@ -162,16 +163,33 @@ and bound to one queue job plus its prepared-file digest; the queue runner can
 claim only that exact job. A focused re-audit found no remaining
 high-confidence consent-binding defect.
 
-The final browser pass deliberately did not create or remove a participant.
-Its foreground delivery attempt reached the central service but was rejected
+The first final browser pass did not create or remove a participant. Its
+foreground delivery attempt reached the central service but was rejected
 because the isolated local device had not been paired; the reviewed
-authorization was consumed and no other queued item was sent. Accepted ingest,
-participant export, individual deletion, full deletion, aggregate
-rebuild/withdrawal, and restart remain proven by the disposable HTTP
-acceptance run above, while earlier rendered evidence proves the direct
-participant upload and export path. This distinction keeps the browser receipt
-honest instead of treating an unpaired development device as an accepted
-upload.
+authorization was consumed and no other queued item was sent. That remains an
+honest negative device-path receipt rather than an accepted-upload claim.
+
+A subsequent disposable seeded-participant pass closed the participant-rights
+gap:
+
+- browser recovery restored one contribution, one usage event, one quota
+  snapshot, `$0.0032` of server-repriced API-equivalent usage, its private
+  comparison, and the twenty-participant delayed community snapshot;
+- the rendered export control produced a 4,517-byte
+  `participant-export-v0.2`; recursive key and content scans found no local
+  paths, credentials, email addresses, raw-content canaries, or upload
+  capabilities (`fileSearch` was the permitted coarse tool-class field);
+- individual deletion removed the contribution from private results, changed
+  D1 from 20 to 19 accepted contributions and 40 to 38 canonical records, and
+  visibly withdrew the community revision;
+- complete participant deletion hid the private controls, emptied contribution
+  history, rendered `No personal result is available`, reported one deleted
+  contribution batch, and left 19 active participants, 19 accepted
+  contributions, 38 canonical records, 19 active sessions, one deletion
+  tombstone, no retained quarantine references, and a complete direct R2
+  object count of zero; and
+- the deletion browser pass reported zero console errors. Its disposable state
+  and downloaded export were moved to Trash after verification.
 
 ## What remains before an outside pilot
 

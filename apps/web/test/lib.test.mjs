@@ -1311,6 +1311,8 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="preparation-identity"/);
   assert.match(html, /id="sync-exact-review"/);
   assert.match(html, /Every retained field and value in the next upload/);
+  assert.match(html, /Send reviewed upload/);
+  assert.match(html, /can claim only the\s+exact reviewed queue job/);
   assert.match(html, /Raw log contents and source paths never enter this page/);
   assert.match(html, /id="central-state"/);
   assert.match(html, /id="backend"/);
@@ -1337,6 +1339,10 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(appSource, /contributionSyncExactReview/);
   assert.match(appSource, /Open Keychain Access, select the login Keychain, unlock it/);
   assert.match(appSource, /Review every retained field and value below/);
+  assert.match(
+    appSource,
+    /Your contributed data and anonymous participant capability were deleted/,
+  );
   const loadBody = appSource.match(/async function loadLocalDashboard\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });
