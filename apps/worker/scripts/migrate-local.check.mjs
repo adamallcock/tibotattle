@@ -7,6 +7,7 @@ import {
   readFile,
   realpath,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -44,6 +45,11 @@ appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) +
       .split("\n")
       .map((line) => JSON.parse(line));
     const expectedState = resolve(await realpath(root), "isolated/state");
+    const stateMetadata = await stat(expectedState);
+    assert.equal(stateMetadata.isDirectory(), true);
+    if (process.platform !== "win32") {
+      assert.equal(stateMetadata.mode & 0o777, 0o700);
+    }
     assert.deepEqual(invocations, [
       [
         "d1", "migrations", "apply", "USAGE_MONITOR_DB", "--local",
@@ -66,6 +72,50 @@ appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) +
       (await readFile(calls, "utf8")).trim().split("\n").length,
       2,
     );
+
+    const permissiveState = join(root, "permissive-state");
+    await mkdir(permissiveState, { mode: 0o755 });
+    if (process.platform !== "win32") await chmod(permissiveState, 0o755);
+    const permissive = spawnSync(
+      process.execPath,
+      [script, "--persist-to", permissiveState],
+      { cwd: root, encoding: "utf8" },
+    );
+    if (process.platform !== "win32") {
+      assert.equal(permissive.status, 2);
+      assert.match(permissive.stderr, /real owner-only directory/u);
+      assert.equal(
+        (await readFile(calls, "utf8")).trim().split("\n").length,
+        2,
+      );
+    }
+
+    const defaultStateResult = spawnSync(
+      process.execPath,
+      [script],
+      { cwd: root, encoding: "utf8" },
+    );
+    assert.equal(defaultStateResult.status, 0);
+    const defaultState = resolve(await realpath(root), ".wrangler/state");
+    const defaultStateMetadata = await stat(defaultState);
+    assert.equal(defaultStateMetadata.isDirectory(), true);
+    if (process.platform !== "win32") {
+      assert.equal(defaultStateMetadata.mode & 0o777, 0o700);
+    }
+    const allInvocations = (await readFile(calls, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(allInvocations.slice(-2), [
+      [
+        "d1", "migrations", "apply", "USAGE_MONITOR_DB", "--local",
+        "--persist-to", defaultState,
+      ],
+      [
+        "d1", "migrations", "apply", "DELETION_LEDGER", "--local",
+        "--persist-to", defaultState,
+      ],
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

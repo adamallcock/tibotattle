@@ -29,7 +29,10 @@ npm run dev
 ```
 
 `keys:local` creates a mode-0600 `.dev.vars` file and refuses to overwrite an
-existing one. The file is ignored by Git. Never commit or paste its contents.
+existing one. `migrate:local` creates `.wrangler/state` as an owner-only
+directory and refuses to use an existing group/world-readable or linked state
+directory. These paths are ignored by Git. Never commit or paste their
+contents.
 
 Useful checks:
 
@@ -91,12 +94,15 @@ npm run product:backend:inspect -- \
   --persist-to /exact/lab/directory/state
 ```
 
-The stopped-state inspector reports canonical D1 counts and accepted quarantine
-references. During startup, the laboratory also counts the live local R2
-objects through Wrangler's fixed explorer route, discards all object keys, and
-fails unless that count matches the accepted contributions. R2 deletion is
-separately exercised through the Worker integration and destructive HTTP smoke
-tests.
+The stopped-state inspector reports canonical D1 counts and retained
+quarantine references. During startup, the laboratory also counts the live
+local R2 objects through Wrangler's fixed explorer route, discards all object
+keys, and fails unless that count matches the canonical references still
+marked as retained. The aggregate-publication smoke advances the scheduled
+clock past the ingestion cutoff and may therefore exercise the seven-day
+encrypted-quarantine deletion before inspection; accepted canonical metadata
+and personal statistics remain in D1. R2 deletion is also exercised through
+the Worker integration and destructive HTTP smoke tests.
 
 The laboratory additionally encrypts a fixed payload containing a forbidden
 `prompt` canary, proves the server returns `PRIVACY_CANARY_DETECTED`, and then

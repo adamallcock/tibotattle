@@ -1,4 +1,8 @@
 import { spawnSync } from "node:child_process";
+import {
+  lstatSync,
+  mkdirSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
 
@@ -8,7 +12,7 @@ if (args.includes("--remote")) {
   process.exit(2);
 }
 
-let persistTo = null;
+let persistTo = resolve(".wrangler", "state");
 for (let index = 0; index < args.length; index += 1) {
   const argument = args[index];
   if (argument !== "--persist-to") {
@@ -24,6 +28,21 @@ for (let index = 0; index < args.length; index += 1) {
   index += 1;
 }
 
+try {
+  mkdirSync(persistTo, { recursive: true, mode: 0o700 });
+  const metadata = lstatSync(persistTo);
+  if (!metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+    throw new Error("unsafe state directory");
+  }
+} catch {
+  process.stderr.write(
+    "Local migration state must be a real owner-only directory.\n",
+  );
+  process.exit(2);
+}
+
 const wrangler = resolve(
   "node_modules",
   ".bin",
@@ -36,7 +55,8 @@ for (const binding of ["USAGE_MONITOR_DB", "DELETION_LEDGER"]) {
     "apply",
     binding,
     "--local",
-    ...(persistTo ? ["--persist-to", persistTo] : []),
+    "--persist-to",
+    persistTo,
   ];
   const result = spawnSync(wrangler, command, {
     cwd: process.cwd(),

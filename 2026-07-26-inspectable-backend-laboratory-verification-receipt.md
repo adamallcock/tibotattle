@@ -174,6 +174,89 @@ operator-script tests, 65 Cloudflare-runtime Worker tests, generated type and
 TypeScript checks, and both development and contained-staging deployment dry
 runs. No deployment occurred.
 
+## UTC-week-boundary rerun and corrected retention invariant
+
+A third clean laboratory run completed at approximately
+`2026-07-27T01:25:00Z`, after the source usage event crossed into a new UTC
+week. It again enrolled 20 participants through the invite-only HTTP route,
+accepted 20 encrypted contributions, stored 40 canonical records, published
+one delayed privacy-safe snapshot, rejected the forbidden-content canary, and
+restarted against the same D1 state.
+
+This run exposed an incorrect laboratory assertion. Publishing the weekly
+snapshot advances the scheduled clock to the fixed post-week ingestion cutoff.
+For an event near the beginning of its UTC week, that clock is more than seven
+days after contribution receipt. The retention lifecycle therefore correctly
+deleted all 20 encrypted R2 objects and marked all 20 canonical quarantine
+references as deleted while preserving the accepted canonical metadata and
+personal results.
+
+The laboratory had incorrectly required the live R2 count to equal the number
+of accepted contributions. It now requires the live R2 count to equal the
+canonical references still marked as retained. The current rerun passed with:
+
+| Measure | Count |
+|---|---:|
+| Active participants | 20 |
+| Accepted contributions | 20 |
+| Canonical records | 40 |
+| Contribution occurrences | 40 |
+| Retained quarantine references | 0 |
+| Direct local R2 objects | 0 |
+| Published community snapshots | 1 |
+| Deletion tombstones | 0 |
+
+The portal showed the retained canonical contribution as accepted, displayed
+its encrypted object as deleted, and still returned the participant's private
+server-repriced result. The README now distinguishes accepted canonical data
+from the temporary encrypted quarantine.
+
+The same verification pass found that an operator could let Wrangler create a
+new persistence directory with group/world-readable mode before the
+privacy-safe inspector rejected it. The migration wrapper now creates a new
+state directory as mode `0700` and refuses existing directories that are
+symlinks, non-directories, or group/world readable. The operator-script test
+proves both safe creation and fail-closed refusal.
+
+The destructive second-state HTTP smoke independently completed the full
+upload, deduplication, private read, aggregate publication, contribution
+withdrawal, revisioned aggregate rebuild, and 20-participant deletion journey.
+Its final direct state was zero active participants, contributions, canonical
+records, sessions, devices, retained quarantine references, and R2 objects,
+with 20 digest-only deletion tombstones.
+
+## Current rendered product verification
+
+The central Worker portal was loaded against the retained 20-participant
+laboratory state. Anonymous users saw connected D1, the independent deletion
+ledger, reachable encrypted quarantine, operational invite-only collection,
+and the released clipped/rounded community snapshot. Recovering the seeded
+participant through the owner-only capability displayed one safe usage event,
+one quota snapshot, `$0.0032` of server-repriced API-price-equivalent usage,
+100% pricing coverage, canonical contribution history, the deleted-quarantine
+state, and the private clipped-versus-public-rounded comparison.
+
+The loopback companion was then started against that public backend. It loaded
+the real retained local monitoring artifacts, exposed both locally observed
+account windows without account identifiers, rendered 823 matched rolling
+windows and 14 qualifying weekly reset series, and showed the public central
+snapshot alongside the local analysis. Its real foreground refresh completed
+in under the one-minute UI timeout and advanced the latest local observation
+from `2026-07-26T08:30:00Z` to approximately
+`2026-07-27T01:29:00Z`; the header changed from stale to live without sending
+raw logs to the central service.
+
+The complete product gate passed after the fixes:
+
+- 28 browser/UI contract tests;
+- 41 local companion, prepared-set, and foreground-delivery tests;
+- 30 operator-script checks;
+- 65 Cloudflare-runtime Worker tests;
+- generated Worker type and TypeScript checks; and
+- development and contained-staging deployment dry runs.
+
+No external deployment, enrollment, or data transfer occurred.
+
 ## Remaining gates
 
 - The Cloudflare account still has no enabled R2 staging resource.

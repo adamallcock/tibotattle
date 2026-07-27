@@ -235,14 +235,16 @@ try {
   ], "Inspectable HTTP seed", { capture: true });
   const smoke = JSON.parse(smokeOutput);
   const r2ObjectCount = await inspectLocalR2ObjectCount(origin);
-  if (r2ObjectCount !== smoke.participants) {
-    throw new Error("The retained R2 object count did not match accepted contributions");
-  }
   await stopWorker(worker);
   const storage = inspectLocalBackendState({
     persistTo: stateDirectory,
     workerDirectory,
   });
+  if (r2ObjectCount !== storage.database.retainedQuarantineReferences) {
+    throw new Error(
+      "The retained R2 object count did not match canonical retention state",
+    );
+  }
   worker = startWorker(port, stateDirectory, { visible: true });
   const health = await waitForHealth(origin, worker);
   const receipt = {
@@ -270,6 +272,9 @@ try {
     storage: storage.database,
     encryptedQuarantine: {
       directLocalR2ObjectCount: r2ObjectCount,
+      canonicalRetainedReferenceCount:
+        storage.database.retainedQuarantineReferences,
+      lifecycleMayDeleteAcceptedObjectsBeforeInspection: true,
       explorerResponseIncludedObjectKeys: false,
     },
     deletionLedger: storage.deletionLedger,

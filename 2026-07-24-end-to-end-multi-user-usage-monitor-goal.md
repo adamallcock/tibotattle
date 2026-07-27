@@ -1316,3 +1316,35 @@ staging resources require owner action; signing/notarization, genuine
 clean-machine execution, privacy/consent approval, independent review,
 volunteer pilots, 30-day ongoing collection, public disclosure approval, and
 the population operational proofs remain open.
+
+## Progress update — full local product and backend loop
+
+The July 26 backend-product checkpoint now proves the complete local consumer
+loop through the actual HTTP and UI boundaries:
+
+- the real loopback companion refreshed retained Codex evidence and rendered
+  current quota cards, 823 matched rolling windows, 14 weekly reset series,
+  uncertainty, error measures, coverage gaps, and detailed reports;
+- a fresh Worker laboratory enrolled 20 isolated invite-only participants,
+  accepted 20 encrypted privacy-safe contributions, stored 40 canonical
+  records, published a thresholded weekly snapshot, and served anonymous and
+  recovered personal results through the rendered portal;
+- strict server validation rejected a forbidden-content canary, duplicate
+  replay remained idempotent, upload-only/device/session authorities remained
+  separated, and server repricing replaced client diagnostics;
+- an independent destructive HTTP run completed contribution deletion,
+  snapshot withdrawal, revisioned rebuild, complete participant deletion, and
+  zero-residual D1/R2/session/device cleanup;
+- the migration operator now creates only owner-private local persistence
+  state and refuses unsafe pre-existing directories; and
+- the laboratory now compares live R2 objects with canonical references still
+  marked retained, because the scheduled aggregate pass can correctly expire
+  the seven-day encrypted quarantine while retaining canonical metadata.
+
+The current product gate passes 28 UI tests, 41 local companion/delivery tests,
+30 operator-script checks, and 65 Cloudflare-runtime Worker tests plus type
+checks and both deployment dry runs. This closes the local functional
+server/product proof requested for the proof of concept. It does not authorize
+external collection: live staging resources, HTTPS/cross-browser QA, named
+privacy/security approval, signed distribution, backups/restore operations,
+pilot consent, and population-scale evidence remain open.
