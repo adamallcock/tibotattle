@@ -64,24 +64,24 @@ flag. The SQLite-backed `export-set` path is release-qualified only on Node.js
 24.14.0 and 26.2.0.
 
 ```bash
-pnpm install --ignore-workspace
-pnpm --ignore-workspace doctor
-pnpm --ignore-workspace capture --label baseline --controlled
+pnpm install --frozen-lockfile
+pnpm doctor
+pnpm capture --label baseline --controlled
 # Run a declared Codex workload, with other shared-pool activity paused.
-pnpm --ignore-workspace capture --label after-task --controlled
-pnpm --ignore-workspace report # descriptive snapshot summary; never reports a capacity
+pnpm capture --label after-task --controlled
+pnpm report # descriptive snapshot summary; never reports a capacity
 # Mine a fixed historical interval reproducibly.
-pnpm --ignore-workspace transitions --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z --offline
-pnpm --ignore-workspace infer
+pnpm transitions --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z --offline
+pnpm infer
 # Mine weekly history without storing all adjacent snapshots, then diagnose reset-to-reset movement.
-pnpm --ignore-workspace transitions --since 2026-06-11T00:00:00.000Z --until 2026-07-23T23:59:59.000Z --offline --compact --window-minutes 10080 --output .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
-pnpm --ignore-workspace history --input .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
+pnpm transitions --since 2026-06-11T00:00:00.000Z --until 2026-07-23T23:59:59.000Z --offline --compact --window-minutes 10080 --output .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
+pnpm history --input .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
 # Select the best accounting basis on chronological holdout data and emit reset-by-reset seven-day values.
-pnpm --ignore-workspace calibrate:weekly -- --input .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
+pnpm calibrate:weekly -- --input .usage-monitor/transitions-history-2026-06-11-to-2026-07-23-v0.3.2.json
 # Mark a bounded unlogged surface or quiet period without storing content or URLs.
-pnpm --ignore-workspace mark:activity -- --surface chatgpt_web --state start
-pnpm --ignore-workspace mark:activity -- --surface chatgpt_web --state end
-pnpm --ignore-workspace collect-once
+pnpm mark:activity -- --surface chatgpt_web --state start
+pnpm mark:activity -- --surface chatgpt_web --state end
+pnpm collect-once
 # Inspect or install the privacy-minimized Claude status-line callback.
 node ./src/cli.js inspect-claude-callback
 node ./src/cli.js install-claude-callback
@@ -96,7 +96,7 @@ node ./src/cli.js uninstall-claude-callback
 node ./src/cli.js remove-claude-callback-identity
 node ./src/cli.js remove-claude-callback-identity --confirm-removal TOKEN_FROM_PREFLIGHT
 # Profile monitorability from a full-grain transition dataset and the passive ledger.
-pnpm --ignore-workspace quality -- --input .usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json
+pnpm quality -- --input .usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json
 # Reuse the cached replay-safe history for a fast provider/account crosscheck.
 # On supported macOS arm64 systems, account scoping uses its dedicated Keychain item automatically.
 node ./src/cli.js crosscheck \
@@ -106,19 +106,19 @@ node ./src/cli.js crosscheck \
   --plan-timeline .usage-monitor/account-plan-timeline-v0.1.json \
   --provider-ui .usage-monitor/provider-ui-observations-v0.1.jsonl
 # Foreground mode remains opt-in and exits cleanly on Ctrl-C.
-pnpm --ignore-workspace collect-foreground
+pnpm collect-foreground
 # Dry-run the first controlled pair; add --execute-live only after preflight headroom is safe.
-pnpm --ignore-workspace experiment --manifest experiments/manifests/terra-low-no-tool-uncached.json --offline
+pnpm experiment --manifest experiments/manifests/terra-low-no-tool-uncached.json --offline
 # Analyze all adjacent intervals, including repeated integer displays.
-pnpm --ignore-workspace contamination
+pnpm contamination
 # Inventory client tool observations versus official provider units.
-pnpm --ignore-workspace tools --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z
+pnpm tools --since 2026-07-21T17:06:03.000Z --until 2026-07-23T16:15:40.974Z
 # Append and resolve the deterministic schema-0.1 replay correction.
-pnpm --ignore-workspace migrate-corrections
+pnpm migrate-corrections
 # Preview a bounded metadata-only export. This writes no bundle; first use creates an owner-only identity secret.
-pnpm --ignore-workspace inspect:export -- --since 2026-07-24T18:00:00.000Z --until 2026-07-24T19:00:00.000Z
+pnpm inspect:export -- --since 2026-07-24T18:00:00.000Z --until 2026-07-24T19:00:00.000Z
 # Write an owner-only local-review bundle and separate privacy receipt. No upload exists.
-pnpm --ignore-workspace export:local -- --since 2026-07-24T18:00:00.000Z --until 2026-07-24T19:00:00.000Z --output exports/local-review.umx.json
+pnpm export:local -- --since 2026-07-24T18:00:00.000Z --until 2026-07-24T19:00:00.000Z --output exports/local-review.umx.json
 # Independently verify the exact local bundle/receipt bytes and closed contract tuple.
 node ./src/cli.js verify-bundle --input exports/local-review.umx.json
 # Create a resumable disk-backed export set, then verify the complete set.
@@ -139,7 +139,9 @@ node ./src/cli.js rotate-local-identity
 node ./src/cli.js rotate-local-identity --confirm
 ```
 
-`--ignore-workspace` is needed on this machine because the home directory contains an unrelated pnpm workspace. It can be omitted elsewhere.
+The repository includes its own `pnpm-workspace.yaml`, so pnpm does not inherit
+an unrelated workspace from a parent directory. The policy also explicitly
+denies third-party lifecycle builds for the digest-pinned Keytar prebuild.
 
 Observations are appended to `.usage-monitor/observations.jsonl`, which is ignored by Git. Override it with `--data-file /absolute/path/observations.jsonl`.
 
@@ -682,11 +684,11 @@ The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-m
 `artifact.json` is extended idempotently from the prior weekly-history artifact, so all earlier sections, data, sources, and caveats remain present.
 
 ```bash
-pnpm --ignore-workspace build:report-data
+pnpm build:report-data
 node /Users/adamallcock/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/build_portable_artifact.mjs \
   --input artifact.json \
   --output 2026-07-24-codex-work-account-usage-report.html
-pnpm --ignore-workspace fix:report-width -- 2026-07-24-codex-work-account-usage-report.html
+pnpm fix:report-width -- 2026-07-24-codex-work-account-usage-report.html
 node /Users/adamallcock/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/verify_portable_artifact.mjs \
   --html 2026-07-24-codex-work-account-usage-report.html \
   --artifact artifact.json
