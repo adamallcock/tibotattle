@@ -30,9 +30,9 @@ This Mac has:
 The existence of the identity is not authorization to use it. Notary service
 credentials and a successful Apple submission have not been verified.
 
-The refreshed non-mutating preflight is bound to the current native-audited
-archive and manifest in the
-[signing-readiness refresh receipt](./2026-07-26-macos-signing-readiness-refresh-verification-receipt.md).
+The latest non-mutating preflight is bound to the exact private-remote
+clean-clone archive and manifest in the
+[clean-clone artifact receipt](./2026-07-26-clean-clone-local-review-artifact-verification-receipt.md).
 Its state is `owner_authorization_required`; the technical path is ready, but
 no signing or notary credential use has occurred.
 

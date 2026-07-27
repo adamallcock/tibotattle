@@ -1295,3 +1295,24 @@ Do not mark this goal complete until all of the following have durable evidence:
 Only then may the goal be marked complete. Until that point, each completed gate should be reported as a bounded milestone, not as completion of the end-to-end system.
 
 Agents may prepare evidence, run audits, and recommend decisions, but they may not accept privacy residual risk or authorize real-user collection/publication. Named human approval is mandatory at G3, G4, G9, G10, and G11.
+
+## Progress update — clean-clone reproducibility
+
+The July 26 clean-clone checkpoint closes the reproducible-golden-artifact
+portion of G0/G1 for the current macOS arm64 engineering candidate. A new clone
+of the exact private-remote commit installed both dependency trees from
+lockfiles, remained Git-clean, passed 895 repository tests and the complete
+product gate, and produced two byte-identical artifacts. The exact artifact
+also passed the 12-command network-audited lifecycle with and without macOS
+network denial.
+
+The rehearsal found and fixed a package-manager isolation defect that had made
+the first fresh install dirty. The repository now owns its pnpm workspace
+policy and explicitly denies third-party Keytar lifecycle execution while
+using the digest-pinned packaged prebuild.
+
+This does not make the program complete. R2 account enablement and remote
+staging resources require owner action; signing/notarization, genuine
+clean-machine execution, privacy/consent approval, independent review,
+volunteer pilots, 30-day ongoing collection, public disclosure approval, and
+the population operational proofs remain open.
