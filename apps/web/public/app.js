@@ -15,7 +15,8 @@ import {
 const localClient = new LocalCompanionClient();
 let communitySession = null;
 const communityClient = new CommunityClient({
-  getCsrfToken: () => communitySession?.csrfToken ?? null
+  getCsrfToken: () => communitySession?.csrfToken ?? null,
+  getParticipantId: () => communitySession?.participantId ?? null
 });
 
 let dashboard = null;
@@ -2993,10 +2994,8 @@ async function deleteSingleContribution(contributionId) {
   status.className = "participant-action-status";
   status.textContent = "Deleting this contribution and refreshing derived results…";
   try {
-    const receipt = await communityClient.deleteContribution(contributionId);
-    status.textContent = receipt?.deleted === true
-      ? "Contribution deleted. Private and community results have been refreshed."
-      : "The service completed the contribution deletion request.";
+    await communityClient.deleteContribution(contributionId);
+    status.textContent = "Contribution deleted. Private and community results have been refreshed.";
     await loadCommunityResults();
   } catch {
     status.className = "participant-action-status error";

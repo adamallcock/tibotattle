@@ -29,9 +29,11 @@ import {
   normalizeContributionSyncStatus,
   normalizeContributionSyncPreview,
   normalizeContributionSyncRun,
+  normalizeContributionDeletionReceipt,
   normalizeLocalContributionPreparation,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
+  normalizeParticipantDeletionReceipt,
   normalizeParticipantHistory,
   normalizeParticipantStats,
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
@@ -828,11 +830,15 @@ test("local contribution preparation exposes only verified bounded results", asy
 
 test("community adapter separates cookie sessions from one-use upload authority", async () => {
   const calls = [];
+  const participantId = "participant:00000000-0000-4000-8000-000000000001";
   const client = new CommunityClient({
     getCsrfToken: () => "csrf-confirmation",
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      return new Response(JSON.stringify({ ok: true }), {
+      const payload = url === "/api/v1/me" && options.method === "DELETE"
+        ? { deleted: true, participantId, contributionsDeleted: 0 }
+        : { ok: true };
+      return new Response(JSON.stringify(payload), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
@@ -898,7 +904,10 @@ test("contribution read and deletion keep identifiers out of request URLs", asyn
     getCsrfToken: () => "csrf-confirmation",
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
-      return new Response(JSON.stringify({ ok: true }), {
+      const payload = url.endsWith("/delete")
+        ? { deleted: true, contributionId }
+        : { ok: true };
+      return new Response(JSON.stringify(payload), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
@@ -918,6 +927,90 @@ test("contribution read and deletion keep identifiers out of request URLs", asyn
     assert.equal(JSON.parse(call.options.body).contributionId, contributionId);
     assert.equal(call.url.includes(contributionId), false);
   }
+});
+
+test("deletion receipts fail closed before the UI can claim success", async () => {
+  const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
+  const participantId = "participant:00000000-0000-4000-8000-000000000001";
+
+  assert.deepEqual(
+    normalizeContributionDeletionReceipt(
+      { deleted: true, contributionId },
+      contributionId
+    ),
+    { deleted: true, contributionId }
+  );
+  assert.deepEqual(
+    normalizeParticipantDeletionReceipt({
+      deleted: true,
+      participantId,
+      contributionsDeleted: 2
+    }),
+    { deleted: true, participantId, contributionsDeleted: 2 }
+  );
+
+  assert.throws(
+    () => normalizeContributionDeletionReceipt({ deleted: true }, contributionId),
+    /invalid contribution deletion receipt/
+  );
+  assert.throws(
+    () => normalizeContributionDeletionReceipt(
+      {
+        deleted: true,
+        contributionId: "contribution:00000000-0000-4000-8000-000000000002"
+      },
+      contributionId
+    ),
+    /invalid contribution deletion receipt/
+  );
+  assert.throws(
+    () => normalizeParticipantDeletionReceipt({
+      deleted: true,
+      participantId,
+      contributionsDeleted: -1
+    }),
+    /invalid participant deletion receipt/
+  );
+  assert.throws(
+    () => normalizeParticipantDeletionReceipt({
+      deleted: true,
+      participantId,
+      contributionsDeleted: "1"
+    }),
+    /invalid participant deletion receipt/
+  );
+  assert.throws(
+    () => normalizeParticipantDeletionReceipt(
+      { deleted: true, participantId, contributionsDeleted: 1 },
+      "participant:00000000-0000-4000-8000-000000000002"
+    ),
+    /invalid participant deletion receipt/
+  );
+  assert.throws(
+    () => normalizeParticipantDeletionReceipt({
+      deleted: true,
+      participantId,
+      contributionsDeleted: 1,
+      ignored: true
+    }),
+    /invalid participant deletion receipt/
+  );
+
+  const malformedClient = new CommunityClient({
+    getCsrfToken: () => "csrf-confirmation",
+    fetchImpl: async () => new Response(JSON.stringify({ deleted: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    })
+  });
+  await assert.rejects(
+    malformedClient.deleteContribution(contributionId),
+    /invalid contribution deletion receipt/
+  );
+  await assert.rejects(
+    malformedClient.deleteParticipant(),
+    /invalid participant deletion receipt/
+  );
 });
 
 test("community snapshots fail closed and never disclose threshold distance", () => {

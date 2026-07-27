@@ -62,6 +62,8 @@ const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
 });
 const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PARTICIPANT_ID_PATTERN =
+  /^participant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const CONTRIBUTION_SCHEMA_VERSIONS = new Set([
   "synthetic-contribution-v0.1",
   "telemetry-contribution-v0.1",
@@ -117,6 +119,43 @@ function count(value, fallback = null) {
 function nonNegative(value, fallback = null) {
   const number = finite(value, fallback);
   return number !== null && number >= 0 ? number : fallback;
+}
+
+function hasExactKeys(value, expectedKeys) {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\u0000")
+      === [...expectedKeys].sort().join("\u0000");
+}
+
+export function normalizeContributionDeletionReceipt(payload, expectedContributionId) {
+  if (!hasExactKeys(payload, ["deleted", "contributionId"])
+      || payload.deleted !== true
+      || !CONTRIBUTION_ID_PATTERN.test(payload.contributionId)
+      || payload.contributionId !== expectedContributionId) {
+    throw new Error("The service returned an invalid contribution deletion receipt.");
+  }
+  return Object.freeze({
+    deleted: true,
+    contributionId: payload.contributionId
+  });
+}
+
+export function normalizeParticipantDeletionReceipt(payload, expectedParticipantId = null) {
+  if (!hasExactKeys(payload, ["deleted", "participantId", "contributionsDeleted"])
+      || payload.deleted !== true
+      || !PARTICIPANT_ID_PATTERN.test(payload.participantId)
+      || (expectedParticipantId !== null && payload.participantId !== expectedParticipantId)
+      || !Number.isSafeInteger(payload.contributionsDeleted)
+      || payload.contributionsDeleted < 0) {
+    throw new Error("The service returned an invalid participant deletion receipt.");
+  }
+  return Object.freeze({
+    deleted: true,
+    participantId: payload.participantId,
+    contributionsDeleted: payload.contributionsDeleted
+  });
 }
 
 export function normalizeContributionSyncStatus(payload) {
@@ -1596,9 +1635,14 @@ export class LocalCompanionClient {
 }
 
 export class CommunityClient {
-  constructor({ fetchImpl = globalThis.fetch, getCsrfToken = () => null } = {}) {
+  constructor({
+    fetchImpl = globalThis.fetch,
+    getCsrfToken = () => null,
+    getParticipantId = () => null
+  } = {}) {
     this.fetchImpl = fetchImpl;
     this.getCsrfToken = getCsrfToken;
+    this.getParticipantId = getParticipantId;
     this.pendingRecovery = null;
   }
 
@@ -1726,7 +1770,7 @@ export class CommunityClient {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contributionId })
       })
-    );
+    ).then((payload) => normalizeContributionDeletionReceipt(payload, contributionId));
   }
 
   async personalStats() {
@@ -1766,12 +1810,13 @@ export class CommunityClient {
     );
   }
 
-  deleteParticipant() {
-    return fetchJson(
+  async deleteParticipant() {
+    const payload = await fetchJson(
       this.fetchImpl,
       `${CENTRAL_ROOT}/me`,
       this.mutationOptions({ method: "DELETE" })
     );
+    return normalizeParticipantDeletionReceipt(payload, this.getParticipantId());
   }
 
   createDevicePairing(accountScoped = false) {

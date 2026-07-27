@@ -61,6 +61,13 @@ npm run product:backend:lab
 
 The default portal is `http://127.0.0.1:8792/`. The recovery capability is
 written only to the mode-`0600` participant-access file and is not printed.
+The laboratory receipt prints the exact path to that file. To inspect the
+seeded participant safely, open that specific owner-only file locally, copy
+only its current `recoveryCode`, expand **Recover an existing anonymous
+participant** in the portal, paste the code, and choose **Recover access**.
+Recovery rotates the capability; do not paste it into chat, shell history,
+logs, screenshots, or a committed file. The entire laboratory directory is
+disposable and should be moved to Trash after inspection.
 
 ## Start the unified consumer experience
 
@@ -85,6 +92,19 @@ queries, headers, or hosts fail closed. Participant export has its own bounded
 192 MiB response allowance so the maximum valid retained history is not cut off
 by the ordinary 4 MiB API-response ceiling.
 
+## MVP boundary
+
+| Area | Implementation | Verification | Status |
+| --- | --- | --- | --- |
+| Real local personal dashboard | Incremental content-free collector plus unified loopback UI | Real retained Codex evidence rendered across every primary view | Verified |
+| Privacy preparation and review | Closed-schema builder, independent verifier, prepared spool, exact human review | Real bounded interval plus reviewed-job consent-binding tests and browser inspection | Verified |
+| Real sanitized backend path | Local exporter connected to the Worker ingestion contract | One real 200-record contribution completed validation, repricing, D1/R2 lifecycle, private/community analysis, export, restart, and deletion | Verified |
+| Community behavior | Twenty isolated pseudonymous participants with clipped, support-gated delayed publication | Synthetic laboratory and rendered participant comparison | Verified |
+| Participant rights | Recovery, private results/history, export, individual deletion, complete deletion | Rendered browser controls plus direct post-deletion D1 and R2 inspection | Verified |
+| Production Keychain on this Mac | Native Keychain remains the fail-closed default | Existing login Keychain item currently returns `errSecAuthFailed`; explicit owner-file development mode works | Partial environment issue |
+| Public service deployment | Disabled-by-default staging configuration only | Configuration and dry-deploy checks | Deferred |
+| R7 corpus/runtime qualification | Kept outside the consumer path | Existing unrelated work preserved | Deferred hardening |
+
 ## Backend acceptance matrix
 
 | Capability | Verification | Result |
@@ -105,6 +125,11 @@ by the ordinary 4 MiB API-response ceiling.
 | Participant export | Rendered UI download plus content-free artifact inspection | Verified |
 | Persisted restart | Recovery and private statistics restored from the same state | Verified |
 | Final storage state | Destructive pass reaches zero live D1/R2 participant data with tombstones retained | Verified |
+
+Both rendered deletion controls validate an exact, participant-bound success
+receipt before clearing local access or claiming that deletion completed.
+Malformed HTTP-success bodies, mismatched identifiers, negative or non-integer
+counts, and unexpected fields fail closed and retain the current UI state.
 
 ## Fresh real-local acceptance
 
