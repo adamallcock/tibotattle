@@ -217,39 +217,56 @@ USAGE_MONITOR_PORT=8791 \
   npm run product:local
 ```
 
-The relay accepts only the reviewed central API routes and cannot proxy a
-request-selected URL. Specifically, it forwards only unauthenticated `GET`
-requests for health, the envelope key, and stored aggregate snapshots. It cannot
-forward enrollment, recovery, uploads, personal sessions, personal statistics,
-exports, security controls, deletion, authorization headers, cookies, CSRF
-values, or upstream cookies.
+The relay accepts only reviewed central API routes and cannot proxy a
+request-selected URL. In addition to public health, envelope-key, and stored
+aggregate reads, an exact participant allowlist supports enrollment, recovery,
+one-use encrypted uploads, personal results, contribution history, participant
+export, security controls, and deletion from the same local dashboard. The
+relay validates bounded JSON bodies and responses and only forwards the fixed
+Usage Monitor session cookie, expected CSRF value, or correctly shaped one-use
+upload authorization on its specific route. Arbitrary hosts, paths, queries,
+headers, cookies, upstream responses, and redirects are rejected.
 
-Open `http://127.0.0.1:8792/` to inspect the Worker-served portal and exercise
-its public central API. The Codex in-app browser completed the same-origin
-loopback recovery and private-result journey on July 26, 2026, including its
-`Secure`, `HttpOnly`, `SameSite=Strict`, `__Host-` session cookie. This is a
-local browser-development exception, not production evidence. A staged
-same-origin HTTPS preview must repeat enrollment, recovery, upload, personal
-results, export, and deletion across target browsers before any participant
-pilot. The loopback companion still does not relay authenticated routes or
-tunnel cookies. The central service remains local-development-only and is not
-deployed.
+Open `http://127.0.0.1:8791/` for the unified local journey. The Worker portal
+at `http://127.0.0.1:8792/` remains useful for direct backend inspection. On
+July 27, 2026 the browser journey enrolled a fresh anonymous participant,
+validated a real content-free contribution, encrypted it in the browser,
+uploaded it with one-use authorization, displayed private server-repriced
+results and history, and generated the participant export through the local
+origin. This is local development evidence, not production evidence. A staged
+same-origin HTTPS preview must still repeat the lifecycle across target
+browsers before any participant pilot. The central service remains
+local-development-only and is not deployed.
 
 For an inspectable central backend with real local D1/R2 emulation and seeded
 individual plus community results, use:
 
 ```bash
+# Run once on a clean checkout; this writes ignored owner-only local keys.
+npm run product:keys:local
+
 npm run product:backend:lab
 ```
 
-This is different from the fixed local-analysis dashboard on port 8791. The
-laboratory starts the production-shaped Worker portal on port 8792, uploads a
-generated content-free contribution for twenty isolated participants through
-the encrypted API, rejects a fixed privacy canary, writes a content-free
-verification receipt, restarts against the same durable state, and leaves the
-portal running. Its printed owner-only participant-access file contains the
-recovery capability needed to open the seeded participant's private results.
-The value is not printed by the command.
+The laboratory first runs a destructive HTTP acceptance pass, then starts the
+production-shaped Worker portal on port 8792, uploads a generated content-free
+contribution for twenty isolated participants through the encrypted API,
+rejects malformed, oversized, over-count, out-of-range, and privacy-canary
+inputs, verifies deduplication and canonical server repricing, exercises both
+deletion scopes, restarts against the same durable state, and leaves the
+inspectable portal running. Its mode-0600 receipt records D1, R2, aggregate,
+private-statistics, export, deletion, and restart results. Its owner-only
+participant-access file contains the recovery capability needed to open the
+seeded participant's private results; the capability value is never printed.
+
+For the same verification without leaving a server running:
+
+```bash
+# Run once on a clean checkout; this writes ignored owner-only local keys.
+npm run product:keys:local
+
+npm run product:backend:acceptance
+```
 
 The corresponding plan is
 [2026-07-26-inspectable-backend-laboratory-plan.md](./2026-07-26-inspectable-backend-laboratory-plan.md).

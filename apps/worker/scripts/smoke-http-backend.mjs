@@ -227,6 +227,14 @@ function expectStatus(result, status, label) {
   return result.value;
 }
 
+function expectErrorCode(result, status, code, label) {
+  const value = expectStatus(result, status, label);
+  if (value?.error?.code !== code) {
+    throw new Error(`${label} did not return ${code}.`);
+  }
+  return value;
+}
+
 function scheduledSnapshotTime(contribution) {
   const usageTimes = contribution.usageEvents.map((event) => Date.parse(event.eventTime));
   if (usageTimes.length === 0 || usageTimes.some((time) => !Number.isFinite(time))) {
@@ -611,6 +619,9 @@ try {
   const device = await pairDevice(primary);
   const first = await uploadFromDevice(device, serializedEnvelope);
   const accepted = expectStatus(first.result, 202, "Contribution upload");
+  if (accepted.accountingVerification !== "server_repriced") {
+    throw new Error("The accepted contribution was not canonically repriced.");
+  }
   const reusedUpload = await request("/api/v1/contributions", {
     method: "POST",
     body: serializedEnvelope,
@@ -625,6 +636,34 @@ try {
   );
   if (replay.replayed !== true || replay.contributionId !== accepted.contributionId) {
     throw new Error("A fresh upload authority did not produce an idempotent replay.");
+  }
+  if (replay.accountingVerification !== "server_repriced") {
+    throw new Error("The replay did not preserve canonical repricing.");
+  }
+
+  const conflictSafeAuthorization = await registerUpload(primary, serializedEnvelope);
+  expectErrorCode(
+    await request("/api/v1/contributions", {
+      method: "POST",
+      authorization: `Upload ${conflictSafeAuthorization}`,
+      body: `${serializedEnvelope} `,
+    }),
+    401,
+    "UPLOAD_AUTH_INVALID",
+    "Upload scope conflict",
+  );
+  const conflictSafeRetry = expectStatus(
+    await request("/api/v1/contributions", {
+      method: "POST",
+      authorization: `Upload ${conflictSafeAuthorization}`,
+      body: serializedEnvelope,
+    }),
+    202,
+    "Upload after rejected scope conflict",
+  );
+  if (conflictSafeRetry.replayed !== true
+      || conflictSafeRetry.contributionId !== accepted.contributionId) {
+    throw new Error("A rejected upload scope conflict damaged canonical replay state.");
   }
 
   const contaminatedEnvelope = await createServerValidationProbe({
@@ -645,6 +684,82 @@ try {
   if (contaminatedResponse?.error?.code !== "PRIVACY_CANARY_DETECTED") {
     throw new Error("The privacy-canary upload did not fail at the expected boundary.");
   }
+
+  const invalidSchemaEnvelope = await createServerValidationProbe({
+    payload: {
+      ...contribution,
+      schemaVersion: "telemetry-contribution-invalid",
+    },
+    publicJwk: envelopeKey.publicJwk,
+    keyId: envelopeKey.keyId,
+  });
+  expectErrorCode(
+    (await upload(primary, JSON.stringify(invalidSchemaEnvelope))).result,
+    400,
+    "TELEMETRY_RECORD_INVALID",
+    "Invalid-schema contribution",
+  );
+
+  const invalidTimestampContribution = structuredClone(contribution);
+  invalidTimestampContribution.usageEvents[0].eventTime = new Date(
+    Date.parse(contribution.coveredAt.startAt) - 1,
+  ).toISOString();
+  const invalidTimestampEnvelope = await createServerValidationProbe({
+    payload: invalidTimestampContribution,
+    publicJwk: envelopeKey.publicJwk,
+    keyId: envelopeKey.keyId,
+  });
+  expectErrorCode(
+    (await upload(primary, JSON.stringify(invalidTimestampEnvelope))).result,
+    400,
+    "TELEMETRY_RECORD_INVALID",
+    "Out-of-range timestamp contribution",
+  );
+
+  const countLimitedContribution = structuredClone(contribution);
+  const countProbeEvent = structuredClone(contribution.usageEvents[0]);
+  countProbeEvent.accounting = {
+    estimatedApiCostUsd: null,
+    pricingCoveragePercent: 0,
+    unknownBillableUnits: 0,
+    priceBasis: "unpriced",
+  };
+  countLimitedContribution.usageEvents = Array.from({ length: 201 }, (_, index) => ({
+    ...structuredClone(countProbeEvent),
+    eventId: `event:v2:${index.toString(16).padStart(64, "0")}`,
+  }));
+  countLimitedContribution.accounting = {
+    estimatedApiCostUsd: null,
+    pricedEventCoveragePercent: 0,
+    unknownModelEventCount: countProbeEvent.modelId === "unknown" ? 201 : 0,
+    unknownBillableUnits: 0,
+    priceBasis: "unpriced",
+  };
+  const countLimitedEnvelope = await createServerValidationProbe({
+    payload: countLimitedContribution,
+    publicJwk: envelopeKey.publicJwk,
+    keyId: envelopeKey.keyId,
+  });
+  expectErrorCode(
+    (await upload(primary, JSON.stringify(countLimitedEnvelope))).result,
+    400,
+    "TELEMETRY_RECORD_INVALID",
+    "Over-count contribution",
+  );
+
+  const oversizedBody = JSON.stringify({
+    padding: "x".repeat(2 * 1024 * 1024),
+  });
+  expectErrorCode(
+    await request("/api/v1/contributions", {
+      method: "POST",
+      authorization: "Upload intentionally_invalid",
+      body: oversizedBody,
+    }),
+    413,
+    "BODY_TOO_LARGE",
+    "Oversized contribution request",
+  );
 
   const uploadOnlyPersonal = await request("/api/v1/me/stats", {
     authorization: `Upload ${await registerUpload(primary, serializedEnvelope)}`,
@@ -734,9 +849,15 @@ try {
   );
   const serializedProfile = JSON.stringify(participantProfile);
   if (contributionStatus.recordCounts?.accepted !== expectedTotal
+      || contributionStatus.serverAccounting?.verification !== "server_repriced"
+      || typeof contributionStatus.serverAccounting?.methodVersion !== "string"
+      || !/^[a-f0-9]{64}$/u.test(
+        contributionStatus.serverAccounting?.registrySha256 ?? "",
+      )
       || personal.totals?.usageEvents !== expected.usageEvents
       || personal.totals?.quotaSnapshots !== expected.quotaSnapshots
       || personal.totals?.activityMarkers !== expected.activityMarkers
+      || personal.totals?.priceVerification !== "server_repriced"
       || participantProfile.schemaVersion !== "participant-profile-v0.2"
       || participantProfile.contributionCount !== 1
       || participantProfile.historyPolicy?.maximumItems !== 101
@@ -752,6 +873,7 @@ try {
       || historyItem?.recordCounts?.declared !== expectedTotal
       || historyItem?.recordCounts?.accepted !== expectedTotal
       || historyItem?.recordCounts?.deduplicated !== 0
+      || historyItem?.serverAccounting?.verification !== "server_repriced"
       || historyItem?.quarantine?.state !== "retained"
       || historyItem?.quarantine?.deletedAt !== null
       || historyItem?.quarantine?.canonicalMetadataRetained !== true
@@ -862,8 +984,14 @@ try {
       participants: COMMUNITY_SNAPSHOT_PARTICIPANTS,
       acceptedRecordsPerParticipant: expectedTotal,
       idempotentReplay: true,
+      uploadScopeConflictRejected: true,
       privacyCanaryRejected: true,
+      invalidSchemaRejected: true,
+      oversizedRequestRejected: true,
+      overCountRejected: true,
+      outOfRangeTimestampRejected: true,
       serverValidation: true,
+      canonicalServerRepricing: true,
       personalStatisticsRecomputed: true,
       authenticatedContributionHistory: true,
       aggregateUnavailableBeforeSchedule: true,
@@ -1080,7 +1208,14 @@ try {
     participants: COMMUNITY_SNAPSHOT_PARTICIPANTS,
     acceptedRecordsPerParticipant: expectedTotal,
     idempotentReplay: true,
+    uploadScopeConflictRejected: true,
     privacyCanaryRejected: true,
+    invalidSchemaRejected: true,
+    oversizedRequestRejected: true,
+    overCountRejected: true,
+    outOfRangeTimestampRejected: true,
+    serverValidation: true,
+    canonicalServerRepricing: true,
     personalStatisticsRecomputed: true,
     authenticatedContributionHistory: true,
     historyUpdatedAfterContributionDeletion: true,

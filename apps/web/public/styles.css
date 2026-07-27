@@ -473,6 +473,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .privacy-lists ul { margin: 8px 0 0; padding-left: 18px; color: var(--ink); }
 .privacy-lists li { margin: 5px 0; }
 .evidence-chip.neutral { color: var(--muted); background: var(--paper-2); }
+.evidence-chip.error { color: var(--rust); background: var(--rust-soft); }
 .file-drop {
   display: grid;
   place-items: center;
@@ -493,6 +494,28 @@ tbody tr:last-child td { border-bottom: 0; }
 .file-drop strong { font-size: .82rem; }
 .file-drop small { margin-top: 4px; color: var(--muted); font-size: .68rem; }
 .file-drop.selected { border-style: solid; background: var(--green-soft); }
+.selected-contribution-inspection {
+  margin: 14px 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: .4rem;
+  background: rgba(255, 254, 249, .6);
+}
+.selected-contribution-facts { margin: 12px 0; }
+.exact-json-inspection { padding-top: 12px; border-top: 1px solid var(--line); }
+.exact-json-inspection summary { cursor: pointer; font-size: .73rem; font-weight: 750; }
+.exact-json-inspection pre {
+  max-height: 28rem;
+  overflow: auto;
+  margin: 12px 0 0;
+  padding: 14px;
+  border-radius: .35rem;
+  color: #e8f1f7;
+  background: #101923;
+  font: .68rem/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre;
+  tab-size: 2;
+}
 .consent-row { display: flex; gap: 12px; align-items: flex-start; margin: 14px 0; padding: 13px; border: 1px solid var(--line); border-radius: .35rem; cursor: pointer; }
 .consent-row input { width: 17px; height: 17px; margin-top: 2px; accent-color: var(--green); }
 .consent-row span { display: flex; flex-direction: column; font-size: .73rem; }

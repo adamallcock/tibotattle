@@ -1028,6 +1028,28 @@ export async function buildLocalCompanionSnapshot({
           explanation: "Subscription speed is observed separately; API standard, priority and flex are not inferred from it.",
         },
         {
+          id: "provider_accounting_changes",
+          title: "Provider resets and accounting changes",
+          status: "uncertain",
+          explanation: "Provider-side quota resets, propagation delays and unannounced accounting changes can alter observed allowance movement without a matching local usage event.",
+        },
+        {
+          id: "unknown_token_components",
+          title: "Unknown or combined token components",
+          status: (displayUsage?.components?.outputCombinedTokens ?? 0) > 0
+            ? "observed_combined"
+            : "not_observed",
+          explanation: "Some retained events expose only a combined output count. Text and reasoning output are not invented when the provider does not separate them.",
+        },
+        {
+          id: "calculation_disagreement",
+          title: "Calculated usage versus observed quota",
+          status: (gradient.datasets?.rollingResidual?.length ?? 0) > 0
+            ? "review_available"
+            : "insufficient_evidence",
+          explanation: "Periods with material residuals remain visible in calibration evidence and may reflect missing surfaces, uncertain prices, reset contamination or provider-side accounting.",
+        },
+        {
           id: "ordinary_chat",
           title: "Ordinary Chat conversations",
           status: "excluded",

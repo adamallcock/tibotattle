@@ -26,6 +26,8 @@ let activeAccountingPeriod = "7d";
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncBusy = false;
+let selectedContributionValidated = false;
+let contributionSelectionRevision = 0;
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -288,9 +290,12 @@ function renderPricing(data) {
   const pricing = data.pricing;
   $("#cost-period").textContent = pricing.periodLabel;
   $("#cost-total").textContent = formatMoney(pricing.totalCostUsd, 2);
+  const provenance = pricing.registryVersion
+    ? ` · API price registry ${pricing.registryVersion}${pricing.registryObservedAt ? ` (${formatUtc(pricing.registryObservedAt)})` : ""}`
+    : "";
   $("#cost-coverage").textContent = pricing.coveragePercent === null
     ? "Price coverage is not available"
-    : `${formatPercent(pricing.coveragePercent, 1)} of recorded usage priced · API tier: ${pricing.apiTier}`;
+    : `${formatPercent(pricing.coveragePercent, 1)} of recorded usage priced · API tier: ${pricing.apiTier}${provenance}`;
   const list = $("#cost-components");
   clear(list);
   if (!pricing.components.length) {
@@ -1317,6 +1322,57 @@ function parseSafeExport(file) {
   });
 }
 
+function resetSelectedContributionInspection() {
+  selectedContributionValidated = false;
+  $("#selected-contribution-inspection").hidden = true;
+  $("#selected-contribution-state").textContent = "Not validated";
+  $("#selected-contribution-state").className = "evidence-chip neutral";
+  $("#selected-contribution-message").textContent =
+    "Choose a Usage Monitor export to validate it locally.";
+  $("#selected-contribution-schema").textContent = "—";
+  $("#selected-contribution-bytes").textContent = "—";
+  $("#selected-contribution-usage").textContent = "—";
+  $("#selected-contribution-quota").textContent = "—";
+  $("#selected-contribution-json").textContent = "";
+}
+
+function renderSelectedContributionInspection(file, payload) {
+  const usageRows = Array.isArray(payload.usageEvents)
+    ? payload.usageEvents.length
+    : 0;
+  const quotaRows = Array.isArray(payload.quotaSnapshots)
+    ? payload.quotaSnapshots.length
+    : 0;
+  selectedContributionValidated = true;
+  $("#selected-contribution-inspection").hidden = false;
+  $("#selected-contribution-state").textContent = "Validated locally";
+  $("#selected-contribution-state").className = "evidence-chip";
+  $("#selected-contribution-message").textContent =
+    "The closed-schema browser preflight passed. Expand the review below before consenting.";
+  $("#selected-contribution-schema").textContent = payload.schemaVersion;
+  $("#selected-contribution-bytes").textContent =
+    `${new Intl.NumberFormat("en-US").format(file.size)} bytes`;
+  $("#selected-contribution-usage").textContent = compact(usageRows);
+  $("#selected-contribution-quota").textContent = compact(quotaRows);
+  $("#selected-contribution-json").textContent = JSON.stringify(payload, null, 2);
+}
+
+function renderSelectedContributionError(error) {
+  selectedContributionValidated = false;
+  $("#selected-contribution-inspection").hidden = false;
+  $("#selected-contribution-state").textContent = "Rejected locally";
+  $("#selected-contribution-state").className = "evidence-chip error";
+  $("#selected-contribution-message").textContent =
+    error instanceof Error
+      ? error.message
+      : "The selected file did not pass the closed-schema browser preflight.";
+  $("#selected-contribution-schema").textContent = "Not accepted";
+  $("#selected-contribution-bytes").textContent = "—";
+  $("#selected-contribution-usage").textContent = "—";
+  $("#selected-contribution-quota").textContent = "—";
+  $("#selected-contribution-json").textContent = "";
+}
+
 async function ensureCommunitySession(contributionSchemaVersion) {
   const requiredConsent = contributionSchemaVersion === "telemetry-contribution-v0.2"
     ? "privacy-safe-telemetry-v0.2"
@@ -1396,7 +1452,11 @@ async function submitContribution(event) {
     status.className = "upload-status error";
     status.textContent = error instanceof Error ? error.message : safeApiError(error, "The contribution was rejected.");
   } finally {
-    button.disabled = !($("#contribution-consent").checked && $("#contribution-file").files.length);
+    button.disabled = !(
+      selectedContributionValidated
+      && $("#contribution-consent").checked
+      && $("#contribution-file").files.length
+    );
   }
 }
 
@@ -2516,33 +2576,48 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
 });
 
 $("#contribution-file").addEventListener("change", async () => {
+  contributionSelectionRevision += 1;
+  const selectionRevision = contributionSelectionRevision;
   const file = $("#contribution-file").files[0];
   const drop = $(".file-drop");
   drop.classList.toggle("selected", Boolean(file));
   $("#file-help").textContent = file ? `${file.name} · ${compact(file.size)} bytes` : "Privacy-safe JSON export · 1.25 MB browser validation limit";
+  resetSelectedContributionInspection();
   $("#contribution-consent").checked = false;
   $("#contribution-consent-title").textContent =
     "I reviewed this as a privacy-safe Usage Monitor export.";
   $("#contribution-consent-detail").textContent =
     "Uploading is optional and can be tested against a local backend.";
-  if (file && file.size <= 1_310_720) {
+  if (file) {
     try {
-      const payload = JSON.parse(await file.text());
+      const payload = await parseSafeExport(file);
+      if (
+        selectionRevision !== contributionSelectionRevision
+        || $("#contribution-file").files[0] !== file
+      ) return;
+      renderSelectedContributionInspection(file, payload);
       if (payload?.schemaVersion === "telemetry-contribution-v0.2") {
         $("#contribution-consent-title").textContent =
           "I consent to upload participant-scoped pseudonymous account tracks.";
         $("#contribution-consent-detail").textContent =
           "They link usage and quota rows only within this anonymous participant for private calibration; they are never published in community output and are deleted with the participant.";
       }
-    } catch {
-      // Submission performs the authoritative browser preflight and presents
-      // the exact validation error.
+    } catch (error) {
+      if (
+        selectionRevision !== contributionSelectionRevision
+        || $("#contribution-file").files[0] !== file
+      ) return;
+      renderSelectedContributionError(error);
     }
   }
   $("#contribution-submit").disabled = true;
 });
 $("#contribution-consent").addEventListener("change", () => {
-  $("#contribution-submit").disabled = !($("#contribution-consent").checked && $("#contribution-file").files.length);
+  $("#contribution-submit").disabled = !(
+    selectedContributionValidated
+    && $("#contribution-consent").checked
+    && $("#contribution-file").files.length
+  );
 });
 $("#contribution-form").addEventListener("submit", submitContribution);
 $("#recover-form").addEventListener("submit", recoverParticipant);

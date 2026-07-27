@@ -29,6 +29,37 @@ const MAX_STATIC_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const LOCAL_SYNC_MAXIMUM_JOBS = 10;
 const LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES = 16 * 1024 * 1024;
+const MAX_PARTICIPANT_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
+const MAX_PARTICIPANT_RELAY_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES = 192 * 1024 * 1024;
+const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
+
+const PARTICIPANT_RELAY_ROUTES = new Map([
+  ["/api/v1/enroll", new Set(["POST"])],
+  ["/api/v1/recover", new Set(["POST"])],
+  ["/api/v1/session", new Set(["GET"])],
+  ["/api/v1/logout", new Set(["POST"])],
+  ["/api/v1/me", new Set(["GET", "DELETE"])],
+  ["/api/v1/me/stats", new Set(["GET"])],
+  ["/api/v1/me/insights", new Set(["GET"])],
+  ["/api/v1/me/export", new Set(["GET"])],
+  ["/api/v1/me/security-reset", new Set(["POST"])],
+  ["/api/v1/me/upload-authorizations", new Set(["POST"])],
+  ["/api/v1/me/device-pairings", new Set(["POST"])],
+  ["/api/v1/me/devices", new Set(["GET"])],
+  ["/api/v1/me/devices/revoke", new Set(["POST"])],
+  ["/api/v1/me/contributions/read", new Set(["POST"])],
+  ["/api/v1/me/contributions/delete", new Set(["POST"])],
+  ["/api/v1/contributions", new Set(["POST"])],
+]);
+
+const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
+const SESSION_COOKIE_VALUE = /^[A-Za-z0-9_.-]{0,384}$/u;
+const SET_COOKIE_VALUE =
+  /^__Host-usage_monitor_session=[A-Za-z0-9_.-]{0,384}; Path=\/; Max-Age=[0-9]+; Secure; HttpOnly; SameSite=Strict$/u;
+const CSRF_VALUE = /^[A-Za-z0-9_-]{1,384}$/u;
+const UPLOAD_AUTHORIZATION_VALUE =
+  /^Upload um_(?:upload|device_upload)_[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/u;
 
 const STATIC_FILES = Object.freeze({
   "/": Object.freeze({ file: "index.html", type: "text/html; charset=utf-8" }),
@@ -119,6 +150,215 @@ function sameOrigin(request) {
 function isLoopbackPeer(request) {
   const peer = request.socket.remoteAddress;
   return peer === LOOPBACK_HOST || peer === "::ffff:127.0.0.1";
+}
+
+function fixedRelayError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function loopbackCentralOrigin(value) {
+  if (value === null || value === undefined || value === "") return null;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:"
+      || !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname)
+      || parsed.username || parsed.password
+      || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+    return null;
+  }
+  return parsed.origin;
+}
+
+function participantSessionCookie(value) {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || value.length > 2_048) {
+    throw fixedRelayError("central_participant_cookie_invalid");
+  }
+  const candidates = value.split(";").map((item) => item.trim());
+  const matching = candidates.filter((item) => item.startsWith(`${SESSION_COOKIE_NAME}=`));
+  if (matching.length === 0) return null;
+  if (matching.length !== 1) throw fixedRelayError("central_participant_cookie_invalid");
+  const cookie = matching[0];
+  const cookieValue = cookie.slice(SESSION_COOKIE_NAME.length + 1);
+  if (!SESSION_COOKIE_VALUE.test(cookieValue)) {
+    throw fixedRelayError("central_participant_cookie_invalid");
+  }
+  return cookie;
+}
+
+async function boundedParticipantRelayBody(request) {
+  if (["GET", "DELETE"].includes(request.method)) {
+    const declared = Number(request.headers["content-length"] ?? 0);
+    if (Number.isFinite(declared) && declared > 0) {
+      throw fixedRelayError("central_participant_request_invalid");
+    }
+    return null;
+  }
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    throw fixedRelayError("central_participant_content_type_invalid");
+  }
+  const declared = request.headers["content-length"];
+  if (declared !== undefined) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 1) {
+      throw fixedRelayError("central_participant_request_invalid");
+    }
+    if (length > MAX_PARTICIPANT_RELAY_REQUEST_BYTES) {
+      throw fixedRelayError("central_participant_request_too_large");
+    }
+  }
+  let total = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    total += chunk.length;
+    if (total > MAX_PARTICIPANT_RELAY_REQUEST_BYTES) {
+      throw fixedRelayError("central_participant_request_too_large");
+    }
+    chunks.push(chunk);
+  }
+  if (total === 0) throw fixedRelayError("central_participant_request_invalid");
+  return Buffer.concat(chunks);
+}
+
+async function boundedParticipantRelayResponse(
+  response,
+  maximumBytes = MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
+) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw fixedRelayError("central_participant_response_invalid");
+    }
+    if (length > maximumBytes) {
+      throw fixedRelayError("central_participant_response_too_large");
+    }
+  }
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const item = await reader.read();
+      if (item.done) break;
+      total += item.value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel();
+        throw fixedRelayError("central_participant_response_too_large");
+      }
+      chunks.push(Buffer.from(item.value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks);
+}
+
+function createLoopbackParticipantRelay({
+  centralOrigin,
+  fetchImpl,
+  timeoutMs = PARTICIPANT_RELAY_TIMEOUT_MS,
+}) {
+  const origin = loopbackCentralOrigin(centralOrigin);
+  return Object.freeze({
+    enabled: origin !== null,
+    handles(path) {
+      return origin !== null && PARTICIPANT_RELAY_ROUTES.has(path);
+    },
+    async request(request, path) {
+      if (origin === null) throw fixedRelayError("central_participant_relay_not_configured");
+      const methods = PARTICIPANT_RELAY_ROUTES.get(path);
+      if (!methods) throw fixedRelayError("central_participant_route_not_allowed");
+      if (!methods.has(request.method)) {
+        throw fixedRelayError("central_participant_method_not_allowed");
+      }
+      const body = await boundedParticipantRelayBody(request);
+      const headers = {
+        Accept: "application/json",
+        Origin: origin,
+      };
+      if (body !== null) headers["Content-Type"] = "application/json";
+      const cookie = participantSessionCookie(request.headers.cookie);
+      if (cookie !== null) headers.Cookie = cookie;
+      const csrf = request.headers["x-usage-monitor-csrf"];
+      if (csrf !== undefined) {
+        if (typeof csrf !== "string" || !CSRF_VALUE.test(csrf)) {
+          throw fixedRelayError("central_participant_csrf_invalid");
+        }
+        headers["X-Usage-Monitor-CSRF"] = csrf;
+      }
+      const authorization = request.headers.authorization;
+      if (authorization !== undefined) {
+        if (path !== "/api/v1/contributions"
+            || typeof authorization !== "string"
+            || !UPLOAD_AUTHORIZATION_VALUE.test(authorization)) {
+          throw fixedRelayError("central_participant_authorization_invalid");
+        }
+        headers.Authorization = authorization;
+      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      timeout.unref?.();
+      let upstream;
+      try {
+        upstream = await fetchImpl(`${origin}${path}`, {
+          method: request.method,
+          headers,
+          body,
+          redirect: "error",
+          signal: controller.signal,
+        });
+      } catch {
+        throw fixedRelayError("central_participant_service_unavailable");
+      } finally {
+        clearTimeout(timeout);
+      }
+      const contentType = upstream.headers.get("content-type")
+        ?.split(";", 1)[0]?.trim();
+      if (contentType !== "application/json") {
+        throw fixedRelayError("central_participant_response_invalid");
+      }
+      const responseBody = await boundedParticipantRelayResponse(
+        upstream,
+        path === "/api/v1/me/export"
+          ? MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES
+          : MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
+      );
+      try {
+        JSON.parse(responseBody.toString("utf8"));
+      } catch {
+        throw fixedRelayError("central_participant_response_invalid");
+      }
+      const responseHeaders = {};
+      const setCookie = upstream.headers.get("set-cookie");
+      if (setCookie !== null) {
+        if (setCookie.length > 1_024 || !SET_COOKIE_VALUE.test(setCookie)) {
+          throw fixedRelayError("central_participant_response_invalid");
+        }
+        responseHeaders["Set-Cookie"] = setCookie;
+      }
+      if (upstream.headers.get("idempotency-replayed") === "true") {
+        responseHeaders["Idempotency-Replayed"] = "true";
+      }
+      if (upstream.headers.get("vary") === "Cookie") {
+        responseHeaders.Vary = "Cookie";
+      }
+      return {
+        status: upstream.status,
+        body: responseBody,
+        headers: responseHeaders,
+      };
+    },
+  });
 }
 
 async function readEmptyJsonObject(request) {
@@ -524,6 +764,10 @@ export function createLocalCompanionServer({
     centralOrigin,
     fetchImpl: centralFetch,
   });
+  const participantRelay = createLoopbackParticipantRelay({
+    centralOrigin,
+    fetchImpl: centralFetch,
+  });
 
   const server = createServer(async (request, response) => {
     try {
@@ -569,6 +813,39 @@ export function createLocalCompanionServer({
         }
         return;
       }
+      if (participantRelay.handles(path)) {
+        if (request.method !== "GET" && !sameOrigin(request)) {
+          sendError(response, 403, "central_participant_request_not_authorized");
+          return;
+        }
+        try {
+          const upstream = await participantRelay.request(request, path);
+          send(
+            response,
+            upstream.status,
+            upstream.body,
+            "application/json; charset=utf-8",
+            { headers: upstream.headers },
+          );
+        } catch (error) {
+          const status =
+            error.code === "central_participant_method_not_allowed" ? 405
+              : error.code === "central_participant_content_type_invalid" ? 415
+                : error.code === "central_participant_request_too_large" ? 413
+                  : error.code === "central_participant_request_invalid"
+                    || error.code === "central_participant_cookie_invalid"
+                    || error.code === "central_participant_csrf_invalid"
+                    || error.code === "central_participant_authorization_invalid" ? 400
+                    : error.code === "central_participant_route_not_allowed" ? 404
+                      : 502;
+          sendError(
+            response,
+            status,
+            error.code ?? "central_participant_service_unavailable",
+          );
+        }
+        return;
+      }
       if (path.startsWith("/api/") && !API_ROUTES.has(path)) {
         sendError(response, 404, "not_found");
         return;
@@ -592,6 +869,7 @@ export function createLocalCompanionServer({
             contributionSyncNext: syncPreviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
             centralServiceProxy: centralProxy.enabled,
+            centralParticipantRelay: participantRelay.enabled,
             arbitraryPathAccess: false,
             remoteProxy: false,
           },

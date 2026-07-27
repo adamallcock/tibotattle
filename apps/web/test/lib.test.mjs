@@ -351,6 +351,8 @@ test("local dashboard normalizer accepts artifact rows and keeps stale state exp
   assert.equal(result.mode, "real_local_evidence");
   assert.equal(result.quotaWindows[0].remainingPercent, 61);
   assert.equal(result.pricing.totalCostUsd, 12.34);
+  assert.equal(result.pricing.basis, "api_price_equivalent");
+  assert.equal(result.pricing.apiServiceTier, "unknown");
   assert.equal(result.gradient.summary.mean_absolute_error_pp, 2.7);
   assert.equal(result.gradient.rollingHistory.length, 1);
 });
@@ -1176,6 +1178,9 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /Exact metadata categories a contribution may contain/);
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
+  assert.match(html, /id="selected-contribution-inspection"/);
+  assert.match(html, /Exact retained fields and values/);
+  assert.match(html, /Review every validated field and value/);
   assert.match(html, /id="central-state"/);
   assert.match(html, /id="backend"/);
   assert.match(html, /id="backend-state"/);
@@ -1211,6 +1216,11 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /communityClient\.participantProfile\(\)/);
   assert.match(appSource, /communityClient\.deleteContribution\(contributionId\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);
+  assert.match(appSource, /renderSelectedContributionInspection\(file, payload\)/);
+  assert.match(appSource, /selectedContributionValidated/);
+  assert.match(appSource, /selectionRevision !== contributionSelectionRevision/);
+  assert.match(appSource, /files\[0\] !== file/);
+  assert.match(appSource, /JSON\.stringify\(payload, null, 2\)/);
   assert.doesNotMatch(appSource, /\brenderStats\(/);
   assert.match(appSource, /communityClient\.createDevicePairing\(/);
   assert.match(appSource, /communityClient\.devices\(\)/);

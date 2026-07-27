@@ -567,6 +567,38 @@
                 <strong>Choose a safe export</strong>
                 <small id="file-help">Privacy-safe JSON export · 1.25 MB browser validation limit</small>
               </label>
+              <section
+                class="selected-contribution-inspection"
+                id="selected-contribution-inspection"
+                aria-live="polite"
+                hidden
+              >
+                <div class="panel-heading compact-heading">
+                  <div>
+                    <p class="panel-kicker">Selected export inspection</p>
+                    <h4>Exact retained fields and values</h4>
+                  </div>
+                  <span class="evidence-chip neutral" id="selected-contribution-state">Not validated</span>
+                </div>
+                <p class="annotation" id="selected-contribution-message">
+                  Choose a Usage Monitor export to validate it locally.
+                </p>
+                <dl class="backend-facts selected-contribution-facts">
+                  <div><dt>Schema</dt><dd id="selected-contribution-schema">—</dd></div>
+                  <div><dt>Exact bytes</dt><dd id="selected-contribution-bytes">—</dd></div>
+                  <div><dt>Usage rows</dt><dd id="selected-contribution-usage">—</dd></div>
+                  <div><dt>Quota rows</dt><dd id="selected-contribution-quota">—</dd></div>
+                </dl>
+                <details class="exact-json-inspection">
+                  <summary>Review every validated field and value</summary>
+                  <pre id="selected-contribution-json"></pre>
+                </details>
+                <p class="backend-contract-note">
+                  This is the complete plaintext contribution. These exact values
+                  are encrypted in your browser; raw logs and any field not shown
+                  here are not sent.
+                </p>
+              </section>
               <label class="consent-row">
                 <input id="contribution-consent" type="checkbox" required>
                 <span>

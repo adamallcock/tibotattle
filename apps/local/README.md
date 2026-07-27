@@ -22,17 +22,20 @@ USAGE_MONITOR_PORT=8791 \
   node ./apps/local/server.js
 ```
 
-`USAGE_MONITOR_CENTRAL_ORIGIN` is fixed at startup. The relay permits only
-public `GET` requests for health, the public envelope key, and
-privacy-thresholded aggregate results. It cannot proxy an arbitrary host,
-path, query, content type, authorization header, cookie, CSRF value, or
-upstream `Set-Cookie` response.
+`USAGE_MONITOR_CENTRAL_ORIGIN` is fixed at startup and must be loopback. The
+relay permits the reviewed public API plus an exact participant-lifecycle
+allowlist for enrollment, recovery, uploads, personal statistics, contribution
+history, export, security controls, and deletion. It cannot proxy an arbitrary
+host, path, query, content type, cookie, CSRF value, authorization value, or
+upstream response.
 
-Enrollment, recovery, uploads, personal statistics, contribution details,
-exports, security controls, and deletion require the central service's
-same-origin HTTPS portal. The loopback server deliberately cannot relay those
-authenticated operations because a Secure personal-session cookie must not be
-tunneled through plain HTTP loopback.
+The participant relay is intentionally narrow rather than a generic reverse
+proxy. It validates bounded JSON request and response bodies, forwards only the
+fixed Usage Monitor session cookie, accepts CSRF and one-use upload
+authorization values only in their expected routes and formats, and rejects
+unexpected upstream cookies. This lets the local dashboard exercise the full
+disposable backend lifecycle from one origin without exposing raw logs or
+granting arbitrary network access.
 
 ## Local API
 
@@ -44,6 +47,8 @@ tunneled through plain HTTP loopback.
 - `GET /api/local/reports`
 - `GET|POST /api/local/refresh`
 - `GET /api/local/contribution/preview`
+- the fixed central public and participant routes under `/api/v1/*` when a
+  loopback central origin is configured
 
 Refresh POSTs require the exact same origin, JSON, and
 `X-Usage-Monitor-Local: 1`. Detailed reports and browser assets use fixed
@@ -58,3 +63,15 @@ node --test \
   test/telemetry-contribution-builder.test.js \
   apps/local/server.test.mjs
 ```
+
+Run the disposable Worker/D1/R2 acceptance laboratory separately with:
+
+```bash
+# Run once on a clean checkout.
+npm run product:keys:local
+
+npm run product:backend:acceptance
+```
+
+Use `npm run product:backend:lab` instead when you want the verified state and
+portal to remain available for inspection.

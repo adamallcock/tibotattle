@@ -52,6 +52,7 @@
     "product:backend:incident-smoke": "npm --prefix apps/worker run smoke:incident:http --",
     "product:backend:inspect": "npm --prefix apps/worker run inspect:local-state --",
     "product:backend:lab": "npm --prefix apps/worker run lab:local --",
+    "product:backend:acceptance": "npm --prefix apps/worker run acceptance:local --",
     "product:backend:load": "npm --prefix apps/worker run load:http --",
     "product:backend:load-profile": "npm --prefix apps/worker run load:profile",
     "product:staging:check": "npm --prefix apps/worker run staging:check",

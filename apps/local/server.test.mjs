@@ -110,6 +110,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       contributionSyncNext: false,
       contributionSyncActions: false,
       centralServiceProxy: false,
+      centralParticipantRelay: false,
       arbitraryPathAccess: false,
       remoteProxy: false,
     });
@@ -133,6 +134,189 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal((await fetch(`${base}/api/local/not-allowed`)).status, 404);
     assert.equal((await fetch(`${base}/package.json`)).status, 404);
     assert.equal((await fetch(`${base}/api/local/overview?path=/Users/private`)).status, 400);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("loopback central relay supports only the participant lifecycle with exact forwarding", async () => {
+  const files = await fixture();
+  const forwarded = [];
+  const validSetCookie =
+    "__Host-usage_monitor_session=um_session_00000000-0000-4000-8000-000000000000.secret; Path=/; Max-Age=1800; Secure; HttpOnly; SameSite=Strict";
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    centralOrigin: "http://127.0.0.1:8792",
+    centralFetch: async (url, options) => {
+      forwarded.push({
+        url,
+        method: options.method,
+        headers: { ...options.headers },
+        body: options.body?.toString("utf8") ?? null,
+      });
+      const headers = {
+        "Content-Type": "application/json",
+        Vary: "Cookie",
+      };
+      if (url.endsWith("/api/v1/enroll")) headers["Set-Cookie"] = validSetCookie;
+      const responseBody = url.endsWith("/api/v1/me/export")
+        ? JSON.stringify({ payload: "x".repeat(5 * 1024 * 1024) })
+        : JSON.stringify({ status: "ok" });
+      return new Response(responseBody, {
+        status: url.endsWith("/api/v1/enroll") ? 201 : 200,
+        headers,
+      });
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const health = await fetch(`${base}/api/local/health`).then((response) => response.json());
+    assert.equal(health.capabilities.centralParticipantRelay, true);
+
+    const enrolled = await fetch(`${base}/api/v1/enroll`, {
+      method: "POST",
+      headers: {
+        Origin: base,
+        "Content-Type": "application/json",
+        Cookie: "unrelated=must-not-pass",
+      },
+      body: '{"consentVersion":"privacy-safe-telemetry-v0.1","syntheticOnly":false}',
+    });
+    assert.equal(enrolled.status, 201);
+    assert.equal(enrolled.headers.get("set-cookie"), validSetCookie);
+
+    const sessionCookie =
+      "__Host-usage_monitor_session=um_session_00000000-0000-4000-8000-000000000000.secret";
+    assert.equal((await fetch(`${base}/api/v1/me/stats`, {
+      headers: { Cookie: `${sessionCookie}; unrelated=must-not-pass` },
+    })).status, 200);
+    assert.equal((await fetch(`${base}/api/v1/me/upload-authorizations`, {
+      method: "POST",
+      headers: {
+        Origin: base,
+        "Content-Type": "application/json",
+        Cookie: `${sessionCookie}; unrelated=must-not-pass`,
+        "X-Usage-Monitor-CSRF": "csrf_token",
+      },
+      body: '{"envelopeDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentLengthBytes":100,"contentType":"application/json"}',
+    })).status, 200);
+    const uploadAuthorization =
+      "Upload um_upload_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    assert.equal((await fetch(`${base}/api/v1/contributions`, {
+      method: "POST",
+      headers: {
+        Origin: base,
+        "Content-Type": "application/json",
+        Authorization: uploadAuthorization,
+      },
+      body: '{"schemaVersion":"telemetry-envelope-v0.1"}',
+    })).status, 200);
+    assert.equal((await fetch(`${base}/api/v1/me`, {
+      method: "DELETE",
+      headers: {
+        Origin: base,
+        Cookie: sessionCookie,
+        "X-Usage-Monitor-CSRF": "csrf_token",
+      },
+    })).status, 200);
+    const exported = await fetch(`${base}/api/v1/me/export`, {
+      headers: { Cookie: sessionCookie },
+    });
+    assert.equal(exported.status, 200);
+    assert.equal((await exported.arrayBuffer()).byteLength > 4 * 1024 * 1024, true);
+
+    assert.equal(forwarded[0].url, "http://127.0.0.1:8792/api/v1/enroll");
+    assert.equal(forwarded[0].headers.Origin, "http://127.0.0.1:8792");
+    assert.equal(Object.hasOwn(forwarded[0].headers, "Cookie"), false);
+    assert.deepEqual(forwarded[1].headers, {
+      Accept: "application/json",
+      Origin: "http://127.0.0.1:8792",
+      Cookie: sessionCookie,
+    });
+    assert.equal(forwarded[2].headers.Cookie, sessionCookie);
+    assert.equal(forwarded[2].headers["X-Usage-Monitor-CSRF"], "csrf_token");
+    assert.equal(forwarded[2].body.includes("envelopeDigest"), true);
+    assert.equal(forwarded[3].headers.Authorization, uploadAuthorization);
+    assert.equal(Object.hasOwn(forwarded[3].headers, "Cookie"), false);
+    assert.equal(forwarded[4].method, "DELETE");
+    assert.equal(forwarded[4].body, null);
+    assert.equal(forwarded[5].url, "http://127.0.0.1:8792/api/v1/me/export");
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("loopback participant relay blocks unknown authority routes and fails closed", async () => {
+  const files = await fixture();
+  let mode = "ok";
+  let forwarded = 0;
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    centralOrigin: "http://localhost:8792",
+    centralFetch: async () => {
+      forwarded += 1;
+      if (mode === "throw") throw new Error("private upstream detail");
+      if (mode === "html") {
+        return new Response("<h1>not json</h1>", {
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+      if (mode === "cookie") {
+        return Response.json({ status: "ok" }, {
+          headers: { "Set-Cookie": "attacker=value; Path=/" },
+        });
+      }
+      return Response.json({ status: "ok" });
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    for (const path of [
+      "/api/v1/admin",
+      "/api/v1/device-pairings/claim",
+      "/api/v1/device/upload-authorizations",
+      "/api/v1/contributions/contribution:00000000-0000-4000-8000-000000000000",
+    ]) {
+      assert.equal((await fetch(`${base}${path}`)).status, 404);
+    }
+    assert.equal(forwarded, 0);
+    assert.equal((await fetch(`${base}/api/v1/me/stats`, {
+      method: "POST",
+      headers: { Origin: base, "Content-Type": "application/json" },
+      body: "{}",
+    })).status, 405);
+    assert.equal(forwarded, 0);
+    assert.equal((await fetch(`${base}/api/v1/enroll`, {
+      method: "POST",
+      headers: {
+        Origin: "http://attacker.example",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    })).status, 403);
+    assert.equal(forwarded, 0);
+    assert.equal((await fetch(`${base}/api/v1/me/stats`, {
+      headers: { Authorization: "Bearer must-not-pass" },
+    })).status, 400);
+    assert.equal(forwarded, 0);
+
+    mode = "throw";
+    assert.equal((await fetch(`${base}/api/v1/session`)).status, 502);
+    mode = "html";
+    assert.equal((await fetch(`${base}/api/v1/session`)).status, 502);
+    mode = "cookie";
+    assert.equal((await fetch(`${base}/api/v1/session`)).status, 502);
+    assert.equal(forwarded, 3);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -518,7 +702,7 @@ test("optional central proxy exposes public reads and blocks every authenticated
           "Content-Type": "application/json",
           "Idempotency-Replayed": "true",
           "X-Private-Upstream": "must-not-pass",
-          "Set-Cookie": "__Host-um_session=must-not-pass; Secure; HttpOnly",
+          "Set-Cookie": "__Host-usage_monitor_session=must-not-pass; Secure; HttpOnly",
         },
       });
     },
@@ -533,7 +717,7 @@ test("optional central proxy exposes public reads and blocks every authenticated
       headers: {
         Origin: base,
         Authorization: "Bearer must-not-pass",
-        Cookie: "__Host-um_session=must-not-pass",
+        Cookie: "__Host-usage_monitor_session=must-not-pass",
         "X-Usage-Monitor-CSRF": "must-not-pass",
       },
     });
@@ -577,7 +761,7 @@ test("optional central proxy exposes public reads and blocks every authenticated
           "Content-Type": "application/json",
           Origin: base,
           Authorization: "Bearer must-not-pass",
-          Cookie: "__Host-um_session=must-not-pass",
+          Cookie: "__Host-usage_monitor_session=must-not-pass",
           "X-Usage-Monitor-CSRF": "must-not-pass",
         },
         body: item.method === "POST" ? "{}" : undefined,

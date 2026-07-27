@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "check": "npm run types:check && npm run typecheck && npm run scripts:check && npm test && npm run deploy:dry && npm run staging:check",
+    "acceptance:local": "node ./scripts/start-local-backend-lab.mjs --exit-after-receipt",
     "control:collection": "node ./scripts/collection-control.mjs",
     "deploy:dry": "wrangler deploy --env=\"\" --dry-run --outdir .wrangler-dry-run",
     "dev": "wrangler dev --local",

@@ -1174,6 +1174,11 @@ function normalizePricing(pricing = {}) {
     coveragePercent: finite(pricing?.coveragePercent ?? pricing?.pricedCoveragePercent ?? pricing?.pricedEventCoveragePercent, null),
     eventCount: finite(pricing?.eventCount ?? pricing?.pricedEventCount, null),
     apiTier: text(pricing?.apiTier ?? pricing?.tier, "standard"),
+    basis: text(pricing?.basis, "api_price_equivalent"),
+    apiServiceTier: text(pricing?.apiServiceTier, "unknown"),
+    subscriptionSpeedIsSeparate: pricing?.subscriptionSpeedIsSeparate === true,
+    registryVersion: text(pricing?.registryVersion, ""),
+    registryObservedAt: text(pricing?.registryObservedAt, ""),
     components: componentRows.slice(0, 12).map((row) => ({
       name: text(row?.name ?? row?.component, "Unknown"),
       tokens: finite(row?.tokens ?? row?.value, 0),

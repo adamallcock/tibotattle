@@ -1,12 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -36,6 +40,23 @@ function boundedPort(value) {
     throw new Error("--port must be between 1024 and 65535");
   }
   return port;
+}
+
+async function assertPortAvailable(port) {
+  await new Promise((resolvePromise, rejectPromise) => {
+    const server = createServer();
+    server.once("error", () => {
+      rejectPromise(
+        new Error(`Loopback port ${port} is already in use; choose another --port.`),
+      );
+    });
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      server.close((error) => {
+        if (error) rejectPromise(error);
+        else resolvePromise();
+      });
+    });
+  });
 }
 
 function createLabDirectory(value) {
@@ -155,14 +176,141 @@ async function stopWorker(child) {
     new Promise((resolvePromise) => child.once("exit", resolvePromise)),
     new Promise((resolvePromise) => setTimeout(resolvePromise, 5_000)),
   ]);
-  if (child.exitCode === null) child.kill("SIGTERM");
+  if (child.exitCode === null) {
+    child.kill("SIGTERM");
+    await Promise.race([
+      new Promise((resolvePromise) => child.once("exit", resolvePromise)),
+      new Promise((resolvePromise) => setTimeout(resolvePromise, 5_000)),
+    ]);
+  }
+  if (child.exitCode === null) {
+    throw new Error("The local Worker did not stop within 10 seconds");
+  }
+}
+
+function prepareState(stateDirectory, invitationDirectory) {
+  mkdirSync(stateDirectory, { mode: 0o700 });
+  mkdirSync(invitationDirectory, { mode: 0o700 });
+  run(node, [
+    resolve(workerDirectory, "scripts", "migrate-local.mjs"),
+    "--persist-to",
+    stateDirectory,
+  ], "Local D1 migration", { capture: true });
+
+  const invitationFiles = [];
+  for (let index = 0; index < 20; index += 1) {
+    const invitationFile = join(
+      invitationDirectory,
+      `participant-${String(index + 1).padStart(2, "0")}.secret`,
+    );
+    run(node, [
+      resolve(workerDirectory, "scripts", "issue-enrollment-grant.mjs"),
+      "--persist-to",
+      stateDirectory,
+      "--output-file",
+      invitationFile,
+    ], "Local invitation issuance", { capture: true });
+    invitationFiles.push(invitationFile);
+  }
+  return invitationFiles;
+}
+
+function assertDeletedLifecycle(storage, r2ObjectCount) {
+  const database = storage.database;
+  if (database.activeParticipants !== 0
+      || database.deletingParticipants !== 0
+      || database.acceptedContributions !== 0
+      || database.canonicalRecords !== 0
+      || database.contributionOccurrences !== 0
+      || database.retainedQuarantineReferences !== 0
+      || database.activeSessions !== 0
+      || database.activeDevices !== 0
+      || database.suppressedSnapshots < 1
+      || database.withdrawnSnapshots < 1
+      || storage.deletionLedger.tombstones !== 20
+      || r2ObjectCount !== 0) {
+    throw new Error("The destructive lifecycle left unexpected D1 or R2 state");
+  }
+}
+
+async function probePersistedParticipant(origin, participantAccessFile) {
+  const access = JSON.parse(readFileSync(participantAccessFile, "utf8"));
+  if (access?.origin !== origin
+      || typeof access?.recoveryCode !== "string"
+      || !access.recoveryCode.startsWith("um_recovery_")) {
+    throw new Error("The retained participant access file was invalid");
+  }
+  const recoveredResponse = await fetch(`${origin}/api/v1/recover`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Origin: origin,
+    },
+    body: JSON.stringify({
+      recoveryCode: access.recoveryCode,
+      recoveryAttemptId:
+        `um_recovery_attempt_${randomBytes(32).toString("base64url")}`,
+    }),
+    redirect: "error",
+    signal: AbortSignal.timeout(5_000),
+  });
+  const recovered = await recoveredResponse.json();
+  const cookie = recoveredResponse.headers.get("set-cookie")?.split(";", 1)[0];
+  if (!recoveredResponse.ok
+      || typeof recovered?.csrfToken !== "string"
+      || typeof recovered?.recoveryCode !== "string"
+      || !recovered.recoveryCode.startsWith("um_recovery_")
+      || typeof cookie !== "string"
+      || !cookie.startsWith("__Host-usage_monitor_session=")) {
+    throw new Error("The retained participant could not recover after restart");
+  }
+  const statsResponse = await fetch(`${origin}/api/v1/me/stats`, {
+    headers: {
+      Accept: "application/json",
+      Cookie: cookie,
+    },
+    redirect: "error",
+    signal: AbortSignal.timeout(5_000),
+  });
+  const stats = await statsResponse.json();
+  if (!statsResponse.ok
+      || stats?.schemaVersion !== "participant-stats-v0.2"
+      || stats?.totals?.contributions !== 1
+      || !Number.isSafeInteger(stats?.totals?.usageEvents)
+      || stats.totals.usageEvents < 1
+      || stats?.totals?.priceVerification !== "server_repriced") {
+    throw new Error("Private persisted statistics did not survive restart");
+  }
+
+  const replacement = `${participantAccessFile}.${randomUUID()}.next`;
+  writeFileSync(replacement, `${JSON.stringify({
+    ...access,
+    recoveryCode: recovered.recoveryCode,
+    rotatedAfterRestartAt: new Date().toISOString(),
+  }, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  renameSync(replacement, participantAccessFile);
+  return {
+    participantRecovered: true,
+    privateStatsRestored: true,
+    canonicalServerRepricingRestored: true,
+    contributions: stats.totals.contributions,
+    usageEvents: stats.totals.usageEvents,
+    replacementRecoveryCapabilityStoredOwnerOnly: true,
+  };
 }
 
 const args = process.argv.slice(2);
-const allowed = new Set(["--port", "--state-directory"]);
+const valueOptions = new Set(["--port", "--state-directory"]);
+const flagOptions = new Set(["--exit-after-receipt"]);
 for (let index = 0; index < args.length; index += 1) {
   const argument = args[index];
-  if (!allowed.has(argument)) throw new Error(`Unknown option: ${argument}`);
+  if (flagOptions.has(argument)) continue;
+  if (!valueOptions.has(argument)) throw new Error(`Unknown option: ${argument}`);
   index += 1;
   if (!args[index] || args[index].startsWith("--")) {
     throw new Error(`${argument} requires a value`);
@@ -170,39 +318,27 @@ for (let index = 0; index < args.length; index += 1) {
 }
 
 const port = boundedPort(optionValue(args, "--port", "8792"));
+const exitAfterReceipt = args.includes("--exit-after-receipt");
+await assertPortAvailable(port);
 const labDirectory = createLabDirectory(optionValue(args, "--state-directory"));
 const stateDirectory = join(labDirectory, "state");
 const invitationDirectory = join(labDirectory, "redeemed-invitations");
+const lifecycleStateDirectory = join(labDirectory, "lifecycle-state");
+const lifecycleInvitationDirectory = join(
+  labDirectory,
+  "lifecycle-redeemed-invitations",
+);
 const participantAccessFile = join(labDirectory, "participant-access.json");
 const receiptFile = join(labDirectory, "lab-receipt.json");
-mkdirSync(stateDirectory, { mode: 0o700 });
-mkdirSync(invitationDirectory, { mode: 0o700 });
 assertLocalSecrets();
-
-run(node, [
-  resolve(workerDirectory, "scripts", "migrate-local.mjs"),
-  "--persist-to",
-  stateDirectory,
-], "Local D1 migration", { capture: true });
-
-const invitationFiles = [];
-for (let index = 0; index < 20; index += 1) {
-  const invitationFile = join(
-    invitationDirectory,
-    `participant-${String(index + 1).padStart(2, "0")}.secret`,
-  );
-  run(node, [
-    resolve(workerDirectory, "scripts", "issue-enrollment-grant.mjs"),
-    "--persist-to",
-    stateDirectory,
-    "--output-file",
-    invitationFile,
-  ], "Local invitation issuance", { capture: true });
-  invitationFiles.push(invitationFile);
-}
+const lifecycleInvitationFiles = prepareState(
+  lifecycleStateDirectory,
+  lifecycleInvitationDirectory,
+);
+const invitationFiles = prepareState(stateDirectory, invitationDirectory);
 
 const origin = `http://127.0.0.1:${port}`;
-let worker = startWorker(port, stateDirectory);
+let worker = startWorker(port, lifecycleStateDirectory);
 let stopping = false;
 
 async function shutdown(signal) {
@@ -222,6 +358,24 @@ process.once("SIGINT", () => void shutdown("SIGINT"));
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
 try {
+  await waitForHealth(origin, worker);
+  const lifecycleSmokeOutput = run(node, [
+    resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
+    "--origin",
+    origin,
+    "--generated-content-free-fixture",
+    ...lifecycleInvitationFiles.flatMap((path) => ["--invite-file", path]),
+  ], "Destructive lifecycle HTTP acceptance", { capture: true });
+  const lifecycleSmoke = JSON.parse(lifecycleSmokeOutput);
+  const lifecycleR2ObjectCount = await inspectLocalR2ObjectCount(origin);
+  await stopWorker(worker);
+  const lifecycleStorage = inspectLocalBackendState({
+    persistTo: lifecycleStateDirectory,
+    workerDirectory,
+  });
+  assertDeletedLifecycle(lifecycleStorage, lifecycleR2ObjectCount);
+
+  worker = startWorker(port, stateDirectory);
   await waitForHealth(origin, worker);
   const smokeOutput = run(node, [
     resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
@@ -247,8 +401,16 @@ try {
   }
   worker = startWorker(port, stateDirectory, { visible: true });
   const health = await waitForHealth(origin, worker);
+  const restartedR2ObjectCount = await inspectLocalR2ObjectCount(origin);
+  if (restartedR2ObjectCount !== r2ObjectCount) {
+    throw new Error("The retained R2 object count changed across restart");
+  }
+  const persistedRestart = await probePersistedParticipant(
+    origin,
+    participantAccessFile,
+  );
   const receipt = {
-    schemaVersion: "local-backend-lab-receipt-v0.1",
+    schemaVersion: "local-backend-lab-receipt-v0.2",
     status: "ready",
     createdAt: new Date().toISOString(),
     origin,
@@ -262,12 +424,37 @@ try {
       participants: smoke.participants,
       acceptedRecordsPerParticipant: smoke.acceptedRecordsPerParticipant,
       idempotentReplay: smoke.idempotentReplay,
+      uploadScopeConflictRejected: smoke.uploadScopeConflictRejected,
       privacyCanaryRejected: smoke.privacyCanaryRejected,
+      invalidSchemaRejected: smoke.invalidSchemaRejected,
+      oversizedRequestRejected: smoke.oversizedRequestRejected,
+      overCountRejected: smoke.overCountRejected,
+      outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
       serverValidation: smoke.serverValidation,
+      canonicalServerRepricing: smoke.canonicalServerRepricing,
       personalStatisticsRecomputed: smoke.personalStatisticsRecomputed,
       aggregatePublishedAtTwenty: smoke.aggregatePublishedAtTwenty,
       authenticatedWeeklyComparison: smoke.authenticatedWeeklyComparison,
       participantExportVerified: smoke.participantExportVerified,
+    },
+    destructiveLifecycle: {
+      individualContributionDeletion:
+        lifecycleSmoke.historyUpdatedAfterContributionDeletion,
+      fullParticipantDeletion:
+        lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
+      aggregateWithdrawnOnDeletion:
+        lifecycleSmoke.aggregateWithdrawnOnContributionDeletion,
+      aggregateRebuiltWithoutDeletedSources:
+        lifecycleSmoke.aggregateRebuiltAfterParticipantDeletion,
+      d1: lifecycleStorage.database,
+      deletionLedger: lifecycleStorage.deletionLedger,
+      directLocalR2ObjectCount: lifecycleR2ObjectCount,
+    },
+    persistedRestart: {
+      workerRestartedAgainstSameStateDirectory: true,
+      r2ObjectCountBeforeRestart: r2ObjectCount,
+      r2ObjectCountAfterRestart: restartedR2ObjectCount,
+      ...persistedRestart,
     },
     storage: storage.database,
     encryptedQuarantine: {
@@ -284,6 +471,30 @@ try {
       encryptedQuarantine: health.checks.encryptedObjectStore,
       enrollmentMode: health.enrollmentMode,
     },
+    acceptance: {
+      safeFileAcceptance: true,
+      forbiddenContentRejected: smoke.privacyCanaryRejected,
+      invalidSchemaRejected: smoke.invalidSchemaRejected,
+      oversizedRequestRejected: smoke.oversizedRequestRejected,
+      overCountRejected: smoke.overCountRejected,
+      outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
+      idempotentDeduplication: smoke.idempotentReplay,
+      conflictSafeCanonicalState: smoke.uploadScopeConflictRejected,
+      canonicalServerRepricing: smoke.canonicalServerRepricing,
+      d1LifecycleVerified: true,
+      r2LifecycleVerified: lifecycleR2ObjectCount === 0
+        && restartedR2ObjectCount === r2ObjectCount,
+      privateStatisticsVerified: smoke.personalStatisticsRecomputed,
+      aggregateStatisticsVerified: smoke.aggregatePublishedAtTwenty,
+      participantExportVerified: smoke.participantExportVerified,
+      individualContributionDeletionVerified:
+        lifecycleSmoke.historyUpdatedAfterContributionDeletion,
+      fullParticipantDeletionVerified:
+        lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
+      persistedRestartVerified:
+        persistedRestart.participantRecovered
+        && persistedRestart.privateStatsRestored,
+    },
     cleanup: {
       automaticOnShutdown: false,
       instruction:
@@ -296,19 +507,11 @@ try {
     mode: 0o600,
   });
   process.stdout.write(`${JSON.stringify({
-    status: "ready",
-    portalUrl: receipt.portalUrl,
-    stateDirectory: labDirectory,
-    participantAccessFile,
+    ...receipt,
     receiptFile,
-    participants: receipt.smoke.participants,
-    acceptedContributions: receipt.storage.acceptedContributions,
-    canonicalRecords: receipt.storage.canonicalRecords,
-    publishedSnapshots: receipt.storage.publishedSnapshots,
-    encryptedQuarantineObjects: receipt.encryptedQuarantine.directLocalR2ObjectCount,
-    privacyCanaryRejected: receipt.smoke.privacyCanaryRejected,
     note: "The recovery code is only in the owner-only participant access file.",
   }, null, 2)}\n`);
+  if (exitAfterReceipt) await stopWorker(worker);
 } catch (error) {
   await stopWorker(worker);
   process.stderr.write("The inspectable backend laboratory failed at a bounded setup or verification step.\n");
