@@ -22,6 +22,13 @@ import {
 import {
   createProductionContributionDeviceBackend,
 } from "../../src/contribution-device-capability.js";
+import {
+  LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
+  LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION,
+  createLocalContributionPreparationRunner,
+  defaultLocalContributionPreparationDirectories,
+  projectLocalContributionPreparationError,
+} from "../../src/local-contribution-preparation.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BODY_BYTES = 1_024;
@@ -86,6 +93,7 @@ const API_ROUTES = new Set([
   "/api/local/reports",
   "/api/local/refresh",
   "/api/local/contribution/preview",
+  "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
   "/api/local/contribution/sync-once",
@@ -361,7 +369,10 @@ function createLoopbackParticipantRelay({
   });
 }
 
-async function readEmptyJsonObject(request) {
+async function readEmptyJsonObject(
+  request,
+  { allowFixedUserRequest = true } = {},
+) {
   const contentType = request.headers["content-type"];
   if (typeof contentType !== "string" || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType)) {
     const error = new Error("unsupported_media_type");
@@ -397,21 +408,26 @@ async function readEmptyJsonObject(request) {
   const keys = isObject ? Object.keys(value) : [];
   const isEmpty = isObject && keys.length === 0;
   const isFixedUserRequest = isObject && keys.length === 1 && keys[0] === "reason" && value.reason === "user_request";
-  if (!isEmpty && !isFixedUserRequest) {
+  if (!isEmpty && !(allowFixedUserRequest && isFixedUserRequest)) {
     const error = new Error("invalid_request");
     error.code = "invalid_request";
     throw error;
   }
 }
 
-async function authorizeLocalMutation(request, response, errorCode) {
+async function authorizeLocalMutation(
+  request,
+  response,
+  errorCode,
+  { allowFixedUserRequest = true } = {},
+) {
   if (!sameOrigin(request)
       || request.headers["x-usage-monitor-local"] !== "1") {
     sendError(response, 403, errorCode);
     return false;
   }
   try {
-    await readEmptyJsonObject(request);
+    await readEmptyJsonObject(request, { allowFixedUserRequest });
     return true;
   } catch (error) {
     const status = error.code === "unsupported_media_type"
@@ -656,6 +672,122 @@ function syncRunProjection(value) {
   };
 }
 
+const PREPARATION_ERROR_CODES = new Set([
+  "coverage_unavailable",
+  "coverage_invalid",
+  "identity_unavailable",
+  "no_safe_records",
+  "export_too_large",
+  "privacy_verification_failed",
+  "review_archive_invalid",
+  "prepared_spool_invalid",
+  "preparation_in_progress",
+  "preparation_failed",
+]);
+
+function preparationResultProjection(value) {
+  const startAt = nullableInstant(value?.coveredAt?.startAt);
+  const endAt = nullableInstant(value?.coveredAt?.endAt);
+  const counts = value?.recordCounts ?? {};
+  const countValues = [
+    counts.usageEvents,
+    counts.quotaSnapshots,
+    counts.activityMarkers,
+  ];
+  const totalRecords = countValues.every(isNonNegativeInteger)
+    ? countValues.reduce((sum, count) => sum + count, 0)
+    : -1;
+  const startMs = startAt === null ? Number.NaN : Date.parse(startAt);
+  const endMs = endAt === null ? Number.NaN : Date.parse(endAt);
+  const valid = value?.schemaVersion
+      === LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION
+    && value?.status === "prepared"
+    && Number.isFinite(startMs)
+    && Number.isFinite(endMs)
+    && endMs > startMs
+    && endMs - startMs <= 60 * 60 * 1_000
+    && totalRecords > 0
+    && totalRecords <= 100_000
+    && value?.privacy?.verdict === "passed"
+    && isNonNegativeInteger(value?.privacy?.checksPassed)
+    && value.privacy.checksPassed <= 32
+    && value?.privacy?.checksFailed === 0
+    && value?.privacy?.sourceTransportReady === false
+    && value?.privacy?.provenanceRetained === true
+    && value?.prepared?.schemaVersion === "prepared-contribution-set-v0.1"
+    && value?.prepared?.eligibleSchemaVersion
+      === "telemetry-contribution-v0.1"
+    && Number.isSafeInteger(value?.prepared?.batchCount)
+    && value.prepared.batchCount >= 1
+    && value.prepared.batchCount <= 100
+    && Number.isSafeInteger(value?.prepared?.bytes)
+    && value.prepared.bytes >= 1
+    && value.prepared.bytes <= 131_072_000
+    && value?.networkActivity === false
+    && value?.includesContent === false
+    && value?.includesPaths === false
+    && value?.includesIdentifiers === false
+    && value?.includesCredentials === false;
+  if (!valid) return null;
+  return {
+    schemaVersion: LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION,
+    status: "prepared",
+    coveredAt: { startAt, endAt },
+    recordCounts: {
+      usageEvents: counts.usageEvents,
+      quotaSnapshots: counts.quotaSnapshots,
+      activityMarkers: counts.activityMarkers,
+    },
+    privacy: {
+      verdict: "passed",
+      checksPassed: value.privacy.checksPassed,
+      checksFailed: 0,
+      sourceTransportReady: false,
+      provenanceRetained: true,
+    },
+    prepared: {
+      schemaVersion: "prepared-contribution-set-v0.1",
+      eligibleSchemaVersion: "telemetry-contribution-v0.1",
+      batchCount: value.prepared.batchCount,
+      bytes: value.prepared.bytes,
+    },
+    networkActivity: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+}
+
+function preparationErrorProjection(error, overrideCode = null) {
+  const source = projectLocalContributionPreparationError(error);
+  const candidate = overrideCode ?? source?.errorCode;
+  const errorCode = PREPARATION_ERROR_CODES.has(candidate)
+    ? candidate
+    : "preparation_failed";
+  return {
+    schemaVersion: LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
+    status: "failed",
+    errorCode,
+    networkActivity: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+}
+
+function preparationErrorStatus(code) {
+  if (code === "preparation_in_progress") return 409;
+  if (code === "export_too_large") return 413;
+  if (code === "coverage_unavailable"
+      || code === "identity_unavailable") return 503;
+  if (code === "coverage_invalid"
+      || code === "no_safe_records"
+      || code === "privacy_verification_failed") return 422;
+  return 500;
+}
+
 export function createLocalCompanionServer({
   root = process.cwd(),
   staticRoot = resolve(root, "apps", "web", "public"),
@@ -667,6 +799,7 @@ export function createLocalCompanionServer({
   centralOrigin = process.env.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),
+  contributionPreparationRunner = null,
   contributionQueueFile =
     process.env.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
     ?? resolve(
@@ -679,7 +812,9 @@ export function createLocalCompanionServer({
     queueFile: contributionQueueFile,
   }),
   preparedContributionDirectory =
-    process.env.USAGE_MONITOR_PREPARED_DIRECTORY ?? null,
+    process.env.USAGE_MONITOR_PREPARED_DIRECTORY
+    ?? defaultLocalContributionPreparationDirectories()
+      .preparedSpoolDirectory,
   contributionServiceOrigin = centralOrigin,
   contributionDeviceBackendFactory =
     createProductionContributionDeviceBackend,
@@ -694,6 +829,12 @@ export function createLocalCompanionServer({
   }
   if (typeof contributionPreviewProvider !== "function") {
     throw new TypeError("contributionPreviewProvider must be a function");
+  }
+  if (contributionPreparationRunner !== null
+      && typeof contributionPreparationRunner !== "function") {
+    throw new TypeError(
+      "contributionPreparationRunner must be a function or null",
+    );
   }
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
@@ -754,6 +895,16 @@ export function createLocalCompanionServer({
     (preparedContributionDirectory !== null
       && contributionServiceOrigin !== null)
     || contributionSyncOnceRunner !== null;
+  const runContributionPreparation = contributionPreparationRunner
+    ?? createLocalContributionPreparationRunner({
+      coverageProvider: () => (
+        dataStore.getOverview()?.collector?.exportableCoveredAt
+      ),
+      ...(preparedContributionDirectory === null
+        ? {}
+        : { preparedSpoolDirectory: preparedContributionDirectory }),
+    });
+  let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
   const refresh = new LocalCompanionRefreshController({
     runner: refreshRunner,
@@ -865,6 +1016,7 @@ export function createLocalCompanionServer({
             localDashboard: true,
             explicitRefresh: true,
             contributionPreview: true,
+            contributionPreparation: true,
             contributionSyncStatus: true,
             contributionSyncNext: syncPreviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
@@ -937,6 +1089,51 @@ export function createLocalCompanionServer({
           preview = { status: "not_configured" };
         }
         send(response, 200, previewProjection(preview));
+        return;
+      }
+      if (path === "/api/local/contribution/prepare") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "preparation_not_authorized",
+          { allowFixedUserRequest: false },
+        )) return;
+        if (contributionPreparationInProgress) {
+          send(
+            response,
+            409,
+            preparationErrorProjection(null, "preparation_in_progress"),
+          );
+          return;
+        }
+        contributionPreparationInProgress = true;
+        try {
+          const result = preparationResultProjection(
+            await runContributionPreparation(),
+          );
+          if (result === null) {
+            send(
+              response,
+              500,
+              preparationErrorProjection(null, "preparation_failed"),
+            );
+            return;
+          }
+          send(response, 200, result);
+        } catch (error) {
+          const projected = preparationErrorProjection(error);
+          send(
+            response,
+            preparationErrorStatus(projected.errorCode),
+            projected,
+          );
+        } finally {
+          contributionPreparationInProgress = false;
+        }
         return;
       }
       if (path === "/api/local/contribution/sync-status") {

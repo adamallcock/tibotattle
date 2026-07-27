@@ -36,6 +36,45 @@ const MAX_RECENT_EVENT_KEYS = 5_000;
 const MAX_ACCOUNT_SCOPE_MARKER_AGE_MS = 5 * 60_000;
 const MAX_BUFFERED_ROLLOUT_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_RECORD_BATCH_SIZE = 1_000;
+const INDEXING_BOUNDARY = "modified_at_and_collection_start";
+const INDEXING_PHASES = new Set([
+  "discovering",
+  "rollout_index",
+  "quota_refresh",
+  "complete",
+  "paused",
+  "prospective",
+]);
+const INDEXING_STATUSES = new Set([
+  "recent_7d_indexing",
+  "recent_7d_complete",
+  "prospective_only",
+  "bounded_pause",
+]);
+const ROLLOUT_FILENAME_TIME =
+  /rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})/u;
+const DIAGNOSTIC_COUNT_FIELDS = Object.freeze([
+  "filesDiscovered",
+  "filesInitializedAtEnd",
+  "filesTruncated",
+  "filesReplacedOrNew",
+  "completeLinesRead",
+  "oversizedLinesSkipped",
+  "partialLinesDeferred",
+  "malformedLines",
+  "malformedTimestamps",
+  "malformedUsageRecords",
+  "duplicateEventsSkipped",
+  "preCollectionEventsSkipped",
+  "rolloutRecordsWritten",
+  "rolloutRecordBatchesWritten",
+  "appServerRecordsWritten",
+  "accountCredentialLocked",
+  "accountCredentialUnavailable",
+  "tierSettingEvents",
+  "tierSettingOmissions",
+  "malformedTierSettingEvents",
+]);
 
 export function defaultCollectorDataFile() {
   return resolve(process.cwd(), ".usage-monitor", "collector-events.jsonl");
@@ -53,10 +92,49 @@ export function defaultCollectorBatchJournalFile(checkpointFile = defaultCollect
   return `${checkpointFile}.batch-journal`;
 }
 
-function emptyCheckpoint(nowIso, backfill) {
+function indexingDescriptor({
+  mode,
+  status,
+  phase,
+  filesDiscovered = 0,
+  filesSelected = 0,
+  filesProcessed = 0,
+  recordsWritten = 0,
+  startAt,
+  endAt = null,
+}) {
+  if (!["recent_7d", "prospective"].includes(mode)
+      || !INDEXING_STATUSES.has(status)
+      || !INDEXING_PHASES.has(phase)) {
+    throw new TypeError("Collector indexing descriptor is invalid");
+  }
+  return {
+    mode,
+    status,
+    phase,
+    boundedBy: INDEXING_BOUNDARY,
+    filesDiscovered,
+    filesSelected,
+    filesProcessed,
+    recordsWritten,
+    coveredAt: { startAt, endAt },
+  };
+}
+
+function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
+  const collectionStartedAt = backfill
+    ? (backfillSinceAt ?? "1970-01-01T00:00:00.000Z")
+    : nowIso;
   return {
     schemaVersion: CHECKPOINT_SCHEMA_VERSION,
-    collectionStartedAt: backfill ? "1970-01-01T00:00:00.000Z" : nowIso,
+    collectionStartedAt,
+    indexing: indexingDescriptor({
+      mode: backfill ? "recent_7d" : "prospective",
+      status: backfill ? "recent_7d_indexing" : "prospective_only",
+      phase: backfill ? "discovering" : "prospective",
+      startAt: collectionStartedAt,
+      endAt: backfill ? null : nowIso,
+    }),
     files: {},
     recentEventKeys: [],
     lastQuotaObservedAt: null,
@@ -87,6 +165,111 @@ function emptyCheckpoint(nowIso, backfill) {
       tierSettingCounts: {},
     },
   };
+}
+
+function canonicalInstant(value, label) {
+  if (typeof value !== "string") throw new TypeError(`${label} must be an ISO timestamp`);
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    throw new TypeError(`${label} must be a canonical ISO timestamp`);
+  }
+  return value;
+}
+
+function validSignal(signal) {
+  return signal === undefined || signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function"
+      && typeof signal.removeEventListener === "function");
+}
+
+function cloneIndexing(value) {
+  return value ? structuredClone(value) : null;
+}
+
+function validCheckpointIndexing(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort().join("\0");
+  if (keys !== [
+    "boundedBy",
+    "coveredAt",
+    "filesDiscovered",
+    "filesProcessed",
+    "filesSelected",
+    "mode",
+    "phase",
+    "recordsWritten",
+    "status",
+  ].sort().join("\0")) return false;
+  if (!["recent_7d", "prospective"].includes(value.mode)
+      || !INDEXING_STATUSES.has(value.status)
+      || !INDEXING_PHASES.has(value.phase)
+      || value.boundedBy !== INDEXING_BOUNDARY) return false;
+  if (!value.coveredAt || typeof value.coveredAt !== "object"
+      || Array.isArray(value.coveredAt)
+      || Object.keys(value.coveredAt).sort().join("\0") !== "endAt\0startAt") return false;
+  try {
+    canonicalInstant(value.coveredAt.startAt, "indexing coveredAt.startAt");
+    if (value.coveredAt.endAt !== null) {
+      canonicalInstant(value.coveredAt.endAt, "indexing coveredAt.endAt");
+    }
+  } catch {
+    return false;
+  }
+  return ["filesDiscovered", "filesSelected", "filesProcessed", "recordsWritten"]
+    .every((key) => Number.isSafeInteger(value[key]) && value[key] >= 0);
+}
+
+function publicDiagnostics(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+  const result = Object.fromEntries(DIAGNOSTIC_COUNT_FIELDS.map((key) => [
+    key,
+    Number.isSafeInteger(source[key]) && source[key] >= 0 ? source[key] : 0,
+  ]));
+  for (const mapKey of ["appServerErrorCounts", "ingestionErrorCounts", "tierSettingCounts"]) {
+    const candidate = source[mapKey];
+    result[mapKey] = {};
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    for (const [key, count] of Object.entries(candidate)) {
+      if (/^[a-z0-9_:-]{1,64}$/iu.test(key)
+          && Number.isSafeInteger(count) && count >= 0) {
+        result[mapKey][key] = count;
+      }
+    }
+  }
+  return result;
+}
+
+async function emitIndexingProgress(onProgress, descriptor) {
+  if (onProgress === null || onProgress === undefined) return;
+  await onProgress(cloneIndexing(descriptor));
+}
+
+function ensureCheckpointIndexing(checkpoint, {
+  created,
+  backfill,
+  backfillSinceAt,
+  nowIso,
+}) {
+  if (validCheckpointIndexing(checkpoint.indexing)) return checkpoint.indexing;
+  const legacyStart = canonicalInstant(checkpoint.collectionStartedAt, "checkpoint collectionStartedAt");
+  const legacyHistorical = legacyStart === "1970-01-01T00:00:00.000Z";
+  const requestedRecent = created && backfill;
+  checkpoint.indexing = indexingDescriptor({
+    mode: legacyHistorical || requestedRecent ? "recent_7d" : "prospective",
+    status: legacyHistorical
+      ? "recent_7d_complete"
+      : requestedRecent ? "recent_7d_indexing" : "prospective_only",
+    phase: legacyHistorical
+      ? "complete"
+      : requestedRecent ? "discovering" : "prospective",
+    startAt: requestedRecent ? backfillSinceAt : legacyStart,
+    endAt: legacyHistorical || !requestedRecent ? nowIso : null,
+  });
+  return checkpoint.indexing;
 }
 
 function eventKey(value) {
@@ -305,7 +488,24 @@ function rolloutName(path) {
   return basename(path);
 }
 
-export async function discoverCollectorRollouts(codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex")) {
+function rolloutFilenameTime(path) {
+  const match = rolloutName(path).match(ROLLOUT_FILENAME_TIME);
+  if (!match) return Number.NaN;
+  return Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.000Z`);
+}
+
+function rolloutMayOverlap(file, sinceMs) {
+  if (!Number.isFinite(sinceMs)) return true;
+  if (file.location === "active") return true;
+  return [file.metadata.mtimeMs, rolloutFilenameTime(file.path)]
+    .some((value) => Number.isFinite(value) && value >= sinceMs);
+}
+
+export async function discoverCollectorRollouts(
+  codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+  { sinceAt = null } = {},
+) {
+  const sinceMs = sinceAt === null ? Number.NaN : Date.parse(canonicalInstant(sinceAt, "sinceAt"));
   const [active, archived] = await Promise.all([
     collectJsonlFiles(join(codexHome, "sessions"), "active"),
     collectJsonlFiles(join(codexHome, "archived_sessions"), "archive"),
@@ -313,7 +513,9 @@ export async function discoverCollectorRollouts(codexHome = process.env.CODEX_HO
   const selected = new Map();
   for (const file of archived) selected.set(rolloutName(file.path), file);
   for (const file of active) selected.set(rolloutName(file.path), file);
-  return [...selected.values()].sort((left, right) => rolloutName(left.path).localeCompare(rolloutName(right.path)));
+  return [...selected.values()]
+    .filter((file) => rolloutMayOverlap(file, sinceMs))
+    .sort((left, right) => rolloutName(left.path).localeCompare(rolloutName(right.path)));
 }
 
 function cursorKey(metadata) {
@@ -323,8 +525,16 @@ function cursorKey(metadata) {
 async function forEachCompleteLine(path, offset, size, onLine, {
   maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
   highWaterMark = 256 * 1024,
+  signal = null,
 } = {}) {
-  if (size <= offset) return { nextOffset: offset, partialDeferred: false, oversizedLinesSkipped: 0 };
+  if (size <= offset) {
+    return {
+      nextOffset: offset,
+      partialDeferred: false,
+      oversizedLinesSkipped: 0,
+      aborted: signal?.aborted === true,
+    };
+  }
   const input = createReadStream(path, { start: offset, end: size - 1, highWaterMark });
   let lineChunks = [];
   let lineBytes = 0;
@@ -332,6 +542,7 @@ async function forEachCompleteLine(path, offset, size, onLine, {
   let absolutePosition = offset;
   let nextOffset = offset;
   let oversizedLinesSkipped = 0;
+  let aborted = false;
 
   function appendSegment(segment) {
     if (skippingOversized || segment.length === 0) return;
@@ -345,8 +556,16 @@ async function forEachCompleteLine(path, offset, size, onLine, {
   }
 
   for await (const chunk of input) {
+    if (signal?.aborted) {
+      aborted = true;
+      break;
+    }
     let segmentStart = 0;
     for (let index = 0; index < chunk.length; index += 1) {
+      if (signal?.aborted) {
+        aborted = true;
+        break;
+      }
       if (chunk[index] !== 0x0a) continue;
       appendSegment(chunk.subarray(segmentStart, index));
       const lineEndOffset = absolutePosition + index + 1;
@@ -358,13 +577,15 @@ async function forEachCompleteLine(path, offset, size, onLine, {
       nextOffset = lineEndOffset;
       segmentStart = index + 1;
     }
+    if (aborted) break;
     appendSegment(chunk.subarray(segmentStart));
     absolutePosition += chunk.length;
   }
   return {
     nextOffset,
-    partialDeferred: absolutePosition > nextOffset,
+    partialDeferred: !aborted && absolutePosition > nextOffset,
     oversizedLinesSkipped,
+    aborted,
   };
 }
 
@@ -501,6 +722,9 @@ export async function ingestRolloutUpdates({
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
   commitRecordBatch = null,
+  rollouts = null,
+  signal = null,
+  onProgress = null,
 }) {
   if (!Number.isSafeInteger(maximumRecordBatchSize) || maximumRecordBatchSize < 1) {
     throw new TypeError("maximumRecordBatchSize must be a positive safe integer");
@@ -508,7 +732,12 @@ export async function ingestRolloutUpdates({
   if (!Number.isSafeInteger(maximumRecentEventKeys) || maximumRecentEventKeys < 1) {
     throw new TypeError("maximumRecentEventKeys must be a positive safe integer");
   }
-  const files = await discoverCollectorRollouts(codexHome);
+  if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
+  if (onProgress !== null && typeof onProgress !== "function") {
+    throw new TypeError("onProgress must be a function");
+  }
+  const files = rollouts ?? await discoverCollectorRollouts(codexHome);
+  if (!Array.isArray(files)) throw new TypeError("rollouts must be an array");
   checkpoint.diagnostics.filesDiscovered += files.length;
   const recentSet = new Set(checkpoint.recentEventKeys);
   let recordBatch = [];
@@ -518,6 +747,8 @@ export async function ingestRolloutUpdates({
   let changed = false;
   let changeVersion = 0;
   let committedVersion = -1;
+  let filesProcessed = 0;
+  let aborted = signal?.aborted === true;
   const receivedAt = new Date(clock()).toISOString();
 
   function markChanged() {
@@ -537,9 +768,19 @@ export async function ingestRolloutUpdates({
     recordBatchesWritten += 1;
     recordBatch = [];
     if (commitRecordBatch) committedVersion = changeVersion;
+    await onProgress?.({
+      recordsWritten,
+      recordBatchesWritten,
+      filesProcessed,
+      filesDiscovered: files.length,
+    });
   }
 
   for (const file of files) {
+    if (signal?.aborted) {
+      aborted = true;
+      break;
+    }
     const key = cursorKey(file.metadata);
     let state = checkpoint.files[key];
     if (!state) {
@@ -562,6 +803,13 @@ export async function ingestRolloutUpdates({
       checkpoint.diagnostics.filesReplacedOrNew += 1;
       if (initializeAtEnd) {
         checkpoint.diagnostics.filesInitializedAtEnd += 1;
+        filesProcessed += 1;
+        await onProgress?.({
+          recordsWritten,
+          recordBatchesWritten,
+          filesProcessed,
+          filesDiscovered: files.length,
+        });
         continue;
       }
     }
@@ -617,13 +865,24 @@ export async function ingestRolloutUpdates({
       maximumBufferedRecords = Math.max(maximumBufferedRecords, recordBatch.length);
       if (safe.windows?.length > 0) checkpoint.lastQuotaObservedAt = safe.observedAt;
       if (recordBatch.length >= maximumRecordBatchSize) await flushRecordBatch();
-    }, { maximumBufferedLineBytes });
+    }, { maximumBufferedLineBytes, signal });
     if (chunk.partialDeferred) checkpoint.diagnostics.partialLinesDeferred += 1;
     checkpoint.diagnostics.oversizedLinesSkipped = (checkpoint.diagnostics.oversizedLinesSkipped ?? 0) + chunk.oversizedLinesSkipped;
     if (chunk.nextOffset !== state.offset) {
       state.offset = chunk.nextOffset;
       markChanged();
     }
+    if (chunk.aborted) {
+      aborted = true;
+      break;
+    }
+    filesProcessed += 1;
+    await onProgress?.({
+      recordsWritten,
+      recordBatchesWritten,
+      filesProcessed,
+      filesDiscovered: files.length,
+    });
   }
   await flushRecordBatch();
   return {
@@ -631,6 +890,8 @@ export async function ingestRolloutUpdates({
     recordBatchesWritten,
     maximumBufferedRecords,
     filesDiscovered: files.length,
+    filesProcessed,
+    aborted,
     changed,
     lastChangeCommitted: commitRecordBatch !== null && committedVersion === changeVersion,
   };
@@ -796,6 +1057,9 @@ export async function runCollectorOnce({
   staleAfterMs = 60_000,
   refreshStale = true,
   backfill = false,
+  backfillSinceAt = null,
+  signal = null,
+  onProgress = null,
   maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
@@ -804,13 +1068,79 @@ export async function runCollectorOnce({
   loadAccountObservationSecret = null,
   commitBatch = commitCollectorRecordBatch,
 } = {}) {
+  if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
+  if (onProgress !== null && typeof onProgress !== "function") {
+    throw new TypeError("onProgress must be a function");
+  }
+  if (backfillSinceAt !== null) {
+    canonicalInstant(backfillSinceAt, "backfillSinceAt");
+    if (!backfill) throw new TypeError("backfillSinceAt requires backfill");
+  }
   const release = await acquireCollectorLock(lockFile, { clock });
   let client = null;
+  let abortClient = null;
   try {
     await recoverCollectorBatchJournal({ dataFile, checkpointFile, journalFile });
     const nowIso = new Date(clock()).toISOString();
     const existing = await readJsonIfExists(checkpointFile, null);
-    const checkpoint = existing ?? emptyCheckpoint(nowIso, backfill);
+    const requestedBackfillStart = backfill
+      ? (backfillSinceAt ?? "1970-01-01T00:00:00.000Z")
+      : null;
+    const checkpoint = existing
+      ?? emptyCheckpoint(nowIso, backfill, requestedBackfillStart);
+    const indexing = ensureCheckpointIndexing(checkpoint, {
+      created: existing === null,
+      backfill,
+      backfillSinceAt: requestedBackfillStart,
+      nowIso,
+    });
+    const indexingRun = indexing.mode === "recent_7d"
+      && indexing.status !== "recent_7d_complete";
+    const priorIndexedRecords = indexing.status === "bounded_pause"
+      ? indexing.recordsWritten
+      : 0;
+    if (indexingRun) {
+      indexing.status = "recent_7d_indexing";
+      indexing.phase = "discovering";
+      indexing.filesProcessed = 0;
+      indexing.coveredAt.endAt = null;
+    }
+    const discovered = await discoverCollectorRollouts(codexHome);
+    const collectionStartMs = Date.parse(checkpoint.collectionStartedAt);
+    const selected = discovered.filter((file) => rolloutMayOverlap(file, collectionStartMs));
+    if (indexingRun || indexing.mode === "prospective") {
+      indexing.filesDiscovered = discovered.length;
+      indexing.filesSelected = selected.length;
+      indexing.filesProcessed = 0;
+      if (indexingRun) indexing.recordsWritten = priorIndexedRecords;
+    }
+    await emitIndexingProgress(onProgress, indexing);
+    if (signal?.aborted && indexingRun) {
+      indexing.status = "bounded_pause";
+      indexing.phase = "paused";
+      checkpoint.savedAt = new Date(clock()).toISOString();
+      await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+      await emitIndexingProgress(onProgress, indexing);
+      const paused = {
+        mode: "run_once",
+        status: "bounded_pause",
+        rolloutRecordsWritten: 0,
+        recordBatchesWritten: 0,
+        maximumBufferedRecords: 0,
+        filesDiscovered: discovered.length,
+        filesSelected: selected.length,
+        filesProcessed: 0,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: cloneIndexing(indexing),
+        diagnostics: publicDiagnostics(checkpoint.diagnostics),
+      };
+      Object.defineProperties(paused, {
+        checkpointFile: { value: checkpointFile, enumerable: false },
+        dataFile: { value: dataFile, enumerable: false },
+      });
+      return paused;
+    }
+    if (indexingRun) indexing.phase = "rollout_index";
     const ingestion = await ingestRolloutUpdates({
       codexHome,
       checkpoint,
@@ -820,6 +1150,18 @@ export async function runCollectorOnce({
       maximumBufferedLineBytes,
       maximumRecordBatchSize,
       maximumRecentEventKeys,
+      rollouts: selected,
+      signal,
+      onProgress: async (progress) => {
+        if (indexingRun) {
+          indexing.filesProcessed = progress.filesProcessed;
+          indexing.recordsWritten = priorIndexedRecords + progress.recordsWritten;
+        } else if (indexing.mode === "prospective") {
+          indexing.filesProcessed = progress.filesProcessed;
+          indexing.recordsWritten = progress.recordsWritten;
+        }
+        await emitIndexingProgress(onProgress, indexing);
+      },
       commitRecordBatch: (records) => commitBatch({
         records,
         checkpoint,
@@ -829,20 +1171,43 @@ export async function runCollectorOnce({
         clock,
       }),
     });
+    if (indexingRun) {
+      indexing.filesProcessed = ingestion.filesProcessed;
+      indexing.recordsWritten = priorIndexedRecords + ingestion.recordsWritten;
+      indexing.status = ingestion.aborted ? "bounded_pause" : "recent_7d_complete";
+      indexing.phase = ingestion.aborted ? "paused" : "complete";
+      indexing.coveredAt.endAt = ingestion.aborted ? null : nowIso;
+    } else if (indexing.mode === "prospective") {
+      indexing.status = ingestion.aborted ? "bounded_pause" : "prospective_only";
+      indexing.phase = ingestion.aborted ? "paused" : "prospective";
+      indexing.filesProcessed = ingestion.filesProcessed;
+      indexing.recordsWritten = ingestion.recordsWritten;
+      indexing.coveredAt.endAt = ingestion.aborted ? null : nowIso;
+    }
     if (ingestion.changed && ingestion.lastChangeCommitted !== true) {
       checkpoint.savedAt = new Date(clock()).toISOString();
       await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
     }
     const lastObservedMs = checkpoint.lastQuotaObservedAt ? Date.parse(checkpoint.lastQuotaObservedAt) : Number.NEGATIVE_INFINITY;
-    const shouldRefresh = refreshStale && clock() - lastObservedMs > staleAfterMs;
+    const shouldRefresh = !signal?.aborted
+      && refreshStale
+      && clock() - lastObservedMs > staleAfterMs;
     let refresh = { attempted: false, recordWritten: false, errorCode: null };
     if (shouldRefresh) {
+      if (indexingRun) {
+        indexing.phase = "quota_refresh";
+        await emitIndexingProgress(onProgress, indexing);
+      }
       refresh.attempted = true;
       try {
         client = appServerFactory();
+        abortClient = () => client?.close();
+        signal?.addEventListener("abort", abortClient, { once: true });
         await client.start();
+        if (signal?.aborted) throw new Error("collector_aborted");
         const capturedAt = new Date(clock()).toISOString();
         const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
+        if (signal?.aborted) throw new Error("collector_aborted");
         const record = await appendAppRecord({
           payload,
           source: "app_server_read",
@@ -868,25 +1233,40 @@ export async function runCollectorOnce({
         if (!restored) throw new Error("Collector app-record recovery completed without a durable checkpoint");
         for (const key of Object.keys(checkpoint)) delete checkpoint[key];
         Object.assign(checkpoint, restored);
-        refresh.errorCode = recordAppServerError(checkpoint, error);
+        if (!signal?.aborted) refresh.errorCode = recordAppServerError(checkpoint, error);
       } finally {
+        signal?.removeEventListener("abort", abortClient);
+        abortClient = null;
         client?.close();
       }
     }
+    if (indexingRun) {
+      indexing.phase = ingestion.aborted ? "paused" : "complete";
+      checkpoint.indexing = cloneIndexing(indexing);
+    }
     checkpoint.savedAt = new Date(clock()).toISOString();
     await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
-    return {
+    await emitIndexingProgress(onProgress, checkpoint.indexing);
+    const result = {
       mode: "run_once",
+      status: ingestion.aborted || signal?.aborted ? "bounded_pause" : "complete",
       rolloutRecordsWritten: ingestion.recordsWritten,
       recordBatchesWritten: ingestion.recordBatchesWritten,
       maximumBufferedRecords: ingestion.maximumBufferedRecords,
-      filesDiscovered: ingestion.filesDiscovered,
+      filesDiscovered: discovered.length,
+      filesSelected: selected.length,
+      filesProcessed: ingestion.filesProcessed,
       refresh,
-      checkpointFile,
-      dataFile,
-      diagnostics: checkpoint.diagnostics,
+      indexing: cloneIndexing(checkpoint.indexing),
+      diagnostics: publicDiagnostics(checkpoint.diagnostics),
     };
+    Object.defineProperties(result, {
+      checkpointFile: { value: checkpointFile, enumerable: false },
+      dataFile: { value: dataFile, enumerable: false },
+    });
+    return result;
   } finally {
+    signal?.removeEventListener("abort", abortClient);
     client?.close();
     await release();
   }

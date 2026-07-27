@@ -520,6 +520,19 @@
               <div><dt>Source bytes</dt><dd>Not exposed to browser</dd></div>
               <div><dt>Identity</dt><dd>Pseudonymous</dd></div>
             </dl>
+            <section class="index-progress" id="index-progress" aria-live="polite" hidden>
+              <div class="index-progress-heading">
+                <strong id="index-progress-title">Indexing recent local history</strong>
+                <span class="evidence-chip neutral" id="index-progress-phase">Waiting</span>
+              </div>
+              <progress id="index-progress-bar" max="1" value="0"></progress>
+              <p id="index-progress-summary">
+                The local companion has not started a bounded history scan.
+              </p>
+              <p class="annotation" id="index-progress-coverage">
+                Raw log contents and source paths never enter this page.
+              </p>
+            </section>
             <div class="privacy-lists">
               <div>
                 <strong>Included</strong>
@@ -541,10 +554,18 @@
               <span class="evidence-chip neutral" id="service-state">Checking service</span>
             </div>
             <p class="annotation">
-              Select only an export produced by Usage Monitor—not a raw Codex log.
-              The server must schema-validate, reject content-like fields, deduplicate,
-              and quarantine outliers before aggregation.
+              Prepare the latest hour locally, or select an existing Usage Monitor
+              export—not a raw Codex log. Preparation creates a privacy-verified
+              queue entry and performs no upload.
             </p>
+            <div class="local-preparation">
+              <button class="button button-secondary" id="prepare-contribution" type="button">
+                Prepare latest hour locally
+              </button>
+              <p class="participant-action-status" id="prepare-contribution-status" role="status">
+                Nothing is sent until you separately inspect and choose a send action.
+              </p>
+            </div>
             <form id="contribution-form">
               <label class="invite-row" for="contribution-invite">
                 <span>

@@ -125,12 +125,21 @@ history through the unified local origin.
 
 These are deliberate boundaries, not hidden completion claims:
 
-- The current contribution picker consumes a prepared privacy-verified file.
-  Creating that file is still a local CLI/runbook step rather than a one-click
-  app workflow.
-- Recent real results are available, restart-safe retained evidence is reused,
-  and coverage dates are visible. A polished first-run incremental-indexing
-  progress experience and bounded older-history backfill remain incomplete.
+- The loopback app can now prepare the latest covered hour in one click. It
+  writes a verified review pair and committed prepared batches locally,
+  performs no upload, and refreshes the foreground queue. The existing file
+  picker remains available for exact plaintext review of an already prepared
+  batch. This machine's normal profile currently cannot complete preparation
+  because its existing Keychain identity is unreadable; the app fails closed
+  with fixed guidance rather than overwriting that identity.
+- A fresh companion checkpoint now indexes a fixed recent seven-day window
+  with bounded path-free progress and durable pause/resume. Existing
+  prospective checkpoints are not rewound; they are labelled honestly with
+  their retained coverage dates and remain partial historical evidence.
+  Very large long-lived active rollout files still begin at byte zero because
+  model/tier state must be reconstructed; the UI automatically resumes
+  timeout-paused checkpoints for up to five minutes, but a byte-tail index is
+  still follow-up performance work.
 - Timeline range, hour/day/week grouping, 15-minute/one-hour/three-hour
   smoothing, UTC/local labels, residuals, and weekly uncertainty are present.
   Direct graphical drag-to-zoom and richer in-chart gap annotations remain
@@ -154,6 +163,12 @@ npm --prefix apps/worker run scripts:check
 npm run product:backend:acceptance
 git diff --check
 ```
+
+The July 27 continuation reran the disposable 20-participant backend
+acceptance successfully. Every safe-ingest, rejection, deduplication,
+server-repricing, personal-statistics, aggregate, export, deletion, and
+persisted-restart flag was true. The secret-bearing laboratory state and the
+isolated browser-QA spool were moved to Trash after verification.
 
 The backend acceptance receipt, rather than a screenshot alone, is the compact
 machine-readable proof for safe acceptance, rejection, deduplication,

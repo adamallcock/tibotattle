@@ -7,6 +7,9 @@ import { join } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
+import {
+  LocalContributionPreparationError,
+} from "../../src/local-contribution-preparation.js";
 import { startLocalCompanionServer } from "./server.js";
 
 function fakeStore() {
@@ -106,8 +109,9 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       localDashboard: true,
       explicitRefresh: true,
       contributionPreview: true,
+      contributionPreparation: true,
       contributionSyncStatus: true,
-      contributionSyncNext: false,
+      contributionSyncNext: true,
       contributionSyncActions: false,
       centralServiceProxy: false,
       centralParticipantRelay: false,
@@ -437,6 +441,249 @@ test("contribution preview returns counts and accounting only", async () => {
     assert.equal(serialized.includes("private prompt"), false);
     assert.equal(serialized.includes("private-account"), false);
     assert.equal(Object.hasOwn(value, "usageEvents"), false);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("contribution preparation is an explicit, bounded, local-only action", async () => {
+  const files = await fixture();
+  let preparationCalls = 0;
+  let releasePreparation;
+  const preparationGate = new Promise((resolvePreparation) => {
+    releasePreparation = resolvePreparation;
+  });
+  const privateCanary = "/Users/private/source/session.jsonl";
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionPreparationRunner: async (...args) => {
+      preparationCalls += 1;
+      assert.equal(args.length, 0);
+      await preparationGate;
+      return {
+        schemaVersion: "local-contribution-preparation-result-v0.1",
+        status: "prepared",
+        coveredAt: {
+          startAt: "2026-07-26T12:00:00.000Z",
+          endAt: "2026-07-26T12:30:00.000Z",
+        },
+        recordCounts: {
+          usageEvents: 2,
+          quotaSnapshots: 1,
+          activityMarkers: 0,
+        },
+        privacy: {
+          verdict: "passed",
+          checksPassed: 6,
+          checksFailed: 0,
+          sourceTransportReady: false,
+          provenanceRetained: true,
+        },
+        prepared: {
+          schemaVersion: "prepared-contribution-set-v0.1",
+          eligibleSchemaVersion: "telemetry-contribution-v0.1",
+          batchCount: 1,
+          bytes: 4_096,
+          privatePath: privateCanary,
+        },
+        networkActivity: false,
+        includesContent: false,
+        includesPaths: false,
+        includesIdentifiers: false,
+        includesCredentials: false,
+        privateContent: "must not cross the loopback boundary",
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const authorizedHeaders = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+
+    assert.equal((await fetch(`${base}/api/local/contribution/prepare`)).status, 405);
+    assert.equal((await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })).status, 403);
+    assert.equal((await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: '{"reason":"user_request"}',
+    })).status, 400);
+    assert.equal((await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: '{"path":"/Users/private"}',
+    })).status, 400);
+    const oversized = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/prepare",
+      method: "POST",
+      headers: {
+        ...authorizedHeaders,
+        "Content-Length": 1_025,
+      },
+      body: " ".repeat(1_025),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(preparationCalls, 0);
+
+    const first = fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    await waitFor(() => preparationCalls === 1);
+    const overlap = await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(overlap.status, 409);
+    assert.deepEqual(await overlap.json(), {
+      schemaVersion: "local-contribution-preparation-error-v0.1",
+      status: "failed",
+      errorCode: "preparation_in_progress",
+      networkActivity: false,
+      includesContent: false,
+      includesPaths: false,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    });
+
+    releasePreparation();
+    const response = await first;
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      schemaVersion: "local-contribution-preparation-result-v0.1",
+      status: "prepared",
+      coveredAt: {
+        startAt: "2026-07-26T12:00:00.000Z",
+        endAt: "2026-07-26T12:30:00.000Z",
+      },
+      recordCounts: {
+        usageEvents: 2,
+        quotaSnapshots: 1,
+        activityMarkers: 0,
+      },
+      privacy: {
+        verdict: "passed",
+        checksPassed: 6,
+        checksFailed: 0,
+        sourceTransportReady: false,
+        provenanceRetained: true,
+      },
+      prepared: {
+        schemaVersion: "prepared-contribution-set-v0.1",
+        eligibleSchemaVersion: "telemetry-contribution-v0.1",
+        batchCount: 1,
+        bytes: 4_096,
+      },
+      networkActivity: false,
+      includesContent: false,
+      includesPaths: false,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("contribution preparation failures expose only fixed safe projections", async () => {
+  const files = await fixture();
+  let mode = "known_error";
+  const privateCanary = "/Users/private/source/session.jsonl";
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionPreparationRunner: async () => {
+      if (mode === "known_error") {
+        const error = new LocalContributionPreparationError(
+          "export_too_large",
+        );
+        error.privatePath = privateCanary;
+        throw error;
+      }
+      return {
+        schemaVersion: "local-contribution-preparation-result-v0.1",
+        status: "prepared",
+        coveredAt: {
+          startAt: "2026-07-26T12:00:00.000Z",
+          endAt: "2026-07-26T12:30:00.000Z",
+        },
+        recordCounts: {
+          usageEvents: 2,
+          quotaSnapshots: 1,
+          activityMarkers: 0,
+        },
+        privacy: {
+          verdict: "passed",
+          checksPassed: 6,
+          checksFailed: 0,
+          sourceTransportReady: false,
+          provenanceRetained: true,
+        },
+        prepared: {
+          schemaVersion: "prepared-contribution-set-v0.1",
+          eligibleSchemaVersion: "telemetry-contribution-v0.1",
+          batchCount: 1,
+          bytes: 4_096,
+        },
+        networkActivity: false,
+        includesContent: false,
+        includesPaths: true,
+        includesIdentifiers: false,
+        includesCredentials: false,
+        privatePath: privateCanary,
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const request = () => fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+
+    const knownError = await request();
+    assert.equal(knownError.status, 413);
+    assert.deepEqual(await knownError.json(), {
+      schemaVersion: "local-contribution-preparation-error-v0.1",
+      status: "failed",
+      errorCode: "export_too_large",
+      networkActivity: false,
+      includesContent: false,
+      includesPaths: false,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    });
+
+    mode = "invalid_result";
+    const invalidResult = await request();
+    assert.equal(invalidResult.status, 500);
+    const projected = await invalidResult.json();
+    assert.equal(projected.errorCode, "preparation_failed");
+    assert.equal(projected.includesPaths, false);
+    assert.equal(JSON.stringify(projected).includes(privateCanary), false);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

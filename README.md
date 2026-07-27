@@ -203,7 +203,14 @@ with their observation age; stale evidence is not presented as live.
 Raw Codex logs never enter the browser. The server binds only to loopback,
 accepts a fixed host, serves fixed assets/reports, and exposes no source-path
 parameter. Refresh is an explicit same-origin action and remains single-flight
-until the collector finishes.
+until the collector finishes. On a fresh collector checkpoint, the first
+refresh indexes only the fixed recent seven-day window, publishes path-free
+file/record progress, and resumes from durable byte offsets after interruption.
+The page automatically continues completed bounded pauses during the same
+five-minute user-initiated refresh attempt.
+An existing prospective checkpoint is never rewound: the dashboard labels it
+`Prospective Only`, shows its actual retained coverage dates, and states that
+older activity was not retroactively indexed.
 
 To exercise both product surfaces, start the central Worker on a separate port
 and optionally let the companion read its health and delayed weekly community
@@ -275,9 +282,24 @@ provisions Cloudflare resources nor authorizes outside participants.
 
 ### Preparing a contribution
 
-The hosted service does not read a user's log directory. First produce a
-current privacy-verified local bundle and receipt. Then convert that reviewed
-bundle into bounded `telemetry-contribution-v0.1` files:
+The hosted service does not read a user's log directory. In the loopback
+dashboard, **Prepare latest hour locally** is the normal path. It clamps the
+request to the latest covered hour, creates a privacy-verified review pair,
+independently reopens it, materializes bounded
+`telemetry-contribution-v0.1` batches into an owner-only spool, re-verifies the
+committed set, and then refreshes the path-free queue preview. Preparation
+performs no service request or upload; inspection and sending remain separate
+user actions.
+
+The production local identity is stored in the dedicated
+`app-usagemonitor.export-identity.v1` macOS Keychain item. If that item is
+locked or access is unavailable, preparation fails closed and the dashboard
+asks the user to unlock or allow access. It never silently replaces the
+identity or falls back to a new plaintext credential.
+
+The lower-level reviewed-bundle converter remains available for development
+and recovery. First produce a current privacy-verified local bundle and
+receipt, then convert it into bounded contribution files:
 
 ```bash
 npm run product:prepare-contribution -- \
@@ -723,7 +745,15 @@ Inference allows a separate hidden-usage offset for every reset window, so its p
 
 The token-count schema still has no per-request tier field. RunCost ledgers set `service_tier: standard` only to answer the counterfactual “what would these components cost at Standard API prices?” Long-context selection remains per event. `codexSpeedMode` and `apiServiceTier` are independent: on the ChatGPT subscription surface the app protocol's raw `priority` currently names Fast, while on the API surface `priority` means the API processing tier. Billing surface is therefore mandatory context. Controlled experiment manifests explicitly declare Standard or Fast and pass the matching provider setting to the spawned workload.
 
-The passive collector does not install a daemon or modify Codex settings. On first start it checkpoints existing rollout files at EOF and obtains a fresh quota snapshot only if no sufficiently fresh observation exists. Use `--backfill` only for an explicit isolated replay test; historical research should normally use `transitions`. Operational checkpoints store byte offsets, cumulative token/model cursor state, filesystem inode/birth-time cursor keys, and hashes of privacy-sanitized events—not rollout paths or session IDs.
+The passive collector does not install a daemon or modify Codex settings. The
+CLI's default prospective mode checkpoints existing rollout files at EOF and
+obtains a fresh quota snapshot only if no sufficiently fresh observation
+exists. The loopback companion's fresh-checkpoint refresh instead performs the
+fixed recent seven-day index described above. Use CLI `--backfill` only for an
+explicit isolated replay test; historical research should normally use
+`transitions`. Operational checkpoints store byte offsets, cumulative
+token/model cursor state, filesystem inode/birth-time cursor keys, and hashes
+of privacy-sanitized events—not rollout paths or session IDs.
 
 Raw privacy-minimized collector records are deliberately append-only during this proof of concept. No automatic retention or deletion is enabled because losing reset/account evidence would be harder to repair than excess local disk use. File size should be monitored and old closed periods should eventually be archived into owner-only monthly partitions with a manifest and digest before any source records are removed.
 

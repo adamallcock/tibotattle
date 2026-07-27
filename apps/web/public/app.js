@@ -28,6 +28,7 @@ let contributionSyncPreview = null;
 let contributionSyncBusy = false;
 let selectedContributionValidated = false;
 let contributionSelectionRevision = 0;
+let contributionPreparationBusy = false;
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -1052,6 +1053,9 @@ function renderCollector(data) {
     ["Safe records", compact(collector.safeRecordCount ?? data.activity?.safeRecordCount ?? data.activity?.recordCount)],
     ["Covered from", collector.coveredAt?.startAt ? formatUtc(collector.coveredAt.startAt) : "Unavailable"],
     ["Covered through", collector.coveredAt?.endAt ? formatUtc(collector.coveredAt.endAt) : "Unavailable"],
+    ["Contribution through", collector.exportableCoveredAt?.endAt
+      ? formatUtc(collector.exportableCoveredAt.endAt)
+      : "No rollout usage available"],
     ["Usage / quota rows", `${compact(collector.recordCounts?.usage)} / ${compact(collector.recordCounts?.quota)}`],
     ["Index state", humanize(collector.indexingState || "Unavailable")],
     ["Source bytes", "Not exposed to browser"],
@@ -1064,6 +1068,68 @@ function renderCollector(data) {
     wrapper.append(node("dt", "", term), node("dd", "", value));
     dl.append(wrapper);
   }
+  renderIndexProgress(collector.indexing ?? null, {
+    status: collector.indexing?.status ?? collector.indexingState
+  });
+}
+
+function renderIndexProgress(progress, { status = "" } = {}) {
+  const container = $("#index-progress");
+  if (!container) return;
+  if (!progress || typeof progress !== "object") {
+    container.hidden = true;
+    return;
+  }
+  const allowedPhases = new Set([
+    "starting",
+    "discovering",
+    "rollout_index",
+    "quota_refresh",
+    "reloading",
+    "complete",
+    "paused",
+    "prospective",
+    "failed"
+  ]);
+  const phase = allowedPhases.has(progress.phase) ? progress.phase : "rollout_index";
+  const filesSelected = Number.isSafeInteger(progress.filesSelected)
+    && progress.filesSelected >= 0 ? progress.filesSelected : null;
+  const filesProcessed = Number.isSafeInteger(progress.filesProcessed)
+    && progress.filesProcessed >= 0 ? progress.filesProcessed : 0;
+  const recordsWritten = Number.isSafeInteger(progress.recordsWritten)
+    && progress.recordsWritten >= 0 ? progress.recordsWritten : 0;
+  const startAt = Number.isFinite(Date.parse(progress.coveredAt?.startAt))
+    ? progress.coveredAt.startAt : "";
+  const endAt = Number.isFinite(Date.parse(progress.coveredAt?.endAt))
+    ? progress.coveredAt.endAt : "";
+  const bar = $("#index-progress-bar");
+  if (filesSelected !== null && filesSelected > 0) {
+    bar.max = filesSelected;
+    bar.value = Math.min(filesProcessed, filesSelected);
+  } else {
+    bar.max = 1;
+    bar.removeAttribute("value");
+  }
+  $("#index-progress-title").textContent =
+    status === "recent_7d_complete"
+      ? "Recent local history indexed"
+      : status === "prospective_only"
+        ? "Collecting new activity prospectively"
+        : status === "bounded_pause"
+          ? "Recent history indexing paused"
+          : "Indexing recent local history";
+  $("#index-progress-phase").textContent = humanize(
+    status === "recent_7d_complete" ? "complete" : phase
+  );
+  $("#index-progress-summary").textContent = status === "prospective_only"
+    ? `${compact(recordsWritten)} safe records retained since local collection began. Older activity was not retroactively indexed for this existing checkpoint.`
+    : filesSelected === null
+      ? `${compact(recordsWritten)} safe records retained; discovering bounded recent rollouts.`
+      : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
+  $("#index-progress-coverage").textContent = startAt && endAt
+    ? `Content-free evidence currently covers ${formatUtc(startAt)} through ${formatUtc(endAt)}. Raw content and source paths never enter this page.`
+    : "Raw log contents and source paths never enter this page.";
+  container.hidden = false;
 }
 
 function renderContributionSyncStatus(status) {
@@ -1190,10 +1256,10 @@ function showContributionSyncAction(message, error = false) {
 }
 
 async function refreshContributionSyncControls() {
-  const [status, preview] = await Promise.all([
-    localClient.contributionSyncStatus(),
-    localClient.contributionSyncPreview()
-  ]);
+  // Preview discovery commits newly prepared sets to the queue. Read queue
+  // status afterwards so the two cards describe the same durable state.
+  const preview = await localClient.contributionSyncPreview();
+  const status = await localClient.contributionSyncStatus();
   renderContributionSyncStatus(status);
   renderContributionSyncPreview(preview);
 }
@@ -1280,14 +1346,46 @@ async function requestRefresh() {
   const button = $("#refresh-button");
   button.disabled = true;
   button.textContent = "Starting scan…";
+  renderIndexProgress({
+    phase: "starting",
+    filesSelected: null,
+    filesProcessed: 0,
+    recordsWritten: 0,
+    coveredAt: { startAt: "", endAt: "" }
+  }, { status: "running" });
   try {
     await localClient.refresh();
     let outcome = "running";
-    for (let attempt = 0; attempt < 80 && outcome === "running"; attempt += 1) {
-      button.textContent = attempt < 2 ? "Scanning local evidence…" : `Scanning… ${attempt + 1}s`;
+    for (let attempt = 0; attempt < 400 && outcome === "running"; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 750));
       const status = await localClient.refreshStatus();
-      outcome = status?.refresh?.status ?? "failed";
+      const refresh = status?.refresh ?? {};
+      outcome = refresh.status ?? "failed";
+      const progress = refresh.progress ?? refresh.result?.indexing ?? null;
+      if (progress) renderIndexProgress(progress, { status: outcome });
+      const processed = Number.isSafeInteger(progress?.filesProcessed)
+        ? progress.filesProcessed : null;
+      const selected = Number.isSafeInteger(progress?.filesSelected)
+        ? progress.filesSelected : null;
+      button.textContent = processed !== null && selected !== null
+        ? `Indexing ${processed}/${selected} files…`
+        : attempt < 2 ? "Scanning local evidence…" : `Scanning… ${attempt + 1}s`;
+      if (outcome === "failed"
+          && refresh.errorCode === "refresh_timed_out") {
+        if (progress?.status === "bounded_pause") {
+          try {
+            await localClient.refresh();
+            button.textContent = "Continuing bounded index…";
+          } catch (error) {
+            // A 409 means the aborted run is still finishing its durable
+            // checkpoint. Keep polling until it becomes resumable.
+            if (error?.status !== 409) throw error;
+          }
+        } else {
+          button.textContent = "Finalizing bounded pause…";
+        }
+        outcome = "running";
+      }
     }
     if (outcome !== "succeeded") throw new Error("The local refresh did not complete successfully.");
     button.textContent = "Loading updated evidence…";
@@ -1302,6 +1400,54 @@ async function requestRefresh() {
   } finally {
     button.disabled = false;
     button.textContent = "Refresh local data";
+  }
+}
+
+async function prepareLocalContribution() {
+  if (contributionPreparationBusy) return;
+  contributionPreparationBusy = true;
+  const button = $("#prepare-contribution");
+  const status = $("#prepare-contribution-status");
+  button.disabled = true;
+  button.textContent = "Preparing locally…";
+  status.classList.remove("error");
+  status.textContent =
+    "Building and independently verifying a content-free latest-hour contribution. No network upload is performed.";
+  try {
+    const result = await localClient.prepareContribution();
+    if (result.status !== "prepared") {
+      throw new Error("Preparation did not return a verified contribution.");
+    }
+    const records = result.recordCounts.usageEvents
+      + result.recordCounts.quotaSnapshots
+      + result.recordCounts.activityMarkers;
+    status.textContent =
+      `Prepared ${compact(result.prepared.batchCount)} verified batch${result.prepared.batchCount === 1 ? "" : "es"} with ${compact(records)} safe records (${compact(result.prepared.bytes)} bytes). Nothing was uploaded.`;
+    await refreshContributionSyncControls();
+  } catch (error) {
+    status.classList.add("error");
+    const preparationMessages = {
+      identity_unavailable:
+        "The local Keychain identity is unavailable. Unlock or allow access to the app-usagemonitor export identity, then retry. No upload occurred.",
+      coverage_unavailable:
+        "No usable local coverage is available yet. Refresh local data first. No upload occurred.",
+      coverage_invalid:
+        "The latest local coverage interval is not usable for a contribution. No upload occurred.",
+      no_safe_records:
+        "No privacy-safe records were found in the latest covered hour. No upload occurred.",
+      export_too_large:
+        "The latest-hour export exceeded a fixed safety bound. No upload occurred.",
+      privacy_verification_failed:
+        "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
+      preparation_in_progress:
+        "A local preparation is already running. Nothing has been uploaded."
+    };
+    status.textContent = preparationMessages[error?.code]
+      ?? "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue.";
+  } finally {
+    contributionPreparationBusy = false;
+    button.disabled = false;
+    button.textContent = "Prepare latest hour locally";
   }
 }
 
@@ -2510,6 +2656,7 @@ async function logoutParticipant() {
 }
 
 $("#refresh-button").addEventListener("click", requestRefresh);
+$("#prepare-contribution").addEventListener("click", prepareLocalContribution);
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
 $("#sync-inspect").addEventListener("click", async () => {
   contributionSyncBusy = true;

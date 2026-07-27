@@ -37,6 +37,8 @@ export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
   "contribution-sync-preview-v0.1";
 export const CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION =
   "contribution-sync-run-v0.1";
+export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
+  "local-contribution-preparation-result-v0.1";
 
 const COMMUNITY_METRIC_UNITS = Object.freeze({
   usageEvents: "events_rounded_down",
@@ -77,6 +79,18 @@ const PARTICIPANT_CONSENT_VERSIONS = new Set([
   "privacy-safe-telemetry-v0.2",
   "ongoing-privacy-safe-telemetry-v0.1",
   "ongoing-privacy-safe-telemetry-v0.2"
+]);
+const LOCAL_PREPARATION_ERROR_CODES = new Set([
+  "coverage_unavailable",
+  "coverage_invalid",
+  "identity_unavailable",
+  "no_safe_records",
+  "export_too_large",
+  "privacy_verification_failed",
+  "review_archive_invalid",
+  "prepared_spool_invalid",
+  "preparation_in_progress",
+  "preparation_failed"
 ]);
 
 function array(value) {
@@ -307,6 +321,70 @@ export function normalizeContributionSyncRun(payload) {
     status: payload.status,
     ...values,
     bandwidthLimited: payload.bandwidthLimited
+  };
+}
+
+export function normalizeLocalContributionPreparation(payload) {
+  const unavailable = {
+    status: "unavailable",
+    coveredAt: { startAt: "", endAt: "" },
+    recordCounts: {
+      usageEvents: 0,
+      quotaSnapshots: 0,
+      activityMarkers: 0
+    },
+    privacy: {
+      verdict: "unavailable",
+      checksPassed: 0,
+      checksFailed: 0,
+      provenanceRetained: false
+    },
+    prepared: { batchCount: 0, bytes: 0 }
+  };
+  const startAt = text(payload?.coveredAt?.startAt, "");
+  const endAt = text(payload?.coveredAt?.endAt, "");
+  const usageEvents = count(payload?.recordCounts?.usageEvents, null);
+  const quotaSnapshots = count(payload?.recordCounts?.quotaSnapshots, null);
+  const activityMarkers = count(payload?.recordCounts?.activityMarkers, null);
+  const checksPassed = count(payload?.privacy?.checksPassed, null);
+  const checksFailed = count(payload?.privacy?.checksFailed, null);
+  const batchCount = count(payload?.prepared?.batchCount, null);
+  const bytes = count(payload?.prepared?.bytes, null);
+  const valid = payload?.schemaVersion
+      === LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION
+    && payload?.status === "prepared"
+    && startAt && endAt
+    && Number.isFinite(Date.parse(startAt))
+    && Number.isFinite(Date.parse(endAt))
+    && Date.parse(endAt) > Date.parse(startAt)
+    && [usageEvents, quotaSnapshots, activityMarkers, checksPassed,
+      checksFailed, batchCount, bytes].every((value) => value !== null)
+    && payload?.privacy?.verdict === "passed"
+    && checksFailed === 0
+    && payload?.privacy?.sourceTransportReady === false
+    && payload?.privacy?.provenanceRetained === true
+    && payload?.prepared?.schemaVersion
+      === "prepared-contribution-set-v0.1"
+    && payload?.prepared?.eligibleSchemaVersion
+      === "telemetry-contribution-v0.1"
+    && batchCount > 0
+    && payload?.networkActivity === false
+    && payload?.includesContent === false
+    && payload?.includesPaths === false
+    && payload?.includesIdentifiers === false
+    && payload?.includesCredentials === false;
+  if (!valid) return unavailable;
+  return {
+    status: "prepared",
+    coveredAt: { startAt, endAt },
+    recordCounts: { usageEvents, quotaSnapshots, activityMarkers },
+    privacy: {
+      verdict: "passed",
+      checksPassed,
+      checksFailed: 0,
+      provenanceRetained: true
+    },
+    prepared: { batchCount, bytes }
   };
 }
 
@@ -1302,9 +1380,37 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       identityMode: text(overview?.collector?.identityMode, ""),
       sourceMode: text(overview?.collector?.sourceMode, ""),
       indexingState: text(overview?.collector?.indexingState, ""),
+      indexing: overview?.collector?.indexing
+        && typeof overview.collector.indexing === "object"
+        && !Array.isArray(overview.collector.indexing)
+        ? {
+          status: text(overview.collector.indexing.status, ""),
+          phase: text(overview.collector.indexing.phase, ""),
+          mode: text(overview.collector.indexing.mode, ""),
+          filesDiscovered: count(overview.collector.indexing.filesDiscovered, 0),
+          filesSelected: count(overview.collector.indexing.filesSelected, 0),
+          filesProcessed: count(overview.collector.indexing.filesProcessed, 0),
+          recordsWritten: count(overview.collector.indexing.recordsWritten, 0),
+          coveredAt: {
+            startAt: text(overview.collector.indexing.coveredAt?.startAt, ""),
+            endAt: text(overview.collector.indexing.coveredAt?.endAt, "")
+          },
+          boundedBy: text(overview.collector.indexing.boundedBy, "")
+        }
+        : null,
       coveredAt: {
         startAt: text(overview?.collector?.coveredAt?.startAt, ""),
         endAt: text(overview?.collector?.coveredAt?.endAt, "")
+      },
+      exportableCoveredAt: {
+        startAt: text(
+          overview?.collector?.exportableCoveredAt?.startAt,
+          ""
+        ),
+        endAt: text(
+          overview?.collector?.exportableCoveredAt?.endAt,
+          ""
+        )
       },
       recordCounts: {
         usage: count(overview?.collector?.recordCounts?.usage, 0),
@@ -1442,6 +1548,34 @@ export class LocalCompanionClient {
     return normalizeContributionSyncRun(
       await this.localContributionMutation("sync-once")
     );
+  }
+
+  async prepareContribution() {
+    const fetchImpl = this.fetchImpl;
+    const response = await fetchImpl(
+      `${LOCAL_ROOT}/contribution/prepare`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({})
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(`Request failed (${response.status}).`);
+      error.status = response.status;
+      error.code = payload?.schemaVersion
+          === "local-contribution-preparation-error-v0.1"
+        && LOCAL_PREPARATION_ERROR_CODES.has(payload?.errorCode)
+        ? payload.errorCode
+        : "preparation_failed";
+      throw error;
+    }
+    return normalizeLocalContributionPreparation(payload);
   }
 
   async setContributionSyncPaused(paused) {

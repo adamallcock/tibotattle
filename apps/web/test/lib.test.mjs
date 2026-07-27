@@ -29,6 +29,7 @@ import {
   normalizeContributionSyncStatus,
   normalizeContributionSyncPreview,
   normalizeContributionSyncRun,
+  normalizeLocalContributionPreparation,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
   normalizeParticipantHistory,
@@ -702,6 +703,86 @@ test("local sync preview and actions keep privileged values behind loopback", as
   }
 });
 
+test("local contribution preparation exposes only verified bounded results", async () => {
+  const privateCanary = "/Users/private/raw-rollout.jsonl";
+  const payload = {
+    schemaVersion: "local-contribution-preparation-result-v0.1",
+    status: "prepared",
+    coveredAt: {
+      startAt: "2026-07-26T12:00:00.000Z",
+      endAt: "2026-07-26T13:00:00.000Z"
+    },
+    recordCounts: {
+      usageEvents: 10,
+      quotaSnapshots: 2,
+      activityMarkers: 1
+    },
+    privacy: {
+      verdict: "passed",
+      checksPassed: 8,
+      checksFailed: 0,
+      sourceTransportReady: false,
+      provenanceRetained: true
+    },
+    prepared: {
+      schemaVersion: "prepared-contribution-set-v0.1",
+      eligibleSchemaVersion: "telemetry-contribution-v0.1",
+      batchCount: 1,
+      bytes: 4_096
+    },
+    networkActivity: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+    privatePath: privateCanary
+  };
+  const result = normalizeLocalContributionPreparation(payload);
+  assert.equal(result.status, "prepared");
+  assert.equal(result.recordCounts.usageEvents, 10);
+  assert.equal(result.prepared.bytes, 4_096);
+  assert.equal(JSON.stringify(result).includes(privateCanary), false);
+  assert.equal(
+    normalizeLocalContributionPreparation({
+      ...payload,
+      includesPaths: true
+    }).status,
+    "unavailable"
+  );
+
+  const successClient = new LocalCompanionClient({
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "/api/local/contribution/prepare");
+      assert.equal(options.method, "POST");
+      assert.equal(options.headers["X-Usage-Monitor-Local"], "1");
+      assert.equal(options.body, "{}");
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+  assert.equal((await successClient.prepareContribution()).status, "prepared");
+
+  const failureClient = new LocalCompanionClient({
+    fetchImpl: async () => new Response(JSON.stringify({
+      schemaVersion: "local-contribution-preparation-error-v0.1",
+      status: "failed",
+      errorCode: "identity_unavailable",
+      privatePath: privateCanary
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" }
+    })
+  });
+  await assert.rejects(
+    failureClient.prepareContribution(),
+    (error) => error.code === "identity_unavailable"
+      && error.message === "Request failed (503)."
+      && !JSON.stringify(error).includes(privateCanary)
+  );
+});
+
 test("community adapter separates cookie sessions from one-use upload authority", async () => {
   const calls = [];
   const client = new CommunityClient({
@@ -1181,6 +1262,9 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="selected-contribution-inspection"/);
   assert.match(html, /Exact retained fields and values/);
   assert.match(html, /Review every validated field and value/);
+  assert.match(html, /id="index-progress"/);
+  assert.match(html, /id="prepare-contribution"/);
+  assert.match(html, /Raw log contents and source paths never enter this page/);
   assert.match(html, /id="central-state"/);
   assert.match(html, /id="backend"/);
   assert.match(html, /id="backend-state"/);
@@ -1221,6 +1305,11 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /selectionRevision !== contributionSelectionRevision/);
   assert.match(appSource, /files\[0\] !== file/);
   assert.match(appSource, /JSON\.stringify\(payload, null, 2\)/);
+  assert.match(appSource, /renderIndexProgress\(progress/);
+  assert.match(appSource, /progress\.filesProcessed/);
+  assert.match(appSource, /Continuing bounded index/);
+  assert.match(appSource, /prepareLocalContribution/);
+  assert.match(appSource, /localClient\.prepareContribution\(\)/);
   assert.doesNotMatch(appSource, /\brenderStats\(/);
   assert.match(appSource, /communityClient\.createDevicePairing\(/);
   assert.match(appSource, /communityClient\.devices\(\)/);

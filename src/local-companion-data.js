@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { priceCodexUsageEvent } from "./local-api-pricing.js";
@@ -11,6 +11,7 @@ const MAX_LEDGER_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_LEDGER_LINE_BYTES = 1024 * 1024;
 const MAX_LEDGER_RECORDS = 5_000_000;
 const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024;
+const MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024;
 const MAX_DATASET_ROWS = 2_500;
 const MAX_SAFE_TEXT_LENGTH = 2_000;
 
@@ -636,6 +637,8 @@ async function readCollectorProjection(path, nowMs) {
         malformedLines: 0,
         firstRecordAt: null,
         latestRecordAt: null,
+        firstExportableRecordAt: null,
+        latestExportableRecordAt: null,
         usage: summarizeUsage([], nowMs),
         quota: latestQuotaProjection([]),
         tools: summarizeToolClasses([]),
@@ -662,6 +665,8 @@ async function readCollectorProjection(path, nowMs) {
   let malformedLines = 0;
   let firstRecordAt = null;
   let latestRecordAt = null;
+  let firstExportableRecordAt = null;
+  let latestExportableRecordAt = null;
   let latestQuotaRecord = null;
   const lines = createInterface({
     input: createReadStream(path, { encoding: "utf8", highWaterMark: 64 * 1024 }),
@@ -722,6 +727,14 @@ async function readCollectorProjection(path, nowMs) {
     }
     if (value.kind === "codex_rollout_usage_snapshot"
         && observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
+      if (firstExportableRecordAt === null
+          || observedMs < firstExportableRecordAt) {
+        firstExportableRecordAt = observedMs;
+      }
+      if (latestExportableRecordAt === null
+          || observedMs > latestExportableRecordAt) {
+        latestExportableRecordAt = observedMs;
+      }
       const projection = usageProjection(value);
       for (const period of periods) {
         if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
@@ -729,6 +742,16 @@ async function readCollectorProjection(path, nowMs) {
       if (observedMs >= recentStartMs) addTimelineUsage(timelineBuckets, observedMs, projection);
     }
     if (value.kind === "codex_tool_class_event") {
+      if (observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
+        if (firstExportableRecordAt === null
+            || observedMs < firstExportableRecordAt) {
+          firstExportableRecordAt = observedMs;
+        }
+        if (latestExportableRecordAt === null
+            || observedMs > latestExportableRecordAt) {
+          latestExportableRecordAt = observedMs;
+        }
+      }
       const toolClass = KNOWN_TOOL_CLASSES.has(value.toolClass) ? value.toolClass : "other";
       toolCounts[toolClass] += 1;
       toolTotal += 1;
@@ -740,6 +763,8 @@ async function readCollectorProjection(path, nowMs) {
     malformedLines,
     firstRecordAt,
     latestRecordAt,
+    firstExportableRecordAt,
+    latestExportableRecordAt,
     usage: periods.map((period) => finalizeUsagePeriod(period.summary)),
     quota: latestQuotaProjection(latestQuotaRecord === null ? [] : [latestQuotaRecord]),
     tools: { total: toolTotal, counts: toolCounts },
@@ -757,6 +782,156 @@ async function readCollectorProjection(path, nowMs) {
       quota: finalizeQuotaTimeline(quotaTimeline),
     },
     recordCounts,
+  };
+}
+
+function safeIndexCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function canonicalIndexInstant(value, { nullable = false } = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string") return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+      && new Date(milliseconds).toISOString() === value
+    ? value
+    : null;
+}
+
+function validCollectorIndexDescriptor(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const expected = [
+    "boundedBy",
+    "coveredAt",
+    "filesDiscovered",
+    "filesProcessed",
+    "filesSelected",
+    "mode",
+    "phase",
+    "recordsWritten",
+    "status",
+  ];
+  if (Object.keys(value).sort().join("\0")
+      !== expected.sort().join("\0")) return false;
+  if (!value.coveredAt || typeof value.coveredAt !== "object"
+      || Array.isArray(value.coveredAt)
+      || Object.keys(value.coveredAt).sort().join("\0")
+        !== "endAt\0startAt") return false;
+  const startAt = canonicalIndexInstant(value.coveredAt.startAt);
+  const endAt = canonicalIndexInstant(
+    value.coveredAt.endAt,
+    { nullable: true },
+  );
+  if (startAt === null
+      || (value.coveredAt.endAt !== null && endAt === null)
+      || value.boundedBy !== "modified_at_and_collection_start"
+      || !["recent_7d", "prospective"].includes(value.mode)
+      || !["recent_7d_indexing", "recent_7d_complete",
+        "prospective_only", "bounded_pause"].includes(value.status)
+      || !["discovering", "rollout_index", "quota_refresh",
+        "complete", "paused", "prospective"].includes(value.phase)
+      || !["filesDiscovered", "filesSelected", "filesProcessed",
+        "recordsWritten"].every((key) => (
+        Number.isSafeInteger(value[key]) && value[key] >= 0
+      ))
+      || value.filesSelected > value.filesDiscovered
+      || value.filesProcessed > value.filesSelected) return false;
+  if (value.status === "prospective_only") {
+    return value.mode === "prospective"
+      && value.phase === "prospective"
+      && endAt !== null;
+  }
+  if (value.status === "bounded_pause") {
+    return value.phase === "paused" && endAt === null;
+  }
+  if (value.mode !== "recent_7d") return false;
+  if (value.status === "recent_7d_complete") {
+    return ["complete", "quota_refresh"].includes(value.phase)
+      && endAt !== null;
+  }
+  return ["discovering", "rollout_index"].includes(value.phase)
+    && endAt === null;
+}
+
+async function readCollectorIndexProjection(path, collector) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return {
+        status: "not_started",
+        phase: "starting",
+        mode: "recent_7d",
+        filesDiscovered: 0,
+        filesSelected: 0,
+        filesProcessed: 0,
+        recordsWritten: 0,
+        coveredAt: { startAt: null, endAt: null },
+        boundedBy: "modified_at_and_collection_start",
+      };
+    }
+    throw fixedError("collector_unavailable");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()
+      || metadata.size > MAX_CHECKPOINT_BYTES) {
+    throw fixedError("collector_unavailable");
+  }
+  let checkpoint;
+  try {
+    checkpoint = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw fixedError("collector_unavailable");
+  }
+  const diagnostics = checkpoint?.diagnostics ?? {};
+  const retainedFiles = checkpoint?.files
+    && typeof checkpoint.files === "object"
+    && !Array.isArray(checkpoint.files)
+    ? Object.keys(checkpoint.files).length
+    : 0;
+  const raw = validCollectorIndexDescriptor(checkpoint?.indexing)
+    ? checkpoint.indexing
+    : null;
+  const status = raw !== null
+    ? raw.status
+    : safeIndexCount(diagnostics.filesInitializedAtEnd) > 0
+      ? "prospective_only"
+      : collector.recordCount > 0
+        ? "retained_ledger_only"
+        : "not_started";
+  const phase = raw !== null
+    ? raw.phase
+    : status === "bounded_pause" ? "paused"
+      : status === "prospective_only" ? "prospective" : "complete";
+  return {
+    status,
+    phase,
+    mode: raw?.mode === "recent_7d" ? "recent_7d" : "prospective",
+    filesDiscovered: safeIndexCount(
+      raw?.filesDiscovered ?? diagnostics.filesDiscovered,
+    ),
+    filesSelected: safeIndexCount(raw?.filesSelected ?? retainedFiles),
+    filesProcessed: safeIndexCount(
+      raw?.filesProcessed
+      ?? (["recent_7d_complete", "prospective_only", "retained_ledger_only"].includes(status)
+        ? retainedFiles
+        : 0),
+    ),
+    recordsWritten: safeIndexCount(
+      raw?.recordsWritten ?? diagnostics.rolloutRecordsWritten,
+    ),
+    coveredAt: {
+      startAt: collector.firstRecordAt === null
+        ? null
+        : new Date(collector.firstRecordAt).toISOString(),
+      endAt: collector.latestRecordAt === null
+        ? null
+        : new Date(collector.latestRecordAt).toISOString(),
+    },
+    boundedBy: raw?.boundedBy === "modified_at_and_collection_start"
+      ? raw.boundedBy
+      : "prospective_checkpoint_and_retained_ledger",
   };
 }
 
@@ -828,6 +1003,7 @@ async function reportProjection(root) {
 export async function buildLocalCompanionSnapshot({
   root = process.cwd(),
   collectorFile = resolve(root, ".usage-monitor", "collector-events.jsonl"),
+  checkpointFile = resolve(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
@@ -840,6 +1016,7 @@ export async function buildLocalCompanionSnapshot({
     reportProjection(root),
   ]);
   const latestRecordAt = collector.latestRecordAt;
+  const indexing = await readCollectorIndexProjection(checkpointFile, collector);
   const latestEvidenceAt = latestRecordAt === null ? null : new Date(latestRecordAt).toISOString();
   const evidenceAgeSeconds = latestRecordAt === null ? null : Math.max(0, Math.round((nowMs - latestRecordAt) / 1_000));
   const freshnessStatus = evidenceAgeSeconds === null
@@ -857,6 +1034,9 @@ export async function buildLocalCompanionSnapshot({
     : Number(((pricedEvents / displayUsage.events) * 100).toFixed(3));
   const warnings = [];
   if (freshnessStatus === "stale") warnings.push("The newest retained collector evidence is stale.");
+  if (indexing.status === "prospective_only") {
+    warnings.push("The retained ledger began prospectively and does not prove recent-history coverage.");
+  }
   if ((displayUsage?.pricingCoverage.unpricedEvents ?? 0) > 0) {
     warnings.push("Some usage events have an unknown model and are excluded from API-price-equivalent cost.");
   }
@@ -884,12 +1064,21 @@ export async function buildLocalCompanionSnapshot({
         safeRecordCount: collector.recordCount,
         identityMode: "prospective_pseudonymous_not_exposed",
         sourceMode: "content_free_collector_ledger",
-        indexingState: "complete_for_retained_ledger",
+        indexingState: indexing.status,
+        indexing,
         coveredAt: {
           startAt: collector.firstRecordAt === null
             ? null
             : new Date(collector.firstRecordAt).toISOString(),
           endAt: latestEvidenceAt,
+        },
+        exportableCoveredAt: {
+          startAt: collector.firstExportableRecordAt === null
+            ? null
+            : new Date(collector.firstExportableRecordAt).toISOString(),
+          endAt: collector.latestExportableRecordAt === null
+            ? null
+            : new Date(collector.latestExportableRecordAt).toISOString(),
         },
       },
       quota,

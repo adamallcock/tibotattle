@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { appendFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAppServerError } from "../src/codex-app-server.js";
@@ -121,6 +121,149 @@ test("run-once restarts from byte checkpoints without duplicate records", async 
     assert.equal((await readLines(fixture.dataFile)).length, 2);
     assert.equal((await stat(fixture.dataFile)).mode & 0o777, 0o600);
     assert.equal((await stat(fixture.checkpointFile)).mode & 0o777, 0o600);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("fresh recent backfill selects only overlapping archives and reports content-free progress", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const oldArchive = join(
+    fixture.archive,
+    "rollout-2026-06-01T00-00-00-old.jsonl",
+  );
+  const recentArchive = join(
+    fixture.archive,
+    "rollout-2026-07-22T00-00-00-recent.jsonl",
+  );
+  try {
+    await writeFile(
+      oldArchive,
+      `${tokenRecord("2026-06-01T00:00:01.000Z", usage(10), usage(10), 1)}\n`,
+    );
+    await utimes(
+      oldArchive,
+      new Date("2026-06-01T00:00:00.000Z"),
+      new Date("2026-06-01T00:00:00.000Z"),
+    );
+    await writeFile(
+      recentArchive,
+      `${tokenRecord("2026-07-22T00:00:01.000Z", usage(10), usage(10), 2)}\n`,
+    );
+    const progress = [];
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-16T00:00:00.000Z",
+      onProgress: (value) => progress.push(value),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.filesDiscovered, 3);
+    assert.equal(result.filesSelected, 2);
+    assert.equal(result.rolloutRecordsWritten, 2);
+    assert.deepEqual(result.indexing, {
+      mode: "recent_7d",
+      status: "recent_7d_complete",
+      phase: "complete",
+      boundedBy: "modified_at_and_collection_start",
+      filesDiscovered: 3,
+      filesSelected: 2,
+      filesProcessed: 2,
+      recordsWritten: 2,
+      coveredAt: {
+        startAt: "2026-07-16T00:00:00.000Z",
+        endAt: "2026-07-23T00:01:00.000Z",
+      },
+    });
+    assert.ok(progress.length >= 3);
+    assert.ok(progress.every((value) => {
+      const serialized = JSON.stringify(value);
+      return !serialized.includes(fixture.root)
+        && !serialized.includes("old.jsonl")
+        && !serialized.includes("recent.jsonl");
+    }));
+    assert.equal(JSON.stringify(result).includes(fixture.root), false);
+    assert.equal(Object.keys(result).includes("dataFile"), false);
+    assert.equal(result.dataFile, fixture.dataFile, "legacy direct property access remains compatible");
+    assert.equal((await readLines(fixture.dataFile)).length, 2);
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.deepEqual(checkpoint.indexing, result.indexing);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("recent backfill pauses on abort and resumes from the durable checkpoint", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+    tokenRecord("2026-07-23T00:00:02.000Z", usage(20), usage(10), 2),
+  ]);
+  const controller = new AbortController();
+  try {
+    const first = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-16T00:00:00.000Z",
+      maximumRecordBatchSize: 1,
+      signal: controller.signal,
+      onProgress(progress) {
+        if (progress.recordsWritten >= 1) controller.abort();
+      },
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    assert.equal(first.status, "bounded_pause");
+    assert.equal(first.indexing.status, "bounded_pause");
+    assert.equal(first.indexing.phase, "paused");
+    assert.equal(first.indexing.coveredAt.endAt, null);
+    assert.equal((await readLines(fixture.dataFile)).length, 1);
+
+    const resumed = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-16T00:00:00.000Z",
+      maximumRecordBatchSize: 1,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    assert.equal(resumed.status, "complete");
+    assert.equal(resumed.indexing.status, "recent_7d_complete");
+    assert.equal(resumed.indexing.recordsWritten, 2);
+    assert.equal((await readLines(fixture.dataFile)).length, 2);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a backfill request never rewinds an existing prospective checkpoint", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-01T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const now = Date.parse("2026-07-23T00:01:00.000Z");
+  try {
+    await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      clock: () => now,
+    });
+    const before = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-16T00:00:00.000Z",
+      clock: () => now,
+    });
+    const after = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+
+    assert.equal(after.collectionStartedAt, before.collectionStartedAt);
+    assert.equal(result.indexing.mode, "prospective");
+    assert.equal(result.indexing.status, "prospective_only");
+    assert.equal((await readLines(fixture.dataFile)).length, 0);
   } finally {
     await rm(fixture.root, { recursive: true });
   }

@@ -131,6 +131,37 @@ test("local companion builds a closed real-data projection without identifiers o
       join(root, ".usage-monitor", "collector-events.jsonl"),
       `${ledger.map((row) => JSON.stringify(row)).join("\n")}\nmalformed\n`,
     );
+    await writeFile(
+      join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
+      JSON.stringify({
+        schemaVersion: "0.3",
+        collectionStartedAt: "2026-07-18T12:00:00.000Z",
+        files: {
+          "private-inode-key": { offset: 1, privatePath: "/Users/private/rollout.jsonl" },
+        },
+        diagnostics: {
+          filesDiscovered: 3,
+          filesInitializedAtEnd: 0,
+          rolloutRecordsWritten: 5,
+        },
+        indexing: {
+          status: "recent_7d_complete",
+          phase: "complete",
+          mode: "recent_7d",
+          boundedBy: "modified_at_and_collection_start",
+          filesDiscovered: 3,
+          filesSelected: 1,
+          filesProcessed: 1,
+          recordsWritten: 5,
+          coveredAt: {
+            startAt: "2026-07-18T12:00:00.000Z",
+            endAt: "2026-07-25T12:00:00.000Z",
+          },
+        },
+        privateDetail: "person@example.com",
+      }),
+      { mode: 0o600 },
+    );
     const snapshot = await buildLocalCompanionSnapshot({
       root,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
@@ -152,6 +183,25 @@ test("local companion builds a closed real-data projection without identifiers o
       quota: 1,
       tools: 2,
       other: 0,
+    });
+    assert.deepEqual(snapshot.overview.collector.exportableCoveredAt, {
+      startAt: "2026-07-25T11:00:00.000Z",
+      endAt: "2026-07-25T11:47:00.000Z",
+    });
+    assert.equal(snapshot.overview.collector.indexingState, "recent_7d_complete");
+    assert.deepEqual(snapshot.overview.collector.indexing, {
+      status: "recent_7d_complete",
+      phase: "complete",
+      mode: "recent_7d",
+      filesDiscovered: 3,
+      filesSelected: 1,
+      filesProcessed: 1,
+      recordsWritten: 5,
+      coveredAt: {
+        startAt: "2026-07-25T11:00:00.000Z",
+        endAt: "2026-07-25T11:47:00.000Z",
+      },
+      boundedBy: "modified_at_and_collection_start",
     });
     assert.equal(snapshot.overview.timeline.bucketMinutes, 15);
     assert.equal(snapshot.overview.timeline.usage.length, 2);
@@ -181,6 +231,8 @@ test("local companion builds a closed real-data projection without identifiers o
       "https://private.example/",
       "eventKey",
       "accountScope",
+      "private-inode-key",
+      "privatePath",
     ]) {
       assert.equal(serialized.includes(privateValue), false, `response leaked ${privateValue}`);
     }
@@ -194,6 +246,26 @@ test("missing and malformed artifacts fail closed while collector evidence remai
   try {
     await mkdir(join(root, ".usage-monitor"));
     await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await writeFile(
+      join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
+      JSON.stringify({
+        collectionStartedAt: "2026-07-25T12:00:00.000Z",
+        indexing: {
+          mode: "recent_7d",
+          status: "recent_7d_complete",
+          phase: "paused",
+          boundedBy: "modified_at_and_collection_start",
+          filesDiscovered: 1,
+          filesSelected: 2,
+          filesProcessed: 3,
+          recordsWritten: 4,
+          coveredAt: {
+            startAt: "not-an-instant",
+            endAt: null,
+          },
+        },
+      }),
+    );
     await writeFile(join(root, ARTIFACT_FILES.gradient), "{malformed");
     const snapshot = await buildLocalCompanionSnapshot({ root });
     assert.equal(snapshot.gradient.status, "unavailable");
@@ -201,6 +273,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
     assert.equal(snapshot.weekly.status, "unavailable");
     assert.equal(snapshot.weekly.errorCode, "artifact_missing");
     assert.equal(snapshot.reports.every((report) => report.status === "unavailable"), true);
+    assert.equal(snapshot.overview.collector.indexingState, "not_started");
   } finally {
     await rm(root, { recursive: true });
   }
