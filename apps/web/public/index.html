@@ -27,7 +27,7 @@
         <a href="#weekly" data-nav="weekly">Weekly</a>
         <a href="#accounting" data-nav="accounting">Accounting</a>
         <a href="#community" data-nav="community">Community</a>
-        <a href="#history" data-nav="history">History</a>
+        <a href="#history" data-nav="history">Your data</a>
         <a href="#coverage" data-nav="coverage">Gaps</a>
         <a href="#data" data-nav="data">Privacy</a>
         <a href="#backend" data-nav="backend">Backend</a>
@@ -135,6 +135,24 @@
             </div>
             <p class="plain-result" id="comparison-result">
               More observations are required before a useful comparison can be made.
+            </p>
+            <dl class="calibration-facts" id="calibration-facts">
+              <div>
+                <dt>Central fitted rate</dt>
+                <dd id="calibration-rate">Not estimable</dd>
+              </div>
+              <div>
+                <dt>Plausible 80% range</dt>
+                <dd id="calibration-range">Not estimable</dd>
+              </div>
+              <div>
+                <dt>Example translation</dt>
+                <dd id="calibration-example">Not estimable</dd>
+              </div>
+            </dl>
+            <p class="annotation calibration-explanation" id="calibration-explanation">
+              This fit uses API prices as a measuring stick. It is not a
+              provider-published dollar allowance.
             </p>
           </article>
         </div>
@@ -300,6 +318,10 @@
               </div>
             </div>
             <div class="weekly-stats" id="weekly-stats"></div>
+            <div class="weekly-trend" id="weekly-trend" role="status">
+              <strong>Has the inferred limit changed?</strong>
+              <p>There is not yet enough comparable weekly evidence to call a change.</p>
+            </div>
             <p class="annotation" id="weekly-caveat">
               Error is measured on held-out observations when available.
             </p>
@@ -572,6 +594,10 @@
               queue entry and performs no upload.
             </p>
             <div class="local-preparation">
+              <div class="preparation-readiness">
+                <strong>Preparation identity</strong>
+                <span class="evidence-chip neutral" id="preparation-identity">Checking</span>
+              </div>
               <button class="button button-secondary" id="prepare-contribution" type="button">
                 Prepare latest hour locally
               </button>
@@ -725,7 +751,25 @@
                 Resume
               </button>
             </div>
+            <p class="annotation">
+              Sending stays disabled until you open the exact local review for
+              the current queued contribution.
+            </p>
             <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
+            <section class="sync-exact-review" id="sync-exact-review" hidden>
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="panel-kicker">Exact local review</p>
+                  <h4>Every retained field and value in the next upload</h4>
+                </div>
+                <span class="evidence-chip" id="sync-exact-review-state">Verified</span>
+              </div>
+              <p class="annotation">
+                This verified JSON is read from the owner-only prepared set over
+                loopback. It has not been sent to the contribution service.
+              </p>
+              <pre id="sync-exact-review-json" tabindex="0"></pre>
+            </section>
             <p class="backend-contract-note">
               Inspection uses loopback only: it performs no service request,
               key fetch, authorization, or upload. A send action is capped at
@@ -789,9 +833,15 @@
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Your contributed evidence</p>
-                <h3>Private participant analysis</h3>
+                <h3>Your private results, export and deletion</h3>
               </div>
             </div>
+            <p class="annotation">
+              This is the control center for your contributed data. After enrollment
+              or recovery, you can inspect each accepted contribution, download a
+              content-free export, revoke other access, or permanently delete your
+              participant record.
+            </p>
             <div class="result-summary" id="personal-result">
               <p>No accepted contribution is associated with this browser yet.</p>
             </div>

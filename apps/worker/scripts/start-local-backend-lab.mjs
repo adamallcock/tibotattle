@@ -15,6 +15,11 @@ import { join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { inspectLocalBackendState } from "./inspect-local-backend-state.mjs";
+import {
+  backendSmokeSourceArguments,
+  parseLocalBackendLabArguments,
+  projectLocalBackendLabReceipt,
+} from "./start-local-backend-lab-lib.mjs";
 
 const workerDirectory = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const wrangler = resolve(
@@ -24,23 +29,6 @@ const wrangler = resolve(
   process.platform === "win32" ? "wrangler.cmd" : "wrangler",
 );
 const node = process.execPath;
-
-function optionValue(args, name, fallback = null) {
-  const index = args.indexOf(name);
-  if (index < 0) return fallback;
-  const value = args[index + 1];
-  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-  return value;
-}
-
-function boundedPort(value) {
-  if (!/^[0-9]+$/u.test(value)) throw new Error("--port requires an integer");
-  const port = Number(value);
-  if (!Number.isSafeInteger(port) || port < 1024 || port > 65_535) {
-    throw new Error("--port must be between 1024 and 65535");
-  }
-  return port;
-}
 
 async function assertPortAvailable(port) {
   await new Promise((resolvePromise, rejectPromise) => {
@@ -118,7 +106,7 @@ function startWorker(port, stateDirectory, { visible = false } = {}) {
     "ACCOUNT_SCOPED_INGEST_MODE:disabled",
   ], {
     cwd: workerDirectory,
-    env: process.env,
+    env: { ...process.env, WRANGLER_SEND_METRICS: "false" },
     stdio: visible ? "inherit" : ["ignore", "pipe", "pipe"],
   });
   if (!visible) {
@@ -304,23 +292,12 @@ async function probePersistedParticipant(origin, participantAccessFile) {
   };
 }
 
-const args = process.argv.slice(2);
-const valueOptions = new Set(["--port", "--state-directory"]);
-const flagOptions = new Set(["--exit-after-receipt"]);
-for (let index = 0; index < args.length; index += 1) {
-  const argument = args[index];
-  if (flagOptions.has(argument)) continue;
-  if (!valueOptions.has(argument)) throw new Error(`Unknown option: ${argument}`);
-  index += 1;
-  if (!args[index] || args[index].startsWith("--")) {
-    throw new Error(`${argument} requires a value`);
-  }
-}
-
-const port = boundedPort(optionValue(args, "--port", "8792"));
-const exitAfterReceipt = args.includes("--exit-after-receipt");
+const options = parseLocalBackendLabArguments(process.argv.slice(2));
+const port = options.port;
+const exitAfterReceipt = options.exitAfterReceipt;
+const smokeSourceArguments = backendSmokeSourceArguments(options.source);
 await assertPortAvailable(port);
-const labDirectory = createLabDirectory(optionValue(args, "--state-directory"));
+const labDirectory = createLabDirectory(options.stateDirectory);
 const stateDirectory = join(labDirectory, "state");
 const invitationDirectory = join(labDirectory, "redeemed-invitations");
 const lifecycleStateDirectory = join(labDirectory, "lifecycle-state");
@@ -345,12 +322,20 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   await stopWorker(worker);
-  process.stdout.write(`${JSON.stringify({
-    status: "stopped",
-    signal,
-    stateDirectory: labDirectory,
-    dataDeleted: false,
-  })}\n`);
+  const stopped = options.source.mode === "prepared_contribution"
+    ? {
+        status: "stopped",
+        signal,
+        dataDeleted: false,
+        privateWorkspaceRetained: true,
+      }
+    : {
+        status: "stopped",
+        signal,
+        stateDirectory: labDirectory,
+        dataDeleted: false,
+      };
+  process.stdout.write(`${JSON.stringify(stopped)}\n`);
   process.exit(0);
 }
 
@@ -363,7 +348,7 @@ try {
     resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
     "--origin",
     origin,
-    "--generated-content-free-fixture",
+    ...smokeSourceArguments,
     ...lifecycleInvitationFiles.flatMap((path) => ["--invite-file", path]),
   ], "Destructive lifecycle HTTP acceptance", { capture: true });
   const lifecycleSmoke = JSON.parse(lifecycleSmokeOutput);
@@ -381,7 +366,7 @@ try {
     resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
     "--origin",
     origin,
-    "--generated-content-free-fixture",
+    ...smokeSourceArguments,
     "--retain-inspection-state",
     "--participant-access-file",
     participantAccessFile,
@@ -399,7 +384,7 @@ try {
       "The retained R2 object count did not match canonical retention state",
     );
   }
-  worker = startWorker(port, stateDirectory, { visible: true });
+  worker = startWorker(port, stateDirectory, { visible: !exitAfterReceipt });
   const health = await waitForHealth(origin, worker);
   const restartedR2ObjectCount = await inspectLocalR2ObjectCount(origin);
   if (restartedR2ObjectCount !== r2ObjectCount) {
@@ -409,108 +394,110 @@ try {
     origin,
     participantAccessFile,
   );
-  const receipt = {
-    schemaVersion: "local-backend-lab-receipt-v0.2",
-    status: "ready",
-    createdAt: new Date().toISOString(),
-    origin,
-    portalUrl: `${origin}/`,
-    stateDirectory: labDirectory,
-    participantAccessFile,
-    participantAccessFileContainsSecret: true,
-    redeemedInvitationDirectory: invitationDirectory,
-    redeemedInvitationFilesRetained: invitationFiles.length,
-    smoke: {
-      participants: smoke.participants,
-      acceptedRecordsPerParticipant: smoke.acceptedRecordsPerParticipant,
-      idempotentReplay: smoke.idempotentReplay,
-      uploadScopeConflictRejected: smoke.uploadScopeConflictRejected,
-      privacyCanaryRejected: smoke.privacyCanaryRejected,
-      invalidSchemaRejected: smoke.invalidSchemaRejected,
-      oversizedRequestRejected: smoke.oversizedRequestRejected,
-      overCountRejected: smoke.overCountRejected,
-      outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
-      serverValidation: smoke.serverValidation,
-      canonicalServerRepricing: smoke.canonicalServerRepricing,
-      personalStatisticsRecomputed: smoke.personalStatisticsRecomputed,
-      aggregatePublishedAtTwenty: smoke.aggregatePublishedAtTwenty,
-      authenticatedWeeklyComparison: smoke.authenticatedWeeklyComparison,
-      participantExportVerified: smoke.participantExportVerified,
+  const receipt = projectLocalBackendLabReceipt({
+    receipt: {
+      schemaVersion: "local-backend-lab-receipt-v0.3",
+      status: "ready",
+      createdAt: new Date().toISOString(),
+      origin,
+      portalUrl: `${origin}/`,
+      smoke: {
+        participants: smoke.participants,
+        acceptedRecordsPerParticipant: smoke.acceptedRecordsPerParticipant,
+        idempotentReplay: smoke.idempotentReplay,
+        uploadScopeConflictRejected: smoke.uploadScopeConflictRejected,
+        privacyCanaryRejected: smoke.privacyCanaryRejected,
+        invalidSchemaRejected: smoke.invalidSchemaRejected,
+        oversizedRequestRejected: smoke.oversizedRequestRejected,
+        overCountRejected: smoke.overCountRejected,
+        outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
+        serverValidation: smoke.serverValidation,
+        canonicalServerRepricing: smoke.canonicalServerRepricing,
+        personalStatisticsRecomputed: smoke.personalStatisticsRecomputed,
+        aggregatePublishedAtTwenty: smoke.aggregatePublishedAtTwenty,
+        authenticatedWeeklyComparison: smoke.authenticatedWeeklyComparison,
+        participantExportVerified: smoke.participantExportVerified,
+      },
+      destructiveLifecycle: {
+        individualContributionDeletion:
+          lifecycleSmoke.historyUpdatedAfterContributionDeletion,
+        fullParticipantDeletion:
+          lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
+        aggregateWithdrawnOnDeletion:
+          lifecycleSmoke.aggregateWithdrawnOnContributionDeletion,
+        aggregateRebuiltWithoutDeletedSources:
+          lifecycleSmoke.aggregateRebuiltAfterParticipantDeletion,
+        d1: lifecycleStorage.database,
+        deletionLedger: lifecycleStorage.deletionLedger,
+        directLocalR2ObjectCount: lifecycleR2ObjectCount,
+      },
+      persistedRestart: {
+        workerRestartedAgainstSameStateDirectory: true,
+        r2ObjectCountBeforeRestart: r2ObjectCount,
+        r2ObjectCountAfterRestart: restartedR2ObjectCount,
+        ...persistedRestart,
+      },
+      storage: storage.database,
+      encryptedQuarantine: {
+        directLocalR2ObjectCount: r2ObjectCount,
+        canonicalRetainedReferenceCount:
+          storage.database.retainedQuarantineReferences,
+        lifecycleMayDeleteAcceptedObjectsBeforeInspection: true,
+        explorerResponseIncludedObjectKeys: false,
+      },
+      deletionLedger: storage.deletionLedger,
+      health: {
+        database: health.checks.database,
+        deletionLedger: health.checks.deletionLedger,
+        encryptedQuarantine: health.checks.encryptedObjectStore,
+        enrollmentMode: health.enrollmentMode,
+      },
+      acceptance: {
+        safeFileAcceptance: true,
+        forbiddenContentRejected: smoke.privacyCanaryRejected,
+        invalidSchemaRejected: smoke.invalidSchemaRejected,
+        oversizedRequestRejected: smoke.oversizedRequestRejected,
+        overCountRejected: smoke.overCountRejected,
+        outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
+        idempotentDeduplication: smoke.idempotentReplay,
+        conflictSafeCanonicalState: smoke.uploadScopeConflictRejected,
+        canonicalServerRepricing: smoke.canonicalServerRepricing,
+        d1LifecycleVerified: true,
+        r2LifecycleVerified: lifecycleR2ObjectCount === 0
+          && restartedR2ObjectCount === r2ObjectCount,
+        privateStatisticsVerified: smoke.personalStatisticsRecomputed,
+        aggregateStatisticsVerified: smoke.aggregatePublishedAtTwenty,
+        participantExportVerified: smoke.participantExportVerified,
+        individualContributionDeletionVerified:
+          lifecycleSmoke.historyUpdatedAfterContributionDeletion,
+        fullParticipantDeletionVerified:
+          lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
+        persistedRestartVerified:
+          persistedRestart.participantRecovered
+          && persistedRestart.privateStatsRestored,
+      },
     },
-    destructiveLifecycle: {
-      individualContributionDeletion:
-        lifecycleSmoke.historyUpdatedAfterContributionDeletion,
-      fullParticipantDeletion:
-        lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
-      aggregateWithdrawnOnDeletion:
-        lifecycleSmoke.aggregateWithdrawnOnContributionDeletion,
-      aggregateRebuiltWithoutDeletedSources:
-        lifecycleSmoke.aggregateRebuiltAfterParticipantDeletion,
-      d1: lifecycleStorage.database,
-      deletionLedger: lifecycleStorage.deletionLedger,
-      directLocalR2ObjectCount: lifecycleR2ObjectCount,
+    sourceMode: options.source.mode,
+    locations: {
+      stateDirectory: labDirectory,
+      participantAccessFile,
+      redeemedInvitationDirectory: invitationDirectory,
+      redeemedInvitationFilesRetained: invitationFiles.length,
     },
-    persistedRestart: {
-      workerRestartedAgainstSameStateDirectory: true,
-      r2ObjectCountBeforeRestart: r2ObjectCount,
-      r2ObjectCountAfterRestart: restartedR2ObjectCount,
-      ...persistedRestart,
-    },
-    storage: storage.database,
-    encryptedQuarantine: {
-      directLocalR2ObjectCount: r2ObjectCount,
-      canonicalRetainedReferenceCount:
-        storage.database.retainedQuarantineReferences,
-      lifecycleMayDeleteAcceptedObjectsBeforeInspection: true,
-      explorerResponseIncludedObjectKeys: false,
-    },
-    deletionLedger: storage.deletionLedger,
-    health: {
-      database: health.checks.database,
-      deletionLedger: health.checks.deletionLedger,
-      encryptedQuarantine: health.checks.encryptedObjectStore,
-      enrollmentMode: health.enrollmentMode,
-    },
-    acceptance: {
-      safeFileAcceptance: true,
-      forbiddenContentRejected: smoke.privacyCanaryRejected,
-      invalidSchemaRejected: smoke.invalidSchemaRejected,
-      oversizedRequestRejected: smoke.oversizedRequestRejected,
-      overCountRejected: smoke.overCountRejected,
-      outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
-      idempotentDeduplication: smoke.idempotentReplay,
-      conflictSafeCanonicalState: smoke.uploadScopeConflictRejected,
-      canonicalServerRepricing: smoke.canonicalServerRepricing,
-      d1LifecycleVerified: true,
-      r2LifecycleVerified: lifecycleR2ObjectCount === 0
-        && restartedR2ObjectCount === r2ObjectCount,
-      privateStatisticsVerified: smoke.personalStatisticsRecomputed,
-      aggregateStatisticsVerified: smoke.aggregatePublishedAtTwenty,
-      participantExportVerified: smoke.participantExportVerified,
-      individualContributionDeletionVerified:
-        lifecycleSmoke.historyUpdatedAfterContributionDeletion,
-      fullParticipantDeletionVerified:
-        lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
-      persistedRestartVerified:
-        persistedRestart.participantRecovered
-        && persistedRestart.privateStatsRestored,
-    },
-    cleanup: {
-      automaticOnShutdown: false,
-      instruction:
-        "Stop the lab, inspect the exact stateDirectory, then move that directory to Trash.",
-    },
-  };
+  });
   writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`, {
     encoding: "utf8",
     flag: "wx",
     mode: 0o600,
   });
-  process.stdout.write(`${JSON.stringify({
-    ...receipt,
-    receiptFile,
-    note: "The recovery code is only in the owner-only participant access file.",
-  }, null, 2)}\n`);
+  const publicOutput = options.source.mode === "prepared_contribution"
+    ? receipt
+    : {
+        ...receipt,
+        receiptFile,
+        note: "The recovery code is only in the owner-only participant access file.",
+      };
+  process.stdout.write(`${JSON.stringify(publicOutput, null, 2)}\n`);
   if (exitAfterReceipt) await stopWorker(worker);
 } catch (error) {
   await stopWorker(worker);

@@ -494,6 +494,25 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
   assert.equal(calls[1].options.method, undefined);
 });
 
+test("local health exposes the content-free preparation mode", async () => {
+  const calls = [];
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return new Response(JSON.stringify({
+        capabilities: {
+          contributionPreparationIdentityMode: "production_keychain"
+        }
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+  });
+  assert.equal(
+    (await client.health()).capabilities.contributionPreparationIdentityMode,
+    "production_keychain"
+  );
+  assert.deepEqual(calls, ["/api/local/health"]);
+});
+
 test("local contribution queue status remains bounded and fails closed", async () => {
   const normalized = normalizeContributionSyncStatus({
     schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
@@ -573,6 +592,7 @@ test("local contribution queue status remains bounded and fails closed", async (
 
 test("local sync preview and actions keep privileged values behind loopback", async () => {
   const privateCanary = "/Users/private/telemetry-secret.json";
+  const reviewToken = "r".repeat(43);
   const previewPayload = {
     schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
     status: "available",
@@ -689,7 +709,7 @@ test("local sync preview and actions keep privileged values behind loopback", as
     }
   });
   assert.equal((await client.contributionSyncPreview()).state, "ready");
-  assert.equal((await client.runContributionSyncOnce()).accepted, 1);
+  assert.equal((await client.runContributionSyncOnce(reviewToken)).accepted, 1);
   assert.equal((await client.setContributionSyncPaused(true)).state, "paused");
   assert.deepEqual(calls.map((call) => call.url), [
     "/api/local/contribution/sync-next",
@@ -698,9 +718,32 @@ test("local sync preview and actions keep privileged values behind loopback", as
   ]);
   for (const call of calls.slice(1)) {
     assert.equal(call.options.method, "POST");
-    assert.equal(call.options.body, "{}");
     assert.equal(call.options.headers["X-Usage-Monitor-Local"], "1");
   }
+  assert.equal(calls[1].options.body, JSON.stringify({ reviewToken }));
+  assert.equal(calls[2].options.body, "{}");
+});
+
+test("exact prepared review uses a fixed local mutation route", async () => {
+  const calls = [];
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({
+        schemaVersion: "contribution-sync-exact-review-v0.1",
+        status: "available",
+        state: "ready",
+        networkActivity: false,
+        payloadBytes: 100,
+        reviewToken: "r".repeat(43),
+        payload: { schemaVersion: "telemetry-contribution-v0.1" }
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+  });
+  await client.contributionSyncExactReview();
+  assert.equal(calls[0].url, "/api/local/contribution/sync-inspect-exact");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
 });
 
 test("local contribution preparation exposes only verified bounded results", async () => {
@@ -1246,7 +1289,7 @@ test("participant results fail closed for unverifiable prices and honest not-tes
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  for (const label of ["Overview", "Timeline", "Weekly", "Accounting", "Community", "History", "Gaps", "Privacy", "Backend"]) {
+  for (const label of ["Overview", "Timeline", "Weekly", "Accounting", "Community", "Your data", "Gaps", "Privacy", "Backend"]) {
     assert.match(html, new RegExp(label));
   }
   assert.match(html, /id="usage-timeline-chart"/);
@@ -1256,6 +1299,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="accounting-models"/);
   assert.match(html, /id="community"/);
   assert.match(html, /id="history"/);
+  assert.match(html, /Your private results, export and deletion/);
   assert.match(html, /Exact metadata categories a contribution may contain/);
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
@@ -1264,6 +1308,9 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /Review every validated field and value/);
   assert.match(html, /id="index-progress"/);
   assert.match(html, /id="prepare-contribution"/);
+  assert.match(html, /id="preparation-identity"/);
+  assert.match(html, /id="sync-exact-review"/);
+  assert.match(html, /Every retained field and value in the next upload/);
   assert.match(html, /Raw log contents and source paths never enter this page/);
   assert.match(html, /id="central-state"/);
   assert.match(html, /id="backend"/);
@@ -1287,6 +1334,9 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="contribution-history"/);
   assert.match(html, /privacy-safe Usage Monitor export/);
   assert.match(appSource, /demo-button.*addEventListener/s);
+  assert.match(appSource, /contributionSyncExactReview/);
+  assert.match(appSource, /Open Keychain Access, select the login Keychain, unlock it/);
+  assert.match(appSource, /Review every retained field and value below/);
   const loadBody = appSource.match(/async function loadLocalDashboard\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });
@@ -1332,6 +1382,33 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(styles, /grid-template-columns: repeat\(5, minmax\(0, 1fr\)\)/);
   assert.match(styles, /min-height: 48px/);
   assert.match(styles, /\.primary-nav \{[\s\S]*overflow-x: auto;/);
+});
+
+test("default calibration view explains the fitted rate and uncertainty plainly", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  for (const id of [
+    "calibration-rate",
+    "calibration-range",
+    "calibration-example",
+    "calibration-explanation",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(appSource, /function renderCalibrationRate/);
+  assert.match(appSource, /API equivalent per 1 percentage point/);
+  assert.match(appSource, /not an 80% probability/);
+  assert.match(appSource, /not a provider-published dollar cap/);
+});
+
+test("weekly view gives a plain-language change conclusion", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(html, /id="weekly-trend"/);
+  assert.match(html, /Has the inferred limit changed/);
+  assert.match(appSource, /function renderWeeklyTrend/);
+  assert.match(appSource, /no convincing change detected/);
+  assert.match(appSource, /possible accounting or allowance shift/);
 });
 
 test("real contribution UI encrypts before sending and renders delayed snapshots", async () => {

@@ -16,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   conservativeUploadReservationBytes,
   discoverCommittedPreparedSets,
+  inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
   runContributionSyncQueueOnce,
@@ -31,11 +32,15 @@ import {
 } from "../src/telemetry-contribution-builder.js";
 import {
   PREPARED_CONTRIBUTION_SET_VERSION,
+  loadVerifiedPreparedContribution,
   publishPreparedContributionFile,
   publishPreparedContributionManifest,
 } from "../src/telemetry-prepared-set.js";
 import { stableJson } from "../src/storage.js";
-import { createTelemetryEnvelope } from "../apps/web/public/lib.js";
+import {
+  createTelemetryEnvelope,
+  MAX_TELEMETRY_BROWSER_BYTES,
+} from "../apps/web/public/lib.js";
 
 const ORIGIN = "https://usage.example";
 const ACCEPTED_ID =
@@ -200,10 +205,14 @@ test("upload reservation exceeds a real maximum-record encrypted envelope", asyn
 
 test("inspect-next verifies and projects one queued payload without identifiers", async () => {
   const value = await fixture();
+  let nowMilliseconds = Date.parse("2026-07-26T12:00:00.000Z");
   const result = await inspectNextContributionSyncUpload({
     directory: value.preparedRoot,
     queueFile: value.queueFile,
-    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    // Real clocks advance while discovery and verification run. A newly
+    // enqueued job must still be immediately ready rather than appearing to
+    // wait for its own insertion timestamp.
+    now: () => new Date(nowMilliseconds++),
   });
   assert.equal(result.schemaVersion, "contribution-sync-preview-v0.1");
   assert.equal(result.state, "ready");
@@ -236,6 +245,113 @@ test("inspect-next verifies and projects one queued payload without identifiers"
   ]) {
     assert.equal(serialized.includes(privateValue), false);
   }
+});
+
+test("exact inspection returns the verified next telemetry payload without queue identifiers", async () => {
+  const value = await fixture();
+  const verifiedPayloads = [];
+  const result = await inspectExactNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+    loadContribution: async (options) => {
+      const payload = await loadVerifiedPreparedContribution(options);
+      verifiedPayloads.push(payload);
+      return payload;
+    },
+  });
+
+  assert.equal(result.schemaVersion, "contribution-sync-exact-review-v0.1");
+  assert.equal(result.state, "ready");
+  assert.equal(result.networkActivity, false);
+  assert.equal(verifiedPayloads.length, 2);
+  assert.equal(
+    result.payloadBytes,
+    value.prepared.manifest.files[0].bytes,
+  );
+  assert.ok(result.payloadBytes <= MAX_TELEMETRY_BROWSER_BYTES);
+  assert.deepEqual(result.payload, verifiedPayloads.at(-1));
+  assert.deepEqual(result.recordCounts, {
+    usageEvents: 1,
+    quotaSnapshots: 0,
+    activityMarkers: 0,
+    total: 1,
+  });
+  assert.match(
+    result.reviewBinding.jobId,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  );
+  assert.equal(
+    result.reviewBinding.contributionSha256,
+    value.prepared.manifest.files[0].sha256,
+  );
+
+  const outer = JSON.stringify({ ...result, payload: null });
+  for (const privateValue of [
+    value.root,
+    "telemetry-contribution-000001.json",
+    "event:v2:",
+    "session:v1:",
+    "contribution:",
+    "usage.example",
+  ]) {
+    assert.equal(outer.includes(privateValue), false);
+  }
+
+  const aggregate = await inspectNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+  });
+  const aggregateSerialized = JSON.stringify(aggregate);
+  assert.equal(aggregate.item.coveredAt.startAt, result.payload.coveredAt.startAt);
+  assert.equal(aggregate.item.coveredAt.endAt, result.payload.coveredAt.endAt);
+  for (const privateValue of [
+    value.root,
+    "telemetry-contribution-000001.json",
+    "event:v2:",
+    "session:v1:",
+    "contribution:",
+    "usage.example",
+  ]) {
+    assert.equal(aggregateSerialized.includes(privateValue), false);
+  }
+});
+
+test("review-bound foreground send processes exactly the inspected job", async () => {
+  const value = await fixture({ spool: true });
+  await createPreparedSet(value.preparedRoot, {
+    setName: `prepared-set-${randomUUID()}`,
+    index: 2,
+  });
+  const review = await inspectExactNextContributionSyncUpload({
+    directory: value.preparedRoot,
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:00:00.000Z"),
+  });
+  const calls = [];
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    now: () => new Date("2026-07-26T12:01:00.000Z"),
+    reviewedJob: review.reviewBinding,
+    maximumJobs: 10,
+    syncEntry: async (options) => {
+      calls.push(options);
+      return acceptedReceipt();
+    },
+  });
+  assert.equal(result.processed, 1);
+  assert.equal(result.accepted, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].entry.sha256,
+    review.reviewBinding.contributionSha256,
+  );
+  assert.equal(result.queue.counts.accepted, 1);
+  assert.equal(result.queue.counts.pending, 1);
 });
 
 test("inspect-next rejects arbitrary text in projected classification fields", async () => {

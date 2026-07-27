@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,7 +17,74 @@ import {
 import {
   LocalContributionPreparationError,
 } from "../../src/local-contribution-preparation.js";
+import {
+  buildTelemetryContributionsFromBundle,
+} from "../../src/telemetry-contribution-builder.js";
 import { startLocalCompanionServer } from "./server.js";
+
+const DEVELOPMENT_COVERAGE = Object.freeze({
+  startAt: "2026-07-24T21:00:00.000Z",
+  endAt: "2026-07-24T23:02:00.000Z",
+});
+const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
+const REVIEW_SHA256 = "a".repeat(64);
+
+function exactReviewContribution() {
+  return buildTelemetryContributionsFromBundle({
+    schemaVersion: "usage-metadata-bundle-v0.1",
+    createdAt: "2026-07-26T12:10:00.000Z",
+    coveredAt: {
+      startAt: "2026-07-26T12:00:00.000Z",
+      endAt: "2026-07-26T12:10:00.000Z",
+    },
+    clientPlatform: "macos",
+    records: {
+      usageEvents: [{
+        schemaVersion: "usage-event-v0.1",
+        eventTime: "2026-07-26T12:05:00.000Z",
+        provider: "openai_codex",
+        modelId: "gpt-5.6-sol",
+        modelRecognition: "recognized",
+        modelFingerprint: null,
+        billingSurface: "chatgpt_subscription",
+        speedMode: "standard",
+        apiServiceTier: "unknown",
+        reasoningEffort: "unknown",
+        components: {
+          inputUncachedTokens: 100,
+          inputCacheReadTokens: 200,
+          inputCacheWriteTokens: 0,
+          outputTextTokens: 5,
+          outputReasoningTokens: 2,
+        },
+        totalInputContextTokens: 300,
+        surface: "extension_or_ide",
+        agentScope: "root",
+        lineageDisposition: "standalone",
+        toolClassCounts: {
+          webSearch: 0,
+          fileSearch: 0,
+          codeInterpreter: 0,
+          hostedShell: 0,
+          computerUse: 0,
+          mcp: 0,
+          applyPatch: 0,
+          localShell: 0,
+          subagent: 0,
+          toolGateway: 0,
+          other: 0,
+          unknown: 0,
+        },
+        outcome: "unknown",
+        eventId: `event:v2:${"a".repeat(64)}`,
+        sessionScopeId: `session:v1:${"b".repeat(64)}`,
+        accountScopeId: "unattributed",
+      }],
+      quotaSnapshots: [],
+      activityMarkers: [],
+    },
+  })[0];
+}
 
 function fakeStore() {
   let reloads = 0;
@@ -110,8 +184,10 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       explicitRefresh: true,
       contributionPreview: true,
       contributionPreparation: true,
+      contributionPreparationIdentityMode: "production_keychain",
       contributionSyncStatus: true,
       contributionSyncNext: true,
+      contributionSyncExactReview: true,
       contributionSyncActions: false,
       centralServiceProxy: false,
       centralParticipantRelay: false,
@@ -447,6 +523,268 @@ test("contribution preview returns counts and accounting only", async () => {
   }
 });
 
+test("development file override drives the real default preparation runner without Keychain", async () => {
+  const files = await fixture();
+  const privateCanary = "private-session-that-must-not-leak";
+  const secretCanary = Buffer.alloc(32, 37).toString("base64url");
+  const secretFile = join(files.root, "development-export-identity");
+  const codexHome = join(files.root, "codex-home");
+  const sessionDirectory = join(codexHome, "sessions");
+  const preparedDirectory = join(files.root, "prepared");
+  const reviewDirectory = join(files.root, "reviews");
+  const queueFile = join(files.root, "queue.sqlite3");
+  await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(secretFile, `${secretCanary}\n`, { mode: 0o600 });
+  const tokenUsage = {
+    input_tokens: 100,
+    cached_input_tokens: 40,
+    cache_write_input_tokens: 0,
+    output_tokens: 20,
+    reasoning_output_tokens: 8,
+    total_tokens: 120,
+  };
+  const rows = [
+    {
+      timestamp: "2026-07-24T23:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: privateCanary,
+        source: "user",
+      },
+    },
+    {
+      timestamp: "2026-07-24T23:00:01.000Z",
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol" },
+    },
+    {
+      timestamp: "2026-07-24T23:01:00.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: tokenUsage,
+          last_token_usage: tokenUsage,
+        },
+        rate_limits: {
+          limit_id: "codex",
+          plan_type: "pro",
+          primary: {
+            used_percent: 20,
+            window_minutes: 10_080,
+            resets_at: 1_785_438_000,
+          },
+        },
+      },
+    },
+  ];
+  await writeFile(
+    join(sessionDirectory, "rollout-current.jsonl"),
+    `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+    { mode: 0o600 },
+  );
+  const store = fakeStore();
+  store.getOverview = () => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    evidenceStatus: "available",
+    collector: {
+      exportableCoveredAt: DEVELOPMENT_COVERAGE,
+    },
+  });
+  let keychainConstructions = 0;
+  const app = await startLocalCompanionServer({
+    root: files.root,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async () => ({}),
+    environment: {
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: secretFile,
+      USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    },
+    contributionQueueFile: queueFile,
+    preparedContributionDirectory: preparedDirectory,
+    contributionPreparationCreateKeychainBackend() {
+      keychainConstructions += 1;
+      throw new Error("Keychain must not be constructed");
+    },
+    contributionPreparationOptions: {
+      codexHome,
+      activityFile: join(files.root, "missing-activity-markers.jsonl"),
+      reviewArchiveDirectory: reviewDirectory,
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.equal(
+      health.capabilities.contributionPreparationIdentityMode,
+      "development_file_override",
+    );
+    assert.equal(JSON.stringify(health).includes(secretFile), false);
+    assert.equal(JSON.stringify(health).includes(secretCanary), false);
+
+    const prepared = await fetch(
+      `${base}/api/local/contribution/prepare`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: "{}",
+      },
+    );
+    assert.equal(prepared.status, 200);
+    const result = await prepared.json();
+    assert.equal(result.status, "prepared");
+    assert.equal(result.prepared.batchCount, 1);
+    assert.equal(result.networkActivity, false);
+    assert.equal(JSON.stringify(result).includes(files.root), false);
+    assert.equal(JSON.stringify(result).includes(privateCanary), false);
+    assert.equal(JSON.stringify(result).includes(secretCanary), false);
+    assert.equal(keychainConstructions, 0);
+
+    const next = await fetch(
+      `${base}/api/local/contribution/sync-next`,
+    ).then((response) => response.json());
+    assert.equal(next.status, "available");
+    assert.equal(next.state, "ready");
+    assert.equal(next.networkActivity, false);
+
+    const unauthorizedReview = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST" },
+    );
+    assert.equal(unauthorizedReview.status, 403);
+    const exactReviewResponse = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: "{}",
+      },
+    );
+    assert.equal(exactReviewResponse.status, 200);
+    const exactReview = await exactReviewResponse.json();
+    assert.equal(exactReview.status, "available");
+    assert.equal(exactReview.state, "ready");
+    assert.equal(exactReview.networkActivity, false);
+    assert.equal(exactReview.includesExactRetainedFields, true);
+    assert.equal(exactReview.includesRawContent, false);
+    assert.equal(exactReview.includesPaths, false);
+    assert.equal(exactReview.includesDirectIdentifiers, false);
+    assert.equal(exactReview.includesCredentials, false);
+    assert.equal(exactReview.payload.schemaVersion, "telemetry-contribution-v0.1");
+    assert.ok(exactReview.payload.usageEvents.length > 0);
+    assert.ok(exactReview.payloadBytes > 0);
+    assert.match(exactReview.reviewToken, /^[A-Za-z0-9_-]{43}$/u);
+    assert.equal(JSON.stringify(exactReview).includes(files.root), false);
+    assert.equal(JSON.stringify(exactReview).includes(privateCanary), false);
+    assert.equal(JSON.stringify(exactReview).includes(secretCanary), false);
+    assert.equal(
+      (await fetch(
+        `${base}/api/local/contribution/sync-inspect-exact`,
+      )).status,
+      405,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("development identity configuration fails before listen without disclosing its path", async () => {
+  const files = await fixture();
+  const secretFile = join(files.root, "development-export-identity");
+  const secretLink = join(files.root, "development-export-identity-link");
+  const directory = join(files.root, "identity-directory");
+  await writeFile(
+    secretFile,
+    `${Buffer.alloc(32, 41).toString("base64url")}\n`,
+    { mode: 0o600 },
+  );
+  await symlink(secretFile, secretLink);
+  await mkdir(directory, { mode: 0o700 });
+
+  const assertInvalid = async (options) => {
+    await assert.rejects(
+      startLocalCompanionServer({
+        root: files.root,
+        staticRoot: files.staticRoot,
+        dataStore: fakeStore(),
+        refreshRunner: async () => ({}),
+        environment: {},
+        port: 0,
+        ...options,
+      }),
+      (error) => error?.code
+          === "USAGE_MONITOR_DEVELOPMENT_IDENTITY_INVALID"
+        && error.message
+          === "Development identity override configuration is invalid"
+        && !error.message.includes(files.root)
+        && !JSON.stringify(error).includes(files.root),
+    );
+  };
+
+  try {
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: secretFile,
+      },
+    });
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      },
+    });
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE:
+          "relative-export-identity",
+        USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      },
+    });
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: directory,
+        USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      },
+    });
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: secretLink,
+        USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      },
+    });
+
+    await chmod(secretFile, 0o644);
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: secretFile,
+        USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      },
+    });
+    await chmod(secretFile, 0o600);
+    await assertInvalid({
+      environment: {
+        USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: secretFile,
+        USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+        APP_USAGEMONITOR_EXPORT_SECRET: "must-not-be-read",
+      },
+    });
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("contribution preparation is an explicit, bounded, local-only action", async () => {
   const files = await fixture();
   let preparationCalls = 0;
@@ -769,6 +1107,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
   let runCalls = 0;
   let pausedState = false;
   let releaseRun;
+  const reviewedPayload = exactReviewContribution();
   const runGate = new Promise((resolve) => {
     releaseRun = resolve;
   });
@@ -817,9 +1156,26 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
         },
       };
     },
-    contributionSyncOnceRunner: async ({ signal }) => {
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: Buffer.byteLength(JSON.stringify(reviewedPayload), "utf8"),
+      payload: reviewedPayload,
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+    contributionSyncOnceRunner: async ({ signal, reviewedJob }) => {
       runCalls += 1;
       assert.equal(signal instanceof AbortSignal, true);
+      assert.deepEqual(reviewedJob, {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      });
       await runGate;
       return {
         status: "completed",
@@ -881,15 +1237,34 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
       "X-Usage-Monitor-Local": "1",
       Origin: base,
     };
+    const missingReview = await fetch(
+      `${base}/api/local/contribution/sync-once`,
+      { method: "POST", headers, body: "{}" },
+    );
+    assert.equal(missingReview.status, 400);
+    assert.equal(runCalls, 0);
+    const review = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    assert.match(review.reviewToken, /^[A-Za-z0-9_-]{43}$/u);
     const firstRun = fetch(`${base}/api/local/contribution/sync-once`, {
       method: "POST",
       headers,
-      body: "{}",
+      body: JSON.stringify({ reviewToken: review.reviewToken }),
     });
     await waitFor(() => runCalls === 1);
+    const overlapReview = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
     const overlap = await fetch(
       `${base}/api/local/contribution/sync-once`,
-      { method: "POST", headers, body: "{}" },
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewToken: overlapReview.reviewToken }),
+      },
     );
     assert.equal(overlap.status, 409);
     releaseRun();

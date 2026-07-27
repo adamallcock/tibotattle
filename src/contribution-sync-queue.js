@@ -27,6 +27,8 @@ export const CONTRIBUTION_SYNC_STATUS_SCHEMA =
   "contribution-sync-status-v0.1";
 export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA =
   "contribution-sync-preview-v0.1";
+export const CONTRIBUTION_SYNC_EXACT_REVIEW_SCHEMA =
+  "contribution-sync-exact-review-v0.1";
 
 const SQLITE_USER_VERSION = 1;
 const MAX_QUEUE_BYTES = 128 * 1024 * 1024;
@@ -45,6 +47,8 @@ const MAXIMUM_WATCH_INTERVAL_SECONDS = 3600;
 const SET_NAME =
   /^prepared-set-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const CONTRIBUTION_ID =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const JOB_STATES = Object.freeze([
@@ -749,6 +753,40 @@ function safeContributionProjection(payload) {
   };
 }
 
+function nextQueuedJob(database) {
+  return database.prepare(`
+    SELECT job_id, prepared_set_id, set_name, contribution_basename,
+           contribution_sha256, contribution_bytes, schema_version,
+           covered_start_at, covered_end_at, attempt_count, next_attempt_at
+      FROM contribution_jobs
+     WHERE state IN ('pending', 'retryable')
+     ORDER BY created_at, job_id
+     LIMIT 1
+  `).get();
+}
+
+function setAndEntryForQueuedJob(sets, job) {
+  const set = sets.find(
+    (candidate) => candidate.preparedSetId === job.prepared_set_id,
+  );
+  const entry = entryForJob(set, job);
+  if (!set || !entry) fail("queue_invalid");
+  return { set, entry };
+}
+
+function verifiedPayloadForQueuedJob({ sets, job, payload }) {
+  const { set, entry } = setAndEntryForQueuedJob(sets, job);
+  const projection = safeContributionProjection(payload);
+  if (projection.coveredAt.startAt !== job.covered_start_at
+      || projection.coveredAt.endAt !== job.covered_end_at
+      || job.schema_version !== projection.schemaVersion
+      || Buffer.byteLength(stableJson(payload), "utf8")
+        !== job.contribution_bytes) {
+    fail("queue_invalid");
+  }
+  return { set, entry, projection };
+}
+
 export async function inspectNextContributionSyncUpload({
   directory,
   queueFile = defaultContributionSyncQueueFile(),
@@ -765,8 +803,7 @@ export async function inspectNextContributionSyncUpload({
   const sets = await discoverSets({ directory });
   const database = await openQueueDatabase(queueFile, now);
   try {
-    const timestamp = iso(now());
-    recoverExpiredLeases(database, timestamp);
+    recoverExpiredLeases(database, iso(now()));
     const enqueued = await enqueueDiscoveredSets({
       database,
       sets,
@@ -774,16 +811,9 @@ export async function inspectNextContributionSyncUpload({
       loadContribution,
       maximumQueuedJobs,
     });
+    const timestamp = iso(now());
     const queue = statusFromDatabase(database, timestamp);
-    const job = database.prepare(`
-      SELECT job_id, prepared_set_id, set_name, contribution_basename,
-             contribution_sha256, contribution_bytes, schema_version,
-             covered_start_at, covered_end_at, attempt_count, next_attempt_at
-        FROM contribution_jobs
-       WHERE state IN ('pending', 'retryable')
-       ORDER BY created_at, job_id
-       LIMIT 1
-    `).get();
+    const job = nextQueuedJob(database);
     if (!job) {
       return Object.freeze({
         schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA,
@@ -795,21 +825,9 @@ export async function inspectNextContributionSyncUpload({
         item: null,
       });
     }
-    const set = sets.find(
-      (candidate) => candidate.preparedSetId === job.prepared_set_id,
-    );
-    const entry = entryForJob(set, job);
-    if (!set || !entry) fail("queue_invalid");
-    const payload = await loadContribution({
-      directory: set.directory,
-      entry,
-    });
-    const projection = safeContributionProjection(payload);
-    if (projection.coveredAt.startAt !== job.covered_start_at
-        || projection.coveredAt.endAt !== job.covered_end_at
-        || job.schema_version !== projection.schemaVersion) {
-      fail("queue_invalid");
-    }
+    const { set, entry } = setAndEntryForQueuedJob(sets, job);
+    const payload = await loadContribution({ directory: set.directory, entry });
+    const { projection } = verifiedPayloadForQueuedJob({ sets, job, payload });
     const retryWaiting = job.next_attempt_at > timestamp;
     return Object.freeze({
       schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA,
@@ -837,6 +855,79 @@ export async function inspectNextContributionSyncUpload({
   }
 }
 
+/**
+ * Load the exact next queued telemetry contribution for an explicit local
+ * review. This is deliberately separate from the aggregate preview: the
+ * telemetry payload is safe only because it has passed the prepared-set
+ * verifier, while queue bookkeeping remains path- and identifier-free.
+ */
+export async function inspectExactNextContributionSyncUpload({
+  directory,
+  queueFile = defaultContributionSyncQueueFile(),
+  now = () => new Date(),
+  maximumQueuedJobs = MAX_QUEUE_JOBS,
+  discoverSets = discoverCommittedPreparedSets,
+  loadContribution = loadVerifiedPreparedContribution,
+} = {}) {
+  if (typeof discoverSets !== "function"
+      || typeof loadContribution !== "function"
+      || !integer(maximumQueuedJobs, 1, MAX_QUEUE_JOBS)) {
+    fail("configuration_invalid");
+  }
+  const sets = await discoverSets({ directory });
+  const database = await openQueueDatabase(queueFile, now);
+  try {
+    recoverExpiredLeases(database, iso(now()));
+    const enqueued = await enqueueDiscoveredSets({
+      database,
+      sets,
+      now,
+      loadContribution,
+      maximumQueuedJobs,
+    });
+    const timestamp = iso(now());
+    const queue = statusFromDatabase(database, timestamp);
+    const job = nextQueuedJob(database);
+    if (!job) {
+      return Object.freeze({
+        schemaVersion: CONTRIBUTION_SYNC_EXACT_REVIEW_SCHEMA,
+        state: "empty",
+        networkActivity: false,
+        discoveredSets: sets.length,
+        enqueued: enqueued.inserted,
+        queue,
+        payloadBytes: null,
+        payload: null,
+      });
+    }
+    const { set, entry } = setAndEntryForQueuedJob(sets, job);
+    const payload = await loadContribution({ directory: set.directory, entry });
+    const { projection } = verifiedPayloadForQueuedJob({ sets, job, payload });
+    const retryWaiting = job.next_attempt_at > timestamp;
+    return Object.freeze({
+      schemaVersion: CONTRIBUTION_SYNC_EXACT_REVIEW_SCHEMA,
+      state: queue.paused
+        ? "paused"
+        : retryWaiting
+          ? "retry_wait"
+          : "ready",
+      networkActivity: false,
+      discoveredSets: sets.length,
+      enqueued: enqueued.inserted,
+      queue,
+      payloadBytes: job.contribution_bytes,
+      payload: structuredClone(payload),
+      recordCounts: projection.recordCounts,
+      reviewBinding: Object.freeze({
+        jobId: job.job_id,
+        contributionSha256: job.contribution_sha256,
+      }),
+    });
+  } finally {
+    database.close();
+  }
+}
+
 export async function runContributionSyncQueueOnce({
   directory,
   origin,
@@ -852,6 +943,7 @@ export async function runContributionSyncQueueOnce({
   maximumJobs = DEFAULT_MAXIMUM_JOBS_PER_PASS,
   maximumReservedUploadBytes =
     DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
+  reviewedJob = undefined,
   discoverSets = discoverCommittedPreparedSets,
   loadContribution = loadVerifiedPreparedContribution,
   syncEntry = syncPreparedContributionEntryOnce,
@@ -870,6 +962,11 @@ export async function runContributionSyncQueueOnce({
         MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
         MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
       )
+      || (reviewedJob !== undefined
+        && (typeof reviewedJob !== "object"
+          || reviewedJob === null
+          || !UUID_V4.test(reviewedJob.jobId ?? "")
+          || !SHA256.test(reviewedJob.contributionSha256 ?? "")))
       || (signal !== undefined && !(signal instanceof AbortSignal))) {
     fail("configuration_invalid");
   }
@@ -906,14 +1003,28 @@ export async function runContributionSyncQueueOnce({
     const availableSets = new Map(
       sets.map((set) => [set.preparedSetId, set]),
     );
-    const candidates = database.prepare(`
-      SELECT job_id, prepared_set_id, contribution_bytes
-        FROM contribution_jobs
-       WHERE state IN ('pending', 'retryable')
-         AND next_attempt_at <= ?
-       ORDER BY created_at, job_id
-       LIMIT ?
-    `).all(readyAt, maximumJobs);
+    const candidates = reviewedJob === undefined
+      ? database.prepare(`
+        SELECT job_id, prepared_set_id, contribution_bytes
+          FROM contribution_jobs
+         WHERE state IN ('pending', 'retryable')
+           AND next_attempt_at <= ?
+         ORDER BY created_at, job_id
+         LIMIT ?
+      `).all(readyAt, maximumJobs)
+      : database.prepare(`
+        SELECT job_id, prepared_set_id, contribution_bytes
+          FROM contribution_jobs
+         WHERE job_id = ?
+           AND contribution_sha256 = ?
+           AND state IN ('pending', 'retryable')
+           AND next_attempt_at <= ?
+         LIMIT 1
+      `).all(
+        reviewedJob.jobId,
+        reviewedJob.contributionSha256,
+        readyAt,
+      );
     const result = {
       processed: 0,
       accepted: 0,

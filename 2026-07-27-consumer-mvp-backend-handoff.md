@@ -44,8 +44,14 @@ npm run product:backend:acceptance
 The command creates isolated local D1/R2 state, runs destructive lifecycle
 acceptance, creates an inspectable 20-participant state, restarts the Worker
 against that state, verifies recovery and private statistics, writes a
-mode-`0600` `local-backend-lab-receipt-v0.2`, and exits. It prints the exact
+mode-`0600` `local-backend-lab-receipt-v0.3`, and exits. It prints the exact
 temporary state directory so the owner can inspect or move it to Trash.
+
+For an explicitly authorized proof using one real locally sanitized interval,
+run `npm run product:backend:acceptance:real-local --` with the required
+confirmation, exact UTC start/end, Codex home, owner-only identity file, new
+workspace, new receipt destination, and `--cleanup recoverable-trash`. This is
+separate from ordinary startup and never becomes an automatic log scan.
 
 To keep the verified backend running:
 
@@ -100,6 +106,27 @@ by the ordinary 4 MiB API-response ceiling.
 | Persisted restart | Recovery and private statistics restored from the same state | Verified |
 | Final storage state | Destructive pass reaches zero live D1/R2 participant data with tombstones retained | Verified |
 
+## Fresh real-local acceptance
+
+On July 27, 2026, the reproducible real-local command completed against the
+bounded `2026-07-27T01:00:00.000Z`–`02:00:00.000Z` interval:
+
+- 394 sanitized usage events and 402 quota snapshots passed the independent
+  source privacy verifier;
+- four bounded prepared contributions were committed;
+- the selected 200-record contribution passed the same twenty-participant
+  acceptance lifecycle used by the generated fixture;
+- rejection, deduplication, server repricing, private and community results,
+  export, restart, and both deletion scopes all passed; and
+- final live participants, contributions, canonical records, quarantine
+  references, and R2 objects were all zero.
+
+The secret-bearing workspace and temporary development identity were moved to
+Trash. The durable
+`.usage-monitor/private/real-local-backend-acceptance-2026-07-27-v0.1.json`
+receipt is content-free and contains no paths, credentials, account or
+participant identifiers, or source content.
+
 The automated destructive acceptance pass is authoritative for deletion
 storage assertions. Browser QA stopped before clicking irreversible deletion
 controls; the rendered controls and non-destructive export journey were
@@ -123,6 +150,29 @@ file with the wrong contract was visibly rejected before upload. The accepted
 real contribution produced private server-repriced results and contribution
 history through the unified local origin.
 
+A final July 27 pass after the reviewed-upload binding fix rendered all nine
+primary destinations from the same unified loopback page: Overview, Timeline,
+Weekly, Accounting, Community, Your data, Gaps, Privacy, and Backend. It
+confirmed real local values in each view, a ready central health state, delayed
+twenty-participant community evidence, local preparation, and an exact
+4.2-KiB queued-payload review with send disabled before review and enabled only
+after review. The browser reported zero console errors. The reviewed action is
+now a single-use, ten-minute opaque authorization held by the loopback server
+and bound to one queue job plus its prepared-file digest; the queue runner can
+claim only that exact job. A focused re-audit found no remaining
+high-confidence consent-binding defect.
+
+The final browser pass deliberately did not create or remove a participant.
+Its foreground delivery attempt reached the central service but was rejected
+because the isolated local device had not been paired; the reviewed
+authorization was consumed and no other queued item was sent. Accepted ingest,
+participant export, individual deletion, full deletion, aggregate
+rebuild/withdrawal, and restart remain proven by the disposable HTTP
+acceptance run above, while earlier rendered evidence proves the direct
+participant upload and export path. This distinction keeps the browser receipt
+honest instead of treating an unpaired development device as an accepted
+upload.
+
 ## What remains before an outside pilot
 
 These are deliberate boundaries, not hidden completion claims:
@@ -139,6 +189,12 @@ These are deliberate boundaries, not hidden completion claims:
   items. The next safe action is a manual `login` Keychain unlock in Keychain
   Access followed by a retry—not reset, deletion, ACL broadening, or identity
   rotation.
+- The normal queued contribution can now be opened through an authorized
+  loopback exact-review action. The page shows every verified retained field
+  and value, performs no service request, and keeps sending disabled until
+  that review succeeds. An explicit owner-only development identity file is
+  available for isolated testing; production still fails closed on Keychain
+  access and never falls back.
 - A fresh companion checkpoint now indexes a fixed recent seven-day window
   with bounded path-free progress and durable pause/resume. Existing
   prospective checkpoints are not rewound; they are labelled honestly with

@@ -27,6 +27,7 @@ let timelineViewport = null;
 let timelinePointerStart = null;
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
+let contributionSyncExactReview = null;
 let contributionSyncBusy = false;
 let selectedContributionValidated = false;
 let contributionSelectionRevision = 0;
@@ -350,7 +351,11 @@ function renderComparison(data) {
   const summary = data.gradient.summary ?? {};
   const mae = finite(summary.mean_absolute_error_pp ?? summary.meanAbsoluteErrorPp);
   const within = finite(summary.points_within_80_band_fraction ?? summary.pointsWithin80BandFraction);
+  const capacity = finite(summary.capacity_usd ?? summary.capacityUsd);
+  const lower = finite(summary.lower_80_usd ?? summary.lower80Usd);
+  const upper = finite(summary.upper_80_usd ?? summary.upper80Usd);
   const chip = $("#fit-chip");
+  renderCalibrationRate({ capacity, lower, upper });
   if (!pair || pair.observed === null || pair.expected === null) {
     chip.textContent = "Insufficient";
     $("#comparison-result").textContent = "There is not yet a matched quota-and-cost window to compare.";
@@ -366,6 +371,32 @@ function renderComparison(data) {
   const residual = pair.residual ?? pair.observed - pair.expected;
   chip.textContent = mae === null ? "Matched window" : `MAE ${mae.toFixed(1)} pp`;
   $("#comparison-result").textContent = `${formatPp(Math.abs(residual))} separates the observed and cost-implied movement in the latest matched window.${within === null ? "" : ` Across the series, ${formatPercent(within * 100)} of points fall inside the modeled 80% band.`}`;
+}
+
+function renderCalibrationRate({ capacity, lower, upper }) {
+  const rate = $("#calibration-rate");
+  const range = $("#calibration-range");
+  const example = $("#calibration-example");
+  const explanation = $("#calibration-explanation");
+  if (capacity === null || capacity <= 0) {
+    rate.textContent = "Not estimable";
+    range.textContent = "Not estimable";
+    example.textContent = "Not estimable";
+    explanation.textContent =
+      "There is not yet enough matched cost and quota evidence for a positive fitted rate. API prices remain a measuring stick, not a subscription charge.";
+    return;
+  }
+  const perPoint = capacity / 100;
+  const movementForHundred = 10_000 / capacity;
+  rate.textContent = `${formatMoney(perPoint, 2)} API equivalent per 1 percentage point`;
+  range.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
+    ? `${formatMoney(lower / 100, 2)}–${formatMoney(upper / 100, 2)} per point`
+    : "Range unavailable";
+  example.textContent =
+    `$100 of recorded API-price-equivalent usage corresponds to about ${movementForHundred.toFixed(1)} percentage points`;
+  explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
+    ? `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent. The 80% range (${formatMoney(lower, 0)}–${formatMoney(upper, 0)}) describes variation across qualifying reset periods; it is not an 80% probability or a provider-published dollar cap.`
+    : `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.`;
 }
 
 function groupRolling(rows, hours) {
@@ -1101,7 +1132,44 @@ function renderWeekly(data) {
     }));
   }
   renderWeeklyStats(summary, values);
+  renderWeeklyTrend(data.gradient.summary ?? {}, values);
   renderWeeklyTable(values);
+}
+
+function medianValue(values) {
+  const sorted = values.filter(Number.isFinite).toSorted((left, right) => left - right);
+  if (!sorted.length) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function renderWeeklyTrend(gradientSummary, values) {
+  const container = $("#weekly-trend");
+  const earlyFromArtifact = finite(gradientSummary.early_three_median_usd);
+  const recentFromArtifact = finite(gradientSummary.recent_three_median_usd);
+  const artifactChange = finite(gradientSummary.early_to_recent_change);
+  const enoughRows = values.length >= 6;
+  const early = earlyFromArtifact
+    ?? (enoughRows ? medianValue(values.slice(0, 3).map((row) => row.value)) : null);
+  const recent = recentFromArtifact
+    ?? (enoughRows ? medianValue(values.slice(-3).map((row) => row.value)) : null);
+  const change = artifactChange
+    ?? (early !== null && early > 0 && recent !== null ? recent / early - 1 : null);
+  const heading = node("strong", "", "Has the inferred limit changed?");
+  let conclusion;
+  if (change === null || early === null || recent === null) {
+    conclusion = "Not enough comparable resets yet. We need at least three early and three recent weekly estimates before making even a descriptive comparison.";
+  } else {
+    const magnitude = Math.abs(change);
+    const direction = change >= 0 ? "higher" : "lower";
+    const comparison = `The recent three-reset median is ${formatPercent(magnitude * 100, 1)} ${direction} than the early three-reset median (${formatMoney(early)} → ${formatMoney(recent)} API equivalent).`;
+    conclusion = magnitude < 0.15
+      ? `${comparison} That is not a clear regime change given the observed uncertainty, so the practical conclusion is “no convincing change detected.”`
+      : `${comparison} This is a possible accounting or allowance shift, but not proof: it must persist across later resets and remain after plan, account, model, and Fast-mode differences are controlled.`;
+  }
+  container.replaceChildren(heading, node("p", "", conclusion));
 }
 
 function renderWeeklyStats(summary, values) {
@@ -1537,6 +1605,7 @@ function updateContributionSyncButtons() {
     || !available
     || contributionSyncPreview?.deliveryConfigured !== true
     || contributionSyncPreview?.state !== "ready"
+    || contributionSyncExactReview?.state !== "ready"
     || paused;
   $("#sync-pause").disabled = contributionSyncBusy
     || !available
@@ -1555,7 +1624,42 @@ function showContributionSyncAction(message, error = false) {
   status.classList.toggle("error", error);
 }
 
+function clearContributionSyncExactReview() {
+  contributionSyncExactReview = null;
+  $("#sync-exact-review").hidden = true;
+  $("#sync-exact-review-json").textContent = "";
+}
+
+function renderContributionSyncExactReview(value) {
+  if (value?.schemaVersion !== "contribution-sync-exact-review-v0.1"
+      || value.status !== "available"
+      || value.state !== "ready"
+      || value.networkActivity !== false
+      || value.includesExactRetainedFields !== true
+      || value.includesRawContent !== false
+      || value.includesPaths !== false
+      || value.includesDirectIdentifiers !== false
+      || value.includesCredentials !== false
+      || !/^[A-Za-z0-9_-]{43}$/u.test(value.reviewToken ?? "")
+      || !Number.isSafeInteger(value.payloadBytes)
+      || value.payloadBytes < 1
+      || value.payloadBytes > 1_310_720) {
+    throw new Error("The exact local review response was not usable.");
+  }
+  validateContributionForUpload(value.payload);
+  contributionSyncExactReview = {
+    state: value.state,
+    payloadBytes: value.payloadBytes,
+    reviewToken: value.reviewToken,
+  };
+  $("#sync-exact-review-json").textContent = JSON.stringify(value.payload, null, 2);
+  $("#sync-exact-review-state").textContent =
+    `Verified · ${compact(value.payloadBytes)} bytes`;
+  $("#sync-exact-review").hidden = false;
+}
+
 async function refreshContributionSyncControls() {
+  clearContributionSyncExactReview();
   // Preview discovery commits newly prepared sets to the queue. Read queue
   // status afterwards so the two cards describe the same durable state.
   const preview = await localClient.contributionSyncPreview();
@@ -1575,7 +1679,12 @@ async function runContributionSyncAction(action) {
   );
   try {
     if (action === "run") {
-      const result = await localClient.runContributionSyncOnce();
+      if (contributionSyncExactReview?.state !== "ready") {
+        throw new Error("exact review required");
+      }
+      const result = await localClient.runContributionSyncOnce(
+        contributionSyncExactReview.reviewToken
+      );
       if (result.status === "unavailable") throw new Error("sync unavailable");
       showContributionSyncAction(
         `Pass ${result.status}: ${compact(result.processed)} processed, ${compact(result.accepted)} accepted, ${compact(result.reservedUploadBytes)} upload bytes reserved${result.bandwidthLimited ? "; stopped at byte cap" : ""}.`
@@ -1604,18 +1713,21 @@ async function loadLocalDashboard() {
   button.disabled = true;
   button.textContent = "Connecting…";
   try {
-    const [data, syncStatus, syncPreview] = await Promise.all([
+    const [data, syncStatus, syncPreview, localHealth] = await Promise.all([
       localClient.load(),
       localClient.contributionSyncStatus(),
-      localClient.contributionSyncPreview()
+      localClient.contributionSyncPreview(),
+      localClient.health().catch(() => null)
     ]);
     renderDashboard(data);
+    renderPreparationIdentity(localHealth);
     renderContributionSyncStatus(syncStatus);
     renderContributionSyncPreview(syncPreview);
   } catch {
     dashboard = null;
     renderContributionSyncStatus(null);
     renderContributionSyncPreview(null);
+    renderPreparationIdentity(null);
     setGlobalState("offline");
     $("#latest-observation").textContent = "Companion unavailable";
     $("#data-source").textContent = "No real usage is displayed";
@@ -1630,6 +1742,20 @@ async function loadLocalDashboard() {
     button.disabled = false;
     button.textContent = "Refresh local data";
   }
+}
+
+function renderPreparationIdentity(health) {
+  const chip = $("#preparation-identity");
+  const mode = health?.capabilities?.contributionPreparationIdentityMode;
+  const labels = {
+    production_keychain: "Keychain checked on prepare",
+    development_file_override: "Development file ready",
+    development_environment_override: "Development environment override",
+  };
+  chip.textContent = labels[mode] ?? "Unavailable";
+  chip.className = mode === "development_file_override"
+    ? "evidence-chip"
+    : "evidence-chip neutral";
 }
 
 function renderDashboardSkeleton() {
@@ -1713,6 +1839,7 @@ async function prepareLocalContribution() {
   status.classList.remove("error");
   status.textContent =
     "Building and independently verifying a content-free latest-hour contribution. No network upload is performed.";
+  clearContributionSyncExactReview();
   try {
     const result = await localClient.prepareContribution();
     if (result.status !== "prepared") {
@@ -1728,7 +1855,7 @@ async function prepareLocalContribution() {
     status.classList.add("error");
     const preparationMessages = {
       identity_unavailable:
-        "The local Keychain identity is unavailable. Unlock or allow access to the app-usagemonitor export identity, then retry. No upload occurred.",
+        "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then retry. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
       coverage_unavailable:
         "No usable local coverage is available yet. Refresh local data first. No upload occurred.",
       coverage_invalid:
@@ -2964,7 +3091,9 @@ $("#sync-inspect").addEventListener("click", async () => {
   showContributionSyncAction("Inspecting locally verified metadata through loopback; no service request or upload is performed.");
   try {
     await refreshContributionSyncControls();
-    showContributionSyncAction("Inspection complete. No service request or upload was performed.");
+    const review = await localClient.contributionSyncExactReview();
+    renderContributionSyncExactReview(review);
+    showContributionSyncAction("Exact inspection complete. Review every retained field and value below; no service request or upload was performed.");
   } catch {
     showContributionSyncAction("The next contribution could not be inspected.", true);
   } finally {

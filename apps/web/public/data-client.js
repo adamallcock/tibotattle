@@ -1492,6 +1492,10 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
+  health() {
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/health`);
+  }
+
   async refresh() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
       method: "POST",
@@ -1533,20 +1537,24 @@ export class LocalCompanionClient {
     }
   }
 
-  localContributionMutation(path) {
+  contributionSyncExactReview() {
+    return this.localContributionMutation("sync-inspect-exact");
+  }
+
+  localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Usage-Monitor-Local": "1"
       },
-      body: JSON.stringify({})
+      body: JSON.stringify(body)
     });
   }
 
-  async runContributionSyncOnce() {
+  async runContributionSyncOnce(reviewToken) {
     return normalizeContributionSyncRun(
-      await this.localContributionMutation("sync-once")
+      await this.localContributionMutation("sync-once", { reviewToken })
     );
   }
 

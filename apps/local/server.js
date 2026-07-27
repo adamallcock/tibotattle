@@ -1,6 +1,8 @@
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
+import { lstatSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
@@ -14,6 +16,7 @@ import {
   createLocalCollectorRefreshRunner,
 } from "../../src/local-companion-refresh.js";
 import {
+  inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
   runContributionSyncQueueOnce,
@@ -29,6 +32,10 @@ import {
   defaultLocalContributionPreparationDirectories,
   projectLocalContributionPreparationError,
 } from "../../src/local-contribution-preparation.js";
+import {
+  selectProductionParticipantIdentity,
+} from "../../src/export-identity-production.js";
+import { validateTelemetryContribution } from "../web/public/lib.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_REQUEST_BODY_BYTES = 1_024;
@@ -40,6 +47,71 @@ const MAX_PARTICIPANT_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES = 192 * 1024 * 1024;
 const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
+const DEVELOPMENT_IDENTITY_FILE_ENV =
+  "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE";
+const DEVELOPMENT_IDENTITY_OPT_IN_ENV =
+  "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY";
+const EXPORT_IDENTITY_ENV = "APP_USAGEMONITOR_EXPORT_SECRET";
+const REVIEW_TOKEN = /^[A-Za-z0-9_-]{43}$/u;
+const REVIEW_JOB_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
+const REVIEW_AUTHORIZATION_LIFETIME_MS = 10 * 60 * 1000;
+
+function developmentIdentityConfigurationError() {
+  const error = new TypeError(
+    "Development identity override configuration is invalid",
+  );
+  error.code = "USAGE_MONITOR_DEVELOPMENT_IDENTITY_INVALID";
+  return error;
+}
+
+function resolveDevelopmentIdentityConfiguration({
+  file,
+  optIn,
+  environmentExportSecretPresent,
+} = {}) {
+  const fileConfigured = file !== null && file !== undefined;
+  const optInConfigured = optIn !== null && optIn !== undefined;
+  if (!fileConfigured) {
+    if (optInConfigured) throw developmentIdentityConfigurationError();
+    return Object.freeze({
+      explicitSecretFile: null,
+      mode: environmentExportSecretPresent
+        ? "development_environment_override"
+        : "production_keychain",
+    });
+  }
+  if (typeof file !== "string"
+      || file.length < 1
+      || !isAbsolute(file)
+      || optIn !== "1"
+      || environmentExportSecretPresent) {
+    throw developmentIdentityConfigurationError();
+  }
+  let metadata;
+  try {
+    metadata = lstatSync(file);
+  } catch {
+    throw developmentIdentityConfigurationError();
+  }
+  const userId = typeof process.getuid === "function"
+    ? process.getuid()
+    : null;
+  if (!metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.nlink !== 1
+      || metadata.size !== 44
+      || !Number.isSafeInteger(userId)
+      || metadata.uid !== userId
+      || (metadata.mode & 0o7777) !== 0o600) {
+    throw developmentIdentityConfigurationError();
+  }
+  return Object.freeze({
+    explicitSecretFile: file,
+    mode: "development_file_override",
+  });
+}
 
 const PARTICIPANT_RELAY_ROUTES = new Map([
   ["/api/v1/enroll", new Set(["POST"])],
@@ -96,6 +168,7 @@ const API_ROUTES = new Set([
   "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
+  "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/sync-once",
   "/api/local/contribution/sync-pause",
   "/api/local/contribution/sync-resume",
@@ -438,6 +511,54 @@ async function authorizeLocalMutation(
   }
 }
 
+async function authorizeReviewedContributionMutation(
+  request,
+  response,
+  errorCode,
+) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, errorCode);
+    return null;
+  }
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    sendError(response, 415, "unsupported_media_type");
+    return null;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength)
+      && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    sendError(response, 413, "request_too_large");
+    return null;
+  }
+  let bytes = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_REQUEST_BODY_BYTES) {
+      sendError(response, 413, "request_too_large");
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    sendError(response, 400, "invalid_json");
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== 1
+      || !REVIEW_TOKEN.test(value.reviewToken ?? "")) {
+    sendError(response, 400, "invalid_request");
+    return null;
+  }
+  return value.reviewToken;
+}
+
 async function readFixedFile(root, file, maximumBytes) {
   const path = resolve(root, file);
   let metadata;
@@ -639,6 +760,55 @@ function syncNextProjection(value, {
   };
 }
 
+function syncExactReviewProjection(
+  value,
+  { configured = false, reviewToken = null } = {},
+) {
+  const allowedStates = new Set(["empty", "ready", "retry_wait", "paused"]);
+  const validEnvelope = value?.schemaVersion
+      === "contribution-sync-exact-review-v0.1"
+    && value?.networkActivity === false
+    && allowedStates.has(value?.state)
+    && isNonNegativeInteger(value?.discoveredSets)
+    && isNonNegativeInteger(value?.enqueued);
+  const projected = {
+    schemaVersion: "contribution-sync-exact-review-v0.1",
+    status: validEnvelope
+      ? "available"
+      : configured ? "unavailable" : "not_configured",
+    state: validEnvelope ? value.state : "unavailable",
+    networkActivity: false,
+    payloadBytes: null,
+    payload: null,
+    reviewToken: null,
+    includesExactRetainedFields: false,
+    includesRawContent: false,
+    includesPaths: false,
+    includesDirectIdentifiers: false,
+    includesCredentials: false,
+  };
+  if (!validEnvelope || value.state === "empty") return projected;
+  try {
+    validateTelemetryContribution(value.payload);
+  } catch {
+    return { ...projected, status: "unavailable", state: "unavailable" };
+  }
+  const payloadBytes = value.payloadBytes;
+  if (!Number.isSafeInteger(payloadBytes)
+      || payloadBytes < 1
+      || payloadBytes > 1_310_720
+      || Buffer.byteLength(JSON.stringify(value.payload), "utf8") > 1_310_720) {
+    return { ...projected, status: "unavailable", state: "unavailable" };
+  }
+  return {
+    ...projected,
+    payloadBytes,
+    payload: value.payload,
+    reviewToken: REVIEW_TOKEN.test(reviewToken ?? "") ? reviewToken : null,
+    includesExactRetainedFields: true,
+  };
+}
+
 function syncRunProjection(value) {
   const allowedStates = new Set(["completed", "paused", "interrupted"]);
   const numericFields = [
@@ -790,18 +960,25 @@ function preparationErrorStatus(code) {
 
 export function createLocalCompanionServer({
   root = process.cwd(),
+  environment = process.env,
   staticRoot = resolve(root, "apps", "web", "public"),
   dataStore = new LocalCompanionDataStore({
     builder: () => buildLocalCompanionSnapshot({ root }),
   }),
   refreshRunner = createLocalCollectorRefreshRunner(),
   refreshTimeoutMs = 60_000,
-  centralOrigin = process.env.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
+  centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),
   contributionPreparationRunner = null,
+  contributionPreparationOptions = {},
+  contributionPreparationCreateKeychainBackend = undefined,
+  developmentExportSecretFile =
+    environment[DEVELOPMENT_IDENTITY_FILE_ENV] ?? null,
+  developmentIdentityOptIn =
+    environment[DEVELOPMENT_IDENTITY_OPT_IN_ENV] ?? null,
   contributionQueueFile =
-    process.env.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
+    environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
     ?? resolve(
       root,
       ".usage-monitor",
@@ -812,18 +989,23 @@ export function createLocalCompanionServer({
     queueFile: contributionQueueFile,
   }),
   preparedContributionDirectory =
-    process.env.USAGE_MONITOR_PREPARED_DIRECTORY
+    environment.USAGE_MONITOR_PREPARED_DIRECTORY
     ?? defaultLocalContributionPreparationDirectories()
       .preparedSpoolDirectory,
   contributionServiceOrigin = centralOrigin,
   contributionDeviceBackendFactory =
     createProductionContributionDeviceBackend,
   contributionSyncNextProvider = null,
+  contributionSyncExactReviewProvider = null,
   contributionSyncOnceRunner = null,
   contributionSyncPauseSetter = null,
   contributionSyncTimeoutMs = 60_000,
   onError = () => {},
 } = {}) {
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("environment must be an object");
+  }
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
   }
@@ -836,6 +1018,23 @@ export function createLocalCompanionServer({
       "contributionPreparationRunner must be a function or null",
     );
   }
+  if (!contributionPreparationOptions
+      || typeof contributionPreparationOptions !== "object"
+      || Array.isArray(contributionPreparationOptions)) {
+    throw new TypeError("contributionPreparationOptions must be an object");
+  }
+  if (contributionPreparationCreateKeychainBackend !== undefined
+      && typeof contributionPreparationCreateKeychainBackend !== "function") {
+    throw new TypeError(
+      "contributionPreparationCreateKeychainBackend must be a function",
+    );
+  }
+  const developmentIdentity = resolveDevelopmentIdentityConfiguration({
+    file: developmentExportSecretFile,
+    optIn: developmentIdentityOptIn,
+    environmentExportSecretPresent:
+      Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
+  });
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
@@ -854,6 +1053,8 @@ export function createLocalCompanionServer({
   if (typeof contributionDeviceBackendFactory !== "function"
       || (contributionSyncNextProvider !== null
         && typeof contributionSyncNextProvider !== "function")
+      || (contributionSyncExactReviewProvider !== null
+        && typeof contributionSyncExactReviewProvider !== "function")
       || (contributionSyncOnceRunner !== null
         && typeof contributionSyncOnceRunner !== "function")
       || (contributionSyncPauseSetter !== null
@@ -870,11 +1071,18 @@ export function createLocalCompanionServer({
         directory: preparedContributionDirectory,
         queueFile: contributionQueueFile,
       }));
+  const reviewExactContribution = contributionSyncExactReviewProvider
+    ?? (preparedContributionDirectory === null
+      ? async () => null
+      : () => inspectExactNextContributionSyncUpload({
+        directory: preparedContributionDirectory,
+        queueFile: contributionQueueFile,
+      }));
   const runContributionPass = contributionSyncOnceRunner
     ?? (preparedContributionDirectory === null
         || contributionServiceOrigin === null
       ? async () => null
-      : ({ signal }) => runContributionSyncQueueOnce({
+      : ({ signal, reviewedJob }) => runContributionSyncQueueOnce({
         directory: preparedContributionDirectory,
         origin: contributionServiceOrigin,
         backend: contributionDeviceBackendFactory(),
@@ -882,6 +1090,7 @@ export function createLocalCompanionServer({
         maximumJobs: LOCAL_SYNC_MAXIMUM_JOBS,
         maximumReservedUploadBytes:
           LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
+        reviewedJob,
         signal,
       }));
   const setContributionPaused = contributionSyncPauseSetter
@@ -891,18 +1100,34 @@ export function createLocalCompanionServer({
     }));
   const syncPreviewConfigured = preparedContributionDirectory !== null
     || contributionSyncNextProvider !== null;
+  const syncExactReviewConfigured = preparedContributionDirectory !== null
+    || contributionSyncExactReviewProvider !== null;
   const syncDeliveryConfigured =
     (preparedContributionDirectory !== null
       && contributionServiceOrigin !== null)
     || contributionSyncOnceRunner !== null;
   const runContributionPreparation = contributionPreparationRunner
     ?? createLocalContributionPreparationRunner({
+      ...contributionPreparationOptions,
       coverageProvider: () => (
         dataStore.getOverview()?.collector?.exportableCoveredAt
       ),
       ...(preparedContributionDirectory === null
         ? {}
         : { preparedSpoolDirectory: preparedContributionDirectory }),
+      explicitSecretFile: developmentIdentity.explicitSecretFile,
+      selectIdentity: ({ explicitSecretFile }) => (
+        selectProductionParticipantIdentity({
+          explicitSecretFile,
+          environmentSecret: environment[EXPORT_IDENTITY_ENV],
+          ...(contributionPreparationCreateKeychainBackend === undefined
+            ? {}
+            : {
+              createKeychainBackend:
+                contributionPreparationCreateKeychainBackend,
+            }),
+        })
+      ),
     });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
@@ -919,6 +1144,7 @@ export function createLocalCompanionServer({
     centralOrigin,
     fetchImpl: centralFetch,
   });
+  let reviewedContributionAuthorization = null;
 
   const server = createServer(async (request, response) => {
     try {
@@ -1017,8 +1243,11 @@ export function createLocalCompanionServer({
             explicitRefresh: true,
             contributionPreview: true,
             contributionPreparation: true,
+            contributionPreparationIdentityMode:
+              developmentIdentity.mode,
             contributionSyncStatus: true,
             contributionSyncNext: syncPreviewConfigured,
+            contributionSyncExactReview: syncExactReviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
             centralServiceProxy: centralProxy.enabled,
             centralParticipantRelay: participantRelay.enabled,
@@ -1167,7 +1396,7 @@ export function createLocalCompanionServer({
         }));
         return;
       }
-      if (path === "/api/local/contribution/sync-once") {
+      if (path === "/api/local/contribution/sync-inspect-exact") {
         if (request.method !== "POST") {
           sendError(response, 405, "method_not_allowed");
           return;
@@ -1175,8 +1404,56 @@ export function createLocalCompanionServer({
         if (!await authorizeLocalMutation(
           request,
           response,
-          "sync_not_authorized",
+          "exact_review_not_authorized",
         )) return;
+        let review;
+        try {
+          review = await reviewExactContribution();
+        } catch {
+          review = null;
+        }
+        const binding = review?.reviewBinding;
+        const bindingValid = review?.state === "ready"
+          && REVIEW_JOB_ID.test(binding?.jobId ?? "")
+          && SHA256.test(binding?.contributionSha256 ?? "");
+        const reviewToken = bindingValid
+          ? randomBytes(32).toString("base64url")
+          : null;
+        reviewedContributionAuthorization = bindingValid
+          ? {
+            reviewToken,
+            reviewedJob: {
+              jobId: binding.jobId,
+              contributionSha256: binding.contributionSha256,
+            },
+            expiresAt: Date.now() + REVIEW_AUTHORIZATION_LIFETIME_MS,
+          }
+          : null;
+        send(response, 200, syncExactReviewProjection(review, {
+          configured: syncExactReviewConfigured,
+          reviewToken,
+        }));
+        return;
+      }
+      if (path === "/api/local/contribution/sync-once") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const reviewToken = await authorizeReviewedContributionMutation(
+          request,
+          response,
+          "sync_not_authorized",
+        );
+        if (reviewToken === null) return;
+        const authorization = reviewedContributionAuthorization;
+        reviewedContributionAuthorization = null;
+        if (authorization === null
+            || authorization.expiresAt < Date.now()
+            || authorization.reviewToken !== reviewToken) {
+          sendError(response, 409, "review_expired_or_changed");
+          return;
+        }
         if (contributionSyncInProgress) {
           sendError(response, 409, "sync_in_progress");
           return;
@@ -1191,6 +1468,7 @@ export function createLocalCompanionServer({
         try {
           result = await runContributionPass({
             signal: controller.signal,
+            reviewedJob: authorization.reviewedJob,
           });
         } catch {
           sendError(response, 502, "sync_failed");
