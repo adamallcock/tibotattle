@@ -91,7 +91,7 @@ digests.
 | Artifact integrity | Every shipped file verified against manifest | Tamper detection before use/install |
 | Isolated install | Explicit absent target, exact receipt, no overwrite | Bounded installation |
 | Local workflows | Doctor, inspect, export, verify, rotation preflight, deletion/discard preflights | Command surface works from artifact |
-| Network isolation | Every process emits a positive-control-tested JavaScript API-attempt receipt and the complete workflow also succeeds under `sandbox-exec` network denial | Covered Node APIs record zero attempts and native egress is denied; native syscall, QUIC, and non-Node child attempts remain unmeasured |
+| Network isolation | Every process emits positive-control-tested JavaScript and macOS libc attempt receipts; the complete workflow succeeds both under `sandbox-exec` network denial and without that denial | Covered Node APIs and native libc IP-socket/resolver entrypoints record zero attempts in both runs; direct syscall instructions, QUIC frameworks, and non-Node child attempts remain unmeasured |
 | Uninstall | Exact receipt, modified-file refusal, identity preserved | Bounded removal without overclaiming identity erasure |
 | Private-data scan | No prohibited path, credential, email, source-map, or fixture hit | Built tree is distribution-minimized |
 
@@ -100,12 +100,12 @@ digests.
 - Freeze a successor telemetry/receipt compatibility contract only after the
   local-review artifact is proven; the current export contract remains draft
   and transport-disabled.
-- The external audit preload now records and blocks standard Node TCP, server,
-  TLS, DNS, HTTP/1, HTTP/2, UDP, fetch, WebSocket, and EventSource entrypoints
-  and binds zero attempts across 12 processes to the archive and manifest
-  digests. Add native syscall-level attempt telemetry if R8 requires a literal
-  OS-level zero-attempt claim; QUIC and non-Node child attempts remain
-  explicitly unmeasured.
+- The external JavaScript preload and macOS libc interposer bind zero covered
+  attempts across 12 processes to the exact current archive and manifest
+  digests in both denied and permitted network environments. Direct
+  machine-code syscall instructions, QUIC frameworks, and non-Node child
+  attempts remain explicitly unmeasured; do not shorten this to an absolute
+  "zero network attempts" claim.
 - Implement separately confirmed participant Keychain identity removal if the
   owner decides that is required for G1. Ordinary uninstall intentionally
   preserves it.
