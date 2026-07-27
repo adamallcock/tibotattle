@@ -913,6 +913,212 @@ function artifactData(payload) {
   return payload?.snapshot?.datasets ?? payload?.datasets ?? payload ?? {};
 }
 
+const LOCAL_COMPONENT_KEYS = Object.freeze([
+  "input_uncached_tokens",
+  "input_cache_read_tokens",
+  "input_cache_write_tokens",
+  "output_text_tokens",
+  "output_reasoning_tokens",
+  "output_combined_tokens"
+]);
+const LOCAL_MODELS = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5",
+  "gpt-4.1",
+  "unknown"
+]);
+const MONITORING_GAP_COPY = Object.freeze({
+  quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
+  account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
+  fast_mode: ["Fast-mode accounting", "Fast is observed separately from the Standard API-price counterfactual; its quota multiplier remains empirical."],
+  subagents: ["Subagents and child rollouts", "Child-rollout usage is counted when lineage metadata is present; ambiguous lineage remains unknown."],
+  shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
+  third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
+  reasoning_effort: ["Reasoning effort", "Current retained usage snapshots do not expose a reasoning-effort field."],
+  api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority and flex are never inferred from it."],
+  ordinary_chat: ["Ordinary Chat conversations", "Ordinary Chat is excluded from the shared agentic pool unless new provider evidence shows otherwise."]
+});
+
+function normalizeLocalComponents(value) {
+  return Object.fromEntries(LOCAL_COMPONENT_KEYS.map((key) => [
+    key,
+    count(value?.[key], 0)
+  ]));
+}
+
+function normalizeAccountingDimension(value, allowedKeys) {
+  return Object.fromEntries([...allowedKeys].map((key) => {
+    const row = value?.[key] ?? {};
+    return [key, {
+      events: count(row.events, 0),
+      totalTokens: count(row.totalTokens, 0),
+      apiPriceEquivalentUsd: nonNegative(row.apiPriceEquivalentUsd, 0)
+    }];
+  }));
+}
+
+function normalizeLocalTimeline(value = {}) {
+  const usage = array(value.usage).slice(-3_000).flatMap((row) => {
+    const startAt = text(row?.startAt, "");
+    const endAt = text(row?.endAt, "");
+    const startMs = Date.parse(startAt);
+    const endMs = Date.parse(endAt);
+    const usageEvents = count(row?.usageEvents, null);
+    const totalTokens = count(row?.totalTokens, null);
+    const cost = nonNegative(row?.apiPriceEquivalentUsd, null);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs
+        || usageEvents === null || totalTokens === null || cost === null) return [];
+    return [{
+      startAt,
+      endAt,
+      usageEvents,
+      totalTokens,
+      apiPriceEquivalentUsd: cost,
+      components: normalizeLocalComponents(row.components),
+      pricingCoverage: {
+        fullyPricedEvents: count(row?.pricingCoverage?.fullyPricedEvents, 0),
+        partiallyPricedEvents: count(row?.pricingCoverage?.partiallyPricedEvents, 0),
+        unpricedEvents: count(row?.pricingCoverage?.unpricedEvents, 0)
+      }
+    }];
+  });
+  const quota = array(value.quota).slice(-10_000).flatMap((row) => {
+    const observedAt = text(row?.observedAt, "");
+    const usedPercent = finite(row?.usedPercent, null);
+    const remainingPercent = finite(row?.remainingPercent, null);
+    const durationMinutes = count(row?.durationMinutes, null);
+    const resetAt = row?.resetAt === null ? "" : text(row?.resetAt, "");
+    if (!Number.isFinite(Date.parse(observedAt))
+        || usedPercent === null || usedPercent < 0 || usedPercent > 100
+        || remainingPercent === null || remainingPercent < 0 || remainingPercent > 100
+        || (resetAt && !Number.isFinite(Date.parse(resetAt)))) return [];
+    return [{
+      observedAt,
+      usedPercent,
+      remainingPercent,
+      durationMinutes,
+      resetAt,
+      limitId: ["codex", "codex_bengalfox", "unknown"].includes(row?.limitId)
+        ? row.limitId
+        : "unknown",
+      slot: ["primary", "secondary", "unknown"].includes(row?.slot)
+        ? row.slot
+        : "unknown",
+      planType: ["free", "plus", "pro", "team", "business", "enterprise", "unknown"]
+        .includes(row?.planType) ? row.planType : "unknown",
+      accountAttribution: row?.accountAttribution === "attributed_pseudonymous"
+        ? "attributed_pseudonymous"
+        : "unattributed"
+    }];
+  });
+  return {
+    bucketMinutes: count(value.bucketMinutes, 15),
+    coveredAt: {
+      startAt: text(value?.coveredAt?.startAt, ""),
+      endAt: text(value?.coveredAt?.endAt, "")
+    },
+    usage,
+    quota
+  };
+}
+
+function normalizeLocalAccounting(value = {}) {
+  const models = array(value.byModel).slice(0, 32).flatMap((row) => {
+    if (!LOCAL_MODELS.has(row?.model)) return [];
+    return [{
+      model: row.model,
+      events: count(row.events, 0),
+      totalTokens: count(row.totalTokens, 0),
+      apiPriceEquivalentUsd: nonNegative(row.apiPriceEquivalentUsd, 0)
+    }];
+  });
+  const normalized = {
+    periodId: ["24h", "7d", "30d", "all"].includes(value.periodId)
+      ? value.periodId
+      : "all",
+    periodLabel: text(value.periodLabel, "Recorded period"),
+    events: count(value.events, 0),
+    totalTokens: count(value.totalTokens, 0),
+    apiPriceEquivalentUsd: nonNegative(value.apiPriceEquivalentUsd, 0),
+    components: normalizeLocalComponents(value.components),
+    byModel: models,
+    bySpeed: normalizeAccountingDimension(
+      value.bySpeed,
+      new Set(["standard", "fast", "flex", "batch", "unknown"])
+    ),
+    byApiServiceTier: normalizeAccountingDimension(
+      value.byApiServiceTier,
+      new Set(["standard", "priority", "flex", "batch", "unknown"])
+    ),
+    bySurface: normalizeAccountingDimension(
+      value.bySurface,
+      new Set(["extension_or_ide", "scheduled_task", "subagent", "cli_exec", "work", "workspace_agent", "excel", "voice_task", "unknown"])
+    ),
+    byAgentScope: normalizeAccountingDimension(
+      value.byAgentScope,
+      new Set(["root", "subagent", "automation", "unknown"])
+    ),
+    byLineage: normalizeAccountingDimension(
+      value.byLineage,
+      new Set(["standalone", "forked", "parent_linked", "unknown"])
+    ),
+    byReasoningEffort: normalizeAccountingDimension(
+      value.byReasoningEffort,
+      new Set(["unknown"])
+    ),
+    accountAttribution: {
+      attributedPseudonymousEvents: count(
+        value?.accountAttribution?.attributedPseudonymousEvents,
+        0
+      ),
+      unattributedEvents: count(value?.accountAttribution?.unattributedEvents, 0)
+    },
+    toolClasses: {
+      total: count(value?.toolClasses?.total, 0),
+      counts: Object.fromEntries(
+        ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+          .map((key) => [key, count(value?.toolClasses?.counts?.[key], 0)])
+      )
+    },
+    apiPriceCounterfactualTier: value.apiPriceCounterfactualTier === "standard"
+      ? "standard"
+      : "unknown",
+    subscriptionSpeedIsSeparate: value.subscriptionSpeedIsSeparate === true,
+    reasoningEffortAvailable: value.reasoningEffortAvailable === true,
+    unknownModelEvents: count(value.unknownModelEvents, 0),
+    periods: []
+  };
+  normalized.periods = array(value.periods).slice(0, 4).map((period) => (
+    normalizeLocalAccounting({ ...period, periods: [] })
+  ));
+  return normalized;
+}
+
+function normalizeMonitoringGaps(value) {
+  return array(value).flatMap((row) => {
+    const copy = MONITORING_GAP_COPY[row?.id];
+    if (!copy) return [];
+    const status = [
+      "observed",
+      "missing",
+      "partial",
+      "unattributed",
+      "not_observed",
+      "unsupported_or_partial",
+      "unsupported",
+      "unavailable",
+      "mostly_unknown",
+      "excluded"
+    ].includes(row?.status) ? row.status : "unavailable";
+    return [{ id: row.id, title: copy[0], explanation: copy[1], status }];
+  });
+}
+
 function safeState(value, fallback = "insufficient") {
   const normalized = String(value ?? "").toLowerCase();
   if (["live", "current", "ok", "ready"].includes(normalized)) return "live";
@@ -926,9 +1132,21 @@ function normalizeQuota(window, index) {
   const used = finite(window?.usedPercent ?? window?.used_percent ?? window?.used, null);
   const remaining = finite(window?.remainingPercent ?? window?.remaining_percent, used === null ? null : 100 - used);
   const durationMinutes = finite(window?.durationMinutes ?? window?.duration_minutes ?? window?.windowMinutes, null);
+  const limitId = text(window?.limitId, "unknown");
+  const defaultLabel = durationMinutes === 300
+    ? "Five-hour allowance"
+    : limitId === "codex"
+      ? "Seven-day allowance"
+      : limitId === "codex_bengalfox"
+        ? "Secondary observed allowance"
+        : durationMinutes === 10080
+          ? "Provider-reported seven-day window"
+          : "Quota window";
   return {
-    id: text(window?.id ?? window?.limitId, `quota-${index}`),
-    label: text(window?.label, durationMinutes === 10080 ? "Seven-day allowance" : durationMinutes === 300 ? "Five-hour allowance" : "Quota window"),
+    id: text(window?.id ?? limitId, `quota-${index}`),
+    limitId,
+    slot: text(window?.slot, "unknown"),
+    label: text(window?.label, defaultLabel),
     durationMinutes,
     usedPercent: used,
     remainingPercent: remaining,
@@ -936,6 +1154,7 @@ function normalizeQuota(window, index) {
     observedAt: text(window?.observedAt ?? window?.observed_at, ""),
     precision: finite(window?.precision ?? window?.displayPrecision, null),
     planType: text(window?.planType ?? window?.plan_type, ""),
+    accountAttribution: text(window?.accountAttribution, ""),
     status: safeState(window?.status, "live")
   };
 }
@@ -1027,21 +1246,9 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
   const reportsPayload = payload?.reports ?? fragments.reports ?? {};
   const quotaWindows = quotaRows.map((window, index) => normalizeQuota({
     ...window,
-    observedAt: window?.observedAt ?? quota?.observedAt
+    observedAt: window?.observedAt ?? quota?.observedAt,
+    accountAttribution: window?.accountAttribution ?? quota?.accountAttribution
   }, index));
-  const durationCounts = new Map();
-  for (const window of quotaWindows) {
-    const key = window.durationMinutes ?? window.label;
-    durationCounts.set(key, (durationCounts.get(key) ?? 0) + 1);
-  }
-  const durationOrdinals = new Map();
-  for (const window of quotaWindows) {
-    const key = window.durationMinutes ?? window.label;
-    if ((durationCounts.get(key) ?? 0) < 2) continue;
-    const ordinal = (durationOrdinals.get(key) ?? 0) + 1;
-    durationOrdinals.set(key, ordinal);
-    window.label = `Account ${ordinal} · ${window.label.toLowerCase()}`;
-  }
   return {
     schemaVersion: text(overview?.schemaVersion ?? payload?.schemaVersion, "local-dashboard-unknown"),
     mode,
@@ -1059,6 +1266,14 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       usageEvents: overview?.activity?.usageEvents ?? selectedUsage?.events,
       totalTokens: overview?.activity?.totalTokens ?? selectedUsage?.totalTokens
     },
+    usagePeriods: usagePeriods.slice(0, 4).map((period) => ({
+      id: ["24h", "7d", "30d", "all"].includes(period?.id) ? period.id : "all",
+      label: text(period?.label, "Recorded period"),
+      events: count(period?.events, 0),
+      totalTokens: count(period?.totalTokens, 0),
+      apiPriceEquivalentUsd: nonNegative(period?.apiPriceEquivalentUsd, 0),
+      pricedEventFraction: finite(period?.pricedEventFraction, null)
+    })),
     pricing: normalizePricing({
       ...pricing,
       totalCostUsd: pricing?.totalCostUsd ?? selectedUsage?.apiPriceEquivalentUsd,
@@ -1073,7 +1288,46 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
     }),
     coverage: overview?.coverage ?? {},
     warnings: array(overview?.warnings).map((warning) => text(warning?.message ?? warning, "")).filter(Boolean),
-    collector: overview?.collector ?? {},
+    collector: {
+      status: text(overview?.collector?.status, "unavailable"),
+      records: count(overview?.collector?.records, 0),
+      malformedLines: count(overview?.collector?.malformedLines, 0),
+      lastScanAt: text(overview?.collector?.lastScanAt, ""),
+      safeRecordCount: count(overview?.collector?.safeRecordCount, 0),
+      identityMode: text(overview?.collector?.identityMode, ""),
+      sourceMode: text(overview?.collector?.sourceMode, ""),
+      indexingState: text(overview?.collector?.indexingState, ""),
+      coveredAt: {
+        startAt: text(overview?.collector?.coveredAt?.startAt, ""),
+        endAt: text(overview?.collector?.coveredAt?.endAt, "")
+      },
+      recordCounts: {
+        usage: count(overview?.collector?.recordCounts?.usage, 0),
+        quota: count(overview?.collector?.recordCounts?.quota, 0),
+        tools: count(overview?.collector?.recordCounts?.tools, 0),
+        other: count(overview?.collector?.recordCounts?.other, 0)
+      }
+    },
+    timeline: normalizeLocalTimeline(overview?.timeline),
+    accounting: normalizeLocalAccounting(overview?.accounting),
+    monitoringGaps: normalizeMonitoringGaps(overview?.monitoringGaps),
+    artifactStatus: {
+      gradient: {
+        status: text(overview?.artifactStatus?.gradient?.status, "unavailable"),
+        generatedAt: text(overview?.artifactStatus?.gradient?.generatedAt, ""),
+        dataClass: text(overview?.artifactStatus?.gradient?.dataClass, "")
+      },
+      weekly: {
+        status: text(overview?.artifactStatus?.weekly?.status, "unavailable"),
+        generatedAt: text(overview?.artifactStatus?.weekly?.generatedAt, ""),
+        dataClass: text(overview?.artifactStatus?.weekly?.dataClass, "")
+      },
+      quality: {
+        status: text(overview?.artifactStatus?.quality?.status, "unavailable"),
+        generatedAt: text(overview?.artifactStatus?.quality?.generatedAt, ""),
+        dataClass: text(overview?.artifactStatus?.quality?.dataClass, "")
+      }
+    },
     gradient: normalizeGradient(payload?.gradient ?? fragments.gradient),
     weekly: normalizeWeekly(payload?.weekly ?? fragments.weekly),
     quality: normalizeQuality(payload?.quality ?? fragments.quality),

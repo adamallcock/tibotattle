@@ -20,6 +20,7 @@ const COMPONENT_KEYS = Object.freeze([
   "input_cache_write_tokens",
   "output_text_tokens",
   "output_reasoning_tokens",
+  "output_combined_tokens",
 ]);
 
 const KNOWN_MODELS = new Set([
@@ -34,10 +35,27 @@ const KNOWN_MODELS = new Set([
 ]);
 
 const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
+const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
+const KNOWN_SURFACES = new Set([
+  "extension_or_ide",
+  "scheduled_task",
+  "subagent",
+  "cli_exec",
+  "work",
+  "workspace_agent",
+  "excel",
+  "voice_task",
+  "unknown",
+]);
+const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
+const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
 const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
 const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox"]);
 const KNOWN_PLANS = new Set(["free", "plus", "pro", "team", "business", "enterprise", "unknown"]);
 const KNOWN_SLOTS = new Set(["primary", "secondary"]);
+const RECENT_TIMELINE_DAYS = 31;
+const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
+const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 
 const REPORTS = Object.freeze([
   {
@@ -350,6 +368,59 @@ function safeSpeed(speed) {
   return KNOWN_SPEEDS.has(speed) ? speed : "unknown";
 }
 
+function safeEnum(value, allowed) {
+  return allowed.has(value) ? value : "unknown";
+}
+
+function emptyDimension(keys) {
+  return Object.fromEntries([...keys].map((key) => [
+    key,
+    { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
+  ]));
+}
+
+function usageProjection(record) {
+  const components = emptyComponents();
+  addComponents(components, record.components);
+  const totalTokens = Object.values(components).reduce((sum, value) => sum + value, 0);
+  if (totalTokens === 0) return null;
+  const model = safeModel(record.model);
+  let priced;
+  try {
+    priced = priceCodexUsageEvent({
+      timestamp: record.observedAt,
+      model,
+      components,
+    }, {
+      // Subscription speed and the API billing tier are separate concepts.
+      // Standard is the explicit counterfactual until an API tier is observed.
+      apiServiceTier: "standard",
+      priceEpochBasis: "current_price_sensitivity",
+    });
+  } catch {
+    priced = { totalUsd: "0", coverageStatus: "unpriced" };
+  }
+  const rawCost = Number(priced.totalUsd);
+  return {
+    model,
+    components,
+    totalTokens,
+    apiPriceEquivalentUsd: Number.isFinite(rawCost) ? rawCost : 0,
+    pricingCoverageStatus: ["fully_priced", "partially_priced"].includes(priced.coverageStatus)
+      ? priced.coverageStatus
+      : "unpriced",
+    speed: safeSpeed(record.tierSemantics?.codexSpeedMode),
+    apiServiceTier: safeEnum(record.tierSemantics?.apiServiceTier, KNOWN_API_TIERS),
+    surface: safeEnum(record.surfaceClassification?.surface, KNOWN_SURFACES),
+    agentScope: safeEnum(record.surfaceClassification?.agentScope, KNOWN_AGENT_SCOPES),
+    lineage: safeEnum(record.surfaceClassification?.lineageDisposition, KNOWN_LINEAGE),
+    reasoningEffort: "unknown",
+    accountAttribution: record.accountScope?.status === "available"
+      ? "attributed_pseudonymous"
+      : "unattributed",
+  };
+}
+
 function newUsagePeriod(id, label) {
   return {
     id,
@@ -364,51 +435,70 @@ function newUsagePeriod(id, label) {
       unpricedEvents: 0,
     },
     byModel: {},
-    bySpeed: Object.fromEntries([...KNOWN_SPEEDS].map((speed) => [speed, { events: 0, totalTokens: 0 }])),
+    bySpeed: emptyDimension(KNOWN_SPEEDS),
+    byApiServiceTier: emptyDimension(KNOWN_API_TIERS),
+    bySurface: emptyDimension(KNOWN_SURFACES),
+    byAgentScope: emptyDimension(KNOWN_AGENT_SCOPES),
+    byLineage: emptyDimension(KNOWN_LINEAGE),
+    byReasoningEffort: {
+      unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
+    },
+    accountAttribution: {
+      attributedPseudonymousEvents: 0,
+      unattributedEvents: 0,
+    },
   };
 }
 
-function addUsageToPeriod(period, record) {
-  const model = safeModel(record.model);
-  const speed = safeSpeed(record.tierSemantics?.codexSpeedMode);
-  const components = emptyComponents();
-  addComponents(components, record.components);
-  const totalTokens = Object.values(components).reduce((sum, value) => sum + value, 0);
-  if (totalTokens === 0) return;
+function addDimension(dimension, key, projection) {
+  const row = dimension[key] ?? dimension.unknown;
+  row.events += 1;
+  row.totalTokens += projection.totalTokens;
+  row.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+}
+
+function addUsageToPeriod(period, projection) {
+  if (projection === null) return;
   period.events += 1;
-  period.totalTokens += totalTokens;
-  addComponents(period.components, components);
-  const modelSummary = period.byModel[model] ??= {
-    model,
+  period.totalTokens += projection.totalTokens;
+  addComponents(period.components, projection.components);
+  const modelSummary = period.byModel[projection.model] ??= {
+    model: projection.model,
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
   };
   modelSummary.events += 1;
-  modelSummary.totalTokens += totalTokens;
-  period.bySpeed[speed].events += 1;
-  period.bySpeed[speed].totalTokens += totalTokens;
-  let priced;
-  try {
-    priced = priceCodexUsageEvent({
-      timestamp: record.observedAt,
-      model,
-      components,
-    }, {
-      apiServiceTier: "standard",
-      priceEpochBasis: "current_price_sensitivity",
-    });
-  } catch {
-    priced = { totalUsd: "0", coverageStatus: "unpriced" };
+  modelSummary.totalTokens += projection.totalTokens;
+  modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  addDimension(period.bySpeed, projection.speed, projection);
+  addDimension(period.byApiServiceTier, projection.apiServiceTier, projection);
+  addDimension(period.bySurface, projection.surface, projection);
+  addDimension(period.byAgentScope, projection.agentScope, projection);
+  addDimension(period.byLineage, projection.lineage, projection);
+  addDimension(period.byReasoningEffort, projection.reasoningEffort, projection);
+  if (projection.accountAttribution === "attributed_pseudonymous") {
+    period.accountAttribution.attributedPseudonymousEvents += 1;
+  } else {
+    period.accountAttribution.unattributedEvents += 1;
   }
-  const cost = Number(priced.totalUsd);
-  if (Number.isFinite(cost)) {
-    period.apiPriceEquivalentUsd += cost;
-    modelSummary.apiPriceEquivalentUsd += cost;
+  if (projection.pricingCoverageStatus === "fully_priced") {
+    period.pricingCoverage.fullyPricedEvents += 1;
+  } else if (projection.pricingCoverageStatus === "partially_priced") {
+    period.pricingCoverage.partiallyPricedEvents += 1;
   }
-  if (priced.coverageStatus === "fully_priced") period.pricingCoverage.fullyPricedEvents += 1;
-  else if (priced.coverageStatus === "partially_priced") period.pricingCoverage.partiallyPricedEvents += 1;
   else period.pricingCoverage.unpricedEvents += 1;
+}
+
+function finalizeDimension(dimension) {
+  return Object.fromEntries(Object.entries(dimension).map(([key, row]) => [
+    key,
+    {
+      ...row,
+      apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)),
+    },
+  ]));
 }
 
 function finalizeUsagePeriod(period) {
@@ -420,12 +510,118 @@ function finalizeUsagePeriod(period) {
     byModel: Object.values(period.byModel)
       .map((row) => ({ ...row, apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)) }))
       .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd || left.model.localeCompare(right.model)),
+    bySpeed: finalizeDimension(period.bySpeed),
+    byApiServiceTier: finalizeDimension(period.byApiServiceTier),
+    bySurface: finalizeDimension(period.bySurface),
+    byAgentScope: finalizeDimension(period.byAgentScope),
+    byLineage: finalizeDimension(period.byLineage),
+    byReasoningEffort: finalizeDimension(period.byReasoningEffort),
   };
 }
 
 function validObservedAt(record) {
   const timestamp = Date.parse(record?.observedAt);
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function newTimelineBucket(startMs) {
+  return {
+    startMs,
+    endMs: startMs + TIMELINE_BUCKET_MS,
+    usageEvents: 0,
+    totalTokens: 0,
+    components: emptyComponents(),
+    apiPriceEquivalentUsd: 0,
+    fullyPricedEvents: 0,
+    partiallyPricedEvents: 0,
+    unpricedEvents: 0,
+  };
+}
+
+function addTimelineUsage(buckets, observedMs, projection) {
+  if (projection === null) return;
+  const startMs = Math.floor(observedMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS;
+  const bucket = buckets.get(startMs) ?? newTimelineBucket(startMs);
+  bucket.usageEvents += 1;
+  bucket.totalTokens += projection.totalTokens;
+  bucket.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  addComponents(bucket.components, projection.components);
+  if (projection.pricingCoverageStatus === "fully_priced") bucket.fullyPricedEvents += 1;
+  else if (projection.pricingCoverageStatus === "partially_priced") bucket.partiallyPricedEvents += 1;
+  else bucket.unpricedEvents += 1;
+  buckets.set(startMs, bucket);
+}
+
+function finalizeTimelineBuckets(buckets) {
+  return [...buckets.values()]
+    .sort((left, right) => left.startMs - right.startMs)
+    .map((bucket) => ({
+      startAt: new Date(bucket.startMs).toISOString(),
+      endAt: new Date(bucket.endMs).toISOString(),
+      usageEvents: bucket.usageEvents,
+      totalTokens: bucket.totalTokens,
+      components: bucket.components,
+      apiPriceEquivalentUsd: Number(bucket.apiPriceEquivalentUsd.toFixed(6)),
+      pricingCoverage: {
+        fullyPricedEvents: bucket.fullyPricedEvents,
+        partiallyPricedEvents: bucket.partiallyPricedEvents,
+        unpricedEvents: bucket.unpricedEvents,
+      },
+    }));
+}
+
+function quotaWindowProjection(window) {
+  if (!window || typeof window !== "object") return null;
+  const usedPercent = finiteNumber(window.usedPercent);
+  const durationMinutes = Number.isSafeInteger(window.windowDurationMins)
+    && window.windowDurationMins > 0
+    ? window.windowDurationMins
+    : null;
+  const resetsAtSeconds = Number.isSafeInteger(window.resetsAt) && window.resetsAt > 0
+    ? window.resetsAt
+    : null;
+  return {
+    limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
+    slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
+    planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
+    usedPercent,
+    remainingPercent: usedPercent === null
+      ? null
+      : Number(Math.max(0, 100 - usedPercent).toFixed(3)),
+    durationMinutes,
+    resetAt: resetsAtSeconds === null
+      ? null
+      : new Date(resetsAtSeconds * 1_000).toISOString(),
+  };
+}
+
+function finalizeQuotaTimeline(rows) {
+  rows.sort((left, right) => (
+    Date.parse(left.observedAt) - Date.parse(right.observedAt)
+    || left.limitId.localeCompare(right.limitId)
+    || left.slot.localeCompare(right.slot)
+  ));
+  const latestByTrack = new Map();
+  const lastEmittedAtByTrack = new Map();
+  const changes = [];
+  for (const row of rows) {
+    const track = `${row.limitId}:${row.slot}:${row.durationMinutes ?? "unknown"}`;
+    const prior = latestByTrack.get(track);
+    const changed = prior === undefined
+      || prior.usedPercent !== row.usedPercent
+      || prior.resetAt !== row.resetAt
+      || prior.planType !== row.planType
+      || prior.accountAttribution !== row.accountAttribution;
+    const observedMs = Date.parse(row.observedAt);
+    const elapsedSinceEmission = observedMs - (lastEmittedAtByTrack.get(track)
+      ?? Number.NEGATIVE_INFINITY);
+    if (changed || elapsedSinceEmission >= TIMELINE_BUCKET_MS) {
+      changes.push(row);
+      latestByTrack.set(track, row);
+      lastEmittedAtByTrack.set(track, observedMs);
+    }
+  }
+  return deterministicSample(changes, MAX_QUOTA_TIMELINE_POINTS);
 }
 
 async function readCollectorProjection(path, nowMs) {
@@ -438,10 +634,13 @@ async function readCollectorProjection(path, nowMs) {
         status: "missing",
         recordCount: 0,
         malformedLines: 0,
+        firstRecordAt: null,
         latestRecordAt: null,
         usage: summarizeUsage([], nowMs),
         quota: latestQuotaProjection([]),
         tools: summarizeToolClasses([]),
+        timeline: { bucketMinutes: 15, usage: [], quota: [] },
+        recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
       };
     }
     throw fixedError("collector_unavailable");
@@ -454,9 +653,14 @@ async function readCollectorProjection(path, nowMs) {
     { summary: newUsagePeriod("all", "All retained evidence"), start: Number.NEGATIVE_INFINITY },
   ];
   const toolCounts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
+  const recordCounts = { usage: 0, quota: 0, tools: 0, other: 0 };
+  const recentStartMs = nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
+  const timelineBuckets = new Map();
+  const quotaTimeline = [];
   let toolTotal = 0;
   let recordCount = 0;
   let malformedLines = 0;
+  let firstRecordAt = null;
   let latestRecordAt = null;
   let latestQuotaRecord = null;
   const lines = createInterface({
@@ -482,19 +686,47 @@ async function readCollectorProjection(path, nowMs) {
     recordCount += 1;
     if (recordCount > MAX_LEDGER_RECORDS) throw fixedError("collector_invalid_size");
     const observedMs = validObservedAt(value);
+    if (observedMs !== null && (firstRecordAt === null || observedMs < firstRecordAt)) {
+      firstRecordAt = observedMs;
+    }
     if (observedMs !== null && (latestRecordAt === null || observedMs > latestRecordAt)) {
       latestRecordAt = observedMs;
     }
-    if (value.kind === "codex_quota_snapshot" && observedMs !== null
-        && (latestQuotaRecord === null
-          || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0)) {
-      latestQuotaRecord = value;
+    if (value.kind === "codex_quota_snapshot") {
+      recordCounts.quota += 1;
+    } else if (value.kind === "codex_rollout_usage_snapshot") {
+      recordCounts.usage += 1;
+    } else if (value.kind === "codex_tool_class_event") {
+      recordCounts.tools += 1;
+    } else {
+      recordCounts.other += 1;
+    }
+    if (value.kind === "codex_quota_snapshot" && observedMs !== null) {
+      if (latestQuotaRecord === null
+          || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0) {
+        latestQuotaRecord = value;
+      }
+      if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
+        for (const window of Array.isArray(value.windows) ? value.windows : []) {
+          const projected = quotaWindowProjection(window);
+          if (projected === null) continue;
+          quotaTimeline.push({
+            observedAt: new Date(observedMs).toISOString(),
+            ...projected,
+            accountAttribution: value.accountScope?.status === "available"
+              ? "attributed_pseudonymous"
+              : "unattributed",
+          });
+        }
+      }
     }
     if (value.kind === "codex_rollout_usage_snapshot"
         && observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
+      const projection = usageProjection(value);
       for (const period of periods) {
-        if (observedMs >= period.start) addUsageToPeriod(period.summary, value);
+        if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
       }
+      if (observedMs >= recentStartMs) addTimelineUsage(timelineBuckets, observedMs, projection);
     }
     if (value.kind === "codex_tool_class_event") {
       const toolClass = KNOWN_TOOL_CLASSES.has(value.toolClass) ? value.toolClass : "other";
@@ -506,10 +738,25 @@ async function readCollectorProjection(path, nowMs) {
     status: "available",
     recordCount,
     malformedLines,
+    firstRecordAt,
     latestRecordAt,
     usage: periods.map((period) => finalizeUsagePeriod(period.summary)),
     quota: latestQuotaProjection(latestQuotaRecord === null ? [] : [latestQuotaRecord]),
     tools: { total: toolTotal, counts: toolCounts },
+    timeline: {
+      bucketMinutes: TIMELINE_BUCKET_MS / 60_000,
+      coveredAt: {
+        startAt: timelineBuckets.size === 0
+          ? null
+          : new Date(Math.min(...timelineBuckets.keys())).toISOString(),
+        endAt: timelineBuckets.size === 0
+          ? null
+          : new Date(Math.max(...timelineBuckets.keys()) + TIMELINE_BUCKET_MS).toISOString(),
+      },
+      usage: finalizeTimelineBuckets(timelineBuckets),
+      quota: finalizeQuotaTimeline(quotaTimeline),
+    },
+    recordCounts,
   };
 }
 
@@ -519,26 +766,18 @@ function latestQuotaProjection(records) {
     .sort((left, right) => left.observedAt.localeCompare(right.observedAt))
     .at(-1);
   if (!latest) return { status: "unavailable", observedAt: null, windows: [] };
-  const windows = Array.isArray(latest.windows) ? latest.windows.flatMap((window) => {
-    if (!window || typeof window !== "object") return [];
-    const usedPercent = finiteNumber(window.usedPercent);
-    const durationMinutes = Number.isSafeInteger(window.windowDurationMins) && window.windowDurationMins > 0
-      ? window.windowDurationMins
-      : null;
-    const resetsAtSeconds = Number.isSafeInteger(window.resetsAt) && window.resetsAt > 0 ? window.resetsAt : null;
-    return [{
-      limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
-      slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
-      planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
-      usedPercent,
-      remainingPercent: usedPercent === null ? null : Number(Math.max(0, 100 - usedPercent).toFixed(3)),
-      durationMinutes,
-      resetAt: resetsAtSeconds === null ? null : new Date(resetsAtSeconds * 1_000).toISOString(),
-    }];
-  }) : [];
+  const windows = Array.isArray(latest.windows)
+    ? latest.windows.flatMap((window) => {
+      const projected = quotaWindowProjection(window);
+      return projected === null ? [] : [projected];
+    })
+    : [];
   return {
     status: windows.length > 0 ? "available" : "unavailable",
     observedAt: safeText(latest.observedAt),
+    accountAttribution: latest.accountScope?.status === "available"
+      ? "attributed_pseudonymous"
+      : "unattributed",
     windows,
   };
 }
@@ -566,8 +805,9 @@ function summarizeUsage(records, nowMs) {
     if (record.kind !== "codex_rollout_usage_snapshot") continue;
     const observedMs = validObservedAt(record);
     if (observedMs === null || observedMs > nowMs + 5 * 60_000) continue;
+    const projection = usageProjection(record);
     for (const period of periods) {
-      if (observedMs >= period.start) addUsageToPeriod(period.summary, record);
+      if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
     }
   }
   return periods.map((period) => finalizeUsagePeriod(period.summary));
@@ -638,10 +878,19 @@ export async function buildLocalCompanionSnapshot({
       collector: {
         status: collector.status,
         records: collector.recordCount,
+        recordCounts: collector.recordCounts,
         malformedLines: collector.malformedLines,
         lastScanAt: latestEvidenceAt,
         safeRecordCount: collector.recordCount,
         identityMode: "prospective_pseudonymous_not_exposed",
+        sourceMode: "content_free_collector_ledger",
+        indexingState: "complete_for_retained_ledger",
+        coveredAt: {
+          startAt: collector.firstRecordAt === null
+            ? null
+            : new Date(collector.firstRecordAt).toISOString(),
+          endAt: latestEvidenceAt,
+        },
       },
       quota,
       quotaWindows: quota.windows.map((window) => ({
@@ -651,6 +900,51 @@ export async function buildLocalCompanionSnapshot({
       })),
       usage,
       tools,
+      timeline: collector.timeline,
+      accounting: {
+        periodId: displayUsage?.id ?? "all",
+        periodLabel: displayUsage?.label ?? "All retained evidence",
+        events: displayUsage?.events ?? 0,
+        totalTokens: displayUsage?.totalTokens ?? 0,
+        apiPriceEquivalentUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
+        components: displayUsage?.components ?? emptyComponents(),
+        byModel: displayUsage?.byModel ?? [],
+        bySpeed: displayUsage?.bySpeed ?? emptyDimension(KNOWN_SPEEDS),
+        byApiServiceTier: displayUsage?.byApiServiceTier ?? emptyDimension(KNOWN_API_TIERS),
+        bySurface: displayUsage?.bySurface ?? emptyDimension(KNOWN_SURFACES),
+        byAgentScope: displayUsage?.byAgentScope ?? emptyDimension(KNOWN_AGENT_SCOPES),
+        byLineage: displayUsage?.byLineage ?? emptyDimension(KNOWN_LINEAGE),
+        byReasoningEffort: displayUsage?.byReasoningEffort ?? {
+          unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
+        },
+        accountAttribution: displayUsage?.accountAttribution ?? {
+          attributedPseudonymousEvents: 0,
+          unattributedEvents: 0,
+        },
+        toolClasses: tools,
+        apiPriceCounterfactualTier: "standard",
+        subscriptionSpeedIsSeparate: true,
+        reasoningEffortAvailable: false,
+        unknownModelEvents: displayUsage?.byModel
+          ?.find((row) => row.model === "unknown")?.events ?? 0,
+        periods: usage.map((period) => ({
+          periodId: period.id,
+          periodLabel: period.label,
+          events: period.events,
+          totalTokens: period.totalTokens,
+          apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,
+          pricingCoverage: period.pricingCoverage,
+          components: period.components,
+          byModel: period.byModel,
+          bySpeed: period.bySpeed,
+          byApiServiceTier: period.byApiServiceTier,
+          bySurface: period.bySurface,
+          byAgentScope: period.byAgentScope,
+          byLineage: period.byLineage,
+          byReasoningEffort: period.byReasoningEffort,
+          accountAttribution: period.accountAttribution,
+        })),
+      },
       activity: {
         safeRecordCount: collector.recordCount,
         usageEvents: displayUsage?.events ?? 0,
@@ -674,10 +968,88 @@ export async function buildLocalCompanionSnapshot({
         overallPercent: pricingCoveragePercent,
       },
       warnings,
+      monitoringGaps: [
+        {
+          id: "quota_snapshots",
+          title: "Quota snapshots",
+          status: quota.windows.length > 0 ? "observed" : "missing",
+          explanation: quota.windows.length > 0
+            ? "Current provider quota windows are present in the local collector."
+            : "No current quota window is available.",
+        },
+        {
+          id: "account_attribution",
+          title: "Account attribution",
+          status: quota.accountAttribution === "attributed_pseudonymous"
+            ? "partial"
+            : "unattributed",
+          explanation: quota.accountAttribution === "attributed_pseudonymous"
+            ? "The latest quota observation is tied to a local pseudonymous account scope; most usage may still be unattributed."
+            : "The latest observation cannot be tied safely to one local account scope.",
+        },
+        {
+          id: "fast_mode",
+          title: "Fast-mode accounting",
+          status: (displayUsage?.bySpeed?.fast?.events ?? 0) > 0 ? "observed" : "not_observed",
+          explanation: "Subscription Fast is kept separate from the Standard API-price counterfactual; its quota multiplier remains empirical.",
+        },
+        {
+          id: "subagents",
+          title: "Subagents and child rollouts",
+          status: (displayUsage?.byAgentScope?.subagent?.events ?? 0) > 0
+            ? "observed"
+            : "not_observed",
+          explanation: "Child-rollout usage is counted when lineage metadata is present; ambiguous lineage remains unknown.",
+        },
+        {
+          id: "shared_pool_surfaces",
+          title: "Work, Workspace Agents, Excel and connected Voice",
+          status: "unsupported_or_partial",
+          explanation: "These shared-pool surfaces may not write complete local Codex evidence and can explain quota movement not matched locally.",
+        },
+        {
+          id: "third_party_auth",
+          title: "Third-party ChatGPT-authenticated apps",
+          status: "unsupported",
+          explanation: "No complete local accounting source is available for third-party apps using ChatGPT authentication.",
+        },
+        {
+          id: "reasoning_effort",
+          title: "Reasoning effort",
+          status: "unavailable",
+          explanation: "Current retained usage snapshots do not expose a reasoning-effort field.",
+        },
+        {
+          id: "api_service_tier",
+          title: "API service tier",
+          status: (displayUsage?.byApiServiceTier?.unknown?.events ?? 0) > 0
+            ? "mostly_unknown"
+            : "observed",
+          explanation: "Subscription speed is observed separately; API standard, priority and flex are not inferred from it.",
+        },
+        {
+          id: "ordinary_chat",
+          title: "Ordinary Chat conversations",
+          status: "excluded",
+          explanation: "Ordinary Chat is excluded from the shared agentic pool unless new provider evidence shows otherwise.",
+        },
+      ],
       artifactStatus: {
-        gradient: { status: gradient.status, generatedAt: gradient.generatedAt },
-        weekly: { status: weekly.status, generatedAt: weekly.generatedAt },
-        quality: { status: quality.status, generatedAt: quality.generatedAt },
+        gradient: {
+          status: gradient.status,
+          generatedAt: gradient.generatedAt,
+          dataClass: "historical_local_artifact",
+        },
+        weekly: {
+          status: weekly.status,
+          generatedAt: weekly.generatedAt,
+          dataClass: "historical_local_artifact",
+        },
+        quality: {
+          status: quality.status,
+          generatedAt: quality.generatedAt,
+          dataClass: "historical_local_artifact",
+        },
       },
       privacy: {
         rawLogsSentToBrowser: false,

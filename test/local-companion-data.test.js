@@ -79,6 +79,11 @@ test("local companion builds a closed real-data projection without identifiers o
           output_reasoning_tokens: 30,
         },
         tierSemantics: { codexSpeedMode: "fast" },
+        surfaceClassification: {
+          surface: "subagent",
+          agentScope: "subagent",
+          lineageDisposition: "forked",
+        },
         eventKey: "private-event-key",
         accountScope: { scopeId: "private-account-id" },
       },
@@ -138,6 +143,31 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(snapshot.overview.tools.counts.subagent, 1);
     assert.equal(snapshot.overview.tools.counts.other, 1);
     assert.equal(snapshot.overview.collector.malformedLines, 1);
+    assert.deepEqual(snapshot.overview.collector.coveredAt, {
+      startAt: "2026-07-25T11:00:00.000Z",
+      endAt: "2026-07-25T11:47:00.000Z",
+    });
+    assert.deepEqual(snapshot.overview.collector.recordCounts, {
+      usage: 2,
+      quota: 1,
+      tools: 2,
+      other: 0,
+    });
+    assert.equal(snapshot.overview.timeline.bucketMinutes, 15);
+    assert.equal(snapshot.overview.timeline.usage.length, 2);
+    assert.equal(snapshot.overview.timeline.usage[0].usageEvents, 1);
+    assert.equal(snapshot.overview.timeline.quota.length, 1);
+    assert.equal(snapshot.overview.timeline.quota[0].accountAttribution, "unattributed");
+    assert.equal(snapshot.overview.accounting.bySpeed.fast.events, 1);
+    assert.equal(snapshot.overview.accounting.bySurface.subagent.events, 1);
+    assert.equal(snapshot.overview.accounting.byAgentScope.subagent.events, 1);
+    assert.equal(snapshot.overview.accounting.byLineage.forked.events, 1);
+    assert.equal(snapshot.overview.accounting.reasoningEffortAvailable, false);
+    assert.equal(snapshot.overview.accounting.apiPriceCounterfactualTier, "standard");
+    assert.equal(
+      snapshot.overview.monitoringGaps.find((row) => row.id === "ordinary_chat")?.status,
+      "excluded",
+    );
     assert.equal(snapshot.gradient.datasets.summary[0].private_field, undefined);
     assert.equal(snapshot.gradient.datasets.reset_calendar[0].source_url, undefined);
     const serialized = JSON.stringify(snapshot);

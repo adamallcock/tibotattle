@@ -19,7 +19,10 @@ const communityClient = new CommunityClient({
 });
 
 let dashboard = null;
-let activeWindowHours = 3;
+let activeWindowHours = 1;
+let activeTimelineRangeDays = 7;
+let activeUsageGrouping = "hour";
+let activeAccountingPeriod = "7d";
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncBusy = false;
@@ -123,6 +126,14 @@ function formatUtc(value, { dateOnly = false } = {}) {
   ).format(new Date(value));
 }
 
+function formatLocal(value, { dateOnly = false } = {}) {
+  if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
+  return new Intl.DateTimeFormat("en-US", dateOnly
+    ? { month: "short", day: "numeric", year: "numeric" }
+    : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
+  ).format(new Date(value));
+}
+
 function formatAge(value) {
   const seconds = finite(value);
   if (seconds === null) return "Unknown age";
@@ -130,6 +141,20 @@ function formatAge(value) {
   if (seconds < 7200) return `${Math.round(seconds / 60)} minutes ago`;
   if (seconds < 172800) return `${(seconds / 3600).toFixed(1)} hours ago`;
   return `${(seconds / 86400).toFixed(1)} days ago`;
+}
+
+function formatTimeRemaining(value) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "Time remaining unavailable";
+  const remainingMs = timestamp - Date.now();
+  if (remainingMs <= 0) return "Reset due or recently passed";
+  const totalMinutes = Math.ceil(remainingMs / 60_000);
+  const days = Math.floor(totalMinutes / 1_440);
+  const hours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h remaining`;
+  if (hours > 0) return `${hours}h ${minutes}m remaining`;
+  return `${minutes}m remaining`;
 }
 
 function clear(element) {
@@ -207,6 +232,7 @@ function renderDashboard(data) {
   renderComparison(data);
   renderTimeline(data);
   renderWeekly(data);
+  renderAccounting(data);
   renderQuality(data);
   renderCollector(data);
   renderReports(data);
@@ -247,7 +273,13 @@ function renderQuotaCards(data) {
       node("span", "", window.resetAt ? `Resets ${formatUtc(window.resetAt)}` : "Reset unknown")
     );
     card.append(header, value, progress, meta);
-    if (window.observedAt) card.append(node("p", "", `Observed ${formatUtc(window.observedAt)}`));
+    if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
+    if (window.observedAt) {
+      const attribution = window.accountAttribution === "attributed_pseudonymous"
+        ? "pseudonymous account attributed"
+        : "account unattributed";
+      card.append(node("p", "", `Observed ${formatUtc(window.observedAt)} · ${attribution}`));
+    }
     container.append(card);
   }
 }
@@ -286,6 +318,12 @@ function humanize(value) {
 }
 
 function latestRollingPair(data) {
+  if (data.mode !== "demo" && data.timeline?.usage?.length) {
+    const live = liveTimelinePoints(data)
+      .filter((row) => row.observed !== null && row.expected !== null)
+      .at(-1);
+    if (live) return live;
+  }
   if (data.gradient.rollingDetail.length) {
     const row = data.gradient.rollingDetail.at(-1);
     return {
@@ -345,16 +383,181 @@ function groupRolling(rows, hours) {
     .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
+function timelineCutoffMs(data) {
+  const latest = data.timeline.usage.at(-1)?.endAt
+    ?? data.timeline.quota.at(-1)?.observedAt
+    ?? data.freshness.latestObservedAt;
+  const latestMs = Date.parse(latest);
+  return Number.isFinite(latestMs)
+    ? latestMs - activeTimelineRangeDays * 24 * 60 * 60 * 1_000
+    : Number.NEGATIVE_INFINITY;
+}
+
+function latestQuotaAtOrBefore(rows, timestampMs) {
+  let selected = null;
+  for (const row of rows) {
+    const observedMs = Date.parse(row.observedAt);
+    if (observedMs > timestampMs) break;
+    selected = row;
+  }
+  return selected;
+}
+
+function liveTimelinePoints(data) {
+  const usage = data.timeline.usage;
+  const capacity = finite(
+    data.gradient.summary?.capacity_usd
+      ?? data.weekly.summary?.median_weekly_value_usd
+  );
+  if (!usage.length) return [];
+  const windowMs = activeWindowHours * 60 * 60 * 1_000;
+  const cutoff = timelineCutoffMs(data);
+  const preferredQuota = data.timeline.quota.filter((row) => row.limitId === "codex");
+  const quota = (preferredQuota.length ? preferredQuota : data.timeline.quota)
+    .sort((left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt));
+  const points = [];
+  let startIndex = 0;
+  let rollingCost = 0;
+  let rollingEvents = 0;
+  for (let index = 0; index < usage.length; index += 1) {
+    const current = usage[index];
+    const endMs = Date.parse(current.endAt);
+    rollingCost += current.apiPriceEquivalentUsd;
+    rollingEvents += current.usageEvents;
+    while (startIndex <= index
+        && Date.parse(usage[startIndex].endAt) <= endMs - windowMs) {
+      rollingCost -= usage[startIndex].apiPriceEquivalentUsd;
+      rollingEvents -= usage[startIndex].usageEvents;
+      startIndex += 1;
+    }
+    if (endMs < cutoff) continue;
+    const startMs = endMs - windowMs;
+    const before = latestQuotaAtOrBefore(quota, startMs);
+    const after = latestQuotaAtOrBefore(quota, endMs);
+    const maximumBracketGapMs = Math.max(30 * 60 * 1_000, windowMs);
+    const bracketed = before && after
+      && startMs - Date.parse(before.observedAt) <= maximumBracketGapMs
+      && endMs - Date.parse(after.observedAt) <= maximumBracketGapMs;
+    const sameReset = bracketed && before.resetAt && before.resetAt === after.resetAt;
+    const observed = sameReset && after.usedPercent >= before.usedPercent
+      ? after.usedPercent - before.usedPercent
+      : null;
+    const expected = capacity !== null && capacity > 0
+      ? rollingCost / capacity * 100
+      : null;
+    points.push({
+      timestamp: current.endAt,
+      observed,
+      expected,
+      residual: observed === null || expected === null ? null : observed - expected,
+      apiCostUsd: Math.max(0, rollingCost),
+      usageEvents: Math.max(0, rollingEvents),
+      status: !bracketed ? "missing_quota_bracket"
+        : !sameReset ? "reset_or_track_change"
+          : observed === null ? "backward_or_ambiguous"
+            : "matched"
+    });
+  }
+  return points;
+}
+
+function groupedUsageTimeline(data) {
+  const sizes = {
+    hour: 60 * 60 * 1_000,
+    day: 24 * 60 * 60 * 1_000,
+    week: 7 * 24 * 60 * 60 * 1_000
+  };
+  const size = sizes[activeUsageGrouping] ?? sizes.hour;
+  const cutoff = timelineCutoffMs(data);
+  const groups = new Map();
+  for (const row of data.timeline.usage) {
+    const timestamp = Date.parse(row.startAt);
+    if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
+    const startMs = Math.floor(timestamp / size) * size;
+    const group = groups.get(startMs) ?? {
+      timestamp: new Date(startMs).toISOString(),
+      apiCostUsd: 0,
+      usageEvents: 0,
+      totalTokens: 0
+    };
+    group.apiCostUsd += row.apiPriceEquivalentUsd;
+    group.usageEvents += row.usageEvents;
+    group.totalTokens += row.totalTokens;
+    groups.set(startMs, group);
+  }
+  return [...groups.values()]
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp))
+    .map((row) => ({ ...row, apiCostUsd: Number(row.apiCostUsd.toFixed(6)) }));
+}
+
+function renderUsageTimeline(data) {
+  const points = groupedUsageTimeline(data);
+  const shell = $("#usage-timeline-chart");
+  const empty = $("#usage-timeline-empty");
+  const label = { hour: "hour", day: "day", week: "week" }[activeUsageGrouping];
+  $("#usage-timeline-title").textContent =
+    `API-price-equivalent usage by ${label} · latest ${activeTimelineRangeDays} day${activeTimelineRangeDays === 1 ? "" : "s"}`;
+  if (!points.length) {
+    shell.hidden = true;
+    empty.hidden = false;
+  } else {
+    shell.hidden = false;
+    empty.hidden = true;
+    shell.replaceChildren(lineChart({
+      points,
+      series: [{
+        key: "apiCostUsd",
+        className: "chart-line-value",
+        label: "API-price-equivalent usage"
+      }],
+      yLabel: "API-equivalent USD",
+      title: "Real local API-price-equivalent usage over time",
+      description: "Content-free local usage metadata grouped over the selected interval.",
+      includeZero: true
+    }));
+  }
+  const summary = $("#usage-timeline-summary");
+  clear(summary);
+  const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
+  const events = points.reduce((sum, row) => sum + row.usageEvents, 0);
+  const tokens = points.reduce((sum, row) => sum + row.totalTokens, 0);
+  for (const [name, value] of [
+    ["Real local buckets", compact(points.length)],
+    ["API-price equivalent", formatApiMoney(total)],
+    ["Usage events", compact(events)],
+    ["Recorded tokens", compact(tokens)]
+  ]) {
+    const item = node("div");
+    item.append(node("span", "", name), node("strong", "", value));
+    summary.append(item);
+  }
+}
+
 function renderTimeline(data) {
-  const points = groupRolling([...data.gradient.rollingHistory, ...data.gradient.rolling], activeWindowHours);
-  $("#timeline-chart-title").textContent = `${activeWindowHours}-hour rolling quota change versus cost-implied change`;
-  $("#timeline-chart-copy").textContent = "UTC timestamps · observed and API-cost-equivalent movement";
+  renderUsageTimeline(data);
+  const livePoints = data.mode !== "demo" ? liveTimelinePoints(data) : [];
+  const historicalPoints = groupRolling(
+    [...data.gradient.rollingHistory, ...data.gradient.rolling],
+    activeWindowHours
+  );
+  const liveMatched = livePoints.filter(
+    (row) => row.observed !== null && row.expected !== null
+  ).length;
+  const usingLive = liveMatched > 0 || historicalPoints.length === 0;
+  const points = usingLive ? livePoints : historicalPoints;
+  const windowLabel = activeWindowHours === 0.25
+    ? "15-minute"
+    : `${activeWindowHours}-hour`;
+  $("#timeline-chart-title").textContent = `${windowLabel} rolling quota change versus cost-implied change`;
+  $("#timeline-chart-copy").textContent = usingLive
+    ? "Real local collector · UTC chart axis · exact UTC and local times in the table below"
+    : `Historical local calibration artifact from ${formatUtc(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
   if (!points.length) {
     shell.hidden = true;
     empty.hidden = false;
-    empty.querySelector("strong").textContent = `No ${activeWindowHours}-hour series loaded`;
+    empty.querySelector("strong").textContent = `No ${windowLabel} series loaded`;
     empty.querySelector("p").textContent = "This is a missing-data state, not a zero-usage period.";
   } else {
     empty.hidden = true;
@@ -377,11 +580,21 @@ function renderTimeline(data) {
 function renderTimelineSummary(data, points) {
   const summary = data.gradient.summary ?? {};
   const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === activeWindowHours);
+  const matched = points.filter((row) => row.observed !== null && row.expected !== null);
+  const live = points.some((row) => Object.hasOwn(row, "status"));
+  const liveMae = matched.length
+    ? matched.reduce((sum, row) => sum + Math.abs(row.observed - row.expected), 0) / matched.length
+    : null;
+  const livePeak = matched.length
+    ? Math.max(...matched.map((row) => Math.abs(row.observed - row.expected)))
+    : null;
   const values = [
-    ["Matched windows", compact(points.filter((row) => row.observed !== null && row.expected !== null).length)],
-    ["Mean absolute error", formatPp(sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp)],
-    ["Peak residual", formatPp(summary.rolling_peak_absolute_residual_pp)],
-    ["Coverage band", summary.points_within_80_band_fraction === undefined ? "—" : formatPercent(summary.points_within_80_band_fraction * 100)]
+    ["Matched windows", compact(matched.length)],
+    ["Mean absolute error", formatPp(live ? liveMae : sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp)],
+    ["Peak residual", formatPp(live ? livePeak : summary.rolling_peak_absolute_residual_pp)],
+    ["Usable quota coverage", points.length
+      ? formatPercent(matched.length / points.length * 100)
+      : "—"]
   ];
   const container = $("#timeline-summary");
   clear(container);
@@ -393,7 +606,8 @@ function renderTimelineSummary(data, points) {
 }
 
 function residualRows(data, points) {
-  const source = data.gradient.residual.length
+  const live = points.some((row) => Object.hasOwn(row, "status"));
+  const source = !live && data.gradient.residual.length
     ? data.gradient.residual.map((row) => ({
         timestamp: row.timestamp ?? row.window_end_utc,
         observed: finite(row.observed_quota_change_pp),
@@ -437,7 +651,7 @@ function renderResiduals(data, points) {
   for (const item of largest) {
     const row = node("tr");
     row.append(
-      node("td", "", formatUtc(item.timestamp)),
+      node("td", "", `${formatUtc(item.timestamp)} · ${formatLocal(item.timestamp)}`),
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
       node("td", item.residual >= 0 ? "positive" : "negative", `${item.residual >= 0 ? "+" : ""}${formatPp(item.residual)}`)
@@ -610,28 +824,146 @@ function renderWeeklyTable(values) {
   if (!values.length) {
     const row = node("tr");
     const cell = node("td", "empty-cell", "No weekly evidence loaded.");
-    cell.colSpan = 5;
+    cell.colSpan = 8;
     row.append(cell);
     table.append(row);
     return;
   }
   for (const row of values.slice(-14).reverse()) {
     const transitions = finite(row.eligible_transitions, 0);
+    const span = finite(row.displayed_span_pp);
+    const observedCost = span === null ? null : row.value * span / 100;
+    const speedCoverage = finite(row.known_speed_fraction);
     const evidence = transitions < 25 ? "Low" : transitions < 75 ? "Moderate" : "Higher";
     const prior = finite(row.prior_prediction_mae_pp);
-    const interpretation = prior === null
+    const caveat = prior === null
       ? "First estimate; no prior forecast"
       : prior < 3 ? "Prior forecast tracked closely" : prior < 7 ? "Meaningful model error" : "High-error period";
     const tr = node("tr");
     tr.append(
       node("td", "", formatUtc(row.timestamp, { dateOnly: true })),
+      node("td", "", formatApiMoney(observedCost)),
+      node("td", "", formatPp(span)),
       node("td", "", formatMoney(row.value)),
       node("td", "", row.low === null || row.high === null ? "—" : `${formatMoney(row.low)}–${formatMoney(row.high)}`),
-      node("td", "", `${evidence} · ${transitions} transitions`),
-      node("td", "", interpretation)
+      node("td", "", `${transitions} transitions`),
+      node("td", "", `${evidence}${speedCoverage === null ? "" : ` · ${formatPercent(speedCoverage * 100)} speed known`}`),
+      node("td", "", caveat)
     );
     table.append(tr);
   }
+}
+
+function accountingPeriod(data) {
+  return data.accounting.periods.find((period) => period.periodId === activeAccountingPeriod)
+    ?? data.accounting;
+}
+
+function renderAccountingDimension(containerSelector, dimension, {
+  emptyMessage = "No observations in this period."
+} = {}) {
+  const container = $(containerSelector);
+  clear(container);
+  const rows = Object.entries(dimension ?? {})
+    .filter(([, row]) => finite(row.events, 0) > 0)
+    .sort((left, right) => right[1].events - left[1].events);
+  if (!rows.length) {
+    container.append(node("p", "empty-inline", emptyMessage));
+    return;
+  }
+  const total = rows.reduce((sum, [, row]) => sum + row.events, 0);
+  for (const [key, row] of rows) {
+    const item = node("div", "dimension-row");
+    const copy = node("div");
+    copy.append(
+      node("strong", "", humanize(key)),
+      node("span", "", `${compact(row.events)} events · ${compact(row.totalTokens)} tokens`)
+    );
+    item.append(
+      copy,
+      node("span", "dimension-share", formatPercent(row.events / Math.max(1, total) * 100, 1))
+    );
+    container.append(item);
+  }
+}
+
+function renderAccounting(data) {
+  const accounting = accountingPeriod(data);
+  const summary = $("#accounting-summary");
+  clear(summary);
+  const pricedEvents = Object.values(accounting.byModel ?? {})
+    .reduce((sum, row) => sum + finite(row.events, 0), 0);
+  const attributed = finite(accounting.accountAttribution?.attributedPseudonymousEvents, 0);
+  for (const [label, value, note] of [
+    ["API-price equivalent", formatApiMoney(accounting.apiPriceEquivalentUsd), accounting.periodLabel],
+    ["Usage events", compact(accounting.events ?? pricedEvents), "Content-free rollout snapshots"],
+    ["Recorded tokens", compact(accounting.totalTokens), "All available token components"],
+    ["Account attribution", formatPercent(attributed / Math.max(1, accounting.events) * 100, attributed > 0 ? 2 : 1), "Pseudonymous and local only"]
+  ]) {
+    const card = node("article", "metric-card compact-metric");
+    card.append(
+      node("span", "metric-name", label),
+      node("strong", "metric-value", value),
+      node("p", "", note)
+    );
+    summary.append(card);
+  }
+
+  const components = $("#accounting-components");
+  clear(components);
+  const componentRows = Object.entries(accounting.components ?? {})
+    .sort((left, right) => right[1] - left[1]);
+  const maximum = Math.max(1, ...componentRows.map(([, value]) => value));
+  for (const [key, value] of componentRows) {
+    const row = node("div", "component-row");
+    row.append(node("span", "", humanize(key)));
+    const track = node("div", "component-track");
+    const fill = node("i");
+    fill.style.width = `${Math.max(value > 0 ? 1 : 0, value / maximum * 100)}%`;
+    track.append(fill);
+    row.append(track, node("strong", "", compact(value)));
+    components.append(row);
+  }
+
+  const models = $("#accounting-models");
+  clear(models);
+  const modelRows = [...(accounting.byModel ?? [])]
+    .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd);
+  if (!modelRows.length) {
+    const row = node("tr");
+    const cell = node("td", "empty-cell", "No model accounting in this period.");
+    cell.colSpan = 4;
+    row.append(cell);
+    models.append(row);
+  } else {
+    for (const model of modelRows) {
+      const row = node("tr");
+      row.append(
+        node("td", "", model.model === "unknown" ? "Unknown / unrecognized" : model.model),
+        node("td", "", compact(model.events)),
+        node("td", "", compact(model.totalTokens)),
+        node("td", "", formatApiMoney(model.apiPriceEquivalentUsd))
+      );
+      models.append(row);
+    }
+  }
+
+  renderAccountingDimension("#accounting-speed", accounting.bySpeed);
+  renderAccountingDimension("#accounting-tier", accounting.byApiServiceTier);
+  renderAccountingDimension("#accounting-surface", accounting.bySurface);
+  renderAccountingDimension("#accounting-lineage", accounting.byLineage);
+  renderAccountingDimension("#accounting-effort", accounting.byReasoningEffort, {
+    emptyMessage: "Reasoning effort is unavailable in the retained collector schema."
+  });
+  const toolDimension = Object.fromEntries(
+    Object.entries(data.accounting.toolClasses?.counts ?? {}).map(([key, events]) => [
+      key,
+      { events, totalTokens: 0, apiPriceEquivalentUsd: 0 }
+    ])
+  );
+  renderAccountingDimension("#accounting-tools", toolDimension, {
+    emptyMessage: "No coarse tool-class events are retained."
+  });
 }
 
 function renderQuality(data) {
@@ -661,7 +993,11 @@ function renderQuality(data) {
     }
   }
 
-  const issues = [...data.quality.opportunities, ...data.quality.blindSpots].slice(0, 10);
+  const issues = [
+    ...data.monitoringGaps,
+    ...data.quality.opportunities,
+    ...data.quality.blindSpots
+  ].slice(0, 18);
   const issueList = $("#blind-spot-list");
   clear(issueList);
   if (!issues.length) {
@@ -673,9 +1009,9 @@ function renderQuality(data) {
       const copy = node("div");
       copy.append(
         node("strong", "", item.title ?? item.dimension ?? "Unresolved coverage gap"),
-        node("p", "", item.evidence ?? item.description ?? item.action ?? "Additional evidence is required.")
+        node("p", "", item.explanation ?? item.evidence ?? item.description ?? item.action ?? "Additional evidence is required.")
       );
-      issue.append(copy, node("span", "issue-priority", item.priority ?? "Open"));
+      issue.append(copy, node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")));
       issueList.append(issue);
     }
   }
@@ -709,6 +1045,10 @@ function renderCollector(data) {
   const rows = [
     ["Last scan", formatUtc(collector.lastScanAt ?? data.activity?.lastScanAt ?? data.freshness.latestObservedAt)],
     ["Safe records", compact(collector.safeRecordCount ?? data.activity?.safeRecordCount ?? data.activity?.recordCount)],
+    ["Covered from", collector.coveredAt?.startAt ? formatUtc(collector.coveredAt.startAt) : "Unavailable"],
+    ["Covered through", collector.coveredAt?.endAt ? formatUtc(collector.coveredAt.endAt) : "Unavailable"],
+    ["Usage / quota rows", `${compact(collector.recordCounts?.usage)} / ${compact(collector.recordCounts?.quota)}`],
+    ["Index state", humanize(collector.indexingState || "Unavailable")],
     ["Source bytes", "Not exposed to browser"],
     ["Identity", collector.identityMode ?? "Pseudonymous"]
   ];
@@ -2139,6 +2479,40 @@ $("#window-controls").addEventListener("click", (event) => {
   }
   renderTimeline(dashboard);
   renderComparison(dashboard);
+});
+$("#range-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-days]");
+  if (!button || !dashboard) return;
+  activeTimelineRangeDays = Number(button.dataset.days);
+  for (const control of $("#range-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderTimeline(dashboard);
+  renderComparison(dashboard);
+});
+$("#usage-group-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-group]");
+  if (!button || !dashboard) return;
+  activeUsageGrouping = button.dataset.group;
+  for (const control of $("#usage-group-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderUsageTimeline(dashboard);
+});
+$("#accounting-period-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-period]");
+  if (!button || !dashboard) return;
+  activeAccountingPeriod = button.dataset.period;
+  for (const control of $("#accounting-period-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderAccounting(dashboard);
 });
 
 $("#contribution-file").addEventListener("change", async () => {

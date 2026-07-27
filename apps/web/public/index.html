@@ -25,8 +25,11 @@
         <a href="#overview" data-nav="overview">Overview</a>
         <a href="#timeline" data-nav="timeline">Timeline</a>
         <a href="#weekly" data-nav="weekly">Weekly</a>
-        <a href="#coverage" data-nav="coverage">Coverage &amp; gaps</a>
-        <a href="#data" data-nav="data">Data &amp; privacy</a>
+        <a href="#accounting" data-nav="accounting">Accounting</a>
+        <a href="#community">Community</a>
+        <a href="#history">History</a>
+        <a href="#coverage" data-nav="coverage">Gaps</a>
+        <a href="#data" data-nav="data">Privacy</a>
         <a href="#backend">Backend</a>
       </nav>
       <div class="top-actions">
@@ -143,12 +146,39 @@
             <p class="eyebrow">02 · Timeline</p>
             <h2 id="timeline-title">Quota movement over time</h2>
           </div>
-          <div class="segmented-control" id="window-controls" aria-label="Rolling comparison window">
-            <button type="button" data-hours="1">1 hour</button>
-            <button type="button" data-hours="2">2 hours</button>
-            <button type="button" data-hours="3" class="active" aria-pressed="true">3 hours</button>
+          <div class="timeline-controls">
+            <div class="segmented-control" id="window-controls" aria-label="Rolling comparison window">
+              <button type="button" data-hours="0.25">15 min</button>
+              <button type="button" data-hours="1" class="active" aria-pressed="true">1 hour</button>
+              <button type="button" data-hours="3">3 hours</button>
+            </div>
+            <div class="segmented-control" id="range-controls" aria-label="Timeline date range">
+              <button type="button" data-days="1">24h</button>
+              <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
+              <button type="button" data-days="31">31d</button>
+            </div>
           </div>
         </div>
+
+        <article class="panel chart-panel">
+          <div class="chart-heading">
+            <div>
+              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
+              <p>Real content-free collector evidence · current API pricing · not a subscription charge</p>
+            </div>
+            <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping">
+              <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
+              <button type="button" data-group="day">Day</button>
+              <button type="button" data-group="week">Week</button>
+            </div>
+          </div>
+          <div class="chart-empty" id="usage-timeline-empty">
+            <strong>No real usage timeline loaded</strong>
+            <p>Refresh the local companion to project recent content-free usage buckets.</p>
+          </div>
+          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
+          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
+        </article>
 
         <article class="panel chart-panel">
           <div class="chart-heading">
@@ -275,25 +305,87 @@
               <caption class="sr-only">Weekly allowance estimates and uncertainty</caption>
               <thead>
                 <tr>
-                  <th scope="col">Week / epoch</th>
-                  <th scope="col">Estimate</th>
-                  <th scope="col">Range</th>
-                  <th scope="col">Evidence</th>
-                  <th scope="col">Interpretation</th>
+                  <th scope="col">Week / reset</th>
+                  <th scope="col">Observed API equivalent</th>
+                  <th scope="col">Quota decrease</th>
+                  <th scope="col">Implied full allowance</th>
+                  <th scope="col">Plausible range</th>
+                  <th scope="col">Usable observations</th>
+                  <th scope="col">Coverage quality</th>
+                  <th scope="col">Caveats</th>
                 </tr>
               </thead>
               <tbody id="weekly-table">
-                <tr><td colspan="5" class="empty-cell">No weekly evidence loaded.</td></tr>
+                <tr><td colspan="8" class="empty-cell">No weekly evidence loaded.</td></tr>
               </tbody>
             </table>
           </div>
         </article>
       </section>
 
+      <section class="dashboard-section" id="accounting" aria-labelledby="accounting-title">
+        <div class="section-heading split">
+          <div>
+            <p class="eyebrow">04 · Cost accounting</p>
+            <h2 id="accounting-title">What contributed to the API-price equivalent</h2>
+          </div>
+          <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period">
+            <button type="button" data-period="24h">24h</button>
+            <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
+            <button type="button" data-period="30d">30d</button>
+            <button type="button" data-period="all">All</button>
+          </div>
+        </div>
+        <div class="notice notice-info accounting-disclosure">
+          <div>
+            <strong>API pricing is a measuring stick, not your bill.</strong>
+            <p>
+              Subscription Fast speed and API service tier are shown separately.
+              Unknown API tier is priced using the Standard API counterfactual and is
+              never silently relabeled Priority or Flex.
+            </p>
+          </div>
+        </div>
+        <div class="metric-grid accounting-summary" id="accounting-summary"></div>
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Token components</p>
+                <h3>Cached, uncached, output and reasoning</h3>
+              </div>
+            </div>
+            <div class="accounting-bars" id="accounting-components"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <p class="panel-kicker">Models</p>
+                <h3>Recognized and unknown model usage</h3>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Model</th><th>Events</th><th>Tokens</th><th>API equivalent</th></tr></thead>
+                <tbody id="accounting-models"></tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+        <div class="accounting-dimensions">
+          <article class="panel"><p class="panel-kicker">Subscription speed</p><h3>Standard, Fast and unknown</h3><div id="accounting-speed"></div></article>
+          <article class="panel"><p class="panel-kicker">API service tier</p><h3>Observed tier, not inferred</h3><div id="accounting-tier"></div></article>
+          <article class="panel"><p class="panel-kicker">Surface</p><h3>Desktop, task, subagent and unknown</h3><div id="accounting-surface"></div></article>
+          <article class="panel"><p class="panel-kicker">Lineage</p><h3>Root and child-rollout coverage</h3><div id="accounting-lineage"></div></article>
+          <article class="panel"><p class="panel-kicker">Tool classes</p><h3>Coarse content-free counts</h3><div id="accounting-tools"></div></article>
+          <article class="panel"><p class="panel-kicker">Reasoning effort</p><h3>Observed availability</h3><div id="accounting-effort"></div></article>
+        </div>
+      </section>
+
       <section class="dashboard-section" id="coverage" aria-labelledby="coverage-title">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">04 · Coverage &amp; gaps</p>
+            <p class="eyebrow">05 · Monitoring gaps</p>
             <h2 id="coverage-title">What this monitor can actually see</h2>
           </div>
           <p>
@@ -341,7 +433,7 @@
       <section class="dashboard-section" id="data" aria-labelledby="data-title">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">05 · Data &amp; privacy</p>
+            <p class="eyebrow">06 · Data &amp; privacy</p>
             <h2 id="data-title">Local by default. Contribute by choice.</h2>
           </div>
           <p>
@@ -369,6 +461,49 @@
             <small>Content-free schema, bounded size, explicit consent</small>
           </div>
         </div>
+
+        <details class="panel schema-inspection" open>
+          <summary>
+            <span>
+              <span class="panel-kicker">Pre-upload inspection</span>
+              <strong>Exact metadata categories a contribution may contain</strong>
+            </span>
+            <span class="evidence-chip">Closed schema</span>
+          </summary>
+          <div class="schema-grid">
+            <div>
+              <h3>Permitted metadata</h3>
+              <ul>
+                <li>Observation, event and reset timestamps</li>
+                <li>Uncached input, cached input, cache write, text output, reasoning output and combined-output token counts</li>
+                <li>Recognized model declaration or safe opaque model fingerprint</li>
+                <li>Subscription speed and separately observed API service tier</li>
+                <li>Coarse surface, agent scope and child-rollout lineage classes</li>
+                <li>Coarse tool-class counts</li>
+                <li>Quota percentage, window duration, slot and reset timing</li>
+                <li>Domain-separated participant, account, session, event and snapshot pseudonyms where the selected contract permits them</li>
+                <li>Schema, pricing, parser and consent provenance plus fixed diagnostics</li>
+              </ul>
+            </div>
+            <div class="excluded">
+              <h3>Never collected or uploaded</h3>
+              <ul>
+                <li>Prompts, responses or reasoning text</li>
+                <li>Tool names, arguments, commands or command output</li>
+                <li>URLs, files, paths, repositories, branches or working directories</li>
+                <li>Email addresses, account names, hostnames or usernames</li>
+                <li>Raw participant, device, account, session or request identifiers</li>
+                <li>Credentials, cookies, API keys, tokens or authorization material</li>
+                <li>Arbitrary labels, unknown fields or free-form metadata</li>
+              </ul>
+            </div>
+          </div>
+          <p class="backend-contract-note">
+            Browser validation is a preflight. The Worker decrypts into bounded
+            memory, validates the same closed schema again, rejects content canaries,
+            and recalculates API-price-equivalent values before D1 ingestion.
+          </p>
+        </details>
 
         <div class="two-column data-panels">
           <article class="panel">
@@ -584,7 +719,7 @@
         </article>
 
         <div class="two-column result-panels">
-          <article class="panel personal-result-panel">
+          <article class="panel personal-result-panel" id="history">
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Your contributed evidence</p>
@@ -655,7 +790,7 @@
               <p class="participant-action-status" id="participant-action-status" role="status" hidden></p>
             </div>
           </article>
-          <article class="panel community-result-panel">
+          <article class="panel community-result-panel" id="community">
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Delayed community evidence</p>

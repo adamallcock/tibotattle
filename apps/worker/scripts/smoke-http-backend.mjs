@@ -6,6 +6,7 @@ import {
   createTelemetryEnvelope,
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertDerivedCommunityExpectations } from "./smoke-http-backend-lib.mjs";
 
 function optionValue(name, fallback = null) {
   const index = process.argv.indexOf(name);
@@ -821,24 +822,22 @@ try {
     "Private community comparison",
   );
   const comparison = comparisonStats.communityComparison;
-  const comparisonCell = comparison?.cells?.find(
-    (cell) => cell.provider === "openai_codex" && cell.modelId === "gpt-5.6-sol",
-  );
   const serializedComparison = JSON.stringify(comparison);
   if (comparison?.schemaVersion !== "participant-community-comparison-v0.1"
       || comparison.status !== "ready"
       || comparison.snapshotRevision !== 1
-      || comparisonCell?.participantHasActivity !== true
-      || comparisonCell?.metrics?.usageEvents?.participantClippedValue !== 1
-      || comparisonCell?.metrics?.usageEvents?.communityRoundedValue !== 20
-      || comparisonCell?.metrics?.inputCacheReadTokens?.participantClippedValue !== 900
-      || comparisonCell?.metrics?.inputCacheReadTokens?.communityRoundedValue !== 0
       || ["participantCount", "eligibilityUnitId", "accountTrackId", "percentile", "average"]
         .some((forbidden) => serializedComparison.includes(forbidden))) {
     throw new Error(
       "The authenticated same-week comparison did not preserve clipped-versus-rounded privacy semantics.",
     );
   }
+  assertDerivedCommunityExpectations({
+    contribution,
+    participantCount: COMMUNITY_SNAPSHOT_PARTICIPANTS,
+    comparisonCells: comparison.cells,
+    aggregateCells: aggregate.cells,
+  });
 
   const participantExport = expectStatus(
     await request("/api/v1/me/export", { session: primary }),

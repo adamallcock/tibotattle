@@ -368,7 +368,7 @@ test("missing numeric evidence stays missing instead of becoming zero", () => {
   assert.equal(result.pricing.coveragePercent, null);
 });
 
-test("same-duration account windows are visibly distinguishable without exposing account IDs", () => {
+test("same-duration provider tracks stay distinguishable without inventing account labels", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
     status: "live",
@@ -377,9 +377,10 @@ test("same-duration account windows are visibly distinguishable without exposing
       { limitId: "codex_bengalfox", durationMinutes: 10080, usedPercent: 0 }
     ]
   });
-  assert.equal(result.quotaWindows[0].label, "Account 1 · seven-day allowance");
-  assert.equal(result.quotaWindows[1].label, "Account 2 · seven-day allowance");
+  assert.equal(result.quotaWindows[0].label, "Seven-day allowance");
+  assert.equal(result.quotaWindows[1].label, "Secondary observed allowance");
   assert.doesNotMatch(result.quotaWindows.map((row) => row.label).join(" "), /bengalfox/);
+  assert.doesNotMatch(result.quotaWindows.map((row) => row.label).join(" "), /Account/);
 });
 
 test("local split overview contract derives quota and seven-day pricing without exposing identities", () => {
@@ -1162,11 +1163,17 @@ test("participant results fail closed for unverifiable prices and honest not-tes
 test("public interface is dashboard-first and never substitutes demo data automatically", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  for (const label of ["Overview", "Timeline", "Weekly", "Coverage &amp; gaps", "Data &amp; privacy", "Backend"]) {
+  for (const label of ["Overview", "Timeline", "Weekly", "Accounting", "Community", "History", "Gaps", "Privacy", "Backend"]) {
     assert.match(html, new RegExp(label));
   }
+  assert.match(html, /id="usage-timeline-chart"/);
   assert.match(html, /id="timeline-chart"/);
   assert.match(html, /id="weekly-chart"/);
+  assert.match(html, /id="accounting"/);
+  assert.match(html, /id="accounting-models"/);
+  assert.match(html, /id="community"/);
+  assert.match(html, /id="history"/);
+  assert.match(html, /Exact metadata categories a contribution may contain/);
   assert.match(html, /id="contribution-file"/);
   assert.match(html, /id="contribution-invite"/);
   assert.match(html, /id="central-state"/);
