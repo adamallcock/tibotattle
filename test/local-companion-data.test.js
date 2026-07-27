@@ -241,6 +241,65 @@ test("local companion builds a closed real-data projection without identifiers o
   }
 });
 
+test("a completed bounded tail is projected as useful partial recent coverage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-partial-tail-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${JSON.stringify({
+        kind: "codex_rollout_usage_snapshot",
+        observedAt: "2026-07-25T11:00:00.000Z",
+        model: "gpt-5.6-sol",
+        components: {
+          input_uncached_tokens: 10,
+          input_cached_tokens: 0,
+          cache_write_tokens: 0,
+          output_visible_tokens: 1,
+          output_reasoning_tokens: 0,
+          output_combined_tokens: 1,
+          total_tokens: 11,
+        },
+      })}\n`,
+    );
+    await writeFile(
+      join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
+      JSON.stringify({
+        collectionStartedAt: "2026-07-18T12:00:00.000Z",
+        files: {},
+        diagnostics: {},
+        indexing: {
+          status: "recent_7d_partial",
+          phase: "complete",
+          mode: "recent_7d",
+          boundedBy: "modified_at_and_collection_start",
+          filesDiscovered: 1,
+          filesSelected: 1,
+          filesProcessed: 1,
+          recordsWritten: 1,
+          coveredAt: {
+            startAt: "2026-07-25T11:00:00.000Z",
+            endAt: "2026-07-25T12:00:00.000Z",
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    const snapshot = await buildLocalCompanionSnapshot({ root });
+    assert.equal(
+      snapshot.overview.collector.indexingState,
+      "recent_7d_partial",
+    );
+    assert.equal(snapshot.overview.collector.indexing.phase, "complete");
+    assert.deepEqual(snapshot.overview.collector.indexing.coveredAt, {
+      startAt: "2026-07-25T11:00:00.000Z",
+      endAt: "2026-07-25T11:00:00.000Z",
+    });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("missing and malformed artifacts fail closed while collector evidence remains available", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-companion-missing-"));
   try {

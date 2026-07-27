@@ -823,12 +823,14 @@ function validCollectorIndexDescriptor(value) {
     value.coveredAt.endAt,
     { nullable: true },
   );
-  if (startAt === null
+  if ((startAt === null
+        && !(value.status === "recent_7d_partial"
+          && value.coveredAt.startAt === null))
       || (value.coveredAt.endAt !== null && endAt === null)
       || value.boundedBy !== "modified_at_and_collection_start"
       || !["recent_7d", "prospective"].includes(value.mode)
       || !["recent_7d_indexing", "recent_7d_complete",
-        "prospective_only", "bounded_pause"].includes(value.status)
+        "recent_7d_partial", "prospective_only", "bounded_pause"].includes(value.status)
       || !["discovering", "rollout_index", "quota_refresh",
         "complete", "paused", "prospective"].includes(value.phase)
       || !["filesDiscovered", "filesSelected", "filesProcessed",
@@ -849,6 +851,9 @@ function validCollectorIndexDescriptor(value) {
   if (value.status === "recent_7d_complete") {
     return ["complete", "quota_refresh"].includes(value.phase)
       && endAt !== null;
+  }
+  if (value.status === "recent_7d_partial") {
+    return value.phase === "complete" && endAt !== null;
   }
   return ["discovering", "rollout_index"].includes(value.phase)
     && endAt === null;
@@ -914,7 +919,8 @@ async function readCollectorIndexProjection(path, collector) {
     filesSelected: safeIndexCount(raw?.filesSelected ?? retainedFiles),
     filesProcessed: safeIndexCount(
       raw?.filesProcessed
-      ?? (["recent_7d_complete", "prospective_only", "retained_ledger_only"].includes(status)
+      ?? (["recent_7d_complete", "recent_7d_partial",
+        "prospective_only", "retained_ledger_only"].includes(status)
         ? retainedFiles
         : 0),
     ),

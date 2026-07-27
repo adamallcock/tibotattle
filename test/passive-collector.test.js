@@ -197,6 +197,391 @@ test("fresh recent backfill selects only overlapping archives and reports conten
   }
 });
 
+test("large active rollouts use a bounded recent tail and preserve pre-boundary state", async () => {
+  const recent = tokenRecord(
+    "2026-07-23T00:00:01.000Z",
+    usage(125),
+    usage(25),
+    2,
+  );
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-19T23:59:57.000Z",
+      type: "session_meta",
+      payload: { id: "private-session-value", originator: "codex" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-07-19T23:59:58.000Z",
+      type: "turn_context",
+      payload: { model: "gpt-test" },
+    }),
+    tierRecord("2026-07-19T23:59:58.500Z", "default"),
+    tokenRecord(
+      "2026-07-19T23:59:59.000Z",
+      usage(100),
+      usage(100),
+      1,
+    ),
+    JSON.stringify({
+      timestamp: "2026-07-22T23:59:59.000Z",
+      type: "event_msg",
+      payload: { type: "irrelevant", padding: "x".repeat(600) },
+    }),
+    recent,
+  ]);
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentTailBytes: Buffer.byteLength(recent) + 128,
+      maximumRecentPreludeBytes: 4 * 1024,
+      maximumRecentRunBytes: 16 * 1024,
+      maximumLineagePrefixBytes: 2 * 1024,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.equal(result.indexing.status, "recent_7d_complete");
+    assert.equal(result.rolloutRecordsWritten, 1);
+    const [record] = await readLines(fixture.dataFile);
+    assert.equal(record.observedAt, "2026-07-23T00:00:01.000Z");
+    assert.equal(record.model, "gpt-test");
+    assert.equal(record.components.input_uncached_tokens, 25);
+    assert.equal(record.tierSemantics.codexSpeedMode, "standard");
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [cursor] = Object.values(checkpoint.files);
+    assert.equal(cursor.recentTail.strategy, "bounded_recent_tail_v0.2");
+    assert.equal(cursor.recentTail.coverageComplete, true);
+    assert.equal(JSON.stringify(result).includes(fixture.root), false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a bounded tail that cannot reach the requested boundary is reported as partial", async () => {
+  const recent = tokenRecord(
+    "2026-07-23T00:00:01.000Z",
+    usage(25),
+    usage(25),
+    2,
+  );
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-22T23:59:59.000Z",
+      type: "event_msg",
+      payload: { type: "irrelevant", padding: "x".repeat(900) },
+    }),
+    recent,
+  ]);
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentTailBytes: Buffer.byteLength(recent) + 64,
+      maximumRecentPreludeBytes: 32,
+      maximumRecentRunBytes: 8 * 1024,
+      maximumLineagePrefixBytes: 64,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.status, "partial");
+    assert.equal(result.indexing.status, "recent_7d_partial");
+    assert.equal(result.indexing.phase, "complete");
+    assert.equal(result.indexing.coveredAt.startAt, "2026-07-23T00:00:01.000Z");
+    assert.equal(result.rolloutRecordsWritten, 1);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("an in-window token event seen only in the state prelude cannot make coverage complete", async () => {
+  const omittedPreludeEvent = tokenRecord(
+    "2026-07-22T23:59:58.000Z",
+    usage(20),
+    usage(20),
+    1,
+  );
+  const retainedTailEvent = tokenRecord(
+    "2026-07-23T00:00:01.000Z",
+    usage(25),
+    usage(5),
+    2,
+  );
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-19T23:59:59.000Z",
+      type: "turn_context",
+      payload: { model: "gpt-test" },
+    }),
+    omittedPreludeEvent,
+    JSON.stringify({
+      timestamp: "2026-07-23T00:00:00.000Z",
+      type: "event_msg",
+      payload: { type: "irrelevant", padding: "x".repeat(500) },
+    }),
+    retainedTailEvent,
+  ]);
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentTailBytes: Buffer.byteLength(retainedTailEvent) + 64,
+      maximumRecentPreludeBytes: 4 * 1024,
+      maximumRecentRunBytes: 16 * 1024,
+      maximumLineagePrefixBytes: 512,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.status, "partial");
+    assert.equal(result.indexing.status, "recent_7d_partial");
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].observedAt, "2026-07-23T00:00:01.000Z");
+    assert.equal(records[0].components.input_uncached_tokens, 5);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("out-of-order timestamps in a bounded tail cannot prove recent coverage complete", async () => {
+  const firstRecent = tokenRecord(
+    "2026-07-23T00:00:01.000Z",
+    usage(10),
+    usage(10),
+    1,
+  );
+  const copiedOld = tokenRecord(
+    "2026-07-19T23:59:59.000Z",
+    usage(20),
+    usage(10),
+    2,
+  );
+  const lastRecent = tokenRecord(
+    "2026-07-23T00:00:02.000Z",
+    usage(30),
+    usage(10),
+    3,
+  );
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-18T00:00:00.000Z",
+      type: "event_msg",
+      payload: { type: "irrelevant", padding: "x".repeat(4 * 1024) },
+    }),
+    firstRecent,
+    copiedOld,
+    lastRecent,
+  ]);
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentTailBytes:
+        Buffer.byteLength(firstRecent)
+        + Buffer.byteLength(copiedOld)
+        + Buffer.byteLength(lastRecent)
+        + 128,
+      maximumRecentPreludeBytes: 64,
+      maximumRecentRunBytes: 32 * 1024,
+      maximumLineagePrefixBytes: 64,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.status, "partial");
+    assert.equal(result.indexing.status, "recent_7d_partial");
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [cursor] = Object.values(checkpoint.files);
+    assert.equal(cursor.recentTail.timestampOrderViolated, true);
+    assert.equal(cursor.recentTail.coverageComplete, false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("timestamp order is checked across a resumed bounded-tail scan", async () => {
+  const firstRecent = tokenRecord(
+    "2026-07-23T00:00:01.000Z",
+    usage(10),
+    usage(10),
+    1,
+  );
+  const copiedOld = tokenRecord(
+    "2026-07-19T23:59:59.000Z",
+    usage(20),
+    usage(10),
+    2,
+  );
+  const lastRecent = tokenRecord(
+    "2026-07-23T00:00:02.000Z",
+    usage(30),
+    usage(10),
+    3,
+  );
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-18T00:00:00.000Z",
+      type: "event_msg",
+      payload: { type: "irrelevant", padding: "x".repeat(4 * 1024) },
+    }),
+    firstRecent,
+    copiedOld,
+    lastRecent,
+  ]);
+  const controller = new AbortController();
+  const options = {
+    ...fixture,
+    refreshStale: false,
+    backfill: true,
+    backfillSinceAt: "2026-07-20T00:00:00.000Z",
+    maximumRecentTailBytes:
+      Buffer.byteLength(firstRecent)
+      + Buffer.byteLength(copiedOld)
+      + Buffer.byteLength(lastRecent)
+      + 128,
+    maximumRecentPreludeBytes: 64,
+    maximumRecentRunBytes: 32 * 1024,
+    maximumLineagePrefixBytes: 64,
+    maximumRecordBatchSize: 1,
+    clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+  };
+  try {
+    const paused = await runCollectorOnce({
+      ...options,
+      signal: controller.signal,
+      onProgress(progress) {
+        if (progress.recordsWritten >= 1) controller.abort();
+      },
+    });
+    assert.equal(paused.status, "bounded_pause");
+    const pausedCheckpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [pausedCursor] = Object.values(pausedCheckpoint.files);
+    assert.equal(pausedCursor.recentTail.lastScannedAt, "2026-07-23T00:00:01.000Z");
+    assert.equal(pausedCursor.recentTail.timestampOrderViolated, false);
+
+    const resumed = await runCollectorOnce(options);
+    assert.equal(resumed.status, "partial");
+    assert.equal(resumed.indexing.status, "recent_7d_partial");
+    const resumedCheckpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [resumedCursor] = Object.values(resumedCheckpoint.files);
+    assert.equal(resumedCursor.recentTail.timestampOrderViolated, true);
+    assert.equal(resumedCursor.recentTail.orderingVerified, false);
+    assert.equal(resumedCursor.recentTail.coverageComplete, false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("the recent-run byte budget pauses before reading the next source and resumes safely", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const second = join(
+    fixture.sessions,
+    "rollout-2026-07-23T00-01-00-second.jsonl",
+  );
+  try {
+    await writeFile(
+      second,
+      `${tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 2)}\n`,
+    );
+    const firstSize = (await stat(fixture.rollout)).size;
+    const options = {
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentTailBytes: 16 * 1024,
+      maximumRecentPreludeBytes: 64,
+      maximumRecentRunBytes: firstSize + 1,
+      maximumLineagePrefixBytes: 1,
+      clock: () => Date.parse("2026-07-23T00:02:00.000Z"),
+    };
+    const first = await runCollectorOnce(options);
+    assert.equal(first.status, "bounded_pause");
+    assert.equal(first.filesProcessed, 1);
+    assert.equal((await readLines(fixture.dataFile)).length, 1);
+
+    const resumed = await runCollectorOnce(options);
+    assert.equal(resumed.status, "complete");
+    assert.equal(resumed.filesProcessed, 2);
+    assert.equal((await readLines(fixture.dataFile)).length, 2);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("alignment bytes are reserved before an oversized recent tail is opened", async () => {
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-22T23:59:59.000Z",
+      type: "event_msg",
+      payload: { type: "irrelevant", padding: "x".repeat(2 * 1024) },
+    }),
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      maximumRecentTailBytes: 256,
+      maximumRecentPreludeBytes: 64,
+      maximumRecentRunBytes: 639,
+      maximumLineagePrefixBytes: 64,
+      maximumBufferedLineBytes: 256,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.status, "bounded_pause");
+    assert.equal(result.filesProcessed, 0);
+    assert.equal((await readLines(fixture.dataFile)).length, 0);
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.deepEqual(checkpoint.files, {});
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a first cumulative total without a last-usage baseline is never charged as a delta", async () => {
+  const withoutLast = (timestamp, total, percent) => JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: { total_token_usage: total },
+      rate_limits: rateLimits(percent),
+    },
+  });
+  const fixture = await collectorFixture([
+    withoutLast("2026-07-23T00:00:01.000Z", usage(100), 1),
+    withoutLast("2026-07-23T00:00:02.000Z", usage(130), 2),
+  ]);
+  try {
+    await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records.length, 2);
+    assert.equal(records[0].components, null);
+    assert.equal(records[1].components.input_uncached_tokens, 30);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
 test("recent backfill pauses on abort and resumes from the durable checkpoint", async () => {
   const fixture = await collectorFixture([
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),

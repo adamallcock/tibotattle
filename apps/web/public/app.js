@@ -23,6 +23,8 @@ let activeWindowHours = 1;
 let activeTimelineRangeDays = 7;
 let activeUsageGrouping = "hour";
 let activeAccountingPeriod = "7d";
+let timelineViewport = null;
+let timelinePointerStart = null;
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncBusy = false;
@@ -399,6 +401,109 @@ function timelineCutoffMs(data) {
     : Number.NEGATIVE_INFINITY;
 }
 
+function timelineBounds(points) {
+  const values = points
+    .map((point) => Date.parse(point.timestamp))
+    .filter(Number.isFinite);
+  if (values.length < 2) return null;
+  return { startMs: Math.min(...values), endMs: Math.max(...values) };
+}
+
+function normalizeTimelineViewport(points) {
+  const bounds = timelineBounds(points);
+  if (bounds === null) return null;
+  if (timelineViewport === null) return bounds;
+  const startMs = Math.max(bounds.startMs, Math.min(timelineViewport.startMs, bounds.endMs));
+  const endMs = Math.max(startMs + 1, Math.min(timelineViewport.endMs, bounds.endMs));
+  if (endMs - startMs < 60_000) return bounds;
+  return { startMs, endMs };
+}
+
+function timelinePointsInViewport(points, viewport) {
+  if (viewport === null) return points;
+  return points.filter((point) => {
+    const timestamp = Date.parse(point.timestamp);
+    return Number.isFinite(timestamp)
+      && timestamp >= viewport.startMs
+      && timestamp <= viewport.endMs;
+  });
+}
+
+function resetTimelineViewport() {
+  timelineViewport = null;
+}
+
+function updateTimelineViewport(points, update) {
+  const bounds = timelineBounds(points);
+  const current = normalizeTimelineViewport(points);
+  if (bounds === null || current === null) return;
+  const next = update({ ...current }, bounds);
+  if (!next || !Number.isFinite(next.startMs) || !Number.isFinite(next.endMs)) return;
+  const minimumSpanMs = Math.min(15 * 60_000, Math.max(60_000, (bounds.endMs - bounds.startMs) / 200));
+  const startMs = Math.max(bounds.startMs, Math.min(next.startMs, bounds.endMs - minimumSpanMs));
+  const endMs = Math.min(bounds.endMs, Math.max(next.endMs, startMs + minimumSpanMs));
+  timelineViewport = endMs - startMs >= bounds.endMs - bounds.startMs - 1
+    ? null
+    : { startMs, endMs };
+  if (dashboard) renderTimeline(dashboard);
+}
+
+function zoomTimeline(points, factor, anchorRatio = .5) {
+  updateTimelineViewport(points, (current, bounds) => {
+    const span = current.endMs - current.startMs;
+    const nextSpan = Math.min(bounds.endMs - bounds.startMs, Math.max(60_000, span * factor));
+    const anchor = current.startMs + span * Math.max(0, Math.min(1, anchorRatio));
+    return {
+      startMs: anchor - nextSpan * anchorRatio,
+      endMs: anchor + nextSpan * (1 - anchorRatio),
+    };
+  });
+}
+
+function panTimeline(points, fraction) {
+  updateTimelineViewport(points, (current, bounds) => {
+    const span = current.endMs - current.startMs;
+    const shift = span * fraction;
+    let startMs = current.startMs + shift;
+    let endMs = current.endMs + shift;
+    if (startMs < bounds.startMs) {
+      endMs += bounds.startMs - startMs;
+      startMs = bounds.startMs;
+    }
+    if (endMs > bounds.endMs) {
+      startMs -= endMs - bounds.endMs;
+      endMs = bounds.endMs;
+    }
+    return { startMs, endMs };
+  });
+}
+
+function timelineStatusLabel(status) {
+  return {
+    matched: "Matched quota bracket",
+    missing_quota_bracket: "Missing quota bracket",
+    reset_or_track_change: "Provider reset or quota-track change",
+    backward_or_ambiguous: "Ambiguous quota movement",
+  }[status] ?? "Historical calibration point";
+}
+
+function timelineStatusIntervals(points, viewport) {
+  const rows = points
+    .filter((point) => Number.isFinite(Date.parse(point.timestamp)))
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+  return rows.flatMap((point, index) => {
+    if (!point.status || point.status === "matched") return [];
+    const current = Date.parse(point.timestamp);
+    const previous = index === 0 ? viewport.startMs : Date.parse(rows[index - 1].timestamp);
+    const next = index === rows.length - 1 ? viewport.endMs : Date.parse(rows[index + 1].timestamp);
+    return [{
+      status: point.status,
+      startMs: Math.max(viewport.startMs, (previous + current) / 2),
+      endMs: Math.min(viewport.endMs, (current + next) / 2),
+    }];
+  });
+}
+
 function latestQuotaAtOrBefore(rows, timestampMs) {
   let selected = null;
   for (const row of rows) {
@@ -539,18 +644,24 @@ function renderUsageTimeline(data) {
   }
 }
 
-function renderTimeline(data) {
-  renderUsageTimeline(data);
+function selectedTimelinePoints(data) {
   const livePoints = data.mode !== "demo" ? liveTimelinePoints(data) : [];
   const historicalPoints = groupRolling(
     [...data.gradient.rollingHistory, ...data.gradient.rolling],
-    activeWindowHours
+    activeWindowHours,
   );
   const liveMatched = livePoints.filter(
-    (row) => row.observed !== null && row.expected !== null
+    (row) => row.observed !== null && row.expected !== null,
   ).length;
   const usingLive = liveMatched > 0 || historicalPoints.length === 0;
-  const points = usingLive ? livePoints : historicalPoints;
+  return { points: usingLive ? livePoints : historicalPoints, usingLive };
+}
+
+function renderTimeline(data) {
+  renderUsageTimeline(data);
+  const { points, usingLive } = selectedTimelinePoints(data);
+  const viewport = normalizeTimelineViewport(points);
+  const visiblePoints = timelinePointsInViewport(points, viewport);
   const windowLabel = activeWindowHours === 0.25
     ? "15-minute"
     : `${activeWindowHours}-hour`;
@@ -560,7 +671,7 @@ function renderTimeline(data) {
     : `Historical local calibration artifact from ${formatUtc(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
-  if (!points.length) {
+  if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
     empty.querySelector("strong").textContent = `No ${windowLabel} series loaded`;
@@ -569,18 +680,102 @@ function renderTimeline(data) {
     empty.hidden = true;
     shell.hidden = false;
     shell.replaceChildren(lineChart({
-      points,
+      points: visiblePoints,
       series: [
         { key: "observed", className: "chart-line-observed", label: "Observed quota change" },
         { key: "expected", className: "chart-line-expected", label: "Expected from API cost" }
       ],
       yLabel: "Percentage points",
       title: `${activeWindowHours}-hour rolling quota movement`,
-      description: "Observed quota movement compared with movement implied by priced token usage."
+      description: "Observed quota movement compared with movement implied by priced token usage. The horizontal axis is UTC; exact UTC and local times are listed below.",
+      xDomain: viewport,
+      statusIntervals: usingLive && viewport !== null
+        ? timelineStatusIntervals(points, viewport)
+        : [],
     }));
+    bindTimelineInteractions(shell, points, viewport);
   }
-  renderTimelineSummary(data, points);
-  renderResiduals(data, points);
+  renderTimelineSummary(data, visiblePoints);
+  renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
+  renderResiduals(data, visiblePoints, viewport);
+}
+
+function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
+  const element = $("#timeline-confidence");
+  const matched = visiblePoints.filter((point) => point.observed !== null && point.expected !== null).length;
+  const excluded = visiblePoints.length - matched;
+  const full = timelineBounds(allPoints);
+  const zoomed = viewport !== null && full !== null
+    && (viewport.startMs !== full.startMs || viewport.endMs !== full.endMs);
+  element.classList.toggle("low", matched < 3 || excluded > matched);
+  if (!visiblePoints.length) {
+    element.textContent = "No points fall inside this zoomed interval. Reset the view to return to the available evidence.";
+  } else if (!usingLive) {
+    element.textContent = "This historical calibration view has no per-window reset annotations. Treat it as diagnostic evidence, not a live allowance reading.";
+  } else if (matched < 3) {
+    element.textContent = `Low confidence: only ${matched} matched quota window${matched === 1 ? "" : "s"} is visible; ${excluded} window${excluded === 1 ? " is" : "s are"} excluded for missing or ambiguous quota evidence.`;
+  } else if (excluded > 0) {
+    element.textContent = `${matched} matched windows are shown. ${excluded} excluded window${excluded === 1 ? " is" : "s are"} shaded above; do not read them as zero usage.`;
+  } else {
+    element.textContent = `${matched} matched quota windows are visible. This compares observed percentage-point movement with a priced-token estimate; it is not a provider-published allowance.`;
+  }
+  if (zoomed) element.textContent += " Use Reset view to return to the selected date range.";
+}
+
+function bindTimelineInteractions(shell, points, viewport) {
+  if (viewport === null) return;
+  shell.classList.add("interactive-chart");
+  shell.tabIndex = 0;
+  shell.setAttribute("aria-label", "Interactive UTC quota timeline. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.");
+  const status = $("#timeline-zoom-status");
+  status.textContent = `Timeline shows ${formatUtc(new Date(viewport.startMs).toISOString())} through ${formatUtc(new Date(viewport.endMs).toISOString())}.`;
+  shell.onwheel = (event) => {
+    if (!event.deltaY) return;
+    event.preventDefault();
+    const bounds = shell.getBoundingClientRect();
+    const ratio = bounds.width > 0 ? (event.clientX - bounds.left) / bounds.width : .5;
+    zoomTimeline(points, event.deltaY > 0 ? 1.35 : .74, ratio);
+  };
+  shell.onpointerdown = (event) => {
+    timelinePointerStart = { x: event.clientX };
+    shell.setPointerCapture?.(event.pointerId);
+    shell.classList.add("is-panning");
+  };
+  shell.onpointermove = (event) => {
+    if (timelinePointerStart === null) return;
+    const width = Math.max(1, shell.getBoundingClientRect().width);
+    const delta = event.clientX - timelinePointerStart.x;
+    if (Math.abs(delta) < 3) return;
+    timelinePointerStart.x = event.clientX;
+    event.preventDefault();
+    panTimeline(points, -delta / width);
+  };
+  const stopPanning = (event) => {
+    timelinePointerStart = null;
+    shell.releasePointerCapture?.(event.pointerId);
+    shell.classList.remove("is-panning");
+  };
+  shell.onpointerup = stopPanning;
+  shell.onpointercancel = stopPanning;
+  shell.onkeydown = (event) => {
+    if (["+", "="].includes(event.key)) {
+      event.preventDefault();
+      zoomTimeline(points, .74);
+    } else if (["-", "_"].includes(event.key)) {
+      event.preventDefault();
+      zoomTimeline(points, 1.35);
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      panTimeline(points, -.2);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      panTimeline(points, .2);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      resetTimelineViewport();
+      renderTimeline(dashboard);
+    }
+  };
 }
 
 function renderTimelineSummary(data, points) {
@@ -613,18 +808,43 @@ function renderTimelineSummary(data, points) {
 
 function residualRows(data, points) {
   const live = points.some((row) => Object.hasOwn(row, "status"));
-  const source = !live && data.gradient.residual.length
+  const visibleBounds = timelineBounds(points);
+  const pointResiduals = points.map((row) => ({
+    ...row,
+    residual: row.observed === null || row.expected === null
+      ? null
+      : row.observed - row.expected,
+  }));
+  const artifactResiduals = !live && data.gradient.residual.length
     ? data.gradient.residual.map((row) => ({
         timestamp: row.timestamp ?? row.window_end_utc,
         observed: finite(row.observed_quota_change_pp),
         expected: finite(row.expected_quota_change_pp),
         residual: finite(row.residual_pp)
       }))
-    : points.map((row) => ({ ...row, residual: row.observed === null || row.expected === null ? null : row.observed - row.expected }));
-  return source.filter((row) => row.residual !== null && row.timestamp).sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    : [];
+  const visibleArtifactResiduals = artifactResiduals.filter((row) => {
+    const timestamp = Date.parse(row.timestamp);
+    return Number.isFinite(timestamp)
+      && visibleBounds !== null
+      && timestamp >= visibleBounds.startMs
+      && timestamp <= visibleBounds.endMs;
+  });
+  const source = visibleArtifactResiduals.length
+    ? visibleArtifactResiduals
+    : pointResiduals;
+  return source
+    .filter((row) => {
+      const timestamp = Date.parse(row.timestamp);
+      return row.residual !== null
+        && Number.isFinite(timestamp)
+        && (visibleBounds === null
+          || (timestamp >= visibleBounds.startMs && timestamp <= visibleBounds.endMs));
+    })
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
-function renderResiduals(data, points) {
+function renderResiduals(data, points, viewport = null) {
   const residuals = residualRows(data, points);
   const empty = $("#residual-empty");
   const shell = $("#residual-chart");
@@ -640,33 +860,55 @@ function renderResiduals(data, points) {
       yLabel: "Percentage points",
       title: "Quota movement residuals",
       description: "Observed quota change minus the API-cost-implied change.",
-      includeZero: true
+      includeZero: true,
+      xDomain: viewport,
     }));
   }
   const table = $("#residual-table");
   clear(table);
-  const largest = [...residuals].sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual)).slice(0, 8);
-  if (!largest.length) {
+  const unmatched = points
+    .filter((point) => point.timestamp && point.status && point.status !== "matched")
+    .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
+  const largest = [...residuals]
+    .sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual));
+  const inspection = [...unmatched, ...largest]
+    .filter((row, index, rows) => rows.findIndex((candidate) => candidate.timestamp === row.timestamp) === index)
+    .slice(0, 8);
+  if (!inspection.length) {
     const row = node("tr");
     const cell = node("td", "empty-cell", "No periods loaded.");
-    cell.colSpan = 4;
+    cell.colSpan = 5;
     row.append(cell);
     table.append(row);
     return;
   }
-  for (const item of largest) {
+  for (const item of inspection) {
     const row = node("tr");
+    const residual = item.observed === null || item.expected === null
+      ? null
+      : item.residual;
     row.append(
       node("td", "", `${formatUtc(item.timestamp)} · ${formatLocal(item.timestamp)}`),
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
-      node("td", item.residual >= 0 ? "positive" : "negative", `${item.residual >= 0 ? "+" : ""}${formatPp(item.residual)}`)
+      node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? "Not comparable" : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
+      node("td", "", timelineStatusLabel(item.status ?? "matched")),
     );
     table.append(row);
   }
 }
 
-function lineChart({ points, series, yLabel, title, description, includeZero = false, confidence = null }) {
+function lineChart({
+  points,
+  series,
+  yLabel,
+  title,
+  description,
+  includeZero = false,
+  confidence = null,
+  xDomain = null,
+  statusIntervals = [],
+}) {
   const width = 900;
   const height = 330;
   const margin = { top: 24, right: 22, bottom: 50, left: 58 };
@@ -680,7 +922,26 @@ function lineChart({ points, series, yLabel, title, description, includeZero = f
   const pad = (max - min) * .1;
   min -= pad;
   max += pad;
-  const x = (index) => margin.left + index / Math.max(1, points.length - 1) * (width - margin.left - margin.right);
+  const timestamps = points.map((point) => Date.parse(point.timestamp ?? point.date));
+  const timed = timestamps.every(Number.isFinite);
+  const dataStartMs = timed ? Math.min(...timestamps) : 0;
+  const dataEndMs = timed ? Math.max(...timestamps) : Math.max(1, points.length - 1);
+  const domainStartMs = timed && Number.isFinite(xDomain?.startMs)
+    ? xDomain.startMs
+    : dataStartMs;
+  const domainEndMs = timed && Number.isFinite(xDomain?.endMs)
+    ? xDomain.endMs
+    : dataEndMs;
+  const safeDomainEndMs = domainEndMs > domainStartMs
+    ? domainEndMs
+    : domainStartMs + 1;
+  const x = (index, point = points[index]) => {
+    const coordinate = timed
+      ? (Date.parse(point.timestamp ?? point.date) - domainStartMs)
+        / (safeDomainEndMs - domainStartMs)
+      : index / Math.max(1, points.length - 1);
+    return margin.left + coordinate * (width - margin.left - margin.right);
+  };
   const y = (value) => margin.top + (max - value) / (max - min) * (height - margin.top - margin.bottom);
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -703,22 +964,57 @@ function lineChart({ points, series, yLabel, title, description, includeZero = f
     svg.append(svgLine(margin.left, y(0), width - margin.right, y(0), "chart-zero"));
   }
 
-  const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
-  for (const index of labelIndexes) {
-    const timestamp = points[index]?.timestamp ?? points[index]?.date;
-    svg.append(svgText(x(index), height - 22, formatUtc(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
+  if (timed) {
+    for (let index = 0; index < 4; index += 1) {
+      const timestamp = new Date(
+        domainStartMs + (safeDomainEndMs - domainStartMs) * index / 3,
+      ).toISOString();
+      svg.append(svgText(
+        margin.left + (width - margin.left - margin.right) * index / 3,
+        height - 22,
+        formatUtc(timestamp, { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 }),
+        "chart-axis-label",
+        index === 0 ? "start" : index === 3 ? "end" : "middle",
+      ));
+    }
+    svg.append(svgText(width / 2, height - 6, "UTC", "chart-axis-label", "middle"));
+  } else {
+    const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
+    for (const index of labelIndexes) {
+      const timestamp = points[index]?.timestamp ?? points[index]?.date;
+      svg.append(svgText(x(index), height - 22, formatUtc(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
+    }
   }
   const yAxisLabel = svgText(15, height / 2, yLabel, "chart-axis-label", "middle");
   yAxisLabel.setAttribute("transform", `rotate(-90 15 ${height / 2})`);
   svg.append(yAxisLabel);
 
   if (confidence) {
-    const upper = points.map((point, index) => [x(index), y(finite(point[confidence.high], 0))]);
-    const lower = points.map((point, index) => [x(index), y(finite(point[confidence.low], 0))]).reverse();
+    const upper = points.map((point, index) => [x(index, point), y(finite(point[confidence.high], 0))]);
+    const lower = points.map((point, index) => [x(index, point), y(finite(point[confidence.low], 0))]).reverse();
     const polygon = document.createElementNS(svg.namespaceURI, "polygon");
     polygon.setAttribute("points", [...upper, ...lower].map(([a, b]) => `${a},${b}`).join(" "));
     polygon.setAttribute("class", "chart-area-confidence");
     svg.append(polygon);
+  }
+
+  for (const interval of statusIntervals) {
+    if (!Number.isFinite(interval.startMs) || !Number.isFinite(interval.endMs)
+        || interval.endMs <= interval.startMs) continue;
+    const start = margin.left + (interval.startMs - domainStartMs)
+      / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
+    const end = margin.left + (interval.endMs - domainStartMs)
+      / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
+    const rect = document.createElementNS(svg.namespaceURI, "rect");
+    rect.setAttribute("x", String(Math.max(margin.left, start)));
+    rect.setAttribute("y", String(margin.top));
+    rect.setAttribute("width", String(Math.max(1, Math.min(width - margin.right, end) - Math.max(margin.left, start))));
+    rect.setAttribute("height", String(height - margin.top - margin.bottom));
+    rect.setAttribute("class", `chart-status-${interval.status === "reset_or_track_change" ? "reset" : interval.status === "missing_quota_bracket" ? "missing" : "ambiguous"}`);
+    const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
+    intervalTitle.textContent = timelineStatusLabel(interval.status);
+    rect.append(intervalTitle);
+    svg.append(rect);
   }
 
   for (const item of series) {
@@ -729,7 +1025,7 @@ function lineChart({ points, series, yLabel, title, description, includeZero = f
       if (value === null) {
         if (segment.length) segments.push(segment);
         segment = [];
-      } else segment.push([x(index), y(value)]);
+      } else segment.push([x(index, point), y(value)]);
     });
     if (segment.length) segments.push(segment);
     for (const pathPoints of segments) {
@@ -1113,6 +1409,8 @@ function renderIndexProgress(progress, { status = "" } = {}) {
   $("#index-progress-title").textContent =
     status === "recent_7d_complete"
       ? "Recent local history indexed"
+      : status === "recent_7d_partial"
+        ? "Useful recent history indexed"
       : status === "prospective_only"
         ? "Collecting new activity prospectively"
         : status === "bounded_pause"
@@ -1123,9 +1421,11 @@ function renderIndexProgress(progress, { status = "" } = {}) {
   );
   $("#index-progress-summary").textContent = status === "prospective_only"
     ? `${compact(recordsWritten)} safe records retained since local collection began. Older activity was not retroactively indexed for this existing checkpoint.`
-    : filesSelected === null
-      ? `${compact(recordsWritten)} safe records retained; discovering bounded recent rollouts.`
-      : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
+    : status === "recent_7d_partial"
+      ? `${compact(recordsWritten)} safe records retained from a bounded recent tail. The scan completed safely, but cannot prove it reached the entire requested seven-day window.`
+      : filesSelected === null
+        ? `${compact(recordsWritten)} safe records retained; discovering bounded recent rollouts.`
+        : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
   $("#index-progress-coverage").textContent = startAt && endAt
     ? `Content-free evidence currently covers ${formatUtc(startAt)} through ${formatUtc(endAt)}. Raw content and source paths never enter this page.`
     : "Raw log contents and source paths never enter this page.";
@@ -2684,6 +2984,7 @@ $("#window-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  resetTimelineViewport();
   renderTimeline(dashboard);
   renderComparison(dashboard);
 });
@@ -2696,8 +2997,29 @@ $("#range-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  resetTimelineViewport();
   renderTimeline(dashboard);
   renderComparison(dashboard);
+});
+$("#timeline-zoom-in").addEventListener("click", () => {
+  if (!dashboard) return;
+  zoomTimeline(selectedTimelinePoints(dashboard).points, .74);
+});
+$("#timeline-zoom-out").addEventListener("click", () => {
+  if (!dashboard) return;
+  zoomTimeline(selectedTimelinePoints(dashboard).points, 1.35);
+});
+$("#timeline-pan-back").addEventListener("click", () => {
+  if (!dashboard) return;
+  panTimeline(selectedTimelinePoints(dashboard).points, -.2);
+});
+$("#timeline-pan-forward").addEventListener("click", () => {
+  if (!dashboard) return;
+  panTimeline(selectedTimelinePoints(dashboard).points, .2);
+});
+$("#timeline-reset-zoom").addEventListener("click", () => {
+  resetTimelineViewport();
+  if (dashboard) renderTimeline(dashboard);
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");
@@ -2793,10 +3115,26 @@ const observer = new IntersectionObserver((entries) => {
   const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
   if (!visible) return;
   for (const link of document.querySelectorAll("[data-nav]")) {
-    link.classList.toggle("active", link.dataset.nav === visible.target.id);
+    const active = link.dataset.nav === visible.target.id;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "location");
+    else link.removeAttribute("aria-current");
   }
 }, { rootMargin: "-25% 0px -65% 0px", threshold: [0, .2, .7] });
-for (const section of document.querySelectorAll(".dashboard-section")) observer.observe(section);
+for (const section of document.querySelectorAll(".dashboard-section, [data-nav-target]")) observer.observe(section);
+
+function syncNavigationFromHash() {
+  const id = window.location.hash.slice(1);
+  if (!id) return;
+  for (const link of document.querySelectorAll("[data-nav]")) {
+    const active = link.dataset.nav === id;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "location");
+    else link.removeAttribute("aria-current");
+  }
+}
+window.addEventListener("hashchange", syncNavigationFromHash);
+syncNavigationFromHash();
 
 loadLocalDashboard();
 restoreCommunitySession().finally(loadCommunityResults);

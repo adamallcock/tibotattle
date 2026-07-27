@@ -36,6 +36,10 @@ const MAX_RECENT_EVENT_KEYS = 5_000;
 const MAX_ACCOUNT_SCOPE_MARKER_AGE_MS = 5 * 60_000;
 const MAX_BUFFERED_ROLLOUT_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_RECORD_BATCH_SIZE = 1_000;
+const MAX_RECENT_TAIL_BYTES = 768 * 1024 * 1024;
+const MAX_RECENT_PRELUDE_BYTES = 32 * 1024 * 1024;
+const MAX_RECENT_RUN_BYTES = 1536 * 1024 * 1024;
+const MAX_LINEAGE_PREFIX_BYTES = 1024 * 1024;
 const INDEXING_BOUNDARY = "modified_at_and_collection_start";
 const INDEXING_PHASES = new Set([
   "discovering",
@@ -48,6 +52,7 @@ const INDEXING_PHASES = new Set([
 const INDEXING_STATUSES = new Set([
   "recent_7d_indexing",
   "recent_7d_complete",
+  "recent_7d_partial",
   "prospective_only",
   "bounded_pause",
 ]);
@@ -210,7 +215,11 @@ function validCheckpointIndexing(value) {
       || Array.isArray(value.coveredAt)
       || Object.keys(value.coveredAt).sort().join("\0") !== "endAt\0startAt") return false;
   try {
-    canonicalInstant(value.coveredAt.startAt, "indexing coveredAt.startAt");
+    if (value.coveredAt.startAt === null) {
+      if (value.status !== "recent_7d_partial") return false;
+    } else {
+      canonicalInstant(value.coveredAt.startAt, "indexing coveredAt.startAt");
+    }
     if (value.coveredAt.endAt !== null) {
       canonicalInstant(value.coveredAt.endAt, "indexing coveredAt.endAt");
     }
@@ -496,7 +505,6 @@ function rolloutFilenameTime(path) {
 
 function rolloutMayOverlap(file, sinceMs) {
   if (!Number.isFinite(sinceMs)) return true;
-  if (file.location === "active") return true;
   return [file.metadata.mtimeMs, rolloutFilenameTime(file.path)]
     .some((value) => Number.isFinite(value) && value >= sinceMs);
 }
@@ -606,6 +614,10 @@ async function seedCursorFromTail(path, size, {
     let currentModel = null;
     let previousTotals = null;
     const tierState = {};
+    let earliestRelevantMs = Number.POSITIVE_INFINITY;
+    let latestRelevantMs = Number.NEGATIVE_INFINITY;
+    let lastRelevantMs = Number.NEGATIVE_INFINITY;
+    let timestampOrderViolated = false;
     for (const line of text.split("\n")) {
       if (!line.includes('"turn_context"') && !line.includes('"token_count"') && !line.includes('"thread_settings_applied"')) continue;
       let record;
@@ -613,6 +625,15 @@ async function seedCursorFromTail(path, size, {
         record = JSON.parse(line);
       } catch {
         continue;
+      }
+      const observedAtMs = Date.parse(record?.timestamp);
+      if (Number.isFinite(observedAtMs)) {
+        if (Number.isFinite(lastRelevantMs) && observedAtMs < lastRelevantMs) {
+          timestampOrderViolated = true;
+        }
+        earliestRelevantMs = Math.min(earliestRelevantMs, observedAtMs);
+        latestRelevantMs = Math.max(latestRelevantMs, observedAtMs);
+        lastRelevantMs = observedAtMs;
       }
       if (record.type === "turn_context" && typeof record.payload?.model === "string") {
         currentModel = record.payload.model;
@@ -623,7 +644,51 @@ async function seedCursorFromTail(path, size, {
         if (total) previousTotals = total;
       }
     }
-    return { currentModel, previousTotals, tierState: tierState.tierState ?? null };
+    return {
+      currentModel,
+      previousTotals,
+      tierState: tierState.tierState ?? null,
+      earliestRelevantAt: Number.isFinite(earliestRelevantMs)
+        ? new Date(earliestRelevantMs).toISOString()
+        : null,
+      latestRelevantAt: Number.isFinite(latestRelevantMs)
+        ? new Date(latestRelevantMs).toISOString()
+        : null,
+      lastRelevantAt: Number.isFinite(lastRelevantMs)
+        ? new Date(lastRelevantMs).toISOString()
+        : null,
+      timestampOrderViolated,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function lineStartAtOrAfter(path, offset, size, {
+  maximumScanBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
+  signal = null,
+} = {}) {
+  if (offset <= 0) return 0;
+  if (offset >= size) return size;
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(Math.min(256 * 1024, maximumScanBytes));
+    let position = offset;
+    let remaining = Math.min(maximumScanBytes, size - offset);
+    while (remaining > 0) {
+      if (signal?.aborted) return null;
+      const requested = Math.min(buffer.length, remaining);
+      const { bytesRead } = await handle.read(buffer, 0, requested, position);
+      if (bytesRead === 0) return size;
+      const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+      if (newline >= 0) return position + newline + 1;
+      position += bytesRead;
+      remaining -= bytesRead;
+    }
+    // The straddling line is itself beyond the normal bounded-line policy.
+    // Starting at the cap lets the ordinary parser skip its remaining suffix
+    // without allocating the complete line.
+    return Math.min(size, offset + maximumScanBytes);
   } finally {
     await handle.close();
   }
@@ -683,7 +748,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
   let usage = null;
   if (total) {
     const delta = addUsageDelta(total, state.previousTotals);
-    if (state.previousTotals === null) usage = last ?? delta;
+    if (state.previousTotals === null) usage = last;
     else if (delta.total_tokens > 0) usage = last && sameUsage(last, delta) ? last : delta;
     state.previousTotals = total;
   } else {
@@ -721,6 +786,11 @@ export async function ingestRolloutUpdates({
   maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
+  recentBackfillSinceAt = null,
+  maximumRecentTailBytes = MAX_RECENT_TAIL_BYTES,
+  maximumRecentPreludeBytes = MAX_RECENT_PRELUDE_BYTES,
+  maximumRecentRunBytes = MAX_RECENT_RUN_BYTES,
+  maximumLineagePrefixBytes = MAX_LINEAGE_PREFIX_BYTES,
   commitRecordBatch = null,
   rollouts = null,
   signal = null,
@@ -732,6 +802,22 @@ export async function ingestRolloutUpdates({
   if (!Number.isSafeInteger(maximumRecentEventKeys) || maximumRecentEventKeys < 1) {
     throw new TypeError("maximumRecentEventKeys must be a positive safe integer");
   }
+  for (const [name, value] of Object.entries({
+    maximumRecentTailBytes,
+    maximumRecentPreludeBytes,
+    maximumRecentRunBytes,
+    maximumLineagePrefixBytes,
+  })) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new TypeError(`${name} must be a positive safe integer`);
+    }
+  }
+  const recentSinceAt = recentBackfillSinceAt === null
+    ? null
+    : canonicalInstant(recentBackfillSinceAt, "recentBackfillSinceAt");
+  const recentSinceMs = recentSinceAt === null
+    ? Number.NaN
+    : Date.parse(recentSinceAt);
   if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
   if (onProgress !== null && typeof onProgress !== "function") {
     throw new TypeError("onProgress must be a function");
@@ -749,6 +835,9 @@ export async function ingestRolloutUpdates({
   let committedVersion = -1;
   let filesProcessed = 0;
   let aborted = signal?.aborted === true;
+  let recentReadBudget = 0;
+  let recentCoverageComplete = true;
+  let recentCoverageStartMs = Number.NaN;
   const receivedAt = new Date(clock()).toISOString();
 
   function markChanged() {
@@ -784,20 +873,89 @@ export async function ingestRolloutUpdates({
     const key = cursorKey(file.metadata);
     let state = checkpoint.files[key];
     if (!state) {
-      const lineage = await readRolloutLineage(file.path);
-      const seed = initializeAtEnd && file.location === "active"
-        ? await seedCursorFromTail(file.path, file.metadata.size, { diagnostics: checkpoint.diagnostics })
+      const boundedRecentTail = recentSinceAt !== null
+        && file.metadata.size > maximumRecentTailBytes;
+      let recentTailStart = null;
+      if (boundedRecentTail) {
+        const proposedStart = Math.max(0, file.metadata.size - maximumRecentTailBytes);
+        const alignmentReservation = Math.min(
+          maximumBufferedLineBytes,
+          file.metadata.size - proposedStart,
+        );
+        const reservedRead = file.metadata.size - proposedStart
+          + Math.min(maximumRecentPreludeBytes, proposedStart)
+          + alignmentReservation
+          + maximumLineagePrefixBytes;
+        if (recentReadBudget + reservedRead > maximumRecentRunBytes) {
+          aborted = true;
+          break;
+        }
+        recentReadBudget += reservedRead;
+        recentTailStart = await lineStartAtOrAfter(
+          file.path,
+          proposedStart,
+          file.metadata.size,
+          { maximumScanBytes: maximumBufferedLineBytes, signal },
+        );
+        if (recentTailStart === null) {
+          aborted = true;
+          break;
+        }
+      } else if (recentSinceAt !== null) {
+        const estimatedRead = file.metadata.size + maximumLineagePrefixBytes;
+        if (recentReadBudget + estimatedRead > maximumRecentRunBytes) {
+          aborted = true;
+          break;
+        }
+        recentReadBudget += estimatedRead;
+      }
+      const lineage = await readRolloutLineage(file.path, {
+        maximumTotalBytes: maximumLineagePrefixBytes,
+      });
+      const seedBoundary = boundedRecentTail
+        ? recentTailStart
+        : file.metadata.size;
+      const seed = (initializeAtEnd && file.location === "active") || boundedRecentTail
+        ? await seedCursorFromTail(file.path, seedBoundary, {
+          maximumBytes: maximumRecentPreludeBytes,
+          diagnostics: checkpoint.diagnostics,
+        })
         : { currentModel: null, previousTotals: null, tierState: null };
       state = {
         cursorKind: "filesystem_inode_and_birthtime_not_session_identifier",
-        offset: initializeAtEnd ? file.metadata.size : 0,
+        offset: boundedRecentTail
+          ? recentTailStart
+          : initializeAtEnd ? file.metadata.size : 0,
         previousTotals: seed.previousTotals,
         currentModel: seed.currentModel,
         tierState: seed.tierState,
-        tailSeeded: initializeAtEnd,
+        tailSeeded: initializeAtEnd || boundedRecentTail,
         surfaceClassification: lineage.surfaceClassification,
         lineageDisposition: lineage.surfaceClassification?.lineageDisposition ?? "standalone",
       };
+      if (boundedRecentTail) {
+        const seedLatestMs = Date.parse(seed.latestRelevantAt);
+        state.recentTail = {
+          strategy: "bounded_recent_tail_v0.2",
+          requestedSinceAt: recentSinceAt,
+          actualCoverageStartAt: null,
+          latestRelevantAt: null,
+          preludeLatestAt: Number.isFinite(seedLatestMs)
+            ? seed.latestRelevantAt
+            : null,
+          preludeLastAt: seed.lastRelevantAt ?? null,
+          firstMainAt: null,
+          lastScannedAt: seed.lastRelevantAt ?? null,
+          timestampOrderViolated: seed.timestampOrderViolated === true,
+          orderingVerified: seed.timestampOrderViolated !== true,
+          coverageComplete: seed.timestampOrderViolated !== true
+            && Number.isFinite(seedLatestMs)
+            && seedLatestMs < recentSinceMs,
+          cumulativeBaselineAvailable: seed.previousTotals !== null,
+          modelSeedAvailable: seed.currentModel !== null,
+          tierSeedAvailable: seed.tierState !== null,
+        };
+      }
       checkpoint.files[key] = state;
       markChanged();
       checkpoint.diagnostics.filesReplacedOrNew += 1;
@@ -812,9 +970,18 @@ export async function ingestRolloutUpdates({
         });
         continue;
       }
+    } else if (recentSinceAt !== null && file.metadata.size > state.offset) {
+      const estimatedRead = file.metadata.size - state.offset;
+      if (recentReadBudget + estimatedRead > maximumRecentRunBytes) {
+        aborted = true;
+        break;
+      }
+      recentReadBudget += estimatedRead;
     }
     if (!state.surfaceClassification) {
-      const lineage = await readRolloutLineage(file.path);
+      const lineage = await readRolloutLineage(file.path, {
+        maximumTotalBytes: maximumLineagePrefixBytes,
+      });
       state.surfaceClassification = lineage.surfaceClassification;
       state.lineageDisposition = lineage.surfaceClassification?.lineageDisposition ?? "standalone";
       markChanged();
@@ -836,6 +1003,11 @@ export async function ingestRolloutUpdates({
       state.tailSeeded = true;
       markChanged();
     }
+    let earliestRelevantMs = Number.POSITIVE_INFINITY;
+    let latestRelevantMs = Number.NEGATIVE_INFINITY;
+    let firstRelevantMs = Number.POSITIVE_INFINITY;
+    let lastRelevantMs = Date.parse(state.recentTail?.lastScannedAt);
+    let timestampOrderViolated = state.recentTail?.timestampOrderViolated === true;
     const chunk = await forEachCompleteLine(file.path, state.offset, file.metadata.size, async (line, lineEndOffset) => {
       state.offset = lineEndOffset;
       markChanged();
@@ -848,6 +1020,16 @@ export async function ingestRolloutUpdates({
       } catch {
         checkpoint.diagnostics.malformedLines += 1;
         return;
+      }
+      const rawTimestampMs = Date.parse(raw?.timestamp);
+      if (Number.isFinite(rawTimestampMs)) {
+        if (!Number.isFinite(firstRelevantMs)) firstRelevantMs = rawTimestampMs;
+        if (Number.isFinite(lastRelevantMs) && rawTimestampMs < lastRelevantMs) {
+          timestampOrderViolated = true;
+        }
+        earliestRelevantMs = Math.min(earliestRelevantMs, rawTimestampMs);
+        latestRelevantMs = Math.max(latestRelevantMs, rawTimestampMs);
+        lastRelevantMs = rawTimestampMs;
       }
       updateTierState(state, tierUpdateFromRecord(raw, checkpoint.diagnostics));
       const safe = rolloutRecord({ record: raw, state, receivedAt, checkpoint });
@@ -872,9 +1054,52 @@ export async function ingestRolloutUpdates({
       state.offset = chunk.nextOffset;
       markChanged();
     }
+    if (state.recentTail?.requestedSinceAt === recentSinceAt) {
+      const priorStartMs = Date.parse(state.recentTail.actualCoverageStartAt);
+      const priorLatestMs = Date.parse(state.recentTail.latestRelevantAt);
+      const mergedStartMs = Math.min(
+        Number.isFinite(priorStartMs) ? priorStartMs : Number.POSITIVE_INFINITY,
+        earliestRelevantMs,
+      );
+      const mergedLatestMs = Math.max(
+        Number.isFinite(priorLatestMs) ? priorLatestMs : Number.NEGATIVE_INFINITY,
+        latestRelevantMs,
+      );
+      if (Number.isFinite(mergedStartMs)) {
+        state.recentTail.actualCoverageStartAt = new Date(mergedStartMs).toISOString();
+      }
+      if (Number.isFinite(mergedLatestMs)) {
+        state.recentTail.latestRelevantAt = new Date(mergedLatestMs).toISOString();
+      }
+      if (state.recentTail.firstMainAt === null && Number.isFinite(firstRelevantMs)) {
+        state.recentTail.firstMainAt = new Date(firstRelevantMs).toISOString();
+      }
+      if (Number.isFinite(lastRelevantMs)) {
+        state.recentTail.lastScannedAt = new Date(lastRelevantMs).toISOString();
+      }
+      state.recentTail.timestampOrderViolated = timestampOrderViolated;
+      state.recentTail.orderingVerified = state.recentTail.orderingVerified === true
+        && timestampOrderViolated !== true;
+      const firstMainMs = Date.parse(state.recentTail.firstMainAt);
+      const boundaryReached = (Number.isFinite(firstMainMs) && firstMainMs <= recentSinceMs)
+        || (Number.isFinite(mergedLatestMs) && mergedLatestMs < recentSinceMs);
+      state.recentTail.coverageComplete = state.recentTail.orderingVerified === true
+        && timestampOrderViolated !== true
+        && (state.recentTail.coverageComplete === true || boundaryReached);
+      markChanged();
+    }
     if (chunk.aborted) {
       aborted = true;
       break;
+    }
+    if (state.recentTail?.requestedSinceAt === recentSinceAt) {
+      recentCoverageComplete &&= state.recentTail.coverageComplete === true;
+      const actualStartMs = Date.parse(state.recentTail.actualCoverageStartAt);
+      if (Number.isFinite(actualStartMs)) {
+        recentCoverageStartMs = Number.isFinite(recentCoverageStartMs)
+          ? Math.max(recentCoverageStartMs, actualStartMs)
+          : actualStartMs;
+      }
     }
     filesProcessed += 1;
     await onProgress?.({
@@ -892,6 +1117,10 @@ export async function ingestRolloutUpdates({
     filesDiscovered: files.length,
     filesProcessed,
     aborted,
+    recentCoverageComplete,
+    recentCoverageStartAt: Number.isFinite(recentCoverageStartMs)
+      ? new Date(recentCoverageStartMs).toISOString()
+      : null,
     changed,
     lastChangeCommitted: commitRecordBatch !== null && committedVersion === changeVersion,
   };
@@ -1063,6 +1292,10 @@ export async function runCollectorOnce({
   maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
+  maximumRecentTailBytes = MAX_RECENT_TAIL_BYTES,
+  maximumRecentPreludeBytes = MAX_RECENT_PRELUDE_BYTES,
+  maximumRecentRunBytes = MAX_RECENT_RUN_BYTES,
+  maximumLineagePrefixBytes = MAX_LINEAGE_PREFIX_BYTES,
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
@@ -1095,7 +1328,7 @@ export async function runCollectorOnce({
       nowIso,
     });
     const indexingRun = indexing.mode === "recent_7d"
-      && indexing.status !== "recent_7d_complete";
+      && !["recent_7d_complete", "recent_7d_partial"].includes(indexing.status);
     const priorIndexedRecords = indexing.status === "bounded_pause"
       ? indexing.recordsWritten
       : 0;
@@ -1150,6 +1383,11 @@ export async function runCollectorOnce({
       maximumBufferedLineBytes,
       maximumRecordBatchSize,
       maximumRecentEventKeys,
+      recentBackfillSinceAt: indexingRun ? checkpoint.collectionStartedAt : null,
+      maximumRecentTailBytes,
+      maximumRecentPreludeBytes,
+      maximumRecentRunBytes,
+      maximumLineagePrefixBytes,
       rollouts: selected,
       signal,
       onProgress: async (progress) => {
@@ -1174,9 +1412,18 @@ export async function runCollectorOnce({
     if (indexingRun) {
       indexing.filesProcessed = ingestion.filesProcessed;
       indexing.recordsWritten = priorIndexedRecords + ingestion.recordsWritten;
-      indexing.status = ingestion.aborted ? "bounded_pause" : "recent_7d_complete";
+      indexing.status = ingestion.aborted
+        ? "bounded_pause"
+        : ingestion.recentCoverageComplete
+          ? "recent_7d_complete"
+          : "recent_7d_partial";
       indexing.phase = ingestion.aborted ? "paused" : "complete";
       indexing.coveredAt.endAt = ingestion.aborted ? null : nowIso;
+      if (!ingestion.aborted) {
+        indexing.coveredAt.startAt = ingestion.recentCoverageComplete
+          ? checkpoint.collectionStartedAt
+          : ingestion.recentCoverageStartAt;
+      }
     } else if (indexing.mode === "prospective") {
       indexing.status = ingestion.aborted ? "bounded_pause" : "prospective_only";
       indexing.phase = ingestion.aborted ? "paused" : "prospective";
@@ -1249,7 +1496,11 @@ export async function runCollectorOnce({
     await emitIndexingProgress(onProgress, checkpoint.indexing);
     const result = {
       mode: "run_once",
-      status: ingestion.aborted || signal?.aborted ? "bounded_pause" : "complete",
+      status: ingestion.aborted || signal?.aborted
+        ? "bounded_pause"
+        : checkpoint.indexing?.status === "recent_7d_partial"
+          ? "partial"
+          : "complete",
       rolloutRecordsWritten: ingestion.recordsWritten,
       recordBatchesWritten: ingestion.recordBatchesWritten,
       maximumBufferedRecords: ingestion.maximumBufferedRecords,

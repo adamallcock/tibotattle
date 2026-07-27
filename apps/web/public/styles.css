@@ -322,6 +322,8 @@ h2 {
 .segmented-control button { padding: .5rem .7rem; border: 0; border-radius: .25rem; color: var(--muted); background: transparent; font-size: .7rem; font-weight: 750; cursor: pointer; }
 .segmented-control button.active { color: white; background: var(--green); }
 .timeline-controls { display: grid; justify-items: end; gap: 7px; }
+.chart-navigation { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.chart-navigation .button { min-height: 30px; }
 .chart-panel { padding: 30px; }
 .chart-heading p { margin: 4px 0 0; color: var(--muted); font-size: .72rem; }
 .legend { display: flex; flex-wrap: wrap; gap: 15px; color: var(--muted); font-size: .68rem; }
@@ -332,6 +334,9 @@ h2 {
 .chart-empty p { margin: 0; font-size: .78rem; }
 .chart-empty.small { min-height: 215px; font-size: .8rem; }
 .chart-shell { width: 100%; overflow-x: auto; }
+.chart-shell.interactive-chart { cursor: grab; touch-action: pan-y; outline: none; }
+.chart-shell.interactive-chart:focus-visible { outline: 3px solid rgba(38, 107, 91, .36); outline-offset: 4px; }
+.chart-shell.interactive-chart.is-panning { cursor: grabbing; user-select: none; }
 .chart-shell svg { display: block; width: 100%; min-width: 720px; height: 350px; overflow: visible; }
 .chart-shell.compact-chart svg { min-width: 440px; height: 235px; }
 .chart-grid { stroke: rgba(23, 33, 30, .1); stroke-width: 1; }
@@ -340,6 +345,12 @@ h2 {
 .chart-line-expected { fill: none; stroke: var(--rust); stroke-width: 2.4; vector-effect: non-scaling-stroke; }
 .chart-line-value { fill: none; stroke: var(--blue); stroke-width: 2.5; vector-effect: non-scaling-stroke; }
 .chart-area-confidence { fill: rgba(49, 95, 132, .14); }
+.chart-status-missing { fill: rgba(154, 102, 50, .14); }
+.chart-status-reset { fill: rgba(49, 95, 132, .14); }
+.chart-status-ambiguous { fill: rgba(131, 73, 55, .13); }
+.legend-dot.chart-status-missing { background: rgba(154, 102, 50, .72); }
+.legend-dot.chart-status-reset { background: rgba(49, 95, 132, .72); }
+.legend-dot.chart-status-ambiguous { background: rgba(131, 73, 55, .72); }
 .chart-zero { stroke: var(--muted); stroke-dasharray: 5 5; }
 .chart-point-observed { fill: var(--green); }
 .chart-point-expected { fill: var(--rust); }
@@ -348,6 +359,8 @@ h2 {
 .chart-summary-grid > div { padding: 13px 15px; background: var(--white); }
 .chart-summary-grid span { display: block; color: var(--muted); font-size: .64rem; text-transform: uppercase; }
 .chart-summary-grid strong { font-size: .84rem; }
+.timeline-confidence { margin: 13px 0 0; padding: 10px 12px; color: var(--muted); border-left: 3px solid var(--line); background: rgba(236, 230, 218, .34); font-size: .75rem; }
+.timeline-confidence.low { color: #784d25; border-left-color: var(--rust); background: var(--rust-soft); }
 .lower-charts { margin-top: 18px; }
 .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: .35rem; }
 table { width: 100%; border-collapse: collapse; font-size: .73rem; }
@@ -700,6 +713,7 @@ footer {
   .topbar { padding-inline: 14px; }
   .state-pill { max-width: 118px; overflow: hidden; white-space: nowrap; }
   .button.compact { display: none; }
+  .chart-navigation .button.compact { display: inline-flex; }
   .primary-nav { gap: 1rem; }
   .page-heading, .section-heading, .section-heading.split, .weekly-hero { grid-template-columns: 1fr; gap: 24px; }
   .page-heading { padding-top: 48px; }
@@ -715,6 +729,7 @@ footer {
   .comparison-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
   .chart-summary-grid { grid-template-columns: 1fr 1fr; }
   .timeline-controls { justify-items: start; }
+  .chart-navigation { justify-content: flex-start; }
   .boundary-diagram { grid-template-columns: 1fr; }
   .invite-row, .recover-form { grid-template-columns: 1fr; }
   .boundary-arrow { transform: rotate(90deg); justify-self: center; }
@@ -739,18 +754,30 @@ footer {
     font-size: 0;
   }
   .primary-nav {
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 0;
+    display: flex;
+    gap: .25rem;
     width: 100%;
-    overflow: visible;
+    overflow-x: auto;
+    scrollbar-width: thin;
   }
   .primary-nav a {
-    min-width: 0;
-    padding-inline: .1rem;
+    flex: 0 0 auto;
+    min-width: 62px;
+    padding-inline: .25rem;
     font-size: .62rem;
     line-height: 1.2;
     text-align: center;
+  }
+  .chart-navigation {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    width: 100%;
+  }
+  .chart-navigation .button.compact {
+    min-width: 0;
+    min-height: 48px;
+    padding-inline: .35rem;
+    font-size: .62rem;
   }
 }
 

@@ -1291,6 +1291,49 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });
 
+test("timeline keeps time, uncertainty, and primary navigation explicit", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  for (const id of [
+    "timeline-zoom-in",
+    "timeline-zoom-out",
+    "timeline-pan-back",
+    "timeline-pan-forward",
+    "timeline-reset-zoom",
+    "timeline-confidence",
+    "timeline-zoom-status",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(html, /data-nav="community"/);
+  assert.match(html, /data-nav="history"/);
+  assert.match(html, /data-nav="backend"/);
+  assert.match(html, /Exact UTC \/ local time/);
+  assert.match(html, /Missing quota bracket/);
+  assert.match(appSource, /function selectedTimelinePoints/);
+  assert.match(appSource, /function timelineStatusIntervals/);
+  assert.match(appSource, /function bindTimelineInteractions/);
+  assert.match(appSource, /event\.key === "ArrowLeft"/);
+  assert.match(appSource, /event\.key === "Home"/);
+  assert.match(appSource, /statusIntervals/);
+  assert.match(appSource, /visibleBounds = timelineBounds\(points\)/);
+  assert.match(appSource, /visibleArtifactResiduals\.length[\s\S]*pointResiduals/);
+  assert.match(appSource, /renderResiduals\(data, visiblePoints, viewport\)/);
+  assert.match(appSource, /safeDomainEndMs - domainStartMs/);
+  assert.match(appSource, /"UTC"/);
+  assert.match(appSource, /timelineStatusLabel/);
+  assert.match(appSource, /recent_7d_partial/);
+  assert.match(appSource, /cannot prove it reached the entire requested seven-day window/);
+  assert.match(styles, /interactive-chart/);
+  assert.match(styles, /chart-status-missing/);
+  assert.match(styles, /touch-action: pan-y/);
+  assert.match(styles, /\.chart-navigation \.button\.compact \{ display: inline-flex; \}/);
+  assert.match(styles, /grid-template-columns: repeat\(5, minmax\(0, 1fr\)\)/);
+  assert.match(styles, /min-height: 48px/);
+  assert.match(styles, /\.primary-nav \{[\s\S]*overflow-x: auto;/);
+});
+
 test("real contribution UI encrypts before sending and renders delayed snapshots", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /createTelemetryEnvelope/);

@@ -208,6 +208,15 @@ refresh indexes only the fixed recent seven-day window, publishes path-free
 file/record progress, and resumes from durable byte offsets after interruption.
 The page automatically continues completed bounded pauses during the same
 five-minute user-initiated refresh attempt.
+Oversized rollouts use a bounded 768 MiB recent tail plus a 32 MiB state
+prelude, under a conservative 1.5 GiB per-pass read budget. If that tail cannot
+prove the requested boundary, the result is labelled `Partial Recent
+Coverage`; it is never promoted to a complete seven-day index. Alignment I/O
+is reserved before the file is opened, and timestamp-order violations
+permanently downgrade the affected tail to partial. On the July 27 real-source
+fixture after those checks were added, seven resumable passes processed 459
+selected files and 478,389 safe records in 60.6 seconds of collector time
+while proving the requested seven-day boundary.
 An existing prospective checkpoint is never rewound: the dashboard labels it
 `Prospective Only`, shows its actual retained coverage dates, and states that
 older activity was not retroactively indexed.
@@ -296,6 +305,13 @@ The production local identity is stored in the dedicated
 locked or access is unavailable, preparation fails closed and the dashboard
 asks the user to unlock or allow access. It never silently replaces the
 identity or falls back to a new plaintext credential.
+
+On this development machine the item metadata is present, but macOS returns
+`errSecAuthFailed` for the login Keychain as a whole. The safe recovery is to
+open Keychain Access and manually unlock the `login` keychain, then retry.
+Do not reset the keychain, delete the item, or rotate the identity merely to
+clear this error: those actions change pseudonymous continuity and require a
+separate explicit decision.
 
 The lower-level reviewed-bundle converter remains available for development
 and recovery. First produce a current privacy-verified local bundle and
@@ -565,6 +581,16 @@ The [participant contribution history verification
 receipt](./2026-07-26-participant-contribution-history-verification-receipt.md)
 records the live encrypted HTTP and browser-driven product passes, including a
 UI lifecycle regression found and fixed during rendered QA.
+
+The consumer timeline now uses real timestamp spacing and exposes bounded
+zoom, pan, reset, keyboard, pointer-drag, and wheel interactions. Residuals are
+kept within the visible time interval, exact UTC/local inspection rows remain
+available below the graph, and live missing/reset/ambiguous evidence can be
+shaded without treating it as zero. The rendered evidence includes the
+[desktop comparison chart](./docs/qa/2026-07-27-interactive-quota-timeline.jpg)
+and a [narrow mobile control pass](./docs/qa/2026-07-27-mobile-timeline-controls.jpg).
+The mobile pass had no document-level horizontal overflow at an effective
+293 px content width; only the primary navigation scrolls intentionally.
 
 The backend also has a loopback-only, aggregate-diagnostic load runner:
 

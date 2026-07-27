@@ -110,6 +110,8 @@ HTTP acceptance test.
 
 - [Consumer overview](./docs/qa/2026-07-27-consumer-overview.png)
 - [Real local usage timeline](./docs/qa/2026-07-27-consumer-timeline.png)
+- [Interactive UTC quota timeline](./docs/qa/2026-07-27-interactive-quota-timeline.jpg)
+- [Mobile timeline controls](./docs/qa/2026-07-27-mobile-timeline-controls.jpg)
 - [Exact pre-upload inspection](./docs/qa/2026-07-27-exact-pre-upload-inspection.jpg)
 - [Private server-calculated results](./docs/qa/2026-07-27-unified-private-results.png)
 - [Backend status](./docs/qa/2026-07-27-unified-backend-status.png)
@@ -131,24 +133,40 @@ These are deliberate boundaries, not hidden completion claims:
   picker remains available for exact plaintext review of an already prepared
   batch. This machine's normal profile currently cannot complete preparation
   because its existing Keychain identity is unreadable; the app fails closed
-  with fixed guidance rather than overwriting that identity.
+  with fixed guidance rather than overwriting that identity. Read-only
+  diagnosis found the item at the exact expected service/account, but the
+  login Keychain returns `errSecAuthFailed` for this and other application
+  items. The next safe action is a manual `login` Keychain unlock in Keychain
+  Access followed by a retry—not reset, deletion, ACL broadening, or identity
+  rotation.
 - A fresh companion checkpoint now indexes a fixed recent seven-day window
   with bounded path-free progress and durable pause/resume. Existing
   prospective checkpoints are not rewound; they are labelled honestly with
   their retained coverage dates and remain partial historical evidence.
-  Very large long-lived active rollout files still begin at byte zero because
-  model/tier state must be reconstructed; the UI automatically resumes
-  timeout-paused checkpoints for up to five minutes, but a byte-tail index is
-  still follow-up performance work.
+  Oversized rollouts now use a bounded 768 MiB recent tail and 32 MiB state
+  prelude under a 1.5 GiB per-pass budget. Missing cumulative state never turns
+  a total into an invented usage delta, and a tail that cannot reach the
+  requested boundary is labelled partial. Alignment is budgeted before I/O,
+  and an out-of-order timestamp permanently downgrades the affected tail to
+  partial. An isolated real-source rerun with those checks proved the
+  seven-day boundary after seven resumable passes: 459 selected files and
+  478,389 safe records in 60.6 seconds of collector time.
 - Timeline range, hour/day/week grouping, 15-minute/one-hour/three-hour
   smoothing, UTC/local labels, residuals, and weekly uncertainty are present.
-  Direct graphical drag-to-zoom and richer in-chart gap annotations remain
-  follow-up UI work.
+  The quota chart now uses timestamp-proportional spacing, keyboard and
+  pointer-drag navigation, wheel zoom, explicit zoom/pan/reset controls,
+  exact UTC/local inspection rows, and shaded missing/reset/ambiguous
+  intervals where live evidence exposes those states. Residuals are restricted
+  to the visible interval and fall back to the displayed comparison series
+  instead of silently showing an unrelated historical period.
 - The reusable backend is local-only. Public HTTPS staging, remote D1/R2
   provisioning, backups, alerting, abuse controls, external review, and
   production deletion exercises are explicitly deferred.
-- Mobile/narrow layout still needs a dedicated rendered-device pass before
-  calling the interface broadly consumer-ready.
+- A dedicated narrow rendered pass succeeded at an effective 293 px browser
+  content width (stricter than the requested approximately 390 px target):
+  no document-level horizontal overflow, 48 px-high timeline navigation
+  controls, and intentional horizontal scrolling only inside the nine-item
+  primary navigation.
 - R7 large-corpus and dual-runtime receipt regeneration is intentionally
   separate hardening work. Existing unrelated R7 worktree changes were
   preserved and were not included in this implementation.

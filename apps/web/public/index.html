@@ -26,11 +26,11 @@
         <a href="#timeline" data-nav="timeline">Timeline</a>
         <a href="#weekly" data-nav="weekly">Weekly</a>
         <a href="#accounting" data-nav="accounting">Accounting</a>
-        <a href="#community">Community</a>
-        <a href="#history">History</a>
+        <a href="#community" data-nav="community">Community</a>
+        <a href="#history" data-nav="history">History</a>
         <a href="#coverage" data-nav="coverage">Gaps</a>
         <a href="#data" data-nav="data">Privacy</a>
-        <a href="#backend">Backend</a>
+        <a href="#backend" data-nav="backend">Backend</a>
       </nav>
       <div class="top-actions">
         <span class="state-pill state-connecting" id="central-state">
@@ -157,6 +157,14 @@
               <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
               <button type="button" data-days="31">31d</button>
             </div>
+            <div class="chart-navigation" aria-label="Timeline zoom and pan">
+              <button class="button button-quiet compact" id="timeline-pan-back" type="button" title="Pan timeline earlier">← Earlier</button>
+              <button class="button button-quiet compact" id="timeline-zoom-out" type="button" title="Zoom out">−</button>
+              <button class="button button-quiet compact" id="timeline-zoom-in" type="button" title="Zoom in">+</button>
+              <button class="button button-quiet compact" id="timeline-reset-zoom" type="button">Reset view</button>
+              <button class="button button-quiet compact" id="timeline-pan-forward" type="button" title="Pan timeline later">Later →</button>
+              <span class="sr-only" id="timeline-zoom-status" aria-live="polite"></span>
+            </div>
           </div>
         </div>
 
@@ -184,11 +192,14 @@
           <div class="chart-heading">
             <div>
               <h3 id="timeline-chart-title">Observed quota change versus cost-implied change</h3>
-              <p id="timeline-chart-copy">UTC timestamps · drag or scroll horizontally on smaller screens</p>
+              <p id="timeline-chart-copy">UTC chart axis · exact UTC and local times are listed below</p>
             </div>
             <div class="legend" aria-label="Chart legend">
               <span><i class="legend-dot observed"></i>Observed quota</span>
               <span><i class="legend-dot expected"></i>Expected from API cost</span>
+              <span><i class="legend-dot chart-status-missing"></i>Missing quota bracket</span>
+              <span><i class="legend-dot chart-status-reset"></i>Reset or track change</span>
+              <span><i class="legend-dot chart-status-ambiguous"></i>Ambiguous movement</span>
             </div>
           </div>
           <div class="chart-empty" id="timeline-empty">
@@ -197,6 +208,7 @@
           </div>
           <div class="chart-shell" id="timeline-chart" hidden></div>
           <div class="chart-summary-grid" id="timeline-summary"></div>
+          <p class="timeline-confidence" id="timeline-confidence" role="status"></p>
         </article>
 
         <div class="two-column lower-charts">
@@ -218,7 +230,7 @@
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Inspect exact periods</p>
-                <h3>Largest unexplained windows</h3>
+                <h3>Exact windows and evidence state</h3>
               </div>
             </div>
             <div class="table-wrap">
@@ -226,14 +238,15 @@
                 <caption class="sr-only">Largest unexplained quota movement periods</caption>
                 <thead>
                   <tr>
-                    <th scope="col">UTC period</th>
-                    <th scope="col">Observed</th>
-                    <th scope="col">Expected</th>
-                    <th scope="col">Difference</th>
+                  <th scope="col">Exact UTC / local time</th>
+                  <th scope="col">Observed</th>
+                  <th scope="col">Expected</th>
+                  <th scope="col">Difference</th>
+                  <th scope="col">Evidence state</th>
                   </tr>
                 </thead>
                 <tbody id="residual-table">
-                  <tr><td colspan="4" class="empty-cell">No periods loaded.</td></tr>
+                  <tr><td colspan="5" class="empty-cell">No periods loaded.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -430,7 +443,7 @@
         </article>
       </section>
 
-      <section class="dashboard-section" id="data" aria-labelledby="data-title">
+      <section class="dashboard-section" id="data" data-nav-target aria-labelledby="data-title">
         <div class="section-heading">
           <div>
             <p class="eyebrow">06 · Data &amp; privacy</p>
@@ -727,7 +740,7 @@
           </p>
         </article>
 
-        <article class="panel backend-panel" id="backend" aria-labelledby="backend-title">
+        <article class="panel backend-panel" id="backend" data-nav-target aria-labelledby="backend-title">
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Central service</p>
@@ -772,7 +785,7 @@
         </article>
 
         <div class="two-column result-panels">
-          <article class="panel personal-result-panel" id="history">
+          <article class="panel personal-result-panel" id="history" data-nav-target>
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Your contributed evidence</p>
@@ -843,7 +856,7 @@
               <p class="participant-action-status" id="participant-action-status" role="status" hidden></p>
             </div>
           </article>
-          <article class="panel community-result-panel" id="community">
+          <article class="panel community-result-panel" id="community" data-nav-target>
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Delayed community evidence</p>
