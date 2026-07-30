@@ -1,6 +1,6 @@
-import { createReadStream } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
-import { opendir, stat } from "node:fs/promises";
+import { lstat, open, opendir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -44,13 +44,212 @@ const EXPORT_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"type":"local_shell_call"',
 ]);
 
-function boundedScannerLines(path, resourceGuard, maximumTotalBytes = Number.POSITIVE_INFINITY) {
+const MAXIMUM_ACTIVE_APPEND_PROOF_BYTES = 8 * 1024 * 1024;
+
+export class CodexLogSourceChangedError extends Error {
+  constructor() {
+    super("Codex log source changed during scan; retry");
+    this.name = "CodexLogSourceChangedError";
+    this.code = "codex_log_source_changed";
+    this.retryable = true;
+  }
+}
+
+function sourceChanged() {
+  throw new CodexLogSourceChangedError();
+}
+
+function rethrowScannerControlError(error) {
+  if (error?.name === "AbortError"
+      || (typeof error?.code === "string" && error.code.startsWith("export_resource_"))) throw error;
+}
+
+function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error("codex_log_scan_aborted");
+  error.name = "AbortError";
+  error.code = "codex_log_scan_aborted";
+  throw error;
+}
+
+function boundedScannerLines(
+  path,
+  resourceGuard,
+  maximumTotalBytes = Number.POSITIVE_INFINITY,
+  signal = null,
+) {
   return readBoundedUtf8Lines(path, {
     maximumLineBytes: resourceGuard?.limits.maximumLineBytes,
     resourceGuard,
     oversizedIrrelevantNeedles: EXPORT_RELEVANT_LINE_NEEDLES,
     maximumTotalBytes,
+    signal,
   });
+}
+
+function sameSourceIdentity(stats, expected) {
+  if (Number.isSafeInteger(expected?.dev) && stats.dev !== expected.dev) return false;
+  if (Number.isSafeInteger(expected?.ino) && stats.ino !== expected.ino) return false;
+  if (Number.isFinite(expected?.birthtimeMs)
+      && Math.trunc(stats.birthtimeMs) !== Math.trunc(expected.birthtimeMs)) return false;
+  return true;
+}
+
+function sameSourceState(left, right) {
+  return sameSourceIdentity(left, right)
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function assertActiveSourceStats(stats, expected = null) {
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1) sourceChanged();
+  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) sourceChanged();
+  if (expected && !sameSourceIdentity(stats, expected)) sourceChanged();
+}
+
+async function statActiveSourcePath(path, expected) {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch {
+    sourceChanged();
+  }
+  assertActiveSourceStats(stats, expected);
+  return stats;
+}
+
+async function hashActiveSourcePrefix(handle, prefixBytes, resourceGuard = null) {
+  if (!Number.isSafeInteger(prefixBytes) || prefixBytes < 0) sourceChanged();
+  const digest = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(256 * 1024);
+  let offset = 0;
+  while (offset < prefixBytes) {
+    resourceGuard?.checkRuntime();
+    const length = Math.min(buffer.length, prefixBytes - offset);
+    let result;
+    try {
+      result = await handle.read(buffer, 0, length, offset);
+    } catch {
+      sourceChanged();
+    }
+    if (result.bytesRead !== length) sourceChanged();
+    digest.update(buffer.subarray(0, result.bytesRead));
+    offset += result.bytesRead;
+  }
+  return digest.digest("hex");
+}
+
+async function assertAppendedRecordsAfterEnd(
+  handle,
+  prefixBytes,
+  currentSize,
+  endMs,
+  resourceGuard = null,
+) {
+  if (currentSize === prefixBytes) return;
+  if (!Number.isSafeInteger(currentSize) || currentSize < prefixBytes
+      || currentSize - prefixBytes > MAXIMUM_ACTIVE_APPEND_PROOF_BYTES) sourceChanged();
+  if (prefixBytes > 0) {
+    const boundary = Buffer.allocUnsafe(1);
+    let result;
+    try {
+      result = await handle.read(boundary, 0, 1, prefixBytes - 1);
+    } catch {
+      sourceChanged();
+    }
+    if (result.bytesRead !== 1 || boundary[0] !== 0x0a) sourceChanged();
+  }
+  const maximumLineBytes = Math.min(
+    resourceGuard?.limits.maximumLineBytes ?? MAXIMUM_ACTIVE_APPEND_PROOF_BYTES,
+    MAXIMUM_ACTIVE_APPEND_PROOF_BYTES,
+  );
+  try {
+    for await (const line of readBoundedUtf8Lines(handle, {
+      maximumLineBytes,
+      maximumTotalBytes: currentSize,
+      startByte: prefixBytes,
+    })) {
+      resourceGuard?.checkRuntime();
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        sourceChanged();
+      }
+      const timestampMs = Date.parse(record?.timestamp);
+      if (!Number.isFinite(timestampMs) || timestampMs <= endMs) sourceChanged();
+    }
+  } catch (error) {
+    if (error instanceof CodexLogSourceChangedError) throw error;
+    rethrowScannerControlError(error);
+    sourceChanged();
+  }
+}
+
+async function openActiveRolloutSnapshot(info, endMs, resourceGuard = null) {
+  let handle;
+  try {
+    handle = await open(info.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const stats = await handle.stat();
+    assertActiveSourceStats(stats, info);
+    await statActiveSourcePath(info.path, stats);
+    if (stats.size < info.size) sourceChanged();
+    if (stats.size === info.size
+        && (stats.mtimeMs !== info.mtimeMs || stats.ctimeMs !== info.ctimeMs)) sourceChanged();
+    await assertAppendedRecordsAfterEnd(handle, info.size, stats.size, endMs, resourceGuard);
+    const prefixSha256 = await hashActiveSourcePrefix(handle, info.size, resourceGuard);
+    const afterSnapshot = await handle.stat();
+    assertActiveSourceStats(afterSnapshot, stats);
+    await statActiveSourcePath(info.path, afterSnapshot);
+    if (afterSnapshot.size < info.size) sourceChanged();
+    await assertAppendedRecordsAfterEnd(handle, info.size, afterSnapshot.size, endMs, resourceGuard);
+    return { handle, prefixSha256 };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error instanceof CodexLogSourceChangedError) throw error;
+    rethrowScannerControlError(error);
+    sourceChanged();
+  }
+}
+
+async function verifyActiveRolloutSnapshot(info, snapshot, endMs, resourceGuard = null) {
+  const { handle, prefixSha256 } = snapshot;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let before;
+    try {
+      before = await handle.stat();
+    } catch {
+      sourceChanged();
+    }
+    assertActiveSourceStats(before, info);
+    if (before.size < info.size) sourceChanged();
+    await assertAppendedRecordsAfterEnd(handle, info.size, before.size, endMs, resourceGuard);
+    if (await hashActiveSourcePrefix(handle, info.size, resourceGuard) !== prefixSha256) sourceChanged();
+    let after;
+    try {
+      after = await handle.stat();
+    } catch {
+      sourceChanged();
+    }
+    const pathStats = await statActiveSourcePath(info.path, after);
+    if (sameSourceState(before, after) && sameSourceState(after, pathStats)) return;
+    const appendOnlyGrowth = sameSourceIdentity(after, before)
+      && after.size >= before.size
+      && sameSourceIdentity(pathStats, after)
+      && pathStats.size >= after.size
+      && pathStats.size > before.size;
+    if (!appendOnlyGrowth) sourceChanged();
+  }
+  sourceChanged();
 }
 
 export function normalizeTokenUsage(value) {
@@ -83,9 +282,10 @@ export function sameUsage(left, right) {
   return COMPONENT_KEYS.every((key) => left[key] === right[key]);
 }
 
-async function collectJsonlFileInfos(root, resourceGuard = null) {
+async function collectJsonlFileInfos(root, resourceGuard = null, signal = null) {
   const files = [];
   async function walk(directory) {
+    throwIfAborted(signal);
     let entries;
     try {
       entries = await opendir(directory);
@@ -93,16 +293,28 @@ async function collectJsonlFileInfos(root, resourceGuard = null) {
       return;
     }
     for await (const entry of entries) {
+      throwIfAborted(signal);
       resourceGuard?.observeDirectoryEntry();
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
         await walk(path);
       } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        throwIfAborted(signal);
         const metadata = await stat(path);
-        resourceGuard?.observeSourceFile(metadata.size);
+        // Discovery walks the whole bounded history so it can resolve fork
+        // ancestry, but only the interval-selected rollouts are export
+        // sources. Charging every historical file here makes a one-hour
+        // export fail as soon as the lifetime log directory crosses the
+        // single-export byte ceiling. Directory-entry, elapsed-time and RSS
+        // guards still bound this transient walk; the exact selected file and
+        // byte totals are charged once below before any selected source is
+        // parsed.
+        resourceGuard?.checkRuntime();
         files.push({
           path,
+          dev: metadata.dev,
           mtimeMs: metadata.mtimeMs,
+          ctimeMs: metadata.ctimeMs,
           size: metadata.size,
           ino: metadata.ino,
           birthtimeMs: metadata.birthtimeMs,
@@ -117,8 +329,17 @@ async function collectJsonlFileInfos(root, resourceGuard = null) {
 export async function readRolloutLineage(path, {
   resourceGuard = null,
   maximumTotalBytes = Number.POSITIVE_INFINITY,
+  signal = null,
 } = {}) {
-  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
+  if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
+  throwIfAborted(signal);
+  for await (const line of boundedScannerLines(
+    path,
+    resourceGuard,
+    maximumTotalBytes,
+    signal,
+  )) {
+    throwIfAborted(signal);
     if (line === null) continue;
     if (!line.includes('"session_meta"')) continue;
     try {
@@ -171,21 +392,29 @@ export async function discoverCodexRolloutInfos({
   startAt,
   endAt = null,
   resourceGuard = null,
+  signal = null,
 }) {
+  if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
+  throwIfAborted(signal);
   const cutoffMs = new Date(startAt).getTime();
   const endMs = endAt === null ? Number.POSITIVE_INFINITY : new Date(endAt).getTime();
   const [active, archived] = await Promise.all([
-    collectJsonlFileInfos(join(codexHome, "sessions"), resourceGuard),
-    collectJsonlFileInfos(join(codexHome, "archived_sessions"), resourceGuard),
+    collectJsonlFileInfos(join(codexHome, "sessions"), resourceGuard, signal),
+    collectJsonlFileInfos(join(codexHome, "archived_sessions"), resourceGuard, signal),
   ]);
+  throwIfAborted(signal);
   const byName = new Map();
   for (const info of archived) byName.set(rolloutKey(info.path), { ...info, location: "archive" });
   for (const info of active) byName.set(rolloutKey(info.path), { ...info, location: "active" });
-  const all = await mapWithConcurrency([...byName.entries()], 16, async ([key, info]) => ({
-    ...info,
-    rolloutKey: key,
-    lineage: await readRolloutLineage(info.path, { resourceGuard }),
-  }));
+  const all = await mapWithConcurrency([...byName.entries()], 16, async ([key, info]) => {
+    throwIfAborted(signal);
+    return {
+      ...info,
+      rolloutKey: key,
+      lineage: await readRolloutLineage(info.path, { resourceGuard, signal }),
+    };
+  });
+  throwIfAborted(signal);
   const bySessionId = new Map();
   for (const info of all) {
     if (!info.lineage.sessionId) continue;
@@ -476,8 +705,20 @@ export function cumulativeSnapshotKey(total, last) {
   return [...COMPONENT_KEYS.map((key) => total[key]), ...(last ? COMPONENT_KEYS.map((key) => last[key]) : [])].join("|");
 }
 
-async function collectCumulativeSnapshotKeys(path, target, resourceGuard = null, maximumTotalBytes = Number.POSITIVE_INFINITY) {
-  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
+async function collectCumulativeSnapshotKeys(
+  path,
+  target,
+  resourceGuard = null,
+  maximumTotalBytes = Number.POSITIVE_INFINITY,
+  signal = null,
+) {
+  for await (const line of boundedScannerLines(
+    path,
+    resourceGuard,
+    maximumTotalBytes,
+    signal,
+  )) {
+    throwIfAborted(signal);
     if (line === null) continue;
     if (!line.includes('"token_count"')) continue;
     try {
@@ -493,10 +734,22 @@ async function collectCumulativeSnapshotKeys(path, target, resourceGuard = null,
   }
 }
 
-async function collectTierTimeline(path, diagnostics, resourceGuard = null, maximumTotalBytes = Number.POSITIVE_INFINITY) {
+async function collectTierTimeline(
+  path,
+  diagnostics,
+  resourceGuard = null,
+  maximumTotalBytes = Number.POSITIVE_INFINITY,
+  signal = null,
+) {
   const timeline = [];
   let ordinal = 0;
-  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
+  for await (const line of boundedScannerLines(
+    path,
+    resourceGuard,
+    maximumTotalBytes,
+    signal,
+  )) {
+    throwIfAborted(signal);
     if (line === null) continue;
     ordinal += 1;
     if (!line.includes('"type":"thread_settings_applied"')) continue;
@@ -558,15 +811,28 @@ async function parseRollout(path, {
   sourceDedupeScope,
   resourceGuard,
   maximumTotalBytes = Number.POSITIVE_INFINITY,
+  signal = null,
 }) {
-  const tierTimeline = await collectTierTimeline(path, diagnostics, resourceGuard, maximumTotalBytes);
+  const tierTimeline = await collectTierTimeline(
+    path,
+    diagnostics,
+    resourceGuard,
+    maximumTotalBytes,
+    signal,
+  );
   let currentModel = null;
   let previousTotals = null;
   let previousTotalsPresence = null;
   const openTaskIds = new Set();
   let sourceRecordOrdinal = 0;
 
-  for await (const line of boundedScannerLines(path, resourceGuard, maximumTotalBytes)) {
+  for await (const line of boundedScannerLines(
+    path,
+    resourceGuard,
+    maximumTotalBytes,
+    signal,
+  )) {
+    throwIfAborted(signal);
     sourceRecordOrdinal += 1;
     if (line === null) continue;
     if (!EXPORT_RELEVANT_LINE_NEEDLES.some((needle) => line.includes(needle))) continue;
@@ -754,6 +1020,7 @@ export async function scanCodexLogEvents({
   activeTaskRecencyMs = null,
   sourceScopeForRollout = null,
   resourceGuard = null,
+  signal = null,
   rolloutInfos: suppliedRolloutInfos = null,
   openRolloutSource = null,
   verifyRolloutSource = null,
@@ -770,12 +1037,20 @@ export async function scanCodexLogEvents({
   if (suppliedRolloutInfos !== null && !Array.isArray(suppliedRolloutInfos)) {
     throw new TypeError("rolloutInfos must be an array or null");
   }
+  if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
+  throwIfAborted(signal);
   const rolloutInfos = suppliedRolloutInfos ?? await discoverCodexRolloutInfos({
       codexHome,
       startAt: new Date(Math.min(startMs, activeCutoffMs)).toISOString(),
       endAt,
       resourceGuard,
+      signal,
     });
+  resourceGuard?.observeSourcePlan(
+    rolloutInfos.length,
+    rolloutInfos.reduce((sum, info) => sum + info.size, 0),
+  );
+  throwIfAborted(signal);
   const excludedSessions = new Set(excludeSessionIds.filter((value) => typeof value === "string" && value.length > 0));
   const seenEvents = new Set();
   const seenToolCalls = new Set();
@@ -811,8 +1086,14 @@ export async function scanCodexLogEvents({
   const snapshotsBySession = new Map();
   diagnostics.sourceProvenance = summarizeCodexRolloutSources(rolloutInfos, { endAt });
   for (let sourceRolloutOrdinal = 0; sourceRolloutOrdinal < rolloutInfos.length; sourceRolloutOrdinal += 1) {
+    throwIfAborted(signal);
     const info = rolloutInfos[sourceRolloutOrdinal];
-    const openedSource = typeof openRolloutSource === "function" ? await openRolloutSource(info) : null;
+    const activeSnapshot = typeof openRolloutSource !== "function" && info.location === "active"
+      ? await openActiveRolloutSnapshot(info, endMs, resourceGuard)
+      : null;
+    const openedSource = typeof openRolloutSource === "function"
+      ? await openRolloutSource(info)
+      : activeSnapshot?.handle ?? null;
     const sourceInput = openedSource ?? info.path;
     try {
     const classification = info.lineage.surfaceClassification ?? classifySessionSurface(null);
@@ -824,7 +1105,13 @@ export async function scanCodexLogEvents({
         ? snapshotsBySession.get(info.lineage.parentId)
         : null;
       const rolloutSnapshots = createSnapshotLineage(inheritedSnapshots ?? null);
-      await collectCumulativeSnapshotKeys(sourceInput, rolloutSnapshots, resourceGuard, info.size);
+      await collectCumulativeSnapshotKeys(
+        sourceInput,
+        rolloutSnapshots,
+        resourceGuard,
+        info.size,
+        signal,
+      );
       snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
       diagnostics.excludedRollouts += 1;
       continue;
@@ -862,12 +1149,15 @@ export async function scanCodexLogEvents({
       sourceDedupeScope,
       resourceGuard,
       maximumTotalBytes: info.size,
+      signal,
     });
     if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) diagnostics.activeTaskRolloutsAtEnd += 1;
     if (info.lineage.sessionId) snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
     } finally {
       try {
-        if (openedSource && typeof verifyRolloutSource === "function") {
+        if (activeSnapshot) {
+          await verifyActiveRolloutSnapshot(info, activeSnapshot, endMs, resourceGuard);
+        } else if (openedSource && typeof verifyRolloutSource === "function") {
           await verifyRolloutSource(info, openedSource);
         }
       } finally {
@@ -875,6 +1165,7 @@ export async function scanCodexLogEvents({
       }
     }
   }
+  throwIfAborted(signal);
   return {
     parserVersion: CODEX_LOG_SCAN_VERSION,
     diagnostics,

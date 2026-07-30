@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   backendSmokeSourceArguments,
+  localCompanionEnvironment,
   parseLocalBackendLabArguments,
   projectLocalBackendLabReceipt,
 } from "./start-local-backend-lab-lib.mjs";
@@ -69,6 +70,29 @@ test("backend-only laboratory leaves the local companion stopped", () => {
   ]);
   assert.equal(parsed.backendOnly, true);
   assert.equal(parsed.startCompanion, false);
+});
+
+test("backend laboratory isolates companion state from the installed app", () => {
+  const environment = localCompanionEnvironment({
+    environment: { EXISTING: "preserved" },
+    port: 8891,
+    centralOrigin: "http://127.0.0.1:8892",
+    stateRoot: "/private/lab/companion-state",
+  });
+  assert.deepEqual(environment, {
+    EXISTING: "preserved",
+    USAGE_MONITOR_PORT: "8891",
+    USAGE_MONITOR_CENTRAL_ORIGIN: "http://127.0.0.1:8892",
+    USAGE_MONITOR_STATE_ROOT: "/private/lab/companion-state",
+  });
+  assert.throws(
+    () => localCompanionEnvironment({
+      port: 8891,
+      centralOrigin: "http://127.0.0.1:8892",
+      stateRoot: "relative-state",
+    }),
+    /state root must be absolute/u,
+  );
 });
 
 test("real-file laboratory receipt projection excludes private locations", () => {

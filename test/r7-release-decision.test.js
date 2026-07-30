@@ -219,7 +219,17 @@ function assembledProfileEvidence(profile) {
           pathway: "resource_guard_from_file_stats",
         },
       },
-      sqliteBatch: { status: "not_run", reason: "no_injectable_sqlite_batch_seam" },
+      sqliteBatch: {
+        batchLimitRecords: 1_000,
+        recordsIndexed: 1_001,
+        nonEmptyBatchCount: 2,
+        fullBatchCount: 1,
+        maximumBatchRecords: 1_000,
+        finalBatchRecords: 1,
+        pathway: "export_set_verifier_sqlite_index",
+        atBatchLimitStatus: "passed",
+        plusOneRolloverStatus: "passed",
+      },
     };
   }
   return {

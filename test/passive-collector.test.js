@@ -10,6 +10,7 @@ import {
   acquireCollectorLock,
   appServerSnapshotRecord,
   commitCollectorRecordBatch,
+  discoverCollectorRollouts,
   ingestRolloutUpdates,
   recoverCollectorBatchJournal,
   runCollectorForeground,
@@ -105,6 +106,127 @@ async function readLines(path) {
     throw error;
   }
 }
+
+test("recursive rollout discovery stops promptly when its AbortSignal fires", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  let abortChecks = 0;
+  const signal = {
+    get aborted() {
+      abortChecks += 1;
+      if (abortChecks === 9) controller.abort();
+      return controller.signal.aborted;
+    },
+    addEventListener: (...args) => controller.signal.addEventListener(...args),
+    removeEventListener: (...args) => controller.signal.removeEventListener(...args),
+  };
+  try {
+    await writeFile(join(fixture.sessions, "second.jsonl"), "");
+    await assert.rejects(
+      () => discoverCollectorRollouts(fixture.codexHome, { signal }),
+      (error) => {
+        assert.equal(error.name, "AbortError");
+        assert.equal(error.code, "collector_discovery_aborted");
+        assert.ok(error.discoveryProgress.directoryEntries >= 1);
+        assert.equal(JSON.stringify(error).includes(fixture.root), false);
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("recursive rollout discovery enforces a content-free directory-entry ceiling", async () => {
+  const fixture = await collectorFixture();
+  try {
+    await writeFile(join(fixture.sessions, "unrelated.txt"), "");
+    await assert.rejects(
+      () => discoverCollectorRollouts(fixture.codexHome, {
+        maximumDirectoryEntries: 1,
+      }),
+      (error) => {
+        assert.equal(error.code, "collector_resource_directory_entries_limit_exceeded");
+        assert.deepEqual(error.resourceLimit, {
+          code: "collector_resource_directory_entries_limit_exceeded",
+          dimension: "directory_entries",
+          limit: 1,
+          observed: 2,
+        });
+        assert.equal(JSON.stringify(error).includes(fixture.root), false);
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("recursive rollout discovery enforces a content-free rollout-file ceiling", async () => {
+  const fixture = await collectorFixture();
+  try {
+    await writeFile(join(fixture.sessions, "second.jsonl"), "");
+    await assert.rejects(
+      () => discoverCollectorRollouts(fixture.codexHome, {
+        maximumRolloutFiles: 1,
+      }),
+      (error) => {
+        assert.equal(error.code, "collector_resource_rollout_files_limit_exceeded");
+        assert.deepEqual(error.resourceLimit, {
+          code: "collector_resource_rollout_files_limit_exceeded",
+          dimension: "rollout_files",
+          limit: 1,
+          observed: 2,
+        });
+        assert.equal(JSON.stringify(error).includes(fixture.root), false);
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("run-once exposes discovery ceilings as a bounded pause without replacing the last good index", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:01:00.000Z");
+  try {
+    const complete = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(complete.status, "complete");
+    const checkpointBefore = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const dataBefore = await readFile(fixture.dataFile);
+    await writeFile(join(fixture.sessions, "unrelated.txt"), "");
+
+    const paused = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      maximumDiscoveryDirectoryEntries: 1,
+      clock,
+    });
+    assert.equal(paused.status, "bounded_pause");
+    assert.equal(paused.pauseReason, "collector_resource_directory_entries_limit_exceeded");
+    assert.deepEqual(paused.resourceLimit, {
+      code: "collector_resource_directory_entries_limit_exceeded",
+      dimension: "directory_entries",
+      limit: 1,
+      observed: 2,
+    });
+    const checkpointPaused = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.deepEqual(checkpointPaused.files, checkpointBefore.files);
+    assert.deepEqual(checkpointPaused.indexing, checkpointBefore.indexing);
+    assert.deepEqual(await readFile(fixture.dataFile), dataBefore);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
 
 test("run-once restarts from byte checkpoints without duplicate records", async () => {
   const fixture = await collectorFixture([
@@ -509,9 +631,70 @@ test("the recent-run byte budget pauses before reading the next source and resum
     assert.equal(first.filesProcessed, 1);
     assert.equal((await readLines(fixture.dataFile)).length, 1);
 
+    const reseeded = await runCollectorOnce(options);
+    assert.equal(reseeded.status, "bounded_pause");
+    assert.equal(reseeded.filesProcessed, 1);
     const resumed = await runCollectorOnce(options);
     assert.equal(resumed.status, "complete");
     assert.equal(resumed.filesProcessed, 2);
+    assert.equal((await readLines(fixture.dataFile)).length, 2);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("the per-run byte ceiling also pauses a post-index delta without advancing durable state", async () => {
+  const fixture = await collectorFixture([
+    JSON.stringify({
+      timestamp: "2026-07-23T00:00:00.000Z",
+      type: "turn_context",
+      payload: { model: "gpt-test" },
+    }),
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:02:00.000Z");
+  try {
+    const initial = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(initial.status, "complete");
+    const checkpointBefore = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const dataBefore = await readFile(fixture.dataFile);
+    const delta = `${tokenRecord("2026-07-23T00:01:01.000Z", usage(20), usage(10), 2)}\n`;
+    await appendFile(fixture.rollout, delta);
+
+    const paused = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      maximumRecentRunBytes: Buffer.byteLength(delta) - 1,
+      clock,
+    });
+    assert.equal(paused.status, "bounded_pause");
+    assert.equal(paused.pauseReason, "collector_resource_source_bytes_limit_exceeded");
+    assert.deepEqual(paused.resourceLimit, {
+      code: "collector_resource_source_bytes_limit_exceeded",
+      dimension: "source_bytes",
+      limit: Buffer.byteLength(delta) - 1,
+      observed: Buffer.byteLength(delta),
+    });
+    assert.equal(paused.rolloutRecordsWritten, 0);
+    const checkpointPaused = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.deepEqual(checkpointPaused.files, checkpointBefore.files);
+    assert.deepEqual(checkpointPaused.recentEventKeys, checkpointBefore.recentEventKeys);
+    assert.deepEqual(await readFile(fixture.dataFile), dataBefore);
+
+    const resumed = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      maximumRecentRunBytes: Buffer.byteLength(delta),
+      clock,
+    });
+    assert.equal(resumed.status, "complete");
+    assert.equal(resumed.rolloutRecordsWritten, 1);
     assert.equal((await readLines(fixture.dataFile)).length, 2);
   } finally {
     await rm(fixture.root, { recursive: true });

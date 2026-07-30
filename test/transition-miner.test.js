@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mineCodexTransitions } from "../src/codex-transition-miner.js";
+import {
+  deriveCodexTransitionSeries,
+  deriveCodexTransitionSeriesCooperatively,
+  mineCodexTransitions,
+} from "../src/codex-transition-miner.js";
 import { stableJson, writeJsonOwnerOnlyAtomic } from "../src/storage.js";
 
 const PRICE_CARDS = [{
@@ -94,6 +98,69 @@ const RANGE = {
   endAt: "2026-07-23T00:10:00.000Z",
   priceCards: PRICE_CARDS,
 };
+
+test("pure transition derivation rejects invalid envelopes and ignores malformed rows", () => {
+  assert.throws(
+    () => deriveCodexTransitionSeries({
+      startAt: "not-an-instant",
+      endAt: RANGE.endAt,
+    }),
+    /Transition series inputs are invalid/,
+  );
+  const derived = deriveCodexTransitionSeries({
+    startAt: RANGE.startAt,
+    endAt: RANGE.endAt,
+    rawUsageEvents: [null, "not-an-event"],
+    rateLimitSnapshots: [null, { timestamp: RANGE.startAt }],
+    toolEvents: [null],
+  });
+  assert.equal(derived.usageEvents.length, 0);
+  assert.equal(derived.rateLimitSnapshots.length, 0);
+  assert.equal(derived.transitions.length, 0);
+});
+
+test("cooperative transition derivation preserves the synchronous result", async () => {
+  const rawUsageEvents = [{
+    timestamp: "2026-07-23T00:00:01.000Z",
+    model: "gpt-test",
+    totalInputContextTokens: 10,
+    components: {
+      input_uncached_tokens: 10,
+      input_cache_read_tokens: 0,
+      input_cache_write_tokens: 0,
+      output_text_tokens: 0,
+      output_reasoning_tokens: 0,
+    },
+    tierSemantics: {
+      codexSpeedMode: "standard",
+      apiServiceTier: "unknown",
+    },
+  }];
+  const rateLimitSnapshots = [1, 2].map((usedPercent, index) => ({
+    timestamp: `2026-07-23T00:00:0${index + 1}.000Z`,
+    window: {
+      provider: "openai_codex",
+      planType: "pro",
+      limitId: "codex",
+      slot: "primary",
+      windowDurationMins: 300,
+      resetsAt: 1784854800,
+      usedPercent,
+    },
+  }));
+  const options = {
+    ...RANGE,
+    rawUsageEvents,
+    rateLimitSnapshots,
+    diagnostics: {},
+    includeSnapshotIntervals: false,
+  };
+
+  assert.deepEqual(
+    await deriveCodexTransitionSeriesCooperatively(options),
+    deriveCodexTransitionSeries(options),
+  );
+});
 
 test("transition miner collapses repeated snapshots and retains skipped and regressing transitions", async () => {
   const lines = [

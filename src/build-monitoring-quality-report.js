@@ -250,7 +250,7 @@ const artifact = {
       { id: "monitoring_quality", label: "Local monitoring-quality diagnostic", path: ".usage-monitor/monitoring-quality-v0.1.json" },
       { id: "local_transitions", label: "Recent local transition ledger", path: ".usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json" },
       { id: "collector_ledger", label: "Privacy-minimized passive collector ledger", path: ".usage-monitor/collector-events.jsonl" },
-      { id: "coverage_register", label: "Usage-monitor coverage gaps register", path: "2026-07-24-coverage-gaps-register.md" },
+      { id: "coverage_register", label: "Usage-monitor coverage gaps register", path: "docs/governance/2026-07-24-coverage-gaps-register.md" },
       { id: "agentic_pool_policy", label: "OpenAI Codex pricing and usage-limit policy", href: "https://learn.chatgpt.com/docs/pricing" },
     ],
     filters: [],
@@ -329,7 +329,7 @@ const artifact = {
     },
     {
       id: "coverage_register",
-      path: "2026-07-24-coverage-gaps-register.md",
+      path: "docs/governance/2026-07-24-coverage-gaps-register.md",
       description: "Living register of product surfaces and accounting relationships not yet observable at per-turn precision.",
     },
     {

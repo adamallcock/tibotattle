@@ -47,7 +47,7 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
   assert.equal(result.collectionAuthorized, false);
   assert.equal(Object.values(result.checks).every(Boolean), true);
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 4);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 5);
   const serialized = JSON.stringify(result);
   assert.equal(serialized.includes(config.env.staging.d1_databases[0].database_id), false);
   assert.equal(serialized.includes(config.env.staging.r2_buckets[0].bucket_name), false);

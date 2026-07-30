@@ -16,6 +16,11 @@ import {
   SESSION_TTL_MILLISECONDS,
 } from "./constants";
 import { contributionQuarantineLifecycle } from "./contribution-lifecycle";
+import {
+  createDevicePairingMaterial,
+  devicePairingInsert,
+  type DevicePairingMaterial,
+} from "./device-auth";
 import { ApiError } from "./errors";
 import {
   createSessionMaterial,
@@ -104,6 +109,17 @@ export interface Enrollment {
   recoveryCode: string;
   csrfToken: string;
   session: SessionMaterial;
+  pairing: DevicePairingMaterial | null;
+  invitation: {
+    state: "not_required" | "redeemed";
+    redeemedAt: string | null;
+    expiresAt: string | null;
+  };
+}
+
+export interface EnrollmentOptions {
+  deviceBootstrap?: boolean;
+  nowEpoch?: number;
 }
 
 function capability(prefix: "um_recovery"): {
@@ -146,12 +162,23 @@ export async function enroll(
   db: D1Database,
   consentVersion: string,
   inviteGrant: ParsedInviteGrant | null = null,
+  options: EnrollmentOptions = {},
 ): Promise<Enrollment> {
+  const nowEpoch = options.nowEpoch ?? Date.now();
+  const now = new Date(nowEpoch).toISOString();
   const participantId = `participant:${crypto.randomUUID()}`;
   const legacyAccessId = crypto.randomUUID();
   const legacyAccessSecret = randomSecret(32);
   const recovery = capability("um_recovery");
-  const session = await createSessionMaterial(participantId);
+  const session = await createSessionMaterial(participantId, nowEpoch);
+  const pairing = options.deviceBootstrap
+    ? await createDevicePairingMaterial(
+      participantId,
+      session.id,
+      consentVersion,
+      nowEpoch,
+    )
+    : null;
   const [legacyAccessHash, recoveryHash] = await Promise.all([
     hashCapability("access", legacyAccessId, legacyAccessSecret),
     hashCapability("recovery", recovery.id, recovery.secret),
@@ -168,11 +195,17 @@ export async function enroll(
     recovery.id,
     recoveryHash,
     consentVersion,
-    new Date().toISOString(),
-    new Date().toISOString(),
+    now,
+    now,
   );
+  const enrollmentStatements = [
+    participantInsert,
+    sessionInsert(db, session),
+    ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
+  ];
+  let invitationExpiresAt: string | null = null;
   if (!inviteGrant) {
-    const results = await db.batch([participantInsert, sessionInsert(db, session)]);
+    const results = await db.batch(enrollmentStatements);
     if (results.some((entry) => entry.meta.changes !== 1)) {
       throw new ApiError(500, "INTERNAL_ERROR");
     }
@@ -181,14 +214,13 @@ export async function enroll(
       `SELECT id, secret_hash, state, expires_at
          FROM enrollment_grants WHERE id = ?`,
     ).bind(inviteGrant.id).first<InviteGrantRow>();
-    const nowEpoch = Date.now();
-    const now = new Date(nowEpoch).toISOString();
     if (!inviteGrantHashMatches(inviteGrant.secretHash, grant?.secret_hash ?? null)
         || !grant
         || grant.state !== "issued"
         || !canonicalFutureInstant(grant.expires_at, nowEpoch)) {
       throw new ApiError(400, "INVITE_GRANT_INVALID");
     }
+    invitationExpiresAt = grant.expires_at;
     const eligibilityId = `eligibility:${crypto.randomUUID()}`;
     try {
       const result = await db.batch([
@@ -204,6 +236,7 @@ export async function enroll(
           ) VALUES (?, ?, ?, ?)`,
         ).bind(eligibilityId, participantId, inviteGrant.id, now),
         sessionInsert(db, session),
+        ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
       ]);
       if (result.some((entry) => entry.meta.changes !== 1)) {
         throw new ApiError(400, "INVITE_GRANT_INVALID");
@@ -225,6 +258,12 @@ export async function enroll(
     recoveryCode: recovery.encoded,
     csrfToken: session.csrfToken,
     session,
+    pairing,
+    invitation: {
+      state: inviteGrant ? "redeemed" : "not_required",
+      redeemedAt: inviteGrant ? now : null,
+      expiresAt: invitationExpiresAt,
+    },
   };
 }
 

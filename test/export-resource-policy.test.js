@@ -64,6 +64,13 @@ test("resource guard enforces source, record, byte, elapsed, and RSS ceilings wi
     clock: () => 0,
     rss: () => 0,
   });
+  discovery.assertSourceSelection(1, 5);
+  assert.equal(discovery.snapshot().counters.sourceFiles, 0);
+  assert.equal(discovery.snapshot().counters.sourceBytes, 0);
+  assert.throws(
+    () => discovery.assertSourceSelection(1, 6),
+    (error) => error.code === "export_resource_source_bytes",
+  );
   discovery.observeSourceFile(5);
   assert.throws(() => discovery.observeSourceFile(0), (error) => error.code === "export_resource_source_files");
   const entries = createExportResourceGuard({

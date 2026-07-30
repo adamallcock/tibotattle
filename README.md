@@ -1,18 +1,174 @@
 # app-usagemonitor
 
-Local-only proof of concept for comparing provider-reported coding-agent quota with usage reconstructed at standard API prices from local logs.
+Privacy-first Usage Monitor for comparing provider-reported coding-agent quota
+with usage reconstructed at standard API prices from local logs. The personal
+product runs locally; an optional hosted service can accept an explicitly
+reviewed, content-free pseudonymous contribution and publish delayed,
+thresholded community aggregates.
 
-This is an experiment harness, not another quota dashboard. It records privacy-minimized snapshots, preserves pricing warnings, and estimates a quota capacity only when the observations identify one.
+This remains a development pilot, not a publicly distributed service or a
+provider-authoritative billing dashboard. It records privacy-minimized
+snapshots, preserves pricing warnings, and estimates a quota capacity only when
+the observations identify one. See the
+[current end-to-end verification report](./docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md)
+for the implemented boundary and remaining human gates.
+
+## Consumer desktop preview
+
+On macOS, build and open the self-contained local app:
+
+```bash
+npm run product:macos:build
+open ".release-build/macos/Usage Monitor.app"
+```
+
+The app includes its own pinned Node runtime, starts one loopback-only
+companion on an ephemeral port, reads local Codex metadata only after an
+explicit dashboard action, and keeps mutable state in the owner-only
+`~/Library/Application Support/Usage Monitor` directory. Large histories are
+indexed in bounded, automatically continued slices under one user action. A
+separate 64 MiB checkpointed pass publishes a useful current headline first;
+the user can keep reading, cancel safely, and resume later. One click permits
+the initial pass plus exactly two automatic bounded continuations. Each
+accepted pass has a six-minute browser polling window around a five-minute
+server pass, giving roughly an 18-minute finite UI budget before the app pauses
+deep analysis, retains verified state, and offers an explicit later resume.
+
+The app owns local collection and lifecycle. It opens a private loopback
+dashboard for personal results and can also display delayed community
+comparisons. The hosted website is the acquisition, download, documentation,
+and public-aggregate surface; a normal webpage cannot read local Codex files.
+Contributing does not redirect the user away from the personal dashboard.
+
+Contribution is off until the user explicitly reviews the retained metadata,
+sends a first reviewed contribution that the service accepts, and chooses
+**Contribute and keep it current**. Only then can the foreground app prepare
+and send bounded content-free pseudonymous updates every six hours while it
+remains open. Recurring preparation starts from a destination- and
+schema-bound accepted-through watermark, includes a fixed one-hour replay
+overlap, and never advances the watermark for a partial, retryable, rejected,
+aborted, or timed-out delivery. Settings v0.3 durably claims one stable
+preparation attempt before filesystem publication, resumes that exact attempt
+after interruption, and protects its prepared-set ID during maintenance. One
+run requests cooperative abort at a five-minute deadline and is limited to 100
+upload jobs, 64 MiB, and at most 24 hours of covered evidence; longer offline
+gaps catch up in successive passes. Shutdown waits for active cleanup before
+releasing the single-instance lock. Accepted prepared sets are retired only
+under the bounded, state-checked policy described in the verification report:
+unprotected fully accepted sets become eligible when older than seven days or
+beyond the eight most-recent accepted sets, with at most sixteen sets retired
+per pass. The reviewed first-send evidence, active write-ahead claim, and
+pending set are protected from automatic retirement, and work that is
+retryable, in flight, or rejected is never retired. The app installs no daemon,
+Login Item, LaunchAgent, or background service, and the schedule can be paused
+from the dashboard.
+
+Passive discovery is abort-aware and bounded: one pass admits at most 20,000
+directory entries and 5,000 rollout files, applies its byte ceiling to new
+files, appends, truncations, and reseeding, and preserves durable cursors with
+fixed content-free pause evidence when a resource bound is reached. Foreground
+collection inherits the same limits.
+
+The ordinary contribution journey deliberately omits account recovery,
+security reset, personal server export, and multi-device management. A quiet
+hosted deletion action remains under **Hosted privacy controls** because
+contributors must be able to remove accepted metadata. Troubleshooting-only
+local erase and targeted Keychain reset remain native diagnostic actions, not
+onboarding or contribution steps.
+
+Observed on the current development Mac, a useful headline appeared in
+2.180–25 seconds, a cached complete pass took 110.099 seconds, and one larger
+uncached pass took about 5 minutes 27 seconds. These are local observations,
+not a general performance promise; first deep analysis should be expected to
+take a few minutes, with later incremental updates normally faster.
+A fresh packaged clean-state run completed all 714 bounded files and deep
+synthesis without error. Relaunch restored the prior dashboard immediately,
+published a fresh headline in about 21 seconds, and completed its cached
+refresh in roughly 2 minutes 1 second to 2 minutes 31 seconds.
+
+Quota-only relaunches now reuse a current replay-safe accounting cache while
+retaining the fresh provider quota observation. Genuinely new rollout usage
+still triggers a bounded 31-day replay-safe scan. Accounting enforces a real
+resource guard across source files and bytes, directory entries, elapsed time,
+line size, and RSS, including a 1.5 GiB accounting RSS ceiling. A violation
+maps to fixed `refresh_resource_limited` status; the UI keeps the useful
+headline or prior result and says deep analysis stopped at its safety limit.
+That is a pilot-safe bounded path. A persistent incremental accounting index
+remains future performance work for fast complete scans of very large local
+histories, not a prerequisite for the bounded pilot.
+
+This is an ad-hoc-signed developer preview, not a notarized public installer.
+See [the local companion guide](./apps/local/README.md) for onboarding,
+privacy boundaries, tests, and the terminal-only alternative.
+
+The configured GitHub remote,
+[`adamallcock/app-usagemonitor`](https://github.com/adamallcock/app-usagemonitor),
+was verified private on July 29, 2026. The application, local companion,
+dashboard, release-site builder, and backend source belong in that private
+source-transparency boundary; raw logs, local derived reports, credentials,
+signing material, and release artifacts do not. The current working tree is
+still under review and is not claimed to be pushed or bound to a release
+artifact. There is no first-party `LICENSE` or `COPYING` file yet, so a public
+repository switch remains blocked on an explicit license decision.
+
+The macOS release foundation pins Sparkle 2.9.3 for external-distribution
+builds. Automatic update download and install-on-quit are off until the user
+opts in. Development/ad-hoc builds reject updater inputs, omit
+`Sparkle.framework`, and perform no updater networking. Production still
+requires a human-approved HTTPS appcast and download origin, an offline
+Ed25519 update-signing key, Developer ID signing, Apple notarization, and a
+clean-Mac update/rollback rehearsal. Repeated preparation re-verifies and
+reuses an existing exact pinned framework; aliases or modified framework
+content fail closed.
+
+Apple-silicon macOS is the primary pilot target. Intel macOS, Windows, and
+Linux installers remain secondary until the signed, hosted Apple-silicon
+journey is proven with real users.
+
+An approved public release site is built from the same dashboard with explicit,
+fail-closed release inputs. The builder reads the selected notarized DMG,
+records its byte size, streams its SHA-256, and refuses to build unless that
+digest matches the human-supplied release digest. It also requires explicit
+macOS and CPU compatibility, release notes, privacy, security, and support
+links, plus a real 1200x630 PNG. Every public URL must be stable HTTPS on a
+non-placeholder host.
+
+```bash
+npm run product:release-site -- \
+  --output /absolute/path/to/release-site \
+  --site-url "$APPROVED_PUBLIC_SITE_URL" \
+  --installer-path "$NOTARIZED_DMG_PATH" \
+  --installer-url "$APPROVED_PUBLIC_DMG_URL" \
+  --installer-version 1.2.3 \
+  --installer-sha256 "$VERIFIED_DMG_SHA256" \
+  --minimum-macos 13.0 \
+  --architectures arm64 \
+  --release-notes-url "$APPROVED_RELEASE_NOTES_URL" \
+  --privacy-url "$APPROVED_PRIVACY_URL" \
+  --security-url "$APPROVED_SECURITY_URL" \
+  --support-url "$APPROVED_SUPPORT_URL" \
+  --social-image "$ABSOLUTE_1200X630_PNG_PATH" \
+  --replace
+```
+
+`APPROVED_PUBLIC_SITE_URL` must end in `/`; this pilot release builder accepts
+only `arm64` and rejects `x86_64` or universal claims. The output shows the
+verified download size, compatibility, digest, and support links. It also
+includes canonical/Open Graph/Twitter metadata, the supplied image as
+`social-preview.png`, an allow-list `robots.txt`, and a deterministic
+`release-site-manifest.json`. Building does not publish the site or authorize
+a release. DNS, HTTPS hosting, notarization, signing, and the final release
+decision remain human-controlled.
 
 ## Current multi-surface and account-aware outcome
 
 The monitor now combines replay-safe local rollout receipts with read-only Codex app-server accounting and privacy-minimized observations from the authenticated **Codex and Work Analytics** page.
 
-The living [coverage gaps register](./2026-07-24-coverage-gaps-register.md) separately tracks unobserved shared-pool surfaces such as ChatGPT Work, Workspace Agents, ChatGPT for Excel, Codex Cloud, other Codex devices, Work Voice task activity, image generation, third-party authenticated apps, and Claude clients. Ordinary Chat conversations and ordinary Chat Voice are explicitly excluded from the Codex/Work shared agentic pool; Spark is tracked as a separate limit.
+The living [coverage gaps register](./docs/governance/2026-07-24-coverage-gaps-register.md) separately tracks unobserved shared-pool surfaces such as ChatGPT Work, Workspace Agents, ChatGPT for Excel, Codex Cloud, other Codex devices, Work Voice task activity, image generation, third-party authenticated apps, and Claude clients. Ordinary Chat conversations and ordinary Chat Voice are explicitly excluded from the Codex/Work shared agentic pool; Spark is tracked as a separate limit.
 
-The log-derived [monitoring quality report](./2026-07-24-monitoring-quality-report.html) and its [source notes](./2026-07-24-monitoring-quality-source-notes.md) add an operational observability layer. The new `quality` command measures collector/app-server freshness, fixed-reset jitter versus moving reset families, integer-display censoring, regressions, account/plan/speed/snapshot-age coverage, and parser loss. It emits owner-only JSON plus a dated Markdown diagnostic rather than silently fitting weak intervals.
+The log-derived [monitoring quality report](./2026-07-24-monitoring-quality-report.html) and its [source notes](./docs/research/2026-07-24-monitoring-quality-source-notes.md) add an operational observability layer. The new `quality` command measures collector/app-server freshness, fixed-reset jitter versus moving reset families, integer-display censoring, regressions, account/plan/speed/snapshot-age coverage, and parser loss. It emits owner-only JSON plus a dated Markdown diagnostic rather than silently fitting weak intervals.
 
-The [seven-day calibration report](./2026-07-24-weekly-7-day-calibration-report.html) and [source notes](./2026-07-24-weekly-7-day-calibration-source-notes.md) provide the predictive and reset-level view. The `calibrate-weekly` command selects among Standard and speed-aware API-price ledgers using an earlier-70%/later-30% chronological split, then tests lag, forecast, regime, and within-reset update candidates without look-ahead. Fourteen stable windows imply a median $1,878.75 API-price-equivalent seven-day value and a central 80% reset-to-reset range of $1,640.96–$2,280.38. Conservative captured-speed weighting reduces pooled holdout MAE from 2.25 to 2.16 displayed percentage points (4.1%); the no-look-ahead prior-reset error is 3.95 points and 80% of individual errors are bounded explicitly in the report. All 5–60 point online updates and 5–60 second display-lag corrections are currently rejected because they worsen untouched later-period prediction. These are behavioral calibration values, not a provider-published allowance or cash entitlement.
+The [seven-day calibration report](./2026-07-24-weekly-7-day-calibration-report.html) and [source notes](./docs/research/2026-07-24-weekly-7-day-calibration-source-notes.md) provide the predictive and reset-level view. The `calibrate-weekly` command selects among Standard and speed-aware API-price ledgers using an earlier-70%/later-30% chronological split, then tests lag, forecast, regime, and within-reset update candidates without look-ahead. Fourteen stable windows imply a median $1,878.75 API-price-equivalent seven-day value and a central 80% reset-to-reset range of $1,640.96–$2,280.38. Conservative captured-speed weighting reduces pooled holdout MAE from 2.25 to 2.16 displayed percentage points (4.1%); the no-look-ahead prior-reset error is 3.95 points and 80% of individual errors are bounded explicitly in the report. All 5–60 point online updates and 5–60 second display-lag corrections are currently rejected because they worsen untouched later-period prediction. These are behavioral calibration values, not a provider-published allowance or cash entitlement.
 
 - The retained May 17–July 24 interval contains 2,366 classified rollouts, 295,681 request-like usage events, 55.68B tokens, and $51,671.51 at Standard OpenAI API-price-equivalent rates. Another 585,778 fork-replay events are excluded.
 - Codex task surfaces are explicit: 33 scheduled-task rollouts contribute 673 usage events and 44.58M tokens; 1,821 subagent rollouts contribute 58,948 events and 7.09B tokens. Provider-side Cloud or Work activity without a local rollout remains unallocated.
@@ -154,7 +310,8 @@ Local rollout logs normally retain the last provider-reported `used_percent`, wi
 ## Commands
 
 - `usage-monitor doctor`: verify the local Codex app-server, ccusage, and RunCost integration.
-- `usage-monitor benchmark-r7 --profile PROFILE --output PATH`: write an owner-only, self-hashed R7 receipt. `smoke` runs the small lifecycle harness; `release_synthetic_semantics`, `release_synthetic_pressure`, and `release_materialized_boundaries` run the separate preregistered release evidence profiles. These receipts remain `partial` while network activity and literal candidate-scale boundaries are unmeasured. The internal real-history and decision builders produced the reviewed dual-runtime ten-receipt matrix, but the public CLI deliberately refuses them because real history requires one explicit frozen interval plus both exact runtime executables, and a decision must consume the complete eight-receipt input matrix. No profile uploads data.
+- `usage-monitor benchmark-r7 --profile PROFILE --output PATH`: write an owner-only, self-hashed R7 receipt. `smoke` runs the small lifecycle harness; `release_synthetic_semantics`, `release_synthetic_pressure`, and `release_materialized_boundaries` run the separate preregistered release evidence profiles. These receipts remain `partial` while network activity and literal candidate-scale boundaries are unmeasured. The public CLI deliberately refuses the real-history and decision profiles because real history requires one explicit frozen interval plus both exact runtime executables, and a decision must consume the complete eight-receipt input matrix. No profile uploads data.
+- `npm run benchmark:r7:release:regenerate -- --node24 ABSOLUTE_PATH --node26 ABSOLUTE_PATH --start-at 2026-06-24T09:00:00.000Z --end-at 2026-07-25T09:00:00.000Z --destination ABSOLUTE_DIRECTORY --replace`: regenerate the complete retained ten-receipt release matrix only after every hashed source, contract, schema, package, and lockfile input is frozen. Run the wrapper itself under exact Node 26.2.0 on macOS arm64 and supply exact Node 24.14.0 and 26.2.0 child executables. It requires the exact preregistered 31-day interval, freezes one private source plan for both runtimes and both passes, stages and validates all ten content-free receipts, derives both decisions last, and publishes under an exclusive journal. If the process or machine stops, rerun the wrapper under Node 26.2.0 with only `--destination ABSOLUTE_DIRECTORY --recover`; recovery either discards an incomplete staged generation, restores the prior complete matrix, or finishes a fully validated install. Do not edit any hashed input after regeneration without regenerating again.
 - `usage-monitor capture [--label TEXT] [--controlled] [--plan-timeline PATH]`: append one aligned observation partitioned by pseudonymous account scope and the dated specific plan variant when known.
 - `usage-monitor report [--json]`: group observations by reset window as a descriptive diagnostic. It always returns `non_identifiable` and suppresses fit/capacity output; use `transitions` plus `infer` for gated capacity inference.
 - `usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--offline] [--compact] [--window-minutes N]`: reconstruct request-priced usage, collapse repeated integer quota displays into transition boundaries, and emit the normalized dataset plus privacy audit. Compact mode omits the large adjacent-snapshot stream.
@@ -234,18 +391,21 @@ USAGE_MONITOR_PORT=8791 \
 ```
 
 The relay accepts only reviewed central API routes and cannot proxy a
-request-selected URL. In addition to public health, envelope-key, and stored
-aggregate reads, an exact participant allowlist supports enrollment, recovery,
-one-use encrypted uploads, personal results, contribution history, participant
-export, security controls, and deletion from the same local dashboard. The
-relay validates bounded JSON bodies and responses and only forwards the fixed
-Usage Monitor session cookie, expected CSRF value, or correctly shaped one-use
-upload authorization on its specific route. Arbitrary hosts, paths, queries,
-headers, cookies, upstream responses, and redirects are rejected.
+request-selected URL. Its lower-level allowlist retains public health,
+envelope-key, aggregate, enrollment, upload, personal-result, lifecycle, and
+deletion routes for the backend laboratory and support tooling. The ordinary
+consumer UI does not expose recovery, security-reset, personal-export, or
+multi-device-management journeys. It keeps only the explicit first-review/send
+flow, contribution receipts, automatic-contribution status, and quiet hosted
+deletion. The relay validates bounded JSON bodies and responses and only
+forwards the fixed Usage Monitor session cookie, expected CSRF value, or
+correctly shaped one-use upload authorization on its specific route. Arbitrary
+hosts, paths, queries, headers, cookies, upstream responses, and redirects are
+rejected.
 
 Open `http://127.0.0.1:8791/` for the unified local journey. Port 8792 is the
 backend-only Worker origin: it intentionally does not expose `/api/local/*`.
-On July 27, 2026 the browser journey enrolled a fresh anonymous participant,
+On July 27, 2026 the browser journey enrolled a fresh pseudonymous participant,
 validated a real content-free contribution, encrypted it in the browser,
 uploaded it with one-use authorization, displayed private server-repriced
 results and history, and generated the participant export through the local
@@ -286,20 +446,30 @@ npm run product:backend:acceptance
 ```
 
 The corresponding plan is
-[2026-07-26-inspectable-backend-laboratory-plan.md](./2026-07-26-inspectable-backend-laboratory-plan.md).
+[2026-07-26-inspectable-backend-laboratory-plan.md](./docs/plans/2026-07-26-inspectable-backend-laboratory-plan.md).
 The backend remains loopback-only and disposable; this command neither
 provisions Cloudflare resources nor authorizes outside participants.
 
 ### Preparing a contribution
 
 The hosted service does not read a user's log directory. In the loopback
-dashboard, **Prepare latest hour locally** is the normal path. It clamps the
-request to the latest covered hour, creates a privacy-verified review pair,
+dashboard, choose one of three fixed local windows: **1 hour**, **24 hours**
+(the default), or **7 days**. Preparation clamps the requested window to the
+local evidence actually retained, so the exact covered interval may be shorter
+than the selected lookback. It creates a privacy-verified review pair,
 independently reopens it, materializes bounded
 `telemetry-contribution-v0.1` batches into an owner-only spool, re-verifies the
 committed set, and then refreshes the path-free queue preview. Preparation
 performs no service request or upload; inspection and sending remain separate
 user actions.
+
+A dense seven-day selection can exceed the fixed single-reviewed-set resource
+ceiling, and a very active 24-hour interval can do the same. That attempt fails
+closed with `export_too_large`: it is not silently truncated and no partial set
+is queued. Select **24 hours** or **1 hour** and retry explicitly; the app never
+substitutes a shorter interval without the user's choice. Longer dense windows
+need a future locally aggregated contribution format rather than an unsafe
+increase to the raw-row review ceiling.
 
 The production local identity is stored in the dedicated
 `app-usagemonitor.export-identity.v1` macOS Keychain item. If that item is
@@ -307,11 +477,10 @@ locked or access is unavailable, preparation fails closed and the dashboard
 asks the user to unlock or allow access. It never silently replaces the
 identity or falls back to a new plaintext credential.
 
-On this development machine the item metadata is present, but macOS returns
-`errSecAuthFailed` for the login Keychain as a whole. The safe recovery is to
-open Keychain Access and manually unlock the `login` keychain, then retry.
-Do not reset the keychain, delete the item, or rotate the identity merely to
-clear this error: those actions change pseudonymous continuity and require a
+If macOS reports the login Keychain as locked or denies access, the safe first
+step is to open Keychain Access, unlock the `login` Keychain, and retry. Do not
+reset the Keychain, delete the item, or rotate the identity merely to clear an
+access error: those actions change pseudonymous continuity and require a
 separate explicit decision.
 
 The lower-level reviewed-bundle converter remains available for development
@@ -404,8 +573,8 @@ upload bodies; it is not a claim about DNS, TCP/TLS, or the small key-fetch and
 authorization responses. Watch applies both caps independently on every
 visible foreground pass.
 
-The [ongoing sync controls plan](./2026-07-26-ongoing-sync-controls-plan.md)
-and [development verification receipt](./2026-07-26-ongoing-sync-controls-verification-receipt.md)
+The [ongoing sync controls plan](./docs/plans/2026-07-26-ongoing-sync-controls-plan.md)
+and [development verification receipt](./docs/receipts/2026-07-26-ongoing-sync-controls-verification-receipt.md)
 record the privacy contract, exact test evidence, and remaining release gates.
 
 The loopback dashboard can expose the same inspection, one-pass, pause, and
@@ -424,8 +593,8 @@ requests never contain that path, the prepared directory, the service origin,
 or the Keychain credential. The dashboard's send button is enabled only when
 both the verified spool and delivery service are configured.
 
-The [local sync controls UI plan](./2026-07-26-local-sync-controls-ui-plan.md)
-and [rendered verification receipt](./2026-07-26-local-sync-controls-ui-verification-receipt.md)
+The [local sync controls UI plan](./docs/plans/2026-07-26-local-sync-controls-ui-plan.md)
+and [rendered verification receipt](./docs/receipts/2026-07-26-local-sync-controls-ui-verification-receipt.md)
 record the loopback threat boundary, action tests, and visual QA.
 
 Transient network, 408, 429, and 5xx failures use bounded retry with backoff.
@@ -459,9 +628,11 @@ npm run product:staging:ready
 
 The first command validates configuration and performs a staging dry deploy.
 The second makes only bounded, read-only Cloudflare capability checks. The live
-July 26 check reports authenticated D1 access but `R2_NOT_ENABLED`, so the
-staging service remains safely unprovisioned and undeployed. Once the account
-owner explicitly enables R2, the exact resource creation, migration,
+July 29 check returned `state: blocked`, `collectionAuthorized: false`, and the
+exact blockers `STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED` and
+`R2_NOT_ENABLED`, so the staging service remains safely unprovisioned and
+undeployed. Once the account owner explicitly enables R2 and configures the
+real resource identifiers, the exact resource creation, migration,
 containment, isolated-key, and confirmed deployment sequence is in the
 [Worker runbook](./apps/worker/README.md). The deployment wrapper cannot run
 until both D1 migration streams are current, the remote collection-control row
@@ -469,7 +640,7 @@ is fully contained, and the post-deploy HTTPS health response proves every
 collection path remains disabled. No remote resume command exists.
 
 The [disabled staging deployment gate
-plan](./2026-07-26-disabled-staging-deployment-gate-plan.md) distinguishes the
+plan](./docs/plans/2026-07-26-disabled-staging-deployment-gate-plan.md) distinguishes the
 verified dry gate from unproven provisioning, deployment, external review, and
 pilot authorization.
 
@@ -479,8 +650,9 @@ the covered period, accepted and deduplicated record counts, transport
 contract, platform class, server-repriced API-price equivalent, and the
 encrypted-quarantine deletion schedule. It never shows an R2 key, digest,
 dataset/account pseudonym, authority, path, or source content. The participant
-can delete one contribution without deleting the anonymous participant; the
-portal then reloads private and current project-controlled aggregate results.
+can delete one contribution without deleting the pseudonymous participant
+record; the portal then reloads private and current project-controlled
+aggregate results.
 
 For the central service alone, `npm run product:backend:test` is the quickest
 repeatable check. It runs against isolated local Cloudflare Worker, D1, and R2
@@ -512,7 +684,7 @@ directory. The drill stops all four controlled paths through D1 without
 restarting the Worker, preserves private stats/export/deletion, explicitly
 restores collection, proves the previously blocked one-use upload still works,
 and deletes both drill participants. The
-[incident-containment receipt](./2026-07-26-g4-incident-containment-verification-receipt.md)
+[incident-containment receipt](./docs/receipts/2026-07-26-g4-incident-containment-verification-receipt.md)
 records the first live pass and the remaining production blockers.
 
 The account-scoped transport, `telemetry-contribution-v0.2`, now has a verified
@@ -579,7 +751,7 @@ deletion. It prints no participant or credential values and leaves external
 deployment disabled.
 
 The [participant contribution history verification
-receipt](./2026-07-26-participant-contribution-history-verification-receipt.md)
+receipt](./docs/receipts/2026-07-26-participant-contribution-history-verification-receipt.md)
 records the live encrypted HTTP and browser-driven product passes, including a
 UI lifecycle regression found and fixed during rendered QA.
 
@@ -617,37 +789,37 @@ The full profile is 100,000 maximum-size encrypted bundle attempts, not
 exercise additionally requires one owner-only invitation per participant;
 local-open development accounts cannot satisfy independent-eligibility
 thresholds. The [scaled load verification
-receipt](./2026-07-26-backend-load-scaled-verification-receipt.md) records a
+receipt](./docs/receipts/2026-07-26-backend-load-scaled-verification-receipt.md) records a
 passing 20-participant, 160-bundle, 32,000-expanded-record run and does not
 claim that the literal 1,000-user gate has passed.
 
 The [functional end-to-end verification
-receipt](./2026-07-25-functional-product-e2e-verification-receipt.md) records a
+receipt](./docs/receipts/2026-07-25-functional-product-e2e-verification-receipt.md) records a
 fresh real-data local smoke: two encrypted batches, personal-stat updates,
 idempotent replay, aggregate suppression, server-side privacy-canary rejection,
 participant export, browser-driven complete deletion, and zero retained local
 D1/R2 records afterward.
 
 The [privacy-safe weekly aggregate verification
-receipt](./2026-07-26-g4-privacy-safe-weekly-aggregate-verification-receipt.md)
+receipt](./docs/receipts/2026-07-26-g4-privacy-safe-weekly-aggregate-verification-receipt.md)
 records the current 20-participant scheduled-publication smoke, immutable
 snapshot/deletion lifecycle, post-cleanup D1/R2 counts, and rendered
 published/withdrawn UI checks.
 
 The [durable queue and backend verification
-receipt](./2026-07-26-durable-contribution-queue-verification-receipt.md)
+receipt](./docs/receipts/2026-07-26-durable-contribution-queue-verification-receipt.md)
 records the crash/restart/retry/privacy tests, a real encrypted queue smoke,
 the fresh 20-participant invite-only D1/R2 lifecycle, fixed-path private
 resource routes, and exact post-deletion storage counts.
 
 The [revisioned aggregate rebuild verification
-receipt](./2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
+receipt](./docs/receipts/2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
 records the 20-participant encrypted HTTP proof, synchronous withdrawal,
 immutable revisions rebuilt from 19 and then zero remaining contributors,
 empty rebuild queue, and zero remaining participant data.
 
 The [private community comparison verification
-receipt](./2026-07-26-private-community-comparison-verification-receipt.md)
+receipt](./docs/receipts/2026-07-26-private-community-comparison-verification-receipt.md)
 records the authenticated 20-participant HTTP comparison, post-deletion
 not-testable transition, closed browser projection, and rendered portal check.
 It deliberately does not derive an average, percentile, cohort size, share,
@@ -707,18 +879,20 @@ creating a new immutable revision without the deleted source. This mechanism
 has production-shaped local evidence, but external publication remains
 unauthorized pending the G9 disclosure review and release approval.
 
-There is still no public deployment, production route, background
-transmission, public bucket, or authorized volunteer collection. Production
-requires admission controls and rate limiting, production key rotation,
-consent/version governance, privacy/security review, and a staged release
-decision. See the [local companion and central product plan](./2026-07-25-local-companion-app-plan.md),
-the [G3 session/upload capability plan](./2026-07-25-g3-session-capability-separation-plan.md),
-its [verification receipt](./2026-07-25-g3-session-capability-separation-verification-receipt.md),
+There is still no public deployment, production route, public bucket, or
+authorized volunteer collection. The implemented recurring contribution is a
+foreground, while-open path behind explicit consent and an accepted reviewed
+first upload; it is not a daemon or autonomous background service. Production
+requires real resources, admission controls and rate limiting, production key
+rotation, consent/version governance, privacy/security review, and a staged
+release decision. See the [local companion and central product plan](./docs/plans/2026-07-25-local-companion-app-plan.md),
+the [G3 session/upload capability plan](./docs/plans/2026-07-25-g3-session-capability-separation-plan.md),
+its [verification receipt](./docs/receipts/2026-07-25-g3-session-capability-separation-verification-receipt.md),
 and the [Worker runbook](./apps/worker/README.md). The earlier
-[synthetic vertical-slice plan](./2026-07-25-synthetic-consumer-vertical-slice-plan.md)
+[synthetic vertical-slice plan](./docs/plans/2026-07-25-synthetic-consumer-vertical-slice-plan.md)
 is retained only as a superseded historical record.
 
-The [G1 resource-bounded export-set plan](./2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](./2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](./2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](./2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](./2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](./2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](./2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](./2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](./2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
+The [G1 resource-bounded export-set plan](./docs/plans/2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](./docs/receipts/2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](./docs/decisions/2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](./docs/receipts/2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](./docs/receipts/2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](./docs/receipts/2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](./docs/receipts/2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](./docs/goals/2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](./docs/plans/2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
 
 ## Account switching and local secret handling
 
@@ -741,7 +915,7 @@ This creates a different stable pseudonymous scope for future observations. The 
 
 Snapshot reports, interval inference, and weekly reset history include pseudonymous account scope and specific plan variant in their grouping keys. Known accounts and plan eras therefore cannot be pooled. Raw historical transition rows explicitly remain `unattributed` / `unknown`; prospective collector crosschecks accept only records matching the current pseudonymous scope and label their partial-marker time coverage.
 
-The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-monitor/provider-ui-observations-v0.1.jsonl`, `.usage-monitor/local-history-v0.1.json`, and `.usage-monitor/provider-crosscheck-v0.1.json` are mode `0600`. These account-observation commands never upload. The separate central contribution path remains an explicit, local-development-only action using prepared privacy-safe files.
+The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-monitor/provider-ui-observations-v0.1.jsonl`, `.usage-monitor/local-history-v0.1.json`, and `.usage-monitor/provider-crosscheck-v0.1.json` are mode `0600`. These account-observation commands never upload. The separate central contribution path uses prepared privacy-safe files and remains unavailable to real users until a production service is provisioned and collection is explicitly authorized.
 
 `.usage-monitor/local-history-cache-validation-v0.1.json` is an owner-only, cache-digest-bound sidecar containing only hashed source keys and filesystem size/time metadata. It advances after a proven after-end suffix so subsequent cached crosschecks inspect only new bytes; it never stores rollout paths. Collector ingestion likewise streams file growth in 256 KiB chunks, caps one buffered JSONL line at 16 MiB, writes safe output in batches of at most 1,000 records, bounds its recent-key window at 5,000, and uses a path-free digest journal so an appended batch is either retained with its committed checkpoint or truncated and replayed. Transaction payloads and metadata are fsynced in commit order, including parent-directory metadata after atomic rename/removal. Oversized lines remain diagnostic, and idle reconciliation does not rewrite the checkpoint every cycle.
 
@@ -751,11 +925,11 @@ The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-m
 
 ```bash
 pnpm build:report-data
-node /Users/adamallcock/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/build_portable_artifact.mjs \
+node $HOME/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/build_portable_artifact.mjs \
   --input artifact.json \
   --output 2026-07-24-codex-work-account-usage-report.html
 pnpm fix:report-width -- 2026-07-24-codex-work-account-usage-report.html
-node /Users/adamallcock/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/verify_portable_artifact.mjs \
+node $HOME/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/verify_portable_artifact.mjs \
   --html 2026-07-24-codex-work-account-usage-report.html \
   --artifact artifact.json
 ```
@@ -764,7 +938,7 @@ The width fix is a narrow packaging workaround for the portable reader's `100vw`
 
 ## Method boundary
 
-A capacity estimate means only that observed quota changes are consistent with the chosen API price mapping. It does not prove OpenAI's internal quota formula. See [the validation report](./2026-07-23-local-usage-limit-validation.md) for the experiment protocol and stop gate.
+A capacity estimate means only that observed quota changes are consistent with the chosen API price mapping. It does not prove OpenAI's internal quota formula. See [the validation report](./docs/v0.3/2026-07-23-local-usage-limit-validation.md) for the experiment protocol and stop gate.
 
 Historical transitions preserve regressions, skipped display values, incomplete local-window coverage, unknown models, pricing warnings, and snapshot-age uncertainty as evidence rather than silently cleaning them. Quota snapshots contain only integer percentages; neither rollout logs nor the app-server endpoint currently exposes an absolute remaining allowance or sub-percent precision.
 
@@ -790,10 +964,10 @@ Controlled manifests declare the hypothesis, model, effort, context band, cache 
 
 Two live Terra pilots were eventually run after reset. They were bounded and aligned, but a separate Sol rollout contributed during each interval, so both remain `controlledState: unknown`. Later attempts were correctly refused when active/recent work made isolation unsafe. No causal model, cache, effort, context, or tool multiplier is claimed.
 
-Tool counts are explanatory client features unless the transcript exposes an exact server unit. A local web wrapper is not automatically a Responses `web_search_call`; local shell and Apply Patch are not Hosted Shell container sessions; MCP and subagent orchestration have no separate standard API per-call price. See [the Milestone 6 decision](./2026-07-23-milestone-6-tool-mechanism-decision.md).
+Tool counts are explanatory client features unless the transcript exposes an exact server unit. A local web wrapper is not automatically a Responses `web_search_call`; local shell and Apply Patch are not Hosted Shell container sessions; MCP and subagent orchestration have no separate standard API per-call price. See [the Milestone 6 decision](./docs/v0.3/milestones/2026-07-23-milestone-6-tool-mechanism-decision.md).
 
-Corrections are append-only derived records. Duplicate records collapse idempotently, while branches, cycles, missing targets, digest mismatches, and incompatible schemas are errors. The legacy correction changes neither provider quota fields nor raw/local evidence. See [the Milestone 7 decision](./2026-07-23-milestone-7-correction-provenance-decision.md).
+Corrections are append-only derived records. Duplicate records collapse idempotently, while branches, cycles, missing targets, digest mismatches, and incompatible schemas are errors. The legacy correction changes neither provider quota fields nor raw/local evidence. See [the Milestone 7 decision](./docs/v0.3/milestones/2026-07-23-milestone-7-correction-provenance-decision.md).
 
 The collector's first 22 pre-seeding usage records remain `unknown` and total 3,714,307 tokens. They are operational collector provenance, not inputs to `report`, `transitions`, `infer`, contamination, or the observation correction ledger; their model cannot be reconstructed safely from the retained privacy-minimized fields. They are therefore retained—not relabelled or rewritten.
 
-The full implementation goal and all gate receipts are in [the v0.3 goal](./2026-07-23-usage-monitor-v03-goal.md).
+The full implementation goal and all gate receipts are in [the v0.3 goal](./docs/v0.3/2026-07-23-usage-monitor-v03-goal.md).

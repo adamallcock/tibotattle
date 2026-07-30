@@ -1,0 +1,53 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: app-usagemonitor-contained
+  labels:
+    app.kubernetes.io/name: app-usagemonitor
+    app.kubernetes.io/component: contained-backend
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "3"
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      serviceAccountName: __RUNTIME_SERVICE_ACCOUNT__
+      containerConcurrency: 20
+      timeoutSeconds: 30
+      containers:
+        - image: __CONTAINER_IMAGE__
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            - name: ENVIRONMENT
+              value: contained-staging
+            - name: COLLECTION_MODE
+              value: disabled
+            - name: OBJECT_STORE_MODE
+              value: gcs
+            - name: GCS_BUCKET
+              value: __PRIVATE_BUCKET__
+            - name: GCS_PREFIX
+              value: quarantine/v1
+            - name: GCS_READINESS_OBJECT
+              value: operations/readiness-v1
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 30
+            timeoutSeconds: 2
+            failureThreshold: 3

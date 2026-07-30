@@ -13,6 +13,64 @@ const COMPONENT_NAMES = [
   "output_text_tokens",
   "output_reasoning_tokens",
 ];
+const COOPERATIVE_CHECK_INTERVAL = 2_048;
+const MAX_COOPERATIVE_USAGE_EVENTS = 750_000;
+const MAX_COOPERATIVE_RATE_LIMIT_SNAPSHOTS = 750_000;
+const MAX_COOPERATIVE_TOOL_EVENTS = 100_000;
+const MAX_COOPERATIVE_TOTAL_INPUTS = 1_500_000;
+const MAX_COOPERATIVE_TRANSITIONS = 10_000;
+const MAX_COOPERATIVE_EVENT_VISITS = 8_000_000;
+
+export const CODEX_TRANSITION_DERIVATION_CEILINGS = Object.freeze({
+  usageEvents: MAX_COOPERATIVE_USAGE_EVENTS,
+  rateLimitSnapshots: MAX_COOPERATIVE_RATE_LIMIT_SNAPSHOTS,
+  toolEvents: MAX_COOPERATIVE_TOOL_EVENTS,
+  totalInputs: MAX_COOPERATIVE_TOTAL_INPUTS,
+  derivedRows: MAX_COOPERATIVE_TRANSITIONS,
+  eventVisits: MAX_COOPERATIVE_EVENT_VISITS,
+});
+
+function fixedError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
+}
+
+function throwIfDerivationAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = fixedError("transition_derivation_aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+async function cooperativeCheckpoint(
+  index,
+  signal,
+  { force = false, resourceCheck = null } = {},
+) {
+  if (!force && index % COOPERATIVE_CHECK_INTERVAL !== 0) return;
+  throwIfDerivationAborted(signal);
+  resourceCheck?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  throwIfDerivationAborted(signal);
+  resourceCheck?.();
+}
+
+function consumeDerivationWork(guard, count = 1) {
+  if (guard === null) return;
+  guard.eventVisits += count;
+  if (guard.eventVisits > MAX_COOPERATIVE_EVENT_VISITS) {
+    throw fixedError("transition_derivation_work_limit_exceeded");
+  }
+  throwIfDerivationAborted(guard.signal);
+}
 
 function emptyComponents() {
   return Object.fromEntries(COMPONENT_NAMES.map((name) => [name, 0]));
@@ -57,7 +115,12 @@ function upperBound(events, timestampMs) {
   return low;
 }
 
-function aggregateUsage(events, startExclusiveMs, endInclusiveMs) {
+function aggregateUsage(
+  events,
+  startExclusiveMs,
+  endInclusiveMs,
+  guard = null,
+) {
   const startIndex = upperBound(events, startExclusiveMs);
   const endIndex = upperBound(events, endInclusiveMs);
   const components = emptyComponents();
@@ -67,6 +130,7 @@ function aggregateUsage(events, startExclusiveMs, endInclusiveMs) {
   const tierUsageEventCounts = {};
   let costUsd = 0;
   for (let index = startIndex; index < endIndex; index += 1) {
+    consumeDerivationWork(guard);
     const event = events[index];
     addComponents(components, event.components);
     costUsd += event.costUsd;
@@ -108,11 +172,17 @@ function aggregateCumulativeField(events, startExclusiveMs, endInclusiveMs, fiel
   return roundUsd(endValue - startValue);
 }
 
-function aggregateTools(events, startExclusiveMs, endInclusiveMs) {
+function aggregateTools(
+  events,
+  startExclusiveMs,
+  endInclusiveMs,
+  guard = null,
+) {
   const result = {};
   const startIndex = upperBound(events, startExclusiveMs);
   const endIndex = upperBound(events, endInclusiveMs);
   for (let index = startIndex; index < endIndex; index += 1) {
+    consumeDerivationWork(guard);
     const event = events[index];
     result[event.toolClass] = (result[event.toolClass] ?? 0) + 1;
   }
@@ -173,7 +243,15 @@ function coverageFor(snapshot, scanStartMs) {
   };
 }
 
-function makeTransition({ prior, next, usageEvents, toolEvents, scanStartMs, diagnostics }) {
+function makeTransition({
+  prior,
+  next,
+  usageEvents,
+  toolEvents,
+  scanStartMs,
+  diagnostics,
+  guard = null,
+}) {
   const windowStartMs = (prior.window.resetsAt - prior.window.windowDurationMins * 60) * 1000;
   const localWindowStartExclusiveMs = Math.max(scanStartMs, windowStartMs) - 1;
   const cumulativePriorCostUsd = aggregateCost(usageEvents, localWindowStartExclusiveMs, prior.timestampMs);
@@ -182,8 +260,18 @@ function makeTransition({ prior, next, usageEvents, toolEvents, scanStartMs, dia
   const cumulativeNextQuotaWeightedLowerUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, next.timestampMs, "cumulativeQuotaWeightedLowerUsd");
   const cumulativePriorQuotaWeightedUpperUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, prior.timestampMs, "cumulativeQuotaWeightedUpperUsd");
   const cumulativeNextQuotaWeightedUpperUsd = aggregateCumulativeField(usageEvents, localWindowStartExclusiveMs, next.timestampMs, "cumulativeQuotaWeightedUpperUsd");
-  const marginal = aggregateUsage(usageEvents, prior.timestampMs, next.timestampMs);
-  const toolMix = aggregateTools(toolEvents, prior.timestampMs, next.timestampMs);
+  const marginal = aggregateUsage(
+    usageEvents,
+    prior.timestampMs,
+    next.timestampMs,
+    guard,
+  );
+  const toolMix = aggregateTools(
+    toolEvents,
+    prior.timestampMs,
+    next.timestampMs,
+    guard,
+  );
   const coverage = coverageFor(next, scanStartMs);
   const warnings = new Set(["local_receipt_age_unavailable", "provider_snapshot_age_unavailable"]);
   if (next.window.usedPercent < prior.window.usedPercent) warnings.add("display_percentage_regression");
@@ -256,8 +344,20 @@ function makeTransition({ prior, next, usageEvents, toolEvents, scanStartMs, dia
   };
 }
 
-function makeSnapshotInterval({ prior, next, usageEvents, toolEvents, scanStartMs }) {
-  const marginal = aggregateUsage(usageEvents, prior.timestampMs, next.timestampMs);
+function makeSnapshotInterval({
+  prior,
+  next,
+  usageEvents,
+  toolEvents,
+  scanStartMs,
+  guard = null,
+}) {
+  const marginal = aggregateUsage(
+    usageEvents,
+    prior.timestampMs,
+    next.timestampMs,
+    guard,
+  );
   const coverage = coverageFor(next, scanStartMs);
   const warnings = [];
   if (next.window.usedPercent < prior.window.usedPercent) warnings.push("display_percentage_regression");
@@ -290,7 +390,12 @@ function makeSnapshotInterval({ prior, next, usageEvents, toolEvents, scanStartM
       costUsd: value.costUsd,
     }])),
     tierUsageEventCounts: marginal.tierUsageEventCounts,
-    aggregateToolClassMix: aggregateTools(toolEvents, prior.timestampMs, next.timestampMs),
+    aggregateToolClassMix: aggregateTools(
+      toolEvents,
+      prior.timestampMs,
+      next.timestampMs,
+      guard,
+    ),
     controlledState: "unknown",
     priceCardIds: marginal.priceCardIds,
     snapshot: {
@@ -393,6 +498,576 @@ function collapseTransitions({ snapshots, usageEvents, toolEvents, scanStartMs, 
   };
 }
 
+function decodeCompactAccountingUsage(value) {
+  if (!Array.isArray(value) || value.length !== 10) return null;
+  return {
+    timestamp: value[0],
+    model: value[1],
+    totalInputContextTokens: value[2],
+    components: {
+      input_uncached_tokens: value[3],
+      input_cache_read_tokens: value[4],
+      input_cache_write_tokens: value[5],
+      output_text_tokens: value[6],
+      output_reasoning_tokens: value[7],
+      output_combined_tokens: value[8],
+    },
+    tierSemantics: {
+      codexSpeedMode: value[9],
+      apiServiceTier: "unknown",
+    },
+  };
+}
+
+function decodeCompactAccountingSnapshot(value) {
+  if (!Array.isArray(value) || value.length !== 9) return null;
+  return {
+    timestamp: value[0],
+    timestampMs: value[1],
+    window: {
+      provider: value[2],
+      planType: value[3],
+      limitId: value[4],
+      slot: value[5],
+      windowDurationMins: value[6],
+      resetsAt: value[7],
+      usedPercent: value[8],
+    },
+  };
+}
+
+async function normalizeTransitionInputsCooperatively({
+  rawUsageEvents,
+  rateLimitSnapshots,
+  rawToolEvents,
+  scanStartMs,
+  scanEndMs,
+  windowDurationMins,
+  signal,
+  consumeInputs,
+  inputEncoding,
+  resourceCheck,
+}) {
+  let sequence = 0;
+  const usageInput = [];
+  for (let index = 0; index < rawUsageEvents.length; index += 1) {
+    await cooperativeCheckpoint(index, signal, { resourceCheck });
+    const source = rawUsageEvents[index];
+    if (consumeInputs) rawUsageEvents[index] = null;
+    const event = inputEncoding === "accounting_compact_v1"
+      ? decodeCompactAccountingUsage(source)
+      : source;
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    const normalized = {
+      ...event,
+      timestampMs: Date.parse(event.timestamp),
+      sequence: sequence++,
+    };
+    if (Number.isFinite(normalized.timestampMs)
+        && normalized.timestampMs >= scanStartMs
+        && normalized.timestampMs <= scanEndMs) {
+      usageInput.push(normalized);
+    }
+  }
+  if (consumeInputs) rawUsageEvents.length = 0;
+  await cooperativeCheckpoint(rawUsageEvents.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+  usageInput.sort((left, right) => left.timestampMs - right.timestampMs
+    || left.sequence - right.sequence);
+  await cooperativeCheckpoint(usageInput.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+
+  const snapshots = [];
+  for (let index = 0; index < rateLimitSnapshots.length; index += 1) {
+    await cooperativeCheckpoint(index, signal, { resourceCheck });
+    const source = rateLimitSnapshots[index];
+    if (consumeInputs) rateLimitSnapshots[index] = null;
+    const snapshot = inputEncoding === "accounting_compact_v1"
+      ? decodeCompactAccountingSnapshot(source)
+      : source;
+    if (!snapshot || typeof snapshot !== "object"
+        || Array.isArray(snapshot)
+        || !snapshot.window
+        || typeof snapshot.window !== "object"
+        || (windowDurationMins !== null
+          && snapshot.window.windowDurationMins !== windowDurationMins)) {
+      continue;
+    }
+    const normalized = {
+      ...snapshot,
+      timestampMs: Number.isFinite(snapshot.timestampMs)
+        ? snapshot.timestampMs
+        : Date.parse(snapshot.timestamp),
+      sequence: sequence++,
+    };
+    if (Number.isFinite(normalized.timestampMs)
+        && normalized.timestampMs >= scanStartMs
+        && normalized.timestampMs <= scanEndMs) {
+      snapshots.push(normalized);
+    }
+  }
+  if (consumeInputs) rateLimitSnapshots.length = 0;
+  await cooperativeCheckpoint(rateLimitSnapshots.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+  snapshots.sort((left, right) => left.timestampMs - right.timestampMs
+    || left.sequence - right.sequence);
+  await cooperativeCheckpoint(snapshots.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+
+  const toolEvents = [];
+  for (let index = 0; index < rawToolEvents.length; index += 1) {
+    await cooperativeCheckpoint(index, signal, { resourceCheck });
+    const event = rawToolEvents[index];
+    if (consumeInputs) rawToolEvents[index] = null;
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    const normalized = {
+      ...event,
+      timestampMs: Number.isFinite(event.timestampMs)
+        ? event.timestampMs
+        : Date.parse(event.timestamp),
+      sequence: sequence++,
+    };
+    if (Number.isFinite(normalized.timestampMs)
+        && normalized.timestampMs >= scanStartMs
+        && normalized.timestampMs <= scanEndMs) {
+      toolEvents.push(normalized);
+    }
+  }
+  if (consumeInputs) rawToolEvents.length = 0;
+  await cooperativeCheckpoint(rawToolEvents.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+  toolEvents.sort((left, right) => left.timestampMs - right.timestampMs
+    || left.sequence - right.sequence);
+  await cooperativeCheckpoint(toolEvents.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+
+  return { usageInput, snapshots, toolEvents };
+}
+
+async function priceUsageEventsCooperatively({
+  usageInput,
+  priceCards,
+  signal,
+  resourceCheck,
+}) {
+  let cumulativeScanCostUsd = 0;
+  let cumulativeScanCostUsdExact = "0";
+  let cumulativeQuotaWeightedLowerUsd = 0;
+  let cumulativeQuotaWeightedUpperUsd = 0;
+  let quotaWeightedSensitivityComplete = true;
+  const usageEvents = [];
+  for (let index = 0; index < usageInput.length; index += 1) {
+    await cooperativeCheckpoint(index, signal, { resourceCheck });
+    const priced = priceUsageEvent(usageInput[index], priceCards);
+    cumulativeScanCostUsd = roundUsd(cumulativeScanCostUsd + priced.costUsd);
+    cumulativeScanCostUsdExact = addUsdStrings(
+      cumulativeScanCostUsdExact,
+      priced.costUsdExact,
+    );
+    if (!Number.isFinite(priced.quotaWeightedLowerUsd)
+        || !Number.isFinite(priced.quotaWeightedUpperUsd)) {
+      quotaWeightedSensitivityComplete = false;
+    } else {
+      cumulativeQuotaWeightedLowerUsd = roundUsd(
+        cumulativeQuotaWeightedLowerUsd + priced.quotaWeightedLowerUsd,
+      );
+      cumulativeQuotaWeightedUpperUsd = roundUsd(
+        cumulativeQuotaWeightedUpperUsd + priced.quotaWeightedUpperUsd,
+      );
+    }
+    usageEvents.push({
+      ...priced,
+      cumulativeScanCostUsd,
+      cumulativeScanCostUsdExact,
+      cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete
+        ? cumulativeQuotaWeightedLowerUsd
+        : null,
+      cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete
+        ? cumulativeQuotaWeightedUpperUsd
+        : null,
+    });
+    usageInput[index] = null;
+  }
+  usageInput.length = 0;
+  await cooperativeCheckpoint(usageEvents.length, signal, {
+    force: true,
+    resourceCheck,
+  });
+  return {
+    usageEvents,
+    quotaWeightedSensitivityComplete,
+    cumulativeScanCostUsd,
+    cumulativeScanCostUsdExact,
+    cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete
+      ? cumulativeQuotaWeightedLowerUsd
+      : null,
+    cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete
+      ? cumulativeQuotaWeightedUpperUsd
+      : null,
+  };
+}
+
+async function collapseTransitionsCooperatively({
+  snapshots,
+  usageEvents,
+  toolEvents,
+  scanStartMs,
+  diagnostics,
+  includeSnapshotIntervals,
+  signal,
+  resourceCheck,
+}) {
+  const guard = { signal, eventVisits: 0 };
+  const groups = new Map();
+  const deduplicated = new Map();
+  for (let index = 0; index < snapshots.length; index += 1) {
+    await cooperativeCheckpoint(index, signal, { resourceCheck });
+    const snapshot = snapshots[index];
+    const key = snapshotKey(snapshot);
+    if (!deduplicated.has(key)) deduplicated.set(key, snapshot);
+  }
+  let grouped = 0;
+  for (const snapshot of deduplicated.values()) {
+    await cooperativeCheckpoint(grouped, signal, { resourceCheck });
+    grouped += 1;
+    const key = windowKey(snapshot.window);
+    const group = groups.get(key) ?? [];
+    group.push(snapshot);
+    groups.set(key, group);
+  }
+
+  const transitions = [];
+  const snapshotIntervals = [];
+  const groupSummaries = [];
+  let derivedRows = 0;
+  let groupIndex = 0;
+  for (const group of groups.values()) {
+    await cooperativeCheckpoint(groupIndex, signal, {
+      force: true,
+      resourceCheck,
+    });
+    groupIndex += 1;
+    group.sort((left, right) => left.timestampMs - right.timestampMs
+      || left.window.usedPercent - right.window.usedPercent);
+    if (includeSnapshotIntervals) {
+      for (let index = 1; index < group.length; index += 1) {
+        await cooperativeCheckpoint(index, signal, { resourceCheck });
+        derivedRows += 1;
+        if (derivedRows > MAX_COOPERATIVE_TRANSITIONS) {
+          throw fixedError("transition_derivation_row_limit_exceeded");
+        }
+        snapshotIntervals.push(makeSnapshotInterval({
+          prior: group[index - 1],
+          next: group[index],
+          usageEvents,
+          toolEvents,
+          scanStartMs,
+          guard,
+        }));
+      }
+    }
+    let lastOfRun = group[0];
+    let groupTransitionCount = 0;
+    let monotonicTransitionCount = 0;
+    let regressionTransitionCount = 0;
+    for (let index = 1; index < group.length; index += 1) {
+      await cooperativeCheckpoint(index, signal, { resourceCheck });
+      const snapshot = group[index];
+      if (snapshot.window.usedPercent === lastOfRun.window.usedPercent) {
+        lastOfRun = snapshot;
+        continue;
+      }
+      derivedRows += 1;
+      if (derivedRows > MAX_COOPERATIVE_TRANSITIONS) {
+        throw fixedError("transition_derivation_row_limit_exceeded");
+      }
+      transitions.push(makeTransition({
+        prior: lastOfRun,
+        next: snapshot,
+        usageEvents,
+        toolEvents,
+        scanStartMs,
+        diagnostics,
+        guard,
+      }));
+      groupTransitionCount += 1;
+      if (snapshot.window.usedPercent > lastOfRun.window.usedPercent) {
+        monotonicTransitionCount += 1;
+      } else {
+        regressionTransitionCount += 1;
+      }
+      lastOfRun = snapshot;
+    }
+    groupSummaries.push({
+      accountScopeId: "unattributed",
+      planVariant: "unknown",
+      provider: group[0].window.provider,
+      planType: group[0].window.planType,
+      limitId: group[0].window.limitId,
+      slot: group[0].window.slot,
+      windowDurationMins: group[0].window.windowDurationMins,
+      resetsAt: group[0].window.resetsAt,
+      snapshotCount: group.length,
+      transitionCount: groupTransitionCount,
+      monotonicTransitionCount,
+      regressionTransitionCount,
+    });
+  }
+  await cooperativeCheckpoint(derivedRows, signal, {
+    force: true,
+    resourceCheck,
+  });
+  transitions.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
+    || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.slot.localeCompare(right.slot));
+  snapshotIntervals.sort((left, right) => left.eventTime.localeCompare(right.eventTime)
+    || left.resetIdentity.localeCompare(right.resetIdentity)
+    || left.slot.localeCompare(right.slot));
+  groupSummaries.sort((left, right) => left.resetsAt - right.resetsAt
+    || left.slot.localeCompare(right.slot));
+  throwIfDerivationAborted(signal);
+  return {
+    transitions,
+    snapshotIntervals,
+    groupSummaries,
+    windowGroupCount: groups.size,
+    deduplicatedSnapshotCount: deduplicated.size,
+  };
+}
+
+export async function deriveCodexTransitionSeriesCooperatively({
+  startAt,
+  endAt,
+  rawUsageEvents = [],
+  rateLimitSnapshots = [],
+  toolEvents: rawToolEvents = [],
+  diagnostics = {},
+  priceCards = null,
+  includeSnapshotIntervals = true,
+  windowDurationMins = null,
+  signal = null,
+  consumeInputs = false,
+  includeNormalizedInputs = true,
+  inputEncoding = "object",
+  resourceCheck = null,
+} = {}) {
+  const scanStartMs = Date.parse(startAt);
+  const scanEndMs = Date.parse(endAt);
+  if (!Number.isFinite(scanStartMs)
+      || !Number.isFinite(scanEndMs)
+      || scanEndMs < scanStartMs
+      || !Array.isArray(rawUsageEvents)
+      || !Array.isArray(rateLimitSnapshots)
+      || !Array.isArray(rawToolEvents)
+      || typeof diagnostics !== "object"
+      || diagnostics === null
+      || !validAbortSignal(signal)
+      || typeof consumeInputs !== "boolean"
+      || typeof includeNormalizedInputs !== "boolean"
+      || (resourceCheck !== null && typeof resourceCheck !== "function")
+      || !["object", "accounting_compact_v1"].includes(inputEncoding)) {
+    throw new TypeError("Cooperative transition series inputs are invalid");
+  }
+  const totalInputs = rawUsageEvents.length
+    + rateLimitSnapshots.length
+    + rawToolEvents.length;
+  if (rawUsageEvents.length > MAX_COOPERATIVE_USAGE_EVENTS
+      || rateLimitSnapshots.length > MAX_COOPERATIVE_RATE_LIMIT_SNAPSHOTS
+      || rawToolEvents.length > MAX_COOPERATIVE_TOOL_EVENTS
+      || totalInputs > MAX_COOPERATIVE_TOTAL_INPUTS) {
+    throw fixedError("transition_derivation_input_limit_exceeded");
+  }
+  await cooperativeCheckpoint(0, signal, { force: true, resourceCheck });
+  const normalized = await normalizeTransitionInputsCooperatively({
+    rawUsageEvents,
+    rateLimitSnapshots,
+    rawToolEvents,
+    scanStartMs,
+    scanEndMs,
+    windowDurationMins,
+    signal,
+    consumeInputs,
+    inputEncoding,
+    resourceCheck,
+  });
+  const priced = await priceUsageEventsCooperatively({
+    usageInput: normalized.usageInput,
+    priceCards,
+    signal,
+    resourceCheck,
+  });
+  const collapsed = await collapseTransitionsCooperatively({
+    snapshots: normalized.snapshots,
+    usageEvents: priced.usageEvents,
+    toolEvents: normalized.toolEvents,
+    scanStartMs,
+    diagnostics,
+    includeSnapshotIntervals,
+    signal,
+    resourceCheck,
+  });
+  return {
+    ...collapsed,
+    ...(includeNormalizedInputs
+      ? {
+        usageEvents: priced.usageEvents,
+        rateLimitSnapshots: normalized.snapshots,
+        toolEvents: normalized.toolEvents,
+      }
+      : {}),
+    quotaWeightedSensitivityComplete:
+      priced.quotaWeightedSensitivityComplete,
+    cumulativeScanCostUsd: priced.cumulativeScanCostUsd,
+    cumulativeScanCostUsdExact: priced.cumulativeScanCostUsdExact,
+    cumulativeQuotaWeightedLowerUsd:
+      priced.cumulativeQuotaWeightedLowerUsd,
+    cumulativeQuotaWeightedUpperUsd:
+      priced.cumulativeQuotaWeightedUpperUsd,
+  };
+}
+
+export function deriveCodexTransitionSeries({
+  startAt,
+  endAt,
+  rawUsageEvents = [],
+  rateLimitSnapshots = [],
+  toolEvents: rawToolEvents = [],
+  diagnostics = {},
+  priceCards = null,
+  includeSnapshotIntervals = true,
+  windowDurationMins = null,
+} = {}) {
+  const scanStartMs = Date.parse(startAt);
+  const scanEndMs = Date.parse(endAt);
+  if (!Number.isFinite(scanStartMs)
+      || !Number.isFinite(scanEndMs)
+      || scanEndMs < scanStartMs
+      || !Array.isArray(rawUsageEvents)
+      || !Array.isArray(rateLimitSnapshots)
+      || !Array.isArray(rawToolEvents)
+      || typeof diagnostics !== "object"
+      || diagnostics === null) {
+    throw new TypeError("Transition series inputs are invalid");
+  }
+  let sequence = 0;
+  const usageInput = rawUsageEvents
+    .filter((event) => event && typeof event === "object"
+      && !Array.isArray(event))
+    .map((event) => ({
+      ...event,
+      timestampMs: Date.parse(event.timestamp),
+      sequence: sequence++,
+    }))
+    .filter((event) => Number.isFinite(event.timestampMs)
+      && event.timestampMs >= scanStartMs
+      && event.timestampMs <= scanEndMs)
+    .sort((left, right) => left.timestampMs - right.timestampMs
+      || left.sequence - right.sequence);
+  const snapshots = rateLimitSnapshots
+    .filter((snapshot) => snapshot && typeof snapshot === "object"
+      && !Array.isArray(snapshot)
+      && snapshot.window && typeof snapshot.window === "object"
+      && (windowDurationMins === null
+        || snapshot.window.windowDurationMins === windowDurationMins))
+    .map((snapshot) => ({
+      ...snapshot,
+      timestampMs: Number.isFinite(snapshot.timestampMs)
+        ? snapshot.timestampMs
+        : Date.parse(snapshot.timestamp),
+      sequence: sequence++,
+    }))
+    .filter((snapshot) => Number.isFinite(snapshot.timestampMs)
+      && snapshot.timestampMs >= scanStartMs
+      && snapshot.timestampMs <= scanEndMs)
+    .sort((left, right) => left.timestampMs - right.timestampMs
+      || left.sequence - right.sequence);
+  const toolEvents = rawToolEvents
+    .filter((event) => event && typeof event === "object"
+      && !Array.isArray(event))
+    .map((event) => ({
+      ...event,
+      timestampMs: Number.isFinite(event.timestampMs)
+        ? event.timestampMs
+        : Date.parse(event.timestamp),
+      sequence: sequence++,
+    }))
+    .filter((event) => Number.isFinite(event.timestampMs)
+      && event.timestampMs >= scanStartMs
+      && event.timestampMs <= scanEndMs)
+    .sort((left, right) => left.timestampMs - right.timestampMs
+      || left.sequence - right.sequence);
+  let cumulativeScanCostUsd = 0;
+  let cumulativeScanCostUsdExact = "0";
+  let cumulativeQuotaWeightedLowerUsd = 0;
+  let cumulativeQuotaWeightedUpperUsd = 0;
+  let quotaWeightedSensitivityComplete = true;
+  const usageEvents = usageInput.map((event) => {
+    const priced = priceUsageEvent(event, priceCards);
+    cumulativeScanCostUsd = roundUsd(cumulativeScanCostUsd + priced.costUsd);
+    cumulativeScanCostUsdExact = addUsdStrings(
+      cumulativeScanCostUsdExact,
+      priced.costUsdExact,
+    );
+    if (!Number.isFinite(priced.quotaWeightedLowerUsd)
+        || !Number.isFinite(priced.quotaWeightedUpperUsd)) {
+      quotaWeightedSensitivityComplete = false;
+    } else {
+      cumulativeQuotaWeightedLowerUsd = roundUsd(
+        cumulativeQuotaWeightedLowerUsd + priced.quotaWeightedLowerUsd,
+      );
+      cumulativeQuotaWeightedUpperUsd = roundUsd(
+        cumulativeQuotaWeightedUpperUsd + priced.quotaWeightedUpperUsd,
+      );
+    }
+    return {
+      ...priced,
+      cumulativeScanCostUsd,
+      cumulativeScanCostUsdExact,
+      cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete
+        ? cumulativeQuotaWeightedLowerUsd
+        : null,
+      cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete
+        ? cumulativeQuotaWeightedUpperUsd
+        : null,
+    };
+  });
+  const collapsed = collapseTransitions({
+    snapshots,
+    usageEvents,
+    toolEvents,
+    scanStartMs,
+    diagnostics,
+    includeSnapshotIntervals,
+  });
+  return {
+    ...collapsed,
+    usageEvents,
+    rateLimitSnapshots: snapshots,
+    toolEvents,
+    quotaWeightedSensitivityComplete,
+    cumulativeScanCostUsd,
+    cumulativeScanCostUsdExact,
+    cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete
+      ? cumulativeQuotaWeightedLowerUsd
+      : null,
+    cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete
+      ? cumulativeQuotaWeightedUpperUsd
+      : null,
+  };
+}
+
 export async function mineCodexTransitions({
   startAt,
   endAt,
@@ -427,40 +1102,24 @@ export async function mineCodexTransitions({
       toolEvents.push({ ...event, sequence: sequence++ });
     },
   });
-  rawUsageEvents.sort((left, right) => left.timestampMs - right.timestampMs || left.sequence - right.sequence);
-  snapshots.sort((left, right) => left.timestampMs - right.timestampMs || left.sequence - right.sequence);
-  toolEvents.sort((left, right) => left.timestampMs - right.timestampMs || left.sequence - right.sequence);
-  let cumulativeScanCostUsd = 0;
-  let cumulativeScanCostUsdExact = "0";
-  let cumulativeQuotaWeightedLowerUsd = 0;
-  let cumulativeQuotaWeightedUpperUsd = 0;
-  let quotaWeightedSensitivityComplete = true;
-  const usageEvents = rawUsageEvents.map((event) => {
-    const priced = priceUsageEvent(event, priceCards);
-    cumulativeScanCostUsd = roundUsd(cumulativeScanCostUsd + priced.costUsd);
-    cumulativeScanCostUsdExact = addUsdStrings(cumulativeScanCostUsdExact, priced.costUsdExact);
-    if (!Number.isFinite(priced.quotaWeightedLowerUsd) || !Number.isFinite(priced.quotaWeightedUpperUsd)) {
-      quotaWeightedSensitivityComplete = false;
-    } else {
-      cumulativeQuotaWeightedLowerUsd = roundUsd(cumulativeQuotaWeightedLowerUsd + priced.quotaWeightedLowerUsd);
-      cumulativeQuotaWeightedUpperUsd = roundUsd(cumulativeQuotaWeightedUpperUsd + priced.quotaWeightedUpperUsd);
-    }
-    return {
-      ...priced,
-      cumulativeScanCostUsd,
-      cumulativeScanCostUsdExact,
-      cumulativeQuotaWeightedLowerUsd: quotaWeightedSensitivityComplete ? cumulativeQuotaWeightedLowerUsd : null,
-      cumulativeQuotaWeightedUpperUsd: quotaWeightedSensitivityComplete ? cumulativeQuotaWeightedUpperUsd : null,
-    };
-  });
-  const collapsed = collapseTransitions({
-    snapshots,
-    usageEvents,
+  const derived = deriveCodexTransitionSeries({
+    startAt,
+    endAt,
+    rawUsageEvents,
+    rateLimitSnapshots: snapshots,
     toolEvents,
-    scanStartMs,
     diagnostics: scanned.diagnostics,
+    priceCards,
     includeSnapshotIntervals,
+    windowDurationMins,
   });
+  const {
+    usageEvents,
+    quotaWeightedSensitivityComplete,
+    cumulativeScanCostUsdExact,
+    cumulativeQuotaWeightedLowerUsd,
+    cumulativeQuotaWeightedUpperUsd,
+  } = derived;
   const pricedEvents = usageEvents.filter((event) => event.pricingCoverageStatus === "fully_priced").length;
   const partiallyPricedEvents = usageEvents.filter((event) => event.pricingCoverageStatus === "partially_priced").length;
   const unpricedEvents = usageEvents.filter((event) => event.pricingCoverageStatus === "unpriced").length;
@@ -537,13 +1196,13 @@ export async function mineCodexTransitions({
       partiallyPricedEvents,
       unpricedEvents,
       rawRateLimitSnapshots: scanned.diagnostics.rateLimitSnapshots,
-      deduplicatedRateLimitSnapshots: collapsed.deduplicatedSnapshotCount,
-      resetGroups: collapsed.windowGroupCount,
-      transitionResetGroups: collapsed.groupSummaries.filter((group) => group.transitionCount > 0).length,
-      transitions: collapsed.transitions.length,
-      snapshotIntervals: collapsed.snapshotIntervals.length,
-      monotonicTransitions: collapsed.transitions.filter((transition) => transition.nextUsedPercent > transition.priorUsedPercent).length,
-      regressionTransitions: collapsed.transitions.filter((transition) => transition.nextUsedPercent < transition.priorUsedPercent).length,
+      deduplicatedRateLimitSnapshots: derived.deduplicatedSnapshotCount,
+      resetGroups: derived.windowGroupCount,
+      transitionResetGroups: derived.groupSummaries.filter((group) => group.transitionCount > 0).length,
+      transitions: derived.transitions.length,
+      snapshotIntervals: derived.snapshotIntervals.length,
+      monotonicTransitions: derived.transitions.filter((transition) => transition.nextUsedPercent > transition.priorUsedPercent).length,
+      regressionTransitions: derived.transitions.filter((transition) => transition.nextUsedPercent < transition.priorUsedPercent).length,
       usageEventsByModel,
       tokenComponentsByModel,
       unpricedModels: [...unpricedModels].sort(),
@@ -553,9 +1212,9 @@ export async function mineCodexTransitions({
       }, {}),
     },
     diagnostics: scanned.diagnostics,
-    windowGroups: collapsed.groupSummaries,
-    snapshotIntervals: collapsed.snapshotIntervals,
-    transitions: collapsed.transitions,
+    windowGroups: derived.groupSummaries,
+    snapshotIntervals: derived.snapshotIntervals,
+    transitions: derived.transitions,
     privacy: {
       excluded: [
         "prompt_and_response_content",

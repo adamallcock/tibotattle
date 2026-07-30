@@ -5,6 +5,21 @@ import { ExportResourceLimitError } from "./export-resource-policy.js";
 const DEFAULT_MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_HIGH_WATER_MARK = 256 * 1024;
 
+function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error("Bounded JSONL read aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  throw error;
+}
+
 export async function* readBoundedUtf8LineEntries(path, {
   maximumLineBytes = DEFAULT_MAXIMUM_LINE_BYTES,
   highWaterMark = DEFAULT_HIGH_WATER_MARK,
@@ -13,6 +28,7 @@ export async function* readBoundedUtf8LineEntries(path, {
   maximumTotalBytes = Number.POSITIVE_INFINITY,
   startByte = 0,
   startLineOrdinal = 1,
+  signal = null,
 } = {}) {
   if (!Number.isSafeInteger(maximumLineBytes) || maximumLineBytes < 1) {
     throw new TypeError("maximumLineBytes must be a positive safe integer");
@@ -29,6 +45,10 @@ export async function* readBoundedUtf8LineEntries(path, {
       || (maximumTotalBytes !== Number.POSITIVE_INFINITY && startByte > maximumTotalBytes)) {
     throw new TypeError("Line cursor must use a valid byte offset and positive line ordinal");
   }
+  if (!validAbortSignal(signal)) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  throwIfAborted(signal);
   if (maximumTotalBytes === 0 || startByte === maximumTotalBytes) return;
   const callerOwnedHandle = path && typeof path === "object" && Number.isInteger(path.fd);
   const input = callerOwnedHandle ? null : createReadStream(path, {
@@ -45,6 +65,7 @@ export async function* readBoundedUtf8LineEntries(path, {
     async *[Symbol.asyncIterator]() {
       let position = startByte;
       while (position < maximumTotalBytes) {
+        throwIfAborted(signal);
         const remaining = maximumTotalBytes === Number.POSITIVE_INFINITY
           ? highWaterMark
           : Math.min(highWaterMark, maximumTotalBytes - position);
@@ -123,17 +144,20 @@ export async function* readBoundedUtf8LineEntries(path, {
   }
 
   for await (const chunk of chunksInput) {
+    throwIfAborted(signal);
     resourceGuard?.checkRuntime();
     if (absoluteOffset + chunk.length > maximumTotalBytes) {
       input?.destroy();
       throw new ExportResourceLimitError("source_bytes");
     }
     let start = 0;
-    for (let index = 0; index < chunk.length; index += 1) {
-      if (chunk[index] !== 0x0a) continue;
+    let index = chunk.indexOf(0x0a, start);
+    while (index !== -1) {
+      throwIfAborted(signal);
       append(chunk.subarray(start, index));
       yield completeLine(absoluteOffset + index + 1);
       start = index + 1;
+      index = chunk.indexOf(0x0a, start);
     }
     append(chunk.subarray(start));
     absoluteOffset += chunk.length;
@@ -150,11 +174,16 @@ export async function readBoundedJsonLines(path, {
   maximumLineBytes = DEFAULT_MAXIMUM_LINE_BYTES,
   maximumRecords,
   resourceGuard = null,
+  signal = null,
 } = {}) {
   if (!Number.isSafeInteger(maximumFileBytes) || maximumFileBytes < 1
       || !Number.isSafeInteger(maximumRecords) || maximumRecords < 1) {
     throw new TypeError("Bounded JSONL file and record limits must be positive safe integers");
   }
+  if (!validAbortSignal(signal)) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  throwIfAborted(signal);
   let stats;
   try {
     stats = await lstat(path);
@@ -170,7 +199,9 @@ export async function readBoundedJsonLines(path, {
     maximumLineBytes,
     maximumTotalBytes: maximumFileBytes,
     resourceGuard,
+    signal,
   })) {
+    throwIfAborted(signal);
     if (!line.trim()) continue;
     if (records.length >= maximumRecords) throw new ExportResourceLimitError("output_records");
     try {

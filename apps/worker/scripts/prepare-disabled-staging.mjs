@@ -7,6 +7,7 @@ import { parse } from "jsonc-parser";
 import {
   probeStagingLive,
   REQUIRED_D1_BINDINGS,
+  stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
@@ -114,6 +115,14 @@ UPDATE collection_controls
     code: "DISABLED_STAGING_PREPARED",
     collectionAuthorized: false,
     secretsInstalled: after.checks.requiredSecretsInstalled,
+    receipt: stagingOperationReceipt("disabled_staging_prepared", {
+      resourcesVerified: after.checks.d1ResourcesExist
+        && after.checks.r2ResourceExists,
+      migrationsCurrent: after.checks.migrationsCurrent,
+      pilotSchemaCurrent: after.checks.pilotSchemaCurrent,
+      collectionContained: after.checks.collectionContained,
+      secretsInstalled: after.checks.requiredSecretsInstalled,
+    }),
   };
 }
 

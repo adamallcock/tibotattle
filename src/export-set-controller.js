@@ -219,6 +219,7 @@ function combinedSourcePlanPlanningGuard(resourceGuard) {
     // selection gauge, so it remains charged while the combined plan is built.
     observeDirectoryEntry: resourceGuard.observeDirectoryEntry.bind(resourceGuard),
     observeLine: resourceGuard.observeLine.bind(resourceGuard),
+    assertSourceSelection: resourceGuard.assertSourceSelection.bind(resourceGuard),
     // Individual discovered files and the Codex plan total would otherwise
     // establish a partial gauge before the frozen collector prefix can be
     // included. Validate runtime now; the exact combined total is charged once

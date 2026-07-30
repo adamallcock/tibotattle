@@ -4,6 +4,13 @@ import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { priceCodexUsageEvent } from "./local-api-pricing.js";
 import { APP_PRICE_REGISTRY_MANIFEST } from "./price-registry.js";
+import {
+  defaultReplaySafeAccountingCachePath,
+  readReplaySafeAccountingCache,
+} from "./replay-safe-accounting-cache.js";
+import {
+  BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
+} from "./weekly-calibration.js";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
@@ -57,6 +64,8 @@ const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 const RECENT_TIMELINE_DAYS = 31;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_POINTS = 10_000;
+const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
+const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
 
 const REPORTS = Object.freeze([
   {
@@ -349,6 +358,222 @@ async function projectArtifact(root, kind) {
   }
 }
 
+function unavailableLiveWeekly(errorCode) {
+  return {
+    status: "unavailable",
+    generatedAt: null,
+    artifactStatus: null,
+    errorCode,
+    dataClass: "live_replay_safe_cache",
+    accountAttribution: null,
+    datasets: {},
+  };
+}
+
+function canonicalWeeklyInstant(value) {
+  if (typeof value !== "string") return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+      && new Date(milliseconds).toISOString() === value
+    ? value
+    : null;
+}
+
+function finiteWeeklyNumber(value, {
+  nullable = false,
+  minimum = Number.NEGATIVE_INFINITY,
+  maximum = Number.POSITIVE_INFINITY,
+} = {}) {
+  if (nullable && value === null) return true;
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= minimum
+    && value <= maximum;
+}
+
+function validWeeklyRange(range) {
+  if (!range || typeof range !== "object" || Array.isArray(range)
+      || !finiteWeeklyNumber(range.lower, { nullable: true, minimum: 0 })
+      || !finiteWeeklyNumber(range.upper, { nullable: true, minimum: 0 })) {
+    return false;
+  }
+  return range.lower === null
+    || range.upper === null
+    || range.lower <= range.upper;
+}
+
+function validWeeklyReset(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)
+      || canonicalWeeklyInstant(row.resetIdentity) === null
+      || canonicalWeeklyInstant(row.firstObservedAt) === null
+      || canonicalWeeklyInstant(row.lastObservedAt) === null
+      || Date.parse(row.firstObservedAt) > Date.parse(row.lastObservedAt)
+      || !KNOWN_SLOTS.has(row.slot)
+      || !finiteWeeklyNumber(row.observedSpanPercentagePoints, {
+        minimum: 0,
+        maximum: 100,
+      })
+      || !finiteWeeklyNumber(row.apiPriceEquivalentUsd, { minimum: 0 })
+      || !validWeeklyRange(row.plausibleRangeUsd)
+      || !Number.isSafeInteger(row.eligibleTransitions)
+      || row.eligibleTransitions < 0
+      || !Number.isSafeInteger(row.uniqueBoundaries)
+      || row.uniqueBoundaries < 0
+      || !finiteWeeklyNumber(row.knownSpeedFraction, {
+        nullable: true,
+        minimum: 0,
+        maximum: 1,
+      })
+      || !finiteWeeklyNumber(
+        row.holdoutMeanAbsoluteErrorPercentagePoints,
+        { nullable: true, minimum: 0, maximum: 100 },
+      )) {
+    return false;
+  }
+  return true;
+}
+
+function validLiveWeeklyCalibration(weekly) {
+  if (!weekly || typeof weekly !== "object" || Array.isArray(weekly)
+      || weekly.schemaVersion !== "weekly-calibration-summary-v0.1"
+      || !["estimated", "insufficient_evidence"].includes(weekly.status)
+      || canonicalWeeklyInstant(weekly.generatedAt) === null
+      || weekly.evidenceBasis
+        !== "lineage_aware_local_usage_and_provider_percentage_snapshots"
+      || weekly.interpretation
+        !== "conditional_api_price_equivalent_not_provider_allowance_or_bill"
+      || weekly.accountAttribution?.status !== "historical_unattributed"
+      || weekly.accountAttribution?.maySpanMultipleAccounts !== true
+      || weekly.accountAttribution?.label
+        !== "Historical estimate; account-unattributed and may combine multiple accounts"
+      || !Array.isArray(weekly.limitations)
+      || weekly.limitations.length < 1
+      || weekly.limitations.length > 8
+      || !weekly.limitations.every((value) => (
+        typeof value === "string"
+        && value.length > 0
+        && value.length <= MAX_SAFE_TEXT_LENGTH
+        && safeText(value) === value
+      ))
+      || !Array.isArray(weekly.recentResets)
+      || weekly.recentResets.length
+        > BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT
+      || !weekly.recentResets.every(validWeeklyReset)
+      || !weekly.validation
+      || typeof weekly.validation !== "object"
+      || Array.isArray(weekly.validation)) {
+    return false;
+  }
+  const estimate = weekly.estimate;
+  if (weekly.status === "estimated") {
+    if (!estimate || typeof estimate !== "object" || Array.isArray(estimate)
+        || !Number.isSafeInteger(estimate.qualifyingResets)
+        || estimate.qualifyingResets < 1
+        || !finiteWeeklyNumber(
+          estimate.medianApiPriceEquivalentUsd,
+          { minimum: 0 },
+        )
+        || !validWeeklyRange(estimate.plausibleRangeUsd)
+        || !finiteWeeklyNumber(estimate.minimumUsd, { minimum: 0 })
+        || !finiteWeeklyNumber(estimate.maximumUsd, { minimum: 0 })
+        || estimate.minimumUsd > estimate.maximumUsd) {
+      return false;
+    }
+  } else if (estimate !== null) {
+    return false;
+  }
+  const validation = weekly.validation;
+  if (validation.selectedCostBasis !== null
+      && (typeof validation.selectedCostBasis !== "string"
+        || validation.selectedCostBasis.length < 1
+        || validation.selectedCostBasis.length > 128
+        || safeText(validation.selectedCostBasis)
+          !== validation.selectedCostBasis)) {
+    return false;
+  }
+  return [
+    validation.sameResetHoldoutMeanAbsoluteErrorPercentagePoints,
+    validation.priorResetMeanAbsoluteErrorPercentagePoints,
+    validation.forecastErrorP80PercentagePoints,
+  ].every((value) => finiteWeeklyNumber(
+    value,
+    { nullable: true, minimum: 0, maximum: 100 },
+  )) && finiteWeeklyNumber(
+    validation.priorResetAbsoluteBiasPercentagePoints,
+    { nullable: true, minimum: -100, maximum: 100 },
+  );
+}
+
+function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
+  const weekly = cache?.weeklyCalibration;
+  if (!weekly) {
+    return unavailableLiveWeekly(
+      cacheReadErrorCode === "cache_invalid"
+        || cacheReadErrorCode === "cache_malformed"
+        || cacheReadErrorCode === "cache_invalid_size"
+        ? "live_cache_invalid"
+        : "live_cache_missing",
+    );
+  }
+  if (!validLiveWeeklyCalibration(weekly)) {
+    return unavailableLiveWeekly("live_cache_invalid");
+  }
+  const estimate = weekly.estimate;
+  return {
+    status: weekly.status === "estimated" ? "available" : "insufficient_evidence",
+    generatedAt: weekly.generatedAt,
+    artifactStatus: weekly.status,
+    errorCode: null,
+    dataClass: "live_replay_safe_cache",
+    accountAttribution: {
+      status: "historical_unattributed",
+      maySpanMultipleAccounts: true,
+      label:
+        "Historical estimate; account-unattributed and may combine multiple accounts",
+    },
+    interpretation: weekly.interpretation,
+    limitations: [...weekly.limitations],
+    datasets: {
+      summary: [{
+        median_weekly_value_usd:
+          estimate?.medianApiPriceEquivalentUsd ?? null,
+        lower_80_across_resets_usd:
+          estimate?.plausibleRangeUsd?.lower ?? null,
+        upper_80_across_resets_usd:
+          estimate?.plausibleRangeUsd?.upper ?? null,
+        qualifying_resets: estimate?.qualifyingResets ?? 0,
+        selected_holdout_mae_pp:
+          weekly.validation
+            ?.sameResetHoldoutMeanAbsoluteErrorPercentagePoints ?? null,
+        prior_reset_mae_pp:
+          weekly.validation
+            ?.priorResetMeanAbsoluteErrorPercentagePoints ?? null,
+        prior_reset_bias_pp:
+          weekly.validation
+            ?.priorResetAbsoluteBiasPercentagePoints ?? null,
+        prior_reset_p80_absolute_error_pp:
+          weekly.validation?.forecastErrorP80PercentagePoints ?? null,
+      }],
+      weekly_values: weekly.recentResets.map((row, index) => ({
+        sequence: index + 1,
+        first_observed_at: row.firstObservedAt,
+        last_observed_at: row.lastObservedAt,
+        reset_due_at: row.resetIdentity,
+        slot: row.slot,
+        displayed_span_pp: row.observedSpanPercentagePoints,
+        value_usd: row.apiPriceEquivalentUsd,
+        pairwise_p10_usd: row.plausibleRangeUsd?.lower ?? null,
+        pairwise_p90_usd: row.plausibleRangeUsd?.upper ?? null,
+        holdout_mae_pp:
+          row.holdoutMeanAbsoluteErrorPercentagePoints,
+        known_speed_fraction: row.knownSpeedFraction,
+        eligible_transitions: row.eligibleTransitions,
+        unique_percentage_boundaries: row.uniqueBoundaries,
+      })),
+    },
+  };
+}
+
 function emptyComponents() {
   return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
 }
@@ -383,7 +608,16 @@ function emptyDimension(keys) {
 function usageProjection(record) {
   const components = emptyComponents();
   addComponents(components, record.components);
-  const totalTokens = Object.values(components).reduce((sum, value) => sum + value, 0);
+  if (components.output_combined_tokens > 0
+      && components.output_text_tokens + components.output_reasoning_tokens > 0) {
+    components.output_combined_tokens = 0;
+  }
+  const totalTokens = components.input_uncached_tokens
+    + components.input_cache_read_tokens
+    + components.input_cache_write_tokens
+    + (components.output_combined_tokens > 0
+      ? components.output_combined_tokens
+      : components.output_text_tokens + components.output_reasoning_tokens);
   if (totalTokens === 0) return null;
   const model = safeModel(record.model);
   let priced;
@@ -625,7 +859,11 @@ function finalizeQuotaTimeline(rows) {
   return deterministicSample(changes, MAX_QUOTA_TIMELINE_POINTS);
 }
 
-async function readCollectorProjection(path, nowMs) {
+async function readCollectorProjection(
+  path,
+  nowMs,
+  { summarizeUsageEvents = true } = {},
+) {
   let metadata;
   try {
     metadata = await stat(path);
@@ -735,11 +973,15 @@ async function readCollectorProjection(path, nowMs) {
           || observedMs > latestExportableRecordAt) {
         latestExportableRecordAt = observedMs;
       }
-      const projection = usageProjection(value);
-      for (const period of periods) {
-        if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
+      if (summarizeUsageEvents) {
+        const projection = usageProjection(value);
+        for (const period of periods) {
+          if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
+        }
+        if (observedMs >= recentStartMs) {
+          addTimelineUsage(timelineBuckets, observedMs, projection);
+        }
       }
-      if (observedMs >= recentStartMs) addTimelineUsage(timelineBuckets, observedMs, projection);
     }
     if (value.kind === "codex_tool_class_event") {
       if (observedMs !== null && observedMs <= nowMs + 5 * 60_000) {
@@ -1010,28 +1252,72 @@ export async function buildLocalCompanionSnapshot({
   root = process.cwd(),
   collectorFile = resolve(root, ".usage-monitor", "collector-events.jsonl"),
   checkpointFile = resolve(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
+  accountingCacheFile = defaultReplaySafeAccountingCachePath(root),
+  allowDevelopmentArtifactFallback = false,
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
   if (!Number.isFinite(nowMs)) throw new TypeError("now must return a finite epoch timestamp");
-  const [gradient, weekly, quality, collector, reports] = await Promise.all([
+  const replaySafeAccounting = await readReplaySafeAccountingCache({
+    cacheFile: accountingCacheFile,
+    now: () => nowMs,
+    maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
+  });
+  const replaySafeCache = ["available", "stale"].includes(
+    replaySafeAccounting.status,
+  )
+    ? replaySafeAccounting.cache
+    : null;
+  if (typeof allowDevelopmentArtifactFallback !== "boolean") {
+    throw new TypeError("allowDevelopmentArtifactFallback must be a boolean");
+  }
+  const [gradient, historicalWeekly, quality, collector, reports] = await Promise.all([
     projectArtifact(root, "gradient"),
-    projectArtifact(root, "weekly"),
+    allowDevelopmentArtifactFallback
+      ? projectArtifact(root, "weekly")
+      : Promise.resolve({
+        status: "unavailable",
+        generatedAt: null,
+        artifactStatus: null,
+        errorCode: "development_fallback_disabled",
+        dataClass: "development_only_historical_artifact",
+        datasets: {},
+      }),
     projectArtifact(root, "quality"),
-    readCollectorProjection(collectorFile, nowMs),
+    readCollectorProjection(collectorFile, nowMs, {
+      summarizeUsageEvents: replaySafeCache === null,
+    }),
     reportProjection(root),
   ]);
+  const liveWeekly = projectLiveWeeklyCalibration(
+    replaySafeCache,
+    replaySafeAccounting.errorCode,
+  );
+  const weekly = liveWeekly.status === "unavailable"
+    && allowDevelopmentArtifactFallback
+    ? {
+      ...historicalWeekly,
+      dataClass: "development_only_historical_artifact",
+    }
+    : liveWeekly;
   const latestRecordAt = collector.latestRecordAt;
   const indexing = await readCollectorIndexProjection(checkpointFile, collector);
   const latestEvidenceAt = latestRecordAt === null ? null : new Date(latestRecordAt).toISOString();
   const evidenceAgeSeconds = latestRecordAt === null ? null : Math.max(0, Math.round((nowMs - latestRecordAt) / 1_000));
-  const freshnessStatus = evidenceAgeSeconds === null
+  const collectorFreshnessStatus = evidenceAgeSeconds === null
     ? "unavailable"
-    : evidenceAgeSeconds <= 5 * 60 ? "live" : "stale";
-  const usage = collector.usage;
+    : evidenceAgeSeconds * 1_000 <= MAX_COLLECTOR_LIVE_AGE_MS ? "live" : "stale";
+  const freshnessStatus = replaySafeAccounting.status === "stale"
+    ? "stale"
+    : collectorFreshnessStatus;
+  const usage = replaySafeCache?.periods ?? collector.usage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
     ?? usage.find((period) => period.id === "all");
   const quota = collector.quota;
+  const quotaTimeline = Array.isArray(replaySafeCache?.quotaTimeline)
+      && replaySafeCache.quotaTimeline.length > 0
+    ? replaySafeCache.quotaTimeline
+    : collector.timeline.quota;
   const tools = collector.tools;
   const pricedEvents = (displayUsage?.pricingCoverage.fullyPricedEvents ?? 0)
     + (displayUsage?.pricingCoverage.partiallyPricedEvents ?? 0);
@@ -1039,7 +1325,19 @@ export async function buildLocalCompanionSnapshot({
     ? null
     : Number(((pricedEvents / displayUsage.events) * 100).toFixed(3));
   const warnings = [];
-  if (freshnessStatus === "stale") warnings.push("The newest retained collector evidence is stale.");
+  if (collectorFreshnessStatus === "stale") {
+    warnings.push("The newest retained collector evidence is stale.");
+  }
+  if (replaySafeAccounting.status === "stale") {
+    warnings.push(
+      `Replay-safe cost accounting is ${Math.round((replaySafeAccounting.ageSeconds ?? 0) / 60)} minutes old and is shown as stale until refreshed.`,
+    );
+  }
+  if (replaySafeCache === null && (displayUsage?.events ?? 0) > 0) {
+    warnings.push(
+      "Recent cost accounting is using the legacy collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
+    );
+  }
   if (indexing.status === "prospective_only") {
     warnings.push("The retained ledger began prospectively and does not prove recent-history coverage.");
   }
@@ -1055,12 +1353,14 @@ export async function buildLocalCompanionSnapshot({
       evidenceStatus: collector.recordCount > 0 ? "available" : "unavailable",
       latestEvidenceAt,
       latestObservedAt: latestEvidenceAt,
-      freshness: {
-        status: freshnessStatus,
-        latestObservedAt: latestEvidenceAt,
-        ageSeconds: evidenceAgeSeconds,
-        staleAfterSeconds: 300,
-      },
+        freshness: {
+          status: freshnessStatus,
+          latestObservedAt: latestEvidenceAt,
+          ageSeconds: evidenceAgeSeconds,
+          staleAfterSeconds: MAX_COLLECTOR_LIVE_AGE_MS / 1_000,
+          accountingStatus: replaySafeAccounting.status,
+          accountingAgeSeconds: replaySafeAccounting.ageSeconds ?? null,
+        },
       collector: {
         status: collector.status,
         records: collector.recordCount,
@@ -1095,7 +1395,16 @@ export async function buildLocalCompanionSnapshot({
       })),
       usage,
       tools,
-      timeline: collector.timeline,
+      timeline: {
+        ...collector.timeline,
+        bucketMinutes: replaySafeCache?.bucketMinutes
+          ?? collector.timeline.bucketMinutes,
+        coveredAt: replaySafeCache?.coveredAt
+          ?? collector.timeline.coveredAt,
+        usage: replaySafeCache?.timeline
+          ?? collector.timeline.usage,
+        quota: quotaTimeline,
+      },
       accounting: {
         periodId: displayUsage?.id ?? "all",
         periodLabel: displayUsage?.label ?? "All retained evidence",
@@ -1103,6 +1412,7 @@ export async function buildLocalCompanionSnapshot({
         totalTokens: displayUsage?.totalTokens ?? 0,
         apiPriceEquivalentUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
         components: displayUsage?.components ?? emptyComponents(),
+        componentCosts: displayUsage?.componentCosts ?? {},
         byModel: displayUsage?.byModel ?? [],
         bySpeed: displayUsage?.bySpeed ?? emptyDimension(KNOWN_SPEEDS),
         byApiServiceTier: displayUsage?.byApiServiceTier ?? emptyDimension(KNOWN_API_TIERS),
@@ -1120,6 +1430,13 @@ export async function buildLocalCompanionSnapshot({
         apiPriceCounterfactualTier: "standard",
         subscriptionSpeedIsSeparate: true,
         reasoningEffortAvailable: false,
+        accountingSource: replaySafeCache === null
+          ? "legacy_collector_unverified"
+          : replaySafeCache.accountingMethod,
+        accountingCacheStatus: replaySafeAccounting.status,
+        replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
+        generatedAt: replaySafeCache?.generatedAt ?? null,
+        coveredAt: replaySafeCache?.coveredAt ?? null,
         unknownModelEvents: displayUsage?.byModel
           ?.find((row) => row.model === "unknown")?.events ?? 0,
         periods: usage.map((period) => ({
@@ -1130,6 +1447,7 @@ export async function buildLocalCompanionSnapshot({
           apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,
           pricingCoverage: period.pricingCoverage,
           components: period.components,
+          componentCosts: period.componentCosts ?? {},
           byModel: period.byModel,
           bySpeed: period.bySpeed,
           byApiServiceTier: period.byApiServiceTier,
@@ -1153,11 +1471,32 @@ export async function buildLocalCompanionSnapshot({
         coveragePercent: pricingCoveragePercent,
         eventCount: displayUsage?.events ?? 0,
         apiTier: "standard",
-        components: displayUsage?.components ?? emptyComponents(),
+        components: Object.entries(
+          displayUsage?.componentCosts ?? displayUsage?.components ?? emptyComponents(),
+        ).map(([name, value]) => ({
+          name,
+          tokens: typeof value === "object"
+            ? value.tokens ?? 0
+            : value,
+          pricedTokens: typeof value === "object"
+            ? value.pricedTokens ?? 0
+            : 0,
+          unpricedTokens: typeof value === "object"
+            ? value.unpricedTokens ?? 0
+            : 0,
+          costUsd: typeof value === "object"
+            ? value.costUsd ?? null
+            : null,
+        })),
         apiServiceTier: "standard",
         subscriptionSpeedIsSeparate: true,
         registryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
         registryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+        accountingSource: replaySafeCache === null
+          ? "legacy_collector_unverified"
+          : replaySafeCache.accountingMethod,
+        accountingCacheStatus: replaySafeAccounting.status,
+        replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
       },
       coverage: {
         overallPercent: pricingCoveragePercent,
@@ -1194,7 +1533,9 @@ export async function buildLocalCompanionSnapshot({
           status: (displayUsage?.byAgentScope?.subagent?.events ?? 0) > 0
             ? "observed"
             : "not_observed",
-          explanation: "Child-rollout usage is counted when lineage metadata is present; ambiguous lineage remains unknown.",
+          explanation: replaySafeCache === null
+            ? "Child-rollout attribution is provisional until lineage-aware replay exclusion has been refreshed."
+            : "Inherited parent snapshots are excluded before genuine child-rollout increments are attributed.",
         },
         {
           id: "shared_pool_surfaces",
@@ -1231,7 +1572,7 @@ export async function buildLocalCompanionSnapshot({
         {
           id: "unknown_token_components",
           title: "Unknown or combined token components",
-          status: (displayUsage?.components?.outputCombinedTokens ?? 0) > 0
+          status: (displayUsage?.components?.output_combined_tokens ?? 0) > 0
             ? "observed_combined"
             : "not_observed",
           explanation: "Some retained events expose only a combined output count. Text and reasoning output are not invented when the provider does not separate them.",
@@ -1260,7 +1601,7 @@ export async function buildLocalCompanionSnapshot({
         weekly: {
           status: weekly.status,
           generatedAt: weekly.generatedAt,
-          dataClass: "historical_local_artifact",
+          dataClass: weekly.dataClass,
         },
         quality: {
           status: quality.status,

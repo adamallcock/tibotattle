@@ -46,6 +46,7 @@ const VERIFIER_ENFORCED = new Set([
   "export_set_decoded_bytes",
   "export_set_encoded_bytes",
   "workspace_bytes",
+  "sqlite_batch_records",
   "manifest_bytes",
   "chunk_count",
 ]);
@@ -65,6 +66,26 @@ function assertEnforcedSurface(surface, dimension, surfaceName) {
   );
   assert.equal(surface.atLimit.observedValue, surface.atLimit.configuredLimit, dimension);
   assert.equal(surface.plusOne.observedValue, surface.plusOne.configuredLimit + 1, dimension);
+}
+
+function assertSqliteRolloverSurface(surface) {
+  assert.equal(surface.surface, "verifier");
+  assert.equal(surface.pathway, "export_set_verifier_sqlite_index");
+  assert.equal(surface.status, "enforced");
+  assert.deepEqual(surface.atLimit, {
+    mode: "at_limit",
+    configuredLimit: 1_000,
+    observedValue: 1_000,
+    status: "passed",
+    failureCode: "none",
+  });
+  assert.deepEqual(surface.plusOne, {
+    mode: "limit_plus_one",
+    configuredLimit: 1_000,
+    observedValue: 1_001,
+    status: "passed",
+    failureCode: "none",
+  });
 }
 
 test("R7 materialized boundary harness executes content-free producer and verifier value/plus-one evidence", {
@@ -91,7 +112,11 @@ test("R7 materialized boundary harness executes content-free producer and verifi
       assert.equal(row.producer.plusOne.mode, "limit_plus_one", row.dimension);
     }
     if (VERIFIER_ENFORCED.has(row.dimension)) {
-      assertEnforcedSurface(row.verifier, row.dimension, "verifier");
+      if (row.dimension === "sqlite_batch_records") {
+        assertSqliteRolloverSurface(row.verifier);
+      } else {
+        assertEnforcedSurface(row.verifier, row.dimension, "verifier");
+      }
     } else {
       assert.ok(["not_run", "not_applicable"].includes(row.verifier.status), row.dimension);
       assert.equal(row.verifier.atLimit.mode, "at_limit", row.dimension);
@@ -159,11 +184,17 @@ test("R7 materialized boundary harness executes content-free producer and verifi
     assert.equal(row.selectedLimit, selected, row.dimension);
     assert.equal(row.identification === "identified", false, row.dimension);
     if (row.dimension === "sqlite_batch_records") {
-      assert.equal(row.mode, "not_identified");
-      assert.equal(row.identification, "not_run");
-      assert.equal(row.reason, "no_injectable_sqlite_batch_seam");
-      assert.equal(row.atLimit.status, "not_run");
-      assert.equal(row.plusOne.status, "not_run");
+      assert.equal(row.mode, "materialized_batch_rollover");
+      assert.equal(row.receiptMode, "materialized");
+      assert.equal(row.pathway, "export_set_verifier_sqlite_index");
+      assert.equal(row.identification, "not_identified");
+      assert.equal(row.reason, "operational_batch_rollover_not_rejection_ceiling");
+      assert.equal(row.atLimit.observedValue, selected);
+      assert.equal(row.atLimit.status, "passed");
+      assert.equal(row.atLimit.failureCode, "none");
+      assert.equal(row.plusOne.observedValue, selected + 1);
+      assert.equal(row.plusOne.status, "passed");
+      assert.equal(row.plusOne.failureCode, "none");
       continue;
     }
     assert.equal(row.mode, "synthetic_boundary_only", row.dimension);
@@ -180,6 +211,17 @@ test("R7 materialized boundary harness executes content-free producer and verifi
       row.dimension,
     );
   }
+  assert.deepEqual(value.sqliteBatch, {
+    batchLimitRecords: 1_000,
+    recordsIndexed: 1_001,
+    nonEmptyBatchCount: 2,
+    fullBatchCount: 1,
+    maximumBatchRecords: 1_000,
+    finalBatchRecords: 1,
+    pathway: "export_set_verifier_sqlite_index",
+    atBatchLimitStatus: "passed",
+    plusOneRolloverStatus: "passed",
+  });
 
   assert.deepEqual(value.summary, {
     dimensions: 19,
@@ -188,10 +230,10 @@ test("R7 materialized boundary harness executes content-free producer and verifi
     executedSurfaces: PRODUCER_ENFORCED.size + VERIFIER_ENFORCED.size,
     unexpectedSurfaces: 0,
     materialCases: 4,
-    literalCandidateTrials: 18,
+    literalCandidateTrials: 19,
     literalCandidatesIdentified: 0,
     literalCandidateUnexpected: 0,
-    sqliteBatchStatus: "not_run",
+    sqliteBatchStatus: "passed",
   });
   const serialized = JSON.stringify(value);
   assert.equal(serialized.includes("R7_SYNTHETIC_CONTENT_CANARY_NEVER_EXPORT"), false);

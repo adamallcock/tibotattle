@@ -48,12 +48,23 @@ export type ErrorCode =
 export class ApiError extends Error {
   readonly code: ErrorCode;
   readonly status: number;
+  readonly publicDetails: Readonly<Record<string, unknown>> | null;
+  readonly responseHeaders: HeadersInit | null;
 
-  constructor(status: number, code: ErrorCode) {
+  constructor(
+    status: number,
+    code: ErrorCode,
+    options: {
+      publicDetails?: Readonly<Record<string, unknown>>;
+      responseHeaders?: HeadersInit;
+    } = {},
+  ) {
     super(code);
     this.name = "ApiError";
     this.code = code;
     this.status = status;
+    this.publicDetails = options.publicDetails ?? null;
+    this.responseHeaders = options.responseHeaders ?? null;
   }
 }
 
@@ -69,7 +80,16 @@ export function jsonResponse(value: unknown, status = 200, extraHeaders?: Header
 
 export function errorResponse(error: ApiError, requestId: string): Response {
   return jsonResponse(
-    { error: { code: error.code, requestId } },
+    {
+      error: {
+        code: error.code,
+        requestId,
+        ...(error.publicDetails === null
+          ? {}
+          : { details: error.publicDetails }),
+      },
+    },
     error.status,
+    error.responseHeaders ?? undefined,
   );
 }

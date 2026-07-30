@@ -1,4 +1,8 @@
 import { sha256Hex } from "./crypto";
+import {
+  MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
+  TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS,
+} from "./constants";
 import { ApiError } from "./errors";
 import {
   priceTelemetryUsageEvent,
@@ -63,6 +67,81 @@ export interface TelemetryTransportMetadata {
   usage: Map<string, { accountTrackId: string; recordJson: string }>;
   quota: Map<string, { accountTrackId: string; recordJson: string }>;
   activity: Map<string, { accountTrackId: string; recordJson: string }>;
+}
+
+export interface TelemetryContributionAdmission {
+  schemaVersion: "telemetry-contribution-admission-v0.1";
+  state: "available" | "exhausted";
+  window: {
+    kind: "fixed_utc";
+    anchor: "monday_00_00_utc";
+    startsAt: string;
+    endsAt: string;
+    durationMilliseconds: number;
+  };
+  acceptedBatches: number;
+  remainingBatches: number;
+  maximumBatches: number;
+  slotRefundPolicy: "not_refunded_by_contribution_deletion";
+}
+
+const MONDAY_WINDOW_OFFSET_MILLISECONDS = 3 * 24 * 60 * 60 * 1000;
+
+export function telemetryContributionAdmissionWindow(
+  nowEpoch = Date.now(),
+): { startsAt: string; endsAt: string } {
+  if (!Number.isFinite(nowEpoch)) throw new ApiError(500, "INTERNAL_ERROR");
+  const startsAtEpoch = Math.floor(
+    (nowEpoch + MONDAY_WINDOW_OFFSET_MILLISECONDS)
+      / TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS,
+  ) * TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS
+    - MONDAY_WINDOW_OFFSET_MILLISECONDS;
+  return {
+    startsAt: new Date(startsAtEpoch).toISOString(),
+    endsAt: new Date(
+      startsAtEpoch + TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS,
+    ).toISOString(),
+  };
+}
+
+export async function telemetryContributionAdmission(
+  db: D1Database,
+  participantId: string,
+  nowEpoch = Date.now(),
+): Promise<TelemetryContributionAdmission> {
+  const window = telemetryContributionAdmissionWindow(nowEpoch);
+  const row = await db.prepare(
+    `SELECT accepted_count
+       FROM telemetry_contribution_admission_windows
+      WHERE participant_id = ? AND window_started_at = ?`,
+  ).bind(participantId, window.startsAt).first<{ accepted_count: number }>();
+  const acceptedBatches = Math.max(
+    0,
+    Math.min(
+      MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
+      Number(row?.accepted_count ?? 0),
+    ),
+  );
+  const remainingBatches = Math.max(
+    0,
+    MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW - acceptedBatches,
+  );
+  return {
+    schemaVersion: "telemetry-contribution-admission-v0.1",
+    state: remainingBatches > 0 ? "available" : "exhausted",
+    window: {
+      kind: "fixed_utc",
+      anchor: "monday_00_00_utc",
+      startsAt: window.startsAt,
+      endsAt: window.endsAt,
+      durationMilliseconds:
+        TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS,
+    },
+    acceptedBatches,
+    remainingBatches,
+    maximumBatches: MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
+    slotRefundPolicy: "not_refunded_by_contribution_deletion",
+  };
 }
 
 function stableJson(value: unknown): string {
@@ -482,6 +561,192 @@ export async function listTelemetryContributions(
   return result.results;
 }
 
+export async function listRecentTelemetryContributions(
+  db: D1Database,
+  participantId: string,
+  limit: number,
+): Promise<TelemetryContributionRow[]> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  const result = await db.prepare(
+    `SELECT c.*,
+        (SELECT COUNT(*) FROM telemetry_records r WHERE r.origin_contribution_id = c.id)
+          AS accepted_record_count
+      FROM telemetry_contributions c
+      WHERE c.participant_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).bind(participantId, limit).all<TelemetryContributionRow>();
+  return result.results.reverse();
+}
+
+export interface TelemetryContributionPage {
+  rows: Array<{
+    contribution: TelemetryContributionRow;
+    records: Array<{ record_kind: string; record_json: string }>;
+  }>;
+  nextCursor: { createdAt: string; contributionId: string } | null;
+}
+
+const MAX_TELEMETRY_EXPORT_PAGE_SIZE = 4;
+const MAX_TELEMETRY_RECORDS_PER_CONTRIBUTION = 200;
+
+export async function telemetryContributionPage(
+  db: D1Database,
+  participantId: string,
+  cursor: { createdAt: string; contributionId: string } | null = null,
+  limit = MAX_TELEMETRY_EXPORT_PAGE_SIZE,
+): Promise<TelemetryContributionPage> {
+  if (!Number.isSafeInteger(limit)
+      || limit < 1
+      || limit > MAX_TELEMETRY_EXPORT_PAGE_SIZE) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  const cursorPredicate = cursor
+    ? "AND (c.created_at > ? OR (c.created_at = ? AND c.id > ?))"
+    : "";
+  const pageBindings = cursor
+    ? [
+      participantId,
+      cursor.createdAt,
+      cursor.createdAt,
+      cursor.contributionId,
+      limit + 1,
+      limit,
+      participantId,
+      limit * MAX_TELEMETRY_RECORDS_PER_CONTRIBUTION + 1,
+    ]
+    : [
+      participantId,
+      limit + 1,
+      limit,
+      participantId,
+      limit * MAX_TELEMETRY_RECORDS_PER_CONTRIBUTION + 1,
+    ];
+  type ExportPageRow = TelemetryContributionRow & {
+    export_page_contribution_count: number;
+    export_record_kind: string | null;
+    export_record_json: string | null;
+  };
+  const result = await db.prepare(
+    `WITH contribution_page AS (
+      SELECT c.*,
+        (SELECT COUNT(*) FROM telemetry_records accepted
+          WHERE accepted.participant_id = c.participant_id
+            AND accepted.origin_contribution_id = c.id) AS accepted_record_count
+      FROM telemetry_contributions c
+      WHERE c.participant_id = ?
+        ${cursorPredicate}
+      ORDER BY c.created_at ASC, c.id ASC
+      LIMIT ?
+    ),
+    selected_page AS (
+      SELECT * FROM contribution_page
+      ORDER BY created_at ASC, id ASC
+      LIMIT ?
+    )
+    SELECT selected_page.*,
+      (SELECT COUNT(*) FROM contribution_page) AS export_page_contribution_count,
+      records.record_kind AS export_record_kind,
+      records.record_json AS export_record_json
+    FROM selected_page
+    LEFT JOIN telemetry_contribution_occurrences occurrences
+      ON occurrences.participant_id = selected_page.participant_id
+     AND occurrences.contribution_id = selected_page.id
+    LEFT JOIN telemetry_records records
+      ON records.participant_id = occurrences.participant_id
+     AND records.record_kind = occurrences.record_kind
+     AND records.occurrence_id = occurrences.occurrence_id
+    WHERE selected_page.participant_id = ?
+    ORDER BY selected_page.created_at ASC, selected_page.id ASC,
+      records.observed_at ASC, records.id ASC
+    LIMIT ?`,
+  ).bind(...pageBindings).all<ExportPageRow>();
+  const maximumResultRows =
+    limit * MAX_TELEMETRY_RECORDS_PER_CONTRIBUTION;
+  if (result.results.length > maximumResultRows) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  const page = new Map<string, TelemetryContributionPage["rows"][number]>();
+  for (const row of result.results) {
+    let item = page.get(row.id);
+    if (!item) {
+      item = { contribution: row, records: [] };
+      page.set(row.id, item);
+    }
+    if (row.export_record_kind !== null && row.export_record_json !== null) {
+      item.records.push({
+        record_kind: row.export_record_kind,
+        record_json: row.export_record_json,
+      });
+    }
+  }
+  const rows = [...page.values()];
+  const last = rows.at(-1)?.contribution;
+  const hasMore = Number(
+    result.results[0]?.export_page_contribution_count ?? 0,
+  ) > limit;
+  return {
+    rows,
+    nextCursor: last && hasMore
+      ? { createdAt: last.created_at, contributionId: last.id }
+      : null,
+  };
+}
+
+export async function telemetryContributionR2KeyPage(
+  db: D1Database,
+  participantId: string,
+  cursor: { createdAt: string; contributionId: string } | null = null,
+  limit = 100,
+): Promise<{
+  rows: Array<{ id: string; r2Key: string; createdAt: string }>;
+  nextCursor: { createdAt: string; contributionId: string } | null;
+}> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  const result = cursor
+    ? await db.prepare(
+      `SELECT id, r2_key, created_at
+         FROM telemetry_contributions
+        WHERE participant_id = ?
+          AND (created_at > ? OR (created_at = ? AND id > ?))
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?`,
+    ).bind(
+      participantId,
+      cursor.createdAt,
+      cursor.createdAt,
+      cursor.contributionId,
+      limit,
+    ).all<{ id: string; r2_key: string; created_at: string }>()
+    : await db.prepare(
+      `SELECT id, r2_key, created_at
+         FROM telemetry_contributions
+        WHERE participant_id = ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?`,
+    ).bind(participantId, limit).all<{
+      id: string;
+      r2_key: string;
+      created_at: string;
+    }>();
+  const rows = result.results.map((row) => ({
+    id: row.id,
+    r2Key: row.r2_key,
+    createdAt: row.created_at,
+  }));
+  const last = rows.at(-1);
+  return {
+    rows,
+    nextCursor: last && rows.length === limit
+      ? { createdAt: last.createdAt, contributionId: last.id }
+      : null,
+  };
+}
+
 export async function telemetryContributionById(
   db: D1Database,
   participantId: string,
@@ -651,13 +916,14 @@ function formatNanousd(value: number): string {
   return fraction ? `${whole}.${fraction}` : String(whole);
 }
 
-interface CalibrationGroupRow extends Record<string, unknown> {
+export interface CalibrationGroupRow extends Record<string, unknown> {
   provider?: string;
   plan_type?: string;
   plan_variant?: string;
   limit_id?: string;
   slot?: string;
   resets_at?: string;
+  window_duration_minutes?: number;
   firstObservedAt?: string;
   lastObservedAt?: string;
   minimumUsedPercent?: number;
@@ -665,12 +931,27 @@ interface CalibrationGroupRow extends Record<string, unknown> {
   serverCostNanousd?: number;
 }
 
-async function rollingQuotaMovement(
-  db: D1Database,
-  participantId: string,
+export interface RollingQuotaObservationRow {
+  observed_at: string;
+  used_percent: number;
+  record_json: string;
+}
+
+export interface RollingUsageObservationRow {
+  observed_at: string;
+  server_cost_nanousd: number | null;
+  server_pricing_status: string | null;
+}
+
+const HOUR_MILLISECONDS = 3_600_000;
+const MAX_ROLLING_QUOTA_ANALYSIS_HOURS = 365 * 24 + 1;
+
+export function buildRollingQuotaMovement(
   group: CalibrationGroupRow | undefined,
   accountContinuity: "transmitted" | "not_transmitted",
-): Promise<object> {
+  quotaRows: readonly RollingQuotaObservationRow[],
+  usageRows: readonly RollingUsageObservationRow[],
+): object {
   if (!group?.provider || !group.plan_type || !group.plan_variant
       || !group.limit_id || !group.slot || !group.resets_at
       || !group.firstObservedAt || !group.lastObservedAt) {
@@ -691,40 +972,7 @@ async function rollingQuotaMovement(
       accountContinuity,
     };
   }
-  const [quotaResult, usageResult] = await Promise.all([
-    db.prepare(
-      `SELECT observed_at, used_percent, record_json FROM telemetry_records
-        WHERE participant_id = ? AND record_kind = 'quota'
-          AND provider = ? AND plan_type = ? AND plan_variant = ?
-          AND limit_id = ? AND slot = ? AND resets_at = ?
-        ORDER BY observed_at, id LIMIT 2001`,
-    ).bind(
-      participantId,
-      group.provider,
-      group.plan_type,
-      group.plan_variant,
-      group.limit_id,
-      group.slot,
-      group.resets_at,
-    ).all<{ observed_at: string; used_percent: number; record_json: string }>(),
-    db.prepare(
-      `SELECT observed_at, server_cost_nanousd, server_pricing_status
-        FROM telemetry_records
-        WHERE participant_id = ? AND record_kind = 'usage' AND provider = ?
-          AND observed_at BETWEEN ? AND ?
-        ORDER BY observed_at, id LIMIT 5001`,
-    ).bind(
-      participantId,
-      group.provider,
-      group.firstObservedAt,
-      group.lastObservedAt,
-    ).all<{
-      observed_at: string;
-      server_cost_nanousd: number | null;
-      server_pricing_status: string | null;
-    }>(),
-  ]);
-  if (quotaResult.results.length > 2000 || usageResult.results.length > 5000) {
+  if (quotaRows.length > 2000 || usageRows.length > 5000) {
     return {
       schemaVersion: "participant-quota-movement-v0.1",
       status: "not_testable",
@@ -733,7 +981,7 @@ async function rollingQuotaMovement(
       accountContinuity,
     };
   }
-  const quota = quotaResult.results.map((row) => {
+  const quota = quotaRows.map((row) => {
     let receivedAt = Number.NaN;
     try {
       const record = JSON.parse(row.record_json) as { receivedTime?: unknown };
@@ -784,7 +1032,7 @@ async function rollingQuotaMovement(
       accountContinuity,
     };
   }
-  if (usageResult.results.some((row) => row.server_pricing_status !== "fully_priced")) {
+  if (usageRows.some((row) => row.server_pricing_status !== "fully_priced")) {
     return {
       schemaVersion: "participant-quota-movement-v0.1",
       status: "not_testable",
@@ -795,7 +1043,7 @@ async function rollingQuotaMovement(
   }
   const observedSpan = Math.max(...quota.map((row) => row.used))
     - Math.min(...quota.map((row) => row.used));
-  const totalCostNanousd = usageResult.results.reduce(
+  const totalCostNanousd = usageRows.reduce(
     (sum, row) => sum + Number(row.server_cost_nanousd ?? 0),
     0,
   );
@@ -809,8 +1057,48 @@ async function rollingQuotaMovement(
     };
   }
 
-  const firstHour = Math.floor(quota[0]!.at / 3_600_000) * 3_600_000;
-  const lastHour = Math.floor(quota.at(-1)!.at / 3_600_000) * 3_600_000;
+  const firstHour = Math.floor(quota[0]!.at / HOUR_MILLISECONDS)
+    * HOUR_MILLISECONDS;
+  const lastHour = Math.floor(quota.at(-1)!.at / HOUR_MILLISECONDS)
+    * HOUR_MILLISECONDS;
+  const analyzedHourCount =
+    Math.floor((lastHour - firstHour) / HOUR_MILLISECONDS) + 1;
+  const declaredDurationMinutes = Number(group.window_duration_minutes);
+  const declaredMaximumHours = Number.isSafeInteger(declaredDurationMinutes)
+      && declaredDurationMinutes > 0
+    ? Math.ceil(declaredDurationMinutes / 60) + 1
+    : MAX_ROLLING_QUOTA_ANALYSIS_HOURS;
+  if (!Number.isSafeInteger(analyzedHourCount)
+      || analyzedHourCount < 1
+      || analyzedHourCount > Math.min(
+        declaredMaximumHours,
+        MAX_ROLLING_QUOTA_ANALYSIS_HOURS,
+      )) {
+    return {
+      schemaVersion: "participant-quota-movement-v0.1",
+      status: "not_testable",
+      reason: "analysis_time_range_exceeded",
+      rows: [],
+      accountContinuity,
+    };
+  }
+  const usageByHour = Array.from(
+    { length: analyzedHourCount },
+    () => ({ costNanousd: 0, events: 0 }),
+  );
+  const analysisEnd = firstHour
+    + analyzedHourCount * HOUR_MILLISECONDS;
+  for (const row of usageRows) {
+    const at = Date.parse(row.observed_at);
+    if (!Number.isFinite(at) || at < firstHour || at >= analysisEnd) continue;
+    const hourIndex = Math.floor(
+      (at - firstHour) / HOUR_MILLISECONDS,
+    );
+    const bin = usageByHour[hourIndex];
+    if (!bin) continue;
+    bin.costNanousd += Number(row.server_cost_nanousd ?? 0);
+    bin.events += 1;
+  }
   const hours: Array<{
     start: number;
     end: number;
@@ -828,44 +1116,46 @@ async function rollingQuotaMovement(
     }
     return currentUsed;
   };
-  for (let start = firstHour; start <= lastHour; start += 3_600_000) {
-    const end = start + 3_600_000;
+  for (let hourIndex = 0; hourIndex < analyzedHourCount; hourIndex += 1) {
+    const start = firstHour + hourIndex * HOUR_MILLISECONDS;
+    const end = start + HOUR_MILLISECONDS;
     const startUsed = quotaAt(start);
     const endUsed = quotaAt(end);
-    const usage = usageResult.results.filter((row) => {
-      const at = Date.parse(row.observed_at);
-      return at >= start && at < end;
-    });
+    const usage = usageByHour[hourIndex]!;
     hours.push({
       start,
       end,
-      costNanousd: usage.reduce(
-        (sum, row) => sum + Number(row.server_cost_nanousd ?? 0),
-        0,
-      ),
-      events: usage.length,
+      costNanousd: usage.costNanousd,
+      events: usage.events,
       startUsed,
       endUsed,
     });
   }
   const capacityUsd = (totalCostNanousd / 1_000_000_000) * 100 / observedSpan;
+  const costPrefix = [0];
+  const eventPrefix = [0];
+  for (const hour of hours) {
+    costPrefix.push(costPrefix.at(-1)! + hour.costNanousd);
+    eventPrefix.push(eventPrefix.at(-1)! + hour.events);
+  }
   const rows = [1, 2, 3].flatMap((smoothingHours) => (
-    hours.slice(smoothingHours - 1).map((hour, index) => {
-      const window = hours.slice(index, index + smoothingHours);
-      const costNanousd = window.reduce((sum, item) => sum + item.costNanousd, 0);
-      const observed = hour.endUsed - window[0]!.startUsed;
+    hours.slice(smoothingHours - 1).map((hour, offset) => {
+      const endIndex = offset + smoothingHours;
+      const startIndex = offset;
+      const costNanousd = costPrefix[endIndex]! - costPrefix[startIndex]!;
+      const observed = hour.endUsed - hours[startIndex]!.startUsed;
       const expected = capacityUsd > 0
         ? (costNanousd / 1_000_000_000) * 100 / capacityUsd
         : 0;
       return {
         timestamp: new Date(hour.end).toISOString(),
-        windowStartUtc: new Date(window[0]!.start).toISOString(),
+        windowStartUtc: new Date(hours[startIndex]!.start).toISOString(),
         windowEndUtc: new Date(hour.end).toISOString(),
         smoothingHours,
         observedQuotaChangePp: Number(observed.toFixed(6)),
         expectedQuotaChangePp: Number(expected.toFixed(6)),
         apiPriceEquivalentUsd: formatNanousd(costNanousd),
-        usageEvents: window.reduce((sum, item) => sum + item.events, 0),
+        usageEvents: eventPrefix[endIndex]! - eventPrefix[startIndex]!,
       };
     })
   ));
@@ -885,6 +1175,55 @@ async function rollingQuotaMovement(
     pricedUsageUsd: formatNanousd(totalCostNanousd),
     rows,
   };
+}
+
+async function rollingQuotaMovement(
+  db: D1Database,
+  participantId: string,
+  group: CalibrationGroupRow | undefined,
+  accountContinuity: "transmitted" | "not_transmitted",
+): Promise<object> {
+  if (!group?.provider || !group.plan_type || !group.plan_variant
+      || !group.limit_id || !group.slot || !group.resets_at
+      || !group.firstObservedAt || !group.lastObservedAt
+      || accountContinuity !== "transmitted") {
+    return buildRollingQuotaMovement(group, accountContinuity, [], []);
+  }
+  const [quotaResult, usageResult] = await Promise.all([
+    db.prepare(
+      `SELECT observed_at, used_percent, record_json FROM telemetry_records
+        WHERE participant_id = ? AND record_kind = 'quota'
+          AND provider = ? AND plan_type = ? AND plan_variant = ?
+          AND limit_id = ? AND slot = ? AND resets_at = ?
+        ORDER BY observed_at, id LIMIT 2001`,
+    ).bind(
+      participantId,
+      group.provider,
+      group.plan_type,
+      group.plan_variant,
+      group.limit_id,
+      group.slot,
+      group.resets_at,
+    ).all<RollingQuotaObservationRow>(),
+    db.prepare(
+      `SELECT observed_at, server_cost_nanousd, server_pricing_status
+        FROM telemetry_records
+        WHERE participant_id = ? AND record_kind = 'usage' AND provider = ?
+          AND observed_at BETWEEN ? AND ?
+        ORDER BY observed_at, id LIMIT 5001`,
+    ).bind(
+      participantId,
+      group.provider,
+      group.firstObservedAt,
+      group.lastObservedAt,
+    ).all<RollingUsageObservationRow>(),
+  ]);
+  return buildRollingQuotaMovement(
+    group,
+    accountContinuity,
+    quotaResult.results,
+    usageResult.results,
+  );
 }
 
 interface CountsRow {

@@ -19,6 +19,14 @@ telemetry support is for local backend and end-to-end product testing until the
 separate consent, admission-control, security, and privacy review gates are
 complete.
 
+Telemetry admission is bounded to 100 accepted batches in each fixed
+Monday-to-Monday UTC seven-day window. The transactional D1 counter stores no
+contribution content or digest, and contribution deletion does not refund a
+slot. The participant profile reports the current window and remaining
+batches. Profile history is a bounded recent view, while personal export
+streams the complete retained history and participant deletion pages through
+every retained quarantine reference.
+
 ## Local run
 
 ```sh
@@ -197,12 +205,15 @@ npm run staging:deploy -- \
 ```
 
 The wrapper refuses unless configuration, authentication, resources,
-migrations, and containment are proven. On the first deploy, it accepts only
-the fixed owner-only `.dev.vars.staging` file and supplies those secrets to
-Wrangler without printing them. It then checks `/api/health` over HTTPS and
+migrations, pilot admission/reconciliation schema, and containment are
+proven. On the first deploy, it accepts only the fixed owner-only
+`.dev.vars.staging` file and supplies those secrets to Wrangler without
+printing them. It then checks `/api/health` and `/api/ready` over HTTPS and
 fails unless enrollment, upload registration, processing, publication,
 encrypted upload, aggregate publication, ongoing device upload, and external
-account-scoped participation all remain disabled.
+account-scoped participation all remain disabled and lifecycle readiness uses
+the expected fail-closed contract. Preparation and deployment each emit a
+bounded receipt that explicitly records that collection is not authorized.
 
 This route follows Cloudflare's documented required-secret validation and
 first-deploy `--secrets-file` support:
@@ -211,8 +222,13 @@ It is a contained infrastructure check, not pilot authorization. There is
 deliberately no remote “resume” command in this repository.
 
 The [disabled staging deployment gate
-plan](../../2026-07-26-disabled-staging-deployment-gate-plan.md) records the
+plan](../../docs/plans/2026-07-26-disabled-staging-deployment-gate-plan.md) records the
 trust boundary and remaining live blockers.
+
+The [invite-only pilot operational readiness
+runbook](../../docs/runbooks/2026-07-29-invite-pilot-operational-readiness.md) records the atomic
+enrollment/pairing contract, contained staging procedure, incident and restore
+gates, and remaining human/cloud actions.
 
 From the repository root, the shorter backend-only command is:
 
@@ -236,6 +252,33 @@ encrypted quarantine objects. The hourly scheduled handler removes objects
 seven days after accepted processing but preserves the separately governed
 canonical metadata used for private results and calibration.
 
+Migration `0013_quarantine_reconciliation.sql` closes the object-write crash
+window with a D1-first registration protocol:
+
+1. commit an opaque pending registration before calling R2 `put`;
+2. write the encrypted envelope to the private bucket;
+3. commit the canonical contribution and its accepted records while an insert
+   trigger clears the pending registration in that same D1 transaction.
+
+A termination after step 2 therefore leaves a durable, content-free
+registration. The hourly reconciler resumes from a persisted D1 cursor, scans
+at most 100 due registrations per pass, and waits one hour before treating an
+unreferenced registration as abandoned. It checks both canonical contribution
+tables. A referenced object is preserved while only its stale registration is
+cleared; an unreferenced object is removed idempotently with `head` and
+`delete`. Destructive claims are fenced by the current reconciliation lease,
+and a replacement pass can reclaim work left by an expired invocation. Failed
+D1 or R2 work leaves the cursor retryable and readiness closed. The reconciler
+does not enumerate, log, or expose bucket keys.
+
+`GET /api/health` remains the existing non-sensitive liveness and dependency
+surface. `GET /api/ready` is the fail-closed traffic-readiness surface. It
+returns `503` until the hourly lifecycle has completed within the last two
+hours and quarantine retention, deletion-ledger restore replay, pending
+aggregate rebuilds, and quarantine reconciliation are all complete. Retention
+and reconciliation must also record the same maintenance-cycle timestamp, so a
+termination between the two passes cannot reuse an older successful status.
+
 `DELETION_LEDGER` has its own migration directory and must be backed up and
 restored independently from `USAGE_MONITOR_DB`. Participant deletion first
 withdraws derived snapshots, then writes a content-free deletion tombstone,
@@ -243,12 +286,15 @@ then removes R2 and primary D1 data. If the independent ledger is unavailable,
 deletion fails closed with the primary participant left in a retryable,
 non-serving `deleting` state.
 
-Before a restored primary D1 database serves traffic, invoke the same
-`runBackendLifecycle` replay path in an isolated stopped-service restore
-procedure. It compares domain-separated participant digests, withdraws any
-restored derived snapshot, removes R2 objects, and deletes restored primary
-rows. The hourly pass is defense in depth, not permission to serve a restored
-database before replay.
+Before a restored primary D1 database serves traffic, invoke
+`runBackendLifecycle` and then `reconcilePendingQuarantineObjects` in an
+isolated stopped-service restore procedure. The lifecycle replay compares
+domain-separated participant digests, withdraws any restored derived snapshot,
+removes R2 objects, and deletes restored primary rows. Reconciliation then
+resolves pending object registrations against both restored canonical tables.
+`GET /api/ready` remains `503` until both passes and any queued aggregate
+rebuilds are complete. The hourly pass is defense in depth, not permission to
+serve a restored database before replay.
 
 The development tombstone has a 400-day `retain_until`. This is a bounded test
 value, not an approved production policy. A production backup/soft-delete
@@ -428,7 +474,7 @@ binding is globally limited to twenty attempts per sixty seconds. The literal
 full run therefore has at least 3,096,900 milliseconds of enrollment setup.
 
 The [scaled verification
-receipt](../../2026-07-26-backend-load-scaled-verification-receipt.md) records
+receipt](../../docs/receipts/2026-07-26-backend-load-scaled-verification-receipt.md) records
 the current passing evidence and the remaining full-profile limitations.
 
 The Worker runtime suite, rather than this transport smoke, supplies the exact
@@ -529,6 +575,7 @@ production operator command and approval boundary exist.
 ## API
 
 - `GET /api/health`
+- `GET /api/ready`
 - `POST /api/v1/enroll`
 - `POST /api/v1/recover`
 - `GET /api/v1/session`

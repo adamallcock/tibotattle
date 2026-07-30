@@ -10,6 +10,173 @@ export const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
 export const TELEMETRY_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
 export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 
+export function createQuotaTimelineLookup(rows) {
+  if (!Array.isArray(rows)) {
+    throw new TypeError("Quota timeline rows must be an array.");
+  }
+  const entries = rows.flatMap((row, sourceIndex) => {
+    const timestampMs = Date.parse(row?.observedAt);
+    return Number.isFinite(timestampMs)
+      ? [{ row, sourceIndex, timestampMs }]
+      : [];
+  }).sort((left, right) => (
+    left.timestampMs - right.timestampMs
+    || left.sourceIndex - right.sourceIndex
+  )).map(({ row, timestampMs }) => Object.freeze({ row, timestampMs }));
+
+  return Object.freeze({
+    size: entries.length,
+    atOrBefore(timestampMs) {
+      if (typeof timestampMs !== "number" || Number.isNaN(timestampMs)) {
+        return null;
+      }
+      let lower = 0;
+      let upper = entries.length;
+      while (lower < upper) {
+        const middle = lower + Math.floor((upper - lower) / 2);
+        if (entries[middle].timestampMs <= timestampMs) {
+          lower = middle + 1;
+        } else {
+          upper = middle;
+        }
+      }
+      return lower === 0 ? null : entries[lower - 1];
+    }
+  });
+}
+
+export function contributionBatchAdmission({
+  estimatedBatches,
+  participantAdmission = null,
+  localReviewLimit = 100,
+} = {}) {
+  if (!Number.isSafeInteger(estimatedBatches)
+      || estimatedBatches < 0
+      || !Number.isSafeInteger(localReviewLimit)
+      || localReviewLimit < 1) {
+    throw new TypeError("Contribution batch admission inputs are invalid.");
+  }
+  const admissionKnown =
+    ["available", "exhausted"].includes(participantAdmission?.state)
+    && Number.isSafeInteger(participantAdmission?.remainingBatches)
+    && participantAdmission.remainingBatches >= 0
+    && Number.isSafeInteger(participantAdmission?.maximumBatches)
+    && participantAdmission.maximumBatches > 0
+    && participantAdmission.remainingBatches
+      <= participantAdmission.maximumBatches
+    && participantAdmission.state === (
+      participantAdmission.remainingBatches > 0 ? "available" : "exhausted"
+    );
+  const remainingBatches = admissionKnown
+    ? participantAdmission.remainingBatches
+    : null;
+  const exceedsLocalReviewLimit = estimatedBatches > localReviewLimit;
+  const exceedsParticipantAdmission = admissionKnown
+    && estimatedBatches > remainingBatches;
+  return Object.freeze({
+    admissionKnown,
+    remainingBatches,
+    maximumBatches: admissionKnown
+      ? participantAdmission.maximumBatches
+      : null,
+    renewsAt: admissionKnown
+        && typeof participantAdmission.renewsAt === "string"
+      ? participantAdmission.renewsAt
+      : "",
+    localReviewLimit,
+    effectiveBatchLimit: admissionKnown
+      ? Math.min(localReviewLimit, remainingBatches)
+      : localReviewLimit,
+    exceedsLocalReviewLimit,
+    exceedsParticipantAdmission,
+    blocked: exceedsLocalReviewLimit || exceedsParticipantAdmission,
+  });
+}
+
+export async function runReviewedContributionGate({
+  reviewToken,
+  hasPendingAutomaticConsent,
+  runReviewedSend,
+  enableAutomaticContribution,
+} = {}) {
+  if (typeof reviewToken !== "string"
+      || reviewToken.length === 0
+      || typeof hasPendingAutomaticConsent !== "boolean"
+      || typeof runReviewedSend !== "function"
+      || typeof enableAutomaticContribution !== "function") {
+    throw new TypeError("Reviewed contribution gate inputs are invalid.");
+  }
+  const result = await runReviewedSend(reviewToken);
+  const accepted =
+    result?.status === "completed"
+    && Number.isSafeInteger(result.accepted)
+    && result.accepted > 0;
+  let automatic = null;
+  let automaticError = null;
+  if (accepted && hasPendingAutomaticConsent) {
+    try {
+      automatic = await enableAutomaticContribution();
+    } catch (error) {
+      automaticError = error;
+    }
+  }
+  return Object.freeze({
+    accepted,
+    automatic,
+    automaticError,
+    result,
+  });
+}
+
+export function createRefreshPollingBudget({
+  now = () => Date.now(),
+  windowMs = 6 * 60 * 1_000,
+  settlementGraceMs = 30 * 1_000,
+  maximumContinuations = 2
+} = {}) {
+  if (typeof now !== "function"
+      || !Number.isSafeInteger(windowMs)
+      || windowMs < 1_000
+      || !Number.isSafeInteger(settlementGraceMs)
+      || settlementGraceMs < 1_000
+      || !Number.isSafeInteger(maximumContinuations)
+      || maximumContinuations < 1) {
+    throw new TypeError("Refresh polling budget is invalid.");
+  }
+  let deadlineMs = now() + windowMs;
+  let continuations = 0;
+  return Object.freeze({
+    hasTime() {
+      return now() < deadlineMs;
+    },
+    noteSettling() {
+      deadlineMs = Math.max(deadlineMs, now() + settlementGraceMs);
+    },
+    canContinue() {
+      return continuations < maximumContinuations;
+    },
+    noteContinuation() {
+      if (continuations >= maximumContinuations) return false;
+      continuations += 1;
+      deadlineMs = now() + windowMs;
+      return true;
+    },
+    get continuations() {
+      return continuations;
+    }
+  });
+}
+
+export function refreshNeedsContinuation({
+  outcome,
+  errorCode = null,
+  progress = null,
+} = {}) {
+  if (progress?.status !== "bounded_pause") return false;
+  return outcome === "succeeded"
+    || (outcome === "failed" && errorCode === "refresh_timed_out");
+}
+
 export function buildSyntheticFixture() {
   return {
     schemaVersion: SYNTHETIC_SCHEMA_VERSION,

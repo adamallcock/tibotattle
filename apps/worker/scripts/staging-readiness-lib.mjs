@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 
 export const STAGING_READINESS_SCHEMA_VERSION =
   "usage-monitor-staging-readiness-v0.1";
+export const STAGING_OPERATION_RECEIPT_SCHEMA_VERSION =
+  "usage-monitor-staging-operation-receipt-v0.1";
 export const REQUIRED_STAGING_SECRETS = Object.freeze([
   "ENVELOPE_PRIVATE_JWK",
   "ENVELOPE_PUBLIC_JWK",
@@ -192,6 +194,28 @@ function collectionControlRow(value) {
   )?.results?.[0] ?? null;
 }
 
+export function stagingOperationReceipt(
+  operation,
+  evidence,
+  generatedAt = new Date().toISOString(),
+) {
+  if (![
+    "disabled_staging_prepared",
+    "disabled_staging_deployed",
+  ].includes(operation)) {
+    throw new Error("Unsupported staging receipt operation");
+  }
+  return {
+    schemaVersion: STAGING_OPERATION_RECEIPT_SCHEMA_VERSION,
+    operation,
+    environment: "staging",
+    generatedAt,
+    collectionAuthorized: false,
+    activationState: "not_authorized",
+    evidence,
+  };
+}
+
 export function probeStagingLive({
   config,
   wrangler,
@@ -208,6 +232,7 @@ export function probeStagingLive({
     r2ResourceExists: false,
     requiredSecretsInstalled: false,
     migrationsCurrent: false,
+    pilotSchemaCurrent: false,
     collectionContained: false,
   };
   const blockers = [...configuration.blockers];
@@ -302,6 +327,52 @@ export function probeStagingLive({
     if (!checks.migrationsCurrent) blockers.push("REMOTE_MIGRATIONS_PENDING");
 
     if (checks.migrationsCurrent) {
+      const schemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "USAGE_MONITOR_DB",
+          "--remote", "--env", "staging",
+          "--command",
+          `SELECT
+             EXISTS(
+               SELECT 1 FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'telemetry_contribution_admission_windows'
+             ) AS admission_table,
+             EXISTS(
+               SELECT 1 FROM sqlite_master
+                WHERE type = 'trigger'
+                  AND name = 'telemetry_contributions_enforce_admission_window'
+             ) AS admission_guard,
+             EXISTS(
+               SELECT 1 FROM sqlite_master
+                WHERE type = 'trigger'
+                  AND name = 'telemetry_contributions_record_admission_window'
+             ) AS admission_counter,
+             EXISTS(
+               SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'pending_quarantine_objects'
+             ) AS quarantine_reconciliation,
+             EXISTS(
+               SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'retention_state'
+             ) AS lifecycle_status;`,
+          "--json",
+        ],
+        spawn,
+      );
+      const schemaRow = collectionControlRow(parseJson(schemaProbe.stdout));
+      checks.pilotSchemaCurrent = schemaProbe.ok
+        && schemaRow?.admission_table === 1
+        && schemaRow?.admission_guard === 1
+        && schemaRow?.admission_counter === 1
+        && schemaRow?.quarantine_reconciliation === 1
+        && schemaRow?.lifecycle_status === 1;
+      if (!checks.pilotSchemaCurrent) {
+        blockers.push("REMOTE_PILOT_SCHEMA_INCOMPLETE");
+      }
+
       const control = runWrangler(
         wrangler,
         workerDirectory,

@@ -4,7 +4,10 @@ import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
-import { probeStagingLive } from "./staging-readiness-lib.mjs";
+import {
+  probeStagingLive,
+  stagingOperationReceipt,
+} from "./staging-readiness-lib.mjs";
 
 export const DEPLOY_CONFIRMATION = "DEPLOY_DISABLED_STAGING";
 
@@ -64,6 +67,28 @@ function closedHealth(value) {
     && value?.capabilities?.encryptedUpload === false
     && value?.capabilities?.delayedAggregateStats === false
     && value?.capabilities?.ongoingDeviceUploadRegistration === false;
+}
+
+function lifecycleReadiness(value, status) {
+  return [200, 503].includes(status)
+    && value?.status === (status === 200 ? "ready" : "not_ready")
+    && typeof value?.checks === "object"
+    && value.checks !== null
+    && typeof value.checks.lifecycleFresh === "boolean"
+    && typeof value.checks.quarantineRetentionComplete === "boolean"
+    && typeof value.checks.restoreReplayComplete === "boolean"
+    && typeof value.checks.aggregateRebuildComplete === "boolean"
+    && typeof value.checks.maintenanceCycleMatched === "boolean"
+    && typeof value.checks.quarantineReconciliationComplete === "boolean"
+    && value?.policy?.lifecycleStaleAfterMilliseconds === 2 * 60 * 60 * 1000;
+}
+
+function safeJsonHeaders(response) {
+  return response.headers.get("content-type")?.split(";", 1)[0]
+      === "application/json"
+    && response.headers.get("cache-control") === "no-store"
+    && response.headers.get("referrer-policy") === "no-referrer"
+    && response.headers.get("x-content-type-options") === "nosniff";
 }
 
 function deployedWorkersDevOrigins(output) {
@@ -161,12 +186,7 @@ export async function runDisabledStagingDeployment({
   } catch {
     return { ok: false, code: "STAGING_HEALTH_UNREACHABLE" };
   }
-  if (!response.ok
-      || response.headers.get("content-type")?.split(";", 1)[0]
-        !== "application/json"
-      || response.headers.get("cache-control") !== "no-store"
-      || response.headers.get("referrer-policy") !== "no-referrer"
-      || response.headers.get("x-content-type-options") !== "nosniff") {
+  if (!response.ok || !safeJsonHeaders(response)) {
     return { ok: false, code: "STAGING_HEALTH_INVALID" };
   }
   let health;
@@ -178,10 +198,43 @@ export async function runDisabledStagingDeployment({
   if (!closedHealth(health)) {
     return { ok: false, code: "STAGING_NOT_CONTAINED" };
   }
+
+  let readinessResponse;
+  try {
+    readinessResponse = await fetchImpl(new URL("/api/ready", parsedOrigin), {
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    return { ok: false, code: "STAGING_READINESS_UNREACHABLE" };
+  }
+  if (!safeJsonHeaders(readinessResponse)) {
+    return { ok: false, code: "STAGING_READINESS_INVALID" };
+  }
+  let lifecycle;
+  try {
+    lifecycle = await readinessResponse.json();
+  } catch {
+    return { ok: false, code: "STAGING_READINESS_INVALID" };
+  }
+  if (!lifecycleReadiness(lifecycle, readinessResponse.status)) {
+    return { ok: false, code: "STAGING_READINESS_INVALID" };
+  }
   return {
     ok: true,
     code: "DISABLED_STAGING_DEPLOYED",
     collectionAuthorized: false,
+    receipt: stagingOperationReceipt("disabled_staging_deployed", {
+      originMatchedWranglerOutput: true,
+      remoteResourcesVerified: readiness.checks.d1ResourcesExist
+        && readiness.checks.r2ResourceExists,
+      migrationsCurrent: readiness.checks.migrationsCurrent,
+      pilotSchemaCurrent: readiness.checks.pilotSchemaCurrent,
+      collectionContained: readiness.checks.collectionContained,
+      healthContained: true,
+      lifecycleReadiness: lifecycle.status,
+    }),
   };
 }
 

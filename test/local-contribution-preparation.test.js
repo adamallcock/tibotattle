@@ -17,11 +17,16 @@ import {
   LocalContributionPreparationError,
   createLocalContributionPreparationRunner,
   prepareLatestHourLocalContribution,
+  prepareRecentLocalContribution,
   projectLocalContributionPreparationError,
 } from "../src/local-contribution-preparation.js";
 import {
+  loadVerifiedLocalMetadataBundleFiles,
   verifyLocalMetadataBundleFiles,
 } from "../src/bundle-verifier.js";
+import {
+  writeLocalMetadataBundle,
+} from "../src/metadata-exporter.js";
 import {
   discoverCommittedPreparedSets,
 } from "../src/contribution-sync-queue.js";
@@ -32,6 +37,9 @@ import {
   PREPARED_CONTRIBUTION_SET_MANIFEST,
   verifyPreparedContributionSet,
 } from "../src/telemetry-prepared-set.js";
+import {
+  createExportResourceGuard,
+} from "../src/export-resource-policy.js";
 
 const COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -39,6 +47,9 @@ const COVERAGE = Object.freeze({
 });
 const UUID_ONE = "00000000-0000-4000-8000-000000000001";
 const UUID_TWO = "00000000-0000-4000-8000-000000000002";
+const UUID_THREE = "00000000-0000-4000-8000-000000000003";
+const UUID_FOUR = "00000000-0000-4000-8000-000000000004";
+const UUID_FIVE = "00000000-0000-4000-8000-000000000005";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-local-prepare-"));
@@ -138,6 +149,7 @@ test("latest-hour preparation retains a verified review pair and atomically publ
     assert.equal(result.privacy.checksFailed, 0);
     assert.equal(result.privacy.provenanceRetained, true);
     assert.equal(result.prepared.batchCount, 1);
+    assert.match(result.prepared.preparedSetId, /^[a-f0-9]{64}$/u);
     assert.equal(result.networkActivity, false);
     assert.equal(result.includesContent, false);
     assert.equal(result.includesPaths, false);
@@ -145,6 +157,7 @@ test("latest-hour preparation retains a verified review pair and atomically publ
     assert.equal(result.includesCredentials, false);
 
     const serializedResult = JSON.stringify(result);
+    assert.equal(serializedResult.includes("preparedSetId"), false);
     assert.equal(serializedResult.includes(files.root), false);
     assert.equal(
       serializedResult.includes("private-session-that-must-not-leak"),
@@ -202,6 +215,204 @@ test("latest-hour preparation retains a verified review pair and atomically publ
   }
 });
 
+test("recent preparation supports bounded 24-hour and seven-day review sets without weakening privacy invariants", async () => {
+  const files = await fixture();
+  const coveredAt = {
+    startAt: "2026-07-10T23:02:00.000Z",
+    endAt: COVERAGE.endAt,
+  };
+  const prepare = (lookbackHours, uuid, options = {}) =>
+    prepareRecentLocalContribution({
+      lookbackHours,
+      coveredAt,
+      codexHome: files.codexHome,
+      activityFile: join(files.root, "missing-activity-markers.jsonl"),
+      reviewArchiveDirectory: files.reviewArchiveDirectory,
+      preparedSpoolDirectory: files.preparedSpoolDirectory,
+      uuid: () => uuid,
+      ...identityDependencies(),
+      ...options,
+    });
+  try {
+    const oneDay = await prepare(24, UUID_ONE);
+    assert.deepEqual(oneDay.coveredAt, {
+      startAt: "2026-07-23T23:02:00.000Z",
+      endAt: COVERAGE.endAt,
+    });
+    assert.equal(oneDay.networkActivity, false);
+    assert.equal(oneDay.privacy.verdict, "passed");
+
+    const sevenDays = await prepare(7 * 24, UUID_TWO);
+    assert.deepEqual(sevenDays.coveredAt, {
+      startAt: "2026-07-17T23:02:00.000Z",
+      endAt: COVERAGE.endAt,
+    });
+    assert.equal(sevenDays.networkActivity, false);
+    assert.equal(sevenDays.includesContent, false);
+    assert.equal(sevenDays.includesPaths, false);
+    assert.equal(sevenDays.includesIdentifiers, false);
+    assert.equal(sevenDays.includesCredentials, false);
+
+    const incremental = await prepare(24, UUID_THREE, {
+      acceptedThroughAt: "2026-07-24T22:00:00.000Z",
+      replayOverlapHours: 1,
+    });
+    assert.deepEqual(incremental.coveredAt, {
+      startAt: "2026-07-24T21:00:00.000Z",
+      endAt: COVERAGE.endAt,
+    });
+
+    await assert.rejects(
+      prepare(24, UUID_FIVE, {
+        acceptedThroughAt: COVERAGE.endAt,
+        replayOverlapHours: 1,
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "no_safe_records",
+    );
+
+    await assert.rejects(
+      prepare(7 * 24, UUID_FOUR, {
+        createResourceGuard: () => createExportResourceGuard({
+          limits: { maximumOutputRecords: 1 },
+        }),
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "export_too_large",
+    );
+    assert.deepEqual(
+      (await readdir(files.preparedSpoolDirectory)).sort(),
+      [
+        `prepared-set-${UUID_ONE}`,
+        `prepared-set-${UUID_TWO}`,
+        `prepared-set-${UUID_THREE}`,
+      ],
+    );
+
+    await assert.rejects(
+      prepare(2, UUID_FIVE),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "coverage_invalid",
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("public success counts come from the finally reopened source and published artifacts", async () => {
+  const files = await fixture();
+  let sourceVerificationCalls = 0;
+  try {
+    const inMemoryCounts = {
+      usageEvents: 197,
+      quotaSnapshots: 2,
+      activityMarkers: 1,
+    };
+    const result = await runPreparation(files, UUID_ONE, {
+      async writeBundle(options) {
+        await writeLocalMetadataBundle(options);
+        options.receipt.recordCounts = inMemoryCounts;
+      },
+      async verifySource(options) {
+        sourceVerificationCalls += 1;
+        return loadVerifiedLocalMetadataBundleFiles(options);
+      },
+    });
+    const reviewDirectory = join(
+      files.reviewArchiveDirectory,
+      `review-${UUID_ONE}`,
+    );
+    const verifiedSource = await verifyLocalMetadataBundleFiles({
+      bundleFile: join(reviewDirectory, "review.umx.json"),
+      receiptFile: join(
+        reviewDirectory,
+        "review.umx.json.privacy-receipt.json",
+      ),
+    });
+    const publishedManifest = await verifyPreparedContributionSet({
+      directory: join(
+        files.preparedSpoolDirectory,
+        `prepared-set-${UUID_ONE}`,
+      ),
+      builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    });
+    const publishedCounts = publishedManifest.files.reduce(
+      (aggregate, file) => ({
+        usageEvents:
+          aggregate.usageEvents + file.recordCounts.usageEvents,
+        quotaSnapshots:
+          aggregate.quotaSnapshots + file.recordCounts.quotaSnapshots,
+        activityMarkers:
+          aggregate.activityMarkers + file.recordCounts.activityMarkers,
+      }),
+      { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 },
+    );
+
+    assert.equal(sourceVerificationCalls, 2);
+    assert.deepEqual(result.recordCounts, verifiedSource.recordCounts);
+    assert.deepEqual(result.recordCounts, publishedCounts);
+    assert.notDeepEqual(result.recordCounts, inMemoryCounts);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a prepared aggregate mismatch fails closed before publication", async () => {
+  const files = await fixture();
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        async verifyPreparedSet(options) {
+          const manifest = await verifyPreparedContributionSet(options);
+          const mismatched = structuredClone(manifest);
+          mismatched.files[0].recordCounts.usageEvents += 1;
+          return mismatched;
+        },
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "privacy_verification_failed"
+        && error.message === "Local contribution preparation failed",
+    );
+    assert.deepEqual(
+      await readdir(files.preparedSpoolDirectory),
+      [`.preparing-${UUID_ONE}`],
+    );
+    assert.deepEqual(
+      await discoverCommittedPreparedSets({
+        directory: files.preparedSpoolDirectory,
+      }),
+      [],
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a published aggregate mismatch cannot produce public success", async () => {
+  const files = await fixture();
+  let preparedVerificationCalls = 0;
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        async verifyPreparedSet(options) {
+          const manifest = await verifyPreparedContributionSet(options);
+          preparedVerificationCalls += 1;
+          if (preparedVerificationCalls === 1) return manifest;
+          const mismatched = structuredClone(manifest);
+          mismatched.files[0].recordCounts.quotaSnapshots += 1;
+          return mismatched;
+        },
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "privacy_verification_failed"
+        && error.message === "Local contribution preparation failed",
+    );
+    assert.equal(preparedVerificationCalls, 2);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("an interrupted materializer remains non-discoverable while the privacy review provenance survives", async () => {
   const files = await fixture();
   try {
@@ -241,6 +452,141 @@ test("an interrupted materializer remains non-discoverable while the privacy rev
       ),
     });
     assert.equal(review.verdict, "passed");
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a durable attempt resumes from its verified review pair without minting another artifact", async () => {
+  const files = await fixture();
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        async failpoint(name) {
+          if (name === "after_review_pair") {
+            throw new Error("simulated process interruption");
+          }
+        },
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_failed",
+    );
+    assert.deepEqual(
+      await readdir(files.reviewArchiveDirectory),
+      [`review-${UUID_ONE}`],
+    );
+    assert.deepEqual(await readdir(files.preparedSpoolDirectory), []);
+
+    const recovered = await runPreparation(files, UUID_ONE);
+    assert.equal(recovered.status, "prepared");
+    assert.deepEqual(
+      await readdir(files.reviewArchiveDirectory),
+      [`review-${UUID_ONE}`],
+    );
+    assert.deepEqual(
+      await readdir(files.preparedSpoolDirectory),
+      [`prepared-set-${UUID_ONE}`],
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a post-publication crash reopens the exact attempt and never duplicates its review or prepared set", async () => {
+  const files = await fixture();
+  let handoffs = 0;
+  const beforePreparedPublish = async () => {
+    handoffs += 1;
+  };
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        beforePreparedPublish,
+        async failpoint(name) {
+          if (name === "after_prepared_publish") {
+            throw new Error("simulated crash after atomic rename");
+          }
+        },
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_failed",
+    );
+    assert.equal(handoffs, 1);
+    assert.deepEqual(
+      await readdir(files.reviewArchiveDirectory),
+      [`review-${UUID_ONE}`],
+    );
+    assert.deepEqual(
+      await readdir(files.preparedSpoolDirectory),
+      [`prepared-set-${UUID_ONE}`],
+    );
+
+    const recovered = await runPreparation(files, UUID_ONE, {
+      beforePreparedPublish,
+    });
+    assert.equal(recovered.status, "prepared");
+    assert.equal(handoffs, 2);
+    assert.deepEqual(
+      await readdir(files.reviewArchiveDirectory),
+      [`review-${UUID_ONE}`],
+    );
+    assert.deepEqual(
+      await readdir(files.preparedSpoolDirectory),
+      [`prepared-set-${UUID_ONE}`],
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("an invalid partial staging attempt fails closed under one stable identity across repeated recovery", async () => {
+  const files = await fixture();
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        async failpoint(name) {
+          if (name === "materializer:after_contribution_file") {
+            throw new Error("simulated partial staging crash");
+          }
+        },
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_failed",
+    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await assert.rejects(
+        runPreparation(files, UUID_ONE),
+        (error) => error instanceof LocalContributionPreparationError
+          && error.code === "preparation_failed",
+      );
+      assert.deepEqual(
+        await readdir(files.reviewArchiveDirectory),
+        [`review-${UUID_ONE}`],
+      );
+      assert.deepEqual(
+        await readdir(files.preparedSpoolDirectory),
+        [`.preparing-${UUID_ONE}`],
+      );
+    }
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a pre-build resource rejection removes only empty unpublished attempt directories", async () => {
+  const files = await fixture();
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        createResourceGuard: () => createExportResourceGuard({
+          limits: { maximumSourceBytes: 1 },
+        }),
+      }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "export_too_large",
+    );
+    assert.deepEqual(await readdir(files.reviewArchiveDirectory), []);
+    assert.deepEqual(await readdir(files.preparedSpoolDirectory), []);
   } finally {
     await rm(files.root, { recursive: true });
   }
@@ -327,6 +673,69 @@ test("coverage, owner-only directories, runner injection, and public errors fail
         && error.code === "coverage_unavailable",
     );
     assert.equal(coverageCalls, 1);
+
+    const alreadyAborted = new AbortController();
+    alreadyAborted.abort();
+    coverageCalls = 0;
+    await assert.rejects(
+      runner({ signal: alreadyAborted.signal }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_aborted",
+    );
+    assert.equal(coverageCalls, 0);
+
+    let preparationStarted = false;
+    const cooperativeRunner = createLocalContributionPreparationRunner({
+      async coverageProvider() {
+        return COVERAGE;
+      },
+      async prepare({ signal }) {
+        preparationStarted = true;
+        await new Promise((resolveAbort) => {
+          signal.addEventListener("abort", resolveAbort, { once: true });
+        });
+        signal.throwIfAborted();
+      },
+    });
+    const inFlightAbort = new AbortController();
+    const inFlightPreparation = cooperativeRunner({
+      signal: inFlightAbort.signal,
+    });
+    while (!preparationStarted) {
+      await new Promise((resolveWait) => setImmediate(resolveWait));
+    }
+    inFlightAbort.abort();
+    await assert.rejects(
+      inFlightPreparation,
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_aborted",
+    );
+
+    const selected = [];
+    const boundedRunner = createLocalContributionPreparationRunner({
+      async coverageProvider() {
+        return COVERAGE;
+      },
+      async prepare(options) {
+        selected.push(options);
+        return options;
+      },
+    });
+    assert.equal((await boundedRunner()).lookbackHours, 24);
+    assert.equal((await boundedRunner({ lookbackHours: 1 })).lookbackHours, 1);
+    assert.equal(
+      (await boundedRunner({ lookbackHours: 7 * 24 })).lookbackHours,
+      7 * 24,
+    );
+    assert.deepEqual(
+      selected.map((value) => value.coveredAt),
+      [COVERAGE, COVERAGE, COVERAGE],
+    );
+    await assert.rejects(
+      boundedRunner({ lookbackHours: 2 }),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "coverage_invalid",
+    );
   } finally {
     await chmod(files.preparedSpoolDirectory, 0o700).catch(() => {});
     await rm(files.root, { recursive: true });

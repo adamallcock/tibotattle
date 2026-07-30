@@ -196,6 +196,8 @@ function boundary(row) {
   }
   const notRunSurface = { status: "not_run", failureCode: "not_run_profile" };
   const notRun = row.identification === "not_run";
+  const batchRollover = row.dimension === "sqlite_batch_records"
+    && row.mode === "materialized_batch_rollover";
   return {
     dimension: row.dimension,
     unit: R7_RELEASE_EVIDENCE_UNIT_BY_DIMENSION[row.dimension],
@@ -211,8 +213,12 @@ function boundary(row) {
       status: row.plusOne.status,
       failureCode: row.plusOne.failureCode,
     },
-    producer: notRunSurface,
-    verifier: notRunSurface,
+    producer: batchRollover
+      ? { status: "not_applicable", failureCode: "not_applicable" }
+      : notRunSurface,
+    verifier: batchRollover
+      ? { status: "enforced", failureCode: "none" }
+      : notRunSurface,
     identification: row.identification,
   };
 }
@@ -384,10 +390,7 @@ export async function runR7MaterializedBoundaryBenchmark({
         literalCandidateAllocationRequired: false,
         harnessMetrics: combinedHarnessMetrics(first, second),
         materializedCases: materializedEvidence(first.evidence.materialCases),
-        sqliteBatch: {
-          status: "not_run",
-          reason: "no_injectable_sqlite_batch_seam",
-        },
+        sqliteBatch: structuredClone(first.evidence.sqliteBatch),
       },
       receiptSha256: "0".repeat(64),
     };

@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +14,9 @@ import {
   LocalCompanionDataStore,
   buildLocalCompanionSnapshot,
 } from "../src/local-companion-data.js";
+import {
+  refreshReplaySafeAccountingCache,
+} from "../src/replay-safe-accounting-cache.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -164,6 +173,7 @@ test("local companion builds a closed real-data projection without identifiers o
     );
     const snapshot = await buildLocalCompanionSnapshot({
       root,
+      allowDevelopmentArtifactFallback: true,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(snapshot.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
@@ -326,13 +336,125 @@ test("missing and malformed artifacts fail closed while collector evidence remai
       }),
     );
     await writeFile(join(root, ARTIFACT_FILES.gradient), "{malformed");
-    const snapshot = await buildLocalCompanionSnapshot({ root });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      allowDevelopmentArtifactFallback: true,
+    });
     assert.equal(snapshot.gradient.status, "unavailable");
     assert.equal(snapshot.gradient.errorCode, "artifact_malformed");
     assert.equal(snapshot.weekly.status, "unavailable");
     assert.equal(snapshot.weekly.errorCode, "artifact_missing");
     assert.equal(snapshot.reports.every((report) => report.status === "unavailable"), true);
     assert.equal(snapshot.overview.collector.indexingState, "not_started");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("live weekly cache replaces the repo artifact and labels historical account ambiguity", async () => {
+  const root = await fixtureRoot();
+  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  try {
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await refreshReplaySafeAccountingCache({
+      cacheFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      windowDays: 31,
+      scan: async ({ onUsage, onRateLimitSnapshot }) => {
+        onUsage({
+          timestamp: "2026-07-25T10:00:00.000Z",
+          model: "gpt-5.6-sol",
+          components: { input_uncached_tokens: 1_000_000 },
+        });
+        for (const [timestamp, usedPercent] of [
+          ["2026-07-25T10:00:00.000Z", 10],
+          ["2026-07-25T11:00:00.000Z", 11],
+        ]) {
+          onRateLimitSnapshot({
+            timestamp,
+            timestampMs: Date.parse(timestamp),
+            window: {
+              provider: "openai_codex",
+              planType: "pro",
+              limitId: "codex",
+              slot: "secondary",
+              windowDurationMins: 10_080,
+              resetsAt: 1_775_000_000,
+              usedPercent,
+            },
+          });
+        }
+        return { diagnostics: {} };
+      },
+    });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingCacheFile: cacheFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.weekly.dataClass, "live_replay_safe_cache");
+    assert.equal(snapshot.weekly.status, "insufficient_evidence");
+    assert.equal(
+      snapshot.weekly.accountAttribution.label,
+      "Historical estimate; account-unattributed and may combine multiple accounts",
+    );
+    assert.equal(
+      snapshot.overview.artifactStatus.weekly.dataClass,
+      "live_replay_safe_cache",
+    );
+    assert.notEqual(
+      snapshot.weekly.datasets.summary[0].median_weekly_value_usd,
+      112,
+    );
+    assert.deepEqual(
+      snapshot.overview.timeline.quota.map((row) => [
+        row.observedAt,
+        row.usedPercent,
+        row.accountAttribution,
+      ]),
+      [
+        [
+          "2026-07-25T10:00:00.000Z",
+          10,
+          "historical_unattributed",
+        ],
+        [
+          "2026-07-25T11:00:00.000Z",
+          11,
+          "historical_unattributed",
+        ],
+      ],
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("malformed live weekly reset rows fail closed without crashing the dashboard", async () => {
+  const root = await fixtureRoot();
+  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  try {
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await refreshReplaySafeAccountingCache({
+      cacheFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      windowDays: 31,
+      scan: async () => ({ diagnostics: {} }),
+    });
+    const cache = JSON.parse(await readFile(cacheFile, "utf8"));
+    cache.weeklyCalibration.recentResets = [null];
+    await writeFile(cacheFile, JSON.stringify(cache));
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingCacheFile: cacheFile,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.weekly.status, "unavailable");
+    assert.equal(snapshot.weekly.errorCode, "live_cache_invalid");
+    assert.deepEqual(snapshot.weekly.datasets, {});
+    assert.equal(snapshot.overview.artifactStatus.weekly.status, "unavailable");
   } finally {
     await rm(root, { recursive: true });
   }

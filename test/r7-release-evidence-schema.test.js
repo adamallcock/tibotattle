@@ -227,7 +227,17 @@ function profileEvidence(profile) {
           pathway: "resource_guard_from_file_stats",
         },
       },
-      sqliteBatch: { status: "not_run", reason: "no_injectable_sqlite_batch_seam" },
+      sqliteBatch: {
+        batchLimitRecords: 1_000,
+        recordsIndexed: 1_001,
+        nonEmptyBatchCount: 2,
+        fullBatchCount: 1,
+        maximumBatchRecords: 1_000,
+        finalBatchRecords: 1,
+        pathway: "export_set_verifier_sqlite_index",
+        atBatchLimitStatus: "passed",
+        plusOneRolloverStatus: "passed",
+      },
     };
   }
   if (profile === "release_real_local_history") {
@@ -568,16 +578,14 @@ test("boundary rows enforce canonical order, exact plus one, and producer/verifi
   ));
 });
 
-test("materialized aggregate cases are exact, closed, and keep the unrun SQLite gate partial", () => {
+test("materialized aggregate cases are exact, closed, and prove SQLite batch rollover", () => {
   const value = receipt("release_materialized_boundaries");
   assert.equal(validateR7ReleaseEvidenceReceipt(value).valid, true);
 
-  const mislabeledComplete = structuredClone(value);
-  mislabeledComplete.outcome = "passed";
-  seal(mislabeledComplete);
-  assert.ok(validateR7ReleaseEvidenceReceipt(mislabeledComplete).errors.some(
-    (error) => error.schemaPath === "#/x-invariant/materialized-sqlite-gate-open",
-  ));
+  const falseRollover = structuredClone(value);
+  falseRollover.profileEvidence.sqliteBatch.finalBatchRecords = 2;
+  seal(falseRollover);
+  assert.equal(validateR7ReleaseEvidenceReceipt(falseRollover).valid, false);
 
   const unknownDetail = structuredClone(value);
   unknownDetail.profileEvidence.materializedCases.longLine.path = "/private/source";

@@ -352,27 +352,27 @@
     },
     {
       "atLimit": {
-        "failureCode": "not_run_profile",
-        "status": "not_run",
+        "failureCode": "none",
+        "status": "passed",
         "value": 1000
       },
       "dimension": "sqlite_batch_records",
-      "identification": "not_run",
-      "mode": "not_identified",
+      "identification": "not_identified",
+      "mode": "materialized",
       "plusOne": {
-        "failureCode": "not_run_profile",
-        "status": "not_run",
+        "failureCode": "none",
+        "status": "passed",
         "value": 1001
       },
       "producer": {
-        "failureCode": "not_run_profile",
-        "status": "not_run"
+        "failureCode": "not_applicable",
+        "status": "not_applicable"
       },
       "selectedLimit": 1000,
       "unit": "records",
       "verifier": {
-        "failureCode": "not_run_profile",
-        "status": "not_run"
+        "failureCode": "none",
+        "status": "enforced"
       }
     },
     {
@@ -477,12 +477,12 @@
     }
   ],
   "contractProvenance": {
-    "receiptSchemaSha256": "97d91d943e7c174bb4d2e5b9859d6481acec50d423a0320fd65b8c2035f009ce",
-    "resourcePolicySourceSha256": "0dabc0a62cfb9476aaf2678271f62ab9f5109657421fd77e5d7152f02331efb7",
+    "receiptSchemaSha256": "4683a469ad0143721eedeccc026f07929f2506339aeab7c52e1312cad93f5701",
+    "resourcePolicySourceSha256": "c67de2ad13cb9c52e8c680fb69cd50530dfb5b7c51d7ce3612bc9357c16781b6",
     "resourcePolicyValuesSha256": "a3dde0db440015886144b76b88a8a663095c7e5eb08f0a68f062e597e95552f6",
-    "schemaModuleSha256": "96122d26303a683c0212ec57321324c503a8b442b5b0d89d018bbd70f7470e40",
-    "workloadCodeFileCount": 147,
-    "workloadCodeSha256": "dcdf2f7872e5a2e29586785349f208c51e41c06202fbfa046359564a454ff16f"
+    "schemaModuleSha256": "5dcd2648243d20adffa5d95cda5756274c711dcd9525f9cbfb7262885fe4c973",
+    "workloadCodeFileCount": 152,
+    "workloadCodeSha256": "2dd4aeacbc6b97e8fc91561694edd96936f83b6415d332e065938c7ae7998ae7"
   },
   "determinism": {
     "comparisons": {
@@ -500,8 +500,8 @@
     "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
     "runCount": 2,
     "runProjectionSha256es": [
-      "289bb783d24157dea5e1ba1c1e9099014d87073ae85396e21af95cba0609bfbd",
-      "289bb783d24157dea5e1ba1c1e9099014d87073ae85396e21af95cba0609bfbd"
+      "d780ae8069961e261bdd680b5e3f20f3cde96fcd97981f2f8f99b6f761a5cf9f",
+      "d780ae8069961e261bdd680b5e3f20f3cde96fcd97981f2f8f99b6f761a5cf9f"
     ],
     "status": "partial"
   },
@@ -822,21 +822,21 @@
       "decodedBytes": 0,
       "durablePeakRssBytes": 0,
       "encodedBytes": 0,
-      "externalPeakRssBytes": 283049984,
-      "externalRssSampleCount": 57,
+      "externalPeakRssBytes": 316440576,
+      "externalRssSampleCount": 62,
       "externalRssSampleFailureCount": 0,
       "filesystem": {
         "afterBytes": 0,
         "beforeBytes": 0,
-        "sampledHighWaterBytes": 27524225
+        "sampledHighWaterBytes": 30819526
       },
       "outputRecords": 0,
-      "parentElapsedMs": 2915,
+      "parentElapsedMs": 3114,
       "runCount": 2,
       "sourceBytes": 0,
       "sourceFiles": 0,
       "stderrBytes": 169,
-      "stdoutBytes": 42049
+      "stdoutBytes": 42472
     },
     "kind": "release_materialized_boundaries",
     "literalCandidateAllocationRequired": false,
@@ -882,12 +882,19 @@
       }
     },
     "sqliteBatch": {
-      "reason": "no_injectable_sqlite_batch_seam",
-      "status": "not_run"
+      "atBatchLimitStatus": "passed",
+      "batchLimitRecords": 1000,
+      "finalBatchRecords": 1,
+      "fullBatchCount": 1,
+      "maximumBatchRecords": 1000,
+      "nonEmptyBatchCount": 2,
+      "pathway": "export_set_verifier_sqlite_index",
+      "plusOneRolloverStatus": "passed",
+      "recordsIndexed": 1001
     }
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "4ccf8eaca620e766732495984470c38c854a042540fa16a2d52862d38a925cc8",
+  "receiptSha256": "d9f1102ea8ac09eeda4fbac5b16de56e14b81e868786e6d285fb889753c7eca7",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",

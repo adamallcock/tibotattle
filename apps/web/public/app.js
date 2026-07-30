@@ -7,7 +7,12 @@ import {
   normalizeParticipantStats
 } from "./data-client.js";
 import {
+  contributionBatchAdmission,
+  createQuotaTimelineLookup,
+  createRefreshPollingBudget,
   createTelemetryEnvelope,
+  refreshNeedsContinuation,
+  runReviewedContributionGate,
   safeApiError,
   validateContributionForUpload
 } from "./lib.js";
@@ -21,54 +26,312 @@ const communityClient = new CommunityClient({
 
 let dashboard = null;
 let activeWindowHours = 1;
-let activeTimelineRangeDays = 7;
+let activeUsageRangeDays = 7;
+let activeCalibrationRangeDays = 7;
 let activeUsageGrouping = "hour";
 let activeAccountingPeriod = "7d";
+let activeWeeklyRangeDays = 31;
+let showWeeklyPartialDiagnostics = false;
 let timelineViewport = null;
 let timelinePointerStart = null;
+let localCompanionHealth = null;
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncExactReview = null;
 let contributionSyncBusy = false;
+let automaticContributionStatus = null;
+let automaticContributionBusy = false;
+let pendingAutomaticContributionConsent = null;
+let participantContributionAdmission = null;
+let localOnboarding = null;
 let selectedContributionValidated = false;
 let contributionSelectionRevision = 0;
 let contributionPreparationBusy = false;
+let communityConnectBusy = false;
+let activeContributionLookbackHours = 24;
+let localActionBusy = false;
+let localRefreshInProgress = false;
+let localRefreshCancelRequested = false;
+let returnRefreshScheduled = false;
+let returnRefreshDeferrals = 0;
+const USER_TIME_ZONE =
+  Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
+const USER_TIME_ZONE_OPTION = USER_TIME_ZONE === "local time"
+  ? {}
+  : { timeZone: USER_TIME_ZONE };
+const LOCAL_CALENDAR_PARTS = new Intl.DateTimeFormat("en-US", {
+  ...USER_TIME_ZONE_OPTION,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit"
+});
 
 const $ = (selector) => document.querySelector(selector);
 
+function configuredSemanticOpenTarget() {
+  const target = document
+    .querySelector('meta[name="usage-monitor-semantic-open-target"]')
+    ?.getAttribute("content")
+    ?.trim();
+  return target && /^[a-z][a-z0-9+.-]*:\/\/open$/iu.test(target)
+    ? target
+    : null;
+}
+
+const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget();
+const installedAppLink = $("#open-installed-app");
+if (SEMANTIC_OPEN_TARGET) {
+  installedAppLink.href = SEMANTIC_OPEN_TARGET;
+} else {
+  installedAppLink.removeAttribute("href");
+  installedAppLink.setAttribute("aria-disabled", "true");
+}
+
+function configuredInstallerUrl() {
+  const raw = document
+    .querySelector('meta[name="usage-monitor-installer-url"]')
+    ?.getAttribute("content")
+    ?.trim();
+  if (!raw) return null;
+  try {
+    const selected = new URL(raw);
+    return selected.protocol === "https:"
+      && !selected.username
+      && !selected.password
+      && !selected.port
+      && !selected.search
+      && !selected.hash
+      && selected.pathname.toLowerCase().endsWith(".dmg")
+      ? selected.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function configuredInstallerMetadata(name, pattern) {
+  const value = document
+    .querySelector(`meta[name="${name}"]`)
+    ?.getAttribute("content")
+    ?.trim();
+  return value && pattern.test(value) ? value : null;
+}
+
+function configuredReleaseUrl(name) {
+  const raw = document
+    .querySelector(`meta[name="${name}"]`)
+    ?.getAttribute("content")
+    ?.trim();
+  if (!raw) return null;
+  try {
+    const selected = new URL(raw);
+    return selected.protocol === "https:"
+      && !selected.username
+      && !selected.password
+      && !selected.port
+      && !selected.search
+      && !selected.hash
+      ? selected.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function configuredInstallerRelease() {
+  const installerUrl = configuredInstallerUrl();
+  const version = configuredInstallerMetadata(
+    "usage-monitor-installer-version",
+    /^[0-9]+(?:\.[0-9]+){2,3}$/u,
+  );
+  const sha256 = configuredInstallerMetadata(
+    "usage-monitor-installer-sha256",
+    /^[a-f0-9]{64}$/u,
+  );
+  const byteText = configuredInstallerMetadata(
+    "usage-monitor-installer-bytes",
+    /^[1-9][0-9]{0,15}$/u,
+  );
+  const minimumMacos = configuredInstallerMetadata(
+    "usage-monitor-minimum-macos",
+    /^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u,
+  );
+  const architectureText = configuredInstallerMetadata(
+    "usage-monitor-architectures",
+    /^(?:arm64|x86_64)(?:,(?:arm64|x86_64))?$/u,
+  );
+  const architectures = architectureText?.split(",") ?? [];
+  const links = {
+    releaseNotes: configuredReleaseUrl("usage-monitor-release-notes-url"),
+    privacy: configuredReleaseUrl("usage-monitor-privacy-url"),
+    security: configuredReleaseUrl("usage-monitor-security-url"),
+    support: configuredReleaseUrl("usage-monitor-support-url"),
+  };
+  const bytes = byteText === null ? null : Number(byteText);
+  if (!installerUrl
+      || !version
+      || !sha256
+      || !Number.isSafeInteger(bytes)
+      || bytes <= 0
+      || !minimumMacos
+      || architectures.length === 0
+      || new Set(architectures).size !== architectures.length
+      || Object.values(links).some((value) => value === null)) {
+    return null;
+  }
+  return {
+    installerUrl,
+    version,
+    sha256,
+    bytes,
+    minimumMacos,
+    architectures,
+    links,
+  };
+}
+
+function formatInstallerSize(bytes) {
+  if (bytes < 1024 * 1024) {
+    return `${Math.ceil(bytes / 1024)} KiB download`;
+  }
+  const mebibytes = bytes / (1024 * 1024);
+  return `${new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: mebibytes >= 10 ? 0 : 1,
+  }).format(mebibytes)} MiB download`;
+}
+
+function renderInstallerJourney() {
+  const release = configuredInstallerRelease();
+  const link = $("#installer-link");
+  const details = $("#installer-details");
+  const releaseLinks = $("#installer-links");
+  const unavailable = $("#installer-unavailable");
+  if (release) {
+    const architectureLabel = release.architectures.length === 2
+      ? "Apple silicon and Intel"
+      : release.architectures[0] === "arm64"
+        ? "Apple silicon"
+        : "Intel";
+    link.href = release.installerUrl;
+    link.hidden = false;
+    $("#installer-version").textContent = `Version ${release.version}`;
+    $("#installer-compatibility").textContent =
+      `Requires macOS ${release.minimumMacos} or later · ${architectureLabel}`;
+    $("#installer-size").textContent = formatInstallerSize(release.bytes);
+    $("#installer-sha256").textContent = `SHA-256 ${release.sha256}`;
+    details.hidden = false;
+    for (const [id, url] of [
+      ["release-notes-link", release.links.releaseNotes],
+      ["privacy-link", release.links.privacy],
+      ["security-link", release.links.security],
+      ["support-link", release.links.support],
+    ]) {
+      const item = $(`#${id}`);
+      item.href = url;
+      item.hidden = false;
+    }
+    releaseLinks.hidden = false;
+    unavailable.hidden = true;
+    return;
+  }
+  link.removeAttribute("href");
+  link.hidden = true;
+  details.hidden = true;
+  for (const id of [
+    "installer-version",
+    "installer-compatibility",
+    "installer-size",
+    "installer-sha256",
+  ]) {
+    $(`#${id}`).textContent = "";
+  }
+  for (const id of [
+    "release-notes-link",
+    "privacy-link",
+    "security-link",
+    "support-link",
+  ]) {
+    const item = $(`#${id}`);
+    item.removeAttribute("href");
+    item.hidden = true;
+  }
+  releaseLinks.hidden = true;
+  unavailable.hidden = false;
+}
+
+function openInstalledApp() {
+  const status = $("#open-installed-app-status");
+  status.hidden = false;
+  status.textContent =
+    "Opening Usage Monitor… If no app appears, install the signed Mac download above, then try again.";
+  window.setTimeout(() => {
+    if (!status.hidden) {
+      status.textContent =
+        "Continue in the local dashboard tab opened by Usage Monitor. If nothing opened, the app is not installed or macOS blocked the link.";
+    }
+  }, 2_000);
+}
+
+function setJourneyState(state) {
+  const body = document.body;
+  body.classList.remove("first-run", "needs-local-setup", "local-ready", "demo-mode");
+  body.classList.add(state);
+  $("#companion-setup").hidden = state !== "first-run";
+  const hasEvidence = state === "local-ready" || state === "demo-mode";
+  for (const element of document.querySelectorAll("[data-requires-evidence]")) {
+    element.hidden = !hasEvidence;
+  }
+  if (!hasEvidence) {
+    $("#community-contribution-disclosure").open = false;
+  }
+}
+
+function localAnalysisAllowed(value = localOnboarding) {
+  return Boolean(
+    value
+      && value.state === "ready"
+      && (value.sessionsReadable || value.archivedSessionsReadable)
+      && value.rolloutFilesPresent
+      && value.stateWritable
+      && value.explicitRefresh,
+  );
+}
+
+function localAnalysisLabel() {
+  if (dashboard?.collector?.indexing?.status === "bounded_pause") {
+    return "Continue local analysis";
+  }
+  return dashboard?.activity?.lastScanAt || dashboard?.collector?.lastScanAt
+    ? "Update local usage"
+    : "Analyze local usage";
+}
+
+function updateLocalActionButtons() {
+  const allowed = localAnalysisAllowed();
+  const label = localAnalysisLabel();
+  for (const selector of ["#refresh-button", "#setup-refresh"]) {
+    const button = $(selector);
+    button.disabled = localActionBusy || !allowed;
+    if (!localActionBusy) button.textContent = label;
+  }
+  const setupCheck = $("#setup-check-again");
+  if (setupCheck) setupCheck.disabled = localActionBusy;
+  const companionCheck = $("#companion-check");
+  if (companionCheck) companionCheck.disabled = localActionBusy;
+  const connectionCheck = $("#connection-check");
+  if (connectionCheck) connectionCheck.disabled = localActionBusy;
+  const cancel = $("#cancel-refresh");
+  cancel.hidden = !localRefreshInProgress;
+  cancel.disabled = localRefreshCancelRequested;
+  cancel.textContent = localRefreshCancelRequested ? "Cancelling…" : "Cancel";
+}
+
 function setCommunitySession(value) {
   communitySession = value;
-  const deviceConsentTitle = $("#device-consent-title");
-  if (deviceConsentTitle) {
-    deviceConsentTitle.textContent = value?.consentVersion
-      === "privacy-safe-telemetry-v0.2"
-      ? "Allow this pairing to register privacy-safe account-scoped v0.2 uploads."
-      : "Allow this pairing to register privacy-safe v0.1 uploads.";
+  if (!value) {
+    participantContributionAdmission = null;
+    renderContributionPreparationEstimate();
   }
-}
-
-function showRecoveryCodeOnce(value) {
-  const panel = $("#recovery-once");
-  const code = $("#recovery-code-once");
-  if (typeof value !== "string" || value.length === 0) {
-    code.textContent = "";
-    panel.hidden = true;
-    return;
-  }
-  code.textContent = value;
-  panel.hidden = false;
-}
-
-function showDevicePairingOnce(value) {
-  const panel = $("#device-pairing-once");
-  const code = $("#device-pairing-code");
-  if (typeof value !== "string" || !value.startsWith("um_pair_") || value.length > 180) {
-    code.textContent = "";
-    panel.hidden = true;
-    return;
-  }
-  code.textContent = value;
-  panel.hidden = false;
 }
 
 async function sha256Hex(value) {
@@ -98,14 +361,14 @@ function formatMoney(value, digits = 0) {
 
 function formatApiMoney(value) {
   const number = finite(value);
-  return number === null
-    ? "—"
-    : new Intl.NumberFormat("en-US", {
-        style: "currency",
-        currency: "USD",
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 6
-      }).format(number);
+  if (number === null) return "—";
+  if (number > 0 && number < .01) return "<$0.01";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(number);
 }
 
 function formatPercent(value, digits = 0) {
@@ -136,9 +399,22 @@ function formatUtc(value, { dateOnly = false } = {}) {
 function formatLocal(value, { dateOnly = false } = {}) {
   if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
   return new Intl.DateTimeFormat("en-US", dateOnly
-    ? { month: "short", day: "numeric", year: "numeric" }
-    : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
+    ? { ...USER_TIME_ZONE_OPTION, month: "short", day: "numeric", year: "numeric" }
+    : { ...USER_TIME_ZONE_OPTION, month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
   ).format(new Date(value));
+}
+
+const COMPONENT_LABELS = Object.freeze({
+  input_uncached_tokens: "Uncached input",
+  input_cache_read_tokens: "Cached input",
+  input_cache_write_tokens: "Cache writes",
+  output_text_tokens: "Output text",
+  output_reasoning_tokens: "Reasoning output",
+  output_combined_tokens: "Output (split unavailable)"
+});
+
+function componentLabel(value) {
+  return COMPONENT_LABELS[value] ?? humanize(value);
 }
 
 function formatAge(value) {
@@ -175,12 +451,14 @@ function node(tag, className, text) {
   return element;
 }
 
-function setGlobalState(state) {
+function setGlobalState(state, { companionReachable = false } = {}) {
   const labels = {
     live: "Live local evidence",
+    updating: "Updating local evidence",
     stale: "Stale local evidence",
     insufficient: "Insufficient evidence",
-    offline: "Companion offline",
+    setup: "Local setup needed",
+    offline: companionReachable ? "Ready to analyze" : "Mac app not connected",
     demo: "Labeled demo data"
   };
   const pill = $("#global-state");
@@ -188,11 +466,18 @@ function setGlobalState(state) {
   pill.replaceChildren(node("span", "state-dot"), document.createTextNode(labels[state] ?? "Unknown state"));
 }
 
-function showConnectionNotice({ title, copy, kind = "warning", showDemo = false }) {
+function showConnectionNotice({
+  title,
+  copy,
+  kind = "warning",
+  showDemo = false,
+  showCheck = false,
+}) {
   const notice = $("#connection-notice");
   notice.className = `notice notice-${kind}`;
   $("#connection-title").textContent = title;
   $("#connection-copy").textContent = copy;
+  $("#connection-check").hidden = !showCheck;
   $("#demo-button").hidden = !showDemo;
   notice.hidden = false;
 }
@@ -201,22 +486,143 @@ function hideConnectionNotice() {
   $("#connection-notice").hidden = true;
 }
 
+function onboardingSourceGuidance(value) {
+  const customLocation = value.customCodexHomeConfigured
+    ? "The custom Codex data location configured for this app"
+    : "The usual Codex data folder";
+  const guidance = {
+    codex_home_missing: {
+      title: value.customCodexHomeConfigured
+        ? "The configured Codex location is missing"
+        : "Open Codex once, then check again",
+      summary: `${customLocation} was not found. ${
+        value.customCodexHomeConfigured
+          ? "Reopen the normal app build or restore the configured location, then check again."
+          : "Open Codex, start or resume a task, and let one response finish."
+      }`,
+      check: `${customLocation} was not found`,
+    },
+    codex_home_unreadable: {
+      title: "Allow local Codex access, then check again",
+      summary: `${customLocation} exists but cannot be read. Quit Usage Monitor, open System Settings → Privacy & Security → Files and Folders, allow Usage Monitor if it is listed, then reopen the app.`,
+      check: `${customLocation} cannot be read`,
+    },
+    session_directories_missing: {
+      title: "Complete one Codex task, then check again",
+      summary: "Codex is present but has not created a readable sessions folder. Start or resume a Codex task, let one response finish, then check again.",
+      check: "No Codex sessions folder has been created yet",
+    },
+    session_directories_unreadable: {
+      title: "Allow access to Codex sessions, then check again",
+      summary: "Codex session folders exist but cannot be read. Quit Usage Monitor, allow it under System Settings → Privacy & Security → Files and Folders if it is listed, then reopen the app.",
+      check: "Codex session folders cannot be read",
+    },
+    no_rollout_files: {
+      title: "Complete one Codex response, then check again",
+      summary: "The Codex sessions folder is readable but contains no completed rollout yet. Start or resume a task and let one response finish.",
+      check: "No completed local Codex task was detected",
+    },
+  };
+  return guidance[value.sourceStatus] ?? {
+    title: "Open Codex once, then check again",
+    summary: "Usage Monitor cannot find readable Codex session metadata yet. Open Codex, start or resume a task, and let one response finish.",
+    check: "Codex session metadata is not ready",
+  };
+}
+
+function renderLocalOnboarding(value) {
+  localOnboarding = value;
+  const card = $("#setup-card");
+  if (!value || value.state === "unavailable") {
+    card.hidden = true;
+    setJourneyState(dashboard?.mode === "demo" ? "demo-mode" : "first-run");
+    updateLocalActionButtons();
+    return;
+  }
+  const sourceReady = value.sourceStatus === "ready";
+  const sourceAccessible = ["ready", "no_rollout_files"].includes(
+    value.sourceStatus,
+  );
+  const sourceGuidance = onboardingSourceGuidance(value);
+  const indexing = dashboard?.collector?.indexing ?? null;
+  const boundedPause = indexing?.status === "bounded_pause";
+  const ready = localAnalysisAllowed(value);
+  card.hidden = false;
+  card.classList.toggle("needs-attention", !ready);
+  $("#setup-title").textContent = boundedPause
+    ? "Continue your local analysis"
+    : ready
+      ? "This Mac is ready"
+      : value.stateStatus === "unwritable" && sourceReady
+        ? "Local app state needs attention"
+        : sourceGuidance.title;
+  $("#setup-summary").textContent = boundedPause
+    ? `A bounded pass completed safely: ${compact(indexing.filesProcessed)} of ${compact(indexing.filesSelected)} recent rollout files are analyzed. Continue when convenient; existing results remain usable.`
+    : ready
+      ? "Codex metadata and Usage Monitor's private state are available. Raw logs remain inside the local companion."
+    : value.stateStatus === "unwritable" && sourceReady
+      ? "Usage Monitor can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
+      : sourceGuidance.summary;
+
+  const checks = $("#setup-checks");
+  clear(checks);
+  const items = [
+    {
+      ok: sourceAccessible,
+      text: sourceAccessible
+        ? "Codex session metadata is readable"
+        : sourceGuidance.check
+    },
+    {
+      ok: value.stateWritable,
+      text: value.stateWritable
+        ? "Private app state is writable"
+        : "Quit and reopen Usage Monitor"
+    },
+    {
+      ok: value.rolloutFilesPresent,
+      text: value.rolloutFilesPresent
+        ? `${value.rolloutFilesObservedCapped ? `${compact(value.rolloutFilesObserved)}+` : compact(value.rolloutFilesObserved)} local rollout file${value.rolloutFilesObserved === 1 ? "" : "s"} detected`
+        : "No completed local Codex task detected yet"
+    }
+  ];
+  for (const item of items) {
+    const row = node("li", item.ok ? "" : "missing", item.text);
+    checks.append(row);
+  }
+  $("#setup-note").textContent = ready
+    ? boundedPause
+      ? "Continue when convenient. A useful headline is already available; later bounded updates are normally faster. Existing results remain visible, and every additional pass stays on this Mac."
+      : "A useful headline often appears in seconds. The first deep pass can take a few minutes and later updates are normally faster. Work stops or checkpoints at a fixed bound; prompts, responses, commands, paths, and account identifiers never enter this page."
+      : "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.";
+  if (!ready) setGlobalState("setup", { companionReachable: true });
+  setJourneyState(ready ? "local-ready" : "needs-local-setup");
+  updateLocalActionButtons();
+}
+
 function renderDashboard(data) {
   dashboard = data;
-  setGlobalState(data.state);
+  if (data.mode === "demo") {
+    setJourneyState("demo-mode");
+    $("#setup-card").hidden = true;
+  }
+  setGlobalState(data.state, {
+    companionReachable: data.mode !== "demo"
+  });
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
     : "No timestamp";
   $("#data-source").textContent = data.mode === "demo"
     ? "Illustrative fixture — not your usage"
-    : `${formatUtc(data.freshness.latestObservedAt)} · local companion`;
+    : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
   $("#schema-version").textContent = `Dashboard contract: ${data.schemaVersion}`;
 
   if (data.mode === "demo") {
     showConnectionNotice({
       title: "You are exploring a labeled demonstration",
-      copy: "Every number on this page is illustrative. Start the local companion and refresh to load your own evidence.",
-      kind: "demo"
+      copy: "Every number on this page is illustrative. Open the Mac app and use the separate local dashboard tab to see your own evidence.",
+      kind: "demo",
+      showCheck: true
     });
   } else if (data.state === "stale") {
     showConnectionNotice({
@@ -228,7 +634,8 @@ function renderDashboard(data) {
     showConnectionNotice({
       title: "The companion is connected, but evidence is incomplete",
       copy: "Available measurements are shown below. Missing estimates remain blank rather than being filled with demo values.",
-      kind: "warning"
+      kind: "warning",
+      showCheck: true
     });
   } else {
     hideConnectionNotice();
@@ -237,12 +644,14 @@ function renderDashboard(data) {
   renderQuotaCards(data);
   renderPricing(data);
   renderComparison(data);
+  renderUsageTimeline(data);
   renderTimeline(data);
   renderWeekly(data);
   renderAccounting(data);
   renderQuality(data);
   renderCollector(data);
   renderReports(data);
+  renderContributionPreparationEstimate();
 }
 
 function renderQuotaCards(data) {
@@ -277,7 +686,7 @@ function renderQuotaCards(data) {
     const meta = node("div", "metric-meta");
     meta.append(
       node("span", "", window.usedPercent === null ? "Used unknown" : `${formatPercent(window.usedPercent)} used`),
-      node("span", "", window.resetAt ? `Resets ${formatUtc(window.resetAt)}` : "Reset unknown")
+      node("span", "", window.resetAt ? `Resets ${formatLocal(window.resetAt)}` : "Reset unknown")
     );
     card.append(header, value, progress, meta);
     if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
@@ -285,7 +694,7 @@ function renderQuotaCards(data) {
       const attribution = window.accountAttribution === "attributed_pseudonymous"
         ? "pseudonymous account attributed"
         : "account unattributed";
-      card.append(node("p", "", `Observed ${formatUtc(window.observedAt)} · ${attribution}`));
+      card.append(node("p", "", `Observed ${formatLocal(window.observedAt)} · ${attribution}`));
     }
     container.append(card);
   }
@@ -296,26 +705,47 @@ function renderPricing(data) {
   $("#cost-period").textContent = pricing.periodLabel;
   $("#cost-total").textContent = formatMoney(pricing.totalCostUsd, 2);
   const provenance = pricing.registryVersion
-    ? ` · API price registry ${pricing.registryVersion}${pricing.registryObservedAt ? ` (${formatUtc(pricing.registryObservedAt)})` : ""}`
+    ? ` · price registry ${pricing.registryVersion}${pricing.registryObservedAt ? ` (${formatLocal(pricing.registryObservedAt)})` : ""}`
     : "";
+  const replay = pricing.replayExclusionDiagnostics?.forkReplayEventsExcluded ?? 0;
+  const accountingMethod = pricing.accountingSource
+    === "lineage_aware_cumulative_snapshot_replay_exclusion"
+    ? `${pricing.accountingCacheStatus === "stale" ? "stale replay-safe cache" : "replay-safe"} · ${compact(replay)} inherited child snapshots excluded`
+    : "legacy projection; replay exclusion has not been verified";
   $("#cost-coverage").textContent = pricing.coveragePercent === null
     ? "Price coverage is not available"
-    : `${formatPercent(pricing.coveragePercent, 1)} of recorded usage priced · API tier: ${pricing.apiTier}${provenance}`;
+    : `${formatPercent(pricing.coveragePercent, 1)} priced · ${accountingMethod}${provenance}`;
   const list = $("#cost-components");
   clear(list);
-  if (!pricing.components.length) {
+  const components = pricing.components.filter(
+    (row) => finite(row.costUsd, 0) > 0 || finite(row.tokens, 0) > 0
+  );
+  if (!components.length) {
     list.append(node("p", "empty-inline", "No token-component accounting was returned."));
     return;
   }
-  const max = Math.max(...pricing.components.map((row) => row.costUsd ?? row.tokens ?? 0), 1);
-  for (const component of pricing.components) {
+  const max = Math.max(...components.map((row) => row.costUsd ?? 0), .01);
+  for (const component of components) {
     const row = node("div", "component-row");
-    row.append(node("span", "", humanize(component.name)));
+    row.append(node("span", "", componentLabel(component.name)));
     const track = node("div", "component-track");
     const fill = node("i");
-    fill.style.width = `${Math.max(1, ((component.costUsd ?? component.tokens ?? 0) / max) * 100)}%`;
+    fill.style.width = `${Math.max(component.costUsd > 0 ? 1 : 0, ((component.costUsd ?? 0) / max) * 100)}%`;
     track.append(fill);
-    row.append(track, node("strong", "", component.costUsd === null ? `${compact(component.tokens)} tok` : formatMoney(component.costUsd, 2)));
+    const hasUnpricedTokens = finite(component.unpricedTokens, 0) > 0;
+    const hasPricedTokens = finite(component.pricedTokens, 0) > 0;
+    const costLabel = hasUnpricedTokens && !hasPricedTokens
+      ? "Unpriced"
+      : hasUnpricedTokens
+        ? `${formatApiMoney(component.costUsd)} + unpriced`
+        : formatApiMoney(component.costUsd);
+    row.append(
+      track,
+      node("strong", "", costLabel)
+    );
+    row.title = hasUnpricedTokens
+      ? `${compact(component.tokens)} tokens · ${compact(component.unpricedTokens)} unpriced`
+      : `${compact(component.tokens)} tokens`;
     list.append(row);
   }
 }
@@ -329,7 +759,10 @@ function humanize(value) {
 
 function latestRollingPair(data) {
   if (data.mode !== "demo" && data.timeline?.usage?.length) {
-    const live = liveTimelinePoints(data)
+    const live = liveTimelinePoints(data, {
+      windowHours: 1,
+      rangeDays: activeUsageRangeDays,
+    })
       .filter((row) => row.observed !== null && row.expected !== null)
       .at(-1);
     if (live) return live;
@@ -342,7 +775,7 @@ function latestRollingPair(data) {
       residual: finite(row.residual_pp ?? row.residualPp)
     };
   }
-  const groups = groupRolling(data.gradient.rolling, activeWindowHours);
+  const groups = groupRolling(data.gradient.rolling, 1);
   const last = groups.at(-1);
   return last ? { observed: last.observed, expected: last.expected, residual: last.observed - last.expected } : null;
 }
@@ -423,14 +856,19 @@ function groupRolling(rows, hours) {
     .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
-function timelineCutoffMs(data) {
+function latestTimelineObservationMs(data) {
   const latest = data.timeline.usage.at(-1)?.endAt
     ?? data.timeline.quota.at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
-  return Number.isFinite(latestMs)
-    ? latestMs - activeTimelineRangeDays * 24 * 60 * 60 * 1_000
-    : Number.NEGATIVE_INFINITY;
+  return Number.isFinite(latestMs) ? latestMs : null;
+}
+
+function timelineCutoffMs(data, rangeDays) {
+  const latestMs = latestTimelineObservationMs(data);
+  return latestMs === null
+    ? Number.NEGATIVE_INFINITY
+    : latestMs - rangeDays * 24 * 60 * 60 * 1_000;
 }
 
 function timelineBounds(points) {
@@ -536,28 +974,45 @@ function timelineStatusIntervals(points, viewport) {
   });
 }
 
-function latestQuotaAtOrBefore(rows, timestampMs) {
-  let selected = null;
-  for (const row of rows) {
-    const observedMs = Date.parse(row.observedAt);
-    if (observedMs > timestampMs) break;
-    selected = row;
+function mainWeeklyQuotaTrack(rows) {
+  const weeklyCodex = rows.filter(
+    (row) => row.limitId === "codex" && row.durationMinutes === 10_080,
+  );
+  if (!weeklyCodex.length) return [];
+  const primary = weeklyCodex.filter((row) => row.slot === "primary");
+  if (primary.length) return primary;
+  const bySlot = new Map();
+  for (const row of weeklyCodex) {
+    const slot = row.slot ?? "unknown";
+    const group = bySlot.get(slot) ?? [];
+    group.push(row);
+    bySlot.set(slot, group);
   }
-  return selected;
+  return [...bySlot.entries()]
+    .sort((left, right) => (
+      right[1].length - left[1].length
+      || left[0].localeCompare(right[0])
+    ))[0]?.[1] ?? [];
 }
 
-function liveTimelinePoints(data) {
+function liveTimelinePoints(
+  data,
+  {
+    windowHours = activeWindowHours,
+    rangeDays = activeCalibrationRangeDays,
+  } = {},
+) {
   const usage = data.timeline.usage;
   const capacity = finite(
-    data.gradient.summary?.capacity_usd
-      ?? data.weekly.summary?.median_weekly_value_usd
+    data.weekly.summary?.median_weekly_value_usd
+      ?? data.gradient.summary?.capacity_usd
   );
   if (!usage.length) return [];
-  const windowMs = activeWindowHours * 60 * 60 * 1_000;
-  const cutoff = timelineCutoffMs(data);
-  const preferredQuota = data.timeline.quota.filter((row) => row.limitId === "codex");
-  const quota = (preferredQuota.length ? preferredQuota : data.timeline.quota)
-    .sort((left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt));
+  const windowMs = windowHours * 60 * 60 * 1_000;
+  const cutoff = timelineCutoffMs(data, rangeDays);
+  const weeklyQuota = mainWeeklyQuotaTrack(data.timeline.quota);
+  const quota = (weeklyQuota.length ? weeklyQuota : data.timeline.quota);
+  const quotaLookup = createQuotaTimelineLookup(quota);
   const points = [];
   let startIndex = 0;
   let rollingCost = 0;
@@ -575,12 +1030,14 @@ function liveTimelinePoints(data) {
     }
     if (endMs < cutoff) continue;
     const startMs = endMs - windowMs;
-    const before = latestQuotaAtOrBefore(quota, startMs);
-    const after = latestQuotaAtOrBefore(quota, endMs);
+    const beforeMatch = quotaLookup.atOrBefore(startMs);
+    const afterMatch = quotaLookup.atOrBefore(endMs);
+    const before = beforeMatch?.row ?? null;
+    const after = afterMatch?.row ?? null;
     const maximumBracketGapMs = Math.max(30 * 60 * 1_000, windowMs);
     const bracketed = before && after
-      && startMs - Date.parse(before.observedAt) <= maximumBracketGapMs
-      && endMs - Date.parse(after.observedAt) <= maximumBracketGapMs;
+      && startMs - beforeMatch.timestampMs <= maximumBracketGapMs
+      && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = bracketed && before.resetAt && before.resetAt === after.resetAt;
     const observed = sameReset && after.usedPercent >= before.usedPercent
       ? after.usedPercent - before.usedPercent
@@ -605,41 +1062,95 @@ function liveTimelinePoints(data) {
 }
 
 function groupedUsageTimeline(data) {
-  const sizes = {
-    hour: 60 * 60 * 1_000,
-    day: 24 * 60 * 60 * 1_000,
-    week: 7 * 24 * 60 * 60 * 1_000
-  };
-  const size = sizes[activeUsageGrouping] ?? sizes.hour;
-  const cutoff = timelineCutoffMs(data);
+  const hourMs = 60 * 60 * 1_000;
+  const cutoff = timelineCutoffMs(data, activeUsageRangeDays);
   const groups = new Map();
   for (const row of data.timeline.usage) {
     const timestamp = Date.parse(row.startAt);
     if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
-    const startMs = Math.floor(timestamp / size) * size;
-    const group = groups.get(startMs) ?? {
-      timestamp: new Date(startMs).toISOString(),
+    let key;
+    let sortMs;
+    if (activeUsageGrouping === "hour") {
+      sortMs = Math.floor(timestamp / hourMs) * hourMs;
+      key = `hour:${sortMs}`;
+    } else {
+      const parts = Object.fromEntries(
+        LOCAL_CALENDAR_PARTS.formatToParts(timestamp)
+          .filter((part) => part.type !== "literal")
+          .map((part) => [part.type, part.value])
+      );
+      const civilDayMs = Date.UTC(
+        Number(parts.year),
+        Number(parts.month) - 1,
+        Number(parts.day)
+      );
+      sortMs = activeUsageGrouping === "week"
+        ? civilDayMs - ((new Date(civilDayMs).getUTCDay() + 6) % 7) * 24 * hourMs
+        : civilDayMs;
+      key = `${activeUsageGrouping}:${new Date(sortMs).toISOString().slice(0, 10)}`;
+    }
+    const rowStartMs = Date.parse(row.startAt);
+    const rowEndMs = Date.parse(row.endAt);
+    const group = groups.get(key) ?? {
+      sortMs,
+      periodStartMs: rowStartMs,
+      periodEndMs: rowEndMs,
       apiCostUsd: 0,
       usageEvents: 0,
       totalTokens: 0
     };
+    group.periodStartMs = Math.min(group.periodStartMs, rowStartMs);
+    group.periodEndMs = Math.max(group.periodEndMs, rowEndMs);
     group.apiCostUsd += row.apiPriceEquivalentUsd;
     group.usageEvents += row.usageEvents;
     group.totalTokens += row.totalTokens;
-    groups.set(startMs, group);
+    groups.set(key, group);
   }
   return [...groups.values()]
-    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp))
-    .map((row) => ({ ...row, apiCostUsd: Number(row.apiCostUsd.toFixed(6)) }));
+    .sort((left, right) => left.sortMs - right.sortMs)
+    .map(({ sortMs: _sortMs, periodStartMs, periodEndMs, ...row }) => ({
+      ...row,
+      timestamp: new Date(periodEndMs).toISOString(),
+      periodStartAt: new Date(periodStartMs).toISOString(),
+      periodEndAt: new Date(periodEndMs).toISOString(),
+      apiCostUsd: Number(row.apiCostUsd.toFixed(6))
+    }));
+}
+
+function usagePointsWithAllowance(data, points) {
+  const preferred = mainWeeklyQuotaTrack(data.timeline.quota);
+  const fallback = data.timeline.quota.filter(
+    (row) => row.durationMinutes === 10_080 || row.limitId === "codex"
+  );
+  const quota = preferred.length ? preferred : fallback;
+  const quotaLookup = createQuotaTimelineLookup(quota);
+  const maximumObservationAgeMs = {
+    hour: 6 * 60 * 60 * 1_000,
+    day: 12 * 60 * 60 * 1_000,
+    week: 24 * 60 * 60 * 1_000
+  }[activeUsageGrouping] ?? 6 * 60 * 60 * 1_000;
+  return points.map((point) => {
+    const endMs = Date.parse(point.periodEndAt ?? point.timestamp);
+    const observationMatch = quotaLookup.atOrBefore(endMs);
+    const observationAge = observationMatch
+      ? endMs - observationMatch.timestampMs
+      : Number.POSITIVE_INFINITY;
+    return {
+      ...point,
+      allowanceRemaining: observationAge <= maximumObservationAgeMs
+        ? finite(observationMatch.row.remainingPercent)
+        : null
+    };
+  });
 }
 
 function renderUsageTimeline(data) {
-  const points = groupedUsageTimeline(data);
+  const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
   const shell = $("#usage-timeline-chart");
   const empty = $("#usage-timeline-empty");
   const label = { hour: "hour", day: "day", week: "week" }[activeUsageGrouping];
   $("#usage-timeline-title").textContent =
-    `API-price-equivalent usage by ${label} · latest ${activeTimelineRangeDays} day${activeTimelineRangeDays === 1 ? "" : "s"}`;
+    `API-price-equivalent usage by ${label} · latest ${activeUsageRangeDays} day${activeUsageRangeDays === 1 ? "" : "s"}`;
   if (!points.length) {
     shell.hidden = true;
     empty.hidden = false;
@@ -654,21 +1165,30 @@ function renderUsageTimeline(data) {
         label: "API-price-equivalent usage"
       }],
       yLabel: "API-equivalent USD",
+      secondarySeries: [{
+        key: "allowanceRemaining",
+        className: "chart-line-allowance",
+        label: "Seven-day allowance remaining"
+      }],
+      secondaryYLabel: "Allowance remaining (%)",
       title: "Real local API-price-equivalent usage over time",
-      description: "Content-free local usage metadata grouped over the selected interval.",
+      description: `Replay-safe local usage cost with provider-observed seven-day allowance remaining in ${USER_TIME_ZONE}.`,
       includeZero: true
     }));
   }
+  $("#usage-timeline-copy").textContent =
+    `Replay-safe local increments · ${USER_TIME_ZONE} · current Standard API prices`;
   const summary = $("#usage-timeline-summary");
   clear(summary);
   const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
   const events = points.reduce((sum, row) => sum + row.usageEvents, 0);
-  const tokens = points.reduce((sum, row) => sum + row.totalTokens, 0);
+  const replayExcluded = data.accounting.replayExclusionDiagnostics
+    ?.forkReplayEventsExcluded ?? 0;
   for (const [name, value] of [
-    ["Real local buckets", compact(points.length)],
+    ["Replay-safe buckets", compact(points.length)],
     ["API-price equivalent", formatApiMoney(total)],
-    ["Usage events", compact(events)],
-    ["Recorded tokens", compact(tokens)]
+    ["Usage increments", compact(events)],
+    ["Inherited replay excluded", compact(replayExcluded)]
   ]) {
     const item = node("div");
     item.append(node("span", "", name), node("strong", "", value));
@@ -678,10 +1198,11 @@ function renderUsageTimeline(data) {
 
 function selectedTimelinePoints(data) {
   const livePoints = data.mode !== "demo" ? liveTimelinePoints(data) : [];
+  const cutoff = timelineCutoffMs(data, activeCalibrationRangeDays);
   const historicalPoints = groupRolling(
     [...data.gradient.rollingHistory, ...data.gradient.rolling],
     activeWindowHours,
-  );
+  ).filter((row) => Date.parse(row.timestamp) >= cutoff);
   const liveMatched = livePoints.filter(
     (row) => row.observed !== null && row.expected !== null,
   ).length;
@@ -690,24 +1211,30 @@ function selectedTimelinePoints(data) {
 }
 
 function renderTimeline(data) {
-  renderUsageTimeline(data);
   const { points, usingLive } = selectedTimelinePoints(data);
   const viewport = normalizeTimelineViewport(points);
   const visiblePoints = timelinePointsInViewport(points, viewport);
+  const matchedVisible = visiblePoints.filter(
+    (point) => point.observed !== null && point.expected !== null,
+  );
   const windowLabel = activeWindowHours === 0.25
     ? "15-minute"
     : `${activeWindowHours}-hour`;
   $("#timeline-chart-title").textContent = `${windowLabel} rolling quota change versus cost-implied change`;
   $("#timeline-chart-copy").textContent = usingLive
-    ? "Real local collector · UTC chart axis · exact UTC and local times in the table below"
-    : `Historical local calibration artifact from ${formatUtc(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
+    ? `Replay-safe local increments · ${USER_TIME_ZONE} chart axis · exact local and UTC times below`
+    : `Historical local calibration artifact from ${formatLocal(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
-  if (!visiblePoints.length) {
+  if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
-    empty.querySelector("strong").textContent = `No ${windowLabel} series loaded`;
-    empty.querySelector("p").textContent = "This is a missing-data state, not a zero-usage period.";
+    empty.querySelector("strong").textContent = visiblePoints.length
+      ? "Not comparable yet"
+      : `No ${windowLabel} series loaded`;
+    empty.querySelector("p").textContent = visiblePoints.length
+      ? `Cost history exists, but quota observations do not bracket any ${windowLabel} window in this date range. The calculated line is hidden until there is measured evidence to compare it with.`
+      : "This is a missing-data state, not a zero-usage period.";
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -718,8 +1245,9 @@ function renderTimeline(data) {
         { key: "expected", className: "chart-line-expected", label: "Expected from API cost" }
       ],
       yLabel: "Percentage points",
-      title: `${activeWindowHours}-hour rolling quota movement`,
-      description: "Observed quota movement compared with movement implied by priced token usage. The horizontal axis is UTC; exact UTC and local times are listed below.",
+      title: `${windowLabel} rolling quota movement`,
+      description: `Observed quota movement compared with movement implied by priced token usage. The horizontal axis is ${USER_TIME_ZONE}.`,
+      includeZero: true,
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
@@ -758,9 +1286,9 @@ function bindTimelineInteractions(shell, points, viewport) {
   if (viewport === null) return;
   shell.classList.add("interactive-chart");
   shell.tabIndex = 0;
-  shell.setAttribute("aria-label", "Interactive UTC quota timeline. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.");
+  shell.setAttribute("aria-label", `Interactive quota timeline in ${USER_TIME_ZONE}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.`);
   const status = $("#timeline-zoom-status");
-  status.textContent = `Timeline shows ${formatUtc(new Date(viewport.startMs).toISOString())} through ${formatUtc(new Date(viewport.endMs).toISOString())}.`;
+  status.textContent = `Timeline shows ${formatLocal(new Date(viewport.startMs).toISOString())} through ${formatLocal(new Date(viewport.endMs).toISOString())}.`;
   shell.onwheel = (event) => {
     if (!event.deltaY) return;
     event.preventDefault();
@@ -920,7 +1448,7 @@ function renderResiduals(data, points, viewport = null) {
       ? null
       : item.residual;
     row.append(
-      node("td", "", `${formatUtc(item.timestamp)} · ${formatLocal(item.timestamp)}`),
+      node("td", "", `${formatLocal(item.timestamp)} · ${formatUtc(item.timestamp)}`),
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
       node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? "Not comparable" : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
@@ -940,10 +1468,13 @@ function lineChart({
   confidence = null,
   xDomain = null,
   statusIntervals = [],
+  secondarySeries = [],
+  secondaryYLabel = null,
 }) {
   const width = 900;
   const height = 330;
-  const margin = { top: 24, right: 22, bottom: 50, left: 58 };
+  const hasSecondary = secondarySeries.length > 0;
+  const margin = { top: 24, right: hasSecondary ? 64 : 22, bottom: 50, left: 58 };
   const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
   if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
   if (includeZero) values.push(0);
@@ -952,7 +1483,7 @@ function lineChart({
   if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
   if (min === max) { min -= 1; max += 1; }
   const pad = (max - min) * .1;
-  min -= pad;
+  min = includeZero && min >= 0 ? 0 : min - pad;
   max += pad;
   const timestamps = points.map((point) => Date.parse(point.timestamp ?? point.date));
   const timed = timestamps.every(Number.isFinite);
@@ -975,6 +1506,9 @@ function lineChart({
     return margin.left + coordinate * (width - margin.left - margin.right);
   };
   const y = (value) => margin.top + (max - value) / (max - min) * (height - margin.top - margin.bottom);
+  const ySecondary = (value) => margin.top
+    + (100 - Math.max(0, Math.min(100, value))) / 100
+      * (height - margin.top - margin.bottom);
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -990,6 +1524,15 @@ function lineChart({
     const yPosition = y(value);
     svg.append(svgLine(margin.left, yPosition, width - margin.right, yPosition, "chart-grid"));
     svg.append(svgText(margin.left - 8, yPosition + 3, value.toFixed(Math.abs(max - min) < 10 ? 1 : 0), "chart-axis-label", "end"));
+    if (hasSecondary) {
+      svg.append(svgText(
+        width - margin.right + 8,
+        ySecondary(100 - index * 25) + 3,
+        `${100 - index * 25}%`,
+        "chart-axis-label",
+        "start"
+      ));
+    }
   }
 
   if (includeZero && min <= 0 && max >= 0) {
@@ -1004,30 +1547,58 @@ function lineChart({
       svg.append(svgText(
         margin.left + (width - margin.left - margin.right) * index / 3,
         height - 22,
-        formatUtc(timestamp, { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 }),
+        formatLocal(timestamp, { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 }),
         "chart-axis-label",
         index === 0 ? "start" : index === 3 ? "end" : "middle",
       ));
     }
-    svg.append(svgText(width / 2, height - 6, "UTC", "chart-axis-label", "middle"));
+    svg.append(svgText(width / 2, height - 6, USER_TIME_ZONE, "chart-axis-label", "middle"));
   } else {
     const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
     for (const index of labelIndexes) {
       const timestamp = points[index]?.timestamp ?? points[index]?.date;
-      svg.append(svgText(x(index), height - 22, formatUtc(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
+      svg.append(svgText(x(index), height - 22, formatLocal(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
     }
   }
   const yAxisLabel = svgText(15, height / 2, yLabel, "chart-axis-label", "middle");
   yAxisLabel.setAttribute("transform", `rotate(-90 15 ${height / 2})`);
   svg.append(yAxisLabel);
+  if (hasSecondary && secondaryYLabel) {
+    const secondaryLabel = svgText(
+      width - 8,
+      height / 2,
+      secondaryYLabel,
+      "chart-axis-label",
+      "middle"
+    );
+    secondaryLabel.setAttribute(
+      "transform",
+      `rotate(90 ${width - 8} ${height / 2})`
+    );
+    svg.append(secondaryLabel);
+  }
 
   if (confidence) {
-    const upper = points.map((point, index) => [x(index, point), y(finite(point[confidence.high], 0))]);
-    const lower = points.map((point, index) => [x(index, point), y(finite(point[confidence.low], 0))]).reverse();
-    const polygon = document.createElementNS(svg.namespaceURI, "polygon");
-    polygon.setAttribute("points", [...upper, ...lower].map(([a, b]) => `${a},${b}`).join(" "));
-    polygon.setAttribute("class", "chart-area-confidence");
-    svg.append(polygon);
+    const confidencePoints = points
+      .map((point, index) => ({
+        point,
+        index,
+        low: finite(point[confidence.low]),
+        high: finite(point[confidence.high]),
+      }))
+      .filter((point) => point.low !== null && point.high !== null);
+    if (confidencePoints.length >= 2) {
+      const upper = confidencePoints.map(
+        ({ point, index, high }) => [x(index, point), y(high)],
+      );
+      const lower = confidencePoints.map(
+        ({ point, index, low }) => [x(index, point), y(low)],
+      ).reverse();
+      const polygon = document.createElementNS(svg.namespaceURI, "polygon");
+      polygon.setAttribute("points", [...upper, ...lower].map(([a, b]) => `${a},${b}`).join(" "));
+      polygon.setAttribute("class", "chart-area-confidence");
+      svg.append(polygon);
+    }
   }
 
   for (const interval of statusIntervals) {
@@ -1060,9 +1631,48 @@ function lineChart({
       } else segment.push([x(index, point), y(value)]);
     });
     if (segment.length) segments.push(segment);
-    for (const pathPoints of segments) {
+    if (item.connect !== false) for (const pathPoints of segments) {
       const path = document.createElementNS(svg.namespaceURI, "polyline");
       path.setAttribute("points", pathPoints.map(([a, b]) => `${a},${b}`).join(" "));
+      path.setAttribute("class", item.className);
+      svg.append(path);
+    }
+    if (item.markers === true) {
+      points.forEach((point, index) => {
+        const value = finite(point[item.key]);
+        if (value === null) return;
+        const marker = document.createElementNS(svg.namespaceURI, "circle");
+        marker.setAttribute("cx", String(x(index, point)));
+        marker.setAttribute("cy", String(y(value)));
+        marker.setAttribute("r", String(item.markerRadius ?? 4));
+        marker.setAttribute("class", `${item.className} chart-point`);
+        const markerTitle = document.createElementNS(svg.namespaceURI, "title");
+        const timestamp = point.timestamp ?? point.date;
+        markerTitle.textContent = `${item.label}: ${formatMoney(value)}${timestamp ? ` · ${formatLocal(timestamp)}` : ""}`;
+        marker.append(markerTitle);
+        svg.append(marker);
+      });
+    }
+  }
+  for (const item of secondarySeries) {
+    const segments = [];
+    let segment = [];
+    points.forEach((point, index) => {
+      const value = finite(point[item.key]);
+      if (value === null) {
+        if (segment.length) segments.push(segment);
+        segment = [];
+      } else {
+        segment.push([x(index, point), ySecondary(value)]);
+      }
+    });
+    if (segment.length) segments.push(segment);
+    for (const pathPoints of segments) {
+      const path = document.createElementNS(svg.namespaceURI, "polyline");
+      path.setAttribute(
+        "points",
+        pathPoints.map(([a, b]) => `${a},${b}`).join(" ")
+      );
       path.setAttribute("class", item.className);
       svg.append(path);
     }
@@ -1103,37 +1713,89 @@ function renderWeekly(data) {
     : `80% across-reset range: ${formatMoney(lower)}–${formatMoney(upper)}`;
   $("#evidence-meter").style.width = `${strength}%`;
   $("#evidence-label").textContent = qualifying < 3 ? "Insufficient" : qualifying < 8 ? "Developing" : qualifying < 14 ? "Moderate" : "Substantial";
-  $("#weekly-explanation").textContent = qualifying
-    ? `Based on ${qualifying} qualifying reset series. This is an API-price-equivalent calibration, not a published dollar cap.`
+  const attributionLabel = data.weekly.accountAttribution?.label;
+  const evidenceExplanation = qualifying
+    ? `Historical median across ${qualifying} qualifying reset-series fits. The headline chart starts with fits observed across at least 80 percentage points; partial extrapolations remain available as diagnostics. This is an API-price-equivalent calibration, not a published dollar cap.`
     : "The estimate will appear when enough quota transitions can be matched to priced usage.";
+  $("#weekly-explanation").textContent = attributionLabel
+    ? `${evidenceExplanation} ${attributionLabel}.`
+    : evidenceExplanation;
 
-  const values = data.weekly.weeklyValues.map((row, index) => ({
+  const values = data.weekly.weeklyValues.map((row, index) => {
+    const value = finite(row.value_usd ?? row.value);
+    const observedSpanPp = finite(row.displayed_span_pp);
+    return {
     ...row,
-    timestamp: row.reset_due_at ?? row.resetAt ?? row.first_observed_at,
-    value: finite(row.value_usd ?? row.value),
+    timestamp: row.last_observed_at ?? row.first_observed_at,
+    resetDueAt: row.reset_due_at ?? row.resetAt ?? null,
+    value,
     low: finite(row.pairwise_p10_usd ?? row.lower),
     high: finite(row.pairwise_p90_usd ?? row.upper),
+    observedSpanPp,
+    historicalMedian: estimate,
+    acrossResetLow: lower,
+    acrossResetHigh: upper,
+    matureValue: observedSpanPp !== null && observedSpanPp >= 80 ? value : null,
+    provisionalValue: observedSpanPp === null || observedSpanPp < 80 ? value : null,
     index
-  })).filter((row) => row.timestamp && row.value !== null);
+    };
+  }).filter((row) => row.timestamp && row.value !== null)
+    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+  const latestObservedMs = values.reduce(
+    (latest, row) => Math.max(latest, Date.parse(row.timestamp)),
+    Number.NEGATIVE_INFINITY,
+  );
+  const cutoffMs = Number.isFinite(latestObservedMs)
+    ? latestObservedMs - activeWeeklyRangeDays * 24 * 60 * 60 * 1_000
+    : Number.NEGATIVE_INFINITY;
+  const rangedValues = values.filter((row) => Date.parse(row.timestamp) >= cutoffMs);
+  const chartValues = showWeeklyPartialDiagnostics
+    ? rangedValues
+    : rangedValues.filter((row) => row.matureValue !== null);
   const empty = $("#weekly-empty");
   const shell = $("#weekly-chart");
-  if (!values.length) {
+  if (!chartValues.length) {
     empty.hidden = false;
     shell.hidden = true;
+    empty.textContent = showWeeklyPartialDiagnostics
+      ? "No weekly estimates loaded."
+      : "No ≥80 percentage-point reset fits fall inside this date range.";
   } else {
     empty.hidden = true;
     shell.hidden = false;
     shell.replaceChildren(lineChart({
-      points: values,
-      series: [{ key: "value", className: "chart-line-value", label: "Weekly estimate" }],
-      confidence: { low: "low", high: "high" },
+      points: chartValues,
+      series: [
+        {
+          key: "historicalMedian",
+          className: "chart-line-weekly-center",
+          label: "Historical median",
+        },
+        {
+          key: "matureValue",
+          className: "chart-point-weekly-mature",
+          label: "Fit observed across at least 80 percentage points",
+          connect: false,
+          markers: true,
+          markerRadius: 5,
+        },
+        {
+          key: "provisionalValue",
+          className: "chart-point-weekly-partial",
+          label: "Partial diagnostic extrapolated to 100 percentage points",
+          connect: false,
+          markers: true,
+          markerRadius: 5,
+        },
+      ],
+      confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
       yLabel: "API-equivalent USD",
-      title: "Weekly allowance estimate history",
-      description: "Central weekly estimate with the 10th to 90th percentile across-reset range."
+      title: "Seven-day allowance estimate history",
+      description: `Historical median and independent reset-series fits plotted on the date each estimate became available in ${USER_TIME_ZONE}.`
     }));
   }
-  renderWeeklyStats(summary, values);
-  renderWeeklyTrend(data.gradient.summary ?? {}, values);
+  renderWeeklyStats(summary, chartValues);
+  renderWeeklyTrend(chartValues);
   renderWeeklyTable(values);
 }
 
@@ -1146,18 +1808,18 @@ function medianValue(values) {
     : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-function renderWeeklyTrend(gradientSummary, values) {
+function renderWeeklyTrend(values) {
   const container = $("#weekly-trend");
-  const earlyFromArtifact = finite(gradientSummary.early_three_median_usd);
-  const recentFromArtifact = finite(gradientSummary.recent_three_median_usd);
-  const artifactChange = finite(gradientSummary.early_to_recent_change);
   const enoughRows = values.length >= 6;
-  const early = earlyFromArtifact
-    ?? (enoughRows ? medianValue(values.slice(0, 3).map((row) => row.value)) : null);
-  const recent = recentFromArtifact
-    ?? (enoughRows ? medianValue(values.slice(-3).map((row) => row.value)) : null);
-  const change = artifactChange
-    ?? (early !== null && early > 0 && recent !== null ? recent / early - 1 : null);
+  const early = enoughRows
+    ? medianValue(values.slice(0, 3).map((row) => row.value))
+    : null;
+  const recent = enoughRows
+    ? medianValue(values.slice(-3).map((row) => row.value))
+    : null;
+  const change = early !== null && early > 0 && recent !== null
+    ? recent / early - 1
+    : null;
   const heading = node("strong", "", "Has the inferred limit changed?");
   let conclusion;
   if (change === null || early === null || recent === null) {
@@ -1175,7 +1837,7 @@ function renderWeeklyTrend(gradientSummary, values) {
 
 function renderWeeklyStats(summary, values) {
   const stats = [
-    ["Qualifying resets", finite(summary.qualifying_resets, values.length)],
+    ["Fits shown", values.length],
     ["Held-out MAE", formatPp(summary.selected_holdout_mae_pp)],
     ["Prior-reset MAE", formatPp(summary.prior_reset_mae_pp)],
     ["80th pct error", formatPp(summary.prior_reset_p80_absolute_error_pp)]
@@ -1202,17 +1864,25 @@ function renderWeeklyTable(values) {
   }
   for (const row of values.slice(-14).reverse()) {
     const transitions = finite(row.eligible_transitions, 0);
-    const span = finite(row.displayed_span_pp);
+    const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
     const observedCost = span === null ? null : row.value * span / 100;
     const speedCoverage = finite(row.known_speed_fraction);
-    const evidence = transitions < 25 ? "Low" : transitions < 75 ? "Moderate" : "Higher";
+    const evidence = span !== null && span < 80
+      ? "Partial diagnostic"
+      : transitions < 25 ? "Low" : transitions < 75 ? "Moderate" : "Higher";
     const prior = finite(row.prior_prediction_mae_pp);
-    const caveat = prior === null
-      ? "First estimate; no prior forecast"
-      : prior < 3 ? "Prior forecast tracked closely" : prior < 7 ? "Meaningful model error" : "High-error period";
+    const caveat = span !== null && span < 80
+      ? `Observed ${formatPp(span)}; extrapolated to 100 pp`
+      : prior === null
+        ? "First estimate; no prior forecast"
+        : prior < 3 ? "Prior forecast tracked closely" : prior < 7 ? "Meaningful model error" : "High-error period";
+    const evidenceDate = formatLocal(row.timestamp, { dateOnly: true });
+    const resetDate = row.resetDueAt
+      ? formatLocal(row.resetDueAt, { dateOnly: true })
+      : "unknown";
     const tr = node("tr");
     tr.append(
-      node("td", "", formatUtc(row.timestamp, { dateOnly: true })),
+      node("td", "", `${evidenceDate} / ${resetDate}`),
       node("td", "", formatApiMoney(observedCost)),
       node("td", "", formatPp(span)),
       node("td", "", formatMoney(row.value)),
@@ -1226,12 +1896,24 @@ function renderWeeklyTable(values) {
 }
 
 function accountingPeriod(data) {
-  return data.accounting.periods.find((period) => period.periodId === activeAccountingPeriod)
-    ?? data.accounting;
+  const selected = data.accounting.periods.find(
+    (period) => period.periodId === activeAccountingPeriod
+  );
+  return selected
+    ? {
+      ...data.accounting,
+      ...selected,
+      replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
+      accountingSource: data.accounting.accountingSource
+    }
+    : data.accounting;
 }
 
 function renderAccountingDimension(containerSelector, dimension, {
-  emptyMessage = "No observations in this period."
+  emptyMessage = "No observations in this period.",
+  unknownLabel = "Not recorded",
+  eventNoun = "usage increments",
+  labels = {}
 } = {}) {
   const container = $(containerSelector);
   clear(container);
@@ -1242,17 +1924,39 @@ function renderAccountingDimension(containerSelector, dimension, {
     container.append(node("p", "empty-inline", emptyMessage));
     return;
   }
-  const total = rows.reduce((sum, [, row]) => sum + row.events, 0);
+  const totalCost = rows.reduce(
+    (sum, [, row]) => sum + finite(row.apiPriceEquivalentUsd, 0),
+    0
+  );
+  const totalEvents = rows.reduce((sum, [, row]) => sum + row.events, 0);
+  const useCost = totalCost > 0;
   for (const [key, row] of rows) {
     const item = node("div", "dimension-row");
     const copy = node("div");
     copy.append(
-      node("strong", "", humanize(key)),
-      node("span", "", `${compact(row.events)} events · ${compact(row.totalTokens)} tokens`)
+      node(
+        "strong",
+        "",
+        key === "unknown" ? unknownLabel : labels[key] ?? humanize(key)
+      ),
+      node(
+        "span",
+        "",
+        useCost
+          ? `${formatApiMoney(row.apiPriceEquivalentUsd)} · ${compact(row.events)} ${eventNoun}`
+          : `${compact(row.events)} ${eventNoun}`
+      )
     );
     item.append(
       copy,
-      node("span", "dimension-share", formatPercent(row.events / Math.max(1, total) * 100, 1))
+      node(
+        "span",
+        "dimension-share",
+        formatPercent(
+          (useCost ? row.apiPriceEquivalentUsd / totalCost : row.events / Math.max(1, totalEvents)) * 100,
+          1
+        )
+      )
     );
     container.append(item);
   }
@@ -1262,14 +1966,17 @@ function renderAccounting(data) {
   const accounting = accountingPeriod(data);
   const summary = $("#accounting-summary");
   clear(summary);
-  const pricedEvents = Object.values(accounting.byModel ?? {})
-    .reduce((sum, row) => sum + finite(row.events, 0), 0);
-  const attributed = finite(accounting.accountAttribution?.attributedPseudonymousEvents, 0);
+  const pricedEvents = finite(accounting.pricingCoverage?.fullyPricedEvents, 0)
+    + finite(accounting.pricingCoverage?.partiallyPricedEvents, 0);
+  const replayExcluded = finite(
+    accounting.replayExclusionDiagnostics?.forkReplayEventsExcluded,
+    0
+  );
   for (const [label, value, note] of [
-    ["API-price equivalent", formatApiMoney(accounting.apiPriceEquivalentUsd), accounting.periodLabel],
-    ["Usage events", compact(accounting.events ?? pricedEvents), "Content-free rollout snapshots"],
-    ["Recorded tokens", compact(accounting.totalTokens), "All available token components"],
-    ["Account attribution", formatPercent(attributed / Math.max(1, accounting.events) * 100, attributed > 0 ? 2 : 1), "Pseudonymous and local only"]
+    ["Usage increments", compact(accounting.events), "Non-overlapping cumulative deltas"],
+    ["Non-overlapping tokens", compact(accounting.totalTokens), accounting.periodLabel],
+    ["Inherited replay excluded", compact(replayExcluded), "Removed across the cached scan window"],
+    ["Model price coverage", formatPercent(pricedEvents / Math.max(1, accounting.events) * 100, 1), "Share of increments with a mapped price"]
   ]) {
     const card = node("article", "metric-card compact-metric");
     card.append(
@@ -1283,11 +1990,12 @@ function renderAccounting(data) {
   const components = $("#accounting-components");
   clear(components);
   const componentRows = Object.entries(accounting.components ?? {})
+    .filter(([, value]) => value > 0)
     .sort((left, right) => right[1] - left[1]);
   const maximum = Math.max(1, ...componentRows.map(([, value]) => value));
   for (const [key, value] of componentRows) {
     const row = node("div", "component-row");
-    row.append(node("span", "", humanize(key)));
+    row.append(node("span", "", componentLabel(key)));
     const track = node("div", "component-track");
     const fill = node("i");
     fill.style.width = `${Math.max(value > 0 ? 1 : 0, value / maximum * 100)}%`;
@@ -1307,24 +2015,46 @@ function renderAccounting(data) {
     row.append(cell);
     models.append(row);
   } else {
-    for (const model of modelRows) {
+    const visibleModelRows = modelRows.some((model) => model.model === "unknown")
+      ? modelRows
+      : [...modelRows, {
+        model: "unknown",
+        events: 0,
+        totalTokens: 0,
+        apiPriceEquivalentUsd: 0
+      }];
+    for (const model of visibleModelRows) {
       const row = node("tr");
       row.append(
-        node("td", "", model.model === "unknown" ? "Unknown / unrecognized" : model.model),
+        node("td", "", model.model === "unknown" ? "Unrecognized / unpriced overflow" : model.model),
         node("td", "", compact(model.events)),
         node("td", "", compact(model.totalTokens)),
-        node("td", "", formatApiMoney(model.apiPriceEquivalentUsd))
+        node(
+          "td",
+          "",
+          model.model === "unknown"
+            ? "—"
+            : formatApiMoney(model.apiPriceEquivalentUsd)
+        )
       );
       models.append(row);
     }
   }
 
-  renderAccountingDimension("#accounting-speed", accounting.bySpeed);
-  renderAccountingDimension("#accounting-tier", accounting.byApiServiceTier);
-  renderAccountingDimension("#accounting-surface", accounting.bySurface);
-  renderAccountingDimension("#accounting-lineage", accounting.byLineage);
-  renderAccountingDimension("#accounting-effort", accounting.byReasoningEffort, {
-    emptyMessage: "Reasoning effort is unavailable in the retained collector schema."
+  renderAccountingDimension("#accounting-speed", accounting.bySpeed, {
+    unknownLabel: "Not recorded"
+  });
+  renderAccountingDimension("#accounting-surface", accounting.bySurface, {
+    unknownLabel: "Unclassified",
+    labels: {
+      extension_or_ide: "Codex desktop / IDE",
+      scheduled_task: "Scheduled task",
+      cli_exec: "Codex CLI",
+      subagent: "Subagent"
+    }
+  });
+  renderAccountingDimension("#accounting-lineage", accounting.byLineage, {
+    unknownLabel: "Lineage unavailable"
   });
   const toolDimension = Object.fromEntries(
     Object.entries(data.accounting.toolClasses?.counts ?? {}).map(([key, events]) => [
@@ -1333,21 +2063,31 @@ function renderAccounting(data) {
     ])
   );
   renderAccountingDimension("#accounting-tools", toolDimension, {
-    emptyMessage: "No coarse tool-class events are retained."
+    emptyMessage: "No coarse tool-class calls are retained.",
+    eventNoun: "calls"
   });
+  $("#accounting-tier").replaceChildren(node(
+    "p",
+    "empty-inline",
+    "Subscription logs do not expose an API billing tier. Standard API pricing is an explicit counterfactual, not an observation."
+  ));
+  $("#accounting-effort").replaceChildren(node(
+    "p",
+    "empty-inline",
+    "Reasoning-token counts are available, but the selected low/medium/high reasoning-effort setting is not retained in these usage snapshots."
+  ));
 }
 
 function renderQuality(data) {
   const coverage = data.quality.coverage;
   const summary = data.quality.summary ?? {};
-  const overall = finite(data.coverage?.overallPercent ?? data.coverage?.percent, null);
-  $("#coverage-total").textContent = overall === null ? `${coverage.length} signals` : formatPercent(overall, 1);
   const list = $("#coverage-list");
   clear(list);
   const rows = coverage.length ? coverage : [
     { dimension: "Fit-eligible transitions", coverage_fraction: summary.fit_eligible_fraction },
     { dimension: "Known speed tier", coverage_fraction: summary.known_speed_fraction }
   ].filter((row) => finite(row.coverage_fraction) !== null);
+  $("#coverage-total").textContent = `${rows.length} signals`;
   if (!rows.length) {
     list.append(node("p", "empty-inline", "No coverage dimensions were returned."));
   } else {
@@ -1411,18 +2151,22 @@ function renderReports(data) {
 function renderCollector(data) {
   const collector = data.collector ?? {};
   const state = $("#collector-state");
-  state.textContent = data.state === "live" ? "Current" : humanize(data.state);
+  state.textContent = data.state === "live"
+    ? "Current"
+    : data.state === "offline" && data.mode !== "demo"
+      ? "Ready to analyze"
+      : humanize(data.state);
   state.className = `evidence-chip ${data.state === "live" ? "" : "neutral"}`;
   const rows = [
-    ["Last scan", formatUtc(collector.lastScanAt ?? data.activity?.lastScanAt ?? data.freshness.latestObservedAt)],
+    ["Last analysis", formatLocal(collector.lastScanAt ?? data.activity?.lastScanAt ?? data.freshness.latestObservedAt)],
     ["Safe records", compact(collector.safeRecordCount ?? data.activity?.safeRecordCount ?? data.activity?.recordCount)],
-    ["Covered from", collector.coveredAt?.startAt ? formatUtc(collector.coveredAt.startAt) : "Unavailable"],
-    ["Covered through", collector.coveredAt?.endAt ? formatUtc(collector.coveredAt.endAt) : "Unavailable"],
+    ["Covered from", collector.coveredAt?.startAt ? formatLocal(collector.coveredAt.startAt) : "Unavailable"],
+    ["Covered through", collector.coveredAt?.endAt ? formatLocal(collector.coveredAt.endAt) : "Unavailable"],
     ["Contribution through", collector.exportableCoveredAt?.endAt
-      ? formatUtc(collector.exportableCoveredAt.endAt)
+      ? formatLocal(collector.exportableCoveredAt.endAt)
       : "No rollout usage available"],
     ["Usage / quota rows", `${compact(collector.recordCounts?.usage)} / ${compact(collector.recordCounts?.quota)}`],
-    ["Index state", humanize(collector.indexingState || "Unavailable")],
+    ["Analysis state", humanize(collector.indexingState || "Unavailable")],
     ["Source bytes", "Not exposed to browser"],
     ["Identity", collector.identityMode ?? "Pseudonymous"]
   ];
@@ -1449,6 +2193,7 @@ function renderIndexProgress(progress, { status = "" } = {}) {
     "starting",
     "discovering",
     "rollout_index",
+    "quick_result",
     "quota_refresh",
     "reloading",
     "complete",
@@ -1461,6 +2206,9 @@ function renderIndexProgress(progress, { status = "" } = {}) {
     && progress.filesSelected >= 0 ? progress.filesSelected : null;
   const filesProcessed = Number.isSafeInteger(progress.filesProcessed)
     && progress.filesProcessed >= 0 ? progress.filesProcessed : 0;
+  const filesComplete = filesSelected !== null
+    && filesSelected > 0
+    && filesProcessed >= filesSelected;
   const recordsWritten = Number.isSafeInteger(progress.recordsWritten)
     && progress.recordsWritten >= 0 ? progress.recordsWritten : 0;
   const startAt = Number.isFinite(Date.parse(progress.coveredAt?.startAt))
@@ -1476,29 +2224,159 @@ function renderIndexProgress(progress, { status = "" } = {}) {
     bar.removeAttribute("value");
   }
   $("#index-progress-title").textContent =
-    status === "recent_7d_complete"
+    status === "cancelled"
+      ? "Local analysis cancelled"
+      : status === "cancelling"
+        ? "Stopping at a safe checkpoint"
+      : phase === "quick_result"
+        ? "Headline results are ready"
+      : status === "recent_7d_complete"
       ? "Recent local history indexed"
       : status === "recent_7d_partial"
         ? "Useful recent history indexed"
       : status === "prospective_only"
         ? "Collecting new activity prospectively"
         : status === "bounded_pause"
-          ? "Recent history indexing paused"
-          : "Indexing recent local history";
+          ? "Recent history analysis paused"
+          : filesComplete && status === "running"
+            ? "Calculating usage and allowance"
+          : "Analyzing recent local history";
   $("#index-progress-phase").textContent = humanize(
-    status === "recent_7d_complete" ? "complete" : phase
+    status === "cancelled"
+      ? "cancelled"
+      : status === "cancelling"
+        ? "cancelling"
+      : phase === "quick_result"
+        ? "deeper accounting"
+      : status === "recent_7d_complete"
+      ? "complete"
+      : filesComplete && status === "running"
+        ? "finalizing"
+        : phase
   );
-  $("#index-progress-summary").textContent = status === "prospective_only"
+  $("#index-progress-summary").textContent = status === "cancelled"
+    ? "The analysis stopped without replacing verified existing results. Run it again whenever convenient."
+    : status === "cancelling"
+      ? "Usage Monitor is finishing its current atomic step and preserving a resumable checkpoint."
+    : phase === "quick_result"
+      ? "Your headline local result is available. Deeper replay-safe cost accounting and weekly calibration are still finishing."
+    : status === "prospective_only"
     ? `${compact(recordsWritten)} safe records retained since local collection began. Older activity was not retroactively indexed for this existing checkpoint.`
     : status === "recent_7d_partial"
-      ? `${compact(recordsWritten)} safe records retained from a bounded recent tail. The scan completed safely, but cannot prove it reached the entire requested seven-day window.`
+      ? `${compact(recordsWritten)} safe records retained from a bounded recent tail. The analysis completed safely, but cannot prove it reached the entire requested seven-day window.`
       : filesSelected === null
         ? `${compact(recordsWritten)} safe records retained; discovering bounded recent rollouts.`
-        : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
+        : filesComplete && status === "running"
+          ? `${compact(filesProcessed)} bounded rollout files are indexed. Replaying safe token increments, quota transitions, and the seven-day calibration now.`
+          : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
   $("#index-progress-coverage").textContent = startAt && endAt
-    ? `Content-free evidence currently covers ${formatUtc(startAt)} through ${formatUtc(endAt)}. Raw content and source paths never enter this page.`
+    ? `Content-free evidence currently covers ${formatLocal(startAt)} through ${formatLocal(endAt)}. Raw content and source paths never enter this page.`
     : "Raw log contents and source paths never enter this page.";
   container.hidden = false;
+}
+
+function renderAutomaticContributionStatus(status) {
+  const value = status ?? {
+    state: "unavailable",
+    enabled: false,
+    consentCurrent: false,
+    firstReviewComplete: false,
+    firstReviewedAcceptedAt: "",
+    requiredConsent: null,
+    lastAttemptAt: "",
+    lastSuccessAt: "",
+    nextAttemptAt: "",
+    lastOutcome: null
+  };
+  automaticContributionStatus = value;
+  const awaitingReviewedSend = Boolean(
+    pendingAutomaticContributionConsent && !value.enabled
+  );
+  const labels = {
+    unavailable: "Unavailable",
+    not_configured: "Not configured",
+    disabled: "Off",
+    first_review_required: "First review needed",
+    consent_required: "Consent needed",
+    scheduled: "On",
+    running: "Running now",
+    paused: "Paused",
+    failed: "Needs attention"
+  };
+  const chip = $("#automatic-contribution-state");
+  chip.textContent = awaitingReviewedSend
+    ? "Review first send"
+    : labels[value.state] ?? "Unavailable";
+  chip.className = ["scheduled", "running"].includes(value.state)
+    ? "evidence-chip"
+    : value.state === "failed"
+      ? "evidence-chip error"
+      : "evidence-chip neutral";
+
+  const next = value.nextAttemptAt
+    ? ` Next check ${formatLocal(value.nextAttemptAt)}.`
+    : "";
+  const last = value.lastSuccessAt
+    ? ` Last contribution ${formatLocal(value.lastSuccessAt)}.`
+    : "";
+  const outcome = value.lastOutcome?.status === "failed"
+    ? ` The last attempt needs attention (${value.lastOutcome.code.replaceAll("_", " ")}).`
+    : "";
+  const pausedDescriptions = {
+    queue_paused:
+      `Automatic contribution is stopped because the local queue is paused. No automatic retry is scheduled; inspect and resume the queue before continuing.${last}`,
+    run_timeout:
+      `Automatic contribution stopped after its five-minute abort deadline. No retry is scheduled; turn it off, inspect local status, and explicitly enable it again.${last}`,
+    identity_unavailable:
+      `Automatic contribution stopped because its local pseudonymous identity is unavailable. Nothing more is scheduled until the local identity is repaired and you explicitly enable it again.${last}`,
+    privacy_verification_failed:
+      `Automatic contribution stopped because the privacy verification failed. Nothing was inferred or retried; inspect the local result before explicitly enabling it again.${last}`,
+    delivery_rejected:
+      `Automatic contribution stopped because the service rejected part of the exact prepared set. No retry is scheduled; inspect the contribution status before explicitly enabling it again.${last}`,
+    preparation_failed:
+      `Automatic contribution stopped because local preparation or maintenance failed. No retry is scheduled; inspect local status before explicitly enabling it again.${last}`,
+    upload_failed:
+      `Automatic contribution stopped because delivery failed without a safe retry signal. No retry is scheduled; inspect local status before explicitly enabling it again.${last}`
+  };
+  const pausedDescription = pausedDescriptions[value.lastOutcome?.code]
+    ?? `Automatic contribution is stopped and no retry is scheduled. Inspect the bounded last outcome before explicitly enabling it again.${last}${outcome}`;
+  const descriptions = {
+    unavailable:
+      "Automatic contribution is unavailable in this app build. You can still prepare and send a reviewed contribution.",
+    not_configured:
+      "The contribution service is not configured in this app build. Nothing will be sent.",
+    disabled:
+      "Off until you explicitly consent. No daemon or login item is installed; checks run only while Usage Monitor is open.",
+    first_review_required:
+      "Automatic contribution is off. Consent, inspect, and send one exact reviewed contribution before a recurring schedule can be enabled.",
+    consent_required:
+      "The metadata contract or destination changed. Review the current disclosure and consent again before anything is scheduled.",
+    scheduled:
+      `On. Usage Monitor checks for new content-free pseudonymous metadata every 6 hours while the app is open.${last}${next}${outcome}`,
+    running:
+      `A bounded foreground contribution check is running now.${last}${next}`,
+    paused: pausedDescription,
+    failed:
+      `Automatic contribution has stopped because its local settings are unavailable. No retry is scheduled; repair the local app state, then review the current consent before turning it on again.${last}${outcome}`
+  };
+  $("#automatic-contribution-description").textContent = awaitingReviewedSend
+    ? "Consent is held only in this open tab. Automatic contribution remains off until your exact reviewed first send is accepted."
+    : descriptions[value.state] ?? descriptions.unavailable;
+
+  const toggle = $("#automatic-contribution-toggle");
+  toggle.hidden = !value.enabled;
+  toggle.disabled = automaticContributionBusy;
+  toggle.textContent = automaticContributionBusy
+    ? "Turning off…"
+    : "Turn off automatic contribution";
+  $("#contribution-not-now").hidden = value.enabled;
+  updateCommunityConnectButton();
+}
+
+async function refreshAutomaticContributionStatus() {
+  const status = await localClient.automaticContributionStatus();
+  renderAutomaticContributionStatus(status);
+  return status;
 }
 
 function renderContributionSyncStatus(status) {
@@ -1534,10 +2412,10 @@ function renderContributionSyncStatus(status) {
   $("#sync-accepted").textContent = compact(counts.accepted);
   $("#sync-attention").textContent = compact(counts.retryable + counts.rejected);
   $("#sync-next-attempt").textContent = value.nextAttemptAt
-    ? formatUtc(value.nextAttemptAt)
+    ? formatLocal(value.nextAttemptAt)
     : "None scheduled";
   $("#sync-last-accepted").textContent = value.lastAcceptedAt
-    ? formatUtc(value.lastAcceptedAt)
+    ? formatLocal(value.lastAcceptedAt)
     : "No accepted batch yet";
   const descriptions = {
     unavailable: "No verified local queue state is available. Nothing about a file, path, identity, origin, or credential is inferred.",
@@ -1588,7 +2466,7 @@ function renderContributionSyncPreview(preview) {
   }
   const item = value.item;
   $("#sync-next-coverage").textContent =
-    `${formatUtc(item.coveredAt.startAt)} – ${formatUtc(item.coveredAt.endAt)}`;
+    `${formatLocal(item.coveredAt.startAt)} – ${formatLocal(item.coveredAt.endAt)}`;
   $("#sync-next-records").textContent =
     `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`;
   $("#sync-next-cost").textContent =
@@ -1623,6 +2501,24 @@ function showContributionSyncAction(message, error = false) {
   status.hidden = false;
   status.textContent = message;
   status.classList.toggle("error", error);
+}
+
+function contributionSyncPassResult(result) {
+  const needsAttention = result.status === "completed"
+    && result.accepted === 0
+    && result.retryable + result.rejected > 0;
+  const counts =
+    `${compact(result.accepted)} accepted, ${compact(result.retryable)} waiting to retry, ${compact(result.rejected)} rejected`;
+  const bandwidth =
+    `${compact(result.reservedUploadBytes)} upload bytes reserved${result.bandwidthLimited ? "; stopped at byte cap" : ""}`;
+  const guidance = needsAttention
+    ? " Nothing was accepted. Check device pairing before trying again; this Mac may need to be paired as an upload-only device. These bounded counters do not identify the exact server-side reason."
+    : "";
+  return {
+    message:
+      `Pass ${result.status}: ${compact(result.processed)} processed; ${counts}; ${bandwidth}.${guidance}`,
+    needsAttention
+  };
 }
 
 function clearContributionSyncExactReview() {
@@ -1664,14 +2560,19 @@ async function refreshContributionSyncControls() {
   // Preview discovery commits newly prepared sets to the queue. Read queue
   // status afterwards so the two cards describe the same durable state.
   const preview = await localClient.contributionSyncPreview();
-  const status = await localClient.contributionSyncStatus();
+  const [status, automatic] = await Promise.all([
+    localClient.contributionSyncStatus(),
+    localClient.automaticContributionStatus()
+  ]);
   renderContributionSyncStatus(status);
   renderContributionSyncPreview(preview);
+  renderAutomaticContributionStatus(automatic);
 }
 
 async function runContributionSyncAction(action) {
   if (contributionSyncBusy) return;
   contributionSyncBusy = true;
+  let acceptedContribution = false;
   updateContributionSyncButtons();
   showContributionSyncAction(
     action === "run"
@@ -1683,13 +2584,38 @@ async function runContributionSyncAction(action) {
       if (contributionSyncExactReview?.state !== "ready") {
         throw new Error("exact review required");
       }
-      const result = await localClient.runContributionSyncOnce(
-        contributionSyncExactReview.reviewToken
-      );
+      const gate = await runReviewedContributionGate({
+        reviewToken: contributionSyncExactReview.reviewToken,
+        hasPendingAutomaticConsent:
+          Boolean(pendingAutomaticContributionConsent),
+        runReviewedSend: (reviewToken) =>
+          localClient.runContributionSyncOnce(reviewToken),
+        enableAutomaticContribution:
+          enableAutomaticContributionAfterReviewedSend
+      });
+      const { result } = gate;
       if (result.status === "unavailable") throw new Error("sync unavailable");
-      showContributionSyncAction(
-        `Pass ${result.status}: ${compact(result.processed)} processed, ${compact(result.accepted)} accepted, ${compact(result.reservedUploadBytes)} upload bytes reserved${result.bandwidthLimited ? "; stopped at byte cap" : ""}.`
-      );
+      const outcome = contributionSyncPassResult(result);
+      acceptedContribution = gate.accepted;
+      showContributionSyncAction(outcome.message, outcome.needsAttention);
+      if (acceptedContribution && pendingAutomaticContributionConsent) {
+        if (gate.automaticError === null) {
+          showContributionSyncAction(
+            `${outcome.message} Automatic contribution is now on every 6 hours while Usage Monitor is open.`
+          );
+          renderAutomaticContributionStatus(gate.automatic);
+        } else {
+          const firstReviewNotConfirmed =
+            gate.automaticError?.code
+              === "automatic_contribution_first_review_required";
+          showContributionSyncAction(
+            firstReviewNotConfirmed
+              ? `${outcome.message} Automatic contribution remains off because the local companion did not confirm the exact reviewed-send gate. Consent is retained only in this tab; inspect and send again to retry.`
+              : `${outcome.message} The reviewed contribution was accepted, but automatic contribution could not be enabled. It remains off; consent is retained only in this tab so you can retry.`,
+            true
+          );
+        }
+      }
     } else {
       const status = await localClient.setContributionSyncPaused(action === "pause");
       if (status.state === "unavailable") throw new Error("control unavailable");
@@ -1698,6 +2624,7 @@ async function runContributionSyncAction(action) {
       );
     }
     await refreshContributionSyncControls();
+    if (acceptedContribution) await loadCommunityResults();
   } catch {
     showContributionSyncAction(
       "The local companion rejected or could not complete this action. Durable queue state was retained.",
@@ -1709,32 +2636,75 @@ async function runContributionSyncAction(action) {
   }
 }
 
-async function loadLocalDashboard() {
-  const button = $("#refresh-button");
-  button.disabled = true;
-  button.textContent = "Connecting…";
+async function inspectNextContribution() {
+  contributionSyncBusy = true;
+  $(".sync-status-panel").open = true;
+  updateContributionSyncButtons();
+  showContributionSyncAction(
+    "Inspecting content-free pseudonymous metadata through loopback; no service request or upload is performed."
+  );
   try {
-    const [data, syncStatus, syncPreview, localHealth] = await Promise.all([
+    await refreshContributionSyncControls();
+    const review = await localClient.contributionSyncExactReview();
+    renderContributionSyncExactReview(review);
+    $("#sync-exact-review").open = false;
+    showContributionSyncAction(
+      "Review the concise coverage and record totals above. Expand the exact JSON if wanted, then confirm the first send."
+    );
+  } catch {
+    showContributionSyncAction(
+      "The next contribution could not be inspected. Nothing was uploaded.",
+      true
+    );
+  } finally {
+    contributionSyncBusy = false;
+    updateContributionSyncButtons();
+  }
+}
+
+async function loadLocalDashboard() {
+  const previousBusy = localActionBusy;
+  localActionBusy = true;
+  const button = $("#refresh-button");
+  button.textContent = "Connecting…";
+  updateLocalActionButtons();
+  try {
+    const syncState = (async () => {
+      const [preview, status, automatic] = await Promise.all([
+        localClient.contributionSyncPreview(),
+        localClient.contributionSyncStatus(),
+        localClient.automaticContributionStatus()
+      ]);
+      return { preview, status, automatic };
+    })();
+    const [data, sync, localHealth, onboarding] = await Promise.all([
       localClient.load(),
-      localClient.contributionSyncStatus(),
-      localClient.contributionSyncPreview(),
-      localClient.health().catch(() => null)
+      syncState,
+      localClient.health().catch(() => null),
+      localClient.onboarding()
     ]);
+    localCompanionHealth = localHealth;
     renderDashboard(data);
     renderPreparationIdentity(localHealth);
-    renderContributionSyncStatus(syncStatus);
-    renderContributionSyncPreview(syncPreview);
+    renderContributionSyncStatus(sync.status);
+    renderContributionSyncPreview(sync.preview);
+    renderAutomaticContributionStatus(sync.automatic);
+    renderLocalOnboarding(onboarding);
   } catch {
-    const [localHealth, backendHealth] = await Promise.all([
+    const [localHealth, backendHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
-      communityClient.health().catch(() => null)
+      communityClient.health().catch(() => null),
+      localClient.onboarding().catch(() => null),
     ]);
+    localCompanionHealth = localHealth;
     const backendOnly = localHealth === null
       && backendHealth?.checks?.database === "ok";
     dashboard = null;
     renderContributionSyncStatus(null);
     renderContributionSyncPreview(null);
+    renderAutomaticContributionStatus(null);
     renderPreparationIdentity(null);
+    renderLocalOnboarding(onboarding);
     setGlobalState("offline");
     $("#latest-observation").textContent = backendOnly
       ? "Backend-only origin"
@@ -1747,17 +2717,18 @@ async function loadLocalDashboard() {
           ? "The companion could not load the local dashboard"
           : "The local companion is not available",
       copy: backendOnly
-        ? "Open the unified portal URL printed by the product laboratory. Local usage APIs are intentionally unavailable on the backend origin."
+        ? "This service accepts optional community requests but cannot read this Mac. Open Usage Monitor from Applications and use the separate local dashboard tab it opens."
         : localHealth
-          ? "The loopback server is running, but its local evidence contract could not be loaded. Existing evidence remains on this machine."
-          : "Start the product laboratory, then open its printed portal URL. You can explore a clearly labeled demonstration in the meantime.",
+          ? "The Mac app is running, but its local dashboard could not be loaded. Quit and reopen Usage Monitor, press Open Dashboard, then check again."
+          : "Open Usage Monitor from Applications, wait for Ready, then press Open Dashboard. If no installer is published below, this build is not yet available for a new installation.",
       kind: "error",
-      showDemo: true
+      showDemo: true,
+      showCheck: true,
     });
     renderDashboardSkeleton();
   } finally {
-    button.disabled = false;
-    button.textContent = "Refresh local data";
+    localActionBusy = previousBusy;
+    updateLocalActionButtons();
   }
 }
 
@@ -1785,10 +2756,36 @@ function renderDashboardSkeleton() {
   container.append(card);
 }
 
+async function loadQuickResultDashboard() {
+  const data = await localClient.load();
+  renderDashboard(data);
+  if (localOnboarding) renderLocalOnboarding(localOnboarding);
+}
+
 async function requestRefresh() {
+  if (localActionBusy) return;
+  if (!localAnalysisAllowed()) {
+    showConnectionNotice({
+      title: "Finish the local check before analyzing",
+      copy: "Open Codex and complete one response, then choose Check again. Usage Monitor will not start an analysis while its local preflight is incomplete.",
+      kind: "warning",
+      showCheck: true,
+      showDemo: !dashboard,
+    });
+    updateLocalActionButtons();
+    return;
+  }
   const button = $("#refresh-button");
-  button.disabled = true;
-  button.textContent = "Starting scan…";
+  let refreshAccepted = false;
+  let cancelled = false;
+  let quickResultLoaded = false;
+  let continuationLimitReached = false;
+  localActionBusy = true;
+  localRefreshInProgress = true;
+  localRefreshCancelRequested = false;
+  button.textContent = "Starting local analysis…";
+  updateLocalActionButtons();
+  setGlobalState("updating");
   renderIndexProgress({
     phase: "starting",
     filesSelected: null,
@@ -1798,75 +2795,603 @@ async function requestRefresh() {
   }, { status: "running" });
   try {
     await localClient.refresh();
+    refreshAccepted = true;
+    let activePassStartedMs = Date.now();
+    const pollingBudget = createRefreshPollingBudget();
+    let consecutiveStatusFailures = 0;
     let outcome = "running";
-    for (let attempt = 0; attempt < 400 && outcome === "running"; attempt += 1) {
+    let finalErrorCode = null;
+    let pollCount = 0;
+    let timeoutSettlementNoted = false;
+    while (pollingBudget.hasTime()
+        && ["running", "cancelling"].includes(outcome)) {
       await new Promise((resolve) => setTimeout(resolve, 750));
-      const status = await localClient.refreshStatus();
+      pollCount += 1;
+      let status;
+      try {
+        status = await localClient.refreshStatus();
+        consecutiveStatusFailures = 0;
+      } catch (error) {
+        consecutiveStatusFailures += 1;
+        button.textContent = "Update running; reconnecting…";
+        if (consecutiveStatusFailures >= 8) throw error;
+        continue;
+      }
       const refresh = status?.refresh ?? {};
       outcome = refresh.status ?? "failed";
+      finalErrorCode = refresh.errorCode ?? null;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
       if (progress) renderIndexProgress(progress, { status: outcome });
+      if (progress?.phase === "quick_result" && !quickResultLoaded) {
+        try {
+          await loadQuickResultDashboard();
+          quickResultLoaded = true;
+        } catch {
+          // Keep polling. The verified quick snapshot can still be loaded when
+          // deep accounting finishes, and no partial replacement is invented.
+        }
+      }
+      const elapsedSeconds = Math.max(
+        0,
+        Math.floor((Date.now() - activePassStartedMs) / 1_000),
+      );
+      const elapsedLabel = elapsedSeconds >= 60
+        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
+        : `${elapsedSeconds}s`;
       const processed = Number.isSafeInteger(progress?.filesProcessed)
         ? progress.filesProcessed : null;
       const selected = Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = processed !== null && selected !== null
-        ? `Indexing ${processed}/${selected} files…`
-        : attempt < 2 ? "Scanning local evidence…" : `Scanning… ${attempt + 1}s`;
+      button.textContent = outcome === "cancelling"
+        ? "Stopping safely…"
+        : progress?.phase === "quick_result"
+          ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
+        : processed !== null && selected !== null
+        ? selected > 0 && processed >= selected
+          ? `Calculating usage and allowance… ${elapsedLabel}`
+          : `Analyzing ${processed}/${selected} files…`
+        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+      if (refreshNeedsContinuation({
+        outcome,
+        errorCode: refresh.errorCode,
+        progress,
+      })) {
+        if (!pollingBudget.canContinue()) {
+          continuationLimitReached = true;
+          throw new Error("The bounded continuation limit was reached.");
+        }
+        try {
+          await localClient.refresh();
+          pollingBudget.noteContinuation();
+          activePassStartedMs = Date.now();
+          timeoutSettlementNoted = false;
+          button.textContent = "Continuing local analysis…";
+        } catch (error) {
+          // A 409 means a timed-out pass is still finishing its durable
+          // checkpoint. Keep polling until it becomes resumable.
+          if (error?.status !== 409) throw error;
+          if (!timeoutSettlementNoted) {
+            pollingBudget.noteSettling();
+            timeoutSettlementNoted = true;
+          }
+        }
+        outcome = "running";
+        continue;
+      }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        if (progress?.status === "bounded_pause") {
-          try {
-            await localClient.refresh();
-            button.textContent = "Continuing bounded index…";
-          } catch (error) {
-            // A 409 means the aborted run is still finishing its durable
-            // checkpoint. Keep polling until it becomes resumable.
-            if (error?.status !== 409) throw error;
-          }
-        } else {
-          button.textContent = "Finalizing bounded pause…";
+        button.textContent = "Finalizing bounded pause…";
+        if (!timeoutSettlementNoted) {
+          pollingBudget.noteSettling();
+          timeoutSettlementNoted = true;
         }
         outcome = "running";
       }
+    }
+    cancelled = outcome === "cancelled";
+    if (cancelled) {
+      button.textContent = "Loading saved results…";
+      await loadLocalDashboard();
+      showConnectionNotice({
+        title: "Local analysis cancelled",
+        copy: "Usage Monitor stopped at a safe boundary. Verified existing results were kept, and the resumable checkpoint remains on this Mac.",
+        kind: "info",
+      });
+      return;
+    }
+    if (outcome === "failed"
+        && finalErrorCode === "refresh_resource_limited") {
+      button.textContent = "Loading saved results…";
+      await loadLocalDashboard();
+      showConnectionNotice({
+        title: "Deep analysis stopped at a safety limit",
+        copy: "Your available headline and previously verified results remain usable. Usage Monitor stopped before reading or retaining more local data than its fixed safety limits allow; no partial accounting result replaced them.",
+        kind: "warning",
+      });
+      return;
     }
     if (outcome !== "succeeded") throw new Error("The local refresh did not complete successfully.");
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
   } catch {
+    if (dashboard) {
+      setGlobalState(dashboard.state, {
+        companionReachable: dashboard.mode !== "demo",
+      });
+    }
     showConnectionNotice({
-      title: "Refresh could not be started",
-      copy: "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
-      kind: "error",
+      title: continuationLimitReached
+        ? "Deep analysis paused after two bounded continuations"
+        : refreshAccepted
+          ? "The local analysis did not finish"
+        : "Local analysis could not be started",
+      copy: continuationLimitReached
+        ? "Usage Monitor stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
+        : refreshAccepted
+          ? "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it."
+        : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
+      kind: continuationLimitReached ? "warning" : "error",
       showDemo: !dashboard
     });
   } finally {
-    button.disabled = false;
-    button.textContent = "Refresh local data";
+    localActionBusy = false;
+    localRefreshInProgress = false;
+    localRefreshCancelRequested = false;
+    updateLocalActionButtons();
   }
+}
+
+async function cancelLocalAnalysis() {
+  if (!localRefreshInProgress || localRefreshCancelRequested) return;
+  localRefreshCancelRequested = true;
+  updateLocalActionButtons();
+  try {
+    await localClient.cancelRefresh();
+    showConnectionNotice({
+      title: "Cancellation requested",
+      copy: "Usage Monitor is stopping after its current atomic step and preserving a resumable local checkpoint.",
+      kind: "info",
+    });
+  } catch {
+    localRefreshCancelRequested = false;
+    showConnectionNotice({
+      title: "Cancellation could not be requested",
+      copy: "The analysis may already have finished or the local companion may be reconnecting. Existing verified results are unchanged.",
+      kind: "warning",
+      showCheck: true,
+    });
+  }
+  updateLocalActionButtons();
+}
+
+async function checkLocalSetup() {
+  if (localActionBusy) return;
+  localActionBusy = true;
+  for (const selector of [
+    "#connection-check",
+    "#companion-check",
+    "#setup-check-again",
+  ]) {
+    const button = $(selector);
+    if (button) button.textContent = "Checking…";
+  }
+  updateLocalActionButtons();
+  try {
+    await loadLocalDashboard();
+  } finally {
+    localActionBusy = false;
+    $("#connection-check").textContent = "Check again";
+    $("#companion-check").textContent = "Check this page again";
+    $("#setup-check-again").textContent = "Check again";
+    updateLocalActionButtons();
+  }
+}
+
+function scheduleReturningUserRefresh() {
+  const priorEvidence = dashboard?.mode !== "demo"
+    && Boolean(
+      dashboard?.activity?.lastScanAt
+      || dashboard?.collector?.lastScanAt
+      || dashboard?.freshness?.latestObservedAt
+    );
+  if (returnRefreshScheduled
+      || !priorEvidence
+      || !localAnalysisAllowed()
+      || localRefreshInProgress) {
+    return;
+  }
+  returnRefreshScheduled = true;
+  window.setTimeout(() => {
+    if (localActionBusy || localRefreshInProgress) {
+      returnRefreshScheduled = false;
+      returnRefreshDeferrals += 1;
+      if (returnRefreshDeferrals < 20) scheduleReturningUserRefresh();
+      return;
+    }
+    returnRefreshDeferrals = 0;
+    showConnectionNotice({
+      title: "Cached results are ready",
+      copy: "Usage Monitor is checking for new local evidence from the last verified checkpoint. You can keep reading or cancel the update; no upload occurs.",
+      kind: "info",
+    });
+    void requestRefresh();
+  }, 750);
+}
+
+function updateCommunityConnectButton() {
+  const button = $("#connect-community");
+  const consent = $("#community-connect-consent");
+  const awaitingReviewedSend = Boolean(pendingAutomaticContributionConsent);
+  consent.disabled = automaticContributionStatus?.enabled
+    || awaitingReviewedSend;
+  button.disabled = communityConnectBusy
+    || automaticContributionBusy
+    || automaticContributionStatus?.enabled
+    || awaitingReviewedSend
+    || !consent.checked;
+  if (!communityConnectBusy) {
+    button.textContent = awaitingReviewedSend
+      ? "Review first contribution below"
+      : automaticContributionStatus?.enabled
+      ? "Automatic contribution is on"
+      : "Contribute and keep it current";
+  }
+}
+
+function contributionDeviceRecoveryIsRequired(error) {
+  try {
+    return error?.code === "contribution_device_recovery_required";
+  } catch {
+    return false;
+  }
+}
+
+function renderContributionDeviceRecovery(status) {
+  const action = node(
+    "a",
+    "button button-secondary",
+    "Open Usage Monitor"
+  );
+  if (SEMANTIC_OPEN_TARGET) {
+    action.href = SEMANTIC_OPEN_TARGET;
+  } else {
+    action.hidden = true;
+  }
+  status.className = "participant-action-status error";
+  status.replaceChildren(
+    node(
+      "strong",
+      "",
+      "This Mac has a conflicting local contribution-device credential."
+    ),
+    document.createTextNode(
+      " No evidence was uploaded, and this page did not delete or rotate anything. Open the Usage Monitor app, choose Data & Diagnostics…, then Identity & Device Reset…, and complete both native confirmations. Return here and choose Connect this Mac again. The reset affects only the local export identity and paired-device credential; it does not revoke hosted devices or delete hosted data. "
+    ),
+    action
+  );
+}
+
+async function finishCommunityDevicePairing(pairing, status) {
+  if (typeof pairing?.pairingCode !== "string") {
+    throw new Error("The service did not return a one-use pairing capability.");
+  }
+  const paired = await localClient.pairContributionDevice(pairing.pairingCode);
+  if (paired.status !== "paired") {
+    throw new Error("The local app did not accept the upload-only pairing.");
+  }
+  status.textContent =
+    `This Mac is connected through ${formatLocal(paired.expiresAt)}. Nothing was uploaded.`;
+  return paired;
+}
+
+function openContributionReview() {
+  const disclosure = $("#community-contribution-disclosure");
+  disclosure.open = true;
+  const queue = $(".sync-status-panel");
+  queue.open = true;
+}
+
+function automaticContributionConsentBinding(status) {
+  const required = status?.requiredConsent;
+  return required?.destinationOrigin
+    ? Object.freeze({
+        telemetrySchemaVersion: required.telemetrySchemaVersion,
+        fieldDictionaryVersion: required.fieldDictionaryVersion,
+        privacyContractVersion: required.privacyContractVersion,
+        destinationOrigin: required.destinationOrigin
+      })
+    : null;
+}
+
+async function armAutomaticContributionAfterReviewedSend() {
+  let current = automaticContributionStatus;
+  if (!current || current.state === "unavailable") {
+    current = await refreshAutomaticContributionStatus();
+  }
+  if (current.enabled) {
+    pendingAutomaticContributionConsent = null;
+    return current;
+  }
+  const binding = automaticContributionConsentBinding(current);
+  if (!binding) {
+    throw new Error("Automatic contribution is not configured.");
+  }
+  pendingAutomaticContributionConsent = binding;
+  renderAutomaticContributionStatus(current);
+  return current;
+}
+
+async function enableAutomaticContributionAfterReviewedSend() {
+  const binding = pendingAutomaticContributionConsent;
+  if (!binding) {
+    throw new Error("No live automatic-contribution consent is pending.");
+  }
+  automaticContributionBusy = true;
+  renderAutomaticContributionStatus(automaticContributionStatus);
+  try {
+    const enabled = await localClient.enableAutomaticContribution(
+      binding
+    );
+    if (!enabled.enabled) {
+      throw new Error("Automatic contribution was not enabled.");
+    }
+    pendingAutomaticContributionConsent = null;
+    renderAutomaticContributionStatus(enabled);
+    return enabled;
+  } finally {
+    automaticContributionBusy = false;
+    renderAutomaticContributionStatus(automaticContributionStatus);
+  }
+}
+
+async function disableAutomaticContribution() {
+  if (automaticContributionBusy) return;
+  const status = $("#community-connect-status");
+  automaticContributionBusy = true;
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Turning off automatic contribution…";
+  renderAutomaticContributionStatus(automaticContributionStatus);
+  try {
+    const disabled = await localClient.disableAutomaticContribution();
+    if (disabled.state === "unavailable" || disabled.enabled) {
+      throw new Error("Automatic contribution did not turn off.");
+    }
+    pendingAutomaticContributionConsent = null;
+    renderAutomaticContributionStatus(disabled);
+    status.textContent =
+      "Automatic contribution is off. Already accepted metadata is unchanged; use Hosted privacy controls if you want it deleted.";
+  } catch {
+    status.className = "participant-action-status error";
+    status.textContent =
+      "Automatic contribution could not be turned off. No setting was inferred; check the local companion and try again.";
+  } finally {
+    automaticContributionBusy = false;
+    renderAutomaticContributionStatus(automaticContributionStatus);
+  }
+}
+
+async function connectCommunityContribution() {
+  if (communityConnectBusy) return;
+  const status = $("#community-connect-status");
+  const inviteInput = $("#contribution-invite");
+  const inviteCode = inviteInput.value.trim();
+  let pairing = null;
+  communityConnectBusy = true;
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent =
+    "Creating pseudonymous contribution access and connecting this Mac…";
+  $("#connect-community").textContent = "Connecting contribution…";
+  updateCommunityConnectButton();
+  try {
+    if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
+      throw new Error(
+        "The local app is not connected to a configured contribution service."
+      );
+    }
+    if (communitySession?.csrfToken) {
+      pairing = await communityClient.createDevicePairing(false);
+      await finishCommunityDevicePairing(pairing, status);
+    } else {
+      const enrollment = await communityClient.enroll(
+        inviteCode || null,
+        "telemetry-contribution-v0.1",
+        { deviceBootstrap: true }
+      );
+      if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
+          || enrollment?.state !== "pairing_ready"
+          || typeof enrollment?.csrfToken !== "string"
+          || typeof enrollment?.pairing?.pairingCode !== "string") {
+        throw new Error(
+          "The contribution service did not establish paired pseudonymous access."
+        );
+      }
+      setCommunitySession({
+        csrfToken: enrollment.csrfToken,
+        participantId: enrollment.participantId ?? null,
+        consentVersion: "privacy-safe-telemetry-v0.1"
+      });
+      // The ordinary contribution product has no recovery journey. The server
+      // still returns this legacy capability, but the browser intentionally
+      // neither displays nor persists it.
+      void enrollment.recoveryCode;
+      pairing = enrollment.pairing;
+      await finishCommunityDevicePairing(pairing, status);
+    }
+    let automatic = automaticContributionStatus;
+    let automaticArmFailed = false;
+    try {
+      automatic = await armAutomaticContributionAfterReviewedSend();
+    } catch {
+      automaticArmFailed = true;
+      await refreshAutomaticContributionStatus();
+      automatic = automaticContributionStatus;
+    }
+    $("#community-connect-consent").checked = false;
+    openContributionReview();
+    await Promise.all([
+      refreshContributionSyncControls(),
+      loadCommunityResults(),
+    ]);
+    status.textContent = automatic?.enabled
+      ? "Connected. Automatic contribution was already on."
+      : automaticArmFailed
+        ? "Connected for a reviewed contribution, but recurring consent could not be armed. Nothing will repeat unless you consent and try again."
+        : "Connected. Review and send the first contribution below. Automatic contribution remains off until that exact reviewed send is accepted.";
+    await prepareLocalContribution();
+    if (contributionSyncPreview?.state === "ready") {
+      await inspectNextContribution();
+    }
+  } catch (error) {
+    status.className = "participant-action-status error";
+    if (contributionDeviceRecoveryIsRequired(error)) {
+      renderContributionDeviceRecovery(status);
+    } else {
+      status.textContent = safeApiError(
+        error,
+        "This Mac could not be connected. No evidence was uploaded. Check the invitation, service availability, and Keychain access, then retry."
+      );
+    }
+  } finally {
+    pairing = null;
+    inviteInput.value = "";
+    communityConnectBusy = false;
+    updateCommunityConnectButton();
+  }
+}
+
+function contributionPreparationEstimate(
+  data = dashboard,
+  lookbackHours = activeContributionLookbackHours,
+  admission = participantContributionAdmission,
+) {
+  if (!data || data.mode === "demo") return null;
+  const referenceMs = Date.parse(data.freshness?.latestObservedAt);
+  const endMs = Number.isFinite(referenceMs) ? referenceMs : Date.now();
+  const startMs = endMs - lookbackHours * 60 * 60 * 1_000;
+  const usageEvents = (data.timeline?.usage ?? []).reduce((total, row) => {
+    const rowEnd = Date.parse(row.endAt);
+    return Number.isFinite(rowEnd) && rowEnd >= startMs && rowEnd <= endMs
+      ? total + Math.max(0, Math.floor(finite(row.usageEvents, 0)))
+      : total;
+  }, 0);
+  const quotaSnapshots = (data.timeline?.quota ?? []).filter((row) => {
+    const observed = Date.parse(row.observedAt);
+    return Number.isFinite(observed) && observed >= startMs && observed <= endMs;
+  }).length;
+  const records = usageEvents + quotaSnapshots;
+  const batches = records > 0 ? Math.ceil(records / 200) : 0;
+  const batchAdmission = contributionBatchAdmission({
+    estimatedBatches: batches,
+    participantAdmission: admission,
+  });
+  return {
+    usageEvents,
+    quotaSnapshots,
+    records,
+    batches,
+    maximumSerializedBytes: batches * 1_310_720,
+    localReviewLimit: batchAdmission.localReviewLimit,
+    admissionKnown: batchAdmission.admissionKnown,
+    remainingBatches: batchAdmission.remainingBatches,
+    maximumBatches: batchAdmission.maximumBatches,
+    renewsAt: batchAdmission.renewsAt,
+    effectiveBatchLimit: batchAdmission.effectiveBatchLimit,
+    exceedsLocalReviewLimit: batchAdmission.exceedsLocalReviewLimit,
+    exceedsParticipantAdmission:
+      batchAdmission.exceedsParticipantAdmission,
+    tooLarge: batchAdmission.blocked,
+    partial: ![
+      "recent_7d_complete",
+      "recent_7d_partial",
+      "prospective_only",
+    ].includes(data.collector?.indexing?.status),
+  };
+}
+
+function renderContributionPreparationEstimate() {
+  const element = $("#preparation-estimate");
+  const button = $("#prepare-contribution");
+  const estimate = contributionPreparationEstimate();
+  if (!element || !button) return null;
+  if (!estimate) {
+    element.textContent =
+      "Analyze local usage to estimate privacy-safe records and upload batches before preparation.";
+    if (!contributionPreparationBusy) button.disabled = false;
+    return null;
+  }
+  if (estimate.records === 0) {
+    element.textContent =
+      "No privacy-safe records are visible in this indexed interval. Choose another window or update local usage first.";
+  } else {
+    const coverage = estimate.partial
+      ? " The local index is partial, so the exact count may be higher."
+      : "";
+    const renews = estimate.renewsAt
+      ? ` The participant allowance renews ${formatLocal(estimate.renewsAt)}.`
+      : "";
+    if (estimate.exceedsParticipantAdmission) {
+      element.textContent = estimate.remainingBatches === 0
+        ? `This participant has no community batch allowance remaining.${renews} Wait for renewal before preparing another reviewed set. No local preparation or upload has started.`
+        : `Preflight estimates ${compact(estimate.batches)} batches, above this participant’s ${compact(estimate.remainingBatches)} remaining community batch${estimate.remainingBatches === 1 ? "" : "es"}.${renews} Choose a shorter window or wait for renewal before preparing.${coverage}`;
+    } else if (estimate.exceedsLocalReviewLimit) {
+      element.textContent =
+        `Preflight estimates ${compact(estimate.records)} records across ${compact(estimate.batches)} batches, above the local ${compact(estimate.localReviewLimit)}-batch reviewed-set safety cap. Choose a shorter window before preparing.${coverage}`;
+    } else {
+      const admission = estimate.admissionKnown
+        ? ` This participant has ${compact(estimate.remainingBatches)} of ${compact(estimate.maximumBatches)} community batches remaining${estimate.renewsAt ? ` until ${formatLocal(estimate.renewsAt)}` : ""}.`
+        : " Community batch allowance is unknown until this Mac is connected; the service checks it again before accepting any upload.";
+      element.textContent =
+        `Preflight estimates ${compact(estimate.records)} records across about ${compact(estimate.batches)} batch${estimate.batches === 1 ? "" : "es"} (${compact(estimate.maximumSerializedBytes)} bytes worst-case). Exact counts and bytes are independently verified before queueing; no wall-clock ETA is inferred from record count.${admission}${coverage}`;
+    }
+  }
+  if (!contributionPreparationBusy) {
+    button.disabled = estimate.records === 0 || estimate.tooLarge;
+  }
+  return estimate;
 }
 
 async function prepareLocalContribution() {
   if (contributionPreparationBusy) return;
+  const estimate = renderContributionPreparationEstimate();
+  if (estimate?.tooLarge) {
+    const status = $("#prepare-contribution-status");
+    status.classList.add("error");
+    status.textContent = estimate.exceedsParticipantAdmission
+      ? `This interval is estimated to exceed the participant’s remaining community allowance${estimate.renewsAt ? `, which renews ${formatLocal(estimate.renewsAt)}` : ""}. Choose a shorter window or wait for renewal. No preparation or upload started.`
+      : "This interval is estimated to exceed the local 100-batch reviewed-set safety cap. Choose a shorter window. No preparation or upload started.";
+    return;
+  }
   contributionPreparationBusy = true;
   const button = $("#prepare-contribution");
   const status = $("#prepare-contribution-status");
   button.disabled = true;
   button.textContent = "Preparing locally…";
   status.classList.remove("error");
+  const lookbackLabel = activeContributionLookbackHours === 1
+    ? "latest hour"
+    : activeContributionLookbackHours === 24
+      ? "last 24 hours"
+      : "last seven days";
   status.textContent =
-    "Building and independently verifying a content-free latest-hour contribution. No network upload is performed.";
+    `Building and independently verifying content-free evidence from the ${lookbackLabel}. No network upload is performed.`;
   clearContributionSyncExactReview();
   try {
-    const result = await localClient.prepareContribution();
+    const result = await localClient.prepareContribution({
+      lookbackHours: activeContributionLookbackHours,
+    });
     if (result.status !== "prepared") {
       throw new Error("Preparation did not return a verified contribution.");
     }
     const records = result.recordCounts.usageEvents
       + result.recordCounts.quotaSnapshots
       + result.recordCounts.activityMarkers;
+    const coveredLabel = result.coveredAt?.startAt && result.coveredAt?.endAt
+      ? ` covering ${formatLocal(result.coveredAt.startAt)} through ${formatLocal(result.coveredAt.endAt)}`
+      : "";
     status.textContent =
-      `Prepared ${compact(result.prepared.batchCount)} verified batch${result.prepared.batchCount === 1 ? "" : "es"} with ${compact(records)} safe records (${compact(result.prepared.bytes)} bytes). Nothing was uploaded.`;
+      `Prepared ${compact(result.prepared.batchCount)} verified batch${result.prepared.batchCount === 1 ? "" : "es"} with ${compact(records)} safe records (${compact(result.prepared.bytes)} bytes)${coveredLabel}. Nothing was uploaded.`;
     await refreshContributionSyncControls();
   } catch (error) {
     status.classList.add("error");
@@ -1874,13 +3399,17 @@ async function prepareLocalContribution() {
       identity_unavailable:
         "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then retry. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
       coverage_unavailable:
-        "No usable local coverage is available yet. Refresh local data first. No upload occurred.",
+        "No usable local coverage is available yet. Analyze local usage first. No upload occurred.",
       coverage_invalid:
-        "The latest local coverage interval is not usable for a contribution. No upload occurred.",
+        "The selected local coverage interval is not usable for a contribution. No upload occurred.",
       no_safe_records:
-        "No privacy-safe records were found in the latest covered hour. No upload occurred.",
+        "No privacy-safe records were found in the selected interval. No upload occurred.",
       export_too_large:
-        "The latest-hour export exceeded a fixed safety bound. No upload occurred.",
+        activeContributionLookbackHours > 24
+          ? "Seven days exceeded the current single reviewed-set safety cap. Try 24 hours; on a very active history, use 1 hour. Nothing was truncated or uploaded."
+          : activeContributionLookbackHours === 24
+            ? "This high-activity 24-hour interval exceeded the current single reviewed-set safety cap. Choose 1 hour. Nothing was truncated or uploaded; longer dense intervals need the planned locally aggregated export format."
+            : "The latest hour exceeded a fixed reviewed-set safety bound. Nothing was truncated or uploaded.",
       privacy_verification_failed:
         "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
       preparation_in_progress:
@@ -1891,7 +3420,12 @@ async function prepareLocalContribution() {
   } finally {
     contributionPreparationBusy = false;
     button.disabled = false;
-    button.textContent = "Prepare latest hour locally";
+    button.textContent = activeContributionLookbackHours === 1
+      ? "Prepare and review latest hour"
+      : activeContributionLookbackHours === 24
+        ? "Prepare and review last 24 hours"
+        : "Prepare and review last 7 days";
+    renderContributionPreparationEstimate();
   }
 }
 
@@ -1970,7 +3504,7 @@ async function ensureCommunitySession(contributionSchemaVersion) {
   if (communitySession?.csrfToken) {
     if (communitySession.consentVersion !== requiredConsent) {
       throw new Error(
-        `This browser session accepted ${communitySession.consentVersion || "an older consent contract"}. Sign out and enroll with this export, or recover the matching anonymous participant.`
+        `This browser session accepted ${communitySession.consentVersion || "an older consent contract"}. Reload the local dashboard before using a different contribution contract.`
       );
     }
     return communitySession;
@@ -1987,14 +3521,16 @@ async function ensureCommunitySession(contributionSchemaVersion) {
     inviteInput.value = "";
   }
   if (typeof enrollment?.csrfToken !== "string") {
-    throw new Error("The contribution service did not establish an anonymous web session.");
+    throw new Error("The contribution service did not establish a pseudonymous contribution session.");
   }
   setCommunitySession({
     csrfToken: enrollment.csrfToken,
     participantId: enrollment.participantId ?? null,
     consentVersion: requiredConsent
   });
-  showRecoveryCodeOnce(enrollment.recoveryCode);
+  // Recovery is intentionally absent from the ordinary product. Do not display
+  // or persist this legacy server capability.
+  void enrollment.recoveryCode;
   return communitySession;
 }
 
@@ -2310,7 +3846,7 @@ function renderParticipantQuotaMovement(container, movement) {
     section.append(state);
   } else {
     const metadata = node("div", "movement-metadata");
-    const resetLabel = movement.resetsAt ? `Reset ${formatUtc(movement.resetsAt)}` : "Reset time unavailable";
+    const resetLabel = movement.resetsAt ? `Reset ${formatLocal(movement.resetsAt)}` : "Reset time unavailable";
     const capacityLabel = movement.apiPriceEquivalentCapacityUsd === null
       ? "Capacity estimate unavailable"
       : `${formatApiMoney(movement.apiPriceEquivalentCapacityUsd)} per 100 percentage points`;
@@ -2368,7 +3904,7 @@ function renderParticipantQuotaMovement(container, movement) {
         const tr = document.createElement("tr");
         const difference = row.observedQuotaChangePp - row.expectedQuotaChangePp;
         for (const value of [
-          formatUtc(row.windowEndUtc),
+          formatLocal(row.windowEndUtc),
           formatPp(row.observedQuotaChangePp, 2),
           formatPp(row.expectedQuotaChangePp, 2),
           formatPp(difference, 2),
@@ -2442,7 +3978,7 @@ function renderPrivateCommunityComparison(container, comparison) {
   section.append(node(
     "p",
     "snapshot-disclosure",
-    `${formatUtc(comparison.period.startAt, { dateOnly: true })}–${formatUtc(comparison.period.endAt, { dateOnly: true })} · revision ${compact(comparison.snapshotRevision)}. This is not an average, percentile, bill, or provider allowance. A rounded-down public total can be lower than your own clipped value.`
+    `${formatLocal(comparison.period.startAt, { dateOnly: true })}–${formatLocal(comparison.period.endAt, { dateOnly: true })} · revision ${compact(comparison.snapshotRevision)}. This is not an average, percentile, bill, or provider allowance. A rounded-down public total can be lower than your own clipped value.`
   ));
   const activeCells = comparison.cells.filter((cell) => cell.participantHasActivity);
   if (!activeCells.length) {
@@ -2584,7 +4120,7 @@ function renderContributionHistory(container, payload) {
     const label = node("div");
     label.append(
       node("strong", "", `Contribution ${history.items.length - index}`),
-      node("small", "", `Received ${formatUtc(item.createdAt)}`)
+      node("small", "", `Received ${formatLocal(item.createdAt)}`)
     );
     cardHeading.append(
       label,
@@ -2606,10 +4142,10 @@ function renderContributionHistory(container, payload) {
       ? `${formatApiMoney(item.serverAccounting.apiPriceEquivalentUsd)} API-price equivalent`
       : "Server repricing unavailable";
     const quarantineSummary = item.quarantine.state === "deleted"
-      ? `Encrypted object deleted ${formatUtc(item.quarantine.deletedAt)}`
-      : `Encrypted object scheduled for deletion after ${formatUtc(item.quarantine.scheduledDeletionAt)}`;
+      ? `Encrypted object deleted ${formatLocal(item.quarantine.deletedAt)}`
+      : `Encrypted object scheduled for deletion after ${formatLocal(item.quarantine.scheduledDeletionAt)}`;
     for (const [term, description] of [
-      ["Covered period", `${formatUtc(item.coveredAt.startAt)}–${formatUtc(item.coveredAt.endAt)}`],
+      ["Covered period", `${formatLocal(item.coveredAt.startAt)}–${formatLocal(item.coveredAt.endAt)}`],
       ["Records", recordSummary],
       ["Contract", `${item.transportSchemaVersion} · ${item.clientPlatform}`],
       ["Pricing", pricingSummary],
@@ -2641,6 +4177,23 @@ function renderCommunitySnapshot(container, payload) {
   const snapshot = normalizeCommunitySnapshot(payload);
   if (snapshot.state === "service_unavailable") {
     container.append(node("p", "", "The central service is unavailable. This is separate from whether a weekly snapshot exists."));
+    const quality = node("dl", "snapshot-quality-grid");
+    for (const [term, value] of [
+      ["Released snapshot", "Not loaded"],
+      ["Cohort limit estimate", "Not in current contract"],
+      ["Matched quota coverage", "Not in current contract"],
+      ["Change confidence", "Not in current contract"]
+    ]) {
+      const item = node("div");
+      item.append(node("dt", "", term), node("dd", "", value));
+      quality.append(item);
+    }
+    container.append(quality);
+    container.append(node(
+      "p",
+      "snapshot-disclosure",
+      "No community capacity or change claim is inferred from aggregate activity alone. The next contract must publish replay exclusions, matched quota coverage, uncertainty, and cohort support together."
+    ));
     return;
   }
   if (snapshot.state === "development_unsafe") {
@@ -2666,10 +4219,22 @@ function renderCommunitySnapshot(container, payload) {
 
   const heading = node("div", "snapshot-heading");
   heading.append(
-    node("strong", "", `${formatUtc(snapshot.period.startAt, { dateOnly: true })} – ${formatUtc(snapshot.period.endAt, { dateOnly: true })}`),
-    node("span", "", `Ingestion cutoff ${formatUtc(snapshot.ingestionCutoffAt)} · released ${formatUtc(snapshot.releasedAt)}`)
+    node("strong", "", `${formatLocal(snapshot.period.startAt, { dateOnly: true })} – ${formatLocal(snapshot.period.endAt, { dateOnly: true })}`),
+    node("span", "", `Ingestion cutoff ${formatLocal(snapshot.ingestionCutoffAt)} · released ${formatLocal(snapshot.releasedAt)}`)
   );
   container.append(heading);
+  const quality = node("dl", "snapshot-quality-grid");
+  for (const [term, value] of [
+    ["Released model cells", compact(snapshot.cells.length)],
+    ["Minimum support", `≥${compact(snapshot.minimumIndependentParticipants)} participants per cell`],
+    ["Snapshot age", formatAge(Math.max(0, (Date.now() - Date.parse(snapshot.releasedAt)) / 1_000))],
+    ["Coverage state", snapshot.state === "published_partial" ? "Partially released" : "All contracted cells released"]
+  ]) {
+    const item = node("div");
+    item.append(node("dt", "", term), node("dd", "", value));
+    quality.append(item);
+  }
+  container.append(quality);
   container.append(node(
     "p",
     "snapshot-disclosure",
@@ -2678,6 +4243,11 @@ function renderCommunitySnapshot(container, payload) {
   if (snapshot.state === "published_partial") {
     container.append(node("p", "snapshot-partial", "Some metrics were not released because their independent support was insufficient."));
   }
+  container.append(node(
+    "p",
+    "snapshot-disclosure",
+    "This release currently reports privacy-safe activity totals. Cohort weekly-limit estimates, matched quota coverage, replay exclusions, and change confidence require the next community contract before they can be shown honestly."
+  ));
 
   const wrap = node("div", "table-wrap snapshot-table");
   const table = document.createElement("table");
@@ -2717,33 +4287,61 @@ async function loadCommunityResults() {
   const personal = $("#personal-result");
   const community = $("#community-result");
   const participantControls = $("#participant-controls");
+  const centralConfigured = localCompanionHealth === null
+    || localCompanionHealth?.capabilities?.centralServiceProxy === true;
+  if (!centralConfigured) {
+    participantContributionAdmission = null;
+    renderBackendHealth(null, null, { configured: false });
+    service.textContent = "Local preparation available; community service not connected";
+    service.className = "evidence-chip neutral";
+    participantControls.hidden = true;
+    renderPersonalStats(personal, null);
+    renderContributionHistory($("#contribution-history"), null);
+    renderCommunitySnapshot(community, null);
+    renderContributionPreparationEstimate();
+    $("#invite-help").textContent =
+      "The optional community service is not connected in this local-only build.";
+    return;
+  }
   try {
     const [
       healthResult,
+      readinessResult,
       personalResult,
       communityResult,
-      devicesResult,
       profileResult
     ] = await Promise.allSettled([
       communityClient.health(),
+      communityClient.readiness(),
       communitySession?.csrfToken ? communityClient.personalStats() : Promise.resolve(null),
       communityClient.communityStats(),
-      communitySession?.csrfToken ? communityClient.devices() : Promise.resolve(null),
       communitySession?.csrfToken ? communityClient.participantProfile() : Promise.resolve(null)
     ]);
     const serviceReachable = healthResult.status === "fulfilled"
       || communityResult.status === "fulfilled"
       || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
-    renderBackendHealth(healthResult.status === "fulfilled" ? healthResult.value : null);
-    service.textContent = serviceReachable ? "Service reachable" : "Service unavailable";
+    renderBackendHealth(
+      healthResult.status === "fulfilled" ? healthResult.value : null,
+      readinessResult.status === "fulfilled" ? readinessResult.value : null,
+      { configured: true },
+    );
+    service.textContent = serviceReachable
+      ? "Community service reachable"
+      : "Community service unavailable";
     service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
+    const normalizedProfile = normalizeParticipantHistory(
+      profileResult.status === "fulfilled" ? profileResult.value : null,
+    );
+    participantContributionAdmission = normalizedProfile.state === "ready"
+      ? normalizedProfile.contributionAdmission
+      : null;
     renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
     renderContributionHistory(
       $("#contribution-history"),
       profileResult.status === "fulfilled" ? profileResult.value : null
     );
     renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
-    renderDevices(devicesResult.status === "fulfilled" ? devicesResult.value : null);
+    renderContributionPreparationEstimate();
     participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
     const enrollmentMode = healthResult.status === "fulfilled" ? healthResult.value?.enrollmentMode : null;
     $("#invite-help").textContent = enrollmentMode === "invite_only"
@@ -2752,100 +4350,40 @@ async function loadCommunityResults() {
         ? "New enrollment is currently paused. Existing participants can still manage their data."
         : "Required only for an invite-only pilot. It is used once and never stored by this page.";
   } catch {
-    renderBackendHealth(null);
-    service.textContent = "Service unavailable";
+    participantContributionAdmission = null;
+    renderBackendHealth(null, null, { configured: true });
+    service.textContent = "Community service unavailable";
     service.className = "evidence-chip neutral";
     participantControls.hidden = true;
-    renderDevices(null);
     renderContributionHistory($("#contribution-history"), null);
+    renderContributionPreparationEstimate();
   }
 }
 
-function renderDevices(payload) {
-  const container = $("#device-list");
-  const count = $("#device-count");
-  const devices = Array.isArray(payload) ? payload : Array.isArray(payload?.devices) ? payload.devices : [];
-  const safeDevices = devices.filter((device) => (
-    typeof device?.deviceId === "string"
-    && /^[0-9a-f-]{36}$/u.test(device.deviceId)
-    && ["active", "revoked", "expired"].includes(device.state)
-  )).slice(0, 20);
-  count.textContent = safeDevices.length === 0
-    ? "No devices"
-    : `${safeDevices.length} device${safeDevices.length === 1 ? "" : "s"}`;
-  count.className = safeDevices.some((device) => device.state === "active")
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  clear(container);
-  if (safeDevices.length === 0) {
-    container.append(node("p", "", "No upload-only devices are paired."));
+function renderBackendHealth(health, readiness, { configured = true } = {}) {
+  if (!configured) {
+    const state = $("#backend-state");
+    state.textContent = "Not connected";
+    state.className = "evidence-chip neutral";
+    const centralState = $("#central-state");
+    centralState.replaceChildren(
+      node("span", "state-dot"),
+      document.createTextNode("Local-only mode"),
+    );
+    centralState.className = "state-pill state-local";
+    $("#backend-facts").hidden = true;
+    $("#backend-description").textContent =
+      "Your local usage, allowance estimates, and privacy review are working without a remote service. Community upload, aggregate comparisons, and participant recovery appear only in a build with an explicit community-service origin.";
+    $("#backend-contract-note").textContent =
+      "No community origin is sealed into this app. Nothing is failing and no upload is attempted.";
     return;
   }
-  for (const device of safeDevices) {
-    const row = node("div", "device-row");
-    const detail = node("div");
-    detail.append(
-      node("strong", "", `Device …${device.deviceId.slice(-8)} · ${device.state}`),
-      node(
-        "small",
-        "",
-        `Paired ${formatUtc(device.createdAt ?? device.issuedAt)} · expires ${formatUtc(device.expiresAt)}`
-      )
-    );
-    row.append(detail);
-    if (device.state === "active") {
-      const revoke = node("button", "button button-danger", "Revoke");
-      revoke.type = "button";
-      revoke.dataset.deviceId = device.deviceId;
-      row.append(revoke);
-    }
-    container.append(row);
-  }
-}
-
-async function createDevicePairing() {
-  const status = $("#device-action-status");
-  const button = $("#create-device-pairing");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Creating a short-lived upload-only pairing capability…";
-  button.disabled = true;
-  try {
-    const pairing = await communityClient.createDevicePairing(
-      communitySession?.consentVersion === "privacy-safe-telemetry-v0.2"
-    );
-    if (typeof pairing?.pairingCode !== "string") {
-      throw new Error("The service did not return a pairing capability.");
-    }
-    showDevicePairingOnce(pairing.pairingCode);
-    $("#device-consent").checked = false;
-    status.textContent = `Pairing ready until ${formatUtc(pairing.expiresAt)}. It can be claimed once.`;
-  } catch (error) {
-    status.className = "participant-action-status error";
-    status.textContent = safeApiError(error, "The device pairing could not be created.");
-  } finally {
-    button.disabled = !$("#device-consent").checked;
-  }
-}
-
-async function revokeDevice(deviceId) {
-  const status = $("#device-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Revoking this upload-only device and its pending authorizations…";
-  try {
-    await communityClient.revokeDevice(deviceId);
-    showDevicePairingOnce(null);
-    status.textContent = "Device revoked. It can no longer register uploads.";
-    renderDevices(await communityClient.devices());
-  } catch (error) {
-    status.className = "participant-action-status error";
-    status.textContent = safeApiError(error, "The device could not be revoked.");
-  }
-}
-
-function renderBackendHealth(health) {
+  $("#backend-facts").hidden = false;
+  $("#backend-description").textContent =
+    "This optional service is separate from the local collector above. Live readiness verifies database and encrypted-object access, fresh retention and restore replay, object reconciliation, and aggregate rebuild state.";
   const reachable = health?.status === "ok";
+  const servingReady = readiness?.state === "ready";
+  const readinessKnown = servingReady || readiness?.state === "not_ready";
   const controls = health?.collectionControls;
   const collectionState = reachable
     && ["operational", "degraded", "contained"].includes(controls?.state)
@@ -2853,15 +4391,19 @@ function renderBackendHealth(health) {
     : null;
   const state = $("#backend-state");
   const stateLabels = {
-    operational: "Backend ready",
+    operational: "Community backend ready",
     degraded: "Collection partially paused",
     contained: "Collection contained"
   };
-  const stateLabel = reachable
-    ? stateLabels[collectionState] ?? "Backend status incomplete"
-    : "Backend unavailable";
+  const stateLabel = !reachable
+    ? "Community service unavailable"
+    : !readinessKnown
+      ? "Readiness unavailable"
+      : !servingReady
+        ? "Community recovery pending"
+        : stateLabels[collectionState] ?? "Community status incomplete";
   state.textContent = stateLabel;
-  state.className = reachable && collectionState === "operational"
+  state.className = servingReady && collectionState === "operational"
     ? "evidence-chip"
     : "evidence-chip neutral";
   const centralState = $("#central-state");
@@ -2869,7 +4411,7 @@ function renderBackendHealth(health) {
     node("span", "state-dot"),
     document.createTextNode(stateLabel)
   );
-  centralState.className = reachable && collectionState === "operational"
+  centralState.className = servingReady && collectionState === "operational"
     ? "state-pill"
     : reachable
       ? "state-pill state-insufficient"
@@ -2890,10 +4432,31 @@ function renderBackendHealth(health) {
       && health?.checks?.restoreReplayComplete === true
       ? "Retention and restore replay current"
       : "Catching up; publication held",
-    failed: "Lifecycle pass failed; operator review required"
+    failed: "Lifecycle pass failed; operator review required",
+    stale: "Lifecycle evidence stale; publication held",
+    incomplete: "Catching up; publication held",
+    ready: "Retention and restore replay current"
   };
-  $("#backend-lifecycle").textContent = lifecycleLabels[health?.checks?.lifecycle]
+  $("#backend-lifecycle").textContent = lifecycleLabels[
+    readinessKnown ? readiness.lifecycle : health?.checks?.lifecycle
+  ]
     ?? "Unavailable";
+  const reconciliationLabels = {
+    never_run: "Awaiting first reconciliation pass",
+    running: "Reconciliation running",
+    completed: readiness?.quarantineReconciliationComplete === true
+      ? "Tracked objects and metadata reconciled"
+      : "Reconciliation incomplete",
+    failed: "Reconciliation failed; operator review required"
+  };
+  $("#backend-reconciliation").textContent = readinessKnown
+    ? reconciliationLabels[readiness.quarantineReconciliation] ?? "Unavailable"
+    : "Unavailable";
+  $("#backend-aggregate-rebuild").textContent = readinessKnown
+    ? readiness.aggregateRebuildComplete
+      ? "Complete"
+      : "Pending; publication held"
+    : "Unavailable";
   $("#backend-collection-state").textContent = {
     operational: "Operational",
     degraded: "One or more intake stages paused",
@@ -2949,38 +4512,23 @@ async function restoreCommunitySession() {
   }
 }
 
-async function downloadParticipantExport() {
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Preparing your content-free participant export…";
-  try {
-    const payload = await communityClient.participantExport();
-    const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
-    const href = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = href;
-    anchor.download = "usage-monitor-participant-export.json";
-    anchor.click();
-    URL.revokeObjectURL(href);
-    status.textContent = "Your content-free participant export is ready.";
-  } catch {
-    status.className = "participant-action-status error";
-    status.textContent = "The participant export could not be prepared.";
-  }
-}
-
 async function deleteParticipantData() {
-  if (!window.confirm("Delete every contribution and personal statistic associated with this anonymous participant? This cannot be undone.")) return;
+  if (!window.confirm("Permanently delete every hosted contribution and private statistic associated with this pseudonymous contribution session? This cannot be undone.")) return;
   const status = $("#participant-action-status");
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = "Deleting your contributed data…";
+  status.textContent = "Turning off automatic contribution, then deleting hosted metadata…";
   try {
+    pendingAutomaticContributionConsent = null;
+    if (automaticContributionStatus?.enabled) {
+      const disabled = await localClient.disableAutomaticContribution();
+      if (disabled.state === "unavailable" || disabled.enabled) {
+        throw new Error("Automatic contribution could not be disabled.");
+      }
+      renderAutomaticContributionStatus(disabled);
+    }
     const receipt = await communityClient.deleteParticipant();
     setCommunitySession(null);
-    showRecoveryCodeOnce(null);
-    showDevicePairingOnce(null);
     $("#contribution-file").value = "";
     $("#contribution-consent").checked = false;
     $("#contribution-submit").disabled = true;
@@ -2989,8 +4537,8 @@ async function deleteParticipantData() {
     const uploadStatus = $("#upload-status");
     uploadStatus.hidden = false;
     uploadStatus.className = "upload-status";
-    uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the anonymous participant capability.`;
-    status.textContent = "Your contributed data and anonymous participant capability were deleted.";
+    uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the pseudonymous hosted session.`;
+    status.textContent = "Your hosted content-free pseudonymous metadata was deleted.";
     $("#participant-controls").hidden = true;
     renderPersonalStats($("#personal-result"), null);
     renderContributionHistory($("#contribution-history"), null);
@@ -3019,104 +4567,55 @@ async function deleteSingleContribution(contributionId) {
   }
 }
 
-async function recoverParticipant(event) {
-  event.preventDefault();
-  const input = $("#recover-code");
-  const status = $("#recover-status");
-  const recoveryCode = input.value.trim();
-  input.value = "";
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Rotating the anonymous recovery code and prior access…";
-  try {
-    const recovered = await communityClient.recover(recoveryCode);
-    if (typeof recovered?.csrfToken !== "string"
-        || typeof recovered?.recoveryCode !== "string") {
-      throw new Error("Recovery did not establish a replacement session.");
-    }
-    setCommunitySession({
-      csrfToken: recovered.csrfToken,
-      participantId: recovered.participantId ?? null,
-      consentVersion: recovered.consentVersion ?? null
-    });
-    showRecoveryCodeOnce(recovered.recoveryCode);
-    showDevicePairingOnce(null);
-    status.textContent = "Access restored. Save the replacement recovery code shown above.";
-    await loadCommunityResults();
-  } catch {
-    setCommunitySession(null);
-    status.className = "participant-action-status error";
-    status.textContent = "That recovery code was invalid, expired, or already used.";
-  }
-}
-
-async function resetParticipantSecurity() {
-  if (!window.confirm("Revoke every other session and unused upload authorization, and replace your recovery code?")) return;
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Revoking other access and rotating recovery…";
-  try {
-    const reset = await communityClient.securityReset();
-    if (typeof reset?.csrfToken !== "string"
-        || typeof reset?.recoveryCode !== "string") {
-      throw new Error("Security reset did not return replacement authority.");
-    }
-    setCommunitySession({
-      csrfToken: reset.csrfToken,
-      participantId: reset.participantId ?? communitySession?.participantId ?? null,
-      consentVersion: reset.consentVersion ?? communitySession?.consentVersion ?? null
-    });
-    showRecoveryCodeOnce(reset.recoveryCode);
-    showDevicePairingOnce(null);
-    renderDevices(null);
-    status.textContent = "Other sessions and unused uploads were revoked. Save the new recovery code.";
-  } catch {
-    status.className = "participant-action-status error";
-    status.textContent = "The security reset could not be completed.";
-  }
-}
-
-async function logoutParticipant() {
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Signing out this browser session…";
-  try {
-    await communityClient.logout();
-  } catch {
-    // The local state is still cleared; the server also clears the cookie on
-    // expired or already-revoked sessions.
-  }
-  setCommunitySession(null);
-  showRecoveryCodeOnce(null);
-  showDevicePairingOnce(null);
-  renderDevices(null);
-  $("#participant-controls").hidden = true;
-  renderPersonalStats($("#personal-result"), null);
-  renderContributionHistory($("#contribution-history"), null);
-  status.textContent = "Signed out. Use the latest recovery code to return.";
-}
-
 $("#refresh-button").addEventListener("click", requestRefresh);
+$("#setup-refresh").addEventListener("click", requestRefresh);
+$("#cancel-refresh").addEventListener("click", cancelLocalAnalysis);
+$("#open-installed-app").addEventListener("click", openInstalledApp);
+$("#connection-check").addEventListener("click", checkLocalSetup);
+$("#companion-check").addEventListener("click", checkLocalSetup);
+$("#setup-check-again").addEventListener("click", checkLocalSetup);
+$("#contribution-lookback-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-lookback-hours]");
+  if (!button || contributionPreparationBusy) return;
+  activeContributionLookbackHours = Number(button.dataset.lookbackHours);
+  for (const control of $("#contribution-lookback-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  $("#prepare-contribution").textContent = activeContributionLookbackHours === 1
+    ? "Prepare and review latest hour"
+    : activeContributionLookbackHours === 24
+      ? "Prepare and review last 24 hours"
+      : "Prepare and review last 7 days";
+  renderContributionPreparationEstimate();
+});
+$("#community-connect-consent").addEventListener(
+  "change",
+  updateCommunityConnectButton
+);
+$("#connect-community").addEventListener(
+  "click",
+  connectCommunityContribution
+);
+$("#contribution-not-now").addEventListener("click", () => {
+  pendingAutomaticContributionConsent = null;
+  $("#community-connect-consent").checked = false;
+  renderAutomaticContributionStatus(automaticContributionStatus);
+  updateCommunityConnectButton();
+  const status = $("#community-connect-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent =
+    "Nothing will be contributed. Your local reporting continues unchanged.";
+});
+$("#automatic-contribution-toggle").addEventListener(
+  "click",
+  disableAutomaticContribution
+);
 $("#prepare-contribution").addEventListener("click", prepareLocalContribution);
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
-$("#sync-inspect").addEventListener("click", async () => {
-  contributionSyncBusy = true;
-  updateContributionSyncButtons();
-  showContributionSyncAction("Inspecting locally verified metadata through loopback; no service request or upload is performed.");
-  try {
-    await refreshContributionSyncControls();
-    const review = await localClient.contributionSyncExactReview();
-    renderContributionSyncExactReview(review);
-    showContributionSyncAction("Exact inspection complete. Review every retained field and value below; no service request or upload was performed.");
-  } catch {
-    showContributionSyncAction("The next contribution could not be inspected.", true);
-  } finally {
-    contributionSyncBusy = false;
-    updateContributionSyncButtons();
-  }
-});
+$("#sync-inspect").addEventListener("click", inspectNextContribution);
 $("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
 $("#sync-pause").addEventListener("click", () => runContributionSyncAction("pause"));
 $("#sync-resume").addEventListener("click", () => runContributionSyncAction("resume"));
@@ -3131,20 +4630,30 @@ $("#window-controls").addEventListener("click", (event) => {
   }
   resetTimelineViewport();
   renderTimeline(dashboard);
-  renderComparison(dashboard);
 });
 $("#range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
   if (!button || !dashboard) return;
-  activeTimelineRangeDays = Number(button.dataset.days);
+  activeUsageRangeDays = Number(button.dataset.days);
   for (const control of $("#range-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderUsageTimeline(dashboard);
+  renderComparison(dashboard);
+});
+$("#calibration-range-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-days]");
+  if (!button || !dashboard) return;
+  activeCalibrationRangeDays = Number(button.dataset.days);
+  for (const control of $("#calibration-range-controls").querySelectorAll("button")) {
     const active = control === button;
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
   resetTimelineViewport();
   renderTimeline(dashboard);
-  renderComparison(dashboard);
 });
 $("#timeline-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
@@ -3176,6 +4685,28 @@ $("#usage-group-controls").addEventListener("click", (event) => {
     control.setAttribute("aria-pressed", String(active));
   }
   renderUsageTimeline(dashboard);
+});
+$("#weekly-range-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-days]");
+  if (!button || !dashboard) return;
+  activeWeeklyRangeDays = Number(button.dataset.days);
+  for (const control of $("#weekly-range-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderWeekly(dashboard);
+});
+$("#weekly-evidence-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-evidence]");
+  if (!button || !dashboard) return;
+  showWeeklyPartialDiagnostics = button.dataset.evidence === "all";
+  for (const control of $("#weekly-evidence-controls").querySelectorAll("button")) {
+    const active = control === button;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+  renderWeekly(dashboard);
 });
 $("#accounting-period-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-period]");
@@ -3214,7 +4745,7 @@ $("#contribution-file").addEventListener("change", async () => {
         $("#contribution-consent-title").textContent =
           "I consent to upload participant-scoped pseudonymous account tracks.";
         $("#contribution-consent-detail").textContent =
-          "They link usage and quota rows only within this anonymous participant for private calibration; they are never published in community output and are deleted with the participant.";
+          "They link usage and quota rows only within this pseudonymous contribution session for private calibration; they are never published in community output and are deleted with the hosted session.";
       }
     } catch (error) {
       if (
@@ -3234,20 +4765,6 @@ $("#contribution-consent").addEventListener("change", () => {
   );
 });
 $("#contribution-form").addEventListener("submit", submitContribution);
-$("#recover-form").addEventListener("submit", recoverParticipant);
-$("#acknowledge-recovery").addEventListener("click", () => showRecoveryCodeOnce(null));
-$("#device-consent").addEventListener("change", () => {
-  $("#create-device-pairing").disabled = !$("#device-consent").checked;
-});
-$("#create-device-pairing").addEventListener("click", createDevicePairing);
-$("#acknowledge-device-pairing").addEventListener("click", () => showDevicePairingOnce(null));
-$("#device-list").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-device-id]");
-  if (button?.dataset.deviceId) revokeDevice(button.dataset.deviceId);
-});
-$("#download-participant").addEventListener("click", downloadParticipantExport);
-$("#security-reset").addEventListener("click", resetParticipantSecurity);
-$("#logout-participant").addEventListener("click", logoutParticipant);
 $("#delete-participant").addEventListener("click", deleteParticipantData);
 $("#contribution-history").addEventListener("click", (event) => {
   const button = event.target.closest("[data-contribution-id]");
@@ -3271,6 +4788,9 @@ for (const section of document.querySelectorAll(".dashboard-section, [data-nav-t
 function syncNavigationFromHash() {
   const id = window.location.hash.slice(1);
   if (!id) return;
+  if (["community", "history", "backend"].includes(id)) {
+    $("#community-contribution-disclosure").open = true;
+  }
   for (const link of document.querySelectorAll("[data-nav]")) {
     const active = link.dataset.nav === id;
     link.classList.toggle("active", active);
@@ -3281,5 +4801,18 @@ function syncNavigationFromHash() {
 window.addEventListener("hashchange", syncNavigationFromHash);
 syncNavigationFromHash();
 
-loadLocalDashboard();
-restoreCommunitySession().finally(loadCommunityResults);
+async function bootstrapDashboard() {
+  renderInstallerJourney();
+  updateLocalActionButtons();
+  await loadLocalDashboard();
+  if (
+    localCompanionHealth === null
+    || localCompanionHealth?.capabilities?.centralServiceProxy === true
+  ) {
+    await restoreCommunitySession();
+  }
+  await loadCommunityResults();
+  scheduleReturningUserRefresh();
+}
+
+bootstrapDashboard();

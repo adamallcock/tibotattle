@@ -2,11 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { request as httpRequest } from "node:http";
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+} from "node:http";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
+  readdir,
   rm,
   symlink,
   writeFile,
@@ -20,8 +25,15 @@ import {
   LocalContributionPreparationError,
 } from "../../src/local-contribution-preparation.js";
 import {
+  claimContributionDevicePairing,
+} from "../../src/contribution-device-client.js";
+import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
+import {
+  PRODUCT_BRAND,
+  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+} from "../../config/product-brand.js";
 import { startLocalCompanionServer } from "./server.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
@@ -122,18 +134,37 @@ function fakeStore() {
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "local-companion-server-"));
-  const staticRoot = join(root, "public");
-  await mkdir(staticRoot);
-  await writeFile(join(staticRoot, "index.html"), "<!doctype html><title>Usage Monitor</title>");
+  const resourceRoot = join(root, "resources");
+  const stateRoot = join(root, "state");
+  const codexHome = join(root, "home", ".codex");
+  const staticRoot = join(resourceRoot, "public");
+  await mkdir(staticRoot, { recursive: true });
+  await mkdir(join(codexHome, "sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await mkdir(join(codexHome, "archived_sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await writeFile(
+    join(codexHome, "sessions", "rollout-fixture.jsonl"),
+    `${JSON.stringify({ type: "session_meta" })}\n`,
+    { mode: 0o600 },
+  );
+  await writeFile(
+    join(staticRoot, "index.html"),
+    `<!doctype html><meta name="usage-monitor-semantic-open-target" content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><title>Usage Monitor</title>`,
+  );
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
   await writeFile(join(staticRoot, "styles.css"), "body { color: black; }");
   await writeFile(
-    join(root, "2026-07-24-simple-quota-gradient-report.html"),
+    join(resourceRoot, "2026-07-24-simple-quota-gradient-report.html"),
     "<!doctype html><title>Gradient detail</title>",
   );
-  return { root, staticRoot };
+  return { root, resourceRoot, stateRoot, codexHome, staticRoot };
 }
 
 function rawRequest({ port, path, method = "GET", headers = {}, body = "" }) {
@@ -167,11 +198,69 @@ async function waitFor(predicate, timeoutMs = 1_000) {
   throw new Error("condition was not reached");
 }
 
+function deferred() {
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolveDeferred, rejectDeferred) => {
+    resolvePromise = resolveDeferred;
+    rejectPromise = rejectDeferred;
+  });
+  return {
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+  };
+}
+
+function processIsRunning(processId) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+const WATCHDOG_PARENT_SCRIPT = `
+const { spawn } = require("node:child_process");
+const { writeSync } = require("node:fs");
+const child = spawn(
+  process.execPath,
+  [process.env.WATCHDOG_SERVER_PATH],
+  {
+    cwd: process.env.USAGE_MONITOR_RESOURCE_ROOT,
+    env: {
+      ...process.env,
+      USAGE_MONITOR_PARENT_PID: String(process.pid),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  },
+);
+writeSync(1, \`WATCHDOG_CHILD_PID=\${child.pid}\\n\`);
+let pending = "";
+let ready = false;
+child.stdout.on("data", (chunk) => {
+  writeSync(1, chunk);
+  pending += chunk.toString("utf8");
+  if (!ready && pending.includes("USAGE_MONITOR_READY")) {
+    ready = true;
+    setTimeout(() => process.exit(0), 25);
+  }
+});
+child.stderr.on("data", (chunk) => writeSync(2, chunk));
+child.once("exit", () => {
+  if (!ready) process.exit(2);
+});
+setTimeout(() => process.exit(3), 15_000);
+`;
+
 test("loopback server exposes only fixed API, static, and report routes", async () => {
   const files = await fixture();
   const store = fakeStore();
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: store,
     refreshRunner: async () => ({}),
@@ -189,6 +278,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       contributionPreparationIdentityMode: "production_keychain",
       contributionSyncStatus: true,
       contributionSyncNext: true,
+      contributionDevicePairing: false,
       contributionSyncExactReview: true,
       contributionSyncActions: false,
       centralServiceProxy: false,
@@ -199,13 +289,50 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(health.headers.get("access-control-allow-origin"), null);
     assert.match(health.headers.get("content-security-policy"), /default-src 'none'/);
 
+    const onboarding = await fetch(`${base}/api/local/onboarding`);
+    assert.equal(onboarding.status, 200);
+    assert.deepEqual(await onboarding.json(), {
+      schemaVersion: "local-onboarding-v0.2",
+      status: "ready",
+      source: {
+        status: "ready",
+        sessionsReadable: true,
+        archivedSessionsReadable: true,
+        rolloutFilesPresent: true,
+        rolloutFilesObserved: 1,
+        rolloutFilesObservedCapped: false,
+      },
+      state: {
+        status: "ready",
+        writable: true,
+      },
+      capabilities: {
+        explicitRefresh: true,
+        customCodexHomeConfigured: false,
+        rawContentExposed: false,
+        arbitraryPathAccess: false,
+      },
+    });
+    assert.equal((await fetch(`${base}/api/local/onboarding`, {
+      method: "POST",
+    })).status, 405);
+
     const overview = await fetch(`${base}/api/local/overview`);
     assert.equal(overview.status, 200);
     assert.equal((await overview.json()).mode, "real_local_evidence");
 
     const page = await fetch(`${base}/`);
     assert.equal(page.status, 200);
-    assert.match(await page.text(), /Usage Monitor/);
+    const pageBody = await page.text();
+    assert.match(pageBody, /Usage Monitor/);
+    assert.match(
+      pageBody,
+      new RegExp(
+        `content="${PRODUCT_BRAND.appOpenURL.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}"`,
+        "u",
+      ),
+    );
+    assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
 
     const report = await fetch(`${base}/reports/gradient`);
@@ -216,19 +343,656 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal((await fetch(`${base}/api/local/not-allowed`)).status, 404);
     assert.equal((await fetch(`${base}/package.json`)).status, 404);
     assert.equal((await fetch(`${base}/api/local/overview?path=/Users/private`)).status, 400);
+
+    await writeFile(
+      join(files.staticRoot, "index.html"),
+      "<!doctype html><title>Unstamped</title>",
+    );
+    assert.equal((await fetch(`${base}/index.html`)).status, 404);
+    await writeFile(
+      join(files.staticRoot, "index.html"),
+      `<meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
+    );
+    assert.equal((await fetch(`${base}/index.html`)).status, 404);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
   }
 });
 
-test("loopback central relay supports only the participant lifecycle with exact forwarding", async () => {
+test("automatic contribution endpoints require exact consent and remain foreground-only", async () => {
+  const files = await fixture();
+  let now = Date.parse("2026-07-29T12:00:00.000Z");
+  let preparations = 0;
+  const preparationRequests = [];
+  const retirementRequests = [];
+  let uploads = 0;
+  let manualRuns = 0;
+  let networkCalls = 0;
+  let nextTimer = 1;
+  const timers = new Map();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    centralOrigin: "http://127.0.0.1:8792",
+    centralFetch: async () => {
+      networkCalls += 1;
+      throw new Error("automatic contribution test must not use fetch");
+    },
+    contributionPreparationRunner: async (request) => {
+      preparations += 1;
+      preparationRequests.push(request);
+      const { lookbackHours } = request;
+      assert.equal(lookbackHours, 24);
+      const coveredAt = {
+        startAt: "2026-07-29T11:00:00.000Z",
+        endAt: "2026-07-29T18:00:00.000Z",
+      };
+      await request.beforePreparedPublish({
+        preparedSetId: "a".repeat(64),
+        coveredAt,
+      });
+      return {
+        schemaVersion: "local-contribution-preparation-result-v0.1",
+        status: "prepared",
+        prepared: { preparedSetId: "a".repeat(64) },
+        coveredAt,
+        networkActivity: false,
+      };
+    },
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: Buffer.byteLength(
+        JSON.stringify(exactReviewContribution()),
+        "utf8",
+      ),
+      payload: exactReviewContribution(),
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+    contributionSyncOnceRunner: async ({
+      signal,
+      reviewedJob,
+      preparedSetId,
+      maximumJobs,
+      maximumReservedUploadBytes,
+    }) => {
+      uploads += 1;
+      assert.ok(signal instanceof AbortSignal);
+      if (reviewedJob !== undefined) {
+        manualRuns += 1;
+        assert.deepEqual(reviewedJob, {
+          jobId: REVIEW_JOB_ID,
+          contributionSha256: REVIEW_SHA256,
+        });
+        return {
+          status: "completed",
+          discoveredSets: 1,
+          enqueued: 0,
+          processed: 1,
+          accepted: manualRuns === 1 ? 0 : 1,
+          retryable: manualRuns === 1 ? 1 : 0,
+          rejected: 0,
+          reservedUploadBytes: 1024,
+          bandwidthLimited: false,
+          queue: { paused: false },
+          preparedSet: {
+            preparedSetId: "a".repeat(64),
+            coveredAt: {
+              startAt: "2026-07-29T11:00:00.000Z",
+              endAt: "2026-07-29T12:00:00.000Z",
+            },
+            totalJobs: 1,
+            acceptedJobs: manualRuns === 1 ? 0 : 1,
+            pendingJobs: 0,
+            retryableJobs: manualRuns === 1 ? 1 : 0,
+            inFlightJobs: 0,
+            rejectedJobs: 0,
+            completeAccepted: manualRuns !== 1,
+          },
+        };
+      }
+      assert.equal(preparedSetId, "a".repeat(64));
+      assert.equal(maximumJobs, 100);
+      assert.equal(maximumReservedUploadBytes, 64 * 1024 * 1024);
+      return {
+        status: "completed",
+        discoveredSets: 1,
+        enqueued: 1,
+        processed: 1,
+        accepted: 1,
+        retryable: 0,
+        rejected: 0,
+        reservedUploadBytes: 1024,
+        bandwidthLimited: false,
+        queue: { paused: false },
+        preparedSet: {
+          preparedSetId: "a".repeat(64),
+          coveredAt: {
+            startAt: "2026-07-29T11:00:00.000Z",
+            endAt: "2026-07-29T18:00:00.000Z",
+          },
+          totalJobs: 1,
+          acceptedJobs: 1,
+          pendingJobs: 0,
+          retryableJobs: 0,
+          inFlightJobs: 0,
+          rejectedJobs: 0,
+          completeAccepted: true,
+        },
+      };
+    },
+    automaticContributionRetirementRunner: async (request) => {
+      retirementRequests.push(request);
+      return {
+        retiredSets: 0,
+        retiredJobs: 0,
+        interrupted: false,
+        networkActivity: false,
+      };
+    },
+    automaticContributionOptions: {
+      now: () => new Date(now),
+      setTimeoutImpl(callback, delay) {
+        const id = nextTimer;
+        nextTimer += 1;
+        timers.set(id, { callback, delay });
+        return id;
+      },
+      clearTimeoutImpl(id) {
+        timers.delete(id);
+      },
+    },
+    port: 0,
+  });
+  try {
+    const origin = `http://127.0.0.1:${app.port}`;
+    const settingsResponse = await fetch(
+      `${origin}/api/local/contribution/automatic-settings`,
+    );
+    assert.equal(settingsResponse.status, 200);
+    const settings = await settingsResponse.json();
+    assert.equal(settings.schemaVersion, "automatic-contribution-status-v0.1");
+    assert.equal(settings.status, "first_review_required");
+    assert.equal(settings.enabled, false);
+    assert.equal(settings.firstReviewComplete, false);
+    assert.equal(settings.intervalHours, 6);
+    assert.equal(settings.requiredConsent.destinationOrigin,
+      "http://127.0.0.1:8792");
+    assert.equal(settings.foregroundOnly, true);
+    assert.equal(settings.daemonInstalled, false);
+    assert.equal(preparations, 0);
+    assert.equal(uploads, 0);
+    assert.equal(networkCalls, 0);
+
+    const enableBody = JSON.stringify({
+      intervalHours: 6,
+      consent: settings.requiredConsent,
+    });
+    const unauthorized = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/automatic-enable",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: enableBody,
+    });
+    assert.equal(unauthorized.status, 403);
+
+    const mismatched = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/automatic-enable",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: origin,
+        "X-Usage-Monitor-Local": "1",
+      },
+      body: JSON.stringify({
+        intervalHours: 6,
+        consent: {
+          ...settings.requiredConsent,
+          privacyContractVersion: "changed-contract",
+        },
+      }),
+    });
+    assert.equal(mismatched.status, 409);
+    assert.equal(
+      JSON.parse(mismatched.body).error.code,
+      "automatic_contribution_first_review_required",
+    );
+    assert.equal(timers.size, 0);
+    assert.equal(uploads, 0);
+    const contributionHeaders = {
+      "Content-Type": "application/json",
+      Origin: origin,
+      "X-Usage-Monitor-Local": "1",
+    };
+    const runReviewedContribution = async () => {
+      const review = await fetch(
+        `${origin}/api/local/contribution/sync-inspect-exact`,
+        {
+          method: "POST",
+          headers: contributionHeaders,
+          body: "{}",
+        },
+      ).then((response) => response.json());
+      return fetch(`${origin}/api/local/contribution/sync-once`, {
+        method: "POST",
+        headers: contributionHeaders,
+        body: JSON.stringify({ reviewToken: review.reviewToken }),
+      });
+    };
+    const unsuccessful = await runReviewedContribution();
+    assert.equal(unsuccessful.status, 200);
+    assert.equal((await unsuccessful.json()).accepted, 0);
+    assert.equal(
+      (await fetch(
+        `${origin}/api/local/contribution/automatic-settings`,
+      ).then((response) => response.json())).status,
+      "first_review_required",
+    );
+    const stillLocked = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/automatic-enable",
+      method: "POST",
+      headers: contributionHeaders,
+      body: enableBody,
+    });
+    assert.equal(stillLocked.status, 409);
+    assert.equal(timers.size, 0);
+
+    const successful = await runReviewedContribution();
+    assert.equal(successful.status, 200);
+    assert.equal((await successful.json()).accepted, 1);
+    const reviewedSettings = await fetch(
+      `${origin}/api/local/contribution/automatic-settings`,
+    ).then((response) => response.json());
+    assert.equal(reviewedSettings.status, "disabled");
+    assert.equal(reviewedSettings.firstReviewComplete, true);
+    assert.equal(
+      reviewedSettings.firstReviewedAcceptedAt,
+      "2026-07-29T12:00:00.000Z",
+    );
+
+    const mismatchAfterReview = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/automatic-enable",
+      method: "POST",
+      headers: contributionHeaders,
+      body: JSON.stringify({
+        intervalHours: 6,
+        consent: {
+          ...settings.requiredConsent,
+          privacyContractVersion: "changed-contract",
+        },
+      }),
+    });
+    assert.equal(mismatchAfterReview.status, 409);
+    assert.equal(
+      JSON.parse(mismatchAfterReview.body).error.code,
+      "automatic_contribution_consent_binding_mismatch",
+    );
+
+    const enabled = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/automatic-enable",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: origin,
+        "X-Usage-Monitor-Local": "1",
+      },
+      body: enableBody,
+    });
+    assert.equal(enabled.status, 200);
+    const enabledStatus = JSON.parse(enabled.body);
+    assert.equal(enabledStatus.status, "scheduled");
+    assert.equal(enabledStatus.nextAttemptAt, "2026-07-29T18:00:00.000Z");
+    assert.equal(preparations, 0);
+    assert.equal(uploads, 2);
+    assert.equal(networkCalls, 0);
+
+    now += 6 * 60 * 60 * 1_000;
+    const completed = await app.automaticContribution.runDue();
+    assert.equal(completed.status, "scheduled");
+    assert.deepEqual(completed.lastOutcome, {
+      status: "succeeded",
+      code: "accepted",
+      at: "2026-07-29T18:00:00.000Z",
+    });
+    assert.equal(preparations, 1);
+    assert.equal(
+      preparationRequests[0].acceptedThroughAt,
+      "2026-07-29T12:00:00.000Z",
+    );
+    assert.equal(preparationRequests[0].replayOverlapHours, 1);
+    assert.deepEqual(
+      preparationRequests[0].protectedPreparedSetIds,
+      ["a".repeat(64)],
+    );
+    assert.equal(retirementRequests.length, 1);
+    assert.equal(uploads, 3);
+    assert.equal(networkCalls, 0);
+
+    const disabled = await rawRequest({
+      port: app.port,
+      path: "/api/local/contribution/automatic-disable",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: origin,
+        "X-Usage-Monitor-Local": "1",
+      },
+      body: JSON.stringify({ reason: "user_request" }),
+    });
+    assert.equal(disabled.status, 200);
+    assert.equal(JSON.parse(disabled.body).status, "disabled");
+    assert.equal(JSON.parse(disabled.body).consentedAt, null);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("one state root cannot run concurrent automatic schedulers", async () => {
+  const files = await fixture();
+  let first;
+  let restarted;
+  const options = {
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    port: 0,
+  };
+  try {
+    first = await startLocalCompanionServer(options);
+    await assert.rejects(
+      startLocalCompanionServer({
+        ...options,
+        dataStore: fakeStore(),
+      }),
+      (error) => error?.code === "automatic_contribution_instance_active",
+    );
+    await first.close();
+    first = null;
+    await assert.rejects(
+      lstat(join(
+        files.stateRoot,
+        "private",
+        "automatic-contribution-v0.1.lock",
+      )),
+      (error) => error?.code === "ENOENT",
+    );
+    restarted = await startLocalCompanionServer({
+      ...options,
+      dataStore: fakeStore(),
+    });
+    assert.equal(
+      (await fetch(
+        `http://127.0.0.1:${restarted.port}/api/local/health`,
+      )).status,
+      200,
+    );
+  } finally {
+    await restarted?.close();
+    await first?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("shutdown retains the automatic-contribution lock until an aborted run finishes cleanup", async () => {
+  const files = await fixture();
+  const preparationStarted = deferred();
+  const abortObserved = deferred();
+  const cleanupBarrier = deferred();
+  let first;
+  let restarted;
+  let activeRun;
+  let closePromise;
+  let now = Date.parse("2026-07-29T12:00:00.000Z");
+  const options = {
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    centralOrigin: "http://127.0.0.1:8792",
+    contributionPreparationRunner: async ({ signal }) => {
+      preparationStarted.resolve();
+      if (!signal.aborted) {
+        await new Promise((resolveAbort) => {
+          signal.addEventListener("abort", resolveAbort, { once: true });
+        });
+      }
+      abortObserved.resolve();
+      await cleanupBarrier.promise;
+      throw new LocalContributionPreparationError("preparation_aborted");
+    },
+    contributionSyncOnceRunner: async () => {
+      throw new Error("shutdown test must not reach upload");
+    },
+    automaticContributionRetirementRunner: async () => ({
+      retiredSets: 0,
+      retiredJobs: 0,
+      interrupted: false,
+      networkActivity: false,
+    }),
+    automaticContributionOptions: {
+      now: () => new Date(now),
+    },
+    port: 0,
+  };
+  try {
+    first = await startLocalCompanionServer(options);
+    const reviewedAt = {
+      startAt: "2026-07-29T11:00:00.000Z",
+      endAt: "2026-07-29T12:00:00.000Z",
+    };
+    await first.automaticContribution.recordReviewedManualAcceptance({
+      status: "completed",
+      accepted: 1,
+      preparedSet: {
+        preparedSetId: "d".repeat(64),
+        coveredAt: reviewedAt,
+        totalJobs: 1,
+        acceptedJobs: 1,
+        pendingJobs: 0,
+        retryableJobs: 0,
+        inFlightJobs: 0,
+        rejectedJobs: 0,
+        completeAccepted: true,
+      },
+    });
+    const disabled = await first.automaticContribution.inspect();
+    await first.automaticContribution.enable({
+      intervalHours: 6,
+      consent: disabled.requiredConsent,
+    });
+    now += 6 * 60 * 60 * 1_000;
+    activeRun = first.automaticContribution.runDue();
+    await preparationStarted.promise;
+
+    let closeSettled = false;
+    closePromise = first.close().then(() => {
+      closeSettled = true;
+    });
+    await abortObserved.promise;
+    assert.equal(closeSettled, false);
+    let explicitShutdownSettled = false;
+    const explicitShutdown = first.shutdownAutomaticContribution().then(() => {
+      explicitShutdownSettled = true;
+    });
+    await Promise.resolve();
+    assert.equal(explicitShutdownSettled, false);
+
+    await assert.rejects(
+      startLocalCompanionServer({
+        ...options,
+        dataStore: fakeStore(),
+      }),
+      (error) => error?.code === "automatic_contribution_instance_active",
+    );
+    assert.equal(closeSettled, false);
+
+    cleanupBarrier.resolve();
+    await Promise.all([activeRun, closePromise, explicitShutdown]);
+    assert.equal(explicitShutdownSettled, true);
+    activeRun = null;
+    closePromise = null;
+    first = null;
+    await assert.rejects(
+      lstat(join(
+        files.stateRoot,
+        "private",
+        "automatic-contribution-v0.1.lock",
+      )),
+      (error) => error?.code === "ENOENT",
+    );
+
+    restarted = await startLocalCompanionServer({
+      ...options,
+      dataStore: fakeStore(),
+    });
+    assert.equal(
+      (await fetch(
+        `http://127.0.0.1:${restarted.port}/api/local/health`,
+      )).status,
+      200,
+    );
+  } finally {
+    cleanupBarrier.resolve();
+    await Promise.allSettled([
+      activeRun,
+      closePromise,
+      restarted?.close(),
+      first?.close(),
+    ].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("initialization failure retains the lock until idempotent automatic shutdown finishes", async () => {
+  const files = await fixture();
+  const stopStarted = deferred();
+  const cleanupBarrier = deferred();
+  const initializationError = new Error("simulated initialization failure");
+  let stopCalls = 0;
+  let restarted;
+  let observedFailure;
+  const automaticContributionController = {
+    async start() {
+      throw new Error("automatic controller must not start after data init fails");
+    },
+    async stop() {
+      stopCalls += 1;
+      stopStarted.resolve();
+      await cleanupBarrier.promise;
+    },
+    async inspect() {
+      return {};
+    },
+    async enable() {
+      return {};
+    },
+    async disable() {
+      return {};
+    },
+    async recordReviewedManualAcceptance() {
+      return {};
+    },
+  };
+  const baseOptions = {
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    refreshRunner: async () => ({}),
+    port: 0,
+  };
+  try {
+    observedFailure = assert.rejects(
+      startLocalCompanionServer({
+        ...baseOptions,
+        dataStore: {
+          ...fakeStore(),
+          async initialize() {
+            throw initializationError;
+          },
+        },
+        automaticContributionController,
+      }),
+      (error) => error === initializationError,
+    );
+    await stopStarted.promise;
+    assert.equal(stopCalls, 1);
+
+    await assert.rejects(
+      startLocalCompanionServer({
+        ...baseOptions,
+        dataStore: fakeStore(),
+      }),
+      (error) => error?.code === "automatic_contribution_instance_active",
+    );
+    assert.equal(stopCalls, 1);
+
+    cleanupBarrier.resolve();
+    await observedFailure;
+    observedFailure = null;
+    assert.equal(stopCalls, 1);
+    await assert.rejects(
+      lstat(join(
+        files.stateRoot,
+        "private",
+        "automatic-contribution-v0.1.lock",
+      )),
+      (error) => error?.code === "ENOENT",
+    );
+
+    restarted = await startLocalCompanionServer({
+      ...baseOptions,
+      dataStore: fakeStore(),
+    });
+    assert.equal(
+      (await fetch(
+        `http://127.0.0.1:${restarted.port}/api/local/health`,
+      )).status,
+      200,
+    );
+  } finally {
+    cleanupBarrier.resolve();
+    await Promise.allSettled([
+      observedFailure,
+      restarted?.close(),
+    ].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("participant relay supports explicit loopback development with exact forwarding", async () => {
   const files = await fixture();
   const forwarded = [];
   const validSetCookie =
     "__Host-usage_monitor_session=um_session_00000000-0000-4000-8000-000000000000.secret; Path=/; Max-Age=1800; Secure; HttpOnly; SameSite=Strict";
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
@@ -239,6 +1003,7 @@ test("loopback central relay supports only the participant lifecycle with exact 
         method: options.method,
         headers: { ...options.headers },
         body: options.body?.toString("utf8") ?? null,
+        redirect: options.redirect,
       });
       const headers = {
         "Content-Type": "application/json",
@@ -334,16 +1099,109 @@ test("loopback central relay supports only the participant lifecycle with exact 
   }
 });
 
-test("loopback participant relay blocks unknown authority routes and fails closed", async () => {
+test("participant relay accepts one pinned production HTTPS origin without forwarding ambient authority", async () => {
+  const files = await fixture();
+  const forwarded = [];
+  const centralOrigin = "https://usage-monitor.example";
+  const validSetCookie =
+    "__Host-usage_monitor_session=um_session_00000000-0000-4000-8000-000000000000.secret; Path=/; Max-Age=1800; Secure; HttpOnly; SameSite=Strict";
+  const sessionCookie =
+    "__Host-usage_monitor_session=um_session_00000000-0000-4000-8000-000000000000.secret";
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    centralOrigin,
+    centralFetch: async (url, options) => {
+      forwarded.push({
+        url,
+        method: options.method,
+        headers: { ...options.headers },
+        body: options.body?.toString("utf8") ?? null,
+        redirect: options.redirect,
+      });
+      return Response.json({ status: "ok" }, {
+        status: url.endsWith("/api/v1/enroll") ? 201 : 200,
+        headers: url.endsWith("/api/v1/enroll")
+          ? { "Set-Cookie": validSetCookie }
+          : {},
+      });
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.equal(health.capabilities.centralParticipantRelay, true);
+
+    const enrollmentBody =
+      '{"consentVersion":"privacy-safe-telemetry-v0.1","syntheticOnly":false}';
+    const enrolled = await fetch(`${base}/api/v1/enroll`, {
+      method: "POST",
+      headers: {
+        Origin: base,
+        "Content-Type": "application/json",
+        Cookie: "ambient=must-not-pass",
+        "X-Ambient-Authority": "must-not-pass",
+      },
+      body: enrollmentBody,
+    });
+    assert.equal(enrolled.status, 201);
+    assert.equal(enrolled.headers.get("set-cookie"), validSetCookie);
+
+    const stats = await fetch(`${base}/api/v1/me/stats`, {
+      headers: {
+        Cookie: `${sessionCookie}; ambient=must-not-pass`,
+        "X-Ambient-Authority": "must-not-pass",
+      },
+    });
+    assert.equal(stats.status, 200);
+    assert.deepEqual(forwarded, [
+      {
+        url: `${centralOrigin}/api/v1/enroll`,
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Origin: centralOrigin,
+          "Content-Type": "application/json",
+        },
+        body: enrollmentBody,
+        redirect: "error",
+      },
+      {
+        url: `${centralOrigin}/api/v1/me/stats`,
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          Origin: centralOrigin,
+          Cookie: sessionCookie,
+        },
+        body: null,
+        redirect: "error",
+      },
+    ]);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("participant relay blocks unknown authority routes and fails closed", async () => {
   const files = await fixture();
   let mode = "ok";
   let forwarded = 0;
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
-    centralOrigin: "http://localhost:8792",
+    centralOrigin: "http://127.0.0.1:8792",
     centralFetch: async () => {
       forwarded += 1;
       if (mode === "throw") throw new Error("private upstream detail");
@@ -405,6 +1263,49 @@ test("loopback participant relay blocks unknown authority routes and fails close
   }
 });
 
+test("participant relay never follows an upstream redirect", async () => {
+  const files = await fixture();
+  const upstreamRequests = [];
+  const upstream = createHttpServer((request, response) => {
+    upstreamRequests.push(request.url);
+    response.writeHead(302, {
+      Location: "/redirected",
+      "Content-Type": "application/json",
+    });
+    response.end('{"status":"redirect"}');
+  });
+  await new Promise((resolveListen, rejectListen) => {
+    upstream.once("error", rejectListen);
+    upstream.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = upstream.address();
+  assert.equal(typeof address, "object");
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    centralOrigin: `http://127.0.0.1:${address.port}`,
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(`${base}/api/v1/session`);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "central_participant_service_unavailable" },
+    });
+    assert.deepEqual(upstreamRequests, ["/api/v1/session"]);
+  } finally {
+    await app.close();
+    await new Promise((resolveClose) => upstream.close(resolveClose));
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("server rejects forged hosts and requires same-origin refresh authorization", async () => {
   const files = await fixture();
   const store = fakeStore();
@@ -413,7 +1314,9 @@ test("server rejects forged hosts and requires same-origin refresh authorization
     resolveRefresh = resolve;
   });
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: store,
     refreshRunner: async () => {
@@ -482,10 +1385,121 @@ test("server rejects forged hosts and requires same-origin refresh authorization
   }
 });
 
+test("server exposes an authorized bounded refresh cancellation", async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  let observedAbort = false;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: ({ signal, onProgress }) => new Promise((resolve) => {
+      onProgress({
+        mode: "recent_7d",
+        status: "recent_7d_indexing",
+        phase: "rollout_index",
+        boundedBy: "modified_at_and_collection_start",
+        filesDiscovered: 3,
+        filesSelected: 3,
+        filesProcessed: 1,
+        recordsWritten: 2,
+        coveredAt: {
+          startAt: "2026-07-16T12:00:00.000Z",
+          endAt: null,
+        },
+      });
+      signal.addEventListener("abort", () => {
+        observedAbort = true;
+        resolve({
+          rolloutRecordsWritten: 2,
+          filesDiscovered: 3,
+          indexing: {
+            mode: "recent_7d",
+            status: "bounded_pause",
+            phase: "paused",
+            boundedBy: "modified_at_and_collection_start",
+            filesDiscovered: 3,
+            filesSelected: 3,
+            filesProcessed: 1,
+            recordsWritten: 2,
+            coveredAt: {
+              startAt: "2026-07-16T12:00:00.000Z",
+              endAt: null,
+            },
+          },
+        });
+      }, { once: true });
+    }),
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const authorizedHeaders = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+
+    const unauthorizedCancel = await fetch(
+      `${base}/api/local/refresh/cancel`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    assert.equal(unauthorizedCancel.status, 403);
+
+    const cancelled = await fetch(`${base}/api/local/refresh/cancel`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(cancelled.status, 202);
+    assert.equal((await cancelled.json()).refresh.status, "cancelling");
+
+    await waitFor(async () => {
+      const status = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return status.refresh.status === "cancelled";
+    });
+    const status = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.equal(observedAbort, true);
+    assert.equal(status.refresh.errorCode, "refresh_cancelled");
+    assert.equal(status.refresh.progress.status, "bounded_pause");
+    assert.equal(store.reloads, 1);
+
+    const duplicateCancel = await fetch(`${base}/api/local/refresh/cancel`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(duplicateCancel.status, 409);
+    assert.equal(
+      (await duplicateCancel.json()).error.code,
+      "refresh_not_running",
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("contribution preview returns counts and accounting only", async () => {
   const files = await fixture();
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
@@ -532,9 +1546,9 @@ test("development file override drives the real default preparation runner witho
   const secretFile = join(files.root, "development-export-identity");
   const codexHome = join(files.root, "codex-home");
   const sessionDirectory = join(codexHome, "sessions");
-  const preparedDirectory = join(files.root, "prepared");
-  const reviewDirectory = join(files.root, "reviews");
-  const queueFile = join(files.root, "queue.sqlite3");
+  const preparedDirectory = join(files.stateRoot, "prepared");
+  const reviewDirectory = join(files.stateRoot, "reviews");
+  const queueFile = join(files.stateRoot, "queue.sqlite3");
   await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
   await writeFile(secretFile, `${secretCanary}\n`, { mode: 0o600 });
   const tokenUsage = {
@@ -596,7 +1610,9 @@ test("development file override drives the real default preparation runner witho
   });
   let keychainConstructions = 0;
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: store,
     refreshRunner: async () => ({}),
@@ -612,7 +1628,10 @@ test("development file override drives the real default preparation runner witho
     },
     contributionPreparationOptions: {
       codexHome,
-      activityFile: join(files.root, "missing-activity-markers.jsonl"),
+      activityFile: join(
+        files.stateRoot,
+        "missing-activity-markers.jsonl",
+      ),
       reviewArchiveDirectory: reviewDirectory,
     },
     port: 0,
@@ -652,6 +1671,15 @@ test("development file override drives the real default preparation runner witho
 
     const next = await fetch(
       `${base}/api/local/contribution/sync-next`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: "{}",
+      },
     ).then((response) => response.json());
     assert.equal(next.status, "available");
     assert.equal(next.state, "ready");
@@ -719,7 +1747,9 @@ test("development identity configuration fails before listen without disclosing 
   const assertInvalid = async (options) => {
     await assert.rejects(
       startLocalCompanionServer({
-        root: files.root,
+        resourceRoot: files.resourceRoot,
+        stateRoot: files.stateRoot,
+        codexHome: files.codexHome,
         staticRoot: files.staticRoot,
         dataStore: fakeStore(),
         refreshRunner: async () => ({}),
@@ -790,27 +1820,35 @@ test("development identity configuration fails before listen without disclosing 
 test("contribution preparation is an explicit, bounded, local-only action", async () => {
   const files = await fixture();
   let preparationCalls = 0;
+  const preparationRequests = [];
   let releasePreparation;
   const preparationGate = new Promise((resolvePreparation) => {
     releasePreparation = resolvePreparation;
   });
   const privateCanary = "/Users/private/source/session.jsonl";
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
-    contributionPreparationRunner: async (...args) => {
+    contributionPreparationRunner: async (preparationRequest) => {
       preparationCalls += 1;
-      assert.equal(args.length, 0);
+      preparationRequests.push(preparationRequest);
       await preparationGate;
       return {
         schemaVersion: "local-contribution-preparation-result-v0.1",
         status: "prepared",
-        coveredAt: {
-          startAt: "2026-07-26T12:00:00.000Z",
-          endAt: "2026-07-26T12:30:00.000Z",
-        },
+        coveredAt: preparationRequest.lookbackHours === 7 * 24
+          ? {
+            startAt: "2026-07-20T12:30:00.000Z",
+            endAt: "2026-07-26T12:30:00.000Z",
+          }
+          : {
+            startAt: "2026-07-26T12:00:00.000Z",
+            endAt: "2026-07-26T12:30:00.000Z",
+          },
         recordCounts: {
           usageEvents: 2,
           quotaSnapshots: 1,
@@ -864,6 +1902,16 @@ test("contribution preparation is an explicit, bounded, local-only action", asyn
       headers: authorizedHeaders,
       body: '{"path":"/Users/private"}',
     })).status, 400);
+    assert.equal((await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: '{"lookbackHours":2}',
+    })).status, 400);
+    assert.equal((await fetch(`${base}/api/local/contribution/prepare`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: '{"lookbackHours":24,"path":"/Users/private"}',
+    })).status, 400);
     const oversized = await rawRequest({
       port: app.port,
       path: "/api/local/contribution/prepare",
@@ -883,6 +1931,7 @@ test("contribution preparation is an explicit, bounded, local-only action", asyn
       body: "{}",
     });
     await waitFor(() => preparationCalls === 1);
+    assert.deepEqual(preparationRequests, [{ lookbackHours: 24 }]);
     const overlap = await fetch(`${base}/api/local/contribution/prepare`, {
       method: "POST",
       headers: authorizedHeaders,
@@ -934,6 +1983,44 @@ test("contribution preparation is an explicit, bounded, local-only action", asyn
       includesIdentifiers: false,
       includesCredentials: false,
     });
+
+    const sevenDayResponse = await fetch(
+      `${base}/api/local/contribution/prepare`,
+      {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: '{"lookbackHours":168}',
+      },
+    );
+    assert.equal(sevenDayResponse.status, 200);
+    assert.deepEqual(
+      (await sevenDayResponse.json()).coveredAt,
+      {
+        startAt: "2026-07-20T12:30:00.000Z",
+        endAt: "2026-07-26T12:30:00.000Z",
+      },
+    );
+    assert.deepEqual(
+      preparationRequests,
+      [{ lookbackHours: 24 }, { lookbackHours: 7 * 24 }],
+    );
+    const oneHourResponse = await fetch(
+      `${base}/api/local/contribution/prepare`,
+      {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: '{"lookbackHours":1}',
+      },
+    );
+    assert.equal(oneHourResponse.status, 200);
+    assert.deepEqual(
+      preparationRequests,
+      [
+        { lookbackHours: 24 },
+        { lookbackHours: 7 * 24 },
+        { lookbackHours: 1 },
+      ],
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -945,7 +2032,9 @@ test("contribution preparation failures expose only fixed safe projections", asy
   let mode = "known_error";
   const privateCanary = "/Users/private/source/session.jsonl";
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
@@ -1034,7 +2123,9 @@ test("contribution sync status exposes bounded queue counts only", async () => {
   const files = await fixture();
   const privatePath = "/Users/private/prepared-set";
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
@@ -1108,17 +2199,30 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
   let previewValid = true;
   let runCalls = 0;
   let pausedState = false;
+  let pairedCode = null;
   let releaseRun;
   const reviewedPayload = exactReviewContribution();
   const runGate = new Promise((resolve) => {
     releaseRun = resolve;
   });
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
     contributionSyncStatusProvider: async () => queueStatus(pausedState),
+    contributionDevicePairingProvider: async ({ pairingCode }) => {
+      pairedCode = pairingCode;
+      return {
+        status: "paired",
+        scope: "upload_registration",
+        expiresAt: "2026-07-26T14:00:00.000Z",
+        deviceId: "00000000-0000-4000-8000-000000000000",
+        origin: "https://private.example",
+      };
+    },
     contributionSyncNextProvider: async () => {
       previewCalls += 1;
       if (!previewValid) throw new Error("prepared set invalid");
@@ -1205,9 +2309,57 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
       .then((response) => response.json());
     assert.equal(health.capabilities.contributionSyncNext, true);
     assert.equal(health.capabilities.contributionSyncActions, true);
+    assert.equal(health.capabilities.contributionDevicePairing, true);
 
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const unauthorizedPreview = await fetch(
+      `${base}/api/local/contribution/sync-next`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    assert.equal(unauthorizedPreview.status, 403);
+    assert.equal(previewCalls, 0);
+    const pairingCode =
+      "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const unauthorizedPairing = await fetch(
+      `${base}/api/local/contribution/device-pair`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pairingCode }),
+      },
+    );
+    assert.equal(unauthorizedPairing.status, 403);
+    assert.equal(pairedCode, null);
+    const paired = await fetch(
+      `${base}/api/local/contribution/device-pair`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ pairingCode }),
+      },
+    ).then((response) => response.json());
+    assert.equal(pairedCode, pairingCode);
+    assert.deepEqual(paired, {
+      schemaVersion: "local-contribution-device-pairing-v0.1",
+      status: "paired",
+      scope: "upload_registration",
+      expiresAt: "2026-07-26T14:00:00.000Z",
+      includesCredentials: false,
+      includesIdentifiers: false,
+    });
+    assert.equal(JSON.stringify(paired).includes("00000000"), false);
+    assert.equal(JSON.stringify(paired).includes("private.example"), false);
     const inspected = await fetch(
       `${base}/api/local/contribution/sync-next`,
+      { method: "POST", headers, body: "{}" },
     ).then((response) => response.json());
     assert.equal(previewCalls, 1);
     assert.equal(runCalls, 0);
@@ -1219,6 +2371,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     previewValid = false;
     const invalidPreview = await fetch(
       `${base}/api/local/contribution/sync-next`,
+      { method: "POST", headers, body: "{}" },
     ).then((response) => response.json());
     assert.equal(invalidPreview.status, "unavailable");
     previewValid = true;
@@ -1234,11 +2387,6 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     assert.equal(unauthorized.status, 403);
     assert.equal(runCalls, 0);
 
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Usage-Monitor-Local": "1",
-      Origin: base,
-    };
     const missingReview = await fetch(
       `${base}/api/local/contribution/sync-once`,
       { method: "POST", headers, body: "{}" },
@@ -1289,9 +2437,7 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
     assert.equal(resumed.paused, false);
     assert.equal(
       (await fetch(`${base}/api/local/contribution/sync-next`, {
-        method: "POST",
-        headers,
-        body: "{}",
+        method: "GET",
       })).status,
       405,
     );
@@ -1301,11 +2447,96 @@ test("next inspection and foreground actions use fixed same-origin routes", asyn
   }
 });
 
-test("optional central proxy exposes public reads and blocks every authenticated route", async () => {
+test("stale contribution-device credentials return fixed recovery guidance without mutation", async () => {
+  const files = await fixture();
+  const privateCanary =
+    "DO-NOT-LEAK-stale-device-credential-conflict";
+  const stateFile = join(
+    files.stateRoot,
+    "missing-device-binding-v1.json",
+  );
+  let reads = 0;
+  let creates = 0;
+  let deletes = 0;
+  let networkRequests = 0;
+  const backend = {
+    async read() {
+      reads += 1;
+      return Buffer.alloc(32, 77);
+    },
+    async createIfMissing() {
+      creates += 1;
+      return "created";
+    },
+    async deleteExact() {
+      deletes += 1;
+      return "deleted";
+    },
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDevicePairingProvider: ({ pairingCode }) =>
+      claimContributionDevicePairing({
+        origin: "https://central.example",
+        pairingCode,
+        capabilityOptions: { backend, stateFile },
+        fetchImpl: async () => {
+          networkRequests += 1;
+          throw new Error(privateCanary);
+        },
+      }),
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const pairingCode =
+      "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(
+        `${base}/api/local/contribution/device-pair`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ pairingCode }),
+        },
+      );
+      assert.equal(response.status, 409);
+      const payload = await response.json();
+      assert.deepEqual(payload, {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        error: {
+          code: "contribution_device_recovery_required",
+        },
+      });
+      assert.equal(JSON.stringify(payload).includes(privateCanary), false);
+    }
+    assert.equal(reads, 2);
+    assert.equal(creates, 0);
+    assert.equal(deletes, 0);
+    assert.equal(networkRequests, 0);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("optional HTTPS central proxy exposes public reads without leaking authority headers", async () => {
   const files = await fixture();
   const forwarded = [];
   const app = await startLocalCompanionServer({
-    root: files.root,
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
     staticRoot: files.staticRoot,
     dataStore: fakeStore(),
     refreshRunner: async () => ({}),
@@ -1317,11 +2548,24 @@ test("optional central proxy exposes public reads and blocks every authenticated
         headers: { ...options.headers },
         body: options.body?.toString("utf8") ?? null,
       });
-      return new Response(JSON.stringify({
+      const readiness = url.endsWith("/api/ready");
+      return new Response(JSON.stringify(readiness ? {
+        status: "not_ready",
+        checks: {
+          lifecycle: "running",
+          lifecycleFresh: false,
+          quarantineRetentionComplete: false,
+          restoreReplayComplete: false,
+          aggregateRebuildComplete: false,
+          quarantineReconciliation: "running",
+          quarantineReconciliationComplete: false,
+        },
+        policy: { lifecycleStaleAfterMilliseconds: 3_600_000 },
+      } : {
         status: "ok",
         suppressed: true,
       }), {
-        status: 200,
+        status: readiness ? 503 : 200,
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Replayed": "true",
@@ -1336,6 +2580,7 @@ test("optional central proxy exposes public reads and blocks every authenticated
     const base = `http://127.0.0.1:${app.port}`;
     const health = await fetch(`${base}/api/local/health`).then((response) => response.json());
     assert.equal(health.capabilities.centralServiceProxy, true);
+    assert.equal(health.capabilities.centralParticipantRelay, true);
 
     const response = await fetch(`${base}/api/v1/stats/aggregate`, {
       headers: {
@@ -1356,59 +2601,261 @@ test("optional central proxy exposes public reads and blocks every authenticated
       headers: { Accept: "application/json" },
       body: null,
     });
+    const readiness = await fetch(`${base}/api/ready`);
+    assert.equal(readiness.status, 503);
+    assert.equal((await readiness.json()).status, "not_ready");
+    assert.deepEqual(forwarded[1], {
+      url: "https://central.example/api/ready",
+      method: "GET",
+      headers: { Accept: "application/json" },
+      body: null,
+    });
 
-    const blocked = [
-      { path: "/api/v1/enroll", method: "POST" },
-      { path: "/api/v1/recover", method: "POST" },
-      { path: "/api/v1/session", method: "GET" },
-      { path: "/api/v1/logout", method: "POST" },
-      { path: "/api/v1/me", method: "GET" },
-      { path: "/api/v1/me", method: "DELETE" },
-      { path: "/api/v1/me/stats", method: "GET" },
-      { path: "/api/v1/me/insights", method: "GET" },
-      { path: "/api/v1/me/export", method: "GET" },
-      { path: "/api/v1/me/security-reset", method: "POST" },
-      { path: "/api/v1/me/upload-authorizations", method: "POST" },
-      { path: "/api/v1/me/devices/revoke", method: "POST" },
-      { path: "/api/v1/me/contributions/read", method: "POST" },
-      { path: "/api/v1/me/contributions/delete", method: "POST" },
-      { path: "/api/v1/contributions", method: "POST" },
-      {
-        path: `/api/v1/contributions/${encodeURIComponent("contribution:00000000-0000-4000-8000-000000000000")}`,
-        method: "GET",
-      },
-    ];
-    for (const item of blocked) {
-      const blockedResponse = await fetch(`${base}${item.path}`, {
-        method: item.method,
-        headers: {
-          "Content-Type": "application/json",
-          Origin: base,
-          Authorization: "Bearer must-not-pass",
-          Cookie: "__Host-usage_monitor_session=must-not-pass",
-          "X-Usage-Monitor-CSRF": "must-not-pass",
-        },
-        body: item.method === "POST" ? "{}" : undefined,
-      });
-      assert.equal(blockedResponse.status, 404, `${item.method} ${item.path}`);
-    }
     assert.equal((await fetch(`${base}/api/v1/stats/aggregate?next=https://attacker.example`)).status, 400);
     assert.equal((await fetch(`${base}/api/v1/admin`)).status, 404);
-    assert.equal(forwarded.length, 1);
+    assert.equal(forwarded.length, 2);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
   }
 });
 
-test("CLI shutdown does not hang on loopback connections", async () => {
+test("production root environment keeps writable queue state outside resources", async () => {
+  const files = await fixture();
+  const environment = {
+    HOME: join(files.root, "home"),
+    USAGE_MONITOR_RESOURCE_ROOT: files.resourceRoot,
+    USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+  };
+  const resourceEntriesBefore = await readdir(files.resourceRoot);
+  const app = await startLocalCompanionServer({
+    environment,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    assert.equal(
+      (await fetch(
+        `${base}/api/local/contribution/sync-status`,
+      )).status,
+      200,
+    );
+    assert.deepEqual(
+      await readdir(files.resourceRoot),
+      resourceEntriesBefore,
+    );
+    assert.deepEqual(
+      await readdir(join(files.stateRoot, "private")),
+      [
+        "automatic-contribution-v0.1.lock",
+        "contribution-sync-v0.1.sqlite3",
+      ],
+    );
+    if (process.platform !== "win32") {
+      assert.equal((await lstat(files.stateRoot)).mode & 0o777, 0o700);
+    }
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("production root environment rejects unsafe roots before listen", async () => {
+  const files = await fixture();
+  const resourceLink = join(files.root, "resource-link");
+  const stateTarget = join(files.root, "state-target");
+  const stateLink = join(files.root, "state-link");
+  await symlink(files.resourceRoot, resourceLink);
+  await mkdir(stateTarget, { mode: 0o700 });
+  await symlink(stateTarget, stateLink);
+  const assertInvalid = async (environment) => {
+    await assert.rejects(
+      startLocalCompanionServer({
+        environment,
+        dataStore: fakeStore(),
+        refreshRunner: async () => ({}),
+        port: 0,
+      }),
+      (error) => error?.code
+          === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID"
+        && error.message
+          === "Local installation configuration is invalid"
+        && !error.message.includes(files.root)
+        && !JSON.stringify(error).includes(files.root),
+    );
+  };
+  try {
+    await assertInvalid({
+      HOME: join(files.root, "home"),
+      USAGE_MONITOR_RESOURCE_ROOT: "relative-resource",
+      USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+    });
+    await assertInvalid({
+      HOME: join(files.root, "home"),
+      USAGE_MONITOR_RESOURCE_ROOT: files.resourceRoot,
+      USAGE_MONITOR_STATE_ROOT: "relative-state",
+    });
+    await assertInvalid({
+      HOME: join(files.root, "home"),
+      USAGE_MONITOR_RESOURCE_ROOT: resourceLink,
+      USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+    });
+    await assertInvalid({
+      HOME: join(files.root, "home"),
+      USAGE_MONITOR_RESOURCE_ROOT: files.resourceRoot,
+      USAGE_MONITOR_STATE_ROOT: stateLink,
+    });
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("parent watchdog accepts only the exact live parent PID", async () => {
+  const files = await fixture();
+  const invalidValues = [
+    "",
+    "0",
+    "1",
+    "01",
+    "+2",
+    ` ${process.ppid}`,
+    `${process.ppid} `,
+    "2147483648",
+    String(process.pid),
+    null,
+    123,
+  ];
+  try {
+    for (const [index, value] of invalidValues.entries()) {
+      const stateRoot = join(files.root, `invalid-parent-${index}`);
+      await assert.rejects(
+        startLocalCompanionServer({
+          environment: {
+            HOME: join(files.root, "home"),
+            USAGE_MONITOR_RESOURCE_ROOT: files.resourceRoot,
+            USAGE_MONITOR_STATE_ROOT: stateRoot,
+            USAGE_MONITOR_PARENT_PID: value,
+          },
+          codexHome: files.codexHome,
+          staticRoot: files.staticRoot,
+          dataStore: fakeStore(),
+          refreshRunner: async () => ({}),
+          port: 0,
+        }),
+        (error) => error?.code === "USAGE_MONITOR_PARENT_PID_INVALID"
+          && error.message === "Parent watchdog configuration is invalid"
+          && (String(value).length === 0
+            || (!error.message.includes(String(value))
+              && !JSON.stringify(error).includes(String(value)))),
+      );
+      await assert.rejects(lstat(stateRoot));
+    }
+
+    const app = await startLocalCompanionServer({
+      environment: {
+        HOME: join(files.root, "home"),
+        USAGE_MONITOR_RESOURCE_ROOT: files.resourceRoot,
+        USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+        USAGE_MONITOR_PARENT_PID: String(process.ppid),
+      },
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    try {
+      const healthUrl =
+        `http://127.0.0.1:${app.port}/api/local/health`;
+      assert.equal((await fetch(healthUrl)).status, 200);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 400));
+      assert.equal((await fetch(healthUrl)).status, 200);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("configured CLI exits after its declared parent disappears", async () => {
+  const files = await fixture();
+  const parentEnvironment = {
+    ...process.env,
+    WATCHDOG_SERVER_PATH: resolve("apps/local/server.js"),
+    USAGE_MONITOR_PORT: "0",
+    USAGE_MONITOR_RESOURCE_ROOT: process.cwd(),
+    USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+    HOME: join(files.root, "home"),
+    CODEX_HOME: files.codexHome,
+  };
+  delete parentEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
+  delete parentEnvironment.USAGE_MONITOR_PARENT_PID;
+  const parent = spawn(
+    process.execPath,
+    ["--input-type=commonjs", "-e", WATCHDOG_PARENT_SCRIPT],
+    {
+      cwd: files.root,
+      env: parentEnvironment,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let output = "";
+  let errors = "";
+  let childPid = null;
+  parent.stdout.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+    const observed = Number(
+      output.match(/WATCHDOG_CHILD_PID=([1-9][0-9]*)/u)?.[1],
+    );
+    if (Number.isSafeInteger(observed)) childPid = observed;
+  });
+  parent.stderr.on("data", (chunk) => {
+    errors += chunk.toString("utf8");
+  });
+  try {
+    const [code, signal] = await once(parent, "exit");
+    assert.equal(signal, null);
+    assert.equal(code, 0, errors);
+    assert.equal(Number.isSafeInteger(childPid), true);
+    const url = output.match(
+      /USAGE_MONITOR_READY (http:\/\/127\.0\.0\.1:\d+\/)/u,
+    )?.[1];
+    assert.ok(url);
+    await waitFor(() => !processIsRunning(childPid), 5_000);
+    await assert.rejects(fetch(url, {
+      signal: AbortSignal.timeout(1_000),
+    }));
+  } finally {
+    if (parent.exitCode === null && parent.signalCode === null) {
+      parent.kill("SIGKILL");
+      await once(parent, "exit");
+    }
+    if (Number.isSafeInteger(childPid) && processIsRunning(childPid)) {
+      process.kill(childPid, "SIGKILL");
+    }
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("CLI port zero prints its actual ready URL and honors explicit roots", async () => {
+  const files = await fixture();
   const childEnvironment = {
     ...process.env,
     USAGE_MONITOR_PORT: "0",
+    USAGE_MONITOR_RESOURCE_ROOT: process.cwd(),
+    USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+    HOME: join(files.root, "home"),
+    CODEX_HOME: files.codexHome,
   };
   delete childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
+  delete childEnvironment.USAGE_MONITOR_PARENT_PID;
   const child = spawn(process.execPath, [resolve("apps/local/server.js")], {
-    cwd: process.cwd(),
+    cwd: files.root,
     env: childEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1417,7 +2864,19 @@ test("CLI shutdown does not hang on loopback connections", async () => {
     output += chunk.toString("utf8");
   });
   try {
-    await waitFor(() => output.includes("Usage Monitor is available"), 15_000);
+    await waitFor(() => output.includes("USAGE_MONITOR_READY"), 15_000);
+    const url = output.match(
+      /USAGE_MONITOR_READY (http:\/\/127\.0\.0\.1:\d+\/)/u,
+    )?.[1];
+    assert.ok(url);
+    assert.notEqual(new URL(url).port, "0");
+    const health = await fetch(new URL("/api/local/health", url));
+    assert.equal(health.status, 200);
+    const onboarding = await fetch(
+      new URL("/api/local/onboarding", url),
+    ).then((response) => response.json());
+    assert.equal(onboarding.status, "ready");
+    assert.equal(JSON.stringify(onboarding).includes(files.root), false);
     child.kill("SIGINT");
     const [code, signal] = await Promise.race([
       once(child, "exit"),
@@ -1434,5 +2893,6 @@ test("CLI shutdown does not hang on loopback connections", async () => {
       child.kill("SIGKILL");
       await once(child, "exit");
     }
+    await rm(files.root, { recursive: true });
   }
 });

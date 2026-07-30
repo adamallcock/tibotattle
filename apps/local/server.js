@@ -2,7 +2,8 @@ import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
@@ -10,6 +11,14 @@ import {
   LocalCompanionDataStore,
   buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
+import {
+  refreshReplaySafeAccountingCache,
+} from "../../src/replay-safe-accounting-cache.js";
+import {
+  AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
+  acquireAutomaticContributionInstanceLock,
+  createAutomaticContributionController,
+} from "../../src/automatic-contribution.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
   LocalCompanionRefreshController,
@@ -19,6 +28,7 @@ import {
   inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
+  retireAcceptedContributionArtifacts,
   runContributionSyncQueueOnce,
   setContributionSyncPaused,
 } from "../../src/contribution-sync-queue.js";
@@ -26,23 +36,55 @@ import {
   createProductionContributionDeviceBackend,
 } from "../../src/contribution-device-capability.js";
 import {
+  claimContributionDevicePairing,
+} from "../../src/contribution-device-client.js";
+import {
+  LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS,
+  LOCAL_CONTRIBUTION_PREPARATION_DEFAULT_LOOKBACK_HOURS,
   LOCAL_CONTRIBUTION_PREPARATION_ERROR_VERSION,
+  LOCAL_CONTRIBUTION_PREPARATION_MAX_WINDOW_MS,
   LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION,
   createLocalContributionPreparationRunner,
-  defaultLocalContributionPreparationDirectories,
   projectLocalContributionPreparationError,
 } from "../../src/local-contribution-preparation.js";
 import {
+  assertLocalAbsolutePath,
+  assertLocalResourceDirectory,
+  assertLocalStatePath,
+  defaultLocalCompanionStateRoot,
+  inspectLocalOnboarding,
+  prepareLocalInstallationRoots,
+  projectLocalOnboarding,
+} from "../../src/local-installation-diagnostics.js";
+import {
   selectProductionParticipantIdentity,
 } from "../../src/export-identity-production.js";
+import {
+  PRODUCT_BRAND,
+  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+} from "../../config/product-brand.js";
 import { validateTelemetryContribution } from "../web/public/lib.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
+const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
+const DEFAULT_RESOURCE_ROOT = resolve(
+  dirname(LOCAL_COMPANION_MODULE_FILE),
+  "..",
+  "..",
+);
+const PARENT_WATCHDOG_PID = Symbol("parentWatchdogPid");
+const PARENT_PID_ENV = "USAGE_MONITOR_PARENT_PID";
+const PARENT_PID = /^[1-9][0-9]{0,9}$/u;
+const MAXIMUM_PARENT_PID = 2_147_483_647;
+const PARENT_WATCHDOG_INTERVAL_MS = 250;
 const MAX_REQUEST_BODY_BYTES = 1_024;
 const MAX_STATIC_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const LOCAL_SYNC_MAXIMUM_JOBS = 10;
 const LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES = 16 * 1024 * 1024;
+const LOCAL_AUTOMATIC_SYNC_MAXIMUM_JOBS = 100;
+const LOCAL_AUTOMATIC_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES =
+  64 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES = 192 * 1024 * 1024;
@@ -53,6 +95,8 @@ const DEVELOPMENT_IDENTITY_OPT_IN_ENV =
   "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY";
 const EXPORT_IDENTITY_ENV = "APP_USAGEMONITOR_EXPORT_SECRET";
 const REVIEW_TOKEN = /^[A-Za-z0-9_-]{43}$/u;
+const CONTRIBUTION_DEVICE_PAIRING_CODE =
+  /^um_pair_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 const REVIEW_JOB_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -158,20 +202,26 @@ const REPORT_ROUTES = Object.freeze(
 
 const API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/onboarding",
   "/api/local/overview",
   "/api/local/gradient",
   "/api/local/weekly",
   "/api/local/quality",
   "/api/local/reports",
   "/api/local/refresh",
+  "/api/local/refresh/cancel",
   "/api/local/contribution/preview",
   "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
+  "/api/local/contribution/device-pair",
   "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/sync-once",
   "/api/local/contribution/sync-pause",
   "/api/local/contribution/sync-resume",
+  "/api/local/contribution/automatic-settings",
+  "/api/local/contribution/automatic-enable",
+  "/api/local/contribution/automatic-disable",
 ]);
 
 function jsonBody(value) {
@@ -209,6 +259,14 @@ function sendError(response, statusCode, code) {
   });
 }
 
+function contributionDeviceRecoveryRequired(error) {
+  try {
+    return error?.code === "contribution_device_credential_conflict";
+  } catch {
+    return false;
+  }
+}
+
 function actualPort(server) {
   const address = server.address();
   return address && typeof address === "object" ? address.port : null;
@@ -239,7 +297,7 @@ function fixedRelayError(code) {
   return error;
 }
 
-function loopbackCentralOrigin(value) {
+function participantCentralOrigin(value) {
   if (value === null || value === undefined || value === "") return null;
   let parsed;
   try {
@@ -247,12 +305,16 @@ function loopbackCentralOrigin(value) {
   } catch {
     return null;
   }
-  if (parsed.protocol !== "http:"
-      || !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname)
-      || parsed.username || parsed.password
+  if (parsed.username || parsed.password
       || parsed.pathname !== "/" || parsed.search || parsed.hash) {
     return null;
   }
+  const developmentLoopback = parsed.protocol === "http:"
+    && parsed.hostname === LOOPBACK_HOST
+    && parsed.port !== "";
+  const productionHTTPS = parsed.protocol === "https:"
+    && !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+  if (!developmentLoopback && !productionHTTPS) return null;
   return parsed.origin;
 }
 
@@ -344,12 +406,12 @@ async function boundedParticipantRelayResponse(
   return Buffer.concat(chunks);
 }
 
-function createLoopbackParticipantRelay({
+function createParticipantRelay({
   centralOrigin,
   fetchImpl,
   timeoutMs = PARTICIPANT_RELAY_TIMEOUT_MS,
 }) {
-  const origin = loopbackCentralOrigin(centralOrigin);
+  const origin = participantCentralOrigin(centralOrigin);
   return Object.freeze({
     enabled: origin !== null,
     handles(path) {
@@ -511,6 +573,210 @@ async function authorizeLocalMutation(
   }
 }
 
+async function authorizeContributionDevicePairing(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "contribution_device_pairing_not_authorized");
+    return null;
+  }
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    sendError(response, 415, "unsupported_media_type");
+    return null;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength)
+      && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    sendError(response, 413, "request_too_large");
+    return null;
+  }
+  let bytes = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_REQUEST_BODY_BYTES) {
+      sendError(response, 413, "request_too_large");
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    sendError(response, 400, "invalid_json");
+    return null;
+  }
+  if (!value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== "pairingCode"
+      || !CONTRIBUTION_DEVICE_PAIRING_CODE.test(value.pairingCode)) {
+    sendError(response, 400, "invalid_request");
+    return null;
+  }
+  return value.pairingCode;
+}
+
+async function readContributionPreparationRequest(request) {
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    const error = new Error("unsupported_media_type");
+    error.code = "unsupported_media_type";
+    throw error;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength)
+      && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    const error = new Error("request_too_large");
+    error.code = "request_too_large";
+    throw error;
+  }
+  let bytes = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_REQUEST_BODY_BYTES) {
+      const error = new Error("request_too_large");
+      error.code = "request_too_large";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("invalid_json");
+    error.code = "invalid_json";
+    throw error;
+  }
+  const isObject = value && typeof value === "object" && !Array.isArray(value);
+  const keys = isObject ? Object.keys(value) : [];
+  if (!isObject
+      || keys.length > 1
+      || (keys.length === 1 && keys[0] !== "lookbackHours")) {
+    const error = new Error("invalid_request");
+    error.code = "invalid_request";
+    throw error;
+  }
+  const lookbackHours = keys.length === 0
+    ? LOCAL_CONTRIBUTION_PREPARATION_DEFAULT_LOOKBACK_HOURS
+    : value.lookbackHours;
+  if (!LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS.includes(
+    lookbackHours,
+  )) {
+    const error = new Error("invalid_request");
+    error.code = "invalid_request";
+    throw error;
+  }
+  return Object.freeze({ lookbackHours });
+}
+
+async function authorizeContributionPreparation(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "preparation_not_authorized");
+    return null;
+  }
+  try {
+    return await readContributionPreparationRequest(request);
+  } catch (error) {
+    const status = error.code === "unsupported_media_type"
+      ? 415
+      : error.code === "request_too_large" ? 413 : 400;
+    sendError(response, status, error.code ?? "invalid_request");
+    return null;
+  }
+}
+
+async function readAutomaticContributionEnableRequest(request) {
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    const error = new Error("unsupported_media_type");
+    error.code = "unsupported_media_type";
+    throw error;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength)
+      && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    const error = new Error("request_too_large");
+    error.code = "request_too_large";
+    throw error;
+  }
+  let bytes = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_REQUEST_BODY_BYTES) {
+      const error = new Error("request_too_large");
+      error.code = "request_too_large";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("invalid_json");
+    error.code = "invalid_json";
+    throw error;
+  }
+  const consent = value?.consent;
+  if (!value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== "consent\0intervalHours"
+      || value.intervalHours !== AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS
+      || !consent
+      || typeof consent !== "object"
+      || Array.isArray(consent)
+      || Object.keys(consent).sort().join("\0")
+        !== "destinationOrigin\0fieldDictionaryVersion\0privacyContractVersion\0telemetrySchemaVersion"
+      || ![
+        consent.telemetrySchemaVersion,
+        consent.fieldDictionaryVersion,
+        consent.privacyContractVersion,
+        consent.destinationOrigin,
+      ].every((entry) => typeof entry === "string"
+        && entry.length > 0
+        && entry.length <= 2_048)) {
+    const error = new Error("invalid_request");
+    error.code = "invalid_request";
+    throw error;
+  }
+  return Object.freeze({
+    intervalHours: value.intervalHours,
+    consent: Object.freeze({
+      telemetrySchemaVersion: consent.telemetrySchemaVersion,
+      fieldDictionaryVersion: consent.fieldDictionaryVersion,
+      privacyContractVersion: consent.privacyContractVersion,
+      destinationOrigin: consent.destinationOrigin,
+    }),
+  });
+}
+
+async function authorizeAutomaticContributionEnable(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "automatic_contribution_not_authorized");
+    return null;
+  }
+  try {
+    return await readAutomaticContributionEnableRequest(request);
+  } catch (error) {
+    const status = error.code === "unsupported_media_type"
+      ? 415
+      : error.code === "request_too_large" ? 413 : 400;
+    sendError(response, status, error.code ?? "invalid_request");
+    return null;
+  }
+}
+
 async function authorizeReviewedContributionMutation(
   request,
   response,
@@ -575,6 +841,26 @@ async function readFixedFile(root, file, maximumBytes) {
     throw error;
   }
   return readFile(path);
+}
+
+function stampSemanticOpenTarget(body) {
+  const source = body.toString("utf8");
+  const first = source.indexOf(SEMANTIC_OPEN_TARGET_PLACEHOLDER);
+  if (first < 0
+      || source.indexOf(
+        SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+        first + SEMANTIC_OPEN_TARGET_PLACEHOLDER.length,
+      ) >= 0) {
+    const error = new Error("not_found");
+    error.code = "not_found";
+    throw error;
+  }
+  return Buffer.from(
+    source.replace(
+      SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+      PRODUCT_BRAND.appOpenURL,
+    ),
+  );
 }
 
 function finiteNonNegativeInteger(value) {
@@ -875,7 +1161,11 @@ function preparationResultProjection(value) {
     && Number.isFinite(startMs)
     && Number.isFinite(endMs)
     && endMs > startMs
-    && endMs - startMs <= 60 * 60 * 1_000
+    // Seven days is the largest request contract. The existing 100-batch,
+    // 100k-record and 125 MiB ceilings below remain authoritative: a dense
+    // seven-day selection deterministically fails as export_too_large rather
+    // than being silently truncated or split into an unreviewed second set.
+    && endMs - startMs <= LOCAL_CONTRIBUTION_PREPARATION_MAX_WINDOW_MS
     && totalRecords > 0
     && totalRecords <= 100_000
     && value?.privacy?.verdict === "passed"
@@ -958,15 +1248,222 @@ function preparationErrorStatus(code) {
   return 500;
 }
 
-export function createLocalCompanionServer({
-  root = process.cwd(),
-  environment = process.env,
-  staticRoot = resolve(root, "apps", "web", "public"),
+function configuredHomeDirectory(environment) {
+  const selected = process.platform === "win32"
+    ? environment.USERPROFILE
+    : environment.HOME;
+  return typeof selected === "string" && selected.length > 0
+    ? selected
+    : homedir();
+}
+
+function parentWatchdogConfigurationError() {
+  const error = new TypeError(
+    "Parent watchdog configuration is invalid",
+  );
+  error.code = "USAGE_MONITOR_PARENT_PID_INVALID";
+  return error;
+}
+
+function configuredParentWatchdogPid(
+  environment,
+  observedParentPid = process.ppid,
+) {
+  if (!Object.hasOwn(environment, PARENT_PID_ENV)) return null;
+  const value = environment[PARENT_PID_ENV];
+  if (typeof value !== "string" || !PARENT_PID.test(value)) {
+    throw parentWatchdogConfigurationError();
+  }
+  const selected = Number(value);
+  if (!Number.isSafeInteger(selected)
+      || selected <= 1
+      || selected > MAXIMUM_PARENT_PID
+      || String(selected) !== value
+      || selected !== observedParentPid) {
+    throw parentWatchdogConfigurationError();
+  }
+  return selected;
+}
+
+function declaredParentIsCurrent(expectedParentPid) {
+  if (expectedParentPid === null) return true;
+  if (process.ppid !== expectedParentPid) return false;
+  try {
+    process.kill(expectedParentPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function closeHttpServer(server) {
+  if (!server.listening) return Promise.resolve();
+  return new Promise((resolveClose, rejectClose) => {
+    server.close((error) => {
+      if (!error || error.code === "ERR_SERVER_NOT_RUNNING") {
+        resolveClose();
+      } else {
+        rejectClose(error);
+      }
+    });
+    server.closeAllConnections?.();
+  });
+}
+
+function startParentDeathWatchdog({
+  server,
+  expectedParentPid,
+  terminateProcess,
+}) {
+  if (expectedParentPid === null) {
+    return Object.freeze({ stop() {} });
+  }
+  let active = true;
+  const timer = setInterval(() => {
+    if (!active || declaredParentIsCurrent(expectedParentPid)) return;
+    active = false;
+    clearInterval(timer);
+    void closeHttpServer(server)
+      .catch(() => {})
+      .then(() => {
+        if (terminateProcess) process.exit(0);
+      });
+  }, PARENT_WATCHDOG_INTERVAL_MS);
+  timer.unref?.();
+  return Object.freeze({
+    stop() {
+      if (!active) return;
+      active = false;
+      clearInterval(timer);
+    },
+  });
+}
+
+export function createLocalCompanionServer(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("options must be an object");
+  }
+  const environment = options.environment ?? process.env;
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("environment must be an object");
+  }
+  const parentWatchdogPid = configuredParentWatchdogPid(environment);
+  const homeDirectory = configuredHomeDirectory(environment);
+  const resourceRoot = options.resourceRoot
+    ?? environment.USAGE_MONITOR_RESOURCE_ROOT
+    ?? options.root
+    ?? DEFAULT_RESOURCE_ROOT;
+  const stateRoot = options.stateRoot
+    ?? environment.USAGE_MONITOR_STATE_ROOT
+    ?? defaultLocalCompanionStateRoot({
+      homeDirectory,
+      environment,
+    });
+  const installation = prepareLocalInstallationRoots({
+    resourceRoot,
+    stateRoot,
+  });
+  const staticRoot = assertLocalResourceDirectory(
+    installation.resourceRoot,
+    options.staticRoot
+      ?? resolve(installation.resourceRoot, "apps", "web", "public"),
+  );
+  const codexHome = assertLocalAbsolutePath(
+    options.codexHome
+      ?? environment.CODEX_HOME
+      ?? join(homeDirectory, ".codex"),
+  );
+  const contributionQueueFile = assertLocalStatePath(
+    installation.stateRoot,
+    options.contributionQueueFile
+      ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
+      ?? installation.paths.contributionQueueFile,
+  );
+  const preparedCandidate = Object.hasOwn(
+    options,
+    "preparedContributionDirectory",
+  )
+    ? options.preparedContributionDirectory
+    : Object.hasOwn(environment, "USAGE_MONITOR_PREPARED_DIRECTORY")
+      ? environment.USAGE_MONITOR_PREPARED_DIRECTORY
+      : installation.paths.preparedSpoolDirectory;
+  const preparedContributionDirectory = preparedCandidate === null
+    ? null
+    : assertLocalStatePath(installation.stateRoot, preparedCandidate);
+  const contributionPreparationOptions =
+    options.contributionPreparationOptions ?? {};
+  if (!contributionPreparationOptions
+      || typeof contributionPreparationOptions !== "object"
+      || Array.isArray(contributionPreparationOptions)) {
+    throw new TypeError("contributionPreparationOptions must be an object");
+  }
+  const selectedPreparationOptions = {
+    ...contributionPreparationOptions,
+    activityFile: assertLocalStatePath(
+      installation.stateRoot,
+      contributionPreparationOptions.activityFile
+        ?? installation.paths.activityMarkersFile,
+    ),
+    reviewArchiveDirectory: assertLocalStatePath(
+      installation.stateRoot,
+      contributionPreparationOptions.reviewArchiveDirectory
+        ?? installation.paths.reviewArchiveDirectory,
+    ),
+  };
+  return createPreparedLocalCompanionServer({
+    ...options,
+    environment,
+    resourceRoot: installation.resourceRoot,
+    stateRoot: installation.stateRoot,
+    statePaths: installation.paths,
+    staticRoot,
+    codexHome,
+    contributionQueueFile,
+    preparedContributionDirectory,
+    contributionPreparationOptions: selectedPreparationOptions,
+    parentWatchdogPid,
+  });
+}
+
+function createPreparedLocalCompanionServer({
+  environment,
+  resourceRoot,
+  stateRoot,
+  statePaths,
+  staticRoot,
+  codexHome,
+  parentWatchdogPid,
   dataStore = new LocalCompanionDataStore({
-    builder: () => buildLocalCompanionSnapshot({ root }),
+    builder: () => buildLocalCompanionSnapshot({
+      root: resourceRoot,
+      collectorFile: statePaths.collectorFile,
+      checkpointFile: statePaths.checkpointFile,
+      accountingCacheFile: statePaths.accountingCacheFile,
+      allowDevelopmentArtifactFallback:
+        environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
+    }),
   }),
-  refreshRunner = createLocalCollectorRefreshRunner(),
-  refreshTimeoutMs = 60_000,
+  refreshRunner = createLocalCollectorRefreshRunner({
+    codexHome,
+    dataFile: statePaths.collectorFile,
+    checkpointFile: statePaths.checkpointFile,
+    lockFile: statePaths.collectorLockFile,
+    journalFile: statePaths.collectorJournalFile,
+    accountObservationOperationLockFile:
+      statePaths.accountObservationLockFile,
+    refreshAccounting: refreshReplaySafeAccountingCache,
+    accountingCacheFile: statePaths.accountingCacheFile,
+  }),
+  onboardingProvider = () => inspectLocalOnboarding({
+    codexHome,
+    stateRoot,
+    explicitRefresh: true,
+    customCodexHomeConfigured:
+      typeof environment.CODEX_HOME === "string"
+      && environment.CODEX_HOME.length > 0,
+  }),
+  refreshTimeoutMs = 300_000,
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),
@@ -977,29 +1474,23 @@ export function createLocalCompanionServer({
     environment[DEVELOPMENT_IDENTITY_FILE_ENV] ?? null,
   developmentIdentityOptIn =
     environment[DEVELOPMENT_IDENTITY_OPT_IN_ENV] ?? null,
-  contributionQueueFile =
-    environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
-    ?? resolve(
-      root,
-      ".usage-monitor",
-      "private",
-      "contribution-sync-v0.1.sqlite3",
-    ),
+  contributionQueueFile,
   contributionSyncStatusProvider = () => inspectContributionSyncQueue({
     queueFile: contributionQueueFile,
   }),
-  preparedContributionDirectory =
-    environment.USAGE_MONITOR_PREPARED_DIRECTORY
-    ?? defaultLocalContributionPreparationDirectories()
-      .preparedSpoolDirectory,
+  preparedContributionDirectory,
   contributionServiceOrigin = centralOrigin,
   contributionDeviceBackendFactory =
     createProductionContributionDeviceBackend,
+  contributionDevicePairingProvider = null,
   contributionSyncNextProvider = null,
   contributionSyncExactReviewProvider = null,
   contributionSyncOnceRunner = null,
+  automaticContributionRetirementRunner = null,
   contributionSyncPauseSetter = null,
   contributionSyncTimeoutMs = 60_000,
+  automaticContributionController = null,
+  automaticContributionOptions = {},
   onError = () => {},
 } = {}) {
   if (!environment || typeof environment !== "object"
@@ -1008,6 +1499,9 @@ export function createLocalCompanionServer({
   }
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
+  }
+  if (typeof onboardingProvider !== "function") {
+    throw new TypeError("onboardingProvider must be a function");
   }
   if (typeof contributionPreviewProvider !== "function") {
     throw new TypeError("contributionPreviewProvider must be a function");
@@ -1028,6 +1522,23 @@ export function createLocalCompanionServer({
     throw new TypeError(
       "contributionPreparationCreateKeychainBackend must be a function",
     );
+  }
+  if (!automaticContributionOptions
+      || typeof automaticContributionOptions !== "object"
+      || Array.isArray(automaticContributionOptions)) {
+    throw new TypeError("automaticContributionOptions must be an object");
+  }
+  if (automaticContributionController !== null
+      && (!automaticContributionController
+        || typeof automaticContributionController !== "object"
+        || typeof automaticContributionController.start !== "function"
+        || typeof automaticContributionController.stop !== "function"
+        || typeof automaticContributionController.inspect !== "function"
+        || typeof automaticContributionController.enable !== "function"
+        || typeof automaticContributionController.disable !== "function"
+        || typeof automaticContributionController
+          .recordReviewedManualAcceptance !== "function")) {
+    throw new TypeError("automaticContributionController is invalid");
   }
   const developmentIdentity = resolveDevelopmentIdentityConfiguration({
     file: developmentExportSecretFile,
@@ -1051,12 +1562,16 @@ export function createLocalCompanionServer({
     throw new TypeError("contributionServiceOrigin must be a string or null");
   }
   if (typeof contributionDeviceBackendFactory !== "function"
+      || (contributionDevicePairingProvider !== null
+        && typeof contributionDevicePairingProvider !== "function")
       || (contributionSyncNextProvider !== null
         && typeof contributionSyncNextProvider !== "function")
       || (contributionSyncExactReviewProvider !== null
         && typeof contributionSyncExactReviewProvider !== "function")
       || (contributionSyncOnceRunner !== null
         && typeof contributionSyncOnceRunner !== "function")
+      || (automaticContributionRetirementRunner !== null
+        && typeof automaticContributionRetirementRunner !== "function")
       || (contributionSyncPauseSetter !== null
         && typeof contributionSyncPauseSetter !== "function")
       || !Number.isSafeInteger(contributionSyncTimeoutMs)
@@ -1071,6 +1586,17 @@ export function createLocalCompanionServer({
         directory: preparedContributionDirectory,
         queueFile: contributionQueueFile,
       }));
+  const pairContributionDevice = contributionDevicePairingProvider
+    ?? (contributionServiceOrigin === null
+      ? null
+      : ({ pairingCode }) => claimContributionDevicePairing({
+        origin: contributionServiceOrigin,
+        pairingCode,
+        capabilityOptions: {
+          backend: contributionDeviceBackendFactory(),
+          stateFile: statePaths.contributionDeviceStateFile,
+        },
+      }));
   const reviewExactContribution = contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
@@ -1082,15 +1608,23 @@ export function createLocalCompanionServer({
     ?? (preparedContributionDirectory === null
         || contributionServiceOrigin === null
       ? async () => null
-      : ({ signal, reviewedJob }) => runContributionSyncQueueOnce({
+      : ({
+        signal,
+        reviewedJob,
+        preparedSetId,
+        maximumJobs = LOCAL_SYNC_MAXIMUM_JOBS,
+        maximumReservedUploadBytes =
+          LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
+      }) => runContributionSyncQueueOnce({
         directory: preparedContributionDirectory,
         origin: contributionServiceOrigin,
         backend: contributionDeviceBackendFactory(),
         queueFile: contributionQueueFile,
-        maximumJobs: LOCAL_SYNC_MAXIMUM_JOBS,
-        maximumReservedUploadBytes:
-          LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
+        stateFile: statePaths.contributionDeviceStateFile,
+        maximumJobs,
+        maximumReservedUploadBytes,
         reviewedJob,
+        preparedSetId,
         signal,
       }));
   const setContributionPaused = contributionSyncPauseSetter
@@ -1100,6 +1634,8 @@ export function createLocalCompanionServer({
     }));
   const syncPreviewConfigured = preparedContributionDirectory !== null
     || contributionSyncNextProvider !== null;
+  const contributionDevicePairingConfigured =
+    pairContributionDevice !== null;
   const syncExactReviewConfigured = preparedContributionDirectory !== null
     || contributionSyncExactReviewProvider !== null;
   const syncDeliveryConfigured =
@@ -1120,6 +1656,7 @@ export function createLocalCompanionServer({
         selectProductionParticipantIdentity({
           explicitSecretFile,
           environmentSecret: environment[EXPORT_IDENTITY_ENV],
+          appStateSecretFile: statePaths.exportParticipantSecretFile,
           ...(contributionPreparationCreateKeychainBackend === undefined
             ? {}
             : {
@@ -1131,6 +1668,95 @@ export function createLocalCompanionServer({
     });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
+  const runAutomaticContributionRetirement =
+    automaticContributionRetirementRunner
+    ?? (preparedContributionDirectory === null
+      ? async () => ({
+        retiredSets: 0,
+        retiredJobs: 0,
+        interrupted: false,
+        networkActivity: false,
+      })
+      : ({ protectedPreparedSetIds, signal }) =>
+        retireAcceptedContributionArtifacts({
+          preparedSpoolDirectory: preparedContributionDirectory,
+          reviewArchiveDirectory:
+            contributionPreparationOptions.reviewArchiveDirectory,
+          queueFile: contributionQueueFile,
+          protectedPreparedSetIds,
+          signal,
+        }));
+  const runAutomaticContributionPreparation = async (request) => {
+    if (contributionPreparationInProgress) {
+      const error = new Error("preparation_in_progress");
+      error.code = "preparation_in_progress";
+      throw error;
+    }
+    contributionPreparationInProgress = true;
+    try {
+      return await runContributionPreparation(request);
+    } finally {
+      contributionPreparationInProgress = false;
+    }
+  };
+  const runAutomaticContributionUpload = async ({
+    signal,
+    preparedSetId,
+  }) => {
+    if (contributionSyncInProgress) {
+      const error = new Error("sync_in_progress");
+      error.code = "sync_in_progress";
+      error.retryable = true;
+      throw error;
+    }
+    contributionSyncInProgress = true;
+    try {
+      return await runContributionPass({
+        signal,
+        preparedSetId,
+        maximumJobs: LOCAL_AUTOMATIC_SYNC_MAXIMUM_JOBS,
+        maximumReservedUploadBytes:
+          LOCAL_AUTOMATIC_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
+      });
+    } finally {
+      contributionSyncInProgress = false;
+    }
+  };
+  const automaticContribution = automaticContributionController
+    ?? createAutomaticContributionController({
+      ...automaticContributionOptions,
+      settingsFile: statePaths.automaticContributionSettingsFile,
+      destinationOrigin: syncDeliveryConfigured
+        ? contributionServiceOrigin
+        : null,
+      prepareRunner: runAutomaticContributionPreparation,
+      uploadRunner: runAutomaticContributionUpload,
+      maintenanceRunner: runAutomaticContributionRetirement,
+    });
+  let automaticContributionInstanceLock = null;
+  let automaticContributionInstanceLockRelease = null;
+  let automaticContributionShutdown = null;
+  let initializationPromise = null;
+  const releaseAutomaticContributionInstanceLock = () => {
+    if (automaticContributionInstanceLockRelease !== null) {
+      return automaticContributionInstanceLockRelease;
+    }
+    const lock = automaticContributionInstanceLock;
+    automaticContributionInstanceLock = null;
+    automaticContributionInstanceLockRelease = Promise.resolve(
+      lock?.release(),
+    );
+    return automaticContributionInstanceLockRelease;
+  };
+  const shutdownAutomaticContribution = () => {
+    if (automaticContributionShutdown === null) {
+      automaticContributionShutdown = (async () => {
+        await automaticContribution.stop();
+        await releaseAutomaticContributionInstanceLock();
+      })();
+    }
+    return automaticContributionShutdown;
+  };
   const refresh = new LocalCompanionRefreshController({
     runner: refreshRunner,
     dataStore,
@@ -1140,7 +1766,7 @@ export function createLocalCompanionServer({
     centralOrigin,
     fetchImpl: centralFetch,
   });
-  const participantRelay = createLoopbackParticipantRelay({
+  const participantRelay = createParticipantRelay({
     centralOrigin,
     fetchImpl: centralFetch,
   });
@@ -1247,6 +1873,8 @@ export function createLocalCompanionServer({
               developmentIdentity.mode,
             contributionSyncStatus: true,
             contributionSyncNext: syncPreviewConfigured,
+            contributionDevicePairing:
+              contributionDevicePairingConfigured,
             contributionSyncExactReview: syncExactReviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
             centralServiceProxy: centralProxy.enabled,
@@ -1255,6 +1883,21 @@ export function createLocalCompanionServer({
             remoteProxy: false,
           },
         });
+        return;
+      }
+      if (path === "/api/local/onboarding") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        let onboarding = null;
+        try {
+          onboarding = await onboardingProvider();
+        } catch {
+          // A failed source inspection is projected as closed, path-free
+          // readiness rather than disclosing filesystem diagnostics.
+        }
+        send(response, 200, projectLocalOnboarding(onboarding));
         return;
       }
       if (path === "/api/local/overview") {
@@ -1325,12 +1968,11 @@ export function createLocalCompanionServer({
           sendError(response, 405, "method_not_allowed");
           return;
         }
-        if (!await authorizeLocalMutation(
+        const preparationRequest = await authorizeContributionPreparation(
           request,
           response,
-          "preparation_not_authorized",
-          { allowFixedUserRequest: false },
-        )) return;
+        );
+        if (preparationRequest === null) return;
         if (contributionPreparationInProgress) {
           send(
             response,
@@ -1342,7 +1984,7 @@ export function createLocalCompanionServer({
         contributionPreparationInProgress = true;
         try {
           const result = preparationResultProjection(
-            await runContributionPreparation(),
+            await runContributionPreparation(preparationRequest),
           );
           if (result === null) {
             send(
@@ -1365,6 +2007,93 @@ export function createLocalCompanionServer({
         }
         return;
       }
+      if (path === "/api/local/contribution/automatic-settings") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        try {
+          send(response, 200, await automaticContribution.inspect());
+        } catch {
+          sendError(
+            response,
+            500,
+            "automatic_contribution_settings_unavailable",
+          );
+        }
+        return;
+      }
+      if (path === "/api/local/contribution/automatic-enable") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const enableRequest = await authorizeAutomaticContributionEnable(
+          request,
+          response,
+        );
+        if (enableRequest === null) return;
+        try {
+          send(
+            response,
+            200,
+            await automaticContribution.enable(enableRequest),
+          );
+        } catch (error) {
+          const code = error?.code;
+          if (code === "automatic_contribution_not_configured") {
+            sendError(
+              response,
+              409,
+              "automatic_contribution_not_configured",
+            );
+          } else if (
+            code === "automatic_contribution_first_review_required"
+          ) {
+            sendError(
+              response,
+              409,
+              "automatic_contribution_first_review_required",
+            );
+          } else if (
+            code === "automatic_contribution_consent_binding_mismatch"
+          ) {
+            sendError(
+              response,
+              409,
+              "automatic_contribution_consent_binding_mismatch",
+            );
+          } else {
+            sendError(
+              response,
+              500,
+              "automatic_contribution_settings_unavailable",
+            );
+          }
+        }
+        return;
+      }
+      if (path === "/api/local/contribution/automatic-disable") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "automatic_contribution_not_authorized",
+        )) return;
+        try {
+          send(response, 200, await automaticContribution.disable());
+        } catch {
+          sendError(
+            response,
+            500,
+            "automatic_contribution_settings_unavailable",
+          );
+        }
+        return;
+      }
       if (path === "/api/local/contribution/sync-status") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
@@ -1380,10 +2109,15 @@ export function createLocalCompanionServer({
         return;
       }
       if (path === "/api/local/contribution/sync-next") {
-        if (request.method !== "GET") {
+        if (request.method !== "POST") {
           sendError(response, 405, "method_not_allowed");
           return;
         }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "sync_preview_not_authorized",
+        )) return;
         let preview;
         try {
           preview = await nextContribution();
@@ -1394,6 +2128,53 @@ export function createLocalCompanionServer({
           previewConfigured: syncPreviewConfigured,
           deliveryConfigured: syncDeliveryConfigured,
         }));
+        return;
+      }
+      if (path === "/api/local/contribution/device-pair") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const pairingCode = await authorizeContributionDevicePairing(
+          request,
+          response,
+        );
+        if (pairingCode === null) return;
+        if (!contributionDevicePairingConfigured) {
+          sendError(
+            response,
+            409,
+            "contribution_device_pairing_not_configured",
+          );
+          return;
+        }
+        try {
+          const paired = await pairContributionDevice({ pairingCode });
+          const expiresAt = nullableInstant(paired?.expiresAt);
+          if (paired?.status !== "paired"
+              || paired?.scope !== "upload_registration"
+              || expiresAt === null) {
+            throw new Error("pairing response invalid");
+          }
+          send(response, 200, {
+            schemaVersion: "local-contribution-device-pairing-v0.1",
+            status: "paired",
+            scope: "upload_registration",
+            expiresAt,
+            includesCredentials: false,
+            includesIdentifiers: false,
+          });
+        } catch (error) {
+          const recoveryRequired =
+            contributionDeviceRecoveryRequired(error);
+          sendError(
+            response,
+            recoveryRequired ? 409 : 502,
+            recoveryRequired
+              ? "contribution_device_recovery_required"
+              : "contribution_device_pairing_failed",
+          );
+        }
         return;
       }
       if (path === "/api/local/contribution/sync-inspect-exact") {
@@ -1481,6 +2262,22 @@ export function createLocalCompanionServer({
           sendError(response, 503, "sync_not_configured");
           return;
         }
+        if (result.status === "completed"
+            && Number.isSafeInteger(result.accepted)
+            && result.accepted > 0) {
+          try {
+            await automaticContribution.recordReviewedManualAcceptance({
+              status: result.status,
+              accepted: result.accepted,
+              preparedSet: result.preparedSet,
+            });
+          } catch {
+            // Delivery already succeeded. Never misreport it as failed or invite
+            // a duplicate send merely because the optional scheduler receipt
+            // could not be persisted; automatic enablement remains closed.
+            onError("automatic_contribution_bootstrap_persist_failed");
+          }
+        }
         send(response, 200, syncRunProjection(result));
         return;
       }
@@ -1538,6 +2335,26 @@ export function createLocalCompanionServer({
         });
         return;
       }
+      if (path === "/api/local/refresh/cancel") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "refresh_cancel_not_authorized",
+        )) return;
+        if (!refresh.cancel()) {
+          sendError(response, 409, "refresh_not_running");
+          return;
+        }
+        send(response, 202, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          refresh: refresh.getStatus(),
+        });
+        return;
+      }
 
       const report = REPORT_ROUTES[path];
       if (report) {
@@ -1546,7 +2363,11 @@ export function createLocalCompanionServer({
           return;
         }
         try {
-          const body = await readFixedFile(root, report.file, MAX_REPORT_BYTES);
+          const body = await readFixedFile(
+            resourceRoot,
+            report.file,
+            MAX_REPORT_BYTES,
+          );
           send(response, 200, body, report.type, { report: true });
         } catch {
           sendError(response, 404, "not_found");
@@ -1561,7 +2382,14 @@ export function createLocalCompanionServer({
           return;
         }
         try {
-          const body = await readFixedFile(staticRoot, staticFile.file, MAX_STATIC_BYTES);
+          const source = await readFixedFile(
+            staticRoot,
+            staticFile.file,
+            MAX_STATIC_BYTES,
+          );
+          const body = staticFile.file === "index.html"
+            ? stampSemanticOpenTarget(source)
+            : source;
           send(response, 200, body, staticFile.type);
         } catch {
           sendError(response, 404, "not_found");
@@ -1575,55 +2403,111 @@ export function createLocalCompanionServer({
       else response.destroy();
     }
   });
+  server.once("close", () => {
+    void shutdownAutomaticContribution().catch(() => {
+      onError("automatic_contribution_lock_release_failed");
+    });
+  });
 
   return {
     server,
     dataStore,
     refresh,
+    automaticContribution,
+    [PARENT_WATCHDOG_PID]: parentWatchdogPid,
     async initialize() {
-      await dataStore.initialize();
+      if (initializationPromise === null) {
+        initializationPromise = (async () => {
+          automaticContributionInstanceLock =
+            await acquireAutomaticContributionInstanceLock({
+              lockFile: statePaths.automaticContributionLockFile,
+            });
+          try {
+            await dataStore.initialize();
+            await automaticContribution.start();
+          } catch (error) {
+            await shutdownAutomaticContribution().catch(() => {});
+            throw error;
+          }
+        })();
+      }
+      return initializationPromise;
     },
+    shutdownAutomaticContribution,
   };
 }
 
 export async function startLocalCompanionServer({
   port = 8787,
   host = LOOPBACK_HOST,
+  terminateProcessOnParentDeath = false,
   ...options
 } = {}) {
   if (host !== LOOPBACK_HOST) throw new TypeError("Local companion must bind to 127.0.0.1");
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new TypeError("port is invalid");
+  if (typeof terminateProcessOnParentDeath !== "boolean") {
+    throw new TypeError("terminateProcessOnParentDeath must be a boolean");
+  }
   const app = createLocalCompanionServer(options);
-  await app.initialize();
-  await new Promise((resolveListen, rejectListen) => {
-    app.server.once("error", rejectListen);
-    app.server.listen(port, host, () => {
-      app.server.off("error", rejectListen);
-      resolveListen();
-    });
+  const expectedParentPid = app[PARENT_WATCHDOG_PID];
+  if (!declaredParentIsCurrent(expectedParentPid)) {
+    throw parentWatchdogConfigurationError();
+  }
+  const parentWatchdog = startParentDeathWatchdog({
+    server: app.server,
+    expectedParentPid,
+    terminateProcess: terminateProcessOnParentDeath,
   });
+  try {
+    await app.initialize();
+    if (!declaredParentIsCurrent(expectedParentPid)) {
+      throw parentWatchdogConfigurationError();
+    }
+    await new Promise((resolveListen, rejectListen) => {
+      app.server.once("error", rejectListen);
+      app.server.listen(port, host, () => {
+        app.server.off("error", rejectListen);
+        resolveListen();
+      });
+    });
+    if (!declaredParentIsCurrent(expectedParentPid)) {
+      throw parentWatchdogConfigurationError();
+    }
+  } catch (error) {
+    parentWatchdog.stop();
+    await closeHttpServer(app.server).catch(() => {});
+    await app.shutdownAutomaticContribution().catch(() => {});
+    throw error;
+  }
   return {
     ...app,
     host,
     port: actualPort(app.server),
-    close: () => new Promise((resolveClose, rejectClose) => {
-      app.server.close((error) => error ? rejectClose(error) : resolveClose());
-    }),
+    close: async () => {
+      parentWatchdog.stop();
+      await closeHttpServer(app.server);
+      await app.shutdownAutomaticContribution();
+    },
   };
 }
 
-const currentFile = fileURLToPath(import.meta.url);
-if (process.argv[1] && resolve(process.argv[1]) === currentFile) {
+if (process.argv[1]
+    && resolve(process.argv[1]) === LOCAL_COMPANION_MODULE_FILE) {
   const requestedPort = Number(process.env.USAGE_MONITOR_PORT ?? 8787);
-  const app = await startLocalCompanionServer({ port: requestedPort });
-  process.stdout.write(`Usage Monitor is available at http://${app.host}:${app.port}/\n`);
+  const app = await startLocalCompanionServer({
+    port: requestedPort,
+    terminateProcessOnParentDeath: true,
+  });
+  process.stdout.write(`USAGE_MONITOR_READY http://${app.host}:${app.port}/\n`);
   let closing = false;
   const close = () => {
     if (closing) process.exit(0);
     closing = true;
-    app.server.close();
     app.server.closeAllConnections?.();
-    process.exit(0);
+    void app.close().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    );
   };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);

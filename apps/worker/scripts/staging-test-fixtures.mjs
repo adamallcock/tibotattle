@@ -57,6 +57,22 @@ export function successSpawn(config, calls) {
     if (joined.startsWith("d1 migrations list ")) {
       return { status: 0, stdout: "No migrations to apply!", stderr: "" };
     }
+    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
+        && joined.includes("sqlite_master")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: [{
+            admission_table: 1,
+            admission_guard: 1,
+            admission_counter: 1,
+            quarantine_reconciliation: 1,
+            lifecycle_status: 1,
+          }],
+        }]),
+        stderr: "",
+      };
+    }
     if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")) {
       return {
         status: 0,

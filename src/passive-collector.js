@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream, watch } from "node:fs";
-import { mkdir, open, readdir, stat, unlink } from "node:fs/promises";
+import { mkdir, open, opendir, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -40,6 +40,9 @@ const MAX_RECENT_TAIL_BYTES = 768 * 1024 * 1024;
 const MAX_RECENT_PRELUDE_BYTES = 32 * 1024 * 1024;
 const MAX_RECENT_RUN_BYTES = 1536 * 1024 * 1024;
 const MAX_LINEAGE_PREFIX_BYTES = 1024 * 1024;
+const MAX_CURSOR_SEED_BYTES = 8 * 1024 * 1024;
+const MAX_DISCOVERY_DIRECTORY_ENTRIES = 20_000;
+const MAX_DISCOVERY_ROLLOUT_FILES = 5_000;
 const INDEXING_BOUNDARY = "modified_at_and_collection_start";
 const INDEXING_PHASES = new Set([
   "discovering",
@@ -79,6 +82,19 @@ const DIAGNOSTIC_COUNT_FIELDS = Object.freeze([
   "tierSettingEvents",
   "tierSettingOmissions",
   "malformedTierSettingEvents",
+]);
+const COLLECTOR_RESOURCE_LIMIT_CODES = Object.freeze({
+  directory_entries: "collector_resource_directory_entries_limit_exceeded",
+  rollout_files: "collector_resource_rollout_files_limit_exceeded",
+  source_bytes: "collector_resource_source_bytes_limit_exceeded",
+});
+const COLLECTOR_RESOURCE_LIMIT_CODE_SET = new Set(
+  Object.values(COLLECTOR_RESOURCE_LIMIT_CODES),
+);
+const COLLECTOR_DISCOVERY_STOP_CODES = new Set([
+  "collector_discovery_aborted",
+  COLLECTOR_RESOURCE_LIMIT_CODES.directory_entries,
+  COLLECTOR_RESOURCE_LIMIT_CODES.rollout_files,
 ]);
 
 export function defaultCollectorDataFile() {
@@ -470,23 +486,105 @@ function sameUsage(left, right) {
     .every((key) => left[key] === right[key]);
 }
 
-async function collectJsonlFiles(root, location) {
+function positiveSafeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function collectorResourceLimitEvidence(dimension, limit, observed) {
+  const code = COLLECTOR_RESOURCE_LIMIT_CODES[dimension];
+  if (!code) throw new TypeError("Collector resource-limit dimension is invalid");
+  return Object.freeze({ code, dimension, limit, observed });
+}
+
+function collectorResourceLimitError(dimension, limit, observed, discoveryProgress = null) {
+  const error = new Error("Collector stopped at a content-free resource limit");
+  error.name = "CollectorResourceLimitError";
+  error.code = COLLECTOR_RESOURCE_LIMIT_CODES[dimension];
+  error.resourceLimit = collectorResourceLimitEvidence(dimension, limit, observed);
+  if (discoveryProgress) error.discoveryProgress = Object.freeze({ ...discoveryProgress });
+  return error;
+}
+
+function recordCollectorResourceLimit(checkpoint, resourceLimit) {
+  const code = resourceLimit?.code;
+  if (!COLLECTOR_RESOURCE_LIMIT_CODE_SET.has(code)) return;
+  checkpoint.diagnostics.ingestionErrorCounts ??= {};
+  checkpoint.diagnostics.ingestionErrorCounts[code] =
+    (checkpoint.diagnostics.ingestionErrorCounts[code] ?? 0) + 1;
+}
+
+function collectorDiscoveryAbortError(discoveryProgress) {
+  const error = new Error("Collector discovery was aborted");
+  error.name = "AbortError";
+  error.code = "collector_discovery_aborted";
+  error.discoveryProgress = Object.freeze({ ...discoveryProgress });
+  return error;
+}
+
+function assertDiscoveryNotAborted(signal, discoveryProgress) {
+  if (signal?.aborted) throw collectorDiscoveryAbortError(discoveryProgress);
+}
+
+function safeBudgetTotal(current, addition, limit) {
+  if (!Number.isSafeInteger(addition) || addition < 0) return limit + 1;
+  const total = current + addition;
+  return Number.isSafeInteger(total) ? total : limit + 1;
+}
+
+async function collectJsonlFiles(root, location, {
+  signal,
+  discoveryProgress,
+  maximumDirectoryEntries,
+  maximumRolloutFiles,
+}) {
   const files = [];
   async function walk(directory) {
-    let entries;
+    assertDiscoveryNotAborted(signal, discoveryProgress);
+    let handle;
     try {
-      entries = await readdir(directory, { withFileTypes: true });
+      handle = await opendir(directory);
     } catch (error) {
       if (error.code === "ENOENT") return;
       throw error;
     }
-    for (const entry of entries) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) await walk(path);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        const metadata = await stat(path);
-        files.push({ path, location, metadata });
+    try {
+      while (true) {
+        assertDiscoveryNotAborted(signal, discoveryProgress);
+        const entry = await handle.read();
+        assertDiscoveryNotAborted(signal, discoveryProgress);
+        if (entry === null) break;
+        discoveryProgress.directoryEntries += 1;
+        if (discoveryProgress.directoryEntries > maximumDirectoryEntries) {
+          throw collectorResourceLimitError(
+            "directory_entries",
+            maximumDirectoryEntries,
+            discoveryProgress.directoryEntries,
+            discoveryProgress,
+          );
+        }
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path);
+        } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+          discoveryProgress.rolloutFiles += 1;
+          if (discoveryProgress.rolloutFiles > maximumRolloutFiles) {
+            throw collectorResourceLimitError(
+              "rollout_files",
+              maximumRolloutFiles,
+              discoveryProgress.rolloutFiles,
+              discoveryProgress,
+            );
+          }
+          const metadata = await stat(path);
+          assertDiscoveryNotAborted(signal, discoveryProgress);
+          files.push({ path, location, metadata });
+        }
       }
+    } finally {
+      await handle.close();
     }
   }
   await walk(root);
@@ -511,13 +609,32 @@ function rolloutMayOverlap(file, sinceMs) {
 
 export async function discoverCollectorRollouts(
   codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex"),
-  { sinceAt = null } = {},
+  {
+    sinceAt = null,
+    signal = null,
+    maximumDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
+    maximumRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
+  } = {},
 ) {
+  if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
+  positiveSafeInteger(maximumDirectoryEntries, "maximumDirectoryEntries");
+  positiveSafeInteger(maximumRolloutFiles, "maximumRolloutFiles");
   const sinceMs = sinceAt === null ? Number.NaN : Date.parse(canonicalInstant(sinceAt, "sinceAt"));
-  const [active, archived] = await Promise.all([
-    collectJsonlFiles(join(codexHome, "sessions"), "active"),
-    collectJsonlFiles(join(codexHome, "archived_sessions"), "archive"),
-  ]);
+  const discoveryProgress = { directoryEntries: 0, rolloutFiles: 0 };
+  assertDiscoveryNotAborted(signal, discoveryProgress);
+  const archived = await collectJsonlFiles(join(codexHome, "archived_sessions"), "archive", {
+    signal,
+    discoveryProgress,
+    maximumDirectoryEntries,
+    maximumRolloutFiles,
+  });
+  const active = await collectJsonlFiles(join(codexHome, "sessions"), "active", {
+    signal,
+    discoveryProgress,
+    maximumDirectoryEntries,
+    maximumRolloutFiles,
+  });
+  assertDiscoveryNotAborted(signal, discoveryProgress);
   const selected = new Map();
   for (const file of archived) selected.set(rolloutName(file.path), file);
   for (const file of active) selected.set(rolloutName(file.path), file);
@@ -598,7 +715,7 @@ async function forEachCompleteLine(path, offset, size, onLine, {
 }
 
 async function seedCursorFromTail(path, size, {
-  maximumBytes = 8 * 1024 * 1024,
+  maximumBytes = MAX_CURSOR_SEED_BYTES,
   diagnostics = {},
 } = {}) {
   const start = Math.max(0, size - maximumBytes);
@@ -791,6 +908,8 @@ export async function ingestRolloutUpdates({
   maximumRecentPreludeBytes = MAX_RECENT_PRELUDE_BYTES,
   maximumRecentRunBytes = MAX_RECENT_RUN_BYTES,
   maximumLineagePrefixBytes = MAX_LINEAGE_PREFIX_BYTES,
+  maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
+  maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
   commitRecordBatch = null,
   rollouts = null,
   signal = null,
@@ -822,7 +941,13 @@ export async function ingestRolloutUpdates({
   if (onProgress !== null && typeof onProgress !== "function") {
     throw new TypeError("onProgress must be a function");
   }
-  const files = rollouts ?? await discoverCollectorRollouts(codexHome);
+  positiveSafeInteger(maximumDiscoveryDirectoryEntries, "maximumDiscoveryDirectoryEntries");
+  positiveSafeInteger(maximumDiscoveryRolloutFiles, "maximumDiscoveryRolloutFiles");
+  const files = rollouts ?? await discoverCollectorRollouts(codexHome, {
+    signal,
+    maximumDirectoryEntries: maximumDiscoveryDirectoryEntries,
+    maximumRolloutFiles: maximumDiscoveryRolloutFiles,
+  });
   if (!Array.isArray(files)) throw new TypeError("rollouts must be an array");
   checkpoint.diagnostics.filesDiscovered += files.length;
   const recentSet = new Set(checkpoint.recentEventKeys);
@@ -835,7 +960,8 @@ export async function ingestRolloutUpdates({
   let committedVersion = -1;
   let filesProcessed = 0;
   let aborted = signal?.aborted === true;
-  let recentReadBudget = 0;
+  let sourceReadBudget = 0;
+  let resourceLimit = null;
   let recentCoverageComplete = true;
   let recentCoverageStartMs = Number.NaN;
   const receivedAt = new Date(clock()).toISOString();
@@ -843,6 +969,21 @@ export async function ingestRolloutUpdates({
   function markChanged() {
     changed = true;
     changeVersion += 1;
+  }
+
+  function reserveSourceBytes(byteCount) {
+    const observed = safeBudgetTotal(sourceReadBudget, byteCount, maximumRecentRunBytes);
+    if (observed > maximumRecentRunBytes) {
+      resourceLimit = collectorResourceLimitEvidence(
+        "source_bytes",
+        maximumRecentRunBytes,
+        observed,
+      );
+      aborted = true;
+      return false;
+    }
+    sourceReadBudget = observed;
+    return true;
   }
 
   async function flushRecordBatch() {
@@ -886,11 +1027,7 @@ export async function ingestRolloutUpdates({
           + Math.min(maximumRecentPreludeBytes, proposedStart)
           + alignmentReservation
           + maximumLineagePrefixBytes;
-        if (recentReadBudget + reservedRead > maximumRecentRunBytes) {
-          aborted = true;
-          break;
-        }
-        recentReadBudget += reservedRead;
+        if (!reserveSourceBytes(reservedRead)) break;
         recentTailStart = await lineStartAtOrAfter(
           file.path,
           proposedStart,
@@ -901,13 +1038,13 @@ export async function ingestRolloutUpdates({
           aborted = true;
           break;
         }
-      } else if (recentSinceAt !== null) {
-        const estimatedRead = file.metadata.size + maximumLineagePrefixBytes;
-        if (recentReadBudget + estimatedRead > maximumRecentRunBytes) {
-          aborted = true;
-          break;
-        }
-        recentReadBudget += estimatedRead;
+      } else {
+        const mainRead = initializeAtEnd ? 0 : file.metadata.size;
+        const lineageRead = Math.min(file.metadata.size, maximumLineagePrefixBytes);
+        const seedRead = initializeAtEnd && file.location === "active"
+          ? Math.min(file.metadata.size, MAX_CURSOR_SEED_BYTES)
+          : 0;
+        if (!reserveSourceBytes(mainRead + lineageRead + seedRead)) break;
       }
       const lineage = await readRolloutLineage(file.path, {
         maximumTotalBytes: maximumLineagePrefixBytes,
@@ -970,13 +1107,19 @@ export async function ingestRolloutUpdates({
         });
         continue;
       }
-    } else if (recentSinceAt !== null && file.metadata.size > state.offset) {
-      const estimatedRead = file.metadata.size - state.offset;
-      if (recentReadBudget + estimatedRead > maximumRecentRunBytes) {
-        aborted = true;
-        break;
-      }
-      recentReadBudget += estimatedRead;
+    } else {
+      const effectiveOffset = file.metadata.size < state.offset ? 0 : state.offset;
+      const mainRead = Math.max(0, file.metadata.size - effectiveOffset);
+      const lineageRead = state.surfaceClassification
+        ? 0
+        : Math.min(file.metadata.size, maximumLineagePrefixBytes);
+      const seedRead = state.currentModel === null
+          && state.tailSeeded !== true
+          && file.location === "active"
+          && effectiveOffset > 0
+        ? Math.min(effectiveOffset, MAX_CURSOR_SEED_BYTES)
+        : 0;
+      if (!reserveSourceBytes(mainRead + lineageRead + seedRead)) break;
     }
     if (!state.surfaceClassification) {
       const lineage = await readRolloutLineage(file.path, {
@@ -1121,6 +1264,8 @@ export async function ingestRolloutUpdates({
     recentCoverageStartAt: Number.isFinite(recentCoverageStartMs)
       ? new Date(recentCoverageStartMs).toISOString()
       : null,
+    sourceBytesReserved: sourceReadBudget,
+    resourceLimit,
     changed,
     lastChangeCommitted: commitRecordBatch !== null && committedVersion === changeVersion,
   };
@@ -1296,6 +1441,8 @@ export async function runCollectorOnce({
   maximumRecentPreludeBytes = MAX_RECENT_PRELUDE_BYTES,
   maximumRecentRunBytes = MAX_RECENT_RUN_BYTES,
   maximumLineagePrefixBytes = MAX_LINEAGE_PREFIX_BYTES,
+  maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
+  maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
@@ -1338,7 +1485,53 @@ export async function runCollectorOnce({
       indexing.filesProcessed = 0;
       indexing.coveredAt.endAt = null;
     }
-    const discovered = await discoverCollectorRollouts(codexHome);
+    let discovered;
+    try {
+      discovered = await discoverCollectorRollouts(codexHome, {
+        signal,
+        maximumDirectoryEntries: maximumDiscoveryDirectoryEntries,
+        maximumRolloutFiles: maximumDiscoveryRolloutFiles,
+      });
+    } catch (error) {
+      if (!COLLECTOR_DISCOVERY_STOP_CODES.has(error?.code)) throw error;
+      const discoveryProgress = error.discoveryProgress ?? {};
+      const filesDiscovered = Number.isSafeInteger(discoveryProgress.rolloutFiles)
+        ? discoveryProgress.rolloutFiles
+        : 0;
+      if (indexingRun || indexing.mode === "prospective") {
+        indexing.status = "bounded_pause";
+        indexing.phase = "paused";
+        indexing.filesDiscovered = filesDiscovered;
+        indexing.filesSelected = 0;
+        indexing.filesProcessed = 0;
+        indexing.coveredAt.endAt = null;
+      }
+      checkpoint.indexing = cloneIndexing(indexing);
+      recordCollectorResourceLimit(checkpoint, error.resourceLimit);
+      checkpoint.savedAt = new Date(clock()).toISOString();
+      await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+      await emitIndexingProgress(onProgress, checkpoint.indexing);
+      const paused = {
+        mode: "run_once",
+        status: "bounded_pause",
+        pauseReason: error.code,
+        resourceLimit: error.resourceLimit ?? null,
+        rolloutRecordsWritten: 0,
+        recordBatchesWritten: 0,
+        maximumBufferedRecords: 0,
+        filesDiscovered,
+        filesSelected: 0,
+        filesProcessed: 0,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: cloneIndexing(checkpoint.indexing),
+        diagnostics: publicDiagnostics(checkpoint.diagnostics),
+      };
+      Object.defineProperties(paused, {
+        checkpointFile: { value: checkpointFile, enumerable: false },
+        dataFile: { value: dataFile, enumerable: false },
+      });
+      return paused;
+    }
     const collectionStartMs = Date.parse(checkpoint.collectionStartedAt);
     const selected = discovered.filter((file) => rolloutMayOverlap(file, collectionStartMs));
     if (indexingRun || indexing.mode === "prospective") {
@@ -1357,6 +1550,8 @@ export async function runCollectorOnce({
       const paused = {
         mode: "run_once",
         status: "bounded_pause",
+        pauseReason: "collector_aborted",
+        resourceLimit: null,
         rolloutRecordsWritten: 0,
         recordBatchesWritten: 0,
         maximumBufferedRecords: 0,
@@ -1388,6 +1583,8 @@ export async function runCollectorOnce({
       maximumRecentPreludeBytes,
       maximumRecentRunBytes,
       maximumLineagePrefixBytes,
+      maximumDiscoveryDirectoryEntries,
+      maximumDiscoveryRolloutFiles,
       rollouts: selected,
       signal,
       onProgress: async (progress) => {
@@ -1409,6 +1606,7 @@ export async function runCollectorOnce({
         clock,
       }),
     });
+    recordCollectorResourceLimit(checkpoint, ingestion.resourceLimit);
     if (indexingRun) {
       indexing.filesProcessed = ingestion.filesProcessed;
       indexing.recordsWritten = priorIndexedRecords + ingestion.recordsWritten;
@@ -1501,6 +1699,9 @@ export async function runCollectorOnce({
         : checkpoint.indexing?.status === "recent_7d_partial"
           ? "partial"
           : "complete",
+      pauseReason: ingestion.resourceLimit?.code
+        ?? (ingestion.aborted || signal?.aborted ? "collector_aborted" : null),
+      resourceLimit: ingestion.resourceLimit,
       rolloutRecordsWritten: ingestion.recordsWritten,
       recordBatchesWritten: ingestion.recordBatchesWritten,
       maximumBufferedRecords: ingestion.maximumBufferedRecords,
@@ -1557,6 +1758,9 @@ export async function runCollectorForeground({
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
+  maximumRecentRunBytes = MAX_RECENT_RUN_BYTES,
+  maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
+  maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
 } = {}) {
   const release = await acquireCollectorLock(lockFile, { clock });
   let existing;
@@ -1672,6 +1876,10 @@ export async function runCollectorForeground({
               initializeAtEnd: !hasDurableCheckpoint && checkpoint.diagnostics.filesDiscovered === 0,
               maximumRecordBatchSize,
               maximumRecentEventKeys,
+              maximumRecentRunBytes,
+              maximumDiscoveryDirectoryEntries,
+              maximumDiscoveryRolloutFiles,
+              signal,
               commitRecordBatch: async (records) => {
                 await commitCollectorRecordBatch({ records, checkpoint, dataFile, checkpointFile, journalFile, clock });
                 checkpointWrites += 1;
@@ -1682,6 +1890,7 @@ export async function runCollectorForeground({
             await restoreCheckpoint();
             throw error;
           }
+          recordCollectorResourceLimit(checkpoint, result.resourceLimit);
           rolloutRecords += result.recordsWritten ?? result.records?.length ?? 0;
           recordBatchesWritten += result.recordBatchesWritten ?? 0;
           maximumBufferedRecords = Math.max(maximumBufferedRecords, result.maximumBufferedRecords ?? 0);

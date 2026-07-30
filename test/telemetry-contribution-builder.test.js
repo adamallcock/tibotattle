@@ -209,6 +209,19 @@ test("builder splits large canonical bundles into bounded transport batches", ()
   assert.ok(contributions.every((row) => Buffer.byteLength(JSON.stringify(row)) < 1_250_000));
 });
 
+test("builder refuses a local set larger than one fresh weekly admission window", () => {
+  assert.throws(
+    () => buildTelemetryContributionsFromBundle(bundle({
+      usageEvents: Array.from(
+        { length: 20_001 },
+        (_, index) => usage(index + 1),
+      ),
+      quotaSnapshots: [],
+    })),
+    (error) => error?.code === "batch_count_invalid",
+  );
+});
+
 test("materializer re-verifies a reviewed bundle and writes owner-only no-clobber files", async () => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-telemetry-build-"));
   const { bundleFile, receiptFile } = await verifiedSource(root);

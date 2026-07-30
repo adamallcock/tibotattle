@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { analyzeWeeklyCalibration, renderWeeklyCalibrationReport } from "../src/weekly-calibration.js";
+import {
+  analyzeWeeklyCalibration,
+  BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
+  projectBoundedWeeklyCalibrationSummary,
+  renderWeeklyCalibrationReport,
+} from "../src/weekly-calibration.js";
 import { verifyWeeklyCalibration } from "../src/verify-weekly-calibration.js";
 
 test("weekly calibration package shortcut pins the full historical ledger", async () => {
@@ -9,6 +14,50 @@ test("weekly calibration package shortcut pins the full historical ledger", asyn
   const command = packageJson.scripts["calibrate:weekly"];
   assert.match(command, /transitions-simple-history-2026-06-11-to-2026-07-24-v0\.3\.2\.json/);
   assert.match(command, /weekly-calibration-v0\.2\.json/);
+});
+
+test("bounded weekly summary rejects malformed datasets", () => {
+  assert.throws(
+    () => projectBoundedWeeklyCalibrationSummary(null),
+    /Weekly calibration dataset is invalid/,
+  );
+  assert.throws(
+    () => projectBoundedWeeklyCalibrationSummary({ transitions: {} }),
+    /Weekly calibration dataset is invalid/,
+  );
+});
+
+test("bounded weekly summary retains up to 64 reset series from a 31-day window", () => {
+  const firstReset = Math.floor(
+    Date.parse("2026-07-01T12:00:00.000Z") / 1_000,
+  );
+  const resets = Array.from(
+    { length: BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT + 6 },
+    (_, index) => firstReset + index * 10 * 60 * 60,
+  );
+  const input = dataset(resets.flatMap((reset, index) => (
+    resetTransitions({ reset, capacityUsd: 600 + index })
+  )));
+  input.scope = {
+    ...input.scope,
+    startAt: "2026-06-30T00:00:00.000Z",
+    endAt: "2026-08-01T00:00:00.000Z",
+  };
+
+  const summary = projectBoundedWeeklyCalibrationSummary(input);
+
+  assert.equal(
+    summary.recentResets.length,
+    BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
+  );
+  assert.equal(
+    summary.recentResets[0].resetIdentity,
+    new Date(resets[6] * 1_000).toISOString(),
+  );
+  assert.equal(
+    summary.recentResets.at(-1).resetIdentity,
+    new Date(resets.at(-1) * 1_000).toISOString(),
+  );
 });
 
 function resetTransitions({

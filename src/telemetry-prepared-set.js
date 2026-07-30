@@ -18,6 +18,10 @@ export const PREPARED_CONTRIBUTION_SET_MANIFEST =
   "prepared-contribution-set-v0.1.json";
 export const PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA =
   "telemetry-contribution-v0.1";
+// This is deliberately equal to the server's maximum accepted batches in one
+// fixed weekly admission window. A prepared set can therefore never exceed a
+// fresh window by itself; prior accepted batches may cause the remainder to
+// wait until the server-advertised retry time.
 export const MAX_PREPARED_CONTRIBUTION_BATCHES = 100;
 
 const MAX_CONTRIBUTION_BYTES = 1_310_720;
@@ -215,6 +219,10 @@ const ERROR_CODES = new Set([
   "file_schema",
   "publication_invalid",
 ]);
+
+export function preparedContributionSetId(manifest) {
+  return createHash("sha256").update(stableJson(manifest)).digest("hex");
+}
 
 export class PreparedContributionSetError extends Error {
   constructor(code) {

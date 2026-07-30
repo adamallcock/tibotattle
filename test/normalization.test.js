@@ -593,3 +593,19 @@ test("activity scans can exclude exactly the controller session without exposing
     await rm(codexHome, { recursive: true });
   }
 });
+
+test("Codex log scans stop before discovery when their refresh is aborted", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    scanCodexLogEvents({
+      startAt: "2026-07-20T00:00:00.000Z",
+      endAt: "2026-07-21T00:00:00.000Z",
+      codexHome: "/unused",
+      rolloutInfos: [],
+      signal: controller.signal,
+    }),
+    (error) => error?.name === "AbortError"
+      && error?.code === "codex_log_scan_aborted",
+  );
+});

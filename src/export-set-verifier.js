@@ -244,26 +244,52 @@ async function createUniquenessIndex(resourceGuard, {
     database.enableDefensive?.(true);
     database.exec("CREATE TABLE ids(family TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY(family, record_id)) STRICT");
     const insert = database.prepare("INSERT INTO ids(family, record_id) VALUES (?, ?)");
+    const batchLimitRecords = resourceGuard.limits.maximumSqliteBatchRecords;
     let batchRecords = 0;
-    let transactionOpen = true;
-    database.exec("BEGIN IMMEDIATE");
+    let recordsIndexed = 0;
+    let nonEmptyBatchCount = 0;
+    let fullBatchCount = 0;
+    let maximumBatchRecords = 0;
+    let finalBatchRecords = 0;
+    let transactionOpen = false;
+
+    function observeDatabaseBytes() {
+      const pageCount = Number(database.prepare("PRAGMA page_count").get().page_count);
+      const pageSize = Number(database.prepare("PRAGMA page_size").get().page_size);
+      const bytes = pageCount * pageSize;
+      if (bytes > maximumBytes) throw new ExportResourceLimitError("workspace_bytes");
+      resourceGuard.observeWorkspace(bytes);
+    }
+
+    function beginTransaction() {
+      if (transactionOpen) return;
+      database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      batchRecords = 0;
+    }
+
+    function commitTransaction() {
+      if (!transactionOpen) return;
+      database.exec("COMMIT");
+      transactionOpen = false;
+      if (batchRecords > 0) {
+        nonEmptyBatchCount += 1;
+        if (batchRecords === batchLimitRecords) fullBatchCount += 1;
+        maximumBatchRecords = Math.max(maximumBatchRecords, batchRecords);
+        finalBatchRecords = batchRecords;
+      }
+      batchRecords = 0;
+      observeDatabaseBytes();
+    }
+
     return {
       add(family, id) {
         try {
+          beginTransaction();
           insert.run(family, id);
           batchRecords += 1;
-          if (batchRecords >= DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSqliteBatchRecords) {
-            database.exec("COMMIT");
-            transactionOpen = false;
-            const pageCount = Number(database.prepare("PRAGMA page_count").get().page_count);
-            const pageSize = Number(database.prepare("PRAGMA page_size").get().page_size);
-            const bytes = pageCount * pageSize;
-            if (bytes > maximumBytes) throw new ExportResourceLimitError("workspace_bytes");
-            resourceGuard.observeWorkspace(bytes);
-            database.exec("BEGIN IMMEDIATE");
-            transactionOpen = true;
-            batchRecords = 0;
-          }
+          recordsIndexed += 1;
+          if (batchRecords >= batchLimitRecords) commitTransaction();
         } catch (error) {
           if (error instanceof ExportResourceLimitError) throw error;
           if (String(error?.code).includes("CONSTRAINT") || /UNIQUE constraint/i.test(error?.message)) {
@@ -275,15 +301,8 @@ async function createUniquenessIndex(resourceGuard, {
       async close() {
         let failure = null;
         try {
-          if (transactionOpen) {
-            database.exec("COMMIT");
-            transactionOpen = false;
-          }
-          const pageCount = Number(database.prepare("PRAGMA page_count").get().page_count);
-          const pageSize = Number(database.prepare("PRAGMA page_size").get().page_size);
-          const bytes = pageCount * pageSize;
-          if (bytes > maximumBytes) throw new ExportResourceLimitError("workspace_bytes");
-          resourceGuard.observeWorkspace(bytes);
+          commitTransaction();
+          if (recordsIndexed === 0) observeDatabaseBytes();
         } catch (error) {
           failure = error;
         }
@@ -298,6 +317,14 @@ async function createUniquenessIndex(resourceGuard, {
           failure ??= error;
         }
         if (failure) throw failure;
+        return {
+          batchLimitRecords,
+          recordsIndexed,
+          nonEmptyBatchCount,
+          fullBatchCount,
+          maximumBatchRecords,
+          finalBatchRecords,
+        };
       },
     };
   } catch (error) {
@@ -444,6 +471,7 @@ export async function verifyLocalExportSet({
   let actualDecodedBytes = 0;
   let actualEncodedBytes = 0;
   let actualReceiptBytes = 0;
+  let verificationIndex = null;
   try {
     for (const entry of manifest.chunks) {
       const verified = await loadVerifiedSetChunk({ root, manifest, entry, resourceGuard });
@@ -489,7 +517,7 @@ export async function verifyLocalExportSet({
         || actualEncodedBytes !== declaredBytes.encoded
         || actualReceiptBytes !== manifest.totals.receiptBytes) fail("chunk_metadata");
   } finally {
-    await unique.close();
+    verificationIndex = await unique.close();
   }
 
   return {
@@ -502,5 +530,6 @@ export async function verifyLocalExportSet({
     decodedBundleBytes: declaredBytes.decoded,
     encodedArtifactBytes: declaredBytes.encoded,
     transportReady: manifest.transportReady,
+    verificationIndex,
   };
 }

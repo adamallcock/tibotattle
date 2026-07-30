@@ -33,7 +33,7 @@ import {
 import { cleanupR7OwnedTree, inventoryR7OwnedTree } from "./r7-resource-benchmark.js";
 
 export const R7_MATERIALIZED_BOUNDARY_HARNESS_VERSION =
-  "g1-r7-materialized-boundary-integration-v0.2";
+  "g1-r7-materialized-boundary-integration-v0.3";
 
 const FIXED_BUNDLE_ID = `bundle:v1:${"6".repeat(64)}`;
 const EXECUTED_STATUSES = new Set(["passed", "rejected"]);
@@ -301,21 +301,43 @@ async function materialWorkspaceFileCase(root) {
   };
 }
 
-async function literalCandidateTrial(dimension) {
+async function literalCandidateTrial(dimension, { sqliteBatch = null } = {}) {
   const selectedLimit = DEFAULT_EXPORT_RESOURCE_LIMITS[
     R7_RESOURCE_BENCHMARK_LIMIT_KEY_BY_DIMENSION[dimension]
   ];
   if (dimension === "sqlite_batch_records") {
+    if (!sqliteBatch
+        || sqliteBatch.batchLimitRecords !== selectedLimit
+        || sqliteBatch.recordsIndexed !== selectedLimit + 1
+        || sqliteBatch.nonEmptyBatchCount !== 2
+        || sqliteBatch.fullBatchCount !== 1
+        || sqliteBatch.maximumBatchRecords !== selectedLimit
+        || sqliteBatch.finalBatchRecords !== 1) {
+      throw new Error("R7 SQLite rollover evidence did not match the selected batching policy");
+    }
     return {
       dimension,
       unit: R7_RESOURCE_BENCHMARK_UNIT_BY_DIMENSION[dimension],
       selectedLimit,
-      mode: "not_identified",
-      pathway: "not_run",
-      atLimit: unexecutedTrial("not_run", "at_limit"),
-      plusOne: unexecutedTrial("not_run", "limit_plus_one"),
-      identification: "not_run",
-      reason: "no_injectable_sqlite_batch_seam",
+      mode: "materialized_batch_rollover",
+      receiptMode: "materialized",
+      pathway: "export_set_verifier_sqlite_index",
+      atLimit: {
+        mode: "at_limit",
+        configuredLimit: selectedLimit,
+        observedValue: selectedLimit,
+        status: "passed",
+        failureCode: "none",
+      },
+      plusOne: {
+        mode: "limit_plus_one",
+        configuredLimit: selectedLimit,
+        observedValue: selectedLimit + 1,
+        status: "passed",
+        failureCode: "none",
+      },
+      identification: "not_identified",
+      reason: "operational_batch_rollover_not_rejection_ceiling",
     };
   }
   const scope = dimension.includes("export_set") || dimension === "workspace_bytes"
@@ -371,6 +393,88 @@ async function literalCandidateTrial(dimension) {
     },
     identification: "not_identified",
     reason: "counter_only_not_integrated",
+  };
+}
+
+function sqliteUsage(totalInputTokens) {
+  return {
+    input_tokens: totalInputTokens,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: totalInputTokens,
+  };
+}
+
+async function materializedSqliteBatchCase(root) {
+  const selectedLimit = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSqliteBatchRecords;
+  const recordCount = selectedLimit + 1;
+  const home = join(root, "sqlite-home");
+  const workspaceDirectory = join(root, "sqlite-workspace");
+  const outputDirectory = join(root, "sqlite-output");
+  await mkdir(join(home, "sessions"), { recursive: true, mode: 0o700 });
+  await mkdir(join(home, "archived_sessions"), { recursive: true, mode: 0o700 });
+  const startMs = Date.parse(R7_FIXTURE_START_AT);
+  const lines = [
+    JSON.stringify({
+      timestamp: R7_FIXTURE_START_AT,
+      type: "session_meta",
+      payload: { id: "R7_SQLITE_BATCH_STRUCTURAL_FIXTURE" },
+    }),
+    JSON.stringify({
+      timestamp: R7_FIXTURE_START_AT,
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol" },
+    }),
+  ];
+  for (let index = 0; index < recordCount; index += 1) {
+    lines.push(JSON.stringify({
+      timestamp: new Date(startMs + index + 1).toISOString(),
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: sqliteUsage(index + 1),
+          last_token_usage: sqliteUsage(1),
+        },
+        rate_limits: null,
+      },
+    }));
+  }
+  await writeFile(
+    join(home, "sessions", "rollout-2026-07-24T12-00-00-sqlite.jsonl"),
+    `${lines.join("\n")}\n`,
+    { mode: 0o600 },
+  );
+  await createLocalExportWorkspace({
+    directory: workspaceDirectory,
+    startAt: R7_FIXTURE_START_AT,
+    endAt: R7_FIXTURE_END_AT,
+    createdAt: R7_FIXTURE_CREATED_AT,
+    codexHome: home,
+    secret: R7_FIXTURE_SECRET,
+    resourceClock: () => 0,
+    resourceRss: () => 1,
+  });
+  const materialized = await materializeLocalExportSet({
+    workspaceDirectory,
+    outputDirectory,
+    secret: R7_FIXTURE_SECRET,
+    maximumRecordsPerChunk: selectedLimit,
+  });
+  if (totalRecords(materialized.manifest.totals.recordCounts) !== recordCount) {
+    throw new Error("R7 SQLite structural fixture did not produce the prescribed record count");
+  }
+  const verified = await verifyLocalExportSet({
+    directory: outputDirectory,
+    verificationTemporaryRoot: root,
+  });
+  return {
+    ...verified.verificationIndex,
+    pathway: "export_set_verifier_sqlite_index",
+    atBatchLimitStatus: "passed",
+    plusOneRolloverStatus: "passed",
   };
 }
 
@@ -682,6 +786,25 @@ export async function runR7MaterializedBoundaryHarness({
       }),
       workspaceFile: await materialWorkspaceFileCase(nextPath("material-workspace-file")),
     };
+    const sqliteBatch = await materializedSqliteBatchCase(nextPath("material-sqlite-batch"));
+    verifier.set("sqlite_batch_records", {
+      pathway: sqliteBatch.pathway,
+      status: "enforced",
+      atLimit: {
+        mode: "at_limit",
+        configuredLimit: sqliteBatch.batchLimitRecords,
+        observedValue: sqliteBatch.batchLimitRecords,
+        status: sqliteBatch.atBatchLimitStatus,
+        failureCode: "none",
+      },
+      plusOne: {
+        mode: "limit_plus_one",
+        configuredLimit: sqliteBatch.batchLimitRecords,
+        observedValue: sqliteBatch.recordsIndexed,
+        status: sqliteBatch.plusOneRolloverStatus,
+        failureCode: "none",
+      },
+    });
     const expectedMaterialCodes = [
       [materialCases.longLine.plusOne, "export_resource_line_bytes"],
       [materialCases.compressibleArtifact.producerDecodedPlusOne, "export_compression_decoded_bytes"],
@@ -704,10 +827,16 @@ export async function runR7MaterializedBoundaryHarness({
 
     const literalCandidateMatrix = [];
     for (const dimension of R7_RESOURCE_BENCHMARK_BOUNDARY_DIMENSIONS) {
-      literalCandidateMatrix.push(await literalCandidateTrial(dimension));
+      literalCandidateMatrix.push(await literalCandidateTrial(dimension, { sqliteBatch }));
     }
     const literalCandidateUnexpected = literalCandidateMatrix.filter((row) => {
-      if (row.identification === "not_run") return row.dimension !== "sqlite_batch_records";
+      if (row.dimension === "sqlite_batch_records") {
+        return row.atLimit.status !== "passed"
+          || row.atLimit.failureCode !== "none"
+          || row.plusOne.status !== "passed"
+          || row.plusOne.failureCode !== "none";
+      }
+      if (row.identification === "not_run") return true;
       return row.atLimit.status !== "passed"
         || row.atLimit.failureCode !== "none"
         || row.plusOne.status !== "rejected"
@@ -738,6 +867,7 @@ export async function runR7MaterializedBoundaryHarness({
       fixtureManifestSha256: fixture.evidence.manifestSha256,
       contentIncluded: false,
       materialCases,
+      sqliteBatch,
       literalCandidateMatrix,
       rows,
       summary: {
@@ -752,7 +882,7 @@ export async function runR7MaterializedBoundaryHarness({
         ).length,
         literalCandidatesIdentified: 0,
         literalCandidateUnexpected: literalCandidateUnexpected.length,
-        sqliteBatchStatus: "not_run",
+        sqliteBatchStatus: "passed",
       },
     };
   } finally {

@@ -425,10 +425,21 @@
     },
     "sqliteBatchEvidence": {
       "type": "object", "additionalProperties": false,
-      "required": ["status", "reason"],
+      "required": [
+        "batchLimitRecords", "recordsIndexed", "nonEmptyBatchCount", "fullBatchCount",
+        "maximumBatchRecords", "finalBatchRecords", "pathway", "atBatchLimitStatus",
+        "plusOneRolloverStatus"
+      ],
       "properties": {
-        "status": { "const": "not_run" },
-        "reason": { "const": "no_injectable_sqlite_batch_seam" }
+        "batchLimitRecords": { "const": 1000 },
+        "recordsIndexed": { "const": 1001 },
+        "nonEmptyBatchCount": { "const": 2 },
+        "fullBatchCount": { "const": 1 },
+        "maximumBatchRecords": { "const": 1000 },
+        "finalBatchRecords": { "const": 1 },
+        "pathway": { "const": "export_set_verifier_sqlite_index" },
+        "atBatchLimitStatus": { "const": "passed" },
+        "plusOneRolloverStatus": { "const": "passed" }
       }
     },
     "providerAggregate": {

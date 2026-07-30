@@ -72,7 +72,25 @@ export interface DeviceUploadClaim {
   authorizationKind: "device";
 }
 
-function ongoingConsentForParticipant(consentVersion: string): string | null {
+export interface DevicePairingMaterial {
+  id: string;
+  participantId: string;
+  issuedBySessionId: string;
+  secretHash: Uint8Array;
+  transportConsentVersion:
+    | typeof ONGOING_TELEMETRY_CONSENT_VERSION
+    | typeof ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION;
+  pairingCode: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+function ongoingConsentForParticipant(
+  consentVersion: string,
+):
+  | typeof ONGOING_TELEMETRY_CONSENT_VERSION
+  | typeof ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
+  | null {
   if (consentVersion === TELEMETRY_CONSENT_VERSION) {
     return ONGOING_TELEMETRY_CONSENT_VERSION;
   }
@@ -135,6 +153,69 @@ function deviceUploadHash(id: string, secret: string): Promise<Uint8Array> {
   return sha256(`app-usagemonitor/device-upload/v1\0${id}\0${secret}`);
 }
 
+export async function createDevicePairingMaterial(
+  participantId: string,
+  sessionId: string,
+  participantConsentVersion: string,
+  nowEpoch = Date.now(),
+): Promise<DevicePairingMaterial> {
+  const ongoingConsentVersion = ongoingConsentForParticipant(
+    participantConsentVersion,
+  );
+  if (!ongoingConsentVersion) throw new ApiError(400, "TELEMETRY_REQUIRED");
+  const id = crypto.randomUUID();
+  const secret = randomSecret(32);
+  const issuedAt = new Date(nowEpoch).toISOString();
+  const expiresAt = new Date(
+    nowEpoch + DEVICE_PAIRING_TTL_MILLISECONDS,
+  ).toISOString();
+  return {
+    id,
+    participantId,
+    issuedBySessionId: sessionId,
+    secretHash: await pairingHash(id, secret),
+    transportConsentVersion: ongoingConsentVersion,
+    pairingCode: `um_pair_${id}.${secret}`,
+    issuedAt,
+    expiresAt,
+  };
+}
+
+export function devicePairingInsert(
+  db: D1Database,
+  material: DevicePairingMaterial,
+  participantConsentVersion: string,
+): D1PreparedStatement {
+  return db.prepare(
+    `INSERT INTO device_pairings (
+      id, participant_id, issued_by_session_id, secret_hash, consent_version,
+      transport_consent_version, state, issued_at, expires_at
+    )
+    SELECT ?, participant.id, session.id, ?,
+           ?, ?, 'unused', ?, ?
+      FROM participants participant
+      JOIN web_sessions session ON session.participant_id = participant.id
+     WHERE participant.id = ?
+       AND participant.state = 'active'
+       AND participant.consent_version = ?
+       AND session.id = ?
+       AND session.state = 'active'
+       AND session.scope = 'personal'
+       AND session.expires_at > ?`,
+  ).bind(
+    material.id,
+    material.secretHash,
+    ONGOING_TELEMETRY_CONSENT_VERSION,
+    material.transportConsentVersion,
+    material.issuedAt,
+    material.expiresAt,
+    material.participantId,
+    participantConsentVersion,
+    material.issuedBySessionId,
+    material.issuedAt,
+  );
+}
+
 function parsePairingAuthorization(header: string | null): {
   id: string;
   secret: string;
@@ -187,45 +268,22 @@ export async function createDevicePairing(
   participantConsentVersion: string,
   nowEpoch = Date.now(),
 ): Promise<{ pairingCode: string; expiresAt: string }> {
-  const ongoingConsentVersion = ongoingConsentForParticipant(
-    participantConsentVersion,
-  );
-  if (!ongoingConsentVersion) throw new ApiError(400, "TELEMETRY_REQUIRED");
-  const id = crypto.randomUUID();
-  const secret = randomSecret(32);
-  const issuedAt = new Date(nowEpoch).toISOString();
-  const expiresAt = new Date(nowEpoch + DEVICE_PAIRING_TTL_MILLISECONDS).toISOString();
-  const secretHash = await pairingHash(id, secret);
-  const result = await db.prepare(
-    `INSERT INTO device_pairings (
-      id, participant_id, issued_by_session_id, secret_hash, consent_version,
-      transport_consent_version, state, issued_at, expires_at
-    )
-    SELECT ?, participant.id, session.id, ?,
-           ?, ?, 'unused', ?, ?
-      FROM participants participant
-      JOIN web_sessions session ON session.participant_id = participant.id
-     WHERE participant.id = ?
-       AND participant.state = 'active'
-       AND participant.consent_version = ?
-       AND session.id = ?
-       AND session.state = 'active'
-       AND session.scope = 'personal'
-       AND session.expires_at > ?`,
-  ).bind(
-    id,
-    secretHash,
-    ONGOING_TELEMETRY_CONSENT_VERSION,
-    ongoingConsentVersion,
-    issuedAt,
-    expiresAt,
+  const material = await createDevicePairingMaterial(
     participantId,
-    participantConsentVersion,
     sessionId,
-    issuedAt,
+    participantConsentVersion,
+    nowEpoch,
+  );
+  const result = await devicePairingInsert(
+    db,
+    material,
+    participantConsentVersion,
   ).run();
   if (result.meta.changes !== 1) throw new ApiError(401, "AUTH_INVALID");
-  return { pairingCode: `um_pair_${id}.${secret}`, expiresAt };
+  return {
+    pairingCode: material.pairingCode,
+    expiresAt: material.expiresAt,
+  };
 }
 
 async function pairedDeviceForRetry(

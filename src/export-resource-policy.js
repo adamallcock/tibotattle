@@ -209,6 +209,14 @@ export function createExportResourceGuard({
     peakRssBytes = Math.max(peakRssBytes, Math.ceil(currentRss));
   }
 
+  function assertSourceSelection(fileCount, byteCount) {
+    boundedInteger(fileCount, "source file count", { allowZero: true });
+    boundedInteger(byteCount, "source byte count", { allowZero: true });
+    if (fileCount > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
+    if (byteCount > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
+    checkRuntime();
+  }
+
   return {
     policyVersion: EXPORT_RESOURCE_POLICY_VERSION,
     limits,
@@ -220,18 +228,17 @@ export function createExportResourceGuard({
       }
       checkRuntime();
     },
+    assertSourceSelection,
     observeSourcePlan(fileCount, byteCount) {
       boundedInteger(fileCount, "source file count", { allowZero: true });
       boundedInteger(byteCount, "source byte count", { allowZero: true });
       if (sourcePlanObserved && (fileCount !== counters.sourceFiles || byteCount !== counters.sourceBytes)) {
         throw new TypeError("Export source plan does not match the durable selection totals");
       }
+      assertSourceSelection(fileCount, byteCount);
       counters.sourceFiles = fileCount;
       counters.sourceBytes = byteCount;
       sourcePlanObserved = true;
-      if (fileCount > limits.maximumSourceFiles) throw new ExportResourceLimitError("source_files");
-      if (byteCount > limits.maximumSourceBytes) throw new ExportResourceLimitError("source_bytes");
-      checkRuntime();
     },
     observeDirectoryEntry() {
       counters.directoryEntries += 1;

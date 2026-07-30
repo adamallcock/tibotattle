@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -19,6 +20,7 @@ import {
   inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
+  retireAcceptedContributionArtifacts,
   runContributionSyncQueueOnce,
   runContributionSyncQueueWatch,
   setContributionSyncPaused,
@@ -33,6 +35,7 @@ import {
 import {
   PREPARED_CONTRIBUTION_SET_VERSION,
   loadVerifiedPreparedContribution,
+  preparedContributionSetId,
   publishPreparedContributionFile,
   publishPreparedContributionManifest,
 } from "../src/telemetry-prepared-set.js";
@@ -147,6 +150,21 @@ async function createPreparedSet(parent, {
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
   });
   return { directory, manifest };
+}
+
+async function createReviewForPreparedSet(reviewRoot, setName) {
+  const suffix = setName.slice("prepared-set-".length);
+  const directory = join(reviewRoot, `review-${suffix}`);
+  await mkdir(directory, { mode: 0o700 });
+  await writeFile(join(directory, "review.umx.json"), "{}\n", {
+    mode: 0o600,
+  });
+  await writeFile(
+    join(directory, "review.umx.json.privacy-receipt.json"),
+    "{}\n",
+    { mode: 0o600 },
+  );
+  return directory;
 }
 
 async function fixture({ spool = false } = {}) {
@@ -352,6 +370,47 @@ test("review-bound foreground send processes exactly the inspected job", async (
   );
   assert.equal(result.queue.counts.accepted, 1);
   assert.equal(result.queue.counts.pending, 1);
+});
+
+test("prepared-set-bound automatic send cannot process older queued sets", async () => {
+  const value = await fixture({ spool: true });
+  const newer = await createPreparedSet(value.preparedRoot, {
+    setName: `prepared-set-${randomUUID()}`,
+    index: 2,
+  });
+  const aborted = new AbortController();
+  aborted.abort();
+  const seeded = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    signal: aborted.signal,
+  });
+  assert.equal(seeded.status, "interrupted");
+  assert.equal(seeded.queue.counts.pending, 2);
+
+  const selectedId = preparedContributionSetId(newer.manifest);
+  const calls = [];
+  const result = await runContributionSyncQueueOnce({
+    directory: value.preparedRoot,
+    origin: ORIGIN,
+    backend: {},
+    queueFile: value.queueFile,
+    preparedSetId: selectedId,
+    maximumJobs: 10,
+    syncEntry: async (options) => {
+      calls.push(options);
+      return acceptedReceipt();
+    },
+  });
+  assert.equal(result.discoveredSets, 1);
+  assert.equal(result.processed, 1);
+  assert.equal(result.accepted, 1);
+  assert.equal(result.queue.counts.accepted, 1);
+  assert.equal(result.queue.counts.pending, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].entry.sha256, newer.manifest.files[0].sha256);
 });
 
 test("inspect-next rejects arbitrary text in projected classification fields", async () => {
@@ -766,6 +825,281 @@ test("oversized first job remains pending and unattempted", async () => {
   `).get();
   database.close();
   assert.deepEqual({ ...job }, { state: "pending", attempt_count: 0 });
+});
+
+test("accepted artifact retirement is crash-resumable and preserves protected first-review evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-retirement-"));
+  const preparedRoot = join(root, "prepared");
+  const reviewRoot = join(root, "reviews");
+  const privateRoot = join(root, "private");
+  await mkdir(preparedRoot, { mode: 0o700 });
+  await mkdir(reviewRoot, { mode: 0o700 });
+  await mkdir(privateRoot, { mode: 0o700 });
+  const retiredName =
+    "prepared-set-00000000-0000-4000-8000-000000000011";
+  const protectedName =
+    "prepared-set-00000000-0000-4000-8000-000000000012";
+  const retired = await createPreparedSet(preparedRoot, {
+    setName: retiredName,
+    index: 11,
+  });
+  const protectedSet = await createPreparedSet(preparedRoot, {
+    setName: protectedName,
+    index: 12,
+  });
+  await createReviewForPreparedSet(reviewRoot, retiredName);
+  await createReviewForPreparedSet(reviewRoot, protectedName);
+  const retiredId = preparedContributionSetId(retired.manifest);
+  const protectedId = preparedContributionSetId(protectedSet.manifest);
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  for (const preparedSetId of [retiredId, protectedId]) {
+    const result = await runContributionSyncQueueOnce({
+      directory: preparedRoot,
+      origin: ORIGIN,
+      backend: {},
+      queueFile,
+      preparedSetId,
+      now: () => new Date("2026-07-20T12:00:00.000Z"),
+      syncEntry: async () => acceptedReceipt(),
+    });
+    assert.equal(result.preparedSet.completeAccepted, true);
+  }
+
+  await assert.rejects(
+    retireAcceptedContributionArtifacts({
+      preparedSpoolDirectory: preparedRoot,
+      reviewArchiveDirectory: reviewRoot,
+      queueFile,
+      protectedPreparedSetIds: [protectedId],
+      maximumAgeDays: 1,
+      maximumRetainedSets: 1,
+      now: () => new Date("2026-07-29T12:00:00.000Z"),
+      failpoint: async (name, context) => {
+        if (name === "after_prepared_retirement"
+            && context.preparedSetId === retiredId) {
+          throw new Error("simulated retirement crash");
+        }
+      },
+    }),
+    /simulated retirement crash/u,
+  );
+  await assert.rejects(
+    lstat(join(preparedRoot, retiredName)),
+    (error) => error?.code === "ENOENT",
+  );
+  assert.equal(
+    (await lstat(join(
+      reviewRoot,
+      retiredName.replace("prepared-set-", "review-"),
+    ))).isDirectory(),
+    true,
+  );
+  let database = new DatabaseSync(queueFile, { readOnly: true });
+  assert.equal(
+    database.prepare(`
+      SELECT COUNT(*) AS count
+        FROM contribution_jobs
+       WHERE prepared_set_id = ? AND state = 'accepted'
+    `).get(retiredId).count,
+    1,
+  );
+  database.close();
+
+  const completed = await retireAcceptedContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+    protectedPreparedSetIds: [protectedId],
+    maximumAgeDays: 1,
+    maximumRetainedSets: 1,
+    now: () => new Date("2026-07-29T12:00:00.000Z"),
+  });
+  assert.equal(completed.retiredSets, 1);
+  assert.equal(completed.retiredJobs, 1);
+  assert.deepEqual(await readdir(preparedRoot), [protectedName]);
+  assert.deepEqual(await readdir(reviewRoot), [
+    protectedName.replace("prepared-set-", "review-"),
+  ]);
+  database = new DatabaseSync(queueFile, { readOnly: true });
+  assert.deepEqual(
+    database.prepare(`
+      SELECT prepared_set_id, state FROM contribution_jobs
+    `).all().map((row) => ({ ...row })),
+    [{ prepared_set_id: protectedId, state: "accepted" }],
+  );
+  database.close();
+});
+
+test("retirement never deletes pending, retryable, in-flight, or rejected artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-retention-state-"));
+  const preparedRoot = join(root, "prepared");
+  const reviewRoot = join(root, "reviews");
+  const privateRoot = join(root, "private");
+  await mkdir(preparedRoot, { mode: 0o700 });
+  await mkdir(reviewRoot, { mode: 0o700 });
+  await mkdir(privateRoot, { mode: 0o700 });
+  const definitions = [
+    ["accepted", "00000000-0000-4000-8000-000000000021", 21],
+    ["retryable", "00000000-0000-4000-8000-000000000022", 22],
+    ["rejected", "00000000-0000-4000-8000-000000000023", 23],
+    ["pending", "00000000-0000-4000-8000-000000000024", 24],
+    ["in_flight", "00000000-0000-4000-8000-000000000025", 25],
+  ];
+  const preparedSets = [];
+  for (const [state, uuid, index] of definitions) {
+    const setName = `prepared-set-${uuid}`;
+    const prepared = await createPreparedSet(preparedRoot, {
+      setName,
+      index,
+    });
+    await createReviewForPreparedSet(reviewRoot, setName);
+    preparedSets.push({
+      state,
+      setName,
+      preparedSetId: preparedContributionSetId(prepared.manifest),
+    });
+  }
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  for (const set of preparedSets) {
+    const controller = new AbortController();
+    if (set.state === "pending" || set.state === "in_flight") {
+      controller.abort();
+    }
+    await runContributionSyncQueueOnce({
+      directory: preparedRoot,
+      origin: ORIGIN,
+      backend: {},
+      queueFile,
+      preparedSetId: set.preparedSetId,
+      signal: controller.signal,
+      now: () => new Date("2026-07-20T12:00:00.000Z"),
+      syncEntry: async () => {
+        if (set.state === "accepted") return acceptedReceipt();
+        const error = new Error(`${set.state} test`);
+        if (set.state === "retryable") error.retryable = true;
+        throw error;
+      },
+    });
+  }
+  let database = new DatabaseSync(queueFile);
+  database.prepare(`
+    UPDATE contribution_jobs
+       SET state = 'in_flight'
+     WHERE prepared_set_id = ?
+  `).run(
+    preparedSets.find((set) => set.state === "in_flight").preparedSetId,
+  );
+  database.close();
+  const result = await retireAcceptedContributionArtifacts({
+    preparedSpoolDirectory: preparedRoot,
+    reviewArchiveDirectory: reviewRoot,
+    queueFile,
+    maximumAgeDays: 1,
+    maximumRetainedSets: 1,
+    now: () => new Date("2026-07-29T12:00:00.000Z"),
+  });
+  assert.equal(result.retiredSets, 1);
+  const retainedNames = preparedSets
+    .filter((set) => set.state !== "accepted")
+    .map((set) => set.setName)
+    .sort();
+  assert.deepEqual((await readdir(preparedRoot)).sort(), retainedNames);
+  assert.deepEqual((await readdir(reviewRoot)).sort(), retainedNames.map(
+    (name) => name.replace("prepared-set-", "review-"),
+  ));
+  database = new DatabaseSync(queueFile, { readOnly: true });
+  assert.deepEqual(
+    database.prepare(`
+      SELECT state FROM contribution_jobs ORDER BY state
+    `).all().map((row) => row.state),
+    ["in_flight", "pending", "rejected", "retryable"],
+  );
+  database.close();
+});
+
+test("bounded retirement eventually compacts accepted sets beyond one query window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-retention-window-"));
+  const preparedRoot = join(root, "prepared");
+  const reviewRoot = join(root, "reviews");
+  const privateRoot = join(root, "private");
+  await mkdir(preparedRoot, { mode: 0o700 });
+  await mkdir(reviewRoot, { mode: 0o700 });
+  await mkdir(privateRoot, { mode: 0o700 });
+  const queueFile = join(privateRoot, "sync.sqlite3");
+  await inspectContributionSyncQueue({
+    queueFile,
+    now: () => new Date("2026-07-29T12:00:00.000Z"),
+  });
+  const database = new DatabaseSync(queueFile);
+  const insert = database.prepare(`
+    INSERT INTO contribution_jobs (
+      job_id, prepared_set_id, set_name, contribution_basename,
+      contribution_sha256, contribution_bytes, schema_version,
+      covered_start_at, covered_end_at, state, attempt_count,
+      next_attempt_at, last_error_code, contribution_id,
+      lease_token, lease_expires_at, created_at, updated_at, accepted_at
+    ) VALUES (
+      ?, ?, ?, 'telemetry-contribution-000001.json',
+      ?, 3, 'telemetry-contribution-v0.1',
+      '2026-07-29T10:00:00.000Z', '2026-07-29T11:00:00.000Z',
+      'accepted', 1, NULL, NULL, ?, NULL, NULL, ?, ?, ?
+    )
+  `);
+  for (let index = 1; index <= 30; index += 1) {
+    const suffix = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+    const setName = `prepared-set-${suffix}`;
+    const preparedDirectory = join(preparedRoot, setName);
+    await mkdir(preparedDirectory, { mode: 0o700 });
+    await writeFile(join(preparedDirectory, "manifest.json"), "{}\n", {
+      mode: 0o600,
+    });
+    await createReviewForPreparedSet(reviewRoot, setName);
+    const preparedSetId = index.toString(16).padStart(64, "0");
+    const timestamp = new Date(
+      Date.parse("2026-07-29T11:00:00.000Z") + index,
+    ).toISOString();
+    insert.run(
+      randomUUID(),
+      preparedSetId,
+      setName,
+      "f".repeat(64),
+      ACCEPTED_ID,
+      timestamp,
+      timestamp,
+      timestamp,
+    );
+  }
+  database.close();
+
+  let retiredSets = 0;
+  let passes = 0;
+  while (passes < 20) {
+    const result = await retireAcceptedContributionArtifacts({
+      preparedSpoolDirectory: preparedRoot,
+      reviewArchiveDirectory: reviewRoot,
+      queueFile,
+      maximumAgeDays: 30,
+      maximumRetainedSets: 1,
+      maximumRetirements: 2,
+      now: () => new Date("2026-07-29T12:00:00.000Z"),
+    });
+    assert.ok(result.retiredSets <= 2);
+    retiredSets += result.retiredSets;
+    passes += 1;
+    if (result.retiredSets === 0) break;
+  }
+  assert.equal(retiredSets, 29);
+  assert.equal(passes, 16);
+  assert.equal((await readdir(preparedRoot)).length, 1);
+  assert.equal((await readdir(reviewRoot)).length, 1);
+  const finalDatabase = new DatabaseSync(queueFile, { readOnly: true });
+  assert.equal(
+    finalDatabase.prepare(`
+      SELECT COUNT(*) AS count FROM contribution_jobs
+    `).get().count,
+    1,
+  );
+  finalDatabase.close();
 });
 
 test("queue refuses symlinked or non-owner-only database locations", async () => {

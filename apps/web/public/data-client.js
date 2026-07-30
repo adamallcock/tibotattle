@@ -7,7 +7,7 @@
  *   POST /api/local/refresh
  *
  * Split endpoint aliases are supported while the local server evolves:
- *   /api/local/{overview,gradient,weekly,quality,reports}
+ *   /api/local/{onboarding,overview,gradient,weekly,quality,reports}
  *
  * Central contribution contract:
  *   POST /api/v1/contributions
@@ -27,6 +27,21 @@
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
+const BACKEND_LIFECYCLE_STATES = new Set([
+  "never_run",
+  "running",
+  "completed",
+  "failed",
+  "stale",
+  "incomplete",
+  "ready"
+]);
+const BACKEND_RECONCILIATION_STATES = new Set([
+  "never_run",
+  "running",
+  "completed",
+  "failed"
+]);
 export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
 export const PARTICIPANT_PROFILE_SCHEMA_VERSION = "participant-profile-v0.2";
 export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
@@ -37,8 +52,14 @@ export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
   "contribution-sync-preview-v0.1";
 export const CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION =
   "contribution-sync-run-v0.1";
+export const AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION =
+  "automatic-contribution-status-v0.1";
 export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
+  "local-contribution-device-pairing-v0.1";
+export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
+const MAXIMUM_ONBOARDING_ROLLOUT_FILES = 100;
 
 const COMMUNITY_METRIC_UNITS = Object.freeze({
   usageEvents: "events_rounded_down",
@@ -129,6 +150,105 @@ function hasExactKeys(value, expectedKeys) {
       === [...expectedKeys].sort().join("\u0000");
 }
 
+export function normalizeLocalOnboarding(payload) {
+  const unavailable = Object.freeze({
+    state: "unavailable",
+    sourceStatus: "unavailable",
+    sessionsReadable: false,
+    archivedSessionsReadable: false,
+    rolloutFilesPresent: false,
+    rolloutFilesObserved: 0,
+    rolloutFilesObservedCapped: false,
+    stateStatus: "unavailable",
+    stateWritable: false,
+    explicitRefresh: false,
+    customCodexHomeConfigured: false
+  });
+  if (!hasExactKeys(payload, [
+    "schemaVersion",
+    "status",
+    "source",
+    "state",
+    "capabilities"
+  ])
+      || payload.schemaVersion !== LOCAL_ONBOARDING_SCHEMA_VERSION
+      || !["ready", "needs_attention"].includes(payload.status)
+      || !hasExactKeys(payload.source, [
+        "status",
+        "sessionsReadable",
+        "archivedSessionsReadable",
+        "rolloutFilesPresent",
+        "rolloutFilesObserved",
+        "rolloutFilesObservedCapped"
+      ])
+      || !hasExactKeys(payload.state, ["status", "writable"])
+      || !hasExactKeys(payload.capabilities, [
+        "explicitRefresh",
+        "customCodexHomeConfigured",
+        "rawContentExposed",
+        "arbitraryPathAccess"
+      ])
+      || ![
+        "ready",
+        "codex_home_missing",
+        "codex_home_unreadable",
+        "session_directories_missing",
+        "session_directories_unreadable",
+        "no_rollout_files"
+      ].includes(payload.source.status)
+      || typeof payload.source.sessionsReadable !== "boolean"
+      || typeof payload.source.archivedSessionsReadable !== "boolean"
+      || typeof payload.source.rolloutFilesPresent !== "boolean"
+      || !Number.isSafeInteger(payload.source.rolloutFilesObserved)
+      || payload.source.rolloutFilesObserved < 0
+      || payload.source.rolloutFilesObserved
+        > MAXIMUM_ONBOARDING_ROLLOUT_FILES
+      || typeof payload.source.rolloutFilesObservedCapped !== "boolean"
+      || !["ready", "unwritable"].includes(payload.state.status)
+      || typeof payload.state.writable !== "boolean"
+      || typeof payload.capabilities.explicitRefresh !== "boolean"
+      || typeof payload.capabilities.customCodexHomeConfigured !== "boolean"
+      || payload.capabilities.rawContentExposed !== false
+      || payload.capabilities.arbitraryPathAccess !== false
+      || payload.source.rolloutFilesPresent
+        !== (payload.source.rolloutFilesObserved > 0)
+      || payload.source.rolloutFilesObservedCapped
+        !== (payload.source.rolloutFilesObserved
+          === MAXIMUM_ONBOARDING_ROLLOUT_FILES)
+      || payload.state.status !== (payload.state.writable
+        ? "ready"
+        : "unwritable")
+      || (payload.source.status === "ready"
+        && (!payload.source.rolloutFilesPresent
+          || (!payload.source.sessionsReadable
+            && !payload.source.archivedSessionsReadable)))
+      || (payload.source.status === "no_rollout_files"
+        && payload.source.rolloutFilesPresent)
+      || payload.status !== (
+        payload.source.status === "ready"
+        && payload.state.status === "ready"
+        && payload.capabilities.explicitRefresh
+          ? "ready"
+          : "needs_attention"
+      )) {
+    return unavailable;
+  }
+  return Object.freeze({
+    state: payload.status,
+    sourceStatus: payload.source.status,
+    sessionsReadable: payload.source.sessionsReadable,
+    archivedSessionsReadable: payload.source.archivedSessionsReadable,
+    rolloutFilesPresent: payload.source.rolloutFilesPresent,
+    rolloutFilesObserved: payload.source.rolloutFilesObserved,
+    rolloutFilesObservedCapped: payload.source.rolloutFilesObservedCapped,
+    stateStatus: payload.state.status,
+    stateWritable: payload.state.writable,
+    explicitRefresh: payload.capabilities.explicitRefresh,
+    customCodexHomeConfigured:
+      payload.capabilities.customCodexHomeConfigured
+  });
+}
+
 export function normalizeContributionDeletionReceipt(payload, expectedContributionId) {
   if (!hasExactKeys(payload, ["deleted", "contributionId"])
       || payload.deleted !== true
@@ -209,6 +329,223 @@ export function normalizeContributionSyncStatus(payload) {
     nextAttemptAt,
     lastAcceptedAt
   };
+}
+
+export function normalizeAutomaticContributionStatus(payload) {
+  const unavailable = Object.freeze({
+    state: "unavailable",
+    enabled: false,
+    intervalHours: 6,
+    consentCurrent: false,
+    firstReviewComplete: false,
+    firstReviewedAcceptedAt: "",
+    requiredConsent: null,
+    consentedAt: "",
+    lastAttemptAt: "",
+    lastSuccessAt: "",
+    nextAttemptAt: "",
+    lastOutcome: null,
+    foregroundOnly: true,
+    daemonInstalled: false
+  });
+  const exactKeys = [
+    "schemaVersion",
+    "status",
+    "enabled",
+    "intervalHours",
+    "consentCurrent",
+    "firstReviewComplete",
+    "firstReviewedAcceptedAt",
+    "requiredConsent",
+    "consentedAt",
+    "lastAttemptAt",
+    "lastSuccessAt",
+    "nextAttemptAt",
+    "lastOutcome",
+    "foregroundOnly",
+    "daemonInstalled",
+    "networkActivity",
+    "includesContent",
+    "includesPaths",
+    "includesIdentifiers",
+    "includesCredentials"
+  ];
+  const states = new Set([
+    "not_configured",
+    "disabled",
+    "first_review_required",
+    "scheduled",
+    "running",
+    "paused",
+    "consent_required",
+    "failed"
+  ]);
+  if (!hasExactKeys(payload, exactKeys)
+      || payload.schemaVersion !== AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION
+      || !states.has(payload.status)
+      || typeof payload.enabled !== "boolean"
+      || payload.intervalHours !== 6
+      || typeof payload.consentCurrent !== "boolean"
+      || typeof payload.firstReviewComplete !== "boolean"
+      || payload.foregroundOnly !== true
+      || payload.daemonInstalled !== false
+      || payload.networkActivity !== false
+      || payload.includesContent !== false
+      || payload.includesPaths !== false
+      || payload.includesIdentifiers !== false
+      || payload.includesCredentials !== false) {
+    return unavailable;
+  }
+
+  const requiredConsentKeys = [
+    "telemetrySchemaVersion",
+    "fieldDictionaryVersion",
+    "privacyContractVersion",
+    "destinationOrigin"
+  ];
+  const requiredConsent = payload.requiredConsent;
+  const destination = text(requiredConsent?.destinationOrigin, "");
+  let validDestination = requiredConsent?.destinationOrigin === null;
+  if (destination) {
+    try {
+      const origin = new URL(destination);
+      const production = origin.protocol === "https:"
+        && !origin.port
+        && origin.hostname !== "localhost"
+        && origin.hostname !== "127.0.0.1";
+      const localDevelopment = origin.protocol === "http:"
+        && origin.hostname === "127.0.0.1"
+        && /^[1-9][0-9]{0,4}$/u.test(origin.port)
+        && Number(origin.port) <= 65_535;
+      validDestination = (production || localDevelopment)
+        && !origin.username
+        && !origin.password
+        && origin.pathname === "/"
+        && !origin.search
+        && !origin.hash
+        && origin.origin === destination;
+    } catch {
+      validDestination = false;
+    }
+  }
+  if (!hasExactKeys(requiredConsent, requiredConsentKeys)
+      || requiredConsent.telemetrySchemaVersion !== "telemetry-contribution-v0.1"
+      || requiredConsent.fieldDictionaryVersion
+        !== "telemetry-v0.1-registry-2026-07-25.3"
+      || requiredConsent.privacyContractVersion
+        !== "ongoing-privacy-safe-telemetry-v0.1"
+      || !validDestination
+      || (payload.status === "not_configured"
+        ? requiredConsent.destinationOrigin !== null
+        : requiredConsent.destinationOrigin === null)) {
+    return unavailable;
+  }
+
+  const alwaysEnabledStates = new Set(["scheduled", "running", "paused"]);
+  const neverEnabledStates = new Set([
+    "not_configured",
+    "disabled",
+    "first_review_required",
+    "consent_required"
+  ]);
+  if (payload.enabled !== payload.consentCurrent
+      || (alwaysEnabledStates.has(payload.status) && !payload.enabled)
+      || (neverEnabledStates.has(payload.status) && payload.enabled)) {
+    return unavailable;
+  }
+
+  const timestamp = (value) => {
+    if (value === null) return "";
+    const selected = text(value, "");
+    return selected
+      && Number.isFinite(Date.parse(selected))
+      && new Date(Date.parse(selected)).toISOString() === selected
+      ? selected
+      : null;
+  };
+  const consentedAt = timestamp(payload.consentedAt);
+  const firstReviewedAcceptedAt = timestamp(payload.firstReviewedAcceptedAt);
+  const lastAttemptAt = timestamp(payload.lastAttemptAt);
+  const lastSuccessAt = timestamp(payload.lastSuccessAt);
+  const nextAttemptAt = timestamp(payload.nextAttemptAt);
+  if ([
+    consentedAt,
+    firstReviewedAcceptedAt,
+    lastAttemptAt,
+    lastSuccessAt,
+    nextAttemptAt
+  ]
+    .some((value) => value === null)) {
+    return unavailable;
+  }
+  const statusMayLackFirstReview = new Set([
+    "not_configured",
+    "failed",
+    "first_review_required"
+  ]);
+  if (payload.firstReviewComplete !== Boolean(firstReviewedAcceptedAt)
+      || (payload.firstReviewComplete
+        && ["not_configured", "first_review_required"].includes(payload.status))
+      || (!payload.firstReviewComplete
+        && !statusMayLackFirstReview.has(payload.status))) {
+    return unavailable;
+  }
+
+  let lastOutcome = null;
+  if (payload.lastOutcome !== null) {
+    const outcomeCodesByStatus = new Map([
+      ["succeeded", new Set(["accepted", "completed"])],
+      ["skipped", new Set(["no_new_evidence"])],
+      ["failed", new Set([
+        "retry_scheduled",
+        "delivery_rejected",
+        "preparation_failed",
+        "publication_incomplete",
+        "upload_failed",
+        "run_timeout"
+      ])],
+      ["paused", new Set([
+        "queue_paused",
+        "privacy_verification_failed",
+        "identity_unavailable"
+      ])]
+    ]);
+    const at = timestamp(payload.lastOutcome?.at);
+    if (!hasExactKeys(payload.lastOutcome, ["status", "code", "at"])
+        || !outcomeCodesByStatus
+          .get(payload.lastOutcome.status)
+          ?.has(payload.lastOutcome.code)
+        || !at) {
+      return unavailable;
+    }
+    lastOutcome = Object.freeze({
+      status: payload.lastOutcome.status,
+      code: payload.lastOutcome.code,
+      at
+    });
+  }
+
+  return Object.freeze({
+    state: payload.status,
+    enabled: payload.enabled,
+    intervalHours: 6,
+    consentCurrent: payload.consentCurrent,
+    firstReviewComplete: payload.firstReviewComplete,
+    firstReviewedAcceptedAt,
+    requiredConsent: Object.freeze({
+      telemetrySchemaVersion: requiredConsent.telemetrySchemaVersion,
+      fieldDictionaryVersion: requiredConsent.fieldDictionaryVersion,
+      privacyContractVersion: requiredConsent.privacyContractVersion,
+      destinationOrigin: requiredConsent.destinationOrigin
+    }),
+    consentedAt,
+    lastAttemptAt,
+    lastSuccessAt,
+    nextAttemptAt,
+    lastOutcome,
+    foregroundOnly: true,
+    daemonInstalled: false
+  });
 }
 
 export function normalizeContributionSyncPreview(payload) {
@@ -424,6 +761,29 @@ export function normalizeLocalContributionPreparation(payload) {
       provenanceRetained: true
     },
     prepared: { batchCount, bytes }
+  };
+}
+
+export function normalizeLocalContributionDevicePairing(payload) {
+  const unavailable = {
+    status: "unavailable",
+    scope: null,
+    expiresAt: ""
+  };
+  const expiresAt = text(payload?.expiresAt, "");
+  if (payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION
+      || payload?.status !== "paired"
+      || payload?.scope !== "upload_registration"
+      || !Number.isFinite(Date.parse(expiresAt))
+      || new Date(Date.parse(expiresAt)).toISOString() !== expiresAt
+      || payload?.includesCredentials !== false
+      || payload?.includesIdentifiers !== false) {
+    return unavailable;
+  }
+  return {
+    status: "paired",
+    scope: "upload_registration",
+    expiresAt
   };
 }
 
@@ -747,6 +1107,14 @@ export function normalizeParticipantCommunityComparison(payload) {
 }
 
 export function normalizeParticipantHistory(payload) {
+  const unknownAdmission = Object.freeze({
+    state: "unknown",
+    acceptedBatches: null,
+    remainingBatches: null,
+    maximumBatches: null,
+    renewsAt: "",
+    slotRefundPolicy: "",
+  });
   const unavailable = (reason) => ({
     state: "not_available",
     reason,
@@ -754,6 +1122,7 @@ export function normalizeParticipantHistory(payload) {
     participantCreatedAt: "",
     contributionCount: 0,
     clientSoftwareVersion: "unavailable_in_transport",
+    contributionAdmission: unknownAdmission,
     items: []
   });
   if (!payload) return unavailable("service_unavailable");
@@ -878,6 +1247,47 @@ export function normalizeParticipantHistory(payload) {
     right.createdAt.localeCompare(left.createdAt)
       || right.contributionId.localeCompare(left.contributionId)
   ));
+  const admission = payload.contributionAdmission;
+  let contributionAdmission = unknownAdmission;
+  if (admission !== undefined && admission !== null) {
+    const acceptedBatches = count(admission?.acceptedBatches, null);
+    const remainingBatches = count(admission?.remainingBatches, null);
+    const maximumBatches = count(admission?.maximumBatches, null);
+    const startsAt = text(admission?.window?.startsAt, "");
+    const renewsAt = text(admission?.window?.endsAt, "");
+    const startsAtEpoch = Date.parse(startsAt);
+    const renewsAtEpoch = Date.parse(renewsAt);
+    const durationMilliseconds = count(
+      admission?.window?.durationMilliseconds,
+      null,
+    );
+    const validAdmission =
+      admission?.schemaVersion === "telemetry-contribution-admission-v0.1"
+      && ["available", "exhausted"].includes(admission?.state)
+      && admission?.window?.kind === "fixed_utc"
+      && admission?.window?.anchor === "monday_00_00_utc"
+      && Number.isFinite(startsAtEpoch)
+      && Number.isFinite(renewsAtEpoch)
+      && renewsAtEpoch > startsAtEpoch
+      && durationMilliseconds === renewsAtEpoch - startsAtEpoch
+      && acceptedBatches !== null
+      && remainingBatches !== null
+      && maximumBatches !== null
+      && maximumBatches > 0
+      && acceptedBatches + remainingBatches === maximumBatches
+      && admission.state === (remainingBatches > 0 ? "available" : "exhausted")
+      && admission?.slotRefundPolicy
+        === "not_refunded_by_contribution_deletion";
+    if (!validAdmission) return unavailable("invalid_contract");
+    contributionAdmission = Object.freeze({
+      state: admission.state,
+      acceptedBatches,
+      remainingBatches,
+      maximumBatches,
+      renewsAt,
+      slotRefundPolicy: admission.slotRefundPolicy,
+    });
+  }
   return {
     state: "ready",
     reason: "",
@@ -885,6 +1295,7 @@ export function normalizeParticipantHistory(payload) {
     participantCreatedAt: payload.createdAt,
     contributionCount: items.length,
     clientSoftwareVersion: "unavailable_in_transport",
+    contributionAdmission,
     items
   };
 }
@@ -1053,11 +1464,14 @@ const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
   fast_mode: ["Fast-mode accounting", "Fast is observed separately from the Standard API-price counterfactual; its quota multiplier remains empirical."],
-  subagents: ["Subagents and child rollouts", "Child-rollout usage is counted when lineage metadata is present; ambiguous lineage remains unknown."],
+  subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
   reasoning_effort: ["Reasoning effort", "Current retained usage snapshots do not expose a reasoning-effort field."],
   api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority and flex are never inferred from it."],
+  provider_accounting_changes: ["Provider resets and accounting changes", "Reset propagation, credits, account tracks, and provider-side rule changes can move the observed allowance without a matching local usage increment."],
+  unknown_token_components: ["Combined output components", "Some older snapshots expose only one combined output count. It is retained once and never added to separated text and reasoning output."],
+  calculation_disagreement: ["Calculated usage versus observed quota", "Residual periods remain visible for review and may reflect missing surfaces, uncertain prices, reset contamination, or provider-side accounting."],
   ordinary_chat: ["Ordinary Chat conversations", "Ordinary Chat is excluded from the shared agentic pool unless new provider evidence shows otherwise."]
 });
 
@@ -1066,6 +1480,18 @@ function normalizeLocalComponents(value) {
     key,
     count(value?.[key], 0)
   ]));
+}
+
+function normalizeLocalComponentCosts(value) {
+  return Object.fromEntries(LOCAL_COMPONENT_KEYS.map((key) => {
+    const row = value?.[key] ?? {};
+    return [key, {
+      tokens: count(row.tokens, 0),
+      pricedTokens: count(row.pricedTokens, 0),
+      unpricedTokens: count(row.unpricedTokens, 0),
+      costUsd: nonNegative(row.costUsd, 0)
+    }];
+  }));
 }
 
 function normalizeAccountingDimension(value, allowedKeys) {
@@ -1162,7 +1588,13 @@ function normalizeLocalAccounting(value = {}) {
     events: count(value.events, 0),
     totalTokens: count(value.totalTokens, 0),
     apiPriceEquivalentUsd: nonNegative(value.apiPriceEquivalentUsd, 0),
+    pricingCoverage: {
+      fullyPricedEvents: count(value?.pricingCoverage?.fullyPricedEvents, 0),
+      partiallyPricedEvents: count(value?.pricingCoverage?.partiallyPricedEvents, 0),
+      unpricedEvents: count(value?.pricingCoverage?.unpricedEvents, 0)
+    },
     components: normalizeLocalComponents(value.components),
+    componentCosts: normalizeLocalComponentCosts(value.componentCosts),
     byModel: models,
     bySpeed: normalizeAccountingDimension(
       value.bySpeed,
@@ -1207,6 +1639,32 @@ function normalizeLocalAccounting(value = {}) {
       : "unknown",
     subscriptionSpeedIsSeparate: value.subscriptionSpeedIsSeparate === true,
     reasoningEffortAvailable: value.reasoningEffortAvailable === true,
+    accountingSource: text(value.accountingSource, "unknown"),
+    accountingCacheStatus: text(value.accountingCacheStatus, "unknown"),
+    replayExclusionDiagnostics: {
+      filesScanned: count(value?.replayExclusionDiagnostics?.filesScanned, 0),
+      forkReplayEventsExcluded: count(
+        value?.replayExclusionDiagnostics?.forkReplayEventsExcluded,
+        0
+      ),
+      unattributedForkReplayEventsExcluded: count(
+        value?.replayExclusionDiagnostics?.unattributedForkReplayEventsExcluded,
+        0
+      ),
+      duplicateSnapshotsExcluded: count(
+        value?.replayExclusionDiagnostics?.duplicateSnapshotsExcluded,
+        0
+      ),
+      missingLineageParents: count(
+        value?.replayExclusionDiagnostics?.missingLineageParents,
+        0
+      )
+    },
+    generatedAt: text(value.generatedAt, ""),
+    coveredAt: {
+      startAt: text(value?.coveredAt?.startAt, ""),
+      endAt: text(value?.coveredAt?.endAt, "")
+    },
     unknownModelEvents: count(value.unknownModelEvents, 0),
     periods: []
   };
@@ -1230,7 +1688,11 @@ function normalizeMonitoringGaps(value) {
       "unsupported",
       "unavailable",
       "mostly_unknown",
-      "excluded"
+      "excluded",
+      "uncertain",
+      "observed_combined",
+      "review_available",
+      "insufficient_evidence"
     ].includes(row?.status) ? row.status : "unavailable";
     return [{ id: row.id, title: copy[0], explanation: copy[1], status }];
   });
@@ -1299,8 +1761,23 @@ function normalizePricing(pricing = {}) {
     components: componentRows.slice(0, 12).map((row) => ({
       name: text(row?.name ?? row?.component, "Unknown"),
       tokens: finite(row?.tokens ?? row?.value, 0),
+      pricedTokens: finite(row?.pricedTokens, 0),
+      unpricedTokens: finite(row?.unpricedTokens, 0),
       costUsd: finite(row?.costUsd, null)
-    }))
+    })),
+    accountingSource: text(pricing?.accountingSource, "unknown"),
+    accountingCacheStatus: text(pricing?.accountingCacheStatus, "unknown"),
+    replayExclusionDiagnostics: {
+      filesScanned: count(pricing?.replayExclusionDiagnostics?.filesScanned, 0),
+      forkReplayEventsExcluded: count(
+        pricing?.replayExclusionDiagnostics?.forkReplayEventsExcluded,
+        0
+      ),
+      duplicateSnapshotsExcluded: count(
+        pricing?.replayExclusionDiagnostics?.duplicateSnapshotsExcluded,
+        0
+      )
+    }
   };
 }
 
@@ -1328,14 +1805,22 @@ function normalizeGradient(payload = {}) {
 }
 
 function normalizeWeekly(payload = {}) {
-  const source = artifactData(payload?.weekly ?? payload);
+  const envelope = payload?.weekly ?? payload;
+  const source = artifactData(envelope);
   return {
     summary: array(source.summary)[0] ?? source.summary ?? {},
     weeklyValues: array(source.weeklyValues ?? source.weekly_values),
     valueSeries: array(source.valueSeries ?? source.value_series),
     holdoutSeries: array(source.holdoutSeries ?? source.holdout_series),
     errorConcentration: array(source.errorConcentration ?? source.error_concentration),
-    providerEpochs: array(source.providerEpochs ?? source.provider_epochs)
+    providerEpochs: array(source.providerEpochs ?? source.provider_epochs),
+    dataClass: text(envelope?.dataClass, ""),
+    accountAttribution: {
+      status: text(envelope?.accountAttribution?.status, ""),
+      maySpanMultipleAccounts:
+        envelope?.accountAttribution?.maySpanMultipleAccounts === true,
+      label: text(envelope?.accountAttribution?.label, "")
+    }
   };
 }
 
@@ -1505,6 +1990,75 @@ async function fetchJson(fetchImpl, url, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+export function normalizeBackendReadiness(payload) {
+  const unavailable = Object.freeze({
+    state: "unavailable",
+    lifecycle: "unavailable",
+    lifecycleFresh: false,
+    quarantineRetentionComplete: false,
+    restoreReplayComplete: false,
+    aggregateRebuildComplete: false,
+    maintenanceCycleMatched: false,
+    quarantineReconciliation: "unavailable",
+    quarantineReconciliationComplete: false
+  });
+  if (!hasExactKeys(payload, ["status", "checks", "policy"])
+      || !["ready", "not_ready"].includes(payload.status)
+      || !hasExactKeys(payload.checks, [
+        "lifecycle",
+        "lifecycleFresh",
+        "quarantineRetentionComplete",
+        "restoreReplayComplete",
+        "aggregateRebuildComplete",
+        "maintenanceCycleMatched",
+        "quarantineReconciliation",
+        "quarantineReconciliationComplete"
+      ])
+      || !hasExactKeys(payload.policy, ["lifecycleStaleAfterMilliseconds"])
+      || !BACKEND_LIFECYCLE_STATES.has(payload.checks.lifecycle)
+      || !BACKEND_RECONCILIATION_STATES.has(
+        payload.checks.quarantineReconciliation
+      )
+      || typeof payload.checks.lifecycleFresh !== "boolean"
+      || typeof payload.checks.quarantineRetentionComplete !== "boolean"
+      || typeof payload.checks.restoreReplayComplete !== "boolean"
+      || typeof payload.checks.aggregateRebuildComplete !== "boolean"
+      || typeof payload.checks.maintenanceCycleMatched !== "boolean"
+      || typeof payload.checks.quarantineReconciliationComplete !== "boolean"
+      || !Number.isSafeInteger(
+        payload.policy.lifecycleStaleAfterMilliseconds
+      )
+      || payload.policy.lifecycleStaleAfterMilliseconds < 60_000
+      || payload.policy.lifecycleStaleAfterMilliseconds > 86_400_000) {
+    return unavailable;
+  }
+  if (payload.status === "ready"
+      && (payload.checks.lifecycle !== "ready"
+        || payload.checks.lifecycleFresh !== true
+        || payload.checks.quarantineRetentionComplete !== true
+        || payload.checks.restoreReplayComplete !== true
+        || payload.checks.aggregateRebuildComplete !== true
+        || payload.checks.maintenanceCycleMatched !== true
+        || payload.checks.quarantineReconciliation !== "completed"
+        || payload.checks.quarantineReconciliationComplete !== true)) {
+    return unavailable;
+  }
+  return Object.freeze({
+    state: payload.status,
+    lifecycle: payload.checks.lifecycle,
+    lifecycleFresh: payload.checks.lifecycleFresh,
+    quarantineRetentionComplete:
+      payload.checks.quarantineRetentionComplete,
+    restoreReplayComplete: payload.checks.restoreReplayComplete,
+    aggregateRebuildComplete: payload.checks.aggregateRebuildComplete,
+    maintenanceCycleMatched: payload.checks.maintenanceCycleMatched,
+    quarantineReconciliation:
+      payload.checks.quarantineReconciliation,
+    quarantineReconciliationComplete:
+      payload.checks.quarantineReconciliationComplete
+  });
+}
+
 export class LocalCompanionClient {
   constructor({ fetchImpl = globalThis.fetch } = {}) {
     this.fetchImpl = fetchImpl;
@@ -1535,6 +2089,16 @@ export class LocalCompanionClient {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/health`);
   }
 
+  async onboarding() {
+    try {
+      return normalizeLocalOnboarding(
+        await fetchJson(this.fetchImpl, `${LOCAL_ROOT}/onboarding`)
+      );
+    } catch {
+      return normalizeLocalOnboarding(null);
+    }
+  }
+
   async refresh() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
       method: "POST",
@@ -1550,6 +2114,17 @@ export class LocalCompanionClient {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`);
   }
 
+  async cancelRefresh() {
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/cancel`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1"
+      },
+      body: JSON.stringify({})
+    });
+  }
+
   async contributionSyncStatus() {
     try {
       return normalizeContributionSyncStatus(
@@ -1563,17 +2138,124 @@ export class LocalCompanionClient {
     }
   }
 
+  async automaticContributionStatus() {
+    try {
+      return normalizeAutomaticContributionStatus(
+        await fetchJson(
+          this.fetchImpl,
+          `${LOCAL_ROOT}/contribution/automatic-settings`
+        )
+      );
+    } catch {
+      return normalizeAutomaticContributionStatus(null);
+    }
+  }
+
+  async enableAutomaticContribution(requiredConsent) {
+    const normalized = normalizeAutomaticContributionStatus({
+      schemaVersion: AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
+      status: "first_review_required",
+      enabled: false,
+      intervalHours: 6,
+      consentCurrent: false,
+      firstReviewComplete: false,
+      firstReviewedAcceptedAt: null,
+      requiredConsent,
+      consentedAt: null,
+      lastAttemptAt: null,
+      lastSuccessAt: null,
+      nextAttemptAt: null,
+      lastOutcome: null,
+      foregroundOnly: true,
+      daemonInstalled: false,
+      networkActivity: false,
+      includesContent: false,
+      includesPaths: false,
+      includesIdentifiers: false,
+      includesCredentials: false
+    });
+    if (normalized.state === "unavailable"
+        || normalized.requiredConsent?.destinationOrigin === null) {
+      throw new TypeError("Automatic contribution consent is invalid.");
+    }
+    const response = await this.fetchImpl(
+      `${LOCAL_ROOT}/contribution/automatic-enable`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({
+          intervalHours: 6,
+          consent: normalized.requiredConsent
+        })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(`Request failed (${response.status}).`);
+      error.status = response.status;
+      if (response.status === 409
+          && hasExactKeys(payload, ["schemaVersion", "error"])
+          && payload.schemaVersion === "local-companion-v0.1"
+          && hasExactKeys(payload.error, ["code"])
+          && payload.error.code
+            === "automatic_contribution_first_review_required") {
+        error.code = "automatic_contribution_first_review_required";
+      }
+      throw error;
+    }
+    return normalizeAutomaticContributionStatus(payload);
+  }
+
+  async disableAutomaticContribution() {
+    return normalizeAutomaticContributionStatus(
+      await this.localContributionMutation("automatic-disable", {
+        reason: "user_request"
+      })
+    );
+  }
+
   async contributionSyncPreview() {
     try {
       return normalizeContributionSyncPreview(
-        await fetchJson(
-          this.fetchImpl,
-          `${LOCAL_ROOT}/contribution/sync-next`
-        )
+        await this.localContributionMutation("sync-next")
       );
     } catch {
       return normalizeContributionSyncPreview(null);
     }
+  }
+
+  async pairContributionDevice(pairingCode) {
+    const response = await this.fetchImpl(
+      `${LOCAL_ROOT}/contribution/device-pair`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ pairingCode })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(`Request failed (${response.status}).`);
+      error.status = response.status;
+      if (response.status === 409
+          && hasExactKeys(payload, ["schemaVersion", "error"])
+          && payload.schemaVersion === "local-companion-v0.1"
+          && hasExactKeys(payload.error, ["code"])
+          && payload.error.code
+            === "contribution_device_recovery_required") {
+        error.code = "contribution_device_recovery_required";
+      }
+      throw error;
+    }
+    return normalizeLocalContributionDevicePairing(payload);
   }
 
   contributionSyncExactReview() {
@@ -1597,7 +2279,17 @@ export class LocalCompanionClient {
     );
   }
 
-  async prepareContribution() {
+  async prepareContribution(options = {}) {
+    if (!options
+        || typeof options !== "object"
+        || Array.isArray(options)
+        || Object.keys(options).some((key) => key !== "lookbackHours")) {
+      throw new TypeError("Contribution preparation options are invalid.");
+    }
+    const lookbackHours = options.lookbackHours ?? 24;
+    if (![1, 24, 7 * 24].includes(lookbackHours)) {
+      throw new TypeError("Contribution preparation lookback is invalid.");
+    }
     const fetchImpl = this.fetchImpl;
     const response = await fetchImpl(
       `${LOCAL_ROOT}/contribution/prepare`,
@@ -1608,7 +2300,7 @@ export class LocalCompanionClient {
           "Content-Type": "application/json",
           "X-Usage-Monitor-Local": "1"
         },
-        body: JSON.stringify({})
+        body: JSON.stringify({ lookbackHours })
       }
     );
     const payload = await response.json().catch(() => null);
@@ -1668,11 +2360,33 @@ export class CommunityClient {
     return fetchJson(this.fetchImpl, "/api/health");
   }
 
+  async readiness() {
+    // Browser-native fetch is receiver-sensitive. Calling it as a property of
+    // this client can throw "Illegal invocation" before any request is made.
+    const fetchImpl = this.fetchImpl;
+    const response = await fetchImpl("/api/ready", {
+      headers: { Accept: "application/json" }
+    });
+    if (![200, 503].includes(response.status)) {
+      const error = new Error(`Request failed (${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return normalizeBackendReadiness(await response.json().catch(() => null));
+  }
+
   session() {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/session`, this.sessionOptions());
   }
 
-  enroll(inviteCode = null, contributionSchemaVersion = "telemetry-contribution-v0.1") {
+  enroll(
+    inviteCode = null,
+    contributionSchemaVersion = "telemetry-contribution-v0.1",
+    { deviceBootstrap = false } = {}
+  ) {
+    if (typeof deviceBootstrap !== "boolean") {
+      throw new TypeError("Enrollment device bootstrap selection is invalid.");
+    }
     const accountScoped = contributionSchemaVersion === "telemetry-contribution-v0.2";
     const body = {
       consentVersion: accountScoped
@@ -1680,6 +2394,14 @@ export class CommunityClient {
         : "privacy-safe-telemetry-v0.1",
       syntheticOnly: false
     };
+    if (deviceBootstrap) {
+      body.deviceBootstrap = {
+        ongoingUpload: true,
+        consentVersion: accountScoped
+          ? "ongoing-privacy-safe-telemetry-v0.2"
+          : "ongoing-privacy-safe-telemetry-v0.1"
+      };
+    }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/enroll`, {
       method: "POST",

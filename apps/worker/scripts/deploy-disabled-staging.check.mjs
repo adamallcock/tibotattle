@@ -38,9 +38,9 @@ function containedHealth() {
   };
 }
 
-function jsonResponse(value) {
+function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), {
-    status: 200,
+    status,
     headers: {
       "cache-control": "no-store",
       "content-type": "application/json",
@@ -48,6 +48,32 @@ function jsonResponse(value) {
       "x-content-type-options": "nosniff",
     },
   });
+}
+
+function notReadyLifecycle() {
+  return {
+    status: "not_ready",
+    checks: {
+      lifecycle: "never_run",
+      lifecycleFresh: false,
+      quarantineRetentionComplete: false,
+      restoreReplayComplete: false,
+      aggregateRebuildComplete: true,
+      maintenanceCycleMatched: false,
+      quarantineReconciliation: "never_run",
+      quarantineReconciliationComplete: false,
+    },
+    policy: {
+      lifecycleStaleAfterMilliseconds: 2 * 60 * 60 * 1000,
+    },
+  };
+}
+
+function containedFetch(url) {
+  const pathname = new URL(String(url)).pathname;
+  if (pathname === "/api/health") return jsonResponse(containedHealth());
+  if (pathname === "/api/ready") return jsonResponse(notReadyLifecycle(), 503);
+  throw new Error(`Unexpected URL: ${url}`);
 }
 
 const stagingOrigin =
@@ -65,7 +91,7 @@ test("deployment requires an exact confirmation before any command", async () =>
       calls.push(args);
       return { status: 0, stdout: "", stderr: "" };
     },
-    fetchImpl: async () => jsonResponse(containedHealth()),
+    fetchImpl: async (url) => containedFetch(url),
   });
   assert.deepEqual(result, { ok: false, code: "CONFIRMATION_REQUIRED" });
   assert.deepEqual(calls, []);
@@ -110,19 +136,28 @@ test("deployment runs only after live readiness and verifies contained health", 
     spawn,
     fetchImpl: async (url, options) => {
       requested.push({ url: String(url), options });
-      return jsonResponse(containedHealth());
+      return containedFetch(url);
     },
   });
-  assert.deepEqual(result, {
-    ok: true,
-    code: "DISABLED_STAGING_DEPLOYED",
-    collectionAuthorized: false,
-  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, "DISABLED_STAGING_DEPLOYED");
+  assert.equal(result.collectionAuthorized, false);
+  assert.equal(
+    result.receipt.schemaVersion,
+    "usage-monitor-staging-operation-receipt-v0.1",
+  );
+  assert.equal(result.receipt.operation, "disabled_staging_deployed");
+  assert.equal(result.receipt.activationState, "not_authorized");
+  assert.equal(result.receipt.evidence.pilotSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.healthContained, true);
+  assert.equal(result.receipt.evidence.lifecycleReadiness, "not_ready");
   assert.deepEqual(calls.at(-1), [
     "deploy", "--env", "staging", "--strict",
   ]);
   assert.equal(requested[0].url, `${stagingOrigin}/api/health`);
   assert.equal(requested[0].options.redirect, "error");
+  assert.equal(requested[1].url, `${stagingOrigin}/api/ready`);
+  assert.equal(requested[1].options.redirect, "error");
 });
 
 test("deployment refuses a health response with any collection path enabled", async () => {
@@ -209,7 +244,7 @@ test("first deployment accepts only an owner-only validated key file", async () 
       workerDirectory,
       secretsFile,
       spawn,
-      fetchImpl: async () => jsonResponse(containedHealth()),
+      fetchImpl: async (url) => containedFetch(url),
     });
     assert.equal(result.ok, true);
     assert.deepEqual(calls.at(-1), [

@@ -299,6 +299,9 @@ export function buildTelemetryContributionsFromBundle(bundle) {
     batches.push(batch);
   }
   const epoch = providerPolicyEpoch(bundle);
+  if (batches.length > MAX_PREPARED_CONTRIBUTION_BATCHES) {
+    throw fixedError("batch_count_invalid");
+  }
   return batches.map(({ usageEvents, quotaSnapshots, activityMarkers }) => {
     return assertTransportProjection({
       schemaVersion: TELEMETRY_CONTRIBUTION_VERSION,
@@ -320,21 +323,32 @@ export async function materializeTelemetryContributions({
   receiptFile,
   outputDirectory,
   failpoint = async () => {},
+  signal = null,
 } = {}) {
   if (!outputDirectory) throw fixedError("output_required");
   if (typeof failpoint !== "function") throw fixedError("failpoint_invalid");
+  if (signal !== null
+      && (typeof signal !== "object"
+        || typeof signal.aborted !== "boolean"
+        || typeof signal.addEventListener !== "function")) {
+    throw fixedError("signal_invalid");
+  }
+  signal?.throwIfAborted?.();
   const verified = await loadVerifiedLocalMetadataBundleFiles({
     bundleFile,
     receiptFile,
   });
+  signal?.throwIfAborted?.();
   const contributions = buildTelemetryContributionsFromBundle(verified.bundle);
   if (contributions.length > MAX_PREPARED_CONTRIBUTION_BATCHES) {
     throw fixedError("batch_count_invalid");
   }
   const directory = resolve(outputDirectory);
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  signal?.throwIfAborted?.();
   const files = [];
   for (const [index, contribution] of contributions.entries()) {
+    signal?.throwIfAborted?.();
     const content = stableJson(contribution);
     const file = join(
       directory,
@@ -345,6 +359,7 @@ export async function materializeTelemetryContributions({
       name: basename(file),
       content,
     });
+    signal?.throwIfAborted?.();
     const counts = {
       usageEvents: contribution.usageEvents.length,
       quotaSnapshots: contribution.quotaSnapshots.length,
@@ -361,6 +376,7 @@ export async function materializeTelemetryContributions({
       index: index + 1,
       batchCount: contributions.length,
     });
+    signal?.throwIfAborted?.();
   }
   const manifestFiles = await verifyPreparedContributionFiles({
     directory,
@@ -371,6 +387,7 @@ export async function materializeTelemetryContributions({
       recordCounts: file.counts,
     })),
   });
+  signal?.throwIfAborted?.();
   const manifest = {
     schemaVersion: PREPARED_CONTRIBUTION_SET_VERSION,
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
@@ -379,6 +396,7 @@ export async function materializeTelemetryContributions({
     files: manifestFiles,
   };
   await failpoint("before_manifest", { batchCount: contributions.length });
+  signal?.throwIfAborted?.();
   const publishedManifest = await publishPreparedContributionManifest({
     directory,
     manifest,
@@ -387,11 +405,14 @@ export async function materializeTelemetryContributions({
       batchCount: contributions.length,
     }),
   });
+  signal?.throwIfAborted?.();
   await failpoint("after_manifest", { batchCount: contributions.length });
+  signal?.throwIfAborted?.();
   await verifyPreparedContributionSet({
     directory,
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
   });
+  signal?.throwIfAborted?.();
   return {
     schemaVersion: "telemetry-contribution-build-receipt-v0.1",
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,

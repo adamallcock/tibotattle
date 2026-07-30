@@ -95,6 +95,34 @@ export function backendSmokeSourceArguments(source) {
   throw new TypeError("Backend laboratory contribution source is invalid");
 }
 
+export function localCompanionEnvironment({
+  environment = process.env,
+  port,
+  centralOrigin,
+  stateRoot,
+} = {}) {
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    throw new TypeError("Local companion environment must be an object");
+  }
+  if (!Number.isSafeInteger(port) || port < 1024 || port > 65_535) {
+    throw new TypeError("Local companion port must be a valid user port");
+  }
+  if (typeof centralOrigin !== "string"
+      || !/^https?:\/\/[^/]+$/u.test(centralOrigin)) {
+    throw new TypeError("Local companion central origin must be an HTTP origin");
+  }
+  if (typeof stateRoot !== "string" || !stateRoot.startsWith("/")) {
+    throw new TypeError("Local companion state root must be absolute");
+  }
+  return Object.freeze({
+    ...environment,
+    USAGE_MONITOR_PORT: String(port),
+    USAGE_MONITOR_CENTRAL_ORIGIN: centralOrigin,
+    USAGE_MONITOR_STATE_ROOT: stateRoot,
+  });
+}
+
 export function projectLocalBackendLabReceipt({
   receipt,
   sourceMode,

@@ -1,11 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   chmod,
   lstat,
   mkdir,
   open,
+  readdir,
   realpath,
+  rmdir,
+  unlink,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,6 +17,7 @@ import { readBoundedDirectoryEntries } from "./export-resource-policy.js";
 import { syncDirectory, stableJson } from "./storage.js";
 import {
   loadVerifiedPreparedContribution,
+  preparedContributionSetId,
   PREPARED_CONTRIBUTION_SET_MANIFEST,
   verifyPreparedContributionSet,
 } from "./telemetry-prepared-set.js";
@@ -41,11 +45,16 @@ const MAXIMUM_JOBS_PER_PASS = 100;
 const MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024;
 const DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024 * 1024;
 const MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 256 * 1024 * 1024;
+export const ACCEPTED_ARTIFACT_MAXIMUM_AGE_DAYS = 7;
+export const ACCEPTED_ARTIFACT_MAXIMUM_RETAINED_SETS = 8;
+export const ACCEPTED_ARTIFACT_MAXIMUM_RETIREMENTS_PER_PASS = 16;
 const RESERVED_UPLOAD_ENVELOPE_OVERHEAD_BYTES = 8 * 1024;
 const MINIMUM_WATCH_INTERVAL_SECONDS = 30;
 const MAXIMUM_WATCH_INTERVAL_SECONDS = 3600;
 const SET_NAME =
   /^prepared-set-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const REVIEW_NAME =
+  /^review-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -65,6 +74,7 @@ const ERROR_CODES = new Set([
   "queue_invalid",
   "queue_unavailable",
   "prepared_root_invalid",
+  "retirement_invalid",
   "job_limit",
 ]);
 
@@ -329,10 +339,6 @@ async function manifestExists(directory) {
   }
 }
 
-function preparedSetId(manifest) {
-  return createHash("sha256").update(stableJson(manifest)).digest("hex");
-}
-
 /**
  * Accept either one direct prepared set or an owner-only spool whose immediate
  * child names are generated `prepared-set-<uuid>` directories. Unrecognized
@@ -353,7 +359,7 @@ export async function discoverCommittedPreparedSets({
     discovered.push({
       setName: ".",
       directory: root,
-      preparedSetId: preparedSetId(manifest),
+      preparedSetId: preparedContributionSetId(manifest),
       manifest,
     });
     return discovered;
@@ -387,11 +393,225 @@ export async function discoverCommittedPreparedSets({
     discovered.push({
       setName: name,
       directory: child,
-      preparedSetId: preparedSetId(manifest),
+      preparedSetId: preparedContributionSetId(manifest),
       manifest,
     });
   }
   return discovered;
+}
+
+async function prepareOwnerOnlyRetentionRoot(directory) {
+  if (typeof directory !== "string" || directory.length < 1) {
+    fail("configuration_invalid");
+  }
+  try {
+    const requested = resolve(directory);
+    await mkdir(requested, { recursive: true, mode: 0o700 });
+    const requestedStats = await lstat(requested);
+    assertOwnerOnlyDirectory(requestedStats);
+    const canonical = await realpath(requested);
+    const canonicalStats = await lstat(canonical);
+    assertOwnerOnlyDirectory(canonicalStats);
+    if (requestedStats.dev !== canonicalStats.dev
+        || requestedStats.ino !== canonicalStats.ino) {
+      fail("retirement_invalid");
+    }
+    return canonical;
+  } catch (error) {
+    if (error instanceof ContributionSyncQueueError) {
+      if (error.code.endsWith("_queue_invalid")) fail("retirement_invalid");
+      throw error;
+    }
+    fail("retirement_invalid");
+  }
+}
+
+function assertOwnerOnlyRetainedFile(stats) {
+  if (!stats.isFile()
+      || stats.isSymbolicLink()
+      || stats.nlink !== 1
+      || (typeof process.getuid === "function" && stats.uid !== process.getuid())
+      || (process.platform !== "win32" && (stats.mode & 0o077) !== 0)) {
+    fail("retirement_invalid");
+  }
+}
+
+async function retireFlatOwnerOnlyDirectory({
+  root,
+  name,
+  maximumEntries,
+}) {
+  if (basename(name) !== name
+      || !integer(maximumEntries, 1, 256)) {
+    fail("retirement_invalid");
+  }
+  const path = join(root, name);
+  let directoryStats;
+  try {
+    directoryStats = await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    fail("retirement_invalid");
+  }
+  try {
+    assertOwnerOnlyDirectory(directoryStats);
+    const entries = await readdir(path, { withFileTypes: true });
+    if (entries.length > maximumEntries) fail("retirement_invalid");
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink()) {
+        fail("retirement_invalid");
+      }
+      const child = join(path, entry.name);
+      const stats = await lstat(child);
+      assertOwnerOnlyRetainedFile(stats);
+      await unlink(child);
+    }
+    await rmdir(path);
+    await syncDirectory(root);
+    return true;
+  } catch (error) {
+    if (error instanceof ContributionSyncQueueError) throw error;
+    fail("retirement_invalid");
+  }
+}
+
+/**
+ * Retire only fully accepted prepared sets. The protected first-review set is
+ * retained indefinitely as the exact local consent provenance. All other
+ * accepted sets are bounded by both age and count, while each invocation has
+ * a fixed cleanup ceiling so foreground work remains predictable.
+ *
+ * Crash ordering is deliberate: artifacts are removed before accepted queue
+ * rows. A crash can therefore leave harmless accepted rows for the next pass,
+ * but can never make a still-present set discoverable after its dedupe rows
+ * have been deleted.
+ */
+export async function retireAcceptedContributionArtifacts({
+  preparedSpoolDirectory,
+  reviewArchiveDirectory,
+  queueFile = defaultContributionSyncQueueFile(),
+  protectedPreparedSetIds = [],
+  maximumAgeDays = ACCEPTED_ARTIFACT_MAXIMUM_AGE_DAYS,
+  maximumRetainedSets = ACCEPTED_ARTIFACT_MAXIMUM_RETAINED_SETS,
+  maximumRetirements =
+    ACCEPTED_ARTIFACT_MAXIMUM_RETIREMENTS_PER_PASS,
+  now = () => new Date(),
+  signal = undefined,
+  failpoint = async () => {},
+} = {}) {
+  if (!Array.isArray(protectedPreparedSetIds)
+      || protectedPreparedSetIds.length > 8
+      || protectedPreparedSetIds.some((value) => !SHA256.test(value))
+      || new Set(protectedPreparedSetIds).size
+        !== protectedPreparedSetIds.length
+      || !integer(maximumAgeDays, 1, 30)
+      || !integer(maximumRetainedSets, 1, 32)
+      || !integer(maximumRetirements, 1, 64)
+      || typeof failpoint !== "function"
+      || (signal !== undefined && !(signal instanceof AbortSignal))) {
+    fail("configuration_invalid");
+  }
+  const preparedRoot = await prepareOwnerOnlyRetentionRoot(
+    preparedSpoolDirectory,
+  );
+  const reviewRoot = await prepareOwnerOnlyRetentionRoot(
+    reviewArchiveDirectory,
+  );
+  const database = await openQueueDatabase(queueFile, now);
+  try {
+    if (signal?.aborted) {
+      return Object.freeze({
+        retiredSets: 0,
+        retiredJobs: 0,
+        interrupted: true,
+        networkActivity: false,
+      });
+    }
+    const nowMs = nowMilliseconds(now);
+    const cutoff = queueTimestamp(
+      nowMs - maximumAgeDays * 24 * 60 * 60 * 1_000,
+    );
+    const queryLimit = maximumRetainedSets
+      + maximumRetirements
+      + protectedPreparedSetIds.length;
+    const rows = database.prepare(`
+      SELECT prepared_set_id, set_name,
+             COUNT(*) AS total_jobs,
+             SUM(CASE WHEN state = 'accepted' THEN 1 ELSE 0 END)
+               AS accepted_jobs,
+             MAX(accepted_at) AS accepted_at
+        FROM contribution_jobs
+       GROUP BY prepared_set_id, set_name
+      HAVING accepted_jobs = total_jobs
+         AND total_jobs > 0
+       ORDER BY accepted_at DESC, prepared_set_id
+       LIMIT ?
+    `).all(queryLimit);
+    const protectedIds = new Set(protectedPreparedSetIds);
+    const unprotected = rows.filter(
+      (row) => !protectedIds.has(row.prepared_set_id),
+    );
+    const candidates = unprotected.filter((row, index) => (
+      index >= maximumRetainedSets || row.accepted_at <= cutoff
+    )).slice(0, maximumRetirements);
+    let retiredSets = 0;
+    let retiredJobs = 0;
+    for (const row of candidates) {
+      if (signal?.aborted) break;
+      if (!SHA256.test(row.prepared_set_id)
+          || !SET_NAME.test(row.set_name)
+          || !integer(Number(row.total_jobs), 1, MAX_QUEUE_JOBS)
+          || Number(row.accepted_jobs) !== Number(row.total_jobs)
+          || iso(row.accepted_at) !== row.accepted_at) {
+        fail("retirement_invalid");
+      }
+      const suffix = row.set_name.slice("prepared-set-".length);
+      const reviewName = `review-${suffix}`;
+      if (!REVIEW_NAME.test(reviewName)) fail("retirement_invalid");
+      const context = Object.freeze({
+        preparedSetId: row.prepared_set_id,
+        setName: row.set_name,
+        reviewName,
+      });
+      await failpoint("before_artifact_retirement", context);
+      await retireFlatOwnerOnlyDirectory({
+        root: preparedRoot,
+        name: row.set_name,
+        maximumEntries: 128,
+      });
+      await failpoint("after_prepared_retirement", context);
+      await retireFlatOwnerOnlyDirectory({
+        root: reviewRoot,
+        name: reviewName,
+        maximumEntries: 4,
+      });
+      await failpoint("before_queue_compaction", context);
+      const removed = transaction(database, () => database.prepare(`
+        DELETE FROM contribution_jobs
+         WHERE prepared_set_id = ?
+           AND NOT EXISTS (
+             SELECT 1
+               FROM contribution_jobs AS retained
+              WHERE retained.prepared_set_id = ?
+                AND retained.state != 'accepted'
+           )
+      `).run(row.prepared_set_id, row.prepared_set_id));
+      if (removed.changes !== Number(row.total_jobs)) {
+        fail("retirement_invalid");
+      }
+      retiredSets += 1;
+      retiredJobs += removed.changes;
+      await failpoint("after_queue_compaction", context);
+    }
+    return Object.freeze({
+      retiredSets,
+      retiredJobs,
+      interrupted: signal?.aborted === true,
+      networkActivity: false,
+    });
+  } finally {
+    database.close();
+  }
 }
 
 function validateCoveredAt(payload) {
@@ -519,6 +739,60 @@ function statusFromDatabase(database, timestamp) {
     dueNow: Number(due.count),
     nextAttemptAt: next.value ?? null,
     lastAcceptedAt: lastAccepted.value ?? null,
+  });
+}
+
+function preparedSetStatusFromDatabase(database, preparedSetId) {
+  if (!SHA256.test(preparedSetId ?? "")) fail("queue_invalid");
+  const rows = database.prepare(`
+    SELECT state, COUNT(*) AS count,
+           MIN(covered_start_at) AS minimum_start_at,
+           MAX(covered_start_at) AS maximum_start_at,
+           MIN(covered_end_at) AS minimum_end_at,
+           MAX(covered_end_at) AS maximum_end_at
+      FROM contribution_jobs
+     WHERE prepared_set_id = ?
+     GROUP BY state
+  `).all(preparedSetId);
+  if (rows.length === 0) return null;
+  const counts = Object.fromEntries(JOB_STATES.map((state) => [state, 0]));
+  let startAt = null;
+  let endAt = null;
+  let total = 0;
+  for (const row of rows) {
+    if (!JOB_STATES.includes(row.state)
+        || row.minimum_start_at !== row.maximum_start_at
+        || row.minimum_end_at !== row.maximum_end_at
+        || iso(row.minimum_start_at) !== row.minimum_start_at
+        || iso(row.minimum_end_at) !== row.minimum_end_at
+        || Date.parse(row.minimum_start_at) >= Date.parse(row.minimum_end_at)) {
+      fail("queue_invalid");
+    }
+    if (startAt === null) {
+      startAt = row.minimum_start_at;
+      endAt = row.minimum_end_at;
+    } else if (startAt !== row.minimum_start_at
+        || endAt !== row.minimum_end_at) {
+      fail("queue_invalid");
+    }
+    counts[row.state] = Number(row.count);
+    if (!integer(counts[row.state], 0, MAX_QUEUE_JOBS)
+        || !Number.isSafeInteger(total + counts[row.state])) {
+      fail("queue_invalid");
+    }
+    total += counts[row.state];
+  }
+  if (total < 1) fail("queue_invalid");
+  return Object.freeze({
+    preparedSetId,
+    coveredAt: Object.freeze({ startAt, endAt }),
+    totalJobs: total,
+    acceptedJobs: counts.accepted,
+    pendingJobs: counts.pending,
+    retryableJobs: counts.retryable,
+    inFlightJobs: counts.in_flight,
+    rejectedJobs: counts.rejected,
+    completeAccepted: counts.accepted === total,
   });
 }
 
@@ -944,6 +1218,7 @@ export async function runContributionSyncQueueOnce({
   maximumReservedUploadBytes =
     DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
   reviewedJob = undefined,
+  preparedSetId = undefined,
   discoverSets = discoverCommittedPreparedSets,
   loadContribution = loadVerifiedPreparedContribution,
   syncEntry = syncPreparedContributionEntryOnce,
@@ -967,10 +1242,15 @@ export async function runContributionSyncQueueOnce({
           || reviewedJob === null
           || !UUID_V4.test(reviewedJob.jobId ?? "")
           || !SHA256.test(reviewedJob.contributionSha256 ?? "")))
+      || (preparedSetId !== undefined && !SHA256.test(preparedSetId))
+      || (reviewedJob !== undefined && preparedSetId !== undefined)
       || (signal !== undefined && !(signal instanceof AbortSignal))) {
     fail("configuration_invalid");
   }
-  const sets = await discoverSets({ directory });
+  const discoveredSets = await discoverSets({ directory });
+  const sets = preparedSetId === undefined
+    ? discoveredSets
+    : discoveredSets.filter((set) => set.preparedSetId === preparedSetId);
   const database = await openQueueDatabase(queueFile, now);
   const openedAt = queueTimestamp(nowMilliseconds(now));
   let enqueued;
@@ -997,22 +1277,17 @@ export async function runContributionSyncQueueOnce({
         reservedUploadBytes: 0,
         bandwidthLimited: false,
         queue: initialStatus,
+        preparedSet: preparedSetId === undefined
+          ? null
+          : preparedSetStatusFromDatabase(database, preparedSetId),
       });
     }
 
     const availableSets = new Map(
       sets.map((set) => [set.preparedSetId, set]),
     );
-    const candidates = reviewedJob === undefined
+    const candidates = reviewedJob !== undefined
       ? database.prepare(`
-        SELECT job_id, prepared_set_id, contribution_bytes
-          FROM contribution_jobs
-         WHERE state IN ('pending', 'retryable')
-           AND next_attempt_at <= ?
-         ORDER BY created_at, job_id
-         LIMIT ?
-      `).all(readyAt, maximumJobs)
-      : database.prepare(`
         SELECT job_id, prepared_set_id, contribution_bytes
           FROM contribution_jobs
          WHERE job_id = ?
@@ -1024,7 +1299,28 @@ export async function runContributionSyncQueueOnce({
         reviewedJob.jobId,
         reviewedJob.contributionSha256,
         readyAt,
-      );
+      )
+      : preparedSetId !== undefined
+        ? database.prepare(`
+        SELECT job_id, prepared_set_id, contribution_bytes
+          FROM contribution_jobs
+         WHERE prepared_set_id = ?
+           AND state IN ('pending', 'retryable')
+           AND next_attempt_at <= ?
+         ORDER BY created_at, job_id
+         LIMIT ?
+      `).all(preparedSetId, readyAt, maximumJobs)
+        : database.prepare(`
+        SELECT job_id, prepared_set_id, contribution_bytes
+          FROM contribution_jobs
+         WHERE state IN ('pending', 'retryable')
+           AND next_attempt_at <= ?
+         ORDER BY created_at, job_id
+         LIMIT ?
+      `).all(readyAt, maximumJobs);
+    const selectedPreparedSetId = preparedSetId
+      ?? candidates[0]?.prepared_set_id
+      ?? null;
     const result = {
       processed: 0,
       accepted: 0,
@@ -1124,6 +1420,12 @@ export async function runContributionSyncQueueOnce({
       enqueued: enqueued.inserted,
       ...result,
       queue,
+      preparedSet: selectedPreparedSetId === null
+        ? null
+        : preparedSetStatusFromDatabase(
+          database,
+          selectedPreparedSetId,
+        ),
     });
   } finally {
     database.close();

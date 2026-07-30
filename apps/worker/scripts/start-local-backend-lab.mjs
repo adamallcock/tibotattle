@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { inspectLocalBackendState } from "./inspect-local-backend-state.mjs";
 import {
   backendSmokeSourceArguments,
+  localCompanionEnvironment,
   parseLocalBackendLabArguments,
   projectLocalBackendLabReceipt,
 } from "./start-local-backend-lab-lib.mjs";
@@ -123,14 +124,15 @@ function startWorker(port, stateDirectory, { visible = false } = {}) {
   return child;
 }
 
-function startLocalCompanion(port, centralOrigin) {
+function startLocalCompanion(port, centralOrigin, stateRoot) {
   return spawn(node, [localCompanionEntry], {
     cwd: repositoryRoot,
-    env: {
-      ...process.env,
-      USAGE_MONITOR_PORT: String(port),
-      USAGE_MONITOR_CENTRAL_ORIGIN: centralOrigin,
-    },
+    env: localCompanionEnvironment({
+      environment: process.env,
+      port,
+      centralOrigin,
+      stateRoot,
+    }),
     stdio: "inherit",
   });
 }
@@ -376,6 +378,7 @@ await assertPortAvailable(port);
 if (options.startCompanion) await assertPortAvailable(companionPort);
 const labDirectory = createLabDirectory(options.stateDirectory);
 const stateDirectory = join(labDirectory, "state");
+const companionStateDirectory = join(labDirectory, "companion-state");
 const invitationDirectory = join(labDirectory, "redeemed-invitations");
 const lifecycleStateDirectory = join(labDirectory, "lifecycle-state");
 const lifecycleInvitationDirectory = join(
@@ -385,6 +388,7 @@ const lifecycleInvitationDirectory = join(
 const participantAccessFile = join(labDirectory, "participant-access.json");
 const receiptFile = join(labDirectory, "lab-receipt.json");
 assertLocalSecrets();
+mkdirSync(companionStateDirectory, { mode: 0o700 });
 const lifecycleInvitationFiles = prepareState(
   lifecycleStateDirectory,
   lifecycleInvitationDirectory,
@@ -477,7 +481,11 @@ try {
     participantAccessFile,
   );
   if (options.startCompanion) {
-    companion = startLocalCompanion(companionPort, origin);
+    companion = startLocalCompanion(
+      companionPort,
+      origin,
+      companionStateDirectory,
+    );
     await waitForLocalCompanion(companionOrigin, companion);
   }
   const receipt = projectLocalBackendLabReceipt({
@@ -511,6 +519,8 @@ try {
         outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
         serverValidation: smoke.serverValidation,
         canonicalServerRepricing: smoke.canonicalServerRepricing,
+        atomicEnrollmentPairing: smoke.devicePairingAndUpload,
+        deviceRevocation: smoke.deviceRevocation,
         personalStatisticsRecomputed: smoke.personalStatisticsRecomputed,
         aggregatePublishedAtTwenty: smoke.aggregatePublishedAtTwenty,
         authenticatedWeeklyComparison: smoke.authenticatedWeeklyComparison,
@@ -560,6 +570,8 @@ try {
         idempotentDeduplication: smoke.idempotentReplay,
         conflictSafeCanonicalState: smoke.uploadScopeConflictRejected,
         canonicalServerRepricing: smoke.canonicalServerRepricing,
+        atomicEnrollmentPairingVerified: smoke.devicePairingAndUpload,
+        deviceRevocationVerified: smoke.deviceRevocation,
         d1LifecycleVerified: true,
         r2LifecycleVerified: lifecycleR2ObjectCount === 0
           && restartedR2ObjectCount === r2ObjectCount,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildLocalMetadataBundle, writeLocalMetadataBundle } from "../src/metadata-exporter.js";
@@ -424,6 +424,59 @@ test("exporter enforces source, expanded-byte, canonical-byte, elapsed, and RSS 
       }),
       (error) => error.code === "export_resource_rss",
     );
+  } finally {
+    await rm(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test("latest-window export charges selected sources instead of lifetime history bytes", async () => {
+  const fixture = await privateFixture();
+  const selectedPath = join(
+    fixture.home,
+    "sessions",
+    "rollout-2026-07-24T12-00-00-private.jsonl",
+  );
+  const historicalPath = join(
+    fixture.home,
+    "sessions",
+    "rollout-2026-06-01T12-00-00-historical.jsonl",
+  );
+  try {
+    const selectedBytes = (await stat(selectedPath)).size;
+    const historicalHeader = JSON.stringify({
+      timestamp: "2026-06-01T12:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "PRIVATE_HISTORICAL_SESSION" },
+    });
+    await writeFile(
+      historicalPath,
+      `${historicalHeader}\n${"PRIVATE_HISTORICAL_CONTENT".repeat(selectedBytes)}\n`,
+    );
+    const historicalTime = new Date("2026-06-01T12:30:00.000Z");
+    await utimes(historicalPath, historicalTime, historicalTime);
+    assert.ok((await stat(historicalPath)).size > selectedBytes);
+
+    const result = await buildLocalMetadataBundle({
+      startAt: "2026-07-24T11:59:00.000Z",
+      endAt: "2026-07-24T12:10:00.000Z",
+      codexHome: fixture.home,
+      secret: SECRET,
+      bundleId: BUNDLE_ID,
+      createdAt: CREATED_AT,
+      resourceLimits: { maximumSourceBytes: selectedBytes },
+      forbiddenSourceValues: [
+        "PRIVATE_HISTORICAL_SESSION",
+        "PRIVATE_HISTORICAL_CONTENT",
+      ],
+    });
+
+    assert.equal(result.resourceUsage.counters.sourceFiles, 1);
+    assert.equal(result.resourceUsage.counters.sourceBytes, selectedBytes);
+    assert.deepEqual(result.bundle.recordCounts, {
+      usageEvents: 2,
+      quotaSnapshots: 4,
+      activityMarkers: 0,
+    });
   } finally {
     await rm(fixture.home, { recursive: true, force: true });
   }

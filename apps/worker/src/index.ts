@@ -10,10 +10,11 @@ import {
 } from "./account-scoped-ingest";
 import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
+  BACKEND_LIFECYCLE_STALE_MILLISECONDS,
   JSON_HEADERS,
+  MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
-  MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   QUARANTINE_RETENTION_MILLISECONDS,
@@ -67,6 +68,12 @@ import {
   securityReset,
 } from "./repository";
 import {
+  clearPendingQuarantineObject,
+  putTrackedQuarantineObject,
+  readQuarantineReconciliationStatus,
+  reconcilePendingQuarantineObjects,
+} from "./quarantine-reconciliation";
+import {
   hasDeletionTombstone,
   recordDeletionTombstone,
   runBackendLifecycle,
@@ -86,20 +93,43 @@ import {
   type SessionPrincipal,
 } from "./session";
 import {
+  type TelemetryContributionAdmission,
   deleteTelemetryContribution,
   existingTelemetryContribution,
   insertTelemetryContribution,
-  listTelemetryContributions,
+  listRecentTelemetryContributions,
   markTelemetryContributionDeleting,
   personalStats,
   telemetryContributionById,
+  telemetryContributionAdmission,
   telemetryContributionCount,
+  telemetryContributionPage,
   telemetryContributionHistoryMetadata,
   telemetryContributionMetadata,
+  telemetryContributionR2KeyPage,
   telemetryEnvelopeDigest,
   telemetryPlaintextDigest,
   telemetryRecordsForContribution,
 } from "./telemetry-repository";
+
+function telemetryContributionLimitError(
+  admission: TelemetryContributionAdmission,
+  nowEpoch = Date.now(),
+): ApiError {
+  const retryAtEpoch = Date.parse(admission.window.endsAt);
+  const retryAfterSeconds = Number.isFinite(retryAtEpoch)
+    ? Math.max(1, Math.ceil((retryAtEpoch - nowEpoch) / 1000))
+    : 1;
+  return new ApiError(429, "CONTRIBUTION_LIMIT_REACHED", {
+    publicDetails: {
+      admission,
+      retryAt: admission.window.endsAt,
+    },
+    responseHeaders: {
+      "retry-after": String(retryAfterSeconds),
+    },
+  });
+}
 import {
   insertTelemetryContributionV02,
 } from "./telemetry-v0.2-repository";
@@ -215,24 +245,76 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (accountScopedEnrollment) {
     assertAccountScopedLocalPreview(request, env);
   }
+  const deviceBootstrap = Reflect.get(body.value, "deviceBootstrap");
+  const expectedOngoingConsentVersion = accountScopedEnrollment
+    ? ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
+    : ONGOING_TELEMETRY_CONSENT_VERSION;
+  const deviceBootstrapRequested = deviceBootstrap !== undefined;
+  if (deviceBootstrapRequested
+      && (
+        Reflect.get(body.value, "syntheticOnly") !== false
+        || typeof deviceBootstrap !== "object"
+        || deviceBootstrap === null
+        || Array.isArray(deviceBootstrap)
+        || Object.keys(deviceBootstrap).length !== 2
+        || Reflect.get(deviceBootstrap, "ongoingUpload") !== true
+        || Reflect.get(deviceBootstrap, "consentVersion")
+          !== expectedOngoingConsentVersion
+      )) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
   const keys = Object.keys(body.value);
   const allowedKeys = mode === "invite_only"
-    ? ["consentVersion", "syntheticOnly", "inviteCode"]
-    : ["consentVersion", "syntheticOnly"];
+    ? ["consentVersion", "syntheticOnly", "inviteCode", "deviceBootstrap"]
+    : ["consentVersion", "syntheticOnly", "deviceBootstrap"];
   if (keys.some((key) => !allowedKeys.includes(key))
-      || (mode === "local_open" && keys.length !== 2)) {
+      || (mode === "local_open"
+        && keys.length !== (deviceBootstrapRequested ? 3 : 2))) {
     throw new ApiError(400, "BODY_INVALID");
+  }
+  if (deviceBootstrapRequested) {
+    await assertCollectionControl(
+      env.USAGE_MONITOR_DB,
+      "uploadRegistration",
+    );
   }
   const consentVersion = Reflect.get(body.value, "consentVersion") as string;
   const inviteGrant = mode === "invite_only"
     ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
     : null;
-  const enrollment = await enroll(env.USAGE_MONITOR_DB, consentVersion, inviteGrant);
+  const enrollment = await enroll(
+    env.USAGE_MONITOR_DB,
+    consentVersion,
+    inviteGrant,
+    { deviceBootstrap: deviceBootstrapRequested },
+  );
   return jsonResponse({
+    schemaVersion: "participant-bootstrap-v0.1",
+    state: enrollment.pairing ? "pairing_ready" : "enrolled",
     participantId: enrollment.participantId,
     csrfToken: enrollment.csrfToken,
     recoveryCode: enrollment.recoveryCode,
     consentVersion,
+    invitation: enrollment.invitation,
+    session: {
+      state: "active",
+      issuedAt: enrollment.session.issuedAt,
+      expiresAt: enrollment.session.expiresAt,
+    },
+    recovery: {
+      state: "issued",
+      issuedAt: enrollment.session.issuedAt,
+      expiresAt: null,
+      requiresAcknowledgement: true,
+    },
+    pairing: enrollment.pairing ? {
+      state: "claimable",
+      scope: "upload_registration",
+      oneUse: true,
+      pairingCode: enrollment.pairing.pairingCode,
+      issuedAt: enrollment.pairing.issuedAt,
+      expiresAt: enrollment.pairing.expiresAt,
+    } : null,
   }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
@@ -549,14 +631,25 @@ async function handleSyntheticContribution(
   const r2Key = `synthetic/${crypto.randomUUID()}`;
   const createdAt = new Date().toISOString();
 
-  await env.QUARANTINE.put(r2Key, JSON.stringify(envelope), {
-    httpMetadata: { contentType: "application/json" },
-    customMetadata: {
+  await putTrackedQuarantineObject(
+    env.USAGE_MONITOR_DB,
+    env.QUARANTINE,
+    {
       contributionId,
-      schemaVersion: envelope.schemaVersion,
-      synthetic: "true",
+      objectKind: "synthetic",
+      r2Key,
+      registeredAt: createdAt,
     },
-  });
+    JSON.stringify(envelope),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        contributionId,
+        schemaVersion: envelope.schemaVersion,
+        synthetic: "true",
+      },
+    },
+  );
   try {
     await insertContribution(
       env.USAGE_MONITOR_DB,
@@ -571,6 +664,10 @@ async function handleSyntheticContribution(
     );
   } catch (error) {
     await env.QUARANTINE.delete(r2Key);
+    await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+      contributionId,
+      r2Key,
+    });
     const replay = await existingContribution(env.USAGE_MONITOR_DB, participant.id, digest);
     if (replay) {
       return jsonResponse(
@@ -632,9 +729,12 @@ async function handleTelemetryContribution(
       { "idempotency-replayed": "true" },
     );
   }
-  if (await telemetryContributionCount(env.USAGE_MONITOR_DB, participant.id)
-      >= MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
-    throw new ApiError(429, "CONTRIBUTION_LIMIT_REACHED");
+  const admission = await telemetryContributionAdmission(
+    env.USAGE_MONITOR_DB,
+    participant.id,
+  );
+  if (admission.state === "exhausted") {
+    throw telemetryContributionLimitError(admission);
   }
 
   const plaintext = await decryptSyntheticEnvelope(
@@ -671,15 +771,26 @@ async function handleTelemetryContribution(
   const contributionId = `contribution:${crypto.randomUUID()}`;
   const r2Key = `telemetry/${crypto.randomUUID()}`;
   const createdAt = new Date().toISOString();
-  await env.QUARANTINE.put(r2Key, JSON.stringify(envelope), {
-    httpMetadata: { contentType: "application/json" },
-    customMetadata: {
+  await putTrackedQuarantineObject(
+    env.USAGE_MONITOR_DB,
+    env.QUARANTINE,
+    {
       contributionId,
-      schemaVersion: envelope.schemaVersion,
-      plaintextSchemaVersion: record.schemaVersion,
-      synthetic: "false",
+      objectKind: "telemetry",
+      r2Key,
+      registeredAt: createdAt,
     },
-  });
+    JSON.stringify(envelope),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        contributionId,
+        schemaVersion: envelope.schemaVersion,
+        plaintextSchemaVersion: record.schemaVersion,
+        synthetic: "false",
+      },
+    },
+  );
   try {
     const result = accountScoped
       ? await insertTelemetryContributionV02(
@@ -722,6 +833,10 @@ async function handleTelemetryContribution(
     }, 202);
   } catch (error) {
     await env.QUARANTINE.delete(r2Key);
+    await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+      contributionId,
+      r2Key,
+    });
     const replay = await existingTelemetryContribution(
       env.USAGE_MONITOR_DB,
       participant.id,
@@ -743,9 +858,12 @@ async function handleTelemetryContribution(
         { "idempotency-replayed": "true" },
       );
     }
-    if (await telemetryContributionCount(env.USAGE_MONITOR_DB, participant.id)
-        >= MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
-      throw new ApiError(429, "CONTRIBUTION_LIMIT_REACHED");
+    const retryAdmission = await telemetryContributionAdmission(
+      env.USAGE_MONITOR_DB,
+      participant.id,
+    );
+    if (retryAdmission.state === "exhausted") {
+      throw telemetryContributionLimitError(retryAdmission);
     }
     throw error;
   }
@@ -831,11 +949,25 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
 async function handleMe(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   const session = await personalSession(request, env);
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
-  const telemetryContributions = await listTelemetryContributions(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
+  const [
+    contributions,
+    telemetryContributions,
+    telemetryTotal,
+    contributionAdmission,
+  ] = await Promise.all([
+    listContributions(env.USAGE_MONITOR_DB, session.participantId),
+    listRecentTelemetryContributions(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS
+        - MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
+    ),
+    telemetryContributionCount(env.USAGE_MONITOR_DB, session.participantId),
+    telemetryContributionAdmission(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+    ),
+  ]);
   const history = ([
     ...contributions.map(contributionHistoryMetadata),
     ...telemetryContributions.map(telemetryContributionHistoryMetadata),
@@ -850,11 +982,16 @@ async function handleMe(request: Request, env: Env): Promise<Response> {
     consentVersion: session.consentVersion,
     syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
     contributionCount: history.length,
+    totalContributionCount: contributions.length + telemetryTotal,
     latestContribution: history[history.length - 1] ?? null,
     contributions: history,
+    contributionAdmission,
     historyPolicy: {
-      maximumItems: MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT
-        + MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT,
+      maximumItems: MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
+      returnedItems: history.length,
+      totalItems: contributions.length + telemetryTotal,
+      truncated: contributions.length + telemetryTotal > history.length,
+      order: "oldest_to_newest_within_recent_window",
       quarantineRetentionMilliseconds: QUARANTINE_RETENTION_MILLISECONDS,
       canonicalMetadataRetainedAfterQuarantine: true,
       clientSoftwareVersion: "unavailable_in_transport",
@@ -866,38 +1003,78 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   const session = await personalSession(request, env);
   const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
-  const telemetryContributions = await listTelemetryContributions(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const telemetry = [];
-  for (const row of telemetryContributions) {
-    const rows = await telemetryRecordsForContribution(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      row.id,
+  const generatedAt = new Date().toISOString();
+  const encoder = new TextEncoder();
+  const chunks = (async function* participantExportChunks() {
+    let wroteContribution = false;
+    const serializeContribution = (value: unknown): Uint8Array => {
+      const chunk = encoder.encode(
+        `${wroteContribution ? "," : ""}${JSON.stringify(value)}`,
+      );
+      wroteContribution = true;
+      return chunk;
+    };
+    yield encoder.encode(
+      `{"schemaVersion":"participant-export-v0.2",`
+      + `"syntheticOnly":${JSON.stringify(
+        session.consentVersion === "synthetic-preview-v0.1",
+      )},`
+      + `"participant":${JSON.stringify({
+        participantId: session.participantId,
+        createdAt: session.participantCreatedAt,
+      })},"contributions":[`,
     );
-    telemetry.push({
-      ...telemetryContributionMetadata(row),
-      records: rows.map((record) => ({
-        kind: record.record_kind,
-        value: JSON.parse(record.record_json) as unknown,
-      })),
-    });
-  }
-  return jsonResponse({
-    schemaVersion: "participant-export-v0.2",
-    syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
-    participant: {
-      participantId: session.participantId,
-      createdAt: session.participantCreatedAt,
+    for (const contribution of contributions) {
+      yield serializeContribution(contributionForResponse(contribution));
+    }
+    let cursor: { createdAt: string; contributionId: string } | null = null;
+    do {
+      const page = await telemetryContributionPage(
+        env.USAGE_MONITOR_DB,
+        session.participantId,
+        cursor,
+      );
+      for (const item of page.rows) {
+        yield serializeContribution({
+          ...telemetryContributionMetadata(item.contribution),
+          records: item.records.map((record) => ({
+            kind: record.record_kind,
+            value: JSON.parse(record.record_json) as unknown,
+          })),
+        });
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    yield encoder.encode(
+      `],"generatedAt":${JSON.stringify(generatedAt)}}`,
+    );
+  })();
+  let finished = false;
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (finished) return;
+      try {
+        const next = await chunks.next();
+        if (next.done) {
+          finished = true;
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        finished = true;
+        controller.error(error);
+      }
     },
-    contributions: [
-      ...contributions.map(contributionForResponse),
-      ...telemetry,
-    ],
-    generatedAt: new Date().toISOString(),
-  }, 200, { vary: "Cookie" });
+    async cancel() {
+      if (finished) return;
+      finished = true;
+      await chunks.return(undefined);
+    },
+  }, { highWaterMark: 0 });
+  const headers = new Headers(JSON_HEADERS);
+  headers.set("vary", "Cookie");
+  return new Response(stream, { status: 200, headers });
 }
 
 async function handleDelete(request: Request, env: Env): Promise<Response> {
@@ -921,26 +1098,41 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     session.participantId,
   );
   const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
-  const telemetryContributions = await listTelemetryContributions(
+  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  const telemetryTotal = await telemetryContributionCount(
     env.USAGE_MONITOR_DB,
     session.participantId,
   );
-  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT
-      || telemetryContributions.length > MAX_TELEMETRY_CONTRIBUTIONS_PER_PARTICIPANT) {
-    throw new ApiError(500, "INTERNAL_ERROR");
+  const syntheticR2Keys = contributions.map((row) => row.r2_key);
+  if (syntheticR2Keys.length > 0) {
+    await env.QUARANTINE.delete(syntheticR2Keys);
   }
-  const r2Keys = [
-    ...contributions.map((row) => row.r2_key),
-    ...telemetryContributions.map((row) => row.r2_key),
-  ];
-  if (r2Keys.length > 0) {
-    await env.QUARANTINE.delete(r2Keys);
+  let cursor: { createdAt: string; contributionId: string } | null = null;
+  do {
+    const page = await telemetryContributionR2KeyPage(
+      env.USAGE_MONITOR_DB,
+      session.participantId,
+      cursor,
+    );
+    if (page.rows.length > 0) {
+      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+    }
+    cursor = page.nextCursor;
+  } while (cursor);
+  const currentTelemetryTotal = await telemetryContributionCount(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+  );
+  if (currentTelemetryTotal !== telemetryTotal) {
+    throw new ApiError(409, "UPLOAD_IN_PROGRESS");
   }
   await finishParticipantDeletion(env.USAGE_MONITOR_DB, session.participantId);
   return jsonResponse({
     deleted: true,
     participantId: session.participantId,
-    contributionsDeleted: contributions.length + telemetryContributions.length,
+    contributionsDeleted: contributions.length + telemetryTotal,
   }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
 }
 
@@ -1029,6 +1221,107 @@ async function handleContributionResource(
   return jsonResponse({ deleted: true, contributionId }, 200, { vary: "Cookie" });
 }
 
+type LifecycleReadinessState =
+  | "ready"
+  | "never_run"
+  | "running"
+  | "failed"
+  | "stale"
+  | "incomplete";
+
+interface RetentionReadinessRow {
+  state: "never_run" | "running" | "completed" | "failed";
+  last_completed_at: string | null;
+  maintenance_run_at: string | null;
+  quarantine_retention_complete: number;
+  restore_replay_complete: number;
+}
+
+async function aggregateRebuildComplete(db: D1Database): Promise<boolean> {
+  const row = await db.prepare(
+    `SELECT EXISTS (
+      SELECT 1 FROM community_weekly_snapshot_rebuilds
+    ) AS pending`,
+  ).first<{ pending: number }>();
+  if (row?.pending !== 0 && row?.pending !== 1) {
+    throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
+  }
+  return row.pending === 0;
+}
+
+function lifecycleReadiness(
+  retention: RetentionReadinessRow,
+  nowEpoch: number,
+): {
+  fresh: boolean;
+  state: LifecycleReadinessState;
+} {
+  if (retention.state !== "completed") {
+    return { fresh: false, state: retention.state };
+  }
+  const completedEpoch = retention.last_completed_at === null
+    ? Number.NaN
+    : Date.parse(retention.last_completed_at);
+  const fresh = Number.isFinite(completedEpoch)
+    && completedEpoch <= nowEpoch
+    && nowEpoch - completedEpoch <= BACKEND_LIFECYCLE_STALE_MILLISECONDS;
+  if (!fresh) return { fresh: false, state: "stale" };
+  if (retention.quarantine_retention_complete !== 1
+      || retention.restore_replay_complete !== 1) {
+    return { fresh: true, state: "incomplete" };
+  }
+  return { fresh: true, state: "ready" };
+}
+
+async function handleReady(
+  request: Request,
+  env: Env,
+  nowEpoch = Date.now(),
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const retention = await env.USAGE_MONITOR_DB.prepare(
+    `SELECT state, last_completed_at, maintenance_run_at,
+            quarantine_retention_complete, restore_replay_complete
+       FROM retention_state
+      WHERE singleton = 1`,
+  ).first<RetentionReadinessRow>();
+  if (!retention) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  const lifecycle = lifecycleReadiness(retention, nowEpoch);
+  const reconciliation = await readQuarantineReconciliationStatus(
+    env.USAGE_MONITOR_DB,
+  );
+  const rebuildComplete = await aggregateRebuildComplete(
+    env.USAGE_MONITOR_DB,
+  );
+  const maintenanceCycleMatched =
+    retention.maintenance_run_at !== null
+    && reconciliation.maintenanceRunAt === retention.maintenance_run_at;
+  const reconciliationComplete = reconciliation.state === "completed"
+    && reconciliation.reconciliationComplete
+    && maintenanceCycleMatched;
+  const ready = lifecycle.state === "ready"
+    && rebuildComplete
+    && reconciliationComplete;
+  return jsonResponse({
+    status: ready ? "ready" : "not_ready",
+    checks: {
+      lifecycle: lifecycle.state,
+      lifecycleFresh: lifecycle.fresh,
+      quarantineRetentionComplete:
+        retention.quarantine_retention_complete === 1,
+      restoreReplayComplete: retention.restore_replay_complete === 1,
+      aggregateRebuildComplete: rebuildComplete,
+      maintenanceCycleMatched,
+      quarantineReconciliation: reconciliation.state,
+      quarantineReconciliationComplete: reconciliationComplete,
+    },
+    policy: {
+      lifecycleStaleAfterMilliseconds:
+        BACKEND_LIFECYCLE_STALE_MILLISECONDS,
+    },
+  }, ready ? 200 : 503);
+}
+
 async function routeApi(request: Request, env: Env): Promise<Response> {
   const { pathname } = new URL(request.url);
   if (pathname === "/api/v1/enroll") return handleEnroll(request, env);
@@ -1079,6 +1372,7 @@ async function routeApi(request: Request, env: Env): Promise<Response> {
 
 function routeClass(pathname: string): string {
   if (pathname === "/api/health") return "health";
+  if (pathname === "/api/ready") return "ready";
   if (pathname === "/api/v1/enroll") return "enroll";
   if (pathname === "/api/v1/recover") return "recover";
   if (pathname === "/api/v1/session") return "session";
@@ -1117,6 +1411,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   try {
+    if (url.pathname === "/api/ready") {
+      return await handleReady(request, env);
+    }
     if (url.pathname === "/api/health") {
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
@@ -1231,32 +1528,110 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 }
 
+interface ScheduledMaintenanceLog {
+  level: "info" | "error";
+  event: "scheduled_backend_maintenance";
+  outcome: "success" | "failure";
+  code: string;
+  lifecycleComplete: boolean;
+  quarantineRetentionComplete: boolean;
+  restoreReplayComplete: boolean;
+  quarantineReconciliationComplete: boolean;
+  aggregateRebuildComplete: boolean;
+  publicationEnabled: boolean | null;
+}
+
+export async function runScheduledMaintenance(
+  env: Env,
+  scheduledTime: number,
+): Promise<ScheduledMaintenanceLog> {
+  let lifecycleComplete = false;
+  let quarantineRetentionComplete = false;
+  let restoreReplayComplete = false;
+  let quarantineReconciliationComplete = false;
+  let rebuildComplete = false;
+  let publicationEnabled: boolean | null = null;
+  try {
+    const lifecycle = await runBackendLifecycle(
+      env.USAGE_MONITOR_DB,
+      env.DELETION_LEDGER,
+      env.QUARANTINE,
+      scheduledTime,
+    );
+    quarantineRetentionComplete =
+      lifecycle.quarantineRetentionComplete;
+    restoreReplayComplete = lifecycle.restoreReplayComplete;
+    lifecycleComplete = quarantineRetentionComplete
+      && restoreReplayComplete;
+
+    const reconciliation = await reconcilePendingQuarantineObjects(
+      env.USAGE_MONITOR_DB,
+      env.QUARANTINE,
+      scheduledTime,
+    );
+    quarantineReconciliationComplete =
+      reconciliation.reconciliationComplete;
+
+    const controls = await readCollectionControls(env.USAGE_MONITOR_DB);
+    publicationEnabled = controls.publication;
+    if (lifecycleComplete
+        && quarantineReconciliationComplete
+        && publicationEnabled === true) {
+      await buildCommunityWeeklySnapshot(
+        env.USAGE_MONITOR_DB,
+        scheduledTime,
+      );
+      const rebuild = await rebuildPendingCommunityWeeklySnapshots(
+        env.USAGE_MONITOR_DB,
+        scheduledTime,
+      );
+      rebuildComplete = !rebuild.remaining;
+    } else {
+      rebuildComplete = await aggregateRebuildComplete(
+        env.USAGE_MONITOR_DB,
+      );
+    }
+
+    const complete = lifecycleComplete
+      && quarantineReconciliationComplete
+      && rebuildComplete;
+    const log: ScheduledMaintenanceLog = {
+      level: "info",
+      event: "scheduled_backend_maintenance",
+      outcome: "success",
+      code: complete ? "OK" : "MAINTENANCE_INCOMPLETE",
+      lifecycleComplete,
+      quarantineRetentionComplete,
+      restoreReplayComplete,
+      quarantineReconciliationComplete,
+      aggregateRebuildComplete: rebuildComplete,
+      publicationEnabled,
+    };
+    console.log(JSON.stringify(log));
+    return log;
+  } catch (error) {
+    const log: ScheduledMaintenanceLog = {
+      level: "error",
+      event: "scheduled_backend_maintenance",
+      outcome: "failure",
+      code: error instanceof ApiError ? error.code : "INTERNAL_ERROR",
+      lifecycleComplete,
+      quarantineRetentionComplete,
+      restoreReplayComplete,
+      quarantineReconciliationComplete,
+      aggregateRebuildComplete: rebuildComplete,
+      publicationEnabled,
+    };
+    console.error(JSON.stringify(log));
+    throw error;
+  }
+}
+
 export default {
   fetch(request, env): Promise<Response> {
     return handleRequest(request, env);
   },
   scheduled(event, env, context): void {
-    context.waitUntil((async () => {
-      const lifecycle = await runBackendLifecycle(
-        env.USAGE_MONITOR_DB,
-        env.DELETION_LEDGER,
-        env.QUARANTINE,
-        event.scheduledTime,
-      );
-      if (!lifecycle.restoreReplayComplete
-          || !lifecycle.quarantineRetentionComplete) return;
-      const controls = await readCollectionControls(
-        env.USAGE_MONITOR_DB,
-      );
-      if (!controls.publication) return;
-      await buildCommunityWeeklySnapshot(
-        env.USAGE_MONITOR_DB,
-        event.scheduledTime,
-      );
-      await rebuildPendingCommunityWeeklySnapshots(
-        env.USAGE_MONITOR_DB,
-        event.scheduledTime,
-      );
-    })());
+    context.waitUntil(runScheduledMaintenance(env, event.scheduledTime));
   },
 } satisfies ExportedHandler<Env>;

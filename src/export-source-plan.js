@@ -142,6 +142,10 @@ export async function createCodexExportSourcePlan({
   resourceGuard = null,
 } = {}) {
   const infos = await discoverCodexRolloutInfos({ codexHome, startAt, endAt, resourceGuard });
+  resourceGuard?.assertSourceSelection(
+    infos.length,
+    infos.reduce((sum, info) => sum + info.size, 0),
+  );
   const sources = [];
   for (const [ordinal, info] of infos.entries()) {
     resourceGuard?.checkRuntime();

@@ -1,0 +1,1058 @@
+import { readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { scanCodexLogEvents } from "./codex-log-scan.js";
+import {
+  CODEX_TRANSITION_DERIVATION_CEILINGS,
+  deriveCodexTransitionSeriesCooperatively,
+  PARSER_VERSION,
+} from "./codex-transition-miner.js";
+import {
+  createExportResourceGuard,
+  ExportResourceLimitError,
+} from "./export-resource-policy.js";
+import { priceCodexUsageEvent } from "./local-api-pricing.js";
+import { APP_PRICE_REGISTRY_MANIFEST } from "./price-registry.js";
+import { writeJsonOwnerOnlyAtomic } from "./storage.js";
+import {
+  BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
+  projectBoundedWeeklyCalibrationSummary,
+} from "./weekly-calibration.js";
+
+export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
+  "local-replay-safe-accounting-v0.1";
+
+const MAX_CACHE_BYTES = 16 * 1024 * 1024;
+const DEFAULT_WINDOW_DAYS = 31;
+const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
+const MAX_QUOTA_TIMELINE_ROWS = 10_000;
+const WEEKLY_WINDOW_MINUTES = 10_080;
+const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
+const MAX_ACCOUNTING_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
+const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
+const COMPACT_USAGE_RETAINED_BYTES = 256;
+const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
+const DEFAULT_TRANSITION_RESOURCE_LIMITS = Object.freeze({
+  usageEvents: CODEX_TRANSITION_DERIVATION_CEILINGS.usageEvents,
+  weeklySnapshots:
+    CODEX_TRANSITION_DERIVATION_CEILINGS.rateLimitSnapshots,
+  combinedInputs: CODEX_TRANSITION_DERIVATION_CEILINGS.totalInputs,
+  retainedBytes: MAX_RETAINED_TRANSITION_BYTES,
+});
+const COMPONENT_KEYS = Object.freeze([
+  "input_uncached_tokens",
+  "input_cache_read_tokens",
+  "input_cache_write_tokens",
+  "output_text_tokens",
+  "output_reasoning_tokens",
+  "output_combined_tokens",
+]);
+const KNOWN_MODELS = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5",
+  "gpt-4.1",
+]);
+const SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
+const API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
+const SURFACES = new Set([
+  "extension_or_ide",
+  "scheduled_task",
+  "subagent",
+  "cli_exec",
+  "work",
+  "workspace_agent",
+  "excel",
+  "voice_task",
+  "unknown",
+]);
+const AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
+const LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
+const QUOTA_PLANS = new Set([
+  "free",
+  "plus",
+  "pro",
+  "team",
+  "business",
+  "enterprise",
+]);
+const QUOTA_SLOTS = new Set(["primary", "secondary"]);
+
+function fixedError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function accountingScanResourceError(error) {
+  const code = error?.code;
+  if (!(error instanceof ExportResourceLimitError)
+      && (typeof code !== "string"
+        || !code.startsWith("export_resource_"))) return null;
+  const suffix = code.slice("export_resource_".length);
+  return fixedError(`accounting_scan_${suffix}_limit_exceeded`);
+}
+
+function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = fixedError("accounting_refresh_aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+function transitionResourceLimits(value) {
+  if (value === null || value === undefined) {
+    return DEFAULT_TRANSITION_RESOURCE_LIMITS;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("transitionResourceLimits must be an object or null");
+  }
+  const ceilings = {
+    usageEvents: CODEX_TRANSITION_DERIVATION_CEILINGS.usageEvents,
+    weeklySnapshots:
+      CODEX_TRANSITION_DERIVATION_CEILINGS.rateLimitSnapshots,
+    combinedInputs: CODEX_TRANSITION_DERIVATION_CEILINGS.totalInputs,
+    retainedBytes: MAX_RETAINED_TRANSITION_BYTES,
+  };
+  const allowed = new Set(Object.keys(ceilings));
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    throw new TypeError("transitionResourceLimits contains an unknown key");
+  }
+  return Object.fromEntries(Object.entries(ceilings).map(([key, ceiling]) => {
+    const selected = value[key] ?? ceiling;
+    if (!Number.isSafeInteger(selected) || selected < 1 || selected > ceiling) {
+      throw new TypeError(
+        `transitionResourceLimits.${key} must be between 1 and ${ceiling}`,
+      );
+    }
+    return [key, selected];
+  }));
+}
+
+function canonicalInstant(value) {
+  if (typeof value !== "string") return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+    ? value
+    : null;
+}
+
+function emptyComponents() {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
+}
+
+function emptyComponentCosts() {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [
+    key,
+    {
+      tokens: 0,
+      pricedTokens: 0,
+      unpricedTokens: 0,
+      costUsd: 0,
+    },
+  ]));
+}
+
+function tokenTotal(components) {
+  const input = (components.input_uncached_tokens ?? 0)
+    + (components.input_cache_read_tokens ?? 0)
+    + (components.input_cache_write_tokens ?? 0);
+  const separatedOutput = (components.output_text_tokens ?? 0)
+    + (components.output_reasoning_tokens ?? 0);
+  const combinedOutput = components.output_combined_tokens ?? 0;
+  return input + (combinedOutput > 0 ? combinedOutput : separatedOutput);
+}
+
+function safeEnum(value, allowed) {
+  return allowed.has(value) ? value : "unknown";
+}
+
+function safeModel(value) {
+  return KNOWN_MODELS.has(value) ? value : "unknown";
+}
+
+function emptyDimension(keys) {
+  return Object.fromEntries([...keys].map((key) => [
+    key,
+    { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
+  ]));
+}
+
+function newPeriod(id, label) {
+  return {
+    id,
+    label,
+    events: 0,
+    totalTokens: 0,
+    components: emptyComponents(),
+    componentCosts: emptyComponentCosts(),
+    apiPriceEquivalentUsd: 0,
+    pricingCoverage: {
+      fullyPricedEvents: 0,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    },
+    byModel: {},
+    bySpeed: emptyDimension(SPEEDS),
+    byApiServiceTier: emptyDimension(API_TIERS),
+    bySurface: emptyDimension(SURFACES),
+    byAgentScope: emptyDimension(AGENT_SCOPES),
+    byLineage: emptyDimension(LINEAGE),
+  };
+}
+
+function addComponents(target, source) {
+  for (const key of COMPONENT_KEYS) {
+    const value = source?.[key];
+    if (Number.isSafeInteger(value) && value >= 0) target[key] += value;
+  }
+}
+
+function addDimension(target, key, event) {
+  const row = target[key] ?? target.unknown;
+  row.events += 1;
+  row.totalTokens += event.totalTokens;
+  row.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+}
+
+function addComponentCosts(target, components, priced) {
+  const pricedByName = new Map(
+    (Array.isArray(priced?.components) ? priced.components : [])
+      .map((row) => [row.name, row]),
+  );
+  for (const key of COMPONENT_KEYS) {
+    const tokens = components[key] ?? 0;
+    const row = target[key];
+    const pricedRow = pricedByName.get(key);
+    row.tokens += tokens;
+    if (pricedRow?.pricingStatus === "priced") {
+      row.pricedTokens += tokens;
+      const cost = Number(pricedRow.costUsd);
+      if (Number.isFinite(cost) && cost >= 0) row.costUsd += cost;
+    } else {
+      row.unpricedTokens += tokens;
+    }
+  }
+}
+
+function eventProjection(event) {
+  const components = emptyComponents();
+  addComponents(components, event.components);
+  const separatedOutput = components.output_text_tokens
+    + components.output_reasoning_tokens;
+  // Prefer the more informative non-overlapping split when both the split and
+  // a combined alias are present. A combined-only count is preserved for
+  // display, but normalized to ordinary output solely for API pricing.
+  if (components.output_combined_tokens > 0 && separatedOutput > 0) {
+    components.output_combined_tokens = 0;
+  }
+  const totalTokens = tokenTotal(components);
+  if (totalTokens === 0) return null;
+  const model = safeModel(event.model);
+  const combinedOnly = components.output_combined_tokens > 0;
+  const pricingComponents = combinedOnly
+    ? {
+      ...components,
+      output_text_tokens: components.output_combined_tokens,
+      output_combined_tokens: 0,
+    }
+    : components;
+  let priced;
+  try {
+    priced = priceCodexUsageEvent({
+      ...event,
+      model,
+      components: pricingComponents,
+    }, {
+      apiServiceTier: "standard",
+      priceEpochBasis: "current_price_sensitivity",
+    });
+    if (combinedOnly) {
+      priced = {
+        ...priced,
+        components: priced.components.map((row) => (
+          row.name === "output_text_tokens"
+            ? {
+              ...row,
+              name: "output_combined_tokens",
+              pricedAs: "output_text_tokens",
+            }
+            : row
+        )),
+      };
+    }
+  } catch {
+    priced = {
+      totalUsd: "0",
+      coverageStatus: "unpriced",
+      components: [],
+    };
+  }
+  const cost = Number(priced.totalUsd);
+  return {
+    timestamp: event.timestamp,
+    model,
+    components,
+    totalTokens,
+    priced,
+    apiPriceEquivalentUsd: Number.isFinite(cost) && cost >= 0 ? cost : 0,
+    pricingCoverageStatus: ["fully_priced", "partially_priced"].includes(
+      priced.coverageStatus,
+    )
+      ? priced.coverageStatus
+      : "unpriced",
+    speed: safeEnum(event.tierSemantics?.codexSpeedMode, SPEEDS),
+    apiServiceTier: safeEnum(
+      event.tierSemantics?.apiServiceTier,
+      API_TIERS,
+    ),
+    surface: safeEnum(event.surfaceClassification?.surface, SURFACES),
+    agentScope: safeEnum(
+      event.surfaceClassification?.agentScope,
+      AGENT_SCOPES,
+    ),
+    lineage: safeEnum(
+      event.surfaceClassification?.lineageDisposition,
+      LINEAGE,
+    ),
+  };
+}
+
+function transitionUsageProjection(event) {
+  const components = COMPONENT_KEYS.map((key) => (
+    Number.isSafeInteger(event.components?.[key])
+      && event.components[key] >= 0
+      ? event.components[key]
+      : 0
+  ));
+  return [
+    canonicalInstant(event.timestamp),
+    safeModel(event.model),
+    Number.isSafeInteger(event.totalInputContextTokens)
+      && event.totalInputContextTokens >= 0
+      ? event.totalInputContextTokens
+      : 0,
+    ...components,
+    safeEnum(event.tierSemantics?.codexSpeedMode, SPEEDS),
+  ];
+}
+
+function weeklyRateLimitProjection(snapshot) {
+  const window = snapshot.window;
+  const boundedText = (value) => (
+    typeof value === "string"
+      && value.length > 0
+      && value.length <= 64
+      ? value
+      : "unknown"
+  );
+  return [
+    canonicalInstant(snapshot.timestamp),
+    Number.isFinite(snapshot.timestampMs)
+      ? snapshot.timestampMs
+      : Date.parse(snapshot.timestamp),
+    boundedText(window.provider),
+    boundedText(window.planType),
+    boundedText(window.limitId),
+    boundedText(window.slot),
+    window.windowDurationMins,
+    window.resetsAt,
+    window.usedPercent,
+  ];
+}
+
+function weeklyQuotaTimelineProjection(snapshot) {
+  const observedAt = canonicalInstant(snapshot?.timestamp);
+  const window = snapshot?.window;
+  // Keep only the fixed main Codex weekly family used by the UI calibration.
+  // The high-churn codex_bengalfox family is a different track, not a
+  // substitute for missing observations on this allowance.
+  if (observedAt === null
+      || !window
+      || typeof window !== "object"
+      || window.provider !== "openai_codex"
+      || window.limitId !== "codex"
+      || !QUOTA_SLOTS.has(window.slot)
+      || window.windowDurationMins !== WEEKLY_WINDOW_MINUTES
+      || typeof window.usedPercent !== "number"
+      || !Number.isFinite(window.usedPercent)
+      || window.usedPercent < 0
+      || window.usedPercent > 100
+      || !Number.isSafeInteger(window.resetsAt)
+      || window.resetsAt <= 0) {
+    return null;
+  }
+  const resetDate = new Date(window.resetsAt * 1_000);
+  if (!Number.isFinite(resetDate.getTime())) return null;
+  const resetAt = resetDate.toISOString();
+  const usedPercent = Number(window.usedPercent.toFixed(3));
+  return {
+    observedAt,
+    limitId: "codex",
+    slot: window.slot,
+    planType: QUOTA_PLANS.has(window.planType)
+      ? window.planType
+      : "unknown",
+    usedPercent,
+    remainingPercent: Number(Math.max(0, 100 - usedPercent).toFixed(3)),
+    durationMinutes: WEEKLY_WINDOW_MINUTES,
+    resetAt,
+    accountAttribution: "historical_unattributed",
+  };
+}
+
+function quotaTimelineTrackBucketKey(row) {
+  const observedMs = Date.parse(row.observedAt);
+  const bucketStartMs = Math.floor(observedMs / TIMELINE_BUCKET_MS)
+    * TIMELINE_BUCKET_MS;
+  return `${bucketStartMs}:${row.limitId}:${row.slot}:${row.durationMinutes}`;
+}
+
+function quotaTimelineRowTieBreak(row) {
+  return [
+    row.planType,
+    row.usedPercent.toFixed(3),
+    row.resetAt,
+  ].join("\0");
+}
+
+function retainWeeklyQuotaTimeline(buckets, snapshot) {
+  const row = weeklyQuotaTimelineProjection(snapshot);
+  if (row === null) return;
+  const key = quotaTimelineTrackBucketKey(row);
+  const prior = buckets.get(key);
+  if (prior === undefined
+      || row.observedAt > prior.observedAt
+      || (row.observedAt === prior.observedAt
+        && quotaTimelineRowTieBreak(row)
+          < quotaTimelineRowTieBreak(prior))) {
+    buckets.set(key, row);
+  }
+}
+
+function finalizeWeeklyQuotaTimeline(buckets) {
+  const rows = [...buckets.values()].sort((left, right) => (
+    left.observedAt.localeCompare(right.observedAt)
+    || left.limitId.localeCompare(right.limitId)
+    || left.slot.localeCompare(right.slot)
+    || left.resetAt.localeCompare(right.resetAt)
+    || left.planType.localeCompare(right.planType)
+    || left.usedPercent - right.usedPercent
+  ));
+  return rows.length <= MAX_QUOTA_TIMELINE_ROWS
+    ? rows
+    : rows.slice(rows.length - MAX_QUOTA_TIMELINE_ROWS);
+}
+
+function addEvent(period, event) {
+  period.events += 1;
+  period.totalTokens += event.totalTokens;
+  period.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+  addComponents(period.components, event.components);
+  addComponentCosts(period.componentCosts, event.components, event.priced);
+  const model = period.byModel[event.model] ??= {
+    model: event.model,
+    events: 0,
+    totalTokens: 0,
+    apiPriceEquivalentUsd: 0,
+    pricingCoverage: {
+      fullyPricedEvents: 0,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    },
+  };
+  model.events += 1;
+  model.totalTokens += event.totalTokens;
+  model.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+  model.pricingCoverage[
+    event.pricingCoverageStatus === "fully_priced"
+      ? "fullyPricedEvents"
+      : event.pricingCoverageStatus === "partially_priced"
+        ? "partiallyPricedEvents"
+        : "unpricedEvents"
+  ] += 1;
+  addDimension(period.bySpeed, event.speed, event);
+  addDimension(period.byApiServiceTier, event.apiServiceTier, event);
+  addDimension(period.bySurface, event.surface, event);
+  addDimension(period.byAgentScope, event.agentScope, event);
+  addDimension(period.byLineage, event.lineage, event);
+  if (event.pricingCoverageStatus === "fully_priced") {
+    period.pricingCoverage.fullyPricedEvents += 1;
+  } else if (event.pricingCoverageStatus === "partially_priced") {
+    period.pricingCoverage.partiallyPricedEvents += 1;
+  } else {
+    period.pricingCoverage.unpricedEvents += 1;
+  }
+}
+
+function roundedMoney(value) {
+  return Number(value.toFixed(6));
+}
+
+function finalizeDimension(dimension) {
+  return Object.fromEntries(Object.entries(dimension).map(([key, row]) => [
+    key,
+    {
+      ...row,
+      apiPriceEquivalentUsd: roundedMoney(row.apiPriceEquivalentUsd),
+    },
+  ]));
+}
+
+function finalizePeriod(period) {
+  const priced = period.pricingCoverage.fullyPricedEvents
+    + period.pricingCoverage.partiallyPricedEvents;
+  return {
+    ...period,
+    apiPriceEquivalentUsd: roundedMoney(period.apiPriceEquivalentUsd),
+    pricedEventFraction: period.events === 0
+      ? null
+      : Number((priced / period.events).toFixed(6)),
+    componentCosts: Object.fromEntries(
+      Object.entries(period.componentCosts).map(([key, row]) => [
+        key,
+        { ...row, costUsd: roundedMoney(row.costUsd) },
+      ]),
+    ),
+    byModel: Object.values(period.byModel)
+      .map((row) => ({
+        ...row,
+        apiPriceEquivalentUsd: roundedMoney(row.apiPriceEquivalentUsd),
+      }))
+      .sort((left, right) => (
+        right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd
+        || right.totalTokens - left.totalTokens
+        || left.model.localeCompare(right.model)
+      )),
+    bySpeed: finalizeDimension(period.bySpeed),
+    byApiServiceTier: finalizeDimension(period.byApiServiceTier),
+    bySurface: finalizeDimension(period.bySurface),
+    byAgentScope: finalizeDimension(period.byAgentScope),
+    byLineage: finalizeDimension(period.byLineage),
+  };
+}
+
+function newTimelineBucket(startMs) {
+  return {
+    startMs,
+    usageEvents: 0,
+    totalTokens: 0,
+    apiPriceEquivalentUsd: 0,
+    components: emptyComponents(),
+    pricingCoverage: {
+      fullyPricedEvents: 0,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    },
+  };
+}
+
+function addTimelineEvent(buckets, event) {
+  const observedMs = Date.parse(event.timestamp);
+  if (!Number.isFinite(observedMs)) return;
+  const startMs = Math.floor(observedMs / TIMELINE_BUCKET_MS)
+    * TIMELINE_BUCKET_MS;
+  const bucket = buckets.get(startMs) ?? newTimelineBucket(startMs);
+  bucket.usageEvents += 1;
+  bucket.totalTokens += event.totalTokens;
+  bucket.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+  addComponents(bucket.components, event.components);
+  bucket.pricingCoverage[
+    event.pricingCoverageStatus === "fully_priced"
+      ? "fullyPricedEvents"
+      : event.pricingCoverageStatus === "partially_priced"
+        ? "partiallyPricedEvents"
+        : "unpricedEvents"
+  ] += 1;
+  buckets.set(startMs, bucket);
+}
+
+function finalizeTimeline(buckets) {
+  return [...buckets.values()]
+    .sort((left, right) => left.startMs - right.startMs)
+    .map((bucket) => ({
+      startAt: new Date(bucket.startMs).toISOString(),
+      endAt: new Date(bucket.startMs + TIMELINE_BUCKET_MS).toISOString(),
+      usageEvents: bucket.usageEvents,
+      totalTokens: bucket.totalTokens,
+      apiPriceEquivalentUsd: roundedMoney(bucket.apiPriceEquivalentUsd),
+      components: bucket.components,
+      pricingCoverage: bucket.pricingCoverage,
+    }));
+}
+
+function publicDiagnostics(value) {
+  return {
+    filesScanned: Number.isSafeInteger(value?.filesScanned)
+      ? value.filesScanned
+      : 0,
+    forkReplayEventsExcluded: Number.isSafeInteger(value?.forkReplayEventsSkipped)
+      ? value.forkReplayEventsSkipped
+      : 0,
+    unattributedForkReplayEventsExcluded:
+      Number.isSafeInteger(value?.unattributedForkReplayEventsSkipped)
+        ? value.unattributedForkReplayEventsSkipped
+        : 0,
+    duplicateSnapshotsExcluded:
+      Number.isSafeInteger(value?.duplicateSnapshotsSkipped)
+        ? value.duplicateSnapshotsSkipped
+        : 0,
+    missingLineageParents: Number.isSafeInteger(value?.lineageParentsMissing)
+      ? value.lineageParentsMissing
+      : 0,
+  };
+}
+
+export function defaultReplaySafeAccountingCachePath(
+  root = process.cwd(),
+) {
+  return resolve(
+    root,
+    ".usage-monitor",
+    "local-replay-safe-accounting-v0.1.json",
+  );
+}
+
+export async function buildReplaySafeAccountingCache({
+  codexHome = join(homedir(), ".codex"),
+  now = () => Date.now(),
+  windowDays = DEFAULT_WINDOW_DAYS,
+  scan = scanCodexLogEvents,
+  signal = null,
+  transitionResourceLimits: requestedTransitionResourceLimits = null,
+  rss = () => process.memoryUsage().rss,
+  maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
+} = {}) {
+  const endMs = now();
+  if (!Number.isFinite(endMs)
+      || !Number.isSafeInteger(windowDays)
+      || windowDays < 1
+      || windowDays > 93
+      || typeof scan !== "function"
+      || !validAbortSignal(signal)
+      || typeof rss !== "function"
+      || !Number.isSafeInteger(maximumRssBytes)
+      || maximumRssBytes < 1) {
+    throw new TypeError("Replay-safe accounting options are invalid");
+  }
+  const checkRuntimeMemory = () => {
+    const currentRss = rss();
+    if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
+      throw fixedError("accounting_transition_rss_measurement_invalid");
+    }
+    if (currentRss > maximumRssBytes) {
+      throw fixedError("accounting_transition_rss_limit_exceeded");
+    }
+  };
+  checkRuntimeMemory();
+  const scanResourceGuard = createExportResourceGuard({
+    limits: { maximumRssBytes },
+    clock: now,
+    rss,
+  });
+  const limits = transitionResourceLimits(
+    requestedTransitionResourceLimits,
+  );
+  throwIfAborted(signal);
+  const startMs = endMs - windowDays * 24 * 60 * 60 * 1_000;
+  const starts = {
+    "24h": endMs - 24 * 60 * 60 * 1_000,
+    "7d": endMs - 7 * 24 * 60 * 60 * 1_000,
+    "30d": endMs - 30 * 24 * 60 * 60 * 1_000,
+    all: startMs,
+  };
+  const periods = new Map([
+    ["24h", newPeriod("24h", "Last 24 hours")],
+    ["7d", newPeriod("7d", "Last 7 days")],
+    ["30d", newPeriod("30d", "Last 30 days")],
+    ["all", newPeriod("all", `Cached ${windowDays}-day window`)],
+  ]);
+  const timeline = new Map();
+  const weeklyQuotaTimelineBuckets = new Map();
+  const rawUsageEvents = [];
+  const weeklyRateLimitSnapshots = [];
+  let retainedTransitionBytes = 0;
+  let retainedTransitionInputs = 0;
+  const reserveTransitionInput = (kind) => {
+    const usageCount = rawUsageEvents.length;
+    const snapshotCount = weeklyRateLimitSnapshots.length;
+    const combinedCount = usageCount + snapshotCount;
+    if (kind === "usage" && usageCount >= limits.usageEvents) {
+      throw fixedError("accounting_transition_usage_limit_exceeded");
+    }
+    if (kind === "snapshot" && snapshotCount >= limits.weeklySnapshots) {
+      throw fixedError("accounting_transition_snapshot_limit_exceeded");
+    }
+    if (combinedCount >= limits.combinedInputs) {
+      throw fixedError("accounting_transition_input_limit_exceeded");
+    }
+    const retainedBytes = kind === "usage"
+      ? COMPACT_USAGE_RETAINED_BYTES
+      : COMPACT_SNAPSHOT_RETAINED_BYTES;
+    if (retainedTransitionBytes + retainedBytes > limits.retainedBytes) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
+    }
+    retainedTransitionBytes += retainedBytes;
+    retainedTransitionInputs += 1;
+    if (retainedTransitionInputs % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+      checkRuntimeMemory();
+    }
+  };
+  let scanned;
+  try {
+    scanned = await scan({
+      startAt: new Date(startMs).toISOString(),
+      endAt: new Date(endMs).toISOString(),
+      codexHome,
+      resourceGuard: scanResourceGuard,
+      signal,
+      onUsage: (rawEvent) => {
+        throwIfAborted(signal);
+        const observedAt = canonicalInstant(rawEvent?.timestamp);
+        if (observedAt === null) return;
+        const observedMs = Date.parse(observedAt);
+        if (observedMs < startMs || observedMs > endMs + 5 * 60_000) return;
+        reserveTransitionInput("usage");
+        rawUsageEvents.push(transitionUsageProjection(rawEvent));
+        const event = eventProjection(rawEvent);
+        if (event === null) return;
+        for (const [id, period] of periods) {
+          if (observedMs >= starts[id]) addEvent(period, event);
+        }
+        addTimelineEvent(timeline, event);
+      },
+      onRateLimitSnapshot: (snapshot) => {
+        throwIfAborted(signal);
+        if (snapshot?.window?.windowDurationMins === 10_080) {
+          const observedAt = canonicalInstant(snapshot.timestamp);
+          const observedMs = observedAt === null
+            ? Number.NaN
+            : Date.parse(observedAt);
+          if (!Number.isFinite(observedMs)
+              || observedMs < startMs
+              || observedMs > endMs) return;
+          reserveTransitionInput("snapshot");
+          weeklyRateLimitSnapshots.push(weeklyRateLimitProjection(snapshot));
+          retainWeeklyQuotaTimeline(weeklyQuotaTimelineBuckets, snapshot);
+        }
+      },
+    });
+  } catch (error) {
+    const bounded = accountingScanResourceError(error);
+    if (bounded !== null) throw bounded;
+    throw error;
+  }
+  throwIfAborted(signal);
+  checkRuntimeMemory();
+  const retainedUsageEvents = rawUsageEvents.length;
+  const retainedWeeklySnapshots = weeklyRateLimitSnapshots.length;
+  let transitionSeries;
+  try {
+    transitionSeries = await deriveCodexTransitionSeriesCooperatively({
+      startAt: new Date(startMs).toISOString(),
+      endAt: new Date(endMs).toISOString(),
+      rawUsageEvents,
+      rateLimitSnapshots: weeklyRateLimitSnapshots,
+      diagnostics: scanned?.diagnostics ?? {},
+      includeSnapshotIntervals: false,
+      windowDurationMins: 10_080,
+      signal,
+      consumeInputs: true,
+      includeNormalizedInputs: false,
+      inputEncoding: "accounting_compact_v1",
+      resourceCheck: checkRuntimeMemory,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError"
+        || error?.code === "transition_derivation_aborted") {
+      const aborted = fixedError("accounting_refresh_aborted");
+      aborted.name = "AbortError";
+      throw aborted;
+    }
+    if ([
+      "transition_derivation_input_limit_exceeded",
+      "transition_derivation_row_limit_exceeded",
+      "transition_derivation_work_limit_exceeded",
+    ].includes(error?.code)) {
+      throw fixedError("accounting_transition_derivation_limit_exceeded");
+    }
+    throw error;
+  }
+  const weeklyCalibration = projectBoundedWeeklyCalibrationSummary({
+    parserVersion: PARSER_VERSION,
+    scope: {
+      startAt: new Date(startMs).toISOString(),
+      endAt: new Date(endMs).toISOString(),
+      snapshotIntervalsIncluded: false,
+    },
+    pricing: {
+      basis: "standard_openai_api_prices_not_codex_subscription_credits",
+    },
+    summary: {
+      deduplicatedRateLimitSnapshots:
+        transitionSeries.deduplicatedSnapshotCount,
+    },
+    transitions: transitionSeries.transitions,
+  });
+  throwIfAborted(signal);
+  return {
+    schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+    generatedAt: new Date(endMs).toISOString(),
+    coveredAt: {
+      startAt: new Date(startMs).toISOString(),
+      endAt: new Date(endMs).toISOString(),
+    },
+    bucketMinutes: TIMELINE_BUCKET_MS / 60_000,
+    accountingMethod:
+      "lineage_aware_cumulative_snapshot_replay_exclusion",
+    priceBasis: "official_api_price_equivalent_not_subscription_allowance",
+    priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
+    priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+    periods: [...periods.values()].map(finalizePeriod),
+    timeline: finalizeTimeline(timeline),
+    quotaTimeline: finalizeWeeklyQuotaTimeline(
+      weeklyQuotaTimelineBuckets,
+    ),
+    weeklyCalibration,
+    weeklyCalibrationInput: {
+      status: "complete",
+      encoding: "accounting_compact_v1",
+      retainedUsageEvents,
+      retainedWeeklySnapshots,
+      estimatedRetainedBytes: retainedTransitionBytes,
+      limits,
+    },
+    diagnostics: publicDiagnostics(scanned?.diagnostics),
+  };
+}
+
+export async function refreshReplaySafeAccountingCache({
+  cacheFile = defaultReplaySafeAccountingCachePath(),
+  ...options
+} = {}) {
+  const cache = await buildReplaySafeAccountingCache(options);
+  await writeJsonOwnerOnlyAtomic(cacheFile, cache);
+  return cache;
+}
+
+function validWeeklyCalibrationInput(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.status !== "complete"
+      || value.encoding !== "accounting_compact_v1"
+      || !Number.isSafeInteger(value.retainedUsageEvents)
+      || value.retainedUsageEvents < 0
+      || !Number.isSafeInteger(value.retainedWeeklySnapshots)
+      || value.retainedWeeklySnapshots < 0
+      || !Number.isSafeInteger(value.estimatedRetainedBytes)
+      || value.estimatedRetainedBytes < 0
+      || !value.limits
+      || typeof value.limits !== "object"
+      || Array.isArray(value.limits)) return false;
+  let limits;
+  try {
+    limits = transitionResourceLimits(value.limits);
+  } catch {
+    return false;
+  }
+  return value.retainedUsageEvents <= limits.usageEvents
+    && value.retainedWeeklySnapshots <= limits.weeklySnapshots
+    && value.retainedUsageEvents + value.retainedWeeklySnapshots
+      <= limits.combinedInputs
+    && value.estimatedRetainedBytes
+      === value.retainedUsageEvents * COMPACT_USAGE_RETAINED_BYTES
+        + value.retainedWeeklySnapshots * COMPACT_SNAPSHOT_RETAINED_BYTES
+    && value.estimatedRetainedBytes <= limits.retainedBytes;
+}
+
+function validQuotaTimeline(value, coveredAt) {
+  if (!Array.isArray(value) || value.length > MAX_QUOTA_TIMELINE_ROWS) {
+    return false;
+  }
+  const expectedKeys = [
+    "accountAttribution",
+    "durationMinutes",
+    "limitId",
+    "observedAt",
+    "planType",
+    "remainingPercent",
+    "resetAt",
+    "slot",
+    "usedPercent",
+  ].sort().join("\0");
+  const coverageStartMs = Date.parse(coveredAt.startAt);
+  const coverageEndMs = Date.parse(coveredAt.endAt);
+  const seenBuckets = new Set();
+  let priorSortKey = null;
+  for (const row of value) {
+    if (!row || typeof row !== "object" || Array.isArray(row)
+        || Object.keys(row).sort().join("\0") !== expectedKeys
+        || canonicalInstant(row.observedAt) === null
+        || canonicalInstant(row.resetAt) === null
+        || row.limitId !== "codex"
+        || !QUOTA_SLOTS.has(row.slot)
+        || !(QUOTA_PLANS.has(row.planType) || row.planType === "unknown")
+        || typeof row.usedPercent !== "number"
+        || !Number.isFinite(row.usedPercent)
+        || row.usedPercent < 0
+        || row.usedPercent > 100
+        || typeof row.remainingPercent !== "number"
+        || !Number.isFinite(row.remainingPercent)
+        || row.remainingPercent < 0
+        || row.remainingPercent > 100
+        || row.remainingPercent
+          !== Number(Math.max(0, 100 - row.usedPercent).toFixed(3))
+        || row.durationMinutes !== WEEKLY_WINDOW_MINUTES
+        || row.accountAttribution !== "historical_unattributed") {
+      return false;
+    }
+    const observedMs = Date.parse(row.observedAt);
+    if (observedMs < coverageStartMs || observedMs > coverageEndMs) {
+      return false;
+    }
+    const bucketKey = quotaTimelineTrackBucketKey(row);
+    if (seenBuckets.has(bucketKey)) return false;
+    seenBuckets.add(bucketKey);
+    const sortKey = [
+      row.observedAt,
+      row.limitId,
+      row.slot,
+      row.resetAt,
+      row.planType,
+      row.usedPercent.toFixed(3),
+    ].join("\0");
+    if (priorSortKey !== null && sortKey < priorSortKey) return false;
+    priorSortKey = sortKey;
+  }
+  return true;
+}
+
+function validCache(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion !== REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
+      || canonicalInstant(value.generatedAt) === null
+      || canonicalInstant(value.coveredAt?.startAt) === null
+      || canonicalInstant(value.coveredAt?.endAt) === null
+      || value.accountingMethod
+        !== "lineage_aware_cumulative_snapshot_replay_exclusion"
+      || !Array.isArray(value.periods)
+      || !Array.isArray(value.timeline)
+      || !validQuotaTimeline(value.quotaTimeline, value.coveredAt)
+      || !validWeeklyCalibrationInput(value.weeklyCalibrationInput)
+      || value.weeklyCalibration?.schemaVersion
+        !== "weekly-calibration-summary-v0.1"
+      || canonicalInstant(value.weeklyCalibration.generatedAt) === null
+      || !["estimated", "insufficient_evidence"].includes(
+        value.weeklyCalibration.status,
+      )
+      || value.weeklyCalibration.accountAttribution?.status
+        !== "historical_unattributed"
+      || value.weeklyCalibration.accountAttribution?.maySpanMultipleAccounts
+        !== true
+      || !Array.isArray(value.weeklyCalibration.recentResets)
+      || value.weeklyCalibration.recentResets.length
+        > BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT
+      || value.periods.length !== 4
+      || !Number.isSafeInteger(value.bucketMinutes)
+      || value.bucketMinutes !== 15) return false;
+  const ids = value.periods.map((row) => row?.id).sort().join(",");
+  return ids === "24h,30d,7d,all"
+    && value.periods.every((row) => (
+      Number.isSafeInteger(row.events)
+      && row.events >= 0
+      && Number.isSafeInteger(row.totalTokens)
+      && row.totalTokens >= 0
+      && typeof row.apiPriceEquivalentUsd === "number"
+      && Number.isFinite(row.apiPriceEquivalentUsd)
+      && row.apiPriceEquivalentUsd >= 0
+    ))
+    && value.timeline.every((row) => (
+      canonicalInstant(row?.startAt) !== null
+      && canonicalInstant(row?.endAt) !== null
+      && Number.isSafeInteger(row?.usageEvents)
+      && row.usageEvents >= 0
+      && Number.isSafeInteger(row?.totalTokens)
+      && row.totalTokens >= 0
+      && typeof row?.apiPriceEquivalentUsd === "number"
+      && Number.isFinite(row.apiPriceEquivalentUsd)
+      && row.apiPriceEquivalentUsd >= 0
+    ));
+}
+
+export async function readReplaySafeAccountingCache({
+  cacheFile = defaultReplaySafeAccountingCachePath(),
+  now = null,
+  maximumAgeMs = null,
+} = {}) {
+  if (now !== null && typeof now !== "function") {
+    throw new TypeError("now must be a function or null");
+  }
+  if (maximumAgeMs !== null
+      && (!Number.isSafeInteger(maximumAgeMs) || maximumAgeMs < 0)) {
+    throw new TypeError("maximumAgeMs must be a non-negative safe integer or null");
+  }
+  let metadata;
+  try {
+    metadata = await stat(cacheFile);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { status: "unavailable", errorCode: "cache_missing", cache: null };
+    }
+    return { status: "unavailable", errorCode: "cache_unavailable", cache: null };
+  }
+  if (!metadata.isFile() || metadata.size > MAX_CACHE_BYTES) {
+    return { status: "unavailable", errorCode: "cache_invalid_size", cache: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(cacheFile, "utf8"));
+  } catch {
+    return { status: "unavailable", errorCode: "cache_malformed", cache: null };
+  }
+  if (!validCache(parsed)) {
+    return { status: "unavailable", errorCode: "cache_invalid", cache: null };
+  }
+  if (now !== null) {
+    const nowMs = now();
+    if (!Number.isFinite(nowMs)) throw new TypeError("now must return a finite epoch timestamp");
+    const coverageEndMs = Date.parse(parsed.coveredAt.endAt);
+    if (coverageEndMs > nowMs) {
+      return {
+        status: "unavailable",
+        errorCode: "cache_from_future",
+        cache: null,
+      };
+    }
+    const ageMs = Math.max(0, nowMs - coverageEndMs);
+    if (maximumAgeMs !== null && ageMs > maximumAgeMs) {
+      return {
+        status: "stale",
+        errorCode: "cache_stale",
+        ageSeconds: Math.round(ageMs / 1_000),
+        cache: parsed,
+      };
+    }
+    return {
+      status: "available",
+      errorCode: null,
+      ageSeconds: Math.round(ageMs / 1_000),
+      cache: parsed,
+    };
+  }
+  return { status: "available", errorCode: null, cache: parsed };
+}
+
+export function assertReplaySafeAccountingCache(value) {
+  if (!validCache(value)) throw fixedError("cache_invalid");
+  return value;
+}

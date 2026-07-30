@@ -1034,6 +1034,94 @@ export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
   };
 }
 
+export const BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT = 64;
+
+export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
+  if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)
+      || (dataset.transitions !== undefined
+        && !Array.isArray(dataset.transitions))) {
+    throw new TypeError("Weekly calibration dataset is invalid");
+  }
+  const report = analyzeWeeklyCalibration(dataset, options);
+  const value = report.weeklyValueSummary;
+  const resets = report.resetValues
+    .slice(-BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT)
+    .map((row) => ({
+      resetIdentity: row.resetIdentity,
+      firstObservedAt: row.firstObservedAt,
+      lastObservedAt: row.lastObservedAt,
+      slot: row.slot,
+      observedSpanPercentagePoints: row.percentSpan,
+      apiPriceEquivalentUsd: row.apiPriceEquivalentUsd,
+      plausibleRangeUsd: {
+        lower: row.central80PairwiseUsd?.lower ?? null,
+        upper: row.central80PairwiseUsd?.upper ?? null,
+      },
+      eligibleTransitions: row.eligibleTransitions,
+      uniqueBoundaries: row.pointCount,
+      knownSpeedFraction: row.speedEvidence?.knownFraction ?? null,
+      holdoutMeanAbsoluteErrorPercentagePoints:
+        row.chronologicalHoldout?.meanAbsoluteErrorPp ?? null,
+    }));
+  return {
+    schemaVersion: "weekly-calibration-summary-v0.1",
+    status: value === null ? "insufficient_evidence" : "estimated",
+    generatedAt: report.materializedAt,
+    evidenceBasis:
+      "lineage_aware_local_usage_and_provider_percentage_snapshots",
+    interpretation:
+      "conditional_api_price_equivalent_not_provider_allowance_or_bill",
+    accountAttribution: {
+      status: "historical_unattributed",
+      maySpanMultipleAccounts: true,
+      label: "Historical estimate; account-unattributed and may combine multiple accounts",
+    },
+    estimate: value === null
+      ? null
+      : {
+        qualifyingResets: value.resetCount,
+        medianApiPriceEquivalentUsd: value.medianApiPriceEquivalentUsd,
+        plausibleRangeUsd: {
+          lower: value.central80AcrossResetsUsd?.lower ?? null,
+          upper: value.central80AcrossResetsUsd?.upper ?? null,
+        },
+        minimumUsd: value.minimumUsd,
+        maximumUsd: value.maximumUsd,
+      },
+    validation: {
+      selectedCostBasis: report.selection.selectedCandidateId,
+      sameResetHoldoutMeanAbsoluteErrorPercentagePoints:
+        report.accuracyFloorAssessment.sameResetMaePp,
+      priorResetMeanAbsoluteErrorPercentagePoints:
+        report.accuracyFloorAssessment.priorResetMaePp,
+      priorResetAbsoluteBiasPercentagePoints:
+        report.accuracyFloorAssessment.priorResetAbsoluteBiasPp,
+      forecastErrorP80PercentagePoints:
+        report.accuracyFloorAssessment.p80AbsoluteForecastErrorPp,
+      scoredPriorResets:
+        report.prospectiveStyleValidation.scoredResets,
+      scoredPriorPoints:
+        report.prospectiveStyleValidation.scoredPoints,
+    },
+    sourceCounts: {
+      rateLimitSnapshots:
+        Number.isSafeInteger(dataset.summary?.deduplicatedRateLimitSnapshots)
+          ? dataset.summary.deduplicatedRateLimitSnapshots
+          : 0,
+      weeklyTransitions: (dataset.transitions ?? [])
+        .filter((row) => row.windowDurationMins === WEEKLY_WINDOW_MINS)
+        .length,
+      qualifyingResetValues: report.quality.qualifyingResetValues,
+    },
+    recentResets: resets,
+    limitations: [
+      "Provider percentages are whole-number observations, not an exact debit ledger.",
+      "Historical local logs do not safely identify which account was active.",
+      "Unobserved shared-pool activity and provider-side accounting changes remain possible.",
+    ],
+  };
+}
+
 function money(value) {
   return Number.isFinite(value) ? `$${value.toFixed(2)}` : "unavailable";
 }

@@ -111,6 +111,22 @@ test("preparation applies both migrations, contains collection, and rechecks", (
       return { status: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
+        && joined.includes("sqlite_master")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: [{
+            admission_table: 1,
+            admission_guard: 1,
+            admission_counter: 1,
+            quarantine_reconciliation: 1,
+            lifecycle_status: 1,
+          }],
+        }]),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
         && args.includes("--json")) {
       return {
         status: 0,
@@ -140,12 +156,25 @@ test("preparation applies both migrations, contains collection, and rechecks", (
     workerDirectory,
     spawn,
   });
-  assert.deepEqual(result, {
-    ok: true,
-    code: "DISABLED_STAGING_PREPARED",
-    collectionAuthorized: false,
+  assert.equal(result.ok, true);
+  assert.equal(result.code, "DISABLED_STAGING_PREPARED");
+  assert.equal(result.collectionAuthorized, false);
+  assert.equal(result.secretsInstalled, true);
+  assert.equal(
+    result.receipt.schemaVersion,
+    "usage-monitor-staging-operation-receipt-v0.1",
+  );
+  assert.equal(result.receipt.operation, "disabled_staging_prepared");
+  assert.equal(result.receipt.activationState, "not_authorized");
+  assert.equal(result.receipt.collectionAuthorized, false);
+  assert.deepEqual(result.receipt.evidence, {
+    resourcesVerified: true,
+    migrationsCurrent: true,
+    pilotSchemaCurrent: true,
+    collectionContained: true,
     secretsInstalled: true,
   });
+  assert.equal(Number.isFinite(Date.parse(result.receipt.generatedAt)), true);
   assert.equal(applyCount, 2);
   assert.equal(containmentApplied, true);
 });

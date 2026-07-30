@@ -18,19 +18,29 @@ test("R7 materialized boundary benchmark emits measured, deterministic, honest p
   assert.equal(receipt.operations.every((row) => row.status === "not_run"), true);
   assert.equal(receipt.profileEvidence.harnessMetrics.runCount, 2);
   assert.equal(receipt.profileEvidence.harnessMetrics.externalRssSampleCount > 0, true);
-  assert.equal(receipt.boundaries.filter((row) => row.mode === "materialized").length, 0);
+  assert.equal(receipt.boundaries.filter((row) => row.mode === "materialized").length, 1);
   assert.equal(receipt.boundaries.filter((row) => row.mode === "synthetic_counter").length, 18);
   assert.equal(receipt.boundaries.filter((row) => row.identification === "identified").length, 0);
   for (const row of receipt.boundaries) {
-    assert.equal(row.producer.status, "not_run", row.dimension);
-    assert.equal(row.verifier.status, "not_run", row.dimension);
     if (row.dimension === "sqlite_batch_records") {
-      assert.equal(row.mode, "not_identified");
-      assert.equal(row.identification, "not_run");
-      assert.equal(row.atLimit.status, "not_run");
-      assert.equal(row.plusOne.status, "not_run");
+      assert.equal(row.mode, "materialized");
+      assert.equal(row.identification, "not_identified");
+      assert.equal(row.atLimit.status, "passed");
+      assert.equal(row.atLimit.failureCode, "none");
+      assert.equal(row.plusOne.status, "passed");
+      assert.equal(row.plusOne.failureCode, "none");
+      assert.deepEqual(row.producer, {
+        status: "not_applicable",
+        failureCode: "not_applicable",
+      });
+      assert.deepEqual(row.verifier, {
+        status: "enforced",
+        failureCode: "none",
+      });
       continue;
     }
+    assert.equal(row.producer.status, "not_run", row.dimension);
+    assert.equal(row.verifier.status, "not_run", row.dimension);
     assert.equal(row.identification, "not_identified", row.dimension);
     assert.equal(row.atLimit.value, row.selectedLimit, row.dimension);
     assert.equal(row.atLimit.status, "passed", row.dimension);
@@ -75,8 +85,15 @@ test("R7 materialized boundary benchmark emits measured, deterministic, honest p
     pathway: "resource_guard_from_file_stats",
   });
   assert.deepEqual(receipt.profileEvidence.sqliteBatch, {
-    status: "not_run",
-    reason: "no_injectable_sqlite_batch_seam",
+    batchLimitRecords: 1_000,
+    recordsIndexed: 1_001,
+    nonEmptyBatchCount: 2,
+    fullBatchCount: 1,
+    maximumBatchRecords: 1_000,
+    finalBatchRecords: 1,
+    pathway: "export_set_verifier_sqlite_index",
+    atBatchLimitStatus: "passed",
+    plusOneRolloverStatus: "passed",
   });
   assert.equal(receipt.determinism.status, "partial");
   assert.equal(receipt.network.activity, "not_measured");

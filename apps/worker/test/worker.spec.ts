@@ -23,6 +23,9 @@ import {
   recordDeletionTombstone,
   runBackendLifecycle,
 } from "../src/retention";
+import {
+  telemetryContributionAdmissionWindow,
+} from "../src/telemetry-repository";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -60,6 +63,19 @@ function testBindings(overrides: Partial<Env> = {}): Env {
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
     ...overrides,
   } as Env;
+}
+
+function d1PrepareProxy(
+  base: D1Database,
+  prepare: (query: string) => D1PreparedStatement,
+): D1Database {
+  return new Proxy(base, {
+    get(target, property) {
+      if (property === "prepare") return prepare;
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 async function api(
@@ -569,6 +585,199 @@ beforeEach(async () => {
 });
 
 describe("synthetic usage monitor service", () => {
+  it("atomically enrolls an invited participant with a claimable device bootstrap", async () => {
+    const inviteCode = await issueTestGrant();
+    const response = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        inviteCode,
+        deviceBootstrap: {
+          ongoingUpload: true,
+          consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        },
+      }),
+    }, inviteOnlyBindings());
+    expect(response.status).toBe(201);
+    const payload = await response.clone().json<{
+      participantId: string;
+      csrfToken: string;
+      recoveryCode: string;
+      session: { issuedAt: string; expiresAt: string };
+      pairing: {
+        pairingCode: string;
+        issuedAt: string;
+        expiresAt: string;
+      };
+    }>();
+    expect(payload).toMatchObject({
+      schemaVersion: "participant-bootstrap-v0.1",
+      state: "pairing_ready",
+      invitation: {
+        state: "redeemed",
+        redeemedAt: expect.any(String),
+        expiresAt: expect.any(String),
+      },
+      session: {
+        state: "active",
+        issuedAt: expect.any(String),
+        expiresAt: expect.any(String),
+      },
+      recovery: {
+        state: "issued",
+        issuedAt: expect.any(String),
+        expiresAt: null,
+        requiresAcknowledgement: true,
+      },
+      pairing: {
+        state: "claimable",
+        scope: "upload_registration",
+        oneUse: true,
+        pairingCode: expect.stringMatching(/^um_pair_/u),
+        issuedAt: expect.any(String),
+        expiresAt: expect.any(String),
+      },
+    });
+    expect(Date.parse(payload.session.expiresAt) - Date.parse(payload.session.issuedAt))
+      .toBe(30 * 60_000);
+    expect(Date.parse(payload.pairing.expiresAt) - Date.parse(payload.pairing.issuedAt))
+      .toBe(10 * 60_000);
+
+    const state = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM participants WHERE id = ?) AS participants,
+        (SELECT COUNT(*) FROM web_sessions WHERE participant_id = ?) AS sessions,
+        (SELECT COUNT(*) FROM device_pairings WHERE participant_id = ?) AS pairings,
+        (SELECT COUNT(*) FROM enrollment_grants
+          WHERE redeemed_participant_id = ? AND state = 'redeemed') AS grants`,
+    ).bind(
+      payload.participantId,
+      payload.participantId,
+      payload.participantId,
+      payload.participantId,
+    ).first<{
+      participants: number;
+      sessions: number;
+      pairings: number;
+      grants: number;
+    }>();
+    expect(state).toEqual({
+      participants: 1,
+      sessions: 1,
+      pairings: 1,
+      grants: 1,
+    });
+
+    const deviceId = crypto.randomUUID();
+    const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+    const secretHash = await deviceSecretHash(deviceId, rawSecret);
+    rawSecret.fill(0);
+    const claimed = await api("/api/v1/device-pairings/claim", {
+      method: "POST",
+      headers: {
+        authorization: `Pairing ${payload.pairing.pairingCode}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ deviceId, deviceSecretHash: secretHash }),
+    });
+    expect(claimed.status).toBe(201);
+    await expect(claimed.json()).resolves.toMatchObject({
+      deviceId,
+      state: "active",
+      scope: "upload_registration",
+      expiresAt: expect.any(String),
+    });
+  });
+
+  it("fails device bootstrap closed before redeeming an invite", async () => {
+    await setCollectionControls({ uploadRegistration: false });
+    const inviteCode = await issueTestGrant();
+    const inviteId = /^um_invite_([^.]+)\./u.exec(inviteCode)?.[1];
+    expect(inviteId).toBeTruthy();
+    const response = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        inviteCode,
+        deviceBootstrap: {
+          ongoingUpload: true,
+          consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        },
+      }),
+    }, inviteOnlyBindings());
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_REGISTRATION_DISABLED" },
+    });
+    const grant = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state, redeemed_participant_id FROM enrollment_grants WHERE id = ?",
+    ).bind(inviteId).first<{
+      state: string;
+      redeemed_participant_id: string | null;
+    }>();
+    expect(grant).toEqual({ state: "issued", redeemed_participant_id: null });
+    const participantCount = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM participants",
+    ).first<{ total: number }>();
+    expect(participantCount?.total).toBe(0);
+  });
+
+  it("rejects malformed or synthetic device bootstrap without side effects", async () => {
+    for (const body of [
+      {
+        consentVersion: "synthetic-preview-v0.1",
+        syntheticOnly: true,
+        deviceBootstrap: {
+          ongoingUpload: true,
+          consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        },
+      },
+      {
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        deviceBootstrap: null,
+      },
+      {
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        deviceBootstrap: {
+          ongoingUpload: true,
+          consentVersion: "ongoing-privacy-safe-telemetry-v0.2",
+        },
+      },
+      {
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        deviceBootstrap: {
+          ongoingUpload: true,
+          consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+          unexpected: true,
+        },
+      },
+    ]) {
+      const response = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "BODY_INVALID" },
+      });
+    }
+    const state = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM participants) AS participants,
+        (SELECT COUNT(*) FROM web_sessions) AS sessions,
+        (SELECT COUNT(*) FROM device_pairings) AS pairings`,
+    ).first<{ participants: number; sessions: number; pairings: number }>();
+    expect(state).toEqual({ participants: 0, sessions: 0, pairings: 0 });
+  });
+
   it("issues only a hash-backed secure cookie session and resists fixation", async () => {
     const response = await api("/api/v1/enroll", {
       method: "POST",
@@ -1822,6 +2031,197 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
+  it("renews bounded telemetry admission without refunding deleted batches", async () => {
+    const participant = await enrollTelemetry();
+    const expectedWindow = telemetryContributionAdmissionWindow(
+      Date.parse("2026-07-29T18:30:00.000Z"),
+    );
+    expect(expectedWindow).toEqual({
+      startsAt: "2026-07-27T00:00:00.000Z",
+      endsAt: "2026-08-03T00:00:00.000Z",
+    });
+    const currentWindow = telemetryContributionAdmissionWindow();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `INSERT INTO telemetry_contribution_admission_windows (
+        participant_id, window_started_at, accepted_count, last_accepted_at
+      ) VALUES (?, ?, 100, ?)`,
+    ).bind(
+      participant.participantId,
+      currentWindow.startsAt,
+      new Date().toISOString(),
+    ).run();
+
+    const exhaustedProfile = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    await expect(exhaustedProfile.json()).resolves.toMatchObject({
+      contributionAdmission: {
+        schemaVersion: "telemetry-contribution-admission-v0.1",
+        state: "exhausted",
+        window: {
+          kind: "fixed_utc",
+          anchor: "monday_00_00_utc",
+          startsAt: currentWindow.startsAt,
+          endsAt: currentWindow.endsAt,
+          durationMilliseconds: 7 * 24 * 60 * 60 * 1000,
+        },
+        acceptedBatches: 100,
+        remainingBatches: 0,
+        maximumBatches: 100,
+        slotRefundPolicy: "not_refunded_by_contribution_deletion",
+      },
+    });
+    const blocked = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    expect(blocked.status).toBe(429);
+    const retryAfterSeconds = Number(blocked.headers.get("retry-after"));
+    expect(Number.isSafeInteger(retryAfterSeconds)).toBe(true);
+    expect(retryAfterSeconds).toBeGreaterThan(0);
+    await expect(blocked.json()).resolves.toMatchObject({
+      error: {
+        code: "CONTRIBUTION_LIMIT_REACHED",
+        details: {
+          admission: {
+            schemaVersion: "telemetry-contribution-admission-v0.1",
+            state: "exhausted",
+            remainingBatches: 0,
+            maximumBatches: 100,
+            window: {
+              startsAt: currentWindow.startsAt,
+              endsAt: currentWindow.endsAt,
+            },
+          },
+          retryAt: currentWindow.endsAt,
+        },
+      },
+    });
+
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE telemetry_contribution_admission_windows
+          SET window_started_at = ?
+        WHERE participant_id = ? AND window_started_at = ?`,
+    ).bind(
+      new Date(
+        Date.parse(currentWindow.startsAt) - 7 * 24 * 60 * 60 * 1000,
+      ).toISOString(),
+      participant.participantId,
+      currentWindow.startsAt,
+    ).run();
+    const accepted = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("b"), true),
+    );
+    expect(accepted.status).toBe(202);
+    const acceptedBody = await accepted.json<{ contributionId: string }>();
+    const deleted = await contributionResource(
+      participant,
+      acceptedBody.contributionId,
+      "delete",
+    );
+    expect(deleted.status).toBe(200);
+
+    const afterDeletion = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    await expect(afterDeletion.json()).resolves.toMatchObject({
+      contributionCount: 0,
+      totalContributionCount: 0,
+      historyPolicy: {
+        maximumItems: 101,
+        truncated: false,
+      },
+      contributionAdmission: {
+        state: "available",
+        acceptedBatches: 1,
+        remainingBatches: 99,
+      },
+    });
+  });
+
+  it("pulls participant exports on demand with one bounded query per telemetry page", async () => {
+    const participant = await enrollTelemetry();
+    for (const suffix of ["a", "b", "c", "d", "e"]) {
+      const response = await uploadEnvelope(
+        participant,
+        await encrypt(telemetryFixture(suffix), true),
+      );
+      expect(response.status).toBe(202);
+    }
+    const stranger = await enrollTelemetry();
+    const strangerUpload = await uploadEnvelope(
+      stranger,
+      await encrypt(telemetryFixture("f"), true),
+    );
+    expect(strangerUpload.status).toBe(202);
+    const expected = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT id FROM telemetry_contributions
+        WHERE participant_id = ? ORDER BY created_at ASC, id ASC`,
+    ).bind(participant.participantId).all<{ id: string }>();
+    const strangerContributionId = (
+      await strangerUpload.json<{ contributionId: string }>()
+    ).contributionId;
+
+    const base = testBindings().USAGE_MONITOR_DB;
+    const slowQueries: string[] = [];
+    const slowDatabase = d1PrepareProxy(base, (query) => {
+      if (query.includes("WITH contribution_page AS")) slowQueries.push(query);
+      return base.prepare(query);
+    });
+    const slowResponse = await api("/api/v1/me/export", {
+      headers: personalHeaders(participant),
+    }, testBindings({ USAGE_MONITOR_DB: slowDatabase }));
+    expect(slowResponse.status).toBe(200);
+    expect(slowQueries).toHaveLength(0);
+    const slowReader = slowResponse.body!.getReader();
+    const prefix = await slowReader.read();
+    expect(prefix.done).toBe(false);
+    expect(new TextDecoder().decode(prefix.value)).toContain(
+      '"schemaVersion":"participant-export-v0.2"',
+    );
+    expect(slowQueries).toHaveLength(0);
+    const firstContribution = await slowReader.read();
+    expect(firstContribution.done).toBe(false);
+    expect(slowQueries).toHaveLength(1);
+    await Promise.resolve();
+    expect(slowQueries).toHaveLength(1);
+    await slowReader.cancel();
+    expect(slowQueries).toHaveLength(1);
+
+    const fullQueries: string[] = [];
+    const fullDatabase = d1PrepareProxy(base, (query) => {
+      if (query.includes("WITH contribution_page AS")) fullQueries.push(query);
+      return base.prepare(query);
+    });
+    const fullResponse = await api("/api/v1/me/export", {
+      headers: personalHeaders(participant),
+    }, testBindings({ USAGE_MONITOR_DB: fullDatabase }));
+    const exported = await fullResponse.json<{
+      schemaVersion: string;
+      participant: { participantId: string };
+      contributions: Array<{
+        contributionId: string;
+        records: Array<{ kind: string }>;
+      }>;
+    }>();
+    expect(exported.schemaVersion).toBe("participant-export-v0.2");
+    expect(exported.participant.participantId).toBe(participant.participantId);
+    expect(exported.contributions.map((row) => row.contributionId)).toEqual(
+      expected.results.map((row) => row.id),
+    );
+    expect(exported.contributions).toHaveLength(5);
+    expect(exported.contributions.every((row) => (
+      row.records.map((record) => record.kind).join(",") === "usage,quota"
+    ))).toBe(true);
+    expect(JSON.stringify(exported)).not.toContain(strangerContributionId);
+    expect(fullQueries).toHaveLength(2);
+    expect(fullQueries.every((query) => (
+      query.includes("WHERE c.participant_id = ?")
+        && query.includes("WHERE selected_page.participant_id = ?")
+    ))).toBe(true);
+  });
+
   it("ingests closed telemetry, deduplicates overlaps, and isolates participant data", async () => {
     const participant = await enrollTelemetry();
     const firstEnvelope = await encrypt(telemetryFixture("a"), true);
@@ -2358,6 +2758,12 @@ describe("synthetic usage monitor service", () => {
       );
       expect(contribution.status).toBe(202);
       const contributionBody = await contribution.json<{ contributionId: string }>();
+      await testBindings().USAGE_MONITOR_DB.prepare(
+        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+      ).bind(
+        "2026-07-28T23:59:59.000Z",
+        contributionBody.contributionId,
+      ).run();
       if (index === 0) contributionToDelete = contributionBody.contributionId;
     }
     const cutoffContribution = await uploadEnvelope(

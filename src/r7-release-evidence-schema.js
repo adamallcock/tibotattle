@@ -286,7 +286,7 @@ function trialCodeErrors(trial, path, expectedCode, strictRejection = true) {
 
 function surfaceCodeErrors(surface, path, expectedCode) {
   const expected = surface.status === "enforced"
-    ? expectedCode
+    ? expectedCode ?? "none"
     : surface.status === "not_run"
       ? "not_run_profile"
       : surface.status === "not_applicable"
@@ -412,14 +412,16 @@ function decisionErrors(receipt) {
           "materialized-artifact-encoded-bytes-measured",
         ));
       }
-      // The retained aggregate explicitly records that the SQLite batch seam
-      // was not run. This profile therefore remains partial until a new schema
-      // version can represent completed evidence for that gate.
-      if (receipt.profileEvidence.sqliteBatch.status === "not_run"
-          && receipt.outcome === "passed") {
+      const sqlite = receipt.profileEvidence.sqliteBatch;
+      if (sqlite.batchLimitRecords !== DEFAULT_EXPORT_RESOURCE_LIMITS.maximumSqliteBatchRecords
+          || sqlite.recordsIndexed !== sqlite.batchLimitRecords + 1
+          || sqlite.maximumBatchRecords !== sqlite.batchLimitRecords
+          || sqlite.nonEmptyBatchCount !== 2
+          || sqlite.fullBatchCount !== 1
+          || sqlite.finalBatchRecords !== 1) {
         errors.push(invariant(
-          "/outcome",
-          "materialized-sqlite-gate-open",
+          "/profileEvidence/sqliteBatch",
+          "materialized-sqlite-batch-rollover",
         ));
       }
     }

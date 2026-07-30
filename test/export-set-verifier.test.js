@@ -150,6 +150,14 @@ test("set verifier accepts a complete deterministic multi-chunk set", async () =
     assert.equal(result.bundleBytes, value.manifest.totals.decodedBundleBytes);
     assert.equal(result.decodedBundleBytes, value.manifest.totals.decodedBundleBytes);
     assert.equal(result.encodedArtifactBytes, value.manifest.totals.encodedArtifactBytes);
+    assert.deepEqual(result.verificationIndex, {
+      batchLimitRecords: 1_000,
+      recordsIndexed: 2,
+      nonEmptyBatchCount: 1,
+      fullBatchCount: 0,
+      maximumBatchRecords: 2,
+      finalBatchRecords: 2,
+    });
     assert.equal((await readdir(value.output)).filter((name) => name.endsWith(".bundle.json.gz")).length, 2);
     assert.equal(result.transportReady, false);
   } finally {
@@ -169,6 +177,26 @@ test("set verifier bounds directory enumeration using the requested resource pol
         && error.code === "export_resource_directory_entries"
         && !error.message.includes(value.output),
     );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("set verifier honors a lower normalized SQLite transaction batch policy", async () => {
+  const value = await localSet();
+  try {
+    const result = await verifyLocalExportSet({
+      directory: value.output,
+      resourceLimits: { maximumSqliteBatchRecords: 1 },
+    });
+    assert.deepEqual(result.verificationIndex, {
+      batchLimitRecords: 1,
+      recordsIndexed: 2,
+      nonEmptyBatchCount: 2,
+      fullBatchCount: 2,
+      maximumBatchRecords: 1,
+      finalBatchRecords: 1,
+    });
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

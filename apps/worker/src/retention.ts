@@ -276,6 +276,7 @@ export async function runBackendLifecycle(
       `UPDATE retention_state
           SET state = 'completed',
               last_completed_at = ?,
+              maintenance_run_at = ?,
               quarantine_cutoff_at = ?,
               quarantine_objects_deleted = ?,
               quarantine_retention_complete = ?,
@@ -285,6 +286,7 @@ export async function runBackendLifecycle(
         WHERE singleton = 1`,
     ).bind(
       completedAt,
+      startedAt,
       quarantineCutoffAt,
       quarantineRetention.deleted,
       Number(quarantineRetention.complete),
@@ -302,6 +304,7 @@ export async function runBackendLifecycle(
     await db.prepare(
       `UPDATE retention_state
           SET state = 'failed',
+              maintenance_run_at = NULL,
               failure_code = 'LIFECYCLE_PASS_FAILED'
         WHERE singleton = 1`,
     ).run();

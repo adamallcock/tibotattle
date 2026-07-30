@@ -121,6 +121,7 @@ class ParticipantSession {
     this.cookie = null;
     this.csrfToken = null;
     this.recoveryCode = null;
+    this.bootstrapPairing = null;
     this.created = false;
     this.deleted = false;
   }
@@ -361,11 +362,20 @@ async function triggerScheduledSnapshot(scheduledTime) {
   }
 }
 
-async function enrollParticipant(inviteCode = null) {
+async function enrollParticipant(
+  inviteCode = null,
+  { deviceBootstrap = false } = {},
+) {
   const session = new ParticipantSession();
   const body = {
     consentVersion: "privacy-safe-telemetry-v0.1",
     syntheticOnly: false,
+    ...(deviceBootstrap ? {
+      deviceBootstrap: {
+        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        ongoingUpload: true,
+      },
+    } : {}),
   };
   if (inviteCode) body.inviteCode = inviteCode;
   const result = await request("/api/v1/enroll", {
@@ -379,12 +389,29 @@ async function enrollParticipant(inviteCode = null) {
   if (typeof enrollment?.participantId !== "string"
       || typeof enrollment?.csrfToken !== "string"
       || typeof enrollment?.recoveryCode !== "string"
+      || enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
+      || enrollment?.state !== (deviceBootstrap ? "pairing_ready" : "enrolled")
+      || enrollment?.session?.state !== "active"
+      || !Number.isFinite(Date.parse(enrollment?.session?.issuedAt))
+      || !Number.isFinite(Date.parse(enrollment?.session?.expiresAt))
+      || enrollment?.recovery?.state !== "issued"
+      || enrollment?.recovery?.requiresAcknowledgement !== true
+      || (deviceBootstrap
+        ? enrollment?.pairing?.state !== "claimable"
+          || enrollment?.pairing?.scope !== "upload_registration"
+          || enrollment?.pairing?.oneUse !== true
+          || typeof enrollment?.pairing?.pairingCode !== "string"
+          || !enrollment.pairing.pairingCode.startsWith("um_pair_")
+          || !Number.isFinite(Date.parse(enrollment?.pairing?.issuedAt))
+          || !Number.isFinite(Date.parse(enrollment?.pairing?.expiresAt))
+        : enrollment?.pairing !== null)
       || Object.hasOwn(enrollment, "accessToken")
       || !session.cookie) {
     throw new Error("Enrollment did not establish the bounded session contract.");
   }
   session.csrfToken = enrollment.csrfToken;
   session.recoveryCode = enrollment.recoveryCode;
+  session.bootstrapPairing = enrollment.pairing;
   session.created = true;
   sessions.push(session);
 
@@ -419,20 +446,10 @@ async function registerUpload(session, serializedEnvelope) {
   return registration.uploadAuthorization;
 }
 
-async function pairDevice(session) {
-  const pairing = expectStatus(
-    await request("/api/v1/me/device-pairings", {
-      method: "POST",
-      session,
-      csrf: true,
-      body: JSON.stringify({
-        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
-        ongoingUpload: true,
-      }),
-    }),
-    201,
-    "Device pairing",
-  );
+async function pairDevice(session, pairing = session.bootstrapPairing) {
+  if (!pairing) {
+    throw new Error("Enrollment did not supply the atomic device bootstrap.");
+  }
   if (typeof pairing?.pairingCode !== "string"
       || !pairing.pairingCode.startsWith("um_pair_")
       || typeof pairing.expiresAt !== "string") {
@@ -596,7 +613,10 @@ try {
   });
   const serializedEnvelope = JSON.stringify(envelope);
 
-  const primary = await enrollParticipant(inviteCodes[0] ?? null);
+  const primary = await enrollParticipant(
+    inviteCodes[0] ?? null,
+    { deviceBootstrap: true },
+  );
 
   const missingCsrf = await request("/api/v1/me/upload-authorizations", {
     method: "POST",

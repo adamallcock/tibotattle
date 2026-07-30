@@ -43,8 +43,16 @@ export async function buildLocalMetadataBundle({
   resourceClock = () => Date.now(),
   resourceRss = () => process.memoryUsage().rss,
   resourceGuard: suppliedResourceGuard = null,
+  signal = null,
 } = {}) {
   if (!secret) throw new Error("A participant export secret is required");
+  if (signal !== null
+      && (typeof signal !== "object"
+        || typeof signal.aborted !== "boolean"
+        || typeof signal.addEventListener !== "function")) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  signal?.throwIfAborted?.();
   const bounds = normalizeExportBounds(startAt, endAt);
   if (suppliedResourceGuard && Object.keys(resourceLimits).length > 0) {
     throw new TypeError("Provide either a resource guard or resource limit overrides, not both");
@@ -71,7 +79,9 @@ export async function buildLocalMetadataBundle({
       else throw new Error(`Unsupported safe record type: ${recordType}`);
     },
     resourceGuard,
+    signal,
   });
+  signal?.throwIfAborted?.();
 
   const compatibility = exportCompatibilityTuple();
   safeMarkers

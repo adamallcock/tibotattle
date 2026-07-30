@@ -574,11 +574,11 @@ const artifact = {
       { id: "weekly_calibration", label: "Local seven-day calibration result", path: ".usage-monitor/weekly-calibration-v0.2.json" },
       { id: "historical_transitions", label: "Replay-safe historical transition ledger", path: ".usage-monitor/transitions-simple-history-2026-06-11-to-2026-07-24-v0.3.2.json" },
       { id: "calibration_code", label: "Calibration implementation", path: "src/weekly-calibration.js" },
-      { id: "calibration_goal", label: "Calibration goal and completion criteria", path: "2026-07-24-weekly-7-day-calibration-goal.md" },
+      { id: "calibration_goal", label: "Calibration goal and completion criteria", path: "docs/goals/2026-07-24-weekly-7-day-calibration-goal.md" },
       { id: "provider_crosscheck", label: "Account-level provider daily-token cross-check", path: ".usage-monitor/provider-crosscheck-v0.1.json" },
       { id: "experiment_results", label: "Controlled experiment result ledger", path: ".usage-monitor/experiment-results.jsonl" },
       { id: "high_error_audit", label: "Privacy-safe high-error reset surface audit", path: ".usage-monitor/weekly-calibration-high-error-audit-v0.1.json" },
-      { id: "accuracy_floor_decision", label: "Accuracy-floor decision record", path: "2026-07-24-usage-accuracy-floor-decision.md" },
+      { id: "accuracy_floor_decision", label: "Accuracy-floor decision record", path: "docs/decisions/2026-07-24-usage-accuracy-floor-decision.md" },
       { id: "agentic_pool_policy", label: "OpenAI Codex pricing and usage-limit policy", href: "https://learn.chatgpt.com/docs/pricing" },
     ],
     filters: [],
@@ -653,7 +653,7 @@ const artifact = {
       },
     },
     { id: "calibration_code", path: "src/weekly-calibration.js", description: "Reusable model selection, robust fitting, quality gates, and no-look-ahead validation implementation." },
-    { id: "calibration_goal", path: "2026-07-24-weekly-7-day-calibration-goal.md", description: "Dated implementation objective and completion criteria." },
+    { id: "calibration_goal", path: "docs/goals/2026-07-24-weekly-7-day-calibration-goal.md", description: "Dated implementation objective and completion criteria." },
     {
       id: "provider_crosscheck",
       query: {
@@ -690,7 +690,7 @@ const artifact = {
         tables_used: [".usage-monitor/weekly-calibration-high-error-audit-v0.1.json"],
       },
     },
-    { id: "accuracy_floor_decision", path: "2026-07-24-usage-accuracy-floor-decision.md", description: "Requirement-by-requirement stopping decision, empirical uncertainty, validation receipt, and prospective reopen trigger." },
+    { id: "accuracy_floor_decision", path: "docs/decisions/2026-07-24-usage-accuracy-floor-decision.md", description: "Requirement-by-requirement stopping decision, empirical uncertainty, validation receipt, and prospective reopen trigger." },
     {
       id: "agentic_pool_policy",
       label: "OpenAI Codex pricing and usage-limit policy",

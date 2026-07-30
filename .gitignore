@@ -1,6 +1,7 @@
 # Dependencies and editor/OS noise
 node_modules/
 .DS_Store
+.playwright-cli/
 
 # Local monitor state and raw evidence.  These files can contain account-scoped
 # observations or data reconstructed from private rollout logs.
@@ -19,7 +20,11 @@ staging/
 *.umx.json
 *.privacy-receipt.json
 .release-build/
+.release-deps/
 .release-repro/
+.r7-release-evidence-install-v1.json
+.r7-release-evidence-staging-*/
+.r7-release-evidence-backup-*/
 
 # Credentials and local configuration (commit an explicitly reviewed example only).
 .env
@@ -30,6 +35,7 @@ staging/
 !.dev.vars.example
 .wrangler/
 .wrangler-dry-run/
+apps/cloud-run/service.rendered.yaml
 *.pem
 *.key
 *.p12

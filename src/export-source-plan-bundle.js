@@ -84,6 +84,7 @@ function combinedPlanGuard(resourceGuard) {
     checkRuntime: resourceGuard.checkRuntime.bind(resourceGuard),
     observeDirectoryEntry: resourceGuard.observeDirectoryEntry.bind(resourceGuard),
     observeLine: resourceGuard.observeLine.bind(resourceGuard),
+    assertSourceSelection: resourceGuard.assertSourceSelection.bind(resourceGuard),
     observeSourceFile() {
       resourceGuard.checkRuntime();
     },
