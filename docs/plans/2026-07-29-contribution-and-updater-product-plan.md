@@ -90,9 +90,10 @@ the same policy.
 5. Before a public switch, choose and approve the first-party source license.
    No first-party `LICENSE` or `COPYING` file exists today. A public repository
    without a license would be source-visible but not open source.
-6. Commit and push the completed current source to the existing private remote
-   after tests and a renewed secret/privacy scan. The current dirty working
-   tree is not yet claimed to be pushed or artifact-bound.
+6. The completed reviewed source was committed and pushed to the existing
+   private remote as `26050e3b2ecbbb429cca4fe1ace1c08e1b1af639` after the
+   staged patch and full history passed renewed secret scans. Production
+   release artifacts remain separately human-gated.
 
 ## Configurable product target
 
@@ -295,9 +296,9 @@ reporting interface. Do not copy CodexBar's large multi-provider controller.
 - Implemented and tested: the public release builder accepts only the primary
   `arm64` pilot artifact and rejects Intel-only or universal architecture
   claims.
-- Still human-gated: the reviewed current source must be committed and pushed
-  to the existing private GitHub repository with no raw logs, secrets, or
-  release artifacts.
+- Completed: the reviewed source was committed and pushed to the existing
+  private GitHub repository as `26050e3b2ecbbb429cca4fe1ace1c08e1b1af639`
+  with no raw logs, secrets, or release artifacts.
 
 ## Remaining human and cloud gates
 

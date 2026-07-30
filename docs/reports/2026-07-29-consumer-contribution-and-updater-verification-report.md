@@ -30,11 +30,11 @@ primary Apple-silicon Mac pilot:
 - development/ad-hoc builds contain no Sparkle framework and perform no updater
   networking.
 
-This is not a public-release verdict. The configured GitHub remote is private,
-the current working tree is not yet committed and artifact-bound, no
-first-party source license exists, Cloudflare staging is blocked and
-collection remains unauthorized, and no Developer-ID-signed/notarized app,
-live appcast, public download, or clean-Mac update has been produced.
+This is not a public-release verdict. The reviewed source is pushed to the
+private GitHub remote, but no first-party source license exists, Cloudflare
+staging is blocked and collection remains unauthorized, and no
+Developer-ID-signed/notarized app, live appcast, public download, or clean-Mac
+update has been produced.
 
 ## Product boundary
 
@@ -310,11 +310,15 @@ native app, loopback companion, dashboard, release-site artifact, and hosted
 backend. It excludes raw logs, owner-only local analysis, credentials, signing
 material, and generated release artifacts.
 
-The worktree remains intentionally dirty during integration. No claim is made
-that the exact current bytes have been pushed or bound to a distributable
-binary. That requires owner review, a renewed secret/privacy scan, a commit and
-push to the private remote, and an artifact/source inventory generated from
-those exact bytes.
+The reviewed source was committed and pushed to the private remote as
+`26050e3b2ecbbb429cca4fe1ace1c08e1b1af639`. The exact staged patch was scanned
+before commit with no leaks found, and a post-commit scan covered all 69
+commits (about 9.33 MB) with no leaks found. Raw local evidence, credentials,
+prepared exports, updater/signing material, and generated app bundles remain
+ignored. The development app's source inventory and payload hashes above bind
+the locally validated artifact; a distributable production binary still
+requires the signed/notarized release path and a final artifact-to-commit
+receipt.
 
 There is no first-party `LICENSE`, `LICENSE.*`, `COPYING`, or `COPYING.*` file
 in the repository. The included
@@ -500,8 +504,8 @@ No repository-only action can safely complete these:
 9. approve cloud backup and deletion-tombstone horizons, stopped-service
    restore, R2 reconciliation/deletion retry, alerts, incident ownership,
    support ownership, and spend limits;
-10. commit and push the exact reviewed source to the private remote, bind the
-    release artifact to that source inventory, and authorize publication; and
+10. bind the production release artifact to the reviewed source commit and
+    authorize publication; and
 11. explicitly authorize the first real invitation and participant collection.
 
 ## Deliberately unsupported or unproven
