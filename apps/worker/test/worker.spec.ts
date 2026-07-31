@@ -1348,6 +1348,66 @@ describe("synthetic usage monitor service", () => {
     expect(count?.total).toBe(0);
   });
 
+  it("enrolls open-mode production participants with grant-backed eligibility", async () => {
+    const env = testBindings({
+      ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+    });
+    const response = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+      }),
+    }, env);
+    expect(response.status).toBe(201);
+    const payload = await response.clone().json<{ participantId: string }>();
+    const eligibility = await env.USAGE_MONITOR_DB.prepare(
+      `SELECT e.participant_id AS participantId, e.grant_id AS grantId,
+              g.state AS state
+         FROM participant_community_eligibility e
+         JOIN enrollment_grants g ON g.id = e.grant_id
+        WHERE e.participant_id = ?`,
+    ).bind(payload.participantId).first<{
+      participantId: string;
+      grantId: string;
+      state: string;
+    }>();
+    expect(eligibility?.participantId).toBe(payload.participantId);
+    expect(eligibility?.grantId.startsWith("open:")).toBe(true);
+    expect(eligibility?.state).toBe("redeemed");
+
+    const synthetic = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "synthetic-preview-v0.1",
+        syntheticOnly: true,
+      }),
+    }, env);
+    expect(synthetic.status).toBe(201);
+    const syntheticPayload = await synthetic.clone().json<{
+      participantId: string;
+    }>();
+    const syntheticEligibility = await env.USAGE_MONITOR_DB.prepare(
+      `SELECT COUNT(*) AS total FROM participant_community_eligibility
+        WHERE participant_id = ?`,
+    ).bind(syntheticPayload.participantId).first<{ total: number }>();
+    expect(syntheticEligibility?.total).toBe(0);
+
+    const inviteKeyRejection = await api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        inviteCode: "invite:unused",
+      }),
+    }, env);
+    expect(inviteKeyRejection.status).toBe(400);
+  });
+
   it("rejects missing, malformed, expired, and replayed grants without reflecting values", async () => {
     const expired = await issueTestGrant({
       expiresAt: new Date(Date.now() - 60_000).toISOString(),

@@ -272,7 +272,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     ? ["consentVersion", "syntheticOnly", "inviteCode", "deviceBootstrap"]
     : ["consentVersion", "syntheticOnly", "deviceBootstrap"];
   if (keys.some((key) => !allowedKeys.includes(key))
-      || (mode === "local_open"
+      || ((mode === "local_open" || mode === "open")
         && keys.length !== (deviceBootstrapRequested ? 3 : 2))) {
     throw new ApiError(400, "BODY_INVALID");
   }
@@ -290,7 +290,11 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     env.USAGE_MONITOR_DB,
     consentVersion,
     inviteGrant,
-    { deviceBootstrap: deviceBootstrapRequested },
+    {
+      deviceBootstrap: deviceBootstrapRequested,
+      openCommunityEligibility: mode === "open"
+        && Reflect.get(body.value, "syntheticOnly") === false,
+    },
   );
   return jsonResponse({
     schemaVersion: "participant-bootstrap-v0.1",

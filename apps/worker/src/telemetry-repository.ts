@@ -1515,7 +1515,7 @@ export async function communityStats(
       suppressed: true,
       participantCount,
       minimumParticipants,
-      cohortEligibility: eligibleOnly ? "invite_only" : "local_open_development",
+      cohortEligibility: eligibleOnly ? "grant_backed" : "all_enrolled",
       reason: "minimum_cohort_not_met",
     };
   }
@@ -1557,7 +1557,7 @@ export async function communityStats(
     suppressed: false,
     participantCount,
     minimumParticipants,
-    cohortEligibility: eligibleOnly ? "invite_only" : "local_open_development",
+    cohortEligibility: eligibleOnly ? "grant_backed" : "all_enrolled",
     totals: {
       usageEvents: totals.usage_events,
       quotaSnapshots: totals.quota_snapshots,

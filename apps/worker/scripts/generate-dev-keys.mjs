@@ -46,15 +46,15 @@ function main() {
     : process.argv.length === 4 && process.argv[2] === "--environment"
       ? process.argv[3]
       : null;
-  if (!["local", "staging"].includes(environment)) {
+  if (!["local", "staging", "production"].includes(environment)) {
     process.stderr.write(
-      "Usage: generate-dev-keys.mjs [--environment local|staging]\n",
+      "Usage: generate-dev-keys.mjs [--environment local|staging|production]\n",
     );
     process.exit(2);
   }
-  const filename = environment === "staging"
-    ? ".dev.vars.staging"
-    : ".dev.vars";
+  const filename = environment === "local"
+    ? ".dev.vars"
+    : `.dev.vars.${environment}`;
   const result = generateEnvelopeKeys(resolve(filename));
   if (!result.ok) {
     process.stderr.write(

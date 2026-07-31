@@ -2,7 +2,7 @@ import { sha256, timingSafeEqual } from "./crypto";
 import { ENROLLMENT_MODES } from "./constants";
 import { ApiError } from "./errors";
 
-export type EnrollmentMode = "local_open" | "invite_only" | "disabled";
+export type EnrollmentMode = "local_open" | "open" | "invite_only" | "disabled";
 
 export interface ParsedInviteGrant {
   id: string;

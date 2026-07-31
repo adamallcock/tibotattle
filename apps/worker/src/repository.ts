@@ -1,4 +1,5 @@
 import {
+  hashInviteGrantSecret,
   inviteGrantHashMatches,
   type ParsedInviteGrant,
 } from "./admission";
@@ -120,6 +121,13 @@ export interface Enrollment {
 export interface EnrollmentOptions {
   deviceBootstrap?: boolean;
   nowEpoch?: number;
+  /**
+   * Open (non-invite) production enrollment still records community
+   * eligibility through a server-issued, immediately redeemed grant so the
+   * grant-backed eligibility trigger and audit trail hold for every cohort
+   * member.
+   */
+  openCommunityEligibility?: boolean;
 }
 
 function capability(prefix: "um_recovery"): {
@@ -205,9 +213,42 @@ export async function enroll(
   ];
   let invitationExpiresAt: string | null = null;
   if (!inviteGrant) {
-    const results = await db.batch(enrollmentStatements);
-    if (results.some((entry) => entry.meta.changes !== 1)) {
-      throw new ApiError(500, "INTERNAL_ERROR");
+    if (options.openCommunityEligibility) {
+      const grantId = `open:${crypto.randomUUID()}`;
+      const grantSecretHash = await hashInviteGrantSecret(
+        grantId,
+        randomSecret(32),
+      );
+      const grantExpiresAt = new Date(nowEpoch + 5 * 60 * 1_000).toISOString();
+      const eligibilityId = `eligibility:${crypto.randomUUID()}`;
+      const results = await db.batch([
+        participantInsert,
+        db.prepare(
+          `INSERT INTO enrollment_grants (
+            id, secret_hash, state, issued_at, expires_at
+          ) VALUES (?, ?, 'issued', ?, ?)`,
+        ).bind(grantId, grantSecretHash, now, grantExpiresAt),
+        db.prepare(
+          `UPDATE enrollment_grants
+              SET state = 'redeemed', redeemed_at = ?, redeemed_participant_id = ?
+            WHERE id = ? AND state = 'issued'`,
+        ).bind(now, participantId, grantId),
+        db.prepare(
+          `INSERT INTO participant_community_eligibility (
+            id, participant_id, grant_id, created_at
+          ) VALUES (?, ?, ?, ?)`,
+        ).bind(eligibilityId, participantId, grantId, now),
+        sessionInsert(db, session),
+        ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
+      ]);
+      if (results.some((entry) => entry.meta.changes !== 1)) {
+        throw new ApiError(500, "INTERNAL_ERROR");
+      }
+    } else {
+      const results = await db.batch(enrollmentStatements);
+      if (results.some((entry) => entry.meta.changes !== 1)) {
+        throw new ApiError(500, "INTERNAL_ERROR");
+      }
     }
   } else {
     const grant = await db.prepare(
