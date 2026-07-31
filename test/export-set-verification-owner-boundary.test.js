@@ -207,7 +207,7 @@ test("local-review uses reviewed verifier composition and debt is removed", asyn
     architecture.indexOf("]);", baselineStart) + 3,
   );
   assert.doesNotMatch(baseline, /src\/export-set-verifier\.js/u);
-  assert.equal((baseline.match(/"src\//gu) ?? []).length, 3);
+  assert.equal((baseline.match(/"src\//gu) ?? []).length, 0);
 });
 
 test("schema validation collapses hostile getters to fixed diagnostics", () => {

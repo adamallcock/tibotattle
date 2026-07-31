@@ -1,5 +1,6 @@
 import { isProxy } from "node:util/types";
 
+import { ExportResourceLimitError } from "../export/index.js";
 import { createCodexLogScanner } from "../providers/codex/logs.js";
 
 const FILESYSTEM_METHODS = Object.freeze([
@@ -61,10 +62,16 @@ function snapshotCodexLogPorts(codexLogPorts) {
   for (const name of FILESYSTEM_METHODS) {
     safeFilesystem[name] = requireOwnCallable(filesystem, name);
   }
+  const readBoundedUtf8Lines = requireOwnCallable(lineReader, "readBoundedUtf8Lines");
   return Object.freeze({
     filesystem: Object.freeze(safeFilesystem),
     lineReader: Object.freeze({
-      readBoundedUtf8Lines: requireOwnCallable(lineReader, "readBoundedUtf8Lines"),
+      // Resource-limit failures must keep the reviewed error identity even
+      // though the platform reader itself cannot import the export owner.
+      readBoundedUtf8Lines: (source, options) => readBoundedUtf8Lines(source, {
+        ...options,
+        createLimitError: (code) => new ExportResourceLimitError(code),
+      }),
     }),
   });
 }

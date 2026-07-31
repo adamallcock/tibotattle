@@ -78,7 +78,7 @@ test("legacy participant identity is implementation-free and local-review uses t
   );
   assert.match(
     localReviewSource,
-    /from "\.\.\/src\/platform\/index\.js";/u,
+    /from "\.\.\/src\/platform\/local-review\.js";/u,
   );
 });
 

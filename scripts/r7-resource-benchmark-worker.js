@@ -260,7 +260,9 @@ async function perform(config, secret) {
       workspaceDirectory: config.workspaceDirectory,
       outputDirectory: config.outputDirectory,
       secret,
-      maximumRecordsPerChunk: config.maximumRecordsPerChunk,
+      ...(config.maximumRecordsPerChunk === undefined
+        ? {}
+        : { maximumRecordsPerChunk: config.maximumRecordsPerChunk }),
     });
     const manifest = value.manifest;
     return resourceEvidence(value.resourceUsage, {

@@ -2,11 +2,22 @@
 title: Repository Architecture Stabilization and Completion Goal
 date: 2026-07-30
 type: goal
-status: active
+status: archived
+archived: 2026-07-31
 extends: 2026-07-30-repository-architecture-completion-goal.md
 ---
 
 # Repository Architecture Stabilization and Completion Goal
+
+> **Archived 2026-07-31.** The owner decided to ship v0.1.0 from the current
+> verified state rather than complete the S0–S6 sequence. The architecture work
+> recorded here landed in commit `00c7e70` with zero approved debt edges; the
+> root suite, aggregate product gate, and local-review runtime gate were
+> verified green on the development Mac on 2026-07-31. The remaining S2 flat
+> root migration, S4 tooling relocation, and S5 gate-command items are optional
+> post-release maintenance, not release blockers. This document's
+> commit/publish prohibition is superseded by the owner's release
+> authorization.
 
 ## Purpose
 

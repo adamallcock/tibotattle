@@ -2,10 +2,16 @@
 title: Repository Architecture Completion Goal
 date: 2026-07-30
 type: goal
-status: active
+status: archived
+archived: 2026-07-31
 ---
 
 # Repository Architecture Completion Goal
+
+> **Archived 2026-07-31.** Superseded by the owner's v0.1.0 release decision.
+> See the archival note in the
+> [stabilization goal](./2026-07-30-repository-architecture-stabilization-and-completion-goal.md)
+> for the verified state at archive time.
 
 ## Goal
 

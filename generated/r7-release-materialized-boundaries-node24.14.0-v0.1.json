@@ -478,11 +478,11 @@
   ],
   "contractProvenance": {
     "receiptSchemaSha256": "4683a469ad0143721eedeccc026f07929f2506339aeab7c52e1312cad93f5701",
-    "resourcePolicySourceSha256": "c67de2ad13cb9c52e8c680fb69cd50530dfb5b7c51d7ce3612bc9357c16781b6",
+    "resourcePolicySourceSha256": "d9748895468534062e9c8c436db75cbf5acf4ccf54f84319db37e88197627870",
     "resourcePolicyValuesSha256": "a3dde0db440015886144b76b88a8a663095c7e5eb08f0a68f062e597e95552f6",
-    "schemaModuleSha256": "8357e426b0fd243bbfb02d339440925440723d0e60e921dd0a119b9608bcb72e",
-    "workloadCodeFileCount": 167,
-    "workloadCodeSha256": "864c8bd41c9889cf9bf8787d308b045301b8a1f91a0ea2497e7c04409d39a8bc"
+    "schemaModuleSha256": "2c7370edae949688b3c3675cc239d0865d5d39005c460affe7bb939a5e4f7329",
+    "workloadCodeFileCount": 270,
+    "workloadCodeSha256": "49e399c1cc834f0f4ca8015c13d32c895546e87ec83e98124ae322920f4ee220"
   },
   "determinism": {
     "comparisons": {
@@ -500,8 +500,8 @@
     "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
     "runCount": 2,
     "runProjectionSha256es": [
-      "f110c8db2cba3b13e6eaac7581b7445c8e71b979023f356b9179e4e281b64c88",
-      "f110c8db2cba3b13e6eaac7581b7445c8e71b979023f356b9179e4e281b64c88"
+      "5c50dafbad7b4204be141ca91d32355ac21e4f5b2a617fc429bed0c5e5bf74a7",
+      "5c50dafbad7b4204be141ca91d32355ac21e4f5b2a617fc429bed0c5e5bf74a7"
     ],
     "status": "partial"
   },
@@ -822,16 +822,16 @@
       "decodedBytes": 0,
       "durablePeakRssBytes": 0,
       "encodedBytes": 0,
-      "externalPeakRssBytes": 322207744,
-      "externalRssSampleCount": 60,
+      "externalPeakRssBytes": 321224704,
+      "externalRssSampleCount": 68,
       "externalRssSampleFailureCount": 0,
       "filesystem": {
         "afterBytes": 0,
         "beforeBytes": 0,
-        "sampledHighWaterBytes": 30819643
+        "sampledHighWaterBytes": 30819651
       },
       "outputRecords": 0,
-      "parentElapsedMs": 2984,
+      "parentElapsedMs": 3400,
       "runCount": 2,
       "sourceBytes": 0,
       "sourceFiles": 0,
@@ -894,7 +894,7 @@
     }
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "7b8f2ad1b3b916c43fa283a42a19953984b1d7049cc47a2e619310605abf2c75",
+  "receiptSha256": "71a2396736f4ce845c64b8c1f1ba220fd7e99283c5cf1eecd1e80529e6309dfe",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",
