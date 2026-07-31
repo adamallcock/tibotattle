@@ -162,13 +162,13 @@
         {
           "binding": "USAGE_MONITOR_DB",
           "database_name": "app-usagemonitor-production",
-          "database_id": "REPLACE_PRODUCTION_DB_ID",
+          "database_id": "e2b732e7-456a-4472-b556-937bc4a195b4",
           "migrations_dir": "migrations"
         },
         {
           "binding": "DELETION_LEDGER",
           "database_name": "app-usagemonitor-production-deletion-ledger",
-          "database_id": "REPLACE_PRODUCTION_LEDGER_DB_ID",
+          "database_id": "2f918246-07a8-4340-b91e-c37a123d173e",
           "migrations_dir": "deletion-ledger-migrations"
         }
       ],
