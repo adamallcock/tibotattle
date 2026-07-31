@@ -8,6 +8,9 @@ import {
   probeStagingLive,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
+import {
+  checkLocalWorkspacePackages,
+} from "./check-local-workspace-packages.mjs";
 
 export const DEPLOY_CONFIRMATION = "DEPLOY_DISABLED_STAGING";
 
@@ -112,6 +115,7 @@ export async function runDisabledStagingDeployment({
   secretsFile = null,
   spawn = spawnSync,
   fetchImpl = fetch,
+  checkWorkspacePackages = checkLocalWorkspacePackages,
 }) {
   if (confirmation !== DEPLOY_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
@@ -127,6 +131,18 @@ export async function runDisabledStagingDeployment({
       || parsedOrigin.pathname !== "/" || parsedOrigin.search
       || parsedOrigin.hash) {
     return { ok: false, code: "STAGING_ORIGIN_INVALID" };
+  }
+  try {
+    await checkWorkspacePackages();
+  } catch (error) {
+    const code = [
+      "ACCOUNTING_PACKAGE_STALE",
+      "TELEMETRY_CONTRACT_PACKAGE_STALE",
+      "QUOTA_ANALYSIS_PACKAGE_STALE",
+    ].includes(error?.code)
+      ? error.code
+      : "WORKSPACE_PACKAGES_CHECK_FAILED";
+    return { ok: false, code };
   }
 
   const readiness = probeStagingLive({

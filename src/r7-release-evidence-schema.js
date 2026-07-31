@@ -1,6 +1,6 @@
 import Ajv from "ajv";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import {
   DEFAULT_EXPORT_RESOURCE_LIMITS,
@@ -63,17 +63,67 @@ export const R7_RELEASE_EVIDENCE_RESOURCE_POLICY_VALUES_SHA256 = sha256(
   stableJson(DEFAULT_EXPORT_RESOURCE_LIMITS),
 );
 
+function sortedDirectoryEntries(directoryUrl) {
+  return readdirSync(directoryUrl, { withFileTypes: true })
+    .sort((left, right) => (
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    ));
+}
+
+export function collectR7ReleaseEvidenceRuntimeSourcePaths({
+  repositoryRoot = new URL("../", import.meta.url),
+} = {}) {
+  if (!(repositoryRoot instanceof URL) || repositoryRoot.protocol !== "file:") {
+    throw new TypeError("repositoryRoot must be a file URL when provided");
+  }
+  const paths = [];
+  const appendRegularRuntimeFile = (relativePath) => {
+    const fileUrl = new URL(relativePath, repositoryRoot);
+    const metadata = lstatSync(fileUrl);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new TypeError("R7 workload runtime source is not a regular file");
+    }
+    if (!relativePath.endsWith(".js") && !relativePath.endsWith(".mjs")) {
+      throw new TypeError("R7 workload runtime source has an unsupported extension");
+    }
+    paths.push(relativePath);
+  };
+  const visit = (relativeDirectory) => {
+    const directoryUrl = new URL(`${relativeDirectory}/`, repositoryRoot);
+    const directoryMetadata = lstatSync(directoryUrl);
+    if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+      throw new TypeError("R7 workload source tree root is not a regular directory");
+    }
+    for (const entry of sortedDirectoryEntries(directoryUrl)) {
+      const relativePath = `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory()) {
+        visit(relativePath);
+      } else if (entry.isFile()) {
+        if (!entry.name.endsWith(".js") && !entry.name.endsWith(".mjs")) {
+          throw new TypeError("R7 workload source tree contains an unsupported file");
+        }
+        paths.push(relativePath);
+      } else {
+        throw new TypeError("R7 workload source tree contains an unsupported entry");
+      }
+    }
+  };
+  visit("src");
+  visit("shared");
+  visit("packages/accounting/src");
+  appendRegularRuntimeFile("packages/accounting/index.js");
+  visit("packages/telemetry-contract/src");
+  appendRegularRuntimeFile("packages/telemetry-contract/index.js");
+  return paths;
+}
+
 function workloadSourcePaths() {
-  const sourceDirectory = new URL("./", import.meta.url);
   const repositoryRoot = new URL("../", import.meta.url);
   const runtimeJsonPaths = [];
   const visitRuntimeJsonDirectory = (relativeDirectory) => {
-    const entries = readdirSync(new URL(`${relativeDirectory}/`, repositoryRoot), {
-      withFileTypes: true,
-    }).sort((left, right) => (
-      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
-    ));
-    for (const entry of entries) {
+    for (const entry of sortedDirectoryEntries(
+      new URL(`${relativeDirectory}/`, repositoryRoot),
+    )) {
       const relativePath = `${relativeDirectory}/${entry.name}`;
       if (entry.isDirectory()) visitRuntimeJsonDirectory(relativePath);
       else if (entry.isFile() && entry.name.endsWith(".json")) runtimeJsonPaths.push(relativePath);
@@ -84,18 +134,19 @@ function workloadSourcePaths() {
   };
   visitRuntimeJsonDirectory("contracts");
   visitRuntimeJsonDirectory("schemas");
+  visitRuntimeJsonDirectory("packages/telemetry-contract/schemas");
   return [
-    ...readdirSync(sourceDirectory)
-      .filter((name) => name.endsWith(".js"))
-      .sort()
-      .map((name) => `src/${name}`),
+    ...collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
     "scripts/r7-materialized-boundary-worker.js",
     "scripts/r7-resource-benchmark-worker.js",
     ...runtimeJsonPaths,
     "generated/telemetry-v0.1-compatibility.json",
     "generated/telemetry-v0.1-field-dictionary.json",
+    "packages/accounting/package.json",
+    "packages/telemetry-contract/package.json",
     "package.json",
     "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
   ];
 }
 

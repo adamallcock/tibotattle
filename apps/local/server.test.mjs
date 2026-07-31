@@ -159,6 +159,14 @@ async function fixture() {
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
+  await writeFile(
+    join(staticRoot, "telemetry-shared.generated.js"),
+    "export const telemetry = true;",
+  );
+  await writeFile(
+    join(staticRoot, "telemetry-envelope.js"),
+    "export const envelope = true;",
+  );
   await writeFile(join(staticRoot, "styles.css"), "body { color: black; }");
   await writeFile(
     join(resourceRoot, "2026-07-24-simple-quota-gradient-report.html"),
@@ -334,6 +342,16 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     );
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
+    assert.equal(
+      (await fetch(`${base}/telemetry-shared.generated.js`)).status,
+      200,
+    );
+    const telemetryEnvelope = await fetch(`${base}/telemetry-envelope.js`);
+    assert.equal(telemetryEnvelope.status, 200);
+    assert.equal(
+      await telemetryEnvelope.text(),
+      "export const envelope = true;",
+    );
 
     const report = await fetch(`${base}/reports/gradient`);
     assert.equal(report.status, 200);

@@ -67,9 +67,10 @@ After an upload, a participant should be able to see:
 
 ### Shared accounting kernel
 
-- Extract the edge-safe parts of `src/cost-ledger.js`,
-  `src/local-api-pricing.js`, and `src/price-registry.js` into one shared package
-  used by both the local analyzer and Worker.
+- The edge-safe accounting kernel lives behind the single
+  `@app-usagemonitor/accounting` package export used by the local analyzer and
+  Worker. The former flat root paths were retired and are guarded as permanent
+  architecture absences.
 - Keep RunCost as the calculation kernel where it remains edge-safe.
 - Generate or compute one deterministic registry manifest containing version,
   source URLs, observed timestamp, evidence hash, method version, and supported
@@ -135,12 +136,12 @@ tracks into a precise estimate.
 
 ## Work packages
 
-Checkpoint status on July 26:
+Checkpoint status through July 29:
 
 | Package | Status | Evidence |
 | --- | --- | --- |
 | G5.1 Price evidence correction | Verified | Official July 26 registry, tier matrix, and exact long-context boundary tests |
-| G5.2 Edge-safe shared repricer | Verified for OpenAI | Local and Worker use the same framework-free ledger and registry; Claude production work remains paused |
+| G5.2 Edge-safe shared repricer | Verified package boundary | Local and Worker use one typed package; frozen parity covers supported OpenAI and Anthropic accounting semantics while Claude product work remains paused |
 | G5.3 Canonical persistence | Verified | Forward-only D1 migration, server-derived event/contribution fields, tampering tests, and deletion smoke |
 | G5.4 Private results API and UI | Partial | Server-priced totals, coverage, and speed separation are live; rolling conversion fails closed until account continuity is approved |
 | G5.5 Community calibration | Privacy gate open | Existing usage-only weekly snapshots remain unchanged; no public cost/quota field was added |
@@ -159,11 +160,11 @@ The detailed test and lifecycle evidence is recorded in the
 
 ### G5.2 — Edge-safe shared repricer
 
-- Extract one shared pure accounting package.
-- Remove Node-only hashing from request-time price calculation or replace it
-  with a build-time manifest.
-- Add Worker and local parity tests.
-- Ensure no mutable request state or floating promises.
+- [x] Extract one shared pure accounting package.
+- [x] Keep request-time calculation runtime-neutral with a deterministic
+  registry manifest.
+- [x] Add Worker and local parity tests over one frozen supported fixture set.
+- [x] Ensure no mutable request state or floating promises.
 
 ### G5.3 — Canonical persistence
 

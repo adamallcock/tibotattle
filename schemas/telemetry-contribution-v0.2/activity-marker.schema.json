@@ -17,9 +17,17 @@
     "accountTrackId"
   ],
   "properties": {
-    "schemaVersion": { "const": "activity-marker-v0.2" },
-    "observedTime": { "type": "string", "format": "date-time", "maxLength": 32 },
-    "provider": { "const": "openai_codex" },
+    "schemaVersion": {
+      "const": "activity-marker-v0.2"
+    },
+    "observedTime": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 32
+    },
+    "provider": {
+      "const": "openai_codex"
+    },
     "surface": {
       "enum": [
         "chatgpt_chat",
@@ -41,7 +49,13 @@
         "controlled_experiment"
       ]
     },
-    "state": { "enum": ["start", "end", "pulse"] },
+    "state": {
+      "enum": [
+        "start",
+        "end",
+        "pulse"
+      ]
+    },
     "agenticPoolCoupling": {
       "enum": [
         "excluded_ordinary_chat",
@@ -58,12 +72,31 @@
       ]
     },
     "planType": {
-      "enum": ["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]
+      "enum": [
+        "free",
+        "go",
+        "plus",
+        "pro",
+        "business",
+        "enterprise",
+        "edu",
+        "team",
+        "unknown"
+      ]
     },
     "planVariant": {
-      "enum": ["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]
+      "enum": [
+        "pro-20x",
+        "pro-10x-promo",
+        "pro-5x",
+        "plus",
+        "unknown"
+      ]
     },
-    "markerId": { "type": "string", "pattern": "^marker:v2:[a-f0-9]{64}$" },
+    "markerId": {
+      "type": "string",
+      "pattern": "^marker:v2:(?:[a-f0-9]{64}|[A-Za-z0-9_-]{43})$"
+    },
     "accountTrackId": {
       "type": "string",
       "pattern": "^(unattributed|account-track:v1:[a-f0-9]{64})$"

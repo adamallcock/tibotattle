@@ -19,6 +19,10 @@ function run(root, action, extra = []) {
   ], {
     cwd: workerDirectory,
     encoding: "utf8",
+    env: {
+      ...process.env,
+      WRANGLER_LOG_PATH: join(root, "wrangler.log"),
+    },
   });
 }
 
@@ -53,6 +57,10 @@ test("collection controls are local-only, independent, and explicitly restored",
     ], {
       cwd: workerDirectory,
       encoding: "utf8",
+      env: {
+        ...process.env,
+        WRANGLER_LOG_PATH: join(root, "wrangler.log"),
+      },
     });
     assert.equal(migrated.status, 0);
 

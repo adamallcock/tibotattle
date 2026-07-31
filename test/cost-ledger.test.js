@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aggregateCostResults, priceUsageEvent } from "../src/cost-ledger.js";
+import {
+  aggregateCostResults,
+  priceUsageEvent,
+} from "../packages/accounting/index.js";
 
 function component(usageComponent, amount, unit = "token", per = "1000000") {
   return { usage_component: usageComponent, unit, price: { amount: String(amount), currency: "USD", per } };

@@ -29,9 +29,21 @@ import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../config/product-brand.js";
+import {
+  TELEMETRY_BROWSER_MIRROR_FILE,
+  readVerifiedTelemetryBrowserMirror,
+} from "./generate-telemetry-browser-mirror.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
+const TELEMETRY_BROWSER_MIRROR_BASENAME =
+  parse(TELEMETRY_BROWSER_MIRROR_FILE).base;
+const TELEMETRY_BROWSER_CRYPTO_ADAPTER_BASENAME =
+  "telemetry-envelope.js";
+const REQUIRED_TELEMETRY_MODULE_BASENAMES = Object.freeze([
+  TELEMETRY_BROWSER_MIRROR_BASENAME,
+  TELEMETRY_BROWSER_CRYPTO_ADAPTER_BASENAME,
+]);
 const SOCIAL_PREVIEW_FILENAME = "social-preview.png";
 const ROBOTS_FILENAME = "robots.txt";
 const MAXIMUM_SOCIAL_PREVIEW_BYTES = 10 * 1024 * 1024;
@@ -434,7 +446,7 @@ function injectReleaseMetadata(html, values) {
   return output;
 }
 
-async function fileManifest(root) {
+async function fileManifest(root, { excludedFiles = new Set() } = {}) {
   const rows = [];
   async function visit(directory) {
     const entries = await readdir(directory, { withFileTypes: true });
@@ -444,6 +456,7 @@ async function fileManifest(root) {
       if (entry.isDirectory()) {
         await visit(path);
       } else if (entry.isFile()) {
+        if (excludedFiles.has(resolve(path))) continue;
         const bytes = await readFile(path);
         rows.push({
           path: relative(root, path).split(sep).join("/"),
@@ -459,8 +472,43 @@ async function fileManifest(root) {
   return rows;
 }
 
-export async function buildPublicReleaseSite(rawArgs) {
+function verifiedMirrorRecord(record) {
+  if (record === null || typeof record !== "object"
+      || typeof record.sourceText !== "string"
+      || typeof record.sha256 !== "string"
+      || !Number.isSafeInteger(record.byteLength)
+      || record.byteLength < 0) {
+    throw new TypeError("Verified telemetry mirror reader returned an invalid record");
+  }
+  const sha256 = createHash("sha256").update(record.sourceText, "utf8").digest("hex");
+  const byteLength = Buffer.byteLength(record.sourceText, "utf8");
+  if (record.sha256 !== sha256 || record.byteLength !== byteLength) {
+    throw new TypeError("Verified telemetry mirror reader returned inconsistent bytes");
+  }
+  return Object.freeze({ sourceText: record.sourceText, sha256, byteLength });
+}
+
+export async function buildPublicReleaseSite(rawArgs, {
+  readVerifiedMirror = readVerifiedTelemetryBrowserMirror,
+} = {}) {
+  if (typeof readVerifiedMirror !== "function") {
+    throw new TypeError("readVerifiedMirror must be a function");
+  }
   const options = validateInputs(rawArgs);
+  const requiredTelemetryModules = REQUIRED_TELEMETRY_MODULE_BASENAMES.map(
+    (basename) => join(options.source, basename),
+  );
+  for (let index = 0; index < requiredTelemetryModules.length; index += 1) {
+    await regularFile(
+      requiredTelemetryModules[index],
+      `Required public telemetry module ${
+        REQUIRED_TELEMETRY_MODULE_BASENAMES[index]
+      }`,
+    );
+  }
+  const telemetryMirror = verifiedMirrorRecord(await readVerifiedMirror({
+    outputFile: requiredTelemetryModules[0],
+  }));
   const sourceIndex = join(options.source, "index.html");
   const sourceHtml = await readFile(sourceIndex, "utf8");
   const installerStats = await regularFile(
@@ -486,7 +534,9 @@ export async function buildPublicReleaseSite(rawArgs) {
     installerBytes: installerStats.size,
   };
   const releaseHtml = injectReleaseMetadata(sourceHtml, releaseValues);
-  await fileManifest(options.source);
+  await fileManifest(options.source, {
+    excludedFiles: new Set([requiredTelemetryModules[0]]),
+  });
 
   if (await pathExists(options.output)) {
     if (!options.replace) {
@@ -500,7 +550,15 @@ export async function buildPublicReleaseSite(rawArgs) {
     errorOnExist: true,
     force: false,
     verbatimSymlinks: true,
+    filter(source) {
+      return resolve(source) !== requiredTelemetryModules[0];
+    },
   });
+  await writeFile(
+    join(options.output, TELEMETRY_BROWSER_MIRROR_BASENAME),
+    telemetryMirror.sourceText,
+    { encoding: "utf8", mode: 0o644, flag: "wx" },
+  );
   await writeFile(join(options.output, "index.html"), releaseHtml, {
     encoding: "utf8",
     mode: 0o644,
@@ -516,6 +574,14 @@ export async function buildPublicReleaseSite(rawArgs) {
     robots,
     { encoding: "utf8", mode: 0o644 },
   );
+  const files = await fileManifest(options.output);
+  const stagedMirror = files.find(({ path }) =>
+    path === TELEMETRY_BROWSER_MIRROR_BASENAME);
+  if (stagedMirror === undefined
+      || stagedMirror.sha256 !== telemetryMirror.sha256
+      || stagedMirror.bytes !== telemetryMirror.byteLength) {
+    throw new Error("Release output did not stage the verified telemetry mirror bytes");
+  }
   const manifest = {
     schemaVersion: "usage-monitor-release-site-manifest-v0.2",
     site: {
@@ -547,7 +613,7 @@ export async function buildPublicReleaseSite(rawArgs) {
       architectures: options.architectures,
       verifiedFromLocalArtifact: true,
     },
-    files: await fileManifest(options.output),
+    files,
   };
   await writeFile(
     join(options.output, "release-site-manifest.json"),

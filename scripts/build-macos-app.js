@@ -36,20 +36,29 @@ import {
   SPARKLE_VERSION,
   normalizeMacOSUpdaterConfiguration,
 } from "./macos-updater-core.js";
+import {
+  readVerifiedTelemetryBrowserMirror,
+} from "./generate-telemetry-browser-mirror.js";
+import { extractEsmImports } from "./lib/esm-imports.mjs";
+import { captureStableUtf8Source } from "./lib/captured-utf8-source.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
+const CAPTURED_UTF8_SOURCE_HELPER = fileURLToPath(
+  new URL("./lib/captured-utf8-source.mjs", import.meta.url),
+);
 const PRODUCT_BRAND_CONFIG = join(
   REPOSITORY_ROOT,
   "config",
   "product-brand.js",
 );
 const ENTRYPOINT = join(REPOSITORY_ROOT, "apps", "local", "server.js");
-const SWIFT_SOURCE = join(
+const MACOS_SOURCE_ROOT = join(REPOSITORY_ROOT, "apps", "macos");
+const WEB_MODULE_ROOT = join(
   REPOSITORY_ROOT,
   "apps",
-  "macos",
-  "UsageMonitorApp.swift",
+  "web",
+  "public",
 );
 const PINNED_NODE_VERSION = "v26.2.0";
 const PINNED_NODE_ARCHITECTURE = "arm64";
@@ -93,12 +102,13 @@ const ICON_PROVENANCE = join(
   "AppIcon.provenance.txt",
 );
 
-export const MACOS_RUNTIME_ASSETS = Object.freeze([
-  "apps/macos/reset-local-keychain.js",
+export const MACOS_WEB_MODULE_ENTRYPOINTS = Object.freeze([
   "apps/web/public/app.js",
-  "apps/web/public/data-client.js",
+]);
+
+export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([
+  "apps/macos/reset-local-keychain.js",
   "apps/web/public/index.html",
-  "apps/web/public/lib.js",
   "apps/web/public/styles.css",
 ]);
 
@@ -108,16 +118,25 @@ const ALLOWED_GENERATED_RUNTIME_FILES = new Set([
 ]);
 
 const EXPECTED_EXTERNAL_SPECIFIERS = Object.freeze([
+  "@app-usagemonitor/accounting",
+  "@app-usagemonitor/identity-core",
+  "@app-usagemonitor/telemetry-contract",
   "@github/keytar",
   "ajv",
   "runcost/browser",
 ]);
 
 const DYNAMIC_EXTERNAL_BY_FILE = Object.freeze({
-  "src/export-identity-keychain.js": "@github/keytar",
+  "src/platform/export-identity-keychain.js": "@github/keytar",
+});
+const WORKSPACE_RUNTIME_PACKAGE_EXTERNALS = Object.freeze({
+  "@app-usagemonitor/accounting": Object.freeze(["runcost/browser"]),
 });
 
 const PINNED_PACKAGES = Object.freeze({
+  "@app-usagemonitor/accounting": "0.1.0",
+  "@app-usagemonitor/identity-core": "0.1.0",
+  "@app-usagemonitor/telemetry-contract": "0.1.0",
   "@github/keytar": "7.10.6",
   ajv: "8.20.0",
   "fast-deep-equal": "3.1.3",
@@ -127,12 +146,95 @@ const PINNED_PACKAGES = Object.freeze({
   runcost: "0.2.0",
 });
 
+const TELEMETRY_CONTRACT_PACKAGE_NAME =
+  "@app-usagemonitor/telemetry-contract";
+const TELEMETRY_CONTRACT_PACKAGE_ROOT = join(
+  REPOSITORY_ROOT,
+  "packages",
+  "telemetry-contract",
+);
+export const MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES = Object.freeze([
+  "index.js",
+  "package.json",
+  "src/constants.js",
+  "src/envelope.js",
+  "src/errors.js",
+  "src/primitives.js",
+  "src/telemetry-v0.1.js",
+  "src/telemetry-v0.2.js",
+  "src/upload.js",
+]);
+
+const ACCOUNTING_PACKAGE_NAME = "@app-usagemonitor/accounting";
+const ACCOUNTING_PACKAGE_ROOT = join(
+  REPOSITORY_ROOT,
+  "packages",
+  "accounting",
+);
+export const MACOS_ACCOUNTING_RUNTIME_FILES = Object.freeze([
+  "index.js",
+  "package.json",
+  "src/cost-ledger.js",
+  "src/local-api-pricing.js",
+  "src/price-registry.js",
+]);
+const IDENTITY_CORE_PACKAGE_NAME = "@app-usagemonitor/identity-core";
+const IDENTITY_CORE_PACKAGE_ROOT = join(
+  REPOSITORY_ROOT,
+  "packages",
+  "identity-core",
+);
+export const MACOS_IDENTITY_CORE_RUNTIME_FILES = Object.freeze([
+  "index.js",
+  "package.json",
+  "src/pseudonym.js",
+]);
+const MACOS_WORKSPACE_RUNTIME_PACKAGE_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    inputDirectory: "packages/accounting",
+    name: ACCOUNTING_PACKAGE_NAME,
+    root: ACCOUNTING_PACKAGE_ROOT,
+    runtimeFiles: MACOS_ACCOUNTING_RUNTIME_FILES,
+    version: PINNED_PACKAGES[ACCOUNTING_PACKAGE_NAME],
+  }),
+  Object.freeze({
+    inputDirectory: "packages/identity-core",
+    name: IDENTITY_CORE_PACKAGE_NAME,
+    root: IDENTITY_CORE_PACKAGE_ROOT,
+    runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
+    version: PINNED_PACKAGES[IDENTITY_CORE_PACKAGE_NAME],
+  }),
+  Object.freeze({
+    inputDirectory: "packages/telemetry-contract",
+    name: TELEMETRY_CONTRACT_PACKAGE_NAME,
+    root: TELEMETRY_CONTRACT_PACKAGE_ROOT,
+    runtimeFiles: MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
+    version: PINNED_PACKAGES[TELEMETRY_CONTRACT_PACKAGE_NAME],
+  }),
+]);
+
 const SOURCE_PATTERNS = Object.freeze([
   /(?:import|export)\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/gu,
   /import\s*\(\s*["']([^"']+)["']\s*\)/gu,
   /require(?:\.resolve)?\s*\(\s*["']([^"']+)["']\s*\)/gu,
-  /new\s+URL\s*\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/gu,
+  /new\s+URL\s*\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*,?\s*\)/gu,
 ]);
+
+const SWIFT_EXCLUDED_DIRECTORY_NAMES = new Set([
+  ".build",
+  ".release-build",
+  ".swiftpm",
+  "build",
+  "deriveddata",
+  "test",
+  "tests",
+]);
+const SWIFT_INTENTIONALLY_EXCLUDED_TOP_LEVEL_DIRECTORY_NAMES = new Set([
+  "assets",
+  "examples",
+]);
+const SWIFT_PACKAGE_MANIFEST_PATTERN =
+  /^Package(?:@swift-[0-9.]+)?\.swift$/u;
 
 function fail(message, code = "MACOS_APP_BUILD_FAILED") {
   const error = new Error(message);
@@ -265,6 +367,42 @@ function repositoryRelative(path) {
   return selected.split(sep).join("/");
 }
 
+function reviewedRelative(root, path, label) {
+  const selected = relative(root, path);
+  if (selected === ""
+      || selected === ".."
+      || selected.startsWith(`..${sep}`)) {
+    fail(`${label} escaped its reviewed root`);
+  }
+  return selected.split(sep).join("/");
+}
+
+function resolveReviewedInput(root, selected, label) {
+  if (typeof selected !== "string"
+      || selected.length === 0
+      || selected.includes("\0")
+      || selected.includes("\\")
+      || selected.startsWith("/")) {
+    fail(`${label} must be a repository-relative path`);
+  }
+  const resolved = resolve(root, ...selected.split("/"));
+  reviewedRelative(root, resolved, label);
+  return resolved;
+}
+
+async function assertReviewedDirectory(root, path, label) {
+  reviewedRelative(root, path, label);
+  const metadata = await lstat(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    fail(`${label} is not a regular directory`);
+  }
+  const [actualRoot, actualPath] = await Promise.all([
+    realpath(root),
+    realpath(path),
+  ]);
+  reviewedRelative(actualRoot, actualPath, label);
+}
+
 function packageSpecifier(specifier) {
   if (specifier === "runcost/browser"
       || specifier.startsWith("runcost/")) return "runcost/browser";
@@ -356,6 +494,11 @@ export async function collectMacOSRuntimeGraph(entrypoint = ENTRYPOINT) {
       }
     }
   }
+  for (const packageName of [...external]) {
+    for (const dependency of WORKSPACE_RUNTIME_PACKAGE_EXTERNALS[packageName] ?? []) {
+      external.add(dependency);
+    }
+  }
   const externalSpecifiers = [...external].sort();
   if (JSON.stringify(externalSpecifiers)
       !== JSON.stringify(EXPECTED_EXTERNAL_SPECIFIERS)) {
@@ -369,6 +512,321 @@ export async function collectMacOSRuntimeGraph(entrypoint = ENTRYPOINT) {
     relativeFiles: Object.freeze([...files].map(repositoryRelative).sort()),
     builtins: Object.freeze([...builtins].sort()),
     externalSpecifiers: Object.freeze(externalSpecifiers),
+  });
+}
+
+async function webModuleSpecifiers(source, label) {
+  let imports;
+  try {
+    imports = await extractEsmImports(source, {
+      sourceName: label,
+    });
+  } catch {
+    fail(`Reviewed macOS web module is not valid static ESM: ${label}`);
+  }
+  if (imports.some(({ kind }) => kind === "dynamic-import")) {
+    fail(
+      `Dynamic import is not allowed in the reviewed macOS web bundle: ${label}`,
+    );
+  }
+  const specifiers = imports.map(({ specifier }) => specifier);
+  if (specifiers.some((specifier) => typeof specifier !== "string")) {
+    fail(`Reviewed macOS web module parser returned invalid output: ${label}`);
+  }
+  return [...new Set(specifiers)].sort();
+}
+
+async function reviewedRegularFile(path, {
+  allowedRoot,
+  label,
+  repositoryRoot,
+}) {
+  reviewedRelative(allowedRoot, path, label);
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      fail(`Reviewed macOS web module is missing: ${label}`);
+    }
+    throw error;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    fail(`Reviewed macOS web module is not a regular file: ${label}`);
+  }
+  const [actualRoot, actualFile] = await Promise.all([
+    realpath(allowedRoot),
+    realpath(path),
+  ]);
+  reviewedRelative(actualRoot, actualFile, label);
+  if (resolve(repositoryRoot) === REPOSITORY_ROOT) {
+    assertAllowedFirstPartyPath(path);
+  }
+}
+
+export async function collectMacOSWebModuleGraph({
+  allowedRoot = WEB_MODULE_ROOT,
+  entrypoints = MACOS_WEB_MODULE_ENTRYPOINTS,
+  repositoryRoot = REPOSITORY_ROOT,
+  capturedModuleSources = new Map(),
+} = {}) {
+  const selectedRepositoryRoot = resolve(repositoryRoot);
+  const selectedAllowedRoot = resolve(allowedRoot);
+  reviewedRelative(
+    selectedRepositoryRoot,
+    selectedAllowedRoot,
+    "macOS web module root",
+  );
+  await assertReviewedDirectory(
+    selectedRepositoryRoot,
+    selectedAllowedRoot,
+    "macOS web module root",
+  );
+  if (!Array.isArray(entrypoints) || entrypoints.length === 0) {
+    fail("At least one reviewed macOS web module entrypoint is required");
+  }
+  if (!(capturedModuleSources instanceof Map)) {
+    fail("capturedModuleSources must be a Map when provided");
+  }
+  const pending = entrypoints.map((entrypoint) =>
+    resolveReviewedInput(
+      selectedRepositoryRoot,
+      entrypoint,
+      "macOS web module entrypoint",
+    ));
+  const files = new Set();
+  const modules = new Map();
+  while (pending.length > 0) {
+    const file = pending.pop();
+    if (files.has(file)) continue;
+    const label = reviewedRelative(
+      selectedRepositoryRoot,
+      file,
+      "macOS web module",
+    );
+    await reviewedRegularFile(file, {
+      allowedRoot: selectedAllowedRoot,
+      label,
+      repositoryRoot: selectedRepositoryRoot,
+    });
+    if (![".js", ".mjs"].includes(extname(file))) {
+      fail(`Unsupported macOS web module extension: ${label}`);
+    }
+    files.add(file);
+    const captured = capturedModuleSources.get(file);
+    let source;
+    if (captured === undefined) {
+      source = await readFile(file, "utf8");
+    } else {
+      if (captured === null || typeof captured !== "object"
+          || typeof captured.sourceText !== "string"
+          || typeof captured.sha256 !== "string"
+          || !Number.isSafeInteger(captured.byteLength)
+          || captured.byteLength < 0) {
+        fail(`Captured macOS web module record is invalid: ${label}`);
+      }
+      const sha256 = createHash("sha256").update(captured.sourceText, "utf8")
+        .digest("hex");
+      const byteLength = Buffer.byteLength(captured.sourceText, "utf8");
+      if (captured.sha256 !== sha256 || captured.byteLength !== byteLength) {
+        fail(`Captured macOS web module record is inconsistent: ${label}`);
+      }
+      source = captured.sourceText;
+    }
+    modules.set(file, Object.freeze({
+      file,
+      relativeFile: label,
+      sourceText: source,
+      sha256: createHash("sha256").update(source, "utf8").digest("hex"),
+      byteLength: Buffer.byteLength(source, "utf8"),
+    }));
+    for (const specifier of await webModuleSpecifiers(source, label)) {
+      if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
+        fail(
+          `macOS web modules may import only local relative modules: ${label} -> ${specifier}`,
+        );
+      }
+      if (specifier.includes("\0")
+          || specifier.includes("\\")
+          || specifier.includes("?")
+          || specifier.includes("#")) {
+        fail(`Unsafe macOS web module import: ${label} -> ${specifier}`);
+      }
+      const dependency = resolve(dirname(file), specifier);
+      reviewedRelative(
+        selectedAllowedRoot,
+        dependency,
+        `macOS web module import ${label} -> ${specifier}`,
+      );
+      if (![".js", ".mjs"].includes(extname(dependency))) {
+        fail(
+          `macOS web module imports must name a .js or .mjs file: ${label} -> ${specifier}`,
+        );
+      }
+      if (!files.has(dependency)) pending.push(dependency);
+    }
+  }
+  const sortedFiles = [...files].sort((left, right) =>
+    reviewedRelative(selectedRepositoryRoot, left, "macOS web module")
+      .localeCompare(
+        reviewedRelative(selectedRepositoryRoot, right, "macOS web module"),
+      ));
+  return Object.freeze({
+    files: Object.freeze(sortedFiles),
+    relativeFiles: Object.freeze(sortedFiles.map((file) =>
+      reviewedRelative(
+        selectedRepositoryRoot,
+        file,
+        "macOS web module",
+      ))),
+    modules: Object.freeze(sortedFiles.map((file) => modules.get(file))),
+  });
+}
+
+export async function collectVerifiedMacOSWebModuleGraph({
+  readVerifiedBrowserMirror = readVerifiedTelemetryBrowserMirror,
+  webModuleOptions,
+} = {}) {
+  if (typeof readVerifiedBrowserMirror !== "function") {
+    fail("readVerifiedBrowserMirror must be a function when provided");
+  }
+  const selectedOptions = webModuleOptions ?? {};
+  const selectedRoot = resolve(selectedOptions.repositoryRoot ?? REPOSITORY_ROOT);
+  const mirrorPath = join(
+    selectedRoot,
+    "apps",
+    "web",
+    "public",
+    "telemetry-shared.generated.js",
+  );
+  const mirror = await readVerifiedBrowserMirror({
+    outputFile: mirrorPath,
+  });
+  return collectMacOSWebModuleGraph({
+    ...selectedOptions,
+    capturedModuleSources: new Map([
+      [mirrorPath, mirror],
+    ]),
+  });
+}
+
+export async function collectMacOSSwiftSources({
+  repositoryRoot = REPOSITORY_ROOT,
+  sourceRoot = MACOS_SOURCE_ROOT,
+} = {}) {
+  const selectedRepositoryRoot = resolve(repositoryRoot);
+  const selectedSourceRoot = resolve(sourceRoot);
+  reviewedRelative(
+    selectedRepositoryRoot,
+    selectedSourceRoot,
+    "macOS Swift source root",
+  );
+  await assertReviewedDirectory(
+    selectedRepositoryRoot,
+    selectedSourceRoot,
+    "macOS Swift source root",
+  );
+  const files = [];
+  async function containsSwiftProductionCandidate(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        fail(
+          `Symbolic links are not allowed under an unreviewed macOS source tree: ${
+            reviewedRelative(selectedRepositoryRoot, path, "macOS Swift source")
+          }`,
+        );
+      }
+      if (entry.isDirectory()) {
+        if (SWIFT_EXCLUDED_DIRECTORY_NAMES.has(entry.name.toLowerCase())) {
+          continue;
+        }
+        if (await containsSwiftProductionCandidate(path)) return true;
+        continue;
+      }
+      if (entry.isFile()
+          && extname(entry.name).toLowerCase() === ".swift"
+          && !SWIFT_PACKAGE_MANIFEST_PATTERN.test(entry.name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  async function visit(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        fail(
+          `Symbolic links are not allowed under the macOS Swift source root: ${
+            reviewedRelative(selectedRepositoryRoot, path, "macOS Swift source")
+          }`,
+        );
+      }
+      if (entry.isDirectory()) {
+        const normalizedName = entry.name.toLowerCase();
+        if (SWIFT_EXCLUDED_DIRECTORY_NAMES.has(normalizedName)) {
+          continue;
+        }
+        if (directory === selectedSourceRoot && entry.name !== "Sources") {
+          if (
+            SWIFT_INTENTIONALLY_EXCLUDED_TOP_LEVEL_DIRECTORY_NAMES
+              .has(normalizedName)
+          ) {
+            continue;
+          }
+          if (await containsSwiftProductionCandidate(path)) {
+            fail(
+              `Unreviewed top-level macOS directory contains Swift source candidates: ${
+                reviewedRelative(
+                  selectedRepositoryRoot,
+                  path,
+                  "macOS Swift source",
+                )
+              }`,
+            );
+          }
+          continue;
+        }
+        if (entry.name.startsWith(".")) continue;
+        await visit(path);
+        continue;
+      }
+      if (!entry.isFile() || extname(entry.name).toLowerCase() !== ".swift") {
+        continue;
+      }
+      if (SWIFT_PACKAGE_MANIFEST_PATTERN.test(entry.name)) continue;
+      const label = reviewedRelative(
+        selectedRepositoryRoot,
+        path,
+        "macOS Swift source",
+      );
+      if (resolve(selectedRepositoryRoot) === REPOSITORY_ROOT) {
+        assertAllowedFirstPartyPath(path);
+      }
+      files.push(path);
+    }
+  }
+  await visit(selectedSourceRoot);
+  files.sort((left, right) =>
+    reviewedRelative(selectedRepositoryRoot, left, "macOS Swift source")
+      .localeCompare(
+        reviewedRelative(selectedRepositoryRoot, right, "macOS Swift source"),
+      ));
+  if (files.length === 0) {
+    fail("No production macOS Swift sources were found");
+  }
+  return Object.freeze({
+    files: Object.freeze(files),
+    relativeFiles: Object.freeze(files.map((file) =>
+      reviewedRelative(
+        selectedRepositoryRoot,
+        file,
+        "macOS Swift source",
+      ))),
   });
 }
 
@@ -505,8 +963,264 @@ async function pinnedPackage(name, packagePath) {
   };
 }
 
-async function copyThirdPartyDependencies(appRoot) {
+function validateCapturedWorkspaceRuntimePackages(packages) {
+  if (!Array.isArray(packages) || packages.length === 0) {
+    fail("Captured macOS workspace runtime packages are invalid");
+  }
+  const packageNames = new Set();
+  const inputPaths = new Set();
+  for (const packageCapture of packages) {
+    if (packageCapture === null || typeof packageCapture !== "object"
+        || typeof packageCapture.name !== "string"
+        || !/^@[a-z0-9._-]+\/[a-z0-9._-]+$/u.test(packageCapture.name)
+        || typeof packageCapture.version !== "string"
+        || typeof packageCapture.inputDirectory !== "string"
+        || packageCapture.inputDirectory.startsWith("/")
+        || packageCapture.inputDirectory.includes("\\")
+        || packageCapture.inputDirectory.split("/").some((part) =>
+          part === "" || part === "." || part === "..")
+        || !Array.isArray(packageCapture.files)
+        || packageCapture.files.length === 0) {
+      fail("Captured macOS workspace runtime package is invalid");
+    }
+    if (packageNames.has(packageCapture.name)) {
+      fail(`Duplicate captured macOS workspace package: ${packageCapture.name}`);
+    }
+    packageNames.add(packageCapture.name);
+    const relativeFiles = new Set();
+    for (const file of packageCapture.files) {
+      if (file === null || typeof file !== "object"
+          || typeof file.relativeFile !== "string"
+          || file.relativeFile.length === 0
+          || file.relativeFile.startsWith("/")
+          || file.relativeFile.includes("\\")
+          || file.relativeFile.split("/").some((part) =>
+            part === "" || part === "." || part === "..")
+          || typeof file.inputPath !== "string"
+          || file.inputPath.startsWith("/")
+          || file.inputPath.includes("\\")
+          || file.inputPath.split("/").some((part) =>
+            part === "" || part === "." || part === "..")
+          || typeof file.sourceText !== "string"
+          || typeof file.sha256 !== "string"
+          || !Number.isSafeInteger(file.byteLength)
+          || file.byteLength < 0) {
+        fail(`Captured macOS workspace package file is invalid: ${packageCapture.name}`);
+      }
+      if (relativeFiles.has(file.relativeFile)) {
+        fail(`Duplicate captured macOS workspace package file: ${file.relativeFile}`);
+      }
+      relativeFiles.add(file.relativeFile);
+      const expectedInputPath = [
+        packageCapture.inputDirectory,
+        file.relativeFile,
+      ].join("/");
+      if (file.inputPath !== expectedInputPath) {
+        fail(`Captured macOS workspace package input is inconsistent: ${file.inputPath}`);
+      }
+      if (inputPaths.has(file.inputPath)) {
+        fail(`Duplicate captured macOS workspace package input: ${file.inputPath}`);
+      }
+      inputPaths.add(file.inputPath);
+      const byteLength = Buffer.byteLength(file.sourceText, "utf8");
+      const sha256 = createHash("sha256")
+        .update(file.sourceText, "utf8")
+        .digest("hex");
+      if (file.byteLength !== byteLength || file.sha256 !== sha256) {
+        fail(`Captured macOS workspace package file is inconsistent: ${file.inputPath}`);
+      }
+    }
+  }
+  return true;
+}
+
+function assertProductionWorkspaceRuntimePackageCaptures(packages) {
+  validateCapturedWorkspaceRuntimePackages(packages);
+  const expected = new Map(
+    MACOS_WORKSPACE_RUNTIME_PACKAGE_DEFINITIONS.map((definition) => [
+      definition.name,
+      definition,
+    ]),
+  );
+  if (packages.length !== expected.size) {
+    fail("The macOS workspace package closure is incomplete");
+  }
+  for (const packageCapture of packages) {
+    const definition = expected.get(packageCapture.name);
+    if (!definition || packageCapture.version !== definition.version
+        || packageCapture.inputDirectory !== definition.inputDirectory) {
+      fail(`Unexpected captured macOS workspace package: ${packageCapture.name}`);
+    }
+    if (JSON.stringify(packageCapture.files.map(({ relativeFile }) => relativeFile))
+        !== JSON.stringify(definition.runtimeFiles)) {
+      fail(`Captured macOS workspace package closure changed: ${packageCapture.name}`);
+    }
+  }
+  return true;
+}
+
+export async function captureMacOSWorkspaceRuntimePackages({
+  packageDefinitions = MACOS_WORKSPACE_RUNTIME_PACKAGE_DEFINITIONS,
+  postOpenPreReadFailpoint = null,
+  resolvePackageEntrypoint = null,
+} = {}) {
+  if (!Array.isArray(packageDefinitions) || packageDefinitions.length === 0
+      || (postOpenPreReadFailpoint !== null
+        && typeof postOpenPreReadFailpoint !== "function")
+      || (resolvePackageEntrypoint !== null
+        && typeof resolvePackageEntrypoint !== "function")) {
+    fail("macOS workspace runtime package capture options are invalid");
+  }
   const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+  const resolveEntrypoint = resolvePackageEntrypoint
+    ?? ((name) => rootRequire.resolve(name));
+  const captures = [];
+  for (const definition of packageDefinitions) {
+    if (definition === null || typeof definition !== "object"
+        || typeof definition.name !== "string"
+        || typeof definition.version !== "string"
+        || typeof definition.root !== "string"
+        || typeof definition.inputDirectory !== "string"
+        || definition.inputDirectory.startsWith("/")
+        || definition.inputDirectory.includes("\\")
+        || definition.inputDirectory.split("/").some((part) =>
+          part === "" || part === "." || part === "..")
+        || !Array.isArray(definition.runtimeFiles)
+        || definition.runtimeFiles.length === 0) {
+      fail("macOS workspace runtime package definition is invalid");
+    }
+    const root = resolve(definition.root);
+    const rootMetadata = await lstat(root);
+    if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+      fail(`macOS workspace package root is not a regular directory: ${definition.name}`);
+    }
+    const actualRoot = await realpath(root);
+    const expectedEntrypoint = join(actualRoot, "index.js");
+    if (await realpath(await resolveEntrypoint(definition.name))
+        !== await realpath(expectedEntrypoint)) {
+      fail(`The ${definition.name} workspace dependency resolved unexpectedly`);
+    }
+    const files = [];
+    const relativeFiles = new Set();
+    for (const relativeFile of definition.runtimeFiles) {
+      if (typeof relativeFile !== "string" || relativeFile.length === 0
+          || relativeFile.startsWith("/") || relativeFile.includes("\\")
+          || relativeFile.includes("\0") || relativeFiles.has(relativeFile)) {
+        fail(`Invalid macOS workspace package runtime file: ${definition.name}`);
+      }
+      relativeFiles.add(relativeFile);
+      const sourceFile = resolve(root, ...relativeFile.split("/"));
+      reviewedRelative(root, sourceFile, `${definition.name} runtime file`);
+      const failureMessage =
+        `macOS workspace package runtime source is not a stable regular UTF-8 file: ${relativeFile}`;
+      const captured = await captureStableUtf8Source(sourceFile, {
+        failureMessage,
+        maximumBytes: 1024 * 1024,
+        postOpenPreReadFailpoint,
+      });
+      const resolvedSourceFile = await realpath(sourceFile).catch(() => {
+        fail(failureMessage);
+      });
+      reviewedRelative(
+        actualRoot,
+        resolvedSourceFile,
+        `${definition.name} runtime file`,
+      );
+      files.push(Object.freeze({
+        byteLength: captured.byteLength,
+        inputPath: join(definition.inputDirectory, relativeFile)
+          .split(sep).join("/"),
+        relativeFile,
+        sha256: captured.sha256,
+        sourceText: captured.sourceText,
+      }));
+    }
+    const manifestFile = files.find(({ relativeFile }) =>
+      relativeFile === "package.json");
+    let manifest;
+    try {
+      manifest = JSON.parse(manifestFile?.sourceText ?? "");
+    } catch {
+      fail(`Captured package manifest is invalid: ${definition.name}`);
+    }
+    if (manifest.name !== definition.name
+        || manifest.version !== definition.version
+        || definition.version !== PINNED_PACKAGES[definition.name]) {
+      fail(`Pinned package mismatch for ${definition.name}`);
+    }
+    captures.push(Object.freeze({
+      files: Object.freeze(files),
+      inputDirectory: definition.inputDirectory,
+      license: manifest.license ?? null,
+      name: definition.name,
+      version: manifest.version,
+    }));
+  }
+  captures.sort((left, right) => left.name.localeCompare(right.name));
+  validateCapturedWorkspaceRuntimePackages(captures);
+  return Object.freeze(captures);
+}
+
+export async function stageMacOSWorkspaceRuntimePackages(appRoot, packages) {
+  validateCapturedWorkspaceRuntimePackages(packages);
+  const staged = [];
+  for (const packageCapture of packages) {
+    for (const file of packageCapture.files) {
+      const relativePath = [
+        "node_modules",
+        ...packageCapture.name.split("/"),
+        ...file.relativeFile.split("/"),
+      ].join("/");
+      const destination = resolveReviewedInput(
+        appRoot,
+        relativePath,
+        "captured macOS workspace package file",
+      );
+      await writeGeneratedFile(destination, file.sourceText, 0o444);
+      staged.push(Object.freeze({
+        byteLength: file.byteLength,
+        path: relativePath,
+        sha256: file.sha256,
+      }));
+    }
+  }
+  return Object.freeze(staged);
+}
+
+export function assertMacOSWorkspaceRuntimePackageInventory(
+  inventory,
+  packages,
+) {
+  if (!Array.isArray(inventory)) {
+    fail("macOS workspace package inventory is invalid");
+  }
+  validateCapturedWorkspaceRuntimePackages(packages);
+  for (const packageCapture of packages) {
+    for (const file of packageCapture.files) {
+      const expectedPath = [
+        "Contents",
+        "Resources",
+        "app",
+        "node_modules",
+        ...packageCapture.name.split("/"),
+        ...file.relativeFile.split("/"),
+      ].join("/");
+      const rows = inventory.filter(({ path }) => path === expectedPath);
+      if (rows.length !== 1
+          || rows[0].bytes !== file.byteLength
+          || rows[0].sha256 !== file.sha256) {
+        fail(`macOS bundle did not retain captured workspace package bytes: ${file.inputPath}`);
+      }
+    }
+  }
+  return true;
+}
+
+async function copyRuntimeDependencies(appRoot, workspaceRuntimePackages) {
+  assertProductionWorkspaceRuntimePackageCaptures(workspaceRuntimePackages);
+  await stageMacOSWorkspaceRuntimePackages(appRoot, workspaceRuntimePackages);
+  const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+
   const ajvPackage = rootRequire.resolve("ajv/package.json");
   const ajv = await pinnedPackage("ajv", ajvPackage);
   await copyRuntimePackage({
@@ -572,7 +1286,17 @@ async function copyThirdPartyDependencies(appRoot) {
     );
   }
 
-  return [keytar, ajv, ...transitive, runcost]
+  return [
+    ...workspaceRuntimePackages.map(({ license, name, version }) => ({
+      license,
+      name,
+      version,
+    })),
+    keytar,
+    ajv,
+    ...transitive,
+    runcost,
+  ]
     .map((component) => Object.freeze(component))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
@@ -758,7 +1482,7 @@ function preSignLauncherForInventory(appBundle) {
   ]);
 }
 
-async function compileLauncher(destination, updater) {
+async function compileLauncher(destination, updater, swiftSources) {
   const sdk = run("/usr/bin/xcrun", [
     "--sdk",
     "macosx",
@@ -766,13 +1490,19 @@ async function compileLauncher(destination, updater) {
   ], {
     env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
   });
+  const compilerScratch = await mkdtemp(join(
+    dirname(destination),
+    ".usage-monitor-swift-build-",
+  ));
   const compileEnvironment = {
+    CLANG_MODULE_CACHE_PATH: compilerScratch,
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
     SDKROOT: sdk,
     SOURCE_DATE_EPOCH: String(FIXED_EPOCH_SECONDS),
+    SWIFT_MODULE_CACHE_PATH: compilerScratch,
+    TMPDIR: compilerScratch,
     ZERO_AR_DATE: "1",
   };
-  if (process.env.TMPDIR) compileEnvironment.TMPDIR = process.env.TMPDIR;
   const arguments_ = [
     "--sdk",
     "macosx",
@@ -788,6 +1518,8 @@ async function compileLauncher(destination, updater) {
     sdk,
     "-module-name",
     `${PRODUCT_BRAND.executableName}Launcher`,
+    "-module-cache-path",
+    compilerScratch,
     "-framework",
     "AppKit",
     "-framework",
@@ -808,9 +1540,13 @@ async function compileLauncher(destination, updater) {
   arguments_.push(
     "-o",
     destination,
-    SWIFT_SOURCE,
+    ...swiftSources.files,
   );
-  run("/usr/bin/xcrun", arguments_, { env: compileEnvironment });
+  try {
+    run("/usr/bin/xcrun", arguments_, { env: compileEnvironment });
+  } finally {
+    await rm(compilerScratch, { recursive: true, force: true });
+  }
   await chmod(destination, 0o555);
   await utimes(destination, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
   const fileDescription = run("/usr/bin/file", ["-b", destination]);
@@ -880,7 +1616,7 @@ async function copyPinnedNode(resourcesRoot) {
   });
 }
 
-async function copyFirstPartyRuntime(appRoot, graph) {
+async function copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules) {
   const repositoryPackage = await readPackage(
     join(REPOSITORY_ROOT, "package.json"),
   );
@@ -900,8 +1636,14 @@ async function copyFirstPartyRuntime(appRoot, graph) {
       0o444,
     );
   }
-  for (const selected of MACOS_RUNTIME_ASSETS) {
-    if (graph.relativeFiles.includes(selected)) continue;
+  await stageMacOSWebModules(appRoot, webModules);
+  const webModuleFiles = new Set(
+    webModules.modules.map(({ relativeFile }) => relativeFile),
+  );
+  for (const selected of runtimeAssets) {
+    if (graph.relativeFiles.includes(selected) || webModuleFiles.has(selected)) {
+      continue;
+    }
     assertAllowedFirstPartyPath(join(REPOSITORY_ROOT, selected));
     await copyRegularFile(
       join(REPOSITORY_ROOT, ...selected.split("/")),
@@ -919,6 +1661,79 @@ async function copyFirstPartyRuntime(appRoot, graph) {
       engines: { node: PINNED_NODE_VERSION },
     }),
   );
+}
+
+/**
+ * Stage the immutable source records retained by web-module discovery.
+ *
+ * Keeping this operation narrow and exported lets release tests prove that a
+ * source-tree mutation after verification cannot change the bytes shipped in
+ * the native application.
+ */
+export async function stageMacOSWebModules(appRoot, webModules) {
+  if (webModules === null || typeof webModules !== "object"
+      || !Array.isArray(webModules.modules)) {
+    fail("Reviewed macOS web module graph is invalid");
+  }
+  const staged = [];
+  const seen = new Set();
+  for (const module of webModules.modules) {
+    if (module === null || typeof module !== "object"
+        || typeof module.relativeFile !== "string"
+        || typeof module.sourceText !== "string"
+        || typeof module.sha256 !== "string"
+        || !Number.isSafeInteger(module.byteLength)
+        || module.byteLength < 0) {
+      fail("Captured macOS web module record is invalid");
+    }
+    const destination = resolveReviewedInput(
+      appRoot,
+      module.relativeFile,
+      "captured macOS web module",
+    );
+    if (seen.has(module.relativeFile)) {
+      fail(`Duplicate captured macOS web module: ${module.relativeFile}`);
+    }
+    seen.add(module.relativeFile);
+    const sha256 = createHash("sha256")
+      .update(module.sourceText, "utf8")
+      .digest("hex");
+    const byteLength = Buffer.byteLength(module.sourceText, "utf8");
+    if (module.sha256 !== sha256 || module.byteLength !== byteLength) {
+      fail(`Captured macOS web module record is inconsistent: ${module.relativeFile}`);
+    }
+    await writeGeneratedFile(destination, module.sourceText, 0o444);
+    staged.push(Object.freeze({
+      relativeFile: module.relativeFile,
+      byteLength,
+      sha256,
+    }));
+  }
+  return Object.freeze(staged);
+}
+
+export function assertMacOSWebModuleInventory(inventory, webModules) {
+  if (!Array.isArray(inventory)
+      || webModules === null
+      || typeof webModules !== "object"
+      || !Array.isArray(webModules.modules)) {
+    fail("macOS web module inventory inputs are invalid");
+  }
+  for (const module of webModules.modules) {
+    const expectedPath = [
+      "Contents",
+      "Resources",
+      "app",
+      module.relativeFile,
+    ].join("/");
+    const rows = inventory.filter(({ path }) => path === expectedPath);
+    if (rows.length !== 1
+        || rows[0].bytes !== module.byteLength
+        || rows[0].sha256 !== module.sha256) {
+      fail(`macOS bundle did not retain captured web module bytes: ${module.relativeFile}`);
+    }
+  }
+  return true;
 }
 
 async function copyLicenses(resourcesRoot, updater) {
@@ -1038,24 +1853,66 @@ async function loadIconAssets({ required }) {
   });
 }
 
-async function sourceInputDigest(graph, iconAssets = null, updater = null) {
+export async function calculateMacOSSourceInputDigest({
+  graph,
+  runtimeAssets,
+  swiftSources,
+  iconAssets = null,
+  updater = null,
+  webModules = null,
+  workspaceRuntimePackages = [],
+  readSource = readFile,
+} = {}) {
+  if (typeof readSource !== "function") {
+    fail("readSource must be a function when provided");
+  }
   const inputs = new Set([
     ...graph.files,
-    ...MACOS_RUNTIME_ASSETS.map((path) =>
+    ...runtimeAssets.map((path) =>
       join(REPOSITORY_ROOT, ...path.split("/"))),
     PRODUCT_BRAND_CONFIG,
+    CAPTURED_UTF8_SOURCE_HELPER,
     SCRIPT_FILE,
-    SWIFT_SOURCE,
+    ...swiftSources.files,
     ...(iconAssets
       ? [iconAssets.icon.path, iconAssets.provenance.path]
       : []),
   ]);
   const hash = createHash("sha256");
-  for (const file of [...inputs].sort((left, right) =>
-    repositoryRelative(left).localeCompare(repositoryRelative(right)))) {
-    hash.update(repositoryRelative(file));
+  const capturedWebModules = new Map((webModules?.modules ?? []).map(
+    (module) => [module.file, module],
+  ));
+  if (workspaceRuntimePackages.length > 0) {
+    validateCapturedWorkspaceRuntimePackages(workspaceRuntimePackages);
+  }
+  const sourceInputs = new Map();
+  for (const file of inputs) {
+    const inputPath = repositoryRelative(file);
+    const captured = capturedWebModules.get(file);
+    sourceInputs.set(inputPath, captured === undefined
+      ? Object.freeze({ file })
+      : Object.freeze({ sourceText: captured.sourceText }));
+  }
+  for (const packageCapture of workspaceRuntimePackages) {
+    for (const file of packageCapture.files) {
+      if (sourceInputs.has(file.inputPath)) {
+        fail(`Duplicate macOS source input: ${file.inputPath}`);
+      }
+      sourceInputs.set(file.inputPath, Object.freeze({
+        sourceText: file.sourceText,
+      }));
+    }
+  }
+  for (const [inputPath, input] of [...sourceInputs.entries()].sort(
+    ([left], [right]) => left.localeCompare(right),
+  )) {
+    hash.update(inputPath);
     hash.update("\0");
-    hash.update(await readFile(file));
+    if (typeof input.sourceText === "string") {
+      hash.update(input.sourceText, "utf8");
+    } else {
+      hash.update(await readSource(input.file));
+    }
     hash.update("\0");
   }
   if (updater?.enabled) {
@@ -1396,7 +2253,21 @@ async function buildApplication(stageApp, centralService, {
   await mkdir(executables, { recursive: true, mode: 0o755 });
   await mkdir(appRoot, { recursive: true, mode: 0o755 });
 
-  const graph = await collectMacOSRuntimeGraph();
+  const [
+    graph,
+    webModules,
+    swiftSources,
+    workspaceRuntimePackages,
+  ] = await Promise.all([
+    collectMacOSRuntimeGraph(),
+    collectVerifiedMacOSWebModuleGraph(),
+    collectMacOSSwiftSources(),
+    captureMacOSWorkspaceRuntimePackages(),
+  ]);
+  const runtimeAssets = Object.freeze([
+    ...MACOS_RUNTIME_STATIC_ASSETS,
+    ...webModules.relativeFiles,
+  ].sort());
   await writeGeneratedFile(
     join(contents, "Info.plist"),
     infoPlist(centralService, {
@@ -1409,11 +2280,15 @@ async function buildApplication(stageApp, centralService, {
   await compileLauncher(
     join(executables, PRODUCT_BRAND.executableName),
     updater,
+    swiftSources,
   );
   await copyPinnedSparkleFramework(contents, updater);
   const node = await copyPinnedNode(resources);
-  await copyFirstPartyRuntime(appRoot, graph);
-  const dependencies = await copyThirdPartyDependencies(appRoot);
+  await copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules);
+  const dependencies = await copyRuntimeDependencies(
+    appRoot,
+    workspaceRuntimePackages,
+  );
   await copyLicenses(resources, updater);
   if (iconAssets) {
     await copyRegularFile(
@@ -1437,6 +2312,11 @@ async function buildApplication(stageApp, centralService, {
 
   const manifestPath = join(resources, "build-manifest.json");
   const inventory = await bundleInventory(stageApp, manifestPath, updater);
+  assertMacOSWebModuleInventory(inventory.files, webModules);
+  assertMacOSWorkspaceRuntimePackageInventory(
+    inventory.files,
+    workspaceRuntimePackages,
+  );
   const manifest = {
     schemaVersion: MANIFEST_SCHEMA,
     application: {
@@ -1505,9 +2385,17 @@ async function buildApplication(stageApp, centralService, {
       requestedPort: 0,
     },
     inputs: {
-      sourceSha256: await sourceInputDigest(graph, iconAssets, updater),
+      sourceSha256: await calculateMacOSSourceInputDigest({
+        graph,
+        runtimeAssets,
+        swiftSources,
+        iconAssets,
+        updater,
+        webModules,
+        workspaceRuntimePackages,
+      }),
       firstPartyFiles: graph.relativeFiles,
-      staticAssets: MACOS_RUNTIME_ASSETS,
+      staticAssets: runtimeAssets,
       generatedRuntimeContracts: [...ALLOWED_GENERATED_RUNTIME_FILES].sort(),
       builtins: graph.builtins,
       externalSpecifiers: graph.externalSpecifiers,

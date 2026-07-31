@@ -10,7 +10,7 @@ import {
   OPENAI_OFFICIAL_PRICE_CARDS,
   addOfficialPriceRegistry,
   validateOfficialPriceRegistry,
-} from "../src/price-registry.js";
+} from "../packages/accounting/index.js";
 import { sha256Json } from "./helpers/pricing-hash.js";
 
 function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", components, totalInputTokens }) {

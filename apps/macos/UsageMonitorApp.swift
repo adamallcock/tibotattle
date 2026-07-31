@@ -323,27 +323,6 @@ private enum LauncherError: LocalizedError {
     }
 }
 
-private enum AppOpenLink {
-    static func accepts(_ url: URL) -> Bool {
-        guard let components = URLComponents(
-            url: url,
-            resolvingAgainstBaseURL: false
-        ) else {
-            return false
-        }
-        return components.scheme?.lowercased()
-            == BundledProduct.appOpenScheme
-            && components.host?.lowercased() == BundledProduct.appOpenHost
-            && (components.percentEncodedPath.isEmpty
-                || components.percentEncodedPath == "/")
-            && components.user == nil
-            && components.password == nil
-            && components.port == nil
-            && components.query == nil
-            && components.fragment == nil
-    }
-}
-
 private enum CodexHomeMode: String {
     case custom
     case defaultLocation = "default"
@@ -982,6 +961,7 @@ private struct LocalKeychainResetResult: Decodable {
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private let semanticOpenTarget: SemanticOpenTarget
     private let updater = AppUpdater()
     private var centralService: CentralServiceConfiguration?
     private var centralServiceMode: CentralServiceMode?
@@ -1043,6 +1023,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         target: self,
         action: #selector(quitApplication)
     )
+
+    init(semanticOpenTarget: SemanticOpenTarget) {
+        self.semanticOpenTarget = semanticOpenTarget
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
@@ -1933,11 +1918,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         _ application: NSApplication,
         open urls: [URL]
     ) {
-        guard !urls.isEmpty, urls.allSatisfy(AppOpenLink.accepts) else {
+        guard !urls.isEmpty,
+              urls.allSatisfy(semanticOpenTarget.accepts)
+        else {
             lastLifecycleStatus = "Rejected unsupported app link"
             lastFailureCode = "UM_MACOS_APP_LINK_REJECTED"
             lastRecoverySuggestion =
-                "Use only the exact \(BundledProduct.appOpenURL) link."
+                "Use only the exact \(semanticOpenTarget.canonicalURL) link."
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -2414,13 +2401,18 @@ private enum LifecycleContractSmokeTest {
 private struct UsageMonitorMain {
     static func main() {
         let arguments = Array(CommandLine.arguments.dropFirst())
+        let semanticOpenTarget = SemanticOpenTarget(
+            scheme: BundledProduct.appOpenScheme,
+            host: BundledProduct.appOpenHost,
+            canonicalURL: BundledProduct.appOpenURL
+        )
         if let linkIndex = arguments.firstIndex(of: "--app-link-smoke-test") {
             guard linkIndex + 1 < arguments.count,
                   let link = URL(string: arguments[linkIndex + 1])
             else {
                 exit(2)
             }
-            exit(AppOpenLink.accepts(link) ? 0 : 1)
+            exit(semanticOpenTarget.accepts(link) ? 0 : 1)
         }
         if arguments.contains("--central-smoke-test") {
             exit(SmokeTest.run(requireCentralService: true))
@@ -2462,7 +2454,7 @@ private struct UsageMonitorMain {
         }
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
-        let delegate = AppDelegate()
+        let delegate = AppDelegate(semanticOpenTarget: semanticOpenTarget)
         application.delegate = delegate
         application.run()
     }

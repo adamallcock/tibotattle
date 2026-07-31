@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, fork, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile,
@@ -303,6 +303,98 @@ test("a crash after journal preparation aborts safely without authorizing deleti
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
+test("SIGKILL after the committed marker leaves a recoverable durable workspace", async () => {
+  const value = await fixture({ sidecars: ["journal"] });
+  let child;
+  try {
+    const plan = await planLocalExportWorkspaceDiscard({ workspaceDirectory: value.workspace });
+    child = fork(resolve("test/support/export-workspace-discard-sigkill-child.mjs"), [
+      value.workspace,
+      plan.confirmationToken,
+    ], { cwd: resolve("."), stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    await new Promise((resolveReady, rejectReady) => {
+      const timer = setTimeout(() => rejectReady(new Error("discard child did not reach committed state")), 10_000);
+      child.once("message", (message) => {
+        clearTimeout(timer);
+        if (message?.type === "committed") resolveReady();
+        else rejectReady(new Error("discard child sent an invalid handshake"));
+      });
+      child.once("error", rejectReady);
+      child.once("exit", (code, signal) => {
+        if (signal !== "SIGKILL") rejectReady(new Error(`discard child exited before kill (${code}/${signal})`));
+      });
+    });
+    assert.equal(child.kill("SIGKILL"), true);
+    const exit = await new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+    assert.deepEqual(exit, { code: null, signal: "SIGKILL" });
+    assert.equal((await readdir(value.workspace)).includes(".app-usagemonitor-workspace-discard-journal.json"), true);
+    assert.equal((await readdir(value.workspace)).includes(".app-usagemonitor-workspace-discard-commit.json"), true);
+    await recoverLocalExportWorkspaceDiscard({ workspaceDirectory: value.workspace });
+    await assertDiscarded(value);
+  } finally {
+    if (child && child.exitCode === null && !child.killed) child.kill("SIGKILL");
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("receipt and control filesystem failures recover after explicit local transient-lock cleanup", async () => {
+  const cases = [
+    {
+      label: "receipt publication",
+      shouldMakeReadOnly: (stage, detail) => stage === "after_inventory_unlink" && detail?.ordinal === 1,
+    },
+    {
+      label: "journal durable unlink",
+      shouldMakeReadOnly: (stage) => stage === "after_journal_quarantine",
+    },
+    {
+      label: "marker durable unlink",
+      shouldMakeReadOnly: (stage) => stage === "after_commit_marker_quarantine",
+    },
+  ];
+  for (const { label, shouldMakeReadOnly } of cases) {
+    const value = await fixture({ sidecars: ["journal"] });
+    try {
+      const plan = await planLocalExportWorkspaceDiscard({ workspaceDirectory: value.workspace });
+      await assert.rejects(discardLocalExportWorkspace({
+        workspaceDirectory: value.workspace,
+        confirmationToken: plan.confirmationToken,
+        async failpoint(stage, detail) {
+          if (shouldMakeReadOnly(stage, detail)) await chmod(value.workspace, 0o500);
+        },
+      }), (error) => error.code === "export_workspace_discard_execute_replacement"
+        && !error.message.includes(value.workspace));
+      const interruptedEntries = await readdir(value.workspace);
+      assert.equal(interruptedEntries.includes(".app-usagemonitor-export-workspace.lock"), true, label);
+      if (label === "receipt publication") {
+        assert.equal(interruptedEntries.includes("workspace-discard-receipt.json"), false, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-journal.json"), true, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-commit.json"), true, label);
+        assert.equal(interruptedEntries.includes("workspace.sqlite3"), false, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-quarantine-01"), false, label);
+      } else if (label === "journal durable unlink") {
+        assert.equal(interruptedEntries.includes("workspace-discard-receipt.json"), true, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-quarantine-journal"), true, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-commit.json"), true, label);
+      } else {
+        assert.equal(interruptedEntries.includes("workspace-discard-receipt.json"), true, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-journal.json"), false, label);
+        assert.equal(interruptedEntries.includes(".app-usagemonitor-workspace-discard-quarantine-commit"), true, label);
+      }
+      await chmod(value.workspace, 0o700);
+      // The forced permissions failure also prevents the lease's final lock
+      // cleanup. This test explicitly performs local transient-lock cleanup;
+      // it is not evidence of autonomous stale-lock recovery.
+      await unlink(join(value.workspace, ".app-usagemonitor-export-workspace.lock")).catch(() => {});
+      await recoverLocalExportWorkspaceDiscard({ workspaceDirectory: value.workspace });
+      await assertDiscarded(value);
+    } finally {
+      await chmod(value.workspace, 0o700).catch(() => {});
+      await rm(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("recovery rejects a canonical evidence-token mutation in the durable journal", async () => {
   const value = await fixture({ sidecars: ["journal"] });
   try {
@@ -592,6 +684,35 @@ test("CLI confirms workspace discard only through the dedicated discard token op
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
+test("local-review previews, confirms, and replays the fixed discard receipt without leaking paths", async () => {
+  const value = await fixture({ sidecars: ["journal"] });
+  try {
+    const command = resolve("local-review/cli.js");
+    const base = [command, "discard-export-workspace", "--workspace", value.workspace];
+    const preview = execFileSync(process.execPath, base, { cwd: resolve("."), encoding: "utf8" });
+    const token = preview.match(/Confirmation token: ([A-Z2-7]{16})/)?.[1];
+    assert.equal(typeof token, "string");
+    assert.equal(preview.includes(value.root), false);
+    const wrong = spawnSync(process.execPath, [...base, "--confirm-discard", "AAAAAAAAAAAAAAAA"], {
+      cwd: resolve("."), encoding: "utf8",
+    });
+    assert.notEqual(wrong.status, 0);
+    assert.equal(wrong.stderr.includes(value.root), false);
+    const completed = execFileSync(process.execPath, [...base, "--confirm-discard", token], {
+      cwd: resolve("."), encoding: "utf8",
+    });
+    assert.match(completed, /Local export workspace discard: complete/);
+    const replay = execFileSync(process.execPath, [
+      command, "recover-export-workspace-discard", "--workspace", value.workspace,
+    ], { cwd: resolve("."), encoding: "utf8" });
+    assert.match(replay, /Local export workspace discard recovery: complete/);
+    assert.equal(`${completed}\n${replay}`.includes(value.root), false);
+    await assertDiscarded(value);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
 test("storage and lease failures surface only fixed content-free discard errors", async () => {
   const writeFailure = await fixture();
   const leaseFailure = await fixture();
@@ -628,6 +749,10 @@ test("workspace discard implementation contains no recursive deletion primitive"
     "src/export-workspace-discard.js",
     "src/export-workspace-discard-executor.js",
     "src/export-workspace-discard-schema.js",
+    "src/application/local-export-workspace-discard.js",
+    "src/export-workspace-discard-compatibility-internal.js",
+    "src/platform/owner-only-export-workspace-discard-preflight.js",
+    "src/platform/owner-only-export-workspace-discard-storage.js",
   ];
   for (const file of files) {
     const source = await readFile(resolve(file), "utf8");

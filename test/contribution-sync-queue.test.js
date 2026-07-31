@@ -39,11 +39,14 @@ import {
   publishPreparedContributionFile,
   publishPreparedContributionManifest,
 } from "../src/telemetry-prepared-set.js";
-import { stableJson } from "../src/storage.js";
 import {
   createTelemetryEnvelope,
+} from "../src/platform/telemetry-envelope.js";
+import { stableJson } from "../src/storage.js";
+import {
   MAX_TELEMETRY_BROWSER_BYTES,
-} from "../apps/web/public/lib.js";
+  parseTelemetryEnvelope,
+} from "@app-usagemonitor/telemetry-contract";
 
 const ORIGIN = "https://usage.example";
 const ACCEPTED_ID =
@@ -212,8 +215,9 @@ test("upload reservation exceeds a real maximum-record encrypted envelope", asyn
   const envelope = await createTelemetryEnvelope({
     payload,
     publicJwk: publicKey.export({ format: "jwk" }),
-    keyId: `key:${"a".repeat(200)}`,
+    keyId: `key:${"a".repeat(64)}`,
   });
+  assert.equal(parseTelemetryEnvelope(envelope), envelope);
   const envelopeBytes = Buffer.byteLength(
     JSON.stringify(envelope),
     "utf8",

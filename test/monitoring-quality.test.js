@@ -4,7 +4,7 @@ import {
   analyzeMonitoringQuality,
   classifyMonitoringInterval,
   renderMonitoringQualityReport,
-} from "../src/monitoring-quality.js";
+} from "../src/reporting/index.js";
 
 function interval(overrides = {}) {
   return {

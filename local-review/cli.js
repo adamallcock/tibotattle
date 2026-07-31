@@ -1,75 +1,237 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  inspectParticipantSecret,
-  rotateParticipantSecret,
-  withParticipantSecretLease,
-} from "../src/export-identity.js";
-import {
-  renderParticipantIdentityBackendMode,
-  renderParticipantIdentityFileResidueState,
-  renderParticipantIdentitySourceState,
+  ClaudeCallbackCapabilityError,
+  createClaudeCallbackCapabilityContext,
+  createExportCompatibilityContext,
+  createLocalExportArtifactStorageContext,
+  createLocalExportDeletion,
+  createLocalExportSourcePipelineContext,
+  createLocalExportWorkspaceDiscard,
+  createLocalExportSetMaterializationContext,
+  createLocalExportSetVerificationContext,
+  createLocalExportResourceContext,
+  createLocalExportWorkspaceRuntimeContext,
+  createLocalMetadataExportContext,
+  createLocalMetadataBundleVerificationContext,
+  selectProductionClaudeCallbackBackend,
   selectProductionParticipantIdentity,
-} from "../src/export-identity-production.js";
+} from "../src/application/local-review.js";
 import {
-  buildLocalMetadataBundle,
-  renderMetadataExportPreview,
-  writeLocalMetadataBundle,
-} from "../src/metadata-exporter.js";
-import { verifyLocalMetadataBundleFiles } from "../src/bundle-verifier.js";
-import {
-  createLocalExportWorkspace,
-  inspectLocalExportWorkspace,
-  resumeLocalExportWorkspace,
-} from "../src/export-set-controller.js";
-import { materializeLocalExportSet } from "../src/export-set-materializer.js";
-import { verifyLocalExportSet } from "../src/export-set-verifier.js";
-import { planLocalExportDeletion } from "../src/export-deletion.js";
-import {
-  deleteLocalExport,
-  recoverLocalExportDeletion,
-} from "../src/export-deletion-executor.js";
-import { planLocalExportWorkspaceDiscard } from "../src/export-workspace-discard.js";
-import {
-  discardLocalExportWorkspace,
-  recoverLocalExportWorkspaceDiscard,
-} from "../src/export-workspace-discard-executor.js";
-import { readBoundedJsonLines } from "../src/bounded-jsonl.js";
-import {
-  createExportResourceGuard,
-  DEFAULT_EXPORT_RESOURCE_LIMITS,
-} from "../src/export-resource-policy.js";
-import {
-  createProductionClaudeCallbackBackend,
-  readClaudeCallbackCapability,
-} from "../src/claude-callback-capability.js";
-import {
-  inspectClaudeCallbackLifecycle,
-  installClaudeCallback,
-  planManagedClaudeCallbackCapabilityRemoval,
-  recoverClaudeCallbackLifecycle,
-  removeManagedClaudeCallbackCapability,
-  rotateManagedClaudeCallbackCapability,
-  uninstallClaudeCallback,
-} from "../src/claude-callback-lifecycle.js";
-import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  createClaudeCallbackLifecycleContext,
+  createOwnerOnlyExportArtifactStorageContext,
+  createOwnerOnlyExportDeletionPreflightInspector,
+  createOwnerOnlyExportDeletionStorage,
+  createOwnerOnlyExportWorkspaceLeaseContext,
+  createOwnerOnlyExportWorkspaceStorageContext,
+  createOwnerOnlyExportWorkspaceDiscardPreflight,
+  createOwnerOnlyExportWorkspaceDiscardStorage,
+  createExportIdentityKeychainBackend,
+  createExportSetVerificationStorageContext,
+  createLocalCodexLogPorts,
+  createLocalExportSourcePorts,
+  deriveAccountScopeId,
+  deriveExportPseudonym,
+  deriveEventOccurrenceId,
+  deriveMarkerOccurrenceId,
+  deriveModelFingerprint,
+  deriveParticipantId,
+  deriveQuotaStateId,
+  deriveSessionScopeId,
+  deriveSnapshotObservationId,
   defaultActivityMarkerFile,
-  recoverOwnerOnlyPairTransactions,
-} from "../src/storage.js";
+  defaultExportSecretFile,
+  inspectParticipantSecret,
+  localIsProxy,
+  readBoundedJsonLines,
+  readBoundedDirectoryEntries,
+  readExportCompatibilityArtifactSet,
+  readOwnerOnlyLocalMetadataBundlePair,
+  randomBundleId,
+  rotateParticipantSecret,
+  sha256Hex,
+  withParticipantSecretLease,
+} from "../src/platform/local-review.js";
 import {
   installLocalReviewArtifact,
   planLocalReviewUninstall,
   uninstallLocalReviewArtifact,
   verifyLocalReviewArtifact,
 } from "./install.js";
+import { parseLocalReviewArgs } from "./arguments.js";
+import {
+  renderParticipantIdentityBackendMode,
+  renderParticipantIdentityFileResidueState,
+  renderParticipantIdentitySourceState,
+} from "./identity-presentation.js";
+
+export { parseLocalReviewArgs } from "./arguments.js";
 
 export const LOCAL_REVIEW_CLI_VERSION = "0.1.0-alpha.1";
 
 const SOURCE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ARTIFACT_ROOT = resolve(SOURCE_DIRECTORY, "..");
+const DEFAULT_EXPORT_RESOURCE_CONTEXT = createLocalExportResourceContext({
+  readBoundedJsonLines,
+  clock: () => Date.now(),
+  rss: () => process.memoryUsage().rss,
+});
+const DEFAULT_EXPORT_COMPATIBILITY = createExportCompatibilityContext({
+  readExportCompatibilityArtifactSet,
+  sha256Hex,
+});
+const DEFAULT_CLAUDE_CALLBACK_CAPABILITY =
+  createClaudeCallbackCapabilityContext({
+    capability:
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym,
+  });
+const DEFAULT_CLAUDE_CALLBACK_LIFECYCLE =
+  createClaudeCallbackLifecycleContext({
+    ClaudeCallbackCapabilityError,
+    ensureClaudeCallbackCapability:
+      DEFAULT_CLAUDE_CALLBACK_CAPABILITY.ensureClaudeCallbackCapability,
+    planClaudeCallbackCapabilityRemoval:
+      DEFAULT_CLAUDE_CALLBACK_CAPABILITY.planClaudeCallbackCapabilityRemoval,
+    removeClaudeCallbackCapability:
+      DEFAULT_CLAUDE_CALLBACK_CAPABILITY.removeClaudeCallbackCapability,
+    rotateClaudeCallbackCapability:
+      DEFAULT_CLAUDE_CALLBACK_CAPABILITY.rotateClaudeCallbackCapability,
+    runtimeScript: fileURLToPath(
+      new URL("../src/claude-callback-runtime.js", import.meta.url),
+    ),
+  });
+const DEFAULT_BUNDLE_VERIFICATION =
+  createLocalMetadataBundleVerificationContext({
+    readOwnerOnlyLocalMetadataBundlePair,
+    sha256Hex,
+    compatibilityTuple:
+      DEFAULT_EXPORT_COMPATIBILITY.exportCompatibilityTuple,
+  });
+const DEFAULT_EXPORT_SET_VERIFICATION =
+  createLocalExportSetVerificationContext({
+    storage: createExportSetVerificationStorageContext(),
+    bundleVerification: DEFAULT_BUNDLE_VERIFICATION,
+    exportCompatibilityTuple:
+      DEFAULT_EXPORT_COMPATIBILITY.exportCompatibilityTuple,
+    manifestBasename: "export-set-manifest.json",
+    manifestReceiptBasename: "export-set-manifest.privacy-receipt.json",
+  });
+const DEFAULT_EXPORT_ARTIFACT_STORAGE =
+  createLocalExportArtifactStorageContext({
+    createStorage: createOwnerOnlyExportArtifactStorageContext,
+    activityMarkerFile: defaultActivityMarkerFile,
+  });
+const DEFAULT_EXPORT_WORKSPACE_RUNTIME = createLocalExportWorkspaceRuntimeContext({
+  createStorage: createOwnerOnlyExportWorkspaceStorageContext,
+  createLease: createOwnerOnlyExportWorkspaceLeaseContext,
+  sha256Hex,
+  platformName: () => {
+    if (process.platform === "darwin") return "macos";
+    if (process.platform === "linux") return "linux";
+    if (process.platform === "win32") return "windows";
+    return "other";
+  },
+});
+const DEFAULT_LOCAL_EXPORT_SET_CONTROLLER = createLocalExportSourcePipelineContext(
+  localIsProxy,
+  createLocalExportSourcePorts(),
+  {
+    exportCompatibilityTuple: DEFAULT_EXPORT_COMPATIBILITY.exportCompatibilityTuple,
+    workspace: DEFAULT_EXPORT_WORKSPACE_RUNTIME,
+  },
+).controller;
+const DEFAULT_EXPORT_DELETION = createLocalExportDeletion({
+  verifyExportSet: DEFAULT_EXPORT_SET_VERIFICATION.verifyLocalExportSet,
+  openExportWorkspace: DEFAULT_EXPORT_WORKSPACE_RUNTIME.openExportWorkspace,
+  withExistingExportWorkspaceLease: DEFAULT_EXPORT_WORKSPACE_RUNTIME.withExistingExportWorkspaceLease,
+  isTrustedExportWorkspaceLockError: DEFAULT_EXPORT_WORKSPACE_RUNTIME.isTrustedExportWorkspaceLockError,
+  workspaceDatabaseBasename: DEFAULT_EXPORT_WORKSPACE_RUNTIME.EXPORT_WORKSPACE_DATABASE_BASENAME,
+  createPreflightInspector: createOwnerOnlyExportDeletionPreflightInspector,
+  createDeletionStorage: createOwnerOnlyExportDeletionStorage,
+});
+const DEFAULT_EXPORT_WORKSPACE_DISCARD = createLocalExportWorkspaceDiscard({
+  workspaceDatabaseBasename: DEFAULT_EXPORT_WORKSPACE_RUNTIME.EXPORT_WORKSPACE_DATABASE_BASENAME,
+  inspectExportWorkspaceDiscardState: DEFAULT_EXPORT_WORKSPACE_RUNTIME.inspectExportWorkspaceDiscardState,
+  readBoundedDirectoryEntries,
+  withExistingExportWorkspaceLease: DEFAULT_EXPORT_WORKSPACE_RUNTIME.withExistingExportWorkspaceLease,
+  createPreflight: createOwnerOnlyExportWorkspaceDiscardPreflight,
+  createStorage: createOwnerOnlyExportWorkspaceDiscardStorage,
+});
+const {
+  planLocalExportWorkspaceDiscard,
+  discardLocalExportWorkspace,
+  recoverLocalExportWorkspaceDiscard,
+} = DEFAULT_EXPORT_WORKSPACE_DISCARD;
+const {
+  planLocalExportDeletion,
+  deleteLocalExport,
+  recoverLocalExportDeletion,
+} = DEFAULT_EXPORT_DELETION;
+const DEFAULT_EXPORT_SET_MATERIALIZATION = createLocalExportSetMaterializationContext({
+  workspace: DEFAULT_EXPORT_WORKSPACE_RUNTIME,
+  destination: DEFAULT_EXPORT_ARTIFACT_STORAGE,
+  identity: { deriveParticipantId, deriveExportPseudonym },
+  resource: DEFAULT_EXPORT_RESOURCE_CONTEXT,
+  bundleVerification: DEFAULT_BUNDLE_VERIFICATION,
+  compatibilityTuple: DEFAULT_EXPORT_COMPATIBILITY.exportCompatibilityTuple,
+  sha256Hex,
+});
+const DEFAULT_METADATA_EXPORT = createLocalMetadataExportContext({
+  clock: () => Date.now(),
+  codexLogPorts: createLocalCodexLogPorts(),
+  createHash,
+  deriveAccountScopeId,
+  deriveEventOccurrenceId,
+  deriveMarkerOccurrenceId,
+  deriveModelFingerprint,
+  deriveParticipantId,
+  deriveQuotaStateId,
+  deriveSessionScopeId,
+  deriveSnapshotObservationId,
+  exportCompatibilityTuple: DEFAULT_EXPORT_COMPATIBILITY.exportCompatibilityTuple,
+  platformName: () => {
+    if (process.platform === "darwin") return "macos";
+    if (process.platform === "linux") return "linux";
+    if (process.platform === "win32") return "windows";
+    return "other";
+  },
+  randomBundleId,
+  resolvePath: resolve,
+  rss: () => process.memoryUsage().rss,
+  sha256Hex,
+  writeOwnerOnlyPairNoClobber:
+    DEFAULT_EXPORT_ARTIFACT_STORAGE.writeOwnerOnlyPairNoClobber,
+});
+
+function createLocalReviewClaudeCallbackBackend() {
+  return selectProductionClaudeCallbackBackend({
+    platform: process.platform,
+    architecture: process.arch,
+    createBackend: createExportIdentityKeychainBackend,
+  });
+}
+
+function selectLocalReviewParticipantIdentity({
+  explicitSecretFile = null,
+} = {}) {
+  const keychainCapability =
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
+  return selectProductionParticipantIdentity({
+    explicitSecretFile,
+    environmentSecret: process.env.APP_USAGEMONITOR_EXPORT_SECRET,
+    platform: process.platform,
+    architecture: process.arch,
+    appStateSecretFile: defaultExportSecretFile(),
+    createKeychainBackend: createExportIdentityKeychainBackend,
+    keychainCapability,
+    allowedKeychainCapability: keychainCapability,
+  });
+}
 
 function usage() {
   console.log(`Usage Monitor local review ${LOCAL_REVIEW_CLI_VERSION}
@@ -102,108 +264,6 @@ This build contains no enrollment, pairing, upload, queue, backend, web-server,
 remote-configuration, notification, or automatic-update command.`);
 }
 
-function optionValue(argv, index, option) {
-  const value = argv[index + 1];
-  if (!value || value.startsWith("--")) throw new Error(`${option} requires a value`);
-  return value;
-}
-
-function positiveInteger(argv, index, option) {
-  const value = Number(optionValue(argv, index, option));
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new Error(`${option} requires a positive integer`);
-  }
-  return value;
-}
-
-export function parseLocalReviewArgs(argv) {
-  const result = {
-    command: argv[0] ?? "help",
-    startAt: null,
-    endAt: null,
-    outputFile: null,
-    inputFile: null,
-    receiptFile: null,
-    directory: null,
-    workspaceDirectory: null,
-    codexHome: null,
-    collectorFile: null,
-    activityFile: null,
-    exportSecretFile: null,
-    claudeStatus: false,
-    claudeStateDirectory: null,
-    claudeUsage: false,
-    claudeProjectsDirectory: null,
-    resume: false,
-    confirm: false,
-    confirmDeletionToken: null,
-    confirmDiscardToken: null,
-    confirmRemovalToken: null,
-    confirmUninstallToken: null,
-    maximumRecordsPerChunk: null,
-    maximumCanonicalBundleBytes: null,
-    maximumEncodedArtifactBytes: null,
-    target: null,
-    artifactRoot: null,
-  };
-  for (let index = 1; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--since") result.startAt = optionValue(argv, index++, arg);
-    else if (arg === "--until") result.endAt = optionValue(argv, index++, arg);
-    else if (arg === "--output") result.outputFile = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--input") result.inputFile = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--receipt") result.receiptFile = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--directory") result.directory = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--workspace") result.workspaceDirectory = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--codex-home") result.codexHome = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--collector-file") result.collectorFile = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--activity-file") result.activityFile = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--secret-file") result.exportSecretFile = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--claude-status") result.claudeStatus = true;
-    else if (arg === "--claude-state-dir") result.claudeStateDirectory = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--claude-usage") result.claudeUsage = true;
-    else if (arg === "--claude-projects-dir") result.claudeProjectsDirectory = resolve(optionValue(argv, index++, arg));
-    else if (arg === "--resume") result.resume = true;
-    else if (arg === "--confirm") result.confirm = true;
-    else if (arg === "--confirm-deletion") result.confirmDeletionToken = optionValue(argv, index++, arg);
-    else if (arg === "--confirm-discard") result.confirmDiscardToken = optionValue(argv, index++, arg);
-    else if (arg === "--confirm-removal") result.confirmRemovalToken = optionValue(argv, index++, arg);
-    else if (arg === "--confirm-uninstall") result.confirmUninstallToken = optionValue(argv, index++, arg);
-    else if (arg === "--max-records-per-chunk") {
-      result.maximumRecordsPerChunk = positiveInteger(argv, index++, arg);
-    } else if (arg === "--max-bundle-bytes") {
-      result.maximumCanonicalBundleBytes = positiveInteger(argv, index++, arg);
-    } else if (arg === "--max-artifact-bytes") {
-      result.maximumEncodedArtifactBytes = positiveInteger(argv, index++, arg);
-    } else if (arg === "--target") {
-      result.target = optionValue(argv, index++, arg);
-    } else if (arg === "--artifact-root") {
-      result.artifactRoot = resolve(optionValue(argv, index++, arg));
-    } else {
-      throw new Error(`Unknown argument: ${arg}`);
-    }
-  }
-  if (result.claudeStatus && result.claudeStateDirectory !== null) {
-    throw new Error("export-set accepts either --claude-status or --claude-state-dir, not both");
-  }
-  if ((result.claudeStatus || result.claudeStateDirectory !== null
-      || result.claudeUsage || result.claudeProjectsDirectory !== null)
-      && result.command !== "export-set") {
-    throw new Error("Claude export options are available only for export-set");
-  }
-  if (result.confirmRemovalToken !== null
-      && result.command !== "remove-claude-callback-identity") {
-    throw new Error("--confirm-removal is available only for remove-claude-callback-identity");
-  }
-  if (result.confirmUninstallToken !== null && result.command !== "uninstall") {
-    throw new Error("--confirm-uninstall is available only for uninstall");
-  }
-  if (result.target !== null && !["install", "uninstall"].includes(result.command)) {
-    throw new Error("--target is available only for install and uninstall");
-  }
-  return result;
-}
-
 async function exists(path) {
   try {
     await access(path);
@@ -224,33 +284,44 @@ function printIdentityInspection(selection, inspection) {
   }
 }
 
-async function readActivityMarkers(path) {
-  return readBoundedJsonLines(path, {
-    maximumFileBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExpandedRecordBytes,
-    maximumLineBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumLineBytes,
-    maximumRecords: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
-  });
-}
-
 export async function runLocalReview(
   argv = process.argv.slice(2),
   {
     artifactRoot = DEFAULT_ARTIFACT_ROOT,
-    selectParticipantIdentity = selectProductionParticipantIdentity,
+    selectParticipantIdentity = selectLocalReviewParticipantIdentity,
     inspectIdentity = inspectParticipantSecret,
     rotateIdentity = rotateParticipantSecret,
     withIdentityLease = withParticipantSecretLease,
-    createClaudeCallbackBackend = createProductionClaudeCallbackBackend,
-    readClaudeCallbackCredential = readClaudeCallbackCapability,
-    inspectClaudeCallback = inspectClaudeCallbackLifecycle,
-    installClaudeCallbackCommand = installClaudeCallback,
-    uninstallClaudeCallbackCommand = uninstallClaudeCallback,
-    recoverClaudeCallbackCommand = recoverClaudeCallbackLifecycle,
-    rotateClaudeCallbackCommand = rotateManagedClaudeCallbackCapability,
-    planClaudeCallbackRemoval = planManagedClaudeCallbackCapabilityRemoval,
-    removeClaudeCallbackCredential = removeManagedClaudeCallbackCapability,
+    createClaudeCallbackBackend =
+      createLocalReviewClaudeCallbackBackend,
+    readClaudeCallbackCredential =
+      DEFAULT_CLAUDE_CALLBACK_CAPABILITY.readClaudeCallbackCapability,
+    inspectClaudeCallback =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.inspectClaudeCallbackLifecycle,
+    installClaudeCallbackCommand =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.installClaudeCallback,
+    uninstallClaudeCallbackCommand =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.uninstallClaudeCallback,
+    recoverClaudeCallbackCommand =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.recoverClaudeCallbackLifecycle,
+    rotateClaudeCallbackCommand =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.rotateManagedClaudeCallbackCapability,
+    planClaudeCallbackRemoval =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.planManagedClaudeCallbackCapabilityRemoval,
+    removeClaudeCallbackCredential =
+      DEFAULT_CLAUDE_CALLBACK_LIFECYCLE.removeManagedClaudeCallbackCapability,
+    exportResourceContext = DEFAULT_EXPORT_RESOURCE_CONTEXT,
+    bundleVerification = DEFAULT_BUNDLE_VERIFICATION,
+    verifyExportSet =
+      DEFAULT_EXPORT_SET_VERIFICATION.verifyLocalExportSet,
+    exportSetController = DEFAULT_LOCAL_EXPORT_SET_CONTROLLER,
   } = {},
 ) {
+  const {
+    createLocalExportWorkspace,
+    inspectLocalExportWorkspace,
+    resumeLocalExportWorkspace,
+  } = exportSetController;
   const args = parseLocalReviewArgs(argv);
   const selectedArtifactRoot = args.artifactRoot ?? artifactRoot;
 
@@ -325,7 +396,7 @@ export async function runLocalReview(
   }
   if (args.command === "verify-bundle") {
     if (!args.inputFile) throw new Error("verify-bundle requires --input");
-    const verified = await verifyLocalMetadataBundleFiles({
+    const verified = await bundleVerification.verifyLocalMetadataBundleFiles({
       bundleFile: args.inputFile,
       receiptFile: args.receiptFile ?? `${args.inputFile}.privacy-receipt.json`,
     });
@@ -337,7 +408,7 @@ export async function runLocalReview(
   }
   if (args.command === "verify-export-set") {
     if (!args.directory) throw new Error("verify-export-set requires --directory");
-    const verified = await verifyLocalExportSet({ directory: args.directory });
+    const verified = await verifyExportSet({ directory: args.directory });
     console.log("Local metadata export-set verification: passed");
     console.log(`Contract: ${verified.schemaVersion} (${verified.contractStatus})`);
     console.log(`Chunks: ${verified.chunkCount}`);
@@ -372,8 +443,8 @@ export async function runLocalReview(
     if (args.resume && (args.startAt || args.endAt)) {
       throw new Error("export-set --resume uses the workspace interval; omit --since and --until");
     }
-    const activityMarkers = await readActivityMarkers(
-      args.activityFile ?? defaultActivityMarkerFile(),
+    const activityMarkers = await exportResourceContext.readActivityMarkers(
+      args.activityFile ?? DEFAULT_EXPORT_ARTIFACT_STORAGE.defaultActivityMarkerFile(),
     );
     const selection = selectParticipantIdentity({
       explicitSecretFile: args.exportSecretFile,
@@ -397,7 +468,7 @@ export async function runLocalReview(
             startAt: args.startAt,
             endAt: args.endAt,
           });
-      const materialized = await materializeLocalExportSet({
+      const materialized = await DEFAULT_EXPORT_SET_MATERIALIZATION.materializeLocalExportSet({
         workspaceDirectory: args.workspaceDirectory,
         outputDirectory: args.directory,
         secret: identity.secret,
@@ -422,7 +493,7 @@ export async function runLocalReview(
   }
   if (args.command === "recover-exports") {
     if (!args.directory) throw new Error("recover-exports requires --directory");
-    const result = await recoverOwnerOnlyPairTransactions({
+    const result = await DEFAULT_EXPORT_ARTIFACT_STORAGE.recoverOwnerOnlyPairTransactions({
       directory: args.directory,
     });
     console.log(`Local export recovery: ${result.recovered} recovered of ${result.transactionsFound} transaction(s)`);
@@ -536,14 +607,11 @@ export async function runLocalReview(
     if (args.command === "export-local" && !args.outputFile) {
       throw new Error("export-local requires --output");
     }
-    const guard = createExportResourceGuard();
+    const guard = exportResourceContext.createGuard();
     guard.assertCoveredInterval(Date.parse(args.startAt), Date.parse(args.endAt));
-    const activityMarkers = await readBoundedJsonLines(
-      args.activityFile ?? defaultActivityMarkerFile(),
+    const activityMarkers = await exportResourceContext.readActivityMarkers(
+      args.activityFile ?? DEFAULT_EXPORT_ARTIFACT_STORAGE.defaultActivityMarkerFile(),
       {
-        maximumFileBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumExpandedRecordBytes,
-        maximumLineBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumLineBytes,
-        maximumRecords: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumOutputRecords,
         resourceGuard: guard,
       },
     );
@@ -551,7 +619,7 @@ export async function runLocalReview(
       explicitSecretFile: args.exportSecretFile,
     });
     await withIdentityLease(selection.identityOptions, async (identity) => {
-      const result = await buildLocalMetadataBundle({
+      const result = await DEFAULT_METADATA_EXPORT.buildLocalMetadataBundle({
         startAt: args.startAt,
         endAt: args.endAt,
         codexHome: args.codexHome ?? undefined,
@@ -559,11 +627,11 @@ export async function runLocalReview(
         activityMarkers,
         resourceGuard: guard,
       });
-      console.log(renderMetadataExportPreview(result));
+      console.log(DEFAULT_METADATA_EXPORT.renderMetadataExportPreview(result));
       if (args.command === "inspect-export") return;
       const receiptFile = args.receiptFile
         ?? `${args.outputFile}.privacy-receipt.json`;
-      const written = await writeLocalMetadataBundle({
+      const written = await DEFAULT_METADATA_EXPORT.writeLocalMetadataBundle({
         ...result,
         outputFile: args.outputFile,
         receiptFile,

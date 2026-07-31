@@ -41,8 +41,36 @@ import {
   decompressExportBytes,
   ExportCompressionError,
 } from "../src/export-compression.js";
+import {
+  BundleVerificationError,
+  loadVerifiedLocalMetadataBundleBytes,
+  loadVerifiedLocalMetadataBundleFiles,
+} from "../src/bundle-verifier.js";
+import { exportCompatibilityTuple } from "../src/export-contract.js";
+import {
+  createLocalExportSetVerificationContext,
+} from "../src/application/index.js";
+import {
+  createExportSetVerificationStorageContext,
+} from "../src/platform/index.js";
 
 const SECRET = Buffer.alloc(32, 67);
+
+function verifierWith({
+  storage = createExportSetVerificationStorageContext(),
+  bundleVerification = {
+    loadVerifiedLocalMetadataBundleBytes,
+    loadVerifiedLocalMetadataBundleFiles,
+  },
+} = {}) {
+  return createLocalExportSetVerificationContext({
+    storage,
+    bundleVerification,
+    exportCompatibilityTuple,
+    manifestBasename: EXPORT_SET_MANIFEST_BASENAME,
+    manifestReceiptBasename: EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
+  }).verifyLocalExportSet;
+}
 
 function usage(input, output) {
   return {
@@ -557,6 +585,130 @@ test("verification-index resource failure removes its temporary SQLite state", a
         && error.code === "export_resource_workspace_bytes",
     );
     assert.deepEqual(await readdir(temporaryRoot), []);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("verification preserves a primary safe failure when index cleanup fails", async () => {
+  const value = await localSet();
+  const canary = `${value.output}/CLEANUP_DO_NOT_EXPOSE`;
+  try {
+    const base = createExportSetVerificationStorageContext();
+    const trapBind = (operation) => new Proxy(operation, {
+      get(target, property, receiver) {
+        if (property === "bind") throw new Error(canary);
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const passing = verifierWith({
+      storage: {
+        ...base,
+        async createUniquenessIndex(options) {
+          const index = await base.createUniquenessIndex(options);
+          return {
+            add: trapBind(index.add),
+            close: trapBind(index.close),
+          };
+        },
+      },
+    });
+    assert.equal(
+      (await passing({ directory: value.output })).verdict,
+      "passed",
+    );
+
+    const verify = verifierWith({
+      storage: {
+        ...base,
+        async createUniquenessIndex() {
+          return {
+            add() {
+              throw new ExportSetVerificationError("chunk_duplicate");
+            },
+            async close() {
+              throw new Error(canary);
+            },
+          };
+        },
+      },
+    });
+    await assert.rejects(
+      verify({ directory: value.output }),
+      (error) => error instanceof ExportSetVerificationError
+        && error.code === "export_set_verify_chunk_duplicate"
+        && !error.message.includes(canary)
+        && !error.message.includes(value.output),
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("verification snapshots hostile bundle results without leaking getters", async () => {
+  const value = await localSet();
+  const canary = `${value.output}/BUNDLE_DO_NOT_EXPOSE`;
+  try {
+    const verify = verifierWith({
+      bundleVerification: {
+        async loadVerifiedLocalMetadataBundleBytes(input) {
+          const verified = await loadVerifiedLocalMetadataBundleBytes(input);
+          return {
+            ...verified,
+            bundle: new Proxy(verified.bundle, {
+              ownKeys() {
+                throw new Error(canary);
+              },
+            }),
+          };
+        },
+        loadVerifiedLocalMetadataBundleFiles,
+      },
+    });
+    await assert.rejects(
+      verify({ directory: value.output }),
+      (error) => error instanceof ExportSetVerificationError
+        && error.code === "export_set_verify_chunk_metadata"
+        && !error.message.includes(canary)
+        && !error.message.includes(value.output),
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("verification preserves reviewed bundle-verification failures", async () => {
+  const value = await localSet();
+  const reviewed = new BundleVerificationError("bundle_input");
+  const canary = `${value.output}/BUNDLE_ERROR_DO_NOT_EXPOSE`;
+  try {
+    const verify = verifierWith({
+      bundleVerification: {
+        async loadVerifiedLocalMetadataBundleBytes() {
+          throw reviewed;
+        },
+        loadVerifiedLocalMetadataBundleFiles,
+      },
+    });
+    await assert.rejects(
+      verify({ directory: value.output }),
+      (error) => error === reviewed,
+    );
+    const hostile = verifierWith({
+      bundleVerification: {
+        async loadVerifiedLocalMetadataBundleBytes() {
+          throw new BundleVerificationError(canary);
+        },
+        loadVerifiedLocalMetadataBundleFiles,
+      },
+    });
+    await assert.rejects(
+      hostile({ directory: value.output }),
+      (error) => error instanceof ExportSetVerificationError
+        && error.code === "export_set_verify_chunk_metadata"
+        && !error.message.includes(canary)
+        && !error.message.includes(value.output),
+    );
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

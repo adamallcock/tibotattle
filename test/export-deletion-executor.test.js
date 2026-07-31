@@ -647,7 +647,12 @@ ${await readFile(join(value.output, ".app-usagemonitor-deletion-commit.json"), "
 });
 
 test("production deletion modules contain no recursive removal primitive", async () => {
-  for (const path of [resolve("src/export-deletion.js"), resolve("src/export-deletion-executor.js")]) {
+  for (const path of [
+    resolve("src/export-deletion.js"),
+    resolve("src/export-deletion-executor.js"),
+    resolve("src/platform/owner-only-export-deletion-preflight.js"),
+    resolve("src/platform/owner-only-export-deletion-storage.js"),
+  ]) {
     const source = await readFile(path, "utf8");
     assert.doesNotMatch(source, /\brm\s*\(/);
     assert.doesNotMatch(source, /\brmdir\s*\(/);

@@ -24,30 +24,74 @@
     "accountingDiagnostic"
   ],
   "properties": {
-    "schemaVersion": { "const": "telemetry-contribution-v0.2" },
-    "consentVersion": { "const": "privacy-safe-telemetry-v0.2" },
-    "status": { "const": "implementation_disabled" },
-    "synthetic": { "const": false },
+    "schemaVersion": {
+      "const": "telemetry-contribution-v0.2"
+    },
+    "consentVersion": {
+      "const": "privacy-safe-telemetry-v0.2"
+    },
+    "status": {
+      "const": "implementation_disabled"
+    },
+    "synthetic": {
+      "const": false
+    },
     "datasetId": {
       "type": "string",
       "pattern": "^dataset:v1:[a-f0-9]{64}$",
       "description": "Participant-scoped dataset namespace; not an authentication credential."
     },
-    "partIndex": { "type": "integer", "minimum": 1, "maximum": 100 },
-    "partCount": { "type": "integer", "minimum": 1, "maximum": 100 },
-    "completeness": { "enum": ["complete", "partial"] },
-    "createdAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "partIndex": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "partCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "completeness": {
+      "enum": [
+        "complete",
+        "partial"
+      ]
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 32
+    },
     "coveredAt": {
       "type": "object",
       "readOnly": true,
       "additionalProperties": false,
-      "required": ["startAt", "endAt"],
+      "required": [
+        "startAt",
+        "endAt"
+      ],
       "properties": {
-        "startAt": { "type": "string", "format": "date-time", "maxLength": 32 },
-        "endAt": { "type": "string", "format": "date-time", "maxLength": 32 }
+        "startAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 32
+        },
+        "endAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 32
+        }
       }
     },
-    "clientPlatform": { "enum": ["macos", "linux", "windows", "other", "unknown"] },
+    "clientPlatform": {
+      "enum": [
+        "macos",
+        "linux",
+        "windows",
+        "other",
+        "unknown"
+      ]
+    },
     "providerPolicyEpoch": {
       "enum": [
         "openai_pre_agentic_pool_2026_07_09",
@@ -90,16 +134,38 @@
         "priceBasis"
       ],
       "properties": {
-        "status": { "const": "untrusted_diagnostic" },
-        "sourceSchemaVersion": { "const": "telemetry-contribution-v0.1" },
+        "status": {
+          "const": "untrusted_diagnostic"
+        },
+        "sourceSchemaVersion": {
+          "const": "telemetry-contribution-v0.1"
+        },
         "estimatedApiCostUsd": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^(0|[1-9][0-9]*)\\.[0-9]{6}$"
         },
-        "pricedEventCoveragePercent": { "type": "number", "minimum": 0, "maximum": 100 },
-        "unknownModelEventCount": { "type": "integer", "minimum": 0 },
-        "unknownBillableUnits": { "type": "integer", "minimum": 0 },
-        "priceBasis": { "enum": ["current_api_prices", "unpriced"] }
+        "pricedEventCoveragePercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "unknownModelEventCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unknownBillableUnits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "priceBasis": {
+          "enum": [
+            "current_api_prices",
+            "unpriced"
+          ]
+        }
       }
     }
   }

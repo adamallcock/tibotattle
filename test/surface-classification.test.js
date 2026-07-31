@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifySessionSurface } from "../src/surface-classification.js";
+import { classifySessionSurface } from "../src/providers/codex/logs.js";
 
 test("classifies scheduled tasks and subagents without retaining raw session metadata", () => {
   assert.deepEqual(classifySessionSurface({

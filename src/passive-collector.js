@@ -9,7 +9,8 @@ import {
   deriveOpenAIAccountScopeWithSecretLoader,
   sanitizeCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
-} from "./codex-app-server.js";
+  sanitizeAccountScope,
+} from "./providers/codex/account.js";
 import {
   canonicalComponents,
   canonicalRateLimitWindows,
@@ -17,8 +18,10 @@ import {
   normalizeTokenUsage,
   readRolloutLineage,
 } from "./codex-log-scan.js";
-import { sanitizeAccountScope } from "./account-scope.js";
-import { normalizeProviderTier, unknownCodexTier } from "./tier-semantics.js";
+import {
+  normalizeProviderTier,
+  unknownCodexTier,
+} from "./providers/codex/logs.js";
 import {
   appendJsonLinesOwnerOnly,
   appendOwnerOnlyText,
@@ -180,6 +183,7 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
       accountCredentialUnavailable: 0,
       appServerErrorCounts: {},
       ingestionErrorCounts: {},
+      watcherErrorCounts: {},
       tierSettingEvents: 0,
       tierSettingOmissions: 0,
       malformedTierSettingEvents: 0,
@@ -254,7 +258,12 @@ function publicDiagnostics(value) {
     key,
     Number.isSafeInteger(source[key]) && source[key] >= 0 ? source[key] : 0,
   ]));
-  for (const mapKey of ["appServerErrorCounts", "ingestionErrorCounts", "tierSettingCounts"]) {
+  for (const mapKey of [
+    "appServerErrorCounts",
+    "ingestionErrorCounts",
+    "tierSettingCounts",
+    "watcherErrorCounts",
+  ]) {
     const candidate = source[mapKey];
     result[mapKey] = {};
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
@@ -1754,6 +1763,7 @@ export async function runCollectorForeground({
   signal,
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
+  watchRoot = watch,
   loadAccountObservationSecret = null,
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
@@ -1762,6 +1772,7 @@ export async function runCollectorForeground({
   maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
   maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
 } = {}) {
+  if (typeof watchRoot !== "function") throw new TypeError("watchRoot must be a function");
   const release = await acquireCollectorLock(lockFile, { clock });
   let existing;
   try {
@@ -1782,6 +1793,8 @@ export async function runCollectorForeground({
   let checkpointWrites = 0;
   let ingestionRuns = 0;
   let watcherEvents = 0;
+  let watcherFallbackActive = false;
+  let wakeReconciliation = null;
   let reconciliationCycles = 0;
   let operationTail = Promise.resolve();
   let ingestionQueued = false;
@@ -1799,6 +1812,7 @@ export async function runCollectorForeground({
   const watchers = [];
 
   checkpoint.diagnostics.ingestionErrorCounts ??= {};
+  checkpoint.diagnostics.watcherErrorCounts ??= {};
 
   async function save() {
     checkpoint.savedAt = new Date(clock()).toISOString();
@@ -1815,6 +1829,7 @@ export async function runCollectorForeground({
     for (const key of Object.keys(checkpoint)) delete checkpoint[key];
     Object.assign(checkpoint, restored);
     checkpoint.diagnostics.ingestionErrorCounts ??= {};
+    checkpoint.diagnostics.watcherErrorCounts ??= {};
   }
 
   async function appendForegroundAppRecord(payload, source) {
@@ -1843,6 +1858,47 @@ export async function runCollectorForeground({
       : "unknown";
     const key = `${kind}:${code}`;
     checkpoint.diagnostics.ingestionErrorCounts[key] = (checkpoint.diagnostics.ingestionErrorCounts[key] ?? 0) + 1;
+  }
+
+  function recordWatcherError(error) {
+    const code = typeof error?.code === "string" && /^[a-z0-9_:-]{1,64}$/i.test(error.code)
+      ? error.code
+      : "unknown";
+    checkpoint.diagnostics.watcherErrorCounts[code] =
+      (checkpoint.diagnostics.watcherErrorCounts[code] ?? 0) + 1;
+  }
+
+  function activateWatcherFallback() {
+    watcherFallbackActive = true;
+    wakeReconciliation?.();
+  }
+
+  function waitForReconciliation(timeoutMs) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer;
+      function finish(reason) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (wakeReconciliation === wake) wakeReconciliation = null;
+        resolve(reason);
+      }
+      function onAbort() {
+        finish("aborted");
+      }
+      function wake() {
+        finish("wake");
+      }
+      wakeReconciliation = wake;
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        finish("aborted");
+        return;
+      }
+      timer = setTimeout(() => finish("timeout"), timeoutMs);
+    });
   }
 
   function enqueueOperation(kind, operation) {
@@ -2016,18 +2072,27 @@ export async function runCollectorForeground({
     }
     for (const root of [join(codexHome, "sessions"), join(codexHome, "archived_sessions")]) {
       try {
-        const watcher = watch(root, { recursive: true }, () => {
+        const watcher = watchRoot(root, { recursive: true }, () => {
           watcherEvents += 1;
           queueIngestion();
         });
+        watcher.on("error", (error) => {
+          recordWatcherError(error);
+          activateWatcherFallback();
+          watcher.close();
+        });
         watchers.push(watcher);
       } catch (error) {
-        if (error.code !== "ENOENT") throw error;
+        if (error.code !== "ENOENT") {
+          recordWatcherError(error);
+          activateWatcherFallback();
+        }
       }
     }
     while (!signal?.aborted) {
-      const delay = client ? reconciliationMs : Math.min(30_000, reconnectBaseMs * 2 ** Math.min(reconnectAttempts, 5));
-      if (await waitForAbort(signal, delay) === "aborted") break;
+      const connectedDelay = watcherFallbackActive ? Math.min(reconciliationMs, 1_000) : reconciliationMs;
+      const delay = client ? connectedDelay : Math.min(30_000, reconnectBaseMs * 2 ** Math.min(reconnectAttempts, 5));
+      if (await waitForReconciliation(delay) === "aborted") break;
       reconciliationCycles += 1;
       await queueIngestion();
       if (!client) {
@@ -2057,6 +2122,7 @@ export async function runCollectorForeground({
         checkpointWrites,
         ingestionRuns,
         watcherEvents,
+        watcherFallbackActive,
         reconciliationCycles,
         reconciliationMs,
         recordBatchesWritten,

@@ -111,8 +111,14 @@ test("export-set and destructive paths do not call array-returning readdir direc
     "../src/export-set-verifier.js",
     "../src/export-deletion.js",
     "../src/export-deletion-executor.js",
+    "../src/platform/owner-only-export-deletion-preflight.js",
+    "../src/platform/owner-only-export-deletion-storage.js",
     "../src/export-workspace-discard.js",
     "../src/export-workspace-discard-executor.js",
+    "../src/application/local-export-workspace-discard.js",
+    "../src/export-workspace-discard-compatibility-internal.js",
+    "../src/platform/owner-only-export-workspace-discard-preflight.js",
+    "../src/platform/owner-only-export-workspace-discard-storage.js",
     "../src/storage.js",
   ]) {
     const source = await readFile(new URL(path, import.meta.url), "utf8");

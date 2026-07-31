@@ -14,6 +14,9 @@ import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import {
+  checkLocalWorkspacePackages,
+} from "./check-local-workspace-packages.mjs";
 import { inspectLocalBackendState } from "./inspect-local-backend-state.mjs";
 import {
   backendSmokeSourceArguments,
@@ -369,6 +372,7 @@ async function probePersistedParticipant(origin, participantAccessFile) {
   };
 }
 
+await checkLocalWorkspacePackages();
 const options = parseLocalBackendLabArguments(process.argv.slice(2));
 const port = options.port;
 const companionPort = options.companionPort;

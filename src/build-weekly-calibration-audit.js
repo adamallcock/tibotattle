@@ -2,7 +2,7 @@
 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { scanAndPriceCodexLogs } from "./codex-log-scan.js";
+import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
 import { writeJsonOwnerOnlyAtomic } from "./storage.js";
 
 const root = process.cwd();

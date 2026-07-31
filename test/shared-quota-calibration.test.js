@@ -3,9 +3,9 @@ import test from "node:test";
 
 import {
   analyzeQuotaCalibration,
+  buildResetEvidence,
   fitResetCapacity,
-} from "../shared/quota-calibration.js";
-import { buildResetEvidence } from "../shared/quota-tracks.js";
+} from "@app-usagemonitor/quota-analysis";
 
 function opaqueId(kind, value) {
   return `${kind}:v1:${BigInt(value).toString(16).padStart(64, "0")}`;

@@ -11,7 +11,7 @@ import {
 import { selectProductionAccountObservationSecret } from "../src/account-observation-production.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
 import { run } from "../src/cli.js";
-import { sanitizeCodexAccountSnapshotWithSecretLoader } from "../src/codex-app-server.js";
+import { sanitizeCodexAccountSnapshotWithSecretLoader } from "../src/providers/codex/account.js";
 
 const ACCOUNT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
 

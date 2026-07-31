@@ -14,6 +14,7 @@ import {
   createRefreshPollingBudget,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
+  parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
@@ -54,6 +55,63 @@ import {
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION
 } from "../public/data-client.js";
+
+test("browser JSON preflight rejects duplicate object keys before parsing", () => {
+  for (const serialized of [
+    '{"prompt":"first","prompt":"second"}',
+    '{"row":{"accountScopeId":"first","accountScopeId":"second"}}',
+    '{"content":"first","\\u0063ontent":"second"}',
+    '{"safeCount":1,"safeCount":1}',
+  ]) {
+    assert.throws(
+      () => parseJsonWithUniqueObjectKeys(serialized),
+      (error) => (
+        error instanceof SyntaxError
+        && error.code === "duplicate_json_object_key"
+        && error.message === "Duplicate JSON object keys are not accepted."
+        && !error.message.includes("prompt")
+        && !error.message.includes("accountScopeId")
+        && !error.message.includes("content")
+        && !error.message.includes("safeCount")
+      ),
+    );
+  }
+});
+
+test("browser JSON preflight preserves canonical JSON object behavior", () => {
+  const serialized = JSON.stringify({
+    schemaVersion: "telemetry-contribution-v0.2",
+    nested: {
+      accountScopeId: "acct_opaque",
+      values: [null, true, false, -12.5e3, "escaped\nvalue"],
+    },
+    siblings: [
+      { repeatedAcrossObjects: 1 },
+      { repeatedAcrossObjects: 2 },
+    ],
+  });
+  assert.deepEqual(
+    parseJsonWithUniqueObjectKeys(serialized),
+    JSON.parse(serialized),
+  );
+  assert.deepEqual(
+    parseJsonWithUniqueObjectKeys(
+      '{"left":{"same":"allowed"},"right":{"same":"allowed"}}',
+    ),
+    {
+      left: { same: "allowed" },
+      right: { same: "allowed" },
+    },
+  );
+  assert.throws(
+    () => parseJsonWithUniqueObjectKeys('{"truncated":'),
+    (error) => (
+      error instanceof SyntaxError
+      && error.code !== "duplicate_json_object_key"
+      && !error.message.includes("truncated")
+    ),
+  );
+});
 
 test("quota timeline lookup preserves latest-at-or-before boundary semantics", () => {
   const rows = [
@@ -539,18 +597,32 @@ test("account-scoped local-preview telemetry is preflighted and encrypted unchan
   assert.deepEqual(await decryptEnvelope(envelope, pair.privateKey), payload);
 });
 
+function telemetryContractFailure(code, detailCode) {
+  return (error) => {
+    assert.equal(error?.code, code);
+    assert.equal(error?.detailCode, detailCode);
+    return true;
+  };
+}
+
 test("account-scoped browser preflight rejects direct account scopes and content fields", () => {
   const directScope = safeAccountScopedTelemetry();
   directScope.usageEvents[0].accountTrackId = `account:v1:${"a".repeat(64)}`;
   assert.throws(
     () => validateAccountScopedTelemetryContribution(directScope),
-    /invalid usageEvents record/
+    telemetryContractFailure(
+      "PRIVACY_CANARY_DETECTED",
+      "private_projection_invalid",
+    ),
   );
   const content = safeAccountScopedTelemetry();
   content.usageEvents[0].prompt = "private";
   assert.throws(
     () => validateAccountScopedTelemetryContribution(content),
-    /forbidden content field/
+    telemetryContractFailure(
+      "PRIVACY_CANARY_DETECTED",
+      "private_projection_invalid",
+    ),
   );
 });
 
@@ -565,26 +637,61 @@ test("browser telemetry validation rejects raw-content-shaped and identity field
   ]) {
     const payload = safeTelemetry();
     payload.usageEvents[0][key] = value;
-    assert.throws(() => validateTelemetryContribution(payload), /forbidden content field/);
+    assert.throws(
+      () => validateTelemetryContribution(payload),
+      telemetryContractFailure(
+        "PRIVACY_CANARY_DETECTED",
+        "privacy_canary_detected",
+      ),
+    );
   }
 });
 
 test("browser telemetry validation rejects synthetic, wrong-schema, oversized, and deeply nested inputs", () => {
-  assert.throws(() => validateTelemetryContribution({ synthetic: false }), /privacy-safe/);
+  assert.throws(
+    () => validateTelemetryContribution({ synthetic: false }),
+    telemetryContractFailure(
+      "TELEMETRY_RECORD_INVALID",
+      "schema_version_invalid",
+    ),
+  );
   const synthetic = safeTelemetry();
   synthetic.synthetic = true;
-  assert.throws(() => validateTelemetryContribution(synthetic), /privacy-safe/);
+  assert.throws(
+    () => validateTelemetryContribution(synthetic),
+    telemetryContractFailure(
+      "TELEMETRY_RECORD_INVALID",
+      "schema_version_invalid",
+    ),
+  );
   assert.throws(
     () => validateTelemetryContribution(safeTelemetry(), { maxSerializedBytes: 10 }),
-    /larger/
+    telemetryContractFailure(
+      "TELEMETRY_RECORD_INVALID",
+      "maximum_bytes_exceeded",
+    ),
   );
   const nested = safeTelemetry();
   nested.extra = { a: { b: { c: 1 } } };
-  assert.throws(() => validateTelemetryContribution(nested, { maxDepth: 1 }), /closed telemetry/);
+  assert.throws(
+    () => validateTelemetryContribution(nested, { maxDepth: 1 }),
+    telemetryContractFailure(
+      "TELEMETRY_RECORD_INVALID",
+      "maximum_depth_exceeded",
+    ),
+  );
   const tooMany = safeTelemetry();
-  tooMany.usageEvents = Array.from({ length: 101 }, () => structuredClone(tooMany.usageEvents[0]));
-  tooMany.quotaSnapshots = Array.from({ length: 100 }, () => ({}));
-  assert.throws(() => validateTelemetryContribution(tooMany), /smaller batches/);
+  tooMany.usageEvents = Array.from(
+    { length: 201 },
+    () => structuredClone(tooMany.usageEvents[0]),
+  );
+  assert.throws(
+    () => validateTelemetryContribution(tooMany),
+    telemetryContractFailure(
+      "TELEMETRY_RECORD_INVALID",
+      "maximum_array_items_exceeded",
+    ),
+  );
 });
 
 test("local dashboard normalizer accepts artifact rows and keeps stale state explicit", () => {
@@ -2854,6 +2961,29 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /createTelemetryEnvelope/);
   assert.match(appSource, /communityClient\.registerUpload\(/);
   assert.match(appSource, /communityClient\.contributeSerialized\(/);
+  const submitBody = appSource.match(
+    /async function submitContribution\(event\) \{([\s\S]*?)\n\}\n\nfunction renderPersonalStats/u,
+  )?.[1];
+  assert.ok(submitBody, "the browser upload boundary is available");
+  assert.ok(
+    submitBody.indexOf("await parseSafeExport(file)")
+      < submitBody.indexOf("await ensureCommunitySession(payload.schemaVersion)"),
+    "strict file parsing happens before session enrollment",
+  );
+  assert.ok(
+    submitBody.indexOf("await parseSafeExport(file)")
+      < submitBody.indexOf("communityClient.registerUpload"),
+    "strict file parsing happens before upload registration",
+  );
+  assert.ok(
+    submitBody.indexOf("await parseSafeExport(file)")
+      < submitBody.indexOf("communityClient.contributeSerialized"),
+    "strict file parsing happens before upload transport",
+  );
+  assert.match(
+    appSource,
+    /function parseSafeExport\(file\)[\s\S]*parseJsonWithUniqueObjectKeys\(content\)[\s\S]*duplicate JSON object keys/u,
+  );
   assert.match(appSource, /communityClient\.participantProfile\(\)/);
   assert.match(appSource, /communityClient\.deleteContribution\(contributionId\)/);
   assert.match(appSource, /communityClient\.deleteParticipant\(\)/);

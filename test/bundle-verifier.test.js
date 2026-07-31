@@ -5,7 +5,16 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { BundleVerificationError, verifyLocalMetadataBundleFiles } from "../src/bundle-verifier.js";
+import {
+  BundleVerificationError,
+  loadVerifiedLocalMetadataBundleBytes,
+  verifyLocalMetadataBundleFiles,
+} from "../src/bundle-verifier.js";
+import {
+  LOCAL_METADATA_BUNDLE_VERIFICATION_LIMITS,
+  createLocalMetadataBundleByteVerifier,
+} from "../src/export/bundle-verification.js";
+import { exportCompatibilityTuple } from "../src/export-contract.js";
 import { buildLocalMetadataBundle, writeLocalMetadataBundle } from "../src/metadata-exporter.js";
 import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import { stableJson } from "../src/storage.js";
@@ -57,6 +66,27 @@ function assertSafeFailure(error, expectedCode, pair) {
   return true;
 }
 
+function digest(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function canonicalByteVerifier() {
+  return createLocalMetadataBundleByteVerifier({
+    sha256Hex: digest,
+    compatibilityTuple: exportCompatibilityTuple,
+  });
+}
+
+function capturedVerificationCode(verify, options) {
+  try {
+    verify(options);
+  } catch (error) {
+    assert.equal(error instanceof BundleVerificationError, true);
+    return error.code;
+  }
+  assert.fail("Expected bundle verification to fail");
+}
+
 test("standalone verifier accepts an exact canonical owner-only pair", async () => {
   const pair = await localPair();
   try {
@@ -66,6 +96,112 @@ test("standalone verifier accepts an exact canonical owner-only pair", async () 
     assert.equal(verified.contractStatus, "draft_local_only_unfrozen");
     assert.equal(verified.transportReady, false);
     assert.deepEqual(verified.recordCounts, { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 });
+  } finally {
+    await rm(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy byte verifier preserves Buffer results for Uint8Array inputs", async () => {
+  const pair = await localPair();
+  try {
+    const bundleBytes = new Uint8Array(await readFile(pair.bundleFile));
+    const receiptBytes = new Uint8Array(await readFile(pair.receiptFile));
+    const verified = loadVerifiedLocalMetadataBundleBytes({
+      bundleBytes,
+      receiptBytes,
+    });
+    assert.equal(Buffer.isBuffer(verified.bundleBytes), true);
+    assert.equal(Buffer.isBuffer(verified.receiptBytes), true);
+  } finally {
+    await rm(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy and runtime-neutral byte verifiers preserve success and failure parity", async () => {
+  const pair = await localPair();
+  try {
+    const bundleBytes = await readFile(pair.bundleFile);
+    const receiptBytes = await readFile(pair.receiptFile);
+    const canonicalVerify = canonicalByteVerifier();
+    const legacyResult = loadVerifiedLocalMetadataBundleBytes({
+      bundleBytes,
+      receiptBytes,
+    });
+    const canonicalResult = canonicalVerify({
+      bundleBytes: new Uint8Array(bundleBytes),
+      receiptBytes: new Uint8Array(receiptBytes),
+    });
+    assert.deepEqual(canonicalResult.summary, legacyResult.summary);
+    assert.deepEqual(canonicalResult.bundle, legacyResult.bundle);
+    assert.deepEqual(canonicalResult.receipt, legacyResult.receipt);
+    assert.deepEqual(
+      Buffer.from(canonicalResult.bundleBytes),
+      legacyResult.bundleBytes,
+    );
+    assert.deepEqual(
+      Buffer.from(canonicalResult.receiptBytes),
+      legacyResult.receiptBytes,
+    );
+    assert.equal(canonicalResult.bundleSha256, legacyResult.bundleSha256);
+    assert.equal(canonicalResult.receiptSha256, legacyResult.receiptSha256);
+
+    const inconsistentBundle = structuredClone(pair.bundle);
+    inconsistentBundle.recordCounts.usageEvents = 1;
+    const inconsistentBundleBytes = Buffer.from(
+      stableJson(inconsistentBundle),
+    );
+    const inconsistentReceipt = structuredClone(pair.receipt);
+    inconsistentReceipt.recordCounts.usageEvents = 1;
+    inconsistentReceipt.bundleBytes = inconsistentBundleBytes.length;
+    inconsistentReceipt.bundleSha256 = digest(inconsistentBundleBytes);
+
+    const cases = [
+      {
+        expectedCode: "receipt_json",
+        options: {
+          bundleBytes,
+          receiptBytes: Buffer.from("{"),
+        },
+      },
+      {
+        expectedCode: "receipt_not_canonical",
+        options: {
+          bundleBytes,
+          receiptBytes: Buffer.from(JSON.stringify(pair.receipt)),
+        },
+      },
+      {
+        expectedCode: "bundle_size",
+        options: {
+          bundleBytes: new Uint8Array(
+            LOCAL_METADATA_BUNDLE_VERIFICATION_LIMITS.maximumBundleBytes + 1,
+          ),
+          receiptBytes,
+        },
+      },
+      {
+        expectedCode: "privacy_gate",
+        options: {
+          bundleBytes: inconsistentBundleBytes,
+          receiptBytes: Buffer.from(stableJson(inconsistentReceipt)),
+        },
+      },
+    ];
+    for (const { expectedCode, options } of cases) {
+      const legacyCode = capturedVerificationCode(
+        loadVerifiedLocalMetadataBundleBytes,
+        options,
+      );
+      const canonicalCode = capturedVerificationCode(
+        canonicalVerify,
+        {
+          bundleBytes: new Uint8Array(options.bundleBytes),
+          receiptBytes: new Uint8Array(options.receiptBytes),
+        },
+      );
+      assert.equal(legacyCode, expectedCode);
+      assert.equal(canonicalCode, expectedCode);
+    }
   } finally {
     await rm(pair.directory, { recursive: true, force: true });
   }
@@ -142,6 +278,34 @@ test("verifier rejects a coherent pair carrying a stale compatibility tuple", as
     receipt.bundleSha256 = createHash("sha256").update(bundleBytes).digest("hex");
     await writeFile(pair.bundleFile, bundleBytes, { mode: 0o600 });
     await writeFile(pair.receiptFile, stableJson(receipt), { mode: 0o600 });
+    await assert.rejects(
+      verifyLocalMetadataBundleFiles(pair),
+      (error) => assertSafeFailure(error, "privacy_gate", pair),
+    );
+  } finally {
+    await rm(pair.directory, { recursive: true, force: true });
+  }
+});
+
+test("verifier reaches the privacy gate for schema-valid count inconsistency", async () => {
+  const pair = await localPair();
+  try {
+    const bundle = structuredClone(pair.bundle);
+    bundle.recordCounts.usageEvents = 1;
+    const bundleBytes = Buffer.from(stableJson(bundle));
+    const receipt = structuredClone(pair.receipt);
+    receipt.recordCounts.usageEvents = 1;
+    receipt.bundleBytes = bundleBytes.length;
+    receipt.bundleSha256 = createHash("sha256")
+      .update(bundleBytes)
+      .digest("hex");
+    await writeFile(pair.bundleFile, bundleBytes, { mode: 0o600 });
+    await writeFile(
+      pair.receiptFile,
+      stableJson(receipt),
+      { mode: 0o600 },
+    );
+
     await assert.rejects(
       verifyLocalMetadataBundleFiles(pair),
       (error) => assertSafeFailure(error, "privacy_gate", pair),

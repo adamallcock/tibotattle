@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "usage-monitor-local",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["./apps/local/server.js"],
+      "port": 8787
+    }
+  ]
+}

@@ -8,6 +8,18 @@ importers:
 
   .:
     dependencies:
+      '@app-usagemonitor/accounting':
+        specifier: workspace:*
+        version: link:packages/accounting
+      '@app-usagemonitor/identity-core':
+        specifier: workspace:*
+        version: link:packages/identity-core
+      '@app-usagemonitor/quota-analysis':
+        specifier: workspace:*
+        version: link:packages/quota-analysis
+      '@app-usagemonitor/telemetry-contract':
+        specifier: workspace:*
+        version: link:packages/telemetry-contract
       '@github/keytar':
         specifier: 7.10.6
         version: 7.10.6
@@ -21,9 +33,24 @@ importers:
         specifier: 0.2.0
         version: 0.2.0
     devDependencies:
+      es-module-lexer:
+        specifier: 2.3.1
+        version: 2.3.1
       fast-check:
         specifier: ^4.9.0
         version: 4.9.0
+
+  packages/accounting:
+    dependencies:
+      runcost:
+        specifier: 0.2.0
+        version: 0.2.0
+
+  packages/identity-core: {}
+
+  packages/quota-analysis: {}
+
+  packages/telemetry-contract: {}
 
 packages:
 
@@ -66,6 +93,9 @@ packages:
   ccusage@20.0.18:
     resolution: {integrity: sha512-/81kwSZg487xoHQadEdcP4hqw9GICkaPtVjSM1HHJ4nBplUByX9tSZF7YIaQQWMcWZ5Gzt0cD2yDEFrgcAkrZg==}
     hasBin: true
+
+  es-module-lexer@2.3.1:
+    resolution: {integrity: sha512-shc1dbU90Yl/xq1QrC7QRtfcwURZuVRfPhZbDoldJ1cn1gzDvBaBWlv0eFolj5+0znnPJz5TXLxsN77X/12KTA==}
 
   fast-check@4.9.0:
     resolution: {integrity: sha512-7ms6T7SybUev/PQITciI0yLM2pOSFy5zpG8Ty7tQofcVaQUvrMXp6CBwqF6fThLCLOrfBtuHAtwq6Yu4XPCllg==}
@@ -135,6 +165,8 @@ snapshots:
       '@ccusage/ccusage-linux-x64': 20.0.18
       '@ccusage/ccusage-win32-arm64': 20.0.18
       '@ccusage/ccusage-win32-x64': 20.0.18
+
+  es-module-lexer@2.3.1: {}
 
   fast-check@4.9.0:
     dependencies:

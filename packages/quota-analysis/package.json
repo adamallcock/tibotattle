@@ -1,0 +1,22 @@
+{
+  "name": "@app-usagemonitor/quota-analysis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runtime-neutral quota track, calibration, and rolling comparison kernel.",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.d.ts",
+    "index.js",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

@@ -11,11 +11,15 @@ import {
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   createTelemetryEnvelope,
+  parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
   safeApiError,
   validateContributionForUpload
 } from "./lib.js";
+import {
+  mountDashboardNavigation,
+} from "./navigation.js";
 
 const localClient = new LocalCompanionClient();
 let communitySession = null;
@@ -3437,8 +3441,11 @@ function parseSafeExport(file) {
   return file.text().then((content) => {
     let payload;
     try {
-      payload = JSON.parse(content);
-    } catch {
+      payload = parseJsonWithUniqueObjectKeys(content);
+    } catch (error) {
+      if (error?.code === "duplicate_json_object_key") {
+        throw new Error("The selected file contains duplicate JSON object keys.");
+      }
       throw new Error("The selected file is not valid JSON.");
     }
     validateContributionForUpload(payload);
@@ -4773,33 +4780,11 @@ $("#contribution-history").addEventListener("click", (event) => {
   }
 });
 
-const observer = new IntersectionObserver((entries) => {
-  const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-  if (!visible) return;
-  for (const link of document.querySelectorAll("[data-nav]")) {
-    const active = link.dataset.nav === visible.target.id;
-    link.classList.toggle("active", active);
-    if (active) link.setAttribute("aria-current", "location");
-    else link.removeAttribute("aria-current");
-  }
-}, { rootMargin: "-25% 0px -65% 0px", threshold: [0, .2, .7] });
-for (const section of document.querySelectorAll(".dashboard-section, [data-nav-target]")) observer.observe(section);
-
-function syncNavigationFromHash() {
-  const id = window.location.hash.slice(1);
-  if (!id) return;
-  if (["community", "history", "backend"].includes(id)) {
-    $("#community-contribution-disclosure").open = true;
-  }
-  for (const link of document.querySelectorAll("[data-nav]")) {
-    const active = link.dataset.nav === id;
-    link.classList.toggle("active", active);
-    if (active) link.setAttribute("aria-current", "location");
-    else link.removeAttribute("aria-current");
-  }
-}
-window.addEventListener("hashchange", syncNavigationFromHash);
-syncNavigationFromHash();
+mountDashboardNavigation({
+  documentRef: document,
+  windowRef: window,
+  IntersectionObserverRef: IntersectionObserver,
+});
 
 async function bootstrapDashboard() {
   renderInstallerJourney();

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fc from "fast-check";
-import { exportRegistrySnapshot } from "../src/export-registries.js";
+import { exportRegistrySnapshot } from "../src/export/index.js";
 import { exportSchemas, validateExportRecord } from "../src/export-schema.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
 
@@ -133,6 +133,29 @@ test("allowlist schema accepts a valid usage event and rejects unknown nested fi
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((error) => error.keyword === "additionalProperties"));
   assert.equal(JSON.stringify(result.errors).includes("private"), false);
+});
+
+test("date-time fields reject calendar normalization and invalid UTC components", () => {
+  for (const invalid of [
+    "2026-02-29T12:00:00.000Z",
+    "2026-02-31T12:00:00.000Z",
+    "2026-04-31T12:00:00.000Z",
+    "2026-07-24T24:00:00.000Z",
+    "2026-07-24T12:60:00.000Z",
+    "2026-07-24T12:00:60.000Z",
+  ]) {
+    const candidate = usageEvent();
+    candidate.eventTime = invalid;
+    assert.equal(
+      validateExportRecord("usageEvent", candidate).valid,
+      false,
+      invalid,
+    );
+  }
+
+  const leapDay = usageEvent();
+  leapDay.eventTime = "2024-02-29T12:00:00Z";
+  assert.equal(validateExportRecord("usageEvent", leapDay).valid, true);
 });
 
 test("arbitrary source-like fields cannot pass the strict usage schema", () => {

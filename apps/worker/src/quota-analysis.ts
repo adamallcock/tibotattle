@@ -1,11 +1,18 @@
-// The shared quota core is intentionally framework-free JavaScript so the
-// local monitor and Worker execute the same algorithms.
-// @ts-expect-error The shared module is validated by its own Node test suite.
-import { buildResetEvidence } from "../../../shared/quota-tracks.js";
-// @ts-expect-error The shared module is validated by its own Node test suite.
-import { analyzeQuotaCalibration } from "../../../shared/quota-calibration.js";
-// @ts-expect-error The shared module is validated by its own Node test suite.
-import { buildRollingQuotaComparisons } from "../../../shared/quota-rolling.js";
+import {
+  analyzeQuotaCalibration,
+  buildResetEvidence,
+  buildRollingQuotaComparisons,
+} from "@app-usagemonitor/quota-analysis";
+import type {
+  PricingStatus,
+  QuotaCalibration,
+  QuotaResetEvidence,
+  QuotaSlot,
+  QuotaSnapshotInput,
+  QuotaTrackEvidence,
+  QuotaUsageEventInput,
+  QuotaWindowDurationMinutes,
+} from "@app-usagemonitor/quota-analysis";
 
 const MAX_DATASETS = 100;
 const MAX_ANALYSIS_RECORDS = 10_000;
@@ -83,15 +90,23 @@ function quotaTransport(row: AnalysisRecordRow): QuotaTransportRecord | null {
   }
 }
 
-function rollingForLatestForecast(evidence: any, calibration: any): object {
-  const fits = calibration.tracks?.flatMap((track: any) => track.resets ?? []) ?? [];
-  const byReset = new Map((evidence.resets ?? []).map((row: any) => [row.resetKey, row]));
-  const candidate = [...fits].reverse().find((row: any) => (
+function rollingForLatestForecast(
+  evidence: QuotaTrackEvidence,
+  calibration: QuotaCalibration,
+): object {
+  const fits = calibration.tracks.flatMap((track) => track.resets);
+  const byReset = new Map<string, QuotaResetEvidence>(
+    evidence.resets.map((row) => [row.resetKey, row]),
+  );
+  const candidate = [...fits].reverse().find((row) => (
     row?.status === "conditional_estimate"
       && row.priorForecast
       && byReset.has(row.resetKey)
   ));
-  if (!candidate) {
+  const resetEvidence = candidate
+    ? byReset.get(candidate.resetKey)
+    : undefined;
+  if (!candidate?.priorForecast || !resetEvidence) {
     return {
       schemaVersion: "quota-rolling-comparisons-v0.1",
       status: "not_testable",
@@ -101,7 +116,7 @@ function rollingForLatestForecast(evidence: any, calibration: any): object {
   }
   const { score: _score, ...forecast } = candidate.priorForecast;
   return buildRollingQuotaComparisons({
-    resetEvidence: byReset.get(candidate.resetKey),
+    resetEvidence,
     capacityForecast: forecast,
   });
 }
@@ -209,7 +224,7 @@ export async function accountScopedQuotaAnalysis(
   for (const seed of [...seeds.values()].sort((left, right) => (
     seedKey(left).localeCompare(seedKey(right))
   ))) {
-    const quotaSnapshots = quota.flatMap((row) => {
+    const quotaSnapshots: QuotaSnapshotInput[] = quota.flatMap((row) => {
       if (row.account_track_id !== seed.accountTrackId
           || row.provider !== seed.provider
           || row.plan_type !== seed.planType
@@ -229,17 +244,18 @@ export async function accountScopedQuotaAnalysis(
         planType: row.plan_type,
         planVariant: row.plan_variant,
         limitId: row.limit_id,
-        slot: row.slot,
-        windowDurationMinutes: row.window_duration_minutes,
+        slot: row.slot as QuotaSlot,
+        windowDurationMinutes:
+          row.window_duration_minutes as QuotaWindowDurationMinutes,
         resetsAt: row.resets_at,
         observedAt: row.observed_at,
         receivedAt: transport.receivedTime,
         usedPercent: row.used_percent,
-        displayPrecision: transport.displayPrecision,
+        displayPrecision: transport.displayPrecision as number,
         policyEpoch: row.policy_epoch,
       }];
     });
-    const usageEvents = usage.flatMap((row) => (
+    const usageEvents: QuotaUsageEventInput[] = usage.flatMap((row) => (
       row.account_track_id === seed.accountTrackId
         && row.provider === seed.provider
         && row.policy_epoch === seed.policyEpoch
@@ -255,7 +271,7 @@ export async function accountScopedQuotaAnalysis(
           limitId: seed.limitId,
           observedAt: row.observed_at,
           costNanousd: row.server_cost_nanousd,
-          pricingStatus: row.server_pricing_status,
+          pricingStatus: row.server_pricing_status as PricingStatus,
           policyEpoch: row.policy_epoch,
         }]
         : []

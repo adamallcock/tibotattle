@@ -78,7 +78,7 @@ The two line charts answer different questions—temporal value stability versus
 - Independent verification receipt: `.usage-monitor/weekly-calibration-verification-v0.1.json`
 - Accuracy-floor decision: `docs/decisions/2026-07-24-usage-accuracy-floor-decision.md`
 - Provider coupling policy: `https://learn.chatgpt.com/docs/pricing` (checked July 24, 2026)
-- Implementation: `src/weekly-calibration.js`
+- Reviewed public API: `src/reporting/index.js`
 - Tests: `test/weekly-calibration.test.js`
 - Canonical report artifact: `2026-07-24-weekly-7-day-calibration-artifact.json`
 - Portable report: `2026-07-24-weekly-7-day-calibration-report.html`

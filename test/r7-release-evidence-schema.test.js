@@ -2,13 +2,24 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   DEFAULT_EXPORT_RESOURCE_LIMITS,
   EXPORT_RESOURCE_POLICY_VERSION,
 } from "../src/export-resource-policy.js";
 import {
   assertValidR7ReleaseEvidenceReceipt,
+  collectR7ReleaseEvidenceRuntimeSourcePaths,
   computeR7ReleaseEvidenceWorkloadSourceProvenance,
   computeR7ReleaseEvidenceReceiptSha256,
   R7_RELEASE_EVIDENCE_DECISIONS,
@@ -58,6 +69,147 @@ test("release provenance binds both executable R7 worker scripts", () => {
     ),
     true,
   );
+  const sharedPaths = R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_PATHS.filter(
+    (relativePath) => relativePath.startsWith("shared/"),
+  );
+  assert.deepEqual(sharedPaths, [...sharedPaths].sort());
+  assert.equal(new Set(sharedPaths).size, sharedPaths.length);
+  assert.deepEqual(
+    sharedPaths.filter((relativePath) =>
+      relativePath.startsWith("shared/telemetry/")),
+    [],
+  );
+  assert.deepEqual(
+    collectR7ReleaseEvidenceRuntimeSourcePaths().filter(
+      (relativePath) => relativePath.startsWith("shared/"),
+    ),
+    sharedPaths,
+  );
+  const accountingPaths = R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_PATHS.filter(
+    (relativePath) => relativePath.startsWith("packages/accounting/"),
+  );
+  assert.deepEqual(accountingPaths, [
+    "packages/accounting/src/cost-ledger.js",
+    "packages/accounting/src/local-api-pricing.js",
+    "packages/accounting/src/price-registry.js",
+    "packages/accounting/index.js",
+    "packages/accounting/package.json",
+  ]);
+  const telemetryPaths = R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_PATHS.filter(
+    (relativePath) => relativePath.startsWith(
+      "packages/telemetry-contract/",
+    ),
+  );
+  assert.deepEqual(telemetryPaths, [
+    "packages/telemetry-contract/src/constants.js",
+    "packages/telemetry-contract/src/envelope.js",
+    "packages/telemetry-contract/src/errors.js",
+    "packages/telemetry-contract/src/primitives.js",
+    "packages/telemetry-contract/src/telemetry-v0.1.js",
+    "packages/telemetry-contract/src/telemetry-v0.2.js",
+    "packages/telemetry-contract/src/upload.js",
+    "packages/telemetry-contract/index.js",
+    "packages/telemetry-contract/schemas/v0.2/activity-marker.schema.json",
+    "packages/telemetry-contract/schemas/v0.2/contribution.schema.json",
+    "packages/telemetry-contract/schemas/v0.2/quota-snapshot.schema.json",
+    "packages/telemetry-contract/schemas/v0.2/usage-event.schema.json",
+    "packages/telemetry-contract/package.json",
+  ]);
+  assert.equal(
+    R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_PATHS.includes("pnpm-workspace.yaml"),
+    true,
+  );
+});
+
+test("reviewed R7 runtime source trees reject unsupported files and symlinks", async () => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "r7-runtime-sources-"));
+  const repositoryRoot = pathToFileURL(`${temporaryRoot}${sep}`);
+  try {
+    await mkdir(join(temporaryRoot, "src"));
+    await mkdir(join(temporaryRoot, "shared", "telemetry"), {
+      recursive: true,
+    });
+    await mkdir(join(temporaryRoot, "packages", "accounting", "src"), {
+      recursive: true,
+    });
+    await mkdir(
+      join(temporaryRoot, "packages", "telemetry-contract", "src"),
+      { recursive: true },
+    );
+    await mkdir(join(temporaryRoot, "src", "providers"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(temporaryRoot, "src", "entry.js"),
+      "export const entry = true;\n",
+    );
+    await writeFile(
+      join(temporaryRoot, "src", "providers", "adapter.mjs"),
+      "export const adapter = true;\n",
+    );
+    await writeFile(
+      join(temporaryRoot, "shared", "telemetry", "module.mjs"),
+      "export const shared = true;\n",
+    );
+    await writeFile(
+      join(temporaryRoot, "packages", "accounting", "src", "kernel.js"),
+      "export const kernel = true;\n",
+    );
+    await writeFile(
+      join(temporaryRoot, "packages", "accounting", "index.js"),
+      "export * from './src/kernel.js';\n",
+    );
+    await writeFile(
+      join(
+        temporaryRoot,
+        "packages",
+        "telemetry-contract",
+        "src",
+        "contract.js",
+      ),
+      "export const contract = true;\n",
+    );
+    await writeFile(
+      join(
+        temporaryRoot,
+        "packages",
+        "telemetry-contract",
+        "index.js",
+      ),
+      "export * from './src/contract.js';\n",
+    );
+    assert.deepEqual(
+      collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
+      [
+        "src/entry.js",
+        "src/providers/adapter.mjs",
+        "shared/telemetry/module.mjs",
+        "packages/accounting/src/kernel.js",
+        "packages/accounting/index.js",
+        "packages/telemetry-contract/src/contract.js",
+        "packages/telemetry-contract/index.js",
+      ],
+    );
+
+    const unsupported = join(temporaryRoot, "shared", "README.md");
+    await writeFile(unsupported, "not runtime source\n");
+    assert.throws(
+      () => collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
+      /unsupported file/u,
+    );
+    await rm(unsupported);
+
+    await symlink(
+      "telemetry/module.mjs",
+      join(temporaryRoot, "shared", "linked-module.mjs"),
+    );
+    assert.throws(
+      () => collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
+      /unsupported entry/u,
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 const HASH_A = "a".repeat(64);
@@ -474,6 +626,36 @@ test("changing a runtime-loaded non-receipt schema invalidates workload provenan
   assert.ok(validateR7ReleaseEvidenceReceipt(invalid).errors.some(
     (error) => error.path === "/contractProvenance/workloadCodeSha256",
   ));
+});
+
+test("changing package telemetry runtime code invalidates workload provenance", () => {
+  const target = "packages/telemetry-contract/src/telemetry-v0.1.js";
+  const repositoryRoot = new URL("../", import.meta.url);
+  const mutated = computeR7ReleaseEvidenceWorkloadSourceProvenance({
+    readSourceBytes(relativePath) {
+      const bytes = readFileSync(new URL(relativePath, repositoryRoot));
+      return relativePath === target
+        ? Buffer.concat([bytes, Buffer.from("\n")])
+        : bytes;
+    },
+  });
+  assert.notEqual(mutated.sha256, R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_SHA256);
+  assert.equal(mutated.fileCount, R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_FILE_COUNT);
+});
+
+test("changing package accounting runtime code invalidates workload provenance", () => {
+  const target = "packages/accounting/src/cost-ledger.js";
+  const repositoryRoot = new URL("../", import.meta.url);
+  const mutated = computeR7ReleaseEvidenceWorkloadSourceProvenance({
+    readSourceBytes(relativePath) {
+      const bytes = readFileSync(new URL(relativePath, repositoryRoot));
+      return relativePath === target
+        ? Buffer.concat([bytes, Buffer.from("\n")])
+        : bytes;
+    },
+  });
+  assert.notEqual(mutated.sha256, R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_SHA256);
+  assert.equal(mutated.fileCount, R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_FILE_COUNT);
 });
 
 test("privacy, preservation, and network mutations fail closed", () => {

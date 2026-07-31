@@ -573,7 +573,7 @@ const artifact = {
     sources: [
       { id: "weekly_calibration", label: "Local seven-day calibration result", path: ".usage-monitor/weekly-calibration-v0.2.json" },
       { id: "historical_transitions", label: "Replay-safe historical transition ledger", path: ".usage-monitor/transitions-simple-history-2026-06-11-to-2026-07-24-v0.3.2.json" },
-      { id: "calibration_code", label: "Calibration implementation", path: "src/weekly-calibration.js" },
+      { id: "calibration_code", label: "Reviewed public calibration API", path: "src/reporting/index.js" },
       { id: "calibration_goal", label: "Calibration goal and completion criteria", path: "docs/goals/2026-07-24-weekly-7-day-calibration-goal.md" },
       { id: "provider_crosscheck", label: "Account-level provider daily-token cross-check", path: ".usage-monitor/provider-crosscheck-v0.1.json" },
       { id: "experiment_results", label: "Controlled experiment result ledger", path: ".usage-monitor/experiment-results.jsonl" },
@@ -652,7 +652,7 @@ const artifact = {
         tables_used: [".usage-monitor/transitions-simple-history-2026-06-11-to-2026-07-24-v0.3.2.json"],
       },
     },
-    { id: "calibration_code", path: "src/weekly-calibration.js", description: "Reusable model selection, robust fitting, quality gates, and no-look-ahead validation implementation." },
+    { id: "calibration_code", path: "src/reporting/index.js", description: "Reviewed public API for reusable model selection, robust fitting, quality gates, and no-look-ahead validation." },
     { id: "calibration_goal", path: "docs/goals/2026-07-24-weekly-7-day-calibration-goal.md", description: "Dated implementation objective and completion criteria." },
     {
       id: "provider_crosscheck",

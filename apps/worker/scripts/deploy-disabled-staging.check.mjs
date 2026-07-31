@@ -79,9 +79,19 @@ function containedFetch(url) {
 const stagingOrigin =
   "https://app-usagemonitor-staging.test-account.workers.dev";
 
+function runDeployment(options) {
+  return runDisabledStagingDeployment({
+    checkWorkspacePackages: async () => ({
+      packageCount: 2,
+      packages: [],
+    }),
+    ...options,
+  });
+}
+
 test("deployment requires an exact confirmation before any command", async () => {
   const calls = [];
-  const result = await runDisabledStagingDeployment({
+  const result = await runDeployment({
     config: provisionedConfig(),
     origin: "https://staging.example.test",
     confirmation: "yes",
@@ -104,7 +114,7 @@ test("deployment accepts only a bare HTTPS staging origin", async () => {
     "https://staging.example.test/path",
     "not a URL",
   ]) {
-    const result = await runDisabledStagingDeployment({
+    const result = await runDeployment({
       config: provisionedConfig(),
       origin,
       confirmation: DEPLOY_CONFIRMATION,
@@ -113,6 +123,59 @@ test("deployment accepts only a bare HTTPS staging origin", async () => {
     });
     assert.deepEqual(result, { ok: false, code: "STAGING_ORIGIN_INVALID" });
   }
+});
+
+test("deployment refuses any stale workspace package before Wrangler", async (t) => {
+  for (const code of [
+    "ACCOUNTING_PACKAGE_STALE",
+    "TELEMETRY_CONTRACT_PACKAGE_STALE",
+    "QUOTA_ANALYSIS_PACKAGE_STALE",
+  ]) {
+    await t.test(code, async () => {
+      const calls = [];
+      const stale = new Error("stale package bytes");
+      stale.code = code;
+      const result = await runDeployment({
+        config: provisionedConfig(),
+        origin: stagingOrigin,
+        confirmation: DEPLOY_CONFIRMATION,
+        wrangler: "/fake/wrangler",
+        workerDirectory,
+        checkWorkspacePackages: async () => {
+          throw stale;
+        },
+        spawn: (_command, args) => {
+          calls.push(args);
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(result, { ok: false, code });
+      assert.deepEqual(calls, []);
+    });
+  }
+});
+
+test("deployment fails closed on an unexpected package-check failure", async () => {
+  let wranglerCalled = false;
+  const result = await runDeployment({
+    config: provisionedConfig(),
+    origin: stagingOrigin,
+    confirmation: DEPLOY_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    checkWorkspacePackages: async () => {
+      throw new Error("unexpected checker failure");
+    },
+    spawn: () => {
+      wranglerCalled = true;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "WORKSPACE_PACKAGES_CHECK_FAILED",
+  });
+  assert.equal(wranglerCalled, false);
 });
 
 test("deployment runs only after live readiness and verifies contained health", async () => {
@@ -127,7 +190,7 @@ test("deployment runs only after live readiness and verifies contained health", 
     return readinessSpawn(command, args, options);
   };
   const requested = [];
-  const result = await runDisabledStagingDeployment({
+  const result = await runDeployment({
     config,
     origin: stagingOrigin,
     confirmation: DEPLOY_CONFIRMATION,
@@ -164,7 +227,7 @@ test("deployment refuses a health response with any collection path enabled", as
   const config = provisionedConfig();
   const calls = [];
   const readinessSpawn = successSpawn(config, calls);
-  const result = await runDisabledStagingDeployment({
+  const result = await runDeployment({
     config,
     origin: stagingOrigin,
     confirmation: DEPLOY_CONFIRMATION,
@@ -187,7 +250,7 @@ test("deployment binds health verification to Wrangler's deployed origin", async
   const calls = [];
   const readinessSpawn = successSpawn(config, calls);
   let requested = false;
-  const result = await runDisabledStagingDeployment({
+  const result = await runDeployment({
     config,
     origin: stagingOrigin,
     confirmation: DEPLOY_CONFIRMATION,
@@ -236,7 +299,7 @@ test("first deployment accepts only an owner-only validated key file", async () 
       }
       return baseSpawn(command, args, options);
     };
-    const result = await runDisabledStagingDeployment({
+    const result = await runDeployment({
       config,
       origin: stagingOrigin,
       confirmation: DEPLOY_CONFIRMATION,

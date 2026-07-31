@@ -118,17 +118,49 @@ async function framedSourceSha256(urls) {
   return digest.digest("hex");
 }
 
-async function benchmarkImplementationUrls() {
-  const sourceDirectory = new URL("./", import.meta.url);
-  const sourceNames = await readBoundedDirectoryEntries(sourceDirectory, {
-    maximumEntries: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries,
-    sort: true,
-  });
+async function runtimeSourceUrls(relativeDirectory) {
+  const urls = [];
+  async function visit(directory) {
+    const names = await readBoundedDirectoryEntries(directory, {
+      maximumEntries: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries,
+      sort: true,
+    });
+    for (const name of names) {
+      const url = new URL(name, directory);
+      const metadata = await lstat(url);
+      if (metadata.isSymbolicLink()) {
+        throw new TypeError("R7 benchmark runtime source contains a symlink");
+      }
+      if (metadata.isDirectory()) {
+        await visit(new URL(`${name}/`, directory));
+      } else if (metadata.isFile()
+          && (name.endsWith(".js") || name.endsWith(".mjs"))) {
+        urls.push(url);
+      } else {
+        throw new TypeError(
+          "R7 benchmark runtime source contains an unsupported entry",
+        );
+      }
+    }
+  }
+  await visit(new URL(`${relativeDirectory}/`, REPOSITORY_ROOT));
+  return urls;
+}
+
+export async function collectR7BenchmarkImplementationUrls() {
   return [
-    ...sourceNames.filter((name) => name.endsWith(".js")).map((name) => new URL(name, sourceDirectory)),
+    ...await runtimeSourceUrls("src"),
+    ...await runtimeSourceUrls("shared"),
+    ...await runtimeSourceUrls("packages/accounting/src"),
+    new URL("packages/accounting/index.js", REPOSITORY_ROOT),
+    new URL("packages/accounting/package.json", REPOSITORY_ROOT),
+    ...await runtimeSourceUrls("packages/telemetry-contract/src"),
+    new URL("packages/telemetry-contract/index.js", REPOSITORY_ROOT),
+    new URL("packages/telemetry-contract/package.json", REPOSITORY_ROOT),
     WORKER,
     new URL("../package.json", import.meta.url),
     new URL("../pnpm-lock.yaml", import.meta.url),
+    new URL("../pnpm-workspace.yaml", import.meta.url),
   ];
 }
 
@@ -900,7 +932,7 @@ export async function buildR7SmokeReceipt(evidence) {
   const resourcePolicySourceSha256 = await framedSourceSha256([
     new URL("./export-resource-policy.js", import.meta.url),
   ]);
-  const implementationUrls = await benchmarkImplementationUrls();
+  const implementationUrls = await collectR7BenchmarkImplementationUrls();
   const benchmarkSourceSha256 = await framedSourceSha256(implementationUrls);
   const version = runtimeVersion();
   const receipt = {

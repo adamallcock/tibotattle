@@ -7,7 +7,7 @@ import {
   priceCodexProviderToolUnits,
   priceCodexUsageEvent,
   summarizeClaudeApiPriceRecords,
-} from "../src/local-api-pricing.js";
+} from "../packages/accounting/index.js";
 
 test("Codex current-price sensitivity prices current cards without backdating the event", () => {
   const event = {

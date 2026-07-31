@@ -7,21 +7,26 @@ import { captureCodexObservation } from "./capture.js";
 import {
   readCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
-} from "./codex-app-server.js";
+} from "./providers/codex/account.js";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
 import { analyzeObservations } from "./analyze.js";
 import { mineCodexTransitions, renderTransitionAudit } from "./codex-transition-miner.js";
 import { inferCapacityFromTransitions, renderInferenceReport } from "./interval-inference.js";
 import { runExperiment } from "./experiment-harness.js";
 import { analyzeContamination, renderContaminationReport } from "./contamination-analysis.js";
-import { appendedRolloutSourcesAreAfterEnd, codexLogSourceFingerprint, scanAndPriceCodexLogs, scanCodexLogEvents } from "./codex-log-scan.js";
+import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
+import { appendedRolloutSourcesAreAfterEnd, codexLogSourceFingerprint, scanCodexLogEvents } from "./codex-log-scan.js";
 import { analyzeToolMechanisms, renderToolMechanismReport, REQUIRED_TOOL_CLASSES } from "./tool-mechanism-analysis.js";
 import { planBaselineCorrectionMigration } from "./correction-migration.js";
 import { analyzeWeeklyLimitHistory, renderWeeklyLimitHistoryReport } from "./weekly-limit-history.js";
 import { renderCorrectionReport, resolveCorrections } from "./corrections.js";
 import { analyzeProviderCrosscheck, renderProviderCrosscheckReport } from "./provider-crosscheck.js";
-import { analyzeMonitoringQuality, renderMonitoringQualityReport } from "./monitoring-quality.js";
-import { analyzeWeeklyCalibration, renderWeeklyCalibrationReport } from "./weekly-calibration.js";
+import {
+  analyzeMonitoringQuality,
+  analyzeWeeklyCalibration,
+  renderMonitoringQualityReport,
+  renderWeeklyCalibrationReport,
+} from "./reporting/index.js";
 import { upsertPlanProfile, validatePlanTimeline } from "./plan-timeline.js";
 import { createActivityMarker } from "./activity-markers.js";
 import {
@@ -35,6 +40,10 @@ import {
   renderParticipantIdentitySourceState,
   selectProductionParticipantIdentity,
 } from "./export-identity-production.js";
+import {
+  createLocalExportDeletion,
+  createLocalExportWorkspaceDiscard,
+} from "./application/index.js";
 import { buildLocalMetadataBundle, renderMetadataExportPreview, writeLocalMetadataBundle } from "./metadata-exporter.js";
 import { verifyLocalMetadataBundleFiles } from "./bundle-verifier.js";
 import {
@@ -44,15 +53,21 @@ import {
 } from "./export-set-controller.js";
 import { materializeLocalExportSet } from "./export-set-materializer.js";
 import { verifyLocalExportSet } from "./export-set-verifier.js";
-import { planLocalExportDeletion } from "./export-deletion.js";
-import { deleteLocalExport, recoverLocalExportDeletion } from "./export-deletion-executor.js";
-import { planLocalExportWorkspaceDiscard } from "./export-workspace-discard.js";
 import {
-  discardLocalExportWorkspace,
-  recoverLocalExportWorkspaceDiscard,
-} from "./export-workspace-discard-executor.js";
+  EXPORT_WORKSPACE_DATABASE_BASENAME,
+  inspectExportWorkspaceDiscardState,
+  openExportWorkspace,
+} from "./export-workspace.js";
+import { LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL } from "./export-workspace-lock-compatibility-internal.js";
 import { readBoundedJsonLines } from "./bounded-jsonl.js";
 import { createExportResourceGuard, DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
+import {
+  createOwnerOnlyExportDeletionPreflightInspector,
+  createOwnerOnlyExportDeletionStorage,
+  createOwnerOnlyExportWorkspaceDiscardPreflight,
+  createOwnerOnlyExportWorkspaceDiscardStorage,
+  readBoundedDirectoryEntries,
+} from "./platform/index.js";
 import {
   createProductionClaudeCallbackBackend,
   readClaudeCallbackCapability,
@@ -126,6 +141,34 @@ import {
   recoverOwnerOnlyPairTransactions,
   withOwnerOnlyFileLock,
 } from "./storage.js";
+
+const LOCAL_EXPORT_DELETION = createLocalExportDeletion({
+  verifyExportSet: verifyLocalExportSet,
+  openExportWorkspace,
+  withExistingExportWorkspaceLease: LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL.withExistingExportWorkspaceLease,
+  isTrustedExportWorkspaceLockError: LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL.isTrustedExportWorkspaceLockError,
+  workspaceDatabaseBasename: EXPORT_WORKSPACE_DATABASE_BASENAME,
+  createPreflightInspector: createOwnerOnlyExportDeletionPreflightInspector,
+  createDeletionStorage: createOwnerOnlyExportDeletionStorage,
+});
+const {
+  planLocalExportDeletion,
+  deleteLocalExport,
+  recoverLocalExportDeletion,
+} = LOCAL_EXPORT_DELETION;
+const LOCAL_EXPORT_WORKSPACE_DISCARD = createLocalExportWorkspaceDiscard({
+  workspaceDatabaseBasename: EXPORT_WORKSPACE_DATABASE_BASENAME,
+  inspectExportWorkspaceDiscardState,
+  readBoundedDirectoryEntries,
+  withExistingExportWorkspaceLease: LEGACY_EXPORT_WORKSPACE_LEASE_INTERNAL.withExistingExportWorkspaceLease,
+  createPreflight: createOwnerOnlyExportWorkspaceDiscardPreflight,
+  createStorage: createOwnerOnlyExportWorkspaceDiscardStorage,
+});
+const {
+  planLocalExportWorkspaceDiscard,
+  discardLocalExportWorkspace,
+  recoverLocalExportWorkspaceDiscard,
+} = LOCAL_EXPORT_WORKSPACE_DISCARD;
 
 function usage() {
   console.log(`Usage:

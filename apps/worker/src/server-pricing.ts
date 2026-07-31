@@ -1,32 +1,14 @@
-// @ts-ignore Shared accounting kernel is framework-free JavaScript.
-import { priceUsageEvent } from "../../../src/cost-ledger.js";
 import {
   APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
   APP_PRICE_REGISTRY_OBSERVED_AT,
-// @ts-ignore Shared price registry is framework-free JavaScript.
-} from "../../../src/price-registry.js";
+  priceUsageEvent,
+} from "@app-usagemonitor/accounting";
 import type { TelemetryUsageEvent } from "./telemetry-validation";
 
 export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.1";
 
 type PricingStatus = "fully_priced" | "partially_priced" | "unpriced";
-
-interface LedgerComponent {
-  quantity: string | null;
-  pricingStatus: "priced" | "unpriced" | "unavailable";
-  reasonCode?: string;
-}
-
-interface LedgerResult {
-  totalUsd: string;
-  coverageStatus: PricingStatus;
-  components: LedgerComponent[];
-  selectedPriceCardIds: string[];
-  warnings: {
-    coverage: Array<{ code: string }>;
-  };
-}
 
 export interface ServerPricingResult {
   exactCostUsd: string;
@@ -179,7 +161,7 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
     pricingContext: {
       priceEpochBasis: "current_price_sensitivity_at_registry_observation",
     },
-  }) as LedgerResult;
+  });
 
   const pricedUnits = priced.components.reduce(
     (sum: bigint, component) => sum + (

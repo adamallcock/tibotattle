@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   fastQuotaMultiplier,
-  normalizeProviderTier,
   subscriptionSpeedSensitivity,
+} from "../src/application/index.js";
+import {
+  normalizeProviderTier,
   validateTierDeclaration,
-} from "../src/tier-semantics.js";
+} from "../src/providers/codex/logs.js";
 
 test("subscription default and protocol priority normalize to Standard and Fast without inventing API tiers", () => {
   const standard = normalizeProviderTier("default", { billingSurface: "chatgpt_subscription", tierSource: "rollout_thread_settings" });

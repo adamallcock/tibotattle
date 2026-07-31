@@ -253,6 +253,13 @@ async function enrollWithGrant(
 }
 
 async function encrypt(value: unknown, telemetry = false): Promise<object> {
+  return encryptRaw(JSON.stringify(value), telemetry);
+}
+
+async function encryptRaw(
+  plaintext: string,
+  telemetry = false,
+): Promise<object> {
   const publicJwk = JSON.parse(publicJwkJson) as JsonWebKey;
   const rsaKey = await crypto.subtle.importKey(
     "jwk",
@@ -280,7 +287,7 @@ async function encrypt(value: unknown, telemetry = false): Promise<object> {
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     dataKey,
-    new TextEncoder().encode(JSON.stringify(value)),
+    new TextEncoder().encode(plaintext),
   ));
   return {
     schemaVersion: telemetry ? "telemetry-envelope-v0.1" : "synthetic-envelope-v0.1",
@@ -2586,6 +2593,20 @@ describe("synthetic usage monitor service", () => {
     expect(privacy.status).toBe(400);
     await expect(privacy.json()).resolves.toMatchObject({
       error: { code: "PRIVACY_CANARY_DETECTED" },
+    });
+
+    const validPlaintext = JSON.stringify(telemetryFixture("hidden"));
+    const hiddenDuplicate = validPlaintext.replace(
+      '"accounting":',
+      '"accounting":{"prompt":"PRIVATE_CONTENT"},"accounting":',
+    );
+    const duplicatePlaintext = await uploadEnvelope(
+      participant,
+      await encryptRaw(hiddenDuplicate, true),
+    );
+    expect(duplicatePlaintext.status).toBe(400);
+    await expect(duplicatePlaintext.json()).resolves.toMatchObject({
+      error: { code: "DECRYPTION_FAILED" },
     });
 
     const inconsistent = telemetryFixture("c");

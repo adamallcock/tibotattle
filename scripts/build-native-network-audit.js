@@ -42,7 +42,7 @@ function parseArgs(argv) {
   return { output };
 }
 
-function compile(source, output) {
+function compile(source, output, temporaryDirectory) {
   const result = spawnSync("/usr/bin/xcrun", [
     "clang",
     "-dynamiclib",
@@ -64,6 +64,7 @@ function compile(source, output) {
     encoding: "utf8",
     env: {
       PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      TMPDIR: temporaryDirectory,
     },
     timeout: 60_000,
     maxBuffer: 1024 * 1024,
@@ -96,7 +97,7 @@ async function main(argv) {
   );
   const temporaryOutput = join(temporaryDirectory, basename(output));
   try {
-    compile(source, temporaryOutput);
+    compile(source, temporaryOutput, temporaryDirectory);
     const metadata = lstatSync(temporaryOutput);
     if (!metadata.isFile()
         || metadata.isSymbolicLink()

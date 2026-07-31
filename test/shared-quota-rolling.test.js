@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildRollingQuotaComparisons } from "../shared/quota-rolling.js";
-import { buildResetEvidence } from "../shared/quota-tracks.js";
+import {
+  buildResetEvidence,
+  buildRollingQuotaComparisons,
+} from "@app-usagemonitor/quota-analysis";
 
 function opaqueId(kind, value) {
   return `${kind}:v1:${BigInt(value).toString(16).padStart(64, "0")}`;

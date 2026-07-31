@@ -3,7 +3,11 @@ import {
   priceTelemetryUsageEvent,
   SERVER_PRICING_METHOD_VERSION,
 } from "../src/server-pricing";
-import type { TelemetryUsageEvent } from "../src/telemetry-validation";
+import {
+  validateTelemetryContribution,
+  type TelemetryUsageEvent,
+} from "../src/telemetry-validation";
+import parityFixture from "../../../packages/accounting/test/fixtures/accounting-parity-v0.1.json";
 
 function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEvent {
   return {
@@ -57,7 +61,85 @@ function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEv
   };
 }
 
+function validateIngestibleEvent(event: TelemetryUsageEvent): TelemetryUsageEvent {
+  const contribution = validateTelemetryContribution({
+    schemaVersion: "telemetry-contribution-v0.1",
+    synthetic: false,
+    createdAt: "2026-07-25T12:10:00.000Z",
+    coveredAt: {
+      startAt: "2026-07-25T12:00:00.000Z",
+      endAt: "2026-07-25T12:06:00.000Z",
+    },
+    clientPlatform: "macos",
+    providerPolicyEpoch: event.provider === "anthropic_claude_code"
+      ? "anthropic_unknown"
+      : "openai_agentic_pool_2026_07_09",
+    usageEvents: [event],
+    quotaSnapshots: [],
+    activityMarkers: [],
+    accounting: {
+      estimatedApiCostUsd: event.accounting.estimatedApiCostUsd,
+      pricedEventCoveragePercent: event.accounting.pricingCoveragePercent,
+      unknownModelEventCount: event.modelId === "unknown" ? 1 : 0,
+      unknownBillableUnits: event.accounting.unknownBillableUnits,
+      priceBasis: event.accounting.priceBasis,
+    },
+  });
+  return contribution.usageEvents[0]!;
+}
+
 describe("server pricing", () => {
+  it("matches the frozen accounting kernel projection on supported fixtures", () => {
+    expect(parityFixture.schemaVersion).toBe("accounting-parity-fixture-v0.1");
+    expect(parityFixture.cases).toHaveLength(6);
+    for (const item of parityFixture.cases) {
+      const event = validateIngestibleEvent(fixture(
+        item.workerOverrides as Partial<TelemetryUsageEvent>,
+      ));
+      const priced = priceTelemetryUsageEvent(event);
+      expect({
+        exactCostUsd: priced.exactCostUsd,
+        costNanousd: priced.costNanousd,
+        coverageStatus: priced.coverageStatus,
+        unknownBillableUnits: priced.unknownBillableUnits,
+        unpricedReasonCodes: priced.unpricedReasonCodes,
+        selectedPriceCardIds: priced.selectedPriceCardIds,
+      }, item.id).toEqual(item.expected);
+    }
+  });
+
+  it("keeps Anthropic cache writes unpriced when the TTL split is missing", () => {
+    const priced = priceTelemetryUsageEvent(validateIngestibleEvent(fixture({
+      provider: "anthropic_claude_code",
+      modelId: "claude-sonnet-4-6",
+      billingSurface: "claude_subscription",
+      speedMode: "standard",
+      apiServiceTier: "unknown",
+      reasoningEffort: "unknown",
+      components: {
+        inputUncachedTokens: 100,
+        inputCacheReadTokens: 900,
+        inputCacheWriteTokens: 30,
+        inputCacheWrite5mTokens: null,
+        inputCacheWrite1hTokens: null,
+        outputTextTokens: null,
+        outputReasoningTokens: null,
+        outputCombinedTokens: 75,
+      },
+    })));
+    expect(priced).toMatchObject({
+      exactCostUsd: "0.001695",
+      costNanousd: 1_695_000,
+      coveragePercent: 97.285,
+      coverageStatus: "partially_priced",
+      unknownBillableUnits: 30,
+      unpricedReasonCodes: [
+        "anthropic_cache_write_ttl_split_missing",
+        "component_observation_unavailable",
+      ],
+    });
+  });
+
   it("ignores client cost and keeps subscription Fast separate from API Priority", () => {
     const first = priceTelemetryUsageEvent(fixture());
     const second = priceTelemetryUsageEvent(fixture({
@@ -81,6 +163,38 @@ describe("server pricing", () => {
     });
     expect(first.selectedPriceCardIds.join(",")).toContain(":standard:");
     expect(first.selectedPriceCardIds.join(",")).not.toContain(":priority:");
+  });
+
+  it("selects explicit API Flex and Batch while unknown tiers fail closed", () => {
+    for (const apiServiceTier of ["flex", "batch"] as const) {
+      expect(priceTelemetryUsageEvent(fixture({
+        billingSurface: "openai_api",
+        apiServiceTier,
+        speedMode: "standard",
+      }))).toMatchObject({
+        exactCostUsd: "0.0016",
+        costNanousd: 1_600_000,
+        coverageStatus: "fully_priced",
+        apiServiceTier,
+        tierBasis: "observed_api_service_tier",
+        selectedPriceCardIds: [
+          `openai:gpt-5.6-sol:${apiServiceTier}:short:official-observed-2026-07-26`,
+        ],
+      });
+    }
+    for (const apiServiceTier of ["unknown", "other"] as const) {
+      expect(priceTelemetryUsageEvent(fixture({
+        billingSurface: "openai_api",
+        apiServiceTier,
+        speedMode: "standard",
+      }))).toMatchObject({
+        exactCostUsd: "0",
+        coverageStatus: "unpriced",
+        apiServiceTier: "unknown",
+        tierBasis: "api_service_tier_unavailable",
+        unpricedReasonCodes: ["api_service_tier_unavailable"],
+      });
+    }
   });
 
   it("uses an explicit API Priority tier only on an API-billed surface", () => {

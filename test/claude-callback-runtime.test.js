@@ -180,19 +180,22 @@ test("input stream errors preserve the prior command's partial-stream behavior a
 });
 
 test("a closed backpressured output fails promptly instead of waiting forever for drain", async () => {
-  class ClosedOutput extends EventEmitter {
-    write() {
-      queueMicrotask(() => this.emit("close"));
-      return false;
+  await withFixture(async ({ stateDirectory }) => {
+    class ClosedOutput extends EventEmitter {
+      write() {
+        queueMicrotask(() => this.emit("close"));
+        return false;
+      }
     }
-  }
-  await assert.rejects(runClaudeCallback({
-    stdin: Readable.from([payload()]),
-    stdout: new ClosedOutput(),
-    backend: backend(),
-    readRuntimeConfiguration: async () => ({ previousCommand: null }),
-    capturedAt: CAPTURED_AT,
-  }), (error) => error.code === "output_write");
+    await assert.rejects(runClaudeCallback({
+      stdin: Readable.from([payload()]),
+      stdout: new ClosedOutput(),
+      stateDirectory,
+      backend: backend(),
+      readRuntimeConfiguration: async () => ({ previousCommand: null }),
+      capturedAt: CAPTURED_AT,
+    }), (error) => error.code === "output_write");
+  });
 });
 
 test("existing-only fallback exits zero so Claude can retain the prior status output", () => {

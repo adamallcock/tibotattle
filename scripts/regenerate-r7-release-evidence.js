@@ -61,6 +61,10 @@ const GENERATION_MARKER_NAME = ".r7-release-evidence-generation-v1.json";
 const GENERATION_MARKER_SCHEMA = "usage-monitor-r7-release-evidence-generation-v1";
 const JOURNAL_CREATION_PREFIX = `${INSTALL_JOURNAL_NAME}.creating-`;
 const MAXIMUM_CONTROL_FILE_BYTES = 64 * 1024;
+const ACTIVE_REGENERATION_ERROR = "Another R7 evidence regeneration is already active";
+const LIVE_OWNER_RECOVERY_ERROR = "R7 recovery refused because the owning regeneration process is still running";
+const INVALID_PARTIAL_DRAFT_ERROR =
+  "R7 partial journal draft is incomplete or unverifiable";
 const RETAINED_INTERVAL = Object.freeze({
   startAt: "2026-06-24T09:00:00.000Z",
   endAt: "2026-07-25T09:00:00.000Z",
@@ -206,6 +210,104 @@ function validGenerationId(value) {
   return typeof value === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
       .test(value);
+}
+
+function validProcessOwnerIdentity(value) {
+  return value
+    && Number.isSafeInteger(value.pid)
+    && value.pid > 0
+    && value.pid <= 2_147_483_647
+    && value.uid === String(process.getuid())
+    && typeof value.startedAt === "string"
+    && /^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$/u
+      .test(value.startedAt)
+    && typeof value.processGroupId === "string"
+    && /^[0-9]+$/u.test(value.processGroupId)
+    && typeof value.sessionId === "string"
+    && /^[0-9]+$/u.test(value.sessionId)
+    && typeof value.commandSha256 === "string"
+    && /^[0-9a-f]{64}$/u.test(value.commandSha256);
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw new Error("R7 process-owner liveness could not be verified");
+  }
+}
+
+async function processOwnerIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 2_147_483_647) {
+    throw new TypeError("R7 process-owner PID is invalid");
+  }
+  if (!processExists(pid)) return null;
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(
+      "/bin/ps",
+      [
+        "-ww",
+        "-p",
+        String(pid),
+        "-o",
+        "uid=",
+        "-o",
+        "lstart=",
+        "-o",
+        "pgid=",
+        "-o",
+        "sess=",
+        "-o",
+        "command=",
+      ],
+      {
+        encoding: "utf8",
+        env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" },
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+      },
+    ));
+  } catch {
+    if (!processExists(pid)) return null;
+    throw new Error("R7 process-owner liveness could not be verified");
+  }
+  const fields = stdout.trim().split(/\s+/u);
+  if (fields.length < 9) {
+    throw new Error("R7 process-owner liveness could not be verified");
+  }
+  const identity = {
+    pid,
+    uid: fields[0],
+    startedAt: fields.slice(1, 6).join(" "),
+    processGroupId: fields[6],
+    sessionId: fields[7],
+    commandSha256: createHash("sha256")
+      .update(fields.slice(8).join(" "))
+      .digest("hex"),
+  };
+  if (!validProcessOwnerIdentity(identity)) {
+    throw new Error("R7 process-owner liveness could not be verified");
+  }
+  return identity;
+}
+
+async function currentProcessOwnerIdentity() {
+  const identity = await processOwnerIdentity(process.pid);
+  if (identity === null) {
+    throw new Error("R7 process-owner identity disappeared during acquisition");
+  }
+  return identity;
+}
+
+async function processOwnerIsAlive(identity) {
+  if (!validProcessOwnerIdentity(identity)) {
+    throw new Error("R7 evidence install journal has an invalid process owner");
+  }
+  const current = await processOwnerIdentity(identity.pid);
+  return current !== null && stableJson(current) === stableJson(identity);
 }
 
 function expectedOwnedDirectoryName(role, generationId) {
@@ -793,6 +895,7 @@ async function readInstallJournal(destination) {
       ].includes(journal.phase)
       || !validGenerationId(journal.generationId)
       || journal.destination !== destination
+      || !validProcessOwnerIdentity(journal.ownerIdentity)
       || !validJournalRuntimeIdentities(journal.runtimeIdentities)
       || stableJson(journal.expected) !== stableJson(expectedFilenames())) {
     throw new Error("R7 evidence install journal is invalid");
@@ -861,6 +964,27 @@ async function readInstallJournal(destination) {
   };
 }
 
+function assertJournalGeneration(journal, expectedGenerationId) {
+  if (journal.generationId !== expectedGenerationId) {
+    const error = new Error(
+      "R7 automatic recovery refused a journal owned by another generation",
+    );
+    error.code = "R7_FOREIGN_GENERATION";
+    throw error;
+  }
+  return journal;
+}
+
+async function readInstallJournalForGeneration(destination, generationId) {
+  if (!validGenerationId(generationId)) {
+    throw new TypeError("R7 recovery generation ID is invalid");
+  }
+  return assertJournalGeneration(
+    await readInstallJournal(destination),
+    generationId,
+  );
+}
+
 async function unlinkDurable(path) {
   await unlink(path);
   await syncDirectory(dirname(path));
@@ -888,18 +1012,25 @@ async function writeInstallJournalDurable(destination, value) {
   return fileIdentity(stats);
 }
 
-async function createInstallJournalExclusive({
+export async function createInstallJournalExclusive({
   destination,
   staging,
   generationId,
   runtimeIdentities,
-}) {
+}, {
+  beforePublish = null,
+} = {}) {
+  if (beforePublish !== null && typeof beforePublish !== "function") {
+    throw new TypeError("R7 journal before-publish hook must be a function");
+  }
   const path = journalPath(destination);
   const creationDraft = journalCreationPath(destination, generationId);
+  const ownerIdentity = await currentProcessOwnerIdentity();
   const journal = {
     schemaVersion: INSTALL_JOURNAL_SCHEMA,
     phase: "creating",
     generationId,
+    ownerIdentity,
     destination,
     staging,
     stagingIdentity: null,
@@ -911,6 +1042,7 @@ async function createInstallJournalExclusive({
   };
   let handle;
   let draftCreated = false;
+  let draftIdentity = null;
   try {
     handle = await open(
       creationDraft,
@@ -922,10 +1054,25 @@ async function createInstallJournalExclusive({
     await handle.sync();
     await handle.close();
     handle = null;
+    draftIdentity = fileIdentity(await assertSafeReceipt(creationDraft, {
+      maximumBytes: MAXIMUM_CONTROL_FILE_BYTES,
+    }));
     await syncDirectory(dirname(path));
+    if (beforePublish !== null) {
+      await beforePublish();
+    }
     // A hard-link publication is both atomic and no-clobber. No observer can
     // ever see a partially-written journal at the authoritative pathname.
-    await link(creationDraft, path);
+    try {
+      await link(creationDraft, path);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      await unlinkBoundReceipt(creationDraft, draftIdentity);
+      draftCreated = false;
+      const contention = new Error(ACTIVE_REGENERATION_ERROR);
+      contention.code = "R7_LOCK_CONTENDED";
+      throw contention;
+    }
     await syncDirectory(dirname(path));
     const pathStats = await lstat(path);
     const draftStats = await lstat(creationDraft);
@@ -942,6 +1089,7 @@ async function createInstallJournalExclusive({
       throw new Error("R7 journal publication identity did not match its durable draft");
     }
     await unlinkDurable(creationDraft);
+    draftCreated = false;
     await assertSafeReceipt(path, { maximumBytes: MAXIMUM_CONTROL_FILE_BYTES });
     const durable = {
       ...journal,
@@ -951,14 +1099,13 @@ async function createInstallJournalExclusive({
     return { ...durable, path, pathIdentity };
   } catch (error) {
     await handle?.close().catch(() => {});
-    // Leave a created draft in place. `--recover` recognizes that exact
-    // owner-only prefix and can safely clear either a partial or full draft.
-    if (!draftCreated) {
-      await unlink(creationDraft).catch(() => {});
-    }
+    // A draft this process created remains as crash evidence unless publication
+    // lost to an existing journal, in which case it was identity-checked and
+    // removed above. Never unlink a draft that O_EXCL said already existed.
+    if (error?.code === "R7_LOCK_CONTENDED") throw error;
     throw new Error(
-      error?.code === "EEXIST"
-        ? "Another or interrupted R7 evidence regeneration must be recovered first"
+      error?.code === "EEXIST" && !draftCreated
+        ? ACTIVE_REGENERATION_ERROR
         : "R7 evidence regeneration lock could not be created",
     );
   }
@@ -977,24 +1124,96 @@ async function recoverPartialJournalCreation(destination) {
   if (drafts.length === 0) {
     throw new Error("No interrupted R7 evidence install is available to recover");
   }
-  for (const draft of drafts) {
-    const suffix = basename(draft).slice(JOURNAL_CREATION_PREFIX.length);
-    if (!validGenerationId(suffix)) {
-      throw new Error("R7 partial journal draft name is invalid");
+
+  // Validate every draft and every process-owner identity before deleting any
+  // of them. A complete draft is the live owner's durable lock during the
+  // interval between fsync and atomic hard-link publication. Empty, truncated,
+  // or otherwise unverifiable crash drafts deliberately require manual
+  // inspection instead of being guessed safe to remove.
+  const recoveryPlan = [];
+  try {
+    for (const draft of drafts) {
+      const generationId = basename(draft).slice(JOURNAL_CREATION_PREFIX.length);
+      if (!validGenerationId(generationId)) {
+        throw new Error(INVALID_PARTIAL_DRAFT_ERROR);
+      }
+      const stats = await assertSafeReceipt(draft, {
+        maximumBytes: MAXIMUM_CONTROL_FILE_BYTES,
+      });
+      const value = JSON.parse(await readFile(draft, "utf8"));
+      const expectedDraft = {
+        schemaVersion: INSTALL_JOURNAL_SCHEMA,
+        phase: "creating",
+        generationId,
+        ownerIdentity: value?.ownerIdentity,
+        destination,
+        staging: join(
+          dirname(destination),
+          expectedOwnedDirectoryName("staging", generationId),
+        ),
+        stagingIdentity: null,
+        backup: null,
+        backupIdentity: null,
+        creationDraft: draft,
+        expected: expectedFilenames(),
+        runtimeIdentities: value?.runtimeIdentities,
+      };
+      if (!validProcessOwnerIdentity(value?.ownerIdentity)
+          || !validJournalRuntimeIdentities(value?.runtimeIdentities)
+          || stableJson(value) !== stableJson(expectedDraft)) {
+        throw new Error(INVALID_PARTIAL_DRAFT_ERROR);
+      }
+      recoveryPlan.push({
+        draft,
+        identity: fileIdentity(stats),
+        ownerIdentity: value.ownerIdentity,
+      });
     }
-    const stats = await assertSafeReceipt(draft, {
-      maximumBytes: MAXIMUM_CONTROL_FILE_BYTES,
-    });
-    await unlinkBoundReceipt(draft, fileIdentity(stats));
+    for (const entry of recoveryPlan) {
+      if (await processOwnerIsAlive(entry.ownerIdentity)) {
+        const error = new Error(LIVE_OWNER_RECOVERY_ERROR);
+        error.code = "R7_OWNER_ACTIVE";
+        throw error;
+      }
+    }
+  } catch (error) {
+    if (error?.code === "R7_OWNER_ACTIVE"
+        || error?.message === INVALID_PARTIAL_DRAFT_ERROR) {
+      throw error;
+    }
+    throw new Error(INVALID_PARTIAL_DRAFT_ERROR);
+  }
+
+  for (const entry of recoveryPlan) {
+    await unlinkBoundReceipt(entry.draft, entry.identity);
   }
   return "discarded_partial_journal_creation";
 }
 
-async function recoverInterruptedInstall(destination) {
+async function recoverInterruptedInstall(destination, {
+  expectedGenerationId = null,
+} = {}) {
+  if (expectedGenerationId !== null
+      && !validGenerationId(expectedGenerationId)) {
+    throw new TypeError("R7 recovery generation ID is invalid");
+  }
   if (!(await pathExists(journalPath(destination)))) {
+    if (expectedGenerationId !== null) {
+      throw new Error("R7 automatic recovery found no journal for its generation");
+    }
     return recoverPartialJournalCreation(destination);
   }
   const journal = await readInstallJournal(destination);
+  if (expectedGenerationId !== null) {
+    assertJournalGeneration(journal, expectedGenerationId);
+  }
+  if (expectedGenerationId === null
+      && await processOwnerIsAlive(journal.ownerIdentity)) {
+    const error = new Error(LIVE_OWNER_RECOVERY_ERROR);
+    error.code = "R7_OWNER_ACTIVE";
+    throw error;
+  }
+  const recoveryGenerationId = journal.generationId;
   if (journal.creationDraft !== null && await pathExists(journal.creationDraft)) {
     const draftStats = await assertSafeReceipt(journal.creationDraft, {
       maximumBytes: MAXIMUM_CONTROL_FILE_BYTES,
@@ -1058,8 +1277,14 @@ async function recoverInterruptedInstall(destination) {
       journal.stagingIdentity,
       { exactNames: [] },
     );
-    await recoverPartialJournalDraftsAfterJournal(destination);
-    const refreshed = await readInstallJournal(destination);
+    await recoverPartialJournalDraftAfterJournal(
+      destination,
+      recoveryGenerationId,
+    );
+    const refreshed = await readInstallJournalForGeneration(
+      destination,
+      recoveryGenerationId,
+    );
     await unlinkBoundReceipt(refreshed.path, refreshed.pathIdentity);
     return "completed";
   }
@@ -1098,24 +1323,34 @@ async function recoverInterruptedInstall(destination) {
     journal.stagingIdentity,
     { exactNames: journal.expected },
   );
-  await recoverPartialJournalDraftsAfterJournal(destination);
-  const refreshed = await readInstallJournal(destination);
+  await recoverPartialJournalDraftAfterJournal(
+    destination,
+    recoveryGenerationId,
+  );
+  const refreshed = await readInstallJournalForGeneration(
+    destination,
+    recoveryGenerationId,
+  );
   await unlinkBoundReceipt(refreshed.path, refreshed.pathIdentity);
   return "rolled_back";
 }
 
-async function recoverPartialJournalDraftsAfterJournal(destination) {
-  const drafts = await partialJournalDrafts(destination);
-  for (const draft of drafts) {
-    const suffix = basename(draft).slice(JOURNAL_CREATION_PREFIX.length);
-    if (!validGenerationId(suffix)) {
-      throw new Error("R7 partial journal draft name is invalid");
-    }
-    const stats = await assertSafeReceipt(draft, {
-      maximumBytes: MAXIMUM_CONTROL_FILE_BYTES,
-    });
-    await unlinkBoundReceipt(draft, fileIdentity(stats));
-  }
+async function recoverPartialJournalDraftAfterJournal(
+  destination,
+  generationId,
+) {
+  const draft = journalCreationPath(destination, generationId);
+  if (!(await pathExists(draft))) return;
+  const stats = await assertSafeReceipt(draft, {
+    maximumBytes: MAXIMUM_CONTROL_FILE_BYTES,
+  });
+  await unlinkBoundReceipt(draft, fileIdentity(stats));
+}
+
+export async function recoverFailedGeneration(destination, generationId) {
+  return recoverInterruptedInstall(destination, {
+    expectedGenerationId: generationId,
+  });
 }
 
 async function installReceipts(staging, destination) {
@@ -1181,16 +1416,24 @@ async function installReceipts(staging, destination) {
       active.stagingIdentity,
       { exactNames: [] },
     );
-    await recoverPartialJournalDraftsAfterJournal(destination);
-    const completed = await readInstallJournal(destination);
+    await recoverPartialJournalDraftAfterJournal(
+      destination,
+      active.generationId,
+    );
+    const completed = await readInstallJournalForGeneration(
+      destination,
+      active.generationId,
+    );
     await unlinkBoundReceipt(completed.path, completed.pathIdentity);
   } catch (error) {
     try {
-      await recoverInterruptedInstall(destination);
+      await recoverFailedGeneration(destination, active.generationId);
     } catch (recoveryError) {
       throw new AggregateError(
         [error, recoveryError],
-        `R7 evidence install failed; run --destination ${destination} --recover`,
+        recoveryError?.code === "R7_FOREIGN_GENERATION"
+          ? "R7 evidence install failed; another generation owns the active journal"
+          : `R7 evidence install failed; run --destination ${destination} --recover`,
       );
     }
     throw error;
@@ -1234,10 +1477,18 @@ async function main() {
   const node24 = await runtimeDetails(options.node24, "node24");
   const node26 = await runtimeDetails(options.node26, "node26");
   await assertDestinationInventory(destination);
-  if (await pathExists(journalPath(destination))
-      || (await partialJournalDrafts(destination)).length > 0) {
+  if (await pathExists(journalPath(destination))) {
+    const active = await readInstallJournal(destination);
+    if (await processOwnerIsAlive(active.ownerIdentity)) {
+      throw new Error(ACTIVE_REGENERATION_ERROR);
+    }
     throw new Error(
       "Another or interrupted R7 evidence regeneration must be recovered first",
+    );
+  }
+  if ((await partialJournalDrafts(destination)).length > 0) {
+    throw new Error(
+      "An interrupted R7 evidence lock draft must be recovered first",
     );
   }
   const generationId = randomUUID();
@@ -1257,7 +1508,10 @@ async function main() {
       generationId,
       role: "staging",
     });
-    const creatingJournal = await readInstallJournal(destination);
+    const creatingJournal = await readInstallJournalForGeneration(
+      destination,
+      generationId,
+    );
     await writeInstallJournalDurable(destination, {
       ...creatingJournal,
       path: undefined,
@@ -1313,11 +1567,13 @@ async function main() {
   } catch (error) {
     if (await pathExists(journalPath(destination))) {
       try {
-        await recoverInterruptedInstall(destination);
+        await recoverFailedGeneration(destination, generationId);
       } catch (recoveryError) {
         throw new AggregateError(
           [error, recoveryError],
-          `R7 regeneration failed; run --destination ${destination} --recover`,
+          recoveryError?.code === "R7_FOREIGN_GENERATION"
+            ? "R7 regeneration failed; another generation owns the active journal"
+            : `R7 regeneration failed; run --destination ${destination} --recover`,
         );
       }
     }

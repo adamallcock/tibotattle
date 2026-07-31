@@ -2,24 +2,43 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION,
+  AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS,
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS,
   AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION,
   AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
+  AutomaticContributionController,
+  AutomaticContributionError,
+  AUTOMATIC_CONTRIBUTION_LIMITS,
   acquireAutomaticContributionInstanceLock,
   automaticContributionRequiredConsent,
   createAutomaticContributionController,
 } from "../src/automatic-contribution.js";
+import * as automaticContribution from "../src/automatic-contribution.js";
+import {
+  AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION as policyPrivacyVersion,
+  AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS as policyReplayOverlapHours,
+  AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS as policyIntervalHours,
+  AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS as policyLookbackHours,
+  AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION as policySettingsVersion,
+  AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION as policyStatusVersion,
+  AutomaticContributionError as PolicyAutomaticContributionError,
+  automaticContributionRequiredConsent as policyRequiredConsent,
+  createInitialAutomaticContributionState,
+} from "../src/contribution/index.js";
 
 const CENTRAL_ORIGIN = "https://usage.example.test";
 const SECOND_CENTRAL_ORIGIN = "https://other.example.test";
@@ -33,6 +52,35 @@ const FIRST_COVERAGE = Object.freeze({
 const AUTOMATIC_COVERAGE = Object.freeze({
   startAt: "2026-07-29T11:00:00.000Z",
   endAt: "2026-07-29T18:00:00.000Z",
+});
+
+test("root retains its exact public API and policy alias identities", () => {
+  assert.deepEqual(Object.keys(automaticContribution).sort(), [
+    "AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS",
+    "AUTOMATIC_CONTRIBUTION_LIMITS",
+    "AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS",
+    "AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION",
+    "AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS",
+    "AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION",
+    "AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION",
+    "AutomaticContributionController",
+    "AutomaticContributionError",
+    "acquireAutomaticContributionInstanceLock",
+    "automaticContributionRequiredConsent",
+    "createAutomaticContributionController",
+  ].sort());
+  for (const [root, policy] of [
+    [AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS, policyIntervalHours],
+    [AUTOMATIC_CONTRIBUTION_LOOKBACK_HOURS, policyLookbackHours],
+    [AUTOMATIC_CONTRIBUTION_PRIVACY_CONTRACT_VERSION, policyPrivacyVersion],
+    [AUTOMATIC_CONTRIBUTION_REPLAY_OVERLAP_HOURS, policyReplayOverlapHours],
+    [AUTOMATIC_CONTRIBUTION_SETTINGS_SCHEMA_VERSION, policySettingsVersion],
+    [AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION, policyStatusVersion],
+    [AutomaticContributionError, PolicyAutomaticContributionError],
+    [automaticContributionRequiredConsent, policyRequiredConsent],
+  ]) assert.strictEqual(root, policy);
+  assert.equal(typeof AutomaticContributionController, "function");
+  assert.equal(typeof AUTOMATIC_CONTRIBUTION_LIMITS, "object");
 });
 
 function fakeTimers() {
@@ -159,6 +207,92 @@ async function waitFor(predicate, timeoutMilliseconds = 1_000) {
     await new Promise((resolveWait) => setImmediate(resolveWait));
   }
   throw new Error("automatic contribution condition was not reached");
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolveDeferred, rejectDeferred) => {
+    resolve = resolveDeferred;
+    reject = rejectDeferred;
+  });
+  return { promise, resolve, reject };
+}
+
+async function enableAfterCompletedReview(controller) {
+  await recordSuccessfulManualReview(controller);
+  return controller.enable({
+    intervalHours: 6,
+    consent: automaticContributionRequiredConsent({
+      destinationOrigin: CENTRAL_ORIGIN,
+    }),
+  });
+}
+
+async function addFixtureLocalPersistenceBlock(settingsFile) {
+  const blocker = `${settingsFile}.persistence-block`;
+  await link(settingsFile, blocker);
+  return async () => {
+    await unlink(blocker).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  };
+}
+
+async function seedInitialAutomaticContributionSettings(files) {
+  await mkdir(join(files.root, "private"), { mode: 0o700 });
+  await writeFile(
+    files.settingsFile,
+    `${JSON.stringify(createInitialAutomaticContributionState())}\n`,
+    { mode: 0o600 },
+  );
+}
+
+function expectedFailedProjection({
+  enabled = false,
+  consentCurrent = false,
+  firstReviewComplete = true,
+  firstReviewedAcceptedAt = START,
+  consentedAt = null,
+  lastAttemptAt = null,
+  lastSuccessAt = null,
+  lastOutcome = null,
+} = {}) {
+  const requiredConsent = automaticContributionRequiredConsent({
+    destinationOrigin: CENTRAL_ORIGIN,
+  });
+  return {
+    schemaVersion: AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
+    status: "failed",
+    enabled,
+    intervalHours: AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
+    consentCurrent,
+    firstReviewComplete,
+    firstReviewedAcceptedAt: firstReviewComplete
+      ? new Date(firstReviewedAcceptedAt).toISOString() : null,
+    requiredConsent: { ...requiredConsent },
+    consentedAt,
+    lastAttemptAt,
+    lastSuccessAt,
+    nextAttemptAt: null,
+    lastOutcome,
+    foregroundOnly: true,
+    daemonInstalled: false,
+    networkActivity: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+}
+
+function assertExactFrozenFailedProjection(status, expected) {
+  assert.equal(Object.isFrozen(status), true);
+  assert.equal(Object.isFrozen(status.requiredConsent), true);
+  if (status.lastOutcome !== null) {
+    assert.equal(Object.isFrozen(status.lastOutcome), true);
+  }
+  assert.deepEqual(status, expected);
 }
 
 test("automatic contribution is off by default and unconfigured builds never run", async () => {
@@ -1268,5 +1402,567 @@ test("non-owner-only or malformed settings fail closed with no runner activity",
   } finally {
     await controller.stop();
     await rm(files.root, { recursive: true });
+  }
+});
+
+test("reconstructed controller resumes a partial first review without preparing", async () => {
+  const files = await fixture();
+  let first;
+  let second;
+  let uploads = 0;
+  try {
+    first = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async () => { throw new Error("must not prepare"); },
+      uploadRunner: async () => completedUpload(),
+      now: () => new Date(START),
+      ...fakeTimers(),
+    });
+    await first.start();
+    await first.recordReviewedManualAcceptance({
+      status: "completed",
+      accepted: 1,
+      preparedSet: preparedSetStatus({
+        preparedSetId: FIRST_PREPARED_SET_ID,
+        coveredAt: FIRST_COVERAGE,
+        acceptedJobs: 1,
+        pendingJobs: 1,
+      }),
+    });
+    await first.enable({
+      intervalHours: 6,
+      consent: automaticContributionRequiredConsent({ destinationOrigin: CENTRAL_ORIGIN }),
+    });
+    await first.stop();
+    second = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async () => { throw new Error("must not prepare"); },
+      uploadRunner: async ({ preparedSetId }) => {
+        uploads += 1;
+        assert.equal(preparedSetId, FIRST_PREPARED_SET_ID);
+        return completedUpload({
+          accepted: 2,
+          processed: 2,
+          preparedSet: preparedSetStatus({
+            preparedSetId: FIRST_PREPARED_SET_ID,
+            coveredAt: FIRST_COVERAGE,
+            acceptedJobs: 2,
+          }),
+        });
+      },
+      now: () => new Date(START + 6 * 60 * 60 * 1_000),
+      ...fakeTimers(),
+    });
+    await second.start();
+    const result = await second.runDue();
+    assert.equal(uploads, 1);
+    assert.equal(result.lastOutcome.code, "accepted");
+    const stored = JSON.parse(await readFile(files.settingsFile, "utf8"));
+    assert.equal(stored.pendingContribution, null);
+    assert.equal(stored.acceptedThrough.coveredThroughAt, FIRST_COVERAGE.endAt);
+  } finally {
+    await first?.stop();
+    await second?.stop();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("reconstructed controllers retain one write-ahead attempt through publication reconciliation", async () => {
+  const files = await fixture();
+  const preparationIds = [];
+  const prepareProtections = [];
+  const uploadPreparedSetIds = [];
+  const maintenanceProtections = [];
+  let now = START;
+  let first;
+  let second;
+  let third;
+  try {
+    first = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async (request) => {
+        preparationIds.push(request.preparationId);
+        prepareProtections.push([...request.protectedPreparedSetIds]);
+        await request.beforePreparedPublish({
+          preparedSetId: AUTOMATIC_PREPARED_SET_ID,
+          coveredAt: { ...AUTOMATIC_COVERAGE },
+        });
+        throw new Error("simulated restart after durable prepared publication");
+      },
+      uploadRunner: async () => {
+        throw new Error("first process must not upload after preparation failure");
+      },
+      maintenanceRunner: async ({ protectedPreparedSetIds }) => {
+        maintenanceProtections.push([...protectedPreparedSetIds]);
+      },
+      now: () => new Date(now),
+      ...fakeTimers(),
+    });
+    await first.start();
+    await enableAfterCompletedReview(first);
+    now += 6 * 60 * 60 * 1_000;
+    const firstResult = await first.runDue();
+    assert.equal(firstResult.status, "paused");
+    assert.equal(firstResult.lastOutcome.code, "preparation_failed");
+    const afterPrepareFailure = JSON.parse(
+      await readFile(files.settingsFile, "utf8"),
+    );
+    assert.equal(afterPrepareFailure.preparationClaim.preparationId, preparationIds[0]);
+    assert.equal(afterPrepareFailure.preparationClaim.preparedSetId, AUTOMATIC_PREPARED_SET_ID);
+    assert.equal(afterPrepareFailure.pendingContribution.preparedSetId, AUTOMATIC_PREPARED_SET_ID);
+    await first.stop();
+
+    second = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async () => {
+        throw new Error("durable pending contribution must not be re-prepared");
+      },
+      uploadRunner: async ({ preparedSetId }) => {
+        uploadPreparedSetIds.push(preparedSetId);
+        return {
+          status: "completed",
+          accepted: 0,
+          processed: 0,
+          retryable: 0,
+          rejected: 0,
+          preparedSet: null,
+        };
+      },
+      maintenanceRunner: async ({ protectedPreparedSetIds }) => {
+        maintenanceProtections.push([...protectedPreparedSetIds]);
+      },
+      now: () => new Date(now),
+      ...fakeTimers(),
+    });
+    await second.start();
+    await second.enable({
+      intervalHours: 6,
+      consent: automaticContributionRequiredConsent({
+        destinationOrigin: CENTRAL_ORIGIN,
+      }),
+    });
+    now += 6 * 60 * 60 * 1_000;
+    const reconciled = await second.runDue();
+    assert.equal(reconciled.status, "scheduled");
+    assert.deepEqual(reconciled.lastOutcome, {
+      status: "failed",
+      code: "publication_incomplete",
+      at: "2026-07-30T00:00:00.000Z",
+    });
+    const afterPublicationIncomplete = JSON.parse(
+      await readFile(files.settingsFile, "utf8"),
+    );
+    assert.equal(afterPublicationIncomplete.pendingContribution, null);
+    assert.equal(
+      afterPublicationIncomplete.preparationClaim.preparationId,
+      preparationIds[0],
+    );
+    assert.equal(
+      afterPublicationIncomplete.preparationClaim.preparedSetId,
+      AUTOMATIC_PREPARED_SET_ID,
+    );
+    await second.stop();
+
+    third = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async (request) => {
+        preparationIds.push(request.preparationId);
+        prepareProtections.push([...request.protectedPreparedSetIds]);
+        return successfulPreparation(request);
+      },
+      uploadRunner: async ({ preparedSetId }) => {
+        uploadPreparedSetIds.push(preparedSetId);
+        return completedUpload();
+      },
+      maintenanceRunner: async ({ protectedPreparedSetIds }) => {
+        maintenanceProtections.push([...protectedPreparedSetIds]);
+      },
+      now: () => new Date(now),
+      ...fakeTimers(),
+    });
+    await third.start();
+    now += 6 * 60 * 60 * 1_000;
+    const accepted = await third.runDue();
+    assert.equal(accepted.status, "scheduled");
+    assert.equal(accepted.lastOutcome.code, "accepted");
+    assert.equal(preparationIds.length, 2);
+    assert.equal(preparationIds[1], preparationIds[0]);
+    assert.deepEqual(uploadPreparedSetIds, [
+      AUTOMATIC_PREPARED_SET_ID,
+      AUTOMATIC_PREPARED_SET_ID,
+    ]);
+    assert.equal(
+      prepareProtections.every((ids) => ids.includes(FIRST_PREPARED_SET_ID)),
+      true,
+    );
+    assert.equal(
+      maintenanceProtections.slice(1).every(
+        (ids) => ids.includes(AUTOMATIC_PREPARED_SET_ID),
+      ),
+      true,
+    );
+    const final = JSON.parse(await readFile(files.settingsFile, "utf8"));
+    assert.equal(final.preparationClaim, null);
+    assert.equal(final.pendingContribution, null);
+    assert.equal(final.acceptedThrough.coveredThroughAt, AUTOMATIC_COVERAGE.endAt);
+  } finally {
+    await first?.stop();
+    await second?.stop();
+    await third?.stop();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("disable and stop fence late preparation and upload acceptance", async (t) => {
+  for (const action of ["disable", "stop"]) {
+    for (const phase of ["prepare", "upload"]) {
+      await t.test(`${action} during blocked ${phase}`, async () => {
+        const files = await fixture();
+        const gate = deferred();
+        let now = START;
+        let phaseMode = phase === "prepare" ? "blocked" : "seed";
+        let blockedStarted = false;
+        let aborts = 0;
+        let preparations = 0;
+        let uploads = 0;
+        let controller;
+        try {
+          controller = createAutomaticContributionController({
+            settingsFile: files.settingsFile,
+            destinationOrigin: CENTRAL_ORIGIN,
+            prepareRunner: async (request) => {
+              preparations += 1;
+              if (phaseMode !== "blocked") return successfulPreparation(request);
+              blockedStarted = true;
+              request.signal.addEventListener("abort", () => {
+                aborts += 1;
+              }, { once: true });
+              await gate.promise;
+              await request.beforePreparedPublish({
+                preparedSetId: AUTOMATIC_PREPARED_SET_ID,
+                coveredAt: { ...AUTOMATIC_COVERAGE },
+              });
+              return {
+                schemaVersion: "local-contribution-preparation-result-v0.1",
+                status: "prepared",
+                prepared: { preparedSetId: AUTOMATIC_PREPARED_SET_ID },
+                coveredAt: { ...AUTOMATIC_COVERAGE },
+                networkActivity: false,
+              };
+            },
+            uploadRunner: async ({ signal }) => {
+              uploads += 1;
+              if (phaseMode === "seed") {
+                return completedUpload({
+                  accepted: 1,
+                  processed: 1,
+                  preparedSet: preparedSetStatus({
+                    acceptedJobs: 1,
+                    pendingJobs: 1,
+                  }),
+                });
+              }
+              if (phaseMode !== "blocked") {
+                throw new Error("unexpected upload phase");
+              }
+              blockedStarted = true;
+              signal.addEventListener("abort", () => {
+                aborts += 1;
+              }, { once: true });
+              await gate.promise;
+              return completedUpload({
+                accepted: 2,
+                processed: 2,
+                preparedSet: preparedSetStatus({ acceptedJobs: 2 }),
+              });
+            },
+            now: () => new Date(now),
+            ...fakeTimers(),
+          });
+          await controller.start();
+          await enableAfterCompletedReview(controller);
+          now += 6 * 60 * 60 * 1_000;
+          if (phase === "upload") {
+            const seeded = await controller.runDue();
+            assert.equal(seeded.lastOutcome.code, "retry_scheduled");
+            assert.equal(preparations, 1);
+            assert.equal(uploads, 1);
+            phaseMode = "blocked";
+            now += 6 * 60 * 60 * 1_000;
+          }
+          const running = controller.runDue();
+          await waitFor(() => blockedStarted);
+          const bytesBeforeAction = await readFile(files.settingsFile, "utf8");
+          const actionResult = action === "disable"
+            ? controller.disable() : controller.stop();
+          await waitFor(() => aborts === 1);
+          if (action === "disable") await actionResult;
+          const bytesAfterAction = await readFile(files.settingsFile, "utf8");
+          const durableAfterAction = JSON.parse(bytesAfterAction);
+          assert.equal(
+            durableAfterAction.acceptedThrough?.coveredThroughAt,
+            FIRST_COVERAGE.endAt,
+          );
+          assert.equal(
+            durableAfterAction.pendingContribution?.preparedSetId ?? null,
+            phase === "upload" ? AUTOMATIC_PREPARED_SET_ID : null,
+          );
+          if (action === "disable") {
+            assert.equal(durableAfterAction.enabled, false);
+          } else {
+            assert.equal(bytesAfterAction, bytesBeforeAction);
+          }
+          gate.resolve();
+          const finalStatus = await running;
+          if (action === "stop") await actionResult;
+          assert.equal(await readFile(files.settingsFile, "utf8"), bytesAfterAction);
+          assert.equal(finalStatus.lastSuccessAt, null);
+          assert.equal(finalStatus.lastOutcome?.code ?? null,
+            phase === "upload" ? "retry_scheduled" : null);
+          assert.equal(preparations, 1);
+          assert.equal(uploads, phase === "upload" ? 2 : 0);
+        } finally {
+          gate.resolve();
+          await controller?.stop();
+          await rm(files.root, { recursive: true });
+        }
+      });
+    }
+  }
+});
+
+test("malformed preparation and upload adapters pause without advancing durable evidence", async (t) => {
+  const scenarios = [
+    {
+      name: "invalid upload status",
+      upload: async () => ({ ...completedUpload(), status: "accepted" }),
+    },
+    {
+      name: "invalid upload counters",
+      upload: async () => ({ ...completedUpload(), retryable: -1 }),
+    },
+    {
+      name: "mismatched prepared set",
+      upload: async () => completedUpload({
+        preparedSet: preparedSetStatus({
+          preparedSetId: "c".repeat(64),
+        }),
+      }),
+    },
+    {
+      name: "mismatched prepared coverage",
+      upload: async () => completedUpload({
+        preparedSet: preparedSetStatus({
+          coveredAt: {
+            startAt: AUTOMATIC_COVERAGE.startAt,
+            endAt: "2026-07-29T19:00:00.000Z",
+          },
+        }),
+      }),
+    },
+    {
+      name: "malformed preparation result after durable callback",
+      prepare: async (request) => {
+        await request.beforePreparedPublish({
+          preparedSetId: AUTOMATIC_PREPARED_SET_ID,
+          coveredAt: { ...AUTOMATIC_COVERAGE },
+        });
+        return {
+          schemaVersion: "local-contribution-preparation-result-v0.1",
+          status: "invalid",
+          prepared: { preparedSetId: AUTOMATIC_PREPARED_SET_ID },
+          coveredAt: { ...AUTOMATIC_COVERAGE },
+          networkActivity: false,
+        };
+      },
+      expectedCode: "preparation_failed",
+      expectedUploads: 0,
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const files = await fixture();
+      const timers = fakeTimers();
+      let now = START;
+      let uploads = 0;
+      const controller = createAutomaticContributionController({
+        settingsFile: files.settingsFile,
+        destinationOrigin: CENTRAL_ORIGIN,
+        prepareRunner: scenario.prepare ?? successfulPreparation,
+        uploadRunner: async (request) => {
+          uploads += 1;
+          return scenario.upload(request);
+        },
+        now: () => new Date(now),
+        ...timers,
+      });
+      try {
+        await controller.start();
+        await enableAfterCompletedReview(controller);
+        now += 6 * 60 * 60 * 1_000;
+        const status = await controller.runDue();
+        assert.equal(status.status, "paused");
+        assert.equal(status.nextAttemptAt, null);
+        assert.deepEqual(status.lastOutcome, {
+          status: "failed",
+          code: scenario.expectedCode ?? "upload_failed",
+          at: "2026-07-29T18:00:00.000Z",
+        });
+        assert.equal(uploads, scenario.expectedUploads ?? 1);
+        assert.deepEqual(timers.delays(), []);
+        const durable = JSON.parse(await readFile(files.settingsFile, "utf8"));
+        assert.equal(
+          durable.acceptedThrough.coveredThroughAt,
+          FIRST_COVERAGE.endAt,
+        );
+        assert.equal(
+          durable.pendingContribution.preparedSetId,
+          AUTOMATIC_PREPARED_SET_ID,
+        );
+        assert.equal(durable.preparationClaim.preparedSetId, AUTOMATIC_PREPARED_SET_ID);
+      } finally {
+        await controller.stop();
+        await rm(files.root, { recursive: true });
+      }
+    });
+  }
+});
+
+test("persistence failures preserve prior durable state at every controller transition", async (t) => {
+  for (const transition of ["review", "enable", "claim", "prepared-publish"]) {
+    await t.test(transition, async () => {
+      const files = await fixture();
+      const timers = fakeTimers();
+      let now = START;
+      let preparations = 0;
+      let uploads = 0;
+      let restorePersistence;
+      let controller;
+      const callbackGate = deferred();
+      try {
+        await seedInitialAutomaticContributionSettings(files);
+        let callbackStarted = false;
+        controller = createAutomaticContributionController({
+          settingsFile: files.settingsFile,
+          destinationOrigin: CENTRAL_ORIGIN,
+          prepareRunner: async (request) => {
+            preparations += 1;
+            if (transition !== "prepared-publish") {
+              return successfulPreparation(request);
+            }
+            callbackStarted = true;
+            await callbackGate.promise;
+            await request.beforePreparedPublish({
+              preparedSetId: AUTOMATIC_PREPARED_SET_ID,
+              coveredAt: { ...AUTOMATIC_COVERAGE },
+            });
+            return {
+              schemaVersion: "local-contribution-preparation-result-v0.1",
+              status: "prepared",
+              prepared: { preparedSetId: AUTOMATIC_PREPARED_SET_ID },
+              coveredAt: { ...AUTOMATIC_COVERAGE },
+              networkActivity: false,
+            };
+          },
+          uploadRunner: async () => {
+            uploads += 1;
+            return completedUpload();
+          },
+          now: () => new Date(now),
+          ...timers,
+        });
+        await controller.start();
+        if (transition !== "review") {
+          await recordSuccessfulManualReview(controller);
+        }
+        if (transition === "claim" || transition === "prepared-publish") {
+          await controller.enable({
+            intervalHours: 6,
+            consent: automaticContributionRequiredConsent({
+              destinationOrigin: CENTRAL_ORIGIN,
+            }),
+          });
+          now += 6 * 60 * 60 * 1_000;
+        }
+
+        if (transition === "prepared-publish") {
+          const running = controller.runDue();
+          await waitFor(() => callbackStarted);
+          const durableBeforeFailure = await readFile(files.settingsFile, "utf8");
+          restorePersistence = await addFixtureLocalPersistenceBlock(files.settingsFile);
+          callbackGate.resolve();
+          await assert.rejects(
+            running,
+            (error) => error?.code === "automatic_contribution_settings_unavailable",
+          );
+          assert.equal(
+            await readFile(files.settingsFile, "utf8"),
+            durableBeforeFailure,
+          );
+          assert.equal(preparations, 1);
+          assert.equal(uploads, 0);
+          assertExactFrozenFailedProjection(
+            await controller.inspect(),
+            expectedFailedProjection({
+              enabled: true,
+              consentCurrent: true,
+              consentedAt: new Date(START).toISOString(),
+              lastAttemptAt: new Date(now).toISOString(),
+              lastOutcome: {
+                status: "failed",
+                code: "preparation_failed",
+                at: new Date(now).toISOString(),
+              },
+            }),
+          );
+        } else {
+          const durableBeforeFailure = await readFile(files.settingsFile, "utf8");
+          restorePersistence = await addFixtureLocalPersistenceBlock(files.settingsFile);
+          const failedOperation = transition === "review"
+            ? recordSuccessfulManualReview(controller)
+            : transition === "enable"
+              ? controller.enable({
+                intervalHours: 6,
+                consent: automaticContributionRequiredConsent({
+                  destinationOrigin: CENTRAL_ORIGIN,
+                }),
+              })
+              : controller.runDue();
+          await assert.rejects(
+            failedOperation,
+            (error) => error?.code === "automatic_contribution_settings_unavailable",
+          );
+          assert.equal(
+            await readFile(files.settingsFile, "utf8"),
+            durableBeforeFailure,
+          );
+          assert.equal(preparations, 0);
+          assert.equal(uploads, 0);
+          const isEnableOrClaim = transition === "enable" || transition === "claim";
+          assertExactFrozenFailedProjection(
+            await controller.inspect(),
+            expectedFailedProjection({
+              enabled: isEnableOrClaim,
+              consentCurrent: isEnableOrClaim,
+              consentedAt: isEnableOrClaim
+                ? new Date(START).toISOString() : null,
+              lastAttemptAt: transition === "claim"
+                ? new Date(now).toISOString() : null,
+            }),
+          );
+        }
+        assert.deepEqual(timers.delays(), []);
+      } finally {
+        callbackGate.resolve();
+        await restorePersistence?.();
+        await controller?.stop();
+        await rm(files.root, { recursive: true });
+      }
+    });
   }
 });

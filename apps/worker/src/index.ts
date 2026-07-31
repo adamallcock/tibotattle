@@ -79,6 +79,10 @@ import {
   runBackendLifecycle,
 } from "./retention";
 import {
+  matchWorkerRoute,
+  type ApiWorkerRouteId,
+} from "./route-registry";
+import {
   assertCsrf,
   assertSameOrigin,
   abandonUploadAuthorization,
@@ -1322,99 +1326,68 @@ async function handleReady(
   }, ready ? 200 : 503);
 }
 
-async function routeApi(request: Request, env: Env): Promise<Response> {
-  const { pathname } = new URL(request.url);
-  if (pathname === "/api/v1/enroll") return handleEnroll(request, env);
-  if (pathname === "/api/v1/recover") return handleRecover(request, env);
-  if (pathname === "/api/v1/session") return handleSession(request, env);
-  if (pathname === "/api/v1/logout") return handleLogout(request, env);
-  if (pathname === "/api/v1/me/security-reset") {
-    return handleSecurityReset(request, env);
-  }
-  if (pathname === "/api/v1/me/upload-authorizations") {
-    return handleUploadAuthorization(request, env);
-  }
-  if (pathname === "/api/v1/me/device-pairings") {
-    return handleDevicePairing(request, env);
-  }
-  if (pathname === "/api/v1/device-pairings/claim") {
-    return handleDevicePairingClaim(request, env);
-  }
-  if (pathname === "/api/v1/device/upload-authorizations") {
-    return handleDeviceUploadAuthorization(request, env);
-  }
-  if (pathname === "/api/v1/me/devices") return handleDevices(request, env);
-  if (pathname === "/api/v1/me/devices/revoke") {
-    return handleDeviceRevocation(request, env);
-  }
-  if (pathname === "/api/v1/envelope-key") return handleEnvelopeKey(request, env);
-  if (pathname === "/api/v1/contributions") return handleContribution(request, env);
-  if (pathname === "/api/v1/me/contributions/read") {
-    return handleContributionResource(request, env, "read");
-  }
-  if (pathname === "/api/v1/me/contributions/delete") {
-    return handleContributionResource(request, env, "delete");
-  }
-  if (pathname === "/api/v1/me/export") return handleExport(request, env);
-  if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
-    return handleStats(request, env);
-  }
-  if (pathname === "/api/v1/stats/aggregate"
-      || pathname === "/api/v1/community/insights") {
-    return handleCommunityStats(request, env);
-  }
-  if (pathname === "/api/v1/me") {
-    if (request.method === "DELETE") return handleDelete(request, env);
-    return handleMe(request, env);
-  }
-  throw new ApiError(404, "NOT_FOUND");
+function unreachableApiRoute(_: never): never {
+  throw new ApiError(500, "INTERNAL_ERROR");
 }
 
-function routeClass(pathname: string): string {
-  if (pathname === "/api/health") return "health";
-  if (pathname === "/api/ready") return "ready";
-  if (pathname === "/api/v1/enroll") return "enroll";
-  if (pathname === "/api/v1/recover") return "recover";
-  if (pathname === "/api/v1/session") return "session";
-  if (pathname === "/api/v1/logout") return "logout";
-  if (pathname === "/api/v1/me/security-reset") return "security_reset";
-  if (pathname === "/api/v1/me/upload-authorizations") {
-    return "upload_authorization";
+async function routeApi(
+  request: Request,
+  env: Env,
+  routeId: ApiWorkerRouteId,
+): Promise<Response> {
+  switch (routeId) {
+    case "enroll":
+      return handleEnroll(request, env);
+    case "recover":
+      return handleRecover(request, env);
+    case "session":
+      return handleSession(request, env);
+    case "logout":
+      return handleLogout(request, env);
+    case "security_reset":
+      return handleSecurityReset(request, env);
+    case "upload_authorization":
+      return handleUploadAuthorization(request, env);
+    case "device_pairing":
+      return handleDevicePairing(request, env);
+    case "device_pairing_claim":
+      return handleDevicePairingClaim(request, env);
+    case "device_upload_authorization":
+      return handleDeviceUploadAuthorization(request, env);
+    case "participant_devices":
+      return handleDevices(request, env);
+    case "participant_device_revocation":
+      return handleDeviceRevocation(request, env);
+    case "envelope_key":
+      return handleEnvelopeKey(request, env);
+    case "contributions":
+      return handleContribution(request, env);
+    case "contribution_read":
+      return handleContributionResource(request, env, "read");
+    case "contribution_delete":
+      return handleContributionResource(request, env, "delete");
+    case "participant_export":
+      return handleExport(request, env);
+    case "participant_stats":
+      return handleStats(request, env);
+    case "community_stats":
+      return handleCommunityStats(request, env);
+    case "participant":
+      if (request.method === "DELETE") return handleDelete(request, env);
+      return handleMe(request, env);
   }
-  if (pathname === "/api/v1/me/device-pairings") return "device_pairing";
-  if (pathname === "/api/v1/device-pairings/claim") return "device_pairing_claim";
-  if (pathname === "/api/v1/device/upload-authorizations") {
-    return "device_upload_authorization";
-  }
-  if (pathname === "/api/v1/me/devices") return "participant_devices";
-  if (pathname === "/api/v1/me/devices/revoke") {
-    return "participant_device_revocation";
-  }
-  if (pathname === "/api/v1/envelope-key") return "envelope_key";
-  if (pathname === "/api/v1/contributions") return "contributions";
-  if (pathname === "/api/v1/me/contributions/read") return "contribution_read";
-  if (pathname === "/api/v1/me/contributions/delete") return "contribution_delete";
-  if (pathname === "/api/v1/me/export") return "participant_export";
-  if (pathname === "/api/v1/me/stats" || pathname === "/api/v1/me/insights") {
-    return "participant_stats";
-  }
-  if (pathname === "/api/v1/stats/aggregate"
-      || pathname === "/api/v1/community/insights") {
-    return "community_stats";
-  }
-  if (pathname === "/api/v1/me") return "participant";
-  if (pathname.startsWith("/api/")) return "unknown_api";
-  return "asset";
+  return unreachableApiRoute(routeId);
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
+  const route = matchWorkerRoute(url.pathname);
   try {
-    if (url.pathname === "/api/ready") {
+    if (route.id === "ready") {
       return await handleReady(request, env);
     }
-    if (url.pathname === "/api/health") {
+    if (route.id === "health") {
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
       assertAdmissionBindings(env);
@@ -1487,7 +1460,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         },
       });
     }
-    if (url.pathname.startsWith("/api/")) return await routeApi(request, env);
+    if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
+    if (route.id !== "asset") return await routeApi(request, env, route.id);
     const asset = await env.ASSETS.fetch(request);
     const headers = new Headers(asset.headers);
     headers.set("referrer-policy", "no-referrer");
@@ -1513,7 +1487,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       event: "request_failed",
       requestId,
       method: request.method,
-      routeClass: routeClass(url.pathname),
+      routeClass: route.routeClass,
       code: apiError.code,
       status: apiError.status,
     };

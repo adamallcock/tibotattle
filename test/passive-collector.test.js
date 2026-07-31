@@ -4,8 +4,10 @@ import { EventEmitter } from "node:events";
 import { appendFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexAppServerError } from "../src/codex-app-server.js";
-import { deriveOpenAIAccountScope } from "../src/account-scope.js";
+import {
+  CodexAppServerError,
+  deriveOpenAIAccountScope,
+} from "../src/providers/codex/account.js";
 import {
   acquireCollectorLock,
   appServerSnapshotRecord,
@@ -1345,6 +1347,79 @@ test("collector lock rejects contention and recovers a stale lock", async () => 
     const releaseRecovered = await acquireCollectorLock(fixture.lockFile, { processExists: () => false });
     await releaseRecovered();
   } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("foreground degrades to reconciliation when recursive watchers fail asynchronously", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  const canary = "DO-NOT-LEAK-watcher-error";
+  let watcherCalls = 0;
+  let watchersClosed = 0;
+  let ingestionCalls = 0;
+  let hardStop;
+
+  class ErrorWatcher extends EventEmitter {
+    closed = false;
+
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      watchersClosed += 1;
+    }
+  }
+
+  class MinimalClient extends EventEmitter {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+
+  try {
+    await assert.rejects(
+      () => runCollectorForeground({ ...fixture, signal: controller.signal, watchRoot: null }),
+      /watchRoot must be a function/,
+    );
+    await assert.rejects(() => stat(fixture.lockFile), /ENOENT/);
+    hardStop = setTimeout(() => controller.abort(), 10_000);
+    const result = await runCollectorForeground({
+      ...fixture,
+      signal: controller.signal,
+      staleAfterMs: 0,
+      reconciliationMs: 10,
+      appServerFactory: () => new MinimalClient(),
+      watchRoot: () => {
+        watcherCalls += 1;
+        const watcher = new ErrorWatcher();
+        queueMicrotask(() => {
+          const error = new Error(canary);
+          error.code = "EMFILE";
+          watcher.emit("error", error);
+        });
+        return watcher;
+      },
+      ingestUpdates: async (options) => {
+        ingestionCalls += 1;
+        const ingested = await ingestRolloutUpdates(options);
+        if (ingestionCalls >= 3) queueMicrotask(() => controller.abort());
+        return ingested;
+      },
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+
+    assert.equal(result.shutdown, "clean");
+    assert.equal(watcherCalls, 2);
+    assert.equal(watchersClosed, 2);
+    assert.ok(ingestionCalls >= 3);
+    assert.equal(result.resourceActivity.watcherFallbackActive, true);
+    assert.equal(result.diagnostics.watcherErrorCounts.EMFILE, 2);
+    assert.equal(JSON.stringify(result).includes(canary), false);
+  } finally {
+    clearTimeout(hardStop);
+    controller.abort();
     await rm(fixture.root, { recursive: true });
   }
 });

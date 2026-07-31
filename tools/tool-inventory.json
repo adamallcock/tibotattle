@@ -1,0 +1,765 @@
+{
+  "schemaVersion": "tool-inventory-v0.1",
+  "reviewedAt": "2026-07-30",
+  "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
+  "records": [
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/benchmark-local-analysis-pipeline.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Research benchmark is invoked from its dated performance receipt, not as a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "docs/receipts/2026-07-29-local-analysis-performance-receipt.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/receipts/2026-07-29-local-analysis-performance-receipt.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "local_review_release",
+      "canonicalPath": "scripts/build-local-review-artifact.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal release builder is called by policy tests and release documentation rather than a stable public command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/verify-local-review-runtime.js",
+        "test/local-review-build-policy.test.js",
+        "docs/governance/2026-07-25-g0-control-traceability-matrix.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/build-macos-app.js",
+      "stableAlias": "product:macos:build",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:build",
+        "scripts/macos-release-core.js",
+        "test/browser-module-serving-parity.test.js",
+        "test/macos-app-bundle.test.js",
+        "apps/local/README.md",
+        "apps/macos/README.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The live builder is test-covered, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/build-native-network-audit.js",
+      "stableAlias": "product:native-network-audit:build",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:native-network-audit:build",
+        "scripts/verify-local-review-runtime.js",
+        "test/native-network-audit.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The native audit builder is test-covered, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "quota_research",
+      "canonicalPath": "tools/reports/build-prospective-collector-transitions.js",
+      "stableAlias": "build:prospective-transitions",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:prospective-transitions",
+        "scripts/build-prospective-collector-transitions.js",
+        "test/prospective-collector-cli.test.js",
+        "test/prospective-collector-tool-parity.test.js",
+        "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md"
+      ],
+      "decision": "retain_with_forwarding_legacy_path_and_research_provenance",
+      "provenance": "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md",
+      "provenanceReason": null,
+      "legacyPaths": [
+        "scripts/build-prospective-collector-transitions.js"
+      ]
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "public_site_release",
+      "canonicalPath": "scripts/build-public-release-site.js",
+      "stableAlias": "product:release-site",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:release-site",
+        "test/public-release-site.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "No standalone dated provenance artifact exists; release behavior is covered by the public-release-site test.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "shipped_product_operation",
+      "owner": "contribution",
+      "canonicalPath": "scripts/build-telemetry-contributions.js",
+      "stableAlias": "product:prepare-contribution",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:prepare-contribution",
+        "README.md"
+      ],
+      "decision": "retain_in_product_source_until_a_product_composition_root_replaces_it",
+      "provenance": null,
+      "provenanceReason": "This is live product behavior rather than a dated research artifact; its contract is covered by contribution preparation tests.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/check-architecture-boundaries.mjs",
+      "stableAlias": "architecture:check",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.architecture:check",
+        "test/architecture-boundaries.test.js",
+        "test/accounting-package-boundary.test.js",
+        "test/export-artifact-storage-owner-boundary.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The checker is a live repository quality gate and has no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "local_review_release",
+      "canonicalPath": "scripts/check-local-review-signing-readiness.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal signing readiness check is exercised by its focused test and is not a supported end-user command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/local-review-signing-readiness.test.js",
+        "docs/governance/2026-07-25-g0-control-traceability-matrix.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/export-deletion-sigkill-child.js",
+      "stableAlias": null,
+      "stableAliasReason": "Failure-injection child process is invoked only by the export deletion executor test.",
+      "additionalAliases": [],
+      "callers": [
+        "test/export-deletion-executor.test.js"
+      ],
+      "decision": "retain_as_internal_test_support",
+      "provenance": null,
+      "provenanceReason": "Test-only failure injection has no standalone provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "tools/operations/fix-doc-links.mjs",
+      "stableAlias": "docs:links:fix",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "docs:links:check"
+      ],
+      "callers": [
+        "package.json#scripts.docs:links:fix",
+        "package.json#scripts.docs:links:check",
+        "scripts/fix-doc-links.mjs"
+      ],
+      "decision": "retain_with_forwarding_legacy_path",
+      "provenance": null,
+      "provenanceReason": "Repository maintenance operation has no dated output artifact.",
+      "legacyPaths": [
+        "scripts/fix-doc-links.mjs"
+      ]
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "telemetry_contract",
+      "canonicalPath": "scripts/generate-telemetry-browser-mirror.js",
+      "stableAlias": "telemetry:browser:generate",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "telemetry:browser:check"
+      ],
+      "callers": [
+        "package.json#scripts.telemetry:browser:generate",
+        "package.json#scripts.telemetry:browser:check",
+        "scripts/build-public-release-site.js",
+        "scripts/build-macos-app.js",
+        "test/public-release-site.test.js",
+        "test/macos-app-bundle.test.js",
+        "apps/web/test/telemetry-shared-parity.test.mjs"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Generated output carries its generator marker and parity tests; no separate dated provenance artifact exists.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "telemetry_contract",
+      "canonicalPath": "scripts/generate-telemetry-contract.js",
+      "stableAlias": "telemetry:generate",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "telemetry:check"
+      ],
+      "callers": [
+        "package.json#scripts.telemetry:generate",
+        "package.json#scripts.telemetry:check",
+        "test/telemetry-contract.test.js",
+        "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
+        "docs/receipts/2026-07-24-g1-exporter-hardening-receipt.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/receipts/2026-07-24-g1-exporter-hardening-receipt.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/captured-utf8-source.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Descriptor-bound UTF-8 capture is an imported release-integrity helper, not a command entry point.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-local-review-artifact.js",
+        "scripts/build-macos-app.js",
+        "test/captured-utf8-source.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": null,
+      "provenanceReason": "The helper binds captured workspace-package bytes into local-review and macOS release provenance.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/esm-imports.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Imported parser helper is not a command entry point.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-local-review-artifact.js",
+        "scripts/check-architecture-boundaries.mjs",
+        "scripts/build-macos-app.js",
+        "test/application-quota-sensitivity.test.js",
+        "test/architecture-boundaries.test.js",
+        "test/codex-local-usage-analysis-boundary.test.js",
+        "test/codex-provider-log-boundary.test.js",
+        "test/contribution-owner-boundary.test.js",
+        "test/export-owner-boundary.test.js",
+        "test/metadata-export-owner-boundary.test.js",
+        "test/participant-identity-owner-boundary.test.js",
+        "test/reporting-owner-boundary.test.js",
+        "test/tool-inventory.test.js"
+      ],
+      "decision": "retain_as_internal_tooling_support",
+      "provenance": null,
+      "provenanceReason": "Internal parser helper has no standalone output artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "local_review_release",
+      "canonicalPath": "scripts/lib/local-review-artifact-archive.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Bounded archive validation and extraction is imported by the local-review runtime gate and its focused tests.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/verify-local-review-runtime.js",
+        "test/local-review-artifact-archive.test.js",
+        "test/local-review-runtime-gate.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": null,
+      "provenanceReason": "The archive helper is bound into the aggregate runtime receipt rather than producing standalone evidence.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "local_review_release",
+      "canonicalPath": "scripts/local-review-network-audit-preload.cjs",
+      "stableAlias": null,
+      "stableAliasReason": "Preload hook is launched by the local-review network smoke and its focused test.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-local-review-artifact.js",
+        "test/local-review-network-audit.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/macos-release-core.js",
+      "stableAlias": null,
+      "stableAliasReason": "Shared release module is imported by macOS release commands and tests, not invoked directly.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/validate-macos-replacement.js",
+        "scripts/package-macos-dmg.js",
+        "scripts/release-macos-app.js",
+        "scripts/validate-macos-install.js",
+        "test/macos-app-bundle.test.js",
+        "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/macos-updater-core.js",
+      "stableAlias": null,
+      "stableAliasReason": "Shared updater module is imported by build/release commands and tests, not invoked directly.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/prepare-sparkle-framework.js",
+        "scripts/macos-release-core.js",
+        "scripts/build-macos-app.js",
+        "test/macos-app-bundle.test.js",
+        "test/macos-updater.test.js",
+        "test/macos-updater-release.test.mjs",
+        "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "privacy_research",
+      "canonicalPath": "scripts/minimization-ablation.js",
+      "stableAlias": "evaluate:minimization",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.evaluate:minimization",
+        "test/minimization-ablation.test.js",
+        "docs/decisions/2026-07-25-g1-data-minimization-ablation-decision.md",
+        "docs/governance/2026-07-24-g1-local-release-route.md",
+        "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
+        "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md"
+      ],
+      "decision": "retain_at_provenance_bound_canonical_path",
+      "provenance": "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md",
+      "provenanceReason": "The dated receipt records this exact direct command path; relocating it would rewrite historical command provenance or require a stale-path exception.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/native-network-audit-interpose.c",
+      "stableAlias": null,
+      "stableAliasReason": "Native source is compiled by the network-audit builder and is not directly invoked.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-native-network-audit.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": null,
+      "provenanceReason": "Compiled helper source is bound by its builder and tests, but no dated provenance artifact directly identifies this file.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/package-macos-dmg.js",
+      "stableAlias": "product:macos:dmg",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:dmg"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The DMG packager is exercised through release tests, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/prepare-sparkle-framework.js",
+      "stableAlias": "product:macos:updater:prepare",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:updater:prepare",
+        "test/macos-updater-release.test.mjs"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The Sparkle preparation command is test-covered, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "r7_release_evidence",
+      "canonicalPath": "scripts/r7-materialized-boundary-worker.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal benchmark worker is launched by the R7 benchmark module and tests.",
+      "additionalAliases": [],
+      "callers": [
+        "src/r7-materialized-boundary-benchmark.js",
+        "src/r7-release-evidence-schema.js",
+        "test/r7-materialized-boundary-benchmark.test.js",
+        "test/r7-release-evidence-schema.test.js"
+      ],
+      "decision": "retain_without_modification_until_r7_source_freeze",
+      "provenance": null,
+      "provenanceReason": "R7 receipts bind this worker through source inventory, but no dated narrative artifact directly identifies the worker path.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "r7_release_evidence",
+      "canonicalPath": "scripts/r7-resource-benchmark-worker.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal benchmark worker is launched by the R7 benchmark module and tests.",
+      "additionalAliases": [],
+      "callers": [
+        "src/r7-resource-benchmark.js",
+        "src/r7-release-evidence-schema.js",
+        "test/r7-release-evidence-schema.test.js",
+        "test/r7-resource-benchmark.test.js"
+      ],
+      "decision": "retain_without_modification_until_r7_source_freeze",
+      "provenance": null,
+      "provenanceReason": "R7 receipts bind this worker through source inventory, but no dated narrative artifact directly identifies the worker path.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "r7_release_evidence",
+      "canonicalPath": "scripts/regenerate-r7-release-evidence.js",
+      "stableAlias": "benchmark:r7:release:regenerate",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.benchmark:r7:release:regenerate",
+        "test/r7-release-evidence-regeneration.test.js",
+        "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md"
+      ],
+      "decision": "retain_without_modification_until_final_r7_regeneration",
+      "provenance": "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/release-macos-app.js",
+      "stableAlias": "product:macos:release",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:release"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The release command is covered through macOS release tests, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "backend_acceptance",
+      "canonicalPath": "scripts/run-real-local-backend-acceptance.js",
+      "stableAlias": "product:backend:acceptance:real-local",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:backend:acceptance:real-local"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Live acceptance launcher has no standalone dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "local_review_release",
+      "canonicalPath": "scripts/smoke-local-review-artifact.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal packaged-artifact smoke is invoked by release verification, not a public command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/verify-local-review-runtime.js",
+        "docs/governance/2026-07-25-g0-control-traceability-matrix.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "local_review_release",
+      "canonicalPath": "scripts/verify-local-review-runtime.js",
+      "stableAlias": "product:local-review:runtime",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:local-review:runtime",
+        "test/local-review-runtime-gate.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": null,
+      "provenanceReason": "The command creates its own content-free aggregate qualification receipt.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/test-fixtures/checkpoint-crash-worker.js",
+      "stableAlias": null,
+      "stableAliasReason": "Failure-injection process is launched only by checkpoint lifecycle tests.",
+      "additionalAliases": [],
+      "callers": [
+        "test/export-checkpoint-process-death.test.js",
+        "test/supplemental-source-lifecycle.test.js"
+      ],
+      "decision": "retain_as_internal_test_support",
+      "provenance": null,
+      "provenanceReason": "Test-only failure injection has no standalone provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "claude_provider_test_infrastructure",
+      "canonicalPath": "scripts/test-fixtures/claude-callback-existing-status-process.js",
+      "stableAlias": null,
+      "stableAliasReason": "Fixture process is launched only by Claude callback runtime tests.",
+      "additionalAliases": [],
+      "callers": [
+        "test/claude-callback-runtime.test.js"
+      ],
+      "decision": "retain_as_internal_test_support",
+      "provenance": null,
+      "provenanceReason": "Test-only callback fixture has no standalone provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/test-fixtures/supplemental-checkpoint-crash-worker.js",
+      "stableAlias": null,
+      "stableAliasReason": "Failure-injection process is launched only by supplemental source lifecycle tests.",
+      "additionalAliases": [],
+      "callers": [
+        "test/supplemental-source-lifecycle.test.js"
+      ],
+      "decision": "retain_as_internal_test_support",
+      "provenance": null,
+      "provenanceReason": "Test-only failure injection has no standalone provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/validate-macos-install.js",
+      "stableAlias": "product:macos:validate:development",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "product:macos:validate:release"
+      ],
+      "callers": [
+        "package.json#scripts.product:macos:validate:development",
+        "package.json#scripts.product:macos:validate:release",
+        "apps/macos/README.md",
+        "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/validate-macos-replacement.js",
+      "stableAlias": null,
+      "stableAliasReason": "Replacement validator is an internal release helper documented for operator use.",
+      "additionalAliases": [],
+      "callers": [
+        "apps/macos/README.md",
+        "test/macos-app-bundle.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The replacement validator is test-covered, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "tools/operations/check-tool-inventory.mjs",
+      "stableAlias": "tools:inventory:check",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.tools:inventory:check",
+        "test/tool-inventory.test.js"
+      ],
+      "decision": "retain_as_phase_5_quality_gate",
+      "provenance": null,
+      "provenanceReason": "Live machine-checking gate has no separate dated output artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/build-monitoring-quality-report.js",
+      "stableAlias": "build:quality-report-data",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:quality-report-data",
+        "docs/research/2026-07-24-monitoring-quality-source-notes.md"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": "docs/research/2026-07-24-monitoring-quality-source-notes.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/build-multi-surface-report.js",
+      "stableAlias": "build:report-data",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:report-data"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Historical report builder has no single dated provenance artifact; generated reports remain local research output.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/build-rolling-quota-history.js",
+      "stableAlias": "build:rolling-history",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:rolling-history"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Historical report builder has no single dated provenance artifact; generated reports remain local research output.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/build-simple-quota-gradient-report.js",
+      "stableAlias": "build:simple-report-data",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:simple-report-data"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Historical report builder has no single dated provenance artifact; generated reports remain local research output.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/build-weekly-calibration-audit.js",
+      "stableAlias": "build:weekly-calibration-audit",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:weekly-calibration-audit",
+        "test/build-weekly-calibration-audit.test.js"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Historical audit builder is directly covered by its owner-boundary test and has no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/build-weekly-calibration-report.js",
+      "stableAlias": "build:weekly-calibration-report-data",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.build:weekly-calibration-report-data"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Historical report builder has no single dated provenance artifact; generated reports remain local research output.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "src/fix-portable-report-width.js",
+      "stableAlias": "fix:report-width",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.fix:report-width",
+        "test/fix-portable-report-width.test.js",
+        "docs/research/2026-07-24-monitoring-quality-source-notes.md"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": "docs/research/2026-07-24-monitoring-quality-source-notes.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "quota_research",
+      "canonicalPath": "src/verify-weekly-calibration.js",
+      "stableAlias": "verify:weekly-calibration",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.verify:weekly-calibration",
+        "test/weekly-calibration.test.js"
+      ],
+      "decision": "retain_and_relocate_to_tools_reports_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Historical calibration verifier is test-covered but has no single dated provenance artifact.",
+      "legacyPaths": []
+    }
+  ]
+}

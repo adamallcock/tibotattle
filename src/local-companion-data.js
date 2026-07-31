@@ -2,15 +2,18 @@ import { createReadStream } from "node:fs";
 import { lstat, readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
-import { priceCodexUsageEvent } from "./local-api-pricing.js";
-import { APP_PRICE_REGISTRY_MANIFEST } from "./price-registry.js";
+import {
+  APP_PRICE_REGISTRY_MANIFEST,
+  priceCodexUsageEvent,
+} from "@app-usagemonitor/accounting";
 import {
   defaultReplaySafeAccountingCachePath,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
-} from "./weekly-calibration.js";
+} from "./reporting/index.js";
+import { writeJsonOwnerOnlyAtomic } from "./storage.js";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
@@ -66,6 +69,9 @@ const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
+const COLLECTOR_PROJECTION_SCHEMA_VERSION =
+  "collector-dashboard-projection-v1";
+const MAX_COLLECTOR_PROJECTION_BYTES = 16 * 1024 * 1024;
 
 const REPORTS = Object.freeze([
   {
@@ -859,6 +865,175 @@ function finalizeQuotaTimeline(rows) {
   return deterministicSample(changes, MAX_QUOTA_TIMELINE_POINTS);
 }
 
+function safeCachedCount(value, maximum = MAX_LEDGER_RECORDS) {
+  return Number.isSafeInteger(value)
+      && value >= 0
+      && value <= maximum
+    ? value
+    : null;
+}
+
+function safeCachedEpoch(value) {
+  return value === null
+    ? null
+    : Number.isSafeInteger(value) && value >= 0
+      ? value
+      : undefined;
+}
+
+function cachedQuotaRow(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const observedAt = canonicalIndexInstant(value.observedAt);
+  const resetAt = value.resetAt === null
+    ? null
+    : canonicalIndexInstant(value.resetAt);
+  if (observedAt === null
+      || (value.resetAt !== null && resetAt === null)
+      || !KNOWN_LIMITS.has(value.limitId)
+      || !KNOWN_SLOTS.has(value.slot)
+      || !KNOWN_PLANS.has(value.planType)
+      || (value.accountAttribution !== "unattributed"
+        && value.accountAttribution !== "attributed_pseudonymous")
+      || (value.usedPercent !== null
+        && (typeof value.usedPercent !== "number"
+          || !Number.isFinite(value.usedPercent)
+          || value.usedPercent < 0
+          || value.usedPercent > 100))
+      || (value.remainingPercent !== null
+        && (typeof value.remainingPercent !== "number"
+          || !Number.isFinite(value.remainingPercent)
+          || value.remainingPercent < 0
+          || value.remainingPercent > 100))
+      || (value.durationMinutes !== null
+        && (!Number.isSafeInteger(value.durationMinutes)
+          || value.durationMinutes < 1))) {
+    return null;
+  }
+  return {
+    observedAt,
+    limitId: value.limitId,
+    slot: value.slot,
+    planType: value.planType,
+    usedPercent: value.usedPercent,
+    remainingPercent: value.remainingPercent,
+    durationMinutes: value.durationMinutes,
+    resetAt,
+    accountAttribution: value.accountAttribution,
+  };
+}
+
+function cachedCollectorProjection(value, nowMs) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.status !== "available") return null;
+  const countNames = [
+    "recordCount",
+    "malformedLines",
+  ];
+  const counts = Object.fromEntries(countNames.map((name) => [
+    name,
+    safeCachedCount(value[name]),
+  ]));
+  if (Object.values(counts).some((count) => count === null)) return null;
+  const epochNames = [
+    "firstRecordAt",
+    "latestRecordAt",
+    "firstExportableRecordAt",
+    "latestExportableRecordAt",
+  ];
+  const epochs = Object.fromEntries(epochNames.map((name) => [
+    name,
+    safeCachedEpoch(value[name]),
+  ]));
+  if (Object.values(epochs).some((epoch) => epoch === undefined)) {
+    return null;
+  }
+  const recordCounts = {};
+  for (const name of ["usage", "quota", "tools", "other"]) {
+    const count = safeCachedCount(value.recordCounts?.[name]);
+    if (count === null) return null;
+    recordCounts[name] = count;
+  }
+  if (Object.values(recordCounts).reduce(
+    (sum, count) => sum + count,
+    0,
+  ) !== counts.recordCount) return null;
+  const toolCounts = {};
+  for (const name of KNOWN_TOOL_CLASSES) {
+    const count = safeCachedCount(value.tools?.counts?.[name]);
+    if (count === null) return null;
+    toolCounts[name] = count;
+  }
+  const toolTotal = Object.values(toolCounts).reduce(
+    (sum, count) => sum + count,
+    0,
+  );
+  if (toolTotal !== safeCachedCount(value.tools?.total)) return null;
+  const quotaRows = Array.isArray(value.timeline?.quota)
+      && value.timeline.quota.length <= MAX_QUOTA_TIMELINE_POINTS
+    ? value.timeline.quota.map(cachedQuotaRow)
+    : null;
+  if (quotaRows === null || quotaRows.includes(null)) return null;
+  const recentStartMs = nowMs
+    - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
+  const quotaWindows = Array.isArray(value.quota?.windows)
+      && value.quota.windows.length <= 16
+    ? value.quota.windows.map((window) => cachedQuotaRow({
+      ...window,
+      observedAt: value.quota.observedAt,
+      accountAttribution: value.quota.accountAttribution,
+    }))
+    : null;
+  if (quotaWindows === null || quotaWindows.includes(null)) return null;
+  return {
+    status: "available",
+    ...counts,
+    ...epochs,
+    usage: summarizeUsage([], nowMs),
+    quota: {
+      status: value.quota.status === "available"
+        ? "available"
+        : "unavailable",
+      observedAt: canonicalIndexInstant(value.quota.observedAt),
+      accountAttribution:
+        value.quota.accountAttribution === "attributed_pseudonymous"
+          ? "attributed_pseudonymous"
+          : "unattributed",
+      windows: quotaWindows.map((row) => ({
+        limitId: row.limitId,
+        slot: row.slot,
+        planType: row.planType,
+        usedPercent: row.usedPercent,
+        remainingPercent: row.remainingPercent,
+        durationMinutes: row.durationMinutes,
+        resetAt: row.resetAt,
+      })),
+    },
+    tools: { total: toolTotal, counts: toolCounts },
+    timeline: {
+      bucketMinutes: TIMELINE_BUCKET_MS / 60_000,
+      coveredAt: {
+        startAt: canonicalIndexInstant(
+          value.timeline?.coveredAt?.startAt,
+          { nullable: true },
+        ),
+        endAt: canonicalIndexInstant(
+          value.timeline?.coveredAt?.endAt,
+          { nullable: true },
+        ),
+      },
+      usage: [],
+      quota: quotaRows.filter((row) => {
+        const observedMs = Date.parse(row.observedAt);
+        return observedMs >= recentStartMs
+          && observedMs <= nowMs + 5 * 60_000;
+      }),
+    },
+    recordCounts,
+  };
+}
+
 async function readCollectorProjection(
   path,
   nowMs,
@@ -887,6 +1062,38 @@ async function readCollectorProjection(
     throw fixedError("collector_unavailable");
   }
   if (!metadata.isFile() || metadata.size > MAX_LEDGER_BYTES) throw fixedError("collector_invalid_size");
+  const projectionFile = `${path}.projection-v1.json`;
+  if (!summarizeUsageEvents) {
+    try {
+      const cachedMetadata = await lstat(projectionFile);
+      if (cachedMetadata.isFile()
+          && !cachedMetadata.isSymbolicLink()
+          && cachedMetadata.nlink === 1
+          && (typeof process.getuid !== "function"
+            || cachedMetadata.uid === process.getuid())
+          && (cachedMetadata.mode & 0o077) === 0
+          && cachedMetadata.size <= MAX_COLLECTOR_PROJECTION_BYTES) {
+        const cached = JSON.parse(await readFile(projectionFile, "utf8"));
+        const projection = cachedCollectorProjection(
+          cached?.projection,
+          nowMs,
+        );
+        if (cached?.schemaVersion
+              === COLLECTOR_PROJECTION_SCHEMA_VERSION
+            && cached.source?.device === metadata.dev
+            && cached.source?.inode === metadata.ino
+            && cached.source?.birthtimeMs
+              === Math.trunc(metadata.birthtimeMs)
+            && cached.source?.size === metadata.size
+            && cached.source?.mtimeMs === Math.trunc(metadata.mtimeMs)
+            && projection !== null) {
+          return projection;
+        }
+      }
+    } catch {
+      // Any cache ambiguity falls back to the authoritative owner-only ledger.
+    }
+  }
   const periods = [
     { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
     { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
@@ -999,7 +1206,7 @@ async function readCollectorProjection(
       toolTotal += 1;
     }
   }
-  return {
+  const projection = {
     status: "available",
     recordCount,
     malformedLines,
@@ -1025,6 +1232,23 @@ async function readCollectorProjection(
     },
     recordCounts,
   };
+  if (!summarizeUsageEvents) {
+    await writeJsonOwnerOnlyAtomic(projectionFile, {
+      schemaVersion: COLLECTOR_PROJECTION_SCHEMA_VERSION,
+      generatedAt: new Date(nowMs).toISOString(),
+      source: {
+        device: metadata.dev,
+        inode: metadata.ino,
+        birthtimeMs: Math.trunc(metadata.birthtimeMs),
+        size: metadata.size,
+        mtimeMs: Math.trunc(metadata.mtimeMs),
+      },
+      projection,
+    }).catch(() => {
+      // Dashboard availability must not depend on an optimization write.
+    });
+  }
+  return projection;
 }
 
 function safeIndexCount(value) {

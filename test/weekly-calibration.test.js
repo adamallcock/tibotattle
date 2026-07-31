@@ -6,7 +6,7 @@ import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
   renderWeeklyCalibrationReport,
-} from "../src/weekly-calibration.js";
+} from "../src/reporting/index.js";
 import { verifyWeeklyCalibration } from "../src/verify-weekly-calibration.js";
 
 test("weekly calibration package shortcut pins the full historical ledger", async () => {

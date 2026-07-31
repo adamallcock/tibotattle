@@ -2,6 +2,7 @@ import { MAX_PLAINTEXT_BYTES } from "./constants";
 import { ApiError } from "./errors";
 import type { SyntheticEnvelope } from "./validation";
 import type { TelemetryEnvelope } from "./telemetry-validation";
+import { parseStrictJson } from "./strict-json";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
@@ -175,7 +176,10 @@ export async function decryptSyntheticEnvelope(
     if (plaintext.byteLength > MAX_PLAINTEXT_BYTES) {
       throw new ApiError(413, "BODY_TOO_LARGE");
     }
-    return JSON.parse(decoder.decode(plaintext)) as unknown;
+    return parseStrictJson(
+      decoder.decode(plaintext),
+      "DECRYPTION_FAILED",
+    );
   } catch (error) {
     if (error instanceof ApiError) throw error;
     console.warn(JSON.stringify({ event: "envelope_decryption_failed", stage: "payload" }));

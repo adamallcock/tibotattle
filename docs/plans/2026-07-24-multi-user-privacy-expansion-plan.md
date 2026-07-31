@@ -74,8 +74,8 @@ usage-monitor-export delete-my-data
 - `src/codex-log-scan.js`: cumulative-to-marginal token handling, cached/reasoning component separation, rollout discovery, and reset-window normalization.
 - `src/passive-collector.js`: incremental checkpoints, bounded streaming, crash-safe append logic, and safe event construction.
 - `src/surface-classification.js`: closed surface/agent/lineage vocabulary without retaining source metadata.
-- `src/tier-semantics.js`: separation of subscription Standard/Fast from API Standard/Priority/Flex/Batch.
-- `src/account-scope.js`: Keychain-backed HMAC pseudonyms.
+- `src/application/index.js` and `src/providers/codex/logs.js`: separation of subscription Standard/Fast from API Standard/Priority/Flex/Batch.
+- `src/providers/codex/account-scope.js`: Keychain-backed HMAC pseudonyms.
 - `src/claude-statusline.js`: content-free five-hour and seven-day Claude limit snapshots.
 - RunCost for reproducible price reconstruction and ccusage only as an independent comparison path.
 

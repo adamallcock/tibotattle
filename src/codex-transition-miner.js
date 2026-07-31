@@ -1,7 +1,15 @@
 import { scanCodexLogEvents } from "./codex-log-scan.js";
-import { fastQuotaMultiplier, subscriptionSpeedSensitivity, unknownCodexTier } from "./tier-semantics.js";
-import { addUsdStrings } from "./cost-ledger.js";
-import { apiPriceResolutionSummary, costWarningCodes, priceCodexUsageEvent } from "./local-api-pricing.js";
+import {
+  fastQuotaMultiplier,
+  subscriptionSpeedSensitivity,
+} from "./application/index.js";
+import { unknownCodexTier } from "./providers/codex/logs.js";
+import {
+  addUsdStrings,
+  apiPriceResolutionSummary,
+  costWarningCodes,
+  priceCodexUsageEvent,
+} from "@app-usagemonitor/accounting";
 
 const SCHEMA_VERSION = "0.3";
 export const PARSER_VERSION = "0.3.2";
@@ -519,6 +527,29 @@ function decodeCompactAccountingUsage(value) {
   };
 }
 
+function decodePrepricedCompactAccountingUsage(value) {
+  if (!Array.isArray(value)
+      || value.length !== 19
+      || !Array.isArray(value[16])
+      || !Array.isArray(value[17])
+      || !Array.isArray(value[18])) return null;
+  const base = decodeCompactAccountingUsage(value.slice(0, 10));
+  if (base === null) return null;
+  return {
+    ...base,
+    costUsd: value[10],
+    costUsdExact: value[11],
+    pricingCoverageStatus: value[12],
+    fastWeightedEquivalentUsd: value[13],
+    quotaWeightedLowerUsd: value[14],
+    quotaWeightedUpperUsd: value[15],
+    warningCodes: value[16],
+    coverageWarningCodes: value[17],
+    priceCardIds: value[18],
+    prepricedAccountingInput: true,
+  };
+}
+
 function decodeCompactAccountingSnapshot(value) {
   if (!Array.isArray(value) || value.length !== 9) return null;
   return {
@@ -556,7 +587,9 @@ async function normalizeTransitionInputsCooperatively({
     if (consumeInputs) rawUsageEvents[index] = null;
     const event = inputEncoding === "accounting_compact_v1"
       ? decodeCompactAccountingUsage(source)
-      : source;
+      : inputEncoding === "accounting_prepriced_compact_v1"
+        ? decodePrepricedCompactAccountingUsage(source)
+        : source;
     if (!event || typeof event !== "object" || Array.isArray(event)) continue;
     const normalized = {
       ...event,
@@ -586,7 +619,10 @@ async function normalizeTransitionInputsCooperatively({
     await cooperativeCheckpoint(index, signal, { resourceCheck });
     const source = rateLimitSnapshots[index];
     if (consumeInputs) rateLimitSnapshots[index] = null;
-    const snapshot = inputEncoding === "accounting_compact_v1"
+    const snapshot = [
+      "accounting_compact_v1",
+      "accounting_prepriced_compact_v1",
+    ].includes(inputEncoding)
       ? decodeCompactAccountingSnapshot(source)
       : source;
     if (!snapshot || typeof snapshot !== "object"
@@ -670,7 +706,9 @@ async function priceUsageEventsCooperatively({
   const usageEvents = [];
   for (let index = 0; index < usageInput.length; index += 1) {
     await cooperativeCheckpoint(index, signal, { resourceCheck });
-    const priced = priceUsageEvent(usageInput[index], priceCards);
+    const priced = usageInput[index].prepricedAccountingInput === true
+      ? usageInput[index]
+      : priceUsageEvent(usageInput[index], priceCards);
     cumulativeScanCostUsd = roundUsd(cumulativeScanCostUsd + priced.costUsd);
     cumulativeScanCostUsdExact = addUsdStrings(
       cumulativeScanCostUsdExact,
@@ -877,7 +915,11 @@ export async function deriveCodexTransitionSeriesCooperatively({
       || typeof consumeInputs !== "boolean"
       || typeof includeNormalizedInputs !== "boolean"
       || (resourceCheck !== null && typeof resourceCheck !== "function")
-      || !["object", "accounting_compact_v1"].includes(inputEncoding)) {
+      || ![
+        "object",
+        "accounting_compact_v1",
+        "accounting_prepriced_compact_v1",
+      ].includes(inputEncoding)) {
     throw new TypeError("Cooperative transition series inputs are invalid");
   }
   const totalInputs = rawUsageEvents.length

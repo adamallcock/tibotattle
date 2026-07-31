@@ -1,7 +1,13 @@
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
+import {
+  createIndexedCodexLogScan,
+  defaultLocalAnalysisIndexSecretPath,
+  readLocalAnalysisIndexProjection,
+  writeLocalAnalysisIndexProjection,
+} from "./local-analysis-index.js";
 import {
   CODEX_TRANSITION_DERIVATION_CEILINGS,
   deriveCodexTransitionSeriesCooperatively,
@@ -11,13 +17,17 @@ import {
   createExportResourceGuard,
   ExportResourceLimitError,
 } from "./export-resource-policy.js";
-import { priceCodexUsageEvent } from "./local-api-pricing.js";
-import { APP_PRICE_REGISTRY_MANIFEST } from "./price-registry.js";
+import {
+  costWarningCodes,
+  priceCodexUsageEvent,
+  APP_PRICE_REGISTRY_MANIFEST,
+} from "@app-usagemonitor/accounting";
 import { writeJsonOwnerOnlyAtomic } from "./storage.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
-} from "./weekly-calibration.js";
+} from "./reporting/index.js";
+import { fastQuotaMultiplier } from "./application/index.js";
 
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
   "local-replay-safe-accounting-v0.1";
@@ -246,7 +256,124 @@ function addComponentCosts(target, components, priced) {
   }
 }
 
-function eventProjection(event) {
+const FAST_PRICE_SCALE = 1_000_000_000;
+
+function scaledUsdString(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return "0";
+  const whole = Math.floor(value / FAST_PRICE_SCALE);
+  const fraction = String(value % FAST_PRICE_SCALE).padStart(9, "0");
+  return `${whole}.${fraction}`.replace(/\.?0+$/u, "");
+}
+
+function createAccountingPricer() {
+  const plans = new Map();
+  return (event, components) => {
+    const contextBand =
+      Number(event.totalInputContextTokens) >= 272_000
+        ? "long"
+        : "short";
+    const key = `${event.model}\0${contextBand}`;
+    let plan = plans.get(key);
+    if (plan === undefined) {
+      const templateComponents = Object.fromEntries(
+        COMPONENT_KEYS.map((name) => [
+          name,
+          name === "output_combined_tokens" ? 0 : 1,
+        ]),
+      );
+      const template = priceCodexUsageEvent({
+        ...event,
+        totalInputContextTokens:
+          contextBand === "long" ? 272_000 : 0,
+        components: templateComponents,
+      }, {
+        apiServiceTier: "standard",
+        priceEpochBasis: "current_price_sensitivity",
+      });
+      const rows = new Map(template.components.map((row) => [
+        row.name,
+        row,
+      ]));
+      plan = template.coverageStatus === "fully_priced"
+          && [...COMPONENT_KEYS]
+            .filter((name) => name !== "output_combined_tokens")
+            .every((name) => (
+              typeof rows.get(name)?.unitPriceUsd === "string"
+              && /^\d+(?:\.\d{1,9})?$/u.test(
+                rows.get(name).unitPriceUsd,
+              )
+            ))
+        ? {
+          rows,
+          warnings: template.warnings,
+          selectedPriceCardIds: template.selectedPriceCardIds,
+        }
+        : null;
+      plans.set(key, plan);
+    }
+    if (plan === null) {
+      return priceCodexUsageEvent({
+        ...event,
+        components,
+      }, {
+        apiServiceTier: "standard",
+        priceEpochBasis: "current_price_sensitivity",
+      });
+    }
+    const pricedComponents = [];
+    let totalUsdScaled = 0;
+    for (const name of COMPONENT_KEYS) {
+      const quantity = components[name] ?? 0;
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) continue;
+      const template = plan.rows.get(name);
+      if (!template || typeof template.unitPriceUsd !== "string") {
+        return priceCodexUsageEvent({
+          ...event,
+          components,
+        }, {
+          apiServiceTier: "standard",
+          priceEpochBasis: "current_price_sensitivity",
+        });
+      }
+      const unitPriceScaled = Math.round(
+        Number(template.unitPriceUsd) * FAST_PRICE_SCALE,
+      );
+      const costUsdScaled = unitPriceScaled * quantity;
+      if (!Number.isSafeInteger(costUsdScaled)
+          || !Number.isSafeInteger(
+            totalUsdScaled + costUsdScaled,
+          )) {
+        return priceCodexUsageEvent({
+          ...event,
+          components,
+        }, {
+          apiServiceTier: "standard",
+          priceEpochBasis: "current_price_sensitivity",
+        });
+      }
+      totalUsdScaled += costUsdScaled;
+      pricedComponents.push({
+        name,
+        pricedAs: template.pricedAs,
+        quantity: String(quantity),
+        unit: template.unit,
+        pricingStatus: "priced",
+        unitPriceUsd: template.unitPriceUsd,
+        costUsd: scaledUsdString(costUsdScaled),
+        priceCardId: template.priceCardId,
+      });
+    }
+    return {
+      totalUsd: scaledUsdString(totalUsdScaled),
+      coverageStatus: "fully_priced",
+      components: pricedComponents,
+      selectedPriceCardIds: plan.selectedPriceCardIds,
+      warnings: plan.warnings,
+    };
+  };
+}
+
+function eventProjection(event, price) {
   const components = emptyComponents();
   addComponents(components, event.components);
   const separatedOutput = components.output_text_tokens
@@ -270,14 +397,10 @@ function eventProjection(event) {
     : components;
   let priced;
   try {
-    priced = priceCodexUsageEvent({
+    priced = price({
       ...event,
       model,
-      components: pricingComponents,
-    }, {
-      apiServiceTier: "standard",
-      priceEpochBasis: "current_price_sensitivity",
-    });
+    }, pricingComponents);
     if (combinedOnly) {
       priced = {
         ...priced,
@@ -329,22 +452,43 @@ function eventProjection(event) {
   };
 }
 
-function transitionUsageProjection(event) {
+function transitionUsageProjection(event, projection) {
   const components = COMPONENT_KEYS.map((key) => (
     Number.isSafeInteger(event.components?.[key])
       && event.components[key] >= 0
       ? event.components[key]
       : 0
   ));
+  const costUsd = Number(projection.priced.totalUsd);
+  const multiplier = fastQuotaMultiplier(projection.model);
+  const fastWeightedEquivalentUsd =
+    multiplier === null ? null : costUsd * multiplier;
+  const quotaWeightedLowerUsd = projection.speed === "fast"
+    ? fastWeightedEquivalentUsd
+    : costUsd;
+  const quotaWeightedUpperUsd = projection.speed === "standard"
+    ? costUsd
+    : fastWeightedEquivalentUsd;
   return [
     canonicalInstant(event.timestamp),
-    safeModel(event.model),
+    projection.model,
     Number.isSafeInteger(event.totalInputContextTokens)
       && event.totalInputContextTokens >= 0
       ? event.totalInputContextTokens
       : 0,
     ...components,
-    safeEnum(event.tierSemantics?.codexSpeedMode, SPEEDS),
+    projection.speed,
+    Number.isFinite(costUsd) ? costUsd : 0,
+    projection.priced.totalUsd,
+    projection.priced.coverageStatus,
+    fastWeightedEquivalentUsd,
+    quotaWeightedLowerUsd,
+    quotaWeightedUpperUsd,
+    costWarningCodes(projection.priced),
+    projection.priced.warnings.coverage
+      .map((warning) => warning.code)
+      .sort(),
+    projection.priced.selectedPriceCardIds,
   ];
 }
 
@@ -682,6 +826,7 @@ export async function buildReplaySafeAccountingCache({
   const weeklyQuotaTimelineBuckets = new Map();
   const rawUsageEvents = [];
   const weeklyRateLimitSnapshots = [];
+  const price = createAccountingPricer();
   let retainedTransitionBytes = 0;
   let retainedTransitionInputs = 0;
   const reserveTransitionInput = (kind) => {
@@ -723,10 +868,10 @@ export async function buildReplaySafeAccountingCache({
         if (observedAt === null) return;
         const observedMs = Date.parse(observedAt);
         if (observedMs < startMs || observedMs > endMs + 5 * 60_000) return;
-        reserveTransitionInput("usage");
-        rawUsageEvents.push(transitionUsageProjection(rawEvent));
-        const event = eventProjection(rawEvent);
+        const event = eventProjection(rawEvent, price);
         if (event === null) return;
+        reserveTransitionInput("usage");
+        rawUsageEvents.push(transitionUsageProjection(rawEvent, event));
         for (const [id, period] of periods) {
           if (observedMs >= starts[id]) addEvent(period, event);
         }
@@ -770,7 +915,7 @@ export async function buildReplaySafeAccountingCache({
       signal,
       consumeInputs: true,
       includeNormalizedInputs: false,
-      inputEncoding: "accounting_compact_v1",
+      inputEncoding: "accounting_prepriced_compact_v1",
       resourceCheck: checkRuntimeMemory,
     });
   } catch (error) {
@@ -839,10 +984,42 @@ export async function buildReplaySafeAccountingCache({
 
 export async function refreshReplaySafeAccountingCache({
   cacheFile = defaultReplaySafeAccountingCachePath(),
+  indexFile = resolve(
+    dirname(cacheFile),
+    "local-analysis-index-v2.sqlite",
+  ),
+  indexSecretFile = defaultLocalAnalysisIndexSecretPath(indexFile),
+  scan = null,
+  indexWorkerCount,
+  indexChunkBytes,
   ...options
 } = {}) {
-  const cache = await buildReplaySafeAccountingCache(options);
+  if (scan !== null && typeof scan !== "function") {
+    throw new TypeError("scan must be a function or null");
+  }
+  const effectiveScan = scan ?? createIndexedCodexLogScan({
+    indexFile,
+    secretFile: indexSecretFile,
+    ...(indexWorkerCount === undefined
+      ? {}
+      : { workerCount: indexWorkerCount }),
+    ...(indexChunkBytes === undefined
+      ? {}
+      : { chunkBytes: indexChunkBytes }),
+  });
+  const cache = await buildReplaySafeAccountingCache({
+    ...options,
+    scan: effectiveScan,
+  });
   await writeJsonOwnerOnlyAtomic(cacheFile, cache);
+  if (scan === null) {
+    await writeLocalAnalysisIndexProjection({
+      indexFile,
+      schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+      generatedAt: cache.generatedAt,
+      value: cache,
+    });
+  }
   return cache;
 }
 
@@ -991,6 +1168,10 @@ function validCache(value) {
 
 export async function readReplaySafeAccountingCache({
   cacheFile = defaultReplaySafeAccountingCachePath(),
+  indexFile = resolve(
+    dirname(cacheFile),
+    "local-analysis-index-v2.sqlite",
+  ),
   now = null,
   maximumAgeMs = null,
 } = {}) {
@@ -1001,26 +1182,49 @@ export async function readReplaySafeAccountingCache({
       && (!Number.isSafeInteger(maximumAgeMs) || maximumAgeMs < 0)) {
     throw new TypeError("maximumAgeMs must be a non-negative safe integer or null");
   }
+  let unavailableErrorCode = null;
+  let parsed = null;
   let metadata;
   try {
     metadata = await stat(cacheFile);
   } catch (error) {
     if (error.code === "ENOENT") {
-      return { status: "unavailable", errorCode: "cache_missing", cache: null };
+      unavailableErrorCode = "cache_missing";
+    } else {
+      unavailableErrorCode = "cache_unavailable";
     }
-    return { status: "unavailable", errorCode: "cache_unavailable", cache: null };
   }
-  if (!metadata.isFile() || metadata.size > MAX_CACHE_BYTES) {
-    return { status: "unavailable", errorCode: "cache_invalid_size", cache: null };
+  if (metadata !== undefined) {
+    if (!metadata.isFile() || metadata.size > MAX_CACHE_BYTES) {
+      unavailableErrorCode = "cache_invalid_size";
+    } else {
+      try {
+        parsed = JSON.parse(await readFile(cacheFile, "utf8"));
+      } catch {
+        unavailableErrorCode = "cache_malformed";
+      }
+    }
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(await readFile(cacheFile, "utf8"));
-  } catch {
-    return { status: "unavailable", errorCode: "cache_malformed", cache: null };
+  if (parsed !== null && !validCache(parsed)) {
+    unavailableErrorCode = "cache_invalid";
+    parsed = null;
   }
-  if (!validCache(parsed)) {
-    return { status: "unavailable", errorCode: "cache_invalid", cache: null };
+  if (parsed === null) {
+    const projection = await readLocalAnalysisIndexProjection({
+      indexFile,
+      schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
+    });
+    if (projection.status === "available"
+        && validCache(projection.value)) {
+      parsed = projection.value;
+    }
+  }
+  if (parsed === null) {
+    return {
+      status: "unavailable",
+      errorCode: unavailableErrorCode ?? "cache_unavailable",
+      cache: null,
+    };
   }
   if (now !== null) {
     const nowMs = now();

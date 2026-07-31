@@ -1,0 +1,25 @@
+{
+  "name": "@app-usagemonitor/accounting",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runtime-neutral exact API-price-equivalent accounting kernel.",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.d.ts",
+    "index.js",
+    "src"
+  ],
+  "dependencies": {
+    "runcost": "0.2.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

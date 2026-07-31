@@ -5,7 +5,7 @@ import {
   deriveOpenAIAccountScope,
   sanitizeAccountScope,
   sanitizePlanType,
-} from "../src/account-scope.js";
+} from "../src/providers/codex/account.js";
 
 const SECRET = "test-only-local-account-scope-secret";
 

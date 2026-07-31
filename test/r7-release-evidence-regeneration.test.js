@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
   chmod,
   copyFile,
@@ -16,10 +17,11 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import {
   assertRuntimeIdentity,
+  recoverFailedGeneration,
   runtimeDetails,
   validateCompleteStaging,
 } from "../scripts/regenerate-r7-release-evidence.js";
@@ -46,6 +48,20 @@ const JOURNAL_CREATION_PREFIX = `${JOURNAL}.creating-`;
 const MARKER = ".r7-release-evidence-generation-v1.json";
 const MARKER_SCHEMA = "usage-monitor-r7-release-evidence-generation-v1";
 const GENERATION_ID = "11111111-1111-4111-8111-111111111111";
+const FOREIGN_GENERATION_ID = "22222222-2222-4222-8222-222222222222";
+const CONTENDER_GENERATION_ID = "33333333-3333-4333-8333-333333333333";
+const ACTIVE_REGENERATION_ERROR = "Another R7 evidence regeneration is already active";
+const LIVE_OWNER_RECOVERY_ERROR = "R7 recovery refused because the owning regeneration process is still running";
+const INVALID_PARTIAL_DRAFT_ERROR =
+  "R7 partial journal draft is incomplete or unverifiable";
+const DEAD_OWNER_IDENTITY = Object.freeze({
+  pid: 2_147_483_647,
+  uid: String(process.getuid()),
+  startedAt: "Thu Jan 1 00:00:00 1970",
+  processGroupId: "1",
+  sessionId: "1",
+  commandSha256: "0".repeat(64),
+});
 const RUNTIME_IDENTITIES = Object.freeze({
   node24: Object.freeze({
     path: "/fixture/node24",
@@ -84,6 +100,153 @@ function run(arguments_, options = {}) {
   });
 }
 
+function journalOwnerChild({
+  destination,
+  staging,
+  generationId,
+}) {
+  const source = `
+    import { createInstallJournalExclusive } from ${JSON.stringify(pathToFileURL(SCRIPT).href)};
+    const runtimeIdentities = JSON.parse(process.env.R7_TEST_RUNTIME_IDENTITIES);
+    await createInstallJournalExclusive({
+      destination: process.env.R7_TEST_DESTINATION,
+      staging: process.env.R7_TEST_STAGING,
+      generationId: process.env.R7_TEST_GENERATION_ID,
+      runtimeIdentities,
+    });
+    process.stdout.write("READY\\n");
+    setInterval(() => {}, 60_000);
+  `;
+  return spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        R7_TEST_DESTINATION: destination,
+        R7_TEST_STAGING: staging,
+        R7_TEST_GENERATION_ID: generationId,
+        R7_TEST_RUNTIME_IDENTITIES: JSON.stringify(RUNTIME_IDENTITIES),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+}
+
+function journalContenderRun({
+  destination,
+  staging,
+  generationId,
+}) {
+  const source = `
+    import { createInstallJournalExclusive } from ${JSON.stringify(pathToFileURL(SCRIPT).href)};
+    await createInstallJournalExclusive({
+      destination: process.env.R7_TEST_DESTINATION,
+      staging: process.env.R7_TEST_STAGING,
+      generationId: process.env.R7_TEST_GENERATION_ID,
+      runtimeIdentities: JSON.parse(process.env.R7_TEST_RUNTIME_IDENTITIES),
+    });
+  `;
+  return spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        ...process.env,
+        R7_TEST_DESTINATION: destination,
+        R7_TEST_STAGING: staging,
+        R7_TEST_GENERATION_ID: generationId,
+        R7_TEST_RUNTIME_IDENTITIES: JSON.stringify(RUNTIME_IDENTITIES),
+      },
+    },
+  );
+}
+
+function journalDraftOwnerChild({
+  destination,
+  staging,
+  generationId,
+}) {
+  const source = `
+    import { once } from "node:events";
+    import { createInstallJournalExclusive } from ${JSON.stringify(pathToFileURL(SCRIPT).href)};
+    const publishSignal = once(process.stdin, "data");
+    await createInstallJournalExclusive({
+      destination: process.env.R7_TEST_DESTINATION,
+      staging: process.env.R7_TEST_STAGING,
+      generationId: process.env.R7_TEST_GENERATION_ID,
+      runtimeIdentities: JSON.parse(process.env.R7_TEST_RUNTIME_IDENTITIES),
+    }, {
+      beforePublish: async () => {
+        process.stdout.write("DRAFT_READY\\n");
+        await publishSignal;
+      },
+    });
+    process.stdout.write("PUBLISHED\\n");
+    setInterval(() => {}, 60_000);
+  `;
+  return spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        R7_TEST_DESTINATION: destination,
+        R7_TEST_STAGING: staging,
+        R7_TEST_GENERATION_ID: generationId,
+        R7_TEST_RUNTIME_IDENTITIES: JSON.stringify(RUNTIME_IDENTITIES),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+}
+
+async function waitForOutputLine(child, expectedLine) {
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  return new Promise((resolveReady, rejectReady) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      rejectReady(
+        new Error(
+          `R7 journal-owner child timed out waiting for ${expectedLine}: ${stderr}`,
+        ),
+      );
+    }, 5_000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.stdout.off("data", onStdout);
+      child.stderr.off("data", onStderr);
+      child.off("exit", onExit);
+    };
+    const onStdout = (chunk) => {
+      stdout += chunk;
+      if (!stdout.includes(`${expectedLine}\n`)) return;
+      cleanup();
+      resolveReady();
+    };
+    const onStderr = (chunk) => {
+      stderr += chunk;
+    };
+    const onExit = (code, signal) => {
+      cleanup();
+      rejectReady(
+        new Error(`R7 journal-owner child exited ${code ?? signal}: ${stderr}`),
+      );
+    };
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.on("exit", onExit);
+  });
+}
+
 async function writeJournal(parent, value) {
   const path = join(parent, JOURNAL);
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, {
@@ -118,11 +281,14 @@ function journalFixture({
   backup = null,
   backupIdentity = null,
   creationDraft = null,
+  generationId = GENERATION_ID,
+  ownerIdentity = DEAD_OWNER_IDENTITY,
 }) {
   return {
     schemaVersion: JOURNAL_SCHEMA,
     phase,
-    generationId: GENERATION_ID,
+    generationId,
+    ownerIdentity,
     destination,
     staging,
     stagingIdentity,
@@ -182,6 +348,231 @@ test("R7 regeneration fails closed before private work for incomplete invocation
     directChild.stderr,
     /decision child is internal to complete regeneration/u,
   );
+});
+
+test("live journal ownership survives a real contender and blocks explicit recovery", {
+  skip: !EXACT_DRIVER,
+}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-live-owner-test-"));
+  const destination = join(parent, "generated");
+  const ownerStaging = join(
+    parent,
+    `.r7-release-evidence-staging-${GENERATION_ID}`,
+  );
+  const contenderStaging = join(
+    parent,
+    `.r7-release-evidence-staging-${CONTENDER_GENERATION_ID}`,
+  );
+  const contenderDraft = join(
+    parent,
+    `${JOURNAL_CREATION_PREFIX}${CONTENDER_GENERATION_ID}`,
+  );
+  let owner = null;
+  try {
+    await mkdir(destination, { mode: 0o700 });
+    owner = journalOwnerChild({
+      destination,
+      staging: ownerStaging,
+      generationId: GENERATION_ID,
+    });
+    await waitForOutputLine(owner, "READY");
+    const journal = join(parent, JOURNAL);
+    const journalBefore = await readFile(journal, "utf8");
+
+    const contender = journalContenderRun({
+      destination,
+      staging: contenderStaging,
+      generationId: CONTENDER_GENERATION_ID,
+    });
+    assert.equal(contender.status, 1, contender.stderr || contender.stdout);
+    assert.match(contender.stderr, new RegExp(ACTIVE_REGENERATION_ERROR, "u"));
+    assert.doesNotMatch(contender.stderr, /must be recovered|--recover/u);
+    await assert.rejects(lstat(contenderDraft), { code: "ENOENT" });
+    assert.equal(await readFile(journal, "utf8"), journalBefore);
+
+    const liveRecovery = run(["--destination", destination, "--recover"]);
+    assert.equal(liveRecovery.status, 1);
+    assert.equal(
+      liveRecovery.stderr.trimEnd().split("\n").at(-1),
+      LIVE_OWNER_RECOVERY_ERROR,
+    );
+    assert.equal(await readFile(journal, "utf8"), journalBefore);
+
+    const ownerExit = once(owner, "exit");
+    assert.equal(owner.kill("SIGTERM"), true);
+    await ownerExit;
+    const recovered = run(["--destination", destination, "--recover"]);
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+    assert.equal(
+      recovered.stdout,
+      "R7 release evidence recovery: discarded_partial_creation\n",
+    );
+    await assert.rejects(lstat(journal), { code: "ENOENT" });
+  } finally {
+    if (owner !== null && owner.exitCode === null && owner.signalCode === null) {
+      const ownerExit = once(owner, "exit");
+      owner.kill("SIGTERM");
+      await ownerExit;
+    }
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("explicit recovery cannot remove a live owner's pre-publication draft", {
+  skip: !EXACT_DRIVER,
+}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-live-draft-test-"));
+  const destination = join(parent, "generated");
+  const staging = join(parent, `.r7-release-evidence-staging-${GENERATION_ID}`);
+  const draft = join(parent, `${JOURNAL_CREATION_PREFIX}${GENERATION_ID}`);
+  const journal = join(parent, JOURNAL);
+  let owner = null;
+  try {
+    await mkdir(destination, { mode: 0o700 });
+    for (const name of EXPECTED) {
+      await writeFile(join(destination, name), `old:${name}\n`, {
+        mode: 0o600,
+      });
+    }
+    owner = journalDraftOwnerChild({
+      destination,
+      staging,
+      generationId: GENERATION_ID,
+    });
+    await waitForOutputLine(owner, "DRAFT_READY");
+
+    await assert.rejects(lstat(journal), { code: "ENOENT" });
+    const draftStats = await lstat(draft);
+    assert.equal(draftStats.nlink, 1);
+    const draftBefore = await readFile(draft, "utf8");
+
+    const liveRecovery = run(["--destination", destination, "--recover"]);
+    assert.equal(liveRecovery.status, 1);
+    assert.equal(
+      liveRecovery.stderr.trimEnd().split("\n").at(-1),
+      LIVE_OWNER_RECOVERY_ERROR,
+    );
+    assert.equal(await readFile(draft, "utf8"), draftBefore);
+    await assert.rejects(lstat(journal), { code: "ENOENT" });
+    for (const name of EXPECTED) {
+      assert.equal(await readFile(join(destination, name), "utf8"), `old:${name}\n`);
+    }
+
+    const published = waitForOutputLine(owner, "PUBLISHED");
+    owner.stdin.end("PUBLISH\n");
+    await published;
+    await assert.rejects(lstat(draft), { code: "ENOENT" });
+    assert.equal((await lstat(journal)).isFile(), true);
+
+    const ownerExit = once(owner, "exit");
+    assert.equal(owner.kill("SIGTERM"), true);
+    await ownerExit;
+    const recovered = run(["--destination", destination, "--recover"]);
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+    assert.equal(
+      recovered.stdout,
+      "R7 release evidence recovery: discarded_partial_creation\n",
+    );
+    await assert.rejects(lstat(journal), { code: "ENOENT" });
+  } finally {
+    if (owner !== null && owner.exitCode === null && owner.signalCode === null) {
+      const ownerExit = once(owner, "exit");
+      owner.kill("SIGTERM");
+      await ownerExit;
+    }
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("explicit recovery does not mistake a reused PID for the original owner", {
+  skip: !EXACT_DRIVER,
+}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-reused-pid-test-"));
+  const destination = join(parent, "generated");
+  const staging = join(parent, `.r7-release-evidence-staging-${GENERATION_ID}`);
+  try {
+    await mkdir(destination, { mode: 0o700 });
+    const journal = await writeJournal(parent, journalFixture({
+      phase: "creating",
+      destination,
+      staging,
+      stagingIdentity: null,
+      ownerIdentity: {
+        ...DEAD_OWNER_IDENTITY,
+        pid: process.pid,
+      },
+    }));
+
+    const recovered = run(["--destination", destination, "--recover"]);
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+    assert.equal(
+      recovered.stdout,
+      "R7 release evidence recovery: discarded_partial_creation\n",
+    );
+    await assert.rejects(lstat(journal), { code: "ENOENT" });
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("automatic failure recovery preserves a foreign generation and still recovers its own", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-foreign-generation-test-"));
+  const destination = join(parent, "generated");
+  const staging = join(
+    parent,
+    `.r7-release-evidence-staging-${FOREIGN_GENERATION_ID}`,
+  );
+  try {
+    await mkdir(destination, { mode: 0o700 });
+    for (const name of EXPECTED) {
+      await writeFile(join(destination, name), `old:${name}\n`, {
+        mode: 0o600,
+      });
+    }
+    const stagingIdentity = await createOwnedDirectory(
+      staging,
+      "staging",
+      FOREIGN_GENERATION_ID,
+    );
+    await writeFile(join(staging, EXPECTED[0]), "foreign generation\n", {
+      mode: 0o600,
+    });
+    const journal = await writeJournal(parent, journalFixture({
+      phase: "generating",
+      destination,
+      staging,
+      stagingIdentity,
+      generationId: FOREIGN_GENERATION_ID,
+    }));
+    const journalBefore = await readFile(journal, "utf8");
+
+    await assert.rejects(
+      recoverFailedGeneration(destination, GENERATION_ID),
+      (error) => {
+        assert.equal(error?.code, "R7_FOREIGN_GENERATION");
+        assert.match(error.message, /owned by another generation/u);
+        return true;
+      },
+    );
+
+    assert.equal(await readFile(journal, "utf8"), journalBefore);
+    assert.equal(
+      await readFile(join(staging, EXPECTED[0]), "utf8"),
+      "foreign generation\n",
+    );
+    for (const name of EXPECTED) {
+      assert.equal(await readFile(join(destination, name), "utf8"), `old:${name}\n`);
+    }
+
+    assert.equal(
+      await recoverFailedGeneration(destination, FOREIGN_GENERATION_ID),
+      "discarded_incomplete_generation",
+    );
+    await assert.rejects(lstat(journal), { code: "ENOENT" });
+    await assert.rejects(lstat(staging), { code: "ENOENT" });
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("journal recovery restores the complete prior R7 matrix after an interrupted install", {
@@ -319,11 +710,55 @@ test("journal recovery finalizes a post-validation installed R7 matrix", {
   }
 });
 
-test("recovery removes a crash-partial journal draft without touching receipts", {
+test("recovery fails closed on incomplete journal drafts without touching receipts", {
+  skip: !EXACT_DRIVER,
+}, async (context) => {
+  for (const [name, contents] of [
+    ["empty", ""],
+    ["truncated", "{\"schemaVersion\":"],
+  ]) {
+    await context.test(name, async () => {
+      const parent = await mkdtemp(
+        join(tmpdir(), `usage-monitor-r7-${name}-journal-test-`),
+      );
+      const destination = join(parent, "generated");
+      const draft = join(parent, `${JOURNAL_CREATION_PREFIX}${GENERATION_ID}`);
+      try {
+        await mkdir(destination, { mode: 0o700 });
+        for (const receiptName of EXPECTED) {
+          await writeFile(join(destination, receiptName), `old:${receiptName}\n`, {
+            mode: 0o600,
+          });
+        }
+        await writeFile(draft, contents, { mode: 0o600 });
+        await chmod(draft, 0o600);
+
+        const recovered = run(["--destination", destination, "--recover"]);
+        assert.equal(recovered.status, 1);
+        assert.equal(
+          recovered.stderr.trimEnd().split("\n").at(-1),
+          INVALID_PARTIAL_DRAFT_ERROR,
+        );
+        assert.equal(await readFile(draft, "utf8"), contents);
+        for (const receiptName of EXPECTED) {
+          assert.equal(
+            await readFile(join(destination, receiptName), "utf8"),
+            `old:${receiptName}\n`,
+          );
+        }
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("recovery removes a complete journal draft after its exact owner is dead", {
   skip: !EXACT_DRIVER,
 }, async () => {
-  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-partial-journal-test-"));
+  const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-dead-draft-test-"));
   const destination = join(parent, "generated");
+  const staging = join(parent, `.r7-release-evidence-staging-${GENERATION_ID}`);
   const draft = join(parent, `${JOURNAL_CREATION_PREFIX}${GENERATION_ID}`);
   try {
     await mkdir(destination, { mode: 0o700 });
@@ -332,7 +767,14 @@ test("recovery removes a crash-partial journal draft without touching receipts",
         mode: 0o600,
       });
     }
-    await writeFile(draft, "{\"schemaVersion\":", { mode: 0o600 });
+    const completeDraft = `${JSON.stringify(journalFixture({
+      phase: "creating",
+      destination,
+      staging,
+      stagingIdentity: null,
+      creationDraft: draft,
+    }), null, 2)}\n`;
+    await writeFile(draft, completeDraft, { mode: 0o600 });
     await chmod(draft, 0o600);
 
     const recovered = run(["--destination", destination, "--recover"]);

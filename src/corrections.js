@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { stableJson } from "./storage.js";
+import { stableJson } from "./export/index.js";
 
 const CORRECTION_SCHEMA_VERSION = "0.1";
 const CORRECTION_KIND = "derived_observation_correction";

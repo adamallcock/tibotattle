@@ -355,7 +355,17 @@ test("live weekly cache replaces the repo artifact and labels historical account
   const root = await fixtureRoot();
   const cacheFile = join(root, ".usage-monitor", "accounting.json");
   try {
-    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    const collectorFile = join(
+      root,
+      ".usage-monitor",
+      "collector-events.jsonl",
+    );
+    await writeFile(collectorFile, `${JSON.stringify({
+      kind: "codex_tool_class_event",
+      observedAt: "2026-07-25T11:30:00.000Z",
+      toolClass: "subagent",
+      eventKey: "PRIVATE_COLLECTOR_EVENT_KEY",
+    })}\n`);
     await refreshReplaySafeAccountingCache({
       cacheFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
@@ -426,6 +436,24 @@ test("live weekly cache replaces the repo artifact and labels historical account
         ],
       ],
     );
+    assert.equal(snapshot.overview.tools.total, 1);
+    const projectionBytes = await readFile(
+      `${collectorFile}.projection-v1.json`,
+    );
+    assert.equal(
+      projectionBytes.includes(
+        Buffer.from("PRIVATE_COLLECTOR_EVENT_KEY"),
+      ),
+      false,
+    );
+    const cachedSnapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingCacheFile: cacheFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(cachedSnapshot.overview.collector.records, 1);
+    assert.equal(cachedSnapshot.overview.tools.total, 1);
   } finally {
     await rm(root, { recursive: true });
   }

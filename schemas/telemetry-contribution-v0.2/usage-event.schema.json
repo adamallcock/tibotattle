@@ -27,31 +27,91 @@
     "accountingDiagnostic"
   ],
   "properties": {
-    "schemaVersion": { "const": "usage-event-v0.2" },
-    "eventTime": { "type": "string", "format": "date-time", "maxLength": 32 },
-    "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
-    "modelId": {
+    "schemaVersion": {
+      "const": "usage-event-v0.2"
+    },
+    "eventTime": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 32
+    },
+    "provider": {
       "enum": [
-        "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
-        "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
-        "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
-        "claude-sonnet-4-6", "claude-sonnet-5"
+        "openai_codex",
+        "anthropic_claude_code"
       ]
     },
-    "modelRecognition": { "enum": ["recognized", "unrecognized", "missing"] },
+    "modelId": {
+      "enum": [
+        "unknown",
+        "gpt-4.1",
+        "gpt-5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.5",
+        "gpt-5.5-codex",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "claude-fable-5",
+        "claude-haiku-4-5-20251001",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5"
+      ]
+    },
+    "modelRecognition": {
+      "enum": [
+        "recognized",
+        "unrecognized",
+        "missing"
+      ]
+    },
     "modelFingerprint": {
-      "type": ["string", "null"],
-      "pattern": "^model:v1:[a-f0-9]{64}$"
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^model:v1:(?:[a-f0-9]{64}|[A-Za-z0-9_-]{43})$"
     },
     "billingSurface": {
-      "enum": ["chatgpt_subscription", "openai_api", "claude_subscription", "unknown"]
+      "enum": [
+        "chatgpt_subscription",
+        "openai_api",
+        "claude_subscription",
+        "unknown"
+      ]
     },
-    "speedMode": { "enum": ["standard", "fast", "unknown", "other"] },
+    "speedMode": {
+      "enum": [
+        "standard",
+        "fast",
+        "unknown",
+        "other"
+      ]
+    },
     "apiServiceTier": {
-      "enum": ["standard", "priority", "flex", "batch", "unknown", "other"]
+      "enum": [
+        "standard",
+        "priority",
+        "flex",
+        "batch",
+        "unknown",
+        "other"
+      ]
     },
     "reasoningEffort": {
-      "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown"]
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+        "unknown"
+      ]
     },
     "components": {
       "type": "object",
@@ -67,18 +127,77 @@
         "outputCombinedTokens"
       ],
       "properties": {
-        "inputUncachedTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "inputCacheReadTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "inputCacheWriteTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "inputCacheWrite5mTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "inputCacheWrite1hTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "outputTextTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "outputReasoningTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
-        "outputCombinedTokens": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 }
+        "inputUncachedTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "inputCacheReadTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "inputCacheWriteTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "inputCacheWrite5mTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "inputCacheWrite1hTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outputTextTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outputReasoningTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outputCombinedTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
       }
     },
     "totalInputContextTokens": {
-      "type": ["integer", "null"],
+      "type": [
+        "integer",
+        "null"
+      ],
       "minimum": 0,
       "maximum": 9007199254740991
     },
@@ -92,34 +211,115 @@
         "local_rollout_unclassified"
       ]
     },
-    "agentScope": { "enum": ["root", "subagent", "automation", "unknown"] },
-    "lineageDisposition": { "enum": ["standalone", "forked", "parent_linked"] },
+    "agentScope": {
+      "enum": [
+        "root",
+        "subagent",
+        "automation",
+        "unknown"
+      ]
+    },
+    "lineageDisposition": {
+      "enum": [
+        "standalone",
+        "forked",
+        "parent_linked"
+      ]
+    },
     "toolClassCounts": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "webSearch", "fileSearch", "codeInterpreter", "hostedShell", "computerUse", "mcp",
-        "applyPatch", "localShell", "subagent", "toolGateway", "other", "unknown"
+        "webSearch",
+        "fileSearch",
+        "codeInterpreter",
+        "hostedShell",
+        "computerUse",
+        "mcp",
+        "applyPatch",
+        "localShell",
+        "subagent",
+        "toolGateway",
+        "other",
+        "unknown"
       ],
       "properties": {
-        "webSearch": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "fileSearch": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "codeInterpreter": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "hostedShell": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "computerUse": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "mcp": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "applyPatch": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "localShell": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "subagent": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "toolGateway": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "other": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-        "unknown": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+        "webSearch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "fileSearch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "codeInterpreter": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "hostedShell": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "computerUse": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "mcp": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "applyPatch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "localShell": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "subagent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "toolGateway": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "other": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "unknown": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
       }
     },
     "outcome": {
-      "enum": ["completed", "failed", "cancelled", "interrupted", "retry", "unknown"]
+      "enum": [
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "retry",
+        "unknown"
+      ]
     },
-    "eventId": { "type": "string", "pattern": "^event:v2:[a-f0-9]{64}$" },
+    "eventId": {
+      "type": "string",
+      "pattern": "^event:v2:(?:[a-f0-9]{64}|[A-Za-z0-9_-]{43})$"
+    },
     "accountTrackId": {
       "type": "string",
       "pattern": "^(unattributed|account-track:v1:[a-f0-9]{64})$"
@@ -136,15 +336,34 @@
         "priceBasis"
       ],
       "properties": {
-        "status": { "const": "untrusted_diagnostic" },
-        "sourceSchemaVersion": { "const": "telemetry-contribution-v0.1" },
+        "status": {
+          "const": "untrusted_diagnostic"
+        },
+        "sourceSchemaVersion": {
+          "const": "telemetry-contribution-v0.1"
+        },
         "estimatedApiCostUsd": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^(0|[1-9][0-9]*)\\.[0-9]{6}$"
         },
-        "pricingCoveragePercent": { "type": "number", "minimum": 0, "maximum": 100 },
-        "unknownBillableUnits": { "type": "integer", "minimum": 0 },
-        "priceBasis": { "enum": ["current_api_prices", "unpriced"] }
+        "pricingCoveragePercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "unknownBillableUnits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "priceBasis": {
+          "enum": [
+            "current_api_prices",
+            "unpriced"
+          ]
+        }
       }
     }
   }

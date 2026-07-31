@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { createTelemetryEnvelope } from "../apps/web/public/lib.js";
 import {
   withContributionDeviceSecret,
 } from "./contribution-device-capability.js";
+import {
+  createTelemetryEnvelope,
+} from "./platform/telemetry-envelope.js";
 import {
   loadVerifiedPreparedContribution,
   verifyPreparedContributionSet,

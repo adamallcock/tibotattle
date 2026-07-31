@@ -1,0 +1,219 @@
+const COMPONENT_KEYS = [
+  "input_tokens",
+  "cached_input_tokens",
+  "cache_write_input_tokens",
+  "output_tokens",
+  "reasoning_output_tokens",
+  "total_tokens",
+];
+
+export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
+  '"type":"session_meta"',
+  '"type":"turn_context"',
+  '"type":"thread_settings_applied"',
+  '"type":"token_count"',
+  '"type":"task_started"',
+  '"type":"task_complete"',
+  '"type":"custom_tool_call"',
+  '"type":"function_call"',
+  '"type":"web_search_call"',
+  '"type":"file_search_call"',
+  '"type":"code_interpreter_call"',
+  '"type":"shell_call"',
+  '"type":"computer_call"',
+  '"type":"mcp_call"',
+  '"type":"apply_patch_call"',
+  '"type":"local_shell_call"',
+]);
+
+export function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
+}
+
+export function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error("codex_log_scan_aborted");
+  error.name = "AbortError";
+  error.code = "codex_log_scan_aborted";
+  throw error;
+}
+
+export function normalizeTokenUsage(value) {
+  if (!value || typeof value !== "object") return null;
+  const normalized = {};
+  for (const key of COMPONENT_KEYS) {
+    const quantity = value[key] ?? 0;
+    if (!Number.isFinite(quantity) || quantity < 0) return null;
+    normalized[key] = quantity;
+  }
+  return normalized;
+}
+
+export function tokenComponentPresence(value) {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Boolean(value && Object.hasOwn(value, key))]));
+}
+
+export function deltaComponentPresence(current, previous) {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [
+    key,
+    current[key] && (previous === null || previous[key]),
+  ]));
+}
+
+export function subtractUsage(current, previous) {
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Math.max(0, current[key] - (previous?.[key] ?? 0))]));
+}
+
+export function sameUsage(left, right) {
+  return COMPONENT_KEYS.every((key) => left[key] === right[key]);
+}
+
+export function createSnapshotLineage(parent = null) {
+  const local = new Set();
+  return {
+    add(key) {
+      local.add(key);
+      return this;
+    },
+    has(key) {
+      return local.has(key) || Boolean(parent?.has(key));
+    },
+    localSize() {
+      return local.size;
+    },
+    parent,
+  };
+}
+
+export function canonicalComponents(raw) {
+  const cacheRead = Math.min(raw.cached_input_tokens, raw.input_tokens);
+  const cacheWrite = Math.min(raw.cache_write_input_tokens, Math.max(0, raw.input_tokens - cacheRead));
+  const reasoning = Math.min(raw.reasoning_output_tokens, raw.output_tokens);
+  return {
+    input_uncached_tokens: Math.max(0, raw.input_tokens - cacheRead - cacheWrite),
+    input_cache_read_tokens: cacheRead,
+    input_cache_write_tokens: cacheWrite,
+    output_text_tokens: Math.max(0, raw.output_tokens - reasoning),
+    output_reasoning_tokens: reasoning,
+  };
+}
+
+export function canonicalComponentAvailability(presence, raw) {
+  const inputConsistent = raw.cached_input_tokens + raw.cache_write_input_tokens <= raw.input_tokens;
+  const outputConsistent = raw.reasoning_output_tokens <= raw.output_tokens;
+  return {
+    input_uncached_tokens: inputConsistent && presence.input_tokens && presence.cached_input_tokens && presence.cache_write_input_tokens,
+    input_cache_read_tokens: inputConsistent && presence.input_tokens && presence.cached_input_tokens,
+    input_cache_write_tokens: inputConsistent && presence.input_tokens && presence.cached_input_tokens && presence.cache_write_input_tokens,
+    output_text_tokens: outputConsistent && presence.output_tokens && presence.reasoning_output_tokens,
+    output_reasoning_tokens: outputConsistent && presence.output_tokens && presence.reasoning_output_tokens,
+  };
+}
+
+function safeClassification(value) {
+  return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,64}$/.test(value) ? value : "unknown";
+}
+
+export function canonicalRateLimitWindows(rateLimits) {
+  if (!rateLimits || typeof rateLimits !== "object") return [];
+  const limitId = safeClassification(rateLimits.limit_id);
+  const planType = safeClassification(rateLimits.plan_type);
+  const windows = [];
+  for (const slot of ["primary", "secondary"]) {
+    const window = rateLimits[slot];
+    if (!window || typeof window !== "object") continue;
+    const usedPercent = Number(window.used_percent);
+    const windowDurationMins = Number(window.window_minutes);
+    const resetsAt = Number(window.resets_at);
+    if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
+    if (!Number.isInteger(windowDurationMins) || windowDurationMins <= 0) continue;
+    if (!Number.isInteger(resetsAt) || resetsAt <= 0) continue;
+    windows.push({
+      provider: "openai_codex",
+      planType,
+      limitId,
+      slot,
+      usedPercent,
+      windowDurationMins,
+      resetsAt,
+    });
+  }
+  return windows;
+}
+
+export function classifyToolCall(name, namespace = null) {
+  if (typeof name !== "string") return "unknown";
+  const bareName = name.toLowerCase();
+  const value = `${typeof namespace === "string" ? `${namespace}.` : ""}${name}`.toLowerCase();
+  if (value.includes("web") && (value.includes("search") || value.includes("run"))) return "web_search";
+  if (value.includes("file_search")) return "file_search";
+  if (value.includes("code_interpreter") || bareName === "python") return "code_interpreter";
+  if (value.includes("spawn_agent") || value.includes("subagent") || value.includes("thread_spawn")) return "subagent";
+  if (value.includes("wait_agent") || value.includes("send_message") || value.includes("followup_task") || value.includes("interrupt_agent") || value.includes("list_agents")) return "subagent";
+  if (value.includes("mcp__") || value.includes("mcp_call")) return "mcp";
+  if (value.includes("browser") || value.includes("chrome") || value.includes("computer_use") || value.includes("playwright")) return "computer_use";
+  if (value.includes("apply_patch") || value.includes("file_write") || value.includes("file_edit")) return "apply_patch";
+  if (value.includes("exec_command") || value.includes("write_stdin") || value.includes("shell") || value.includes("terminal")) return "local_shell";
+  if (value === "exec" || value === "wait" || value.endsWith(".wait") || value.includes("request_user_input") || value === "functions.exec" || value.endsWith("__exec")) return "tool_gateway";
+  return "other";
+}
+
+const SERVER_TOOL_TYPES = {
+  web_search_call: { toolClass: "web_search", serverBillableUnit: "responses_web_search_call" },
+  file_search_call: { toolClass: "file_search", serverBillableUnit: "responses_file_search_call" },
+  code_interpreter_call: { toolClass: "code_interpreter", serverBillableUnit: null },
+  shell_call: { toolClass: "hosted_shell", serverBillableUnit: null },
+  computer_call: { toolClass: "computer_use", serverBillableUnit: null },
+  mcp_call: { toolClass: "mcp", serverBillableUnit: null },
+  apply_patch_call: { toolClass: "apply_patch", serverBillableUnit: null },
+  local_shell_call: { toolClass: "local_shell", serverBillableUnit: null },
+};
+
+function nestedToolNames(input) {
+  if (typeof input !== "string") return [];
+  const names = [];
+  const matcher = /\btools\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
+  for (let match = matcher.exec(input); match; match = matcher.exec(input)) names.push(match[1]);
+  return names;
+}
+
+/**
+ * Convert one response item to privacy-safe descriptors. Raw tool names and
+ * inputs are inspected only in memory and are never returned.
+ */
+export function extractToolObservations(payload) {
+  if (!payload || typeof payload !== "object") return [];
+  const server = SERVER_TOOL_TYPES[payload.type];
+  if (server) {
+    return [{
+      toolClass: server.toolClass,
+      sourceKind: "responses_typed_output_item",
+      serverBillableUnit: server.serverBillableUnit,
+    }];
+  }
+  if (payload.type !== "function_call" && payload.type !== "custom_tool_call") return [];
+  if (payload.type === "custom_tool_call" && payload.name === "exec") {
+    const nestedNames = nestedToolNames(payload.input);
+    if (nestedNames.length > 0) {
+      return nestedNames.map((name) => ({
+        toolClass: classifyToolCall(name),
+        sourceKind: "client_nested_tool_call",
+        serverBillableUnit: null,
+      }));
+    }
+    return [{ toolClass: "tool_gateway", sourceKind: "client_wrapper", serverBillableUnit: null }];
+  }
+  return [{
+    toolClass: classifyToolCall(payload.name, payload.namespace),
+    sourceKind: payload.type === "function_call" ? "client_function_call" : "client_custom_tool_call",
+    serverBillableUnit: null,
+  }];
+}
+
+export function cumulativeSnapshotKey(total, last) {
+  if (!total) return null;
+  return [...COMPONENT_KEYS.map((key) => total[key]), ...(last ? COMPONENT_KEYS.map((key) => last[key]) : [])].join("|");
+}

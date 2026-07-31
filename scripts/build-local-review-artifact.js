@@ -27,7 +27,17 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+import { extractEsmImports } from "./lib/esm-imports.mjs";
+import { captureStableUtf8Source } from "./lib/captured-utf8-source.mjs";
+
+const SCRIPT_FILE = fileURLToPath(import.meta.url);
+const SCRIPT_DIRECTORY = dirname(SCRIPT_FILE);
+const ESM_IMPORT_HELPER = fileURLToPath(
+  new URL("./lib/esm-imports.mjs", import.meta.url),
+);
+const CAPTURED_UTF8_SOURCE_HELPER = fileURLToPath(
+  new URL("./lib/captured-utf8-source.mjs", import.meta.url),
+);
 const REPOSITORY_ROOT = resolve(SCRIPT_DIRECTORY, "..");
 const ARTIFACT_VERSION = "0.1.0-alpha.1";
 const ROOT_NAME = `usage-monitor-local-review-${ARTIFACT_VERSION}-darwin-arm64`;
@@ -40,11 +50,6 @@ const RELEASE_CONTRACT = join(
 );
 const PINNED_NODE = resolve(process.execPath);
 const PINNED_NODE_LICENSE = resolve(dirname(PINNED_NODE), "..", "LICENSE");
-const PINNED_RUNCOST_LICENSE = join(
-  REPOSITORY_ROOT,
-  "third_party_licenses",
-  "runcost-0.2.0.txt",
-);
 const BUILD_ROOT_MARKER = ".usage-monitor-local-review-build-root-v0.1";
 const BUILD_ROOT_MARKER_BYTES = "usage-monitor local-review generated build root v0.1\n";
 const FORBIDDEN_BUILTINS = new Set([
@@ -56,20 +61,68 @@ const FORBIDDEN_BUILTINS = new Set([
   "node:dns",
   "node:dgram",
 ]);
-const ALLOWED_EXTERNAL_SPECIFIERS = new Set(["ajv", "runcost/browser"]);
+const EXPECTED_EXTERNAL_SPECIFIERS = Object.freeze([
+  "@app-usagemonitor/identity-core",
+  "@github/keytar",
+  "ajv",
+]);
+const DYNAMIC_EXTERNAL_BY_FILE = Object.freeze({
+  "src/platform/export-identity-keychain.js": "@github/keytar",
+});
+const PINNED_RUNTIME_PACKAGES = Object.freeze({
+  "@app-usagemonitor/identity-core": Object.freeze({
+    version: "0.1.0",
+    license: "LicenseRef-Proprietary",
+  }),
+  "@github/keytar": Object.freeze({
+    version: "7.10.6",
+    license: "MIT",
+  }),
+  ajv: Object.freeze({
+    version: "8.20.0",
+    license: "MIT",
+  }),
+  "fast-deep-equal": Object.freeze({
+    version: "3.1.3",
+    license: "MIT",
+  }),
+  "fast-uri": Object.freeze({
+    version: "3.1.4",
+    license: "BSD-3-Clause",
+  }),
+  "json-schema-traverse": Object.freeze({
+    version: "1.0.0",
+    license: "MIT",
+  }),
+  "require-from-string": Object.freeze({
+    version: "2.0.2",
+    license: "MIT",
+  }),
+});
+const IDENTITY_CORE_PACKAGE_NAME = "@app-usagemonitor/identity-core";
+const IDENTITY_CORE_PACKAGE_ROOT = join(
+  REPOSITORY_ROOT,
+  "packages",
+  "identity-core",
+);
+export const LOCAL_REVIEW_IDENTITY_CORE_RUNTIME_FILES = Object.freeze([
+  "index.js",
+  "package.json",
+  "src/pseudonym.js",
+]);
 const FORBIDDEN_SOURCE_BASENAMES = [
   /^contribution-/,
   /^local-companion-/,
   /^passive-collector/,
-  /^codex-app-server/,
   /^telemetry-contribution/,
   /^telemetry-prepared-set/,
 ];
+const FORBIDDEN_SOURCE_PATHS = [
+  /^src\/providers\/codex\/app-server(?:\.|\/|$)/u,
+];
 const SOURCE_PATTERNS = [
-  /(?:import|export)\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/g,
-  /import\s*\(\s*["']([^"']+)["']\s*\)/g,
   /require(?:\.resolve)?\s*\(\s*["']([^"']+)["']\s*\)/g,
-  /new\s+URL\s*\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*\)/g,
+  /new\s+URL\s*\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url\s*,?\s*\)/g,
 ];
 
 function fail(message, code = "LOCAL_REVIEW_BUILD_FAILED") {
@@ -106,13 +159,147 @@ function repositoryRelative(path) {
   return value.split(sep).join("/");
 }
 
+function relativeWithin(root, path, label) {
+  const value = relative(root, path);
+  if (value === "" || value === ".." || value.startsWith(`..${sep}`)) {
+    fail(`${label} escaped its reviewed root`);
+  }
+  return value.split(sep).join("/");
+}
+
+function validateIdentityCoreRuntimeCapture(capture) {
+  if (capture === null || typeof capture !== "object"
+      || capture.name !== IDENTITY_CORE_PACKAGE_NAME
+      || capture.version
+        !== PINNED_RUNTIME_PACKAGES[IDENTITY_CORE_PACKAGE_NAME].version
+      || capture.inputDirectory !== "packages/identity-core"
+      || !Array.isArray(capture.files)
+      || capture.files.length !== LOCAL_REVIEW_IDENTITY_CORE_RUNTIME_FILES.length) {
+    fail("Captured local-review identity-core closure is invalid");
+  }
+  for (const [index, file] of capture.files.entries()) {
+    const relativeFile = LOCAL_REVIEW_IDENTITY_CORE_RUNTIME_FILES[index];
+    const inputPath = `packages/identity-core/${relativeFile}`;
+    if (file === null || typeof file !== "object"
+        || file.relativeFile !== relativeFile
+        || file.inputPath !== inputPath
+        || typeof file.sourceText !== "string"
+        || file.byteLength !== Buffer.byteLength(file.sourceText, "utf8")
+        || file.sha256 !== sha256(Buffer.from(file.sourceText, "utf8"))) {
+      fail(`Captured local-review identity-core file is invalid: ${relativeFile}`);
+    }
+  }
+  return true;
+}
+
+export async function captureLocalReviewIdentityCoreRuntime({
+  packageRoot = IDENTITY_CORE_PACKAGE_ROOT,
+  postOpenPreReadFailpoint = null,
+  resolvePackageEntrypoint = null,
+} = {}) {
+  if (typeof packageRoot !== "string"
+      || (postOpenPreReadFailpoint !== null
+        && typeof postOpenPreReadFailpoint !== "function")
+      || (resolvePackageEntrypoint !== null
+        && typeof resolvePackageEntrypoint !== "function")) {
+    fail("Local-review identity-core capture options are invalid");
+  }
+  const root = resolve(packageRoot);
+  const rootMetadata = await lstat(root).catch((error) => {
+    if (error?.code === "ENOENT") {
+      fail("Local-review identity-core package root is not a regular directory");
+    }
+    throw error;
+  });
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    fail("Local-review identity-core package root is not a regular directory");
+  }
+  const actualRoot = await realpath(root);
+  const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+  const resolveEntrypoint = resolvePackageEntrypoint
+    ?? (() => rootRequire.resolve(IDENTITY_CORE_PACKAGE_NAME));
+  const resolvedEntrypoint = await realpath(
+    await resolveEntrypoint(IDENTITY_CORE_PACKAGE_NAME),
+  );
+  if (resolvedEntrypoint !== await realpath(join(actualRoot, "index.js"))) {
+    fail("The local-review identity-core dependency resolved unexpectedly");
+  }
+  const files = [];
+  for (const relativeFile of LOCAL_REVIEW_IDENTITY_CORE_RUNTIME_FILES) {
+    const sourceFile = resolve(root, ...relativeFile.split("/"));
+    relativeWithin(root, sourceFile, "Local-review identity-core runtime file");
+    const failureMessage =
+      `Local-review identity-core runtime source is not a stable regular UTF-8 file: ${relativeFile}`;
+    const captured = await captureStableUtf8Source(sourceFile, {
+      failureMessage,
+      maximumBytes: 1024 * 1024,
+      postOpenPreReadFailpoint,
+    });
+    const resolvedSourceFile = await realpath(sourceFile).catch(() => {
+      fail(failureMessage);
+    });
+    relativeWithin(
+      actualRoot,
+      resolvedSourceFile,
+      "Local-review identity-core runtime file",
+    );
+    files.push(Object.freeze({
+      byteLength: captured.byteLength,
+      inputPath: `packages/identity-core/${relativeFile}`,
+      relativeFile,
+      sha256: captured.sha256,
+      sourceText: captured.sourceText,
+    }));
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(files.find(({ relativeFile }) =>
+      relativeFile === "package.json")?.sourceText ?? "");
+  } catch {
+    fail("Captured local-review identity-core package manifest is invalid");
+  }
+  if (manifest?.name !== IDENTITY_CORE_PACKAGE_NAME
+      || manifest?.version
+        !== PINNED_RUNTIME_PACKAGES[IDENTITY_CORE_PACKAGE_NAME].version) {
+    fail("Pinned package mismatch for local-review identity-core");
+  }
+  const capture = Object.freeze({
+    files: Object.freeze(files),
+    inputDirectory: "packages/identity-core",
+    license: PINNED_RUNTIME_PACKAGES[IDENTITY_CORE_PACKAGE_NAME].license,
+    name: manifest.name,
+    version: manifest.version,
+  });
+  validateIdentityCoreRuntimeCapture(capture);
+  return capture;
+}
+
 function resolveRelativeSpecifier(fromFile, specifier) {
   const candidate = resolve(dirname(fromFile), specifier);
   if (extname(candidate)) return candidate;
   return `${candidate}.js`;
 }
 
-async function collectStaticGraph(entrypoint) {
+export function isForbiddenLocalReviewSource(relativeFile) {
+  if (!relativeFile.startsWith("src/")) return false;
+  return (
+    FORBIDDEN_SOURCE_PATHS.some((pattern) => pattern.test(relativeFile))
+    || FORBIDDEN_SOURCE_BASENAMES.some((pattern) => pattern.test(basename(relativeFile)))
+  );
+}
+
+export async function collectStaticGraph(entrypoint, {
+  expectedExternalSpecifiers = EXPECTED_EXTERNAL_SPECIFIERS,
+} = {}) {
+  if (
+    !Array.isArray(expectedExternalSpecifiers)
+    || expectedExternalSpecifiers.some(
+      (specifier) => typeof specifier !== "string",
+    )
+  ) {
+    fail("expectedExternalSpecifiers must be an array of strings");
+  }
+  const expectedExternal = [...expectedExternalSpecifiers].sort();
   const pending = [entrypoint];
   const files = new Set();
   const external = new Set();
@@ -121,32 +308,50 @@ async function collectStaticGraph(entrypoint) {
     const file = pending.pop();
     if (files.has(file)) continue;
     const relativeFile = repositoryRelative(file);
-    if (relativeFile.startsWith("src/")
-        && FORBIDDEN_SOURCE_BASENAMES.some((pattern) => pattern.test(basename(file)))) {
+    if (isForbiddenLocalReviewSource(relativeFile)) {
       fail(`Forbidden local-review source module is reachable: ${relativeFile}`);
     }
     const bytes = await readFile(file);
     files.add(file);
     if (extname(file) !== ".js") continue;
     const source = bytes.toString("utf8");
+    const dynamicExternal =
+      DYNAMIC_EXTERNAL_BY_FILE[relativeFile];
+    if (dynamicExternal) external.add(dynamicExternal);
+    let esmImports;
+    try {
+      esmImports = await extractEsmImports(source, {
+        sourceName: relativeFile,
+      });
+    } catch {
+      fail(`Static dependency source is not valid ESM: ${relativeFile}`);
+    }
+    if (esmImports.some(({ specifier }) => specifier === null)) {
+      fail(`Non-literal dynamic import is forbidden: ${relativeFile}`);
+    }
+    const specifiers = [
+      ...esmImports.map(({ specifier }) => specifier),
+    ];
     for (const pattern of SOURCE_PATTERNS) {
       pattern.lastIndex = 0;
       for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
-        const specifier = match[1];
-        if (specifier.startsWith(".")) {
-          const resolved = resolveRelativeSpecifier(file, specifier);
-          await stat(resolved).catch(() => fail(
-            `Static dependency is missing: ${relativeFile} -> ${specifier}`,
-          ));
-          if (!files.has(resolved)) pending.push(resolved);
-        } else if (specifier.startsWith("node:")) {
-          builtins.add(specifier);
-        } else {
-          const root = specifier.startsWith("@")
-            ? specifier.split("/").slice(0, 2).join("/")
-            : specifier.split("/")[0];
-          external.add(root === "runcost" ? "runcost/browser" : root);
-        }
+        specifiers.push(match[1]);
+      }
+    }
+    for (const specifier of specifiers) {
+      if (specifier.startsWith(".")) {
+        const resolved = resolveRelativeSpecifier(file, specifier);
+        await stat(resolved).catch(() => fail(
+          `Static dependency is missing: ${relativeFile} -> ${specifier}`,
+        ));
+        if (!files.has(resolved)) pending.push(resolved);
+      } else if (specifier.startsWith("node:")) {
+        builtins.add(specifier);
+      } else {
+        const root = specifier.startsWith("@")
+          ? specifier.split("/").slice(0, 2).join("/")
+          : specifier.split("/")[0];
+        external.add(root === "runcost" ? "runcost/browser" : root);
       }
     }
   }
@@ -155,15 +360,21 @@ async function collectStaticGraph(entrypoint) {
       fail(`Forbidden network builtin is reachable: ${builtin}`);
     }
   }
-  for (const specifier of external) {
-    if (!ALLOWED_EXTERNAL_SPECIFIERS.has(specifier)) {
-      fail(`Undeclared third-party dependency is reachable: ${specifier}`);
-    }
+  const externalSpecifiers = [...external].sort();
+  if (
+    JSON.stringify(externalSpecifiers)
+    !== JSON.stringify(expectedExternal)
+  ) {
+    fail(
+      `Unexpected local-review dependency closure: ${
+        externalSpecifiers.join(", ")
+      }`,
+    );
   }
   return {
     files: [...files].sort((left, right) =>
       repositoryRelative(left).localeCompare(repositoryRelative(right))),
-    external: [...external].sort(),
+    external: externalSpecifiers,
     builtins: [...builtins].sort(),
   };
 }
@@ -182,6 +393,61 @@ async function writeGenerated(path, value, mode = 0o600) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await writeFile(path, value, { mode, flag: "wx" });
   await chmod(path, mode);
+}
+
+export async function stageLocalReviewIdentityCoreRuntime(
+  artifactRoot,
+  capture,
+) {
+  validateIdentityCoreRuntimeCapture(capture);
+  if (typeof artifactRoot !== "string") {
+    fail("Local-review identity-core staging root is invalid");
+  }
+  const rows = [];
+  for (const file of capture.files) {
+    const relativePath = [
+      "node_modules",
+      ...capture.name.split("/"),
+      ...file.relativeFile.split("/"),
+    ].join("/");
+    await writeGenerated(
+      join(artifactRoot, ...relativePath.split("/")),
+      file.sourceText,
+    );
+    rows.push(Object.freeze({
+      bytes: file.byteLength,
+      path: relativePath,
+      sha256: file.sha256,
+    }));
+  }
+  return Object.freeze(rows);
+}
+
+export function assertLocalReviewIdentityCoreRuntimeInventory(
+  inventory,
+  capture,
+) {
+  validateIdentityCoreRuntimeCapture(capture);
+  if (!Array.isArray(inventory)) {
+    fail("Local-review identity-core inventory is invalid");
+  }
+  const prefix = `node_modules/${capture.name}/`;
+  const actual = inventory.filter(({ path }) => path?.startsWith(prefix));
+  if (actual.length !== capture.files.length) {
+    fail("Local-review identity-core inventory is incomplete");
+  }
+  const rows = new Map(actual.map((row) => [row.path, row]));
+  if (rows.size !== actual.length) {
+    fail("Local-review identity-core inventory contains duplicates");
+  }
+  for (const file of capture.files) {
+    const path = `${prefix}${file.relativeFile}`;
+    const row = rows.get(path);
+    if (row?.bytes !== file.byteLength || row?.sha256 !== file.sha256) {
+      fail(`Local-review identity-core inventory did not retain captured bytes: ${path}`);
+    }
+  }
+  return true;
 }
 
 async function prepareBuildRoot(buildRoot) {
@@ -283,9 +549,34 @@ function packageRuntimeFiles(relativePath) {
   return true;
 }
 
+async function readPinnedPackageMetadata(packagePath, expectedName) {
+  let value;
+  try {
+    value = JSON.parse(await readFile(packagePath, "utf8"));
+  } catch {
+    fail(`Unable to read reviewed package metadata for ${expectedName}`);
+  }
+  const expected = PINNED_RUNTIME_PACKAGES[expectedName];
+  if (
+    !expected
+    || value?.name !== expectedName
+    || value?.version !== expected.version
+  ) {
+    fail(`Reviewed package identity changed for ${expectedName}`);
+  }
+  return Object.freeze({
+    name: expectedName,
+    version: expected.version,
+    license: expected.license,
+  });
+}
+
 async function copyThirdPartyDependencies(artifactRoot) {
   const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
   const ajvPackage = rootRequire.resolve("ajv/package.json");
+  const components = [
+    await readPinnedPackageMetadata(ajvPackage, "ajv"),
+  ];
   const ajvRoot = dirname(ajvPackage);
   await copyRuntimePackage({
     name: "ajv",
@@ -306,7 +597,9 @@ async function copyThirdPartyDependencies(artifactRoot) {
     "require-from-string",
   ];
   for (const name of ajvDependencies) {
-    const packageRoot = dirname(ajvRequire.resolve(`${name}/package.json`));
+    const packagePath = ajvRequire.resolve(`${name}/package.json`);
+    components.push(await readPinnedPackageMetadata(packagePath, name));
+    const packageRoot = dirname(packagePath);
     await copyRuntimePackage({
       name,
       source: packageRoot,
@@ -316,15 +609,12 @@ async function copyThirdPartyDependencies(artifactRoot) {
     });
   }
 
-  const runcostRoot = dirname(rootRequire.resolve("runcost/browser"));
-  for (const relativePath of ["browser.js", "package.json"]) {
-    await copyFileWithMode(
-      join(runcostRoot, relativePath),
-      join(artifactRoot, "node_modules", "runcost", relativePath),
-    );
-  }
-
-  const keytarRoot = dirname(rootRequire.resolve("@github/keytar/package.json"));
+  const keytarPackage =
+    rootRequire.resolve("@github/keytar/package.json");
+  components.push(
+    await readPinnedPackageMetadata(keytarPackage, "@github/keytar"),
+  );
+  const keytarRoot = dirname(keytarPackage);
   for (const relativePath of [
     "package.json",
     "LICENSE.md",
@@ -336,15 +626,8 @@ async function copyThirdPartyDependencies(artifactRoot) {
     );
   }
 
-  return [
-    { name: "ajv", version: "8.20.0", license: "MIT" },
-    { name: "fast-deep-equal", version: "3.1.3", license: "MIT" },
-    { name: "fast-uri", version: "3.1.4", license: "BSD-3-Clause" },
-    { name: "json-schema-traverse", version: "1.0.0", license: "MIT" },
-    { name: "require-from-string", version: "2.0.2", license: "MIT" },
-    { name: "runcost", version: "0.2.0", license: "MIT" },
-    { name: "@github/keytar", version: "7.10.6", license: "MIT" },
-  ];
+  return components.sort((left, right) =>
+    left.name.localeCompare(right.name));
 }
 
 async function copyLicenses(artifactRoot, components) {
@@ -355,17 +638,13 @@ async function copyLicenses(artifactRoot, components) {
     0o644,
   );
   await copyFileWithMode(
-    PINNED_RUNCOST_LICENSE,
-    join(artifactRoot, "LICENSES", "runcost-0.2.0.txt"),
-    0o644,
-  );
-  await copyFileWithMode(
     join(dirname(rootRequire.resolve("@github/keytar/package.json")), "LICENSE.md"),
     join(artifactRoot, "LICENSES", "github-keytar-7.10.6.txt"),
     0o644,
   );
   for (const component of components.filter((item) =>
-    !["runcost", "@github/keytar"].includes(item.name))) {
+    item.name !== "@github/keytar"
+      && item.name !== IDENTITY_CORE_PACKAGE_NAME)) {
     const packagePath = rootRequire.resolve(
       component.name === "ajv"
         ? "ajv/package.json"
@@ -453,7 +732,9 @@ async function writeSupplyChainArtifacts(artifactRoot, components, graph, source
       version: component.version,
       purl: component.purl,
       hashes: [{ alg: "SHA-256", content: component.digest }],
-      licenses: [{ license: { id: component.license } }],
+      licenses: component.license.startsWith("LicenseRef-")
+        ? [{ expression: component.license }]
+        : [{ license: { id: component.license } }],
     })),
   };
   await writeGenerated(join(artifactRoot, "sbom.cdx.json"), stableJson(sbom), 0o644);
@@ -481,22 +762,68 @@ function git(command) {
   }).trim();
 }
 
-async function sourceInputDigest(graph) {
+export async function calculateLocalReviewSourceInputDigest({
+  graph,
+  identityCoreRuntime,
+  readSource = readFile,
+}) {
+  validateIdentityCoreRuntimeCapture(identityCoreRuntime);
+  if (graph === null || typeof graph !== "object"
+      || !Array.isArray(graph.files)
+      || typeof readSource !== "function") {
+    fail("Local-review source digest inputs are invalid");
+  }
   const hash = createHash("sha256");
   const inputs = [
     ...graph.files,
     RELEASE_CONTRACT,
-    PINNED_RUNCOST_LICENSE,
+    ESM_IMPORT_HELPER,
+    CAPTURED_UTF8_SOURCE_HELPER,
     fileURLToPath(import.meta.url),
   ]
     .sort((left, right) => repositoryRelative(left).localeCompare(repositoryRelative(right)));
   for (const file of inputs) {
     hash.update(repositoryRelative(file));
     hash.update("\0");
-    hash.update(await readFile(file));
+    hash.update(await readSource(file));
+    hash.update("\0");
+  }
+  for (const file of identityCoreRuntime.files) {
+    hash.update(file.inputPath);
+    hash.update("\0");
+    hash.update(file.sourceText, "utf8");
     hash.update("\0");
   }
   return hash.digest("hex");
+}
+
+export function localReviewArtifactPackageMetadata(rootPackage) {
+  if (
+    !rootPackage
+    || typeof rootPackage !== "object"
+    || Array.isArray(rootPackage)
+    || typeof rootPackage.name !== "string"
+    || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9][a-z0-9._-]*$/u
+      .test(rootPackage.name)
+    || typeof rootPackage.version !== "string"
+    || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u
+      .test(rootPackage.version)
+    || rootPackage.private !== true
+    || rootPackage.type !== "module"
+  ) {
+    fail("Root package identity is not a reviewed private ESM package");
+  }
+  return Object.freeze({
+    name: rootPackage.name,
+    version: rootPackage.version,
+    private: true,
+    type: "module",
+    artifact: Object.freeze({
+      name: "usage-monitor-local-review",
+      version: ARTIFACT_VERSION,
+      localOnly: true,
+    }),
+  });
 }
 
 async function privacyScan(artifactRoot) {
@@ -506,6 +833,9 @@ async function privacyScan(artifactRoot) {
       || value.startsWith("local-review/")
       || value.startsWith("contracts/")
       || value.startsWith("schemas/")
+      || value.startsWith(
+        "node_modules/@app-usagemonitor/identity-core/",
+      )
       || value === "package.json";
   });
   const prohibited = [
@@ -636,13 +966,18 @@ async function writeDeterministicTar(artifactRoot, archivePath, sourceEpoch) {
   }
 }
 
-async function build({ buildRoot, sourceEpoch }) {
+export async function buildLocalReviewArtifact({ buildRoot, sourceEpoch }) {
   buildRoot = await prepareBuildRoot(buildRoot);
   const artifactRoot = join(buildRoot, ROOT_NAME);
   const archivePath = join(buildRoot, `${ROOT_NAME}.tar`);
   await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
 
   const contract = JSON.parse(await readFile(RELEASE_CONTRACT, "utf8"));
+  const rootPackage = JSON.parse(
+    await readFile(join(REPOSITORY_ROOT, "package.json"), "utf8"),
+  );
+  const artifactPackage =
+    localReviewArtifactPackageMetadata(rootPackage);
   const nodeDigest = await sha256File(PINNED_NODE);
   const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
   const keytarBinding = rootRequire.resolve(
@@ -655,6 +990,7 @@ async function build({ buildRoot, sourceEpoch }) {
   }
 
   const graph = await collectStaticGraph(ENTRYPOINT);
+  const identityCoreRuntime = await captureLocalReviewIdentityCoreRuntime();
   for (const source of graph.files) {
     if (repositoryRelative(source) === "package.json") continue;
     await copyFileWithMode(
@@ -672,7 +1008,18 @@ async function build({ buildRoot, sourceEpoch }) {
     join(artifactRoot, "runtime", "bin", "node"),
     0o755,
   );
-  const components = await copyThirdPartyDependencies(artifactRoot);
+  await stageLocalReviewIdentityCoreRuntime(
+    artifactRoot,
+    identityCoreRuntime,
+  );
+  const components = [
+    {
+      name: identityCoreRuntime.name,
+      version: identityCoreRuntime.version,
+      license: identityCoreRuntime.license,
+    },
+    ...await copyThirdPartyDependencies(artifactRoot),
+  ].sort((left, right) => left.name.localeCompare(right.name));
   await copyLicenses(artifactRoot, components);
 
   const launcher = `#!/bin/sh
@@ -687,17 +1034,7 @@ exec "$ROOT/runtime/bin/node" "$ROOT/local-review/cli.js" "$@"
   );
   await writeGenerated(
     join(artifactRoot, "package.json"),
-    stableJson({
-      name: "app-usagemonitor",
-      version: "0.0.1",
-      private: true,
-      type: "module",
-      artifact: {
-        name: "usage-monitor-local-review",
-        version: ARTIFACT_VERSION,
-        localOnly: true,
-      },
-    }),
+    stableJson(artifactPackage),
     0o644,
   );
   await writeGenerated(
@@ -729,7 +1066,10 @@ authorization remain open release gates.
     graph,
     sourceEpoch,
   );
-  const sourceDigest = await sourceInputDigest(graph);
+  const sourceDigest = await calculateLocalReviewSourceInputDigest({
+    graph,
+    identityCoreRuntime,
+  });
   const provenance = {
     schemaVersion: "usage-monitor-local-review-provenance-v0.1",
     artifactVersion: ARTIFACT_VERSION,
@@ -789,6 +1129,10 @@ authorization remain open release gates.
       mode: modeForArtifactPath(path),
     });
   }
+  assertLocalReviewIdentityCoreRuntimeInventory(
+    inventory,
+    identityCoreRuntime,
+  );
   const manifest = {
     schemaVersion: "usage-monitor-local-review-artifact-manifest-v0.1",
     artifactVersion: ARTIFACT_VERSION,
@@ -953,15 +1297,21 @@ function parseArgs(argv) {
   return { buildRoot, sourceEpoch };
 }
 
-const options = parseArgs(process.argv.slice(2));
-build(options).then(({ artifactRoot, archivePath, receipt }) => {
-  console.log(`Artifact root: ${artifactRoot}`);
-  console.log(`Archive: ${archivePath}`);
-  console.log(`Archive SHA-256: ${receipt.archive.sha256}`);
-  console.log(`Archive bytes: ${receipt.archive.bytes}`);
-  console.log("Signing: unsigned; notarization: not notarized");
-  console.log("External participants authorized: false");
-}).catch((error) => {
-  console.error(`build-local-review-artifact: ${error.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_FILE) {
+  const options = parseArgs(process.argv.slice(2));
+  buildLocalReviewArtifact(options).then(({
+    artifactRoot,
+    archivePath,
+    receipt,
+  }) => {
+    console.log(`Artifact root: ${artifactRoot}`);
+    console.log(`Archive: ${archivePath}`);
+    console.log(`Archive SHA-256: ${receipt.archive.sha256}`);
+    console.log(`Archive bytes: ${receipt.archive.bytes}`);
+    console.log("Signing: unsigned; notarization: not notarized");
+    console.log("External participants authorized: false");
+  }).catch((error) => {
+    console.error(`build-local-review-artifact: ${error.message}`);
+    process.exitCode = 1;
+  });
+}

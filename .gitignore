@@ -50,3 +50,6 @@ artifact.json
 *-verification-failure.png
 *.html.tmp-*
 verify-debug.png
+
+# Package manager store
+.pnpm-store/

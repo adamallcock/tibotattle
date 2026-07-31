@@ -5,7 +5,7 @@ import {
   buildResetEvidence,
   continuityKey,
   resetKey,
-} from "../shared/quota-tracks.js";
+} from "@app-usagemonitor/quota-analysis";
 
 function opaqueId(kind, value) {
   return `${kind}:v1:${BigInt(value).toString(16).padStart(64, "0")}`;

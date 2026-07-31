@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   access,
+  link,
   mkdir,
   readFile,
   stat,
@@ -368,5 +370,74 @@ test("prepared-set verifier never follows a substituted contribution symlink", a
       builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
     }),
     (error) => error?.code === "prepared_contribution_set_file_invalid",
+  );
+});
+
+test("prepared-set verifier rejects hard-linked contribution storage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-telemetry-hardlink-"));
+  const { bundleFile, receiptFile } = await verifiedSource(root);
+  const output = join(root, "out");
+  const result = await materializeTelemetryContributions({
+    bundleFile,
+    receiptFile,
+    outputDirectory: output,
+  });
+  const target = join(root, "hardlink-target.json");
+  await writeFile(target, await readFile(result.files[0].file), { mode: 0o600 });
+  await unlink(result.files[0].file);
+  await link(target, result.files[0].file);
+  await assert.rejects(
+    verifyPreparedContributionSet({
+      directory: output,
+      builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    }),
+    (error) => error?.code === "prepared_contribution_set_file_invalid",
+  );
+});
+
+test("prepared-set verifier treats invalid UTF-8 as a fixed schema failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-telemetry-utf8-"));
+  const { bundleFile, receiptFile } = await verifiedSource(root);
+  const output = join(root, "out");
+  const result = await materializeTelemetryContributions({
+    bundleFile,
+    receiptFile,
+    outputDirectory: output,
+  });
+  const invalid = Buffer.from([0xff]);
+  await writeFile(result.files[0].file, invalid, { mode: 0o600 });
+  const manifestPath = join(output, PREPARED_CONTRIBUTION_SET_MANIFEST);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.files[0].bytes = invalid.length;
+  manifest.files[0].sha256 = createHash("sha256")
+    .update(invalid)
+    .digest("hex");
+  await writeFile(manifestPath, stableJson(manifest), { mode: 0o600 });
+  await assert.rejects(
+    verifyPreparedContributionSet({
+      directory: output,
+      builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    }),
+    (error) => error?.code === "prepared_contribution_set_file_schema",
+  );
+});
+
+test("prepared-set verifier rejects exact-directory membership drift", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-telemetry-extra-"));
+  const { bundleFile, receiptFile } = await verifiedSource(root);
+  const output = join(root, "out");
+  await materializeTelemetryContributions({
+    bundleFile,
+    receiptFile,
+    outputDirectory: output,
+  });
+  await writeFile(join(output, "unexpected.json"), "{}", { mode: 0o600 });
+  await assert.rejects(
+    verifyPreparedContributionSet({
+      directory: output,
+      builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+    }),
+    (error) => error?.code
+      === "prepared_contribution_set_manifest_unexpected_entry",
   );
 });

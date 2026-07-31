@@ -12,7 +12,10 @@ import {
   chmod,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
-import { ClaudeStatuslineError, validateClaudeStatusSnapshot } from "./claude-statusline.js";
+import {
+  ClaudeStatuslineError,
+  validateClaudeStatusSnapshot,
+} from "./providers/claude/statusline.js";
 
 export const DEFAULT_CLAUDE_STATUS_MAX_RECORDS = 20_000;
 export const DEFAULT_CLAUDE_STATUS_MAX_LEDGER_BYTES = 32 * 1024 * 1024;

@@ -1,4 +1,4 @@
-import { sanitizeAccountScope } from "./account-scope.js";
+import { sanitizeAccountScope } from "./providers/codex/account.js";
 import { policyEpochAt, policyEpochsInRange } from "./policy-epochs.js";
 import { resolvePlanContext } from "./plan-timeline.js";
 

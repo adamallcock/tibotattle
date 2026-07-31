@@ -5,7 +5,7 @@ import {
   extractObservationDerived,
   resolveCorrections,
 } from "./corrections.js";
-import { stableJson } from "./storage.js";
+import { stableJson } from "./export/index.js";
 
 const BASELINE_MIGRATION_CREATED_AT = "2026-07-23T21:07:40.000Z";
 const EXPECTED_REPLAYED_UNKNOWN_TOKENS = 71_060_499;

@@ -24,6 +24,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
+import * as claudeStatuslineFacade from "../src/claude-statusline.js";
+import * as claudeStatuslineProvider from "../src/providers/claude/statusline.js";
 import {
   ClaudeStatuslineError,
   formatClaudeStatusline,
@@ -101,6 +103,24 @@ function assertSafeError(fn, code) {
     return true;
   });
 }
+
+test("Claude status-line CLI facade preserves the exact provider contract bindings", () => {
+  assert.deepEqual(
+    Object.keys(claudeStatuslineFacade).sort(),
+    [...Object.keys(claudeStatuslineProvider), "runClaudeStatusline"].sort(),
+  );
+  assert.equal(
+    Object.hasOwn(claudeStatuslineProvider, "runClaudeStatusline"),
+    false,
+  );
+  for (const exportName of Object.keys(claudeStatuslineProvider)) {
+    assert.strictEqual(
+      claudeStatuslineFacade[exportName],
+      claudeStatuslineProvider[exportName],
+      `${exportName} must remain the provider-owned binding`,
+    );
+  }
+});
 
 test("Claude status-line sanitizer retains bounded metadata and drops every private routing/content field", () => {
   const value = snapshot();

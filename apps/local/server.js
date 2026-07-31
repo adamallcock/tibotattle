@@ -63,7 +63,16 @@ import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
-import { validateTelemetryContribution } from "../web/public/lib.js";
+import {
+  validateTelemetryContribution,
+} from "@app-usagemonitor/telemetry-contract";
+import {
+  LOCAL_COMPANION_STATIC_FILES as STATIC_FILES,
+  createLocalCompanionReportRoutes,
+} from "./static-assets.js";
+import {
+  matchParticipantRelayRoute,
+} from "./transport/participant-relay-routes.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
@@ -157,25 +166,6 @@ function resolveDevelopmentIdentityConfiguration({
   });
 }
 
-const PARTICIPANT_RELAY_ROUTES = new Map([
-  ["/api/v1/enroll", new Set(["POST"])],
-  ["/api/v1/recover", new Set(["POST"])],
-  ["/api/v1/session", new Set(["GET"])],
-  ["/api/v1/logout", new Set(["POST"])],
-  ["/api/v1/me", new Set(["GET", "DELETE"])],
-  ["/api/v1/me/stats", new Set(["GET"])],
-  ["/api/v1/me/insights", new Set(["GET"])],
-  ["/api/v1/me/export", new Set(["GET"])],
-  ["/api/v1/me/security-reset", new Set(["POST"])],
-  ["/api/v1/me/upload-authorizations", new Set(["POST"])],
-  ["/api/v1/me/device-pairings", new Set(["POST"])],
-  ["/api/v1/me/devices", new Set(["GET"])],
-  ["/api/v1/me/devices/revoke", new Set(["POST"])],
-  ["/api/v1/me/contributions/read", new Set(["POST"])],
-  ["/api/v1/me/contributions/delete", new Set(["POST"])],
-  ["/api/v1/contributions", new Set(["POST"])],
-]);
-
 const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
 const SESSION_COOKIE_VALUE = /^[A-Za-z0-9_.-]{0,384}$/u;
 const SET_COOKIE_VALUE =
@@ -183,21 +173,8 @@ const SET_COOKIE_VALUE =
 const CSRF_VALUE = /^[A-Za-z0-9_-]{1,384}$/u;
 const UPLOAD_AUTHORIZATION_VALUE =
   /^Upload um_(?:upload|device_upload)_[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/u;
-
-const STATIC_FILES = Object.freeze({
-  "/": Object.freeze({ file: "index.html", type: "text/html; charset=utf-8" }),
-  "/index.html": Object.freeze({ file: "index.html", type: "text/html; charset=utf-8" }),
-  "/app.js": Object.freeze({ file: "app.js", type: "text/javascript; charset=utf-8" }),
-  "/data-client.js": Object.freeze({ file: "data-client.js", type: "text/javascript; charset=utf-8" }),
-  "/lib.js": Object.freeze({ file: "lib.js", type: "text/javascript; charset=utf-8" }),
-  "/styles.css": Object.freeze({ file: "styles.css", type: "text/css; charset=utf-8" }),
-});
-
-const REPORT_ROUTES = Object.freeze(
-  Object.fromEntries(Object.entries(LOCAL_COMPANION_REPORT_FILES).map(([route, file]) => [
-    route,
-    Object.freeze({ file, type: "text/html; charset=utf-8" }),
-  ])),
+const REPORT_ROUTES = createLocalCompanionReportRoutes(
+  LOCAL_COMPANION_REPORT_FILES,
 );
 
 const API_ROUTES = new Set([
@@ -415,13 +392,15 @@ function createParticipantRelay({
   return Object.freeze({
     enabled: origin !== null,
     handles(path) {
-      return origin !== null && PARTICIPANT_RELAY_ROUTES.has(path);
+      return origin !== null && matchParticipantRelayRoute(path) !== null;
     },
     async request(request, path) {
       if (origin === null) throw fixedRelayError("central_participant_relay_not_configured");
-      const methods = PARTICIPANT_RELAY_ROUTES.get(path);
-      if (!methods) throw fixedRelayError("central_participant_route_not_allowed");
-      if (!methods.has(request.method)) {
+      const route = matchParticipantRelayRoute(path);
+      if (route === null) {
+        throw fixedRelayError("central_participant_route_not_allowed");
+      }
+      if (!route.methods.includes(request.method)) {
         throw fixedRelayError("central_participant_method_not_allowed");
       }
       const body = await boundedParticipantRelayBody(request);
@@ -2512,6 +2491,3 @@ if (process.argv[1]
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
 }
-
-export const LOCAL_COMPANION_STATIC_FILES = STATIC_FILES;
-export const LOCAL_COMPANION_REPORT_ROUTES = REPORT_ROUTES;

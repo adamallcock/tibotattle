@@ -1,14 +1,209 @@
-const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+export {
+  ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
+  ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
+  MAX_TELEMETRY_BROWSER_BYTES,
+  TELEMETRY_ENVELOPE_SCHEMA_VERSION,
+  TELEMETRY_SCHEMA_VERSION,
+  validateAccountScopedTelemetryContribution,
+  validateContributionForUpload,
+  validateTelemetryContribution,
+} from "./telemetry-shared.generated.js";
+export {
+  ENVELOPE_SCHEMA_VERSION,
+  SYNTHETIC_SCHEMA_VERSION,
+  buildSyntheticFixture,
+  bytesToBase64Url,
+  createSyntheticEnvelope,
+  createTelemetryEnvelope,
+  validateSyntheticFixture,
+} from "./telemetry-envelope.js";
 
-export const SYNTHETIC_SCHEMA_VERSION = "synthetic-contribution-v0.1";
-export const ENVELOPE_SCHEMA_VERSION = "synthetic-envelope-v0.1";
-export const TELEMETRY_SCHEMA_VERSION = "telemetry-contribution-v0.1";
-export const ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION =
-  "telemetry-contribution-v0.2";
-export const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION =
-  "privacy-safe-telemetry-v0.2";
-export const TELEMETRY_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
-export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
+const JSON_WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
+const JSON_SIMPLE_ESCAPES = Object.freeze({
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+});
+
+function duplicateJsonObjectKeyError() {
+  const error = new SyntaxError(
+    "Duplicate JSON object keys are not accepted.",
+  );
+  error.code = "duplicate_json_object_key";
+  return error;
+}
+
+/**
+ * Parse JSON only after verifying that every object has unique member names.
+ *
+ * Native JSON.parse keeps the last occurrence of a duplicate member, which can
+ * hide an earlier privacy-forbidden value before the closed-schema validator
+ * sees it. This small recursive-descent preflight intentionally retains no
+ * values beyond the current object's member-name set. Error messages never
+ * include a key, value, or source excerpt.
+ */
+export function parseJsonWithUniqueObjectKeys(serialized) {
+  if (typeof serialized !== "string") {
+    throw new TypeError("JSON input must be a string.");
+  }
+
+  let cursor = 0;
+
+  const invalidJson = () => {
+    throw new SyntaxError("Invalid JSON.");
+  };
+
+  const skipWhitespace = () => {
+    while (JSON_WHITESPACE.has(serialized[cursor])) cursor += 1;
+  };
+
+  const parseString = (decode = true) => {
+    if (serialized[cursor] !== '"') invalidJson();
+    cursor += 1;
+    let decoded = "";
+    while (cursor < serialized.length) {
+      const character = serialized[cursor];
+      cursor += 1;
+      if (character === '"') return decoded;
+      if (character === "\\") {
+        if (cursor >= serialized.length) invalidJson();
+        const escape = serialized[cursor];
+        cursor += 1;
+        if (escape === "u") {
+          const codeUnit = serialized.slice(cursor, cursor + 4);
+          if (!/^[0-9a-f]{4}$/iu.test(codeUnit)) invalidJson();
+          if (decode) {
+            decoded += String.fromCharCode(Number.parseInt(codeUnit, 16));
+          }
+          cursor += 4;
+        } else if (Object.hasOwn(JSON_SIMPLE_ESCAPES, escape)) {
+          if (decode) decoded += JSON_SIMPLE_ESCAPES[escape];
+        } else {
+          invalidJson();
+        }
+        continue;
+      }
+      if (character.codePointAt(0) < 0x20) invalidJson();
+      if (decode) decoded += character;
+    }
+    invalidJson();
+  };
+
+  const parseLiteral = (literal) => {
+    if (serialized.slice(cursor, cursor + literal.length) !== literal) {
+      invalidJson();
+    }
+    cursor += literal.length;
+  };
+
+  const parseNumber = () => {
+    if (serialized[cursor] === "-") cursor += 1;
+    if (serialized[cursor] === "0") {
+      cursor += 1;
+    } else if (/[1-9]/u.test(serialized[cursor] ?? "")) {
+      cursor += 1;
+      while (/\d/u.test(serialized[cursor] ?? "")) cursor += 1;
+    } else {
+      invalidJson();
+    }
+    if (serialized[cursor] === ".") {
+      cursor += 1;
+      if (!/\d/u.test(serialized[cursor] ?? "")) invalidJson();
+      while (/\d/u.test(serialized[cursor] ?? "")) cursor += 1;
+    }
+    if (serialized[cursor] === "e" || serialized[cursor] === "E") {
+      cursor += 1;
+      if (serialized[cursor] === "+" || serialized[cursor] === "-") {
+        cursor += 1;
+      }
+      if (!/\d/u.test(serialized[cursor] ?? "")) invalidJson();
+      while (/\d/u.test(serialized[cursor] ?? "")) cursor += 1;
+    }
+  };
+
+  let parseValue;
+
+  const parseArray = () => {
+    cursor += 1;
+    skipWhitespace();
+    if (serialized[cursor] === "]") {
+      cursor += 1;
+      return;
+    }
+    while (cursor < serialized.length) {
+      parseValue();
+      skipWhitespace();
+      if (serialized[cursor] === "]") {
+        cursor += 1;
+        return;
+      }
+      if (serialized[cursor] !== ",") invalidJson();
+      cursor += 1;
+      skipWhitespace();
+    }
+    invalidJson();
+  };
+
+  const parseObject = () => {
+    cursor += 1;
+    skipWhitespace();
+    const memberNames = new Set();
+    if (serialized[cursor] === "}") {
+      cursor += 1;
+      return;
+    }
+    while (cursor < serialized.length) {
+      const memberName = parseString();
+      if (memberNames.has(memberName)) {
+        throw duplicateJsonObjectKeyError();
+      }
+      memberNames.add(memberName);
+      skipWhitespace();
+      if (serialized[cursor] !== ":") invalidJson();
+      cursor += 1;
+      parseValue();
+      skipWhitespace();
+      if (serialized[cursor] === "}") {
+        cursor += 1;
+        return;
+      }
+      if (serialized[cursor] !== ",") invalidJson();
+      cursor += 1;
+      skipWhitespace();
+    }
+    invalidJson();
+  };
+
+  parseValue = () => {
+    skipWhitespace();
+    const character = serialized[cursor];
+    if (character === "{") {
+      parseObject();
+    } else if (character === "[") {
+      parseArray();
+    } else if (character === '"') {
+      parseString(false);
+    } else if (character === "t") {
+      parseLiteral("true");
+    } else if (character === "f") {
+      parseLiteral("false");
+    } else if (character === "n") {
+      parseLiteral("null");
+    } else {
+      parseNumber();
+    }
+  };
+
+  parseValue();
+  skipWhitespace();
+  if (cursor !== serialized.length) invalidJson();
+  return JSON.parse(serialized);
+}
 
 export function createQuotaTimelineLookup(rows) {
   if (!Array.isArray(rows)) {
@@ -175,387 +370,6 @@ export function refreshNeedsContinuation({
   if (progress?.status !== "bounded_pause") return false;
   return outcome === "succeeded"
     || (outcome === "failed" && errorCode === "refresh_timed_out");
-}
-
-export function buildSyntheticFixture() {
-  return {
-    schemaVersion: SYNTHETIC_SCHEMA_VERSION,
-    synthetic: true,
-    fixtureId: "codex-weekly-demo-v0.1",
-    timeRange: {
-      start: "2026-07-14T00:00:00.000Z",
-      end: "2026-07-21T00:00:00.000Z"
-    },
-    quota: {
-      windowMinutes: 10080,
-      usedPercentBefore: 26,
-      usedPercentAfter: 31,
-      displayPrecision: 0
-    },
-    usage: {
-      modelId: "gpt-5.6-sol",
-      subscriptionSpeed: "standard",
-      apiTierAssumption: "standard",
-      inputUncachedTokens: 150000,
-      inputCachedTokens: 900000,
-      outputTextTokens: 28000,
-      outputReasoningTokens: 16000,
-      providerToolUnits: {
-        webSearchCalls: 2,
-        unknownUnits: 1
-      }
-    },
-    accounting: {
-      estimatedApiCostUsd: "12.840000",
-      pricedEventCoveragePercent: 100,
-      unknownBillableUnits: 1,
-      priceBasis: "current-api-price-sensitivity"
-    }
-  };
-}
-
-export function validateSyntheticFixture(fixture) {
-  if (!fixture || fixture.synthetic !== true || fixture.schemaVersion !== SYNTHETIC_SCHEMA_VERSION) {
-    throw new TypeError("Only the fixed synthetic fixture can be contributed.");
-  }
-  const canonical = JSON.stringify(buildSyntheticFixture());
-  if (JSON.stringify(fixture) !== canonical) {
-    throw new TypeError("The synthetic fixture must not be modified.");
-  }
-  return true;
-}
-
-export function bytesToBase64Url(bytes) {
-  if (!(bytes instanceof Uint8Array)) {
-    throw new TypeError("Expected Uint8Array.");
-  }
-  let output = "";
-  for (let index = 0; index < bytes.length; index += 3) {
-    const a = bytes[index];
-    const b = index + 1 < bytes.length ? bytes[index + 1] : 0;
-    const c = index + 2 < bytes.length ? bytes[index + 2] : 0;
-    const triple = (a << 16) | (b << 8) | c;
-    output += BASE64_ALPHABET[(triple >> 18) & 63];
-    output += BASE64_ALPHABET[(triple >> 12) & 63];
-    output += index + 1 < bytes.length ? BASE64_ALPHABET[(triple >> 6) & 63] : "=";
-    output += index + 2 < bytes.length ? BASE64_ALPHABET[triple & 63] : "=";
-  }
-  return output.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-export async function createSyntheticEnvelope({ publicJwk, keyId, cryptoImpl = globalThis.crypto } = {}) {
-  const fixture = buildSyntheticFixture();
-  validateSyntheticFixture(fixture);
-  return createEncryptedEnvelope({
-    payload: fixture,
-    publicJwk,
-    keyId,
-    schemaVersion: ENVELOPE_SCHEMA_VERSION,
-    synthetic: true,
-    cryptoImpl
-  });
-}
-
-/**
- * Encrypts an already privacy-stripped telemetry contribution.
- *
- * This browser-side check is intentionally conservative and is not a substitute
- * for server-side schema validation, content-key rejection, size limits,
- * decompression limits, deduplication, quarantine, or aggregate privacy gates.
- */
-export async function createTelemetryEnvelope({ payload, publicJwk, keyId, cryptoImpl = globalThis.crypto } = {}) {
-  validateContributionForUpload(payload);
-  return createEncryptedEnvelope({
-    payload,
-    publicJwk,
-    keyId,
-    schemaVersion: TELEMETRY_ENVELOPE_SCHEMA_VERSION,
-    synthetic: false,
-    cryptoImpl
-  });
-}
-
-async function createEncryptedEnvelope({
-  payload,
-  publicJwk,
-  keyId,
-  schemaVersion,
-  synthetic,
-  cryptoImpl
-}) {
-  if (!cryptoImpl?.subtle || typeof cryptoImpl.getRandomValues !== "function") {
-    throw new Error("Web Crypto is unavailable in this browser.");
-  }
-  if (!publicJwk || typeof keyId !== "string" || !/^key:[A-Za-z0-9._-]+$/.test(keyId)) {
-    throw new TypeError("A public JWK and key ID are required.");
-  }
-
-  const wrappingKey = await cryptoImpl.subtle.importKey(
-    "jwk",
-    publicJwk,
-    { name: "RSA-OAEP", hash: "SHA-256" },
-    false,
-    ["encrypt"]
-  );
-  const payloadKey = await cryptoImpl.subtle.generateKey(
-    { name: "AES-GCM", length: 256 },
-    true,
-    ["encrypt", "decrypt"]
-  );
-  const iv = cryptoImpl.getRandomValues(new Uint8Array(12));
-  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-  const ciphertext = await cryptoImpl.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    payloadKey,
-    plaintext
-  );
-  const rawPayloadKey = await cryptoImpl.subtle.exportKey("raw", payloadKey);
-  const wrappedKey = await cryptoImpl.subtle.encrypt(
-    { name: "RSA-OAEP" },
-    wrappingKey,
-    rawPayloadKey
-  );
-
-  return {
-    schemaVersion,
-    synthetic,
-    keyId,
-    wrappedKey: bytesToBase64Url(new Uint8Array(wrappedKey)),
-    iv: bytesToBase64Url(iv),
-    ciphertext: bytesToBase64Url(new Uint8Array(ciphertext))
-  };
-}
-
-const FORBIDDEN_CONTENT_KEYS = new Set([
-  "prompt",
-  "prompts",
-  "response",
-  "responses",
-  "message",
-  "messages",
-  "content",
-  "text",
-  "body",
-  "command",
-  "commands",
-  "argument",
-  "arguments",
-  "args",
-  "path",
-  "paths",
-  "filepath",
-  "filepaths",
-  "filename",
-  "filenames",
-  "file",
-  "files",
-  "cwd",
-  "workingdirectory",
-  "repository",
-  "repo",
-  "email",
-  "account",
-  "accountid",
-  "commandarguments",
-  "participantid",
-  "sessionid",
-  "threadid"
-]);
-
-export function validateTelemetryContribution(payload, {
-  maxSerializedBytes = MAX_TELEMETRY_BROWSER_BYTES,
-  maxDepth = 12,
-  maxArrayItems = 200
-} = {}) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new TypeError("The export must be one JSON object.");
-  }
-  if (payload.schemaVersion !== TELEMETRY_SCHEMA_VERSION || payload.synthetic !== false) {
-    throw new TypeError("Choose a real privacy-safe Usage Monitor telemetry export.");
-  }
-  const topLevelKeys = [
-    "schemaVersion", "synthetic", "createdAt", "coveredAt", "clientPlatform",
-    "providerPolicyEpoch", "usageEvents", "quotaSnapshots", "activityMarkers", "accounting"
-  ];
-  if (
-    Object.keys(payload).length !== topLevelKeys.length
-    || topLevelKeys.some((key) => !Object.hasOwn(payload, key))
-  ) {
-    throw new TypeError("The export does not match the closed telemetry contribution schema.");
-  }
-  if (
-    !payload.coveredAt
-    || typeof payload.coveredAt !== "object"
-    || Array.isArray(payload.coveredAt)
-    || Object.keys(payload.coveredAt).length !== 2
-    || typeof payload.coveredAt.startAt !== "string"
-    || typeof payload.coveredAt.endAt !== "string"
-  ) {
-    throw new TypeError("The export has an invalid coveredAt interval.");
-  }
-
-  const serialized = JSON.stringify(payload);
-  if (new TextEncoder().encode(serialized).byteLength > maxSerializedBytes) {
-    throw new RangeError("The export is larger than the browser validation limit.");
-  }
-  for (const [key, maximum] of [
-    ["usageEvents", 200],
-    ["quotaSnapshots", 200],
-    ["activityMarkers", 100]
-  ]) {
-    if (!Array.isArray(payload[key])) {
-      throw new TypeError(`The export must include a ${key} array.`);
-    }
-    if (payload[key].length > maximum) {
-      throw new RangeError(`The export contains too many ${key} records.`);
-    }
-  }
-  const totalRecords = payload.usageEvents.length + payload.quotaSnapshots.length + payload.activityMarkers.length;
-  if (totalRecords < 1) {
-    throw new RangeError("The export contains no telemetry records.");
-  }
-  if (totalRecords > 200) {
-    throw new RangeError("The export contains more than 200 telemetry records and must be contributed in smaller batches.");
-  }
-
-  const visit = (value, depth) => {
-    if (depth > maxDepth) throw new RangeError("The export is nested too deeply.");
-    if (Array.isArray(value)) {
-      if (value.length > maxArrayItems) throw new RangeError("The export contains too many records.");
-      value.forEach((entry) => visit(entry, depth + 1));
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    for (const [key, child] of Object.entries(value)) {
-      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-      if (FORBIDDEN_CONTENT_KEYS.has(normalized)) {
-        throw new TypeError(`The export contains a forbidden content field: ${key}.`);
-      }
-      visit(child, depth + 1);
-    }
-  };
-  visit(payload, 0);
-  return true;
-}
-
-/**
- * Conservative browser preflight for the account-scoped local-preview
- * contract. The Worker remains the authoritative closed-schema validator.
- */
-export function validateAccountScopedTelemetryContribution(payload, {
-  maxSerializedBytes = MAX_TELEMETRY_BROWSER_BYTES,
-  maxDepth = 12,
-  maxArrayItems = 200
-} = {}) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new TypeError("The export must be one JSON object.");
-  }
-  if (
-    payload.schemaVersion !== ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION
-    || payload.consentVersion !== ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION
-    || payload.status !== "implementation_disabled"
-    || payload.synthetic !== false
-  ) {
-    throw new TypeError("Choose a privacy-safe account-scoped Usage Monitor export.");
-  }
-  const topLevelKeys = [
-    "schemaVersion", "consentVersion", "status", "synthetic", "datasetId",
-    "partIndex", "partCount", "completeness", "createdAt", "coveredAt",
-    "clientPlatform", "providerPolicyEpoch", "usageEvents", "quotaSnapshots",
-    "activityMarkers", "accountingDiagnostic"
-  ];
-  if (
-    Object.keys(payload).length !== topLevelKeys.length
-    || topLevelKeys.some((key) => !Object.hasOwn(payload, key))
-    || typeof payload.datasetId !== "string"
-    || !/^dataset:v1:[a-f0-9]{64}$/u.test(payload.datasetId)
-    || !Number.isSafeInteger(payload.partIndex)
-    || !Number.isSafeInteger(payload.partCount)
-    || payload.partIndex < 1
-    || payload.partCount < 1
-    || payload.partCount > 100
-    || payload.partIndex > payload.partCount
-    || !["complete", "partial"].includes(payload.completeness)
-  ) {
-    throw new TypeError("The export does not match the account-scoped contribution contract.");
-  }
-  if (
-    !payload.coveredAt
-    || typeof payload.coveredAt !== "object"
-    || Array.isArray(payload.coveredAt)
-    || Object.keys(payload.coveredAt).length !== 2
-    || typeof payload.coveredAt.startAt !== "string"
-    || typeof payload.coveredAt.endAt !== "string"
-    || !Number.isFinite(Date.parse(payload.coveredAt.startAt))
-    || !Number.isFinite(Date.parse(payload.coveredAt.endAt))
-    || Date.parse(payload.coveredAt.endAt) < Date.parse(payload.coveredAt.startAt)
-  ) {
-    throw new TypeError("The export has an invalid coveredAt interval.");
-  }
-  for (const [key, maximum, schemaVersion] of [
-    ["usageEvents", 200, "usage-event-v0.2"],
-    ["quotaSnapshots", 200, "quota-snapshot-v0.2"],
-    ["activityMarkers", 100, "activity-marker-v0.2"]
-  ]) {
-    if (!Array.isArray(payload[key]) || payload[key].length > maximum) {
-      throw new RangeError(`The export has an invalid ${key} array.`);
-    }
-    for (const row of payload[key]) {
-      if (
-        !row
-        || typeof row !== "object"
-        || Array.isArray(row)
-        || row.schemaVersion !== schemaVersion
-        || !(
-          row.accountTrackId === "unattributed"
-          || /^account-track:v1:[a-f0-9]{64}$/u.test(row.accountTrackId)
-        )
-      ) {
-        throw new TypeError(`The export contains an invalid ${key} record.`);
-      }
-    }
-  }
-  const totalRecords = payload.usageEvents.length
-    + payload.quotaSnapshots.length
-    + payload.activityMarkers.length;
-  if (totalRecords < 1 || totalRecords > 200) {
-    throw new RangeError("The export must contain between 1 and 200 telemetry records.");
-  }
-  const serialized = JSON.stringify(payload);
-  if (new TextEncoder().encode(serialized).byteLength > maxSerializedBytes) {
-    throw new RangeError("The export is larger than the browser validation limit.");
-  }
-  if (
-    /(?:openai-)?account:v1:[a-f0-9]{64}/iu.test(serialized)
-    || /(?:\/Users\/|\/home\/|[A-Z]:\\|@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/u.test(serialized)
-  ) {
-    throw new TypeError("The export contains a direct identity or local-path canary.");
-  }
-  const visit = (value, depth) => {
-    if (depth > maxDepth) throw new RangeError("The export is nested too deeply.");
-    if (Array.isArray(value)) {
-      if (value.length > maxArrayItems) throw new RangeError("The export contains too many records.");
-      value.forEach((entry) => visit(entry, depth + 1));
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    for (const [key, child] of Object.entries(value)) {
-      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-      if (FORBIDDEN_CONTENT_KEYS.has(normalized)) {
-        throw new TypeError(`The export contains a forbidden content field: ${key}.`);
-      }
-      visit(child, depth + 1);
-    }
-  };
-  visit(payload, 0);
-  return true;
-}
-
-export function validateContributionForUpload(payload, options = {}) {
-  if (payload?.schemaVersion === ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION) {
-    return validateAccountScopedTelemetryContribution(payload, options);
-  }
-  return validateTelemetryContribution(payload, options);
 }
 
 export function formatTokenTotal(usage) {

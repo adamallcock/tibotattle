@@ -217,15 +217,18 @@ function runArtifact({
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });
+  if (result.error || result.status !== 0) {
+    fail(
+      `Artifact command failed (${args[0]}): `
+      + String(result.stderr || result.stdout || result.error?.message)
+        .trim()
+        .slice(0, 4096),
+    );
+  }
   const audit = readNetworkAuditReceipt(auditFile);
   const nativeAudit = nativeAuditFile
     ? readNativeNetworkAuditReceipt(nativeAuditFile)
     : null;
-  if (result.status !== 0) {
-    fail(
-      `Artifact command failed (${args[0]}): ${result.stderr || result.stdout}`,
-    );
-  }
   if (audit.totalAttempts !== 0) {
     fail(
       `Artifact command attempted a JavaScript networking API (${args[0]}): `

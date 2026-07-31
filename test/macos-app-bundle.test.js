@@ -3,6 +3,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import {
+  appendFile,
   chmod,
   copyFile,
   lstat,
@@ -12,6 +13,7 @@ import {
   readlink,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -26,13 +28,29 @@ import {
   validateStateDirectoryName,
 } from "../config/product-brand.js";
 import {
-  MACOS_RUNTIME_ASSETS,
+  MACOS_RUNTIME_STATIC_ASSETS,
+  MACOS_ACCOUNTING_RUNTIME_FILES,
+  MACOS_IDENTITY_CORE_RUNTIME_FILES,
+  MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
+  MACOS_WEB_MODULE_ENTRYPOINTS,
   buildMacOSApp,
   collectMacOSRuntimeGraph,
+  collectMacOSSwiftSources,
+  collectMacOSWebModuleGraph,
+  collectVerifiedMacOSWebModuleGraph,
+  captureMacOSWorkspaceRuntimePackages,
+  calculateMacOSSourceInputDigest,
+  assertMacOSWebModuleInventory,
+  assertMacOSWorkspaceRuntimePackageInventory,
   normalizeMacOSBundleVersion,
   normalizeMacOSCentralOrigin,
+  stageMacOSWebModules,
+  stageMacOSWorkspaceRuntimePackages,
   validateMacOSDistributionConfiguration,
 } from "../scripts/build-macos-app.js";
+import {
+  readVerifiedTelemetryBrowserMirror,
+} from "../scripts/generate-telemetry-browser-mirror.js";
 import {
   compareMacOSBundleVersions,
   createMacOSSignedReplacementContract,
@@ -67,6 +85,13 @@ const SWIFT_SOURCE = join(
   "apps",
   "macos",
   "UsageMonitorApp.swift",
+);
+const SEMANTIC_OPEN_TARGET_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "SemanticOpenTarget.swift",
 );
 const BUILD_SCRIPT = join(
   REPOSITORY_ROOT,
@@ -400,7 +425,10 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
 }
 
 test("native launcher keeps the requested foreground-only lifecycle", async () => {
-  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const [source, semanticOpenTargetSource] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(SEMANTIC_OPEN_TARGET_SOURCE, "utf8"),
+  ]);
   assert.match(source, /import AppKit/u);
   assert.match(source, /"USAGE_MONITOR_PORT": "0"/u);
   assert.match(source, /"USAGE_MONITOR_RESOURCE_ROOT"/u);
@@ -457,7 +485,40 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /value != "\."[\s\S]*value != "\.\."/u);
   assert.match(source, /!value\.contains\("\/"\)/u);
   assert.doesNotMatch(source, /appOpenScheme\s*=\s*"usagemonitor"/u);
-  assert.match(source, /AppOpenLink\.accepts/u);
+  assert.doesNotMatch(source, /AppOpenLink/u);
+  assert.match(
+    source,
+    /SemanticOpenTarget\(\s*scheme: BundledProduct\.appOpenScheme,\s*host: BundledProduct\.appOpenHost,\s*canonicalURL: BundledProduct\.appOpenURL\s*\)/u,
+  );
+  assert.match(
+    source,
+    /init\(semanticOpenTarget: SemanticOpenTarget\)[\s\S]*self\.semanticOpenTarget = semanticOpenTarget/u,
+  );
+  assert.match(
+    source,
+    /urls\.allSatisfy\(semanticOpenTarget\.accepts\)/u,
+  );
+  assert.match(
+    source,
+    /semanticOpenTarget\.accepts\(link\) \? 0 : 1/u,
+  );
+  assert.match(
+    source,
+    /Use only the exact \\\(semanticOpenTarget\.canonicalURL\) link\./u,
+  );
+  assert.match(
+    semanticOpenTargetSource,
+    /struct SemanticOpenTarget \{[\s\S]*let canonicalURL: String[\s\S]*private let scheme: String[\s\S]*private let host: String/u,
+  );
+  assert.match(
+    semanticOpenTargetSource,
+    /components\.scheme\?\.caseInsensitiveCompare\(scheme\)[\s\S]*components\.host\?\.caseInsensitiveCompare\(host\)/u,
+  );
+  assert.match(
+    semanticOpenTargetSource,
+    /percentEncodedPath\.isEmpty[\s\S]*percentEncodedPath == "\/"[\s\S]*components\.user == nil[\s\S]*components\.password == nil[\s\S]*components\.port == nil[\s\S]*components\.query == nil[\s\S]*components\.fragment == nil/u,
+  );
+  assert.doesNotMatch(semanticOpenTargetSource, /BundledProduct/u);
   assert.match(source, /--app-link-smoke-test/u);
   assert.match(
     source,
@@ -1401,9 +1462,20 @@ test("macOS central origin policy is fixed, HTTPS-first, and explicit for loopba
 });
 
 test("macOS runtime graph is closed over exact source and dependency allowlists", async () => {
-  const graph = await collectMacOSRuntimeGraph();
+  const [graph, webModules, swiftSources] = await Promise.all([
+    collectMacOSRuntimeGraph(),
+    collectMacOSWebModuleGraph(),
+    collectMacOSSwiftSources(),
+  ]);
+  const runtimeAssets = [
+    ...MACOS_RUNTIME_STATIC_ASSETS,
+    ...webModules.relativeFiles,
+  ].sort();
   assert.equal(graph.relativeFiles[0], "apps/local/server.js");
   assert.deepEqual(graph.externalSpecifiers, [
+    "@app-usagemonitor/accounting",
+    "@app-usagemonitor/identity-core",
+    "@app-usagemonitor/telemetry-contract",
     "@github/keytar",
     "ajv",
     "runcost/browser",
@@ -1412,19 +1484,73 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.equal(graph.builtins.includes("node:sqlite"), true);
   assert.equal(graph.relativeFiles.includes("src/local-installation-diagnostics.js"), true);
   assert.equal(
-    MACOS_RUNTIME_ASSETS.includes("apps/macos/reset-local-keychain.js"),
+    graph.relativeFiles.includes("src/platform/participant-identity.js"),
     true,
   );
+  for (const ownedFile of [
+    "src/application/local-contribution-preparation.js",
+    "src/application/local-export-set-verification.js",
+    "src/application/local-prepared-contribution.js",
+    "src/export/compression.js",
+    "src/export/set-schema.js",
+    "src/export/set-verification.js",
+    "src/platform/export-set-verification-storage.js",
+    "src/platform/owner-only-prepared-contribution-storage.js",
+    "src/prepared-contribution-compatibility-internal.js",
+  ]) {
+    assert.equal(graph.relativeFiles.includes(ownedFile), true, ownedFile);
+  }
+  assert.equal(
+    MACOS_RUNTIME_STATIC_ASSETS.includes("apps/macos/reset-local-keychain.js"),
+    true,
+  );
+  assert.deepEqual(MACOS_WEB_MODULE_ENTRYPOINTS, [
+    "apps/web/public/app.js",
+  ]);
+  assert.deepEqual(webModules.relativeFiles, [
+    "apps/web/public/app.js",
+    "apps/web/public/data-client.js",
+    "apps/web/public/lib.js",
+    "apps/web/public/navigation.js",
+    "apps/web/public/telemetry-envelope.js",
+    "apps/web/public/telemetry-shared.generated.js",
+  ]);
+  assert.deepEqual(swiftSources.relativeFiles, [
+    "apps/macos/Sources/SemanticOpenTarget.swift",
+    "apps/macos/UsageMonitorApp.swift",
+  ]);
+  assert.deepEqual(runtimeAssets, [
+    "apps/macos/reset-local-keychain.js",
+    "apps/web/public/app.js",
+    "apps/web/public/data-client.js",
+    "apps/web/public/index.html",
+    "apps/web/public/lib.js",
+    "apps/web/public/navigation.js",
+    "apps/web/public/styles.css",
+    "apps/web/public/telemetry-envelope.js",
+    "apps/web/public/telemetry-shared.generated.js",
+  ]);
   assert.deepEqual(
-    graph.relativeFiles.filter((path) => path.startsWith("generated/")),
+    graph.relativeFiles.filter((path) =>
+      /^(?:contracts\/telemetry-v0\.1|generated\/telemetry-v0\.1|package\.json|schemas\/telemetry-v0\.1)/u
+        .test(path)),
     [
+      "contracts/telemetry-v0.1/consent-status.json",
+      "contracts/telemetry-v0.1/contract-status.json",
       "generated/telemetry-v0.1-compatibility.json",
       "generated/telemetry-v0.1-field-dictionary.json",
+      "package.json",
+      "schemas/telemetry-v0.1/activity-marker.schema.json",
+      "schemas/telemetry-v0.1/bundle.schema.json",
+      "schemas/telemetry-v0.1/compatibility.schema.json",
+      "schemas/telemetry-v0.1/privacy-receipt.schema.json",
+      "schemas/telemetry-v0.1/quota-snapshot.schema.json",
+      "schemas/telemetry-v0.1/usage-event.schema.json",
     ],
   );
   for (const path of [
     ...graph.relativeFiles,
-    ...MACOS_RUNTIME_ASSETS,
+    ...runtimeAssets,
   ]) {
     assert.doesNotMatch(
       path,
@@ -1433,6 +1559,658 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   }
   assert.equal(graph.relativeFiles.some((path) => path.includes("r7-")), false);
   assert.equal(graph.relativeFiles.some((path) => path.includes("ccusage")), false);
+});
+
+test("macOS web module discovery follows a deterministic transitive relative closure", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-web-modules-"),
+  );
+  const publicRoot = join(temporaryRoot, "apps", "web", "public");
+  try {
+    await mkdir(join(publicRoot, "nested"), { recursive: true });
+    await writeFile(
+      join(publicRoot, "app.js"),
+      [
+        'import "./nested/child.js";',
+        'import "./sibling.js";',
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(publicRoot, "nested", "child.js"),
+      'export { value } from "../leaf.js";\n',
+    );
+    await writeFile(
+      join(publicRoot, "sibling.js"),
+      [
+        "export const side = 1;",
+        "export const prose = \"import('./not-a-dependency.js')\";",
+        "",
+      ].join("\n"),
+    );
+    await writeFile(join(publicRoot, "leaf.js"), "export const value = 2;\n");
+
+    const options = {
+      allowedRoot: publicRoot,
+      entrypoints: ["apps/web/public/app.js"],
+      repositoryRoot: temporaryRoot,
+    };
+    const first = await collectMacOSWebModuleGraph(options);
+    const second = await collectMacOSWebModuleGraph(options);
+    assert.deepEqual(first.relativeFiles, [
+      "apps/web/public/app.js",
+      "apps/web/public/leaf.js",
+      "apps/web/public/nested/child.js",
+      "apps/web/public/sibling.js",
+    ]);
+    assert.deepEqual(second.relativeFiles, first.relativeFiles);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS web module discovery rejects unsafe and unbounded imports", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-web-import-rejection-"),
+  );
+  const publicRoot = join(temporaryRoot, "apps", "web", "public");
+  try {
+    await mkdir(publicRoot, { recursive: true });
+    await writeFile(
+      join(temporaryRoot, "apps", "web", "outside.js"),
+      "export const escaped = true;\n",
+    );
+    const options = {
+      allowedRoot: publicRoot,
+      entrypoints: ["apps/web/public/app.js"],
+      repositoryRoot: temporaryRoot,
+    };
+    for (const [source, expected] of [
+      ['import "unreviewed-package";\n', /only local relative modules/u],
+      ['import "https://cdn.example/module.js";\n', /only local relative modules/u],
+      ['import "/absolute/module.js";\n', /only local relative modules/u],
+      ['import "../outside.js";\n', /escaped its reviewed root/u],
+      ['const deferred = import("./deferred.js");\n', /Dynamic import is not allowed/u],
+      ['const deferred = import(modulePath);\n', /Dynamic import is not allowed/u],
+      [
+        'const deferred = import /* reviewed comment */ ("./deferred.js");\n',
+        /Dynamic import is not allowed/u,
+      ],
+      ['import "./module.js?cache=1";\n', /Unsafe macOS web module import/u],
+      ['import { value from "./invalid.js";\n', /not valid static ESM/u],
+    ]) {
+      await writeFile(join(publicRoot, "app.js"), source);
+      await assert.rejects(
+        collectMacOSWebModuleGraph(options),
+        expected,
+        source.trim(),
+      );
+    }
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS packaging rejects a stale telemetry browser mirror before discovery", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-stale-browser-mirror-"),
+  );
+  const publicRoot = join(temporaryRoot, "apps", "web", "public");
+  const staleMirror = join(publicRoot, "telemetry-shared.generated.js");
+  try {
+    await mkdir(publicRoot, { recursive: true });
+    await writeFile(staleMirror, "// stale browser mirror\n");
+    await assert.rejects(
+      collectVerifiedMacOSWebModuleGraph({
+        webModuleOptions: {
+          allowedRoot: publicRoot,
+          entrypoints: ["apps/web/public/telemetry-shared.generated.js"],
+          repositoryRoot: temporaryRoot,
+        },
+      }),
+      /is stale; regenerate it without --check/u,
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS web closure and source digest retain the verified mirror snapshot", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-captured-browser-mirror-"),
+  );
+  const publicRoot = join(temporaryRoot, "apps", "web", "public");
+  const sourceMirror = join(
+    REPOSITORY_ROOT,
+    "apps",
+    "web",
+    "public",
+    "telemetry-shared.generated.js",
+  );
+  const snapshot = await readVerifiedTelemetryBrowserMirror();
+  try {
+    await mkdir(publicRoot, { recursive: true });
+    const temporaryMirror = join(publicRoot, "telemetry-shared.generated.js");
+    await writeFile(temporaryMirror, snapshot.sourceText);
+    await writeFile(
+      join(publicRoot, "app.js"),
+      'import "./telemetry-shared.generated.js";\n',
+    );
+    const webModules = await collectVerifiedMacOSWebModuleGraph({
+      readVerifiedBrowserMirror: async () => {
+        await writeFile(temporaryMirror, "// mutated after verification\n");
+        return snapshot;
+      },
+      webModuleOptions: {
+        allowedRoot: publicRoot,
+        entrypoints: ["apps/web/public/app.js"],
+        repositoryRoot: temporaryRoot,
+      },
+    });
+    const capturedMirror = webModules.modules.find((module) =>
+      module.relativeFile === "apps/web/public/telemetry-shared.generated.js");
+    assert.equal(capturedMirror.sourceText, snapshot.sourceText);
+    assert.equal(capturedMirror.sha256, snapshot.sha256);
+    assert.equal(capturedMirror.byteLength, snapshot.byteLength);
+
+    const stagedAppRoot = join(temporaryRoot, "staged-app");
+    const stagedRows = await stageMacOSWebModules(stagedAppRoot, webModules);
+    const stagedMirrorPath = join(
+      stagedAppRoot,
+      "apps",
+      "web",
+      "public",
+      "telemetry-shared.generated.js",
+    );
+    const stagedMirrorBytes = await readFile(stagedMirrorPath);
+    assert.equal(stagedMirrorBytes.toString("utf8"), snapshot.sourceText);
+    assert.deepEqual(
+      stagedRows.find(({ relativeFile }) =>
+        relativeFile === "apps/web/public/telemetry-shared.generated.js"),
+      {
+        relativeFile: "apps/web/public/telemetry-shared.generated.js",
+        byteLength: snapshot.byteLength,
+        sha256: snapshot.sha256,
+      },
+    );
+    const stagedInventory = await Promise.all(webModules.modules.map(
+      async (module) => {
+        const bytes = await readFile(join(
+          stagedAppRoot,
+          ...module.relativeFile.split("/"),
+        ));
+        return {
+          path: `Contents/Resources/app/${module.relativeFile}`,
+          bytes: bytes.length,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+        };
+      },
+    ));
+    assert.equal(
+      assertMacOSWebModuleInventory(stagedInventory, webModules),
+      true,
+    );
+
+    const digest = await calculateMacOSSourceInputDigest({
+      graph: { files: [] },
+      runtimeAssets: ["apps/web/public/telemetry-shared.generated.js"],
+      swiftSources: { files: [] },
+      webModules: {
+        modules: [Object.freeze({
+          ...snapshot,
+          file: sourceMirror,
+          relativeFile: "apps/web/public/telemetry-shared.generated.js",
+        })],
+      },
+      readSource: async (path) => {
+        assert.notEqual(path, sourceMirror, "digest must not reread captured mirror");
+        return readFile(path);
+      },
+    });
+    assert.match(digest, /^[a-f0-9]{64}$/u);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS workspace package capture binds staged bytes, inventory, and digest across source mutation", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-captured-workspace-packages-"),
+  );
+  const packageDefinitions = [
+    {
+      inputDirectory: "packages/accounting",
+      name: "@app-usagemonitor/accounting",
+      root: join(temporaryRoot, "packages", "accounting"),
+      runtimeFiles: MACOS_ACCOUNTING_RUNTIME_FILES,
+      version: "0.1.0",
+    },
+    {
+      inputDirectory: "packages/identity-core",
+      name: "@app-usagemonitor/identity-core",
+      root: join(temporaryRoot, "packages", "identity-core"),
+      runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
+      version: "0.1.0",
+    },
+    {
+      inputDirectory: "packages/telemetry-contract",
+      name: "@app-usagemonitor/telemetry-contract",
+      root: join(temporaryRoot, "packages", "telemetry-contract"),
+      runtimeFiles: MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
+      version: "0.1.0",
+    },
+  ];
+  try {
+    for (const definition of packageDefinitions) {
+      const sourceRoot = join(
+        REPOSITORY_ROOT,
+        ...definition.inputDirectory.split("/"),
+      );
+      for (const relativeFile of definition.runtimeFiles) {
+        const destination = join(
+          definition.root,
+          ...relativeFile.split("/"),
+        );
+        await mkdir(dirname(destination), { recursive: true });
+        await copyFile(
+          join(sourceRoot, ...relativeFile.split("/")),
+          destination,
+        );
+      }
+    }
+
+    const captures = await captureMacOSWorkspaceRuntimePackages({
+      packageDefinitions,
+      resolvePackageEntrypoint: (name) => {
+        const definition = packageDefinitions.find((candidate) =>
+          candidate.name === name);
+        assert.ok(definition, `unexpected workspace package ${name}`);
+        return join(definition.root, "index.js");
+      },
+    });
+    assert.equal(captures.length, 3);
+    assert.equal(
+      captures.reduce((total, capture) => total + capture.files.length, 0),
+      MACOS_ACCOUNTING_RUNTIME_FILES.length
+        + MACOS_IDENTITY_CORE_RUNTIME_FILES.length
+        + MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.length,
+    );
+    assert.equal(Object.isFrozen(captures), true);
+    assert.equal(captures.every((capture) =>
+      Object.isFrozen(capture) && Object.isFrozen(capture.files)), true);
+
+    const digestOptions = {
+      graph: { files: [] },
+      runtimeAssets: [],
+      swiftSources: { files: [] },
+      workspaceRuntimePackages: captures,
+      readSource: async (path) => {
+        assert.equal(
+          path.startsWith(join(temporaryRoot, "packages")),
+          false,
+          "digest must not reread a captured workspace package",
+        );
+        return readFile(path);
+      },
+    };
+    const capturedDigest = await calculateMacOSSourceInputDigest(digestOptions);
+    const divergentCaptures = Object.freeze(captures.map((capture) =>
+      Object.freeze({
+        ...capture,
+        files: Object.freeze(capture.files.map((file) => {
+          if (file.inputPath !== "packages/accounting/src/cost-ledger.js") {
+            return file;
+          }
+          const sourceText = `${file.sourceText} `;
+          return Object.freeze({
+            ...file,
+            byteLength: Buffer.byteLength(sourceText, "utf8"),
+            sha256: createHash("sha256")
+              .update(sourceText, "utf8")
+              .digest("hex"),
+            sourceText,
+          });
+        })),
+      })));
+    assert.notEqual(
+      await calculateMacOSSourceInputDigest({
+        ...digestOptions,
+        workspaceRuntimePackages: divergentCaptures,
+      }),
+      capturedDigest,
+      "the source digest must include the captured workspace package bytes",
+    );
+
+    const mutations = [
+      ["@app-usagemonitor/accounting", "src/cost-ledger.js"],
+      ["@app-usagemonitor/identity-core", "src/pseudonym.js"],
+      ["@app-usagemonitor/telemetry-contract", "src/envelope.js"],
+    ];
+    for (const [name, relativeFile] of mutations) {
+      const definition = packageDefinitions.find((candidate) =>
+        candidate.name === name);
+      await writeFile(
+        join(definition.root, ...relativeFile.split("/")),
+        `// physically mutated after capture: ${name}\n`,
+      );
+    }
+    assert.equal(
+      await calculateMacOSSourceInputDigest(digestOptions),
+      capturedDigest,
+      "the source digest must remain bound to the captured package bytes",
+    );
+
+    const stagedAppRoot = join(temporaryRoot, "staged-app");
+    const stagedRows = await stageMacOSWorkspaceRuntimePackages(
+      stagedAppRoot,
+      captures,
+    );
+    assert.equal(stagedRows.length, 17);
+    const stagedInventory = [];
+    for (const capture of captures) {
+      for (const file of capture.files) {
+        const stagedPath = join(
+          stagedAppRoot,
+          "node_modules",
+          ...capture.name.split("/"),
+          ...file.relativeFile.split("/"),
+        );
+        const stagedBytes = await readFile(stagedPath);
+        assert.equal(
+          stagedBytes.toString("utf8"),
+          file.sourceText,
+          `${file.inputPath} must be staged from its captured bytes`,
+        );
+        stagedInventory.push({
+          path: [
+            "Contents",
+            "Resources",
+            "app",
+            "node_modules",
+            ...capture.name.split("/"),
+            ...file.relativeFile.split("/"),
+          ].join("/"),
+          bytes: stagedBytes.length,
+          sha256: createHash("sha256").update(stagedBytes).digest("hex"),
+        });
+      }
+    }
+    assert.equal(
+      assertMacOSWorkspaceRuntimePackageInventory(stagedInventory, captures),
+      true,
+    );
+    const identityCoreProbe = spawnSync(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      [
+        "import { deriveExportPseudonym }",
+        "from '@app-usagemonitor/identity-core';",
+        "process.stdout.write(deriveExportPseudonym(",
+        "new Uint8Array(32), 'participant', 'self'));",
+      ].join(" "),
+    ], {
+      cwd: stagedAppRoot,
+      encoding: "utf8",
+    });
+    assert.equal(
+      identityCoreProbe.status,
+      0,
+      identityCoreProbe.stderr || identityCoreProbe.stdout,
+    );
+    assert.equal(
+      identityCoreProbe.stdout,
+      "participant:v1:18a0babfe92f99d0737d96bd43ed18e494e8930e216eeb12d620742284df3f7c",
+    );
+    for (const [corruptedIndex, corruptedRow] of stagedInventory.entries()) {
+      const corruptedInventory = stagedInventory.map((row, index) => {
+        if (index !== corruptedIndex) return row;
+        const replacementPrefix = row.sha256.startsWith("0") ? "1" : "0";
+        return {
+          ...row,
+          sha256: `${replacementPrefix}${row.sha256.slice(1)}`,
+        };
+      });
+      assert.throws(
+        () => assertMacOSWorkspaceRuntimePackageInventory(
+          corruptedInventory,
+          captures,
+        ),
+        /did not retain captured workspace package bytes/u,
+        corruptedRow.path,
+      );
+    }
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS identity-core capture rejects resolver mismatch and unsafe runtime files", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-identity-core-capture-guards-"),
+  );
+  const sourceRoot = join(REPOSITORY_ROOT, "packages", "identity-core");
+  const makeDefinition = async (fixtureName) => {
+    const root = join(temporaryRoot, fixtureName, "identity-core");
+    for (const relativeFile of MACOS_IDENTITY_CORE_RUNTIME_FILES) {
+      const destination = join(root, ...relativeFile.split("/"));
+      await mkdir(dirname(destination), { recursive: true });
+      await copyFile(join(sourceRoot, ...relativeFile.split("/")), destination);
+    }
+    return {
+      inputDirectory: "packages/identity-core",
+      name: "@app-usagemonitor/identity-core",
+      root,
+      runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
+      version: "0.1.0",
+    };
+  };
+  try {
+    const resolverMismatch = await makeDefinition("resolver-mismatch");
+    const otherEntrypoint = join(resolverMismatch.root, "other.js");
+    await writeFile(otherEntrypoint, "export {};\n");
+    await assert.rejects(
+      captureMacOSWorkspaceRuntimePackages({
+        packageDefinitions: [resolverMismatch],
+        resolvePackageEntrypoint: () => otherEntrypoint,
+      }),
+      (error) => error?.message
+        === "The @app-usagemonitor/identity-core workspace dependency resolved unexpectedly",
+    );
+
+    const missingRuntime = await makeDefinition("missing-runtime");
+    await rm(join(missingRuntime.root, "src", "pseudonym.js"));
+    await assert.rejects(
+      captureMacOSWorkspaceRuntimePackages({
+        packageDefinitions: [missingRuntime],
+        resolvePackageEntrypoint: () => join(missingRuntime.root, "index.js"),
+      }),
+      (error) => error?.message
+        === "macOS workspace package runtime source is not a stable regular UTF-8 file: src/pseudonym.js",
+    );
+
+    const symlinkRuntime = await makeDefinition("symlink-runtime");
+    const symlinkPath = join(symlinkRuntime.root, "src", "pseudonym.js");
+    const symlinkTarget = join(temporaryRoot, "symlink-target.js");
+    await writeFile(symlinkTarget, "export {};\n");
+    await rm(symlinkPath);
+    await symlink(symlinkTarget, symlinkPath);
+    await assert.rejects(
+      captureMacOSWorkspaceRuntimePackages({
+        packageDefinitions: [symlinkRuntime],
+        resolvePackageEntrypoint: () => join(symlinkRuntime.root, "index.js"),
+      }),
+      (error) => error?.message
+        === "macOS workspace package runtime source is not a stable regular UTF-8 file: src/pseudonym.js",
+    );
+
+    const swapToSymlink = await makeDefinition("swap-to-symlink");
+    const swapToSymlinkPath = join(
+      swapToSymlink.root,
+      "src",
+      "pseudonym.js",
+    );
+    const swapSymlinkTarget = join(temporaryRoot, "swap-target.js");
+    await writeFile(swapSymlinkTarget, "export const swapped = true;\n");
+    let symlinkFailpointCalls = 0;
+    await assert.rejects(
+      captureMacOSWorkspaceRuntimePackages({
+        packageDefinitions: [swapToSymlink],
+        resolvePackageEntrypoint: () => join(
+          swapToSymlink.root,
+          "index.js",
+        ),
+        async postOpenPreReadFailpoint() {
+          assert.equal(arguments.length, 0);
+          symlinkFailpointCalls += 1;
+          if (symlinkFailpointCalls !== 3) return;
+          await rename(
+            swapToSymlinkPath,
+            join(temporaryRoot, "displaced-before-symlink.js"),
+          );
+          await symlink(swapSymlinkTarget, swapToSymlinkPath);
+        },
+      }),
+      (error) => error?.message
+        === "macOS workspace package runtime source is not a stable regular UTF-8 file: src/pseudonym.js",
+    );
+    assert.equal(symlinkFailpointCalls, 3);
+
+    const swapToFile = await makeDefinition("swap-to-file");
+    const swapToFilePath = join(swapToFile.root, "src", "pseudonym.js");
+    const swapFileTarget = join(temporaryRoot, "swap-file-target.js");
+    await writeFile(swapFileTarget, "export const replaced = true;\n");
+    let fileFailpointCalls = 0;
+    await assert.rejects(
+      captureMacOSWorkspaceRuntimePackages({
+        packageDefinitions: [swapToFile],
+        resolvePackageEntrypoint: () => join(swapToFile.root, "index.js"),
+        async postOpenPreReadFailpoint() {
+          assert.equal(arguments.length, 0);
+          fileFailpointCalls += 1;
+          if (fileFailpointCalls !== 3) return;
+          await rename(
+            swapToFilePath,
+            join(temporaryRoot, "displaced-before-file.js"),
+          );
+          await copyFile(swapFileTarget, swapToFilePath);
+        },
+      }),
+      (error) => error?.message
+        === "macOS workspace package runtime source is not a stable regular UTF-8 file: src/pseudonym.js",
+    );
+    assert.equal(fileFailpointCalls, 3);
+
+    const growAfterOpen = await makeDefinition("grow-after-open");
+    const growAfterOpenPath = join(
+      growAfterOpen.root,
+      "src",
+      "pseudonym.js",
+    );
+    let growFailpointCalls = 0;
+    await assert.rejects(
+      captureMacOSWorkspaceRuntimePackages({
+        packageDefinitions: [growAfterOpen],
+        resolvePackageEntrypoint: () => join(growAfterOpen.root, "index.js"),
+        async postOpenPreReadFailpoint() {
+          assert.equal(arguments.length, 0);
+          growFailpointCalls += 1;
+          if (growFailpointCalls === 3) {
+            await appendFile(growAfterOpenPath, "// concurrent growth\n");
+          }
+        },
+      }),
+      (error) => error?.message
+        === "macOS workspace package runtime source is not a stable regular UTF-8 file: src/pseudonym.js",
+    );
+    assert.equal(growFailpointCalls, 3);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS Swift discovery is deterministic and excludes test and build trees", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-swift-sources-"),
+  );
+  const sourceRoot = join(temporaryRoot, "apps", "macos");
+  try {
+    for (const directory of [
+      "Sources/Feature",
+      "Examples",
+      "Tests",
+      "Build",
+      ".build",
+      "DerivedData",
+    ]) {
+      await mkdir(join(sourceRoot, directory), { recursive: true });
+    }
+    for (const [path, source] of [
+      ["ZLegacy.swift", "struct ZLegacy {}\n"],
+      ["Package.swift", "// swift-tools-version: 6.0\n"],
+      ["Sources/App.swift", "struct App {}\n"],
+      ["Sources/Feature/Model.swift", "struct Model {}\n"],
+      ["Examples/Sample.swift", "struct Sample {}\n"],
+      ["Tests/AppTests.swift", "struct AppTests {}\n"],
+      ["Build/Generated.swift", "struct Generated {}\n"],
+      [".build/Intermediate.swift", "struct Intermediate {}\n"],
+      ["DerivedData/Output.swift", "struct Output {}\n"],
+    ]) {
+      await writeFile(join(sourceRoot, path), source);
+    }
+    const options = {
+      repositoryRoot: temporaryRoot,
+      sourceRoot,
+    };
+    const first = await collectMacOSSwiftSources(options);
+    const second = await collectMacOSSwiftSources(options);
+    assert.deepEqual(first.relativeFiles, [
+      "apps/macos/Sources/App.swift",
+      "apps/macos/Sources/Feature/Model.swift",
+      "apps/macos/ZLegacy.swift",
+    ]);
+    assert.deepEqual(second.relativeFiles, first.relativeFiles);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("macOS Swift discovery rejects candidates in unknown top-level directories", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-unreviewed-swift-source-"),
+  );
+  const sourceRoot = join(temporaryRoot, "apps", "macos");
+  try {
+    await mkdir(join(sourceRoot, "FutureFeature", "Runtime"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(sourceRoot, "UsageMonitorApp.swift"),
+      "struct UsageMonitorApp {}\n",
+    );
+    await writeFile(
+      join(sourceRoot, "FutureFeature", "README.md"),
+      "No production source yet.\n",
+    );
+    const options = {
+      repositoryRoot: temporaryRoot,
+      sourceRoot,
+    };
+    assert.deepEqual(
+      (await collectMacOSSwiftSources(options)).relativeFiles,
+      ["apps/macos/UsageMonitorApp.swift"],
+    );
+
+    await writeFile(
+      join(sourceRoot, "FutureFeature", "Runtime", "Coordinator.swift"),
+      "struct Coordinator {}\n",
+    );
+    await assert.rejects(
+      collectMacOSSwiftSources(options),
+      /Unreviewed top-level macOS directory contains Swift source candidates/u,
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdog smokes", {
@@ -1536,6 +2314,18 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     assert.deepEqual(
       manifest.dependencies.map(({ name, version }) => ({ name, version })),
       [
+        {
+          name: "@app-usagemonitor/accounting",
+          version: "0.1.0",
+        },
+        {
+          name: "@app-usagemonitor/identity-core",
+          version: "0.1.0",
+        },
+        {
+          name: "@app-usagemonitor/telemetry-contract",
+          version: "0.1.0",
+        },
         { name: "@github/keytar", version: "7.10.6" },
         { name: "ajv", version: "8.20.0" },
         { name: "fast-deep-equal", version: "3.1.3" },
@@ -1544,6 +2334,69 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
         { name: "require-from-string", version: "2.0.2" },
         { name: "runcost", version: "0.2.0" },
       ],
+    );
+    const bundledTelemetryContractPrefix =
+      "Contents/Resources/app/node_modules/"
+      + "@app-usagemonitor/telemetry-contract/";
+    assert.deepEqual(
+      bundleFiles
+        .map(({ relativePath }) => relativePath)
+        .filter((path) => path.startsWith(bundledTelemetryContractPrefix))
+        .map((path) => path.slice(bundledTelemetryContractPrefix.length)),
+      MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
+    );
+    const bundledAccountingPrefix =
+      "Contents/Resources/app/node_modules/"
+      + "@app-usagemonitor/accounting/";
+    assert.deepEqual(
+      bundleFiles
+        .map(({ relativePath }) => relativePath)
+        .filter((path) => path.startsWith(bundledAccountingPrefix))
+        .map((path) => path.slice(bundledAccountingPrefix.length)),
+      MACOS_ACCOUNTING_RUNTIME_FILES,
+    );
+    const bundledIdentityCorePrefix =
+      "Contents/Resources/app/node_modules/"
+      + "@app-usagemonitor/identity-core/";
+    assert.deepEqual(
+      bundleFiles
+        .map(({ relativePath }) => relativePath)
+        .filter((path) => path.startsWith(bundledIdentityCorePrefix))
+        .map((path) => path.slice(bundledIdentityCorePrefix.length)),
+      MACOS_IDENTITY_CORE_RUNTIME_FILES,
+    );
+    const swiftSources = await collectMacOSSwiftSources();
+    const sourceInputPaths = new Set([
+      ...manifest.inputs.firstPartyFiles,
+      ...manifest.inputs.staticAssets,
+      ...MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.map(
+        (path) => `packages/telemetry-contract/${path}`,
+      ),
+      ...MACOS_ACCOUNTING_RUNTIME_FILES.map(
+        (path) => `packages/accounting/${path}`,
+      ),
+      ...MACOS_IDENTITY_CORE_RUNTIME_FILES.map(
+        (path) => `packages/identity-core/${path}`,
+      ),
+      "config/product-brand.js",
+      "scripts/build-macos-app.js",
+      "scripts/lib/captured-utf8-source.mjs",
+      ...swiftSources.relativeFiles,
+    ]);
+    const sourceInputHash = createHash("sha256");
+    for (const path of [...sourceInputPaths].sort((left, right) =>
+      left.localeCompare(right))) {
+      sourceInputHash.update(path);
+      sourceInputHash.update("\0");
+      sourceInputHash.update(
+        await readFile(join(REPOSITORY_ROOT, ...path.split("/"))),
+      );
+      sourceInputHash.update("\0");
+    }
+    assert.equal(
+      manifest.inputs.sourceSha256,
+      sourceInputHash.digest("hex"),
+      "the source digest must cover the copied telemetry package bytes",
     );
     assert.equal(manifestText.includes("/Users/"), false);
     assert.equal(manifestText.includes("adamallcock"), false);
@@ -1646,6 +2499,24 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       "Contents/Resources/app/generated/telemetry-v0.1-compatibility.json",
       "Contents/Resources/app/generated/telemetry-v0.1-field-dictionary.json",
     ]);
+    const compatibilityInputs = bundleFiles
+      .map(({ relativePath }) => relativePath)
+      .filter((path) =>
+        /^Contents\/Resources\/app\/(?:contracts\/telemetry-v0\.1|generated\/telemetry-v0\.1|package\.json|schemas\/telemetry-v0\.1)/u
+          .test(path));
+    assert.deepEqual(compatibilityInputs, [
+      "Contents/Resources/app/contracts/telemetry-v0.1/consent-status.json",
+      "Contents/Resources/app/contracts/telemetry-v0.1/contract-status.json",
+      "Contents/Resources/app/generated/telemetry-v0.1-compatibility.json",
+      "Contents/Resources/app/generated/telemetry-v0.1-field-dictionary.json",
+      "Contents/Resources/app/package.json",
+      "Contents/Resources/app/schemas/telemetry-v0.1/activity-marker.schema.json",
+      "Contents/Resources/app/schemas/telemetry-v0.1/bundle.schema.json",
+      "Contents/Resources/app/schemas/telemetry-v0.1/compatibility.schema.json",
+      "Contents/Resources/app/schemas/telemetry-v0.1/privacy-receipt.schema.json",
+      "Contents/Resources/app/schemas/telemetry-v0.1/quota-snapshot.schema.json",
+      "Contents/Resources/app/schemas/telemetry-v0.1/usage-event.schema.json",
+    ]);
 
     const node = join(outputA, manifest.runtime.node.executable);
     assert.equal(await sha256File(node), manifest.runtime.node.sha256);
@@ -1669,6 +2540,70 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     assert.equal(bundledPackage.name, sourcePackage.name);
     assert.equal(bundledPackage.version, sourcePackage.version);
     assert.equal(bundledPackage.type, sourcePackage.type);
+    const telemetryContractProbe = spawnSync(node, [
+      "--input-type=module",
+      "--eval",
+      [
+        "import { TELEMETRY_SCHEMA_VERSION }",
+        "from '@app-usagemonitor/telemetry-contract';",
+        "process.stdout.write(TELEMETRY_SCHEMA_VERSION);",
+      ].join(" "),
+    ], {
+      cwd: join(outputA, "Contents", "Resources", "app"),
+      encoding: "utf8",
+    });
+    assert.equal(
+      telemetryContractProbe.status,
+      0,
+      telemetryContractProbe.stderr || telemetryContractProbe.stdout,
+    );
+    assert.equal(
+      telemetryContractProbe.stdout,
+      "telemetry-contribution-v0.1",
+    );
+    const accountingProbe = spawnSync(node, [
+      "--input-type=module",
+      "--eval",
+      [
+        "import { LOCAL_API_PRICING_METHOD_VERSION }",
+        "from '@app-usagemonitor/accounting';",
+        "process.stdout.write(LOCAL_API_PRICING_METHOD_VERSION);",
+      ].join(" "),
+    ], {
+      cwd: join(outputA, "Contents", "Resources", "app"),
+      encoding: "utf8",
+    });
+    assert.equal(
+      accountingProbe.status,
+      0,
+      accountingProbe.stderr || accountingProbe.stdout,
+    );
+    assert.equal(
+      accountingProbe.stdout,
+      "provider-neutral-api-price-equivalent-v0.1",
+    );
+    const identityCoreProbe = spawnSync(node, [
+      "--input-type=module",
+      "--eval",
+      [
+        "import { deriveExportPseudonym }",
+        "from '@app-usagemonitor/identity-core';",
+        "process.stdout.write(deriveExportPseudonym(",
+        "new Uint8Array(32), 'participant', 'self'));",
+      ].join(" "),
+    ], {
+      cwd: join(outputA, "Contents", "Resources", "app"),
+      encoding: "utf8",
+    });
+    assert.equal(
+      identityCoreProbe.status,
+      0,
+      identityCoreProbe.stderr || identityCoreProbe.stdout,
+    );
+    assert.equal(
+      identityCoreProbe.stdout,
+      "participant:v1:18a0babfe92f99d0737d96bd43ed18e494e8930e216eeb12d620742284df3f7c",
+    );
     const compatibilityProbe = spawnSync(node, [
       "--input-type=module",
       "--eval",
@@ -1828,9 +2763,16 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     }
     for (const rejected of [
       "usagemonitor://open?next=https://example.com",
+      "usagemonitor://open?",
       "usagemonitor://open#fragment",
+      "usagemonitor://open#",
       "usagemonitor://other",
       "https://open",
+      "usagemonitor://open:443",
+      "usagemonitor://open/extra",
+      "usagemonitor://open//",
+      "usagemonitor://open/%2F",
+      "usagemonitor://@open",
       "usagemonitor://user:secret@open",
     ]) {
       const link = spawnSync(launcher, [

@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  collectR7BenchmarkImplementationUrls,
   R7_BENCHMARK_PROTOCOL_VERSION,
   R7_SELECTION_RULE_VERSION,
   cleanupR7OwnedTree,
@@ -28,6 +29,28 @@ test("the supported default suite keeps resource evidence serial", async () => {
     packageJson.scripts.test,
     "node --test --test-concurrency=1 test/*.test.js apps/web/test/*.test.mjs",
   );
+});
+
+test("R7 smoke provenance binds shared and package runtime sources", async () => {
+  const repositoryRoot = new URL("../", import.meta.url);
+  const urls = await collectR7BenchmarkImplementationUrls();
+  const paths = urls.map((url) => {
+    assert.equal(url.href.startsWith(repositoryRoot.href), true);
+    return decodeURIComponent(url.href.slice(repositoryRoot.href.length));
+  });
+  assert.equal(new Set(paths).size, paths.length);
+  for (const expected of [
+    "packages/accounting/index.js",
+    "packages/accounting/package.json",
+    "packages/accounting/src/cost-ledger.js",
+    "packages/telemetry-contract/index.js",
+    "packages/telemetry-contract/package.json",
+    "packages/telemetry-contract/src/telemetry-v0.1.js",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+  ]) {
+    assert.equal(paths.includes(expected), true, expected);
+  }
 });
 
 const EXPECTED_OPERATIONS = [

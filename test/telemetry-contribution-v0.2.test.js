@@ -119,7 +119,10 @@ function bundle({
 }
 
 async function compiledContributionValidator() {
-  const directory = new URL("../schemas/telemetry-contribution-v0.2/", import.meta.url);
+  const directory = new URL(
+    "../packages/telemetry-contract/schemas/v0.2/",
+    import.meta.url,
+  );
   const names = [
     "usage-event.schema.json",
     "quota-snapshot.schema.json",
