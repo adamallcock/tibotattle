@@ -2101,9 +2101,13 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 
+  // The Google client identifier is public — it appears in every
+  // authorization URL — so it ships in source rather than being injected at
+  // packaging time. Only its paired secret is confidential, and that lives
+  // solely in the contribution service.
   assert.match(
     html,
-    /<meta name="usage-monitor-google-client-id" content="">/u
+    /<meta name="usage-monitor-google-client-id" content="[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com">/u
   );
   assert.match(html, /id="identity-google-signin"/u);
   assert.match(html, /id="identity-apple-signin"/u);
