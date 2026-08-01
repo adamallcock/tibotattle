@@ -21,6 +21,7 @@
     <meta name="usage-monitor-privacy-url" content="">
     <meta name="usage-monitor-security-url" content="">
     <meta name="usage-monitor-support-url" content="">
+    <meta name="usage-monitor-google-client-id" content="">
     <meta name="usage-monitor-semantic-open-target" content="__USAGE_MONITOR_SEMANTIC_OPEN_TARGET__">
     <link rel="canonical" href="">
     <meta property="og:type" content="website">
@@ -697,6 +698,30 @@
           </details>
         </div>
         <div class="contribution-cta-action">
+          <div class="identity-signin" id="identity-signin">
+            <p class="control-label">
+              Sign in for hosted contribution
+              <span class="evidence-chip neutral" id="identity-signin-state">Not signed in</span>
+            </p>
+            <p class="annotation">
+              Hosted participation requires signing in with Google or Apple.
+              The service stores only an irreversible hash of that sign-in —
+              never your email or name — and this page keeps the sign-in token
+              in memory only. Local-only use needs no account.
+            </p>
+            <div class="contribution-cta-buttons">
+              <button class="button button-secondary" id="identity-google-signin" type="button">
+                Sign in with Google
+              </button>
+              <button class="button button-quiet" id="identity-apple-signin" type="button">
+                Use Apple sign-in from the app
+              </button>
+            </div>
+            <p class="annotation" id="identity-google-unavailable" hidden>
+              Hosted sign-in is not configured for this build.
+            </p>
+            <p class="participant-action-status" id="identity-signin-status" role="status" hidden></p>
+          </div>
           <label class="invite-row contribution-invite" for="contribution-invite">
             <span>
               <strong>Invitation code</strong>
@@ -762,6 +787,9 @@
           <p>
             Raw logs are read by the loopback companion, not the webpage. A contribution
             must be a privacy-stripped export and is validated again by the server.
+            Hosted participation requires signing in with Google or Apple; the service
+            stores only an irreversible hash of that sign-in, never your email or name.
+            Local-only use needs no account.
           </p>
         </div>
 

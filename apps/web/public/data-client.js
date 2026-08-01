@@ -103,6 +103,19 @@ const PARTICIPANT_CONSENT_VERSIONS = new Set([
   "ongoing-privacy-safe-telemetry-v0.1",
   "ongoing-privacy-safe-telemetry-v0.2"
 ]);
+export const IDENTITY_GOOGLE_EXCHANGE_SCHEMA_VERSION =
+  "identity-google-exchange-v0.1";
+const HOSTED_IDENTITY_PROVIDERS = new Set(["google", "apple"]);
+const HOSTED_IDENTITY_ERROR_CODES = new Set([
+  "IDENTITY_REQUIRED",
+  "IDENTITY_TOKEN_INVALID",
+  "IDENTITY_CONFIGURATION_INVALID",
+  "IDENTITY_PROVIDER_UNAVAILABLE"
+]);
+const MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH = 16_384;
+const GOOGLE_LOOPBACK_REDIRECT_URI =
+  /^http:\/\/127\.0\.0\.1:\d{1,5}\/oauth\/google\/callback$/u;
+const GOOGLE_PKCE_CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/u;
 const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
@@ -148,6 +161,23 @@ function hasExactKeys(value, expectedKeys) {
     && !Array.isArray(value)
     && Object.keys(value).sort().join("\u0000")
       === [...expectedKeys].sort().join("\u0000");
+}
+
+function validHostedIdentity(identity) {
+  return hasExactKeys(identity, ["provider", "idToken"])
+    && HOSTED_IDENTITY_PROVIDERS.has(identity.provider)
+    && typeof identity.idToken === "string"
+    && identity.idToken.length > 0
+    && identity.idToken.length <= MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH;
+}
+
+function hostedIdentityRequestError(response, payload) {
+  const error = new Error(`Request failed (${response.status}).`);
+  error.status = response.status;
+  if (HOSTED_IDENTITY_ERROR_CODES.has(payload?.error?.code)) {
+    error.code = payload.error.code;
+  }
+  return error;
 }
 
 export function normalizeLocalOnboarding(payload) {
@@ -2134,6 +2164,32 @@ export class LocalCompanionClient {
     });
   }
 
+  async takeAppleIdentityToken() {
+    const fetchImpl = this.fetchImpl;
+    // Single-use consuming read: the companion clears the handed-over token
+    // on success, and 404 simply means the native app has not posted one yet.
+    const response = await fetchImpl(`${LOCAL_ROOT}/identity/apple`, {
+      headers: {
+        Accept: "application/json",
+        "X-Usage-Monitor-Local": "1"
+      }
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const error = new Error(`Request failed (${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    const payload = await response.json().catch(() => null);
+    const identityToken = payload?.identityToken;
+    if (typeof identityToken !== "string"
+        || identityToken.length === 0
+        || identityToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
+      throw new Error("The local app returned an invalid Apple sign-in token.");
+    }
+    return identityToken;
+  }
+
   async contributionSyncStatus() {
     try {
       return normalizeContributionSyncStatus(
@@ -2388,13 +2444,16 @@ export class CommunityClient {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/session`, this.sessionOptions());
   }
 
-  enroll(
+  async enroll(
     inviteCode = null,
     contributionSchemaVersion = "telemetry-contribution-v0.1",
-    { deviceBootstrap = false } = {}
+    { deviceBootstrap = false, identity = null } = {}
   ) {
     if (typeof deviceBootstrap !== "boolean") {
       throw new TypeError("Enrollment device bootstrap selection is invalid.");
+    }
+    if (identity !== null && !validHostedIdentity(identity)) {
+      throw new TypeError("Enrollment identity is invalid.");
     }
     const accountScoped = contributionSchemaVersion === "telemetry-contribution-v0.2";
     const body = {
@@ -2411,13 +2470,58 @@ export class CommunityClient {
           : "ongoing-privacy-safe-telemetry-v0.1"
       };
     }
+    if (identity !== null) {
+      body.identity = {
+        provider: identity.provider,
+        idToken: identity.idToken
+      };
+    }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/enroll`, {
+    const fetchImpl = this.fetchImpl;
+    const response = await fetchImpl(`${CENTRAL_ROOT}/enroll`, {
       method: "POST",
       credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw hostedIdentityRequestError(response, payload);
+    }
+    return payload;
+  }
+
+  async identityGoogleExchange({ code, codeVerifier, redirectUri } = {}) {
+    if (typeof code !== "string"
+        || code.length === 0
+        || code.length > 2_048
+        || !GOOGLE_PKCE_CODE_VERIFIER.test(codeVerifier ?? "")
+        || typeof redirectUri !== "string"
+        || !GOOGLE_LOOPBACK_REDIRECT_URI.test(redirectUri)) {
+      throw new TypeError("Google sign-in exchange inputs are invalid.");
+    }
+    const fetchImpl = this.fetchImpl;
+    const response = await fetchImpl(
+      `${CENTRAL_ROOT}/identity/google/exchange`,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ code, codeVerifier, redirectUri })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw hostedIdentityRequestError(response, payload);
+    }
+    if (payload?.schemaVersion !== IDENTITY_GOOGLE_EXCHANGE_SCHEMA_VERSION
+        || payload?.provider !== "google"
+        || typeof payload?.idToken !== "string"
+        || payload.idToken.length === 0
+        || payload.idToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
+      throw new Error("The service did not return a verifiable Google sign-in token.");
+    }
+    return Object.freeze({ provider: "google", idToken: payload.idToken });
   }
 
   async recover(recoveryCode) {

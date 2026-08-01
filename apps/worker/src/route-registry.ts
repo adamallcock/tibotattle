@@ -7,6 +7,7 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   { pathname: "/api/health", id: "health" },
   { pathname: "/api/ready", id: "ready" },
   { pathname: "/api/v1/enroll", id: "enroll" },
+  { pathname: "/api/v1/identity/google/exchange", id: "identity_google_exchange" },
   { pathname: "/api/v1/recover", id: "recover" },
   { pathname: "/api/v1/session", id: "session" },
   { pathname: "/api/v1/logout", id: "logout" },

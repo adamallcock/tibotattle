@@ -63,10 +63,12 @@ import {
   insertContribution,
   listContributions,
   markParticipantDeleting,
+  reattachParticipantByLinkKey,
   recoverAccess,
   revokeSession,
   securityReset,
 } from "./repository";
+import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
 import {
   clearPendingQuarantineObject,
   putTrackedQuarantineObject,
@@ -267,15 +269,25 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
       )) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  const identityValue = Reflect.get(body.value, "identity");
+  const identityProvided = identityValue !== undefined;
   const keys = Object.keys(body.value);
   const allowedKeys = mode === "invite_only"
-    ? ["consentVersion", "syntheticOnly", "inviteCode", "deviceBootstrap"]
-    : ["consentVersion", "syntheticOnly", "deviceBootstrap"];
+    ? ["consentVersion", "syntheticOnly", "inviteCode", "deviceBootstrap", "identity"]
+    : ["consentVersion", "syntheticOnly", "deviceBootstrap", "identity"];
   if (keys.some((key) => !allowedKeys.includes(key))
       || ((mode === "local_open" || mode === "open")
-        && keys.length !== (deviceBootstrapRequested ? 3 : 2))) {
+        && keys.length !== 2
+          + (deviceBootstrapRequested ? 1 : 0)
+          + (identityProvided ? 1 : 0))) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  if (identityRequired(env) && !identityProvided) {
+    throw new ApiError(401, "IDENTITY_REQUIRED");
+  }
+  const verifiedIdentity = identityProvided
+    ? await verifyHostedIdentity(env, identityValue)
+    : null;
   if (deviceBootstrapRequested) {
     await assertCollectionControl(
       env.USAGE_MONITOR_DB,
@@ -283,10 +295,18 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     );
   }
   const consentVersion = Reflect.get(body.value, "consentVersion") as string;
-  const inviteGrant = mode === "invite_only"
+  const reattached = verifiedIdentity
+    ? await reattachParticipantByLinkKey(
+      env.USAGE_MONITOR_DB,
+      verifiedIdentity.linkKeyHex,
+      consentVersion,
+      { deviceBootstrap: deviceBootstrapRequested },
+    )
+    : null;
+  const inviteGrant = reattached === null && mode === "invite_only"
     ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
     : null;
-  const enrollment = await enroll(
+  const enrollment = reattached ?? await enroll(
     env.USAGE_MONITOR_DB,
     consentVersion,
     inviteGrant,
@@ -294,6 +314,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
       deviceBootstrap: deviceBootstrapRequested,
       openCommunityEligibility: mode === "open"
         && Reflect.get(body.value, "syntheticOnly") === false,
+      identityLinkKey: verifiedIdentity?.linkKeyHex ?? null,
     },
   );
   return jsonResponse({
@@ -326,10 +347,81 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
+/**
+ * Exchanges a Google authorization code (PKCE, loopback redirect from the
+ * local companion) for an ID token, server-side so the browser never talks
+ * to Google's token endpoint. Only the id_token is returned; access and
+ * refresh tokens from the response are discarded in-request and no identity
+ * state is persisted here — enrollment performs verification and linking.
+ */
+async function handleIdentityGoogleExchange(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
+  const clientId = Reflect.get(env, "GOOGLE_OIDC_CLIENT_ID");
+  if (typeof clientId !== "string" || clientId.length === 0) {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  const body = await readBoundedJson(request);
+  const value = body.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const code = Reflect.get(value, "code");
+  const codeVerifier = Reflect.get(value, "codeVerifier");
+  const redirectUri = Reflect.get(value, "redirectUri");
+  const keys = Object.keys(value);
+  const loopbackRedirect = typeof redirectUri === "string"
+    && /^http:\/\/127\.0\.0\.1:\d{1,5}\/oauth\/google\/callback$/u.test(redirectUri);
+  if (keys.some((key) => !["code", "codeVerifier", "redirectUri"].includes(key))
+      || typeof code !== "string" || code.length === 0 || code.length > 2048
+      || typeof codeVerifier !== "string"
+      || !/^[A-Za-z0-9._~-]{43,128}$/u.test(codeVerifier)
+      || !loopbackRedirect) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code,
+      code_verifier: codeVerifier,
+      redirect_uri: redirectUri as string,
+    }),
+  });
+  if (!tokenResponse.ok) throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+  let tokenBody: unknown;
+  try {
+    tokenBody = await tokenResponse.json();
+  } catch {
+    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+  }
+  const idToken = Reflect.get(tokenBody as object, "id_token");
+  if (typeof idToken !== "string" || idToken.length === 0 || idToken.length > 16_384) {
+    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+  }
+  return jsonResponse({
+    schemaVersion: "identity-google-exchange-v0.1",
+    provider: "google",
+    idToken,
+  });
+}
+
 async function handleRecover(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
   configuredEnrollmentMode(env);
+  if (identityRequired(env)) {
+    // Hosted identity is mandatory outside development: signing in again
+    // reattaches the same participant, replacing the recovery-code flow.
+    throw new ApiError(401, "IDENTITY_REQUIRED");
+  }
   assertAdmissionBindings(env);
   await assertAttemptAllowed(env.RECOVERY_RATE_LIMIT, "recovery");
   const body = await readBoundedJson(request);
@@ -1342,6 +1434,8 @@ async function routeApi(
   switch (routeId) {
     case "enroll":
       return handleEnroll(request, env);
+    case "identity_google_exchange":
+      return handleIdentityGoogleExchange(request, env);
     case "recover":
       return handleRecover(request, env);
     case "session":

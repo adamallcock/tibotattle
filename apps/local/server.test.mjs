@@ -34,7 +34,10 @@ import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
-import { startLocalCompanionServer } from "./server.js";
+import {
+  APPLE_IDENTITY_HANDOFF_LIFETIME_MS,
+  startLocalCompanionServer,
+} from "./server.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -1094,6 +1097,18 @@ test("participant relay supports explicit loopback development with exact forwar
     });
     assert.equal(exported.status, 200);
     assert.equal((await exported.arrayBuffer()).byteLength > 4 * 1024 * 1024, true);
+    assert.equal((await fetch(`${base}/api/v1/identity/google/exchange`, {
+      method: "POST",
+      headers: {
+        Origin: base,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        code: "one-time-authorization-code",
+        codeVerifier: "A".repeat(43),
+        redirectUri: `http://127.0.0.1:${app.port}/oauth/google/callback`,
+      }),
+    })).status, 200);
 
     assert.equal(forwarded[0].url, "http://127.0.0.1:8792/api/v1/enroll");
     assert.equal(forwarded[0].headers.Origin, "http://127.0.0.1:8792");
@@ -1111,6 +1126,15 @@ test("participant relay supports explicit loopback development with exact forwar
     assert.equal(forwarded[4].method, "DELETE");
     assert.equal(forwarded[4].body, null);
     assert.equal(forwarded[5].url, "http://127.0.0.1:8792/api/v1/me/export");
+    assert.equal(
+      forwarded[6].url,
+      "http://127.0.0.1:8792/api/v1/identity/google/exchange",
+    );
+    assert.equal(Object.hasOwn(forwarded[6].headers, "Cookie"), false);
+    assert.equal(
+      forwarded[6].body.includes("one-time-authorization-code"),
+      true,
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -2856,6 +2880,184 @@ test("configured CLI exits after its declared parent disappears", async () => {
     if (Number.isSafeInteger(childPid) && processIsRunning(childPid)) {
       process.kill(childPid, "SIGKILL");
     }
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Google sign-in callback serves one inline query-tolerant page only", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(
+      `${base}/oauth/google/callback?code=CANARY-code&state=CANARY-state`,
+    );
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /^text\/html/u);
+    assert.match(
+      response.headers.get("content-security-policy"),
+      /script-src 'self' 'unsafe-inline'/u,
+    );
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const body = await response.text();
+    assert.match(body, /tibotattle-google-oauth-result/u);
+    // The relay key is written for the cross-tab storage event and removed in
+    // the same turn, so the one-time code never persists in browser storage.
+    assert.match(body, /localStorage\.removeItem/u);
+    assert.match(
+      body,
+      /Signed in — return to the TiboTattle dashboard tab\./u,
+    );
+    // Entirely self-contained: no external script, style, image, link, or
+    // navigation reference, and nothing from the query string is reflected.
+    assert.doesNotMatch(body, /\bsrc=|\bhref=|<link|<img|https?:\/\//iu);
+    assert.equal(body.includes("CANARY"), false);
+    assert.equal((await fetch(`${base}/oauth/google/callback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })).status, 405);
+    assert.equal(
+      (await fetch(`${base}/oauth/google/callback/extra`)).status,
+      404,
+    );
+    assert.equal((await fetch(`${base}/?code=CANARY-code`)).status, 400);
+    assert.equal(
+      (await fetch(`${base}/api/local/health?code=CANARY-code`)).status,
+      400,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Apple identity handoff is same-origin, bounded, single-use, and expiring", async () => {
+  const files = await fixture();
+  const identityToken =
+    `${"a".repeat(24)}.${"b".repeat(64)}.${"c".repeat(43)}`;
+  const replacementToken =
+    `${"d".repeat(24)}.${"e".repeat(64)}.${"f".repeat(43)}`;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    appleIdentityHandoffLifetimeMs: 1_000,
+    port: 0,
+  });
+  try {
+    assert.equal(APPLE_IDENTITY_HANDOFF_LIFETIME_MS, 5 * 60 * 1000);
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const post = (body, overrides = {}) => fetch(
+      `${base}/api/local/identity/apple`,
+      {
+        method: "POST",
+        headers: { ...headers, ...overrides },
+        body,
+      },
+    );
+    const take = ({ withLocalHeader = true } = {}) => fetch(
+      `${base}/api/local/identity/apple`,
+      withLocalHeader ? { headers: { "X-Usage-Monitor-Local": "1" } } : {},
+    );
+
+    const unauthorized = await post(
+      JSON.stringify({ identityToken }),
+      { Origin: "http://attacker.example" },
+    );
+    assert.equal(unauthorized.status, 403);
+    assert.equal(
+      (await unauthorized.json()).error.code,
+      "identity_handoff_not_authorized",
+    );
+    const unauthorizedRead = await take({ withLocalHeader: false });
+    assert.equal(unauthorizedRead.status, 403);
+    assert.equal(
+      (await unauthorizedRead.json()).error.code,
+      "identity_handoff_not_authorized",
+    );
+    assert.equal((await post(
+      JSON.stringify({ identityToken }),
+      { "Content-Type": "text/plain" },
+    )).status, 415);
+    const oversized = await rawRequest({
+      port: app.port,
+      path: "/api/local/identity/apple",
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Length": 17_409,
+      },
+      body: " ".repeat(17_409),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(
+      JSON.parse(oversized.body).error.code,
+      "request_too_large",
+    );
+    const invalidJson = await post("{not json");
+    assert.equal(invalidJson.status, 400);
+    assert.equal((await invalidJson.json()).error.code, "invalid_json");
+    for (const body of [
+      JSON.stringify({ identityToken: "not-a-jwt" }),
+      JSON.stringify({ identityToken: "" }),
+      JSON.stringify({ identityToken, extra: true }),
+      JSON.stringify({ identityToken: `${"a".repeat(17_000)}.b.c` }),
+      JSON.stringify([identityToken]),
+      JSON.stringify({}),
+    ]) {
+      const rejected = await post(body);
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).error.code, "invalid_request");
+    }
+    assert.equal((await take()).status, 404);
+
+    const stored = await post(JSON.stringify({ identityToken }));
+    assert.equal(stored.status, 200);
+    const storedBody = await stored.json();
+    assert.equal(storedBody.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
+    assert.equal(storedBody.status, "stored");
+    assert.equal(Number.isFinite(Date.parse(storedBody.expiresAt)), true);
+    assert.equal(JSON.stringify(storedBody).includes("aaaa"), false);
+
+    const replaced = await post(
+      JSON.stringify({ identityToken: replacementToken }),
+    );
+    assert.equal(replaced.status, 200);
+    const taken = await take();
+    assert.equal(taken.status, 200);
+    assert.deepEqual(await taken.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      identityToken: replacementToken,
+    });
+    const drained = await take();
+    assert.equal(drained.status, 404);
+    assert.equal((await drained.json()).error.code, "not_found");
+
+    assert.equal(
+      (await post(JSON.stringify({ identityToken }))).status,
+      200,
+    );
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_100));
+    assert.equal((await take()).status, 404);
+  } finally {
+    await app.close();
     await rm(files.root, { recursive: true });
   }
 });

@@ -7,6 +7,7 @@ function defineParticipantRelayRoute(pathname, methods) {
 
 export const PARTICIPANT_RELAY_ROUTE_POLICY = Object.freeze([
   defineParticipantRelayRoute("/api/v1/enroll", ["POST"]),
+  defineParticipantRelayRoute("/api/v1/identity/google/exchange", ["POST"]),
   defineParticipantRelayRoute("/api/v1/recover", ["POST"]),
   defineParticipantRelayRoute("/api/v1/session", ["GET"]),
   defineParticipantRelayRoute("/api/v1/logout", ["POST"]),

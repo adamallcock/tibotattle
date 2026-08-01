@@ -60,6 +60,15 @@ const NODE_ENTITLEMENTS = join(
   "macos",
   "NodeRuntime.entitlements",
 );
+// Applied only on this Developer ID release-signing path: development ad-hoc
+// builds carry no Apple sign-in entitlement and the launcher degrades to a
+// fixed explanatory dialog instead of requiring it.
+const APP_ENTITLEMENTS = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "UsageMonitorApp.entitlements",
+);
 const APP_EXECUTABLE =
   `Contents/MacOS/${PRODUCT_BRAND.executableName}`;
 const NODE_EXECUTABLE = "Contents/Resources/runtime/bin/node";
@@ -1132,8 +1141,10 @@ export async function developerIDSignMacOSApp(appPath, {
   sign(SPARKLE_FRAMEWORK_PREFIX);
   sign(KEYTAR_EXECUTABLE);
   sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS });
-  sign(APP_EXECUTABLE);
-  sign("");
+  sign(APP_EXECUTABLE, { entitlements: APP_ENTITLEMENTS });
+  // The outer bundle signature re-seals the launcher executable, so the
+  // Apple sign-in entitlement must ride on this final signature as well.
+  sign("", { entitlements: APP_ENTITLEMENTS });
   commandRunner("/usr/bin/codesign", [
     "--verify",
     "--deep",

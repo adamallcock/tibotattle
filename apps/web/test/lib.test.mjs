@@ -7,13 +7,16 @@ import {
 } from "../../../config/product-brand.js";
 
 import {
+  GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   buildSyntheticFixture,
   bytesToBase64Url,
   contributionBatchAdmission,
+  createGoogleSignInRequest,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
+  parseGoogleSignInResult,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
@@ -1755,6 +1758,274 @@ test("community enrollment can atomically request one upload-only device pairing
   });
 });
 
+test("Google sign-in request uses PKCE S256 with the openid scope only", async () => {
+  const first = await createGoogleSignInRequest({
+    clientId: "test-client.apps.googleusercontent.com",
+    redirectUri: "http://127.0.0.1:8787/oauth/google/callback",
+    cryptoImpl: webcrypto
+  });
+  const url = new URL(first.url);
+  assert.equal(url.origin, "https://accounts.google.com");
+  assert.equal(url.pathname, "/o/oauth2/v2/auth");
+  assert.equal(
+    url.searchParams.get("client_id"),
+    "test-client.apps.googleusercontent.com"
+  );
+  assert.equal(
+    url.searchParams.get("redirect_uri"),
+    "http://127.0.0.1:8787/oauth/google/callback"
+  );
+  assert.equal(url.searchParams.get("response_type"), "code");
+  assert.equal(url.searchParams.get("scope"), "openid");
+  assert.equal(url.searchParams.get("code_challenge_method"), "S256");
+  assert.equal(url.searchParams.get("state"), first.state);
+  assert.match(first.codeVerifier, /^[A-Za-z0-9._~-]{43,128}$/u);
+  assert.match(first.state, /^[A-Za-z0-9_-]{43}$/u);
+  const digest = await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(first.codeVerifier)
+  );
+  assert.equal(
+    url.searchParams.get("code_challenge"),
+    bytesToBase64Url(new Uint8Array(digest))
+  );
+  const second = await createGoogleSignInRequest({
+    clientId: "test-client.apps.googleusercontent.com",
+    redirectUri: "http://127.0.0.1:8787/oauth/google/callback",
+    cryptoImpl: webcrypto
+  });
+  assert.notEqual(second.state, first.state);
+  assert.notEqual(second.codeVerifier, first.codeVerifier);
+  await assert.rejects(
+    createGoogleSignInRequest({
+      clientId: "",
+      redirectUri: "http://127.0.0.1:8787/oauth/google/callback",
+      cryptoImpl: webcrypto
+    }),
+    TypeError
+  );
+  await assert.rejects(
+    createGoogleSignInRequest({
+      clientId: "test-client.apps.googleusercontent.com",
+      redirectUri: "https://attacker.example/steal",
+      cryptoImpl: webcrypto
+    }),
+    TypeError
+  );
+});
+
+test("Google sign-in callback results fail closed before any exchange", () => {
+  assert.equal(
+    GOOGLE_OAUTH_RESULT_STORAGE_KEY,
+    "tibotattle-google-oauth-result"
+  );
+  const nowMs = Date.parse("2026-07-31T12:00:00.000Z");
+  const valid = JSON.stringify({
+    code: "one-time-code",
+    state: "expected-state",
+    receivedAt: "2026-07-31T11:59:30.000Z"
+  });
+  assert.deepEqual(
+    parseGoogleSignInResult(valid, { expectedState: "expected-state", nowMs }),
+    { code: "one-time-code" }
+  );
+  assert.throws(
+    () => parseGoogleSignInResult(valid, { expectedState: "other-state", nowMs }),
+    /did not match this dashboard tab/u
+  );
+  assert.throws(
+    () => parseGoogleSignInResult(valid, {
+      expectedState: "expected-state",
+      nowMs: nowMs + 11 * 60 * 1_000
+    }),
+    /invalid or expired/u
+  );
+  assert.throws(
+    () => parseGoogleSignInResult("{not json", {
+      expectedState: "expected-state",
+      nowMs
+    }),
+    /could not be read/u
+  );
+  for (const tampered of [
+    { code: "", state: "expected-state", receivedAt: "2026-07-31T11:59:30.000Z" },
+    { code: "one-time-code", state: "expected-state", receivedAt: "not-a-time" },
+    {
+      code: "one-time-code",
+      state: "expected-state",
+      receivedAt: "2026-07-31T12:05:00.000Z"
+    },
+    {
+      code: "one-time-code",
+      state: "expected-state",
+      receivedAt: "2026-07-31T11:59:30.000Z",
+      extra: true
+    }
+  ]) {
+    assert.throws(
+      () => parseGoogleSignInResult(JSON.stringify(tampered), {
+        expectedState: "expected-state",
+        nowMs
+      }),
+      /invalid or expired/u
+    );
+  }
+  assert.throws(() => parseGoogleSignInResult(valid, { nowMs }), TypeError);
+});
+
+test("hosted identity is exchanged same-origin and enrolls with fixed error codes", async () => {
+  const calls = [];
+  let responseStatus = 200;
+  let responsePayload = () => ({
+    schemaVersion: "identity-google-exchange-v0.1",
+    provider: "google",
+    idToken: "header.payload.signature"
+  });
+  const client = new CommunityClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify(responsePayload()), {
+        status: responseStatus,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+  const exchangeRequest = {
+    code: "one-time-code",
+    codeVerifier: "A".repeat(43),
+    redirectUri: "http://127.0.0.1:8787/oauth/google/callback"
+  };
+  const identity = await client.identityGoogleExchange(exchangeRequest);
+  assert.deepEqual(identity, {
+    provider: "google",
+    idToken: "header.payload.signature"
+  });
+  assert.equal(calls[0].url, "/api/v1/identity/google/exchange");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.credentials, "same-origin");
+  assert.deepEqual(JSON.parse(calls[0].options.body), exchangeRequest);
+
+  await client.enroll(null, "telemetry-contribution-v0.1", {
+    deviceBootstrap: true,
+    identity
+  });
+  assert.equal(calls[1].url, "/api/v1/enroll");
+  assert.deepEqual(JSON.parse(calls[1].options.body).identity, {
+    provider: "google",
+    idToken: "header.payload.signature"
+  });
+  await client.enroll(null, "telemetry-contribution-v0.1", {
+    identity: { provider: "apple", idToken: "a.b.c" }
+  });
+  assert.deepEqual(JSON.parse(calls[2].options.body).identity, {
+    provider: "apple",
+    idToken: "a.b.c"
+  });
+  assert.equal(
+    Object.hasOwn(JSON.parse(calls[2].options.body), "deviceBootstrap"),
+    false
+  );
+  await assert.rejects(
+    client.enroll(null, "telemetry-contribution-v0.1", {
+      identity: { provider: "github", idToken: "a.b.c" }
+    }),
+    TypeError
+  );
+  await assert.rejects(
+    client.enroll(null, "telemetry-contribution-v0.1", {
+      identity: { provider: "google", idToken: "a.b.c", extra: true }
+    }),
+    TypeError
+  );
+  await assert.rejects(
+    client.identityGoogleExchange({
+      ...exchangeRequest,
+      redirectUri: "https://attacker.example/oauth/google/callback"
+    }),
+    TypeError
+  );
+  await assert.rejects(
+    client.identityGoogleExchange({
+      ...exchangeRequest,
+      codeVerifier: "too-short"
+    }),
+    TypeError
+  );
+  assert.equal(calls.length, 3);
+
+  responseStatus = 401;
+  responsePayload = () => ({ error: { code: "IDENTITY_TOKEN_INVALID" } });
+  await assert.rejects(
+    client.identityGoogleExchange(exchangeRequest),
+    (error) => error.status === 401
+      && error.code === "IDENTITY_TOKEN_INVALID"
+  );
+  responseStatus = 503;
+  responsePayload = () => ({ error: { code: "IDENTITY_CONFIGURATION_INVALID" } });
+  await assert.rejects(
+    client.identityGoogleExchange(exchangeRequest),
+    (error) => error.status === 503
+      && error.code === "IDENTITY_CONFIGURATION_INVALID"
+  );
+  responseStatus = 401;
+  responsePayload = () => ({ error: { code: "IDENTITY_REQUIRED" } });
+  await assert.rejects(
+    client.enroll(null, "telemetry-contribution-v0.1", { identity: null }),
+    (error) => error.status === 401 && error.code === "IDENTITY_REQUIRED"
+  );
+  responseStatus = 401;
+  responsePayload = () => ({ error: { code: "PRIVATE_DETAIL_MUST_NOT_PASS" } });
+  await assert.rejects(
+    client.identityGoogleExchange(exchangeRequest),
+    (error) => error.status === 401 && error.code === undefined
+  );
+  responseStatus = 200;
+  responsePayload = () => ({
+    schemaVersion: "identity-google-exchange-v0.1",
+    provider: "google",
+    idToken: ""
+  });
+  await assert.rejects(
+    client.identityGoogleExchange(exchangeRequest),
+    /verifiable Google sign-in token/u
+  );
+});
+
+test("hosted sign-in step gates contribution and keeps identity copy truthful", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  assert.match(
+    html,
+    /<meta name="usage-monitor-google-client-id" content="">/u
+  );
+  assert.match(html, /id="identity-google-signin"/u);
+  assert.match(html, /id="identity-apple-signin"/u);
+  assert.match(html, /Sign in with Google/u);
+  assert.match(html, /Use Apple sign-in from the app/u);
+  assert.match(html, /Hosted sign-in is not configured for this build\./u);
+  assert.match(html, /irreversible hash of that sign-in/u);
+  assert.match(html, /never your email or name/u);
+  assert.match(html, /Local-only use needs no account\./u);
+
+  assert.match(appSource, /function configuredGoogleClientId\(\)/u);
+  assert.match(appSource, /function hostedSignInRequired\(\)/u);
+  assert.match(appSource, /hostedSignInRequired\(\)\s*\|\|/u);
+  assert.match(appSource, /GOOGLE_OAUTH_RESULT_STORAGE_KEY/u);
+  assert.match(appSource, /window\.addEventListener\("storage"/u);
+  assert.match(appSource, /identity: hostedIdentity/u);
+  assert.match(appSource, /communityClient\.identityGoogleExchange\(/u);
+  assert.match(appSource, /takeAppleIdentityToken\(\)/u);
+  assert.match(appSource, /IDENTITY_REQUIRED/u);
+  assert.match(appSource, /IDENTITY_TOKEN_INVALID/u);
+  assert.match(appSource, /IDENTITY_CONFIGURATION_INVALID/u);
+  // The dashboard consumes the one-time result from the storage event's
+  // newValue only; the existing storage-free app.js guard elsewhere in this
+  // suite proves no web-storage API is ever called by the dashboard itself.
+  assert.match(appSource, /typeof event\.newValue === "string"/u);
+  assert.match(appSource, /let hostedIdentity = null;/u);
+});
+
 test("backend readiness accepts fail-closed 503 state without calling it ready", async () => {
   const payload = {
     status: "not_ready",
@@ -2839,7 +3110,10 @@ test("primary contribution journey connects the Mac without exposing a pairing c
   assert.match(html, /every 6 hours while the app is open/u);
   assert.match(html, /This is off until I choose it/u);
   assert.match(appSource, /async function connectCommunityContribution\(\)/u);
-  assert.match(appSource, /\{ deviceBootstrap: true \}/u);
+  assert.match(
+    appSource,
+    /\{ deviceBootstrap: true, identity: hostedIdentity \}/u,
+  );
   assert.match(appSource, /localClient\.pairContributionDevice\(pairing\.pairingCode\)/u);
   assert.match(appSource, /void enrollment\.recoveryCode;/u);
   assert.match(appSource, /armAutomaticContributionAfterReviewedSend/u);

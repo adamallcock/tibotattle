@@ -122,6 +122,12 @@ export interface EnrollmentOptions {
   deviceBootstrap?: boolean;
   nowEpoch?: number;
   /**
+   * Pairwise hosted-identity link key (hex HMAC of issuer+subject). Stored
+   * on the participant row under a partial unique index; never the raw
+   * subject. Callers must first attempt reattachParticipantByLinkKey.
+   */
+  identityLinkKey?: string | null;
+  /**
    * Open (non-invite) production enrollment still records community
    * eligibility through a server-issued, immediately redeemed grant so the
    * grant-backed eligibility trigger and audit trail hold for every cohort
@@ -194,8 +200,9 @@ export async function enroll(
   const participantInsert = db.prepare(
     `INSERT INTO participants (
       id, access_token_id, access_token_hash, recovery_token_id,
-      recovery_token_hash, state, consent_version, consented_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+      recovery_token_hash, state, consent_version, consented_at, created_at,
+      identity_link_key
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
   ).bind(
     participantId,
     legacyAccessId,
@@ -205,6 +212,7 @@ export async function enroll(
     consentVersion,
     now,
     now,
+    options.identityLinkKey ?? null,
   );
   const enrollmentStatements = [
     participantInsert,
@@ -305,6 +313,54 @@ export async function enroll(
       redeemedAt: inviteGrant ? now : null,
       expiresAt: invitationExpiresAt,
     },
+  };
+}
+
+/**
+ * Resolves an existing participant by hosted-identity link key and, when one
+ * exists and is active, issues a fresh session, rotated recovery code, and
+ * optional device pairing for it — the signed-in equivalent of recovery.
+ * Returns null when no participant holds the key; throws while a deletion is
+ * in progress so a deleting identity cannot silently resurrect.
+ */
+export async function reattachParticipantByLinkKey(
+  db: D1Database,
+  identityLinkKey: string,
+  consentVersion: string,
+  options: EnrollmentOptions = {},
+): Promise<Enrollment | null> {
+  const row = await db.prepare(
+    `SELECT id, state FROM participants WHERE identity_link_key = ?`,
+  ).bind(identityLinkKey).first<{ id: string; state: string }>();
+  if (!row) return null;
+  if (row.state !== "active") throw new ApiError(409, "PARTICIPANT_DELETING");
+  const nowEpoch = options.nowEpoch ?? Date.now();
+  const now = new Date(nowEpoch).toISOString();
+  const recovery = capability("um_recovery");
+  const recoveryHash = await hashCapability("recovery", recovery.id, recovery.secret);
+  const session = await createSessionMaterial(row.id, nowEpoch);
+  const pairing = options.deviceBootstrap
+    ? await createDevicePairingMaterial(row.id, session.id, consentVersion, nowEpoch)
+    : null;
+  const results = await db.batch([
+    db.prepare(
+      `UPDATE participants
+          SET recovery_token_id = ?, recovery_token_hash = ?
+        WHERE id = ? AND state = 'active'`,
+    ).bind(recovery.id, recoveryHash, row.id),
+    sessionInsert(db, session),
+    ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
+  ]);
+  if (results.some((entry) => entry.meta.changes !== 1)) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  return {
+    participantId: row.id,
+    recoveryCode: recovery.encoded,
+    csrfToken: session.csrfToken,
+    session,
+    pairing,
+    invitation: { state: "not_required", redeemedAt: null, expiresAt: null },
   };
 }
 

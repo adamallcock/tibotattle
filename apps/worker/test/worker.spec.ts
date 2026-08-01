@@ -1348,8 +1348,90 @@ describe("synthetic usage monitor service", () => {
     expect(count?.total).toBe(0);
   });
 
+  let identitySigningKey: CryptoKey;
+  let identityJwksJson = "";
+  const GOOGLE_CLIENT = "test-google-client.apps.googleusercontent.com";
+  const APPLE_CLIENT = "com.usagemonitor.local";
+
+  beforeAll(async () => {
+    const pair = await crypto.subtle.generateKey(
+      {
+        name: "RSASSA-PKCS1-v1_5",
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256",
+      },
+      true,
+      ["sign", "verify"],
+    ) as CryptoKeyPair;
+    identitySigningKey = pair.privateKey;
+    const publicJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
+    identityJwksJson = JSON.stringify({
+      keys: [{ ...publicJwk, kid: "identity-test-key", alg: "RS256", use: "sig" }],
+    });
+  });
+
+  function identityBindings(overrides: Partial<Env> = {}): Env {
+    return testBindings({
+      GOOGLE_OIDC_CLIENT_ID: GOOGLE_CLIENT,
+      APPLE_OIDC_CLIENT_ID: APPLE_CLIENT,
+      IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
+      IDENTITY_TEST_JWKS_JSON: identityJwksJson,
+      ...overrides,
+    } as unknown as Partial<Env>);
+  }
+
+  async function mintIdToken({
+    provider = "google",
+    audience = GOOGLE_CLIENT,
+    subject = "subject-1234567890",
+    expiresInSeconds = 600,
+    tamper = false,
+  } = {}): Promise<string> {
+    const b64 = (value: object | Uint8Array): string => {
+      const bytes = value instanceof Uint8Array
+        ? value
+        : new TextEncoder().encode(JSON.stringify(value));
+      let raw = "";
+      for (const byte of bytes) raw += String.fromCharCode(byte);
+      return btoa(raw).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+    };
+    const header = { alg: "RS256", kid: "identity-test-key", typ: "JWT" };
+    const payload = {
+      iss: provider === "google" ? "https://accounts.google.com" : "https://appleid.apple.com",
+      aud: audience,
+      sub: subject,
+      exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
+      iat: Math.floor(Date.now() / 1000),
+    };
+    const signingInput = `${b64(header)}.${b64(payload)}`;
+    const signature = new Uint8Array(await crypto.subtle.sign(
+      "RSASSA-PKCS1-v1_5",
+      identitySigningKey,
+      new TextEncoder().encode(signingInput),
+    ));
+    if (tamper) signature[0] = signature[0]! ^ 0xff;
+    return `${signingInput}.${b64(signature)}`;
+  }
+
+  async function identityEnroll(
+    idToken: string,
+    provider = "google",
+    runtimeEnv: Env | null = null,
+  ): Promise<Response> {
+    return api("/api/v1/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        consentVersion: "privacy-safe-telemetry-v0.1",
+        syntheticOnly: false,
+        identity: { provider, idToken },
+      }),
+    }, runtimeEnv ?? identityBindings());
+  }
+
   it("enrolls open-mode production participants with grant-backed eligibility", async () => {
-    const env = testBindings({
+    const env = identityBindings({
       ENVIRONMENT: "production" as Env["ENVIRONMENT"],
       ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
     });
@@ -1359,6 +1441,10 @@ describe("synthetic usage monitor service", () => {
       body: JSON.stringify({
         consentVersion: "privacy-safe-telemetry-v0.1",
         syntheticOnly: false,
+        identity: {
+          provider: "google",
+          idToken: await mintIdToken({ subject: "open-mode-primary" }),
+        },
       }),
     }, env);
     expect(response.status).toBe(201);
@@ -1384,6 +1470,10 @@ describe("synthetic usage monitor service", () => {
       body: JSON.stringify({
         consentVersion: "synthetic-preview-v0.1",
         syntheticOnly: true,
+        identity: {
+          provider: "google",
+          idToken: await mintIdToken({ subject: "open-mode-synthetic" }),
+        },
       }),
     }, env);
     expect(synthetic.status).toBe(201);
@@ -3902,5 +3992,115 @@ describe("synthetic usage monitor service", () => {
       "SELECT COUNT(*) AS total FROM participants",
     ).first<{ total: number }>();
     expect(afterSecond?.total).toBe(0);
+  });
+
+  describe("mandatory hosted identity", () => {
+    it("requires identity for production enrollment and recovery", async () => {
+      const production = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+      });
+      const withoutIdentity = await api("/api/v1/enroll", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          consentVersion: "privacy-safe-telemetry-v0.1",
+          syntheticOnly: false,
+        }),
+      }, production);
+      expect(withoutIdentity.status).toBe(401);
+      expect(await withoutIdentity.json()).toMatchObject({
+        error: { code: "IDENTITY_REQUIRED" },
+      });
+      const recovery = await api("/api/v1/recover", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          recoveryCode: "um_recovery_x.y",
+          recoveryAttemptId: recoveryAttemptId(),
+        }),
+      }, production);
+      expect(recovery.status).toBe(401);
+      expect(await recovery.json()).toMatchObject({
+        error: { code: "IDENTITY_REQUIRED" },
+      });
+    });
+
+    it("enrolls, stores only the pairwise hash, and reattaches the same participant", async () => {
+      const subject = "google-subject-alpha";
+      const first = await identityEnroll(await mintIdToken({ subject }));
+      expect(first.status).toBe(201);
+      const firstBody = await first.json<{ participantId: string; recoveryCode: string }>();
+
+      const row = await testBindings().USAGE_MONITOR_DB.prepare(
+        "SELECT identity_link_key FROM participants WHERE id = ?",
+      ).bind(firstBody.participantId).first<{ identity_link_key: string }>();
+      expect(row?.identity_link_key).toMatch(/^[0-9a-f]{64}$/u);
+      expect(row?.identity_link_key.includes(subject)).toBe(false);
+
+      const second = await identityEnroll(await mintIdToken({ subject }));
+      expect(second.status).toBe(201);
+      const secondBody = await second.json<{ participantId: string; recoveryCode: string }>();
+      expect(secondBody.participantId).toBe(firstBody.participantId);
+      expect(secondBody.recoveryCode).not.toBe(firstBody.recoveryCode);
+
+      const count = await testBindings().USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(count?.total).toBe(1);
+    });
+
+    it("accepts Apple tokens and rejects invalid identities fail-closed", async () => {
+      const apple = await identityEnroll(
+        await mintIdToken({ provider: "apple", audience: APPLE_CLIENT }),
+        "apple",
+      );
+      expect(apple.status).toBe(201);
+
+      for (const [token, provider] of [
+        [await mintIdToken({ audience: "wrong-audience" }), "google"],
+        [await mintIdToken({ expiresInSeconds: -3600 }), "google"],
+        [await mintIdToken({ tamper: true }), "google"],
+        ["not-a-jwt", "google"],
+      ] as const) {
+        const rejected = await identityEnroll(token, provider);
+        expect(rejected.status).toBe(401);
+        expect(await rejected.json()).toMatchObject({
+          error: { code: "IDENTITY_TOKEN_INVALID" },
+        });
+      }
+
+      const unconfigured = await identityEnroll(
+        await mintIdToken(),
+        "google",
+        identityBindings({ GOOGLE_OIDC_CLIENT_ID: "" as Env["GOOGLE_OIDC_CLIENT_ID"] }),
+      );
+      expect(unconfigured.status).toBe(503);
+      expect(await unconfigured.json()).toMatchObject({
+        error: { code: "IDENTITY_CONFIGURATION_INVALID" },
+      });
+    });
+
+    it("refuses reattachment during deletion and unlinks after deletion", async () => {
+      const subject = "google-subject-deleting";
+      const first = await identityEnroll(await mintIdToken({ subject }));
+      expect(first.status).toBe(201);
+      const firstBody = await first.json<{ participantId: string }>();
+      await testBindings().USAGE_MONITOR_DB.prepare(
+        "UPDATE participants SET state = 'deleting' WHERE id = ?",
+      ).bind(firstBody.participantId).run();
+      const duringDeletion = await identityEnroll(await mintIdToken({ subject }));
+      expect(duringDeletion.status).toBe(409);
+
+      const { finishParticipantDeletion } = await import("../src/repository");
+      await finishParticipantDeletion(
+        testBindings().USAGE_MONITOR_DB,
+        firstBody.participantId,
+      );
+      const afterDeletion = await identityEnroll(await mintIdToken({ subject }));
+      expect(afterDeletion.status).toBe(201);
+      const freshBody = await afterDeletion.json<{ participantId: string }>();
+      expect(freshBody.participantId).not.toBe(firstBody.participantId);
+    });
   });
 });

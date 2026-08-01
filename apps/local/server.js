@@ -110,6 +110,13 @@ const REVIEW_JOB_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const REVIEW_AUTHORIZATION_LIFETIME_MS = 10 * 60 * 1000;
+const GOOGLE_OAUTH_CALLBACK_PATH = "/oauth/google/callback";
+const GOOGLE_OAUTH_RESULT_STORAGE_KEY = "tibotattle-google-oauth-result";
+export const APPLE_IDENTITY_HANDOFF_LIFETIME_MS = 5 * 60 * 1000;
+const MAX_APPLE_IDENTITY_REQUEST_BYTES = 17_408;
+const MAX_APPLE_IDENTITY_TOKEN_LENGTH = 16_384;
+const APPLE_IDENTITY_TOKEN =
+  /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
 
 function developmentIdentityConfigurationError() {
   const error = new TypeError(
@@ -179,6 +186,7 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 
 const API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/identity/apple",
   "/api/local/onboarding",
   "/api/local/overview",
   "/api/local/gradient",
@@ -200,6 +208,60 @@ const API_ROUTES = new Set([
   "/api/local/contribution/automatic-enable",
   "/api/local/contribution/automatic-disable",
 ]);
+
+// Served for the provider's loopback redirect. The page is entirely inline:
+// it references no external script, style, image, or navigation target, and
+// the server never parses the ?code or ?state values it arrives with. The
+// inline script hands them to the already-open dashboard tab through one
+// fixed localStorage key, then removes the key in the same turn — the
+// dashboard consumes the storage event's newValue, so nothing persists in
+// browser storage — and scrubs the query from this tab's history.
+const GOOGLE_OAUTH_CALLBACK_HTML = Buffer.from(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${PRODUCT_BRAND.displayName} sign-in</title>
+    <style>
+      body {
+        font: 15px/1.5 -apple-system, system-ui, sans-serif;
+        margin: 3rem auto;
+        max-width: 34rem;
+        padding: 0 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Google sign-in</h1>
+    <p id="signin-status">Handing the one-time sign-in code to the ${PRODUCT_BRAND.displayName} dashboard tab…</p>
+    <script>
+      (() => {
+        const status = document.getElementById("signin-status");
+        try {
+          const parameters = new URLSearchParams(window.location.search);
+          window.localStorage.setItem(
+            "${GOOGLE_OAUTH_RESULT_STORAGE_KEY}",
+            JSON.stringify({
+              code: parameters.get("code") ?? "",
+              state: parameters.get("state") ?? "",
+              receivedAt: new Date().toISOString(),
+            }),
+          );
+          window.localStorage.removeItem(
+            "${GOOGLE_OAUTH_RESULT_STORAGE_KEY}",
+          );
+          window.history.replaceState(null, "", "${GOOGLE_OAUTH_CALLBACK_PATH}");
+          status.textContent =
+            "Signed in — return to the ${PRODUCT_BRAND.displayName} dashboard tab.";
+        } catch {
+          status.textContent =
+            "The sign-in result could not be handed to the dashboard tab. Return to the ${PRODUCT_BRAND.displayName} dashboard tab and start the sign-in again.";
+        }
+      })();
+    </script>
+  </body>
+</html>
+`);
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value));
@@ -596,6 +658,54 @@ async function authorizeContributionDevicePairing(request, response) {
     return null;
   }
   return value.pairingCode;
+}
+
+async function authorizeAppleIdentityHandoff(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "identity_handoff_not_authorized");
+    return null;
+  }
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    sendError(response, 415, "unsupported_media_type");
+    return null;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength)
+      && declaredLength > MAX_APPLE_IDENTITY_REQUEST_BYTES) {
+    sendError(response, 413, "request_too_large");
+    return null;
+  }
+  let bytes = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_APPLE_IDENTITY_REQUEST_BYTES) {
+      sendError(response, 413, "request_too_large");
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    sendError(response, 400, "invalid_json");
+    return null;
+  }
+  if (!value
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== "identityToken"
+      || typeof value.identityToken !== "string"
+      || value.identityToken.length > MAX_APPLE_IDENTITY_TOKEN_LENGTH
+      || !APPLE_IDENTITY_TOKEN.test(value.identityToken)) {
+    sendError(response, 400, "invalid_request");
+    return null;
+  }
+  return value.identityToken;
 }
 
 async function readContributionPreparationRequest(request) {
@@ -1468,6 +1578,7 @@ function createPreparedLocalCompanionServer({
   automaticContributionRetirementRunner = null,
   contributionSyncPauseSetter = null,
   contributionSyncTimeoutMs = 60_000,
+  appleIdentityHandoffLifetimeMs = APPLE_IDENTITY_HANDOFF_LIFETIME_MS,
   automaticContributionController = null,
   automaticContributionOptions = {},
   onError = () => {},
@@ -1557,6 +1668,11 @@ function createPreparedLocalCompanionServer({
       || contributionSyncTimeoutMs < 1_000
       || contributionSyncTimeoutMs > 5 * 60_000) {
     throw new TypeError("contribution sync controls are invalid");
+  }
+  if (!Number.isSafeInteger(appleIdentityHandoffLifetimeMs)
+      || appleIdentityHandoffLifetimeMs < 1
+      || appleIdentityHandoffLifetimeMs > 60 * 60_000) {
+    throw new TypeError("appleIdentityHandoffLifetimeMs is invalid");
   }
   const nextContribution = contributionSyncNextProvider
     ?? (preparedContributionDirectory === null
@@ -1750,6 +1866,10 @@ function createPreparedLocalCompanionServer({
     fetchImpl: centralFetch,
   });
   let reviewedContributionAuthorization = null;
+  // Latest Apple identity token handed over by the native app, held only in
+  // process memory for one bounded window and consumed by a single dashboard
+  // read. It is never written to disk or echoed back by the storing request.
+  let appleIdentityHandoff = null;
 
   const server = createServer(async (request, response) => {
     try {
@@ -1768,11 +1888,28 @@ function createPreparedLocalCompanionServer({
         sendError(response, 400, "invalid_request");
         return;
       }
+      const path = url.pathname;
+      if (path === GOOGLE_OAUTH_CALLBACK_PATH) {
+        // The provider redirect legitimately carries ?code and ?state. This
+        // is the only route that accepts a query string, and the server never
+        // reads it: the inline page passes the values to the dashboard tab.
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        send(
+          response,
+          200,
+          GOOGLE_OAUTH_CALLBACK_HTML,
+          "text/html; charset=utf-8",
+          { report: true },
+        );
+        return;
+      }
       if (url.search !== "" || url.hash !== "") {
         sendError(response, 400, "invalid_request");
         return;
       }
-      const path = url.pathname;
       if (centralProxy.handles(path)) {
         if (request.method !== "GET" && !sameOrigin(request)) {
           sendError(response, 403, "central_request_not_authorized");
@@ -1877,6 +2014,46 @@ function createPreparedLocalCompanionServer({
           // readiness rather than disclosing filesystem diagnostics.
         }
         send(response, 200, projectLocalOnboarding(onboarding));
+        return;
+      }
+      if (path === "/api/local/identity/apple") {
+        if (request.method === "POST") {
+          const identityToken = await authorizeAppleIdentityHandoff(
+            request,
+            response,
+          );
+          if (identityToken === null) return;
+          appleIdentityHandoff = {
+            identityToken,
+            expiresAt: Date.now() + appleIdentityHandoffLifetimeMs,
+          };
+          send(response, 200, {
+            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+            status: "stored",
+            expiresAt: new Date(appleIdentityHandoff.expiresAt).toISOString(),
+          });
+          return;
+        }
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // Reading is a consuming mutation: the fixed local header keeps a
+        // cross-site page from draining the one-use handoff with a bare GET.
+        if (request.headers["x-usage-monitor-local"] !== "1") {
+          sendError(response, 403, "identity_handoff_not_authorized");
+          return;
+        }
+        const handoff = appleIdentityHandoff;
+        appleIdentityHandoff = null;
+        if (handoff === null || handoff.expiresAt < Date.now()) {
+          sendError(response, 404, "not_found");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          identityToken: handoff.identityToken,
+        });
         return;
       }
       if (path === "/api/local/overview") {

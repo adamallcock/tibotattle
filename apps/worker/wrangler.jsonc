@@ -138,12 +138,15 @@
       "vars": {
         "ENVIRONMENT": "production",
         "ENROLLMENT_MODE": "open",
-        "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
+        "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "GOOGLE_OIDC_CLIENT_ID": "",
+        "APPLE_OIDC_CLIENT_ID": ""
       },
       "secrets": {
         "required": [
           "ENVELOPE_PRIVATE_JWK",
-          "ENVELOPE_PUBLIC_JWK"
+          "ENVELOPE_PUBLIC_JWK",
+          "IDENTITY_LINK_SECRET"
         ]
       },
       "ratelimits": [

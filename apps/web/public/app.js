@@ -7,10 +7,13 @@ import {
   normalizeParticipantStats
 } from "./data-client.js";
 import {
+  GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   contributionBatchAdmission,
+  createGoogleSignInRequest,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   createTelemetryEnvelope,
+  parseGoogleSignInResult,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
@@ -52,6 +55,11 @@ let selectedContributionValidated = false;
 let contributionSelectionRevision = 0;
 let contributionPreparationBusy = false;
 let communityConnectBusy = false;
+// The verified sign-in token lives only in this module-scoped memory; it is
+// never persisted to storage and disappears with the tab.
+let hostedIdentity = null;
+let hostedIdentityBusy = false;
+let pendingGoogleSignIn = null;
 let activeContributionLookbackHours = 24;
 let localActionBusy = false;
 let localRefreshInProgress = false;
@@ -119,6 +127,16 @@ function configuredInstallerMetadata(name, pattern) {
     ?.getAttribute("content")
     ?.trim();
   return value && pattern.test(value) ? value : null;
+}
+
+function configuredGoogleClientId() {
+  const value = document
+    .querySelector('meta[name="usage-monitor-google-client-id"]')
+    ?.getAttribute("content")
+    ?.trim();
+  return value && /^[A-Za-z0-9][A-Za-z0-9._-]{7,255}$/u.test(value)
+    ? value
+    : null;
 }
 
 function configuredReleaseUrl(name) {
@@ -3022,6 +3040,162 @@ function scheduleReturningUserRefresh() {
   }, 750);
 }
 
+const HOSTED_IDENTITY_ERROR_COPY = {
+  IDENTITY_REQUIRED:
+    "Hosted participation requires sign-in. Sign in with Google above or use Apple sign-in from the app, then try again. Nothing was uploaded.",
+  IDENTITY_TOKEN_INVALID:
+    "The sign-in could not be verified by the contribution service. Sign in again, then retry. Nothing was uploaded.",
+  IDENTITY_CONFIGURATION_INVALID:
+    "Hosted sign-in is not configured on the contribution service, so hosted actions are unavailable. Local reporting continues unchanged.",
+  IDENTITY_PROVIDER_UNAVAILABLE:
+    "The sign-in provider could not be reached by the contribution service. Try again shortly. Nothing was uploaded."
+};
+
+function hostedIdentityErrorCopy(error) {
+  return HOSTED_IDENTITY_ERROR_COPY[error?.code] ?? null;
+}
+
+// Production builds carry a Google client id in the release-slot meta tag and
+// require sign-in before hosted actions, mirroring the server's mandatory
+// hosted identity. Development builds leave the slot empty: the Google button
+// stays disabled with fixed copy, the Apple app handoff remains usable, and
+// the server stays the authority on whether identity is required.
+function hostedSignInRequired() {
+  return configuredGoogleClientId() !== null && hostedIdentity === null;
+}
+
+function renderHostedIdentity() {
+  const googleButton = $("#identity-google-signin");
+  const appleButton = $("#identity-apple-signin");
+  const chip = $("#identity-signin-state");
+  const googleUnavailable = $("#identity-google-unavailable");
+  const googleConfigured = configuredGoogleClientId() !== null;
+  googleButton.disabled = hostedIdentityBusy
+    || hostedIdentity !== null
+    || !googleConfigured;
+  googleUnavailable.hidden = googleConfigured;
+  appleButton.disabled = hostedIdentityBusy || hostedIdentity !== null;
+  chip.textContent = hostedIdentity === null
+    ? hostedIdentityBusy ? "Signing in…" : "Not signed in"
+    : hostedIdentity.provider === "google"
+      ? "Signed in with Google"
+      : "Signed in with Apple";
+  chip.className = hostedIdentity === null
+    ? "evidence-chip neutral"
+    : "evidence-chip";
+  updateCommunityConnectButton();
+}
+
+async function beginGoogleSignIn() {
+  if (hostedIdentityBusy || hostedIdentity !== null) return;
+  const clientId = configuredGoogleClientId();
+  if (clientId === null) return;
+  const status = $("#identity-signin-status");
+  hostedIdentityBusy = true;
+  renderHostedIdentity();
+  status.hidden = false;
+  status.className = "participant-action-status";
+  try {
+    const request = await createGoogleSignInRequest({
+      clientId,
+      redirectUri: `${window.location.origin}/oauth/google/callback`
+    });
+    pendingGoogleSignIn = request;
+    const opened = window.open(request.url, "_blank", "noopener");
+    if (!opened) {
+      pendingGoogleSignIn = null;
+      throw new Error(
+        "The Google sign-in tab was blocked. Allow pop-ups for this local dashboard, then try again."
+      );
+    }
+    status.textContent =
+      "Finish signing in with Google in the new tab, then return here. Only the openid scope is requested; no email or name is asked for.";
+  } catch (error) {
+    status.className = "participant-action-status error";
+    status.textContent = error instanceof Error
+      ? error.message
+      : "Google sign-in could not be started.";
+  } finally {
+    hostedIdentityBusy = false;
+    renderHostedIdentity();
+  }
+}
+
+async function completeGoogleSignIn(serialized) {
+  const pending = pendingGoogleSignIn;
+  if (pending === null || hostedIdentityBusy || hostedIdentity !== null) return;
+  const status = $("#identity-signin-status");
+  hostedIdentityBusy = true;
+  renderHostedIdentity();
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Completing Google sign-in…";
+  try {
+    const result = parseGoogleSignInResult(serialized, {
+      expectedState: pending.state
+    });
+    hostedIdentity = await communityClient.identityGoogleExchange({
+      code: result.code,
+      codeVerifier: pending.codeVerifier,
+      redirectUri: pending.redirectUri
+    });
+    pendingGoogleSignIn = null;
+    status.textContent =
+      "Signed in with Google. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
+  } catch (error) {
+    status.className = "participant-action-status error";
+    status.textContent = hostedIdentityErrorCopy(error)
+      ?? (error instanceof Error
+        ? error.message
+        : "Google sign-in could not be completed. Sign in again.");
+  } finally {
+    hostedIdentityBusy = false;
+    renderHostedIdentity();
+  }
+}
+
+const APPLE_SIGNIN_POLL_ATTEMPTS = 30;
+const APPLE_SIGNIN_POLL_INTERVAL_MS = 2_000;
+
+async function beginAppleSignIn() {
+  if (hostedIdentityBusy || hostedIdentity !== null) return;
+  const status = $("#identity-signin-status");
+  hostedIdentityBusy = true;
+  renderHostedIdentity();
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent =
+    "Open the TiboTattle app, choose Sign in with Apple…, and keep this tab open. Checking for the app's handoff…";
+  try {
+    for (let attempt = 0; attempt < APPLE_SIGNIN_POLL_ATTEMPTS; attempt += 1) {
+      const identityToken = await localClient.takeAppleIdentityToken();
+      if (identityToken !== null) {
+        hostedIdentity = Object.freeze({
+          provider: "apple",
+          idToken: identityToken
+        });
+        status.textContent =
+          "Signed in with Apple through the app. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
+        return;
+      }
+      await new Promise((resolveWait) => {
+        window.setTimeout(resolveWait, APPLE_SIGNIN_POLL_INTERVAL_MS);
+      });
+    }
+    status.className = "participant-action-status error";
+    status.textContent =
+      "No Apple sign-in arrived from the TiboTattle app. Choose Sign in with Apple… in the app first, then press this button again within five minutes.";
+  } catch (error) {
+    status.className = "participant-action-status error";
+    status.textContent = error instanceof Error
+      ? error.message
+      : "Apple sign-in could not be read from the local app.";
+  } finally {
+    hostedIdentityBusy = false;
+    renderHostedIdentity();
+  }
+}
+
 function updateCommunityConnectButton() {
   const button = $("#connect-community");
   const consent = $("#community-connect-consent");
@@ -3032,12 +3206,15 @@ function updateCommunityConnectButton() {
     || automaticContributionBusy
     || automaticContributionStatus?.enabled
     || awaitingReviewedSend
+    || hostedSignInRequired()
     || !consent.checked;
   if (!communityConnectBusy) {
     button.textContent = awaitingReviewedSend
       ? "Review first contribution below"
       : automaticContributionStatus?.enabled
       ? "Automatic contribution is on"
+      : hostedSignInRequired()
+      ? "Sign in above to contribute"
       : "Contribute and keep it current";
   }
 }
@@ -3178,6 +3355,13 @@ async function disableAutomaticContribution() {
 async function connectCommunityContribution() {
   if (communityConnectBusy) return;
   const status = $("#community-connect-status");
+  if (hostedSignInRequired()) {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    status.textContent =
+      "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account, and nothing was uploaded.";
+    return;
+  }
   const inviteInput = $("#contribution-invite");
   const inviteCode = inviteInput.value.trim();
   let pairing = null;
@@ -3201,7 +3385,7 @@ async function connectCommunityContribution() {
       const enrollment = await communityClient.enroll(
         inviteCode || null,
         "telemetry-contribution-v0.1",
-        { deviceBootstrap: true }
+        { deviceBootstrap: true, identity: hostedIdentity }
       );
       if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
           || enrollment?.state !== "pairing_ready"
@@ -3249,8 +3433,11 @@ async function connectCommunityContribution() {
     }
   } catch (error) {
     status.className = "participant-action-status error";
+    const identityCopy = hostedIdentityErrorCopy(error);
     if (contributionDeviceRecoveryIsRequired(error)) {
       renderContributionDeviceRecovery(status);
+    } else if (identityCopy !== null) {
+      status.textContent = identityCopy;
     } else {
       status.textContent = safeApiError(
         error,
@@ -3516,14 +3703,24 @@ async function ensureCommunitySession(contributionSchemaVersion) {
     }
     return communitySession;
   }
+  if (hostedSignInRequired()) {
+    throw new Error(
+      "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account."
+    );
+  }
   const inviteInput = $("#contribution-invite");
   const inviteCode = inviteInput.value.trim();
   let enrollment;
   try {
     enrollment = await communityClient.enroll(
       inviteCode || null,
-      contributionSchemaVersion
+      contributionSchemaVersion,
+      { identity: hostedIdentity }
     );
+  } catch (error) {
+    const identityCopy = hostedIdentityErrorCopy(error);
+    if (identityCopy !== null) throw new Error(identityCopy);
+    throw error;
   } finally {
     inviteInput.value = "";
   }
@@ -4597,6 +4794,21 @@ $("#contribution-lookback-controls").addEventListener("click", (event) => {
       : "Prepare and review last 7 days";
   renderContributionPreparationEstimate();
 });
+$("#identity-google-signin").addEventListener("click", () => {
+  void beginGoogleSignIn();
+});
+$("#identity-apple-signin").addEventListener("click", () => {
+  void beginAppleSignIn();
+});
+// The loopback callback page writes exactly one fixed key; a storage event
+// from the same origin is the only completion signal this tab listens for.
+window.addEventListener("storage", (event) => {
+  if (event.key === GOOGLE_OAUTH_RESULT_STORAGE_KEY
+      && typeof event.newValue === "string"
+      && event.newValue.length > 0) {
+    void completeGoogleSignIn(event.newValue);
+  }
+});
 $("#community-connect-consent").addEventListener(
   "change",
   updateCommunityConnectButton
@@ -4788,6 +5000,7 @@ mountDashboardNavigation({
 
 async function bootstrapDashboard() {
   renderInstallerJourney();
+  renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
   if (
