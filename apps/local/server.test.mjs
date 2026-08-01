@@ -34,10 +34,7 @@ import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
-import {
-  APPLE_IDENTITY_HANDOFF_LIFETIME_MS,
-  startLocalCompanionServer,
-} from "./server.js";
+import { startLocalCompanionServer } from "./server.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -2934,128 +2931,6 @@ test("Google sign-in callback serves one inline query-tolerant page only", async
       (await fetch(`${base}/api/local/health?code=CANARY-code`)).status,
       400,
     );
-  } finally {
-    await app.close();
-    await rm(files.root, { recursive: true });
-  }
-});
-
-test("Apple identity handoff is same-origin, bounded, single-use, and expiring", async () => {
-  const files = await fixture();
-  const identityToken =
-    `${"a".repeat(24)}.${"b".repeat(64)}.${"c".repeat(43)}`;
-  const replacementToken =
-    `${"d".repeat(24)}.${"e".repeat(64)}.${"f".repeat(43)}`;
-  const app = await startLocalCompanionServer({
-    resourceRoot: files.resourceRoot,
-    stateRoot: files.stateRoot,
-    codexHome: files.codexHome,
-    staticRoot: files.staticRoot,
-    dataStore: fakeStore(),
-    refreshRunner: async () => ({}),
-    appleIdentityHandoffLifetimeMs: 1_000,
-    port: 0,
-  });
-  try {
-    assert.equal(APPLE_IDENTITY_HANDOFF_LIFETIME_MS, 5 * 60 * 1000);
-    const base = `http://127.0.0.1:${app.port}`;
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Usage-Monitor-Local": "1",
-      Origin: base,
-    };
-    const post = (body, overrides = {}) => fetch(
-      `${base}/api/local/identity/apple`,
-      {
-        method: "POST",
-        headers: { ...headers, ...overrides },
-        body,
-      },
-    );
-    const take = ({ withLocalHeader = true } = {}) => fetch(
-      `${base}/api/local/identity/apple`,
-      withLocalHeader ? { headers: { "X-Usage-Monitor-Local": "1" } } : {},
-    );
-
-    const unauthorized = await post(
-      JSON.stringify({ identityToken }),
-      { Origin: "http://attacker.example" },
-    );
-    assert.equal(unauthorized.status, 403);
-    assert.equal(
-      (await unauthorized.json()).error.code,
-      "identity_handoff_not_authorized",
-    );
-    const unauthorizedRead = await take({ withLocalHeader: false });
-    assert.equal(unauthorizedRead.status, 403);
-    assert.equal(
-      (await unauthorizedRead.json()).error.code,
-      "identity_handoff_not_authorized",
-    );
-    assert.equal((await post(
-      JSON.stringify({ identityToken }),
-      { "Content-Type": "text/plain" },
-    )).status, 415);
-    const oversized = await rawRequest({
-      port: app.port,
-      path: "/api/local/identity/apple",
-      method: "POST",
-      headers: {
-        ...headers,
-        "Content-Length": 17_409,
-      },
-      body: " ".repeat(17_409),
-    });
-    assert.equal(oversized.status, 413);
-    assert.equal(
-      JSON.parse(oversized.body).error.code,
-      "request_too_large",
-    );
-    const invalidJson = await post("{not json");
-    assert.equal(invalidJson.status, 400);
-    assert.equal((await invalidJson.json()).error.code, "invalid_json");
-    for (const body of [
-      JSON.stringify({ identityToken: "not-a-jwt" }),
-      JSON.stringify({ identityToken: "" }),
-      JSON.stringify({ identityToken, extra: true }),
-      JSON.stringify({ identityToken: `${"a".repeat(17_000)}.b.c` }),
-      JSON.stringify([identityToken]),
-      JSON.stringify({}),
-    ]) {
-      const rejected = await post(body);
-      assert.equal(rejected.status, 400);
-      assert.equal((await rejected.json()).error.code, "invalid_request");
-    }
-    assert.equal((await take()).status, 404);
-
-    const stored = await post(JSON.stringify({ identityToken }));
-    assert.equal(stored.status, 200);
-    const storedBody = await stored.json();
-    assert.equal(storedBody.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
-    assert.equal(storedBody.status, "stored");
-    assert.equal(Number.isFinite(Date.parse(storedBody.expiresAt)), true);
-    assert.equal(JSON.stringify(storedBody).includes("aaaa"), false);
-
-    const replaced = await post(
-      JSON.stringify({ identityToken: replacementToken }),
-    );
-    assert.equal(replaced.status, 200);
-    const taken = await take();
-    assert.equal(taken.status, 200);
-    assert.deepEqual(await taken.json(), {
-      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-      identityToken: replacementToken,
-    });
-    const drained = await take();
-    assert.equal(drained.status, 404);
-    assert.equal((await drained.json()).error.code, "not_found");
-
-    assert.equal(
-      (await post(JSON.stringify({ identityToken }))).status,
-      200,
-    );
-    await new Promise((resolveWait) => setTimeout(resolveWait, 1_100));
-    assert.equal((await take()).status, 404);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

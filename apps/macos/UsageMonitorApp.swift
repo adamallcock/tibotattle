@@ -1,5 +1,4 @@
 import AppKit
-import AuthenticationServices
 import Darwin
 import Foundation
 #if canImport(Sparkle)
@@ -971,7 +970,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var dashboardURL: URL?
     private var firstRunAcknowledged = false
     private var keychainResetProcess: Process?
-    private var appleSignInController: ASAuthorizationController?
     private var launchGeneration = 0
     private var pendingDashboardOpen = false
     private var quitting = false
@@ -1025,12 +1023,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         target: self,
         action: #selector(quitApplication)
     )
-    private lazy var appleSignInButton = NSButton(
-        title: "Sign in with Apple…",
-        target: self,
-        action: #selector(signInWithApple)
-    )
-
     init(semanticOpenTarget: SemanticOpenTarget) {
         self.semanticOpenTarget = semanticOpenTarget
         super.init()
@@ -1204,9 +1196,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         quitButton.bezelStyle = .rounded
         quitButton.translatesAutoresizingMaskIntoConstraints = false
 
-        appleSignInButton.bezelStyle = .rounded
-        appleSignInButton.translatesAutoresizingMaskIntoConstraints = false
-
         content.addSubview(statusLabel)
         content.addSubview(detailLabel)
         content.addSubview(privacyLabel)
@@ -1217,7 +1206,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         content.addSubview(lifecycleHelpButton)
         content.addSubview(openCodexButton)
         content.addSubview(quitButton)
-        content.addSubview(appleSignInButton)
 
         NSLayoutConstraint.activate([
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
@@ -1270,13 +1258,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             retryButton.bottomAnchor.constraint(equalTo: quitButton.bottomAnchor),
             openButton.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
             openButton.bottomAnchor.constraint(equalTo: quitButton.bottomAnchor),
-            appleSignInButton.trailingAnchor.constraint(
-                equalTo: statusLabel.trailingAnchor
-            ),
-            appleSignInButton.bottomAnchor.constraint(
-                equalTo: openButton.topAnchor,
-                constant: -12
-            ),
         ])
 
         let newWindow = NSWindow(
@@ -1357,103 +1338,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             return
         }
         NSWorkspace.shared.open(dashboardURL)
-    }
-
-    @objc private func signInWithApple() {
-        guard !quitting, appleSignInController == nil else { return }
-        guard let dashboardURL,
-              dashboardURL.scheme == "http",
-              dashboardURL.host == loopbackHost,
-              dashboardURL.port != nil
-        else {
-            let alert = NSAlert()
-            alert.messageText = "The local dashboard is not ready"
-            alert.informativeText = """
-            Wait for Ready, then choose Sign in with Apple… again. The one-time sign-in token is handed only to the local dashboard over loopback; nothing else is contacted.
-            """
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-            return
-        }
-        let request = ASAuthorizationAppleIDProvider().createRequest()
-        // No scopes: neither email nor full name is requested, matching the
-        // service's irreversible-hash-only identity storage.
-        request.requestedScopes = []
-        let controller = ASAuthorizationController(
-            authorizationRequests: [request]
-        )
-        controller.delegate = self
-        controller.presentationContextProvider = self
-        appleSignInController = controller
-        controller.performRequests()
-    }
-
-    fileprivate func finishAppleSignIn(with identityToken: String) {
-        guard let dashboardURL,
-              dashboardURL.scheme == "http",
-              dashboardURL.host == loopbackHost,
-              let port = dashboardURL.port,
-              let endpoint = URL(
-                  string: "http://\(loopbackHost):\(port)/api/local/identity/apple"
-              ),
-              let body = try? JSONSerialization.data(
-                  withJSONObject: ["identityToken": identityToken]
-              )
-        else {
-            showAppleSignInHandoffFailure()
-            return
-        }
-        var handoff = URLRequest(url: endpoint)
-        handoff.httpMethod = "POST"
-        handoff.setValue(
-            "application/json",
-            forHTTPHeaderField: "Content-Type"
-        )
-        handoff.setValue(
-            "http://\(loopbackHost):\(port)",
-            forHTTPHeaderField: "Origin"
-        )
-        handoff.setValue("1", forHTTPHeaderField: "X-Usage-Monitor-Local")
-        handoff.httpBody = body
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 5
-        configuration.timeoutIntervalForResource = 5
-        let session = URLSession(configuration: configuration)
-        let task = session.dataTask(with: handoff) { [weak self] _, response, _ in
-            let status = (response as? HTTPURLResponse)?.statusCode
-            DispatchQueue.main.async {
-                guard let self, !self.quitting else { return }
-                if status == 200 {
-                    self.statusLabel.stringValue = "Apple sign-in ready"
-                    self.detailLabel.stringValue =
-                        "Return to the dashboard tab and choose “Use Apple sign-in from the app” within five minutes. Only the one-time sign-in token crossed loopback; no email or name was requested."
-                } else {
-                    self.showAppleSignInHandoffFailure()
-                }
-            }
-        }
-        task.resume()
-        session.finishTasksAndInvalidate()
-    }
-
-    private func showAppleSignInHandoffFailure() {
-        let alert = NSAlert()
-        alert.messageText = "Apple sign-in could not be handed over"
-        alert.informativeText = """
-        The one-time sign-in token could not be delivered to the local dashboard over loopback. Nothing was stored. Wait for Ready, then choose Sign in with Apple… again.
-        """
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
-    fileprivate func showAppleSignInEntitlementHelp() {
-        let alert = NSAlert()
-        alert.messageText = "Sign in with Apple is unavailable"
-        alert.informativeText = """
-        Sign in with Apple needs this build to be signed with the Apple sign-in entitlement. Signed release builds include it; local development builds do not. No sign-in was performed and nothing was stored.
-        """
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
     }
 
     @objc private func retryCompanion() {
@@ -2103,54 +1987,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 }
 
-extension AppDelegate: ASAuthorizationControllerDelegate,
-    ASAuthorizationControllerPresentationContextProviding {
-    func presentationAnchor(
-        for controller: ASAuthorizationController
-    ) -> ASPresentationAnchor {
-        window ?? ASPresentationAnchor()
-    }
-
-    func authorizationController(
-        controller: ASAuthorizationController,
-        didCompleteWithAuthorization authorization: ASAuthorization
-    ) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.appleSignInController = nil
-            guard let credential = authorization.credential
-                    as? ASAuthorizationAppleIDCredential,
-                  let tokenData = credential.identityToken,
-                  let identityToken = String(
-                      data: tokenData,
-                      encoding: .utf8
-                  ),
-                  !identityToken.isEmpty
-            else {
-                self.showAppleSignInEntitlementHelp()
-                return
-            }
-            self.finishAppleSignIn(with: identityToken)
-        }
-    }
-
-    func authorizationController(
-        controller: ASAuthorizationController,
-        didCompleteWithError error: Error
-    ) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.appleSignInController = nil
-            if let authorizationError = error as? ASAuthorizationError,
-               authorizationError.code == .canceled {
-                return
-            }
-            // An unsigned or ad-hoc development build has no Apple sign-in
-            // entitlement, which surfaces here as an authorization error.
-            self.showAppleSignInEntitlementHelp()
-        }
-    }
-}
+// Sign in with Apple is deliberately absent from this app. Apple provisions
+// the entitlement only for Ad hoc, App Store Connect, and Development
+// distribution, never Developer ID, and a Developer ID build carrying it is
+// terminated by the kernel at launch. Hosted Apple sign-in runs entirely in
+// the browser against the contribution service instead.
 
 private func endpointReportsReady(_ url: URL) -> Bool {
     let completed = DispatchSemaphore(value: 0)

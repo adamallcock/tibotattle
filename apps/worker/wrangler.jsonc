@@ -60,7 +60,12 @@
     "binding": "ASSETS",
     "directory": "../web/public",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    // Mirrors production so the Apple domain-association route behaves the
+    // same under `wrangler dev` as it does on the live custom domain.
+    "run_worker_first": [
+      "/api/*",
+      "/.well-known/apple-developer-domain-association.txt"
+    ]
   },
   "env": {
     "staging": {
@@ -126,7 +131,15 @@
     },
     "production": {
       "name": "app-usagemonitor",
+      // workers_dev stays enabled alongside the custom domain so the original
+      // *.workers.dev origin keeps answering while clients move over.
       "workers_dev": true,
+      // Declarative custom domains: Cloudflare provisions the DNS records and
+      // the TLS certificates for both hostnames on deploy.
+      "routes": [
+        { "pattern": "tibotattle.com", "custom_domain": true },
+        { "pattern": "www.tibotattle.com", "custom_domain": true }
+      ],
       "preview_urls": false,
       "observability": {
         "enabled": true,
@@ -139,14 +152,28 @@
         "ENVIRONMENT": "production",
         "ENROLLMENT_MODE": "open",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
-        "GOOGLE_OIDC_CLIENT_ID": "",
-        "APPLE_OIDC_CLIENT_ID": ""
+        "GOOGLE_OIDC_CLIENT_ID": "806510610397-kjq8ipejhl89tr3om4bt60l9e46o3lrd.apps.googleusercontent.com",
+        // Web Sign in with Apple. APPLE_SERVICES_ID is the Apple Services ID:
+        // it is the OAuth client_id, the subject of the ES256 client secret,
+        // and the audience the returned id_token is verified against.
+        "APPLE_SERVICES_ID": "com.usagemonitor.web",
+        "APPLE_KEY_ID": "L58X7J2J7A",
+        "APPLE_TEAM_ID": "43RTH622SB",
+        // Apple verifies domain ownership by fetching the exact contents of
+        // this value from /.well-known/apple-developer-domain-association.txt.
+        // Empty until the owner supplies Apple's file; the route 404s while it
+        // is unset rather than serving a placeholder.
+        "APPLE_DOMAIN_ASSOCIATION": ""
       },
       "secrets": {
         "required": [
           "ENVELOPE_PRIVATE_JWK",
           "ENVELOPE_PUBLIC_JWK",
-          "IDENTITY_LINK_SECRET"
+          "IDENTITY_LINK_SECRET",
+          "APPLE_PRIVATE_KEY",
+          // Google issues Desktop/installed OAuth clients a client secret and
+          // requires it on the token exchange even with PKCE.
+          "GOOGLE_OIDC_CLIENT_SECRET"
         ]
       },
       "ratelimits": [
@@ -185,7 +212,13 @@
         "binding": "ASSETS",
         "directory": "../web/public",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/api/*"]
+        // The Apple domain-association file is served by the Worker, not by
+        // the asset router: single-page-application handling would otherwise
+        // answer this path with index.html instead of Apple's exact text.
+        "run_worker_first": [
+          "/api/*",
+          "/.well-known/apple-developer-domain-association.txt"
+        ]
       }
     }
   }

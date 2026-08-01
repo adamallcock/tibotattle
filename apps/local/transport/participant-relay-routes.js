@@ -8,6 +8,11 @@ function defineParticipantRelayRoute(pathname, methods) {
 export const PARTICIPANT_RELAY_ROUTE_POLICY = Object.freeze([
   defineParticipantRelayRoute("/api/v1/enroll", ["POST"]),
   defineParticipantRelayRoute("/api/v1/identity/google/exchange", ["POST"]),
+  // Web Sign in with Apple. Only the start and result calls cross this relay:
+  // Apple's form_post callback is delivered straight to the contribution
+  // service over HTTPS and never reaches the loopback companion.
+  defineParticipantRelayRoute("/api/v1/identity/apple/start", ["POST"]),
+  defineParticipantRelayRoute("/api/v1/identity/apple/result", ["POST"]),
   defineParticipantRelayRoute("/api/v1/recover", ["POST"]),
   defineParticipantRelayRoute("/api/v1/session", ["GET"]),
   defineParticipantRelayRoute("/api/v1/logout", ["POST"]),

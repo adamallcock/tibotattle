@@ -33,6 +33,7 @@ import {
 import {
   decryptSyntheticEnvelope,
   publicEnvelopeKey,
+  randomSecret,
   sha256Hex,
 } from "./crypto";
 import {
@@ -68,6 +69,12 @@ import {
   revokeSession,
   securityReset,
 } from "./repository";
+import {
+  APPLE_SIGNIN_STATE_PATTERN,
+  appleAuthorizeUrl,
+  appleSignInConfiguration,
+  exchangeAppleAuthorizationCode,
+} from "./identity-apple";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
 import {
   clearPendingQuarantineObject,
@@ -194,6 +201,63 @@ async function readBoundedJson(request: Request): Promise<{
   try {
     raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined);
     return { bytes: combined, raw, value: JSON.parse(raw) as unknown };
+  } catch {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+/**
+ * Bounded reader for the one form-encoded request this service accepts:
+ * Apple's response_mode=form_post callback. It is deliberately separate from
+ * readBoundedJson, keeps its own much smaller cap, and never parses anything
+ * beyond application/x-www-form-urlencoded.
+ */
+async function readBoundedForm(
+  request: Request,
+  maximumBytes: number,
+): Promise<URLSearchParams> {
+  const contentType = request.headers.get("content-type")
+    ?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/x-www-form-urlencoded") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > maximumBytes) throw new ApiError(413, "BODY_TOO_LARGE");
+  }
+  if (!request.body) throw new ApiError(400, "BODY_INVALID");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      total += result.value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel();
+        throw new ApiError(413, "BODY_TOO_LARGE");
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new URLSearchParams(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
+        .decode(combined),
+    );
   } catch {
     throw new ApiError(400, "BODY_INVALID");
   }
@@ -353,6 +417,13 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
  * to Google's token endpoint. Only the id_token is returned; access and
  * refresh tokens from the response are discarded in-request and no identity
  * state is persisted here — enrollment performs verification and linking.
+ *
+ * The OAuth client is a Desktop/installed client, so Google's token endpoint
+ * requires client_secret in addition to the PKCE verifier. That is the whole
+ * reason the exchange is server-side: the secret stays in the Worker, is sent
+ * only to Google, and is never logged, returned, or named in an error. A
+ * deployment missing it fails closed with the same configuration error as a
+ * missing client id, which discloses nothing about which value is absent.
  */
 async function handleIdentityGoogleExchange(
   request: Request,
@@ -363,7 +434,9 @@ async function handleIdentityGoogleExchange(
   assertAdmissionBindings(env);
   await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
   const clientId = Reflect.get(env, "GOOGLE_OIDC_CLIENT_ID");
-  if (typeof clientId !== "string" || clientId.length === 0) {
+  const clientSecret = Reflect.get(env, "GOOGLE_OIDC_CLIENT_SECRET");
+  if (typeof clientId !== "string" || clientId.length === 0
+      || typeof clientSecret !== "string" || clientSecret.length === 0) {
     throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
   }
   const body = await readBoundedJson(request);
@@ -390,6 +463,7 @@ async function handleIdentityGoogleExchange(
     body: new URLSearchParams({
       grant_type: "authorization_code",
       client_id: clientId,
+      client_secret: clientSecret,
       code,
       code_verifier: codeVerifier,
       redirect_uri: redirectUri as string,
@@ -410,6 +484,247 @@ async function handleIdentityGoogleExchange(
     schemaVersion: "identity-google-exchange-v0.1",
     provider: "google",
     idToken,
+  });
+}
+
+const APPLE_SIGNIN_HANDOFF_TTL_MILLISECONDS = 5 * 60 * 1000;
+const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
+
+/**
+ * Apple rejects loopback redirect URIs, so the redirect target is this
+ * Worker's own callback route, derived from the request origin rather than
+ * from anything a caller supplies. It must be HTTPS: Apple will not register
+ * or honor anything else, and the same absolute string has to be replayed on
+ * the token exchange.
+ */
+function appleCallbackUrl(request: Request): string {
+  const url = new URL(request.url);
+  if (url.protocol !== "https:") {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  return `${url.origin}/api/v1/identity/apple/callback`;
+}
+
+async function deleteExpiredAppleHandoffs(
+  db: D1Database,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    "DELETE FROM apple_signin_handoffs WHERE expires_at <= ?",
+  ).bind(nowIso).run();
+}
+
+function appleCallbackPage(message: string): Response {
+  // Entirely inline and asset-free: no script, no style, no image, no link,
+  // and no value from the request is interpolated. The authorization code,
+  // the id_token, and Apple's optional user payload never reach this markup.
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TiboTattle sign-in</title>
+</head>
+<body>
+<h1>TiboTattle sign-in</h1>
+<p>${message}</p>
+</body>
+</html>
+`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy":
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "permissions-policy": "camera=(), microphone=(), geolocation=()",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+/**
+ * Starts a hosted Apple sign-in. The state row is the whole handoff: it is
+ * created empty here, filled by Apple's callback, and read back exactly once
+ * by the page that started the flow. No participant, session, or provider
+ * identifier is involved at this point.
+ */
+async function handleIdentityAppleStart(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
+  const configuration = appleSignInConfiguration(env);
+  const redirectUri = appleCallbackUrl(request);
+  const body = await readBoundedJson(request);
+  const value = body.value;
+  if (typeof value !== "object"
+      || value === null
+      || Array.isArray(value)
+      || Object.keys(value).length !== 0) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  // 48 random bytes render as 64 base64url characters.
+  const state = randomSecret(48);
+  await env.USAGE_MONITOR_DB.prepare(
+    `INSERT INTO apple_signin_handoffs (state, id_token, created_at, expires_at, consumed_at)
+       VALUES (?, NULL, ?, ?, NULL)`,
+  ).bind(
+    state,
+    nowIso,
+    new Date(nowMs + APPLE_SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+  ).run();
+  return jsonResponse({
+    schemaVersion: "identity-apple-start-v0.1",
+    state,
+    authorizeUrl: appleAuthorizeUrl(configuration, redirectUri, state),
+  });
+}
+
+/**
+ * Apple's form_post callback. This request is cross-site by construction — it
+ * is a top-level form submission from appleid.apple.com — so same-origin
+ * enforcement cannot apply. The unguessable state row is what authorizes it:
+ * a request whose state is unknown, already filled, already consumed, or
+ * expired is answered with a fixed page and nothing else happens, so an
+ * unsolicited callback can neither mint a token exchange nor overwrite a
+ * pending sign-in.
+ */
+async function handleIdentityAppleCallback(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const redirectUri = appleCallbackUrl(request);
+  const form = await readBoundedForm(request, MAX_APPLE_CALLBACK_BYTES);
+  const state = form.get("state");
+  const code = form.get("code");
+  const failure = appleCallbackPage(
+    "Sign-in was not completed. Return to the TiboTattle tab and start the sign-in again.",
+  );
+  if (typeof state !== "string"
+      || !APPLE_SIGNIN_STATE_PATTERN.test(state)
+      || form.get("error") !== null
+      || typeof code !== "string"
+      || code.length === 0) {
+    return failure;
+  }
+  const nowIso = new Date().toISOString();
+  const pending = await env.USAGE_MONITOR_DB.prepare(
+    `SELECT state FROM apple_signin_handoffs
+      WHERE state = ?
+        AND id_token IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).first<{ state: string }>();
+  if (!pending) return failure;
+  let idToken: string;
+  try {
+    idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
+  } catch {
+    return failure;
+  }
+  // Re-checked against the time the exchange finished, not the time it
+  // started, so a handoff that expired mid-exchange is never filled.
+  const stored = await env.USAGE_MONITOR_DB.prepare(
+    `UPDATE apple_signin_handoffs
+        SET id_token = ?
+      WHERE state = ?
+        AND id_token IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?`,
+  ).bind(idToken, state, new Date().toISOString()).run();
+  if (stored.meta.changes !== 1) return failure;
+  return appleCallbackPage("Signed in — return to the TiboTattle tab.");
+}
+
+/**
+ * Reads the completed sign-in back exactly once. The conditional UPDATE both
+ * claims and marks the row, so two concurrent reads cannot both win, and a
+ * replayed read after success is indistinguishable from an expired one.
+ *
+ * This route is deliberately not attempt-limited: the page polls it on a
+ * fixed short schedule while the user finishes at Apple, and it discloses
+ * nothing to anyone who does not already hold the unguessable state.
+ */
+async function handleIdentityAppleResult(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+  const body = await readBoundedJson(request);
+  const value = body.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const state = Reflect.get(value, "state");
+  if (Object.keys(value).length !== 1
+      || typeof state !== "string"
+      || !APPLE_SIGNIN_STATE_PATTERN.test(state)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const nowIso = new Date().toISOString();
+  await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  const claimed = await env.USAGE_MONITOR_DB.prepare(
+    `UPDATE apple_signin_handoffs
+        SET consumed_at = ?
+      WHERE state = ?
+        AND id_token IS NOT NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?
+      RETURNING id_token AS idToken`,
+  ).bind(nowIso, state, nowIso).first<{ idToken: string }>();
+  if (claimed) {
+    return jsonResponse({
+      schemaVersion: "identity-apple-result-v0.1",
+      idToken: claimed.idToken,
+    });
+  }
+  const pending = await env.USAGE_MONITOR_DB.prepare(
+    `SELECT state FROM apple_signin_handoffs
+      WHERE state = ?
+        AND id_token IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).first<{ state: string }>();
+  if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
+  throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+}
+
+/**
+ * Serves Apple's domain-association file. Apple fetches this exact path over
+ * HTTPS to prove the domain belongs to the team behind the Services ID, and
+ * it compares the body byte for byte, so the configured value is returned
+ * verbatim with no wrapping, trimming, or caching.
+ *
+ * The contents are configuration, not a secret, but they are also not
+ * something this service may invent: until the owner supplies Apple's file the
+ * variable is empty and the path answers 404 exactly as an unconfigured route
+ * would, rather than publishing a placeholder Apple would reject.
+ */
+function handleAppleDomainAssociation(request: Request, env: Env): Response {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const association = Reflect.get(env, "APPLE_DOMAIN_ASSOCIATION");
+  if (typeof association !== "string" || association.length === 0) {
+    throw new ApiError(404, "NOT_FOUND");
+  }
+  return new Response(association, {
+    status: 200,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "text/plain; charset=utf-8",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
   });
 }
 
@@ -1432,10 +1747,20 @@ async function routeApi(
   routeId: ApiWorkerRouteId,
 ): Promise<Response> {
   switch (routeId) {
+    // Not an /api route, but it is dispatched here so every Worker-served
+    // path stays in one exhaustively checked switch.
+    case "apple_domain_association":
+      return handleAppleDomainAssociation(request, env);
     case "enroll":
       return handleEnroll(request, env);
     case "identity_google_exchange":
       return handleIdentityGoogleExchange(request, env);
+    case "identity_apple_start":
+      return handleIdentityAppleStart(request, env);
+    case "identity_apple_callback":
+      return handleIdentityAppleCallback(request, env);
+    case "identity_apple_result":
+      return handleIdentityAppleResult(request, env);
     case "recover":
       return handleRecover(request, env);
     case "session":

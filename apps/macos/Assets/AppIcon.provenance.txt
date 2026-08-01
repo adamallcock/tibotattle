@@ -1,13 +1,18 @@
 TiboTattle application icon provenance
 
-Source: Original artwork drawn programmatically with Apple CoreGraphics in
-this repository's tooling on 2026-08-01. The mark (three ascending rounded
-bars with a baseline and an abstract speech bubble) was designed for this
-product and incorporates no external artwork, fonts, photographs, or any
-person's likeness.
+Source: Original artwork commissioned for this project on 2026-08-01. The mark
+(a cream bird raising a wing to its beak as if whispering, on a deep green
+rounded-square plate with an amber beak) was produced with an image-generation
+model from the repository's own written design brief at
+docs/design/2026-08-01-tibotattle-icon-brief.md, then prepared for macOS in
+this repository: the generated background was replaced with real transparency,
+the plate was masked to the standard squircle, a drop shadow was applied, and
+the artwork was rendered to every required icon size. It incorporates no
+third-party artwork, no typeface, no photograph, and no person's likeness.
 
-Rights: Created as an original work for this repository; all rights held by
-Adam Allcock, who reviewed the rendered artwork and approved it for
-distribution with the v0.1.0 release preparation on 2026-08-01.
+Rights: Created as an original work for this repository. All rights held by
+Adam Allcock, who reviewed the rendered artwork at full size and at 16- and
+32-pixel sizes and approved it for distribution with the v0.1.0 release on
+2026-08-01.
 
 License: MIT, under this repository's LICENSE file.

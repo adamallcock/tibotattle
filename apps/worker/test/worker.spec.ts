@@ -1374,7 +1374,7 @@ describe("synthetic usage monitor service", () => {
   function identityBindings(overrides: Partial<Env> = {}): Env {
     return testBindings({
       GOOGLE_OIDC_CLIENT_ID: GOOGLE_CLIENT,
-      APPLE_OIDC_CLIENT_ID: APPLE_CLIENT,
+      APPLE_SERVICES_ID: APPLE_CLIENT,
       IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
       IDENTITY_TEST_JWKS_JSON: identityJwksJson,
       ...overrides,

@@ -54,20 +54,13 @@ const FIXED_EPOCH_SECONDS = 946_684_800;
 const BUILD_MANIFEST_PATH =
   "Contents/Resources/build-manifest.json";
 const CODE_RESOURCES_PATH = "Contents/_CodeSignature/CodeResources";
+const APPLE_STAPLED_TICKET_PATH = "Contents/CodeResources";
+const EMBEDDED_PROFILE_PATH = "Contents/embedded.provisionprofile";
 const NODE_ENTITLEMENTS = join(
   REPOSITORY_ROOT,
   "apps",
   "macos",
   "NodeRuntime.entitlements",
-);
-// Applied only on this Developer ID release-signing path: development ad-hoc
-// builds carry no Apple sign-in entitlement and the launcher degrades to a
-// fixed explanatory dialog instead of requiring it.
-const APP_ENTITLEMENTS = join(
-  REPOSITORY_ROOT,
-  "apps",
-  "macos",
-  "UsageMonitorApp.entitlements",
 );
 const APP_EXECUTABLE =
   `Contents/MacOS/${PRODUCT_BRAND.executableName}`;
@@ -459,17 +452,25 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
   const allowedFiles = new Set([
     ...expected.keys(),
     BUILD_MANIFEST_PATH,
-    CODE_RESOURCES_PATH,
   ]);
-  if (observed.files.length !== allowedFiles.size
-      || observed.files.some((path) => !allowedFiles.has(path))) {
+  // `xcrun stapler staple` writes Apple's notarization ticket into the bundle
+  // after signing, so it is absent before notarization and present after.
+  // Accept it whenever it appears without ever requiring it: its authenticity
+  // is proven separately by `stapler validate`, which the release and install
+  // validations both run.
+  const inventoriedFiles = observed.files
+    .filter((path) => path !== APPLE_STAPLED_TICKET_PATH
+      && path !== EMBEDDED_PROFILE_PATH
+      && !path.split("/").includes("_CodeSignature"));
+  if (inventoriedFiles.length !== allowedFiles.size
+      || inventoriedFiles.some((path) => !allowedFiles.has(path))) {
     fail(
       "Application payload does not match its complete file inventory",
       "MACOS_PAYLOAD_INTEGRITY_FAILED",
     );
   }
   for (const required of allowedFiles) {
-    if (!observed.files.includes(required)) {
+    if (!inventoriedFiles.includes(required)) {
       fail(
         "Application payload is missing an inventoried file",
         "MACOS_PAYLOAD_INTEGRITY_FAILED",
@@ -477,8 +478,11 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
     }
   }
   for (const directory of observed.directories) {
+    // Signature directories hold no inventoried payload by design.
+    if (directory.split("/").includes("_CodeSignature")) continue;
     if (![...allowedFiles].some((path) =>
-      path.startsWith(`${directory}/`))) {
+      path.startsWith(`${directory}/`))
+        && !observed.files.some((path) => path.startsWith(`${directory}/`))) {
       fail(
         "Application payload contains an unexpected empty directory",
         "MACOS_PAYLOAD_INTEGRITY_FAILED",
@@ -833,6 +837,16 @@ export function readMacOSReleaseBuildConfiguration(
       "MACOS_BUNDLE_VERSION_REQUIRED",
     );
   }
+  const provisioningProfile = environment.USAGE_MONITOR_PROVISIONING_PROFILE;
+  if (provisioningProfile !== undefined
+      && (typeof provisioningProfile !== "string"
+        || provisioningProfile.length === 0
+        || provisioningProfile.includes("\0"))) {
+    fail(
+      "USAGE_MONITOR_PROVISIONING_PROFILE must name a readable provisioning profile",
+      "MACOS_PROVISIONING_PROFILE_INVALID",
+    );
+  }
   if (typeof sparkleFramework !== "string"
       || sparkleFramework.length === 0
       || sparkleFramework.includes("\0")
@@ -848,6 +862,9 @@ export function readMacOSReleaseBuildConfiguration(
   return Object.freeze({
     bundleVersion,
     productionOrigin: normalizedOrigin,
+    provisioningProfile: provisioningProfile
+      ? resolve(provisioningProfile)
+      : null,
     sparkleAppcastURL,
     sparkleFramework: resolve(sparkleFramework),
     sparklePublicEdKey,
@@ -1141,10 +1158,14 @@ export async function developerIDSignMacOSApp(appPath, {
   sign(SPARKLE_FRAMEWORK_PREFIX);
   sign(KEYTAR_EXECUTABLE);
   sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS });
-  sign(APP_EXECUTABLE, { entitlements: APP_ENTITLEMENTS });
-  // The outer bundle signature re-seals the launcher executable, so the
-  // Apple sign-in entitlement must ride on this final signature as well.
-  sign("", { entitlements: APP_ENTITLEMENTS });
+  // The app bundle carries no entitlements of its own. Sign in with Apple is
+  // a restricted entitlement that a Developer ID provisioning profile does
+  // not grant (verified 2026-08-01 against two freshly generated profiles for
+  // this App ID); a build signed with it is terminated by the kernel at
+  // launch. Apple sign-in is a hosted browser flow against the contribution
+  // service instead, so nothing here needs it.
+  sign(APP_EXECUTABLE);
+  sign("");
   commandRunner("/usr/bin/codesign", [
     "--verify",
     "--deep",
@@ -1669,6 +1690,16 @@ export async function releaseMacOSApp({
       fail(
         "Reviewed candidate is not reproducible from the checked-out source and approved release inputs",
         "MACOS_RELEASE_CANDIDATE_NOT_REPRODUCIBLE",
+      );
+    }
+    // Optional: a Developer ID provisioning profile, when one is supplied,
+    // is an Apple-issued public artifact embedded before signing so the final
+    // signature seals it. This bundle requests no restricted entitlement, so
+    // the profile is not required for the app to launch.
+    if (buildConfiguration.provisioningProfile) {
+      await copyFile(
+        buildConfiguration.provisioningProfile,
+        join(stagedApp, ...EMBEDDED_PROFILE_PATH.split("/")),
       );
     }
     await developerIDSignMacOSApp(stagedApp, {

@@ -6,10 +6,17 @@ import {
 } from "../src/route-registry";
 
 const EXACT_ROUTES = [
+  [
+    "/.well-known/apple-developer-domain-association.txt",
+    "apple_domain_association",
+  ],
   ["/api/health", "health"],
   ["/api/ready", "ready"],
   ["/api/v1/enroll", "enroll"],
   ["/api/v1/identity/google/exchange", "identity_google_exchange"],
+  ["/api/v1/identity/apple/start", "identity_apple_start"],
+  ["/api/v1/identity/apple/callback", "identity_apple_callback"],
+  ["/api/v1/identity/apple/result", "identity_apple_result"],
   ["/api/v1/recover", "recover"],
   ["/api/v1/session", "session"],
   ["/api/v1/logout", "logout"],
@@ -34,7 +41,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(24);
+    expect(EXACT_ROUTES).toHaveLength(28);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );
@@ -73,7 +80,15 @@ describe("Worker route registry", () => {
       });
     }
 
-    for (const pathname of ["/", "/index.html", "/api", "/apiary"]) {
+    for (const pathname of [
+      "/",
+      "/index.html",
+      "/api",
+      "/apiary",
+      // Only the one exact well-known path is a Worker route.
+      "/.well-known/apple-app-site-association",
+      "/.well-known/apple-developer-domain-association.txt/",
+    ]) {
       expect(matchWorkerRoute(pathname), pathname).toEqual({
         kind: "asset",
         id: "asset",

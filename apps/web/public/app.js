@@ -60,6 +60,9 @@ let communityConnectBusy = false;
 let hostedIdentity = null;
 let hostedIdentityBusy = false;
 let pendingGoogleSignIn = null;
+// Only the contribution service knows whether hosted Apple sign-in is
+// configured, so this stays false until a start attempt says otherwise.
+let appleSignInUnavailable = false;
 let activeContributionLookbackHours = 24;
 let localActionBusy = false;
 let localRefreshInProgress = false;
@@ -3042,7 +3045,7 @@ function scheduleReturningUserRefresh() {
 
 const HOSTED_IDENTITY_ERROR_COPY = {
   IDENTITY_REQUIRED:
-    "Hosted participation requires sign-in. Sign in with Google above or use Apple sign-in from the app, then try again. Nothing was uploaded.",
+    "Hosted participation requires sign-in. Sign in with Google or Apple above, then try again. Nothing was uploaded.",
   IDENTITY_TOKEN_INVALID:
     "The sign-in could not be verified by the contribution service. Sign in again, then retry. Nothing was uploaded.",
   IDENTITY_CONFIGURATION_INVALID:
@@ -3058,8 +3061,9 @@ function hostedIdentityErrorCopy(error) {
 // Production builds carry a Google client id in the release-slot meta tag and
 // require sign-in before hosted actions, mirroring the server's mandatory
 // hosted identity. Development builds leave the slot empty: the Google button
-// stays disabled with fixed copy, the Apple app handoff remains usable, and
-// the server stays the authority on whether identity is required.
+// stays disabled with fixed copy, hosted Apple sign-in remains available
+// whenever the service is configured for it, and the server stays the
+// authority on whether identity is required.
 function hostedSignInRequired() {
   return configuredGoogleClientId() !== null && hostedIdentity === null;
 }
@@ -3069,12 +3073,16 @@ function renderHostedIdentity() {
   const appleButton = $("#identity-apple-signin");
   const chip = $("#identity-signin-state");
   const googleUnavailable = $("#identity-google-unavailable");
+  const appleUnavailable = $("#identity-apple-unavailable");
   const googleConfigured = configuredGoogleClientId() !== null;
   googleButton.disabled = hostedIdentityBusy
     || hostedIdentity !== null
     || !googleConfigured;
   googleUnavailable.hidden = googleConfigured;
-  appleButton.disabled = hostedIdentityBusy || hostedIdentity !== null;
+  appleUnavailable.hidden = !appleSignInUnavailable;
+  appleButton.disabled = hostedIdentityBusy
+    || hostedIdentity !== null
+    || appleSignInUnavailable;
   chip.textContent = hostedIdentity === null
     ? hostedIdentityBusy ? "Signing in…" : "Not signed in"
     : hostedIdentity.provider === "google"
@@ -3101,15 +3109,12 @@ async function beginGoogleSignIn() {
       redirectUri: `${window.location.origin}/oauth/google/callback`
     });
     pendingGoogleSignIn = request;
-    const opened = window.open(request.url, "_blank", "noopener");
-    if (!opened) {
-      pendingGoogleSignIn = null;
-      throw new Error(
-        "The Google sign-in tab was blocked. Allow pop-ups for this local dashboard, then try again."
-      );
-    }
+    // `window.open` always resolves to null when "noopener" is requested, so
+    // its result cannot report whether the tab opened. Keep the isolation and
+    // tell the user what to do if no tab appears instead.
+    window.open(request.url, "_blank", "noopener,noreferrer");
     status.textContent =
-      "Finish signing in with Google in the new tab, then return here. Only the openid scope is requested; no email or name is asked for.";
+      "Finish signing in with Google in the new tab, then return here. If no tab opened, allow pop-ups for this local dashboard and try again. Only the openid scope is requested; no email or name is asked for.";
   } catch (error) {
     status.className = "participant-action-status error";
     status.textContent = error instanceof Error
@@ -3157,6 +3162,13 @@ async function completeGoogleSignIn(serialized) {
 const APPLE_SIGNIN_POLL_ATTEMPTS = 30;
 const APPLE_SIGNIN_POLL_INTERVAL_MS = 2_000;
 
+// Hosted Sign in with Apple. The native path is impossible: Apple provisions
+// the Sign in with Apple entitlement only for Ad hoc, App Store Connect, and
+// Development distribution, so a Developer ID build carrying it is terminated
+// at launch. Apple also rejects loopback redirects and answers with
+// response_mode=form_post, so the contribution service owns the redirect and
+// the client secret; this page opens the authorize URL and then polls for the
+// one-time result keyed by the unguessable state it was given.
 async function beginAppleSignIn() {
   if (hostedIdentityBusy || hostedIdentity !== null) return;
   const status = $("#identity-signin-status");
@@ -3164,32 +3176,46 @@ async function beginAppleSignIn() {
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent =
-    "Open the TiboTattle app, choose Sign in with Apple…, and keep this tab open. Checking for the app's handoff…";
+  status.textContent = "Starting Apple sign-in…";
   try {
+    const request = await communityClient.identityAppleStart();
+    // Opened with noopener so the Apple tab gets no handle on this one. That
+    // makes the return value null by specification, so it is not a usable
+    // signal for a blocked pop-up; the waiting copy says so instead, and an
+    // unopened tab simply runs out the bounded poll below.
+    window.open(request.authorizeUrl, "_blank", "noopener,noreferrer");
+    status.textContent =
+      "Finish signing in with Apple in the new tab, then return here. No name or email is requested. If no tab opened, allow pop-ups for this dashboard and try again.";
     for (let attempt = 0; attempt < APPLE_SIGNIN_POLL_ATTEMPTS; attempt += 1) {
-      const identityToken = await localClient.takeAppleIdentityToken();
-      if (identityToken !== null) {
-        hostedIdentity = Object.freeze({
-          provider: "apple",
-          idToken: identityToken
-        });
-        status.textContent =
-          "Signed in with Apple through the app. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
-        return;
-      }
       await new Promise((resolveWait) => {
         window.setTimeout(resolveWait, APPLE_SIGNIN_POLL_INTERVAL_MS);
       });
+      let identity = null;
+      try {
+        identity = await communityClient.identityAppleResult(request.state);
+      } catch (error) {
+        if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
+      }
+      if (identity !== null) {
+        hostedIdentity = identity;
+        status.textContent =
+          "Signed in with Apple. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
+        return;
+      }
     }
     status.className = "participant-action-status error";
     status.textContent =
-      "No Apple sign-in arrived from the TiboTattle app. Choose Sign in with Apple… in the app first, then press this button again within five minutes.";
+      "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in.";
   } catch (error) {
+    const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
+    if (unconfigured) appleSignInUnavailable = true;
     status.className = "participant-action-status error";
-    status.textContent = error instanceof Error
-      ? error.message
-      : "Apple sign-in could not be read from the local app.";
+    status.textContent = unconfigured
+      ? "Hosted Apple sign-in is not configured for this build."
+      : hostedIdentityErrorCopy(error)
+        ?? (error instanceof Error
+          ? error.message
+          : "Apple sign-in could not be completed. Sign in again.");
   } finally {
     hostedIdentityBusy = false;
     renderHostedIdentity();

@@ -112,11 +112,6 @@ const SHA256 = /^[a-f0-9]{64}$/u;
 const REVIEW_AUTHORIZATION_LIFETIME_MS = 10 * 60 * 1000;
 const GOOGLE_OAUTH_CALLBACK_PATH = "/oauth/google/callback";
 const GOOGLE_OAUTH_RESULT_STORAGE_KEY = "tibotattle-google-oauth-result";
-export const APPLE_IDENTITY_HANDOFF_LIFETIME_MS = 5 * 60 * 1000;
-const MAX_APPLE_IDENTITY_REQUEST_BYTES = 17_408;
-const MAX_APPLE_IDENTITY_TOKEN_LENGTH = 16_384;
-const APPLE_IDENTITY_TOKEN =
-  /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
 
 function developmentIdentityConfigurationError() {
   const error = new TypeError(
@@ -186,7 +181,6 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 
 const API_ROUTES = new Set([
   "/api/local/health",
-  "/api/local/identity/apple",
   "/api/local/onboarding",
   "/api/local/overview",
   "/api/local/gradient",
@@ -658,54 +652,6 @@ async function authorizeContributionDevicePairing(request, response) {
     return null;
   }
   return value.pairingCode;
-}
-
-async function authorizeAppleIdentityHandoff(request, response) {
-  if (!sameOrigin(request)
-      || request.headers["x-usage-monitor-local"] !== "1") {
-    sendError(response, 403, "identity_handoff_not_authorized");
-    return null;
-  }
-  const contentType = request.headers["content-type"];
-  if (typeof contentType !== "string"
-      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
-    sendError(response, 415, "unsupported_media_type");
-    return null;
-  }
-  const declaredLength = Number(request.headers["content-length"]);
-  if (Number.isFinite(declaredLength)
-      && declaredLength > MAX_APPLE_IDENTITY_REQUEST_BYTES) {
-    sendError(response, 413, "request_too_large");
-    return null;
-  }
-  let bytes = 0;
-  const chunks = [];
-  for await (const chunk of request) {
-    bytes += chunk.length;
-    if (bytes > MAX_APPLE_IDENTITY_REQUEST_BYTES) {
-      sendError(response, 413, "request_too_large");
-      return null;
-    }
-    chunks.push(chunk);
-  }
-  let value;
-  try {
-    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    sendError(response, 400, "invalid_json");
-    return null;
-  }
-  if (!value
-      || typeof value !== "object"
-      || Array.isArray(value)
-      || Object.keys(value).sort().join("\0") !== "identityToken"
-      || typeof value.identityToken !== "string"
-      || value.identityToken.length > MAX_APPLE_IDENTITY_TOKEN_LENGTH
-      || !APPLE_IDENTITY_TOKEN.test(value.identityToken)) {
-    sendError(response, 400, "invalid_request");
-    return null;
-  }
-  return value.identityToken;
 }
 
 async function readContributionPreparationRequest(request) {
@@ -1578,7 +1524,6 @@ function createPreparedLocalCompanionServer({
   automaticContributionRetirementRunner = null,
   contributionSyncPauseSetter = null,
   contributionSyncTimeoutMs = 60_000,
-  appleIdentityHandoffLifetimeMs = APPLE_IDENTITY_HANDOFF_LIFETIME_MS,
   automaticContributionController = null,
   automaticContributionOptions = {},
   onError = () => {},
@@ -1668,11 +1613,6 @@ function createPreparedLocalCompanionServer({
       || contributionSyncTimeoutMs < 1_000
       || contributionSyncTimeoutMs > 5 * 60_000) {
     throw new TypeError("contribution sync controls are invalid");
-  }
-  if (!Number.isSafeInteger(appleIdentityHandoffLifetimeMs)
-      || appleIdentityHandoffLifetimeMs < 1
-      || appleIdentityHandoffLifetimeMs > 60 * 60_000) {
-    throw new TypeError("appleIdentityHandoffLifetimeMs is invalid");
   }
   const nextContribution = contributionSyncNextProvider
     ?? (preparedContributionDirectory === null
@@ -1866,10 +1806,6 @@ function createPreparedLocalCompanionServer({
     fetchImpl: centralFetch,
   });
   let reviewedContributionAuthorization = null;
-  // Latest Apple identity token handed over by the native app, held only in
-  // process memory for one bounded window and consumed by a single dashboard
-  // read. It is never written to disk or echoed back by the storing request.
-  let appleIdentityHandoff = null;
 
   const server = createServer(async (request, response) => {
     try {
@@ -2014,46 +1950,6 @@ function createPreparedLocalCompanionServer({
           // readiness rather than disclosing filesystem diagnostics.
         }
         send(response, 200, projectLocalOnboarding(onboarding));
-        return;
-      }
-      if (path === "/api/local/identity/apple") {
-        if (request.method === "POST") {
-          const identityToken = await authorizeAppleIdentityHandoff(
-            request,
-            response,
-          );
-          if (identityToken === null) return;
-          appleIdentityHandoff = {
-            identityToken,
-            expiresAt: Date.now() + appleIdentityHandoffLifetimeMs,
-          };
-          send(response, 200, {
-            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-            status: "stored",
-            expiresAt: new Date(appleIdentityHandoff.expiresAt).toISOString(),
-          });
-          return;
-        }
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        // Reading is a consuming mutation: the fixed local header keeps a
-        // cross-site page from draining the one-use handoff with a bare GET.
-        if (request.headers["x-usage-monitor-local"] !== "1") {
-          sendError(response, 403, "identity_handoff_not_authorized");
-          return;
-        }
-        const handoff = appleIdentityHandoff;
-        appleIdentityHandoff = null;
-        if (handoff === null || handoff.expiresAt < Date.now()) {
-          sendError(response, 404, "not_found");
-          return;
-        }
-        send(response, 200, {
-          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-          identityToken: handoff.identityToken,
-        });
         return;
       }
       if (path === "/api/local/overview") {

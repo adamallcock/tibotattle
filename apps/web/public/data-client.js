@@ -105,17 +105,26 @@ const PARTICIPANT_CONSENT_VERSIONS = new Set([
 ]);
 export const IDENTITY_GOOGLE_EXCHANGE_SCHEMA_VERSION =
   "identity-google-exchange-v0.1";
+export const IDENTITY_APPLE_START_SCHEMA_VERSION =
+  "identity-apple-start-v0.1";
+export const IDENTITY_APPLE_RESULT_SCHEMA_VERSION =
+  "identity-apple-result-v0.1";
 const HOSTED_IDENTITY_PROVIDERS = new Set(["google", "apple"]);
 const HOSTED_IDENTITY_ERROR_CODES = new Set([
   "IDENTITY_REQUIRED",
   "IDENTITY_TOKEN_INVALID",
   "IDENTITY_CONFIGURATION_INVALID",
-  "IDENTITY_PROVIDER_UNAVAILABLE"
+  "IDENTITY_PROVIDER_UNAVAILABLE",
+  "IDENTITY_RESULT_PENDING"
 ]);
 const MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH = 16_384;
 const GOOGLE_LOOPBACK_REDIRECT_URI =
   /^http:\/\/127\.0\.0\.1:\d{1,5}\/oauth\/google\/callback$/u;
 const GOOGLE_PKCE_CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/u;
+const APPLE_SIGNIN_STATE = /^[A-Za-z0-9_-]{43,128}$/u;
+// The only URL this page will ever hand to window.open for Apple sign-in.
+const APPLE_AUTHORIZE_URL_PREFIX =
+  "https://appleid.apple.com/auth/authorize?";
 const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
@@ -2164,32 +2173,6 @@ export class LocalCompanionClient {
     });
   }
 
-  async takeAppleIdentityToken() {
-    const fetchImpl = this.fetchImpl;
-    // Single-use consuming read: the companion clears the handed-over token
-    // on success, and 404 simply means the native app has not posted one yet.
-    const response = await fetchImpl(`${LOCAL_ROOT}/identity/apple`, {
-      headers: {
-        Accept: "application/json",
-        "X-Usage-Monitor-Local": "1"
-      }
-    });
-    if (response.status === 404) return null;
-    if (!response.ok) {
-      const error = new Error(`Request failed (${response.status}).`);
-      error.status = response.status;
-      throw error;
-    }
-    const payload = await response.json().catch(() => null);
-    const identityToken = payload?.identityToken;
-    if (typeof identityToken !== "string"
-        || identityToken.length === 0
-        || identityToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
-      throw new Error("The local app returned an invalid Apple sign-in token.");
-    }
-    return identityToken;
-  }
-
   async contributionSyncStatus() {
     try {
       return normalizeContributionSyncStatus(
@@ -2522,6 +2505,66 @@ export class CommunityClient {
       throw new Error("The service did not return a verifiable Google sign-in token.");
     }
     return Object.freeze({ provider: "google", idToken: payload.idToken });
+  }
+
+  /**
+   * Starts hosted Sign in with Apple. Apple refuses loopback redirects and
+   * answers with response_mode=form_post, so the service owns both the
+   * redirect target and the client secret; this page only learns an
+   * unguessable state and the authorize URL to open.
+   */
+  async identityAppleStart() {
+    const fetchImpl = this.fetchImpl;
+    const response = await fetchImpl(`${CENTRAL_ROOT}/identity/apple/start`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw hostedIdentityRequestError(response, payload);
+    }
+    if (payload?.schemaVersion !== IDENTITY_APPLE_START_SCHEMA_VERSION
+        || typeof payload?.state !== "string"
+        || !APPLE_SIGNIN_STATE.test(payload.state)
+        || typeof payload?.authorizeUrl !== "string"
+        || !payload.authorizeUrl.startsWith(APPLE_AUTHORIZE_URL_PREFIX)) {
+      throw new Error("The service did not return a usable Apple sign-in request.");
+    }
+    return Object.freeze({
+      state: payload.state,
+      authorizeUrl: payload.authorizeUrl
+    });
+  }
+
+  /**
+   * Reads a completed Apple sign-in back exactly once. A pending sign-in
+   * surfaces as IDENTITY_RESULT_PENDING so the caller can keep polling
+   * without treating it as a failure.
+   */
+  async identityAppleResult(state) {
+    if (typeof state !== "string" || !APPLE_SIGNIN_STATE.test(state)) {
+      throw new TypeError("Apple sign-in state is invalid.");
+    }
+    const fetchImpl = this.fetchImpl;
+    const response = await fetchImpl(`${CENTRAL_ROOT}/identity/apple/result`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ state })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw hostedIdentityRequestError(response, payload);
+    }
+    if (payload?.schemaVersion !== IDENTITY_APPLE_RESULT_SCHEMA_VERSION
+        || typeof payload?.idToken !== "string"
+        || payload.idToken.length === 0
+        || payload.idToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
+      throw new Error("The service did not return a verifiable Apple sign-in token.");
+    }
+    return Object.freeze({ provider: "apple", idToken: payload.idToken });
   }
 
   async recover(recoveryCode) {

@@ -2020,8 +2020,13 @@ async function bundleInventory(appBundle, manifestPath, updater) {
   }))
     .filter((path) => {
       if (path === manifestPath) return false;
-      return relative(appBundle, path).split(sep).join("/")
-        !== CODE_RESOURCES_PATH;
+      const relativePath = relative(appBundle, path).split(sep).join("/");
+      // Code signatures are not payload. Developer ID release signing
+      // re-signs every nested bundle, so recording signature bytes here
+      // would make a correctly signed release fail its own inventory. The
+      // signatures are proven instead by codesign --verify --deep --strict
+      // and by notarization.
+      return !relativePath.split("/").includes("_CodeSignature");
     })
     .sort((left, right) => relative(appBundle, left).localeCompare(
       relative(appBundle, right),
@@ -2404,9 +2409,19 @@ async function buildApplication(stageApp, centralService, {
     payload: inventory,
   };
   const serialized = stableJson(manifest);
-  if (serialized.includes(REPOSITORY_ROOT)
-      || serialized.includes("/Users/")
-      || serialized.includes("adamallcock")) {
+  // The reviewed central origin is a deliberately configured public value and
+  // may legitimately contain the account name of its host (a workers.dev
+  // subdomain does). Scan everything else strictly: build paths, home
+  // directories, and any other appearance of the owner identifier still fail.
+  let scanned = serialized;
+  for (const reviewedPublicUrl of [centralService.origin, updater?.appcastURL]) {
+    if (typeof reviewedPublicUrl === "string" && reviewedPublicUrl.length > 0) {
+      scanned = scanned.replaceAll(reviewedPublicUrl, "");
+    }
+  }
+  if (scanned.includes(REPOSITORY_ROOT)
+      || scanned.includes("/Users/")
+      || scanned.includes("adamallcock")) {
     fail("Build manifest exposed a local source path or owner identifier");
   }
   await writeGeneratedFile(manifestPath, serialized);

@@ -1991,6 +1991,112 @@ test("hosted identity is exchanged same-origin and enrolls with fixed error code
   );
 });
 
+test("hosted Apple sign-in starts, polls, and refuses anything but Apple's authorize URL", async () => {
+  const calls = [];
+  const state = "S".repeat(64);
+  let responseStatus = 200;
+  let responsePayload = () => ({
+    schemaVersion: "identity-apple-start-v0.1",
+    state,
+    authorizeUrl:
+      `https://appleid.apple.com/auth/authorize?client_id=com.tibotattle.web&state=${state}`
+  });
+  const client = new CommunityClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify(responsePayload()), {
+        status: responseStatus,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+
+  const started = await client.identityAppleStart();
+  assert.equal(started.state, state);
+  assert.equal(
+    started.authorizeUrl.startsWith("https://appleid.apple.com/auth/authorize?"),
+    true
+  );
+  assert.equal(calls[0].url, "/api/v1/identity/apple/start");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.credentials, "same-origin");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {});
+
+  // A tampered authorize URL is never handed to window.open.
+  for (const authorizeUrl of [
+    "https://attacker.example/auth/authorize?client_id=x",
+    "https://appleid.apple.com.attacker.example/auth/authorize?a=b",
+    "javascript:alert(1)",
+    "https://appleid.apple.com/auth/authorize"
+  ]) {
+    responsePayload = () => ({
+      schemaVersion: "identity-apple-start-v0.1",
+      state,
+      authorizeUrl
+    });
+    await assert.rejects(
+      client.identityAppleStart(),
+      /usable Apple sign-in request/u
+    );
+  }
+  responsePayload = () => ({
+    schemaVersion: "identity-apple-start-v0.1",
+    state: "too-short",
+    authorizeUrl: "https://appleid.apple.com/auth/authorize?a=b"
+  });
+  await assert.rejects(
+    client.identityAppleStart(),
+    /usable Apple sign-in request/u
+  );
+
+  responsePayload = () => ({
+    schemaVersion: "identity-apple-result-v0.1",
+    idToken: "header.payload.signature"
+  });
+  const identity = await client.identityAppleResult(state);
+  assert.deepEqual(identity, {
+    provider: "apple",
+    idToken: "header.payload.signature"
+  });
+  const resultCall = calls.at(-1);
+  assert.equal(resultCall.url, "/api/v1/identity/apple/result");
+  assert.equal(resultCall.options.credentials, "same-origin");
+  assert.deepEqual(JSON.parse(resultCall.options.body), { state });
+
+  await assert.rejects(client.identityAppleResult("short"), TypeError);
+  await assert.rejects(client.identityAppleResult(null), TypeError);
+
+  responseStatus = 404;
+  responsePayload = () => ({ error: { code: "IDENTITY_RESULT_PENDING" } });
+  await assert.rejects(
+    client.identityAppleResult(state),
+    (error) => error.status === 404
+      && error.code === "IDENTITY_RESULT_PENDING"
+  );
+  responseStatus = 401;
+  responsePayload = () => ({ error: { code: "IDENTITY_TOKEN_INVALID" } });
+  await assert.rejects(
+    client.identityAppleResult(state),
+    (error) => error.status === 401 && error.code === "IDENTITY_TOKEN_INVALID"
+  );
+  responseStatus = 503;
+  responsePayload = () => ({ error: { code: "IDENTITY_CONFIGURATION_INVALID" } });
+  await assert.rejects(
+    client.identityAppleStart(),
+    (error) => error.status === 503
+      && error.code === "IDENTITY_CONFIGURATION_INVALID"
+  );
+  responseStatus = 200;
+  responsePayload = () => ({
+    schemaVersion: "identity-apple-result-v0.1",
+    idToken: ""
+  });
+  await assert.rejects(
+    client.identityAppleResult(state),
+    /verifiable Apple sign-in token/u
+  );
+});
+
 test("hosted sign-in step gates contribution and keeps identity copy truthful", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -2001,9 +2107,18 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   );
   assert.match(html, /id="identity-google-signin"/u);
   assert.match(html, /id="identity-apple-signin"/u);
+  assert.match(html, /id="identity-apple-unavailable"/u);
   assert.match(html, /Sign in with Google/u);
-  assert.match(html, /Use Apple sign-in from the app/u);
+  assert.match(html, /Sign in with Apple/u);
   assert.match(html, /Hosted sign-in is not configured for this build\./u);
+  assert.match(
+    html,
+    /Hosted Apple sign-in is not configured for this build\./u
+  );
+  // The dead native handoff copy is gone: Apple provisions Sign in with Apple
+  // only for Ad hoc, App Store Connect, and Development distribution, so a
+  // Developer ID build can never carry the entitlement.
+  assert.equal(/Use Apple sign-in from the app/u.test(html), false);
   assert.match(html, /irreversible hash of that sign-in/u);
   assert.match(html, /never your email or name/u);
   assert.match(html, /Local-only use needs no account\./u);
@@ -2015,7 +2130,15 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(appSource, /window\.addEventListener\("storage"/u);
   assert.match(appSource, /identity: hostedIdentity/u);
   assert.match(appSource, /communityClient\.identityGoogleExchange\(/u);
-  assert.match(appSource, /takeAppleIdentityToken\(\)/u);
+  assert.match(appSource, /communityClient\.identityAppleStart\(\)/u);
+  assert.match(appSource, /communityClient\.identityAppleResult\(/u);
+  assert.match(appSource, /IDENTITY_RESULT_PENDING/u);
+  assert.match(
+    appSource,
+    /Hosted Apple sign-in is not configured for this build\./u
+  );
+  assert.equal(/takeAppleIdentityToken/u.test(appSource), false);
+  assert.equal(/api\/local\/identity\/apple/u.test(appSource), false);
   assert.match(appSource, /IDENTITY_REQUIRED/u);
   assert.match(appSource, /IDENTITY_TOKEN_INVALID/u);
   assert.match(appSource, /IDENTITY_CONFIGURATION_INVALID/u);

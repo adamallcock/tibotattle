@@ -4,10 +4,23 @@ interface WorkerRouteDefinition {
 }
 
 const EXACT_WORKER_ROUTE_DEFINITIONS = [
+  // Apple fetches this exact path to verify domain ownership. It is a Worker
+  // route rather than a static asset because single-page-application not-found
+  // handling would answer a dot-directory path with index.html.
+  {
+    pathname: "/.well-known/apple-developer-domain-association.txt",
+    id: "apple_domain_association",
+  },
   { pathname: "/api/health", id: "health" },
   { pathname: "/api/ready", id: "ready" },
   { pathname: "/api/v1/enroll", id: "enroll" },
   { pathname: "/api/v1/identity/google/exchange", id: "identity_google_exchange" },
+  { pathname: "/api/v1/identity/apple/start", id: "identity_apple_start" },
+  {
+    pathname: "/api/v1/identity/apple/callback",
+    id: "identity_apple_callback",
+  },
+  { pathname: "/api/v1/identity/apple/result", id: "identity_apple_result" },
   { pathname: "/api/v1/recover", id: "recover" },
   { pathname: "/api/v1/session", id: "session" },
   { pathname: "/api/v1/logout", id: "logout" },

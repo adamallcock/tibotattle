@@ -9,6 +9,8 @@ import {
 const EXPECTED_ROUTES = [
   { pathname: "/api/v1/enroll", methods: ["POST"] },
   { pathname: "/api/v1/identity/google/exchange", methods: ["POST"] },
+  { pathname: "/api/v1/identity/apple/start", methods: ["POST"] },
+  { pathname: "/api/v1/identity/apple/result", methods: ["POST"] },
   { pathname: "/api/v1/recover", methods: ["POST"] },
   { pathname: "/api/v1/session", methods: ["GET"] },
   { pathname: "/api/v1/logout", methods: ["POST"] },
@@ -27,8 +29,8 @@ const EXPECTED_ROUTES = [
 ];
 
 test("participant relay route policy preserves the exact allowlist", () => {
-  assert.equal(EXPECTED_ROUTES.length, 17);
-  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 17);
+  assert.equal(EXPECTED_ROUTES.length, 19);
+  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 19);
   assert.deepEqual(PARTICIPANT_RELAY_ROUTE_POLICY, EXPECTED_ROUTES);
   assert.equal(Object.isFrozen(PARTICIPANT_RELAY_ROUTE_POLICY), true);
   for (const policy of PARTICIPANT_RELAY_ROUTE_POLICY) {
@@ -44,6 +46,7 @@ test("participant relay route policy keeps route matching exact", () => {
     "/api/v1/enroll/",
     "/api/v1/ENROLL",
     "/api/v1/device-pairings/claim",
+    "/api/v1/identity/apple/callback",
     "/api/v1/device/upload-authorizations",
     "/api/v1/contributions/contribution:private",
     "",
