@@ -2100,6 +2100,7 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
 test("hosted sign-in step gates contribution and keeps identity copy truthful", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
   // The Google client identifier is public — it appears in every
   // authorization URL — so it ships in source rather than being injected at
@@ -2112,8 +2113,45 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(html, /id="identity-google-signin"/u);
   assert.match(html, /id="identity-apple-signin"/u);
   assert.match(html, /id="identity-apple-unavailable"/u);
-  assert.match(html, /Sign in with Google/u);
-  assert.match(html, /Sign in with Apple/u);
+  // Each vendor's exact required label, on a button carrying that vendor's
+  // mark. The marks are inline SVG: the release build hashes every shipped
+  // file and the local dashboard forbids off-origin subresources, so a hosted
+  // or CDN-served brand asset is not an option.
+  assert.match(
+    html,
+    /id="identity-google-signin"[\s\S]{0,400}#provider-mark-google[\s\S]{0,200}>Sign in with Google</u,
+  );
+  assert.match(
+    html,
+    /id="identity-apple-signin"[\s\S]{0,400}#provider-mark-apple[\s\S]{0,200}>Sign in with Apple</u,
+  );
+  // Google's four-colour "G" and Apple's solid monochrome logo, drawn here.
+  for (const brandColor of ["#ea4335", "#4285f4", "#fbbc05", "#34a853"]) {
+    assert.match(html, new RegExp(`<symbol id="provider-mark-google"[\\s\\S]*?fill="${brandColor}"`, "u"));
+  }
+  assert.match(
+    html,
+    /<symbol id="provider-mark-apple"[\s\S]*?fill="currentColor"/u,
+  );
+  assert.doesNotMatch(html, /<symbol id="provider-mark-apple"[\s\S]*?fill="#/u);
+  // Google requires at least a 40px button; Apple's pill and Google's white
+  // face with its published rule and label colour are reproduced exactly.
+  assert.match(styles, /\.provider-button \{[\s\S]*?min-height: 44px;/u);
+  assert.match(
+    styles,
+    /\.provider-button-google \{ color: #1f1f1f; background: #fff; border-color: #747775; \}/u,
+  );
+  assert.match(
+    styles,
+    /\.provider-button-apple \{ color: #fff; background: #000; border-color: #000; \}/u,
+  );
+  assert.match(styles, /\.provider-button \{[\s\S]*?border-radius: 99px;/u);
+  // Keyboard reachable with a focus ring that is visible against both faces.
+  assert.doesNotMatch(html, /id="identity-(?:google|apple)-signin"[^>]*tabindex/u);
+  assert.match(
+    styles,
+    /\.provider-button:focus-visible \{ outline: 3px solid var\(--blue\); outline-offset: 3px; \}/u,
+  );
   assert.match(html, /Hosted sign-in is not configured for this build\./u);
   assert.match(
     html,
@@ -2126,6 +2164,29 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(html, /irreversible hash of that sign-in/u);
   assert.match(html, /never your email or name/u);
   assert.match(html, /Local-only use needs no account\./u);
+
+  // A real signed-in state: a provider badge, which provider it is, and a way
+  // out. The copy must not imply that leaving deletes anything hosted.
+  for (const id of [
+    "identity-signin-choices",
+    "identity-account",
+    "identity-account-badge",
+    "identity-account-mark",
+    "identity-account-provider",
+    "identity-signout",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`, "u"));
+  }
+  // Sign out must survive the 760px breakpoint, which hides compact buttons.
+  const signOutTag =
+    html.match(/<button[^>]*id="identity-signout"[^>]*>/u)?.[0] ?? "";
+  assert.match(signOutTag, /class="button button-quiet"/u);
+  assert.doesNotMatch(signOutTag, /\bcompact\b/u);
+  assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.button\.compact \{ display: none; \}/u);
+  assert.match(html, />\s*Sign out\s*</u);
+  assert.match(html, /Signing out only forgets this sign-in on this page\./u);
+  assert.match(html, /metadata already contributed stays until you delete it/u);
+  assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
 
   assert.match(appSource, /function configuredGoogleClientId\(\)/u);
   assert.match(appSource, /function hostedSignInRequired\(\)/u);
@@ -2151,6 +2212,40 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   // suite proves no web-storage API is ever called by the dashboard itself.
   assert.match(appSource, /typeof event\.newValue === "string"/u);
   assert.match(appSource, /let hostedIdentity = null;/u);
+
+  // Signing out is page-local: it forgets the memory-only identity and the
+  // pseudonymous session it enrolled, so the next sign-in can be a different
+  // account, and it calls nothing that could delete hosted data.
+  const signOutBody =
+    appSource.match(/function signOutHostedIdentity\(\)\s*\{[\s\S]*?\n\}/u)?.[0]
+      ?? "";
+  assert.match(signOutBody, /hostedIdentity = null;/u);
+  assert.match(signOutBody, /pendingGoogleSignIn = null;/u);
+  assert.match(signOutBody, /setCommunitySession\(null\);/u);
+  assert.match(signOutBody, /renderHostedIdentity\(\);/u);
+  assert.match(signOutBody, /nothing was deleted/u);
+  assert.doesNotMatch(
+    signOutBody,
+    /communityClient\.|localClient\.|deleteParticipant|deleteContribution/u,
+  );
+  assert.match(
+    appSource,
+    /\$\("#identity-signout"\)\.addEventListener\("click", signOutHostedIdentity\);/u,
+  );
+  // Both states are driven from one render pass, so the buttons always return
+  // to their signed-out form when the identity is dropped.
+  const renderBody =
+    appSource.match(/function renderHostedIdentity\(\)\s*\{[\s\S]*?\n\}/u)?.[0]
+      ?? "";
+  assert.match(renderBody, /\$\("#identity-signin-choices"\)\.hidden = signedIn;/u);
+  assert.match(renderBody, /\$\("#identity-account"\)\.hidden = !signedIn;/u);
+  assert.match(renderBody, /\$\("#identity-account-mark"\)\.setAttribute\("href", provider\.mark\);/u);
+
+  // The invitation field is gone from the dashboard: production enrollment is
+  // open, so nothing here collects, echoes, or clears an invitation code.
+  assert.doesNotMatch(html, /contribution-invite|invite-help|Invitation code/u);
+  assert.doesNotMatch(appSource, /inviteInput|inviteCode|invite-help/u);
+  assert.doesNotMatch(styles, /invite-row|contribution-invite/u);
 });
 
 test("backend readiness accepts fail-closed 503 state without calling it ready", async () => {
@@ -2778,7 +2873,6 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /Your contribution receipt/);
   assert.match(html, /Exact metadata categories a contribution may contain/);
   assert.match(html, /id="contribution-file"/);
-  assert.match(html, /id="contribution-invite"/);
   assert.match(html, /id="selected-contribution-inspection"/);
   assert.match(html, /Exact retained fields and values/);
   assert.match(html, /Review every validated field and value/);
@@ -3025,7 +3119,12 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(styles, /interactive-chart/);
   assert.match(styles, /chart-status-missing/);
   assert.match(styles, /touch-action: pan-y/);
-  assert.match(styles, /\.chart-navigation \.button\.compact \{ display: inline-flex; \}/);
+  // Narrow screens shed compact buttons only from the crowded top toolbar, so
+  // chart navigation — and every other compact control, including the one that
+  // turns automatic contribution off — stays reachable without needing its own
+  // exception rule.
+  assert.match(styles, /\.topbar \.button\.compact \{ display: none; \}/);
+  assert.doesNotMatch(styles, /^\s*\.button\.compact \{ display: none; \}/mu);
   assert.match(styles, /grid-template-columns: repeat\(5, minmax\(0, 1fr\)\)/);
   assert.match(styles, /min-height: 48px/);
   assert.match(styles, /\.primary-nav \{[\s\S]*overflow-x: auto;/);
@@ -3141,9 +3240,12 @@ test("local-only UI says the optional community service is not connected", async
     appSource,
     /Local preparation available; community service not connected/u,
   );
+  // The invitation field carried a fourth local-only sentence. That field is
+  // gone with open enrollment, and the three statements below still say the
+  // same thing in the places a reader actually looks.
   assert.match(
     appSource,
-    /The optional community service is not connected in this local-only build\./u,
+    /Community upload, aggregate comparisons, and participant recovery appear only in a build with an explicit community-service origin\./u,
   );
   assert.match(appSource, /document\.createTextNode\("Local-only mode"\)/u);
   assert.match(
@@ -3220,7 +3322,6 @@ test("primary contribution journey connects the Mac without exposing a pairing c
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   for (const id of [
-    "contribution-invite",
     "community-connect-consent",
     "connect-community",
     "community-connect-status",
@@ -3403,7 +3504,12 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /localClient\.automaticContributionStatus\(\)/);
   assert.match(appSource, /localClient\.enableAutomaticContribution\(/);
   assert.match(appSource, /localClient\.disableAutomaticContribution\(\)/);
-  assert.match(appSource, /inviteInput\.value = ""/);
+  // Enrollment is open, so the dashboard always passes a null invitation code;
+  // the client keeps the parameter for the service's invite-only mode.
+  assert.match(
+    appSource,
+    /communityClient\.enroll\(\s*null,\s*contributionSchemaVersion,/u,
+  );
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
   assert.match(appSource, /void enrollment\.recoveryCode;/);
   assert.doesNotMatch(appSource, /showRecoveryCodeOnce/);

@@ -448,13 +448,86 @@ h1 {
   border-radius: .5rem;
   background: rgba(255, 254, 249, .9);
 }
-.contribution-invite {
-  grid-template-columns: 1fr;
-  padding: 0 0 14px;
-  border: 0;
+.identity-signin {
+  padding-bottom: 16px;
   border-bottom: 1px solid var(--line);
-  background: transparent;
 }
+.identity-signin .control-label {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+/*
+  Vendor sign-in buttons. Google and Apple both publish binding guidance for
+  their mark, label, minimum height, and permitted button colours, so the four
+  literal brand values here (Google's white face, its #747775 rule and #1f1f1f
+  label, and Apple's black pill) are deliberate: no palette custom property may
+  stand in for them. Everything else — focus ring, spacing, disabled state —
+  comes from the shared tokens. Roboto is not shipped because the release build
+  loads no external font, so the site sans stack renders both labels at the
+  14px size the guidance specifies.
+*/
+.provider-mark-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+.provider-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.provider-button {
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 1.1rem;
+  border: 1px solid transparent;
+  border-radius: 99px;
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  cursor: pointer;
+}
+.provider-button:hover:not(:disabled) { transform: translateY(-1px); }
+.provider-button:disabled { opacity: .45; cursor: not-allowed; }
+.provider-button:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
+.provider-button-google { color: #1f1f1f; background: #fff; border-color: #747775; }
+.provider-button-apple { color: #fff; background: #000; border-color: #000; }
+.provider-mark { flex: none; width: 18px; height: 18px; }
+.provider-button-apple .provider-mark { width: 17px; height: 17px; margin-top: -2px; }
+.identity-account {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: .4rem;
+  background: var(--white);
+}
+.identity-account-badge {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 50%;
+}
+.identity-account-copy { flex: 1 1 14rem; min-width: 0; }
+.identity-account-copy strong { display: block; font-size: .78rem; }
+.identity-account-copy small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: .68rem;
+}
+.identity-account .button { flex: none; margin-left: auto; }
 .contribution-primary-consent {
   margin-top: 16px;
   border-color: rgba(23, 79, 69, .3);
@@ -934,10 +1007,6 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
 }
 .file-drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .file-drop > span { display: grid; place-items: center; width: 34px; height: 34px; margin-bottom: 8px; color: white; background: var(--green); border-radius: 50%; }
-.invite-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .8fr); gap: 16px; align-items: center; margin-bottom: 14px; padding: 14px; border: 1px solid var(--line); border-radius: .35rem; background: rgba(255, 254, 249, .6); }
-.invite-row strong, .invite-row small { display: block; }
-.invite-row small { margin-top: 3px; color: var(--muted); font-size: .69rem; }
-.invite-row input { min-width: 0; width: 100%; padding: .7rem .8rem; border: 1px solid var(--line); border-radius: .3rem; color: var(--ink); background: var(--white); font-size: .76rem; }
 .file-drop strong { font-size: .82rem; }
 .file-drop small { margin-top: 4px; color: var(--muted); font-size: .68rem; }
 .file-drop.selected { border-style: solid; background: var(--green-soft); }
@@ -1218,8 +1287,13 @@ footer {
   main, footer { width: min(100% - 28px, 1240px); }
   .topbar { padding-inline: 14px; }
   .state-pill { max-width: 118px; overflow: hidden; white-space: nowrap; }
-  .button.compact { display: none; }
-  .chart-navigation .button.compact { display: inline-flex; }
+  /*
+    Only the crowded top toolbar sheds its compact buttons on narrow screens.
+    This rule was previously unscoped, which silently hid every compact button
+    in the page — including the control that turns automatic contribution off.
+    A consent control must never become unreachable.
+  */
+  .topbar .button.compact { display: none; }
   .primary-nav { gap: 1rem; }
   .page-heading, .section-heading, .section-heading.split, .weekly-hero, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
   .companion-setup-actions { grid-column: 1; }
@@ -1253,7 +1327,8 @@ footer {
   .calibration-controls { justify-items: start; }
   .chart-navigation { justify-content: flex-start; }
   .boundary-diagram { grid-template-columns: 1fr; }
-  .invite-row, .recover-form { grid-template-columns: 1fr; }
+  .recover-form { grid-template-columns: 1fr; }
+  .identity-account .button { margin-left: 0; }
   .boundary-arrow { transform: rotate(90deg); justify-self: center; }
   .backend-flow { grid-template-columns: 1fr; }
   .definition-grid { grid-template-columns: 1fr; }

@@ -714,12 +714,56 @@
               never your email or name — and this page keeps the sign-in token
               in memory only. Local-only use needs no account.
             </p>
-            <div class="contribution-cta-buttons">
-              <button class="button button-secondary" id="identity-google-signin" type="button">
-                Sign in with Google
+            <!--
+              Both vendor marks are drawn once here as inline SVG symbols and
+              referenced where they are needed. Nothing is fetched: the local
+              dashboard runs under a strict Content-Security-Policy and the
+              release build hashes every shipped file. The literal brand colours
+              in the Google mark are fixed by Google's published sign-in
+              branding and are the only colours on this page that do not come
+              from a shared custom property; the Apple mark inherits the button
+              colour so it stays a solid single-colour logo as Apple requires.
+            -->
+            <svg class="provider-mark-sprite" aria-hidden="true" focusable="false">
+              <symbol id="provider-mark-google" viewBox="0 0 48 48">
+                <path fill="#ea4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+                <path fill="#4285f4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+                <path fill="#fbbc05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+                <path fill="#34a853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+              </symbol>
+              <symbol id="provider-mark-apple" viewBox="0 0 170 170">
+                <path fill="currentColor" d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.2-2.12-9.98-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.93.21-9.84-1.96-14.75-6.52-3.13-2.73-7.04-7.41-11.73-14.04-5.03-7.08-9.17-15.29-12.41-24.65-3.47-10.11-5.21-19.9-5.21-29.38 0-10.86 2.35-20.22 7.04-28.07 3.69-6.3 8.61-11.28 14.76-14.93 6.15-3.65 12.79-5.51 19.95-5.63 3.92 0 9.05 1.21 15.43 3.59 6.36 2.39 10.45 3.6 12.24 3.6 1.34 0 5.88-1.42 13.57-4.24 7.28-2.62 13.42-3.7 18.45-3.28 13.63 1.1 23.87 6.47 30.68 16.15-12.19 7.39-18.22 17.73-18.1 31 .11 10.34 3.86 18.94 11.23 25.77 3.34 3.17 7.07 5.62 11.22 7.36-.9 2.61-1.85 5.11-2.86 7.51zM119.11 7.24c0 8.1-2.96 15.67-8.86 22.67-7.12 8.32-15.73 13.13-25.07 12.37-.12-.97-.19-2-.19-3.07 0-7.78 3.39-16.1 9.4-22.91 3-3.45 6.82-6.31 11.45-8.6 4.62-2.25 8.99-3.5 13.1-3.71.12 1.08.17 2.17.17 3.24z"></path>
+              </symbol>
+            </svg>
+            <div class="provider-buttons" id="identity-signin-choices">
+              <button class="provider-button provider-button-google" id="identity-google-signin" type="button">
+                <svg class="provider-mark" aria-hidden="true" focusable="false"><use href="#provider-mark-google"></use></svg>
+                <span class="provider-button-label">Sign in with Google</span>
               </button>
-              <button class="button button-secondary" id="identity-apple-signin" type="button">
-                Sign in with Apple
+              <button class="provider-button provider-button-apple" id="identity-apple-signin" type="button">
+                <svg class="provider-mark" aria-hidden="true" focusable="false"><use href="#provider-mark-apple"></use></svg>
+                <span class="provider-button-label">Sign in with Apple</span>
+              </button>
+            </div>
+            <div class="identity-account" id="identity-account" hidden>
+              <span class="identity-account-badge" id="identity-account-badge" aria-hidden="true">
+                <svg class="provider-mark"><use id="identity-account-mark" href="#provider-mark-google"></use></svg>
+              </span>
+              <span class="identity-account-copy">
+                <strong id="identity-account-provider">Signed in with Google</strong>
+                <small>
+                  Signing out only forgets this sign-in on this page. It deletes
+                  nothing: metadata already contributed stays until you delete it
+                  in Hosted privacy controls.
+                </small>
+              </span>
+              <!--
+                Deliberately not a "compact" button: the narrow breakpoint
+                hides those, and signing out has to stay reachable at every
+                width.
+              -->
+              <button class="button button-quiet" id="identity-signout" type="button">
+                Sign out
               </button>
             </div>
             <p class="annotation" id="identity-google-unavailable" hidden>
@@ -730,21 +774,6 @@
             </p>
             <p class="participant-action-status" id="identity-signin-status" role="status" hidden></p>
           </div>
-          <label class="invite-row contribution-invite" for="contribution-invite">
-            <span>
-              <strong>Invitation code</strong>
-              <small id="invite-help">Required only for an invite-only pilot. It is used once and never stored by this page.</small>
-            </span>
-            <input
-              id="contribution-invite"
-              name="invite"
-              type="password"
-              autocomplete="off"
-              autocapitalize="none"
-              spellcheck="false"
-              placeholder="Optional in local development"
-            >
-          </label>
           <label class="consent-row contribution-primary-consent">
             <input id="community-connect-consent" type="checkbox">
             <span>

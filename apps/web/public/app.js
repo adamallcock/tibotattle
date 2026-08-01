@@ -3068,6 +3068,19 @@ function hostedSignInRequired() {
   return configuredGoogleClientId() !== null && hostedIdentity === null;
 }
 
+// The provider is the only identity fact this page ever holds. No name, email,
+// or picture is requested, so the signed-in row can show nothing more.
+const HOSTED_IDENTITY_PROVIDERS = {
+  google: {
+    label: "Signed in with Google",
+    mark: "#provider-mark-google",
+  },
+  apple: {
+    label: "Signed in with Apple",
+    mark: "#provider-mark-apple",
+  },
+};
+
 function renderHostedIdentity() {
   const googleButton = $("#identity-google-signin");
   const appleButton = $("#identity-apple-signin");
@@ -3075,23 +3088,50 @@ function renderHostedIdentity() {
   const googleUnavailable = $("#identity-google-unavailable");
   const appleUnavailable = $("#identity-apple-unavailable");
   const googleConfigured = configuredGoogleClientId() !== null;
+  const signedIn = hostedIdentity !== null;
+  const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider]
+    ?? HOSTED_IDENTITY_PROVIDERS.google;
   googleButton.disabled = hostedIdentityBusy
-    || hostedIdentity !== null
+    || signedIn
     || !googleConfigured;
-  googleUnavailable.hidden = googleConfigured;
-  appleUnavailable.hidden = !appleSignInUnavailable;
+  googleUnavailable.hidden = googleConfigured || signedIn;
+  appleUnavailable.hidden = !appleSignInUnavailable || signedIn;
   appleButton.disabled = hostedIdentityBusy
-    || hostedIdentity !== null
+    || signedIn
     || appleSignInUnavailable;
-  chip.textContent = hostedIdentity === null
-    ? hostedIdentityBusy ? "Signing in…" : "Not signed in"
-    : hostedIdentity.provider === "google"
-      ? "Signed in with Google"
-      : "Signed in with Apple";
-  chip.className = hostedIdentity === null
-    ? "evidence-chip neutral"
-    : "evidence-chip";
+  // Exactly one of the two states is present: the provider choices, or the
+  // signed-in account row that can hand the page back to the choices.
+  $("#identity-signin-choices").hidden = signedIn;
+  $("#identity-account").hidden = !signedIn;
+  $("#identity-signout").disabled = hostedIdentityBusy || !signedIn;
+  $("#identity-account-provider").textContent = provider.label;
+  $("#identity-account-mark").setAttribute("href", provider.mark);
+  chip.textContent = signedIn
+    ? "Signed in"
+    : hostedIdentityBusy ? "Signing in…" : "Not signed in";
+  chip.className = signedIn
+    ? "evidence-chip"
+    : "evidence-chip neutral";
   updateCommunityConnectButton();
+}
+
+// Signing out is entirely page-local. The sign-in token was never persisted,
+// so forgetting it needs no network call and destroys no hosted data; the
+// pseudonymous session is dropped alongside it so the next sign-in — with the
+// same account or a different one — enrolls under the identity just presented
+// rather than reusing the previous participant's session.
+function signOutHostedIdentity() {
+  if (hostedIdentityBusy || hostedIdentity === null) return;
+  hostedIdentity = null;
+  pendingGoogleSignIn = null;
+  setCommunitySession(null);
+  $("#participant-controls").hidden = true;
+  const status = $("#identity-signin-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent =
+    "Signed out on this page only. The in-memory sign-in was discarded and nothing was deleted: metadata you already contributed is unchanged, and Hosted privacy controls still export or delete it. Sign in again with any Google or Apple account.";
+  renderHostedIdentity();
 }
 
 async function beginGoogleSignIn() {
@@ -3388,8 +3428,6 @@ async function connectCommunityContribution() {
       "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account, and nothing was uploaded.";
     return;
   }
-  const inviteInput = $("#contribution-invite");
-  const inviteCode = inviteInput.value.trim();
   let pairing = null;
   communityConnectBusy = true;
   status.hidden = false;
@@ -3408,8 +3446,11 @@ async function connectCommunityContribution() {
       pairing = await communityClient.createDevicePairing(false);
       await finishCommunityDevicePairing(pairing, status);
     } else {
+      // Production enrollment is open, so this page never collects or sends an
+      // invitation code. The client keeps the parameter because the service
+      // still supports an invite-only mode for private pilots.
       const enrollment = await communityClient.enroll(
-        inviteCode || null,
+        null,
         "telemetry-contribution-v0.1",
         { deviceBootstrap: true, identity: hostedIdentity }
       );
@@ -3467,12 +3508,11 @@ async function connectCommunityContribution() {
     } else {
       status.textContent = safeApiError(
         error,
-        "This Mac could not be connected. No evidence was uploaded. Check the invitation, service availability, and Keychain access, then retry."
+        "This Mac could not be connected. No evidence was uploaded. Check service availability and Keychain access, then retry."
       );
     }
   } finally {
     pairing = null;
-    inviteInput.value = "";
     communityConnectBusy = false;
     updateCommunityConnectButton();
   }
@@ -3734,12 +3774,12 @@ async function ensureCommunitySession(contributionSchemaVersion) {
       "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account."
     );
   }
-  const inviteInput = $("#contribution-invite");
-  const inviteCode = inviteInput.value.trim();
   let enrollment;
   try {
+    // No invitation code is collected: production enrollment is open, and the
+    // service remains the authority on whether it accepts a new participant.
     enrollment = await communityClient.enroll(
-      inviteCode || null,
+      null,
       contributionSchemaVersion,
       { identity: hostedIdentity }
     );
@@ -3747,8 +3787,6 @@ async function ensureCommunitySession(contributionSchemaVersion) {
     const identityCopy = hostedIdentityErrorCopy(error);
     if (identityCopy !== null) throw new Error(identityCopy);
     throw error;
-  } finally {
-    inviteInput.value = "";
   }
   if (typeof enrollment?.csrfToken !== "string") {
     throw new Error("The contribution service did not establish a pseudonymous contribution session.");
@@ -4529,8 +4567,6 @@ async function loadCommunityResults() {
     renderContributionHistory($("#contribution-history"), null);
     renderCommunitySnapshot(community, null);
     renderContributionPreparationEstimate();
-    $("#invite-help").textContent =
-      "The optional community service is not connected in this local-only build.";
     return;
   }
   try {
@@ -4573,12 +4609,8 @@ async function loadCommunityResults() {
     renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
     renderContributionPreparationEstimate();
     participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
-    const enrollmentMode = healthResult.status === "fulfilled" ? healthResult.value?.enrollmentMode : null;
-    $("#invite-help").textContent = enrollmentMode === "invite_only"
-      ? "Required for this invite-only service. It is used once and never stored by this page."
-      : enrollmentMode === "disabled"
-        ? "New enrollment is currently paused. Existing participants can still manage their data."
-        : "Required only for an invite-only pilot. It is used once and never stored by this page.";
+    // The advertised enrollment mode is reported by the backend facts panel;
+    // this page collects no invitation code for any of those modes.
   } catch {
     participantContributionAdmission = null;
     renderBackendHealth(null, null, { configured: true });
@@ -4826,6 +4858,7 @@ $("#identity-google-signin").addEventListener("click", () => {
 $("#identity-apple-signin").addEventListener("click", () => {
   void beginAppleSignIn();
 });
+$("#identity-signout").addEventListener("click", signOutHostedIdentity);
 // The loopback callback page writes exactly one fixed key; a storage event
 // from the same origin is the only completion signal this tab listens for.
 window.addEventListener("storage", (event) => {
