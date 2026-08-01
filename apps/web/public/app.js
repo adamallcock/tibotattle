@@ -267,11 +267,11 @@ function openInstalledApp() {
   const status = $("#open-installed-app-status");
   status.hidden = false;
   status.textContent =
-    "Opening Usage Monitor… If no app appears, install the signed Mac download above, then try again.";
+    "Opening TiboTattle… If no app appears, install the signed Mac download above, then try again.";
   window.setTimeout(() => {
     if (!status.hidden) {
       status.textContent =
-        "Continue in the local dashboard tab opened by Usage Monitor. If nothing opened, the app is not installed or macOS blocked the link.";
+        "Continue in the local dashboard tab opened by TiboTattle. If nothing opened, the app is not installed or macOS blocked the link.";
     }
   }, 2_000);
 }
@@ -508,7 +508,7 @@ function onboardingSourceGuidance(value) {
     },
     codex_home_unreadable: {
       title: "Allow local Codex access, then check again",
-      summary: `${customLocation} exists but cannot be read. Quit Usage Monitor, open System Settings → Privacy & Security → Files and Folders, allow Usage Monitor if it is listed, then reopen the app.`,
+      summary: `${customLocation} exists but cannot be read. Quit TiboTattle, open System Settings → Privacy & Security → Files and Folders, allow TiboTattle if it is listed, then reopen the app.`,
       check: `${customLocation} cannot be read`,
     },
     session_directories_missing: {
@@ -518,7 +518,7 @@ function onboardingSourceGuidance(value) {
     },
     session_directories_unreadable: {
       title: "Allow access to Codex sessions, then check again",
-      summary: "Codex session folders exist but cannot be read. Quit Usage Monitor, allow it under System Settings → Privacy & Security → Files and Folders if it is listed, then reopen the app.",
+      summary: "Codex session folders exist but cannot be read. Quit TiboTattle, allow it under System Settings → Privacy & Security → Files and Folders if it is listed, then reopen the app.",
       check: "Codex session folders cannot be read",
     },
     no_rollout_files: {
@@ -529,7 +529,7 @@ function onboardingSourceGuidance(value) {
   };
   return guidance[value.sourceStatus] ?? {
     title: "Open Codex once, then check again",
-    summary: "Usage Monitor cannot find readable Codex session metadata yet. Open Codex, start or resume a task, and let one response finish.",
+    summary: "TiboTattle cannot find readable Codex session metadata yet. Open Codex, start or resume a task, and let one response finish.",
     check: "Codex session metadata is not ready",
   };
 }
@@ -563,9 +563,9 @@ function renderLocalOnboarding(value) {
   $("#setup-summary").textContent = boundedPause
     ? `A bounded pass completed safely: ${compact(indexing.filesProcessed)} of ${compact(indexing.filesSelected)} recent rollout files are analyzed. Continue when convenient; existing results remain usable.`
     : ready
-      ? "Codex metadata and Usage Monitor's private state are available. Raw logs remain inside the local companion."
+      ? "Codex metadata and TiboTattle's private state are available. Raw logs remain inside the local companion."
     : value.stateStatus === "unwritable" && sourceReady
-      ? "Usage Monitor can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
+      ? "TiboTattle can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
       : sourceGuidance.summary;
 
   const checks = $("#setup-checks");
@@ -581,7 +581,7 @@ function renderLocalOnboarding(value) {
       ok: value.stateWritable,
       text: value.stateWritable
         ? "Private app state is writable"
-        : "Quit and reopen Usage Monitor"
+        : "Quit and reopen TiboTattle"
     },
     {
       ok: value.rolloutFilesPresent,
@@ -2261,7 +2261,7 @@ function renderIndexProgress(progress, { status = "" } = {}) {
   $("#index-progress-summary").textContent = status === "cancelled"
     ? "The analysis stopped without replacing verified existing results. Run it again whenever convenient."
     : status === "cancelling"
-      ? "Usage Monitor is finishing its current atomic step and preserving a resumable checkpoint."
+      ? "TiboTattle is finishing its current atomic step and preserving a resumable checkpoint."
     : phase === "quick_result"
       ? "Your headline local result is available. Deeper replay-safe cost accounting and weekly calibration are still finishing."
     : status === "prospective_only"
@@ -2350,13 +2350,13 @@ function renderAutomaticContributionStatus(status) {
     not_configured:
       "The contribution service is not configured in this app build. Nothing will be sent.",
     disabled:
-      "Off until you explicitly consent. No daemon or login item is installed; checks run only while Usage Monitor is open.",
+      "Off until you explicitly consent. No daemon or login item is installed; checks run only while TiboTattle is open.",
     first_review_required:
       "Automatic contribution is off. Consent, inspect, and send one exact reviewed contribution before a recurring schedule can be enabled.",
     consent_required:
       "The metadata contract or destination changed. Review the current disclosure and consent again before anything is scheduled.",
     scheduled:
-      `On. Usage Monitor checks for new content-free pseudonymous metadata every 6 hours while the app is open.${last}${next}${outcome}`,
+      `On. TiboTattle checks for new content-free pseudonymous metadata every 6 hours while the app is open.${last}${next}${outcome}`,
     running:
       `A bounded foreground contribution check is running now.${last}${next}`,
     paused: pausedDescription,
@@ -2605,7 +2605,7 @@ async function runContributionSyncAction(action) {
       if (acceptedContribution && pendingAutomaticContributionConsent) {
         if (gate.automaticError === null) {
           showContributionSyncAction(
-            `${outcome.message} Automatic contribution is now on every 6 hours while Usage Monitor is open.`
+            `${outcome.message} Automatic contribution is now on every 6 hours while TiboTattle is open.`
           );
           renderAutomaticContributionStatus(gate.automatic);
         } else {
@@ -2721,10 +2721,10 @@ async function loadLocalDashboard() {
           ? "The companion could not load the local dashboard"
           : "The local companion is not available",
       copy: backendOnly
-        ? "This service accepts optional community requests but cannot read this Mac. Open Usage Monitor from Applications and use the separate local dashboard tab it opens."
+        ? "This service accepts optional community requests but cannot read this Mac. Open TiboTattle from Applications and use the separate local dashboard tab it opens."
         : localHealth
-          ? "The Mac app is running, but its local dashboard could not be loaded. Quit and reopen Usage Monitor, press Open Dashboard, then check again."
-          : "Open Usage Monitor from Applications, wait for Ready, then press Open Dashboard. If no installer is published below, this build is not yet available for a new installation.",
+          ? "The Mac app is running, but its local dashboard could not be loaded. Quit and reopen TiboTattle, press Open Dashboard, then check again."
+          : "Open TiboTattle from Applications, wait for Ready, then press Open Dashboard. If no installer is published below, this build is not yet available for a new installation.",
       kind: "error",
       showDemo: true,
       showCheck: true,
@@ -2771,7 +2771,7 @@ async function requestRefresh() {
   if (!localAnalysisAllowed()) {
     showConnectionNotice({
       title: "Finish the local check before analyzing",
-      copy: "Open Codex and complete one response, then choose Check again. Usage Monitor will not start an analysis while its local preflight is incomplete.",
+      copy: "Open Codex and complete one response, then choose Check again. TiboTattle will not start an analysis while its local preflight is incomplete.",
       kind: "warning",
       showCheck: true,
       showDemo: !dashboard,
@@ -2898,7 +2898,7 @@ async function requestRefresh() {
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Local analysis cancelled",
-        copy: "Usage Monitor stopped at a safe boundary. Verified existing results were kept, and the resumable checkpoint remains on this Mac.",
+        copy: "TiboTattle stopped at a safe boundary. Verified existing results were kept, and the resumable checkpoint remains on this Mac.",
         kind: "info",
       });
       return;
@@ -2909,7 +2909,7 @@ async function requestRefresh() {
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Deep analysis stopped at a safety limit",
-        copy: "Your available headline and previously verified results remain usable. Usage Monitor stopped before reading or retaining more local data than its fixed safety limits allow; no partial accounting result replaced them.",
+        copy: "Your available headline and previously verified results remain usable. TiboTattle stopped before reading or retaining more local data than its fixed safety limits allow; no partial accounting result replaced them.",
         kind: "warning",
       });
       return;
@@ -2930,7 +2930,7 @@ async function requestRefresh() {
           ? "The local analysis did not finish"
         : "Local analysis could not be started",
       copy: continuationLimitReached
-        ? "Usage Monitor stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
+        ? "TiboTattle stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
         : refreshAccepted
           ? "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it."
         : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
@@ -2953,7 +2953,7 @@ async function cancelLocalAnalysis() {
     await localClient.cancelRefresh();
     showConnectionNotice({
       title: "Cancellation requested",
-      copy: "Usage Monitor is stopping after its current atomic step and preserving a resumable local checkpoint.",
+      copy: "TiboTattle is stopping after its current atomic step and preserving a resumable local checkpoint.",
       kind: "info",
     });
   } catch {
@@ -3015,7 +3015,7 @@ function scheduleReturningUserRefresh() {
     returnRefreshDeferrals = 0;
     showConnectionNotice({
       title: "Cached results are ready",
-      copy: "Usage Monitor is checking for new local evidence from the last verified checkpoint. You can keep reading or cancel the update; no upload occurs.",
+      copy: "TiboTattle is checking for new local evidence from the last verified checkpoint. You can keep reading or cancel the update; no upload occurs.",
       kind: "info",
     });
     void requestRefresh();
@@ -3054,7 +3054,7 @@ function renderContributionDeviceRecovery(status) {
   const action = node(
     "a",
     "button button-secondary",
-    "Open Usage Monitor"
+    "Open TiboTattle"
   );
   if (SEMANTIC_OPEN_TARGET) {
     action.href = SEMANTIC_OPEN_TARGET;
@@ -3069,7 +3069,7 @@ function renderContributionDeviceRecovery(status) {
       "This Mac has a conflicting local contribution-device credential."
     ),
     document.createTextNode(
-      " No evidence was uploaded, and this page did not delete or rotate anything. Open the Usage Monitor app, choose Data & Diagnostics…, then Identity & Device Reset…, and complete both native confirmations. Return here and choose Connect this Mac again. The reset affects only the local export identity and paired-device credential; it does not revoke hosted devices or delete hosted data. "
+      " No evidence was uploaded, and this page did not delete or rotate anything. Open the TiboTattle app, choose Data & Diagnostics…, then Identity & Device Reset…, and complete both native confirmations. Return here and choose Connect this Mac again. The reset affects only the local export identity and paired-device credential; it does not revoke hosted devices or delete hosted data. "
     ),
     action
   );
@@ -3436,7 +3436,7 @@ async function prepareLocalContribution() {
 function parseSafeExport(file) {
   if (!file || file.size > 1_310_720) throw new Error("Choose a JSON export no larger than 1.25 MB.");
   if (!file.name.toLowerCase().endsWith(".json") && file.type !== "application/json") {
-    throw new Error("Choose the JSON export produced by Usage Monitor.");
+    throw new Error("Choose the JSON export produced by TiboTattle.");
   }
   return file.text().then((content) => {
     let payload;
@@ -3459,7 +3459,7 @@ function resetSelectedContributionInspection() {
   $("#selected-contribution-state").textContent = "Not validated";
   $("#selected-contribution-state").className = "evidence-chip neutral";
   $("#selected-contribution-message").textContent =
-    "Choose a Usage Monitor export to validate it locally.";
+    "Choose a TiboTattle export to validate it locally.";
   $("#selected-contribution-schema").textContent = "—";
   $("#selected-contribution-bytes").textContent = "—";
   $("#selected-contribution-usage").textContent = "—";
@@ -4032,7 +4032,7 @@ function renderPrivateCommunityComparison(container, comparison) {
       const row = document.createElement("tr");
       const identity = document.createElement("th");
       identity.scope = "row";
-      identity.textContent = `${cell.provider} · ${cell.modelId}`;
+      identity.textContent = `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`;
       row.append(identity, node("td", "", label));
       if (metric.status === "community_not_released") {
         row.append(
@@ -4273,7 +4273,7 @@ function renderCommunitySnapshot(container, payload) {
     const row = document.createElement("tr");
     const identity = document.createElement("th");
     identity.scope = "row";
-    identity.textContent = `${cell.provider} · ${cell.modelId}`;
+    identity.textContent = `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`;
     row.append(identity);
     for (const metricName of Object.keys(COMMUNITY_METRIC_LABELS)) {
       const td = document.createElement("td");
@@ -4737,7 +4737,7 @@ $("#contribution-file").addEventListener("change", async () => {
   resetSelectedContributionInspection();
   $("#contribution-consent").checked = false;
   $("#contribution-consent-title").textContent =
-    "I reviewed this as a privacy-safe Usage Monitor export.";
+    "I reviewed this as a privacy-safe TiboTattle export.";
   $("#contribution-consent-detail").textContent =
     "Uploading is optional and can be tested against a local backend.";
   if (file) {

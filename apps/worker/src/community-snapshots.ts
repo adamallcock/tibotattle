@@ -5,11 +5,26 @@ import {
   COMMUNITY_WEEKLY_MINIMUM_PARTICIPANTS,
   COMMUNITY_WEEKLY_POLICY_VERSION,
 } from "./constants";
+import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
 import { sha256Hex } from "./crypto";
 import { TELEMETRY_MODEL_IDS } from "./telemetry-validation";
 
 const DAY = 24 * 60 * 60 * 1000;
 const WEEK = 7 * DAY;
+const SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
+const COMPARISON_SCHEMA_VERSION = "participant-community-comparison-v0.2";
+// Mirrors the closed planType/planVariant enums in
+// packages/telemetry-contract/schemas/v0.2/quota-snapshot.schema.json.
+// Allowance-relative aggregates must never blend plans, so every published
+// cell carries an explicit plan cohort; absent or mixed-in-window evidence
+// stays the explicit "unknown" cohort rather than being inferred.
+const PLAN_COHORT_TYPES = Object.freeze([
+  "free", "go", "plus", "pro", "business", "enterprise", "edu", "team",
+  "unknown",
+]);
+const PLAN_COHORT_VARIANTS = Object.freeze([
+  "pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown",
+]);
 const PUBLIC_MODEL_IDS_SQL = TELEMETRY_MODEL_IDS
   .filter((modelId) => modelId !== "unknown")
   .map((modelId) => `'${modelId}'`)
@@ -27,6 +42,8 @@ const METRICS = [
 
 interface AggregatedCellRow {
   provider: string;
+  plan_type: string;
+  plan_variant: string;
   model_id: string;
   cohort_support: number;
   usage_events_support: number;
@@ -92,7 +109,7 @@ function participantComparisonUnavailable(
   row?: SnapshotRow,
 ): object {
   return {
-    schemaVersion: "participant-community-comparison-v0.1",
+    schemaVersion: COMPARISON_SCHEMA_VERSION,
     status: "not_testable",
     reason,
     ...(row ? {
@@ -126,7 +143,7 @@ function basePayload(
   releasedAt: string,
 ): Record<string, unknown> {
   return {
-    schemaVersion: "community-weekly-snapshot-v0.1",
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
     snapshotId,
     snapshotRevision: revision,
     period: { startAt, endAt },
@@ -134,6 +151,11 @@ function basePayload(
     releasedAt,
     immutable: true,
     nonOverlapping: true,
+    priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
+    planCohorts: {
+      key: "provider_planType_planVariant_modelId",
+      unknownPolicy: "absent_or_mixed_in_window_stays_explicit_unknown",
+    },
     privacyPolicy: {
       version: COMMUNITY_WEEKLY_POLICY_VERSION,
       minimumIndependentParticipants: COMMUNITY_WEEKLY_MINIMUM_PARTICIPANTS,
@@ -265,10 +287,36 @@ async function buildCommunityWeeklySnapshotForPeriod(
     : `community-weekly:${startAt.slice(0, 10)}:r${revision}`;
 
   const cellRows = await db.prepare(
-    `WITH qualified AS (
+    `WITH participant_plans AS (
+      SELECT r.participant_id,
+        CASE WHEN COUNT(DISTINCT COALESCE(r.plan_type, 'unknown')) = 1
+             THEN MAX(COALESCE(r.plan_type, 'unknown'))
+             ELSE 'unknown' END AS plan_type,
+        CASE WHEN COUNT(DISTINCT COALESCE(r.plan_variant, 'unknown')) = 1
+             THEN MAX(COALESCE(r.plan_variant, 'unknown'))
+             ELSE 'unknown' END AS plan_variant
+      FROM telemetry_records r
+      JOIN participants p
+        ON p.id = r.participant_id AND p.state = 'active'
+      WHERE r.record_kind = 'quota'
+        AND r.observed_at >= ? AND r.observed_at < ?
+        AND EXISTS (
+          SELECT 1
+            FROM telemetry_contribution_occurrences o
+            JOIN telemetry_contributions c ON c.id = o.contribution_id
+           WHERE o.participant_id = r.participant_id
+             AND o.record_kind = r.record_kind
+             AND o.occurrence_id = r.occurrence_id
+             AND c.status = 'accepted'
+             AND c.created_at < ?
+        )
+      GROUP BY r.participant_id
+    ), qualified AS (
       SELECT
         r.participant_id,
         r.provider,
+        COALESCE(pp.plan_type, 'unknown') AS plan_type,
+        COALESCE(pp.plan_variant, 'unknown') AS plan_variant,
         CASE
         WHEN r.model_id IN (${PUBLIC_MODEL_IDS_SQL})
         THEN r.model_id ELSE 'unknown' END AS model_id,
@@ -276,6 +324,8 @@ async function buildCommunityWeeklySnapshotForPeriod(
         r.input_cache_write_tokens, r.output_text_tokens,
         r.output_reasoning_tokens, r.output_combined_tokens, r.tool_units
       FROM telemetry_records r
+      LEFT JOIN participant_plans pp
+        ON pp.participant_id = r.participant_id
       JOIN participants p
         ON p.id = r.participant_id AND p.state = 'active'
       WHERE r.record_kind = 'usage'
@@ -296,7 +346,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
              AND c.created_at < ?
         )
     ), per_participant AS (
-      SELECT participant_id, provider, model_id,
+      SELECT participant_id, provider, plan_type, plan_variant, model_id,
         COUNT(*) AS usage_events,
         SUM(input_uncached_tokens) AS input_uncached_tokens,
         SUM(input_cache_read_tokens) AS input_cache_read_tokens,
@@ -306,9 +356,9 @@ async function buildCommunityWeeklySnapshotForPeriod(
         SUM(output_combined_tokens) AS output_combined_tokens,
         SUM(tool_units) AS tool_units
       FROM qualified
-      GROUP BY participant_id, provider, model_id
+      GROUP BY participant_id, provider, plan_type, plan_variant, model_id
     )
-    SELECT provider, model_id,
+    SELECT provider, plan_type, plan_variant, model_id,
       (SELECT COUNT(DISTINCT participant_id) FROM qualified) AS cohort_support,
       COUNT(*) AS usage_events_support,
       SUM(MIN(usage_events, 1000)) AS usage_events_clipped,
@@ -327,11 +377,14 @@ async function buildCommunityWeeklySnapshotForPeriod(
       COUNT(tool_units) AS tool_units_support,
       SUM(MIN(tool_units, 1000)) AS tool_units_clipped
     FROM per_participant
-    GROUP BY provider, model_id
+    GROUP BY provider, plan_type, plan_variant, model_id
     HAVING COUNT(*) >= ?
-    ORDER BY provider, model_id
+    ORDER BY provider, plan_type, plan_variant, model_id
     LIMIT ?`,
   ).bind(
+    startAt,
+    endAt,
+    cutoffAt,
     startAt,
     endAt,
     cutoffAt,
@@ -379,7 +432,13 @@ async function buildCommunityWeeklySnapshotForPeriod(
           }];
         },
       ));
-      return { provider: row.provider, modelId: row.model_id, metrics };
+      return {
+        provider: row.provider,
+        planType: row.plan_type,
+        planVariant: row.plan_variant,
+        modelId: row.model_id,
+        metrics,
+      };
     });
     payload = { ...base, releaseStatus: "published", cells };
   }
@@ -503,7 +562,7 @@ export async function readLatestCommunityWeeklySnapshot(
   ).first<SnapshotRow>();
   if (!row) {
     return stableJson({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
       immutable: true,
@@ -512,7 +571,7 @@ export async function readLatestCommunityWeeklySnapshot(
   }
   if (row.release_state === "withdrawn") {
     return stableJson({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       releaseStatus: "withdrawn",
       snapshotId: row.snapshot_id,
       snapshotRevision: row.revision,
@@ -548,7 +607,7 @@ export async function readParticipantCommunityComparison(
     return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
   }
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)
-      || Reflect.get(payload, "schemaVersion") !== "community-weekly-snapshot-v0.1"
+      || Reflect.get(payload, "schemaVersion") !== SNAPSHOT_SCHEMA_VERSION
       || Reflect.get(payload, "releaseStatus") !== "published"
       || Reflect.get(payload, "snapshotId") !== row.snapshot_id
       || Reflect.get(payload, "snapshotRevision") !== row.revision
@@ -557,6 +616,37 @@ export async function readParticipantCommunityComparison(
       || (Reflect.get(payload, "cells") as unknown[]).length > COMMUNITY_WEEKLY_MAX_CELLS) {
     return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
   }
+
+  const participantPlanRow = await db.prepare(
+    `SELECT
+      CASE WHEN COUNT(DISTINCT COALESCE(r.plan_type, 'unknown')) = 1
+           THEN MAX(COALESCE(r.plan_type, 'unknown'))
+           ELSE 'unknown' END AS plan_type,
+      CASE WHEN COUNT(DISTINCT COALESCE(r.plan_variant, 'unknown')) = 1
+           THEN MAX(COALESCE(r.plan_variant, 'unknown'))
+           ELSE 'unknown' END AS plan_variant
+    FROM telemetry_records r
+    WHERE r.participant_id = ?
+      AND r.record_kind = 'quota'
+      AND r.observed_at >= ? AND r.observed_at < ?
+      AND EXISTS (
+        SELECT 1
+          FROM telemetry_contribution_occurrences o
+          JOIN telemetry_contributions c ON c.id = o.contribution_id
+         WHERE o.participant_id = r.participant_id
+           AND o.record_kind = r.record_kind
+           AND o.occurrence_id = r.occurrence_id
+           AND c.status = 'accepted'
+           AND c.created_at < ?
+      )`,
+  ).bind(
+    participantId,
+    row.week_start,
+    row.week_end,
+    row.ingestion_cutoff_at,
+  ).first<{ plan_type: string | null; plan_variant: string | null }>();
+  const participantPlanType = participantPlanRow?.plan_type ?? "unknown";
+  const participantPlanVariant = participantPlanRow?.plan_variant ?? "unknown";
 
   const participantRows = await db.prepare(
     `SELECT
@@ -618,16 +708,24 @@ export async function readParticipantCommunityComparison(
       return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
     }
     const provider = Reflect.get(sourceCell, "provider");
+    const planType = Reflect.get(sourceCell, "planType");
+    const planVariant = Reflect.get(sourceCell, "planVariant");
     const modelId = Reflect.get(sourceCell, "modelId");
     const sourceMetrics = Reflect.get(sourceCell, "metrics");
     if (!["openai_codex", "anthropic_claude_code"].includes(String(provider))
+        || !PLAN_COHORT_TYPES.includes(String(planType))
+        || !PLAN_COHORT_VARIANTS.includes(String(planVariant))
         || ![...TELEMETRY_MODEL_IDS, "unknown"].includes(String(modelId))
         || typeof sourceMetrics !== "object"
         || sourceMetrics === null
         || Array.isArray(sourceMetrics)) {
       return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
     }
-    const participant = participantByCell.get(`${provider}\0${modelId}`);
+    const cellInParticipantCohort = planType === participantPlanType
+      && planVariant === participantPlanVariant;
+    const participant = cellInParticipantCohort
+      ? participantByCell.get(`${provider}\0${modelId}`)
+      : undefined;
     const metrics: Record<string, object> = {};
     for (const [publicName, column, cap, _quantum, unit] of METRICS) {
       const communityMetric = Reflect.get(sourceMetrics, publicName);
@@ -681,18 +779,25 @@ export async function readParticipantCommunityComparison(
     }
     cells.push({
       provider,
+      planType,
+      planVariant,
       modelId,
+      cohortMatchesParticipant: cellInParticipantCohort,
       participantHasActivity: Boolean(participant?.usage_events),
       metrics,
     });
   }
   return {
-    schemaVersion: "participant-community-comparison-v0.1",
+    schemaVersion: COMPARISON_SCHEMA_VERSION,
     status: "ready",
     snapshotId: row.snapshot_id,
     snapshotRevision: row.revision,
     period: { startAt: row.week_start, endAt: row.week_end },
     ingestionCutoffAt: row.ingestion_cutoff_at,
+    participantPlanCohort: {
+      planType: participantPlanType,
+      planVariant: participantPlanVariant,
+    },
     interpretation: "own_clipped_contribution_vs_public_rounded_total",
     cells,
   };

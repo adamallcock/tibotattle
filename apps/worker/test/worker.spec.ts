@@ -536,7 +536,7 @@ function telemetryFixture(suffix = "a"): Record<string, unknown> {
 
 async function seedSealedSuppressedSnapshot(): Promise<void> {
   const payload = JSON.stringify({
-    schemaVersion: "community-weekly-snapshot-v0.1",
+    schemaVersion: "community-weekly-snapshot-v0.2",
     releaseStatus: "suppressed",
     immutable: true,
     nonOverlapping: true,
@@ -2482,7 +2482,7 @@ describe("synthetic usage monitor service", () => {
 
     const community = await api("/api/v1/community/insights");
     await expect(community.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -2693,7 +2693,7 @@ describe("synthetic usage monitor service", () => {
     expect(response.status).toBe(200);
     const body = await response.json<Record<string, unknown>>();
     expect(body).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -2847,6 +2847,36 @@ describe("synthetic usage monitor service", () => {
       ).run();
       if (index === 0) contributionToDelete = contributionBody.contributionId;
     }
+    const unmeteredLimiter = {
+      limit: async () => ({ success: true }),
+    } as unknown as RateLimit;
+    for (let index = 0; index < 2; index += 1) {
+      const grant = await issueTestGrant();
+      const enrolled = await enrollWithGrant(grant, inviteOnlyBindings({
+        ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
+      }));
+      expect(enrolled.status).toBe(201);
+      const smallCohortParticipant = await enrollmentFrom(enrolled);
+      const fixture = telemetryFixture("a");
+      const quotaRows = Reflect.get(fixture, "quotaSnapshots") as Array<Record<string, unknown>>;
+      for (const quotaRow of quotaRows) {
+        Reflect.set(quotaRow, "planVariant", "pro-5x");
+      }
+      const smallCohortContribution = await uploadEnvelope(
+        smallCohortParticipant,
+        await encrypt(fixture, true),
+      );
+      expect(smallCohortContribution.status).toBe(202);
+      const smallCohortBody = await smallCohortContribution.json<{
+        contributionId: string;
+      }>();
+      await testBindings().USAGE_MONITOR_DB.prepare(
+        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+      ).bind(
+        "2026-07-28T23:59:59.000Z",
+        smallCohortBody.contributionId,
+      ).run();
+    }
     const cutoffContribution = await uploadEnvelope(
       cohort[0]!,
       await encrypt(telemetryFixture("b"), true),
@@ -2886,7 +2916,7 @@ describe("synthetic usage monitor service", () => {
     const publishedText = await response.text();
     const published = JSON.parse(publishedText) as Record<string, unknown>;
     expect(published).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       releaseStatus: "published",
       immutable: true,
       nonOverlapping: true,
@@ -2898,6 +2928,8 @@ describe("synthetic usage monitor service", () => {
       releasedAt: "2026-07-29T00:00:00.000Z",
       cells: [{
         provider: "openai_codex",
+        planType: "pro",
+        planVariant: "pro-20x",
         modelId: "gpt-5.6-sol",
         metrics: {
           usageEvents: {
@@ -2931,6 +2963,8 @@ describe("synthetic usage monitor service", () => {
     ]) {
       expect(publishedText).not.toContain(forbidden);
     }
+    expect((published as { cells: unknown[] }).cells).toHaveLength(1);
+    expect(publishedText).not.toContain("pro-5x");
     const privateStatsResponse = await api("/api/v1/me/stats", {
       headers: personalHeaders(participantToDelete!),
     });
@@ -2939,13 +2973,17 @@ describe("synthetic usage monitor service", () => {
     const privateStats = JSON.parse(privateStatsText) as Record<string, unknown>;
     expect(privateStats).toMatchObject({
       communityComparison: {
-        schemaVersion: "participant-community-comparison-v0.1",
+        schemaVersion: "participant-community-comparison-v0.2",
         status: "ready",
         snapshotId: "community-weekly:2026-07-20",
         snapshotRevision: 1,
         interpretation: "own_clipped_contribution_vs_public_rounded_total",
+        participantPlanCohort: { planType: "pro", planVariant: "pro-20x" },
         cells: [{
           provider: "openai_codex",
+          planType: "pro",
+          planVariant: "pro-20x",
+          cohortMatchesParticipant: true,
           modelId: "gpt-5.6-sol",
           participantHasActivity: true,
           metrics: {
@@ -3021,7 +3059,7 @@ describe("synthetic usage monitor service", () => {
     const withdrawn = await api("/api/v1/stats/aggregate");
     const withdrawnText = await withdrawn.text();
     expect(JSON.parse(withdrawnText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       releaseStatus: "withdrawn",
       reason: "source_data_withdrawn",
       immutable: true,
@@ -3035,7 +3073,7 @@ describe("synthetic usage monitor service", () => {
     ).json<Record<string, unknown>>();
     expect(withdrawnPrivateStats).toMatchObject({
       communityComparison: {
-        schemaVersion: "participant-community-comparison-v0.1",
+        schemaVersion: "participant-community-comparison-v0.2",
         status: "not_testable",
         reason: "community_snapshot_not_released",
         snapshotRevision: 1,
@@ -3065,7 +3103,7 @@ describe("synthetic usage monitor service", () => {
     const rebuiltResponse = await api("/api/v1/stats/aggregate");
     const rebuiltText = await rebuiltResponse.text();
     expect(JSON.parse(rebuiltText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       snapshotId: "community-weekly:2026-07-20:r2",
       snapshotRevision: 2,
       releaseStatus: "suppressed",
@@ -3174,7 +3212,7 @@ describe("synthetic usage monitor service", () => {
       inviteOnlyBindings(),
     );
     await expect(suppressed.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -3199,7 +3237,7 @@ describe("synthetic usage monitor service", () => {
     );
     const communityText = await community.text();
     expect(JSON.parse(communityText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.1",
+      schemaVersion: "community-weekly-snapshot-v0.2",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });

@@ -26,7 +26,7 @@
 
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
-export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.1";
+export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -45,7 +45,7 @@ const BACKEND_RECONCILIATION_STATES = new Set([
 export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
 export const PARTICIPANT_PROFILE_SCHEMA_VERSION = "participant-profile-v0.2";
 export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
-  "participant-community-comparison-v0.1";
+  "participant-community-comparison-v0.2";
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION =
   "contribution-sync-status-v0.1";
 export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
@@ -865,6 +865,8 @@ export function normalizeCommunitySnapshot(payload) {
         || Array.isArray(candidate.metrics)) {
       return { ...base, state: "unsupported_schema" };
     }
+    const planType = text(candidate?.planType, "unknown");
+    const planVariant = text(candidate?.planVariant, "unknown");
     const metrics = {};
     for (const [metricName, expectedUnit] of Object.entries(COMMUNITY_METRIC_UNITS)) {
       const metric = snapshotMetric(candidate.metrics[metricName], expectedUnit);
@@ -872,7 +874,7 @@ export function normalizeCommunitySnapshot(payload) {
       metrics[metricName] = metric;
       partial ||= metric.status === "suppressed";
     }
-    cells.push({ provider, modelId, metrics });
+    cells.push({ provider, planType, planVariant, modelId, metrics });
   }
   return {
     ...base,
@@ -1093,6 +1095,9 @@ export function normalizeParticipantCommunityComparison(payload) {
     }
     cells.push({
       provider,
+      planType: text(candidate?.planType, "unknown"),
+      planVariant: text(candidate?.planVariant, "unknown"),
+      cohortMatchesParticipant: candidate?.cohortMatchesParticipant === true,
       modelId,
       participantHasActivity: candidate.participantHasActivity,
       metrics
@@ -1102,6 +1107,10 @@ export function normalizeParticipantCommunityComparison(payload) {
     ...unavailable,
     status: "ready",
     reason: "",
+    participantPlanCohort: {
+      planType: text(payload?.participantPlanCohort?.planType, "unknown"),
+      planVariant: text(payload?.participantPlanCohort?.planVariant, "unknown")
+    },
     cells
   };
 }

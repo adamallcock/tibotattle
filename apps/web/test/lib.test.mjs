@@ -2420,7 +2420,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.doesNotMatch(html, /id="logout-participant"/);
   assert.match(html, /id="delete-participant"/);
   assert.match(html, /id="contribution-history"/);
-  assert.match(html, /privacy-safe Usage Monitor export/);
+  assert.match(html, /privacy-safe TiboTattle export/);
   assert.match(appSource, /demo-button.*addEventListener/s);
   assert.match(appSource, /companionReachable \? "Ready to analyze"/);
   assert.match(appSource, /Continue your local analysis/);
@@ -2438,7 +2438,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(appSource, /This address is the backend-only service/);
   assert.match(
     appSource,
-    /Open Usage Monitor from Applications and use the separate local dashboard tab/,
+    /Open TiboTattle from Applications and use the separate local dashboard tab/,
   );
   const loadBody = appSource.match(/async function loadLocalDashboard\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
   assert.doesNotMatch(loadBody, /demoDashboard/);
