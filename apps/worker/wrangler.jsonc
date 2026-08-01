@@ -137,7 +137,7 @@
       },
       "vars": {
         "ENVIRONMENT": "production",
-        "ENROLLMENT_MODE": "open",
+        "ENROLLMENT_MODE": "disabled",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
       },
       "secrets": {
