@@ -2594,12 +2594,16 @@ export class CommunityClient {
   }
 }
 
-export function demoDashboard() {
-  const now = "2026-07-25T14:00:00.000Z";
+export function demoDashboard({ now = new Date().toISOString() } = {}) {
+  const HOUR = 3_600_000;
+  const DAY = 24 * HOUR;
+  const nowMs = Math.floor(Date.parse(now) / HOUR) * HOUR;
+  const iso = (ms) => new Date(ms).toISOString();
+  const nowIso = iso(nowMs);
   const rolling = [];
   for (const smoothingHours of [1, 2, 3]) {
     for (let index = 0; index < 36; index += 1) {
-      const timestamp = new Date(Date.parse(now) - (35 - index) * 3_600_000).toISOString();
+      const timestamp = iso(nowMs - (35 - index) * HOUR);
       const scale = smoothingHours / 3;
       const observed = Math.max(
         0,
@@ -2619,26 +2623,197 @@ export function demoDashboard() {
       });
     }
   }
-  const weeklyValues = Array.from({ length: 7 }, (_, index) => ({
-    sequence: index + 1,
-    reset_due_at: new Date(Date.parse("2026-06-13T00:00:00Z") + index * 7 * 86_400_000).toISOString(),
-    value_usd: [2125, 2080, 2022, 1960, 1905, 1875, 1888][index],
-    pairwise_p10_usd: [1790, 1740, 1690, 1650, 1590, 1600, 1610][index],
-    pairwise_p90_usd: [2370, 2310, 2240, 2170, 2080, 2100, 2120][index],
-    holdout_mae_pp: [2.1, 2.8, 2.2, 3.4, 2.5, 1.9, 2.2][index],
-    eligible_transitions: 70 + index * 9
-  }));
+  const weeklyValues = Array.from({ length: 7 }, (_, index) => {
+    const dueMs = nowMs - (6 - index) * 7 * DAY - 36 * HOUR;
+    return {
+      sequence: index + 1,
+      reset_due_at: iso(dueMs),
+      first_observed_at: iso(dueMs - 7 * DAY),
+      last_observed_at: iso(dueMs),
+      displayed_span_pp: [92, 88, 85, 96, 90, 83, 91][index],
+      value_usd: [2125, 2080, 2022, 1960, 1905, 1875, 1888][index],
+      pairwise_p10_usd: [1790, 1740, 1690, 1650, 1590, 1600, 1610][index],
+      pairwise_p90_usd: [2370, 2310, 2240, 2170, 2080, 2100, 2120][index],
+      holdout_mae_pp: [2.1, 2.8, 2.2, 3.4, 2.5, 1.9, 2.2][index],
+      eligible_transitions: 70 + index * 9
+    };
+  });
+  const lastResetMs = nowMs - 3 * DAY - 2 * HOUR;
+  const componentShares = {
+    input_uncached_tokens: .1408,
+    input_cache_read_tokens: .7889,
+    input_cache_write_tokens: .0225,
+    output_text_tokens: .0361,
+    output_reasoning_tokens: .0117,
+    output_combined_tokens: 0
+  };
+  const splitTokens = (tokens) => Object.fromEntries(
+    Object.entries(componentShares).map(([key, share]) => [key, Math.round(tokens * share)])
+  );
+  const bucketWeights = Array.from({ length: 168 }, (_, index) => {
+    const startMs = nowMs - (168 - index) * HOUR;
+    const date = new Date(startMs);
+    const weekday = date.getUTCDay();
+    const hour = date.getUTCHours();
+    const dayFactor = weekday === 0 || weekday === 6 ? .35 : 1;
+    const daypart = hour >= 13 && hour < 23 ? 1 : hour >= 23 || hour < 1 ? .45 : .12;
+    return dayFactor * daypart * (1 + .25 * Math.sin(index / 5));
+  });
+  const weightTotal = bucketWeights.reduce((sum, weight) => sum + weight, 0);
+  const totalDemoCost = 463.82;
+  const totalDemoEvents = 8120;
+  const timelineUsage = bucketWeights.map((weight, index) => {
+    const startMs = nowMs - (168 - index) * HOUR;
+    const share = weight / weightTotal;
+    const usageEvents = Math.max(0, Math.round(totalDemoEvents * share));
+    const totalTokens = usageEvents * 33_400;
+    const cost = Number((totalDemoCost * share).toFixed(4));
+    const fullyPriced = Math.round(usageEvents * .92);
+    const partiallyPriced = Math.round(usageEvents * .05);
+    return {
+      startAt: iso(startMs),
+      endAt: iso(startMs + HOUR),
+      usageEvents,
+      totalTokens,
+      apiPriceEquivalentUsd: cost,
+      components: splitTokens(totalTokens),
+      pricingCoverage: {
+        fullyPricedEvents: fullyPriced,
+        partiallyPricedEvents: partiallyPriced,
+        unpricedEvents: Math.max(0, usageEvents - fullyPriced - partiallyPriced)
+      }
+    };
+  }).filter((row) => row.usageEvents > 0);
+  const timelineQuota = Array.from({ length: 85 }, (_, index) => {
+    const observedMs = nowMs - (84 - index) * 2 * HOUR;
+    const sinceResetMs = observedMs - lastResetMs;
+    const remaining = sinceResetMs >= 0
+      ? Math.max(61, 100 - (sinceResetMs / (3 * DAY + 2 * HOUR)) * 39)
+      : Math.max(9, 34 - ((sinceResetMs + 7 * DAY) / (7 * DAY)) * 25);
+    const remainingPercent = Number(remaining.toFixed(1));
+    return {
+      observedAt: iso(observedMs),
+      usedPercent: Number((100 - remainingPercent).toFixed(1)),
+      remainingPercent,
+      durationMinutes: 10_080,
+      resetAt: iso(sinceResetMs >= 0 ? lastResetMs + 7 * DAY : lastResetMs),
+      limitId: "codex",
+      slot: "primary",
+      planType: "pro",
+      accountAttribution: "attributed_pseudonymous"
+    };
+  });
+  const accountingDimension = (total, shares) => Object.fromEntries(
+    Object.entries(shares).map(([key, share]) => [key, {
+      events: Math.round(total.events * share),
+      totalTokens: Math.round(total.tokens * share),
+      apiPriceEquivalentUsd: Number((total.cost * share).toFixed(2))
+    }])
+  );
+  const demoAccountingPeriod = (id, label, factor) => {
+    const events = Math.round(totalDemoEvents * factor);
+    const tokens = Math.round(269_300_000 * factor);
+    const cost = Number((totalDemoCost * factor).toFixed(2));
+    const total = { events, tokens, cost };
+    const componentTokens = splitTokens(tokens);
+    return {
+      periodId: id,
+      periodLabel: label,
+      events,
+      totalTokens: tokens,
+      apiPriceEquivalentUsd: cost,
+      pricingCoverage: {
+        fullyPricedEvents: Math.round(events * .92),
+        partiallyPricedEvents: Math.round(events * .05),
+        unpricedEvents: events - Math.round(events * .92) - Math.round(events * .05)
+      },
+      components: componentTokens,
+      componentCosts: Object.fromEntries(Object.entries(componentTokens).map(([key, count]) => [key, {
+        tokens: count,
+        pricedTokens: Math.round(count * .97),
+        unpricedTokens: count - Math.round(count * .97),
+        costUsd: Number((cost * ({
+          input_uncached_tokens: .458,
+          input_cache_read_tokens: .1535,
+          input_cache_write_tokens: .0128,
+          output_text_tokens: .2128,
+          output_reasoning_tokens: .1629,
+          output_combined_tokens: 0
+        })[key]).toFixed(2))
+      }])),
+      byModel: [
+        { model: "gpt-5.6-sol", events: Math.round(events * .62), totalTokens: Math.round(tokens * .64), apiPriceEquivalentUsd: Number((cost * .66).toFixed(2)) },
+        { model: "gpt-5.6-terra", events: Math.round(events * .18), totalTokens: Math.round(tokens * .19), apiPriceEquivalentUsd: Number((cost * .21).toFixed(2)) },
+        { model: "gpt-5.4-mini", events: Math.round(events * .15), totalTokens: Math.round(tokens * .13), apiPriceEquivalentUsd: Number((cost * .09).toFixed(2)) },
+        { model: "unknown", events: Math.round(events * .05), totalTokens: Math.round(tokens * .04), apiPriceEquivalentUsd: 0 }
+      ],
+      bySpeed: accountingDimension(total, { standard: .78, fast: .13, unknown: .09 }),
+      byApiServiceTier: accountingDimension(total, { standard: .97, unknown: .03 }),
+      bySurface: accountingDimension(total, {
+        cli_exec: .46, extension_or_ide: .38, subagent: .09, unknown: .07
+      }),
+      byAgentScope: accountingDimension(total, { root: .84, subagent: .09, automation: .02, unknown: .05 }),
+      byLineage: accountingDimension(total, { standalone: .71, forked: .11, parent_linked: .12, unknown: .06 }),
+      byReasoningEffort: accountingDimension(total, { unknown: 1 }),
+      accountAttribution: {
+        attributedPseudonymousEvents: Math.round(events * .91),
+        unattributedEvents: events - Math.round(events * .91)
+      },
+      toolClasses: {
+        total: Math.round(events * 2.6),
+        counts: {
+          apply_patch: Math.round(events * .58),
+          local_shell: Math.round(events * 1.42),
+          other: Math.round(events * .34),
+          subagent: Math.round(events * .11),
+          tool_gateway: Math.round(events * .15)
+        }
+      },
+      apiPriceCounterfactualTier: "standard",
+      subscriptionSpeedIsSeparate: true,
+      reasoningEffortAvailable: false,
+      accountingSource: "labeled_demo_fixture",
+      accountingCacheStatus: "fresh",
+      replayExclusionDiagnostics: {
+        filesScanned: Math.round(412 * factor),
+        forkReplayEventsExcluded: Math.round(96_400 * factor),
+        unattributedForkReplayEventsExcluded: Math.round(2_150 * factor),
+        duplicateSnapshotsExcluded: Math.round(11_800 * factor),
+        missingLineageParents: Math.round(37 * factor)
+      },
+      generatedAt: nowIso,
+      coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },
+      unknownModelEvents: Math.round(events * .05),
+      periods: []
+    };
+  };
+  const accounting = {
+    ...demoAccountingPeriod("7d", "Last 7 days", 1),
+    periods: [
+      demoAccountingPeriod("24h", "Last 24 hours", .131),
+      demoAccountingPeriod("7d", "Last 7 days", 1),
+      demoAccountingPeriod("30d", "Last 30 days", 2.15),
+      demoAccountingPeriod("all", "All retained evidence", 2.62)
+    ]
+  };
   return normalizeDashboardPayload({
     schemaVersion: "demo-dashboard-v0.1",
     mode: "demo",
     status: "demo",
-    generatedAt: now,
-    freshness: { status: "demo", latestObservedAt: now, ageSeconds: 0 },
+    generatedAt: nowIso,
+    freshness: { status: "demo", latestObservedAt: nowIso, ageSeconds: 0 },
     quotaWindows: [
-      { id: "weekly", label: "Seven-day allowance", durationMinutes: 10080, usedPercent: 39, remainingPercent: 61, resetAt: "2026-07-28T17:06:03Z", observedAt: now, planType: "pro", status: "demo" },
-      { id: "primary", label: "Five-hour allowance", durationMinutes: 300, usedPercent: 18, remainingPercent: 82, resetAt: "2026-07-25T18:05:00Z", observedAt: now, planType: "pro", status: "demo" }
+      { id: "weekly", label: "Seven-day allowance", durationMinutes: 10080, usedPercent: 39, remainingPercent: 61, resetAt: iso(lastResetMs + 7 * DAY), observedAt: nowIso, planType: "pro", status: "demo" },
+      { id: "primary", label: "Five-hour allowance", durationMinutes: 300, usedPercent: 18, remainingPercent: 82, resetAt: iso(nowMs + 2 * HOUR + 11 * 60_000), observedAt: nowIso, planType: "pro", status: "demo" }
     ],
-    activity: { eventCount: 8120, safeRecordCount: 11432, lastScanAt: now },
+    activity: { eventCount: 8120, safeRecordCount: 11432, lastScanAt: nowIso },
+    timeline: {
+      bucketMinutes: 60,
+      coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },
+      usage: timelineUsage,
+      quota: timelineQuota
+    },
+    accounting,
     pricing: {
       totalCostUsd: 463.82,
       periodLabel: "Last 7 days",

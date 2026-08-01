@@ -762,7 +762,7 @@ function humanize(value) {
 }
 
 function latestRollingPair(data) {
-  if (data.mode !== "demo" && data.timeline?.usage?.length) {
+  if (data.timeline?.usage?.length) {
     const live = liveTimelinePoints(data, {
       windowHours: 1,
       rangeDays: activeUsageRangeDays,
@@ -1201,7 +1201,7 @@ function renderUsageTimeline(data) {
 }
 
 function selectedTimelinePoints(data) {
-  const livePoints = data.mode !== "demo" ? liveTimelinePoints(data) : [];
+  const livePoints = liveTimelinePoints(data);
   const cutoff = timelineCutoffMs(data, activeCalibrationRangeDays);
   const historicalPoints = groupRolling(
     [...data.gradient.rollingHistory, ...data.gradient.rolling],
