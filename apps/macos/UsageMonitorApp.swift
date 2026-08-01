@@ -979,6 +979,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var lastLifecycleStatus = "Starting"
     private var lastFailureCode: String?
     private var lastRecoverySuggestion: String?
+    private var menuBarStatus: MenuBarStatusController?
     private let statusLabel = NSTextField(labelWithString: "Starting locally…")
     private let detailLabel = NSTextField(
         wrappingLabelWithString:
@@ -1031,6 +1032,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
         createWindow()
+        // Installed before any early return below so a launch that fails still
+        // leaves a visible, quittable presence in the menu bar.
+        installMenuBarStatus()
         do {
             centralService = try CentralServiceConfiguration.bundled()
             codexHomeConfiguration = try loadCodexHomeConfiguration(
@@ -1104,6 +1108,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             "Preparing the private local dashboard. No Codex metadata is scanned until you ask."
         openButton.isEnabled = false
         retryButton.isEnabled = false
+        menuBarStatus?.companionStarting()
         let process = CompanionProcess(
             centralService: centralService,
             codexHome: codexHomeConfiguration.url,
@@ -1276,6 +1281,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // The status item is an additional affordance, never a replacement: the
+    // activation policy stays `.regular`, the Dock icon stays, and the window
+    // remains the primary surface. Every action below routes into the exact
+    // path the window's own controls already use, so there is only ever one
+    // dashboard-open path and one shutdown path.
+    private func installMenuBarStatus() {
+        guard menuBarStatus == nil else { return }
+        menuBarStatus = MenuBarStatusController(
+            productName: BundledProduct.displayName,
+            actions: MenuBarStatusController.Actions(
+                openDashboard: { [weak self] in self?.openDashboard() },
+                showWindow: { [weak self] in self?.showMainWindow() },
+                quit: { [weak self] in self?.quitApplication() }
+            )
+        )
+    }
+
+    @objc private func showMainWindow() {
+        if window == nil {
+            createWindow()
+        } else {
+            window?.makeKeyAndOrderFront(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     private func companionReady(_ url: URL, generation: Int) {
         guard generation == launchGeneration else { return }
         startupTimeout?.cancel()
@@ -1298,6 +1329,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         openButton.isEnabled = true
         retryButton.isEnabled = false
+        // The same validated loopback URL the window's Open Dashboard uses.
+        menuBarStatus?.companionReady(dashboardURL: url)
         if pendingDashboardOpen {
             pendingDashboardOpen = false
             openDashboard()
@@ -1328,6 +1361,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             "\(launcherError.errorDescription ?? "The local dashboard could not be started.") Code: \(launcherError.failureCode). \(launcherError.recoverySuggestion)"
         openButton.isEnabled = false
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
+        menuBarStatus?.companionUnavailable(
+            summary:
+                "Not running: \(launcherError.failureCode). Open the window for the recovery step."
+        )
     }
 
     @objc private func openDashboard() {
@@ -1981,6 +2018,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     func applicationWillTerminate(_ notification: Notification) {
         startupTimeout?.cancel()
+        // Released here so the status item can never outlive the companion it
+        // reports on. The companion itself is stopped by the graceful
+        // `applicationShouldTerminate` path above, which every Quit control
+        // — window button and menu-bar item alike — routes through.
+        menuBarStatus?.shutDown()
+        menuBarStatus = nil
         if companion?.isRunning == true {
             companion?.stop {}
         }

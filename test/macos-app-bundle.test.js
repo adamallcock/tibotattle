@@ -93,6 +93,13 @@ const SEMANTIC_OPEN_TARGET_SOURCE = join(
   "Sources",
   "SemanticOpenTarget.swift",
 );
+const MENU_BAR_STATUS_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarStatus.swift",
+);
 const BUILD_SCRIPT = join(
   REPOSITORY_ROOT,
   "scripts",
@@ -558,6 +565,33 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /Large histories may need several passes/iu);
   assert.match(source, /Nothing leaves this Mac/iu);
   assert.match(source, /title: "Quit"/u);
+  // The menu-bar item is additive: the Dock icon and the regular activation
+  // policy stay, and the window remains the primary surface.
+  assert.match(source, /application\.setActivationPolicy\(\.regular\)/u);
+  assert.match(source, /installMenuBarStatus\(\)/u);
+  assert.match(
+    source,
+    /MenuBarStatusController\(\s*productName: BundledProduct\.displayName/u,
+  );
+  // Every menu-bar action reuses an existing path rather than duplicating it.
+  assert.match(source, /openDashboard: \{ \[weak self\] in self\?\.openDashboard\(\) \}/u);
+  assert.match(source, /quit: \{ \[weak self\] in self\?\.quitApplication\(\) \}/u);
+  assert.match(source, /menuBarStatus\?\.companionReady\(dashboardURL: url\)/u);
+  assert.match(source, /menuBarStatus\?\.companionStarting\(\)/u);
+  assert.match(source, /menuBarStatus\?\.companionUnavailable\(/u);
+  assert.match(
+    source,
+    /func applicationWillTerminate[\s\S]*menuBarStatus\?\.shutDown\(\)/u,
+  );
+  // The status item must never become the app's only surface.
+  for (const forbidden of [
+    "LSUIElement",
+    "setActivationPolicy(.accessory)",
+    "setActivationPolicy(.prohibited)",
+    "MenuBarExtra",
+  ]) {
+    assert.equal(source.includes(forbidden), false, forbidden);
+  }
   assert.match(source, /child\.terminate\(\)/u);
   assert.match(source, /SIGKILL/u);
   assert.match(source, /--smoke-test/u);
@@ -571,6 +605,80 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     "SMAppService",
     "SMLoginItemSetEnabled",
     "URLSessionConfiguration.background",
+  ]) {
+    assert.equal(source.includes(forbidden), false, forbidden);
+  }
+});
+
+test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
+  const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
+  assert.match(source, /import AppKit/u);
+  // Variable-length item with a template-rendered glyph, so it adapts to
+  // light and dark menu bars without shipping a hashed asset.
+  assert.match(
+    source,
+    /NSStatusBar\.system\.statusItem\(\s*withLength: NSStatusItem\.variableLength\s*\)/u,
+  );
+  assert.match(source, /systemSymbolName: "gauge"/u);
+  assert.match(source, /isTemplate = true/u);
+  assert.match(source, /setAccessibilityLabel\(/u);
+  assert.match(source, /accessibilityDescription: description/u);
+
+  // The compact title shows a number only for live evidence; stale, absent,
+  // starting, failed, and analyzing states all collapse to a placeholder.
+  assert.match(
+    source,
+    /guard phase == \.ready, evidence == \.live, let window else \{\s*return unknownPlaceholder/u,
+  );
+  assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
+  assert.match(source, /private let analyzingPlaceholder = "…"/u);
+  assert.match(source, /private let unknownPlaceholder = "–"/u);
+  assert.match(source, /so no number is shown/u);
+  assert.match(source, /Seven-day allowance: not observed yet/u);
+
+  // The same window the dashboard treats as primary, selected the same way.
+  assert.match(source, /private let weeklyWindowDurationMinutes = 10_080/u);
+  assert.match(source, /row\["limitId"\] as\? String == "codex"/u);
+  assert.match(source, /\$0\["slot"\] as\? String == "primary"/u);
+  assert.match(
+    source,
+    /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
+  );
+
+  // Menu contract: disabled information rows, the existing actions, and a
+  // separator before Quit.
+  assert.match(source, /menu\.autoenablesItems = false/u);
+  assert.match(source, /allowanceItem\.isEnabled = false/u);
+  assert.match(source, /evidenceItem\.isEnabled = false/u);
+  assert.match(source, /"Open Dashboard"/u);
+  assert.match(source, /"Analyze Local Usage"/u);
+  assert.match(source, /"Show \\\(productName\) Window"/u);
+  assert.match(source, /"Quit \\\(productName\)"/u);
+  assert.match(source, /menu\.addItem\(\.separator\(\)\)\s*\n\s*configure\(quitItem/u);
+  assert.match(source, /analyzeItem\.isEnabled = snapshot\.phase == \.ready/u);
+
+  // The analyze item drives the companion's own refresh route with the exact
+  // same-origin proof the dashboard button sends.
+  assert.match(source, /"\/api\/local\/refresh"/u);
+  assert.match(source, /"\/api\/local\/overview"/u);
+  assert.match(source, /#"\{"reason":"user_request"\}"#/u);
+  assert.match(source, /forHTTPHeaderField: "X-Usage-Monitor-Local"/u);
+  assert.match(source, /forHTTPHeaderField: "Origin"/u);
+  assert.match(source, /case 409:\s*\n\s*result = \.alreadyRunning/u);
+
+  // Loopback only, ephemeral, size-capped, and not aggressive.
+  assert.match(source, /URLSessionConfiguration\.ephemeral/u);
+  assert.match(source, /host == "127\.0\.0\.1" \|\| host == "localhost"/u);
+  assert.match(source, /components\.scheme == "http"/u);
+  assert.match(source, /maximumResponseBytes/u);
+  assert.match(source, /idlePollSeconds = 300/u);
+  assert.match(source, /func menuWillOpen\(_ menu: NSMenu\)/u);
+  for (const forbidden of [
+    "URLSessionConfiguration.background",
+    "https://",
+    "Timer.scheduledTimer",
+    "LaunchAgents",
+    "SMAppService",
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
   }
@@ -802,6 +910,10 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     {
       bundleVersion: "42.7",
       productionOrigin: "https://usage.example",
+      // Absent when no provisioning profile is supplied. Restricted
+      // entitlements are the only reason to embed one, and Developer ID
+      // distribution does not grant any.
+      provisioningProfile: null,
       sparkleAppcastURL: "https://usage.example/appcast.xml",
       sparkleFramework: "/tmp/Sparkle.framework",
       sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
@@ -1516,6 +1628,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/telemetry-shared.generated.js",
   ]);
   assert.deepEqual(swiftSources.relativeFiles, [
+    "apps/macos/Sources/MenuBarStatus.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
     "apps/macos/UsageMonitorApp.swift",
   ]);

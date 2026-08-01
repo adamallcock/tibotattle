@@ -25,25 +25,36 @@ a clean-profile smoke all succeed.
    app data to Trash makes the disclosure appear again.
 3. The native window starts one private loopback companion on an ephemeral
    port. Nothing is scanned or uploaded merely because the app launched.
-4. Choose **Open Dashboard** and explicitly start local analysis.
-5. If the companion fails or exits, choose **Retry**. The app does not require
+4. A menu-bar status item appears alongside the window and the Dock icon. It is
+   an additional affordance, not a replacement: the app stays a regular
+   foreground application and installs no `LSUIElement` agent. The compact
+   title shows the primary seven-day allowance remaining only while the
+   companion reports live evidence; stale, unobserved, starting, and failed
+   states all show a neutral `–`, and an in-progress pass shows `…`. Two
+   disabled rows always name the current allowance and its freshness, so the
+   menu bar never displays a number it cannot justify. The item offers **Open
+   Dashboard**, **Analyze Local Usage**, **Show Usage Monitor Window**, and
+   **Quit Usage Monitor**; Quit uses the same graceful shutdown as the window's
+   own Quit control.
+5. Choose **Open Dashboard** and explicitly start local analysis.
+6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.
-6. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
+7. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
    receipt. Startup and lifecycle failures include a stable `UM_MACOS_*` code
    and a fixed recovery action.
-7. Choose **Codex Source…** to select a custom `CODEX_HOME` with the native
+8. Choose **Codex Source…** to select a custom `CODEX_HOME` with the native
    folder picker, or restore `~/.codex`. The selection is revalidated at every
    launch and stored only in the owner-only app state; copied diagnostics expose
    only `default` or `custom`, never the path.
-8. Choose **Open Codex** to open Codex in the ChatGPT desktop app. If the app is
+9. Choose **Open Codex** to open Codex in the ChatGPT desktop app. If the app is
    unavailable, Usage Monitor offers the official help page.
-9. Choose **Version & Updates…** to check a signed production appcast. Developer
+10. Choose **Version & Updates…** to check a signed production appcast. Developer
    and ad-hoc builds contain no updater framework and perform no update
    networking.
-10. A trusted website or browser bookmark may use `usagemonitor://open` to
+11. A trusted website or browser bookmark may use `usagemonitor://open` to
    activate the app and open its loopback dashboard. All other hosts, paths,
    credentials, queries, and fragments in that custom scheme are rejected.
-11. Closing or quitting the native app stops the companion. No daemon or login
+12. Closing or quitting the native app stops the companion. No daemon or login
    item is installed. After an explicit reviewed first contribution, the user
    may enable six-hour contribution while the app remains open.
 
