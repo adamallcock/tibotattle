@@ -8,7 +8,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-07-26T07:21:54Z",
+        "pricedAt": "2026-08-01T13:47:00Z",
         "totalInputContextTokens": 1000,
         "components": {
           "inputUncachedTokens": 100,
@@ -44,7 +44,7 @@
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:standard:short:official-observed-2026-07-26"
+          "openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"
         ]
       }
     },
@@ -55,7 +55,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "priority",
-        "pricedAt": "2026-07-26T07:21:54Z",
+        "pricedAt": "2026-08-01T13:47:00Z",
         "totalInputContextTokens": 1000,
         "components": {
           "inputUncachedTokens": 100,
@@ -91,7 +91,7 @@
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:priority:short:official-observed-2026-07-26"
+          "openai:gpt-5.6-sol:priority:short:official-observed-2026-08-01"
         ]
       }
     },
@@ -102,7 +102,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-07-26T07:21:54Z",
+        "pricedAt": "2026-08-01T13:47:00Z",
         "totalInputContextTokens": 271999,
         "components": {
           "inputUncachedTokens": 1000000,
@@ -138,7 +138,7 @@
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:standard:short:official-observed-2026-07-26"
+          "openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"
         ]
       }
     },
@@ -149,7 +149,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-07-26T07:21:54Z",
+        "pricedAt": "2026-08-01T13:47:00Z",
         "totalInputContextTokens": 272000,
         "components": {
           "inputUncachedTokens": 1000000,
@@ -185,7 +185,7 @@
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:standard:long:official-observed-2026-07-26"
+          "openai:gpt-5.6-sol:standard:long:official-observed-2026-08-01"
         ]
       }
     },
@@ -196,7 +196,7 @@
         "model": "gpt-5.6-terra",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-07-26T07:21:54Z",
+        "pricedAt": "2026-08-01T13:47:00Z",
         "totalInputContextTokens": 1,
         "components": {
           "inputUncachedTokens": 1,
@@ -226,13 +226,13 @@
         }
       },
       "expected": {
-        "exactCostUsd": "0.0000025",
-        "costNanousd": 2500,
+        "exactCostUsd": "0.000002",
+        "costNanousd": 2000,
         "coverageStatus": "fully_priced",
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-terra:standard:short:official-observed-2026-07-26"
+          "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01"
         ]
       }
     },
@@ -243,7 +243,7 @@
         "model": "claude-sonnet-4-6",
         "surface": "anthropic.messages",
         "apiTier": "standard",
-        "pricedAt": "2026-07-26T07:21:54Z",
+        "pricedAt": "2026-08-01T13:47:00Z",
         "totalInputContextTokens": 1000,
         "components": {
           "inputUncachedTokens": 100,

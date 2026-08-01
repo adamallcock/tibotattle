@@ -111,9 +111,9 @@ const BUILD_SUPPORTED =
 test("reviewed product brand owns the native bundle and semantic-open identity", () => {
   assert.equal(Object.isFrozen(PRODUCT_BRAND), true);
   assert.deepEqual(PRODUCT_BRAND, {
-    displayName: "Usage Monitor",
-    bundleName: "Usage Monitor.app",
-    executableName: "UsageMonitor",
+    displayName: "TiboTattle",
+    bundleName: "TiboTattle.app",
+    executableName: "TiboTattle",
     bundleIdentifier: "com.usagemonitor.local",
     appOpenScheme: "usagemonitor",
     appOpenHost: "open",
@@ -180,7 +180,7 @@ async function sha256File(path) {
 }
 
 const NORMALIZED_TEST_CODE_PATHS = new Set([
-  "Contents/MacOS/UsageMonitor",
+  "Contents/MacOS/TiboTattle",
   "Contents/Resources/runtime/bin/node",
   "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
   ...SPARKLE_MACH_O_PATHS.map(
@@ -934,7 +934,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     application: {
       bundleIdentifier: "com.usagemonitor.local",
       bundleVersion,
-      shortVersion: "0.0.1",
+      shortVersion: "0.1.0",
     },
     artifact: {
       bytes: bytes.length,
@@ -1111,7 +1111,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-signing-hook-test-"),
   );
-  const app = join(temporaryRoot, "Usage Monitor.app");
+  const app = join(temporaryRoot, "TiboTattle.app");
   const resources = join(app, "Contents", "Resources");
   const identity =
     "Developer ID Application: Example Owner (A1B2C3D4E5)";
@@ -1140,7 +1140,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       syntheticMachO,
     ], { stdio: "ignore" });
     for (const relativePath of [
-      "Contents/MacOS/UsageMonitor",
+      "Contents/MacOS/TiboTattle",
       "Contents/Resources/runtime/bin/node",
       "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
       "Contents/Resources/AppIcon.icns",
@@ -1184,7 +1184,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       join(app, "Contents", "Info.plist"),
       JSON.stringify({
         CFBundleDisplayName: PRODUCT_BRAND.displayName,
-        CFBundleExecutable: "UsageMonitor",
+        CFBundleExecutable: "TiboTattle",
         CFBundleIdentifier: "com.usagemonitor.local",
         CFBundleName: PRODUCT_BRAND.displayName,
         CFBundleShortVersionString: "0.0.1",
@@ -1310,7 +1310,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       ],
       /NodeRuntime\.entitlements$/u,
     );
-    assert.match(signing[7].arguments_.at(-1), /MacOS\/UsageMonitor$/u);
+    assert.match(signing[7].arguments_.at(-1), /MacOS\/TiboTattle$/u);
     assert.equal(signing[8].arguments_.at(-1), app);
     for (const call of signing) {
       assert.equal(call.arguments_.includes("--options"), true);
@@ -2220,8 +2220,8 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-test-"),
   );
-  const outputA = join(temporaryRoot, "a", "Usage Monitor.app");
-  const outputB = join(temporaryRoot, "b", "Usage Monitor.app");
+  const outputA = join(temporaryRoot, "a", "TiboTattle.app");
+  const outputB = join(temporaryRoot, "b", "TiboTattle.app");
   const smokeHome = join(temporaryRoot, "smoke-home");
   try {
     const first = await buildMacOSApp({ output: outputA });
@@ -2264,10 +2264,14 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       appOpenScheme: "usagemonitor",
       appOpenURL: "usagemonitor://open",
       externalDistributionRequested: false,
-      iconIncluded: false,
-      iconSha256: null,
+      iconIncluded: true,
+      iconSha256: await sha256File(
+        join(REPOSITORY_ROOT, "apps", "macos", "Assets", "AppIcon.icns"),
+      ),
       productionOriginValidated: false,
-      provenanceSha256: null,
+      provenanceSha256: await sha256File(
+        join(REPOSITORY_ROOT, "apps", "macos", "Assets", "AppIcon.provenance.txt"),
+      ),
       requiresDeveloperIDAndNotarization: false,
       updater: {
         appcastURL: null,
@@ -2288,7 +2292,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     });
     assert.deepEqual(manifest.application.executable, {
       integrity: "strict_codesign",
-      path: "Contents/MacOS/UsageMonitor",
+      path: "Contents/MacOS/TiboTattle",
     });
     assert.equal(manifest.runtime.node.version, "26.2.0");
     assert.equal(manifest.runtime.node.architecture, "arm64");
@@ -2332,7 +2336,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
         { name: "fast-uri", version: "3.1.4" },
         { name: "json-schema-traverse", version: "1.0.0" },
         { name: "require-from-string", version: "2.0.2" },
-        { name: "runcost", version: "0.2.0" },
+        { name: "runcost", version: "0.2.1" },
       ],
     );
     const bundledTelemetryContractPrefix =
@@ -2381,6 +2385,8 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       "config/product-brand.js",
       "scripts/build-macos-app.js",
       "scripts/lib/captured-utf8-source.mjs",
+      "apps/macos/Assets/AppIcon.icns",
+      "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,
     ]);
     const sourceInputHash = createHash("sha256");
@@ -2479,7 +2485,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       false,
     );
     const updaterSmoke = spawnSync(
-      join(outputA, "Contents", "MacOS", "UsageMonitor"),
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
       ["--updater-contract-smoke-test"],
       { encoding: "utf8" },
     );
@@ -2637,7 +2643,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
         ),
       ),
     );
-    const launcher = join(outputA, "Contents", "MacOS", "UsageMonitor");
+    const launcher = join(outputA, "Contents", "MacOS", "TiboTattle");
     assert.match(
       execFileSync("/usr/bin/file", ["-b", launcher], { encoding: "utf8" }),
       /Mach-O 64-bit executable arm64/u,
@@ -2658,7 +2664,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     for (const relativePath of [
       "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
       "Contents/Resources/runtime/bin/node",
-      "Contents/MacOS/UsageMonitor",
+      "Contents/MacOS/TiboTattle",
     ]) {
       execFileSync("/usr/bin/codesign", [
         "--force",
@@ -2701,7 +2707,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       join(outputA, "Contents", "Info.plist"),
     ], { encoding: "utf8" }));
     assert.equal(plistJson.CFBundleDisplayName, PRODUCT_BRAND.displayName);
-    assert.equal(plistJson.CFBundleExecutable, "UsageMonitor");
+    assert.equal(plistJson.CFBundleExecutable, "TiboTattle");
     assert.equal(plistJson.CFBundleName, PRODUCT_BRAND.displayName);
     assert.deepEqual(plistJson.CFBundleURLTypes, [{
       CFBundleTypeRole: "Viewer",
@@ -2736,7 +2742,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       plistJson.UsageMonitorMonitoredAppBundleIdentifier,
       PRODUCT_BRAND.monitoredAppBundleIdentifier,
     );
-    assert.equal(Object.hasOwn(plistJson, "CFBundleIconFile"), false);
+    assert.equal(plistJson.CFBundleIconFile, "AppIcon");
     assert.equal(Object.hasOwn(plistJson, "UsageMonitorCentralOrigin"), false);
     assert.equal(
       Object.hasOwn(plistJson, "UsageMonitorCentralOriginMode"),
@@ -3052,7 +3058,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       {
         bundleIdentifier: "com.usagemonitor.local",
         production: false,
-        shortVersion: "0.0.1",
+        shortVersion: "0.1.0",
       },
     );
 
@@ -3132,7 +3138,7 @@ test("signed app relays central readiness to an explicitly connected loopback la
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-central-test-"),
   );
-  const output = join(temporaryRoot, "connected", "Usage Monitor.app");
+  const output = join(temporaryRoot, "connected", "TiboTattle.app");
   const smokeHome = join(temporaryRoot, "smoke-home");
   const requests = [];
   const central = createServer((request, response) => {
@@ -3208,7 +3214,7 @@ test("signed app relays central readiness to an explicitly connected loopback la
     );
 
     await mkdir(smokeHome, { recursive: true, mode: 0o700 });
-    const launcher = join(output, "Contents", "MacOS", "UsageMonitor");
+    const launcher = join(output, "Contents", "MacOS", "TiboTattle");
     const smoke = await runCaptured(
       launcher,
       ["--central-smoke-test"],

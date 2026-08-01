@@ -65,7 +65,7 @@ const PINNED_NODE_ARCHITECTURE = "arm64";
 const MINIMUM_MACOS_VERSION = "13.0";
 const BUNDLE_VERSION = "1";
 const PACKAGE_NAME = "app-usagemonitor";
-const SHORT_VERSION = "0.0.1";
+const SHORT_VERSION = "0.1.0";
 const LOOPBACK_HOST = "127.0.0.1";
 const CENTRAL_ORIGIN_MODE_NONE = "not_configured";
 const CENTRAL_ORIGIN_MODE_HTTPS = "production_https";
@@ -143,7 +143,7 @@ const PINNED_PACKAGES = Object.freeze({
   "fast-uri": "3.1.4",
   "json-schema-traverse": "1.0.0",
   "require-from-string": "2.0.2",
-  runcost: "0.2.0",
+  runcost: "0.2.1",
 });
 
 const TELEMETRY_CONTRACT_PACKAGE_NAME =

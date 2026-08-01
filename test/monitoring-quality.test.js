@@ -92,7 +92,7 @@ test("profiles collector freshness, reset jitter, quantization, and prioritized 
   assert.equal(report.quantization.usageEventsP50, 2);
   assert.ok(report.opportunities.some((row) => row.id === "collector_continuity" && row.priority === "P0"));
   assert.ok(report.opportunities.some((row) => row.id === "reset_identity_stabilization"));
-  assert.match(renderMonitoringQualityReport(report), /Usage Monitor Quality Diagnostic/);
+  assert.match(renderMonitoringQualityReport(report), /TiboTattle Quality Diagnostic/);
 });
 
 test("keeps continuity as a P0 when a refresh follows a long app-server gap", () => {

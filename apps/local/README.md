@@ -1,7 +1,7 @@
 # Local companion
 
 This loopback-only Node application turns retained privacy-safe monitoring
-artifacts into the functional Usage Monitor dashboard. It does not send raw
+artifacts into the functional TiboTattle dashboard. It does not send raw
 Codex logs, accept arbitrary source paths, or expose raw account/session
 pseudonyms to the browser.
 
@@ -34,7 +34,7 @@ value, redirect, or upstream response.
 
 The participant relay is intentionally narrow rather than a generic reverse
 proxy. It validates bounded JSON request and response bodies, forwards only the
-fixed Usage Monitor session cookie, accepts CSRF and one-use upload
+fixed TiboTattle session cookie, accepts CSRF and one-use upload
 authorization values only in their expected routes and formats, and rejects
 unexpected upstream cookies. This lets the local dashboard exercise the full
 disposable backend lifecycle from one origin without exposing raw logs or
@@ -48,7 +48,7 @@ companion from Terminal:
 
 ```bash
 npm run product:macos:build
-open ".release-build/macos/Usage Monitor.app"
+open ".release-build/macos/TiboTattle.app"
 ```
 
 The native window starts the loopback companion on an ephemeral port and opens
@@ -69,11 +69,11 @@ the signed bundle:
 
 ```bash
 node ./scripts/build-macos-app.js \
-  --output ".release-build/macos-connected/Usage Monitor.app" \
+  --output ".release-build/macos-connected/TiboTattle.app" \
   --central-origin http://127.0.0.1:8792 \
   --allow-loopback-central-origin
 
-".release-build/macos-connected/Usage Monitor.app/Contents/MacOS/UsageMonitor" \
+".release-build/macos-connected/TiboTattle.app/Contents/MacOS/UsageMonitor" \
   --central-smoke-test
 ```
 
@@ -83,7 +83,7 @@ uses a fixed non-loopback HTTPS origin and no development flag:
 
 ```bash
 node ./scripts/build-macos-app.js \
-  --output ".release-build/macos-production/Usage Monitor.app" \
+  --output ".release-build/macos-production/TiboTattle.app" \
   --central-origin https://usage-monitor.example
 ```
 
@@ -106,7 +106,7 @@ On first use:
 2. review whether local Codex metadata and writable installed state are
    available;
 3. choose **Analyze local usage** to start one bounded, cancellable job;
-4. keep reading as Usage Monitor automatically continues bounded slices under
+4. keep reading as TiboTattle automatically continues bounded slices under
    that original action, or choose **Cancel** and resume later; and
 5. review the privacy-safe local results; then
 6. optionally choose **Contribute and keep it current**, review the exact first
@@ -165,7 +165,7 @@ node ./apps/local/server.js
 ```
 
 Mutable installed state is confined to the owner-only
-`~/Library/Application Support/Usage Monitor` directory. App resources stay
+`~/Library/Application Support/TiboTattle` directory. App resources stay
 inside the bundle. The current artifact is only ad-hoc signed for local
 development; it is not Developer ID signed, notarized, packaged as a
 publishable DMG, or ready for unreviewed public installation.

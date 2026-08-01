@@ -212,12 +212,12 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
   assert.equal(latest.components.output_combined_tokens, 0);
   assert.equal(latest.componentCosts.input_uncached_tokens.pricedTokens, 2_000_000);
   assert.equal(latest.componentCosts.input_uncached_tokens.unpricedTokens, 100);
-  assert.equal(latest.componentCosts.input_uncached_tokens.costUsd, 7.5);
+  assert.equal(latest.componentCosts.input_uncached_tokens.costUsd, 7);
   assert.equal(latest.componentCosts.input_cache_read_tokens.costUsd, 0.5);
-  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 6);
-  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 39);
+  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 4.8);
+  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 37.2);
   assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 0);
-  assert.equal(latest.apiPriceEquivalentUsd, 53);
+  assert.equal(latest.apiPriceEquivalentUsd, 49.5);
   assert.equal(
     Object.values(latest.componentCosts)
       .reduce((sum, row) => sum + row.costUsd, 0),
@@ -257,7 +257,7 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
       ],
     ],
   );
-  assert.equal(cache.timeline[2].apiPriceEquivalentUsd, 53);
+  assert.equal(cache.timeline[2].apiPriceEquivalentUsd, 49.5);
   assert.deepEqual(cache.weeklyCalibrationInput, {
     status: "complete",
     encoding: "accounting_compact_v1",
@@ -295,17 +295,17 @@ test("separated output takes precedence over a duplicate combined alias", async 
   assert.equal(latest.components.output_text_tokens, 400_000);
   assert.equal(latest.components.output_reasoning_tokens, 600_000);
   assert.equal(latest.components.output_combined_tokens, 0);
-  assert.equal(latest.apiPriceEquivalentUsd, 17.5);
+  assert.equal(latest.apiPriceEquivalentUsd, 14);
   assert.equal(latest.pricingCoverage.fullyPricedEvents, 1);
-  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 6);
-  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 9);
+  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 4.8);
+  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 7.2);
   assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 0);
   assert.equal(cache.timeline[0].totalTokens, 2_000_000);
-  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 17.5);
+  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 14);
   assert.equal(
     Object.values(latest.componentCosts)
       .reduce((sum, row) => sum + row.costUsd, 0),
-    17.5,
+    14,
   );
 });
 
@@ -329,13 +329,13 @@ test("combined-only output is retained once and priced as ordinary output", asyn
   assert.equal(latest.components.output_text_tokens, 0);
   assert.equal(latest.components.output_reasoning_tokens, 0);
   assert.equal(latest.components.output_combined_tokens, 1_000_000);
-  assert.equal(latest.apiPriceEquivalentUsd, 17.5);
+  assert.equal(latest.apiPriceEquivalentUsd, 14);
   assert.equal(latest.pricingCoverage.fullyPricedEvents, 1);
   assert.equal(latest.componentCosts.output_combined_tokens.pricedTokens, 1_000_000);
   assert.equal(latest.componentCosts.output_combined_tokens.unpricedTokens, 0);
-  assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 15);
+  assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 12);
   assert.equal(cache.timeline[0].totalTokens, 2_000_000);
-  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 17.5);
+  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 14);
 });
 
 test("refresh and read round-trip a valid owner-only cache", async () => {

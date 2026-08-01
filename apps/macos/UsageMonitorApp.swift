@@ -2253,7 +2253,7 @@ private enum WatchdogSmokeTest {
 private enum LifecycleContractSmokeTest {
     static func diagnostics() -> Int32 {
         let rendered = LifecycleDiagnostics.render(
-            version: "0.0.1",
+            version: "0.1.0",
             build: "1",
             lifecycle: "Could not start",
             failureCode: LauncherError.companionTimeout.failureCode,

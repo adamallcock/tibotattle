@@ -1,6 +1,6 @@
-# Usage Monitor
+# TiboTattle
 
-Privacy-first, local-only monitoring for coding-agent usage. Usage Monitor
+Privacy-first, local-only monitoring for coding-agent usage. TiboTattle
 reads the session metadata that Codex already stores on your Mac, reconstructs
 your usage at standard API prices, and compares it with the quota movement your
 provider reports — so you can see where your allowance stands, what a week of
@@ -9,6 +9,13 @@ consumption.
 
 Everything runs locally. Raw logs never leave your machine, and no prompt,
 response, file path, or account identifier ever enters any derived artifact.
+
+
+> **The name:** TiboTattle is named with affection for the Codex community and
+> its patron saint of quota resets. It is not affiliated with or endorsed by
+> OpenAI or Thibault Sottiaux, and we will happily rename it if asked. Your
+> tokens tattle only to you: everything runs locally and nothing leaves your
+> Mac without your explicit, reviewed consent.
 
 ## What it shows
 
@@ -36,7 +43,7 @@ Build and open the self-contained desktop app:
 
 ```bash
 npm run product:macos:build
-open ".release-build/macos/Usage Monitor.app"
+open ".release-build/macos/TiboTattle.app"
 ```
 
 Or run just the local dashboard without building the app:

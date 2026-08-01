@@ -178,7 +178,7 @@ describe("server pricing", () => {
         apiServiceTier,
         tierBasis: "observed_api_service_tier",
         selectedPriceCardIds: [
-          `openai:gpt-5.6-sol:${apiServiceTier}:short:official-observed-2026-07-26`,
+          `openai:gpt-5.6-sol:${apiServiceTier}:short:official-observed-2026-08-01`,
         ],
       });
     }
@@ -223,8 +223,8 @@ describe("server pricing", () => {
       totalInputContextTokens: 1,
     }));
     expect(priced).toMatchObject({
-      exactCostUsd: "0.0000025",
-      costNanousd: 2_500,
+      exactCostUsd: "0.000002",
+      costNanousd: 2_000,
       coverageStatus: "fully_priced",
     });
   });

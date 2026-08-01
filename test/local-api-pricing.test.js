@@ -34,7 +34,7 @@ test("Codex current-price sensitivity prices current cards without backdating th
   const current = priceCodexUsageEvent(event);
   const historical = priceCodexUsageEvent(event, { priceEpochBasis: "event_time" });
 
-  assert.equal(current.totalUsd, "7");
+  assert.equal(current.totalUsd, "1.4");
   assert.equal(current.pricingContext.priceEpochBasis, "current_price_sensitivity_at_registry_observation");
   assert.equal(historical.totalUsd, "0");
   assert.equal(historical.coverageStatus, "unpriced");
@@ -90,8 +90,8 @@ test("Codex pricing prefers canonical totalInputContextTokens for the exact long
   };
   const result = priceCodexUsageEvent(event);
   assert.equal(result.coverageStatus, "fully_priced");
-  assert.equal(result.totalUsd, "11");
-  assert.match(result.selectedPriceCardId, /:long:/);
+  assert.equal(result.totalUsd, "2.2");
+  assert.match(result.selectedPriceCardId, /:long(?:-from-2026-07-30)?:/);
 });
 
 test("Claude canonical records retain cache TTL and combined-output semantics", () => {

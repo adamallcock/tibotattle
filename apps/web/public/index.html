@@ -24,7 +24,7 @@
     <meta name="usage-monitor-semantic-open-target" content="__USAGE_MONITOR_SEMANTIC_OPEN_TARGET__">
     <link rel="canonical" href="">
     <meta property="og:type" content="website">
-    <meta property="og:title" content="Usage Monitor">
+    <meta property="og:title" content="TiboTattle">
     <meta
       property="og:description"
       content="Private, local-first monitoring for AI usage, quota movement, and calibration quality."
@@ -33,9 +33,9 @@
     <meta property="og:image" content="">
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
-    <meta property="og:image:alt" content="Usage Monitor local-first allowance dashboard">
+    <meta property="og:image:alt" content="TiboTattle local-first allowance dashboard">
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="Usage Monitor">
+    <meta name="twitter:title" content="TiboTattle">
     <meta
       name="twitter:description"
       content="Private, local-first monitoring for AI usage, quota movement, and calibration quality."
@@ -45,7 +45,7 @@
       name="description"
       content="Private, local-first monitoring for AI usage, quota movement, calibration quality, and safe community contributions."
     >
-    <title>Usage Monitor</title>
+    <title>TiboTattle</title>
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
   </head>
@@ -53,9 +53,9 @@
     <a class="skip-link" href="#main">Skip to monitoring dashboard</a>
 
     <header class="topbar">
-      <a class="brand" href="#overview" aria-label="Usage Monitor dashboard">
+      <a class="brand" href="#overview" aria-label="TiboTattle dashboard">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span>Usage Monitor</span>
+        <span>TiboTattle</span>
       </a>
       <nav class="primary-nav" aria-label="Dashboard sections">
         <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
@@ -103,7 +103,7 @@
         <div>
           <strong id="connection-title">Local companion unavailable</strong>
           <p id="connection-copy">
-            Open Usage Monitor from Applications and use the local dashboard it
+            Open TiboTattle from Applications and use the local dashboard it
             opens. Nothing has been presented as your real usage.
           </p>
         </div>
@@ -116,9 +116,9 @@
       <section class="companion-setup" id="companion-setup" aria-labelledby="companion-setup-title" hidden>
         <div class="companion-setup-copy">
           <p class="eyebrow">First-time setup</p>
-          <h2 id="companion-setup-title">Open Usage Monitor on this Mac</h2>
+          <h2 id="companion-setup-title">Open TiboTattle on this Mac</h2>
           <p>
-            A normal website cannot read Codex files. The Usage Monitor Mac app
+            A normal website cannot read Codex files. The TiboTattle Mac app
             runs a private loopback companion, reads metadata locally, and opens
             your dashboard in a separate local tab.
           </p>
@@ -127,7 +127,7 @@
           <li>
             <strong>Get the Mac app</strong>
             <a class="button button-primary" id="installer-link" href="" hidden>
-              Download Usage Monitor for Mac
+              Download TiboTattle for Mac
             </a>
             <div class="installer-details" id="installer-details" hidden>
               <span id="installer-version"></span>
@@ -171,7 +171,7 @@
           </p>
           <p class="safe-close-guidance">
             You may close this hosted browser tab at any time. During an
-            analysis, keep the Usage Monitor app open; closing the app stops its
+            analysis, keep the TiboTattle app open; closing the app stops its
             local companion, while the last durable checkpoint remains available
             when you reopen it.
           </p>
@@ -184,7 +184,7 @@
           <p class="eyebrow">Local setup</p>
           <h2 id="setup-title">Check this Mac before analyzing</h2>
           <p id="setup-summary">
-            Usage Monitor checks only whether the expected Codex folders and its
+            TiboTattle checks only whether the expected Codex folders and its
             private state directory are available. It does not send or display
             prompts, responses, commands, paths, or account identifiers.
           </p>
@@ -739,7 +739,7 @@
             </div>
             <p id="automatic-contribution-description">
               Off until you explicitly consent. No daemon or login item is installed;
-              checks run only while Usage Monitor is open.
+              checks run only while TiboTattle is open.
             </p>
             <button
               class="button button-quiet compact"
@@ -865,7 +865,7 @@
               </p>
               <p class="annotation safe-close-guidance" id="index-progress-close-guidance">
                 You may close this browser tab while analysis continues. Keep
-                the Usage Monitor app open; closing it ends the local companion
+                the TiboTattle app open; closing it ends the local companion
                 and preserves the last durable checkpoint for a later resume.
               </p>
             </section>
@@ -922,16 +922,16 @@
               </p>
             </div>
             <details class="manual-contribution">
-              <summary>Advanced: use an existing Usage Monitor export</summary>
+              <summary>Advanced: use an existing TiboTattle export</summary>
               <p class="annotation">
-                Choose a <code>.json</code> file created by Usage Monitor. Do not
+                Choose a <code>.json</code> file created by TiboTattle. Do not
                 choose a <code>.jsonl</code> file, a sessions folder, or a raw Codex log.
               </p>
             <form id="contribution-form">
               <label class="file-drop" for="contribution-file">
                 <input id="contribution-file" name="export" type="file" accept=".json,application/json" required>
                 <span aria-hidden="true">＋</span>
-                <strong>Choose a Usage Monitor .json export</strong>
+                <strong>Choose a TiboTattle .json export</strong>
                 <small id="file-help">Not a Codex log or .jsonl file · 1.25 MB browser validation limit</small>
               </label>
               <section
@@ -948,7 +948,7 @@
                   <span class="evidence-chip neutral" id="selected-contribution-state">Not validated</span>
                 </div>
                 <p class="annotation" id="selected-contribution-message">
-                  Choose a Usage Monitor export to validate it locally.
+                  Choose a TiboTattle export to validate it locally.
                 </p>
                 <dl class="backend-facts selected-contribution-facts">
                   <div><dt>Schema</dt><dd id="selected-contribution-schema">—</dd></div>
@@ -969,7 +969,7 @@
               <label class="consent-row">
                 <input id="contribution-consent" type="checkbox" required>
                 <span>
-                  <strong id="contribution-consent-title">I reviewed this as a privacy-safe Usage Monitor export.</strong>
+                  <strong id="contribution-consent-title">I reviewed this as a privacy-safe TiboTattle export.</strong>
                   <small id="contribution-consent-detail">Uploading is optional and can be tested against a local backend.</small>
                 </span>
               </label>
@@ -1057,7 +1057,7 @@
             </p>
           </div>
           <p class="backend-contract-note">
-            Automatic checks run at most every 6 hours while Usage Monitor is
+            Automatic checks run at most every 6 hours while TiboTattle is
             open and only after explicit consent. No login item, LaunchAgent,
             daemon or silent background process is installed.
           </p>
@@ -1174,7 +1174,12 @@
     </main>
 
     <footer>
-      <p>Usage Monitor · evidence, uncertainty, and privacy boundaries kept visible.</p>
+      <p>TiboTattle · evidence, uncertainty, and privacy boundaries kept visible.</p>
+      <p class="footer-disclaimer">
+        Named with affection for the Codex community. Not affiliated with or
+        endorsed by OpenAI or Thibault Sottiaux — and we will happily rename if
+        asked. Your tokens tattle only to you.
+      </p>
       <p id="schema-version">Dashboard contract: waiting</p>
     </footer>
 

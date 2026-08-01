@@ -234,7 +234,7 @@ function selectLocalReviewParticipantIdentity({
 }
 
 function usage() {
-  console.log(`Usage Monitor local review ${LOCAL_REVIEW_CLI_VERSION}
+  console.log(`TiboTattle local review ${LOCAL_REVIEW_CLI_VERSION}
 
 Local-only commands:
   usage-monitor-local doctor
@@ -383,7 +383,7 @@ export async function runLocalReview(
       explicitSecretFile: args.exportSecretFile,
     });
     const identity = await inspectIdentity(selection.identityOptions);
-    console.log(`Usage Monitor local review: ${LOCAL_REVIEW_CLI_VERSION}`);
+    console.log(`TiboTattle local review: ${LOCAL_REVIEW_CLI_VERSION}`);
     console.log(`Platform: ${process.platform}-${process.arch}`);
     console.log(`Runtime: ${process.version} (${runtimeMatches ? "pinned" : "unexpected"})`);
     console.log(`Codex local data: ${await exists(join(homedir(), ".codex", "sessions")) ? "available" : "not_found"}`);

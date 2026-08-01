@@ -30,8 +30,8 @@ importers:
         specifier: 20.0.18
         version: 20.0.18
       runcost:
-        specifier: 0.2.0
-        version: 0.2.0
+        specifier: 0.2.1
+        version: 0.2.1
     devDependencies:
       es-module-lexer:
         specifier: 2.3.1
@@ -43,8 +43,8 @@ importers:
   packages/accounting:
     dependencies:
       runcost:
-        specifier: 0.2.0
-        version: 0.2.0
+        specifier: 0.2.1
+        version: 0.2.1
 
   packages/identity-core: {}
 
@@ -121,8 +121,8 @@ packages:
     resolution: {integrity: sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw==}
     engines: {node: '>=0.10.0'}
 
-  runcost@0.2.0:
-    resolution: {integrity: sha512-bP/RR1j1HEfkvxLbk2n943ccp0bslwxwycRRdU6PZjHndHv0Nng47Z7xeesjeOBkOD8kafU0K8xB36Nk8Muu/g==}
+  runcost@0.2.1:
+    resolution: {integrity: sha512-+t34HDxIxdZcQ7PYACx/DNlMpYKOVu0/svwCtpPC1fpV1Nkyb0xhSwm1gkRVTeKlHpm/pB2W2kPnssspCCzHlA==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -184,4 +184,4 @@ snapshots:
 
   require-from-string@2.0.2: {}
 
-  runcost@0.2.0: {}
+  runcost@0.2.1: {}

@@ -154,7 +154,7 @@ async function fixture() {
   );
   await writeFile(
     join(staticRoot, "index.html"),
-    `<!doctype html><meta name="usage-monitor-semantic-open-target" content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><title>Usage Monitor</title>`,
+    `<!doctype html><meta name="usage-monitor-semantic-open-target" content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><title>TiboTattle</title>`,
   );
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
@@ -332,7 +332,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     const page = await fetch(`${base}/`);
     assert.equal(page.status, 200);
     const pageBody = await page.text();
-    assert.match(pageBody, /Usage Monitor/);
+    assert.match(pageBody, /TiboTattle/);
     assert.match(
       pageBody,
       new RegExp(

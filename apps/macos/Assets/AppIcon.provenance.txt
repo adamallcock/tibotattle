@@ -1,0 +1,13 @@
+TiboTattle application icon provenance
+
+Source: Original artwork drawn programmatically with Apple CoreGraphics in
+this repository's tooling on 2026-08-01. The mark (three ascending rounded
+bars with a baseline and an abstract speech bubble) was designed for this
+product and incorporates no external artwork, fonts, photographs, or any
+person's likeness.
+
+Rights: Created as an original work for this repository; all rights held by
+Adam Allcock, who reviewed the rendered artwork and approved it for
+distribution with the v0.1.0 release preparation on 2026-08-01.
+
+License: MIT, under this repository's LICENSE file.

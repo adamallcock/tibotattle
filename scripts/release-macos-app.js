@@ -31,7 +31,7 @@ function parseArguments(argv) {
 
 export async function main(argv) {
   const result = await releaseMacOSApp(parseArguments(argv));
-  console.log("Usage Monitor macOS release: complete");
+  console.log("TiboTattle macOS release: complete");
   console.log(`DMG: ${result.output}`);
   console.log(`Release manifest: ${result.releaseManifest}`);
   console.log(`SHA-256: ${result.sha256}`);

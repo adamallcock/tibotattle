@@ -670,7 +670,7 @@ async function copyLicenses(artifactRoot, components) {
   }
   await writeGenerated(
     join(artifactRoot, "LICENSES", "app-usagemonitor-private-poc.txt"),
-    "App Usage Monitor is a private proof of concept. No public source-code license is granted by this artifact.\n",
+    "TiboTattle is distributed under the MIT license; see the repository LICENSE file.\n",
     0o644,
   );
 }
@@ -1039,7 +1039,7 @@ exec "$ROOT/runtime/bin/node" "$ROOT/local-review/cli.js" "$@"
   );
   await writeGenerated(
     join(artifactRoot, "README.txt"),
-    `Usage Monitor local review ${ARTIFACT_VERSION}
+    `TiboTattle local review ${ARTIFACT_VERSION}
 
 This is an unsigned engineering candidate for macOS arm64.
 It contains no upload, enrollment, pairing, backend, server, or updater.

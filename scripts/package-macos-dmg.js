@@ -31,7 +31,7 @@ function parseArguments(argv) {
 
 export async function main(argv) {
   const result = await packageMacOSDMG(parseArguments(argv));
-  console.log("Usage Monitor DMG: built");
+  console.log("TiboTattle DMG: built");
   console.log(`Output: ${result.output}`);
   console.log(`SHA-256: ${result.sha256}`);
   console.log(`Bytes: ${result.bytes}`);

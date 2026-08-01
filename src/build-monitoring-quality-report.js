@@ -63,14 +63,14 @@ const artifact = {
   manifest: {
     version: 1,
     surface: "report",
-    title: "Where the Usage Monitor Can Get Tighter",
+    title: "Where TiboTattle Can Get Tighter",
     description: "A log-derived technical diagnostic of collector freshness, reset identity, quota quantization, and metadata coverage.",
     generatedAt,
     blocks: [
       {
         id: "title",
         type: "markdown",
-        body: "# Where the Usage Monitor Can Get Tighter",
+        body: "# Where TiboTattle Can Get Tighter",
       },
       {
         id: "technical_summary",

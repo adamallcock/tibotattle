@@ -1,7 +1,10 @@
+// Display-layer branding is TiboTattle; machine identifiers deliberately stay
+// on the neutral usagemonitor names so a future rename never breaks bundle
+// identity, URL-scheme registrations, or existing local state.
 const configuredProductBrand = {
-  displayName: "Usage Monitor",
-  bundleName: "Usage Monitor.app",
-  executableName: "UsageMonitor",
+  displayName: "TiboTattle",
+  bundleName: "TiboTattle.app",
+  executableName: "TiboTattle",
   bundleIdentifier: "com.usagemonitor.local",
   appOpenScheme: "usagemonitor",
   appOpenHost: "open",

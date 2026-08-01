@@ -421,7 +421,7 @@ export function parseTelemetryContribution(value, {
   ) {
     invalid(
       "schema_version_invalid",
-      "Choose a real privacy-safe Usage Monitor telemetry export.",
+      "Choose a real privacy-safe telemetry export from this app.",
     );
   }
   if (telemetryPrivacyCanary(value)) {

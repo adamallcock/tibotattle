@@ -89,8 +89,8 @@ export class CodexAppServerClient extends EventEmitter {
     await this.request("initialize", {
       clientInfo: {
         name: "app_usagemonitor",
-        title: "Usage Monitor",
-        version: "0.0.1",
+        title: "TiboTattle",
+        version: "0.1.0",
       },
       capabilities: {
         optOutNotificationMethods: ["remoteControl/status/changed"],

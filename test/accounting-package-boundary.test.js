@@ -50,7 +50,7 @@ test("the accounting package has one reviewed public export and an exact depende
     import: "./index.js",
     default: "./index.js",
   });
-  assert.deepEqual(manifest.dependencies, { runcost: "0.2.0" });
+  assert.deepEqual(manifest.dependencies, { runcost: "0.2.1" });
   assert.equal(Object.hasOwn(manifest, "sideEffects"), false);
   const [workspace, lockfile] = await Promise.all([
     readFile(new URL("../pnpm-workspace.yaml", import.meta.url), "utf8"),

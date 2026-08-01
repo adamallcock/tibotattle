@@ -1,10 +1,11 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-07-26T07:21:54Z";
-const OPENAI_OBSERVED_DATE = APP_PRICE_REGISTRY_OBSERVED_AT.slice(0, 10);
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-08-01T13:47:00Z";
+// First official-page review; undated OpenAI rows assert no validity before it.
+const OPENAI_FIRST_OBSERVED_DATE = "2026-07-26";
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const ANTHROPIC_OBSERVED_DATE = ANTHROPIC_OBSERVED_AT.slice(0, 10);
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.1";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.2";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -25,7 +26,7 @@ const SOURCE_DEFINITIONS = Object.freeze({
     name: "openai-official-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.openai,
     observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
-    evidenceVersion: "openai-api-pricing-reviewed-2026-07-26",
+    evidenceVersion: "openai-api-pricing-reviewed-2026-08-01",
     evidenceUrls: Object.freeze([
       OFFICIAL_PRICE_SOURCE_URLS.openai,
       ...OPENAI_LONG_CONTEXT_SOURCE_URLS,
@@ -43,8 +44,11 @@ const SOURCE_DEFINITIONS = Object.freeze({
 
 const OPENAI_ROWS = Object.freeze([
   // Values are model, API tier, input, cache read, cache write, output
-  // USD/MTok, and optional context band. The 272K boundary is inclusive on
-  // the long side to preserve the monitor's established threshold contract.
+  // USD/MTok, optional context band, and optional dated validity period. The
+  // 272K boundary is inclusive on the long side to preserve the monitor's
+  // established threshold contract. GPT-5.6 Terra and Luna were officially
+  // repriced effective 2026-07-30; Sol was not changed. The pre-change rows
+  // stay behind a closed validity window so historical pricing is preserved.
   ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short"],
   ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long"],
   ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short"],
@@ -52,20 +56,34 @@ const OPENAI_ROWS = Object.freeze([
   ["gpt-5.6-sol", "flex", "2.5", "0.25", "3.125", "15", "short"],
   ["gpt-5.6-sol", "flex", "5", "0.5", "6.25", "22.5", "long"],
   ["gpt-5.6-sol", "priority", "10", "1", "12.5", "60", "short"],
-  ["gpt-5.6-terra", "standard", "2.5", "0.25", "3.125", "15", "short"],
-  ["gpt-5.6-terra", "standard", "5", "0.5", "6.25", "22.5", "long"],
-  ["gpt-5.6-terra", "batch", "1.25", "0.125", "1.5625", "7.5", "short"],
-  ["gpt-5.6-terra", "batch", "2.5", "0.25", "3.125", "11.25", "long"],
-  ["gpt-5.6-terra", "flex", "1.25", "0.125", "1.5625", "7.5", "short"],
-  ["gpt-5.6-terra", "flex", "2.5", "0.25", "3.125", "11.25", "long"],
-  ["gpt-5.6-terra", "priority", "5", "0.5", "6.25", "30", "short"],
-  ["gpt-5.6-luna", "standard", "1", "0.1", "1.25", "6", "short"],
-  ["gpt-5.6-luna", "standard", "2", "0.2", "2.5", "9", "long"],
-  ["gpt-5.6-luna", "batch", "0.5", "0.05", "0.625", "3", "short"],
-  ["gpt-5.6-luna", "batch", "1", "0.1", "1.25", "4.5", "long"],
-  ["gpt-5.6-luna", "flex", "0.5", "0.05", "0.625", "3", "short"],
-  ["gpt-5.6-luna", "flex", "1", "0.1", "1.25", "4.5", "long"],
-  ["gpt-5.6-luna", "priority", "2", "0.2", "2.5", "12", "short"],
+  ["gpt-5.6-terra", "standard", "2.5", "0.25", "3.125", "15", "short", "through-2026-07-29"],
+  ["gpt-5.6-terra", "standard", "2", "0.2", "2.5", "12", "short", "from-2026-07-30"],
+  ["gpt-5.6-terra", "standard", "5", "0.5", "6.25", "22.5", "long", "through-2026-07-29"],
+  ["gpt-5.6-terra", "standard", "4", "0.4", "5", "18", "long", "from-2026-07-30"],
+  ["gpt-5.6-terra", "batch", "1.25", "0.125", "1.5625", "7.5", "short", "through-2026-07-29"],
+  ["gpt-5.6-terra", "batch", "1", "0.1", "1.25", "6", "short", "from-2026-07-30"],
+  ["gpt-5.6-terra", "batch", "2.5", "0.25", "3.125", "11.25", "long", "through-2026-07-29"],
+  ["gpt-5.6-terra", "batch", "2", "0.2", "2.5", "9", "long", "from-2026-07-30"],
+  ["gpt-5.6-terra", "flex", "1.25", "0.125", "1.5625", "7.5", "short", "through-2026-07-29"],
+  ["gpt-5.6-terra", "flex", "1", "0.1", "1.25", "6", "short", "from-2026-07-30"],
+  ["gpt-5.6-terra", "flex", "2.5", "0.25", "3.125", "11.25", "long", "through-2026-07-29"],
+  ["gpt-5.6-terra", "flex", "2", "0.2", "2.5", "9", "long", "from-2026-07-30"],
+  ["gpt-5.6-terra", "priority", "5", "0.5", "6.25", "30", "short", "through-2026-07-29"],
+  ["gpt-5.6-terra", "priority", "4", "0.4", "5", "24", "short", "from-2026-07-30"],
+  ["gpt-5.6-luna", "standard", "1", "0.1", "1.25", "6", "short", "through-2026-07-29"],
+  ["gpt-5.6-luna", "standard", "0.2", "0.02", "0.25", "1.2", "short", "from-2026-07-30"],
+  ["gpt-5.6-luna", "standard", "2", "0.2", "2.5", "9", "long", "through-2026-07-29"],
+  ["gpt-5.6-luna", "standard", "0.4", "0.04", "0.5", "1.8", "long", "from-2026-07-30"],
+  ["gpt-5.6-luna", "batch", "0.5", "0.05", "0.625", "3", "short", "through-2026-07-29"],
+  ["gpt-5.6-luna", "batch", "0.1", "0.01", "0.125", "0.6", "short", "from-2026-07-30"],
+  ["gpt-5.6-luna", "batch", "1", "0.1", "1.25", "4.5", "long", "through-2026-07-29"],
+  ["gpt-5.6-luna", "batch", "0.2", "0.02", "0.25", "0.9", "long", "from-2026-07-30"],
+  ["gpt-5.6-luna", "flex", "0.5", "0.05", "0.625", "3", "short", "through-2026-07-29"],
+  ["gpt-5.6-luna", "flex", "0.1", "0.01", "0.125", "0.6", "short", "from-2026-07-30"],
+  ["gpt-5.6-luna", "flex", "1", "0.1", "1.25", "4.5", "long", "through-2026-07-29"],
+  ["gpt-5.6-luna", "flex", "0.2", "0.02", "0.25", "0.9", "long", "from-2026-07-30"],
+  ["gpt-5.6-luna", "priority", "2", "0.2", "2.5", "12", "short", "through-2026-07-29"],
+  ["gpt-5.6-luna", "priority", "0.4", "0.04", "0.5", "2.4", "short", "from-2026-07-30"],
   ["gpt-5.5", "standard", "5", "0.5", null, "30", "short"],
   ["gpt-5.5", "standard", "10", "1", null, "45", "long"],
   ["gpt-5.5", "batch", "2.5", "0.25", null, "15", "short"],
@@ -76,9 +94,14 @@ const OPENAI_ROWS = Object.freeze([
   ["gpt-5.4", "standard", "2.5", "0.25", null, "15", "short"],
   ["gpt-5.4", "standard", "5", "0.5", null, "22.5", "long"],
   ["gpt-5.4", "batch", "1.25", "0.13", null, "7.5", "short"],
-  ["gpt-5.4", "batch", "2.5", "0.26", null, "11.25", "long"],
+  // The official Batch/Flex long-context cached-input cell read $0.26 in the
+  // 2026-07-26 review and reads $0.25 as of the 2026-08-01 review; the change
+  // is dated with the same 2026-07-30 boundary as the GPT-5.6 repricing.
+  ["gpt-5.4", "batch", "2.5", "0.26", null, "11.25", "long", "through-2026-07-29"],
+  ["gpt-5.4", "batch", "2.5", "0.25", null, "11.25", "long", "from-2026-07-30"],
   ["gpt-5.4", "flex", "1.25", "0.13", null, "7.5", "short"],
-  ["gpt-5.4", "flex", "2.5", "0.26", null, "11.25", "long"],
+  ["gpt-5.4", "flex", "2.5", "0.26", null, "11.25", "long", "through-2026-07-29"],
+  ["gpt-5.4", "flex", "2.5", "0.25", null, "11.25", "long", "from-2026-07-30"],
   ["gpt-5.4", "priority", "5", "0.5", null, "30", "short"],
   ["gpt-5.4-mini", "standard", "0.75", "0.075", null, "4.5"],
   ["gpt-5.4-mini", "batch", "0.375", "0.0375", null, "2.25"],
@@ -129,7 +152,7 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
 // evidence refresh and checked independently in Node-side registry tests. They
 // are constants here so the production registry has no Node crypto dependency.
 const EVIDENCE_HASHES = Object.freeze({
-  openai: "86c0dfaa64094cf69c8c94af25f9cce8869a8bf482bac2a21c0ee3592c34927d",
+  openai: "a43ddf0fce53caeb2cebcd331961ff24c734a0af7f9047d11ef8f34a10a825e2",
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
 });
 
@@ -189,22 +212,56 @@ function cardId(provider, model, tier, suffix = "current") {
   return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
-function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null]) {
+// Undated rows begin at each provider's first review so pre-repricing history
+// stays priceable; new observations must not silently shift those windows.
+const FIRST_OBSERVED_DATES = Object.freeze({
+  openai: OPENAI_FIRST_OBSERVED_DATE,
+  anthropic: ANTHROPIC_OBSERVED_DATE,
+});
+
+function openAiEffective(period) {
+  if (period === "through-2026-07-29") {
+    return {
+      effective: { from: OPENAI_FIRST_OBSERVED_DATE, to: "2026-07-29" },
+      vendorEffectiveFrom: null,
+      vendorEffectiveTo: "2026-07-29",
+      suffix: "through-2026-07-29",
+    };
+  }
+  if (period === "from-2026-07-30") {
+    return {
+      effective: { from: "2026-07-30" },
+      vendorEffectiveFrom: "2026-07-30",
+      vendorEffectiveTo: null,
+      suffix: "from-2026-07-30",
+    };
+  }
+  return {
+    effective: { from: OPENAI_FIRST_OBSERVED_DATE },
+    vendorEffectiveFrom: null,
+    vendorEffectiveTo: null,
+    suffix: "current",
+  };
+}
+
+function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
   const contextConditions = contextBand === "short"
     ? { max_total_input_tokens: "271999" }
     : contextBand === "long"
       ? { min_total_input_tokens: "272000" }
       : null;
   const aliases = model === "gpt-5.5" ? ["gpt-5.5-codex"] : undefined;
+  const validity = openAiEffective(period);
+  const bandSuffix = contextBand ?? "current";
   return {
     schema_version: "0.1",
-    id: cardId("openai", model, tier, contextBand ?? "current"),
+    id: cardId("openai", model, tier, period ? `${bandSuffix}-${validity.suffix}` : bandSuffix),
     provider: "openai",
     model,
     ...(aliases ? { aliases } : {}),
     service_tier: tier,
     region: "global",
-    effective: { from: OPENAI_OBSERVED_DATE },
+    effective: validity.effective,
     components: [
       component("input_uncached_tokens", input, contextConditions),
       component("input_cache_read_tokens", cacheRead, contextConditions),
@@ -219,7 +276,7 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       api_service_tier: tier,
       subscription_speed_tier: null,
       total_input_context_band: contextBand,
-      provenance: provenance("openai"),
+      provenance: provenance("openai", validity),
       ...(aliases ? {
         alias_assumptions: {
           "gpt-5.5-codex": "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
@@ -298,7 +355,7 @@ function providerToolCard(provider, model, rows) {
     model,
     service_tier: "standard",
     region: "global",
-    effective: { from: SOURCE_DEFINITIONS[provider].observedAt.slice(0, 10) },
+    effective: { from: FIRST_OBSERVED_DATES[provider] },
     components: rows.map(([name, amount, unit, per]) => (
       providerUnitComponent(name, amount, unit, per)
     )),
@@ -326,7 +383,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...PROVIDER_TOOL_PRICE_CARDS,
 ]);
 
-export const APP_PRICE_REGISTRY_SHA256 = "c9961d3d0d5de61b7471f1322ed7ce3b75be184a8dddb59450746ed6eb30f71f";
+export const APP_PRICE_REGISTRY_SHA256 = "29f217770ecd220dc9bd8cce86e6b2a3a96251c2aa3dbae8d1019910626c7fe8";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,

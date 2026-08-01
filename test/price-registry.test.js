@@ -42,7 +42,7 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", co
 
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
-  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 46);
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 62);
   assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
@@ -258,16 +258,64 @@ test("GPT-5.6 context bands apply exact official long multipliers and fail close
   }
 });
 
-test("OpenAI official rows do not silently alias subscription Fast to API Priority", () => {
-  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+test("GPT-5.6 Terra and Luna pricing changes at the official July 30 boundary", () => {
+  // Sol was not part of the 2026-07-30 repricing; its totals must not move.
+  const expected = {
+    "gpt-5.6-terra": { before: "17.5", after: "14" },
+    "gpt-5.6-luna": { before: "7", after: "1.4" },
+    "gpt-5.6-sol": { before: "35", after: "35" },
+  };
+  for (const [model, totals] of Object.entries(expected)) {
+    const components = { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 };
+    const before = price({ provider: "openai", model, pricedAt: "2026-07-29", totalInputTokens: 1000, components });
+    const after = price({ provider: "openai", model, pricedAt: "2026-07-31", totalInputTokens: 1000, components });
+    assert.equal(before.total, totals.before, `${model}/2026-07-29`);
+    assert.equal(before.warnings.length, 0, `${model}/2026-07-29/warnings`);
+    assert.equal(after.total, totals.after, `${model}/2026-07-31`);
+    assert.equal(after.warnings.length, 0, `${model}/2026-07-31/warnings`);
+  }
+  const successor = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => (
+    card.model === "gpt-5.6-terra" && card.service_tier === "standard"
+      && card.effective.from === "2026-07-30" && card.metadata.total_input_context_band === "short"
+  ));
+  assert.equal(successor.metadata.provenance.vendor_effective_from, "2026-07-30");
+  const closed = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => (
+    card.model === "gpt-5.6-terra" && card.service_tier === "standard"
+      && card.effective.to === "2026-07-29" && card.metadata.total_input_context_band === "short"
+  ));
+  assert.equal(closed.metadata.provenance.vendor_effective_to, "2026-07-29");
+  assert.equal(closed.effective.from, "2026-07-26");
+});
+
+test("OpenAI service_tier fast is priced only as an explicitly labeled Priority fallback", () => {
+  // OpenAI renamed API Priority processing to Fast mode on 2026-07-30, and
+  // RunCost 0.2.1 resolves an OpenAI "fast" request onto Priority cards with
+  // an explicit service_tier_resolution marker instead of pricing silently.
+  // Subscription speed modes still never reach the engine as API tiers; the
+  // worker maps subscription usage to the Standard counterfactual first.
+  const expected = {
+    "gpt-5.6-sol": { total: "10", cardSuffix: "short" },
+    "gpt-5.6-terra": { total: "4", cardSuffix: "short-from-2026-07-30" },
+    "gpt-5.6-luna": { total: "0.4", cardSuffix: "short-from-2026-07-30" },
+  };
+  for (const [model, { total, cardSuffix }] of Object.entries(expected)) {
     const result = price({
       provider: "openai",
       model,
       tier: "fast",
+      pricedAt: "2026-07-31",
+      totalInputTokens: 1000,
       components: { input_uncached_tokens: 1_000_000 },
     });
-    assert.equal(result.total, "0");
-    assert.ok(result.warnings.some((warning) => warning.code === "service_tier_unsupported"));
+    assert.equal(result.total, total, model);
+    assert.deepEqual(result.metadata.service_tier_resolution, {
+      requested: "fast",
+      priced_as: "priority",
+      fallback: true,
+      price_card_ids: [
+        `openai:${model}:priority:${cardSuffix}:official-observed-2026-08-01`,
+      ],
+    }, model);
   }
 });
 

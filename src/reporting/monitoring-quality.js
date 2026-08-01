@@ -414,13 +414,13 @@ export function renderMonitoringQualityReport(report) {
   const dominant = report.scope.dominantSeries;
   const lines = [
     "---",
-    "title: Usage Monitor Quality Diagnostic",
+    "title: TiboTattle Quality Diagnostic",
     `date: ${date}`,
     "type: research",
     "status: complete",
     "---",
     "",
-    "# Usage Monitor Quality Diagnostic",
+    "# TiboTattle Quality Diagnostic",
     "",
     "## Technical summary",
     "",

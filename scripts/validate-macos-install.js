@@ -41,7 +41,7 @@ export async function main(argv) {
     : await validateMacOSDMG(options.dmgPath, {
       production: options.production,
     });
-  console.log("Usage Monitor clean-install validation: passed");
+  console.log("TiboTattle clean-install validation: passed");
   console.log(`Bundle identifier: ${result.bundleIdentifier}`);
   console.log(`Version: ${result.shortVersion}`);
   console.log(`Production assurances required: ${result.production}`);
