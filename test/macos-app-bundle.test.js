@@ -919,6 +919,62 @@ test("macOS release metadata validates versions, production mode, and Keychain r
       sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
     },
   );
+  assert.deepEqual(
+    readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
+      USAGE_MONITOR_PROVISIONING_PROFILE:
+        "/tmp/embedded.provisionprofile",
+      USAGE_MONITOR_SPARKLE_APPCAST_URL:
+        "https://usage.example/appcast.xml",
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        Buffer.alloc(32, 1).toString("base64"),
+    }),
+    {
+      bundleVersion: "42.7",
+      productionOrigin: "https://usage.example",
+      // A supplied profile reaches the release as an exact path, because it
+      // is copied into the bundle before signing so the signature seals it.
+      provisioningProfile: "/tmp/embedded.provisionprofile",
+      sparkleAppcastURL: "https://usage.example/appcast.xml",
+      sparkleFramework: "/tmp/Sparkle.framework",
+      sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
+    },
+  );
+  // A relative profile path is resolved against the working directory, so the
+  // release embeds the same file whatever directory the build was invoked in.
+  assert.equal(
+    readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
+      USAGE_MONITOR_PROVISIONING_PROFILE:
+        "release/embedded.provisionprofile",
+      USAGE_MONITOR_SPARKLE_APPCAST_URL:
+        "https://usage.example/appcast.xml",
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        Buffer.alloc(32, 1).toString("base64"),
+    }).provisioningProfile,
+    join(process.cwd(), "release", "embedded.provisionprofile"),
+  );
+  // An empty or NUL-bearing profile path is a misconfigured release rather
+  // than an absent one, so it fails closed instead of silencing the profile.
+  for (const unusable of ["", "release/embedded\0.provisionprofile"]) {
+    assert.throws(
+      () => readMacOSReleaseBuildConfiguration({
+        USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+        USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
+        USAGE_MONITOR_PROVISIONING_PROFILE: unusable,
+        USAGE_MONITOR_SPARKLE_APPCAST_URL:
+          "https://usage.example/appcast.xml",
+        USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+        USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+          Buffer.alloc(32, 1).toString("base64"),
+      }),
+      { code: "MACOS_PROVISIONING_PROFILE_INVALID" },
+    );
+  }
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
       USAGE_MONITOR_BUNDLE_VERSION: "42.7",

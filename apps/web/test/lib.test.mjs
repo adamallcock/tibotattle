@@ -2172,6 +2172,16 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     html,
     /Hosted Apple sign-in is not configured for this build\./u
   );
+  // Both providers finish through the contribution service, so a build without
+  // one must disable them rather than fail after the click.
+  assert.match(
+    appSource,
+    /const serviceConfigured\s*=\s*\n?\s*localCompanionHealth\?\.capabilities\?\.contributionDevicePairing === true;/u,
+  );
+  assert.match(
+    appSource,
+    /This build has no contribution service, so hosted sign-in is unavailable\./u,
+  );
   // The dead native handoff copy is gone: Apple provisions Sign in with Apple
   // only for Ad hoc, App Store Connect, and Development distribution, so a
   // Developer ID build can never carry the entitlement.

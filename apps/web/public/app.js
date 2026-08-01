@@ -3266,7 +3266,14 @@ function renderHostedIdentity() {
   const chip = $("#identity-signin-state");
   const googleUnavailable = $("#identity-google-unavailable");
   const appleUnavailable = $("#identity-apple-unavailable");
-  const googleConfigured = configuredGoogleClientId() !== null;
+  // Both providers complete through the contribution service: Google needs it
+  // to exchange its authorization code, Apple needs it to start and claim the
+  // hosted flow. A build with no service configured therefore cannot sign in
+  // at all, so the controls say so instead of failing after the click.
+  const serviceConfigured =
+    localCompanionHealth?.capabilities?.contributionDevicePairing === true;
+  const googleConfigured = configuredGoogleClientId() !== null
+    && serviceConfigured;
   const signedIn = hostedIdentity !== null;
   const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider]
     ?? HOSTED_IDENTITY_PROVIDERS.google;
@@ -3274,10 +3281,17 @@ function renderHostedIdentity() {
     || signedIn
     || !googleConfigured;
   googleUnavailable.hidden = googleConfigured || signedIn;
-  appleUnavailable.hidden = !appleSignInUnavailable || signedIn;
+  googleUnavailable.textContent = serviceConfigured
+    ? "Hosted sign-in is not configured for this build."
+    : "This build has no contribution service, so hosted sign-in is unavailable.";
+  const appleUnavailableNow = appleSignInUnavailable || !serviceConfigured;
+  appleUnavailable.hidden = !appleUnavailableNow || signedIn;
+  appleUnavailable.textContent = serviceConfigured
+    ? "Hosted Apple sign-in is not configured for this build."
+    : "This build has no contribution service, so hosted sign-in is unavailable.";
   appleButton.disabled = hostedIdentityBusy
     || signedIn
-    || appleSignInUnavailable;
+    || appleUnavailableNow;
   // Exactly one of the two states is present: the provider choices, or the
   // signed-in account row that can hand the page back to the choices.
   $("#identity-signin-choices").hidden = signedIn;
