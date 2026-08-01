@@ -794,6 +794,15 @@
             </button>
           </div>
           <p class="participant-action-status" id="community-connect-status" role="status" hidden></p>
+          <p class="annotation" id="diagnostics-log-location">
+            If something fails, the message carries a short reference such as
+            <code>TT-7QF3K2</code>. The same reference is appended to this Mac's
+            local diagnostics log — by default
+            <code>~/Library/Application Support/app-usagemonitor/diagnostics-v0.1.log</code>
+            — so you can quote it when asking for help. The log records only
+            the reference, which action failed, a fixed error code, and the
+            service's own request id.
+          </p>
           <div class="automatic-contribution-status" id="automatic-contribution-status" aria-live="polite">
             <div>
               <strong>Automatic contribution</strong>
@@ -803,8 +812,15 @@
               Off until you explicitly consent. No daemon or login item is installed;
               checks run only while TiboTattle is open.
             </p>
+            <!--
+              Deliberately not a "compact" button, for the same reason as sign
+              out above: this is the only in-page way to stop recurring
+              contribution, so it keeps the full 44px target rather than the
+              37px compact one, and stays clear of any rule that hides compact
+              controls at narrow widths.
+            -->
             <button
-              class="button button-quiet compact"
+              class="button button-quiet"
               id="automatic-contribution-toggle"
               type="button"
               hidden
@@ -1138,11 +1154,20 @@
             <span class="evidence-chip neutral" id="backend-state">Checking backend</span>
           </div>
           <p class="annotation" id="backend-description">
-            This optional service is separate from the local collector above. Live readiness verifies
-            database and encrypted-object access, fresh retention and restore replay,
-            object reconciliation, and aggregate rebuild state. The repeatable backend
-            suite covers the complete ingestion, isolation, export, and deletion
-            lifecycle.
+            This optional service is separate from the local collector above.
+            Your local reporting works whether or not it is reachable, and
+            nothing leaves this Mac unless you choose to contribute.
+          </p>
+          <details class="journey-disclosure service-detail-disclosure" id="backend-service-detail">
+            <summary>
+              <span><strong>Service readiness and lifecycle detail</strong></span>
+            </summary>
+            <div class="service-detail-body">
+          <p class="annotation" id="backend-readiness-note">
+            Live readiness verifies database and encrypted-object access,
+            fresh retention and restore replay, object reconciliation, and
+            aggregate rebuild state. The repeatable backend suite covers the
+            complete ingestion, isolation, export, and deletion lifecycle.
           </p>
           <dl class="backend-facts" id="backend-facts">
             <div><dt>Database</dt><dd id="backend-database">Checking</dd></div>
@@ -1174,6 +1199,8 @@
             configured loopback-only preview can exercise the complete HTTP path;
             external participants remain unauthorized.
           </div>
+            </div>
+          </details>
         </article>
 
         <div class="two-column result-panels">
@@ -1225,13 +1252,21 @@
             <div class="result-summary" id="community-result">
               <p>Checking for the latest delayed weekly snapshot…</p>
             </div>
-            <p class="annotation">
-              Community values use a fixed delay, independent per-cell support,
-              participant-level clipping, and coarse rounding. A sealed
-              revision is never rewritten; privacy-affecting deletion withdraws
-              it and schedules a replacement revision without the deleted
-              source.
-            </p>
+            <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
+              <summary>
+                <span><strong>How this snapshot is produced</strong></span>
+              </summary>
+              <div class="service-detail-body">
+                <div id="community-snapshot-service-detail"></div>
+                <p class="annotation">
+                  Community values use a fixed delay, independent per-cell support,
+                  participant-level clipping, and coarse rounding. A sealed
+                  revision is never rewritten; privacy-affecting deletion withdraws
+                  it and schedules a replacement revision without the deleted
+                  source.
+                </p>
+              </div>
+            </details>
           </article>
         </div>
         </details>

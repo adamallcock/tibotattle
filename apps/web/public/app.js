@@ -9,15 +9,20 @@ import {
 import {
   GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   contributionBatchAdmission,
+  createDiagnosticReference,
   createGoogleSignInRequest,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   createTelemetryEnvelope,
+  diagnosticErrorCode,
+  diagnosticReferenceSentence,
+  diagnosticSurface,
   parseGoogleSignInResult,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
   safeApiError,
+  serviceRequestId,
   validateContributionForUpload
 } from "./lib.js";
 import {
@@ -2650,11 +2655,26 @@ async function runContributionSyncAction(action) {
     }
     await refreshContributionSyncControls();
     if (acceptedContribution) await loadCommunityResults();
-  } catch {
-    showContributionSyncAction(
-      "The local companion rejected or could not complete this action. Durable queue state was retained.",
-      true
-    );
+  } catch (error) {
+    // A leftover device credential stops delivery for a precisely known local
+    // reason with its own repair, so it is answered where the user can act on
+    // it rather than folded into the generic queue message.
+    if (contributionDeviceRecoveryIsRequired(error)) {
+      renderContributionDeviceRecovery($("#community-connect-status"), {
+        error
+      });
+      showContributionSyncAction(
+        "Delivery stopped because this Mac has a leftover device credential. Durable queue state was retained; the repair is offered above.",
+        true
+      );
+    } else {
+      showContributionSyncAction(describeFailure({
+        surface: "contribution_send",
+        error,
+        fallback:
+          "The local companion rejected or could not complete this action. Durable queue state was retained."
+      }).text, true);
+    }
   } finally {
     contributionSyncBusy = false;
     updateContributionSyncButtons();
@@ -3054,8 +3074,167 @@ const HOSTED_IDENTITY_ERROR_COPY = {
     "The sign-in provider could not be reached by the contribution service. Try again shortly. Nothing was uploaded."
 };
 
+/**
+ * Look one fixed code up in a copy map.
+ *
+ * Own properties only: a code is an untrusted string, and plain member access
+ * would otherwise resolve "constructor" or "toString" to something inherited
+ * and render it as copy.
+ */
+function fixedCopy(map, code) {
+  return typeof code === "string" && Object.hasOwn(map, code)
+    ? map[code]
+    : null;
+}
+
 function hostedIdentityErrorCopy(error) {
-  return HOSTED_IDENTITY_ERROR_COPY[error?.code] ?? null;
+  return fixedCopy(HOSTED_IDENTITY_ERROR_COPY, error?.code);
+}
+
+// One precisely known local fault: this Mac still holds a contribution-device
+// secret in its Keychain, but the local record that pairs that secret with the
+// service is gone — typically a leftover from an earlier install. It cannot be
+// read or replaced in that state. Nothing about the invitation, the network,
+// or the service is wrong, so the copy must not send the user to look at them.
+const CONTRIBUTION_DEVICE_CONFLICT_COPY =
+  "This Mac still holds a contribution-device credential from an earlier install, and the local record that paired it is gone, so it cannot be used or replaced. Nothing was uploaded and nothing was changed. Clear the leftover credential below, then connect again.";
+
+// Fixed contribution-service codes this page knows how to explain. The
+// service's own codes are never rendered; each one is answered with a sentence
+// written here, and anything unrecognized falls back to the caller's copy.
+const SERVICE_ERROR_COPY = {
+  ...HOSTED_IDENTITY_ERROR_COPY,
+  AUTH_REQUIRED:
+    "The contribution service did not recognize this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
+  AUTH_INVALID:
+    "The contribution service rejected this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
+  CSRF_INVALID:
+    "This browser session expired while the request was in flight. Reload the local dashboard, then try again. Nothing was uploaded.",
+  ATTEMPT_LIMIT_REACHED:
+    "Too many attempts were made in a short window. Wait a few minutes before trying again. Nothing was uploaded.",
+  BACKEND_STORAGE_UNAVAILABLE:
+    "The contribution service could not reach its own storage. Nothing was uploaded; try again shortly.",
+  COLLECTION_CONTROL_UNAVAILABLE:
+    "The contribution service could not report whether it is accepting evidence. Nothing was uploaded; try again shortly.",
+  COLLECTION_ENROLLMENT_DISABLED:
+    "The contribution service has paused new enrollment. Nothing was uploaded, and local reporting is unaffected.",
+  ENROLLMENT_DISABLED:
+    "The contribution service is not accepting new participants right now. Nothing was uploaded, and local reporting is unaffected.",
+  CONTRIBUTION_LIMIT_REACHED:
+    "This participant has used its community batch allowance for the current window. Nothing was uploaded; the allowance renews on its fixed schedule.",
+  CONTRIBUTION_DELETE_CONFLICT:
+    "A deletion for this contribution is already in progress. Wait for it to finish, then check the history again.",
+  PARTICIPANT_DELETING:
+    "A deletion is still running for this participant. Wait for it to finish, then try again. Nothing was uploaded.",
+  DEVICE_AUTH_INVALID:
+    "The contribution service did not accept this Mac's upload device. Reset this Mac's device credential below, then connect again. Nothing was uploaded.",
+  DEVICE_NOT_FOUND:
+    "The contribution service has no record of this Mac as an upload device. Connect this Mac again. Nothing was uploaded.",
+  PAIRING_AUTH_INVALID:
+    "The pairing this page presented was not accepted. Nothing was uploaded; start the connection again.",
+  UPLOAD_AUTH_INVALID:
+    "The one-use upload authorization was not accepted. Nothing was uploaded; prepare and review the contribution again.",
+  UPLOAD_IN_PROGRESS:
+    "Another upload for this participant is already in flight. Wait for it to finish, then try again.",
+  UPLOAD_REGISTRATION_DISABLED:
+    "The contribution service has paused new uploads. Nothing was uploaded, and local reporting is unaffected.",
+  PROCESSING_DISABLED:
+    "The contribution service has paused ingestion. Nothing was uploaded, and local reporting is unaffected.",
+  PUBLICATION_DISABLED:
+    "The contribution service has paused community publication, so no newer snapshot can appear yet.",
+  PRIVACY_CANARY_DETECTED:
+    "The contribution service found a content marker in the upload and rejected it. Nothing was stored; this is a defect worth reporting.",
+  DECRYPTION_FAILED:
+    "The contribution service could not decrypt this upload. Nothing was stored; prepare and review the contribution again.",
+  ENVELOPE_INVALID:
+    "The contribution service rejected the encrypted envelope's shape. Nothing was stored; prepare and review the contribution again.",
+  TELEMETRY_RECORD_INVALID:
+    "The contribution service rejected a record against its closed schema. Nothing was stored.",
+  TELEMETRY_OCCURRENCE_CONFLICT:
+    "The contribution service already holds a conflicting record for this interval. Nothing new was stored.",
+  BODY_TOO_LARGE:
+    "The request exceeded the service's fixed size bound. Nothing was uploaded; choose a shorter interval.",
+  INTERNAL_ERROR:
+    "The contribution service failed while handling this request. Nothing was uploaded; try again shortly."
+};
+
+// Fixed local companion codes. These describe this Mac, not the service, so
+// they must never send the user looking at the network or the invitation.
+const LOCAL_COMPANION_ERROR_COPY = {
+  contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  contribution_device_pairing_not_configured:
+    "This build is not configured to connect to a contribution service, so there is nothing to pair with. Local reporting is unaffected.",
+  contribution_device_pairing_failed:
+    "The contribution service did not complete device pairing. Nothing was uploaded; try again shortly.",
+  automatic_contribution_first_review_required:
+    "One contribution must be reviewed and accepted before automatic contribution can be armed. Nothing repeats until then.",
+  automatic_contribution_not_configured:
+    "This build has no contribution service configured, so automatic contribution cannot be armed.",
+  automatic_contribution_consent_binding_mismatch:
+    "The stored consent no longer matches the contract this build would send. Reload the local dashboard and consent again; nothing repeats until then.",
+  automatic_contribution_settings_unavailable:
+    "The local companion could not read or write the automatic-contribution setting. No setting was inferred.",
+  device_credential_reset_failed:
+    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service.",
+  device_credential_reset_not_authorized:
+    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was deleted.",
+  review_expired_or_changed:
+    "The reviewed contribution changed or the review expired before sending. Nothing was uploaded; review it again.",
+  sync_in_progress:
+    "A contribution pass is already running. Wait for it to finish before starting another.",
+  sync_not_configured:
+    "This build has no contribution delivery configured, so there is nothing to send.",
+  sync_failed:
+    "The local companion could not complete the contribution pass. Anything not accepted stays queued locally.",
+  refresh_in_progress:
+    "A local analysis is already running. Wait for it to finish before starting another."
+};
+
+/**
+ * Turn one failure into honest copy plus a quotable reference.
+ *
+ * The reference is fresh WebCrypto randomness, never derived from anything the
+ * user typed or the service returned. It is filed in the local diagnostics log
+ * alongside the fixed error code and, when the service supplied one, its own
+ * request id — so a support conversation can join both sides. The sentence
+ * itself always comes from a map written here or from the caller's fallback;
+ * no server string is ever rendered.
+ */
+function describeFailure({ surface, error, messages = {}, fallback }) {
+  const reference = createDiagnosticReference();
+  const code = diagnosticErrorCode(error?.code);
+  const requestId = serviceRequestId(error?.requestId);
+  // Filed without blocking the message: the user must still be told what
+  // happened even when the companion cannot write its log.
+  void localClient.recordDiagnosticNote({
+    reference,
+    surface: diagnosticSurface(surface),
+    code,
+    requestId
+  }).catch(() => {});
+  const explanation = fixedCopy(messages, code)
+    ?? fixedCopy(SERVICE_ERROR_COPY, code)
+    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code)
+    ?? fallback;
+  const trailer = diagnosticReferenceSentence({ reference, requestId });
+  return Object.freeze({
+    reference,
+    requestId,
+    code,
+    text: trailer === "" ? explanation : `${explanation} ${trailer}`
+  });
+}
+
+/**
+ * Report a failure into a status element, preserving the specific cause.
+ */
+function showFailure(status, options) {
+  const described = describeFailure(options);
+  status.hidden = false;
+  status.className = `${options.statusClass ?? "participant-action-status"} error`;
+  status.textContent = described.text;
+  return described;
 }
 
 // Production builds carry a Google client id in the release-slot meta tag and
@@ -3156,10 +3335,13 @@ async function beginGoogleSignIn() {
     status.textContent =
       "Finish signing in with Google in the new tab, then return here. If no tab opened, allow pop-ups for this local dashboard and try again. Only the openid scope is requested; no email or name is asked for.";
   } catch (error) {
-    status.className = "participant-action-status error";
-    status.textContent = error instanceof Error
-      ? error.message
-      : "Google sign-in could not be started.";
+    showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      fallback: error instanceof Error && error.status === undefined
+        ? error.message
+        : "Google sign-in could not be started."
+    });
   } finally {
     hostedIdentityBusy = false;
     renderHostedIdentity();
@@ -3188,11 +3370,14 @@ async function completeGoogleSignIn(serialized) {
     status.textContent =
       "Signed in with Google. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
   } catch (error) {
-    status.className = "participant-action-status error";
-    status.textContent = hostedIdentityErrorCopy(error)
-      ?? (error instanceof Error
-        ? error.message
-        : "Google sign-in could not be completed. Sign in again.");
+    showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      fallback: hostedIdentityErrorCopy(error)
+        ?? (error instanceof Error && error.status === undefined
+          ? error.message
+          : "Google sign-in could not be completed. Sign in again.")
+    });
   } finally {
     hostedIdentityBusy = false;
     renderHostedIdentity();
@@ -3243,19 +3428,31 @@ async function beginAppleSignIn() {
         return;
       }
     }
-    status.className = "participant-action-status error";
-    status.textContent =
-      "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in.";
+    // A bounded poll that ran out is still a failed action from the user's
+    // side, so it is referenced and logged like any other.
+    showFailure(status, {
+      surface: "hosted_identity",
+      error: null,
+      fallback:
+        "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in."
+    });
   } catch (error) {
     const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
     if (unconfigured) appleSignInUnavailable = true;
-    status.className = "participant-action-status error";
-    status.textContent = unconfigured
-      ? "Hosted Apple sign-in is not configured for this build."
-      : hostedIdentityErrorCopy(error)
-        ?? (error instanceof Error
+    showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      messages: unconfigured
+        ? {
+          IDENTITY_CONFIGURATION_INVALID:
+            "Hosted Apple sign-in is not configured for this build."
+        }
+        : {},
+      fallback: hostedIdentityErrorCopy(error)
+        ?? (error instanceof Error && error.status === undefined
           ? error.message
-          : "Apple sign-in could not be completed. Sign in again.");
+          : "Apple sign-in could not be completed. Sign in again.")
+    });
   } finally {
     hostedIdentityBusy = false;
     renderHostedIdentity();
@@ -3285,15 +3482,42 @@ function updateCommunityConnectButton() {
   }
 }
 
+// The local capability layer raises contribution_device_credential_conflict;
+// the companion projects it onto contribution_device_recovery_required at its
+// HTTP boundary. Both name the same leftover credential, so both take the same
+// honest explanation and the same in-page repair.
 function contributionDeviceRecoveryIsRequired(error) {
   try {
-    return error?.code === "contribution_device_recovery_required";
+    return error?.code === "contribution_device_recovery_required"
+      || error?.code === "contribution_device_credential_conflict";
   } catch {
     return false;
   }
 }
 
-function renderContributionDeviceRecovery(status) {
+/**
+ * Explain the leftover-credential fault and offer the one action that fixes it.
+ *
+ * This replaces a generic "check the service and Keychain" message with the
+ * actual cause, and is the only place the reset control appears: it is shown
+ * when, and only when, a credential conflict was actually detected.
+ */
+function renderContributionDeviceRecovery(status, { error } = {}) {
+  const described = describeFailure({
+    surface: "contribution_connect",
+    error,
+    fallback: CONTRIBUTION_DEVICE_CONFLICT_COPY
+  });
+  const reset = node(
+    "button",
+    "button button-danger",
+    "Reset this Mac's device credential"
+  );
+  reset.type = "button";
+  reset.id = "reset-device-credential";
+  reset.addEventListener("click", () => {
+    void resetContributionDeviceCredential();
+  });
   const action = node(
     "a",
     "button button-secondary",
@@ -3304,18 +3528,60 @@ function renderContributionDeviceRecovery(status) {
   } else {
     action.hidden = true;
   }
+  const actions = node("div", "contribution-cta-buttons");
+  actions.append(reset, action);
+  // Reachable from journeys that never revealed this element, so it un-hides
+  // itself rather than relying on the caller having done so.
+  status.hidden = false;
   status.className = "participant-action-status error";
   status.replaceChildren(
     node(
       "strong",
       "",
-      "This Mac has a conflicting local contribution-device credential."
+      "This Mac has a leftover contribution-device credential."
     ),
-    document.createTextNode(
-      " No evidence was uploaded, and this page did not delete or rotate anything. Open the TiboTattle app, choose Data & Diagnostics…, then Identity & Device Reset…, and complete both native confirmations. Return here and choose Connect this Mac again. The reset affects only the local export identity and paired-device credential; it does not revoke hosted devices or delete hosted data. "
+    document.createTextNode(` ${described.text}`),
+    node(
+      "p",
+      "annotation",
+      "Resetting clears only that unusable local credential and its local record. Metadata you already contributed is untouched, no hosted device is revoked, and the TiboTattle app's Data & Diagnostics… menu offers the same repair natively."
     ),
-    action
+    actions
   );
+  return described;
+}
+
+const DEVICE_CREDENTIAL_RESET_CONFIRMATION =
+  "Clear this Mac's unusable contribution-device credential?\n\nThis deletes only the leftover credential in this Mac's Keychain and the local record that went with it. Metadata you already contributed is not deleted, no hosted device is revoked, and your local reporting is unchanged.";
+
+async function resetContributionDeviceCredential() {
+  if (communityConnectBusy) return;
+  if (!window.confirm(DEVICE_CREDENTIAL_RESET_CONFIRMATION)) return;
+  const status = $("#community-connect-status");
+  communityConnectBusy = true;
+  updateCommunityConnectButton();
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Clearing the unusable local device credential…";
+  try {
+    const result = await localClient.resetContributionDeviceCredential();
+    if (result.status === "unavailable") {
+      throw new Error("The local companion did not confirm the reset.");
+    }
+    status.textContent = result.status === "already_absent"
+      ? "No leftover device credential was present on this Mac, so nothing was deleted. Choose Contribute and keep it current to connect."
+      : "The leftover device credential was cleared. Metadata you already contributed is untouched. Choose Contribute and keep it current to connect this Mac again.";
+  } catch (error) {
+    showFailure(status, {
+      surface: "device_credential_reset",
+      error,
+      fallback:
+        "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service."
+    });
+  } finally {
+    communityConnectBusy = false;
+    updateCommunityConnectButton();
+  }
 }
 
 async function finishCommunityDevicePairing(pairing, status) {
@@ -3408,10 +3674,13 @@ async function disableAutomaticContribution() {
     renderAutomaticContributionStatus(disabled);
     status.textContent =
       "Automatic contribution is off. Already accepted metadata is unchanged; use Hosted privacy controls if you want it deleted.";
-  } catch {
-    status.className = "participant-action-status error";
-    status.textContent =
-      "Automatic contribution could not be turned off. No setting was inferred; check the local companion and try again.";
+  } catch (error) {
+    showFailure(status, {
+      surface: "automatic_contribution",
+      error,
+      fallback:
+        "Automatic contribution could not be turned off. No setting was inferred; check the local companion and try again."
+    });
   } finally {
     automaticContributionBusy = false;
     renderAutomaticContributionStatus(automaticContributionStatus);
@@ -3499,17 +3768,17 @@ async function connectCommunityContribution() {
       await inspectNextContribution();
     }
   } catch (error) {
-    status.className = "participant-action-status error";
-    const identityCopy = hostedIdentityErrorCopy(error);
     if (contributionDeviceRecoveryIsRequired(error)) {
-      renderContributionDeviceRecovery(status);
-    } else if (identityCopy !== null) {
-      status.textContent = identityCopy;
+      renderContributionDeviceRecovery(status, { error });
     } else {
-      status.textContent = safeApiError(
+      // The fallback is reached only when the cause is genuinely unknown, so
+      // it must not assert which of several unrelated things to go and check.
+      showFailure(status, {
+        surface: "contribution_connect",
         error,
-        "This Mac could not be connected. No evidence was uploaded. Check service availability and Keychain access, then retry."
-      );
+        fallback:
+          "This Mac could not be connected, and no evidence was uploaded. The cause was not reported in a form this page can explain; retrying is safe."
+      });
     }
   } finally {
     pairing = null;
@@ -3670,10 +3939,21 @@ async function prepareLocalContribution() {
       privacy_verification_failed:
         "Privacy verification rejected the prepared data, so it was not queued or uploaded.",
       preparation_in_progress:
-        "A local preparation is already running. Nothing has been uploaded."
+        "A local preparation is already running. Nothing has been uploaded.",
+      review_archive_invalid:
+        "The local review archive could not be written, so nothing was queued. No upload occurred.",
+      prepared_spool_invalid:
+        "The local prepared-contribution spool is not in a usable state, so nothing was queued. No upload occurred.",
+      preparation_failed:
+        "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
     };
-    status.textContent = preparationMessages[error?.code]
-      ?? "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue.";
+    status.textContent = describeFailure({
+      surface: "contribution_prepare",
+      error,
+      messages: preparationMessages,
+      fallback:
+        "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
+    }).text;
   } finally {
     contributionPreparationBusy = false;
     button.disabled = false;
@@ -3843,8 +4123,16 @@ async function submitContribution(event) {
     status.textContent = `Accepted as ${receipt.contributionId}. The server reported ${compact(receipt.recordCounts?.deduplicated ?? 0)} deduplicated records.`;
     await loadCommunityResults();
   } catch (error) {
-    status.className = "upload-status error";
-    status.textContent = error instanceof Error ? error.message : safeApiError(error, "The contribution was rejected.");
+    showFailure(status, {
+      surface: "contribution_send",
+      error,
+      statusClass: "upload-status",
+      // A rejection this page raised itself carries copy written here; a
+      // transport rejection carries only a status line, which is not copy.
+      fallback: error instanceof Error && error.status === undefined
+        ? error.message
+        : safeApiError(error, "The contribution was rejected.")
+    });
   } finally {
     button.disabled = !(
       selectedContributionValidated
@@ -4059,7 +4347,12 @@ function renderAccountScopedQuotaAnalysis(container, analysis) {
         list.append(node(
           "li",
           "",
-          ACCOUNT_CALIBRATION_REASONS[reason] ?? reason.replaceAll("_", " ")
+          fixedCopy(ACCOUNT_CALIBRATION_REASONS, reason)
+            // An unrecognized refusal code is still a fixed code, but it is
+            // not copy: only identifier-shaped values are ever humanized.
+            ?? (/^[a-z][a-z0-9_]{1,63}$/u.test(reason)
+              ? reason.replaceAll("_", " ")
+              : "A fixed refusal code was reported that this page cannot explain.")
         ));
       }
       card.append(list);
@@ -4104,7 +4397,7 @@ function renderParticipantQuotaMovement(container, movement) {
   }
 
   if (movement.status !== "conditional_estimate") {
-    const copy = QUOTA_MOVEMENT_REASONS[movement.reason]
+    const copy = fixedCopy(QUOTA_MOVEMENT_REASONS, movement.reason)
       ?? "The available private evidence cannot support this comparison yet.";
     const state = node("div", "not-testable-state");
     state.append(
@@ -4234,7 +4527,7 @@ function renderPrivateCommunityComparison(container, comparison) {
       node(
         "p",
         "",
-        COMMUNITY_COMPARISON_REASONS[comparison?.reason]
+        fixedCopy(COMMUNITY_COMPARISON_REASONS, comparison?.reason)
           ?? "A disclosure-safe released week is required before this comparison can be shown."
       )
     );
@@ -4397,7 +4690,8 @@ function renderContributionHistory(container, payload) {
         item.status === "deleting"
           ? "history-state history-state-deleting"
           : "history-state",
-        CONTRIBUTION_STATUS_LABELS[item.status]
+        fixedCopy(CONTRIBUTION_STATUS_LABELS, item.status)
+          ?? "Status unavailable"
       )
     );
     card.append(cardHeading);
@@ -4440,8 +4734,19 @@ function renderContributionHistory(container, payload) {
   container.append(list);
 }
 
+/**
+ * Render one delayed weekly snapshot.
+ *
+ * The default view carries the result and the one caveat needed to read it
+ * honestly. Everything that only describes how the service produces the number
+ * — contract version, ingestion cutoff, release timing, per-cell support
+ * mechanics, sealed-revision policy, and what the current contract cannot yet
+ * publish — is relocated into the collapsed provenance disclosure beside it.
+ */
 function renderCommunitySnapshot(container, payload) {
   clear(container);
+  const detail = $("#community-snapshot-service-detail");
+  clear(detail);
   const snapshot = normalizeCommunitySnapshot(payload);
   if (snapshot.state === "service_unavailable") {
     container.append(node("p", "", "The central service is unavailable. This is separate from whether a weekly snapshot exists."));
@@ -4456,8 +4761,8 @@ function renderCommunitySnapshot(container, payload) {
       item.append(node("dt", "", term), node("dd", "", value));
       quality.append(item);
     }
-    container.append(quality);
-    container.append(node(
+    detail.append(quality);
+    detail.append(node(
       "p",
       "snapshot-disclosure",
       "No community capacity or change claim is inferred from aggregate activity alone. The next contract must publish replay exclusions, matched quota coverage, uncertainty, and cohort support together."
@@ -4487,14 +4792,27 @@ function renderCommunitySnapshot(container, payload) {
 
   const heading = node("div", "snapshot-heading");
   heading.append(
-    node("strong", "", `${formatLocal(snapshot.period.startAt, { dateOnly: true })} – ${formatLocal(snapshot.period.endAt, { dateOnly: true })}`),
-    node("span", "", `Ingestion cutoff ${formatLocal(snapshot.ingestionCutoffAt)} · released ${formatLocal(snapshot.releasedAt)}`)
+    node("strong", "", `${formatLocal(snapshot.period.startAt, { dateOnly: true })} – ${formatLocal(snapshot.period.endAt, { dateOnly: true })}`)
   );
   container.append(heading);
+  // The one sentence a reader needs to know what these numbers are and are
+  // not. The mechanism that produces them lives in the disclosure below.
+  container.append(node(
+    "p",
+    "snapshot-disclosure",
+    `Activity totals for the week above, from people who chose to contribute. A figure appears only when at least ${compact(snapshot.minimumIndependentParticipants)} different participants used that provider and model, and every figure is rounded down — so this is not everyone's usage, not an average, and not a cost.`
+  ));
+  if (snapshot.state === "published_partial") {
+    container.append(node("p", "snapshot-partial", "Some metrics were not released because their independent support was insufficient."));
+  }
+
   const quality = node("dl", "snapshot-quality-grid");
   for (const [term, value] of [
+    ["Contract", snapshot.schemaVersion],
     ["Released model cells", compact(snapshot.cells.length)],
     ["Minimum support", `≥${compact(snapshot.minimumIndependentParticipants)} participants per cell`],
+    ["Ingestion cutoff", formatLocal(snapshot.ingestionCutoffAt)],
+    ["Released", formatLocal(snapshot.releasedAt)],
     ["Snapshot age", formatAge(Math.max(0, (Date.now() - Date.parse(snapshot.releasedAt)) / 1_000))],
     ["Coverage state", snapshot.state === "published_partial" ? "Partially released" : "All contracted cells released"]
   ]) {
@@ -4502,16 +4820,13 @@ function renderCommunitySnapshot(container, payload) {
     item.append(node("dt", "", term), node("dd", "", value));
     quality.append(item);
   }
-  container.append(quality);
-  container.append(node(
+  detail.append(quality);
+  detail.append(node(
     "p",
     "snapshot-disclosure",
     `Each value is clipped per participant, independently support-gated at ${compact(snapshot.minimumIndependentParticipants)} or more participants, and rounded down. A sealed revision is never rewritten; deletion creates a replacement revision.`
   ));
-  if (snapshot.state === "published_partial") {
-    container.append(node("p", "snapshot-partial", "Some metrics were not released because their independent support was insufficient."));
-  }
-  container.append(node(
+  detail.append(node(
     "p",
     "snapshot-disclosure",
     "This release currently reports privacy-safe activity totals. Cohort weekly-limit estimates, matched quota coverage, replay exclusions, and change confidence require the next community contract before they can be shown honestly."
@@ -4635,14 +4950,20 @@ function renderBackendHealth(health, readiness, { configured = true } = {}) {
     centralState.className = "state-pill state-local";
     $("#backend-facts").hidden = true;
     $("#backend-description").textContent =
-      "Your local usage, allowance estimates, and privacy review are working without a remote service. Community upload, aggregate comparisons, and participant recovery appear only in a build with an explicit community-service origin.";
+      "Your local usage, allowance estimates, and privacy review are working without a remote service. Community upload and aggregate comparisons appear only in a build with an explicit community-service origin.";
+    $("#backend-readiness-note").textContent =
+      "This build has no community-service origin sealed into it, so there is no readiness to report.";
     $("#backend-contract-note").textContent =
       "No community origin is sealed into this app. Nothing is failing and no upload is attempted.";
     return;
   }
   $("#backend-facts").hidden = false;
   $("#backend-description").textContent =
-    "This optional service is separate from the local collector above. Live readiness verifies database and encrypted-object access, fresh retention and restore replay, object reconciliation, and aggregate rebuild state.";
+    "This optional service is separate from the local collector above. Your local reporting works whether or not it is reachable, and nothing leaves this Mac unless you choose to contribute.";
+  // Engineering detail about how readiness is established lives inside the
+  // collapsed service-detail disclosure, not in the panel's default view.
+  $("#backend-readiness-note").textContent =
+    "Live readiness verifies database and encrypted-object access, fresh retention and restore replay, object reconciliation, and aggregate rebuild state.";
   const reachable = health?.status === "ok";
   const servingReady = readiness?.state === "ready";
   const readinessKnown = servingReady || readiness?.state === "not_ready";
@@ -4805,9 +5126,13 @@ async function deleteParticipantData() {
     renderPersonalStats($("#personal-result"), null);
     renderContributionHistory($("#contribution-history"), null);
     await loadCommunityResults();
-  } catch {
-    status.className = "participant-action-status error";
-    status.textContent = "The contributed data could not be deleted.";
+  } catch (error) {
+    showFailure(status, {
+      surface: "hosted_privacy",
+      error,
+      fallback:
+        "The contributed data could not be deleted. Nothing was removed; your deletion right is unchanged and you can try again."
+    });
   }
 }
 
@@ -4823,9 +5148,13 @@ async function deleteSingleContribution(contributionId) {
     await communityClient.deleteContribution(contributionId);
     status.textContent = "Contribution deleted. Private and community results have been refreshed.";
     await loadCommunityResults();
-  } catch {
-    status.className = "participant-action-status error";
-    status.textContent = "The contribution could not be deleted.";
+  } catch (error) {
+    showFailure(status, {
+      surface: "hosted_privacy",
+      error,
+      fallback:
+        "The contribution could not be deleted. Nothing was removed; you can try again."
+    });
   }
 }
 

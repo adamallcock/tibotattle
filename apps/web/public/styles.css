@@ -398,6 +398,32 @@ h1 {
 }
 .journey-disclosure > .result-panels { margin-bottom: 24px; }
 
+/*
+ * In-panel variant of the same disclosure. It holds the service plumbing a
+ * result panel used to print by default: contract versions, publication
+ * policy, readiness internals and lifecycle stages. The result and its
+ * plain-language caveat stay above it, in the open.
+ */
+.service-detail-disclosure {
+  margin-top: 16px;
+  border-radius: .45rem;
+  background: rgba(255, 254, 249, .4);
+}
+.service-detail-disclosure > summary { padding: 11px 15px; }
+.service-detail-disclosure > summary::after { font-size: .66rem; }
+.service-detail-disclosure > summary strong {
+  margin-top: 0;
+  color: var(--green);
+  font-family: inherit;
+  font-size: .74rem;
+  font-weight: 800;
+}
+.service-detail-disclosure > .service-detail-body {
+  display: grid;
+  gap: 12px;
+  padding: 0 15px 15px;
+}
+
 .contribution-cta {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(360px, .82fr);

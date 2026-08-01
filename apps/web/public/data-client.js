@@ -27,6 +27,20 @@
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
+// A sealed snapshot is immutable by design: the database refuses to rewrite a
+// released revision, so a week published under an earlier contract keeps being
+// served forever. A reader that accepted only the newest contract would turn
+// every version bump into "unsupported contract" for already-published weeks,
+// so both released contracts are accepted here. The only difference is the
+// plan-cohort fields, which v0.1 cells simply do not carry; every other check
+// stays exactly as strict for both.
+export const SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS = Object.freeze([
+  "community-weekly-snapshot-v0.1",
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION
+]);
+const COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS = new Set([
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION
+]);
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -46,6 +60,16 @@ export const PARTICIPANT_STATS_SCHEMA_VERSION = "participant-stats-v0.2";
 export const PARTICIPANT_PROFILE_SCHEMA_VERSION = "participant-profile-v0.2";
 export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
   "participant-community-comparison-v0.2";
+// The comparison is derived from a sealed snapshot, so it inherits the same
+// immutability and the same two live contracts.
+export const SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS =
+  Object.freeze([
+    "participant-community-comparison-v0.1",
+    PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION
+  ]);
+const PARTICIPANT_COMPARISON_PLAN_COHORT_VERSIONS = new Set([
+  PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION
+]);
 export const CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION =
   "contribution-sync-status-v0.1";
 export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
@@ -85,6 +109,23 @@ const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const PARTICIPANT_ID_PATTERN =
   /^participant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+// The Worker returns one of these in every error body. It identifies a server
+// request, never a participant, so it is safe to show next to the local
+// reference the page mints for the same failure.
+const SERVICE_REQUEST_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
+  "local-diagnostic-note-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
+  "local-contribution-device-reset-v0.1";
+const DIAGNOSTIC_REFERENCE_PATTERN = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+// Both boundaries answer with fixed identifier-shaped codes: the Worker uses
+// SCREAMING_SNAKE, the local companion uses lower_snake. Neither shape can
+// carry a sentence, a path, or a quoted value, so a code that matches is safe
+// to branch on and to record locally. It is still never rendered as copy: the
+// page only ever shows a sentence it wrote itself.
+const SAFE_ERROR_CODE_PATTERN =
+  /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
 const CONTRIBUTION_SCHEMA_VERSIONS = new Set([
   "synthetic-contribution-v0.1",
   "telemetry-contribution-v0.1",
@@ -180,13 +221,50 @@ function validHostedIdentity(identity) {
     && identity.idToken.length <= MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH;
 }
 
+/**
+ * Carry the service's own request id onto a rejected request.
+ *
+ * The Worker mints one UUID per request and returns it in every error body.
+ * Nothing else from the body is retained: the message stays fixed, and only a
+ * value with exactly the minted shape is kept, so no server string can reach
+ * the page through this path.
+ */
+function attachServiceRequestId(error, payload) {
+  const candidate = payload?.error?.requestId;
+  if (typeof candidate === "string"
+      && SERVICE_REQUEST_ID_PATTERN.test(candidate)) {
+    error.requestId = candidate;
+  }
+  return error;
+}
+
+/**
+ * Reject a local companion mutation while preserving its fixed error code.
+ *
+ * The body must be exactly {schemaVersion, error:{code}} and the code must be
+ * identifier-shaped, so an unexpected companion response drops back to a
+ * codeless rejection instead of handing the page something to trust.
+ */
+function localCompanionRequestError(response, payload) {
+  const error = new Error(`Request failed (${response.status}).`);
+  error.status = response.status;
+  if (hasExactKeys(payload, ["schemaVersion", "error"])
+      && payload.schemaVersion === "local-companion-v0.1"
+      && hasExactKeys(payload.error, ["code"])
+      && typeof payload.error.code === "string"
+      && SAFE_ERROR_CODE_PATTERN.test(payload.error.code)) {
+    error.code = payload.error.code;
+  }
+  return error;
+}
+
 function hostedIdentityRequestError(response, payload) {
   const error = new Error(`Request failed (${response.status}).`);
   error.status = response.status;
   if (HOSTED_IDENTITY_ERROR_CODES.has(payload?.error?.code)) {
     error.code = payload.error.code;
   }
-  return error;
+  return attachServiceRequestId(error, payload);
 }
 
 export function normalizeLocalOnboarding(payload) {
@@ -826,6 +904,39 @@ export function normalizeLocalContributionDevicePairing(payload) {
   };
 }
 
+export function normalizeLocalDiagnosticNote(payload) {
+  const unavailable = { status: "unavailable", reference: "" };
+  if (payload?.schemaVersion !== LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION
+      || payload?.status !== "recorded"
+      || !DIAGNOSTIC_REFERENCE_PATTERN.test(payload?.reference ?? "")) {
+    return unavailable;
+  }
+  return { status: "recorded", reference: payload.reference };
+}
+
+export function normalizeLocalContributionDeviceReset(payload) {
+  const unavailable = {
+    status: "unavailable",
+    credential: "unknown",
+    binding: "unknown"
+  };
+  if (payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION
+      || !["reset", "already_absent"].includes(payload?.status)
+      || !["deleted", "already_missing"].includes(payload?.credential)
+      || !["removed", "already_missing"].includes(payload?.binding)
+      // The companion never returns hosted state from this route; a response
+      // that claims otherwise is not the contract this page asked for.
+      || payload?.hostedDataDeleted !== false
+      || payload?.includesIdentifiers !== false) {
+    return unavailable;
+  }
+  return {
+    status: payload.status,
+    credential: payload.credential,
+    binding: payload.binding
+  };
+}
+
 function snapshotMetric(value, expectedUnit) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -849,13 +960,19 @@ export function normalizeCommunitySnapshot(payload) {
   if (payload.publicationStatus === "development_diagnostic_not_publication_safe") {
     return { state: "development_unsafe", cells: [] };
   }
-  if (payload.schemaVersion !== COMMUNITY_SNAPSHOT_SCHEMA_VERSION
+  if (!SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS.includes(
+    payload.schemaVersion
+  )
       || payload.immutable !== true
       || payload.nonOverlapping !== true) {
     return { state: "unsupported_schema", cells: [] };
   }
+  const carriesPlanCohort = COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS.has(
+    payload.schemaVersion
+  );
 
   const base = {
+    schemaVersion: payload.schemaVersion,
     snapshotId: text(payload.snapshotId, ""),
     period: {
       startAt: text(payload.period?.startAt, ""),
@@ -904,8 +1021,14 @@ export function normalizeCommunitySnapshot(payload) {
         || Array.isArray(candidate.metrics)) {
       return { ...base, state: "unsupported_schema" };
     }
-    const planType = text(candidate?.planType, "unknown");
-    const planVariant = text(candidate?.planVariant, "unknown");
+    // Plan cohorts arrived with v0.2. A v0.1 cell has no cohort to report, so
+    // it is described as unknown rather than guessed at or rejected.
+    const planType = carriesPlanCohort
+      ? text(candidate?.planType, "unknown")
+      : "unknown";
+    const planVariant = carriesPlanCohort
+      ? text(candidate?.planVariant, "unknown")
+      : "unknown";
     const metrics = {};
     for (const [metricName, expectedUnit] of Object.entries(COMMUNITY_METRIC_UNITS)) {
       const metric = snapshotMetric(candidate.metrics[metricName], expectedUnit);
@@ -1064,9 +1187,14 @@ export function normalizeParticipantCommunityComparison(payload) {
     },
     cells: []
   };
-  if (payload?.schemaVersion !== PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION) {
+  if (!SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS.includes(
+    payload?.schemaVersion
+  )) {
     return unavailable;
   }
+  const carriesPlanCohort = PARTICIPANT_COMPARISON_PLAN_COHORT_VERSIONS.has(
+    payload.schemaVersion
+  );
   if (payload.status === "not_testable") return unavailable;
   if (payload.status !== "ready"
       || payload.interpretation !== "own_clipped_contribution_vs_public_rounded_total"
@@ -1132,11 +1260,20 @@ export function normalizeParticipantCommunityComparison(payload) {
         unit: expectedUnit
       };
     }
+    // v0.1 comparisons predate plan cohorts entirely, so the cohort question
+    // has no answer for those cells. "unknown" says that; false would claim
+    // the cohort was checked and did not match.
     cells.push({
       provider,
-      planType: text(candidate?.planType, "unknown"),
-      planVariant: text(candidate?.planVariant, "unknown"),
-      cohortMatchesParticipant: candidate?.cohortMatchesParticipant === true,
+      planType: carriesPlanCohort
+        ? text(candidate?.planType, "unknown")
+        : "unknown",
+      planVariant: carriesPlanCohort
+        ? text(candidate?.planVariant, "unknown")
+        : "unknown",
+      cohortMatchesParticipant: carriesPlanCohort
+        ? candidate?.cohortMatchesParticipant === true
+        : "unknown",
       modelId,
       participantHasActivity: candidate.participantHasActivity,
       metrics
@@ -1146,9 +1283,14 @@ export function normalizeParticipantCommunityComparison(payload) {
     ...unavailable,
     status: "ready",
     reason: "",
+    schemaVersion: payload.schemaVersion,
     participantPlanCohort: {
-      planType: text(payload?.participantPlanCohort?.planType, "unknown"),
-      planVariant: text(payload?.participantPlanCohort?.planVariant, "unknown")
+      planType: carriesPlanCohort
+        ? text(payload?.participantPlanCohort?.planType, "unknown")
+        : "unknown",
+      planVariant: carriesPlanCohort
+        ? text(payload?.participantPlanCohort?.planVariant, "unknown")
+        : "unknown"
     },
     cells
   };
@@ -2031,9 +2173,16 @@ async function fetchJson(fetchImpl, url, options = {}) {
     headers: { Accept: "application/json", ...headers }
   });
   if (!response.ok) {
+    const payload = await response.json().catch(() => null);
     const error = new Error(`Request failed (${response.status}).`);
     error.status = response.status;
-    throw error;
+    // Keep the fixed, content-free code so the page can say what actually
+    // went wrong instead of collapsing every failure into one sentence.
+    if (typeof payload?.error?.code === "string"
+        && SAFE_ERROR_CODE_PATTERN.test(payload.error.code)) {
+      error.code = payload.error.code;
+    }
+    throw attachServiceRequestId(error, payload);
   }
   return response.status === 204 ? null : response.json();
 }
@@ -2243,17 +2392,7 @@ export class LocalCompanionClient {
     );
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const error = new Error(`Request failed (${response.status}).`);
-      error.status = response.status;
-      if (response.status === 409
-          && hasExactKeys(payload, ["schemaVersion", "error"])
-          && payload.schemaVersion === "local-companion-v0.1"
-          && hasExactKeys(payload.error, ["code"])
-          && payload.error.code
-            === "automatic_contribution_first_review_required") {
-        error.code = "automatic_contribution_first_review_required";
-      }
-      throw error;
+      throw localCompanionRequestError(response, payload);
     }
     return normalizeAutomaticContributionStatus(payload);
   }
@@ -2291,19 +2430,71 @@ export class LocalCompanionClient {
     );
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const error = new Error(`Request failed (${response.status}).`);
-      error.status = response.status;
-      if (response.status === 409
-          && hasExactKeys(payload, ["schemaVersion", "error"])
-          && payload.schemaVersion === "local-companion-v0.1"
-          && hasExactKeys(payload.error, ["code"])
-          && payload.error.code
-            === "contribution_device_recovery_required") {
-        error.code = "contribution_device_recovery_required";
-      }
-      throw error;
+      throw localCompanionRequestError(response, payload);
     }
     return normalizeLocalContributionDevicePairing(payload);
+  }
+
+  /**
+   * Record one user-visible failure in the local diagnostics log.
+   *
+   * Only four bounded values travel: the reference this page minted, the
+   * fixed journey it happened in, the fixed error code, and the service
+   * request id when the service returned one. No message, payload, path, or
+   * participant value is ever sent, and the companion re-validates all four.
+   */
+  async recordDiagnosticNote({
+    reference,
+    surface,
+    code = "",
+    requestId = ""
+  } = {}) {
+    if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")
+        || typeof surface !== "string"
+        || !SAFE_ERROR_CODE_PATTERN.test(surface)) {
+      throw new TypeError("Diagnostic note inputs are invalid.");
+    }
+    const response = await this.fetchImpl(`${LOCAL_ROOT}/diagnostics/note`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1"
+      },
+      body: JSON.stringify({
+        reference,
+        surface,
+        code: SAFE_ERROR_CODE_PATTERN.test(code) ? code : "unknown",
+        requestId: SERVICE_REQUEST_ID_PATTERN.test(requestId) ? requestId : ""
+      })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw localCompanionRequestError(response, payload);
+    return normalizeLocalDiagnosticNote(payload);
+  }
+
+  /**
+   * Clear an unusable leftover contribution-device credential on this Mac.
+   *
+   * The companion deletes only the local Keychain entry and its state file;
+   * no hosted device, participant, or contributed metadata is touched.
+   */
+  async resetContributionDeviceCredential() {
+    const response = await this.fetchImpl(
+      `${LOCAL_ROOT}/contribution/device-credential-reset`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ confirm: "reset_device_credential" })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw localCompanionRequestError(response, payload);
+    return normalizeLocalContributionDeviceReset(payload);
   }
 
   contributionSyncExactReview() {

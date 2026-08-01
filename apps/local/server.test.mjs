@@ -11,6 +11,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   readdir,
   rm,
   symlink,
@@ -27,6 +28,9 @@ import {
 import {
   claimContributionDevicePairing,
 } from "../../src/contribution-device-client.js";
+import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+} from "../../src/platform/export-identity-keychain.js";
 import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
@@ -2988,6 +2992,408 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
       child.kill("SIGKILL");
       await once(child, "exit");
     }
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  let now = Date.parse("2026-08-01T09:00:00.000Z");
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile,
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const note = {
+      reference: "TT-7QF3K2",
+      surface: "contribution_connect",
+      code: "contribution_device_recovery_required",
+      requestId: "",
+    };
+
+    // Loopback alone is not authority: the dashboard header and same origin
+    // are both required before anything is written.
+    const unauthorized = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(note),
+    });
+    assert.equal(unauthorized.status, 403);
+    assert.deepEqual(await unauthorized.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "diagnostic_note_not_authorized" },
+    });
+    assert.equal((await fetch(`${base}/api/local/diagnostics/note`)).status, 405);
+
+    const recorded = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(note),
+    });
+    assert.equal(recorded.status, 200);
+    assert.deepEqual(await recorded.json(), {
+      schemaVersion: "local-diagnostic-note-v0.1",
+      status: "recorded",
+      reference: "TT-7QF3K2",
+    });
+
+    now = Date.parse("2026-08-01T09:05:00.000Z");
+    await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        reference: "TT-ZZ0011",
+        surface: "contribution_send",
+        code: "INTERNAL_ERROR",
+        requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+      }),
+    });
+
+    const lines = (await readFile(diagnosticsLogFile, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(lines, [
+      {
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-01T09:00:00.000Z",
+        reference: "TT-7QF3K2",
+        surface: "contribution_connect",
+        code: "contribution_device_recovery_required",
+        requestId: "",
+      },
+      {
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-08-01T09:05:00.000Z",
+        reference: "TT-ZZ0011",
+        surface: "contribution_send",
+        code: "INTERNAL_ERROR",
+        requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+      },
+    ]);
+    assert.equal((await lstat(diagnosticsLogFile)).mode & 0o777, 0o600);
+
+    // Only the fixed vocabulary is accepted, so a free-form label, a sentence
+    // masquerading as a code, or an extra member can never be logged.
+    for (const invalid of [
+      { ...note, surface: "arbitrary_journey" },
+      { ...note, reference: "TT-ILLEGAL" },
+      { ...note, reference: "not-a-reference" },
+      { ...note, code: "Failed reading /Users/private/state.json" },
+      { ...note, requestId: "not-a-uuid" },
+      { ...note, extra: "unexpected" },
+    ]) {
+      const rejected = await fetch(`${base}/api/local/diagnostics/note`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(invalid),
+      });
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).error.code, "invalid_request");
+    }
+    const oversized = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...note, code: "a".repeat(4_096) }),
+    });
+    assert.equal(oversized.status, 413);
+    const recordedText = await readFile(diagnosticsLogFile, "utf8");
+    assert.equal(recordedText.includes("/Users/private"), false);
+    assert.equal(recordedText.includes("arbitrary_journey"), false);
+    assert.equal(recordedText.split("\n").filter(Boolean).length, 2);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("the diagnostics log is bounded and keeps one previous generation", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  await mkdir(files.stateRoot, { recursive: true, mode: 0o700 });
+  await writeFile(diagnosticsLogFile, "x".repeat(256 * 1024), { mode: 0o600 });
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile,
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const recorded = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: JSON.stringify({
+        reference: "TT-ABCDEF",
+        surface: "local_refresh",
+        code: "refresh_in_progress",
+        requestId: "",
+      }),
+    });
+    assert.equal(recorded.status, 200);
+    const rotated = await lstat(`${diagnosticsLogFile}.previous`);
+    assert.equal(rotated.size, 256 * 1024);
+    const current = await readFile(diagnosticsLogFile, "utf8");
+    assert.equal(current.split("\n").filter(Boolean).length, 1);
+    assert.equal(JSON.parse(current).reference, "TT-ABCDEF");
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("device credential reset removes only the contribution-device entry and its binding", async () => {
+  const files = await fixture();
+  const stateFile = join(files.stateRoot, "contribution-device-binding-v1.json");
+  const unrelatedFile = join(files.stateRoot, "export-participant-secret");
+  await mkdir(files.stateRoot, { recursive: true, mode: 0o700 });
+  await writeFile(
+    stateFile,
+    `${JSON.stringify({
+      schemaVersion: "contribution-device-binding-v1",
+      origin: "https://contribute.example.test",
+      deviceId: "00000000-0000-4000-8000-000000000000",
+      createdAt: "2026-07-30T10:00:00.000Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await writeFile(unrelatedFile, "unrelated-local-secret", { mode: 0o600 });
+  const capabilities = [];
+  let stored = Buffer.alloc(32, 7);
+  const backend = {
+    async read(capability) {
+      capabilities.push(capability);
+      return stored === null ? null : Buffer.from(stored);
+    },
+    async createIfMissing() {
+      return "existing";
+    },
+    async deleteExact(capability, expected) {
+      capabilities.push(capability);
+      if (stored === null) return "missing";
+      if (!stored.equals(expected)) return "conflict";
+      stored = null;
+      return "deleted";
+    },
+    async describe() {
+      return { backend: "test", status: "available" };
+    },
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDeviceBackendFactory: () => backend,
+    port: 0,
+  });
+  const path = "/api/local/contribution/device-credential-reset";
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const body = JSON.stringify({ confirm: "reset_device_credential" });
+
+    const unauthorized = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    assert.equal(unauthorized.status, 403);
+    assert.equal(
+      (await unauthorized.json()).error.code,
+      "device_credential_reset_not_authorized",
+    );
+    assert.equal((await fetch(`${base}${path}`)).status, 405);
+
+    // The repair is destructive, so it runs only for the one fixed
+    // confirmation; an empty or differently shaped body changes nothing.
+    for (const invalid of ["{}", JSON.stringify({ confirm: "yes" })]) {
+      const rejected = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers,
+        body: invalid,
+      });
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).error.code, "invalid_request");
+    }
+    assert.notEqual(stored, null);
+
+    const reset = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers,
+      body,
+    });
+    assert.equal(reset.status, 200);
+    assert.deepEqual(await reset.json(), {
+      schemaVersion: "local-contribution-device-reset-v0.1",
+      status: "reset",
+      credential: "deleted",
+      binding: "removed",
+      hostedDataDeleted: false,
+      includesIdentifiers: false,
+    });
+    assert.equal(stored, null);
+    // Exactly one Keychain capability is ever touched.
+    assert.equal(capabilities.length, 2);
+    for (const capability of capabilities) {
+      assert.equal(
+        capability,
+        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+      );
+      assert.equal(capability.service, "app-usagemonitor.contribution-device.v1");
+      assert.equal(capability.account, "installation");
+    }
+    await assert.rejects(lstat(stateFile), { code: "ENOENT" });
+    assert.equal(await readFile(unrelatedFile, "utf8"), "unrelated-local-secret");
+
+    // Repeating the repair is safe and says plainly that nothing was left.
+    const repeated = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers,
+      body,
+    });
+    assert.equal(repeated.status, 200);
+    assert.deepEqual(await repeated.json(), {
+      schemaVersion: "local-contribution-device-reset-v0.1",
+      status: "already_absent",
+      credential: "already_missing",
+      binding: "already_missing",
+      hostedDataDeleted: false,
+      includesIdentifiers: false,
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a failed device credential reset reports one fixed code and deletes nothing", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDeviceCredentialResetRunner: async () => {
+      const error = new Error("/Users/private/keychain denied for adamallcock");
+      error.code = "export_identity_keychain_denied";
+      throw error;
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const failed = await fetch(
+      `${base}/api/local/contribution/device-credential-reset`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1",
+          Origin: base,
+        },
+        body: JSON.stringify({ confirm: "reset_device_credential" }),
+      },
+    );
+    assert.equal(failed.status, 500);
+    const payload = await failed.text();
+    assert.deepEqual(JSON.parse(payload), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "device_credential_reset_failed" },
+    });
+    assert.equal(payload.includes("/Users/private"), false);
+    assert.equal(payload.includes("adamallcock"), false);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a leftover device credential stops delivery with its own code, not a generic failure", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: 16,
+      payload: exactReviewContribution(),
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+    contributionSyncOnceRunner: async () => {
+      const error = new Error("contribution device capability failed");
+      error.code = "contribution_device_credential_conflict";
+      throw error;
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const review = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    assert.equal(review.state, "ready");
+    const run = await fetch(`${base}/api/local/contribution/sync-once`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ reviewToken: review.reviewToken }),
+    });
+    // The cause is precisely known and has its own in-page repair, so it must
+    // not be flattened into the generic delivery failure.
+    assert.equal(run.status, 409);
+    assert.deepEqual(await run.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "contribution_device_recovery_required" },
+    });
+  } finally {
+    await app.close();
     await rm(files.root, { recursive: true });
   }
 });

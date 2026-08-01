@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
-import { lstatSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { constants, lstatSync } from "node:fs";
+import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,9 @@ import {
 import {
   createProductionContributionDeviceBackend,
 } from "../../src/contribution-device-capability.js";
+import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+} from "../../src/platform/export-identity-keychain.js";
 import {
   claimContributionDevicePairing,
 } from "../../src/contribution-device-client.js";
@@ -110,6 +113,39 @@ const REVIEW_JOB_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const REVIEW_AUTHORIZATION_LIFETIME_MS = 10 * 60 * 1000;
+// One appended line per user-visible failure, so a support conversation can
+// quote a reference the user can also see on the page. The file name is fixed
+// and lives beside the other local state.
+const DIAGNOSTICS_LOG_FILE_NAME = "diagnostics-v0.1.log";
+export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
+  "local-diagnostic-note-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
+  "local-contribution-device-reset-v0.1";
+const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
+const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+// Fixed journey names. Anything else is refused, so no free-form label can
+// ever be written to the log.
+const DIAGNOSTIC_SURFACES = new Set([
+  "automatic_contribution",
+  "community_results",
+  "contribution_connect",
+  "contribution_prepare",
+  "contribution_send",
+  "device_credential_reset",
+  "hosted_identity",
+  "hosted_privacy",
+  "local_refresh",
+]);
+// Identifier-shaped fixed codes only: SCREAMING_SNAKE from the contribution
+// service, lower_snake from this companion. Neither shape can carry a
+// sentence, a path, or a quoted value.
+const DIAGNOSTIC_ERROR_CODE =
+  /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
+const DIAGNOSTIC_SERVICE_REQUEST_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
+const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
 const GOOGLE_OAUTH_CALLBACK_PATH = "/oauth/google/callback";
 const GOOGLE_OAUTH_RESULT_STORAGE_KEY = "tibotattle-google-oauth-result";
 
@@ -181,6 +217,7 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 
 const API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/diagnostics/note",
   "/api/local/onboarding",
   "/api/local/overview",
   "/api/local/gradient",
@@ -194,6 +231,7 @@ const API_ROUTES = new Set([
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
   "/api/local/contribution/device-pair",
+  "/api/local/contribution/device-credential-reset",
   "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/sync-once",
   "/api/local/contribution/sync-pause",
@@ -351,6 +389,130 @@ function contributionDeviceRecoveryRequired(error) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Append one bounded diagnostics line the user can quote to support.
+ *
+ * Every field was validated before this point and is either minted by the
+ * dashboard (the reference), chosen from a fixed set (the surface), fixed and
+ * identifier-shaped (the code), or the service's own request id. No message,
+ * payload, path, or participant value is written. The file is capped: once it
+ * would exceed the bound, the current file becomes the single previous
+ * generation and a fresh one starts, so the log can never grow without limit.
+ */
+async function appendDiagnosticNote({
+  file,
+  note,
+  now = Date.now(),
+}) {
+  const line = `${JSON.stringify({
+    schemaVersion: LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION,
+    recordedAt: new Date(now).toISOString(),
+    reference: note.reference,
+    surface: note.surface,
+    code: note.code,
+    requestId: note.requestId,
+  })}\n`;
+  const bytes = Buffer.byteLength(line, "utf8");
+  let current = null;
+  try {
+    current = await lstat(file);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (current !== null
+      && (!current.isFile()
+        || current.isSymbolicLink()
+        || current.nlink !== 1)) {
+    throw new Error("diagnostics log is not a plain owner-only file");
+  }
+  if (current !== null && current.size + bytes > MAX_DIAGNOSTICS_LOG_BYTES) {
+    try {
+      await rename(file, `${file}.previous`);
+    } catch (error) {
+      // Another concurrent note may have rotated first. Losing that race is
+      // fine; losing this line because of it is not.
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  let handle;
+  try {
+    handle = await open(
+      file,
+      constants.O_WRONLY
+        | constants.O_APPEND
+        | constants.O_CREAT
+        | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await handle.chmod(0o600);
+    await handle.writeFile(line, "utf8");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/**
+ * Clear this Mac's leftover contribution-device credential.
+ *
+ * This is the narrow repair for one specific local fault: a Keychain secret
+ * whose binding state file is gone, which leaves the ordinary capability layer
+ * unable to read or replace it. Exactly two local things are removed — the
+ * app-usagemonitor.contribution-device.v1 / installation Keychain entry and
+ * the binding state file. It contacts no network, revokes no hosted device,
+ * and deletes no contributed metadata; the hosted side is unaware of it.
+ */
+async function resetContributionDeviceCredentialLocally({
+  backend,
+  stateFile,
+}) {
+  let stored = null;
+  let expected = null;
+  let credential = "already_missing";
+  try {
+    stored = await backend.read(CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY);
+    if (stored !== null) {
+      expected = Buffer.from(stored);
+      const outcome = await backend.deleteExact(
+        CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY,
+        expected,
+      );
+      if (outcome !== "deleted" && outcome !== "missing") {
+        throw new Error("device credential was not removed");
+      }
+      credential = outcome === "deleted" ? "deleted" : "already_missing";
+    }
+  } finally {
+    if (Buffer.isBuffer(stored)) stored.fill(0);
+    expected?.fill(0);
+  }
+  let binding = "already_missing";
+  let current = null;
+  try {
+    current = await lstat(stateFile);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (current !== null) {
+    if (!current.isFile()
+        || current.isSymbolicLink()
+        || current.nlink !== 1
+        || current.size > MAX_CONTRIBUTION_DEVICE_STATE_BYTES
+        || (typeof process.getuid === "function"
+          && current.uid !== process.getuid())) {
+      throw new Error("device binding state file is not owner-only");
+    }
+    await unlink(stateFile);
+    binding = "removed";
+  }
+  return Object.freeze({
+    status: credential === "already_missing" && binding === "already_missing"
+      ? "already_absent"
+      : "reset",
+    credential,
+    binding,
+  });
 }
 
 function actualPort(server) {
@@ -659,6 +821,114 @@ async function authorizeLocalMutation(
     sendError(response, status, error.code ?? "invalid_request");
     return false;
   }
+}
+
+async function readBoundedJsonObject(request) {
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string"
+      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+    const error = new Error("unsupported_media_type");
+    error.code = "unsupported_media_type";
+    throw error;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength)
+      && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    const error = new Error("request_too_large");
+    error.code = "request_too_large";
+    throw error;
+  }
+  let bytes = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_REQUEST_BODY_BYTES) {
+      const error = new Error("request_too_large");
+      error.code = "request_too_large";
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("invalid_json");
+    error.code = "invalid_json";
+    throw error;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    const error = new Error("invalid_request");
+    error.code = "invalid_request";
+    throw error;
+  }
+  return value;
+}
+
+function boundedRequestStatus(error) {
+  if (error?.code === "unsupported_media_type") return 415;
+  return error?.code === "request_too_large" ? 413 : 400;
+}
+
+async function authorizeDiagnosticNote(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "diagnostic_note_not_authorized");
+    return null;
+  }
+  let value;
+  try {
+    value = await readBoundedJsonObject(request);
+  } catch (error) {
+    sendError(
+      response,
+      boundedRequestStatus(error),
+      error.code ?? "invalid_request",
+    );
+    return null;
+  }
+  if (Object.keys(value).sort().join("\0") !== "code\0reference\0requestId\0surface"
+      || !DIAGNOSTIC_REFERENCE.test(value.reference)
+      || !DIAGNOSTIC_SURFACES.has(value.surface)
+      || !DIAGNOSTIC_ERROR_CODE.test(value.code)
+      || typeof value.requestId !== "string"
+      || (value.requestId !== ""
+        && !DIAGNOSTIC_SERVICE_REQUEST_ID.test(value.requestId))) {
+    sendError(response, 400, "invalid_request");
+    return null;
+  }
+  return Object.freeze({
+    reference: value.reference,
+    surface: value.surface,
+    code: value.code,
+    requestId: value.requestId,
+  });
+}
+
+async function authorizeContributionDeviceCredentialReset(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "device_credential_reset_not_authorized");
+    return false;
+  }
+  let value;
+  try {
+    value = await readBoundedJsonObject(request);
+  } catch (error) {
+    sendError(
+      response,
+      boundedRequestStatus(error),
+      error.code ?? "invalid_request",
+    );
+    return false;
+  }
+  // The one fixed confirmation this destructive local repair accepts.
+  if (Object.keys(value).join("\0") !== "confirm"
+      || value.confirm !== "reset_device_credential") {
+    sendError(response, 400, "invalid_request");
+    return false;
+  }
+  return true;
 }
 
 async function authorizeContributionDevicePairing(request, response) {
@@ -1468,6 +1738,11 @@ export function createLocalCompanionServer(options = {}) {
       ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
       ?? installation.paths.contributionQueueFile,
   );
+  const diagnosticsLogFile = assertLocalStatePath(
+    installation.stateRoot,
+    options.diagnosticsLogFile
+      ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
+  );
   const preparedCandidate = Object.hasOwn(
     options,
     "preparedContributionDirectory",
@@ -1508,6 +1783,7 @@ export function createLocalCompanionServer(options = {}) {
     staticRoot,
     codexHome,
     contributionQueueFile,
+    diagnosticsLogFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
     parentWatchdogPid,
@@ -1521,6 +1797,7 @@ function createPreparedLocalCompanionServer({
   statePaths,
   staticRoot,
   codexHome,
+  diagnosticsLogFile,
   parentWatchdogPid,
   dataStore = new LocalCompanionDataStore({
     builder: () => buildLocalCompanionSnapshot({
@@ -1571,6 +1848,9 @@ function createPreparedLocalCompanionServer({
   contributionDeviceBackendFactory =
     createProductionContributionDeviceBackend,
   contributionDevicePairingProvider = null,
+  contributionDeviceCredentialResetRunner = null,
+  diagnosticNoteRecorder = null,
+  clock = () => Date.now(),
   contributionSyncNextProvider = null,
   contributionSyncExactReviewProvider = null,
   contributionSyncOnceRunner = null,
@@ -1649,9 +1929,18 @@ function createPreparedLocalCompanionServer({
       && typeof contributionServiceOrigin !== "string") {
     throw new TypeError("contributionServiceOrigin must be a string or null");
   }
+  if (typeof diagnosticsLogFile !== "string"
+      || diagnosticsLogFile.length < 1
+      || typeof clock !== "function"
+      || (diagnosticNoteRecorder !== null
+        && typeof diagnosticNoteRecorder !== "function")) {
+    throw new TypeError("local diagnostics controls are invalid");
+  }
   if (typeof contributionDeviceBackendFactory !== "function"
       || (contributionDevicePairingProvider !== null
         && typeof contributionDevicePairingProvider !== "function")
+      || (contributionDeviceCredentialResetRunner !== null
+        && typeof contributionDeviceCredentialResetRunner !== "function")
       || (contributionSyncNextProvider !== null
         && typeof contributionSyncNextProvider !== "function")
       || (contributionSyncExactReviewProvider !== null
@@ -1685,6 +1974,21 @@ function createPreparedLocalCompanionServer({
           stateFile: statePaths.contributionDeviceStateFile,
         },
       }));
+  // Purely local repair: it needs the Keychain backend and the binding state
+  // file, never a contribution service origin, so it stays available even when
+  // no service is configured.
+  const resetContributionDeviceCredential =
+    contributionDeviceCredentialResetRunner
+    ?? (() => resetContributionDeviceCredentialLocally({
+      backend: contributionDeviceBackendFactory(),
+      stateFile: statePaths.contributionDeviceStateFile,
+    }));
+  const recordDiagnosticNote = diagnosticNoteRecorder
+    ?? ((note) => appendDiagnosticNote({
+      file: diagnosticsLogFile,
+      note,
+      now: clock(),
+    }));
   const reviewExactContribution = contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
@@ -1990,6 +2294,26 @@ function createPreparedLocalCompanionServer({
         });
         return;
       }
+      if (path === "/api/local/diagnostics/note") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const note = await authorizeDiagnosticNote(request, response);
+        if (note === null) return;
+        try {
+          await recordDiagnosticNote(note);
+        } catch {
+          sendError(response, 500, "diagnostic_note_not_recorded");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION,
+          status: "recorded",
+          reference: note.reference,
+        });
+        return;
+      }
       if (path === "/api/local/onboarding") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
@@ -2282,6 +2606,38 @@ function createPreparedLocalCompanionServer({
         }
         return;
       }
+      if (path === "/api/local/contribution/device-credential-reset") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeContributionDeviceCredentialReset(
+          request,
+          response,
+        )) return;
+        let reset;
+        try {
+          reset = await resetContributionDeviceCredential();
+        } catch {
+          sendError(response, 500, "device_credential_reset_failed");
+          return;
+        }
+        if (!["reset", "already_absent"].includes(reset?.status)
+            || !["deleted", "already_missing"].includes(reset?.credential)
+            || !["removed", "already_missing"].includes(reset?.binding)) {
+          sendError(response, 500, "device_credential_reset_failed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION,
+          status: reset.status,
+          credential: reset.credential,
+          binding: reset.binding,
+          hostedDataDeleted: false,
+          includesIdentifiers: false,
+        });
+        return;
+      }
       if (path === "/api/local/contribution/sync-inspect-exact") {
         if (request.method !== "POST") {
           sendError(response, 405, "method_not_allowed");
@@ -2356,8 +2712,18 @@ function createPreparedLocalCompanionServer({
             signal: controller.signal,
             reviewedJob: authorization.reviewedJob,
           });
-        } catch {
-          sendError(response, 502, "sync_failed");
+        } catch (error) {
+          // A leftover device credential is a precisely known local fault with
+          // its own repair. Reporting it as a generic delivery failure would
+          // send the user looking at the service and the network instead.
+          const recoveryRequired = contributionDeviceRecoveryRequired(error);
+          sendError(
+            response,
+            recoveryRequired ? 409 : 502,
+            recoveryRequired
+              ? "contribution_device_recovery_required"
+              : "sync_failed",
+          );
           return;
         } finally {
           clearTimeout(timeout);

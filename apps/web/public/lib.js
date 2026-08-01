@@ -496,3 +496,92 @@ export function safeApiError(payload, fallback) {
   }
   return fallback;
 }
+
+// Crockford base32 without I, L, O and U, so a reference read aloud or
+// retyped into a support conversation cannot be confused with 1 or 0.
+const DIAGNOSTIC_REFERENCE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const DIAGNOSTIC_REFERENCE_SYMBOLS = 6;
+const DIAGNOSTIC_REFERENCE_PREFIX = "TT-";
+export const DIAGNOSTIC_REFERENCE_PATTERN =
+  /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+// Fixed, content-free journey names. A note may only be filed against one of
+// these, so the local log can never accumulate a free-form label.
+export const DIAGNOSTIC_SURFACES = Object.freeze([
+  "automatic_contribution",
+  "community_results",
+  "contribution_connect",
+  "contribution_prepare",
+  "contribution_send",
+  "device_credential_reset",
+  "hosted_identity",
+  "hosted_privacy",
+  "local_refresh"
+]);
+const DIAGNOSTIC_SURFACE_SET = new Set(DIAGNOSTIC_SURFACES);
+// The same shape the Worker mints with crypto.randomUUID.
+const SERVICE_REQUEST_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+// The same identifier shape both boundaries answer with: SCREAMING_SNAKE from
+// the contribution service, lower_snake from the local companion. Neither can
+// carry a sentence, a path, or a quoted value, so a matching code is safe to
+// branch on and to record. It is still never rendered as copy.
+const DIAGNOSTIC_CODE_PATTERN =
+  /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
+
+/**
+ * Mint one short support reference for a user-visible failure.
+ *
+ * The value is pure WebCrypto randomness. It is never derived from a
+ * participant id, an error body, a hostname, or a timestamp, so it correlates
+ * a support conversation with one local log line and discloses nothing else.
+ */
+export function createDiagnosticReference(cryptoImpl = globalThis.crypto) {
+  const bytes = cryptoImpl.getRandomValues(
+    new Uint8Array(DIAGNOSTIC_REFERENCE_SYMBOLS)
+  );
+  let reference = DIAGNOSTIC_REFERENCE_PREFIX;
+  // 256 is an exact multiple of 32, so the remainder stays uniform.
+  for (const byte of bytes) {
+    reference += DIAGNOSTIC_REFERENCE_ALPHABET[byte % 32];
+  }
+  return reference;
+}
+
+export function diagnosticSurface(candidate) {
+  return DIAGNOSTIC_SURFACE_SET.has(candidate) ? candidate : "";
+}
+
+/**
+ * The Worker returns a UUID requestId in every error body. Surfacing it lets a
+ * support conversation join the local reference to one server-side record;
+ * anything that is not exactly that shape is discarded.
+ */
+export function serviceRequestId(candidate) {
+  return typeof candidate === "string"
+    && SERVICE_REQUEST_ID_PATTERN.test(candidate)
+    ? candidate
+    : "";
+}
+
+export function diagnosticErrorCode(candidate) {
+  return typeof candidate === "string" && DIAGNOSTIC_CODE_PATTERN.test(candidate)
+    ? candidate
+    : "";
+}
+
+/**
+ * The trailing sentence appended to every user-visible failure.
+ *
+ * It carries only identifiers this page minted or validated: the local
+ * reference, and the service request id when the service supplied one.
+ */
+export function diagnosticReferenceSentence({
+  reference,
+  requestId = ""
+} = {}) {
+  if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) return "";
+  const service = serviceRequestId(requestId);
+  return service === ""
+    ? `Reference ${reference}, also written to the local diagnostics log.`
+    : `Reference ${reference} · service request ${service}. Both are written to the local diagnostics log.`;
+}

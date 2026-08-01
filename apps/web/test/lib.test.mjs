@@ -7,10 +7,17 @@ import {
 } from "../../../config/product-brand.js";
 
 import {
+  DIAGNOSTIC_REFERENCE_PATTERN,
+  DIAGNOSTIC_SURFACES,
   GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   buildSyntheticFixture,
   bytesToBase64Url,
   contributionBatchAdmission,
+  createDiagnosticReference,
+  diagnosticErrorCode,
+  diagnosticReferenceSentence,
+  diagnosticSurface,
+  serviceRequestId,
   createGoogleSignInRequest,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
@@ -54,9 +61,13 @@ import {
   normalizeParticipantDeletionReceipt,
   normalizeParticipantHistory,
   normalizeParticipantStats,
+  normalizeLocalContributionDeviceReset,
+  normalizeLocalDiagnosticNote,
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
-  PARTICIPANT_STATS_SCHEMA_VERSION
+  PARTICIPANT_STATS_SCHEMA_VERSION,
+  SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
+  SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS
 } from "../public/data-client.js";
 
 test("browser JSON preflight rejects duplicate object keys before parsing", () => {
@@ -1489,41 +1500,45 @@ test("local sync preview and actions keep privileged values behind loopback", as
   assert.equal(calls[3].options.body, "{}");
 });
 
-test("local pairing preserves only the fixed recovery-required error code", async () => {
+test("local pairing preserves fixed identifier-shaped codes and drops anything else", async () => {
   const pairingCode =
     "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-  const client = new LocalCompanionClient({
+  const rejectingClient = (error, status = 409) => new LocalCompanionClient({
     fetchImpl: async () => new Response(JSON.stringify({
       schemaVersion: "local-companion-v0.1",
-      error: {
-        code: "contribution_device_recovery_required",
-      },
+      error,
     }), {
-      status: 409,
+      status,
       headers: { "Content-Type": "application/json" },
     }),
   });
-  await assert.rejects(
-    client.pairContributionDevice(pairingCode),
-    (error) => error?.status === 409
-      && error?.code === "contribution_device_recovery_required",
-  );
+  // Every fixed companion code survives, so the page can explain the actual
+  // cause instead of collapsing all of them into one vague sentence.
+  for (const [code, status] of [
+    ["contribution_device_recovery_required", 409],
+    ["contribution_device_pairing_not_configured", 409],
+    ["contribution_device_pairing_failed", 502],
+  ]) {
+    await assert.rejects(
+      rejectingClient({ code }, status).pairContributionDevice(pairingCode),
+      (error) => error?.status === status && error?.code === code,
+    );
+  }
 
-  const unrelated = new LocalCompanionClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      schemaVersion: "local-companion-v0.1",
-      error: {
-        code: "contribution_device_pairing_not_configured",
-      },
-    }), {
-      status: 409,
-      headers: { "Content-Type": "application/json" },
-    }),
-  });
-  await assert.rejects(
-    unrelated.pairContributionDevice(pairingCode),
-    (error) => error?.status === 409 && error?.code === undefined,
-  );
+  // Anything that is not an identifier-shaped code cannot reach the page: a
+  // sentence, a path, a non-string, or an extra member all drop back to a
+  // codeless rejection carrying only the page's own fallback copy.
+  for (const error of [
+    { code: "Pairing failed at /Users/private/state.json" },
+    { code: "MixedCase_Code" },
+    { code: 42 },
+    { code: "contribution_device_recovery_required", detail: "untrusted" },
+  ]) {
+    await assert.rejects(
+      rejectingClient(error).pairContributionDevice(pairingCode),
+      (rejected) => rejected?.status === 409 && rejected?.code === undefined,
+    );
+  }
 });
 
 test("exact prepared review uses a fixed local mutation route", async () => {
@@ -2177,12 +2192,18 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   ]) {
     assert.match(html, new RegExp(`id="${id}"`, "u"));
   }
-  // Sign out must survive the 760px breakpoint, which hides compact buttons.
+  // Sign out keeps the full 44px target and stays outside the only rule that
+  // hides compact buttons. Matching the scoped selector matters: the unscoped
+  // ".button.compact { display: none; }" regression is a substring of the
+  // scoped rule, so an unanchored pattern would pass either way.
   const signOutTag =
     html.match(/<button[^>]*id="identity-signout"[^>]*>/u)?.[0] ?? "";
   assert.match(signOutTag, /class="button button-quiet"/u);
   assert.doesNotMatch(signOutTag, /\bcompact\b/u);
-  assert.match(styles, /@media \(max-width: 760px\)[\s\S]*?\.button\.compact \{ display: none; \}/u);
+  assert.match(
+    styles,
+    /@media \(max-width: 760px\)[\s\S]*?\.topbar \.button\.compact \{ display: none; \}/u,
+  );
   assert.match(html, />\s*Sign out\s*</u);
   assert.match(html, /Signing out only forgets this sign-in on this page\./u);
   assert.match(html, /metadata already contributed stays until you delete it/u);
@@ -3245,7 +3266,17 @@ test("local-only UI says the optional community service is not connected", async
   // same thing in the places a reader actually looks.
   assert.match(
     appSource,
-    /Community upload, aggregate comparisons, and participant recovery appear only in a build with an explicit community-service origin\./u,
+    /Community upload and aggregate comparisons appear only in a build with an explicit community-service origin\./u,
+  );
+  // Readiness mechanics belong in the collapsed service-detail disclosure, so
+  // the default panel copy stays about what this means for the reader.
+  assert.match(
+    appSource,
+    /\$\("#backend-readiness-note"\)\.textContent =\s*\n\s*"This build has no community-service origin sealed into it/u,
+  );
+  assert.match(
+    appSource,
+    /Your local reporting works whether or not it is reachable, and nothing leaves this Mac unless you choose to contribute\./u,
   );
   assert.match(appSource, /document\.createTextNode\("Local-only mode"\)/u);
   assert.match(
@@ -3366,6 +3397,14 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.match(html, /id="contribution-not-now"/u);
   assert.match(html, /id="automatic-contribution-status"/u);
   assert.match(html, /id="automatic-contribution-toggle"[\s\S]*hidden/u);
+  // Stopping recurring contribution is a consent control and the only in-page
+  // way to do it, so it must never be "compact": that would drop it to a 37px
+  // target and put it back in reach of the narrow-width rule that hides
+  // compact buttons. [^<] anchors the match to this button's own attributes.
+  const automaticToggleTag =
+    html.match(/<button[^<]*id="automatic-contribution-toggle"[^<]*>/u)?.[0] ?? "";
+  assert.match(automaticToggleTag, /class="button button-quiet"/u);
+  assert.doesNotMatch(automaticToggleTag, /\bcompact\b/u);
   assert.match(html, /No daemon or login item is installed/u);
   assert.match(
     html,
@@ -3427,34 +3466,62 @@ test("automatic contribution is enabled only after the exact reviewed first send
   assert.match(appSource, /No retry is scheduled/u);
 });
 
-test("stale local device conflicts route users to the confirmed native reset", async () => {
+test("stale local device conflicts name the leftover credential and offer the repair", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const recoveryMatch = appSource.match(
-    /function renderContributionDeviceRecovery\(status\) \{([\s\S]*?)\n\}\n\nasync function finishCommunityDevicePairing/u,
+    /function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
   );
   assert.ok(recoveryMatch, "stale-device recovery renderer is available");
   const recoverySource = recoveryMatch[1];
-  assert.match(recoverySource, /No evidence was uploaded/u);
-  assert.match(recoverySource, /did not delete or rotate anything/u);
-  assert.match(
-    recoverySource,
-    /Data & Diagnostics…[\s\S]*Identity & Device Reset…[\s\S]*both native confirmations/u,
-  );
-  assert.match(recoverySource, /does not revoke hosted devices or delete hosted data/u);
-  assert.match(recoverySource, /action\.href = SEMANTIC_OPEN_TARGET/u);
+  // The specific cause is named, and no unrelated thing is blamed.
+  assert.match(recoverySource, /leftover contribution-device credential/u);
   assert.match(
     appSource,
-    /error\?\.code === "contribution_device_recovery_required"/u,
+    /CONTRIBUTION_DEVICE_CONFLICT_COPY =\n\s*"This Mac still holds a contribution-device credential from an earlier install/u,
   );
+  assert.doesNotMatch(
+    appSource.match(
+      /const CONTRIBUTION_DEVICE_CONFLICT_COPY =\n[^\n]*\n/u,
+    )[0],
+    /invitation|invite/iu,
+  );
+  assert.match(recoverySource, /Metadata you already contributed is untouched/u);
+  assert.match(recoverySource, /no hosted device is revoked/u);
+  assert.match(recoverySource, /Data & Diagnostics… menu offers the same repair natively/u);
+  assert.match(recoverySource, /Reset this Mac's device credential/u);
+  assert.match(recoverySource, /action\.href = SEMANTIC_OPEN_TARGET/u);
+  // Both names for the same fault reach the same explanation and repair.
+  assert.match(
+    appSource,
+    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict"/u,
+  );
+  // The reset control exists only inside the conflict renderer, so it can
+  // never appear unless a credential conflict was actually detected.
   assert.equal(
-    (appSource.match(/renderContributionDeviceRecovery\(status\)/gu) ?? [])
-      .length,
-    2,
-    "one declaration and the primary pairing path use the recovery renderer",
+    (appSource.match(/id = "reset-device-credential"/gu) ?? []).length,
+    1,
   );
+  // The renderer itself performs no deletion: it only offers the action.
   assert.doesNotMatch(
     recoverySource,
     /deleteExact|removeContributionDevice|rotateContribution|fetch\(/u,
+  );
+  // The repair requires an explicit confirmation and states its exact scope.
+  const resetMatch = appSource.match(
+    /async function resetContributionDeviceCredential\(\) \{([\s\S]*?)\n\}\n/u,
+  );
+  assert.ok(resetMatch, "the bounded device-credential repair is available");
+  assert.match(
+    resetMatch[1],
+    /if \(!window\.confirm\(DEVICE_CREDENTIAL_RESET_CONFIRMATION\)\) return;/u,
+  );
+  assert.match(
+    appSource,
+    /DEVICE_CREDENTIAL_RESET_CONFIRMATION =[\s\S]*?Metadata you already contributed is not deleted, no hosted device is revoked/u,
+  );
+  assert.match(
+    resetMatch[1],
+    /localClient\.resetContributionDeviceCredential\(\)/u,
   );
 });
 
@@ -3565,4 +3632,587 @@ test("export filenames and reflected API errors remain bounded", () => {
   assert.equal(safeFilename("../../private id"), "usage-monitor-privateid-export.json");
   assert.equal(safeApiError({ error: { code: "INVALID_ENVELOPE" } }, "failed"), "INVALID ENVELOPE");
   assert.equal(safeApiError({ message: "private server detail" }, "failed"), "failed");
+});
+
+test("every user-visible failure carries a quotable, content-free reference", () => {
+  const references = new Set();
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const reference = createDiagnosticReference(webcrypto);
+    assert.match(reference, DIAGNOSTIC_REFERENCE_PATTERN);
+    assert.equal(reference.length, 9);
+    // Crockford base32: no I, L, O or U, so a reference read aloud or retyped
+    // into a support conversation cannot collide with 1 or 0.
+    assert.doesNotMatch(reference.slice(3), /[ILOU]/u);
+    references.add(reference);
+  }
+  assert.ok(references.size > 480, "references are fresh randomness, not a counter");
+
+  // The reference is minted from WebCrypto alone. Nothing the user typed and
+  // nothing the service returned can influence it.
+  const bytes = [];
+  const recording = {
+    getRandomValues(target) {
+      bytes.push(target.length);
+      target.fill(0);
+      return target;
+    },
+  };
+  assert.equal(createDiagnosticReference(recording), "TT-000000");
+  assert.deepEqual(bytes, [6]);
+
+  assert.equal(
+    diagnosticReferenceSentence({ reference: "TT-7QF3K2" }),
+    "Reference TT-7QF3K2, also written to the local diagnostics log.",
+  );
+  assert.equal(
+    diagnosticReferenceSentence({
+      reference: "TT-7QF3K2",
+      requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+    }),
+    "Reference TT-7QF3K2 · service request 0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b. Both are written to the local diagnostics log.",
+  );
+  // A malformed request id is dropped rather than shown, and a malformed
+  // reference yields no sentence at all instead of a misleading one.
+  assert.equal(
+    diagnosticReferenceSentence({
+      reference: "TT-7QF3K2",
+      requestId: "participant:private",
+    }),
+    "Reference TT-7QF3K2, also written to the local diagnostics log.",
+  );
+  assert.equal(diagnosticReferenceSentence({ reference: "nope" }), "");
+  assert.equal(diagnosticReferenceSentence(), "");
+
+  assert.equal(
+    serviceRequestId("0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b"),
+    "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+  );
+  for (const invalid of ["", "not-a-uuid", null, 7, "0F2C7A11-4B93-4BB2-9A7C-1C0D2E3F4A5B"]) {
+    assert.equal(serviceRequestId(invalid), "");
+  }
+  assert.equal(diagnosticErrorCode("INTERNAL_ERROR"), "INTERNAL_ERROR");
+  assert.equal(
+    diagnosticErrorCode("contribution_device_credential_conflict"),
+    "contribution_device_credential_conflict",
+  );
+  for (const invalid of ["failed at /Users/private", "a".repeat(81), null, {}]) {
+    assert.equal(diagnosticErrorCode(invalid), "");
+  }
+  assert.equal(diagnosticSurface("contribution_connect"), "contribution_connect");
+  assert.equal(diagnosticSurface("anything_else"), "");
+  assert.ok(DIAGNOSTIC_SURFACES.includes("device_credential_reset"));
+});
+
+test("service request ids survive rejection so both sides of a failure can be joined", async () => {
+  const requestId = "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b";
+  const failing = (payload, status = 500) => new CommunityClient({
+    getCsrfToken: () => "csrf-confirmation",
+    fetchImpl: async () => new Response(JSON.stringify(payload), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }),
+  });
+  await assert.rejects(
+    failing({ error: { code: "INTERNAL_ERROR", requestId } }).personalStats(),
+    (error) => error.status === 500
+      && error.code === "INTERNAL_ERROR"
+      && error.requestId === requestId,
+  );
+  // A body that is not the service's fixed error shape contributes nothing:
+  // no code to branch on and no request id to show.
+  await assert.rejects(
+    failing({ error: { code: "sorry, it broke", requestId: "private-value" } })
+      .personalStats(),
+    (error) => error.code === undefined && error.requestId === undefined,
+  );
+  await assert.rejects(
+    failing("not json at all").personalStats(),
+    (error) => error.status === 500
+      && error.code === undefined
+      && error.requestId === undefined,
+  );
+});
+
+test("diagnostic notes are recorded through a fixed, bounded local route", async () => {
+  const calls = [];
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({
+        schemaVersion: "local-diagnostic-note-v0.1",
+        status: "recorded",
+        reference: "TT-7QF3K2",
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const recorded = await client.recordDiagnosticNote({
+    reference: "TT-7QF3K2",
+    surface: "contribution_connect",
+    code: "contribution_device_recovery_required",
+    requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+  });
+  assert.deepEqual(recorded, { status: "recorded", reference: "TT-7QF3K2" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/api/local/diagnostics/note");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    reference: "TT-7QF3K2",
+    surface: "contribution_connect",
+    code: "contribution_device_recovery_required",
+    requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+  });
+
+  // A code or request id the boundary cannot vouch for is replaced, never
+  // forwarded, so nothing free-form can reach the local log.
+  await client.recordDiagnosticNote({
+    reference: "TT-ZZ0011",
+    surface: "contribution_send",
+    code: "failed reading /Users/private/state.json",
+    requestId: "private-value",
+  });
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    reference: "TT-ZZ0011",
+    surface: "contribution_send",
+    code: "unknown",
+    requestId: "",
+  });
+
+  for (const invalid of [
+    { reference: "nope", surface: "contribution_send" },
+    { reference: "TT-7QF3K2", surface: "Not A Surface" },
+    { reference: "TT-7QF3K2" },
+  ]) {
+    await assert.rejects(
+      client.recordDiagnosticNote(invalid),
+      /Diagnostic note inputs are invalid/u,
+    );
+  }
+  assert.equal(calls.length, 2);
+
+  assert.deepEqual(
+    normalizeLocalDiagnosticNote({
+      schemaVersion: "local-diagnostic-note-v0.1",
+      status: "recorded",
+      reference: "TT-IL0OU1",
+    }),
+    { status: "unavailable", reference: "" },
+  );
+  assert.deepEqual(
+    normalizeLocalDiagnosticNote(null),
+    { status: "unavailable", reference: "" },
+  );
+});
+
+test("the device credential repair is explicit, local-only, and fails closed", async () => {
+  const calls = [];
+  const client = (payload, status = 200) => new LocalCompanionClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify(payload), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  const reset = await client({
+    schemaVersion: "local-contribution-device-reset-v0.1",
+    status: "reset",
+    credential: "deleted",
+    binding: "removed",
+    hostedDataDeleted: false,
+    includesIdentifiers: false,
+  }).resetContributionDeviceCredential();
+  assert.deepEqual(reset, {
+    status: "reset",
+    credential: "deleted",
+    binding: "removed",
+  });
+  assert.equal(
+    calls[0].url,
+    "/api/local/contribution/device-credential-reset",
+  );
+  assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
+  assert.deepEqual(
+    JSON.parse(calls[0].options.body),
+    { confirm: "reset_device_credential" },
+  );
+
+  // A response that claims hosted data was deleted, or that carries an
+  // identifier, is not the contract this page asked for and is refused.
+  for (const payload of [
+    {
+      schemaVersion: "local-contribution-device-reset-v0.1",
+      status: "reset",
+      credential: "deleted",
+      binding: "removed",
+      hostedDataDeleted: true,
+      includesIdentifiers: false,
+    },
+    {
+      schemaVersion: "local-contribution-device-reset-v0.1",
+      status: "reset",
+      credential: "deleted",
+      binding: "removed",
+      hostedDataDeleted: false,
+      includesIdentifiers: true,
+    },
+    {
+      schemaVersion: "local-contribution-device-reset-v0.2",
+      status: "reset",
+      credential: "deleted",
+      binding: "removed",
+      hostedDataDeleted: false,
+      includesIdentifiers: false,
+    },
+  ]) {
+    assert.equal(
+      normalizeLocalContributionDeviceReset(payload).status,
+      "unavailable",
+    );
+  }
+  assert.equal(
+    normalizeLocalContributionDeviceReset(null).status,
+    "unavailable",
+  );
+
+  await assert.rejects(
+    client({
+      schemaVersion: "local-companion-v0.1",
+      error: { code: "device_credential_reset_failed" },
+    }, 500).resetContributionDeviceCredential(),
+    (error) => error.status === 500
+      && error.code === "device_credential_reset_failed",
+  );
+});
+
+test("sealed snapshots stay readable across both released contracts", () => {
+  assert.deepEqual(SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS, [
+    "community-weekly-snapshot-v0.1",
+    "community-weekly-snapshot-v0.2",
+  ]);
+
+  // A sealed revision is immutable by design, so a week published under the
+  // earlier contract keeps being served and must keep rendering.
+  const v01 = structuredClone(communitySnapshot());
+  v01.schemaVersion = "community-weekly-snapshot-v0.1";
+  delete v01.cells[0].planType;
+  delete v01.cells[0].planVariant;
+  const earlier = normalizeCommunitySnapshot(v01);
+  assert.equal(earlier.state, "published");
+  assert.equal(earlier.schemaVersion, "community-weekly-snapshot-v0.1");
+  assert.equal(earlier.cells[0].metrics.usageEvents.value, 30);
+  // Plan cohorts arrived with v0.2, so a v0.1 cell says unknown rather than
+  // inventing a cohort or refusing the whole snapshot.
+  assert.equal(earlier.cells[0].planType, "unknown");
+  assert.equal(earlier.cells[0].planVariant, "unknown");
+
+  const v02 = structuredClone(communitySnapshot());
+  v02.cells[0].planType = "chatgpt_plus";
+  v02.cells[0].planVariant = "standard";
+  const current = normalizeCommunitySnapshot(v02);
+  assert.equal(current.state, "published");
+  assert.equal(current.schemaVersion, "community-weekly-snapshot-v0.2");
+  assert.equal(current.cells[0].planType, "chatgpt_plus");
+  assert.equal(current.cells[0].planVariant, "standard");
+
+  // A cell that claims a cohort under the earlier contract does not get one:
+  // the contract, not the payload, decides whether the field means anything.
+  const spoofed = structuredClone(v01);
+  spoofed.cells[0].planType = "chatgpt_pro";
+  spoofed.cells[0].planVariant = "priority";
+  const ignored = normalizeCommunitySnapshot(spoofed);
+  assert.equal(ignored.cells[0].planType, "unknown");
+  assert.equal(ignored.cells[0].planVariant, "unknown");
+
+  // Every other check stays exactly as strict on the older contract.
+  for (const mutate of [
+    (payload) => { payload.immutable = false; },
+    (payload) => { payload.nonOverlapping = false; },
+    (payload) => { payload.privacyPolicy.minimumIndependentParticipants = 2; },
+    (payload) => { delete payload.cells[0].metrics.toolUnits; },
+    (payload) => { payload.cells[0].metrics.usageEvents.unit = "tokens_rounded_down"; },
+    (payload) => { payload.cells[0].modelId = ""; },
+    (payload) => { payload.ingestionCutoffAt = ""; },
+  ]) {
+    const broken = structuredClone(v01);
+    mutate(broken);
+    assert.equal(normalizeCommunitySnapshot(broken).state, "unsupported_schema");
+  }
+
+  // A contract nobody has released is still refused rather than guessed at.
+  for (const version of [
+    "community-weekly-snapshot-v0.3",
+    "community-weekly-snapshot",
+    "participant-community-comparison-v0.2",
+    "",
+  ]) {
+    const unsupported = structuredClone(communitySnapshot());
+    unsupported.schemaVersion = version;
+    assert.equal(
+      normalizeCommunitySnapshot(unsupported).state,
+      "unsupported_schema",
+    );
+  }
+});
+
+test("participant community comparison reads both released contracts", () => {
+  assert.deepEqual(SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS, [
+    "participant-community-comparison-v0.1",
+    "participant-community-comparison-v0.2",
+  ]);
+  const comparison = (schemaVersion, cell = {}) => ({
+    schemaVersion,
+    status: "ready",
+    snapshotId: "community-weekly:2026-07-20",
+    snapshotRevision: 2,
+    period: {
+      startAt: "2026-07-20T00:00:00.000Z",
+      endAt: "2026-07-27T00:00:00.000Z",
+    },
+    interpretation: "own_clipped_contribution_vs_public_rounded_total",
+    cells: [{
+      provider: "openai_codex",
+      modelId: "gpt-5.6-sol",
+      participantHasActivity: true,
+      metrics: Object.fromEntries([
+        ["usageEvents", "events"],
+        ["inputUncachedTokens", "tokens"],
+        ["inputCacheReadTokens", "tokens"],
+        ["inputCacheWriteTokens", "tokens"],
+        ["outputTextTokens", "tokens"],
+        ["outputReasoningTokens", "tokens"],
+        ["outputCombinedTokens", "tokens"],
+        ["toolUnits", "units"],
+      ].map(([name, unit]) => [name, {
+        status: "comparable",
+        participantClippedValue: 3,
+        communityRoundedValue: 20,
+        unit,
+      }])),
+      ...cell,
+    }],
+  });
+
+  const earlier = normalizeParticipantCommunityComparison(
+    comparison("participant-community-comparison-v0.1"),
+  );
+  assert.equal(earlier.status, "ready");
+  assert.equal(earlier.cells[0].metrics.usageEvents.participantClippedValue, 3);
+  assert.equal(earlier.cells[0].planType, "unknown");
+  assert.equal(earlier.cells[0].planVariant, "unknown");
+  // v0.1 never checked a cohort, so false would be a claim it did not make.
+  assert.equal(earlier.cells[0].cohortMatchesParticipant, "unknown");
+  assert.deepEqual(earlier.participantPlanCohort, {
+    planType: "unknown",
+    planVariant: "unknown",
+  });
+
+  const current = normalizeParticipantCommunityComparison({
+    ...comparison("participant-community-comparison-v0.2", {
+      planType: "chatgpt_plus",
+      planVariant: "standard",
+      cohortMatchesParticipant: true,
+    }),
+    participantPlanCohort: {
+      planType: "chatgpt_plus",
+      planVariant: "standard",
+    },
+  });
+  assert.equal(current.status, "ready");
+  assert.equal(current.cells[0].planType, "chatgpt_plus");
+  assert.equal(current.cells[0].cohortMatchesParticipant, true);
+  assert.deepEqual(current.participantPlanCohort, {
+    planType: "chatgpt_plus",
+    planVariant: "standard",
+  });
+
+  // Cohort claims on a v0.1 payload are ignored, not adopted.
+  const spoofed = normalizeParticipantCommunityComparison(
+    comparison("participant-community-comparison-v0.1", {
+      planType: "chatgpt_pro",
+      cohortMatchesParticipant: true,
+    }),
+  );
+  assert.equal(spoofed.cells[0].planType, "unknown");
+  assert.equal(spoofed.cells[0].cohortMatchesParticipant, "unknown");
+
+  // Everything else remains strict on the older contract.
+  const invalidUnit = comparison("participant-community-comparison-v0.1");
+  invalidUnit.cells[0].metrics.toolUnits.unit = "tokens";
+  assert.equal(
+    normalizeParticipantCommunityComparison(invalidUnit).reason,
+    "comparison_contract_invalid",
+  );
+  const invalidProvider = comparison("participant-community-comparison-v0.1");
+  invalidProvider.cells[0].provider = "unknown_provider";
+  assert.equal(
+    normalizeParticipantCommunityComparison(invalidProvider).reason,
+    "comparison_contract_invalid",
+  );
+
+  // An unreleased contract is still refused.
+  assert.equal(
+    normalizeParticipantCommunityComparison(
+      comparison("participant-community-comparison-v0.3"),
+    ).status,
+    "not_testable",
+  );
+});
+
+test("result panels show the number and its caveat, not the service plumbing", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  // The publication-policy prose was relocated, not deleted, and now sits in a
+  // collapsed disclosure beside the result.
+  assert.match(html, /id="community-snapshot-provenance"/u);
+  const provenance = html.match(
+    /<details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">([\s\S]*?)<\/details>/u,
+  )?.[1];
+  assert.ok(provenance, "the snapshot provenance disclosure is available");
+  assert.doesNotMatch(provenance, /\bopen\b/u);
+  assert.match(provenance, /How this snapshot is produced/u);
+  assert.match(
+    provenance,
+    /Community values use a fixed delay, independent per-cell support/u,
+  );
+  assert.match(provenance, /A sealed\s+revision is never rewritten/u);
+  assert.match(provenance, /id="community-snapshot-service-detail"/u);
+
+  // The default view keeps only what a reader needs to interpret the number.
+  const detailBody = appSource.match(
+    /const detail = \$\("#community-snapshot-service-detail"\);([\s\S]*?)\n\}\n/u,
+  )?.[1];
+  assert.ok(detailBody, "the snapshot renderer is available");
+  assert.match(
+    detailBody,
+    /container\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*`Activity totals for the week above/u,
+  );
+  assert.match(
+    detailBody,
+    /container\.append\(node\("p", "snapshot-partial", "Some metrics were not released/u,
+  );
+  // Contract version, ingestion cutoff, release timing, clipping mechanics and
+  // the next-contract statement all moved into the disclosure.
+  for (const relocated of [
+    /detail\.append\(quality\);/u,
+    /\["Contract", snapshot\.schemaVersion\]/u,
+    /\["Ingestion cutoff", formatLocal\(snapshot\.ingestionCutoffAt\)\]/u,
+    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*`Each value is clipped per participant/u,
+    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*"This release currently reports privacy-safe activity totals/u,
+  ]) {
+    assert.match(detailBody, relocated);
+  }
+
+  // The backend lifecycle plumbing is behind the same kind of disclosure, and
+  // the panel's default copy answers what it means for the reader instead.
+  const backendDetail = html.match(
+    /<details class="journey-disclosure service-detail-disclosure" id="backend-service-detail">([\s\S]*?)<\/details>/u,
+  )?.[1];
+  assert.ok(backendDetail, "the backend service-detail disclosure is available");
+  assert.match(backendDetail, /Service readiness and lifecycle detail/u);
+  assert.match(backendDetail, /id="backend-facts"/u);
+  assert.match(backendDetail, /class="backend-flow"/u);
+  assert.match(backendDetail, /Account-scoped v0\.2 ingest is disabled by default/u);
+  assert.match(backendDetail, /id="backend-readiness-note"/u);
+  const description = html.match(
+    /<p class="annotation" id="backend-description">([\s\S]*?)<\/p>/u,
+  )?.[1];
+  assert.ok(description, "the backend panel description is available");
+  assert.match(description, /Your local reporting works whether or not it is reachable/u);
+  assert.doesNotMatch(description, /reconciliation|restore replay|aggregate rebuild/u);
+});
+
+test("failure copy is chosen from fixed maps and never echoes a server string", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  // A code is an untrusted string, so every copy lookup goes through the
+  // own-property helper. Plain member access would resolve "constructor" or
+  // "toString" to an inherited value and render it as a sentence.
+  assert.match(
+    appSource,
+    /function fixedCopy\(map, code\) \{\s*\n\s*return typeof code === "string" && Object\.hasOwn\(map, code\)/u,
+  );
+  for (const map of [
+    "HOSTED_IDENTITY_ERROR_COPY",
+    "SERVICE_ERROR_COPY",
+    "LOCAL_COMPANION_ERROR_COPY",
+    "COMMUNITY_COMPARISON_REASONS",
+    "QUOTA_MOVEMENT_REASONS",
+    "ACCOUNT_CALIBRATION_REASONS",
+    "CONTRIBUTION_STATUS_LABELS",
+  ]) {
+    assert.doesNotMatch(appSource, new RegExp(`${map}\\[`, "u"));
+    assert.match(appSource, new RegExp(`fixedCopy\\(\\s*${map},`, "u"));
+  }
+
+  // The explanation always comes from a fixed map or the caller's fallback.
+  const describe = appSource.match(
+    /function describeFailure\(\{ surface, error, messages = \{\}, fallback \}\) \{([\s\S]*?)\n\}\n/u,
+  )?.[1];
+  assert.ok(describe, "the failure describer is available");
+  assert.match(
+    describe,
+    /const explanation = fixedCopy\(messages, code\)\s*\n\s*\?\? fixedCopy\(SERVICE_ERROR_COPY, code\)\s*\n\s*\?\? fixedCopy\(LOCAL_COMPANION_ERROR_COPY, code\)\s*\n\s*\?\? fallback;/u,
+  );
+  // The reference is minted per failure and filed against a fixed surface.
+  assert.match(describe, /const reference = createDiagnosticReference\(\);/u);
+  assert.match(describe, /const code = diagnosticErrorCode\(error\?\.code\);/u);
+  assert.match(describe, /const requestId = serviceRequestId\(error\?\.requestId\);/u);
+  assert.match(
+    describe,
+    /localClient\.recordDiagnosticNote\(\{\s*\n\s*reference,\s*\n\s*surface: diagnosticSurface\(surface\),/u,
+  );
+  // Filing the note must never replace telling the user what happened.
+  assert.match(describe, /\}\)\.catch\(\(\) => \{\}\);/u);
+
+  // The connect fallback no longer names three unrelated things to check.
+  const connect = appSource.match(
+    /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}\n/u,
+  )?.[1];
+  assert.ok(connect, "the connect journey is available");
+  assert.doesNotMatch(connect, /Check the invitation/u);
+  assert.doesNotMatch(
+    connect,
+    /Check service availability and Keychain access/u,
+  );
+  assert.match(
+    connect,
+    /The cause was not reported in a form this page can explain/u,
+  );
+  assert.match(
+    connect,
+    /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*renderContributionDeviceRecovery\(status, \{ error \}\);/u,
+  );
+
+  // Every journey that can fail files its note against a fixed surface.
+  const surfaces = [...appSource.matchAll(/surface: "([a-z_]+)"/gu)]
+    .map((match) => match[1]);
+  assert.ok(surfaces.length >= 7);
+  for (const surface of surfaces) {
+    assert.ok(
+      DIAGNOSTIC_SURFACES.includes(surface),
+      `${surface} is a fixed diagnostic surface`,
+    );
+  }
+  for (const journey of [
+    "contribution_connect",
+    "contribution_prepare",
+    "contribution_send",
+    "device_credential_reset",
+    "hosted_identity",
+    "hosted_privacy",
+    "automatic_contribution",
+  ]) {
+    assert.ok(surfaces.includes(journey), `${journey} reports failures`);
+  }
+
+  // The page states where the log lives so a reference can actually be found.
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="diagnostics-log-location"/u);
+  assert.match(
+    html,
+    /~\/Library\/Application Support\/app-usagemonitor\/diagnostics-v0\.1\.log/u,
+  );
 });
