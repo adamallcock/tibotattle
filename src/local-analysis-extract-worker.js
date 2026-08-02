@@ -29,6 +29,7 @@ const RELEVANT_NEEDLES = Object.freeze([
 const READ_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 const OVERSIZED_CLASSIFICATION_BYTES = 64 * 1024;
+const WITNESS_BYTES = 16;
 
 function fixedFailure(code) {
   const error = new Error(code);
@@ -59,6 +60,32 @@ function canonicalTimestamp(value) {
 
 function relevantLine(line) {
   return RELEVANT_NEEDLES.some((needle) => line.includes(needle));
+}
+
+// A few bytes taken from each end of a segment while it is still the bytes we
+// read, kept apart from the segment itself so the segment cannot vouch for its
+// own contents. A carry that a later read overwrote is overwritten from its
+// first byte, because every read fills the buffer from offset zero.
+function segmentWitness(offset, segment) {
+  const headBytes = Math.min(WITNESS_BYTES, segment.length);
+  return {
+    offset,
+    length: segment.length,
+    head: Buffer.from(segment.subarray(0, headBytes)),
+    tail: Buffer.from(
+      segment.subarray(Math.max(0, segment.length - WITNESS_BYTES)),
+    ),
+  };
+}
+
+function witnessHolds(line, witness) {
+  const end = witness.offset + witness.length;
+  return end <= line.length
+    && line.subarray(
+      witness.offset,
+      witness.offset + witness.head.length,
+    ).equals(witness.head)
+    && line.subarray(end - witness.tail.length, end).equals(witness.tail);
 }
 
 function oversizedRecordRelevant(prefix) {
@@ -305,6 +332,9 @@ function processRecord(line, sourceOffset, task, prepared, diagnostics) {
     ...componentValues(last),
     rateStatus,
   );
+  // The observation count the index pairs with the number of distinct
+  // cumulative-token keys it stores: keys can only ever be fewer.
+  addDiagnostic(diagnostics, task.sourceKey, "tokenCountRecords");
   for (let index = 0; index < windows.length; index += 1) {
     const window = windows[index];
     prepared.quota.run(
@@ -366,6 +396,9 @@ async function scanTask(task, prepared, diagnostics) {
     let carryBytes = 0;
     let oversized = false;
     let classificationPrefix = Buffer.alloc(0);
+    // Evidence about every segment held across a read, so a line rebuilt from
+    // stale bytes is caught instead of quietly dropping the record inside it.
+    let witnesses = [];
 
     function append(segment) {
       if (segment.length === 0) return;
@@ -401,6 +434,18 @@ async function scanTask(task, prepared, diagnostics) {
         const line = carry.length === 1
           ? carry[0]
           : Buffer.concat(carry, carryBytes);
+        // Only a line held across a read can have been rebuilt wrongly; a line
+        // read whole has no witnesses and costs nothing here.
+        if (witnesses.some((witness) => !witnessHolds(line, witness))) {
+          // The rebuilt line is not the bytes that were read, so whatever
+          // record it held is lost. Nothing downstream can notice that on its
+          // own: the line simply stops looking relevant and disappears.
+          addDiagnostic(
+            diagnostics,
+            task.sourceKey,
+            "reassembledLineMismatches",
+          );
+        }
         if (relevantLine(line)) {
           processRecord(line, lineStart, task, prepared, diagnostics);
         }
@@ -409,6 +454,7 @@ async function scanTask(task, prepared, diagnostics) {
       carryBytes = 0;
       oversized = false;
       classificationPrefix = Buffer.alloc(0);
+      witnesses = [];
       lineStart = endExclusive;
     }
 
@@ -427,6 +473,8 @@ async function scanTask(task, prepared, diagnostics) {
       let cursor = 0;
       let newline = buffer.indexOf(0x0a, cursor);
       while (newline !== -1 && newline < bytesRead) {
+        // This segment is consumed by complete() before the next read, so it
+        // needs neither a copy nor a witness.
         append(buffer.subarray(cursor, newline));
         const endExclusive = position + newline + 1;
         complete(endExclusive);
@@ -437,7 +485,19 @@ async function scanTask(task, prepared, diagnostics) {
         }
         newline = buffer.indexOf(0x0a, cursor);
       }
-      if (!finishedBoundaryLine) append(buffer.subarray(cursor, bytesRead));
+      if (!finishedBoundaryLine) {
+        const tail = buffer.subarray(cursor, bytesRead);
+        // An oversized line is never rebuilt, so there is nothing to witness.
+        if (tail.length > 0 && !oversized) {
+          witnesses.push(segmentWitness(carryBytes, tail));
+        }
+        // COPY, DO NOT "OPTIMISE" BACK TO THE VIEW. This tail is a partial
+        // line: it stays in `carry` until a later read supplies the rest of
+        // it, and that read refills this very buffer. A view would then hold
+        // the later read's bytes, `complete()` would join a corrupt line, and
+        // the record in it would silently disappear from the index.
+        append(Buffer.from(tail));
+      }
       position += bytesRead;
       if (!finishedBoundaryLine
           && position >= task.endByte

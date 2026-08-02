@@ -31,11 +31,12 @@ import { stableJson } from "./export/index.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
   "local-analysis-index-v2";
-// Bumped when quota admission changes: an index built before the leading
-// rate-limit gate still holds contradicted readings as facts, so it is
-// rebuilt rather than reused.
+// Bumped when extraction changes what the index can hold. v3 gated quota
+// admission; v4 stops the chunk reader from rebuilding a record out of a reused
+// buffer, so every index built before it is missing whichever records happened
+// to straddle a read boundary and must be rebuilt rather than reused.
 export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
-  "parallel-jsonl-accounting-v3";
+  "parallel-jsonl-accounting-v4";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
 const INDEX_USER_VERSION = 2;
@@ -56,6 +57,10 @@ const DIAGNOSTIC_DEFAULTS = Object.freeze({
   malformedLines: 0,
   malformedTimestamps: 0,
   malformedUsageRecords: 0,
+  tokenCountRecords: 0,
+  snapshotKeysStored: 0,
+  reassembledLineMismatches: 0,
+  impossibleSnapshotSets: 0,
   missingRateLimitRecords: 0,
   malformedRateLimitRecords: 0,
   rateLimitSnapshots: 0,
@@ -1161,6 +1166,17 @@ async function deriveChangedSources({
     ON CONFLICT(source_key, code)
     DO UPDATE SET count = count + excluded.count
   `);
+  // A measurement of the current state rather than a running tally.
+  const setSourceDiagnostic = database.prepare(`
+    INSERT INTO source_diagnostics(source_key, code, count)
+    VALUES (?, ?, ?)
+    ON CONFLICT(source_key, code)
+    DO UPDATE SET count = excluded.count
+  `);
+  const readSourceDiagnostic = database.prepare(`
+    SELECT count FROM source_diagnostics
+    WHERE source_key = ? AND code = ?
+  `);
   const readDiagnosticSeries = database.prepare(`
     SELECT code, timestamps_blob
     FROM diagnostic_series WHERE source_key = ?
@@ -1577,6 +1593,28 @@ async function deriveChangedSources({
       source.sourceKey,
       encodeSnapshotSet(localSnapshots),
     );
+    // The set is a deduplicated view of this source's token_count records, so
+    // it may hold fewer keys than records were seen but never more. Storing
+    // both numbers is what makes a set that was written short auditable at
+    // all: the encoding alone can only prove it decodes to what was encoded.
+    const observedRecords = Number(
+      readSourceDiagnostic.get(
+        source.sourceKey,
+        "tokenCountRecords",
+      )?.count ?? 0,
+    );
+    setSourceDiagnostic.run(
+      source.sourceKey,
+      "snapshotKeysStored",
+      localSnapshots.size,
+    );
+    if (localSnapshots.size > observedRecords) {
+      addSourceDiagnostic.run(
+        source.sourceKey,
+        "impossibleSnapshotSets",
+        1,
+      );
+    }
     snapshotCache.set(source.sourceKey, localSnapshots);
     for (const [code, timestamps] of diagnosticSeries) {
       writeDiagnosticSeries.run(
@@ -1688,6 +1726,10 @@ function buildDiagnostics(database, sources, startMs, endMs) {
     "malformedLines",
     "malformedTimestamps",
     "malformedUsageRecords",
+    "tokenCountRecords",
+    "snapshotKeysStored",
+    "reassembledLineMismatches",
+    "impossibleSnapshotSets",
     "tierSettingEvents",
     "malformedTierSettingEvents",
   ]) diagnostics[code] = diagnosticCount(database, code);
@@ -2336,6 +2378,16 @@ export async function inspectLocalAnalysisIndex({
         0,
       ),
     );
+    // Reported next to the key count so an incomplete set is visible: keys can
+    // only ever be fewer than the records they were deduplicated from.
+    const tokenCountRecords = Number(database.prepare(`
+      SELECT COALESCE(SUM(count), 0) AS count
+      FROM source_diagnostics WHERE code = 'tokenCountRecords'
+    `).get().count);
+    const reassembledLineMismatches = Number(database.prepare(`
+      SELECT COALESCE(SUM(count), 0) AS count
+      FROM source_diagnostics WHERE code = 'reassembledLineMismatches'
+    `).get().count);
     const metadata = await stat(indexFile);
     return {
       schemaVersion: meta.schema_version,
@@ -2349,6 +2401,8 @@ export async function inspectLocalAnalysisIndex({
       usageFacts,
       quotaFacts,
       snapshotKeys,
+      tokenCountRecords,
+      reassembledLineMismatches,
       indexBytes: metadata.size,
       lastScan: {
         wallMs: Number(meta.last_scan_wall_ms),
