@@ -841,10 +841,6 @@ function createChunks(source, startByte, chunkBytes) {
 }
 
 function balancedAssignments(tasks, workerCount) {
-  const assignments = Array.from(
-    { length: Math.min(workerCount, Math.max(1, tasks.length)) },
-    () => ({ bytes: 0, tasks: [] }),
-  );
   const bySource = new Map();
   for (const task of tasks) {
     const group = bySource.get(task.sourceKey) ?? {
@@ -855,6 +851,10 @@ function balancedAssignments(tasks, workerCount) {
     group.tasks.push(task);
     bySource.set(task.sourceKey, group);
   }
+  const assignments = Array.from(
+    { length: Math.min(workerCount, bySource.size) },
+    () => ({ bytes: 0, tasks: [] }),
+  );
   for (const group of [...bySource.values()].sort(
     (left, right) => right.bytes - left.bytes,
   )) {

@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHook } from "node:async_hooks";
 import {
   appendFile,
   mkdir,
   mkdtemp,
   readFile,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -15,6 +17,7 @@ import { scanCodexLogEvents } from "../src/codex-log-scan.js";
 import {
   createIndexedCodexLogScan,
   inspectLocalAnalysisIndex,
+  refreshLocalAnalysisIndex,
 } from "../src/local-analysis-index.js";
 import {
   readReplaySafeAccountingCache,
@@ -23,6 +26,15 @@ import {
 
 const START_AT = "2026-07-24T11:55:00.000Z";
 const END_AT = "2026-07-24T12:10:00.000Z";
+const CHUNK_BYTES = 4 * 1024 * 1024;
+const FILLER_RECORD = JSON.stringify({
+  timestamp: "2026-07-24T12:05:00.000Z",
+  type: "response_item",
+  payload: {
+    type: "message",
+    text: "x".repeat(1024),
+  },
+});
 
 function usage(input, output = 0) {
   return {
@@ -133,6 +145,37 @@ async function fixture() {
   return { root, codexHome, parentPath, childPath };
 }
 
+async function chunkedFixture({ includeSecondSource = false } = {}) {
+  const result = await fixture();
+  if (!includeSecondSource) {
+    await rm(result.childPath, { force: true });
+  }
+  const filler = `${FILLER_RECORD}\n`.repeat(8_000);
+  await appendFile(result.parentPath, `${filler}${token(
+    "2026-07-24T12:06:00.000Z",
+    usage(240, 50),
+    usage(140, 30),
+    18,
+  )}\n`);
+  return result;
+}
+
+async function countWorkerLaunches(callback) {
+  let count = 0;
+  const hook = createHook({
+    init(_asyncId, type) {
+      if (type === "WORKER") count += 1;
+    },
+  });
+  hook.enable();
+  try {
+    await callback();
+  } finally {
+    hook.disable();
+  }
+  return count;
+}
+
 async function receipt(scan, codexHome) {
   const usageRows = [];
   const quotaRows = [];
@@ -168,6 +211,105 @@ async function receipt(scan, codexHome) {
     },
   };
 }
+
+test("does not launch an empty worker for one source with many chunks", async () => {
+  const { root, codexHome } = await chunkedFixture();
+  const indexFile = join(root, "local-analysis-index-v2.sqlite");
+  const secretFile = join(root, "local-analysis-index-secret-v2");
+  let refreshed;
+  const workerLaunches = await countWorkerLaunches(async () => {
+    refreshed = await refreshLocalAnalysisIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      workerCount: 2,
+      chunkBytes: CHUNK_BYTES,
+    });
+  });
+
+  assert.equal(refreshed.sourceCount, 1);
+  assert.ok(refreshed.scanBytes > CHUNK_BYTES * 2);
+  assert.equal(workerLaunches, 1);
+});
+
+test("preserves source-affine shard mapping and chunk order", async () => {
+  const { root, codexHome } = await chunkedFixture({
+    includeSecondSource: true,
+  });
+  const indexFile = join(root, "local-analysis-index-v2.sqlite");
+  const secretFile = join(root, "local-analysis-index-secret-v2");
+  const indexedScan = createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 3,
+    chunkBytes: CHUNK_BYTES,
+  });
+  const legacy = await receipt(scanCodexLogEvents, codexHome);
+  const usageRows = [];
+  const quotaRows = [];
+  let indexed;
+  const workerLaunches = await countWorkerLaunches(async () => {
+    indexed = await indexedScan({
+      codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      onUsage(value) {
+        usageRows.push({
+          timestamp: value.timestamp,
+          model: value.model,
+          components: value.components,
+          sourceRolloutOrdinal: value.sourceRolloutOrdinal,
+          sourceRecordOrdinal: value.sourceRecordOrdinal,
+        });
+      },
+      onRateLimitSnapshot(value) {
+        quotaRows.push({
+          timestamp: value.timestamp,
+          window: value.window,
+        });
+      },
+    });
+  });
+
+  const order = (left, right) => JSON.stringify(left)
+    .localeCompare(JSON.stringify(right));
+  assert.equal(workerLaunches, 2);
+  assert.deepEqual(
+    usageRows.map((row) => ({
+      timestamp: row.timestamp,
+      model: row.model,
+      components: row.components,
+    })).sort(order),
+    legacy.usageRows,
+  );
+  assert.deepEqual({
+    quotaRows: quotaRows.sort(order),
+    diagnostics: {
+      filesScanned: indexed.diagnostics.filesScanned,
+      forkReplayEventsSkipped:
+        indexed.diagnostics.forkReplayEventsSkipped,
+      duplicateSnapshotsSkipped:
+        indexed.diagnostics.duplicateSnapshotsSkipped,
+    },
+  }, {
+    quotaRows: legacy.quotaRows,
+    diagnostics: legacy.diagnostics,
+  });
+  assert.deepEqual(
+    usageRows.map((row) => row.sourceRolloutOrdinal),
+    [0, 0, 0, 1],
+  );
+  assert.ok(
+    usageRows[0].sourceRecordOrdinal
+      < usageRows[1].sourceRecordOrdinal,
+  );
+  assert.ok(
+    usageRows[1].sourceRecordOrdinal
+      < usageRows[2].sourceRecordOrdinal,
+  );
+});
 
 test("persistent local index preserves replay-safe accounting and appends only new bytes", async () => {
   const {
