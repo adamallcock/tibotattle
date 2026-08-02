@@ -168,6 +168,7 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     filesScanned: 9,
     forkReplayEventsExcluded: 21,
     unattributedForkReplayEventsExcluded: 3,
+    contradictedLeadingSnapshotsExcluded: 0,
     duplicateSnapshotsExcluded: 4,
     missingLineageParents: 2,
   });

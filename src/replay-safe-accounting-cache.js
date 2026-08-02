@@ -800,6 +800,10 @@ function publicDiagnostics(value) {
       Number.isSafeInteger(value?.duplicateSnapshotsSkipped)
         ? value.duplicateSnapshotsSkipped
         : 0,
+    contradictedLeadingSnapshotsExcluded:
+      Number.isSafeInteger(value?.contradictedLeadingSnapshotsSkipped)
+        ? value.contradictedLeadingSnapshotsSkipped
+        : 0,
     missingLineageParents: Number.isSafeInteger(value?.lineageParentsMissing)
       ? value.lineageParentsMissing
       : 0,
