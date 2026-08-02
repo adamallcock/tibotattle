@@ -29,10 +29,9 @@ const END_AT = "2026-07-24T12:10:00.000Z";
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const FILLER_RECORD = JSON.stringify({
   timestamp: "2026-07-24T12:05:00.000Z",
-  type: "response_item",
+  type: "synthetic_padding",
   payload: {
-    type: "message",
-    text: "x".repeat(1024),
+    bytes: "x".repeat(1024),
   },
 });
 
