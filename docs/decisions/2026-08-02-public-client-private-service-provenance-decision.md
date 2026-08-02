@@ -2,28 +2,38 @@
 title: Public Client and Private Service Source-Provenance Decision
 date: 2026-08-02
 type: decision-record
-status: approved-private-transition
+status: private-client-seed-created
 ---
 
 # Public client and private service source-provenance decision
 
 ## Decision
 
-TiboTattle should be split into two repositories before the first public
+TiboTattle is being split into two repositories before the first public
 installer release. Both repositories remain private throughout the transition;
 the client repository's visibility changes only after the public-release gates
 below pass and the owner explicitly approves that change.
 
 | Repository | Visibility | Responsibility |
 | --- | --- | --- |
-| `tibotattle-client` | private during transition; public only after release approval | The complete, buildable macOS/local client; public-safe shared contracts; client tests; release workflow; release verification instructions. |
-| `tibotattle-service` | private | Cloudflare Worker, D1 migrations, Cloud Run containment service, operator/admin UI, infrastructure configuration, operational scripts, private test fixtures, and service release credentials. |
+| [`tibotattle-client`](https://github.com/adamallcock/tibotattle-client) | private during transition; public only after release approval | The complete, buildable macOS/local client; public-safe shared contracts; client tests; release workflow; release verification instructions. |
+| `app-usagemonitor` (the private service repository during transition) | private | Cloudflare Worker, D1 migrations, Cloud Run containment service, operator/admin UI, infrastructure configuration, operational scripts, private test fixtures, and service release credentials. |
 
-The client repository is the source of truth for client code.  The private
-service repository consumes an immutable public-client tag, initially as a
-read-only Git submodule pin.  Private code must never be copied back into the
-public repository as part of a release.  The client build must not import a
-file that exists only in the private repository.
+The private client source history was created on 2026-08-02 as a single,
+history-free root commit (`c912c52b6febcc1d7e433a822aec3a96f9977317`) from a
+verified 273-file allow-list export. It contains no private Git history,
+Worker/Cloud Run code, deployment configuration, operator UI, credentials, or
+raw usage data. Its independent dependency install, complete client test suite
+(294 passed, 1 intentionally skipped), and macOS bundle suite (27 passed, 1
+intentionally skipped) passed before the seed was pushed.
+
+The client repository becomes the source of truth only after the next,
+one-way migration. Until then, `app-usagemonitor` contains a transitional
+duplicate and neither repository may produce a customer release. The private
+service repository must then consume an immutable client tag, initially as a
+read-only Git submodule pin. Private code must never be copied back into the
+client repository as part of a release. The client build must not import a file
+that exists only in the private repository.
 
 This is a transparency boundary, not a security boundary.  A native client is
 inspectable by users whether or not its source is published.  Server security
@@ -32,10 +42,10 @@ least-privilege Cloudflare bindings, separate secrets, and reviewable public
 API contracts; it must not rely on server implementation secrecy.
 
 The existing `app-usagemonitor` repository remains the private service-side
-repository while the extraction is completed. A new private `tibotattle-client`
-repository will begin from a reviewed allow-list export, not from this private
-repository's history. Making either repository public still requires an
-explicit publication instruction.
+repository while the one-way migration is completed. The private
+`tibotattle-client` repository began from a reviewed allow-list export, not
+from this private repository's history. Making either repository public still
+requires an explicit publication instruction.
 
 ## Initial content classification
 
@@ -52,7 +62,10 @@ The public repository should contain only the reviewed local-client product:
 - client build, package, updater, verification scripts and the tests that
   exercise them; and
 - a public `README`, licence, `SECURITY.md`, API/telemetry contract, release
-  verification guide, dependency lockfile, and release manifests.
+  verification guide, client-only dependency lockfile, and release manifests.
+  The initial private seed deliberately excludes the monorepo lockfile because
+  it contains service importers; generate and review its client-only lockfile
+  before any release or visibility change.
 
 The private repository retains at least:
 
@@ -145,15 +158,16 @@ hosted service is vulnerability-free.
 
 ## Delivery sequence and gates
 
-1. **Classify and extract.** Add an allow-list export manifest, forbidden-path
-   test, secret scanner, and client-to-private import test.  Produce a clean
-   export and make its build/test suite pass without the private tree.
-2. **Create the private client source history.** Seed a new private repository
-   from that reviewed export, add the future-public documentation and licence,
-   protect `main` and release tags, and configure vulnerability reporting. Do
-   not transfer private Git history. Switch its visibility only after the
-   verification and release gates pass.
-3. **Make the relationship one-way.** Add the exact public client tag to the
+1. **Classify and extract — completed.** An allow-list export manifest,
+   forbidden-path/import-boundary tests, and secret scan produce a clean client
+   candidate which passed an independent dependency install, client test suite,
+   and macOS bundle suite without the private tree.
+2. **Create the private client source history — completed.** The new private
+   repository was seeded from that reviewed export with no private Git history.
+   Before a public release, protect `main` and release tags and configure
+   vulnerability reporting. Do not change visibility without the verification
+   and release gates.
+3. **Make the relationship one-way — pending.** Add the exact client tag to the
    private service repository as a read-only submodule pin; update build paths
    and the service's public API contract compatibility check.  A private
    release cannot proceed with an unpinned or dirty client checkout.

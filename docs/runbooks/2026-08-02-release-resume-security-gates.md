@@ -9,9 +9,10 @@ status: production-service-hardened-release-artifacts-pending
 
 ## Current release state
 
-The hardened Worker and its D1 migrations are deployed, but no consumer DMG,
-appcast, GitHub release, or public client source has been published. Do not
-use a generic `wrangler deploy` against production: the reviewed route is
+The hardened Worker and its D1 migrations are deployed. A verified,
+history-free client seed exists in a separate **private** repository, but no
+consumer DMG, appcast, GitHub release, or public client source has been
+published. Do not use a generic `wrangler deploy` against production: the reviewed route is
 `npm --prefix apps/worker run production:deploy`, which refuses a dirty
 checkout and stages only tracked web assets.
 
@@ -44,7 +45,14 @@ and its bucket remains empty.
 ## Live verification on 2026-08-02
 
 - `adamallcock/app-usagemonitor` is confirmed **private** on GitHub. The
-  release branch must be pushed there before any public-source split is made.
+  release branch `codex/release-security-client-split` is pushed through
+  commit `f4f133e`.
+- `adamallcock/tibotattle-client` is now confirmed **private** on GitHub. Its
+  only commit is the history-free client seed
+  `c912c52b6febcc1d7e433a822aec3a96f9977317`; it passed clean-client
+  dependency install, client test, and macOS bundle test gates before upload.
+  The one-way source-of-truth migration remains pending, so neither repository
+  may yet produce a customer release.
 - The `usage-monitor-notary` Keychain profile is usable: Apple returned recent
   accepted `TiboTattle.zip` submissions. It is no longer an external blocker.
 - The R2 bucket `tibotattle-updates` now exists in `ENAM`; its public custom
@@ -106,5 +114,6 @@ placeholders, and do not put the values in the repository.
 - Owner admin-key binding (admin operations only), Apple console configuration,
   and the Apple association file.
 - R2 appcast publication and DMG release.
-- Git tag, GitHub release, client-repository extraction, or repository
-  visibility change.
+- Git tag, GitHub release, repository visibility change, client-service
+  source-of-truth migration, branch/release-tag protection, and vulnerability
+  reporting configuration.
