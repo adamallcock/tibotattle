@@ -22,6 +22,19 @@
     <meta name="usage-monitor-security-url" content="">
     <meta name="usage-monitor-support-url" content="">
     <!--
+      Not a release slot: this is the product version this dashboard build ships
+      as, and it is filled in source so the packaged Mac app carries it too. A
+      shared results card names it, so a posted figure can be tied back to the
+      build that produced it. A test keeps it equal to the package version.
+    -->
+    <meta name="usage-monitor-app-version" content="0.1.0">
+    <!--
+      The published home this build points at. A shared results card prints it
+      so a reader can find the project; the release build's own canonical URL
+      wins over it whenever release packaging has filled that slot.
+    -->
+    <meta name="usage-monitor-share-home" content="tibotattle.com">
+    <!--
       Public OAuth client identifier, not a secret: it is visible in every
       Google authorization URL the browser opens. The paired client secret
       lives only in the contribution service.
@@ -300,6 +313,52 @@
             </p>
           </article>
         </div>
+
+        <article class="panel share-panel" id="share-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Share</p>
+              <h3>A results card you can post</h3>
+            </div>
+            <span class="evidence-chip" id="share-card-reference">Reference pending</span>
+          </div>
+          <p class="annotation">
+            One image carrying the three headline figures above, the uncertainty
+            each is stated with, this build's version identifiers, and a
+            reference you can quote. It carries no prompts, responses, file
+            paths, URLs, project or folder names, account identifiers, or
+            email — only aggregate numbers already shown on this page. Every
+            field on the card is written out underneath it, so nothing is
+            shared that you cannot first read as text.
+          </p>
+          <div class="share-preview">
+            <canvas
+              id="share-card-canvas"
+              role="img"
+              width="1200"
+              height="675"
+              aria-label="A results card is generated once local evidence is available."
+            ></canvas>
+          </div>
+          <div class="share-actions">
+            <button class="button button-primary" id="share-card-download" type="button" disabled>
+              Save image
+            </button>
+            <button class="button button-secondary" id="share-card-copy" type="button" disabled>
+              Copy image
+            </button>
+            <button class="button button-quiet" id="share-card-copy-text" type="button" disabled>
+              Copy as text
+            </button>
+          </div>
+          <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
+          <dl class="share-card-readout" id="share-card-readout">
+            <div>
+              <dt>Card</dt>
+              <dd>Waiting for local evidence.</dd>
+            </div>
+          </dl>
+        </article>
       </section>
 
       <section class="dashboard-section lead-section" id="weekly" aria-labelledby="weekly-title" data-requires-evidence>

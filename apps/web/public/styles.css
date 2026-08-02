@@ -716,6 +716,52 @@ h2 {
 .calibration-facts dd { margin: 7px 0 0; font-size: .78rem; font-weight: 750; overflow-wrap: anywhere; }
 .calibration-explanation { margin: 12px 0 0; }
 
+.share-panel { margin-top: 22px; }
+.share-preview {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  background: var(--paper-2);
+}
+.share-preview canvas {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  margin: 0 auto;
+  border-radius: .3rem;
+  box-shadow: 0 10px 28px rgba(31, 45, 39, .13);
+}
+.share-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 16px; }
+.share-panel .participant-action-status { margin-bottom: 0; }
+.share-card-readout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 18px 0 0;
+  border: 1px solid var(--line);
+  border-radius: .4rem;
+  background: rgba(255, 255, 255, .38);
+}
+.share-card-readout > div {
+  min-width: 0;
+  padding: 13px 15px;
+  border-top: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+}
+.share-card-readout > div:nth-child(-n+2) { border-top: 0; }
+.share-card-readout > div:nth-child(even) { border-right: 0; }
+.share-card-readout > div.share-card-readout-wide { grid-column: 1 / -1; border-right: 0; }
+.share-card-readout dt {
+  color: var(--muted);
+  font-size: .62rem;
+  font-weight: 750;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.share-card-readout dd { margin: 6px 0 0; font-size: .78rem; overflow-wrap: anywhere; }
+.share-card-readout dd.share-card-figure { font-weight: 750; }
+
 .segmented-control { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: .4rem; background: rgba(255,255,255,.5); }
 .segmented-control button { padding: .5rem .7rem; border: 0; border-radius: .25rem; color: var(--muted); background: transparent; font-size: .7rem; font-weight: 750; cursor: pointer; }
 .segmented-control button.active { color: white; background: var(--green); }
@@ -1409,6 +1455,10 @@ footer {
   .calibration-facts { grid-template-columns: 1fr; }
   .calibration-facts div { border-right: 0; border-bottom: 1px solid var(--line); }
   .calibration-facts div:last-child { border-bottom: 0; }
+  .share-card-readout { grid-template-columns: 1fr; }
+  .share-card-readout > div { border-right: 0; }
+  .share-card-readout > div:nth-child(2) { border-top: 1px solid var(--line); }
+  .share-actions .button { flex: 1 1 auto; }
   .timeline-controls,
   .chart-control-stack,
   .calibration-controls { justify-items: start; }

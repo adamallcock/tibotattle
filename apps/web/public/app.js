@@ -7,6 +7,7 @@ import {
   normalizeParticipantStats
 } from "./data-client.js";
 import {
+  DIAGNOSTIC_REFERENCE_PATTERN,
   GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   contributionBatchAdmission,
   createDiagnosticReference,
@@ -689,6 +690,7 @@ function renderDashboard(data) {
   renderQuotaCards(data);
   renderPricing(data);
   renderComparison(data);
+  renderShareCard(data);
   renderUsageTimeline(data);
   renderTimeline(data);
   renderWeekly(data);
@@ -892,6 +894,660 @@ function renderCalibrationRate({ capacity, lower, upper }) {
   explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
     ? `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent. The 80% range (${formatMoney(lower, 0)}–${formatMoney(upper, 0)}) describes variation across qualifying reset periods; it is not an 80% probability or a provider-published dollar cap.`
     : `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.`;
+}
+
+// ---------------------------------------------------------------------------
+// Shareable results card
+//
+// This is the strictest surface on the page: the user may post the result in
+// public, so the card may carry only figures this dashboard already derived
+// plus fixed copy written here. Nothing that reaches the browser as free-form
+// text is ever echoed onto it. A quota window's label, a plan name and a
+// period name all arrive as unconstrained strings, so each is recomputed from
+// a structural field or matched against a fixed vocabulary first; the version
+// identifiers are accepted only in an identifier shape that cannot hold a
+// path, a sentence, or a quoted value. The traceable identifier reuses the
+// diagnostic-reference idiom rather than a parallel scheme: fresh WebCrypto
+// randomness, never derived from a participant id, an account, a hostname, a
+// figure, or a timestamp.
+// ---------------------------------------------------------------------------
+
+const SHARE_CARD_WIDTH = 1200;
+const SHARE_CARD_HEIGHT = 675;
+// Drawn at twice the posted size so the text stays clean after a feed
+// resamples it, and legible once a timeline scales it down.
+const SHARE_CARD_PIXEL_SCALE = 2;
+const SHARE_CARD_MAX_CAVEATS = 5;
+const SHARE_CARD_MAX_CAVEAT_LINES = 7;
+// Identifier-shaped only, exactly as a diagnostic code is: no space, no
+// slash, no separator that could carry a path or a folder name.
+const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
+const SHARE_CARD_APP_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
+const SHARE_CARD_HOME_PATTERN =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/u;
+// The exact period names this product emits. An unrecognized one is replaced
+// rather than printed, so a renamed or injected label can never reach a post.
+const SHARE_CARD_PERIOD_LABELS = new Set([
+  "All retained evidence",
+  "Last 24 hours",
+  "Last 30 days",
+  "Last 7 days",
+  "Recorded period",
+]);
+// Fixed window names, keyed on the observed window duration rather than on the
+// companion's own label field.
+const SHARE_CARD_WINDOW_LABELS = Object.freeze({
+  five_hour: "five-hour allowance",
+  other: "observed allowance window",
+  seven_day: "seven-day allowance",
+});
+const SHARE_CARD_UNKNOWN_PERIOD = "the recorded period";
+
+let shareCard = null;
+let shareCardReference = "";
+let shareCardSignature = "";
+let shareCardBusy = false;
+
+function shareCardRegistryVersion(candidate) {
+  return typeof candidate === "string"
+    && SHARE_CARD_REGISTRY_VERSION_PATTERN.test(candidate)
+    ? candidate
+    : "";
+}
+
+function configuredAppVersion() {
+  const value = document
+    .querySelector('meta[name="usage-monitor-app-version"]')
+    ?.getAttribute("content")
+    ?.trim();
+  return SHARE_CARD_APP_VERSION_PATTERN.test(value ?? "") ? value : "";
+}
+
+/**
+ * The home a shared card prints.
+ *
+ * A release build fills its own canonical slot, and that wins; otherwise the
+ * fixed home declared in the page is used. Only the host is printed, so no
+ * path, query, or fragment from either source can reach the image.
+ */
+function shareCardHome() {
+  const declared = document
+    .querySelector('meta[name="usage-monitor-share-home"]')
+    ?.getAttribute("content")
+    ?.trim()
+    ?.toLowerCase() ?? "";
+  const fallback = SHARE_CARD_HOME_PATTERN.test(declared) ? declared : "";
+  const canonical = document
+    .querySelector('link[rel="canonical"]')
+    ?.getAttribute("href")
+    ?.trim();
+  if (!canonical) return fallback;
+  try {
+    const host = new URL(canonical).hostname.replace(/^www\./u, "");
+    return SHARE_CARD_HOME_PATTERN.test(host) ? host : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function shareCardWindowKind(window) {
+  const minutes = finite(window?.durationMinutes);
+  if (minutes === 10_080) return "seven_day";
+  if (minutes === 300) return "five_hour";
+  return "other";
+}
+
+/**
+ * Choose the one allowance window the card reports.
+ *
+ * The seven-day window is the headline the rest of the page leads with; when
+ * it is absent the longest observed window stands in, so the card never has to
+ * pick between two figures a reader could confuse.
+ */
+function shareCardWindow(windows) {
+  const observed = (Array.isArray(windows) ? windows : [])
+    .filter((window) => finite(window?.remainingPercent) !== null);
+  return observed.find((window) => shareCardWindowKind(window) === "seven_day")
+    ?? [...observed].sort(
+      (left, right) =>
+        finite(right?.durationMinutes, 0) - finite(left?.durationMinutes, 0),
+    )[0]
+    ?? null;
+}
+
+function shareCardPeriodLabel(candidate) {
+  return SHARE_CARD_PERIOD_LABELS.has(candidate)
+    ? candidate
+    : SHARE_CARD_UNKNOWN_PERIOD;
+}
+
+/**
+ * Compose one card from figures the dashboard already derived.
+ *
+ * Pure: it reads the normalized dashboard contract and the identifiers handed
+ * to it, and returns only numbers and fixed copy. Every claim it makes about
+ * precision is generated from the same state the panels above report, so the
+ * card cannot describe the evidence as better than the page does.
+ */
+function buildShareCard(data, {
+  reference,
+  appVersion = "",
+  registryVersion = "",
+  home = "",
+  contractVersion = "",
+} = {}) {
+  if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) {
+    throw new TypeError("A results card requires a minted reference.");
+  }
+  const isDemo = data?.mode === "demo";
+  const pricing = data?.pricing ?? {};
+  const fastMode = pricing.fastMode ?? {};
+  const summary = data?.gradient?.summary ?? {};
+
+  const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
+  const remaining = finite(allowanceWindow?.remainingPercent);
+  const windowLabel =
+    SHARE_CARD_WINDOW_LABELS[shareCardWindowKind(allowanceWindow)]
+    ?? SHARE_CARD_WINDOW_LABELS.other;
+
+  const weighted = finite(pricing.quotaWeightedTotalCostUsd);
+  const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
+  const spend = useWeighted ? weighted : finite(pricing.totalCostUsd);
+  const excluded = finite(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
+  const period = shareCardPeriodLabel(pricing.periodLabel);
+
+  const capacity = finite(summary.capacity_usd ?? summary.capacityUsd);
+  const lower = finite(summary.lower_80_usd ?? summary.lower80Usd);
+  const upper = finite(summary.upper_80_usd ?? summary.upper80Usd);
+  const hasCapacity = capacity !== null && capacity > 0;
+  const hasRange = hasCapacity
+    && lower !== null && lower > 0
+    && upper !== null && upper > 0;
+
+  const stats = [
+    {
+      label: "Allowance left",
+      value: remaining === null ? "Not observed" : formatPercent(remaining),
+      detail: remaining === null
+        ? "no current allowance window was observed"
+        : `of the ${windowLabel}`,
+    },
+    {
+      // The same two names the accounting panel uses, so a reader comparing a
+      // posted card against the dashboard sees one metric, not two.
+      label: useWeighted
+        ? "Quota-weighted API-price equivalent"
+        : "Standard-rate API-price equivalent",
+      value: spend === null ? "Not available" : formatMoney(spend, 2),
+      detail: spend === null
+        ? "no priced usage was recorded"
+        : `over ${period}`,
+    },
+    {
+      label: "A full allowance measures",
+      value: hasCapacity ? formatMoney(capacity, 0) : "Not estimable",
+      detail: hasRange
+        ? `80% range ${formatMoney(lower, 0)}–${formatMoney(upper, 0)}`
+        : hasCapacity
+          ? "no across-reset range yet"
+          : "not enough matched windows yet",
+    },
+  ];
+
+  // Assembled from the same state the panels report, strongest qualification
+  // first, so a shortened card never drops the caveat that matters most.
+  const caveats = [];
+  if (isDemo) {
+    caveats.push(
+      "Labeled demo data: an illustrative fixture, not measured usage.",
+    );
+  }
+  if (excluded > 0) {
+    caveats.push(
+      `Not a complete total: ${formatMoney(excluded, 2)} of Standard-rate cost could not be speed-weighted and is excluded rather than counted at 1x.`,
+    );
+  }
+  if (fastMode.weightingStatus === "unknown") {
+    caveats.push(
+      "No usage could be speed-weighted, so this is the unchanged Standard-rate total.",
+    );
+  } else if (fastMode.weightingStatus !== "complete") {
+    caveats.push(
+      "Fast-mode attribution is partial: Codex records the speed mode only when it changes, never at session start.",
+    );
+  }
+  const coverage = finite(pricing.coveragePercent);
+  if (coverage !== null && coverage < 100) {
+    caveats.push(
+      `${formatPercent(coverage, 1)} of recorded usage could be priced; the rest is left unpriced rather than estimated.`,
+    );
+  }
+  caveats.push(
+    hasRange
+      ? "The range is variation across qualifying reset periods, not an 80% probability. API prices are a measuring stick for quota consumption, not a subscription charge or a published dollar cap."
+      : "API prices are a measuring stick for quota consumption, not a subscription charge or a published dollar cap.",
+  );
+
+  const identifiers = [
+    reference,
+    appVersion === "" ? "unversioned build" : `TiboTattle ${appVersion}`,
+    registryVersion === "" ? "" : `prices ${registryVersion}`,
+  ].filter((part) => part !== "");
+
+  return Object.freeze({
+    reference,
+    isDemo,
+    title: "Where my Codex allowance stands",
+    subtitle: "Measured on my own Mac. Nothing left it.",
+    stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
+    caveats: Object.freeze(caveats),
+    identifierLine: identifiers.join(" · "),
+    contractVersion,
+    home,
+  });
+}
+
+/**
+ * The same card as a sentence, for a screen reader and for a text-only post.
+ */
+function shareCardText(card) {
+  const figures = card.stats
+    .map((stat) => `${stat.label}: ${stat.value} — ${stat.detail}.`)
+    .join(" ");
+  const trailer = card.contractVersion === ""
+    ? card.identifierLine
+    : `${card.identifierLine} · contract ${card.contractVersion}`;
+  return [
+    `TiboTattle — ${card.title}. ${card.subtitle}`,
+    figures,
+    card.caveats.join(" "),
+    `${trailer}.`,
+    card.home === "" ? "" : `More at ${card.home}`,
+  ].filter((line) => line !== "").join("\n");
+}
+
+function shareCardFont(weight, size, family = "sans") {
+  return family === "serif"
+    ? `${weight} ${size}px "Iowan Old Style", Baskerville, "Times New Roman", serif`
+    : `${weight} ${size}px Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+}
+
+/**
+ * Break one line into at most `maxLines` measured lines.
+ *
+ * Every string on the card is bounded by construction; this only guarantees
+ * that a long fixed sentence wraps inside the card rather than running off it.
+ */
+function shareCardWrap(context, value, maxWidth, maxLines) {
+  const lines = [];
+  let current = "";
+  for (const word of String(value).split(" ")) {
+    const candidate = current === "" ? word : `${current} ${word}`;
+    if (current !== "" && context.measureText(candidate).width > maxWidth) {
+      lines.push(current);
+      current = word;
+      if (lines.length === maxLines) return lines;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current !== "" && lines.length < maxLines) lines.push(current);
+  return lines;
+}
+
+function shareCardFit(context, value, maxWidth) {
+  if (context.measureText(value).width <= maxWidth) return value;
+  let text = value;
+  while (text.length > 1
+    && context.measureText(`${text}…`).width > maxWidth) {
+    text = text.slice(0, -1);
+  }
+  return `${text}…`;
+}
+
+function drawShareCardBrand(context, x, y) {
+  context.save();
+  context.strokeStyle = "rgba(23, 79, 69, .34)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.arc(x + 19, y, 19, 0, Math.PI * 2);
+  context.stroke();
+  context.fillStyle = "#174f45";
+  for (const [index, height] of [11, 20, 15].entries()) {
+    context.beginPath();
+    context.roundRect(x + 11 + index * 6, y + 10 - height, 3.5, height, 2);
+    context.fill();
+  }
+  context.restore();
+}
+
+function drawShareCardPanel(context, x, y, width, height) {
+  context.save();
+  context.fillStyle = "#fffef9";
+  context.strokeStyle = "rgba(23, 33, 30, .16)";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.roundRect(x + .5, y + .5, width - 1, height - 1, 10);
+  context.fill();
+  context.stroke();
+  context.restore();
+}
+
+/**
+ * Paint the card. Every string drawn here comes from the composed model.
+ */
+function drawShareCard(canvas, card) {
+  const context = canvas.getContext("2d");
+  if (context === null) return false;
+  canvas.width = SHARE_CARD_WIDTH * SHARE_CARD_PIXEL_SCALE;
+  canvas.height = SHARE_CARD_HEIGHT * SHARE_CARD_PIXEL_SCALE;
+  context.setTransform(
+    SHARE_CARD_PIXEL_SCALE, 0, 0, SHARE_CARD_PIXEL_SCALE, 0, 0,
+  );
+  const margin = 56;
+  const inner = SHARE_CARD_WIDTH - margin * 2;
+
+  context.fillStyle = "#f5f1e8";
+  context.fillRect(0, 0, SHARE_CARD_WIDTH, SHARE_CARD_HEIGHT);
+  context.fillStyle = "#174f45";
+  context.fillRect(0, 0, SHARE_CARD_WIDTH, 8);
+  context.strokeStyle = "rgba(23, 33, 30, .16)";
+  context.lineWidth = 2;
+  context.strokeRect(1, 1, SHARE_CARD_WIDTH - 2, SHARE_CARD_HEIGHT - 2);
+
+  drawShareCardBrand(context, margin, 68);
+  context.textBaseline = "alphabetic";
+  context.fillStyle = "#17211e";
+  context.font = shareCardFont(800, 25);
+  context.fillText("TiboTattle", margin + 52, 77);
+
+  context.textAlign = "right";
+  context.font = shareCardFont(700, 20);
+  context.fillStyle = "#65706b";
+  if (card.home !== "") {
+    context.fillText(card.home, SHARE_CARD_WIDTH - margin, 77);
+  }
+  context.textAlign = "left";
+
+  context.fillStyle = "#17211e";
+  context.font = shareCardFont(500, 52, "serif");
+  context.fillText(shareCardFit(context, card.title, inner), margin, 158);
+  context.font = shareCardFont(600, 21);
+  context.fillStyle = "#65706b";
+  context.fillText(shareCardFit(context, card.subtitle, inner), margin, 192);
+
+  const gap = 22;
+  const columnWidth = (inner - gap * 2) / 3;
+  const statTop = 222;
+  const statHeight = 178;
+  card.stats.forEach((stat, index) => {
+    const x = margin + index * (columnWidth + gap);
+    drawShareCardPanel(context, x, statTop, columnWidth, statHeight);
+    const padding = 20;
+    const textWidth = columnWidth - padding * 2;
+    context.fillStyle = "#65706b";
+    context.font = shareCardFont(750, 15);
+    const labelLines = shareCardWrap(
+      context, stat.label.toUpperCase(), textWidth, 2,
+    );
+    labelLines.forEach((line, lineIndex) => {
+      context.fillText(line, x + padding, statTop + 34 + lineIndex * 19);
+    });
+    context.fillStyle = "#174f45";
+    context.font = shareCardFont(500, 54, "serif");
+    context.fillText(
+      shareCardFit(context, stat.value, textWidth),
+      x + padding,
+      statTop + 110,
+    );
+    context.fillStyle = "#65706b";
+    context.font = shareCardFont(600, 17);
+    shareCardWrap(context, stat.detail, textWidth, 2).forEach((line, lineIndex) => {
+      context.fillText(line, x + padding, statTop + 140 + lineIndex * 21);
+    });
+  });
+
+  // The qualifications are laid out from the bottom up, so a card with one
+  // caveat and a card with several both sit against the same rule instead of
+  // leaving the strongest qualification stranded in white space.
+  context.font = shareCardFont(500, 17);
+  const caveatLines = card.caveats
+    .slice(0, SHARE_CARD_MAX_CAVEATS)
+    .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
+    .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
+  const caveatStep = 23;
+  let caveatY = Math.max(
+    438,
+    566 - (caveatLines.length - 1) * caveatStep,
+  );
+  context.fillStyle = "rgba(23, 79, 69, .3)";
+  context.fillRect(
+    margin,
+    caveatY - 16,
+    3,
+    (caveatLines.length - 1) * caveatStep + 22,
+  );
+  context.fillStyle = "#65706b";
+  for (const line of caveatLines) {
+    context.fillText(line, margin + 20, caveatY);
+    caveatY += caveatStep;
+  }
+
+  context.strokeStyle = "rgba(23, 33, 30, .16)";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(margin, 592.5);
+  context.lineTo(SHARE_CARD_WIDTH - margin, 592.5);
+  context.stroke();
+
+  context.fillStyle = "#17211e";
+  context.font = shareCardFont(700, 18);
+  context.fillText(
+    shareCardFit(context, card.identifierLine, inner),
+    margin,
+    621,
+  );
+  context.fillStyle = "#65706b";
+  context.font = shareCardFont(500, 16);
+  context.fillText(
+    shareCardFit(
+      context,
+      "Local-first measurement. No prompts, files, folder names, or account details leave the Mac.",
+      inner,
+    ),
+    margin,
+    645,
+  );
+  return true;
+}
+
+function shareCardFileName(card) {
+  // The reference is the only variable part, and it matched the fixed
+  // reference pattern before the card was composed.
+  return `tibotattle-results-${card.reference}.png`;
+}
+
+function setShareCardStatus(text, { error = false } = {}) {
+  const status = $("#share-card-status");
+  status.className = `participant-action-status${error ? " error" : ""}`;
+  status.textContent = text;
+  status.hidden = text === "";
+}
+
+function updateShareCardActions() {
+  const ready = shareCard !== null && !shareCardBusy;
+  for (const id of [
+    "share-card-download",
+    "share-card-copy",
+    "share-card-copy-text",
+  ]) {
+    $(`#${id}`).disabled = !ready;
+  }
+}
+
+function renderShareCardReadout(card) {
+  const readout = $("#share-card-readout");
+  const rows = [
+    ...card.stats.map((stat) => [stat.label, `${stat.value} — ${stat.detail}`, true]),
+    ["How to read it", card.caveats.join(" "), false],
+    ["Traceable reference", card.reference, false],
+    [
+      "Version",
+      card.contractVersion === ""
+        ? card.identifierLine
+        : `${card.identifierLine} · contract ${card.contractVersion}`,
+      false,
+    ],
+    ["Link", card.home === "" ? "No published home is configured." : card.home, false],
+  ];
+  readout.replaceChildren(...rows.map(([term, description, figure], index) => {
+    const row = node("div", index >= card.stats.length ? "share-card-readout-wide" : "");
+    const value = node("dd", figure ? "share-card-figure" : "", description);
+    row.append(node("dt", "", term), value);
+    return row;
+  }));
+}
+
+/**
+ * Render the shareable card for the current evidence.
+ *
+ * A fresh reference is minted whenever the figures change, so one posted image
+ * and one reference always describe the same numbers.
+ */
+function renderShareCard(data) {
+  const canvas = $("#share-card-canvas");
+  const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
+  const signature = JSON.stringify([
+    data?.mode,
+    shareCardWindowKind(allowanceWindow),
+    finite(allowanceWindow?.remainingPercent),
+    finite(data?.pricing?.quotaWeightedTotalCostUsd),
+    finite(data?.pricing?.totalCostUsd),
+    finite(data?.pricing?.coveragePercent),
+    data?.pricing?.fastMode?.weightingStatus ?? "",
+    finite(data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd, 0),
+    finite(data?.gradient?.summary?.capacity_usd
+      ?? data?.gradient?.summary?.capacityUsd),
+  ]);
+  if (signature !== shareCardSignature || shareCardReference === "") {
+    shareCardSignature = signature;
+    shareCardReference = createDiagnosticReference();
+  }
+  shareCard = buildShareCard(data, {
+    reference: shareCardReference,
+    appVersion: configuredAppVersion(),
+    registryVersion: shareCardRegistryVersion(data?.pricing?.registryVersion),
+    contractVersion: shareCardRegistryVersion(data?.schemaVersion),
+    home: shareCardHome(),
+  });
+  $("#share-card-reference").textContent = shareCard.reference;
+  canvas.setAttribute("aria-label", shareCardText(shareCard));
+  renderShareCardReadout(shareCard);
+  if (!drawShareCard(canvas, shareCard)) {
+    shareCard = null;
+    setShareCardStatus(
+      "This browser did not provide a drawing surface, so no image could be produced. The card's figures are listed below it as text.",
+      { error: true },
+    );
+  } else {
+    setShareCardStatus("");
+  }
+  updateShareCardActions();
+}
+
+function shareCardBlob(canvas) {
+  return new Promise((resolve) => {
+    canvas.toBlob(resolve, "image/png");
+  });
+}
+
+async function runShareCardAction(action) {
+  if (shareCard === null || shareCardBusy) return;
+  shareCardBusy = true;
+  updateShareCardActions();
+  try {
+    await action(shareCard);
+  } finally {
+    shareCardBusy = false;
+    updateShareCardActions();
+  }
+}
+
+function downloadShareCard() {
+  return runShareCardAction(async (card) => {
+    const blob = await shareCardBlob($("#share-card-canvas"));
+    if (blob === null) {
+      setShareCardStatus(
+        "This browser could not turn the card into a PNG. Nothing was saved; the figures remain listed below as text.",
+        { error: true },
+      );
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = shareCardFileName(card);
+    link.click();
+    URL.revokeObjectURL(url);
+    setShareCardStatus(
+      `Saved as ${shareCardFileName(card)}. Reference ${card.reference} is printed on the image.`,
+    );
+  });
+}
+
+function copyShareCardImage() {
+  return runShareCardAction(async (card) => {
+    if (typeof ClipboardItem !== "function"
+      || typeof navigator.clipboard?.write !== "function") {
+      setShareCardStatus(
+        "This browser cannot put an image on the clipboard. Use Save image instead, or Copy as text.",
+        { error: true },
+      );
+      return;
+    }
+    const blob = await shareCardBlob($("#share-card-canvas"));
+    if (blob === null) {
+      setShareCardStatus(
+        "This browser could not turn the card into a PNG. Nothing was copied.",
+        { error: true },
+      );
+      return;
+    }
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({ "image/png": blob }),
+      ]);
+      setShareCardStatus(
+        `Copied. Paste it anywhere; reference ${card.reference} is printed on the image.`,
+      );
+    } catch {
+      setShareCardStatus(
+        "The browser refused clipboard access, so nothing was copied. Use Save image instead.",
+        { error: true },
+      );
+    }
+  });
+}
+
+function copyShareCardText() {
+  return runShareCardAction(async (card) => {
+    if (typeof navigator.clipboard?.writeText !== "function") {
+      setShareCardStatus(
+        "This browser cannot write to the clipboard. The card's text is listed below it and can be selected.",
+        { error: true },
+      );
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(shareCardText(card));
+      setShareCardStatus("Copied the card as text.");
+    } catch {
+      setShareCardStatus(
+        "The browser refused clipboard access, so nothing was copied. The card's text is listed below it and can be selected.",
+        { error: true },
+      );
+    }
+  });
 }
 
 function groupRolling(rows, hours) {
@@ -5787,6 +6443,9 @@ $("#contribution-consent").addEventListener("change", () => {
     && $("#contribution-file").files.length
   );
 });
+$("#share-card-download").addEventListener("click", downloadShareCard);
+$("#share-card-copy").addEventListener("click", copyShareCardImage);
+$("#share-card-copy-text").addEventListener("click", copyShareCardText);
 $("#contribution-form").addEventListener("submit", submitContribution);
 $("#delete-participant").addEventListener("click", deleteParticipantData);
 $("#contribution-history").addEventListener("click", (event) => {
