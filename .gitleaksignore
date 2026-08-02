@@ -10,3 +10,9 @@ b4d20274f01cfc059a8dc75e48878405b63b3994:test/normalization.test.js:generic-api-
 b4d20274f01cfc059a8dc75e48878405b63b3994:test/export-deletion-schema.test.js:generic-api-key:52
 b4d20274f01cfc059a8dc75e48878405b63b3994:test/export-deletion-schema.test.js:generic-api-key:213
 2d68c6016dbed624e2e2f2eaade12ebf76a07efc:2026-07-24-end-to-end-multi-user-usage-monitor-goal.md:generic-api-key:194
+# Reviewed 2026-08-01: the Apple client-secret spec builds a PEM around the
+# literal "-----BEGIN PRIVATE KEY-----" header. The key itself is generated per
+# run by crypto.subtle.generateKey (ECDSA P-256) in that file's beforeAll, so no
+# key material is committed. Verified separately that no .p8 has ever been
+# tracked in this repository's history.
+35a60278e6c067bb669bd99962320ac3abcf089d:apps/worker/test/identity-apple.spec.ts:private-key:123
