@@ -2,22 +2,21 @@
 title: TiboTattle Release Resume and Security Gates
 date: 2026-08-02
 type: runbook
-status: release-infrastructure-partially-provisioned
+status: production-service-hardened-release-artifacts-pending
 ---
 
 # TiboTattle release resume — 2026-08-02
 
 ## Current release state
 
-The source tree contains the locally validated release work, but it is **not
-approved to deploy or publish yet**. Do not use a generic `wrangler deploy`
-against production: the reviewed route is `npm --prefix apps/worker run
-production:deploy`, which refuses a dirty checkout and stages only tracked
-web assets.
+The hardened Worker and its D1 migrations are deployed, but no consumer DMG,
+appcast, GitHub release, or public client source has been published. Do not
+use a generic `wrangler deploy` against production: the reviewed route is
+`npm --prefix apps/worker run production:deploy`, which refuses a dirty
+checkout and stages only tracked web assets.
 
-No source deployment, tag, GitHub release, DMG, or appcast has been published
-as part of this recovery. The update-feed infrastructure is now provisioned,
-its TLS certificate is active, and its bucket remains empty.
+The update-feed infrastructure is provisioned, its TLS certificate is active,
+and its bucket remains empty.
 
 ## Completed locally
 
@@ -52,16 +51,17 @@ its TLS certificate is active, and its bucket remains empty.
   domain is `updates.tibotattle.com`. Ownership and TLS are active, the bucket
   is empty, and the canonical future feed URL is
   `https://updates.tibotattle.com/appcast.xml` (currently an expected `404`).
-- The production Worker has the envelope keys, `IDENTITY_LINK_SECRET`, Apple
-  private key, and a Google client secret, but **does not** yet have
-  `ADMIN_IDENTITY_LINK_KEY`.
-- The supplied Google Web-client file contains the exact production callback
-  URI, but its client ID differs from the client ID presently committed in the
-  production Worker configuration. The source must be updated and the Worker
-  secret rotated as one release operation; do not leave a new client ID paired
-  with an old client secret.
-- Remote D1 reports migrations `0017` through `0021` pending. They must be
-  applied before serving the new identity/admin functionality.
+- Remote D1 migrations `0017` through `0021` are applied. Worker version
+  `1e61da66-dcca-4167-8f6c-ab1425116b8c` is live; `/api/health` and
+  `/api/ready` both returned `200` after deployment.
+- The supplied Google Web-client's exact production callback URI is registered
+  in source and its secret was rotated directly into the Worker. The production
+  secret list now contains the required envelope, identity, Apple, and Google
+  secrets without exposing their values.
+- `ADMIN_IDENTITY_LINK_KEY` remains intentionally absent. It is not a Worker
+  deployment prerequisite: `/api/v1/admin/overview` returns the fail-closed
+  `503 ADMIN_NOT_CONFIGURED` until the owner binds their actual pairwise
+  identity-link key.
 - `https://tibotattle.com/.well-known/apple-developer-domain-association.txt`
   currently returns `404`; Apple sign-in remains disabled until the exact
   association text and Apple callback registration are supplied and verified.
@@ -71,22 +71,15 @@ its TLS certificate is active, and its bucket remains empty.
 These are external-account actions or credentials. Do not replace them with
 placeholders, and do not put the values in the repository.
 
-1. Set the production Worker secret `ADMIN_IDENTITY_LINK_KEY` to the
+1. To enable the owner-admin surface, set the production Worker secret
+   `ADMIN_IDENTITY_LINK_KEY` to the
    64-character pairwise identity-link key for the intended active admin
-   participant. It is deliberately separate from `IDENTITY_LINK_SECRET`.
-2. In the same planned release window, deploy the reviewed source with the
-   supplied Google Web-client ID and rotate `GOOGLE_OIDC_CLIENT_SECRET` from
-   the supplied local file. Confirm all other required production secrets are
-   installed, including envelope keys, `IDENTITY_LINK_SECRET`, and Apple
-   private key. Apply migrations only through the reviewed production
-   deployment process.
-3. In Google Cloud Console, register only
-   `https://tibotattle.com/api/v1/identity/google/callback` as the production
-   redirect URI. The Worker will reject a Workers.dev or `www` callback host.
-4. Provide the exact Apple domain-association text as the production
+   participant. It is deliberately separate from `IDENTITY_LINK_SECRET`; do
+   not generate a placeholder. This does not affect ordinary user flow.
+2. Provide the exact Apple domain-association text as the production
    `APPLE_DOMAIN_ASSOCIATION` configuration and register the same
    `tibotattle.com` callback URL with Apple.
-5. The bucket and custom-domain TLS are already provisioned; it contains no
+3. The bucket and custom-domain TLS are already provisioned; it contains no
    release object. Publish only through the reviewed update-feed publisher
    after the appcast is Sparkle-signed.
 
@@ -95,10 +88,9 @@ placeholders, and do not put the values in the repository.
 1. Review the complete diff, commit the intended release, and create an
    **annotated** version tag at that commit. The macOS release command rejects
    a dirty, lightweight-tagged, or untagged source tree.
-2. From that clean tag, run the normal local verification plus
-   `npm --prefix apps/worker run production:deploy:dry`. Then deploy the
-   Worker via `npm --prefix apps/worker run production:deploy` only when
-   production migration and secret checks are satisfied.
+2. From that clean tag, run the normal local verification and
+   `npm --prefix apps/worker run production:deploy:dry`. Deploy the Worker
+   separately only when a new reviewed service change requires it.
 3. Verify live `/api/health`, `/api/ready`, the exact custom-domain callback
    boundary, the Apple domain-association response, and a full Google/Apple
    sign-in completion without inspecting or logging provider tokens.
@@ -111,8 +103,8 @@ placeholders, and do not put the values in the repository.
 
 ## Explicitly not complete
 
-- Production deployment and D1 migration application.
-- Owner admin-key binding, Google client-ID/secret rotation, Apple console
-  configuration, and the Apple association file.
+- Owner admin-key binding (admin operations only), Apple console configuration,
+  and the Apple association file.
 - R2 appcast publication and DMG release.
-- Git tag, GitHub release, push, or repository visibility change.
+- Git tag, GitHub release, client-repository extraction, or repository
+  visibility change.

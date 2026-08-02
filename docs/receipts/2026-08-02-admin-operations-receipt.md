@@ -44,15 +44,14 @@ reference when D1 is available. The record contains route class, error code,
 status, and time only; it does not contain participant IDs, record contents,
 cookies, or request bodies.
 
-## Production gate
+## Production enablement
 
-The production Wrangler configuration now requires
-`ADMIN_IDENTITY_LINK_KEY`. The code and local tests are complete, but the
-production surface stays disabled until the owner provisions that secret from
-the owner's existing pairwise identity link value in an owner-only terminal.
-The value must not be pasted into chat, committed, or written into this
-receipt. The Google OAuth callback-console change remains a separate live
-configuration prerequisite for hosted sign-in.
+`ADMIN_IDENTITY_LINK_KEY` is deliberately optional at deployment time. Without
+it the Worker returns `503 ADMIN_NOT_CONFIGURED` for every admin route, while
+ordinary service and security deployments can proceed. The admin surface stays
+disabled until the owner provisions that secret from the owner's existing
+pairwise identity-link value in an owner-only terminal. The value must not be
+pasted into chat, committed, or written into this receipt.
 
 ## Validation
 
