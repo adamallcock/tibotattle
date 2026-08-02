@@ -3,6 +3,7 @@ import {
   canonicalComponentAvailability,
   canonicalComponents,
   canonicalRateLimitWindows,
+  createLeadingRateLimitGate,
   cumulativeSnapshotKey,
   deltaComponentPresence,
   extractToolObservations,
@@ -159,6 +160,30 @@ export function createCodexLogParser({ lineReader }) {
     let previousTotalsPresence = null;
     const openTaskIds = new Set();
     let sourceRecordOrdinal = 0;
+    const leadingRateLimitGate = createLeadingRateLimitGate();
+
+    // Whether a source's leading reading is trustworthy is a property of the
+    // source, not of the requested interval, so readings outside the interval
+    // are offered to the gate with no emissible payload. The durable index
+    // decides the same way over the same records.
+    async function applyGateDecision(decision) {
+      for (const withheld of decision.withheld) {
+        if (withheld !== null) diagnostics.contradictedLeadingSnapshotsSkipped += 1;
+      }
+      for (const snapshot of decision.released) {
+        if (snapshot === null) continue;
+        await onRateLimitSnapshot?.(snapshot);
+        diagnostics.rateLimitSnapshots += 1;
+      }
+    }
+
+    async function gateUnobservedRateLimits(payload, timestampMs) {
+      for (const window of canonicalRateLimitWindows(payload?.rate_limits)) {
+        await applyGateDecision(
+          leadingRateLimitGate.offer(window, timestampMs, null),
+        );
+      }
+    }
 
     for await (const line of boundedScannerLines(
       source,
@@ -256,6 +281,7 @@ export function createCodexLogParser({ lineReader }) {
           previousTotals = total;
           previousTotalsPresence = totalPresence;
         }
+        await gateUnobservedRateLimits(record.payload, timestampMs);
         continue;
       }
       if (forked && currentModel === null) {
@@ -273,15 +299,14 @@ export function createCodexLogParser({ lineReader }) {
         diagnostics.malformedRateLimitRecords += 1;
       }
       for (const window of rateLimitWindows) {
-        await onRateLimitSnapshot?.({
+        await applyGateDecision(leadingRateLimitGate.offer(window, timestampMs, {
           timestamp: record.timestamp,
           timestampMs,
           window,
           surfaceClassification,
           ...(sourceScopeId ? { sourceScopeId } : {}),
           sourceRecordOrdinal,
-        });
-        diagnostics.rateLimitSnapshots += 1;
+        }));
       }
       let usage = null;
       let usagePresence = null;
@@ -339,6 +364,10 @@ export function createCodexLogParser({ lineReader }) {
         sourceRecordOrdinal,
       });
     }
+    await applyGateDecision({
+      withheld: [],
+      released: leadingRateLimitGate.flush(),
+    });
     return { openTasksAtEnd: openTaskIds.size };
   }
 

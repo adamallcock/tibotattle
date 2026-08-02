@@ -21,6 +21,7 @@ import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import {
   canonicalComponents,
+  createLeadingRateLimitGate,
   deltaComponentPresence,
   discoverCodexRolloutInfos,
   sameUsage,
@@ -30,8 +31,11 @@ import { stableJson } from "./export/index.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
   "local-analysis-index-v2";
+// Bumped when quota admission changes: an index built before the leading
+// rate-limit gate still holds contradicted readings as facts, so it is
+// rebuilt rather than reused.
 export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
-  "parallel-jsonl-accounting-v2";
+  "parallel-jsonl-accounting-v3";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
 const INDEX_USER_VERSION = 2;
@@ -55,6 +59,7 @@ const DIAGNOSTIC_DEFAULTS = Object.freeze({
   missingRateLimitRecords: 0,
   malformedRateLimitRecords: 0,
   rateLimitSnapshots: 0,
+  contradictedLeadingSnapshotsSkipped: 0,
   lastVsCumulativeMismatches: 0,
   duplicateSnapshotsSkipped: 0,
   replayedEventsSkipped: 0,
@@ -1141,6 +1146,10 @@ async function deriveChangedSources({
       window_duration_mins, resets_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const settledQuotaWindows = database.prepare(`
+    SELECT DISTINCT provider, limit_id, slot
+    FROM quota_facts WHERE source_key = ?
+  `);
   const updateState = database.prepare(`
     UPDATE sources SET current_model=?, current_model_seen=?,
       previous_totals_json=?, previous_presence_json=?
@@ -1306,6 +1315,55 @@ async function deriveChangedSources({
     const quotaIterator = extracted.quotaForSource
       .iterate(source.sourceKey);
     let nextQuota = quotaIterator.next();
+    // An appended source already committed its leading reading in an earlier
+    // pass, so only a window this source has never recorded is still leading.
+    const leadingQuotaGate = createLeadingRateLimitGate(
+      [...settledQuotaWindows.iterate(source.sourceKey)].map((row) => ({
+        provider: row.provider,
+        limitId: row.limit_id,
+        slot: row.slot,
+      })),
+    );
+    const commitQuota = async (entry) => {
+      insertQuota.run(
+        source.sourceKey,
+        entry.sourceOffset,
+        entry.slotOrder,
+        entry.timestampMs,
+        entry.observedAt,
+        entry.provider,
+        entry.planType,
+        entry.limitId,
+        entry.slot,
+        entry.usedPercent,
+        entry.windowDurationMins,
+        entry.resetsAt,
+      );
+      if (entry.timestampMs < projectionStartMs
+          || entry.timestampMs > projectionEndMs) return;
+      await invokeProjection(onRateLimitSnapshot, {
+        timestamp: entry.observedAt,
+        timestampMs: entry.timestampMs,
+        sequence: projectionSequence++,
+        window: {
+          provider: entry.provider,
+          planType: entry.planType,
+          limitId: entry.limitId,
+          slot: entry.slot,
+          usedPercent: entry.usedPercent,
+          windowDurationMins: entry.windowDurationMins,
+          resetsAt: entry.resetsAt,
+        },
+        surfaceClassification: {
+          surface: source.surface,
+          threadSource: source.threadSource,
+          agentScope: source.agentScope,
+          lineageDisposition: source.lineageDisposition,
+        },
+        sourceRolloutOrdinal: source.ordinal,
+        sourceRecordOrdinal: entry.sourceOffset,
+      });
+    };
     if (source.parentMissing && resetKeys.has(source.sourceKey)) {
       addSourceDiagnostic.run(
         source.sourceKey,
@@ -1385,45 +1443,32 @@ async function deriveChangedSources({
             && Number(nextQuota.value.source_offset)
               === Number(row.source_offset)) {
           const quota = nextQuota.value;
-          insertQuota.run(
-            source.sourceKey,
-            row.source_offset,
-            quota.slot_order,
-            row.timestamp_ms,
-            row.observed_at,
-            quota.provider,
-            quota.plan_type,
-            quota.limit_id,
-            quota.slot,
-            quota.used_percent,
-            quota.window_duration_mins,
-            quota.resets_at,
-          );
-          if (Number(row.timestamp_ms) >= projectionStartMs
-              && Number(row.timestamp_ms) <= projectionEndMs) {
-            await invokeProjection(onRateLimitSnapshot, {
-            timestamp: row.observed_at,
+          const entry = {
+            sourceOffset: Number(row.source_offset),
+            slotOrder: Number(quota.slot_order),
             timestampMs: Number(row.timestamp_ms),
-            sequence: projectionSequence++,
-            window: {
-              provider: quota.provider,
-              planType: quota.plan_type,
-              limitId: quota.limit_id,
-              slot: quota.slot,
-              usedPercent: Number(quota.used_percent),
-              windowDurationMins:
-                Number(quota.window_duration_mins),
-              resetsAt: Number(quota.resets_at),
-            },
-            surfaceClassification: {
-              surface: source.surface,
-              threadSource: source.threadSource,
-              agentScope: source.agentScope,
-              lineageDisposition: source.lineageDisposition,
-            },
-            sourceRolloutOrdinal: source.ordinal,
-            sourceRecordOrdinal: Number(row.source_offset),
-            });
+            observedAt: row.observed_at,
+            provider: quota.provider,
+            planType: quota.plan_type,
+            limitId: quota.limit_id,
+            slot: quota.slot,
+            usedPercent: Number(quota.used_percent),
+            windowDurationMins: Number(quota.window_duration_mins),
+            resetsAt: Number(quota.resets_at),
+          };
+          const gated = leadingQuotaGate.offer(
+            entry,
+            entry.timestampMs,
+            entry,
+          );
+          for (const withheld of gated.withheld) {
+            addDiagnosticEvent(
+              "contradictedLeadingSnapshotsSkipped",
+              withheld.timestampMs,
+            );
+          }
+          for (const released of gated.released) {
+            await commitQuota(released);
           }
           nextQuota = quotaIterator.next();
         }
@@ -1523,6 +1568,9 @@ async function deriveChangedSources({
         sourceRecordOrdinal: Number(row.source_offset),
         });
       }
+    }
+    for (const released of leadingQuotaGate.flush()) {
+      await commitQuota(released);
     }
     materializePreviousTotals();
     writeSnapshotSet.run(
@@ -1646,6 +1694,7 @@ function buildDiagnostics(database, sources, startMs, endMs) {
   for (const code of [
     "missingRateLimitRecords",
     "malformedRateLimitRecords",
+    "contradictedLeadingSnapshotsSkipped",
     "lastVsCumulativeMismatches",
     "duplicateSnapshotsSkipped",
     "forkReplayEventsSkipped",

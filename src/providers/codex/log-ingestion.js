@@ -64,6 +64,7 @@ export function createCodexLogIngestion({
       missingRateLimitRecords: 0,
       malformedRateLimitRecords: 0,
       rateLimitSnapshots: 0,
+      contradictedLeadingSnapshotsSkipped: 0,
       lastVsCumulativeMismatches: 0,
       duplicateSnapshotsSkipped: 0,
       replayedEventsSkipped: 0,

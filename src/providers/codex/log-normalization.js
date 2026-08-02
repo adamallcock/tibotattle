@@ -144,6 +144,83 @@ export function canonicalRateLimitWindows(rateLimits) {
   return windows;
 }
 
+/**
+ * A rollout that inherits history replays the ancestor's records into its own
+ * file. Replay is normally suppressed by cumulative-snapshot lineage, but a
+ * replayed record whose snapshot key is absent from the ancestor's set is
+ * admitted as if it were freshly observed, and it carries the ancestor's OLD
+ * rate-limit reading. Such a leading reading is recognisable because the same
+ * source contradicts it moments later: within the same quota window, used
+ * percent cannot climb this far in this little wall-clock time.
+ */
+export const CONTRADICTED_LEADING_SNAPSHOT_WINDOW_MS = 60_000;
+export const CONTRADICTED_LEADING_SNAPSHOT_PERCENT = 10;
+
+function rateLimitWindowIdentity(window) {
+  return `${window.provider}|${window.limitId}|${window.slot}`;
+}
+
+function contradicts(held, candidate) {
+  return candidate.resetsAt === held.resetsAt
+    && candidate.timestampMs >= held.timestampMs
+    && candidate.timestampMs - held.timestampMs
+      <= CONTRADICTED_LEADING_SNAPSHOT_WINDOW_MS
+    && candidate.usedPercent - held.usedPercent
+      >= CONTRADICTED_LEADING_SNAPSHOT_PERCENT;
+}
+
+/**
+ * Hold a source's leading rate-limit reading for one observation, per quota
+ * window identity, until the next reading either corroborates it or exposes it
+ * as stale. Nothing is corrected or invented: a contradicted reading is
+ * withheld so it never becomes a data point, and every later reading passes
+ * straight through. A source that genuinely starts low and rises across real
+ * elapsed time keeps its leading reading.
+ */
+export function createLeadingRateLimitGate(settledWindows = null) {
+  const settled = new Set(
+    (settledWindows ?? []).map((window) => rateLimitWindowIdentity(window)),
+  );
+  const held = new Map();
+  return {
+    /**
+     * Offer one observed window. `entry` is opaque payload returned verbatim,
+     * so each caller keeps its own emission shape.
+     */
+    offer(window, timestampMs, entry) {
+      const identity = rateLimitWindowIdentity(window);
+      if (settled.has(identity)) return { released: [entry], withheld: [] };
+      const candidate = {
+        usedPercent: window.usedPercent,
+        resetsAt: window.resetsAt,
+        timestampMs,
+        entry,
+      };
+      const leading = held.get(identity);
+      if (leading === undefined) {
+        held.set(identity, candidate);
+        return { released: [], withheld: [] };
+      }
+      if (contradicts(leading, candidate)) {
+        held.set(identity, candidate);
+        return { released: [], withheld: [leading.entry] };
+      }
+      held.delete(identity);
+      settled.add(identity);
+      return { released: [leading.entry, entry], withheld: [] };
+    },
+    /**
+     * Release every still-held leading reading. A reading nothing contradicts
+     * is a real observation, including the reading of a single-snapshot source.
+     */
+    flush() {
+      const released = [...held.values()].map((value) => value.entry);
+      held.clear();
+      return released;
+    },
+  };
+}
+
 export function classifyToolCall(name, namespace = null) {
   if (typeof name !== "string") return "unknown";
   const bareName = name.toLowerCase();

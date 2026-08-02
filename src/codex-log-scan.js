@@ -23,6 +23,7 @@ export {
   canonicalComponents,
   canonicalRateLimitWindows,
   classifyToolCall,
+  createLeadingRateLimitGate,
   createSnapshotLineage,
   cumulativeSnapshotKey,
   deltaComponentPresence,
