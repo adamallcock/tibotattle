@@ -610,6 +610,108 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   }
 });
 
+test("the in-app dashboard web view stays pinned to the loopback companion", async () => {
+  const [source, buildSource] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "scripts", "build-macos-app.js"), "utf8"),
+  ]);
+  assert.match(source, /import WebKit/u);
+  // WebKit is a system framework: the bundle gains no new binary and the
+  // packaged app declares no new transport exception for it.
+  assert.match(buildSource, /"-framework",\s*\n\s*"WebKit",/u);
+  assert.equal(buildSource.includes("NSAllowsArbitraryLoads"), false);
+  assert.equal(buildSource.includes("NSExceptionDomains"), false);
+  assert.match(
+    buildSource,
+    /<key>NSAppTransportSecurity<\/key>\s*\n\s*<dict>\s*\n\s*<key>NSAllowsLocalNetworking<\/key>\s*\n\s*<true\/>\s*\n\s*<\/dict>/u,
+  );
+
+  // Exactly one origin may load: the http loopback port this launcher started.
+  assert.match(
+    source,
+    /private func isCompanionURL\(_ url: URL\) -> Bool \{[\s\S]*?url\.scheme\?\.lowercased\(\) == "http"[\s\S]*?url\.host == loopbackHost[\s\S]*?url\.port == allowedPort[\s\S]*?url\.user == nil[\s\S]*?url\.password == nil/u,
+  );
+  assert.match(source, /configuration\.websiteDataStore = \.nonPersistent\(\)/u);
+  assert.match(
+    source,
+    /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url, false\)/u,
+  );
+  // A second window is never opened in-app; the target is handed to the
+  // user's own browser and this delegate returns nothing.
+  assert.match(
+    source,
+    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternally\(url, true\)\s*\n\s*\}\s*\n\s*return nil/u,
+  );
+  assert.match(
+    source,
+    /private func openExternalDashboardLink\(_ url: URL, explain: Bool\) \{[\s\S]*?url\.scheme\?\.lowercased\(\) == "https"[\s\S]*?url\.user == nil,\s*\n\s*url\.password == nil/u,
+  );
+  assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);
+  for (const forbidden of [
+    "WKWebsiteDataStore.default()",
+    "allowsLinkPreview = true",
+    "javaScriptCanOpenWindowsAutomatically",
+    "setValue(true, forKey: \"allowUniversalAccessFromFileURLs\"",
+  ]) {
+    assert.equal(source.includes(forbidden), false, forbidden);
+  }
+
+  // Controls the embedded view would otherwise silently kill: the file picker
+  // for a reviewed contribution, the confirmation on a destructive action, and
+  // the share-card download.
+  assert.match(source, /runOpenPanelWith parameters: WKOpenPanelParameters/u);
+  assert.match(
+    source,
+    /runJavaScriptConfirmPanelWithMessage message: String[\s\S]*?completionHandler\(alert\.runModal\(\) == \.alertFirstButtonReturn\)/u,
+  );
+  assert.match(source, /navigationAction\.shouldPerformDownload \{\s*\n\s*decisionHandler\(\.download\)/u);
+  assert.match(source, /static func downloadsDestination\(for suggestedFilename: String\)/u);
+  // A file that could not be saved must not tear down a working dashboard.
+  assert.match(
+    source,
+    /func download\(_ download: WKDownload, didFailWithError error: Error, resumeData: Data\?\) \{[\s\S]*?onDownloadFailure\(\)/u,
+  );
+  // Tearing the view down loads a blank page; that must never be reported as
+  // a dashboard that opened.
+  assert.match(
+    source,
+    /func stop\(\) \{[\s\S]*?hasDashboardTarget = false/u,
+  );
+  assert.match(
+    source,
+    /func webView\(_ webView: WKWebView, didFinish navigation: WKNavigation!\) \{\s*\n\s*guard hasDashboardTarget else \{ return \}/u,
+  );
+
+  // A failed web view never becomes the only thing on screen: the status
+  // stack returns and Retry, Quit, and diagnostics were never hidden.
+  assert.match(
+    source,
+    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
+  );
+  assert.match(
+    source,
+    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
+  );
+  assert.match(
+    source,
+    /private func showFailure\(_ error: Error\) \{[\s\S]*?hideDashboardWebView\(\)/u,
+  );
+  assert.equal(source.includes("actionRow.isHidden"), false);
+  assert.match(source, /layout\.addArrangedSubview\(actionRow\)/u);
+  // The browser remains an explicit, separate choice rather than the default.
+  assert.match(source, /title: "Open in Browser"/u);
+  assert.match(
+    source,
+    /@objc private func openDashboard\(\) \{[\s\S]*?showDashboardWebView\(dashboardURL\)/u,
+  );
+  assert.match(
+    source,
+    /@objc private func openDashboardInBrowser\(\) \{[\s\S]*?NSWorkspace\.shared\.open\(dashboardURL\)/u,
+  );
+  assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
+});
+
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
   const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
   assert.match(source, /import AppKit/u);
@@ -1675,14 +1777,23 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(MACOS_WEB_MODULE_ENTRYPOINTS, [
     "apps/web/public/app.js",
   ]);
+  // The dashboard entry plus the modules it shares with the public community
+  // entry. The community entry itself is website-only and is not bundled.
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/app.js",
+    "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
     "apps/web/public/navigation.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
+    "apps/web/public/ui-format.js",
   ]);
+  assert.equal(
+    webModules.relativeFiles.includes("apps/web/public/community.js"),
+    false,
+  );
   assert.deepEqual(swiftSources.relativeFiles, [
     "apps/macos/Sources/MenuBarStatus.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
@@ -1691,13 +1802,16 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
     "apps/web/public/app.js",
+    "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
     "apps/web/public/index.html",
+    "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
     "apps/web/public/navigation.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
+    "apps/web/public/ui-format.js",
   ]);
   assert.deepEqual(
     graph.relativeFiles.filter((path) =>

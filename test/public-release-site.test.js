@@ -20,6 +20,9 @@ import {
 } from "../config/product-brand.js";
 import { buildPublicReleaseSite } from "../scripts/build-public-release-site.js";
 import {
+  collectMacOSWebModuleGraph,
+} from "../scripts/build-macos-app.js";
+import {
   readVerifiedTelemetryBrowserMirror,
 } from "../scripts/generate-telemetry-browser-mirror.js";
 
@@ -99,8 +102,17 @@ async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-release-site-"));
   const source = join(root, "source");
   await mkdir(source);
-  await writeFile(join(source, "index.html"), sourceHtml());
-  await writeFile(join(source, "app.js"), "console.log('safe');\n");
+  // The site is built from the community entry. The dashboard entry is
+  // written here too so the build is proven to withhold it, not merely to
+  // ignore a file that never existed.
+  await writeFile(join(source, "community.html"), sourceHtml());
+  await writeFile(join(source, "community.js"), "console.log('safe');\n");
+  await writeFile(
+    join(source, "index.html"),
+    "<!doctype html><title>dashboard</title>\n",
+  );
+  await writeFile(join(source, "app.js"), "console.log('dashboard');\n");
+  await writeFile(join(source, "navigation.js"), "export const nav = 1;\n");
   for (const basename of [
     "telemetry-envelope.js",
     "telemetry-shared.generated.js",
@@ -227,7 +239,7 @@ test("release-site build verifies artifacts and materializes complete public met
   assert.deepEqual(
     manifest.files.map(({ path }) => path),
     [
-      "app.js",
+      "community.js",
       "index.html",
       "robots.txt",
       "social-preview.png",
@@ -275,10 +287,67 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildPublicReleaseSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 11);
+  assert.equal(result.fileCount, 13);
+  const manifest = JSON.parse(
+    await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
+  );
+  // The exact published surface: the community entry and the modules it
+  // shares with the app, and nothing that needs the local companion.
+  assert.deepEqual(
+    manifest.files.map(({ path }) => path),
+    [
+      "community-view.js",
+      "community.js",
+      "data-client.js",
+      "index.html",
+      "install-cta.js",
+      "lib.js",
+      "robots.txt",
+      "social-preview.png",
+      "styles.css",
+      "telemetry-envelope.js",
+      "telemetry-shared.generated.js",
+      "ui-format.js",
+    ],
+  );
+  // The list above is a reviewed ledger of names, so it cannot notice a module
+  // that the site both needs and withholds: such a module is missing from the
+  // output and from the ledger at once, and the two absences cancel out. Derive
+  // the community entry's real import closure instead, so extracting a shared
+  // module can never publish an index whose imports 404.
+  const publishedNames = new Set(manifest.files.map(({ path }) => path));
+  const communityClosure = await collectMacOSWebModuleGraph({
+    entrypoints: ["apps/web/public/community.js"],
+  });
+  for (const relativeFile of communityClosure.relativeFiles) {
+    const name = relativeFile.slice("apps/web/public/".length);
+    assert.ok(
+      publishedNames.has(name),
+      `Release site imports ${name} but does not publish it`,
+    );
+  }
   const html = await readFile(join(value.output, "index.html"), "utf8");
   assert.match(html, /id="installer-compatibility"/u);
   assert.match(html, /id="release-notes-link"/u);
+  // The install call to action and the community view are present; the
+  // companion-only dashboard surfaces are not.
+  assert.match(html, /id="installer-link"/u);
+  assert.match(html, /id="community-result"/u);
+  assert.match(html, /src="\.\/community\.js"/u);
+  for (
+    const dashboardOnly of [
+      "./app.js",
+      "./navigation.js",
+      'id="contribution-form"',
+      'id="identity-signin"',
+      'id="connect-community"',
+      'id="quota-cards"',
+      'id="weekly-chart"',
+      'id="refresh-button"',
+    ]
+  ) {
+    assert.equal(html.includes(dashboardOnly), false, dashboardOnly);
+  }
   assert.match(
     await readFile(
       join(value.output, "telemetry-shared.generated.js"),
@@ -458,7 +527,7 @@ test("release-site source must expose each empty metadata slot exactly once", as
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
   await writeFile(
-    join(value.source, "index.html"),
+    join(value.source, "community.html"),
     sourceHtml().replace(
       '<meta name="usage-monitor-installer-url" content="">',
       '<meta name="usage-monitor-installer-url" content="already-filled">',
@@ -478,7 +547,7 @@ test("release-site source must expose the semantic open target placeholder exact
     + `content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`;
 
   await writeFile(
-    join(value.source, "index.html"),
+    join(value.source, "community.html"),
     sourceHtml().replace(semanticMeta, ""),
   );
   await assert.rejects(
@@ -487,7 +556,7 @@ test("release-site source must expose the semantic open target placeholder exact
   );
 
   await writeFile(
-    join(value.source, "index.html"),
+    join(value.source, "community.html"),
     sourceHtml().replace(semanticMeta, `${semanticMeta}\n${semanticMeta}`),
   );
   await assert.rejects(
