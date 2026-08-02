@@ -39,11 +39,13 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
+    CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
     ENVELOPE_PUBLIC_JWK: "",
     ENVIRONMENT: "synthetic-development",
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: runtime.QUARANTINE,
+    PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     GOOGLE_OIDC_CLIENT_ID: CLIENT_ID,
@@ -221,16 +223,17 @@ describe("hosted Google sign-in", () => {
     });
     expect(result.status).toBe(200);
     const payload = await result.json();
-    expect(payload).toEqual({
+    expect(payload).toMatchObject({
       schemaVersion: "identity-google-result-v0.1",
-      idToken: GOOGLE_ID_TOKEN,
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
     });
-    // Google's other tokens and the client secret stay inside the request.
+    // Google's raw credentials and the client secret stay inside the request.
     const serialized = JSON.stringify(payload);
     for (const leak of [
       CLIENT_SECRET,
       "google-access-token",
       "google-refresh-token",
+      GOOGLE_ID_TOKEN,
     ]) {
       expect(serialized.includes(leak), leak).toBe(false);
     }
@@ -246,10 +249,18 @@ describe("hosted Google sign-in", () => {
     });
 
     const rows = await bindings().USAGE_MONITOR_DB.prepare(
-      "SELECT consumed_at AS consumedAt FROM google_signin_handoffs",
-    ).all<{ consumedAt: string | null }>();
+      `SELECT identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+         FROM google_signin_handoffs`,
+    ).all<{
+      linkKey: string;
+      proof: string;
+      deliveredAt: string | null;
+    }>();
     expect(rows.results).toHaveLength(1);
-    expect(rows.results[0]?.consumedAt).not.toBeNull();
+    expect(rows.results[0]?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
+    expect(rows.results[0]?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
+    expect(rows.results[0]?.deliveredAt).not.toBeNull();
+    expect(JSON.stringify(rows.results)).not.toContain(GOOGLE_ID_TOKEN);
   });
 
   it("expires an unread handoff and refuses the expired state", async () => {
@@ -330,17 +341,25 @@ describe("hosted Google sign-in", () => {
     expect(tokenCalls).toHaveLength(1);
 
     const stored = await bindings().USAGE_MONITOR_DB.prepare(
-      "SELECT id_token AS idToken FROM google_signin_handoffs WHERE state = ?",
-    ).bind(started.state).first<{ idToken: string }>();
-    expect(stored?.idToken).toBe(GOOGLE_ID_TOKEN);
+      `SELECT identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+         FROM google_signin_handoffs WHERE state = ?`,
+    ).bind(started.state).first<{
+      linkKey: string;
+      proof: string;
+      deliveredAt: string | null;
+    }>();
+    expect(stored?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
+    expect(stored?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
+    expect(stored?.deliveredAt).toBeNull();
+    expect(JSON.stringify(stored)).not.toContain(GOOGLE_ID_TOKEN);
 
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
     });
     expect(result.status).toBe(200);
-    expect(await result.json()).toEqual({
+    expect(await result.json()).toMatchObject({
       schemaVersion: "identity-google-result-v0.1",
-      idToken: GOOGLE_ID_TOKEN,
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
     });
   });
 
@@ -380,9 +399,16 @@ describe("hosted Google sign-in", () => {
 
     // The pending handoff survived every ignored callback untouched.
     const row = await bindings().USAGE_MONITOR_DB.prepare(
-      "SELECT id_token AS idToken FROM google_signin_handoffs WHERE state = ?",
-    ).bind(started.state).first<{ idToken: string | null }>();
-    expect(row?.idToken ?? null).toBeNull();
+      `SELECT identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+         FROM google_signin_handoffs WHERE state = ?`,
+    ).bind(started.state).first<{
+      linkKey: string | null;
+      proof: string | null;
+      deliveredAt: string | null;
+    }>();
+    expect(row?.linkKey ?? null).toBeNull();
+    expect(row?.proof ?? null).toBeNull();
+    expect(row?.deliveredAt ?? null).toBeNull();
   });
 
   it("keeps a failed Google exchange from filling the handoff", async () => {

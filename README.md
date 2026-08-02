@@ -53,7 +53,8 @@ npm run product:macos:build
 open ".release-build/macos/TiboTattle.app"
 ```
 
-Or run just the local dashboard without building the app:
+For development only, run the local dashboard in an external browser without
+building the app:
 
 ```bash
 npm run product:local

@@ -57,9 +57,11 @@ import {
   developerIDSignMacOSApp,
   inspectMacOSApp,
   packageMacOSDMG,
+  readMacOSReleaseSourceProvenance,
   readMacOSReleaseBuildConfiguration,
   readMacOSReleaseCredentials,
   submitToAppleNotary,
+  validateNodeRuntimeEntitlements,
   validateMacOSSignedReplacementArtifacts,
   validateMacOSSignedReplacementPair,
   validateMacOSApplicationsLink,
@@ -573,8 +575,13 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /MenuBarStatusController\(\s*productName: BundledProduct\.displayName/u,
   );
-  // Every menu-bar action reuses an existing path rather than duplicating it.
-  assert.match(source, /openDashboard: \{ \[weak self\] in self\?\.openDashboard\(\) \}/u);
+  // The menu bar has one primary app destination. It reuses the in-app
+  // dashboard path and leaves the browser as the separate explicit control.
+  assert.match(source, /openTiboTattle: \{ \[weak self\] in self\?\.openTiboTattle\(\) \}/u);
+  assert.match(
+    source,
+    /private func openTiboTattle\(\) \{[\s\S]*?showMainWindow\(\)[\s\S]*?openDashboard\(\)/u,
+  );
   assert.match(source, /quit: \{ \[weak self\] in self\?\.quitApplication\(\) \}/u);
   assert.match(source, /menuBarStatus\?\.companionReady\(dashboardURL: url\)/u);
   assert.match(source, /menuBarStatus\?\.companionStarting\(\)/u);
@@ -730,18 +737,24 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   // starting, failed, and analyzing states all collapse to a placeholder.
   assert.match(
     source,
-    /guard phase == \.ready, evidence == \.live, let window else \{\s*return unknownPlaceholder/u,
+    /guard phase == \.ready, evidence == \.live, let lane = primaryLane else \{\s*return unknownPlaceholder/u,
   );
   assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
-  assert.match(source, /so no number is shown/u);
-  assert.match(source, /Seven-day allowance: not observed yet/u);
+  assert.match(source, /No verified quota lanes observed yet/u);
+  assert.match(source, /Allowance values and reset countdowns are hidden/u);
+  assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
+  assert.match(source, /guard companionReachable, evidence == \.live else/u);
 
-  // The same window the dashboard treats as primary, selected the same way.
+  // Every supported observed lane is projected with a fixed privacy-safe
+  // label; the weekly primary remains only the compact-title preference.
   assert.match(source, /private let weeklyWindowDurationMinutes = 10_080/u);
-  assert.match(source, /row\["limitId"\] as\? String == "codex"/u);
-  assert.match(source, /\$0\["slot"\] as\? String == "primary"/u);
+  assert.match(source, /let lanes = rows\.enumerated\(\)\.compactMap/u);
+  assert.match(source, /return "Five-hour allowance"/u);
+  assert.match(source, /return "Secondary observed allowance"/u);
+  assert.match(source, /Observed quota lane/u);
+  assert.match(source, /isPrimary: limitId == "codex"/u);
   assert.match(
     source,
     /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
@@ -752,11 +765,17 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /menu\.autoenablesItems = false/u);
   assert.match(source, /allowanceItem\.isEnabled = false/u);
   assert.match(source, /evidenceItem\.isEnabled = false/u);
-  assert.match(source, /"Open Dashboard"/u);
+  assert.match(source, /"Open \\\(productName\)"/u);
+  assert.match(source, /openTiboTattleItem\.isEnabled = true/u);
   assert.match(source, /"Analyze Local Usage"/u);
-  assert.match(source, /"Show \\\(productName\) Window"/u);
+  assert.match(source, /"Update Local Usage"/u);
+  assert.match(source, /"Analyzing Local Usage…"/u);
   assert.match(source, /"Quit \\\(productName\)"/u);
-  assert.match(source, /menu\.addItem\(\.separator\(\)\)\s*\n\s*configure\(quitItem/u);
+  assert.match(source, /private var quotaLaneItems: \[NSMenuItem\] = \[\]/u);
+  assert.match(source, /func renderQuotaLanes\(\)/u);
+  assert.match(source, /menu\.insertItem\(item, at: insertionIndex \+ offset\)/u);
+  assert.doesNotMatch(source, /showWindowItem/u);
+  assert.doesNotMatch(source, /openDashboardItem/u);
   assert.match(source, /analyzeItem\.isEnabled = snapshot\.phase == \.ready/u);
 
   // The analyze item drives the companion's own refresh route with the exact
@@ -1211,6 +1230,10 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       fileName,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     },
+    source: {
+      commit: "a".repeat(40),
+      tag: "v0.1.0",
+    },
     assurances: { ...assurances },
     updater: {
       appcastURL: "https://usage.example/appcast.xml",
@@ -1371,6 +1394,55 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         async validateArtifact() {},
       }),
       { code: "MACOS_REPLACEMENT_ARTIFACT_INVALID" },
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("signed macOS releases require a clean, annotated source tag and minimal Node entitlements", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-release-provenance-test-"),
+  );
+  try {
+    execFileSync("/usr/bin/git", ["init", "--quiet"], { cwd: temporaryRoot });
+    execFileSync("/usr/bin/git", ["config", "user.email", "test@example.invalid"], {
+      cwd: temporaryRoot,
+    });
+    execFileSync("/usr/bin/git", ["config", "user.name", "Release provenance test"], {
+      cwd: temporaryRoot,
+    });
+    await writeFile(join(temporaryRoot, "release-input.txt"), "release\n");
+    execFileSync("/usr/bin/git", ["add", "release-input.txt"], { cwd: temporaryRoot });
+    execFileSync("/usr/bin/git", ["commit", "--quiet", "-m", "release input"], {
+      cwd: temporaryRoot,
+    });
+    execFileSync("/usr/bin/git", ["tag", "-a", "v0.1.0", "-m", "release"], {
+      cwd: temporaryRoot,
+    });
+    const provenance = readMacOSReleaseSourceProvenance({
+      repositoryRoot: temporaryRoot,
+    });
+    assert.match(provenance.commit, /^[0-9a-f]{40}$/u);
+    assert.equal(provenance.tag, "v0.1.0");
+
+    await writeFile(join(temporaryRoot, "release-input.txt"), "dirty\n");
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({ repositoryRoot: temporaryRoot }),
+      { code: "MACOS_RELEASE_SOURCE_DIRTY" },
+    );
+
+    const entitlements = await validateNodeRuntimeEntitlements();
+    assert.match(entitlements.path, /NodeRuntime\.entitlements$/u);
+    const entitlementSource = await readFile(entitlements.path, "utf8");
+    assert.match(entitlementSource, /com\.apple\.security\.cs\.allow-jit/u);
+    assert.match(
+      entitlementSource,
+      /com\.apple\.security\.cs\.allow-unsigned-executable-memory/u,
+    );
+    assert.doesNotMatch(
+      entitlementSource,
+      /com\.apple\.security\.cs\.disable-library-validation/u,
     );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });

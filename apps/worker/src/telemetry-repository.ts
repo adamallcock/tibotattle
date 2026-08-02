@@ -43,7 +43,12 @@ export interface TelemetryContributionRow {
   unknown_billable_units: number;
   price_basis: string;
   declared_record_count: number;
-  accepted_record_count?: number;
+  /**
+   * Records this contribution actually stored, decided once at ingest and read
+   * back from the stored column. NULL only while an ingest that wrote records
+   * has not yet written its accounting; that state is repaired on next lookup.
+   */
+  accepted_record_count?: number | null;
   created_at: string;
   quarantine_deleted_at?: string | null;
   server_cost_nanousd?: number;
@@ -174,13 +179,88 @@ export async function existingTelemetryContribution(
   kind: "plaintext" | "envelope" = "plaintext",
 ): Promise<TelemetryContributionRow | null> {
   const column = kind === "plaintext" ? "plaintext_digest" : "envelope_digest";
-  return db.prepare(
-    `SELECT c.*,
-        (SELECT COUNT(*) FROM telemetry_records r WHERE r.origin_contribution_id = c.id)
-          AS accepted_record_count
-      FROM telemetry_contributions c
+  const row = await db.prepare(
+    `SELECT c.* FROM telemetry_contributions c
       WHERE c.participant_id = ? AND c.${column} = ?`,
   ).bind(participantId, digest).first<TelemetryContributionRow>();
+  return row ? repairUnfinishedTelemetryContribution(db, row) : null;
+}
+
+/**
+ * An ingest writes its records and its accounting in two steps, because the
+ * accepted count is only knowable from the write batch's own results. A
+ * contribution whose accounting step did not run is identifiable — and only
+ * identifiable — by a NULL `accepted_record_count`, so it is repaired here from
+ * the records it owns rather than reported with a count of zero.
+ *
+ * This is the sole read path that reaches records from a contribution, it is
+ * bounded by `telemetry_records_origin_contribution` to that contribution's own
+ * rows, and it runs only for a contribution that is actually unfinished. Every
+ * replay of an upload funnels through here, so the repair happens on the client
+ * retry that follows the failure that caused it.
+ */
+async function repairUnfinishedTelemetryContribution(
+  db: D1Database,
+  row: TelemetryContributionRow,
+): Promise<TelemetryContributionRow> {
+  if (row.accepted_record_count !== null
+      && row.accepted_record_count !== undefined) {
+    return row;
+  }
+  const repaired = await db.prepare(
+    `UPDATE telemetry_contributions
+        SET (
+              server_cost_nanousd,
+              server_priced_event_count,
+              server_partially_priced_event_count,
+              server_unpriced_event_count,
+              server_pricing_method_version,
+              server_price_registry_version,
+              server_price_registry_sha256,
+              accepted_record_count
+            ) = (
+              SELECT
+                COALESCE(SUM(CASE WHEN r.record_kind = 'usage'
+                  THEN r.server_cost_nanousd END), 0),
+                COUNT(CASE WHEN r.record_kind = 'usage'
+                  AND r.server_pricing_status = 'fully_priced' THEN 1 END),
+                COUNT(CASE WHEN r.record_kind = 'usage'
+                  AND r.server_pricing_status = 'partially_priced' THEN 1 END),
+                COUNT(CASE WHEN r.record_kind = 'usage'
+                  AND r.server_pricing_status = 'unpriced' THEN 1 END),
+                MAX(CASE WHEN r.record_kind = 'usage'
+                  THEN r.server_pricing_method_version END),
+                MAX(CASE WHEN r.record_kind = 'usage'
+                  THEN r.server_price_registry_version END),
+                MAX(CASE WHEN r.record_kind = 'usage'
+                  THEN r.server_price_registry_sha256 END),
+                COUNT(*)
+                FROM telemetry_records r
+               WHERE r.origin_contribution_id = telemetry_contributions.id
+            )
+      WHERE id = ? AND participant_id = ? AND accepted_record_count IS NULL
+      RETURNING *`,
+  ).bind(row.id, row.participant_id).first<TelemetryContributionRow>();
+  return repaired ?? row;
+}
+
+/**
+ * Same repair across a listed page. The guard is the point: when every row
+ * carries its stored count — which is every row an ingest finished, so all of
+ * them in normal operation — this issues no statement at all, which is the
+ * whole reason the count stopped being derived per listed row.
+ */
+async function repairUnfinishedTelemetryContributions(
+  db: D1Database,
+  rows: readonly TelemetryContributionRow[],
+): Promise<TelemetryContributionRow[]> {
+  const unfinished = rows.some((row) => (
+    row.accepted_record_count === null || row.accepted_record_count === undefined
+  ));
+  if (!unfinished) return [...rows];
+  return Promise.all(
+    rows.map((row) => repairUnfinishedTelemetryContribution(db, row)),
+  );
 }
 
 export async function telemetryContributionCount(
@@ -499,50 +579,87 @@ export async function insertTelemetryContribution(
       transport?.rangeEnd ?? null,
     ),
     ...recordPairs.flat(),
-    db.prepare(
-      `UPDATE telemetry_contributions
-          SET server_cost_nanousd = COALESCE((
-                SELECT SUM(server_cost_nanousd) FROM telemetry_records
-                 WHERE origin_contribution_id = telemetry_contributions.id
-                   AND record_kind = 'usage'
-              ), 0),
-              server_priced_event_count = (
-                SELECT COUNT(*) FROM telemetry_records
-                 WHERE origin_contribution_id = telemetry_contributions.id
-                   AND record_kind = 'usage' AND server_pricing_status = 'fully_priced'
-              ),
-              server_partially_priced_event_count = (
-                SELECT COUNT(*) FROM telemetry_records
-                 WHERE origin_contribution_id = telemetry_contributions.id
-                   AND record_kind = 'usage' AND server_pricing_status = 'partially_priced'
-              ),
-              server_unpriced_event_count = (
-                SELECT COUNT(*) FROM telemetry_records
-                 WHERE origin_contribution_id = telemetry_contributions.id
-                   AND record_kind = 'usage' AND server_pricing_status = 'unpriced'
-              ),
-              server_pricing_method_version = ?,
-              server_price_registry_version = ?,
-              server_price_registry_sha256 = ?
-        WHERE id = ? AND participant_id = ?`,
-    ).bind(
-      serverPricing[0]?.methodVersion ?? null,
-      serverPricing[0]?.registryVersion ?? null,
-      serverPricing[0]?.registrySha256 ?? null,
-      contributionId,
-      participantId,
-    ),
   ];
   const results = await db.batch(statements);
   if ((results[0]?.meta.changes ?? 0) < 1) {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
   const totalRecords = recordPairs.length;
-  const acceptedRecords = recordPairs.reduce(
-    (sum, _pair, index) => sum + Number(results[1 + (index * 2)]?.meta.changes ?? 0),
+  // `INSERT OR IGNORE` stores nothing for a record this participant already
+  // holds — the client's one-hour replay overlap re-sends such records on every
+  // run — so a statement that reported no change is a record this contribution
+  // did not store, and must not be counted or priced against it.
+  const stored = recordPairs.map(
+    (_pair, index) => Number(results[1 + (index * 2)]?.meta.changes ?? 0) > 0,
+  );
+  const acceptedRecords = stored.reduce(
+    (sum, accepted) => sum + (accepted ? 1 : 0),
     0,
   );
+  const accounting = storedServerPricingTotals(serverPricing, stored);
+  await db.prepare(
+    `UPDATE telemetry_contributions
+        SET server_cost_nanousd = ?,
+            server_priced_event_count = ?,
+            server_partially_priced_event_count = ?,
+            server_unpriced_event_count = ?,
+            server_pricing_method_version = ?,
+            server_price_registry_version = ?,
+            server_price_registry_sha256 = ?,
+            accepted_record_count = ?
+      WHERE id = ? AND participant_id = ?`,
+  ).bind(
+    accounting.costNanousd,
+    accounting.fullyPricedEvents,
+    accounting.partiallyPricedEvents,
+    accounting.unpricedEvents,
+    serverPricing[0]?.methodVersion ?? null,
+    serverPricing[0]?.registryVersion ?? null,
+    serverPricing[0]?.registrySha256 ?? null,
+    acceptedRecords,
+    contributionId,
+    participantId,
+  ).run();
   return { acceptedRecords, deduplicatedRecords: totalRecords - acceptedRecords };
+}
+
+/**
+ * The server-repriced totals a contribution is credited with, summed here from
+ * the pricing this request already computed rather than read back out of
+ * `telemetry_records`. Reading them back meant four correlated subqueries with
+ * no index to stand on, each visiting every usage row the service had ever
+ * accepted — a cost set by the size of the whole table, not by the size of the
+ * upload.
+ *
+ * `stored` is positional over the ingest batch, whose usage statements come
+ * first, so a usage event dropped as a duplicate is skipped here exactly as the
+ * removed `origin_contribution_id = ...` filter skipped it: its cost already
+ * belongs to the contribution that first stored it.
+ */
+function storedServerPricingTotals(
+  serverPricing: readonly ServerPricingResult[],
+  stored: readonly boolean[],
+): {
+  costNanousd: number;
+  fullyPricedEvents: number;
+  partiallyPricedEvents: number;
+  unpricedEvents: number;
+} {
+  const totals = {
+    costNanousd: 0,
+    fullyPricedEvents: 0,
+    partiallyPricedEvents: 0,
+    unpricedEvents: 0,
+  };
+  for (const [index, pricing] of serverPricing.entries()) {
+    if (!stored[index]) continue;
+    totals.costNanousd += pricing.costNanousd;
+    if (pricing.coverageStatus === "fully_priced") totals.fullyPricedEvents += 1;
+    else if (pricing.coverageStatus === "partially_priced") {
+      totals.partiallyPricedEvents += 1;
+    } else totals.unpricedEvents += 1;
+  }
+  return totals;
 }
 
 export async function listTelemetryContributions(
@@ -550,15 +667,12 @@ export async function listTelemetryContributions(
   participantId: string,
 ): Promise<TelemetryContributionRow[]> {
   const result = await db.prepare(
-    `SELECT c.*,
-        (SELECT COUNT(*) FROM telemetry_records r WHERE r.origin_contribution_id = c.id)
-          AS accepted_record_count
-      FROM telemetry_contributions c
+    `SELECT c.* FROM telemetry_contributions c
       WHERE c.participant_id = ?
       ORDER BY created_at ASC, id ASC
       LIMIT 101`,
   ).bind(participantId).all<TelemetryContributionRow>();
-  return result.results;
+  return repairUnfinishedTelemetryContributions(db, result.results);
 }
 
 export async function listRecentTelemetryContributions(
@@ -570,15 +684,13 @@ export async function listRecentTelemetryContributions(
     throw new ApiError(500, "INTERNAL_ERROR");
   }
   const result = await db.prepare(
-    `SELECT c.*,
-        (SELECT COUNT(*) FROM telemetry_records r WHERE r.origin_contribution_id = c.id)
-          AS accepted_record_count
-      FROM telemetry_contributions c
+    `SELECT c.* FROM telemetry_contributions c
       WHERE c.participant_id = ?
       ORDER BY created_at DESC, id DESC
       LIMIT ?`,
   ).bind(participantId, limit).all<TelemetryContributionRow>();
-  return result.results.reverse();
+  return repairUnfinishedTelemetryContributions(db, result.results)
+    .then((rows) => rows.reverse());
 }
 
 export interface TelemetryContributionPage {
@@ -631,10 +743,7 @@ export async function telemetryContributionPage(
   };
   const result = await db.prepare(
     `WITH contribution_page AS (
-      SELECT c.*,
-        (SELECT COUNT(*) FROM telemetry_records accepted
-          WHERE accepted.participant_id = c.participant_id
-            AND accepted.origin_contribution_id = c.id) AS accepted_record_count
+      SELECT c.*
       FROM telemetry_contributions c
       WHERE c.participant_id = ?
         ${cursorPredicate}
@@ -683,6 +792,13 @@ export async function telemetryContributionPage(
     }
   }
   const rows = [...page.values()];
+  const repairedContributions = await repairUnfinishedTelemetryContributions(
+    db,
+    rows.map((item) => item.contribution),
+  );
+  for (const [index, item] of rows.entries()) {
+    item.contribution = repairedContributions[index] ?? item.contribution;
+  }
   const last = rows.at(-1)?.contribution;
   const hasMore = Number(
     result.results[0]?.export_page_contribution_count ?? 0,
@@ -752,12 +868,11 @@ export async function telemetryContributionById(
   participantId: string,
   contributionId: string,
 ): Promise<TelemetryContributionRow | null> {
-  return db.prepare(
-    `SELECT c.*,
-        (SELECT COUNT(*) FROM telemetry_records r WHERE r.origin_contribution_id = c.id)
-          AS accepted_record_count
-      FROM telemetry_contributions c WHERE c.participant_id = ? AND c.id = ?`,
+  const row = await db.prepare(
+    `SELECT c.* FROM telemetry_contributions c
+      WHERE c.participant_id = ? AND c.id = ?`,
   ).bind(participantId, contributionId).first<TelemetryContributionRow>();
+  return row ? repairUnfinishedTelemetryContribution(db, row) : null;
 }
 
 export async function telemetryRecordsForContribution(

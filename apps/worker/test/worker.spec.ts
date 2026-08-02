@@ -54,11 +54,13 @@ function testBindings(overrides: Partial<Env> = {}): Env {
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
     ENROLLMENT_RATE_LIMIT: bindings.ENROLLMENT_RATE_LIMIT,
+    CLIENT_ATTEMPT_RATE_LIMIT: bindings.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: privateJwkJson,
     ENVELOPE_PUBLIC_JWK: publicJwkJson,
     ENVIRONMENT: "synthetic-development",
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: bindings.QUARANTINE,
+    PUBLIC_READ_RATE_LIMIT: bindings.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: bindings.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
     ...overrides,
@@ -1362,6 +1364,12 @@ describe("synthetic usage monitor service", () => {
         } as unknown as Partial<Env>),
         code: "ADMISSION_CONFIGURATION_INVALID",
       },
+      {
+        env: testBindings({
+          CLIENT_ATTEMPT_RATE_LIMIT: undefined,
+        } as unknown as Partial<Env>),
+        code: "ADMISSION_CONFIGURATION_INVALID",
+      },
     ];
     for (const testCase of cases) {
       const response = await api("/api/v1/enroll", {
@@ -1383,86 +1391,65 @@ describe("synthetic usage monitor service", () => {
     expect(count?.total).toBe(0);
   });
 
-  let identitySigningKey: CryptoKey;
-  let identityJwksJson = "";
   const GOOGLE_CLIENT = "test-google-client.apps.googleusercontent.com";
   const APPLE_CLIENT = "com.usagemonitor.local";
-
-  beforeAll(async () => {
-    const pair = await crypto.subtle.generateKey(
-      {
-        name: "RSASSA-PKCS1-v1_5",
-        modulusLength: 2048,
-        publicExponent: new Uint8Array([1, 0, 1]),
-        hash: "SHA-256",
-      },
-      true,
-      ["sign", "verify"],
-    ) as CryptoKeyPair;
-    identitySigningKey = pair.privateKey;
-    const publicJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
-    identityJwksJson = JSON.stringify({
-      keys: [{ ...publicJwk, kid: "identity-test-key", alg: "RS256", use: "sig" }],
-    });
-  });
 
   function identityBindings(overrides: Partial<Env> = {}): Env {
     return testBindings({
       GOOGLE_OIDC_CLIENT_ID: GOOGLE_CLIENT,
       APPLE_SERVICES_ID: APPLE_CLIENT,
       IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
-      IDENTITY_TEST_JWKS_JSON: identityJwksJson,
       ...overrides,
     } as unknown as Partial<Env>);
   }
 
-  async function mintIdToken({
-    provider = "google",
-    audience = GOOGLE_CLIENT,
-    subject = "subject-1234567890",
-    expiresInSeconds = 600,
-    tamper = false,
-  } = {}): Promise<string> {
-    const b64 = (value: object | Uint8Array): string => {
-      const bytes = value instanceof Uint8Array
-        ? value
-        : new TextEncoder().encode(JSON.stringify(value));
-      let raw = "";
-      for (const byte of bytes) raw += String.fromCharCode(byte);
-      return btoa(raw).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
-    };
-    const header = { alg: "RS256", kid: "identity-test-key", typ: "JWT" };
-    const payload = {
-      iss: provider === "google" ? "https://accounts.google.com" : "https://appleid.apple.com",
-      aud: audience,
-      sub: subject,
-      exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
-      iat: Math.floor(Date.now() / 1000),
-    };
-    const signingInput = `${b64(header)}.${b64(payload)}`;
-    const signature = new Uint8Array(await crypto.subtle.sign(
-      "RSASSA-PKCS1-v1_5",
-      identitySigningKey,
-      new TextEncoder().encode(signingInput),
-    ));
-    if (tamper) signature[0] = signature[0]! ^ 0xff;
-    return `${signingInput}.${b64(signature)}`;
+  async function deliveredHostedProof(
+    runtimeEnv: Env,
+    provider: "apple" | "google",
+    linkKeyHex: string,
+  ): Promise<string> {
+    const state = encodeBase64Url(crypto.getRandomValues(new Uint8Array(48)));
+    const proof = encodeBase64Url(crypto.getRandomValues(new Uint8Array(48)));
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 5 * 60 * 1_000).toISOString();
+    if (provider === "apple") {
+      await runtimeEnv.USAGE_MONITOR_DB.prepare(
+        `INSERT INTO apple_signin_handoffs
+           (state, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(state, linkKeyHex, proof, now.toISOString(), expiresAt, now.toISOString()).run();
+    } else {
+      await runtimeEnv.USAGE_MONITOR_DB.prepare(
+        `INSERT INTO google_signin_handoffs
+           (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, NULL, ?, ?, ?, ?, ?)`,
+      ).bind(state, linkKeyHex, proof, now.toISOString(), expiresAt, now.toISOString()).run();
+    }
+    return proof;
   }
 
   async function identityEnroll(
-    idToken: string,
+    linkKeyHex: string,
     provider = "google",
     runtimeEnv: Env | null = null,
   ): Promise<Response> {
+    const effectiveEnv = runtimeEnv ?? identityBindings();
     return api("/api/v1/enroll", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         consentVersion: "privacy-safe-telemetry-v0.1",
         syntheticOnly: false,
-        identity: { provider, idToken },
+        identity: {
+          provider,
+          proof: await deliveredHostedProof(
+            effectiveEnv,
+            provider as "apple" | "google",
+            linkKeyHex,
+          ),
+        },
       }),
-    }, runtimeEnv ?? identityBindings());
+    }, effectiveEnv);
   }
 
   it("enrolls open-mode production participants with grant-backed eligibility", async () => {
@@ -1478,7 +1465,11 @@ describe("synthetic usage monitor service", () => {
         syntheticOnly: false,
         identity: {
           provider: "google",
-          idToken: await mintIdToken({ subject: "open-mode-primary" }),
+          proof: await deliveredHostedProof(
+            env,
+            "google",
+            await sha256Hex("test-open-mode-primary"),
+          ),
         },
       }),
     }, env);
@@ -1507,7 +1498,11 @@ describe("synthetic usage monitor service", () => {
         syntheticOnly: true,
         identity: {
           provider: "google",
-          idToken: await mintIdToken({ subject: "open-mode-synthetic" }),
+          proof: await deliveredHostedProof(
+            env,
+            "google",
+            await sha256Hex("test-open-mode-synthetic"),
+          ),
         },
       }),
     }, env);
@@ -1615,18 +1610,18 @@ describe("synthetic usage monitor service", () => {
     expect(eligible?.total).toBe(1);
   });
 
-  it("bounds enrollment and recovery without persisting or logging client identifiers", async () => {
+  it("separates coarse and per-client enrollment, sign-in, and recovery limits without identifiers", async () => {
     const limiterKeys: string[] = [];
-    const blockedLimiter = {
-      async limit(input: { key: string }): Promise<{ success: boolean }> {
-        limiterKeys.push(input.key);
-        return { success: false };
-      },
-    } satisfies RateLimit;
     const allowedLimiter = {
       async limit(input: { key: string }): Promise<{ success: boolean }> {
         limiterKeys.push(input.key);
         return { success: true };
+      },
+    } satisfies RateLimit;
+    const clientBlockedLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: false };
       },
     } satisfies RateLimit;
     const warnings: string[] = [];
@@ -1646,8 +1641,10 @@ describe("synthetic usage monitor service", () => {
           syntheticOnly: false,
         }),
       }, testBindings({
-        ENROLLMENT_RATE_LIMIT: blockedLimiter,
+        ENROLLMENT_RATE_LIMIT: allowedLimiter,
         RECOVERY_RATE_LIMIT: allowedLimiter,
+        CLIENT_ATTEMPT_RATE_LIMIT: clientBlockedLimiter,
+        IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
       }));
       expect(enrollment.status).toBe(429);
 
@@ -1661,9 +1658,23 @@ describe("synthetic usage monitor service", () => {
         body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: recoveryAttemptId() }),
       }, testBindings({
         ENROLLMENT_RATE_LIMIT: allowedLimiter,
-        RECOVERY_RATE_LIMIT: blockedLimiter,
+        RECOVERY_RATE_LIMIT: allowedLimiter,
+        CLIENT_ATTEMPT_RATE_LIMIT: clientBlockedLimiter,
+        IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
       }));
       expect(recovery.status).toBe(429);
+      const signInStart = await api("/api/v1/identity/google/start", {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": "203.0.113.9",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }, identityBindings({
+        ENROLLMENT_RATE_LIMIT: allowedLimiter,
+        CLIENT_ATTEMPT_RATE_LIMIT: allowedLimiter,
+      }));
+      expect(signInStart.status).toBe(503);
       const malformedPath = await api(
         "/api/v1/contributions/PRIVATE_PATH_CANARY",
         { headers: { authorization: "Bearer PRIVATE_CAPABILITY_CANARY" } },
@@ -1673,10 +1684,19 @@ describe("synthetic usage monitor service", () => {
       console.warn = originalWarn;
     }
     expect(warnings.join("\n")).not.toContain("PRIVATE_IP_CANARY");
-    expect(limiterKeys).toEqual([
+    expect(limiterKeys).toContain(
       "usage-monitor:enrollment:global",
-      "usage-monitor:recovery:global",
-    ]);
+    );
+    expect(limiterKeys).toContain("usage-monitor:recovery:global");
+    expect(limiterKeys).toContain("usage-monitor:sign_in_start:global");
+    const clientKeys = limiterKeys.filter((key) => key.includes(":client:"));
+    expect(clientKeys).toHaveLength(3);
+    for (const key of clientKeys) {
+      expect(key).toMatch(/:client:[0-9a-f]{64}$/u);
+      expect(key).not.toContain("PRIVATE_IP_CANARY");
+      expect(key).not.toContain("203.0.113.9");
+    }
+    expect(new Set(clientKeys).size).toBe(3);
     expect(warnings.join("\n")).not.toContain("PRIVATE_PATH_CANARY");
     expect(warnings.join("\n")).not.toContain("PRIVATE_CAPABILITY_CANARY");
     const attemptsTable = await testBindings().USAGE_MONITOR_DB.prepare(
@@ -1737,6 +1757,205 @@ describe("synthetic usage monitor service", () => {
         ongoingDeviceUploadRegistration: true,
       },
     });
+  });
+
+  it("edge-cache-enables only published immutable community snapshots", async () => {
+    const publicReadKeys: string[] = [];
+    const blockedPublicReadLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        publicReadKeys.push(input.key);
+        return { success: false };
+      },
+    } satisfies RateLimit;
+    const limited = await api("/api/v1/stats/aggregate", {}, testBindings({
+      PUBLIC_READ_RATE_LIMIT: blockedPublicReadLimiter,
+    }));
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("cache-control")).toBe("no-store");
+    expect(publicReadKeys).toEqual([
+      expect.stringMatching(/^usage-monitor:public_aggregate_read:client:[0-9a-f]{64}$/u),
+    ]);
+
+    const unavailable = await api("/api/v1/stats/aggregate");
+    expect(unavailable.status).toBe(200);
+    expect(unavailable.headers.get("cache-control")).toBe("no-store");
+    expect(unavailable.headers.get("etag")).toBeNull();
+
+    await seedPublishedSnapshotWithNoCells();
+    const published = await api("/api/v1/stats/aggregate");
+    expect(published.status).toBe(200);
+    const etag = published.headers.get("etag");
+    expect(etag).toBe('"community-snapshot-community-weekly:2026-07-20-r1"');
+    expect(published.headers.get("cache-control")).toBe(
+      "public, max-age=0, must-revalidate, s-maxage=60",
+    );
+
+    const conditional = await api("/api/v1/community/insights", {
+      headers: { "if-none-match": etag! },
+    });
+    expect(conditional.status).toBe(304);
+    expect(await conditional.text()).toBe("");
+    expect(conditional.headers.get("etag")).toBe(etag);
+
+    const participant = await enroll();
+    const personal = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    expect(personal.status).toBe(200);
+    expect(personal.headers.get("cache-control")).toBe("no-store");
+    const unauthenticatedAdmin = await api("/api/v1/admin/overview");
+    expect(unauthenticatedAdmin.status).toBe(503);
+    expect(unauthenticatedAdmin.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("does not cache suppressed community snapshots", async () => {
+    await seedSealedSuppressedSnapshot();
+    const response = await api("/api/v1/stats/aggregate");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("etag")).toBeNull();
+  });
+
+  it("keeps operations owner-gated and exposes only bounded audited controls", async () => {
+    const notConfigured = await api("/api/v1/admin/overview");
+    expect(notConfigured.status).toBe(503);
+    await expect(notConfigured.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_NOT_CONFIGURED" },
+    });
+
+    const participant = await enrollTelemetry();
+    const adminIdentityKey = "a".repeat(64);
+    const otherIdentityKey = "b".repeat(64);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+
+    const denied = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      testBindings({ ADMIN_IDENTITY_LINK_KEY: otherIdentityKey }),
+    );
+    expect(denied.status).toBe(403);
+    await expect(denied.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_REQUIRED" },
+    });
+
+    const failedRequest = await api("/api/v1/this-route-does-not-exist");
+    expect(failedRequest.status).toBe(404);
+    const failedBody = await failedRequest.json<{
+      error: { requestId: string; code: string };
+    }>();
+    expect(failedBody.error.code).toBe("NOT_FOUND");
+
+    const ownerEnv = testBindings({ ADMIN_IDENTITY_LINK_KEY: adminIdentityKey });
+    const overview = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      ownerEnv,
+    );
+    expect(overview.status).toBe(200);
+    await expect(overview.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.1",
+      collection: {
+        state: "operational",
+        enrollment: true,
+        uploadRegistration: true,
+        processing: true,
+        publication: true,
+      },
+      counts: {
+        participants: { active: 1 },
+        contributions: {
+          telemetry: { total: 0 },
+          storedTelemetryRecords: 0,
+        },
+      },
+      errors: { sampled: true, capacity: 256 },
+    });
+
+    const csrfRejected = await api(
+      "/api/v1/admin/action",
+      {
+        method: "POST",
+        headers: {
+          ...personalHeaders(participant),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ action: "run_maintenance" }),
+      },
+      ownerEnv,
+    );
+    expect(csrfRejected.status).toBe(403);
+
+    const changed = await api(
+      "/api/v1/admin/action",
+      {
+        method: "POST",
+        headers: {
+          ...personalHeaders(participant, { csrf: true }),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          action: "set_collection_controls",
+          expectedRevision: 1,
+          enrollment: true,
+          uploadRegistration: true,
+          processing: true,
+          publication: false,
+          reasonCode: "maintenance",
+        }),
+      },
+      ownerEnv,
+    );
+    expect(changed.status).toBe(200);
+    await expect(changed.json()).resolves.toMatchObject({
+      action: "set_collection_controls",
+      collection: { state: "degraded", publication: false, revision: 2 },
+    });
+    const audit = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT action, outcome, details_json FROM admin_action_audit
+        ORDER BY id DESC LIMIT 1`,
+    ).first<{ action: string; outcome: string; details_json: string }>();
+    expect(audit).toMatchObject({
+      action: "set_collection_controls",
+      outcome: "success",
+    });
+    expect(audit?.details_json).toContain("maintenance");
+
+    const conflict = await api(
+      "/api/v1/admin/action",
+      {
+        method: "POST",
+        headers: {
+          ...personalHeaders(participant, { csrf: true }),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          action: "set_collection_controls",
+          expectedRevision: 1,
+          enrollment: true,
+          uploadRegistration: true,
+          processing: true,
+          publication: true,
+          reasonCode: "maintenance",
+        }),
+      },
+      ownerEnv,
+    );
+    expect(conflict.status).toBe(409);
+    await expect(conflict.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_ACTION_CONFLICT" },
+    });
+    const controls = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT revision, publication_enabled FROM collection_controls WHERE singleton = 1",
+    ).first<{ revision: number; publication_enabled: number }>();
+    expect(controls).toEqual({ revision: 2, publication_enabled: 0 });
+    const conflictAudit = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT outcome, details_json FROM admin_action_audit
+        ORDER BY id DESC LIMIT 1`,
+    ).first<{ outcome: string; details_json: string }>();
+    expect(conflictAudit?.outcome).toBe("failure");
+    expect(conflictAudit?.details_json).toContain("ADMIN_ACTION_CONFLICT");
   });
 
   it("independently contains collection while preserving participant rights", async () => {
@@ -2542,6 +2761,81 @@ describe("synthetic usage monitor service", () => {
         },
       ],
     });
+
+    const contributionRows = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT id, declared_record_count, accepted_record_count,
+              server_priced_event_count,
+              server_partially_priced_event_count,
+              server_unpriced_event_count
+         FROM telemetry_contributions
+        WHERE participant_id = ?
+        ORDER BY created_at, id`,
+    ).bind(participant.participantId).all<{
+      id: string;
+      declared_record_count: number;
+      accepted_record_count: number;
+      server_priced_event_count: number;
+      server_partially_priced_event_count: number;
+      server_unpriced_event_count: number;
+    }>();
+    expect(contributionRows.results).toMatchObject([
+      {
+        id: accepted.contributionId,
+        declared_record_count: 2,
+        accepted_record_count: 2,
+        server_priced_event_count: 1,
+      },
+      {
+        id: secondAccepted.contributionId,
+        declared_record_count: 3,
+        accepted_record_count: 1,
+        server_priced_event_count: 0,
+      },
+    ]);
+
+    const baseDb = testBindings().USAGE_MONITOR_DB;
+    const profileQueries: string[] = [];
+    const profileDb = d1PrepareProxy(baseDb, (query) => {
+      profileQueries.push(query);
+      return baseDb.prepare(query);
+    });
+    const boundedProfile = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    }, testBindings({ USAGE_MONITOR_DB: profileDb }));
+    expect(boundedProfile.status).toBe(200);
+    expect(profileQueries.some((query) => (
+      query.includes("origin_contribution_id")
+    ))).toBe(false);
+
+    await baseDb.prepare(
+      `UPDATE telemetry_contributions
+          SET accepted_record_count = NULL,
+              server_pricing_method_version = NULL,
+              server_price_registry_version = NULL,
+              server_price_registry_sha256 = NULL
+        WHERE id = ? AND participant_id = ?`,
+    ).bind(accepted.contributionId, participant.participantId).run();
+    const repairQueries: string[] = [];
+    const repairDb = d1PrepareProxy(baseDb, (query) => {
+      repairQueries.push(query);
+      return baseDb.prepare(query);
+    });
+    const repairedProfile = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    }, testBindings({ USAGE_MONITOR_DB: repairDb }));
+    expect(repairedProfile.status).toBe(200);
+    const repairedBody = await repairedProfile.json<{
+      contributions: Array<{ contributionId: string; recordCounts: object }>;
+    }>();
+    expect(repairedBody.contributions[0]).toMatchObject({
+      contributionId: accepted.contributionId,
+      recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
+    });
+    expect(repairQueries.some((query) => (
+      query.includes("accepted_record_count IS NULL")
+        && query.includes("RETURNING *")
+    ))).toBe(true);
+
     for (const forbidden of [
       "r2_key", "plaintext_digest", "envelope_digest", "datasetId",
       "accountTrackId", "eligibilityUnitId", "recoveryCode", "csrfToken",
@@ -3946,6 +4240,121 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
+  it("retains indeterminate telemetry quarantine objects after committed ingest accounting fails", async () => {
+    const participant = await enrollTelemetry();
+    const rawEnvelope = JSON.stringify(
+      await encrypt(telemetryFixture("e"), true),
+    );
+    const authorization = await registerUpload(participant, rawEnvelope);
+    const baseDb = testBindings().USAGE_MONITOR_DB;
+    let ingestBatchCommitted = false;
+    let accountingFailureInjected = false;
+    const failingDb = new Proxy(baseDb, {
+      get(target, property) {
+        if (property === "batch") {
+          return async (statements: D1PreparedStatement[]) => {
+            const result = await target.batch(statements);
+            ingestBatchCommitted = true;
+            return result;
+          };
+        }
+        if (property === "prepare") {
+          return (query: string) => {
+            if (ingestBatchCommitted
+                && !accountingFailureInjected) {
+              accountingFailureInjected = true;
+              throw new Error("injected post-commit accounting failure");
+            }
+            return target.prepare(query);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const request = {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    } satisfies RequestInit;
+
+    const recovered = await api(
+      "/api/v1/contributions",
+      request,
+      testBindings({ USAGE_MONITOR_DB: failingDb }),
+    );
+    expect(ingestBatchCommitted).toBe(true);
+    expect(accountingFailureInjected).toBe(true);
+    expect(recovered.status).toBe(202);
+    expect(recovered.headers.get("idempotency-replayed")).toBe("true");
+    await expect(recovered.json()).resolves.toMatchObject({
+      status: "accepted",
+      replayed: true,
+    });
+
+    const accepted = await baseDb.prepare(
+      `SELECT id, status, r2_key, declared_record_count, accepted_record_count
+         FROM telemetry_contributions
+        WHERE participant_id = ?`,
+    ).bind(participant.participantId).first<{
+      id: string;
+      status: string;
+      r2_key: string;
+      declared_record_count: number;
+      accepted_record_count: number | null;
+    }>();
+    expect(accepted).toMatchObject({
+      status: "accepted",
+      declared_record_count: 2,
+      accepted_record_count: 2,
+    });
+    expect(await testBindings().QUARANTINE.head(accepted!.r2_key)).not.toBeNull();
+
+    const replayAuthorization = await registerUpload(participant, rawEnvelope);
+    const replay = await api("/api/v1/contributions", {
+      ...request,
+      headers: {
+        ...request.headers,
+        authorization: `Upload ${replayAuthorization.uploadAuthorization}`,
+      },
+    });
+    expect(replay.status).toBe(202);
+    expect(replay.headers.get("idempotency-replayed")).toBe("true");
+    await expect(replay.json()).resolves.toMatchObject({
+      contributionId: accepted!.id,
+      status: "accepted",
+      replayed: true,
+    });
+    expect(await testBindings().QUARANTINE.head(accepted!.r2_key)).not.toBeNull();
+
+    await baseDb.prepare(
+      `UPDATE telemetry_contributions
+          SET created_at = '2026-07-17T00:00:00.000Z'
+        WHERE id = ?`,
+    ).bind(accepted!.id).run();
+    await expect(runBackendLifecycle(
+      baseDb,
+      testBindings().DELETION_LEDGER,
+      testBindings().QUARANTINE,
+      Date.parse("2026-07-25T00:00:00.000Z"),
+    )).resolves.toMatchObject({ quarantineObjectsDeleted: 1 });
+    expect(await testBindings().QUARANTINE.head(accepted!.r2_key)).toBeNull();
+    const retainedMetadata = await baseDb.prepare(
+      `SELECT status, quarantine_deleted_at
+         FROM telemetry_contributions WHERE id = ?`,
+    ).bind(accepted!.id).first<{
+      status: string;
+      quarantine_deleted_at: string | null;
+    }>();
+    expect(retainedMetadata).toEqual({
+      status: "accepted",
+      quarantine_deleted_at: expect.stringMatching(/Z$/u),
+    });
+  });
+
   it("does not mark quarantine retention complete when R2 deletion fails", async () => {
     const participant = await enrollTelemetry();
     const accepted = await uploadEnvelope(
@@ -4170,6 +4579,24 @@ describe("synthetic usage monitor service", () => {
   });
 
   describe("mandatory hosted identity", () => {
+    it("pins production hosted-identity callbacks to the configured public origin", async () => {
+      const production = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+      } as unknown as Partial<Env>);
+      const response = await handleRequest(
+        new Request(
+          "https://unexpected-worker.example/api/v1/identity/google/callback?state=x&code=y",
+        ),
+        production,
+      );
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "NOT_FOUND" },
+      });
+    });
+
     it("requires identity for production enrollment and recovery", async () => {
       const production = identityBindings({
         ENVIRONMENT: "production" as Env["ENVIRONMENT"],
@@ -4203,7 +4630,8 @@ describe("synthetic usage monitor service", () => {
 
     it("enrolls, stores only the pairwise hash, and reattaches the same participant", async () => {
       const subject = "google-subject-alpha";
-      const first = await identityEnroll(await mintIdToken({ subject }));
+      const linkKey = await sha256Hex(`test-hosted-identity\0${subject}`);
+      const first = await identityEnroll(linkKey);
       expect(first.status).toBe(201);
       const firstBody = await first.json<{ participantId: string; recoveryCode: string }>();
 
@@ -4213,7 +4641,7 @@ describe("synthetic usage monitor service", () => {
       expect(row?.identity_link_key).toMatch(/^[0-9a-f]{64}$/u);
       expect(row?.identity_link_key.includes(subject)).toBe(false);
 
-      const second = await identityEnroll(await mintIdToken({ subject }));
+      const second = await identityEnroll(linkKey);
       expect(second.status).toBe(201);
       const secondBody = await second.json<{ participantId: string; recoveryCode: string }>();
       expect(secondBody.participantId).toBe(firstBody.participantId);
@@ -4225,46 +4653,45 @@ describe("synthetic usage monitor service", () => {
       expect(count?.total).toBe(1);
     });
 
-    it("accepts Apple tokens and rejects invalid identities fail-closed", async () => {
+    it("accepts an Apple proof and rejects invalid identities fail-closed", async () => {
       const apple = await identityEnroll(
-        await mintIdToken({ provider: "apple", audience: APPLE_CLIENT }),
+        await sha256Hex("test-hosted-identity\0apple-subject"),
         "apple",
       );
       expect(apple.status).toBe(201);
 
-      for (const [token, provider] of [
-        [await mintIdToken({ audience: "wrong-audience" }), "google"],
-        [await mintIdToken({ expiresInSeconds: -3600 }), "google"],
-        [await mintIdToken({ tamper: true }), "google"],
-        ["not-a-jwt", "google"],
-      ] as const) {
-        const rejected = await identityEnroll(token, provider);
+      for (const identity of [
+        { provider: "google", proof: "x".repeat(64) },
+        { provider: "google", proof: "too-short" },
+        { provider: "github", proof: "x".repeat(64) },
+        { provider: "google", idToken: "not-a-jwt" },
+      ]) {
+        const rejected = await api("/api/v1/enroll", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            consentVersion: "privacy-safe-telemetry-v0.1",
+            syntheticOnly: false,
+            identity,
+          }),
+        }, identityBindings());
         expect(rejected.status).toBe(401);
         expect(await rejected.json()).toMatchObject({
           error: { code: "IDENTITY_TOKEN_INVALID" },
         });
       }
-
-      const unconfigured = await identityEnroll(
-        await mintIdToken(),
-        "google",
-        identityBindings({ GOOGLE_OIDC_CLIENT_ID: "" as Env["GOOGLE_OIDC_CLIENT_ID"] }),
-      );
-      expect(unconfigured.status).toBe(503);
-      expect(await unconfigured.json()).toMatchObject({
-        error: { code: "IDENTITY_CONFIGURATION_INVALID" },
-      });
     });
 
     it("refuses reattachment during deletion and unlinks after deletion", async () => {
       const subject = "google-subject-deleting";
-      const first = await identityEnroll(await mintIdToken({ subject }));
+      const linkKey = await sha256Hex(`test-hosted-identity\0${subject}`);
+      const first = await identityEnroll(linkKey);
       expect(first.status).toBe(201);
       const firstBody = await first.json<{ participantId: string }>();
       await testBindings().USAGE_MONITOR_DB.prepare(
         "UPDATE participants SET state = 'deleting' WHERE id = ?",
       ).bind(firstBody.participantId).run();
-      const duringDeletion = await identityEnroll(await mintIdToken({ subject }));
+      const duringDeletion = await identityEnroll(linkKey);
       expect(duringDeletion.status).toBe(409);
 
       const { finishParticipantDeletion } = await import("../src/repository");
@@ -4272,7 +4699,7 @@ describe("synthetic usage monitor service", () => {
         testBindings().USAGE_MONITOR_DB,
         firstBody.participantId,
       );
-      const afterDeletion = await identityEnroll(await mintIdToken({ subject }));
+      const afterDeletion = await identityEnroll(linkKey);
       expect(afterDeletion.status).toBe(201);
       const freshBody = await afterDeletion.json<{ participantId: string }>();
       expect(freshBody.participantId).not.toBe(firstBody.participantId);

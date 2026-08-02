@@ -35,6 +35,8 @@ export interface LifecyclePassResult {
   restoreReplayComplete: boolean;
 }
 
+type LifecyclePhaseGuard = () => Promise<boolean>;
+
 function canonicalInstant(epoch: number): string {
   return new Date(epoch).toISOString();
 }
@@ -248,11 +250,20 @@ export async function runBackendLifecycle(
   ledger: D1Database,
   quarantine: R2Bucket,
   nowEpoch = Date.now(),
+  beforeDestructivePhase?: LifecyclePhaseGuard,
 ): Promise<LifecyclePassResult> {
+  let ownershipLost = false;
+  const assertOwnership = async (): Promise<void> => {
+    if (beforeDestructivePhase === undefined) return;
+    if (await beforeDestructivePhase()) return;
+    ownershipLost = true;
+    throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
+  };
   const startedAt = canonicalInstant(nowEpoch);
   const quarantineCutoffAt = canonicalInstant(
     nowEpoch - QUARANTINE_RETENTION_MILLISECONDS,
   );
+  await assertOwnership();
   await db.prepare(
     `UPDATE retention_state
         SET state = 'running',
@@ -261,17 +272,23 @@ export async function runBackendLifecycle(
       WHERE singleton = 1`,
   ).bind(startedAt).run();
   try {
+    // Replay can delete whole participant data sets; renew or fence before it.
+    await assertOwnership();
     const restoreReplay = await replayDeletionTombstones(
       db,
       ledger,
       quarantine,
     );
+    // R2 quarantine removal is a distinct destructive phase. An owner that
+    // lost its outer maintenance lease must not enter it.
+    await assertOwnership();
     const quarantineRetention = await deleteDueQuarantineObjects(
       db,
       quarantine,
       quarantineCutoffAt,
     );
     const completedAt = new Date().toISOString();
+    await assertOwnership();
     await db.prepare(
       `UPDATE retention_state
           SET state = 'completed',
@@ -301,6 +318,9 @@ export async function runBackendLifecycle(
       restoreReplayComplete: restoreReplay.complete,
     };
   } catch (error) {
+    // A successor may be running now. The old pass must not rewrite lifecycle
+    // state to failed after its lease guard says it no longer owns the pass.
+    if (ownershipLost) throw error;
     await db.prepare(
       `UPDATE retention_state
           SET state = 'failed',

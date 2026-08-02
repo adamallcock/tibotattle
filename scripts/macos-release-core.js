@@ -102,6 +102,10 @@ const REQUIRED_SIGNED_RELEASE_ASSURANCES = Object.freeze([
   "dmgNotarizationAccepted",
   "dmgTicketStapled",
 ]);
+const REQUIRED_NODE_RUNTIME_ENTITLEMENTS = Object.freeze([
+  "com.apple.security.cs.allow-jit",
+  "com.apple.security.cs.allow-unsigned-executable-memory",
+]);
 
 function fail(message, code = "MACOS_RELEASE_FAILED") {
   const error = new Error(message);
@@ -119,6 +123,119 @@ function stableValue(value) {
 
 function stableJson(value) {
   return `${JSON.stringify(stableValue(value), null, 2)}\n`;
+}
+
+function releaseGit(repositoryRoot, arguments_) {
+  return spawnSync("/usr/bin/git", ["-C", repositoryRoot, ...arguments_], {
+    encoding: "utf8",
+    env: releaseEnvironment(),
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+function requiredReleaseGitOutput(repositoryRoot, arguments_, code) {
+  const result = releaseGit(repositoryRoot, arguments_);
+  if (result.error || result.status !== 0) {
+    fail("Unable to establish signed-release source provenance", code);
+  }
+  return String(result.stdout ?? "").trim();
+}
+
+/**
+ * A notarized DMG must name an immutable source revision. Refuse a dirty,
+ * lightweight-tagged, or untagged checkout instead of relying on the local
+ * filename or a build digest that cannot identify the public source release.
+ */
+export function readMacOSReleaseSourceProvenance({
+  repositoryRoot = REPOSITORY_ROOT,
+} = {}) {
+  const root = resolve(repositoryRoot);
+  const status = releaseGit(
+    root,
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+  );
+  if (status.error || status.status !== 0) {
+    fail("Unable to establish signed-release source provenance", "MACOS_RELEASE_PROVENANCE_INVALID");
+  }
+  if (status.stdout?.trim() !== "") {
+    fail(
+      "A signed release requires a clean source checkout",
+      "MACOS_RELEASE_SOURCE_DIRTY",
+    );
+  }
+  const commit = requiredReleaseGitOutput(
+    root,
+    ["rev-parse", "HEAD"],
+    "MACOS_RELEASE_PROVENANCE_INVALID",
+  );
+  if (!/^[0-9a-f]{40,64}$/u.test(commit)) {
+    fail("Release source commit is invalid", "MACOS_RELEASE_PROVENANCE_INVALID");
+  }
+  const tag = requiredReleaseGitOutput(
+    root,
+    ["describe", "--exact-match", "--tags", "HEAD"],
+    "MACOS_RELEASE_TAG_REQUIRED",
+  );
+  if (!/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(tag)
+      || tag.includes("..")
+      || tag.startsWith("/")
+      || tag.endsWith("/")) {
+    fail("Release source tag is invalid", "MACOS_RELEASE_PROVENANCE_INVALID");
+  }
+  const objectType = requiredReleaseGitOutput(
+    root,
+    ["for-each-ref", "--format=%(objecttype)", `refs/tags/${tag}`],
+    "MACOS_RELEASE_PROVENANCE_INVALID",
+  );
+  if (objectType !== "tag") {
+    fail(
+      "A signed release requires an annotated Git tag",
+      "MACOS_RELEASE_TAG_REQUIRED",
+    );
+  }
+  const taggedCommit = requiredReleaseGitOutput(
+    root,
+    ["rev-parse", `${tag}^{}`],
+    "MACOS_RELEASE_PROVENANCE_INVALID",
+  );
+  if (taggedCommit !== commit) {
+    fail(
+      "Release tag does not identify HEAD",
+      "MACOS_RELEASE_PROVENANCE_INVALID",
+    );
+  }
+  return Object.freeze({ commit, tag });
+}
+
+/**
+ * Node requires these two hardened-runtime exceptions to execute V8. Dynamic
+ * library validation is unrelated, however, and would permit an avoidable
+ * code-loading class. Keep the entitlement file minimal and fail release
+ * signing if it changes.
+ */
+export async function validateNodeRuntimeEntitlements(
+  entitlementsPath = NODE_ENTITLEMENTS,
+) {
+  let source;
+  try {
+    source = await readFile(entitlementsPath, "utf8");
+  } catch {
+    fail("Node runtime entitlements are unavailable", "MACOS_NODE_ENTITLEMENTS_INVALID");
+  }
+  const entries = [...source.matchAll(
+    /<key>([^<]+)<\/key>\s*<(true|false)\/>/gu,
+  )].map((match) => [match[1], match[2]]);
+  if (entries.length !== REQUIRED_NODE_RUNTIME_ENTITLEMENTS.length
+      || entries.some(([key, value]) => value !== "true"
+        || !REQUIRED_NODE_RUNTIME_ENTITLEMENTS.includes(key))
+      || REQUIRED_NODE_RUNTIME_ENTITLEMENTS.some((key) =>
+        !entries.some(([candidate]) => candidate === key))) {
+    fail(
+      "Node runtime entitlements include an unsupported capability",
+      "MACOS_NODE_ENTITLEMENTS_INVALID",
+    );
+  }
+  return Object.freeze({ path: resolve(entitlementsPath) });
 }
 
 function sanitize(text, secrets = []) {
@@ -941,6 +1058,13 @@ function validateSignedReleaseManifest(manifest, label) {
       || !manifest.artifact.fileName.endsWith(".dmg")
       || typeof manifest.artifact?.sha256 !== "string"
       || !/^[a-f0-9]{64}$/u.test(manifest.artifact.sha256)
+      || typeof manifest.source?.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(manifest.source.commit)
+      || typeof manifest.source?.tag !== "string"
+      || !/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(manifest.source.tag)
+      || manifest.source.tag.includes("..")
+      || manifest.source.tag.startsWith("/")
+      || manifest.source.tag.endsWith("/")
       || REQUIRED_SIGNED_RELEASE_ASSURANCES.some(
         (key) => manifest.assurances?.[key] !== true,
       )
@@ -1157,6 +1281,7 @@ export async function developerIDSignMacOSApp(appPath, {
   sign(`${SPARKLE_FRAMEWORK_PREFIX}/Versions/B/Updater.app`);
   sign(SPARKLE_FRAMEWORK_PREFIX);
   sign(KEYTAR_EXECUTABLE);
+  await validateNodeRuntimeEntitlements();
   sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS });
   // The app bundle carries no entitlements of its own. Sign in with Apple is
   // a restricted entitlement that a Developer ID provisioning profile does
@@ -1601,6 +1726,7 @@ export async function releaseMacOSApp({
   environment = process.env,
   replace = false,
 }) {
+  const sourceProvenance = readMacOSReleaseSourceProvenance();
   const credentials = readMacOSReleaseCredentials(environment);
   const buildConfiguration =
     readMacOSReleaseBuildConfiguration(environment);
@@ -1772,6 +1898,7 @@ export async function releaseMacOSApp({
         sourceSha256:
           inspected.buildManifest.inputs.sourceSha256,
       },
+      source: sourceProvenance,
       privacy: {
         credentialsRecorded: false,
         identityRecorded: false,

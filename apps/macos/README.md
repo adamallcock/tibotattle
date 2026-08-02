@@ -28,15 +28,17 @@ a clean-profile smoke all succeed.
 4. A menu-bar status item appears alongside the window and the Dock icon. It is
    an additional affordance, not a replacement: the app stays a regular
    foreground application and installs no `LSUIElement` agent. The compact
-   title shows the primary seven-day allowance remaining only while the
-   companion reports live evidence; stale, unobserved, starting, and failed
-   states all show a neutral `–`, and an in-progress pass shows `…`. Two
-   disabled rows always name the current allowance and its freshness, so the
-   menu bar never displays a number it cannot justify. The item offers **Open
-   Dashboard**, **Analyze Local Usage**, **Show Usage Monitor Window**, and
-   **Quit Usage Monitor**; Quit uses the same graceful shutdown as the window's
-   own Quit control.
-5. Choose **Open Dashboard** and explicitly start local analysis.
+   title shows the primary observed quota lane only while the companion reports
+   fresh verified evidence; stale, unobserved, starting, and failed states all
+   show a neutral `–`, and an in-progress pass shows `…`. The menu lists every
+   supported observed quota lane. It hides stale percentages and reset times,
+   and shows a reset countdown only for fresh verified evidence. Its disabled
+   rows name the observation and freshness state, so the menu bar never
+   displays a number it cannot justify. The item offers one primary **Open
+   TiboTattle** destination, state-aware **Analyze/Update Local Usage**, and
+   **Quit TiboTattle**; Quit uses the same graceful shutdown as the window's own
+   Quit control.
+5. Choose **Open TiboTattle** and explicitly start local analysis.
 6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.
 7. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
@@ -58,9 +60,10 @@ a clean-profile smoke all succeed.
    item is installed. After an explicit reviewed first contribution, the user
    may enable six-hour contribution while the app remains open.
 
-Keep the app open while local analysis runs. Closing only the dashboard tab
-hides progress; reopen it from the app. Quitting the app stops the current pass,
-while already published checkpoints remain available on the next launch.
+Keep the app open while local analysis runs. Closing the TiboTattle window
+exits the app and stops the current pass; completed checkpoints remain
+available on the next launch. **Open in Browser** is a separate optional
+control in the app, not the primary dashboard destination.
 
 The troubleshooting-only local erase action moves only
 `~/Library/Application Support/Usage Monitor` to Trash after the companion has

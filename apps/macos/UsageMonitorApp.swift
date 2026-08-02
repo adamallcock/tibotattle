@@ -1394,7 +1394,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
 
-        Keep the app open while analysis runs. You may close and reopen the dashboard tab; quitting the app stops the current pass and preserves completed checkpoints.
+        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.
         """
         alert.addButton(withTitle: "Get Started")
         alert.addButton(withTitle: "Quit")
@@ -1736,8 +1736,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         menuBarStatus = MenuBarStatusController(
             productName: BundledProduct.displayName,
             actions: MenuBarStatusController.Actions(
-                openDashboard: { [weak self] in self?.openDashboard() },
-                showWindow: { [weak self] in self?.showMainWindow() },
+                openTiboTattle: { [weak self] in self?.openTiboTattle() },
                 quit: { [weak self] in self?.quitApplication() },
                 // The menu bar is the only surface always on screen, so it is
                 // where an update check has to be reachable. A build with no
@@ -1756,6 +1755,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             window?.makeKeyAndOrderFront(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// The menu bar's one primary destination. It always foregrounds the
+    /// regular TiboTattle window and, when the local companion is ready,
+    /// presents the embedded dashboard there rather than opening a browser.
+    private func openTiboTattle() {
+        showMainWindow()
+        if dashboardURL != nil {
+            openDashboard()
+        }
     }
 
     private func companionReady(_ url: URL, generation: Int) {

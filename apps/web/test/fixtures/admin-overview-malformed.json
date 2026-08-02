@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "admin-overview-v0.1",
+  "generatedAt": "2026-08-02T12:00:00.000Z",
+  "service": { "environment": "production" },
+  "collection": {
+    "state": "operational",
+    "revision": "seven",
+    "enrollment": true,
+    "uploadRegistration": true,
+    "processing": true,
+    "publication": true
+  },
+  "counts": {},
+  "lifecycle": {},
+  "reconciliation": {},
+  "snapshots": [],
+  "pendingHistoricalRebuilds": 0,
+  "errors": { "groups": [], "lookup": null },
+  "audit": []
+}

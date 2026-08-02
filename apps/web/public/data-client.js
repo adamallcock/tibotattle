@@ -160,7 +160,6 @@ const HOSTED_IDENTITY_ERROR_CODES = new Set([
   "IDENTITY_PROVIDER_UNAVAILABLE",
   "IDENTITY_RESULT_PENDING"
 ]);
-const MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH = 16_384;
 const HOSTED_SIGNIN_STATE = /^[A-Za-z0-9_-]{43,128}$/u;
 // The only two URLs this page will ever hand to window.open for sign-in. The
 // service builds them; this is the check that it built the one it claimed to.
@@ -242,11 +241,10 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function validHostedIdentity(identity) {
-  return hasExactKeys(identity, ["provider", "idToken"])
+  return hasExactKeys(identity, ["provider", "proof"])
     && HOSTED_IDENTITY_PROVIDERS.has(identity.provider)
-    && typeof identity.idToken === "string"
-    && identity.idToken.length > 0
-    && identity.idToken.length <= MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH;
+    && typeof identity.proof === "string"
+    && /^[A-Za-z0-9_-]{64}$/u.test(identity.proof);
 }
 
 /**
@@ -352,14 +350,13 @@ async function readHostedSignInResult(fetchImpl, provider, state) {
     throw hostedIdentityRequestError(response, payload);
   }
   if (payload?.schemaVersion !== schemaVersion
-      || typeof payload?.idToken !== "string"
-      || payload.idToken.length === 0
-      || payload.idToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
+      || typeof payload?.proof !== "string"
+      || !/^[A-Za-z0-9_-]{64}$/u.test(payload.proof)) {
     throw new Error(
-      `The service did not return a verifiable ${HOSTED_IDENTITY_LABELS[provider]} sign-in token.`
+      `The service did not return a usable ${HOSTED_IDENTITY_LABELS[provider]} sign-in proof.`
     );
   }
-  return Object.freeze({ provider, idToken: payload.idToken });
+  return Object.freeze({ provider, proof: payload.proof });
 }
 
 
@@ -2905,7 +2902,7 @@ export class CommunityClient {
     if (identity !== null) {
       body.identity = {
         provider: identity.provider,
-        idToken: identity.idToken
+        proof: identity.proof
       };
     }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;

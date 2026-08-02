@@ -19,8 +19,10 @@ export const REQUIRED_D1_BINDINGS = Object.freeze([
   }),
 ]);
 export const REQUIRED_RATE_LIMITS = Object.freeze([
-  "ENROLLMENT_RATE_LIMIT",
-  "RECOVERY_RATE_LIMIT",
+  Object.freeze({ name: "ENROLLMENT_RATE_LIMIT", limit: 20 }),
+  Object.freeze({ name: "RECOVERY_RATE_LIMIT", limit: 20 }),
+  Object.freeze({ name: "CLIENT_ATTEMPT_RATE_LIMIT", limit: 5 }),
+  Object.freeze({ name: "PUBLIC_READ_RATE_LIMIT", limit: 120 }),
 ]);
 
 const UUID_PATTERN =
@@ -61,12 +63,21 @@ function oneApiAssetRoute(value) {
 }
 
 function safeRateLimits(value) {
-  if (!exactNamedMembers(value, REQUIRED_RATE_LIMITS, "name")) return false;
+  if (!exactNamedMembers(
+    value,
+    REQUIRED_RATE_LIMITS.map((entry) => entry.name),
+    "name",
+  )) {
+    return false;
+  }
   const namespaceIds = value.map((entry) => entry.namespace_id);
   return namespaceIds.every((entry) => /^[1-9][0-9]{0,9}$/u.test(entry))
     && new Set(namespaceIds).size === namespaceIds.length
-    && value.every((entry) => entry.simple?.limit === 20
-      && entry.simple?.period === 60);
+    && REQUIRED_RATE_LIMITS.every((expected) => {
+      const configured = value.find((entry) => entry.name === expected.name);
+      return configured?.simple?.limit === expected.limit
+        && configured.simple?.period === 60;
+    });
 }
 
 function safeD1Bindings(value) {

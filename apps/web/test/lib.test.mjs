@@ -2003,12 +2003,12 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
 
   responsePayload = () => ({
     schemaVersion: "identity-google-result-v0.1",
-    idToken: "header.payload.signature"
+    proof: "P".repeat(64)
   });
   const identity = await client.identityGoogleResult(state);
   assert.deepEqual(identity, {
     provider: "google",
-    idToken: "header.payload.signature"
+    proof: "P".repeat(64)
   });
   const resultCall = calls.at(-1);
   assert.equal(resultCall.url, "/api/v1/identity/google/result");
@@ -2049,11 +2049,11 @@ test("hosted Google sign-in starts, polls, and refuses anything but Google's aut
   responseStatus = 200;
   responsePayload = () => ({
     schemaVersion: "identity-google-result-v0.1",
-    idToken: ""
+    proof: ""
   });
   await assert.rejects(
     client.identityGoogleResult(state),
-    /verifiable Google sign-in token/u
+    /usable Google sign-in proof/u
   );
 });
 
@@ -2106,7 +2106,7 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
   let responseStatus = 200;
   let responsePayload = () => ({
     schemaVersion: "identity-google-result-v0.1",
-    idToken: "header.payload.signature"
+    proof: "P".repeat(64)
   });
   const client = new CommunityClient({
     fetchImpl: async (url, options = {}) => {
@@ -2120,7 +2120,7 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
   const identity = await client.identityGoogleResult(state);
   assert.deepEqual(identity, {
     provider: "google",
-    idToken: "header.payload.signature"
+    proof: "P".repeat(64)
   });
   assert.equal(calls[0].url, "/api/v1/identity/google/result");
   assert.equal(calls[0].options.method, "POST");
@@ -2134,14 +2134,14 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
   assert.equal(calls[1].url, "/api/v1/enroll");
   assert.deepEqual(JSON.parse(calls[1].options.body).identity, {
     provider: "google",
-    idToken: "header.payload.signature"
+    proof: "P".repeat(64)
   });
   await client.enroll(null, "telemetry-contribution-v0.1", {
-    identity: { provider: "apple", idToken: "a.b.c" }
+    identity: { provider: "apple", proof: "A".repeat(64) }
   });
   assert.deepEqual(JSON.parse(calls[2].options.body).identity, {
     provider: "apple",
-    idToken: "a.b.c"
+    proof: "A".repeat(64)
   });
   assert.equal(
     Object.hasOwn(JSON.parse(calls[2].options.body), "deviceBootstrap"),
@@ -2149,13 +2149,13 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
   );
   await assert.rejects(
     client.enroll(null, "telemetry-contribution-v0.1", {
-      identity: { provider: "github", idToken: "a.b.c" }
+      identity: { provider: "github", proof: "A".repeat(64) }
     }),
     TypeError
   );
   await assert.rejects(
     client.enroll(null, "telemetry-contribution-v0.1", {
-      identity: { provider: "google", idToken: "a.b.c", extra: true }
+      identity: { provider: "google", proof: "A".repeat(64), extra: true }
     }),
     TypeError
   );
@@ -2229,12 +2229,12 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
 
   responsePayload = () => ({
     schemaVersion: "identity-apple-result-v0.1",
-    idToken: "header.payload.signature"
+    proof: "A".repeat(64)
   });
   const identity = await client.identityAppleResult(state);
   assert.deepEqual(identity, {
     provider: "apple",
-    idToken: "header.payload.signature"
+    proof: "A".repeat(64)
   });
   const resultCall = calls.at(-1);
   assert.equal(resultCall.url, "/api/v1/identity/apple/result");
@@ -2267,11 +2267,11 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
   responseStatus = 200;
   responsePayload = () => ({
     schemaVersion: "identity-apple-result-v0.1",
-    idToken: ""
+    proof: ""
   });
   await assert.rejects(
     client.identityAppleResult(state),
-    /verifiable Apple sign-in token/u
+    /usable Apple sign-in proof/u
   );
 });
 
@@ -3173,8 +3173,12 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(appSource, /This address is the backend-only service/);
   assert.match(
     appSource,
-    /Open TiboTattle from Applications and use the separate local dashboard tab/,
+    /Open TiboTattle from Applications and use its in-app window/,
   );
+  assert.match(html, /your dashboard in its own TiboTattle in-app window/u);
+  assert.match(html, /Use the TiboTattle in-app window/u);
+  assert.doesNotMatch(appSource, /dashboard tab|local tab|separate local dashboard/u);
+  assert.doesNotMatch(html, /dashboard tab|local tab|separate local dashboard/u);
   const loadBody = appSource.match(/async function loadLocalDashboard\(\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
   assert.doesNotMatch(loadBody, /demoDashboard/);
 });

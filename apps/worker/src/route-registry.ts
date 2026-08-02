@@ -33,6 +33,8 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   { pathname: "/api/v1/recover", id: "recover" },
   { pathname: "/api/v1/session", id: "session" },
   { pathname: "/api/v1/logout", id: "logout" },
+  { pathname: "/api/v1/admin/overview", id: "admin_overview" },
+  { pathname: "/api/v1/admin/action", id: "admin_action" },
   {
     pathname: "/api/v1/me/security-reset",
     id: "security_reset",

@@ -14,17 +14,17 @@ import Foundation
 //   * stale or absent evidence collapses to a neutral placeholder and the
 //     menu explains, in words, why there is no number.
 
-/// The exact seven-day allowance window the dashboard treats as primary: the
-/// weekly (10 080 minute) `codex` limit, preferring the primary slot. Mirrors
-/// `mainWeeklyQuotaTrack` in the web dashboard so both surfaces can never
-/// disagree about which window "the" allowance means.
-struct SevenDayAllowanceWindow: Equatable {
+/// One quota lane the local companion actually observed. The menu deliberately
+/// knows only the safe display category, remaining percentage, and reset time;
+/// it never exposes an account label, raw provider identifier, or inferred
+/// allowance.
+struct ObservedQuotaLane: Equatable {
+    let label: String
     let remainingPercent: Double
-    let planType: String?
     let resetAt: Date?
+    let isPrimary: Bool
 
-    /// Whole-percent rendering, matching the dashboard's quota card, which
-    /// also renders this window with zero decimal places.
+    /// Whole-percent rendering matches the dashboard quota cards.
     var roundedRemainingPercent: Int {
         Int(min(100, max(0, remainingPercent)).rounded())
     }
@@ -33,7 +33,7 @@ struct SevenDayAllowanceWindow: Equatable {
 /// The subset of `/api/local/overview` the menu bar reads. Everything else in
 /// that payload stays where it belongs: in the dashboard.
 struct LocalCompanionOverview: Equatable {
-    let window: SevenDayAllowanceWindow?
+    let lanes: [ObservedQuotaLane]
     let observedAt: Date?
     /// The companion's own vocabulary: `live`, `stale`, or `unavailable`.
     let freshnessStatus: String
@@ -81,9 +81,17 @@ struct MenuBarStatusSnapshot: Equatable {
 
     var phase: Phase = .starting
     var evidence: Evidence = .none
-    var window: SevenDayAllowanceWindow?
+    var lanes: [ObservedQuotaLane] = []
     var observedAt: Date?
     var failureSummary: String?
+
+    /// Mirrors the dashboard's primary selection while leaving every observed
+    /// lane visible in the expanded menu. When the companion has no primary
+    /// slot, the first observed lane is still a real local observation rather
+    /// than a fabricated fallback.
+    var primaryLane: ObservedQuotaLane? {
+        lanes.first(where: \.isPrimary) ?? lanes.first
+    }
 
     /// True only when the companion has published a loopback dashboard.
     var companionReachable: Bool {
@@ -95,10 +103,10 @@ struct MenuBarStatusSnapshot: Equatable {
     /// shown honestly right now" and the menu says which case applies.
     var title: String {
         if phase == .analyzing { return analyzingPlaceholder }
-        guard phase == .ready, evidence == .live, let window else {
+        guard phase == .ready, evidence == .live, let lane = primaryLane else {
             return unknownPlaceholder
         }
-        return "\(window.roundedRemainingPercent)%"
+        return "\(lane.roundedRemainingPercent)%"
     }
 
     /// Spoken by VoiceOver in place of the glyph and the terse title. The
@@ -110,17 +118,13 @@ struct MenuBarStatusSnapshot: Equatable {
 
     /// First disabled information row, and the tooltip's first line.
     var allowanceSummary: String {
-        guard let window else {
-            return "Seven-day allowance: not observed yet"
+        guard !lanes.isEmpty else {
+            return "No verified quota lanes observed yet"
         }
-        let remaining = "\(window.roundedRemainingPercent)% remaining"
-        // A number is presented as current only while the companion is
-        // actually reachable and reporting live evidence. Once it stops, the
-        // last reading is history and is labelled as such.
         guard companionReachable, evidence == .live else {
-            return "Seven-day allowance: \(remaining) when last observed"
+            return "Quota lanes were last observed, but are not current"
         }
-        return "Seven-day allowance: \(remaining)"
+        return "\(lanes.count) verified quota lane\(lanes.count == 1 ? "" : "s")"
     }
 
     /// Second disabled information row: why the title says what it says.
@@ -141,17 +145,50 @@ struct MenuBarStatusSnapshot: Equatable {
         switch evidence {
         case .live:
             guard let observedAt else {
-                return "Observed locally · live evidence"
+                return "Observed locally · verified current evidence"
             }
-            return "Observed \(relativeAge(observedAt)) · live evidence"
+            return "Observed \(relativeAge(observedAt)) · verified current evidence"
         case .stale:
             guard let observedAt else {
-                return "Evidence is stale, so no number is shown."
+                return "Local evidence is stale. Allowance values and reset countdowns are hidden."
             }
-            return "Observed \(relativeAge(observedAt)) · stale, "
-                + "so no number is shown."
+            return "Last observed \(relativeAge(observedAt)) · stale. "
+                + "Allowance values and reset countdowns are hidden."
         case .none:
-            return "No allowance observed yet · run Analyze Local Usage."
+            return "No verified quota observation yet · choose Analyze Local Usage."
+        }
+    }
+
+    /// A lane is safe to render numerically only while its shared observation
+    /// is both fresh and verified by the local companion. Reset countdowns
+    /// follow the same rule, so the menu never turns a historic reset into a
+    /// current claim.
+    func laneSummary(_ lane: ObservedQuotaLane, now: Date = Date()) -> String {
+        guard companionReachable, evidence == .live else {
+            return "\(lane.label): last observation is not current"
+        }
+        let remaining = "\(lane.roundedRemainingPercent)% remaining"
+        guard let reset = resetCountdown(lane.resetAt, now: now) else {
+            return "\(lane.label): \(remaining) · reset time unavailable"
+        }
+        return "\(lane.label): \(remaining) · resets \(reset)"
+    }
+
+    /// The local analysis action names the state it will enter or is already
+    /// in. It never starts work automatically; the controller still accepts
+    /// only an explicit menu click while the companion is ready.
+    var analysisActionTitle: String {
+        switch phase {
+        case .analyzing:
+            return "Analyzing Local Usage…"
+        case .ready:
+            return evidence == .none
+                ? "Analyze Local Usage"
+                : "Update Local Usage"
+        case .starting:
+            return "Waiting to Analyze Local Usage"
+        case .unavailable:
+            return "Local Analysis Unavailable"
         }
     }
 }
@@ -177,6 +214,22 @@ func relativeAge(_ date: Date, now: Date = Date()) -> String {
     }
     let days = Int((seconds / 86_400).rounded())
     return "\(days) day\(days == 1 ? "" : "s") ago"
+}
+
+/// Countdown wording is deliberately available only to a caller that has
+/// already established fresh local evidence. It returns nil for a passed or
+/// absent reset rather than implying a new reset period.
+func resetCountdown(_ date: Date?, now: Date = Date()) -> String? {
+    guard let date else { return nil }
+    let seconds = date.timeIntervalSince(now)
+    guard seconds > 0 else { return nil }
+    let totalMinutes = max(1, Int((seconds / 60).rounded(.down)))
+    let days = totalMinutes / (24 * 60)
+    let hours = (totalMinutes % (24 * 60)) / 60
+    let minutes = totalMinutes % 60
+    if days > 0 { return "in \(days)d \(hours)h" }
+    if hours > 0 { return "in \(hours)h \(minutes)m" }
+    return "in \(minutes)m"
 }
 
 /// Pure projection of the companion's overview payload. Kept free of AppKit so
@@ -206,28 +259,38 @@ enum LocalCompanionOverviewProjection {
         let rows = root["quotaWindows"] as? [[String: Any]]
             ?? quota?["windows"] as? [[String: Any]]
             ?? []
-        let weekly = rows.filter { row in
-            row["limitId"] as? String == "codex"
-                && (row["durationMinutes"] as? Int) == weeklyWindowDurationMinutes
-        }
-        let selected = weekly.first { $0["slot"] as? String == "primary" }
-            ?? weekly.first
-        var window: SevenDayAllowanceWindow?
-        if let selected,
-           let remaining = selected["remainingPercent"] as? Double,
-           remaining.isFinite, remaining >= 0, remaining <= 100 {
-            let planType = selected["planType"] as? String
-            window = SevenDayAllowanceWindow(
+        let lanes = rows.enumerated().compactMap { index, row -> ObservedQuotaLane? in
+            guard let number = row["remainingPercent"] as? NSNumber else {
+                return nil
+            }
+            let remaining = number.doubleValue
+            guard remaining.isFinite, remaining >= 0, remaining <= 100 else {
+                return nil
+            }
+            let limitId = row["limitId"] as? String ?? "unknown"
+            let duration = (row["durationMinutes"] as? NSNumber)?.intValue
+            let slot = row["slot"] as? String
+            return ObservedQuotaLane(
+                label: laneLabel(
+                    limitId: limitId,
+                    durationMinutes: duration,
+                    index: index
+                ),
                 remainingPercent: remaining,
-                planType: planType == "unknown" ? nil : planType,
-                resetAt: timestamp(selected["resetAt"])
+                resetAt: timestamp(row["resetAt"]),
+                isPrimary: limitId == "codex"
+                    && duration == weeklyWindowDurationMinutes
+                    && slot == "primary"
             )
+        }.sorted { left, right in
+            if left.isPrimary != right.isPrimary { return left.isPrimary }
+            return left.label.localizedStandardCompare(right.label) == .orderedAscending
         }
         let observedAt = timestamp(quota?["observedAt"])
-            ?? timestamp(selected?["observedAt"])
+            ?? rows.compactMap { timestamp($0["observedAt"]) }.max()
         let staleAfter = freshness?["staleAfterSeconds"] as? Double
         return LocalCompanionOverview(
-            window: window,
+            lanes: lanes,
             observedAt: observedAt,
             freshnessStatus: freshness?["status"] as? String
                 ?? root["status"] as? String
@@ -242,11 +305,32 @@ enum LocalCompanionOverviewProjection {
         for overview: LocalCompanionOverview,
         now: Date = Date()
     ) -> MenuBarStatusSnapshot.Evidence {
-        guard overview.window != nil else { return .none }
+        guard !overview.lanes.isEmpty else { return .none }
         guard overview.freshnessStatus == "live" else { return .stale }
         guard let observedAt = overview.observedAt else { return .stale }
         let limit = overview.staleAfterSeconds ?? defaultStaleAfterSeconds
         return now.timeIntervalSince(observedAt) <= limit ? .live : .stale
+    }
+
+    /// The overview intentionally carries no free-form labels. This fixed
+    /// vocabulary gives every supported observed lane a readable, privacy-safe
+    /// name without surfacing provider/account identifiers from raw records.
+    private static func laneLabel(
+        limitId: String,
+        durationMinutes: Int?,
+        index: Int
+    ) -> String {
+        if durationMinutes == 300 { return "Five-hour allowance" }
+        if limitId == "codex" && durationMinutes == weeklyWindowDurationMinutes {
+            return "Seven-day allowance"
+        }
+        if limitId == "codex_bengalfox" {
+            return "Secondary observed allowance"
+        }
+        if durationMinutes == weeklyWindowDurationMinutes {
+            return "Observed seven-day allowance"
+        }
+        return "Observed quota lane \(index + 1)"
     }
 }
 
@@ -418,8 +502,9 @@ final class LocalCompanionEvidenceReader {
 @MainActor
 final class MenuBarStatusController: NSObject, NSMenuDelegate {
     struct Actions {
-        let openDashboard: () -> Void
-        let showWindow: () -> Void
+        /// Brings the actual TiboTattle window forward and opens its embedded
+        /// dashboard when the loopback companion is ready.
+        let openTiboTattle: () -> Void
         let quit: () -> Void
         /// Absent in a build with no updater, which omits the row rather than
         /// offering a check that can never find anything.
@@ -441,9 +526,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let reader = LocalCompanionEvidenceReader()
     private let allowanceItem = NSMenuItem()
     private let evidenceItem = NSMenuItem()
-    private let openDashboardItem = NSMenuItem()
+    private let menu = NSMenu()
+    private let quotaSeparator = NSMenuItem.separator()
+    private let actionSeparator = NSMenuItem.separator()
+    private var quotaLaneItems: [NSMenuItem] = []
+    private let openTiboTattleItem = NSMenuItem()
     private let analyzeItem = NSMenuItem()
-    private let showWindowItem = NSMenuItem()
     private let checkForUpdatesItem = NSMenuItem()
     private let quitItem = NSMenuItem()
     private var snapshot = MenuBarStatusSnapshot()
@@ -462,7 +550,6 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         )
         super.init()
 
-        let menu = NSMenu()
         // Explicit enablement: information rows must stay unclickable, and
         // actions must reflect the companion's real state, not AppKit's guess.
         menu.autoenablesItems = false
@@ -472,22 +559,21 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         evidenceItem.isEnabled = false
         menu.addItem(allowanceItem)
         menu.addItem(evidenceItem)
-        menu.addItem(.separator())
+        menu.addItem(quotaSeparator)
+        menu.addItem(actionSeparator)
 
-        configure(openDashboardItem, "Open Dashboard", #selector(openDashboard))
+        configure(
+            openTiboTattleItem,
+            "Open \(productName)",
+            #selector(openTiboTattle)
+        )
         configure(
             analyzeItem,
             "Analyze Local Usage",
             #selector(analyzeLocalUsage)
         )
-        configure(
-            showWindowItem,
-            "Show \(productName) Window",
-            #selector(showWindow)
-        )
-        menu.addItem(openDashboardItem)
+        menu.addItem(openTiboTattleItem)
         menu.addItem(analyzeItem)
-        menu.addItem(showWindowItem)
         if actions.checkForUpdates != nil {
             configure(
                 checkForUpdatesItem,
@@ -569,8 +655,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
     // MARK: - Actions
 
-    @objc private func openDashboard() {
-        actions.openDashboard()
+    @objc private func openTiboTattle() {
+        actions.openTiboTattle()
     }
 
     @objc private func analyzeLocalUsage() {
@@ -594,10 +680,6 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             self.render()
             self.pollNow()
         }
-    }
-
-    @objc private func showWindow() {
-        actions.showWindow()
     }
 
     @objc private func quit() {
@@ -638,7 +720,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 // tick rather than inventing a state change.
                 return
             }
-            self.snapshot.window = overview.window
+            self.snapshot.lanes = overview.lanes
             self.snapshot.observedAt = overview.observedAt
             self.snapshot.evidence = LocalCompanionOverviewProjection
                 .evidence(for: overview)
@@ -672,9 +754,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private func render() {
         allowanceItem.title = snapshot.allowanceSummary
         evidenceItem.title = snapshot.evidenceSummary
-        openDashboardItem.isEnabled = snapshot.companionReachable
+        renderQuotaLanes()
+        openTiboTattleItem.isEnabled = true
+        analyzeItem.title = snapshot.analysisActionTitle
         analyzeItem.isEnabled = snapshot.phase == .ready
-        showWindowItem.isEnabled = true
         quitItem.isEnabled = true
         guard let button = statusItem.button else { return }
         button.title = snapshot.title
@@ -694,6 +777,32 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         item.target = self
         item.action = action
         item.isEnabled = true
+    }
+
+    /// Adds one disabled, VoiceOver-readable line for every valid quota lane
+    /// in the local overview. Stale lanes retain only their safe category and
+    /// state wording; their historic percentage and reset remain hidden.
+    private func renderQuotaLanes() {
+        for item in quotaLaneItems {
+            menu.removeItem(item)
+        }
+        quotaLaneItems = []
+        guard !snapshot.lanes.isEmpty
+        else {
+            quotaSeparator.isHidden = true
+            return
+        }
+        quotaSeparator.isHidden = false
+        let insertionIndex = menu.index(of: actionSeparator)
+        let items = snapshot.lanes.map { lane in
+            let item = NSMenuItem(title: snapshot.laneSummary(lane), action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            return item
+        }
+        for (offset, item) in items.enumerated() {
+            menu.insertItem(item, at: insertionIndex + offset)
+        }
+        quotaLaneItems = items
     }
 
     /// Template rendering is what makes the glyph correct on light menu bars,

@@ -35,11 +35,13 @@ function bindings(overrides: Partial<Env> = {}): Env {
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
+    CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
     ENVELOPE_PUBLIC_JWK: "",
     ENVIRONMENT: "synthetic-development",
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: runtime.QUARANTINE,
+    PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     ...overrides,
@@ -411,6 +413,67 @@ describe("quarantine crash reconciliation", () => {
     expect(await bindings().QUARANTINE.head(object.r2Key)).not.toBeNull();
   });
 
+  it("purges expired OIDC handoffs in bounded scheduled batches without retaining identity link keys", async () => {
+    const now = Date.now();
+    const expiredAt = new Date(now - 1_000).toISOString();
+    const activeAt = new Date(now + 60_000).toISOString();
+    const db = bindings().USAGE_MONITOR_DB;
+    const identityLinkKey = "a".repeat(64);
+    for (let index = 0; index < 101; index += 1) {
+      await db.prepare(
+        `INSERT INTO apple_signin_handoffs
+           (state, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, NULL, ?, ?, NULL)`,
+      ).bind(
+        `apple-expired-${index}`,
+        identityLinkKey,
+        expiredAt,
+        expiredAt,
+      ).run();
+    }
+    await db.prepare(
+      `INSERT INTO apple_signin_handoffs
+         (state, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES ('apple-active', ?, NULL, ?, ?, NULL)`,
+    ).bind(identityLinkKey, new Date(now).toISOString(), activeAt).run();
+    await db.prepare(
+      `INSERT INTO google_signin_handoffs
+         (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES ('google-expired', NULL, ?, NULL, ?, ?, NULL)`,
+    ).bind(identityLinkKey, expiredAt, expiredAt).run();
+
+    const first = await runScheduledMaintenance(bindings(), now);
+    expect(first).toMatchObject({
+      expiredIdentityHandoffsPurged: 101,
+      expiredIdentityHandoffPurgeComplete: false,
+    });
+    const remainingAfterFirst = await db.prepare(
+      `SELECT COUNT(*) AS total FROM apple_signin_handoffs WHERE expires_at <= ?`,
+    ).bind(new Date(now).toISOString()).first<{ total: number }>();
+    expect(remainingAfterFirst?.total).toBe(1);
+
+    const second = await runScheduledMaintenance(bindings(), now + 1);
+    expect(second).toMatchObject({
+      expiredIdentityHandoffsPurged: 1,
+      expiredIdentityHandoffPurgeComplete: true,
+    });
+    const expiredRows = await db.prepare(
+      `SELECT COUNT(*) AS total
+         FROM (
+           SELECT state FROM apple_signin_handoffs WHERE expires_at <= ?
+           UNION ALL
+           SELECT state FROM google_signin_handoffs WHERE expires_at <= ?
+         )`,
+    ).bind(new Date(now + 1).toISOString(), new Date(now + 1).toISOString()).first<{
+      total: number;
+    }>();
+    expect(expiredRows?.total).toBe(0);
+    const activeRows = await db.prepare(
+      `SELECT COUNT(*) AS total FROM apple_signin_handoffs WHERE state = 'apple-active'`,
+    ).first<{ total: number }>();
+    expect(activeRows?.total).toBe(1);
+  });
+
   it.each<QuarantineObjectKind>(["synthetic", "telemetry"])(
     "preserves a stale %s object referenced by a canonical table",
     async (objectKind) => {
@@ -740,6 +803,152 @@ describe("quarantine crash reconciliation", () => {
 });
 
 describe("backend readiness and scheduled observability", () => {
+  it("stops a lifecycle pass before a later destructive phase when its owner is fenced", async () => {
+    const object = registration("lifecycle-phase-fence");
+    const baseDb = bindings().USAGE_MONITOR_DB;
+    const baseBucket = bindings().QUARANTINE;
+    await putTrackedQuarantineObject(baseDb, baseBucket, object, "{}");
+    await insertCanonicalContribution(object, "lifecycle-phase-fence");
+
+    let guardCalls = 0;
+    await expect(runBackendLifecycle(
+      baseDb,
+      bindings().DELETION_LEDGER,
+      baseBucket,
+      Date.parse("2026-08-04T00:00:00.000Z"),
+      async () => {
+        guardCalls += 1;
+        // Permit state setup and restore replay, then fence before R2
+        // retention so an old maintenance owner cannot delete the object.
+        return guardCalls < 3;
+      },
+    )).rejects.toMatchObject({ code: "LIFECYCLE_STATE_CONFLICT" });
+
+    expect(guardCalls).toBe(3);
+    expect(await baseBucket.head(object.r2Key)).not.toBeNull();
+    await expect(baseDb.prepare(
+      "SELECT state FROM retention_state WHERE singleton = 1",
+    ).first<{ state: string }>()).resolves.toEqual({ state: "running" });
+  });
+
+  it("fences an expired maintenance owner before it can begin reconciliation", async () => {
+    const object = registration("maintenance-expiry-fence");
+    const baseDb = bindings().USAGE_MONITOR_DB;
+    await putTrackedQuarantineObject(baseDb, bindings().QUARANTINE, object, "{}");
+
+    let successorToken = "";
+    let takeoverComplete = false;
+    const fencedDb = d1PrepareProxy(baseDb, (query) => {
+      const statement = baseDb.prepare(query);
+      if (takeoverComplete
+          || !query.includes("SET state = 'completed'")
+          || !query.includes("quarantine_retention_complete")) {
+        return statement;
+      }
+      const takeOverAfterLifecycle = (candidate: D1PreparedStatement): D1PreparedStatement => (
+        new Proxy(candidate, {
+        get(target, property) {
+          if (property === "bind") {
+            return (...values: unknown[]) => takeOverAfterLifecycle(target.bind(...values));
+          }
+          if (property === "run") {
+            return async () => {
+              const result = await target.run();
+              const now = new Date().toISOString();
+              await baseDb.prepare(
+                `UPDATE retention_state
+                    SET maintenance_lease_expires_at = '2000-01-01T00:00:00.000Z'
+                  WHERE singleton = 1`,
+              ).run();
+              successorToken = crypto.randomUUID();
+              const successor = await baseDb.prepare(
+                `UPDATE retention_state
+                    SET maintenance_lease_token = ?, maintenance_lease_expires_at = ?
+                  WHERE singleton = 1 AND maintenance_lease_expires_at <= ?`,
+              ).bind(
+                successorToken,
+                new Date(Date.now() + HOUR_MILLISECONDS).toISOString(),
+                now,
+              ).run();
+              if (successor.meta.changes !== 1) {
+                throw new Error("successor could not acquire expired maintenance lease");
+              }
+              takeoverComplete = true;
+              return result;
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+        }) as D1PreparedStatement
+      );
+      return takeOverAfterLifecycle(statement);
+    });
+
+    await expect(runScheduledMaintenance(
+      bindings({ USAGE_MONITOR_DB: fencedDb }),
+      RECONCILIATION_NOW,
+    )).rejects.toMatchObject({ code: "LIFECYCLE_STATE_CONFLICT" });
+    expect(takeoverComplete).toBe(true);
+    expect(await pendingCount()).toBe(1);
+    expect(await bindings().QUARANTINE.head(object.r2Key)).not.toBeNull();
+    await expect(baseDb.prepare(
+      `SELECT maintenance_lease_token, maintenance_lease_expires_at
+         FROM retention_state WHERE singleton = 1`,
+    ).first<{
+      maintenance_lease_token: string | null;
+      maintenance_lease_expires_at: string | null;
+    }>()).resolves.toMatchObject({
+      maintenance_lease_token: successorToken,
+      maintenance_lease_expires_at: expect.stringMatching(/Z$/u),
+    });
+    await expect(baseDb.prepare(
+      `SELECT state FROM quarantine_reconciliation_state WHERE singleton = 1`,
+    ).first<{ state: string }>()).resolves.toEqual({ state: "never_run" });
+  });
+
+  it("preserves the original maintenance failure when a successor owns release", async () => {
+    const object = registration("maintenance-release-takeover");
+    const baseDb = bindings().USAGE_MONITOR_DB;
+    const baseBucket = bindings().QUARANTINE;
+    await putTrackedQuarantineObject(baseDb, baseBucket, object, "{}");
+    let successorToken = "";
+    const failingBucket = r2Proxy(baseBucket, {
+      async delete() {
+        const now = new Date().toISOString();
+        await baseDb.prepare(
+          `UPDATE retention_state
+              SET maintenance_lease_expires_at = '2000-01-01T00:00:00.000Z'
+            WHERE singleton = 1`,
+        ).run();
+        successorToken = crypto.randomUUID();
+        const successor = await baseDb.prepare(
+          `UPDATE retention_state
+              SET maintenance_lease_token = ?, maintenance_lease_expires_at = ?
+            WHERE singleton = 1 AND maintenance_lease_expires_at <= ?`,
+        ).bind(
+          successorToken,
+          new Date(Date.now() + HOUR_MILLISECONDS).toISOString(),
+          now,
+        ).run();
+        if (successor.meta.changes !== 1) {
+          throw new Error("successor could not acquire expired maintenance lease");
+        }
+        throw new Error("injected original reconciliation failure");
+      },
+    });
+
+    await expect(runScheduledMaintenance(
+      bindings({ QUARANTINE: failingBucket }),
+      RECONCILIATION_NOW,
+    )).rejects.toThrow("injected original reconciliation failure");
+    await expect(baseDb.prepare(
+      `SELECT maintenance_lease_token FROM retention_state WHERE singleton = 1`,
+    ).first<{ maintenance_lease_token: string | null }>()).resolves.toEqual({
+      maintenance_lease_token: successorToken,
+    });
+  });
+
   it("fails readiness closed before the first lifecycle run", async () => {
     const response = await ready();
     expect(response.status).toBe(503);
@@ -916,6 +1125,8 @@ describe("backend readiness and scheduled observability", () => {
       quarantineRetentionComplete: true,
       restoreReplayComplete: true,
       quarantineReconciliationComplete: true,
+      expiredIdentityHandoffsPurged: 0,
+      expiredIdentityHandoffPurgeComplete: true,
       aggregateRebuildComplete: true,
       publicationEnabled: true,
     });
@@ -958,6 +1169,8 @@ describe("backend readiness and scheduled observability", () => {
       quarantineRetentionComplete: true,
       restoreReplayComplete: true,
       quarantineReconciliationComplete: false,
+      expiredIdentityHandoffsPurged: 0,
+      expiredIdentityHandoffPurgeComplete: true,
       aggregateRebuildComplete: false,
       publicationEnabled: null,
     });

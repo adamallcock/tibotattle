@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { encodeBase64Url } from "../src/crypto";
 import { ApiError } from "../src/errors";
@@ -356,10 +356,13 @@ describe("adversarial claim validation", () => {
     }
   });
 
-  it("accepts an audience array that contains the expected client id among others", async () => {
+  it("accepts a multi-audience token only when azp pins it to this client", async () => {
     const token = await rs256Token(
       header(),
-      googlePayload({ aud: ["some-other-audience", GOOGLE_CLIENT_ID] }),
+      googlePayload({
+        aud: ["some-other-audience", GOOGLE_CLIENT_ID],
+        azp: GOOGLE_CLIENT_ID,
+      }),
       primary.privateKey,
     );
     const verified = await verifyHostedIdentity(
@@ -373,7 +376,7 @@ describe("adversarial claim validation", () => {
   it("enforces the 300-second expiry skew boundary precisely", async () => {
     const justWithinSkew = await rs256Token(
       header(),
-      googlePayload({ exp: NOW_SECONDS - 300 }),
+      googlePayload({ exp: NOW_SECONDS - 299 }),
       primary.privateKey,
     );
     const verified = await verifyHostedIdentity(
@@ -385,7 +388,7 @@ describe("adversarial claim validation", () => {
 
     const justOutsideSkew = await rs256Token(
       header(),
-      googlePayload({ exp: NOW_SECONDS - 301 }),
+      googlePayload({ exp: NOW_SECONDS - 300 }),
       primary.privateKey,
     );
     await expect(verifyHostedIdentity(
@@ -412,6 +415,19 @@ describe("adversarial claim validation", () => {
         { jwksFetcher: poisonFetcher, nowMs: NOW_MS },
       )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
     }
+  });
+
+  it("rejects a nonce because neither hosted authorization request creates one", async () => {
+    const token = await rs256Token(
+      header(),
+      googlePayload({ nonce: "replayed-from-another-authorization-request" }),
+      primary.privateKey,
+    );
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "google", idToken: token },
+      { jwksFetcher: poisonFetcher, nowMs: NOW_MS },
+    )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
   });
 
   it("accepts a subject at exactly the 256-character boundary and rejects one character over", async () => {
@@ -569,19 +585,17 @@ describe("key id (kid) handling", () => {
     )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
   });
 
-  it("tries every key when kid is absent, skipping non-matching candidates", async () => {
+  it("rejects a kid-less token when more than one JWKS key is applicable", async () => {
     const token = await rs256Token(
       header({ kid: undefined }),
       googlePayload(),
       primary.privateKey,
     );
-    // Decoy listed first so a correct implementation must fall through it.
-    const verified = await verifyHostedIdentity(
+    await expect(verifyHostedIdentity(
       bindings(),
       { provider: "google", idToken: token },
       { jwksFetcher: jwksFetcherFor([decoy.jwk, primary.jwk]), nowMs: NOW_MS },
-    );
-    expect(verified.provider).toBe("google");
+    )).rejects.toMatchObject({ status: 401, code: "IDENTITY_TOKEN_INVALID" });
   });
 
   it("rejects a kid-less token when no candidate key verifies it", async () => {
@@ -788,30 +802,39 @@ describe("configuration failures", () => {
 
 describe("JWKS caching", () => {
   it("reuses cached keys within the TTL and refetches once it elapses", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
     const calls: string[] = [];
     const fetcher = jwksFetcherFor([primary.jwk], calls);
     const token = await rs256Token(header(), googlePayload(), primary.privateKey);
 
-    await verifyHostedIdentity(
-      bindings(),
-      { provider: "google", idToken: token },
-      { jwksFetcher: fetcher, nowMs: NOW_MS },
-    );
-    expect(calls).toHaveLength(1);
+    try {
+      await verifyHostedIdentity(
+        bindings(),
+        { provider: "google", idToken: token },
+        { jwksFetcher: fetcher, nowMs: NOW_MS },
+      );
+      expect(calls).toHaveLength(1);
 
-    await verifyHostedIdentity(
-      bindings(),
-      { provider: "google", idToken: token },
-      { jwksFetcher: fetcher, nowMs: NOW_MS + 60_000 },
-    );
-    expect(calls).toHaveLength(1);
+      vi.advanceTimersByTime(60_000);
+      await verifyHostedIdentity(
+        bindings(),
+        { provider: "google", idToken: token },
+        { jwksFetcher: fetcher, nowMs: NOW_MS + 60_000 },
+      );
+      expect(calls).toHaveLength(1);
 
-    await verifyHostedIdentity(
-      bindings(),
-      { provider: "google", idToken: token },
-      { jwksFetcher: fetcher, nowMs: NOW_MS + 10 * 60_000 + 1 },
-    );
-    expect(calls).toHaveLength(2);
+      // oauth4webapi refreshes issuer JWKS material after five minutes.
+      vi.advanceTimersByTime(4 * 60_000 + 1);
+      await verifyHostedIdentity(
+        bindings(),
+        { provider: "google", idToken: token },
+        { jwksFetcher: fetcher, nowMs: NOW_MS + 5 * 60_000 + 1 },
+      );
+      expect(calls).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("clearIdentityJwksCacheForTests forces a fresh fetch", async () => {
@@ -895,6 +918,18 @@ describe("default JWKS fetcher", () => {
       "https://www.googleapis.com/oauth2/v3/certs",
       "https://appleid.apple.com/auth/keys",
     ]);
+  });
+});
+
+describe("offline JWKS injection", () => {
+  it("uses the Worker-only injected JWKS without reaching the network", async () => {
+    const token = await rs256Token(header(), googlePayload(), primary.privateKey);
+    const verified = await verifyHostedIdentity(
+      bindings({ IDENTITY_TEST_JWKS_JSON: JSON.stringify({ keys: [primary.jwk] }) }),
+      { provider: "google", idToken: token },
+      { jwksFetcher: poisonFetcher, nowMs: NOW_MS },
+    );
+    expect(verified.provider).toBe("google");
   });
 });
 

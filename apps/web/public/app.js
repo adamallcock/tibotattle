@@ -82,7 +82,7 @@ let selectedContributionValidated = false;
 let contributionSelectionRevision = 0;
 let contributionPreparationBusy = false;
 let communityConnectBusy = false;
-// The verified sign-in token lives only in this module-scoped memory; it is
+// The opaque sign-in proof lives only in this module-scoped memory; it is
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
 let hostedIdentityBusy = false;
@@ -134,7 +134,7 @@ function openInstalledApp() {
   window.setTimeout(() => {
     if (!status.hidden) {
       status.textContent =
-        "Continue in the local dashboard tab opened by TiboTattle. If nothing opened, the app is not installed or macOS blocked the link.";
+        "Continue in the TiboTattle in-app window. If nothing opened, the app is not installed or macOS blocked the link.";
     }
   }, 2_000);
 }
@@ -454,7 +454,7 @@ function renderDashboard(data) {
   if (data.mode === "demo") {
     showConnectionNotice({
       title: "You are exploring a labeled demonstration",
-      copy: "Every number on this page is illustrative. Open the Mac app and use the separate local dashboard tab to see your own evidence.",
+      copy: "Every number on this page is illustrative. Open the Mac app and use the TiboTattle in-app window to see your own evidence.",
       kind: "demo",
       showCheck: true
     });
@@ -3848,10 +3848,10 @@ async function loadLocalDashboard() {
           ? "The companion could not load the local dashboard"
           : "The local companion is not available",
       copy: backendOnly
-        ? "This service accepts optional community requests but cannot read this Mac. Open TiboTattle from Applications and use the separate local dashboard tab it opens."
+        ? "This service accepts optional community requests but cannot read this Mac. Open TiboTattle from Applications and use its in-app window."
         : localHealth
-          ? "The Mac app is running, but its local dashboard could not be loaded. Quit and reopen TiboTattle, press Open Dashboard, then check again."
-          : "Open TiboTattle from Applications, wait for Ready, then press Open Dashboard. If no installer is published below, this build is not yet available for a new installation.",
+          ? "The Mac app is running, but its in-app dashboard could not be loaded. Quit and reopen TiboTattle, then open the dashboard in its window and check again."
+          : "Open TiboTattle from Applications, wait for Ready, then open the dashboard in its window. If no installer is published below, this build is not yet available for a new installation.",
       kind: "error",
       showDemo: true,
       showCheck: true,
@@ -4459,7 +4459,7 @@ const HOSTED_SIGNIN_FLOWS = {
     waiting:
       "Finish signing in with Google in your browser, then come back here — this page collects the result itself and no tab needs to stay open. Only a stable account identifier is requested; no email or name is asked for. If no window opened, allow pop-ups and try again.",
     signedIn:
-      "Signed in with Google. The sign-in token stays in this page's memory; the service keeps only an irreversible hash, never your email or name.",
+      "Signed in with Google. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
       "Google sign-in did not finish in time. Nothing was stored. Press Sign in with Google again to start a fresh sign-in.",
     unconfigured: "Hosted Google sign-in is not configured for this build.",
@@ -4475,7 +4475,7 @@ const HOSTED_SIGNIN_FLOWS = {
     waiting:
       "Finish signing in with Apple in your browser, then come back here — this page collects the result itself and no tab needs to stay open. No name or email is requested. If no window opened, allow pop-ups and try again.",
     signedIn:
-      "Signed in with Apple. The sign-in token stays in this page's memory; the service keeps only an irreversible hash, never your email or name.",
+      "Signed in with Apple. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
       "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in.",
     unconfigured: "Hosted Apple sign-in is not configured for this build.",

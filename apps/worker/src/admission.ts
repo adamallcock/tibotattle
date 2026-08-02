@@ -1,4 +1,4 @@
-import { sha256, timingSafeEqual } from "./crypto";
+import { sha256, sha256Hex, timingSafeEqual } from "./crypto";
 import { ENROLLMENT_MODES } from "./constants";
 import { ApiError } from "./errors";
 
@@ -34,23 +34,101 @@ export function configuredEnrollmentMode(env: Env): EnrollmentMode {
   return mode as EnrollmentMode;
 }
 
-export async function assertAttemptAllowed(
-  limiter: RateLimit | undefined,
-  purpose: "enrollment" | "recovery",
-): Promise<void> {
+type AttemptPurpose = "enrollment" | "sign_in_start" | "recovery";
+
+const RATE_LIMIT_KEY_PREFIX = "app-usagemonitor/rate-limit/v1";
+const CLIENT_ADDRESS_PATTERN = /^[0-9a-f:.]{3,45}$/iu;
+
+function assertLimiterConfigured(limiter: RateLimit | undefined): asserts limiter is RateLimit {
   if (!limiter || typeof limiter.limit !== "function") {
     throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
   }
-  const result = await limiter.limit({ key: `usage-monitor:${purpose}:global` });
+}
+
+function clientAddressForRateLimit(request: Request): string {
+  const address = request.headers.get("cf-connecting-ip");
+  // This Worker receives CF-Connecting-IP from Cloudflare, where the edge
+  // replaces rather than forwards the client-supplied header. Never persist,
+  // return, or log the address; malformed/missing values collapse to one
+  // availability-safe bucket behind the separate coarse breaker.
+  if (address === null || !CLIENT_ADDRESS_PATTERN.test(address)) return "unavailable";
+  return address.toLowerCase();
+}
+
+async function clientRateLimitKey(
+  request: Request,
+  env: Env,
+  purpose: AttemptPurpose | "public_aggregate_read",
+): Promise<string> {
+  const material = `${RATE_LIMIT_KEY_PREFIX}\0${purpose}\0${clientAddressForRateLimit(request)}`;
+  const secret = Reflect.get(env, "IDENTITY_LINK_SECRET");
+  if (typeof secret === "string" && secret.length >= 32) {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const signature = await crypto.subtle.sign(
+      "HMAC",
+      key,
+      new TextEncoder().encode(material),
+    );
+    return [...new Uint8Array(signature)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+  // The offline synthetic environment has no identity secret by design. Its
+  // derived key remains non-reversible in logs or Rate Limit keys, while every
+  // hosted environment fails closed until its existing identity secret exists.
+  if (isDevelopmentEnvironment(env)) return sha256Hex(material);
+  throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
+}
+
+export async function assertAttemptAllowed(
+  coarseLimiter: RateLimit | undefined,
+  clientLimiter: RateLimit | undefined,
+  request: Request,
+  env: Env,
+  purpose: AttemptPurpose,
+): Promise<void> {
+  assertLimiterConfigured(coarseLimiter);
+  assertLimiterConfigured(clientLimiter);
+  const coarse = await coarseLimiter.limit({
+    key: `usage-monitor:${purpose}:global`,
+  });
+  if (!coarse.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
+  const client = await clientLimiter.limit({
+    key: `usage-monitor:${purpose}:client:${await clientRateLimitKey(request, env, purpose)}`,
+  });
+  if (!client.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
+}
+
+export async function assertPublicAggregateReadAllowed(
+  limiter: RateLimit | undefined,
+  request: Request,
+  env: Env,
+): Promise<void> {
+  assertLimiterConfigured(limiter);
+  const result = await limiter.limit({
+    key: `usage-monitor:public_aggregate_read:client:${await clientRateLimitKey(
+      request,
+      env,
+      "public_aggregate_read",
+    )}`,
+  });
   if (!result.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
 }
 
 export function assertAdmissionBindings(env: Env): void {
-  for (const name of ["ENROLLMENT_RATE_LIMIT", "RECOVERY_RATE_LIMIT"] as const) {
-    const limiter = Reflect.get(env, name);
-    if (!limiter || typeof Reflect.get(limiter, "limit") !== "function") {
-      throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
-    }
+  for (const name of [
+    "ENROLLMENT_RATE_LIMIT",
+    "RECOVERY_RATE_LIMIT",
+    "CLIENT_ATTEMPT_RATE_LIMIT",
+    "PUBLIC_READ_RATE_LIMIT",
+  ] as const) {
+    assertLimiterConfigured(Reflect.get(env, name) as RateLimit | undefined);
   }
 }
 

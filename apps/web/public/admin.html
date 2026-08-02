@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f5f1e8">
+    <meta name="robots" content="noindex, nofollow">
+    <title>TiboTattle operations</title>
+    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./admin.css">
+    <script type="module" src="./admin.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="TiboTattle dashboard">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>TiboTattle</span>
+      </a>
+      <div class="admin-topbar-label">Private operations</div>
+      <a class="button button-quiet compact" href="./">Back to dashboard</a>
+    </header>
+
+    <main id="main" class="admin-main">
+      <div class="page-heading admin-heading">
+        <div>
+          <p class="eyebrow">Owner-only operations</p>
+          <h1>Keep the service safe to run.</h1>
+          <p class="lede">
+            This page reads bounded operational aggregates through an authenticated
+            Worker API. It never queries D1 directly or exposes participant records.
+          </p>
+        </div>
+        <div class="freshness-card" aria-live="polite">
+          <span>Last refresh</span>
+          <strong id="last-refresh">Not loaded</strong>
+          <small id="service-state">Checking session…</small>
+        </div>
+      </div>
+
+      <div id="notice" class="notice notice-warning" role="status" hidden></div>
+
+      <section class="admin-section" aria-labelledby="counts-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Bounded counts</p>
+            <h2 id="counts-title">Service shape</h2>
+          </div>
+          <button class="button button-secondary" id="refresh" type="button">Refresh</button>
+        </div>
+        <div class="admin-card-grid" id="counts" aria-live="polite"></div>
+      </section>
+
+      <div class="admin-two-column">
+        <section class="admin-card admin-section" aria-labelledby="controls-title">
+          <p class="eyebrow">Containment controls</p>
+          <h2 id="controls-title">Collection state</h2>
+          <p class="admin-copy">Changes are revisioned and written to the audit log.</p>
+          <form id="controls-form" class="admin-form">
+            <label><input type="checkbox" name="enrollment"> Enrollment</label>
+            <label><input type="checkbox" name="uploadRegistration"> Upload registration</label>
+            <label><input type="checkbox" name="processing"> Processing</label>
+            <label><input type="checkbox" name="publication"> Publication</label>
+            <label class="admin-field" for="reasonCode">Reason for change
+              <select name="reasonCode" id="reasonCode">
+                <option value="maintenance">Maintenance</option>
+                <option value="abuse_or_cost">Abuse or cost</option>
+                <option value="privacy_incident">Privacy incident</option>
+                <option value="security_incident">Security incident</option>
+                <option value="drill_containment">Drill containment</option>
+                <option value="drill_restore">Drill restore</option>
+              </select>
+            </label>
+            <button class="button button-primary" type="submit">Save collection state</button>
+          </form>
+        </section>
+
+        <section class="admin-card admin-section" aria-labelledby="maintenance-title">
+          <p class="eyebrow">Bounded maintenance</p>
+          <h2 id="maintenance-title">Run the maintenance pass</h2>
+          <p class="admin-copy">
+            Processes deletion retention and quarantine reconciliation, then builds
+            the next immutable snapshot only when publication is enabled.
+          </p>
+          <button class="button button-secondary" id="run-maintenance" type="button">
+            Run maintenance
+          </button>
+          <p class="admin-result" id="maintenance-result" role="status"></p>
+        </section>
+      </div>
+
+      <section class="admin-section" aria-labelledby="readiness-title">
+        <p class="eyebrow">Lifecycle and publication</p>
+        <h2 id="readiness-title">Operational readiness</h2>
+        <div class="admin-two-column">
+          <div class="admin-card" id="lifecycle-status" aria-live="polite"></div>
+          <div class="admin-card admin-table-wrap">
+            <table>
+              <thead><tr><th>Snapshot</th><th>Period</th><th>State</th><th>Released</th></tr></thead>
+              <tbody id="snapshot-rows"></tbody>
+            </table>
+            <p class="admin-empty" id="snapshot-empty">No immutable snapshot has been sealed.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="errors-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Diagnostics</p>
+            <h2 id="errors-title">Errors and user-reported references</h2>
+          </div>
+          <form id="diagnostic-form" class="diagnostic-form">
+            <label class="sr-only" for="diagnostic-reference">Diagnostic reference</label>
+            <input id="diagnostic-reference" placeholder="Paste request reference" autocomplete="off">
+            <button class="button button-quiet" type="submit">Look up</button>
+          </form>
+        </div>
+        <div class="admin-card admin-table-wrap">
+          <table>
+            <thead><tr><th>Route</th><th>Error</th><th>Count</th><th>Latest</th></tr></thead>
+            <tbody id="error-groups"></tbody>
+          </table>
+          <p class="admin-empty" id="error-empty">No retained errors in the window.</p>
+          <div id="diagnostic-lookup" class="diagnostic-lookup" hidden></div>
+        </div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="audit-title">
+        <p class="eyebrow">Owner audit</p>
+        <h2 id="audit-title">Recent control actions</h2>
+        <div class="admin-card admin-table-wrap">
+          <table>
+            <thead><tr><th>Action</th><th>Outcome</th><th>Details</th><th>Time</th></tr></thead>
+            <tbody id="audit-rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

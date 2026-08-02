@@ -4,6 +4,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
+  "cache": {
+    "enabled": true,
+    "cross_version_cache": false
+  },
   "workers_dev": false,
   "preview_urls": false,
   "observability": {
@@ -34,6 +38,18 @@
       "name": "RECOVERY_RATE_LIMIT",
       "namespace_id": "1002",
       "simple": { "limit": 20, "period": 60 }
+    },
+    {
+      // Synthetic tests exercise cohorts larger than the production per-client
+      // ceiling, so this remains deliberately high outside hosted environments.
+      "name": "CLIENT_ATTEMPT_RATE_LIMIT",
+      "namespace_id": "1003",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "PUBLIC_READ_RATE_LIMIT",
+      "namespace_id": "1004",
+      "simple": { "limit": 1000, "period": 60 }
     }
   ],
   "d1_databases": [
@@ -72,6 +88,10 @@
       "name": "app-usagemonitor-staging",
       "workers_dev": true,
       "preview_urls": false,
+      "cache": {
+        "enabled": true,
+        "cross_version_cache": false
+      },
       "observability": {
         "enabled": true,
         "head_sampling_rate": 1
@@ -100,6 +120,16 @@
           "name": "RECOVERY_RATE_LIMIT",
           "namespace_id": "2002",
           "simple": { "limit": 20, "period": 60 }
+        },
+        {
+          "name": "CLIENT_ATTEMPT_RATE_LIMIT",
+          "namespace_id": "2003",
+          "simple": { "limit": 5, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_READ_RATE_LIMIT",
+          "namespace_id": "2004",
+          "simple": { "limit": 120, "period": 60 }
         }
       ],
       "d1_databases": [
@@ -131,9 +161,9 @@
     },
     "production": {
       "name": "app-usagemonitor",
-      // workers_dev stays enabled alongside the custom domain so the original
-      // *.workers.dev origin keeps answering while clients move over.
-      "workers_dev": true,
+      // Hosted identity callbacks are pinned to the custom domain. There is no
+      // second production hostname that can become an OAuth redirect boundary.
+      "workers_dev": false,
       // Declarative custom domains: Cloudflare provisions the DNS records and
       // the TLS certificates for both hostnames on deploy.
       "routes": [
@@ -141,6 +171,10 @@
         { "pattern": "www.tibotattle.com", "custom_domain": true }
       ],
       "preview_urls": false,
+      "cache": {
+        "enabled": true,
+        "cross_version_cache": false
+      },
       "observability": {
         "enabled": true,
         "head_sampling_rate": 1
@@ -150,9 +184,10 @@
       },
       "vars": {
         "ENVIRONMENT": "production",
+        "PUBLIC_ORIGIN": "https://tibotattle.com",
         "ENROLLMENT_MODE": "open",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
-        "GOOGLE_OIDC_CLIENT_ID": "806510610397-kjq8ipejhl89tr3om4bt60l9e46o3lrd.apps.googleusercontent.com",
+        "GOOGLE_OIDC_CLIENT_ID": "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com",
         // Web Sign in with Apple. APPLE_SERVICES_ID is the Apple Services ID:
         // it is the OAuth client_id, the subject of the ES256 client secret,
         // and the audience the returned id_token is verified against.
@@ -170,6 +205,7 @@
           "ENVELOPE_PRIVATE_JWK",
           "ENVELOPE_PUBLIC_JWK",
           "IDENTITY_LINK_SECRET",
+          "ADMIN_IDENTITY_LINK_KEY",
           "APPLE_PRIVATE_KEY",
           // The Google OAuth client is a Web application client whose one
           // registered redirect URI is this service's own
@@ -189,6 +225,16 @@
           "name": "RECOVERY_RATE_LIMIT",
           "namespace_id": "3002",
           "simple": { "limit": 20, "period": 60 }
+        },
+        {
+          "name": "CLIENT_ATTEMPT_RATE_LIMIT",
+          "namespace_id": "3003",
+          "simple": { "limit": 5, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_READ_RATE_LIMIT",
+          "namespace_id": "3004",
+          "simple": { "limit": 120, "period": 60 }
         }
       ],
       "d1_databases": [
@@ -213,7 +259,10 @@
       ],
       "assets": {
         "binding": "ASSETS",
-        "directory": "../web/public",
+        // `production:stage-assets` accepts only tracked files from a clean
+        // release checkout. Do not point production at the mutable working
+        // tree: every file in that directory would otherwise be deployable.
+        "directory": "../../.release-build/worker-assets",
         "not_found_handling": "single-page-application",
         // The Apple domain-association file is served by the Worker, not by
         // the asset router: single-page-application handling would otherwise

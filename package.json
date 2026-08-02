@@ -77,6 +77,7 @@
     "product:macos:validate:development": "node ./scripts/validate-macos-install.js --app \".release-build/macos/TiboTattle.app\" --development",
     "product:macos:release": "node ./scripts/release-macos-app.js --app \".release-build/macos-production/TiboTattle.app\" --output \".release-build/macos-release/TiboTattle-0.1.0-macOS-arm64.dmg\"",
     "product:macos:validate:release": "node ./scripts/validate-macos-install.js --dmg \".release-build/macos-release/TiboTattle-0.1.0-macOS-arm64.dmg\"",
+    "product:macos:publish-update": "node ./scripts/publish-sparkle-update.js",
     "product:macos:test": "npm run product:macos:updater:prepare && node --test --test-concurrency=1 test/macos-app-bundle.test.js test/macos-updater.test.js test/macos-updater-release.test.mjs",
     "product:native-network-audit:build": "node ./scripts/build-native-network-audit.js --output \".release-build/native-network-audit/libusage_monitor_network_audit.dylib\"",
     "product:local-review:runtime": "node ./scripts/verify-local-review-runtime.js --output \".release-build/local-review-runtime\"",

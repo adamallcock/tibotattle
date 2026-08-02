@@ -1,0 +1,30 @@
+name: OSV dependency scan
+
+on:
+  pull_request:
+  push:
+    # Restrict push scans to the protected integration branch; branch
+    # protection itself remains repository configuration, not workflow state.
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+# The scanner reports in the job log and fails on vulnerabilities. SARIF
+# upload is intentionally disabled, so no security-events:write permission is
+# needed (which also keeps this usable in private repositories).
+permissions:
+  contents: read
+
+jobs:
+  osv:
+    name: Scan committed dependency locks
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    permissions:
+      contents: read
+    with:
+      upload-sarif: false
+      fail-on-vuln: true
+      scan-args: |-
+        --recursive
+        ./

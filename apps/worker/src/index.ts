@@ -1,6 +1,7 @@
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
+  assertPublicAggregateReadAllowed,
   configuredEnrollmentMode,
   parseInviteGrant,
 } from "./admission";
@@ -20,6 +21,19 @@ import {
   QUARANTINE_RETENTION_MILLISECONDS,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
+import {
+  adminIdentityKeyConfigured,
+  authorizeAdminIdentity,
+  beginAdminOperation,
+  finishAdminOperation,
+  pruneDiagnosticErrors,
+  readAdminOverview,
+  recordDiagnosticError,
+  setCollectionControls,
+  validDiagnosticReference,
+  type AdminAction,
+  type CollectionControlReason,
+} from "./admin-operations";
 import {
   buildCommunityWeeklySnapshot,
   readLatestCommunityWeeklySnapshot,
@@ -281,6 +295,16 @@ function allowedHeader(error: ApiError): HeadersInit | undefined {
   return Array.isArray(value) ? { allow: value.join(", ") } : undefined;
 }
 
+function noStore(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function hasExactEnvelopeKeyOccurrences(raw: string): boolean {
   const keys = [...raw.matchAll(/"([^"\\]+)"\s*:/gu)].map((match) => match[1]);
   const expected = [
@@ -297,7 +321,13 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   assertAdmissionBindings(env);
   if (mode === "disabled") throw new ApiError(503, "ENROLLMENT_DISABLED");
   await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
-  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
+  await assertAttemptAllowed(
+    env.ENROLLMENT_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "enrollment",
+  );
   const body = await readBoundedJson(request);
   const accountScopedEnrollment = typeof body.value === "object"
     && body.value !== null
@@ -357,7 +387,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     throw new ApiError(401, "IDENTITY_REQUIRED");
   }
   const verifiedIdentity = identityProvided
-    ? await verifyHostedIdentity(env, identityValue)
+    ? await consumeHostedIdentityProof(env.USAGE_MONITOR_DB, identityValue)
     : null;
   if (deviceBootstrapRequested) {
     await assertCollectionControl(
@@ -424,45 +454,185 @@ const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
 // code itself is bounded by the exchange, and this bounds the whole callback
 // URL so an oversized redirect is refused before anything is looked up.
 const MAX_GOOGLE_CALLBACK_URL_LENGTH = 8 * 1024;
+const SIGNIN_HANDOFF_PROOF_PATTERN = /^[A-Za-z0-9_-]{64}$/u;
 const SIGNIN_COMPLETED_MESSAGE = "Signed in — return to TiboTattle.";
 const SIGNIN_NOT_COMPLETED_MESSAGE =
   "Sign-in was not completed. Return to TiboTattle and start the sign-in again.";
 
 /**
- * Both hosted providers redirect to this Worker rather than to the page that
- * started the sign-in, so the redirect target is derived from the request
- * origin and never from anything a caller supplies. It must be HTTPS: Apple
- * will not register or honor anything else, Google's Web application client
- * type registers exactly this absolute string, and both replay it on the token
- * exchange.
+ * Production sign-in is deliberately pinned to one configured HTTPS origin.
+ * In particular, no request-derived Workers hostname can become an OAuth
+ * callback merely because it reaches this Worker. Local development keeps the
+ * request origin so the offline harness remains self-contained.
  */
 function signInCallbackUrl(
   request: Request,
+  env: Env,
   provider: "apple" | "google",
 ): string {
   const url = new URL(request.url);
   if (url.protocol !== "https:") {
     throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
   }
-  return `${url.origin}/api/v1/identity/${provider}/callback`;
+  if (!identityRequired(env)) {
+    return `${url.origin}/api/v1/identity/${provider}/callback`;
+  }
+  const rawOrigin = Reflect.get(env, "PUBLIC_ORIGIN");
+  let configured: URL;
+  try {
+    configured = new URL(typeof rawOrigin === "string" ? rawOrigin : "");
+  } catch {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  if (configured.protocol !== "https:"
+      || configured.origin !== rawOrigin
+      || configured.pathname !== "/"
+      || configured.search !== ""
+      || configured.hash !== "") {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+  if (url.origin !== configured.origin) throw new ApiError(404, "NOT_FOUND");
+  return `${configured.origin}/api/v1/identity/${provider}/callback`;
+}
+
+function hostedIdentityProof(value: unknown): {
+  provider: "apple" | "google";
+  proof: string;
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+  }
+  const provider = Reflect.get(value, "provider");
+  const proof = Reflect.get(value, "proof");
+  if (Object.keys(value).sort().join("\0") !== ["proof", "provider"].join("\0")
+      || (provider !== "apple" && provider !== "google")
+      || typeof proof !== "string"
+      || !SIGNIN_HANDOFF_PROOF_PATTERN.test(proof)) {
+    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+  }
+  return { provider, proof };
+}
+
+async function consumeHostedIdentityProof(
+  db: D1Database,
+  identity: unknown,
+): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
+  const { provider, proof } = hostedIdentityProof(identity);
+  const table = provider === "apple"
+    ? "apple_signin_handoffs"
+    : "google_signin_handoffs";
+  const nowIso = new Date().toISOString();
+  const claimed = await db.prepare(
+    `DELETE FROM ${table}
+      WHERE proof = ?
+        AND identity_link_key IS NOT NULL
+        AND delivered_at IS NOT NULL
+        AND expires_at > ?
+      RETURNING identity_link_key AS linkKeyHex`,
+  ).bind(proof, nowIso).first<{ linkKeyHex: string }>();
+  if (!claimed || !/^[0-9a-f]{64}$/u.test(claimed.linkKeyHex)) {
+    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+  }
+  return { provider, linkKeyHex: claimed.linkKeyHex };
+}
+
+/**
+ * Real hosted callbacks verify the provider-signed ID token before reducing it
+ * to the irreversible identity link key. The offline development harness has
+ * no provider signing keys or network access, so it uses a deterministic
+ * synthetic link key solely to exercise the state/PKCE/proof handoff. It
+ * remains impossible for that path to accept a provider token at enrollment:
+ * enrollment always requires the server-issued opaque proof above.
+ */
+async function verifiedHostedCallbackIdentity(
+  env: Env,
+  provider: "apple" | "google",
+  idToken: string,
+): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
+  if (identityRequired(env)) {
+    return verifyHostedIdentity(env, { provider, idToken });
+  }
+  return {
+    provider,
+    linkKeyHex: await sha256Hex(
+      `app-usagemonitor/development-handoff/v1\0${provider}\0${idToken}`,
+    ),
+  };
+}
+
+const MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER = 100;
+
+interface ExpiredIdentityHandoffPurge {
+  purged: number;
+  complete: boolean;
 }
 
 async function deleteExpiredAppleHandoffs(
   db: D1Database,
   nowIso: string,
-): Promise<void> {
-  await db.prepare(
-    "DELETE FROM apple_signin_handoffs WHERE expires_at <= ?",
-  ).bind(nowIso).run();
+  maximumRows = MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER,
+): Promise<number> {
+  const result = await db.prepare(
+    `DELETE FROM apple_signin_handoffs
+      WHERE state IN (
+        SELECT state FROM apple_signin_handoffs
+         WHERE expires_at <= ?
+         ORDER BY expires_at, state
+         LIMIT ?
+      )`,
+  ).bind(nowIso, maximumRows).run();
+  return result.meta.changes;
 }
 
 async function deleteExpiredGoogleHandoffs(
   db: D1Database,
   nowIso: string,
-): Promise<void> {
-  await db.prepare(
-    "DELETE FROM google_signin_handoffs WHERE expires_at <= ?",
-  ).bind(nowIso).run();
+  maximumRows = MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER,
+): Promise<number> {
+  const result = await db.prepare(
+    `DELETE FROM google_signin_handoffs
+      WHERE state IN (
+        SELECT state FROM google_signin_handoffs
+         WHERE expires_at <= ?
+         ORDER BY expires_at, state
+         LIMIT ?
+      )`,
+  ).bind(nowIso, maximumRows).run();
+  return result.meta.changes;
+}
+
+async function hasExpiredAppleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
+  return Boolean(await db.prepare(
+    "SELECT 1 AS found FROM apple_signin_handoffs WHERE expires_at <= ? LIMIT 1",
+  ).bind(nowIso).first<{ found: number }>());
+}
+
+async function hasExpiredGoogleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
+  return Boolean(await db.prepare(
+    "SELECT 1 AS found FROM google_signin_handoffs WHERE expires_at <= ? LIMIT 1",
+  ).bind(nowIso).first<{ found: number }>());
+}
+
+async function purgeExpiredIdentityHandoffs(
+  db: D1Database,
+  nowIso: string,
+): Promise<ExpiredIdentityHandoffPurge> {
+  const [applePurged, googlePurged] = await Promise.all([
+    deleteExpiredAppleHandoffs(db, nowIso),
+    deleteExpiredGoogleHandoffs(db, nowIso),
+  ]);
+  const [appleRemaining, googleRemaining] = await Promise.all([
+    applePurged === MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER
+      ? hasExpiredAppleHandoffs(db, nowIso)
+      : false,
+    googlePurged === MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER
+      ? hasExpiredGoogleHandoffs(db, nowIso)
+      : false,
+  ]);
+  return {
+    purged: applePurged + googlePurged,
+    complete: !appleRemaining && !googleRemaining,
+  };
 }
 
 function signInCallbackPage(message: string): Response {
@@ -512,9 +682,15 @@ async function handleIdentityAppleStart(
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
   assertAdmissionBindings(env);
-  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
+  await assertAttemptAllowed(
+    env.ENROLLMENT_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "sign_in_start",
+  );
   const configuration = appleSignInConfiguration(env);
-  const redirectUri = signInCallbackUrl(request, "apple");
+  const redirectUri = signInCallbackUrl(request, env, "apple");
   const body = await readBoundedJson(request);
   const value = body.value;
   if (typeof value !== "object"
@@ -529,8 +705,9 @@ async function handleIdentityAppleStart(
   // 48 random bytes render as 64 base64url characters.
   const state = randomSecret(48);
   await env.USAGE_MONITOR_DB.prepare(
-    `INSERT INTO apple_signin_handoffs (state, id_token, created_at, expires_at, consumed_at)
-       VALUES (?, NULL, ?, ?, NULL)`,
+    `INSERT INTO apple_signin_handoffs
+       (state, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES (?, NULL, NULL, ?, ?, NULL)`,
   ).bind(
     state,
     nowIso,
@@ -557,7 +734,7 @@ async function handleIdentityAppleCallback(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const redirectUri = signInCallbackUrl(request, "apple");
+  const redirectUri = signInCallbackUrl(request, env, "apple");
   const form = await readBoundedForm(request, MAX_APPLE_CALLBACK_BYTES);
   const state = form.get("state");
   const code = form.get("code");
@@ -573,14 +750,16 @@ async function handleIdentityAppleCallback(
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM apple_signin_handoffs
       WHERE state = ?
-        AND id_token IS NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
         AND expires_at > ?`,
   ).bind(state, nowIso).first<{ state: string }>();
   if (!pending) return failure;
-  let idToken: string;
+  let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
-    idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
+    const idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
+    verified = await verifiedHostedCallbackIdentity(env, "apple", idToken);
   } catch {
     return failure;
   }
@@ -588,20 +767,21 @@ async function handleIdentityAppleCallback(
   // started, so a handoff that expired mid-exchange is never filled.
   const stored = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE apple_signin_handoffs
-        SET id_token = ?
+        SET identity_link_key = ?, proof = ?
       WHERE state = ?
-        AND id_token IS NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
         AND expires_at > ?`,
-  ).bind(idToken, state, new Date().toISOString()).run();
+  ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
   if (stored.meta.changes !== 1) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE);
 }
 
 /**
- * Reads the completed sign-in back exactly once. The conditional UPDATE both
- * claims and marks the row, so two concurrent reads cannot both win, and a
- * replayed read after success is indistinguishable from an expired one.
+ * Reads a completed sign-in back exactly once. This releases a short-lived,
+ * opaque proof only; provider credentials never leave the callback and never
+ * reach D1. Enrollment atomically deletes the proof when it uses it.
  *
  * This route is deliberately not attempt-limited: the page polls it on a
  * fixed short schedule while the user finishes at Apple, and it discloses
@@ -626,26 +806,28 @@ async function handleIdentityAppleResult(
   }
   const nowIso = new Date().toISOString();
   await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
-  const claimed = await env.USAGE_MONITOR_DB.prepare(
+  const delivered = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE apple_signin_handoffs
-        SET consumed_at = ?
+        SET delivered_at = ?
       WHERE state = ?
-        AND id_token IS NOT NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NOT NULL
+        AND proof IS NOT NULL
+        AND delivered_at IS NULL
         AND expires_at > ?
-      RETURNING id_token AS idToken`,
-  ).bind(nowIso, state, nowIso).first<{ idToken: string }>();
-  if (claimed) {
+      RETURNING proof`,
+  ).bind(nowIso, state, nowIso).first<{ proof: string }>();
+  if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-apple-result-v0.1",
-      idToken: claimed.idToken,
+      proof: delivered.proof,
     });
   }
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM apple_signin_handoffs
       WHERE state = ?
-        AND id_token IS NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
         AND expires_at > ?`,
   ).bind(state, nowIso).first<{ state: string }>();
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
@@ -666,9 +848,15 @@ async function handleIdentityGoogleStart(
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
   assertAdmissionBindings(env);
-  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
+  await assertAttemptAllowed(
+    env.ENROLLMENT_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "sign_in_start",
+  );
   const configuration = googleSignInConfiguration(env);
-  const redirectUri = signInCallbackUrl(request, "google");
+  const redirectUri = signInCallbackUrl(request, env, "google");
   const body = await readBoundedJson(request);
   const value = body.value;
   if (typeof value !== "object"
@@ -686,8 +874,8 @@ async function handleIdentityGoogleStart(
   const codeVerifier = randomSecret(48);
   await env.USAGE_MONITOR_DB.prepare(
     `INSERT INTO google_signin_handoffs
-       (state, code_verifier, id_token, created_at, expires_at, consumed_at)
-       VALUES (?, ?, NULL, ?, ?, NULL)`,
+       (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES (?, ?, NULL, NULL, ?, ?, NULL)`,
   ).bind(
     state,
     codeVerifier,
@@ -721,7 +909,7 @@ async function handleIdentityGoogleCallback(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const redirectUri = signInCallbackUrl(request, "google");
+  const redirectUri = signInCallbackUrl(request, env, "google");
   const failure = signInCallbackPage(SIGNIN_NOT_COMPLETED_MESSAGE);
   if (request.url.length > MAX_GOOGLE_CALLBACK_URL_LENGTH) return failure;
   const parameters = new URL(request.url).searchParams;
@@ -738,19 +926,21 @@ async function handleIdentityGoogleCallback(
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT code_verifier AS codeVerifier FROM google_signin_handoffs
       WHERE state = ?
-        AND id_token IS NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
         AND expires_at > ?`,
   ).bind(state, nowIso).first<{ codeVerifier: string }>();
   if (!pending) return failure;
-  let idToken: string;
+  let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
-    idToken = await exchangeGoogleAuthorizationCode(
+    const idToken = await exchangeGoogleAuthorizationCode(
       env,
       code,
       pending.codeVerifier,
       redirectUri,
     );
+    verified = await verifiedHostedCallbackIdentity(env, "google", idToken);
   } catch {
     return failure;
   }
@@ -758,21 +948,20 @@ async function handleIdentityGoogleCallback(
   // started, so a handoff that expired mid-exchange is never filled.
   const stored = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
-        SET id_token = ?
+        SET code_verifier = NULL, identity_link_key = ?, proof = ?
       WHERE state = ?
-        AND id_token IS NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
         AND expires_at > ?`,
-  ).bind(idToken, state, new Date().toISOString()).run();
+  ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
   if (stored.meta.changes !== 1) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE);
 }
 
 /**
- * Reads the completed Google sign-in back exactly once, on the same terms as
- * Apple's: the conditional UPDATE both claims and marks the row, so two
- * concurrent reads cannot both win, and a replayed read after success is
- * indistinguishable from an expired one.
+ * Reads the completed Google sign-in back exactly once, on the same opaque
+ * proof terms as Apple's result route.
  *
  * This route is deliberately not attempt-limited: the page polls it on a fixed
  * short schedule while the user finishes at Google, and it discloses nothing
@@ -797,26 +986,28 @@ async function handleIdentityGoogleResult(
   }
   const nowIso = new Date().toISOString();
   await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
-  const claimed = await env.USAGE_MONITOR_DB.prepare(
+  const delivered = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
-        SET consumed_at = ?
+        SET delivered_at = ?
       WHERE state = ?
-        AND id_token IS NOT NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NOT NULL
+        AND proof IS NOT NULL
+        AND delivered_at IS NULL
         AND expires_at > ?
-      RETURNING id_token AS idToken`,
-  ).bind(nowIso, state, nowIso).first<{ idToken: string }>();
-  if (claimed) {
+      RETURNING proof`,
+  ).bind(nowIso, state, nowIso).first<{ proof: string }>();
+  if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-google-result-v0.1",
-      idToken: claimed.idToken,
+      proof: delivered.proof,
     });
   }
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM google_signin_handoffs
       WHERE state = ?
-        AND id_token IS NULL
-        AND consumed_at IS NULL
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
         AND expires_at > ?`,
   ).bind(state, nowIso).first<{ state: string }>();
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
@@ -861,7 +1052,13 @@ async function handleRecover(request: Request, env: Env): Promise<Response> {
     throw new ApiError(401, "IDENTITY_REQUIRED");
   }
   assertAdmissionBindings(env);
-  await assertAttemptAllowed(env.RECOVERY_RATE_LIMIT, "recovery");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "recovery",
+  );
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
     || body.value === null
@@ -1370,11 +1567,10 @@ async function handleTelemetryContribution(
       accountingVerification: "server_repriced",
     }, 202);
   } catch (error) {
-    await env.QUARANTINE.delete(r2Key);
-    await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
-      contributionId,
-      r2Key,
-    });
+    // The ingest batch can have committed before a later accounting write
+    // fails. Look up the canonical row before any cleanup: a found row makes
+    // this an indeterminate, committed outcome, so ordinary retention is the
+    // only destructive cleanup path.
     const replay = await existingTelemetryContribution(
       env.USAGE_MONITOR_DB,
       participant.id,
@@ -1395,6 +1591,20 @@ async function handleTelemetryContribution(
         202,
         { "idempotency-replayed": "true" },
       );
+    }
+    // A completed lookup with no row proves this request did not create a
+    // retained contribution. Remove its orphan immediately. If either cleanup
+    // operation fails, keep the pending registration so reconciliation can
+    // remove the object later instead of treating that storage failure as
+    // permission to lose a committed envelope.
+    try {
+      await env.QUARANTINE.delete(r2Key);
+      await clearPendingQuarantineObject(env.USAGE_MONITOR_DB, {
+        contributionId,
+        r2Key,
+      });
+    } catch {
+      // The reconciliation registration remains durable by design.
     }
     const retryAdmission = await telemetryContributionAdmission(
       env.USAGE_MONITOR_DB,
@@ -1691,13 +1901,181 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   );
 }
 
+const ADMIN_ACTIONS = new Set<AdminAction>([
+  "set_collection_controls",
+  "run_maintenance",
+]);
+const ADMIN_CONTROL_REASONS = new Set<CollectionControlReason>([
+  "drill_containment",
+  "drill_restore",
+  "privacy_incident",
+  "security_incident",
+  "abuse_or_cost",
+  "maintenance",
+]);
+
+async function adminSession(
+  request: Request,
+  env: Env,
+): Promise<{
+  session: SessionPrincipal;
+  identityKey: string;
+}> {
+  const session = await personalSession(request, env);
+  const identityKey = await authorizeAdminIdentity(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"),
+  );
+  return { session, identityKey };
+}
+
+async function handleAdminOverview(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+    throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+  }
+  await adminSession(request, env);
+  const reference = new URL(request.url).searchParams.get("diagnosticReference");
+  if (reference !== null && !validDiagnosticReference(reference)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  return jsonResponse(
+    await readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
+      environment: env.ENVIRONMENT,
+      enrollmentMode: env.ENROLLMENT_MODE,
+      accountScopedIngestMode: env.ACCOUNT_SCOPED_INGEST_MODE,
+      diagnosticReference: reference ?? undefined,
+    }),
+    200,
+    { "cache-control": "no-store", vary: "Cookie" },
+  );
+}
+
+async function handleAdminAction(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  const { session, identityKey } = await adminSession(request, env);
+  assertCsrf(request, session);
+  const body = await readBoundedJson(request);
+  if (typeof body.value !== "object"
+      || body.value === null
+      || Array.isArray(body.value)
+      || typeof Reflect.get(body.value, "action") !== "string") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const action = Reflect.get(body.value, "action") as string;
+  if (!ADMIN_ACTIONS.has(action as AdminAction)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  if (action === "run_maintenance") {
+    if (Object.keys(body.value).length !== 1) throw new ApiError(400, "BODY_INVALID");
+    const operationId = await beginAdminOperation(
+      env.USAGE_MONITOR_DB,
+      identityKey,
+      "run_maintenance",
+      { phase: "started" },
+    );
+    try {
+      const result = await runScheduledMaintenance(env, Date.now());
+      if (result.code === "MAINTENANCE_IN_PROGRESS") {
+        throw new ApiError(409, "LIFECYCLE_STATE_CONFLICT");
+      }
+      await finishAdminOperation(
+        env.USAGE_MONITOR_DB,
+        operationId,
+        "success",
+        {
+          code: result.code,
+          lifecycleComplete: result.lifecycleComplete,
+          quarantineReconciliationComplete: result.quarantineReconciliationComplete,
+          expiredIdentityHandoffsPurged: result.expiredIdentityHandoffsPurged,
+          expiredIdentityHandoffPurgeComplete: result.expiredIdentityHandoffPurgeComplete,
+          aggregateRebuildComplete: result.aggregateRebuildComplete,
+          publicationEnabled: result.publicationEnabled,
+        },
+      );
+      return jsonResponse(
+        { schemaVersion: "admin-action-v0.1", action, result },
+        200,
+        { "cache-control": "no-store", vary: "Cookie" },
+      );
+    } catch (error) {
+      try {
+        await finishAdminOperation(
+          env.USAGE_MONITOR_DB,
+          operationId,
+          "failure",
+          { code: error instanceof ApiError ? error.code : "INTERNAL_ERROR" },
+        );
+      } catch {
+        // Preserve the original maintenance failure response.
+      }
+      throw error;
+    }
+  }
+
+  const expectedKeys = [
+    "action", "enrollment", "uploadRegistration", "processing", "publication",
+    "reasonCode", "expectedRevision",
+  ].sort();
+  if (Object.keys(body.value).sort().join("\0") !== expectedKeys.join("\0")
+      || typeof Reflect.get(body.value, "enrollment") !== "boolean"
+      || typeof Reflect.get(body.value, "uploadRegistration") !== "boolean"
+      || typeof Reflect.get(body.value, "processing") !== "boolean"
+      || typeof Reflect.get(body.value, "publication") !== "boolean"
+      || typeof Reflect.get(body.value, "reasonCode") !== "string"
+      || !Number.isSafeInteger(Reflect.get(body.value, "expectedRevision"))
+      || (Reflect.get(body.value, "expectedRevision") as number) < 1
+      || !ADMIN_CONTROL_REASONS.has(
+        Reflect.get(body.value, "reasonCode") as CollectionControlReason,
+      )) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const reasonCode = Reflect.get(body.value, "reasonCode") as CollectionControlReason;
+  const expectedRevision = Reflect.get(body.value, "expectedRevision") as number;
+  const flags = {
+    enrollment: Reflect.get(body.value, "enrollment") as boolean,
+    uploadRegistration: Reflect.get(body.value, "uploadRegistration") as boolean,
+    processing: Reflect.get(body.value, "processing") as boolean,
+    publication: Reflect.get(body.value, "publication") as boolean,
+  };
+  const controls = await setCollectionControls(
+    env.USAGE_MONITOR_DB,
+    identityKey,
+    flags,
+    reasonCode,
+    expectedRevision,
+  );
+  return jsonResponse(
+    { schemaVersion: "admin-action-v0.1", action, collection: controls },
+    200,
+    { "cache-control": "no-store", vary: "Cookie" },
+  );
+}
+
 async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
   await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
-  return new Response(
-    await readLatestCommunityWeeklySnapshot(env.USAGE_MONITOR_DB),
-    { headers: JSON_HEADERS },
-  );
+  await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
+  const snapshot = await readLatestCommunityWeeklySnapshot(env.USAGE_MONITOR_DB);
+  if (!snapshot.cacheable) {
+    return new Response(snapshot.payloadJson, {
+      headers: { ...JSON_HEADERS, "cache-control": "no-store" },
+    });
+  }
+  const etag = `"community-snapshot-${snapshot.snapshotId}-r${snapshot.revision}"`;
+  const headers = new Headers({
+    ...JSON_HEADERS,
+    // A released payload is sealed to this revision. Keep browsers
+    // revalidating the mutable `latest` route, while allowing a shared edge
+    // cache to retain this immutable revision briefly.
+    "cache-control": "public, max-age=0, must-revalidate, s-maxage=60",
+    etag,
+  });
+  if (request.headers.get("if-none-match") === etag) {
+    return new Response(null, { status: 304, headers });
+  }
+  return new Response(snapshot.payloadJson, { headers });
 }
 
 const CONTRIBUTION_ID_PATTERN =
@@ -1894,6 +2272,10 @@ async function routeApi(
       return handleSession(request, env);
     case "logout":
       return handleLogout(request, env);
+    case "admin_overview":
+      return handleAdminOverview(request, env);
+    case "admin_action":
+      return handleAdminAction(request, env);
     case "security_reset":
       return handleSecurityReset(request, env);
     case "upload_authorization":
@@ -1935,7 +2317,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const route = matchWorkerRoute(url.pathname);
   try {
     if (route.id === "ready") {
-      return await handleReady(request, env);
+      return noStore(await handleReady(request, env));
     }
     if (route.id === "health") {
       if (request.method !== "GET") methodNotAllowed(["GET"]);
@@ -1964,7 +2346,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         "SELECT schema_version FROM deletion_tombstones LIMIT 1",
       ).first();
       await env.QUARANTINE.head("__usage_monitor_health_probe__");
-      return jsonResponse({
+      return noStore(jsonResponse({
         status: "ok",
         mode: "synthetic-and-private-telemetry",
         enrollmentMode,
@@ -2008,10 +2390,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           ongoingDeviceUploadRegistration:
             collectionControls.uploadRegistration,
         },
-      });
+      }));
     }
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
-    if (route.id !== "asset") return await routeApi(request, env, route.id);
+    if (route.id !== "asset") {
+      const response = await routeApi(request, env, route.id);
+      return route.id === "community_stats" ? response : noStore(response);
+    }
     const asset = await env.ASSETS.fetch(request);
     const headers = new Headers(asset.headers);
     headers.set("referrer-policy", "no-referrer");
@@ -2043,12 +2428,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     };
     if (log.level === "error") console.error(JSON.stringify(log));
     else console.warn(JSON.stringify(log));
+    await recordDiagnosticError(
+      env.USAGE_MONITOR_DB,
+      requestId,
+      route.routeClass,
+      apiError.code,
+      apiError.status,
+    );
     const response = errorResponse(apiError, requestId);
     const allow = allowedHeader(apiError);
-    if (!allow) return response;
+    if (!allow) return noStore(response);
     const headers = new Headers(response.headers);
     for (const [name, value] of new Headers(allow)) headers.set(name, value);
-    return new Response(response.body, { status: response.status, headers });
+    return noStore(new Response(response.body, { status: response.status, headers }));
   }
 }
 
@@ -2061,8 +2453,66 @@ interface ScheduledMaintenanceLog {
   quarantineRetentionComplete: boolean;
   restoreReplayComplete: boolean;
   quarantineReconciliationComplete: boolean;
+  expiredIdentityHandoffsPurged: number;
+  expiredIdentityHandoffPurgeComplete: boolean;
   aggregateRebuildComplete: boolean;
   publicationEnabled: boolean | null;
+}
+
+const MAINTENANCE_LEASE_MILLISECONDS = 20 * 60 * 1_000;
+
+async function acquireMaintenanceLease(
+  db: D1Database,
+  nowEpoch = Date.now(),
+): Promise<string | null> {
+  const token = crypto.randomUUID();
+  const expiresAt = new Date(nowEpoch + MAINTENANCE_LEASE_MILLISECONDS).toISOString();
+  const result = await db.prepare(
+    `UPDATE retention_state
+        SET maintenance_lease_token = ?, maintenance_lease_expires_at = ?
+      WHERE singleton = 1
+        AND (maintenance_lease_expires_at IS NULL OR maintenance_lease_expires_at <= ?)`,
+  ).bind(token, expiresAt, new Date(nowEpoch).toISOString()).run();
+  return result.meta.changes === 1 ? token : null;
+}
+
+async function releaseMaintenanceLease(db: D1Database, token: string): Promise<void> {
+  await db.prepare(
+    `UPDATE retention_state
+        SET maintenance_lease_token = NULL, maintenance_lease_expires_at = NULL
+      WHERE singleton = 1 AND maintenance_lease_token = ?`,
+  ).bind(token).run();
+}
+
+async function renewMaintenanceLease(db: D1Database, token: string): Promise<void> {
+  const nowEpoch = Date.now();
+  const now = new Date(nowEpoch).toISOString();
+  const expiresAt = new Date(nowEpoch + MAINTENANCE_LEASE_MILLISECONDS).toISOString();
+  const result = await db.prepare(
+    `UPDATE retention_state
+        SET maintenance_lease_expires_at = ?
+      WHERE singleton = 1
+        AND maintenance_lease_token = ?
+        AND maintenance_lease_expires_at > ?`,
+  ).bind(expiresAt, token, now).run();
+  if (result.meta.changes !== 1) {
+    throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
+  }
+}
+
+async function ownsRenewedMaintenanceLease(
+  db: D1Database,
+  token: string,
+): Promise<boolean> {
+  try {
+    await renewMaintenanceLease(db, token);
+    return true;
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "LIFECYCLE_STATE_CONFLICT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export async function runScheduledMaintenance(
@@ -2073,14 +2523,55 @@ export async function runScheduledMaintenance(
   let quarantineRetentionComplete = false;
   let restoreReplayComplete = false;
   let quarantineReconciliationComplete = false;
+  let expiredIdentityHandoffsPurged = 0;
+  let expiredIdentityHandoffPurgeComplete = false;
   let rebuildComplete = false;
   let publicationEnabled: boolean | null = null;
+  let maintenanceLease: string | null = null;
   try {
+    maintenanceLease = await acquireMaintenanceLease(env.USAGE_MONITOR_DB);
+    if (maintenanceLease === null) {
+      const log: ScheduledMaintenanceLog = {
+        level: "info",
+        event: "scheduled_backend_maintenance",
+        outcome: "success",
+        code: "MAINTENANCE_IN_PROGRESS",
+        lifecycleComplete,
+        quarantineRetentionComplete,
+        restoreReplayComplete,
+        quarantineReconciliationComplete,
+        expiredIdentityHandoffsPurged,
+        expiredIdentityHandoffPurgeComplete,
+        aggregateRebuildComplete: rebuildComplete,
+        publicationEnabled,
+      };
+      console.log(JSON.stringify(log));
+      return log;
+    }
+    // Keep a non-null token for callback capture. The outer variable remains
+    // available to the unconditional, best-effort final release below.
+    const ownedMaintenanceLease = maintenanceLease;
+    await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+    await pruneDiagnosticErrors(env.USAGE_MONITOR_DB);
+    const handoffPurge = await purgeExpiredIdentityHandoffs(
+      env.USAGE_MONITOR_DB,
+      // A delayed Cron invocation must still clear handoffs that have expired
+      // by the time the Worker actually runs; snapshot construction continues
+      // to use the scheduled timestamp for deterministic reporting periods.
+      new Date().toISOString(),
+    );
+    expiredIdentityHandoffsPurged = handoffPurge.purged;
+    expiredIdentityHandoffPurgeComplete = handoffPurge.complete;
+    await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const lifecycle = await runBackendLifecycle(
       env.USAGE_MONITOR_DB,
       env.DELETION_LEDGER,
       env.QUARANTINE,
       scheduledTime,
+      () => ownsRenewedMaintenanceLease(
+        env.USAGE_MONITOR_DB,
+        ownedMaintenanceLease,
+      ),
     );
     quarantineRetentionComplete =
       lifecycle.quarantineRetentionComplete;
@@ -2088,6 +2579,7 @@ export async function runScheduledMaintenance(
     lifecycleComplete = quarantineRetentionComplete
       && restoreReplayComplete;
 
+    await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const reconciliation = await reconcilePendingQuarantineObjects(
       env.USAGE_MONITOR_DB,
       env.QUARANTINE,
@@ -2101,10 +2593,12 @@ export async function runScheduledMaintenance(
     if (lifecycleComplete
         && quarantineReconciliationComplete
         && publicationEnabled === true) {
+      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
       await buildCommunityWeeklySnapshot(
         env.USAGE_MONITOR_DB,
         scheduledTime,
       );
+      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
       const rebuild = await rebuildPendingCommunityWeeklySnapshots(
         env.USAGE_MONITOR_DB,
         scheduledTime,
@@ -2118,6 +2612,7 @@ export async function runScheduledMaintenance(
 
     const complete = lifecycleComplete
       && quarantineReconciliationComplete
+      && expiredIdentityHandoffPurgeComplete
       && rebuildComplete;
     const log: ScheduledMaintenanceLog = {
       level: "info",
@@ -2128,6 +2623,8 @@ export async function runScheduledMaintenance(
       quarantineRetentionComplete,
       restoreReplayComplete,
       quarantineReconciliationComplete,
+      expiredIdentityHandoffsPurged,
+      expiredIdentityHandoffPurgeComplete,
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };
@@ -2143,11 +2640,25 @@ export async function runScheduledMaintenance(
       quarantineRetentionComplete,
       restoreReplayComplete,
       quarantineReconciliationComplete,
+      expiredIdentityHandoffsPurged,
+      expiredIdentityHandoffPurgeComplete,
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };
     console.error(JSON.stringify(log));
     throw error;
+  } finally {
+    if (maintenanceLease !== null) {
+      try {
+        // A successor may have acquired an expired lease while this pass was
+        // unwinding. Conditional release must never clear its lease or replace
+        // the completed/failing outcome of this pass.
+        await releaseMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+      } catch {
+        // The lease expires as an availability backstop. Do not turn an
+        // otherwise reported lifecycle outcome into a release-only failure.
+      }
+    }
   }
 }
 

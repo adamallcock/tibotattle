@@ -42,11 +42,13 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
+    CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
     ENVELOPE_PUBLIC_JWK: "",
     ENVIRONMENT: "synthetic-development",
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: runtime.QUARANTINE,
+    PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     APPLE_SERVICES_ID: SERVICES_ID,
@@ -246,10 +248,12 @@ describe("web Sign in with Apple", () => {
       state: started.state,
     });
     expect(result.status).toBe(200);
-    expect(await result.json()).toEqual({
+    const resultPayload = await result.json();
+    expect(resultPayload).toMatchObject({
       schemaVersion: "identity-apple-result-v0.1",
-      idToken: APPLE_ID_TOKEN,
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
     });
+    expect(JSON.stringify(resultPayload)).not.toContain(APPLE_ID_TOKEN);
 
     // Single use: the winning read consumed the row, so a replay is
     // indistinguishable from an expired handoff.
@@ -261,13 +265,24 @@ describe("web Sign in with Apple", () => {
       error: { code: "IDENTITY_TOKEN_INVALID" },
     });
 
-    // Apple's optional user payload is never persisted anywhere.
+    // Neither Apple's optional user payload nor the raw provider credential is
+    // persisted anywhere. The short-lived row contains an opaque proof only.
     const stored = await bindings().USAGE_MONITOR_DB.prepare(
-      "SELECT state, id_token AS idToken, consumed_at AS consumedAt FROM apple_signin_handoffs",
-    ).all<{ state: string; idToken: string; consumedAt: string | null }>();
+      `SELECT state, identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+         FROM apple_signin_handoffs`,
+    ).all<{
+      state: string;
+      linkKey: string;
+      proof: string;
+      deliveredAt: string | null;
+    }>();
     expect(stored.results).toHaveLength(1);
-    expect(stored.results[0]?.consumedAt).not.toBeNull();
-    expect(JSON.stringify(stored.results)).not.toContain("Real");
+    expect(stored.results[0]?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
+    expect(stored.results[0]?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
+    expect(stored.results[0]?.deliveredAt).not.toBeNull();
+    const serializedStored = JSON.stringify(stored.results);
+    expect(serializedStored).not.toContain("Real");
+    expect(serializedStored).not.toContain(APPLE_ID_TOKEN);
   });
 
   it("expires an unread handoff and refuses the expired state", async () => {
@@ -347,17 +362,25 @@ describe("web Sign in with Apple", () => {
     expect(tokenCalls).toHaveLength(1);
 
     const stored = await bindings().USAGE_MONITOR_DB.prepare(
-      "SELECT id_token AS idToken FROM apple_signin_handoffs WHERE state = ?",
-    ).bind(started.state).first<{ idToken: string }>();
-    expect(stored?.idToken).toBe(APPLE_ID_TOKEN);
+      `SELECT identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+         FROM apple_signin_handoffs WHERE state = ?`,
+    ).bind(started.state).first<{
+      linkKey: string;
+      proof: string;
+      deliveredAt: string | null;
+    }>();
+    expect(stored?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
+    expect(stored?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
+    expect(stored?.deliveredAt).toBeNull();
+    expect(JSON.stringify(stored)).not.toContain(APPLE_ID_TOKEN);
 
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
     });
     expect(result.status).toBe(200);
-    expect(await result.json()).toEqual({
+    expect(await result.json()).toMatchObject({
       schemaVersion: "identity-apple-result-v0.1",
-      idToken: APPLE_ID_TOKEN,
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
     });
   });
 
@@ -407,9 +430,16 @@ describe("web Sign in with Apple", () => {
 
     // The pending handoff survived every ignored callback untouched.
     const row = await bindings().USAGE_MONITOR_DB.prepare(
-      "SELECT id_token AS idToken FROM apple_signin_handoffs WHERE state = ?",
-    ).bind(started.state).first<{ idToken: string | null }>();
-    expect(row?.idToken ?? null).toBeNull();
+      `SELECT identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+         FROM apple_signin_handoffs WHERE state = ?`,
+    ).bind(started.state).first<{
+      linkKey: string | null;
+      proof: string | null;
+      deliveredAt: string | null;
+    }>();
+    expect(row?.linkKey ?? null).toBeNull();
+    expect(row?.proof ?? null).toBeNull();
+    expect(row?.deliveredAt ?? null).toBeNull();
   });
 
   it("keeps a failed Apple exchange from filling the handoff", async () => {

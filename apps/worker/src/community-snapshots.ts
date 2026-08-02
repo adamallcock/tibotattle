@@ -13,6 +13,7 @@ const DAY = 24 * 60 * 60 * 1000;
 const WEEK = 7 * DAY;
 const SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
 const COMPARISON_SCHEMA_VERSION = "participant-community-comparison-v0.2";
+const SNAPSHOT_ID_PATTERN = /^community-weekly:\d{4}-\d{2}-\d{2}(?::r[1-9]\d*)?$/u;
 // Mirrors the closed planType/planVariant enums in
 // packages/telemetry-contract/schemas/v0.2/quota-snapshot.schema.json.
 // Allowance-relative aggregates must never blend plans, so every published
@@ -551,9 +552,43 @@ export async function rebuildPendingCommunityWeeklySnapshots(
   return { processed, remaining: Boolean(pending), snapshotIds };
 }
 
+export type LatestCommunitySnapshotRead =
+  | Readonly<{
+      payloadJson: string;
+      cacheable: false;
+    }>
+  | Readonly<{
+      payloadJson: string;
+      cacheable: true;
+      snapshotId: string;
+      revision: number;
+    }>;
+
+function publishedSnapshotIsCacheable(row: SnapshotRow): boolean {
+  if (row.release_state !== "published"
+      || !SNAPSHOT_ID_PATTERN.test(row.snapshot_id)
+      || !Number.isSafeInteger(row.revision)
+      || row.revision < 1) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(row.payload_json) as unknown;
+    return typeof payload === "object"
+      && payload !== null
+      && !Array.isArray(payload)
+      && Reflect.get(payload, "schemaVersion") === SNAPSHOT_SCHEMA_VERSION
+      && Reflect.get(payload, "releaseStatus") === "published"
+      && Reflect.get(payload, "snapshotId") === row.snapshot_id
+      && Reflect.get(payload, "snapshotRevision") === row.revision
+      && Reflect.get(payload, "immutable") === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function readLatestCommunityWeeklySnapshot(
   db: D1Database,
-): Promise<string> {
+): Promise<LatestCommunitySnapshotRead> {
   const row = await db.prepare(
     `SELECT payload_json, release_state, snapshot_id, revision, week_start, week_end,
             ingestion_cutoff_at
@@ -561,28 +596,42 @@ export async function readLatestCommunityWeeklySnapshot(
       ORDER BY week_end DESC, revision DESC LIMIT 1`,
   ).first<SnapshotRow>();
   if (!row) {
-    return stableJson({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      releaseStatus: "not_yet_published",
-      reason: "stable_snapshot_unavailable",
-      immutable: true,
-      nonOverlapping: true,
+    return Object.freeze({
+      payloadJson: stableJson({
+        schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+        releaseStatus: "not_yet_published",
+        reason: "stable_snapshot_unavailable",
+        immutable: true,
+        nonOverlapping: true,
+      }),
+      cacheable: false,
     });
   }
   if (row.release_state === "withdrawn") {
-    return stableJson({
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      releaseStatus: "withdrawn",
-      snapshotId: row.snapshot_id,
-      snapshotRevision: row.revision,
-      period: { startAt: row.week_start, endAt: row.week_end },
-      ingestionCutoffAt: row.ingestion_cutoff_at,
-      reason: "source_data_withdrawn",
-      immutable: true,
-      nonOverlapping: true,
+    return Object.freeze({
+      payloadJson: stableJson({
+        schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+        releaseStatus: "withdrawn",
+        snapshotId: row.snapshot_id,
+        snapshotRevision: row.revision,
+        period: { startAt: row.week_start, endAt: row.week_end },
+        ingestionCutoffAt: row.ingestion_cutoff_at,
+        reason: "source_data_withdrawn",
+        immutable: true,
+        nonOverlapping: true,
+      }),
+      cacheable: false,
     });
   }
-  return row.payload_json;
+  if (publishedSnapshotIsCacheable(row)) {
+    return Object.freeze({
+      payloadJson: row.payload_json,
+      cacheable: true,
+      snapshotId: row.snapshot_id,
+      revision: row.revision,
+    });
+  }
+  return Object.freeze({ payloadJson: row.payload_json, cacheable: false });
 }
 
 export async function readParticipantCommunityComparison(
