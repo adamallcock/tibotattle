@@ -4,7 +4,19 @@ import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import {
   APP_PRICE_REGISTRY_MANIFEST,
+  CODEX_SPEED_MODE_OBSERVABILITY,
+  DEFAULT_FAST_MODE_PREFERENCE,
+  FAST_MODE_MODEL_FAMILY_KEYS,
+  FAST_MODE_MULTIPLIER_SOURCE,
+  FAST_MODE_QUOTA_MULTIPLIERS,
+  OBSERVED_SPEED_MODE_KEYS,
+  QUOTA_WEIGHTED_API_PRICE_METRIC,
+  emptySpeedWeightingCrossing,
+  fastModeModelFamilyKey,
+  inferFastModeFromCalibrationWindows,
+  isFastModePreference,
   priceCodexUsageEvent,
+  summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
 import {
   defaultReplaySafeAccountingCachePath,
@@ -430,6 +442,17 @@ function validWeeklyReset(row) {
         minimum: 0,
         maximum: 1,
       })
+      // Speed evidence added after the first cache generation. An older cache
+      // omits it entirely; absent is accepted and read as unknown, but a
+      // present-and-malformed value is rejected rather than coerced.
+      || (row.fastFractionOfKnown !== undefined
+        && !finiteWeeklyNumber(row.fastFractionOfKnown, {
+          nullable: true,
+          minimum: 0,
+          maximum: 1,
+        }))
+      || (row.speedEventCounts !== undefined
+        && !validSpeedEventCounts(row.speedEventCounts))
       || !finiteWeeklyNumber(
         row.holdoutMeanAbsoluteErrorPercentagePoints,
         { nullable: true, minimum: 0, maximum: 100 },
@@ -437,6 +460,15 @@ function validWeeklyReset(row) {
     return false;
   }
   return true;
+}
+
+function validSpeedEventCounts(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && ["standard", "fast", "unknown"].every((key) => (
+      Number.isSafeInteger(value[key]) && value[key] >= 0
+    ));
 }
 
 function validLiveWeeklyCalibration(weekly) {
@@ -684,11 +716,54 @@ function newUsagePeriod(id, label) {
     byReasoningEffort: {
       unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
     },
+    // Observed speed mode crossed with the model's published Fast credit rate
+    // family, so the owner's Fast-mode preference can be applied at read time.
+    speedWeighting: emptySpeedWeightingCrossing(),
     accountAttribution: {
       attributedPseudonymousEvents: 0,
       unattributedEvents: 0,
     },
   };
+}
+
+function addSpeedWeighting(crossing, projection) {
+  const speed = crossing[projection.speed] ? projection.speed : "unknown";
+  const cell = crossing[speed][fastModeModelFamilyKey(projection.model)];
+  cell.events += 1;
+  cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+}
+
+function finalizeSpeedWeighting(crossing) {
+  return Object.fromEntries(Object.entries(crossing).map(([speed, families]) => [
+    speed,
+    Object.fromEntries(Object.entries(families).map(([family, cell]) => [
+      family,
+      {
+        ...cell,
+        apiPriceEquivalentUsd: Number(cell.apiPriceEquivalentUsd.toFixed(6)),
+      },
+    ])),
+  ]));
+}
+
+function safeSpeedWeighting(value) {
+  const crossing = emptySpeedWeightingCrossing();
+  for (const speed of OBSERVED_SPEED_MODE_KEYS) {
+    for (const family of FAST_MODE_MODEL_FAMILY_KEYS) {
+      const cell = value?.[speed]?.[family];
+      crossing[speed][family] = {
+        events: Number.isSafeInteger(cell?.events) && cell.events >= 0
+          ? cell.events
+          : 0,
+        apiPriceEquivalentUsd:
+          finiteNumber(cell?.apiPriceEquivalentUsd) !== null
+            && cell.apiPriceEquivalentUsd >= 0
+            ? cell.apiPriceEquivalentUsd
+            : 0,
+      };
+    }
+  }
+  return crossing;
 }
 
 function addDimension(dimension, key, projection) {
@@ -714,6 +789,7 @@ function addUsageToPeriod(period, projection) {
   modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
   period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
   addDimension(period.bySpeed, projection.speed, projection);
+  addSpeedWeighting(period.speedWeighting, projection);
   addDimension(period.byApiServiceTier, projection.apiServiceTier, projection);
   addDimension(period.bySurface, projection.surface, projection);
   addDimension(period.byAgentScope, projection.agentScope, projection);
@@ -757,6 +833,7 @@ function finalizeUsagePeriod(period) {
     byAgentScope: finalizeDimension(period.byAgentScope),
     byLineage: finalizeDimension(period.byLineage),
     byReasoningEffort: finalizeDimension(period.byReasoningEffort),
+    speedWeighting: finalizeSpeedWeighting(period.speedWeighting),
   };
 }
 
@@ -1472,12 +1549,114 @@ async function reportProjection(root) {
   }));
 }
 
+// Accounting period identifiers mapped to their trailing window. "all" has no
+// bound and is deliberately absent rather than given a sentinel duration.
+const FAST_MODE_PERIOD_WINDOW_MS = Object.freeze({
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
+  "30d": 30 * 24 * 60 * 60 * 1_000,
+});
+
+function fastModeCalibrationWindows(weekly) {
+  const resets = Array.isArray(weekly?.recentResets) ? weekly.recentResets : [];
+  return resets.filter(validWeeklyReset).map((row) => ({
+    id: row.resetIdentity,
+    startAt: row.firstObservedAt,
+    endAt: row.lastObservedAt,
+    apiPriceEquivalentUsd: row.apiPriceEquivalentUsd,
+    knownSpeedFraction: row.knownSpeedFraction ?? null,
+    fastFractionOfKnown: row.fastFractionOfKnown ?? null,
+    eligibleTransitions: row.eligibleTransitions,
+    uniqueBoundaries: row.uniqueBoundaries,
+    observedSpanPercentagePoints: row.observedSpanPercentagePoints,
+    unknownSpeedEvents: row.speedEventCounts?.unknown ?? 0,
+  }));
+}
+
+// Inference is a window-level label, so only windows that reach into the
+// displayed accounting period may contribute a count to it.
+function inferredFastEventsInPeriod(inference, periodId, nowMs) {
+  if (inference.status !== "inferred") return 0;
+  const windowMs = FAST_MODE_PERIOD_WINDOW_MS[periodId];
+  const startMs = windowMs === undefined
+    ? Number.NEGATIVE_INFINITY
+    : nowMs - windowMs;
+  let events = 0;
+  for (const window of inference.windows) {
+    if (window.mode !== "fast") continue;
+    const endMs = Date.parse(window.endAt);
+    if (!Number.isFinite(endMs) || endMs < startMs) continue;
+    events += window.unknownSpeedEvents;
+  }
+  return events;
+}
+
+function fastModeProjection(period, { preference, inference, nowMs }) {
+  const summary = summarizeQuotaWeightedAccounting({
+    speedWeighting: safeSpeedWeighting(period?.speedWeighting),
+    preference,
+    inferredFastEvents: inferredFastEventsInPeriod(
+      inference,
+      period?.id ?? "all",
+      nowMs,
+    ),
+    inference,
+  });
+  return {
+    preference: summary.preference,
+    defaultPreference: DEFAULT_FAST_MODE_PREFERENCE,
+    // Codex records a tier only when the setting is applied or changed, never
+    // at session start. Observed values forward-fill and always win; the
+    // preference attributes only the turns that precede the first observation
+    // in their session.
+    logObservability: { ...CODEX_SPEED_MODE_OBSERVABILITY },
+    metricKey: QUOTA_WEIGHTED_API_PRICE_METRIC.key,
+    metricLabel: QUOTA_WEIGHTED_API_PRICE_METRIC.label,
+    metricShortLabel: QUOTA_WEIGHTED_API_PRICE_METRIC.shortLabel,
+    metricExplainer: QUOTA_WEIGHTED_API_PRICE_METRIC.explainer,
+    standardMetricKey: QUOTA_WEIGHTED_API_PRICE_METRIC.standardMetricKey,
+    standardMetricLabel: QUOTA_WEIGHTED_API_PRICE_METRIC.standardMetricLabel,
+    multipliers: { ...FAST_MODE_QUOTA_MULTIPLIERS },
+    multiplierSource: { ...FAST_MODE_MULTIPLIER_SOURCE },
+    quotaWeightedApiPriceEquivalentUsd:
+      summary.quotaWeightedApiPriceEquivalentUsd,
+    standardApiPriceEquivalentUsd: summary.standardApiPriceEquivalentUsd,
+    unweightedUnknownApiPriceEquivalentUsd:
+      summary.unweightedUnknownApiPriceEquivalentUsd,
+    weightingStatus: summary.weightingStatus,
+    appliedMultipliers: { ...summary.appliedMultipliers },
+    coverage: { ...summary.coverage },
+    inference: {
+      ...summary.inference,
+      referenceWindowCount: inference.referenceWindowCount,
+      scoredWindowCount: inference.scoredWindowCount,
+      relativeTolerance:
+        inference.thresholds.relativeToleranceOfPublishedMultiple,
+    },
+  };
+}
+
+// Blind-spot status for Fast-mode attribution. The honest reading is a share,
+// never a bare "observed"/"not observed".
+function fastModeGapStatus(coverage) {
+  if (coverage.totalEvents === 0) return "insufficient_evidence";
+  if (coverage.unknownEvents === 0) {
+    return coverage.observedEvents === coverage.totalEvents
+      ? "observed"
+      : "partial";
+  }
+  return coverage.unknownSharePercent > 50 ? "mostly_unknown" : "partial";
+}
+
 export async function buildLocalCompanionSnapshot({
   root = process.cwd(),
   collectorFile = resolve(root, ".usage-monitor", "collector-events.jsonl"),
   checkpointFile = resolve(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
   accountingCacheFile = defaultReplaySafeAccountingCachePath(root),
   allowDevelopmentArtifactFallback = false,
+  // Owner-stated Codex speed mode. The composition root reads it from
+  // owner-only local state; an unrecognised value never becomes a silent Fast.
+  fastModePreference = DEFAULT_FAST_MODE_PREFERENCE,
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
@@ -1537,6 +1716,24 @@ export async function buildLocalCompanionSnapshot({
   const usage = replaySafeCache?.periods ?? collector.usage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
     ?? usage.find((period) => period.id === "all");
+  const selectedFastModePreference = isFastModePreference(fastModePreference)
+    ? fastModePreference
+    : DEFAULT_FAST_MODE_PREFERENCE;
+  const fastModeInference = inferFastModeFromCalibrationWindows(
+    fastModeCalibrationWindows(replaySafeCache?.weeklyCalibration),
+  );
+  const fastModeContext = {
+    preference: selectedFastModePreference,
+    inference: fastModeInference,
+    nowMs,
+  };
+  const periodFastMode = new Map(usage.map((period) => [
+    period.id,
+    fastModeProjection(period, fastModeContext),
+  ]));
+  const displayFastMode = displayUsage === undefined
+    ? fastModeProjection(undefined, fastModeContext)
+    : periodFastMode.get(displayUsage.id);
   const quota = collector.quota;
   const quotaTimeline = Array.isArray(replaySafeCache?.quotaTimeline)
       && replaySafeCache.quotaTimeline.length > 0
@@ -1635,6 +1832,10 @@ export async function buildLocalCompanionSnapshot({
         events: displayUsage?.events ?? 0,
         totalTokens: displayUsage?.totalTokens ?? 0,
         apiPriceEquivalentUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
+        quotaWeightedApiPriceEquivalentUsd:
+          displayFastMode.quotaWeightedApiPriceEquivalentUsd,
+        fastMode: displayFastMode,
+        speedWeighting: safeSpeedWeighting(displayUsage?.speedWeighting),
         components: displayUsage?.components ?? emptyComponents(),
         componentCosts: displayUsage?.componentCosts ?? {},
         byModel: displayUsage?.byModel ?? [],
@@ -1669,6 +1870,11 @@ export async function buildLocalCompanionSnapshot({
           events: period.events,
           totalTokens: period.totalTokens,
           apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,
+          quotaWeightedApiPriceEquivalentUsd:
+            periodFastMode.get(period.id)
+              ?.quotaWeightedApiPriceEquivalentUsd ?? null,
+          fastMode: periodFastMode.get(period.id) ?? displayFastMode,
+          speedWeighting: safeSpeedWeighting(period.speedWeighting),
           pricingCoverage: period.pricingCoverage,
           components: period.components,
           componentCosts: period.componentCosts ?? {},
@@ -1691,6 +1897,14 @@ export async function buildLocalCompanionSnapshot({
       pricing: {
         basis: "official_api_price_equivalent_not_subscription_allowance",
         totalCostUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
+        // The headline figure once the published Fast credit rate has been
+        // applied to events whose effective mode is Fast. Null when no
+        // legitimate weighting is available for any of the recorded cost.
+        quotaWeightedTotalCostUsd:
+          displayFastMode.quotaWeightedApiPriceEquivalentUsd,
+        quotaWeightedMetricLabel: displayFastMode.metricLabel,
+        quotaWeightedMetricExplainer: displayFastMode.metricExplainer,
+        fastMode: displayFastMode,
         periodLabel: displayUsage?.label ?? "All retained evidence",
         coveragePercent: pricingCoveragePercent,
         eventCount: displayUsage?.events ?? 0,
@@ -1748,8 +1962,8 @@ export async function buildLocalCompanionSnapshot({
         {
           id: "fast_mode",
           title: "Fast-mode accounting",
-          status: (displayUsage?.bySpeed?.fast?.events ?? 0) > 0 ? "observed" : "not_observed",
-          explanation: "Subscription Fast is kept separate from the Standard API-price counterfactual; its quota multiplier remains empirical.",
+          status: fastModeGapStatus(displayFastMode.coverage),
+          explanation: "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. Observed tiers always win; the remainder is attributed from the owner's stated mode, then a secondary window-level inference, and anything left stays explicitly unknown.",
         },
         {
           id: "subagents",

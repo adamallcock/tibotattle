@@ -247,3 +247,144 @@ export function apiPriceResolutionSummary(options?: {
   priceCards?: readonly PriceCard[] | null;
   apiServiceTier?: string;
 }): Readonly<Record<string, unknown>>;
+
+export type FastModeModelFamily = "gpt-5.6" | "gpt-5.5" | "gpt-5.4";
+export type FastModeModelFamilyKey = FastModeModelFamily | "unsupported";
+export type ObservedSpeedMode = "standard" | "fast" | "unknown";
+export type FastModePreference = "standard" | "fast" | "mixed_unknown";
+export type SpeedModeProvenance =
+  | "observed"
+  | "assumed_from_preference"
+  | "inferred"
+  | "unknown";
+
+export interface QuotaWeightedApiPriceMetric {
+  key: "quotaWeightedApiPriceEquivalentUsd";
+  label: string;
+  shortLabel: string;
+  standardMetricKey: "apiPriceEquivalentUsd";
+  standardMetricLabel: string;
+  explainer: string;
+}
+
+export interface SpeedWeightingCell {
+  events: number;
+  apiPriceEquivalentUsd: number;
+}
+export type SpeedWeightingCrossing = Record<
+  ObservedSpeedMode,
+  Record<FastModeModelFamilyKey, SpeedWeightingCell>
+>;
+
+export interface QuotaWeightedAccountingSummary {
+  metric: QuotaWeightedApiPriceMetric;
+  multiplierSource: Readonly<Record<string, string>>;
+  preference: FastModePreference;
+  standardApiPriceEquivalentUsd: number;
+  quotaWeightedApiPriceEquivalentUsd: number | null;
+  unweightedUnknownApiPriceEquivalentUsd: number;
+  weightingStatus: "complete" | "partial" | "unknown";
+  appliedMultipliers: Readonly<Record<string, number>>;
+  coverage: {
+    totalEvents: number;
+    observedEvents: number;
+    assumedFromPreferenceEvents: number;
+    inferredEvents: number;
+    unknownEvents: number;
+    observedSharePercent: number | null;
+    unknownSharePercent: number | null;
+  };
+  inference: {
+    status: string;
+    reasonCode: string | null;
+    inferredFastWindows: number;
+    appliedToWeighting: false;
+    appliedToWeightingReason: string;
+  };
+}
+
+export interface FastModeCalibrationWindow {
+  id?: string | null;
+  startAt?: string | null;
+  endAt?: string | null;
+  apiPriceEquivalentUsd: number;
+  knownSpeedFraction?: number | null;
+  fastFractionOfKnown?: number | null;
+  eligibleTransitions?: number;
+  uniqueBoundaries?: number;
+  observedSpanPercentagePoints?: number;
+  unknownSpeedEvents?: number;
+}
+
+export interface FastModeInferenceWindow {
+  id: string | null;
+  startAt: string | null;
+  endAt: string | null;
+  mode: "fast" | "standard" | "unknown";
+  provenance: "inferred" | "unknown";
+  observedToStandardPredictedRatio: number;
+  matchedMultiple: number | null;
+  reasonCode: string;
+  isStandardReference: boolean;
+  unknownSpeedEvents: number;
+}
+
+export interface FastModeInferenceResult {
+  status: "inferred" | "insufficient_signal";
+  reasonCode: string | null;
+  thresholds: Readonly<Record<string, number>>;
+  referenceStandardCapacityUsd: number | null;
+  referenceWindowCount: number;
+  scoredWindowCount: number;
+  inferredFastWindowCount: number;
+  inferredFastUnknownSpeedEvents: number;
+  windows: readonly FastModeInferenceWindow[];
+}
+
+export const FAST_MODE_MULTIPLIER_SOURCE: Readonly<Record<string, string>>;
+export const CODEX_SPEED_MODE_OBSERVABILITY: Readonly<{
+  recordedEvent: string;
+  observedValues: Readonly<Record<string, string>>;
+  firesOn: string;
+  sessionBaselineRecorded: false;
+  resolution: string;
+  unobservedMeans: string;
+}>;
+export const FAST_MODE_QUOTA_MULTIPLIERS: Readonly<
+  Record<FastModeModelFamily, number>
+>;
+export const FAST_MODE_MODEL_FAMILY_KEYS: readonly FastModeModelFamilyKey[];
+export const OBSERVED_SPEED_MODE_KEYS: readonly ObservedSpeedMode[];
+export const FAST_MODE_PREFERENCE_VALUES: readonly FastModePreference[];
+export const DEFAULT_FAST_MODE_PREFERENCE: FastModePreference;
+export const SPEED_MODE_PROVENANCE_VALUES: readonly SpeedModeProvenance[];
+export const QUOTA_WEIGHTED_API_PRICE_METRIC: QuotaWeightedApiPriceMetric;
+export const FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS: Readonly<
+  Record<string, number>
+>;
+export const FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES: readonly string[];
+
+export function fastModeModelFamily(model: unknown): FastModeModelFamily | null;
+export function fastModeModelFamilyKey(model: unknown): FastModeModelFamilyKey;
+export function fastModeQuotaMultiplier(model: unknown): number | null;
+export function isFastModePreference(value: unknown): value is FastModePreference;
+export function emptySpeedWeightingCrossing(): SpeedWeightingCrossing;
+export function resolveEffectiveSpeedMode(input?: {
+  observedMode?: string;
+  preference?: string;
+  inferredMode?: string;
+}): { mode: ObservedSpeedMode; provenance: SpeedModeProvenance };
+export function quotaWeightedApiPriceEquivalent(input?: {
+  apiPriceEquivalentUsd?: number;
+  model?: string;
+  mode?: string;
+}): { usd: number | null; multiplier: number | null; status: string };
+export function summarizeQuotaWeightedAccounting(input?: {
+  speedWeighting?: SpeedWeightingCrossing | null;
+  preference?: string;
+  inferredFastEvents?: number;
+  inference?: FastModeInferenceResult | null;
+}): QuotaWeightedAccountingSummary;
+export function inferFastModeFromCalibrationWindows(
+  windows: readonly FastModeCalibrationWindow[] | null | undefined,
+): FastModeInferenceResult;

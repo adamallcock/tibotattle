@@ -228,6 +228,54 @@ test("local companion builds a closed real-data projection without identifiers o
       snapshot.overview.monitoringGaps.find((row) => row.id === "ordinary_chat")?.status,
       "excluded",
     );
+    // The Fast-mode blind spot reports an attribution share. It must never
+    // claim "not observed" while observed Fast evidence is in the projection.
+    const fastModeGap = snapshot.overview.monitoringGaps
+      .find((row) => row.id === "fast_mode");
+    assert.equal(fastModeGap.status, "partial");
+    assert.match(
+      fastModeGap.explanation,
+      /only when it is applied or changed, never at session start/u,
+    );
+    const fastMode = snapshot.overview.accounting.fastMode;
+    assert.equal(fastMode.preference, "standard");
+    assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
+    assert.equal(fastMode.metricLabel, "Quota-weighted API-price equivalent");
+    assert.deepEqual(fastMode.multipliers, {
+      "gpt-5.6": 2.5,
+      "gpt-5.5": 2.5,
+      "gpt-5.4": 2,
+    });
+    assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-01");
+    assert.deepEqual(fastMode.coverage, {
+      totalEvents: 2,
+      observedEvents: 1,
+      assumedFromPreferenceEvents: 1,
+      inferredEvents: 0,
+      unknownEvents: 0,
+      observedSharePercent: 50,
+      unknownSharePercent: 0,
+    });
+    // The only priced event was observed Fast on a GPT-5.6 model, so the
+    // weighted total is exactly the published 2.5x of the Standard total.
+    assert.equal(
+      Math.abs(
+        snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd
+          - snapshot.overview.accounting.apiPriceEquivalentUsd * 2.5,
+      ) < 1e-12,
+      true,
+    );
+    assert.equal(
+      snapshot.overview.pricing.quotaWeightedTotalCostUsd,
+      snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+    );
+    // The Standard-rate figure stays available and unchanged beside it.
+    assert.equal(
+      snapshot.overview.pricing.totalCostUsd,
+      snapshot.overview.accounting.apiPriceEquivalentUsd,
+    );
+    assert.equal(fastMode.inference.appliedToWeighting, false);
+    assert.equal(fastMode.inference.status, "insufficient_signal");
     assert.equal(snapshot.gradient.datasets.summary[0].private_field, undefined);
     assert.equal(snapshot.gradient.datasets.reset_calendar[0].source_url, undefined);
     const serialized = JSON.stringify(snapshot);
@@ -246,6 +294,103 @@ test("local companion builds a closed real-data projection without identifiers o
     ]) {
       assert.equal(serialized.includes(privateValue), false, `response leaked ${privateValue}`);
     }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("the stated speed mode attributes unrecorded evidence and never overrides an observed mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-fast-mode-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    const usage = (observedAt, model, codexSpeedMode) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model,
+      components: {
+        input_uncached_tokens: 1_000_000,
+        input_cache_read_tokens: 0,
+        input_cache_write_tokens: 0,
+        output_text_tokens: 0,
+        output_reasoning_tokens: 0,
+      },
+      tierSemantics: { codexSpeedMode },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        // Observed Standard on a family with a published Fast rate.
+        usage("2026-07-25T11:00:00.000Z", "gpt-5.4", "standard"),
+        // No recorded mode: only the stated preference can attribute this.
+        usage("2026-07-25T11:10:00.000Z", "gpt-5.4", "unknown"),
+      ].map((line) => `${line}\n`).join(""),
+    );
+    const build = (fastModePreference) => buildLocalCompanionSnapshot({
+      root,
+      fastModePreference,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+
+    // Each event prices to $5 of Standard-rate API equivalent. Stating
+    // Standard leaves the total exactly where it was before weighting existed.
+    const standard = await build("standard");
+    assert.equal(standard.overview.accounting.apiPriceEquivalentUsd, 10);
+    assert.equal(
+      standard.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      10,
+    );
+
+    // Stating Fast weights only the event whose mode was not recorded; the
+    // observed Standard event keeps its observed weight of one. GPT-5.4's
+    // published Fast rate is 2x, so $5 + $5 x 2 = $15.
+    const fast = await build("fast");
+    assert.equal(
+      fast.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      15,
+    );
+    assert.deepEqual(fast.overview.accounting.fastMode.coverage, {
+      totalEvents: 2,
+      observedEvents: 1,
+      assumedFromPreferenceEvents: 1,
+      inferredEvents: 0,
+      unknownEvents: 0,
+      observedSharePercent: 50,
+      unknownSharePercent: 0,
+    });
+    assert.deepEqual(fast.overview.accounting.fastMode.appliedMultipliers, {
+      "gpt-5.4": 2,
+    });
+
+    // Stating "not sure" leaves the unrecorded event explicitly unweighted
+    // instead of quietly counting it at the Standard rate.
+    const mixed = await build("mixed_unknown");
+    assert.equal(
+      mixed.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      5,
+    );
+    assert.equal(
+      mixed.overview.accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd,
+      5,
+    );
+    assert.equal(mixed.overview.accounting.fastMode.weightingStatus, "partial");
+    assert.equal(mixed.overview.accounting.fastMode.coverage.unknownEvents, 1);
+    assert.equal(
+      mixed.overview.accounting.fastMode.coverage.unknownSharePercent,
+      50,
+    );
+    assert.equal(
+      mixed.overview.monitoringGaps.find((row) => row.id === "fast_mode").status,
+      "partial",
+    );
+
+    // An unrecognised statement is never treated as Fast.
+    const hostile = await build("turbo");
+    assert.equal(hostile.overview.accounting.fastMode.preference, "standard");
+    assert.equal(
+      hostile.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      10,
+    );
   } finally {
     await rm(root, { recursive: true });
   }

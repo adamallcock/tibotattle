@@ -1036,6 +1036,10 @@ export function analyzeWeeklyCalibration(dataset, { priorWindow = 3 } = {}) {
 
 export const BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT = 64;
 
+function safeSpeedEventCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
   if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)
       || (dataset.transitions !== undefined
@@ -1060,6 +1064,16 @@ export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
       eligibleTransitions: row.eligibleTransitions,
       uniqueBoundaries: row.pointCount,
       knownSpeedFraction: row.speedEvidence?.knownFraction ?? null,
+      // Retained so a consumer can separate windows whose observed speed
+      // evidence is predominantly Standard from windows that are merely
+      // well-covered. Older Codex versions are the only source of this
+      // evidence, so both fractions decay toward null over time.
+      fastFractionOfKnown: row.speedEvidence?.fastFractionOfKnown ?? null,
+      speedEventCounts: {
+        standard: safeSpeedEventCount(row.speedEvidence?.counts?.standard),
+        fast: safeSpeedEventCount(row.speedEvidence?.counts?.fast),
+        unknown: safeSpeedEventCount(row.speedEvidence?.counts?.unknown),
+      },
       holdoutMeanAbsoluteErrorPercentagePoints:
         row.chronologicalHoldout?.meanAbsoluteErrorPp ?? null,
     }));

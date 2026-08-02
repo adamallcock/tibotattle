@@ -234,13 +234,15 @@
           <article class="panel">
             <div class="panel-heading">
               <div>
-                <p class="panel-kicker">API-price equivalent</p>
+                <p class="panel-kicker" id="cost-metric-kicker">Quota-weighted API-price equivalent</p>
                 <h3>Replay-safe usage cost</h3>
               </div>
             </div>
             <p class="annotation" id="pricing-note">
-              This applies public API prices to non-overlapping local token
-              increments. It is not a subscription charge or a published dollar limit.
+              Standard-rate API prices applied to non-overlapping local token
+              increments, then multiplied by the published Fast credit rate for
+              increments whose effective mode is Fast. It tracks relative quota
+              consumption; it is not a subscription charge or a published dollar limit.
             </p>
             <div class="cost-total">
               <span id="cost-period">Recorded period</span>
@@ -563,8 +565,38 @@
             <strong>API pricing is a measuring stick, not your bill.</strong>
             <p>
               Every local usage increment is repriced with the public Standard
-              API rate card. Subscription Fast mode remains a separate observed attribute.
+              API rate card, then multiplied by the published Fast credit rate
+              when its effective mode is Fast. The result is a quota-weighted
+              API-price equivalent, not an invoice.
             </p>
+          </div>
+        </div>
+        <!--
+          Codex writes the speed mode only when it is applied or changed, never
+          at session start, so turns before the first change in a session carry
+          no recorded tier. This control attributes exactly those turns. It is
+          a statement by the owner, kept deliberately close to the numbers it
+          changes, and it never overrides a tier the log actually recorded.
+        -->
+        <div class="notice notice-info fast-mode-preference" id="fast-mode-preference">
+          <div>
+            <strong>Which Codex speed mode do you usually run?</strong>
+            <p id="fast-mode-preference-copy">
+              Codex records the speed mode only when you apply or change it, so
+              a session where you never switched carries no recorded mode.
+              Wherever the log did record one, that observed value is always
+              used and this setting is ignored. For the rest, your answer is the
+              only attribution available &mdash; and it matters, because Fast
+              consumes quota at 2.5&times; the Standard rate on GPT-5.6 and
+              GPT-5.5, and 2&times; on GPT-5.4.
+            </p>
+            <div class="segmented-control" id="fast-mode-preference-controls" aria-label="Codex speed mode">
+              <button type="button" data-fast-mode="standard">Standard</button>
+              <button type="button" data-fast-mode="fast">Fast</button>
+              <button type="button" data-fast-mode="mixed_unknown">Mixed / not sure</button>
+            </div>
+            <p class="participant-action-status" id="fast-mode-preference-status" role="status" hidden></p>
+            <p class="annotation" id="fast-mode-coverage">Awaiting local evidence.</p>
           </div>
         </div>
         <div class="metric-grid accounting-summary" id="accounting-summary"></div>
@@ -603,8 +635,8 @@
           </article>
         </div>
         <div class="accounting-dimensions primary-dimensions">
-          <article class="panel"><p class="panel-kicker">Subscription speed</p><h3>Standard, Fast and not recorded</h3><p class="annotation">Percentages are API-price-equivalent cost shares; counts are non-overlapping usage increments. Not recorded means an older rollout did not retain this setting and is not inferred as Standard.</p><div id="accounting-speed"></div></article>
-          <article class="panel"><p class="panel-kicker">Surface</p><h3>Where replay-safe usage ran</h3><p class="annotation">Percentages are API-price-equivalent cost shares; counts are non-overlapping usage increments, not messages, turns, or every raw log row.</p><div id="accounting-surface"></div></article>
+          <article class="panel"><p class="panel-kicker">Subscription speed</p><h3>As recorded in the logs</h3><p class="annotation">Percentages are Standard-rate API-price-equivalent cost shares, before any Fast weighting; counts are non-overlapping usage increments. Not recorded means the turn came before the first speed-mode change in its session, so the log holds no tier for it; it is never inferred as Standard.</p><div id="accounting-speed"></div></article>
+          <article class="panel"><p class="panel-kicker">Surface</p><h3>Where replay-safe usage ran</h3><p class="annotation">Percentages are Standard-rate API-price-equivalent cost shares; counts are non-overlapping usage increments, not messages, turns, or every raw log row.</p><div id="accounting-surface"></div></article>
         </div>
         <details class="advanced-diagnostics">
           <summary>Advanced metadata coverage</summary>

@@ -27,6 +27,28 @@ const REGISTRY_EXPORTS = Object.freeze([
   "addOfficialPriceRegistry",
   "validateOfficialPriceRegistry",
 ]);
+const SUBSCRIPTION_SPEED_EXPORTS = Object.freeze([
+  "CODEX_SPEED_MODE_OBSERVABILITY",
+  "DEFAULT_FAST_MODE_PREFERENCE",
+  "FAST_MODE_MODEL_FAMILY_KEYS",
+  "FAST_MODE_MULTIPLIER_SOURCE",
+  "FAST_MODE_PREFERENCE_VALUES",
+  "FAST_MODE_QUOTA_MULTIPLIERS",
+  "FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES",
+  "FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS",
+  "OBSERVED_SPEED_MODE_KEYS",
+  "QUOTA_WEIGHTED_API_PRICE_METRIC",
+  "SPEED_MODE_PROVENANCE_VALUES",
+  "emptySpeedWeightingCrossing",
+  "fastModeModelFamily",
+  "fastModeModelFamilyKey",
+  "fastModeQuotaMultiplier",
+  "inferFastModeFromCalibrationWindows",
+  "isFastModePreference",
+  "quotaWeightedApiPriceEquivalent",
+  "resolveEffectiveSpeedMode",
+  "summarizeQuotaWeightedAccounting",
+]);
 const LOCAL_EXPORTS = Object.freeze([
   "LOCAL_API_PRICING_METHOD_VERSION",
   "aggregateLocalApiPriceResults",
@@ -66,7 +88,12 @@ test("the accounting package has one reviewed public export and an exact depende
 test("the accounting package exposes its reviewed combined runtime API", () => {
   assert.deepEqual(
     Object.keys(accounting).sort(),
-    [...COST_EXPORTS, ...REGISTRY_EXPORTS, ...LOCAL_EXPORTS].sort(),
+    [
+      ...COST_EXPORTS,
+      ...REGISTRY_EXPORTS,
+      ...SUBSCRIPTION_SPEED_EXPORTS,
+      ...LOCAL_EXPORTS,
+    ].sort(),
   );
 });
 

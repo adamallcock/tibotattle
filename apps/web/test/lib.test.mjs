@@ -777,6 +777,119 @@ test("new accounting caveats survive the closed dashboard normalizer", () => {
   );
 });
 
+test("the Fast-mode blind spot reports a share instead of a bare not-observed", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    monitoringGaps: [{ id: "fast_mode", status: "mostly_unknown" }]
+  });
+  assert.deepEqual(
+    result.monitoringGaps.map((row) => [row.id, row.status]),
+    [["fast_mode", "mostly_unknown"]]
+  );
+  // The copy must state the cause, not assert an unqualified absence.
+  assert.match(
+    result.monitoringGaps[0].explanation,
+    /only when it is applied or changed, never at session start/u
+  );
+  assert.doesNotMatch(result.monitoringGaps[0].explanation, /NOT OBSERVED/iu);
+});
+
+test("the closed accounting normalizer keeps the quota-weighted metric and its coverage split", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    accounting: {
+      periodId: "7d",
+      events: 10,
+      apiPriceEquivalentUsd: 20,
+      quotaWeightedApiPriceEquivalentUsd: 34,
+      speedWeighting: {
+        fast: { "gpt-5.6": { events: 4, apiPriceEquivalentUsd: 8 } },
+        standard: { "gpt-5.4": { events: 2, apiPriceEquivalentUsd: 4 } },
+        unknown: { unsupported: { events: 4, apiPriceEquivalentUsd: 8 } }
+      },
+      fastMode: {
+        preference: "mixed_unknown",
+        quotaWeightedApiPriceEquivalentUsd: 34,
+        standardApiPriceEquivalentUsd: 20,
+        unweightedUnknownApiPriceEquivalentUsd: 8,
+        weightingStatus: "partial",
+        appliedMultipliers: { "gpt-5.6": 2.5 },
+        coverage: {
+          totalEvents: 10,
+          observedEvents: 6,
+          assumedFromPreferenceEvents: 0,
+          inferredEvents: 3,
+          unknownEvents: 1,
+          observedSharePercent: 60,
+          unknownSharePercent: 10
+        },
+        inference: {
+          status: "inferred",
+          inferredFastWindows: 2,
+          referenceWindowCount: 4,
+          scoredWindowCount: 9,
+          relativeTolerance: 0.1,
+          // A server claiming inference changed the total must not be believed.
+          appliedToWeighting: true
+        }
+      }
+    }
+  });
+  const accounting = result.accounting;
+  assert.equal(accounting.quotaWeightedApiPriceEquivalentUsd, 34);
+  assert.equal(accounting.apiPriceEquivalentUsd, 20);
+  assert.equal(accounting.fastMode.preference, "mixed_unknown");
+  assert.equal(accounting.fastMode.weightingStatus, "partial");
+  assert.equal(accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd, 8);
+  assert.deepEqual(accounting.fastMode.coverage, {
+    totalEvents: 10,
+    observedEvents: 6,
+    assumedFromPreferenceEvents: 0,
+    inferredEvents: 3,
+    unknownEvents: 1,
+    observedSharePercent: 60,
+    unknownSharePercent: 10
+  });
+  // The multipliers and the metric name are stated by this page, never taken
+  // from the server, and inference can never be reported as weighted.
+  assert.deepEqual(accounting.fastMode.multipliers, {
+    "gpt-5.6": 2.5,
+    "gpt-5.5": 2.5,
+    "gpt-5.4": 2
+  });
+  assert.equal(accounting.fastMode.metricLabel, "Quota-weighted API-price equivalent");
+  assert.equal(accounting.fastMode.inference.appliedToWeighting, false);
+  assert.equal(accounting.fastMode.inference.inferredFastWindows, 2);
+  assert.equal(accounting.fastMode.logRecordsTierChangesOnly, true);
+  assert.equal(
+    accounting.fastMode.preferenceAppliesTo,
+    "turns_with_no_observed_tier_only"
+  );
+  assert.equal(accounting.speedWeighting.fast["gpt-5.6"].events, 4);
+  assert.equal(accounting.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd, 8);
+  assert.equal(accounting.speedWeighting.fast["gpt-5.5"].events, 0);
+});
+
+test("an absent or hostile Fast-mode projection degrades to an explicit unknown", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    accounting: {
+      events: 3,
+      apiPriceEquivalentUsd: 5,
+      quotaWeightedApiPriceEquivalentUsd: -12,
+      fastMode: { preference: "turbo", weightingStatus: "definitely" }
+    }
+  });
+  assert.equal(result.accounting.quotaWeightedApiPriceEquivalentUsd, null);
+  assert.equal(result.accounting.fastMode.preference, "standard");
+  assert.equal(result.accounting.fastMode.weightingStatus, "unknown");
+  assert.equal(result.accounting.fastMode.coverage.totalEvents, 0);
+  assert.equal(result.accounting.fastMode.inference.status, "not_run");
+});
+
 test("live weekly calibration keeps its explicit multi-account ambiguity label", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
@@ -1500,6 +1613,51 @@ test("local sync preview and actions keep privileged values behind loopback", as
   assert.equal(calls[3].options.body, "{}");
 });
 
+test("the Fast-mode preference travels on a fixed same-origin local route", async () => {
+  const calls = [];
+  const client = new LocalCompanionClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({
+        schemaVersion: "fast-mode-preference-v0.1",
+        mode: "mixed_unknown",
+        source: "stated",
+        recordedAt: "2026-08-01T12:00:00.000Z"
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+  });
+  const read = await client.fastModePreference();
+  assert.equal(read.mode, "mixed_unknown");
+  assert.equal(read.source, "stated");
+  const written = await client.selectFastModePreference("fast");
+  assert.equal(written.mode, "mixed_unknown");
+  assert.deepEqual(calls.map((call) => call.url), [
+    "/api/local/accounting/fast-mode-preference",
+    "/api/local/accounting/fast-mode-preference"
+  ]);
+  assert.equal(calls[0].options.method, undefined);
+  assert.equal(calls[1].options.method, "POST");
+  assert.equal(calls[1].options.headers["X-Usage-Monitor-Local"], "1");
+  assert.equal(calls[1].options.body, JSON.stringify({ mode: "fast" }));
+  // A value outside the fixed set never reaches the network.
+  await assert.rejects(
+    () => client.selectFastModePreference("turbo"),
+    TypeError
+  );
+  assert.equal(calls.length, 2);
+
+  // An unreadable preference reads back as the untouched Standard default
+  // rather than an invented Fast attribution.
+  const offline = new LocalCompanionClient({
+    fetchImpl: async () => {
+      throw new Error("companion unreachable");
+    }
+  });
+  const fallback = await offline.fastModePreference();
+  assert.equal(fallback.mode, "standard");
+  assert.equal(fallback.source, "default");
+});
+
 test("local pairing preserves fixed identifier-shaped codes and drops anything else", async () => {
   const pairingCode =
     "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -2112,6 +2270,18 @@ test("hosted Apple sign-in starts, polls, and refuses anything but Apple's autho
   );
 });
 
+// Every point where the companion health response is stored, paired with the
+// statements that follow it, so a test can require what must happen there.
+function assignsCompanionHealth(source) {
+  const branches = [];
+  const assignment = /localCompanionHealth = localHealth;/gu;
+  for (let match = assignment.exec(source); match !== null; match = assignment.exec(source)) {
+    branches.push(source.slice(match.index, match.index + 600));
+  }
+  assert.ok(branches.length >= 2, "expected both the loaded and fallback health paths");
+  return branches;
+}
+
 test("hosted sign-in step gates contribution and keeps identity copy truthful", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -2182,6 +2352,18 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource,
     /This build has no contribution service, so hosted sign-in is unavailable\./u,
   );
+  // That gate reads a capability the companion reports asynchronously, so both
+  // load paths must re-render the controls once it lands. Bootstrap renders
+  // them before the first health response, and without these calls the buttons
+  // keep the disabled state they were given when the capability was unknown --
+  // leaving a click that silently does nothing in every build.
+  for (const branch of assignsCompanionHealth(appSource)) {
+    assert.match(
+      branch,
+      /renderHostedIdentity\(\);/u,
+      "each localCompanionHealth assignment must re-render the sign-in controls",
+    );
+  }
   // The dead native handoff copy is gone: Apple provisions Sign in with Apple
   // only for Ad hoc, App Store Connect, and Development distribution, so a
   // Developer ID build can never carry the entitlement.
@@ -2898,7 +3080,12 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="accounting"/);
   assert.match(html, /id="accounting-models"/);
   assert.match(html, /Usage increments/);
-  assert.match(html, /Percentages are API-price-equivalent cost shares/);
+  assert.match(html, /Percentages are Standard-rate API-price-equivalent cost shares/);
+  // The Fast-mode preference is the only attribution current Codex evidence
+  // has, so it must stay reachable from the accounting section itself.
+  assert.match(html, /id="fast-mode-preference-controls"/);
+  assert.match(html, /data-fast-mode="mixed_unknown"/);
+  assert.match(html, /Quota-weighted API-price equivalent/);
   assert.match(html, /id="community"/);
   assert.match(html, /id="history"/);
   assert.match(html, /Your contribution receipt/);

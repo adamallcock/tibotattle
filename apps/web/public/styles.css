@@ -910,6 +910,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .issue strong { display: block; font-size: .78rem; }
 .issue p { margin: 2px 0 0; color: var(--muted); font-size: .69rem; }
 .issue-priority { color: var(--muted); font-size: .62rem; text-transform: uppercase; }
+.issue p.issue-detail { margin-top: 6px; color: var(--text); font-variant-numeric: tabular-nums; }
+.fast-mode-preference .segmented-control { margin-top: 10px; }
+.fast-mode-preference .annotation { margin-top: 8px; }
 .empty-inline { color: var(--muted); font-size: .76rem; }
 .report-panel { display: flex; align-items: center; justify-content: space-between; gap: 30px; margin-top: 18px; }
 .report-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }

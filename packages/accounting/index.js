@@ -21,6 +21,29 @@ export {
 } from "./src/price-registry.js";
 
 export {
+  CODEX_SPEED_MODE_OBSERVABILITY,
+  DEFAULT_FAST_MODE_PREFERENCE,
+  FAST_MODE_MODEL_FAMILY_KEYS,
+  FAST_MODE_MULTIPLIER_SOURCE,
+  FAST_MODE_PREFERENCE_VALUES,
+  FAST_MODE_QUOTA_MULTIPLIERS,
+  FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES,
+  FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS,
+  OBSERVED_SPEED_MODE_KEYS,
+  QUOTA_WEIGHTED_API_PRICE_METRIC,
+  SPEED_MODE_PROVENANCE_VALUES,
+  emptySpeedWeightingCrossing,
+  fastModeModelFamily,
+  fastModeModelFamilyKey,
+  fastModeQuotaMultiplier,
+  inferFastModeFromCalibrationWindows,
+  isFastModePreference,
+  quotaWeightedApiPriceEquivalent,
+  resolveEffectiveSpeedMode,
+  summarizeQuotaWeightedAccounting,
+} from "./src/subscription-speed.js";
+
+export {
   LOCAL_API_PRICING_METHOD_VERSION,
   aggregateLocalApiPriceResults,
   apiPriceResolutionSummary,

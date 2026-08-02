@@ -513,6 +513,7 @@ export const DIAGNOSTIC_SURFACES = Object.freeze([
   "contribution_prepare",
   "contribution_send",
   "device_credential_reset",
+  "fast_mode_preference",
   "hosted_identity",
   "hosted_privacy",
   "local_refresh"

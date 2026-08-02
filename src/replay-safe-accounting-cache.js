@@ -19,6 +19,8 @@ import {
 } from "./export-resource-policy.js";
 import {
   costWarningCodes,
+  emptySpeedWeightingCrossing,
+  fastModeModelFamilyKey,
   priceCodexUsageEvent,
   APP_PRICE_REGISTRY_MANIFEST,
 } from "@app-usagemonitor/accounting";
@@ -219,6 +221,10 @@ function newPeriod(id, label) {
     bySurface: emptyDimension(SURFACES),
     byAgentScope: emptyDimension(AGENT_SCOPES),
     byLineage: emptyDimension(LINEAGE),
+    // Observed speed mode crossed with the model's published Fast credit rate
+    // family. The crossing is what lets the owner's Fast-mode preference be
+    // applied at read time without rebuilding this cache.
+    speedWeighting: emptySpeedWeightingCrossing(),
   };
 }
 
@@ -599,6 +605,25 @@ function finalizeWeeklyQuotaTimeline(buckets) {
     : rows.slice(rows.length - MAX_QUOTA_TIMELINE_ROWS);
 }
 
+function addSpeedWeighting(crossing, event) {
+  // "fast", "standard" and "unknown" are the only observed values; anything
+  // else collapses to unknown rather than being treated as Standard.
+  const speed = crossing[event.speed] ? event.speed : "unknown";
+  const cell = crossing[speed][fastModeModelFamilyKey(event.model)];
+  cell.events += 1;
+  cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+}
+
+function finalizeSpeedWeighting(crossing) {
+  return Object.fromEntries(Object.entries(crossing).map(([speed, families]) => [
+    speed,
+    Object.fromEntries(Object.entries(families).map(([family, cell]) => [
+      family,
+      { ...cell, apiPriceEquivalentUsd: roundedMoney(cell.apiPriceEquivalentUsd) },
+    ])),
+  ]));
+}
+
 function addEvent(period, event) {
   period.events += 1;
   period.totalTokens += event.totalTokens;
@@ -627,6 +652,7 @@ function addEvent(period, event) {
         : "unpricedEvents"
   ] += 1;
   addDimension(period.bySpeed, event.speed, event);
+  addSpeedWeighting(period.speedWeighting, event);
   addDimension(period.byApiServiceTier, event.apiServiceTier, event);
   addDimension(period.bySurface, event.surface, event);
   addDimension(period.byAgentScope, event.agentScope, event);
@@ -684,6 +710,7 @@ function finalizePeriod(period) {
     bySurface: finalizeDimension(period.bySurface),
     byAgentScope: finalizeDimension(period.byAgentScope),
     byLineage: finalizeDimension(period.byLineage),
+    speedWeighting: finalizeSpeedWeighting(period.speedWeighting),
   };
 }
 

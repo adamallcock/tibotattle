@@ -1653,7 +1653,7 @@ const LOCAL_MODELS = new Set([
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Fast is observed separately from the Standard API-price counterfactual; its quota multiplier remains empirical."],
+  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; the rest is attributed from your stated mode, then a secondary window-level inference, and anything left stays explicitly unknown."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
@@ -1682,6 +1682,119 @@ function normalizeLocalComponentCosts(value) {
       costUsd: nonNegative(row.costUsd, 0)
     }];
   }));
+}
+
+const FAST_MODE_PREFERENCES = Object.freeze(["standard", "fast", "mixed_unknown"]);
+const FAST_MODE_FAMILY_KEYS = Object.freeze(["gpt-5.6", "gpt-5.5", "gpt-5.4", "unsupported"]);
+const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "unknown"]);
+// Published Fast credit rates, mirrored so the dashboard never has to trust a
+// server-supplied number to explain its own arithmetic.
+const FAST_MODE_MULTIPLIERS = Object.freeze({
+  "gpt-5.6": 2.5,
+  "gpt-5.5": 2.5,
+  "gpt-5.4": 2
+});
+const FAST_MODE_METRIC_LABEL = "Quota-weighted API-price equivalent";
+const FAST_MODE_METRIC_SHORT_LABEL = "Quota-weighted API equivalent";
+const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
+const FAST_MODE_METRIC_EXPLAINER =
+  "Standard-rate API prices, multiplied by the published Fast credit rate for events in Fast mode: 2.5x for GPT-5.6 and GPT-5.5, 2x for GPT-5.4. It tracks relative quota consumption, not a bill.";
+
+function normalizeSpeedWeighting(value) {
+  return Object.fromEntries(OBSERVED_SPEED_KEYS.map((speed) => [
+    speed,
+    Object.fromEntries(FAST_MODE_FAMILY_KEYS.map((family) => {
+      const cell = value?.[speed]?.[family] ?? {};
+      return [family, {
+        events: count(cell.events, 0),
+        apiPriceEquivalentUsd: nonNegative(cell.apiPriceEquivalentUsd, 0)
+      }];
+    }))
+  ]));
+}
+
+function normalizeFastMode(value) {
+  const coverage = value?.coverage ?? {};
+  const inference = value?.inference ?? {};
+  return {
+    preference: FAST_MODE_PREFERENCES.includes(value?.preference)
+      ? value.preference
+      : "standard",
+    defaultPreference: "standard",
+    // Codex records a tier only when the setting is applied or changed, never
+    // at session start, so turns before the first change in a session carry no
+    // recorded tier. The dashboard states this itself rather than reflecting a
+    // server claim.
+    logRecordsTierChangesOnly: true,
+    preferenceAppliesTo: "turns_with_no_observed_tier_only",
+    metricLabel: FAST_MODE_METRIC_LABEL,
+    metricShortLabel: FAST_MODE_METRIC_SHORT_LABEL,
+    metricExplainer: FAST_MODE_METRIC_EXPLAINER,
+    standardMetricLabel: FAST_MODE_STANDARD_METRIC_LABEL,
+    multipliers: { ...FAST_MODE_MULTIPLIERS },
+    quotaWeightedApiPriceEquivalentUsd: nonNegative(
+      value?.quotaWeightedApiPriceEquivalentUsd,
+      null
+    ),
+    standardApiPriceEquivalentUsd: nonNegative(
+      value?.standardApiPriceEquivalentUsd,
+      0
+    ),
+    unweightedUnknownApiPriceEquivalentUsd: nonNegative(
+      value?.unweightedUnknownApiPriceEquivalentUsd,
+      0
+    ),
+    weightingStatus: ["complete", "partial", "unknown"].includes(value?.weightingStatus)
+      ? value.weightingStatus
+      : "unknown",
+    appliedMultipliers: Object.fromEntries(
+      Object.keys(FAST_MODE_MULTIPLIERS)
+        .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
+        .map((family) => [family, FAST_MODE_MULTIPLIERS[family]])
+    ),
+    coverage: {
+      totalEvents: count(coverage.totalEvents, 0),
+      observedEvents: count(coverage.observedEvents, 0),
+      assumedFromPreferenceEvents: count(coverage.assumedFromPreferenceEvents, 0),
+      inferredEvents: count(coverage.inferredEvents, 0),
+      unknownEvents: count(coverage.unknownEvents, 0),
+      observedSharePercent: nonNegative(coverage.observedSharePercent, null),
+      unknownSharePercent: nonNegative(coverage.unknownSharePercent, null)
+    },
+    inference: {
+      status: ["inferred", "insufficient_signal", "not_run"].includes(inference.status)
+        ? inference.status
+        : "not_run",
+      reasonCode: text(inference.reasonCode, ""),
+      inferredFastWindows: count(inference.inferredFastWindows, 0),
+      referenceWindowCount: count(inference.referenceWindowCount, 0),
+      scoredWindowCount: count(inference.scoredWindowCount, 0),
+      relativeTolerance: nonNegative(inference.relativeTolerance, 0),
+      // Window-level labels are never folded into the weighted total.
+      appliedToWeighting: false
+    }
+  };
+}
+
+function normalizeFastModePreference(value) {
+  const mode = FAST_MODE_PREFERENCES.includes(value?.mode)
+    ? value.mode
+    : "standard";
+  return {
+    mode,
+    defaultMode: "standard",
+    availableModes: [...FAST_MODE_PREFERENCES],
+    // "stated" only when the server confirms a stored statement of this exact
+    // shape; anything else reads as the untouched default.
+    source: value?.source === "stated"
+      && value?.schemaVersion === "fast-mode-preference-v0.1"
+      ? "stated"
+      : "default",
+    recordedAt: text(value?.recordedAt, ""),
+    logRecordsTierChangesOnly: true,
+    appliesTo: "turns_with_no_observed_tier_only",
+    multipliers: { ...FAST_MODE_MULTIPLIERS }
+  };
 }
 
 function normalizeAccountingDimension(value, allowedKeys) {
@@ -1778,6 +1891,12 @@ function normalizeLocalAccounting(value = {}) {
     events: count(value.events, 0),
     totalTokens: count(value.totalTokens, 0),
     apiPriceEquivalentUsd: nonNegative(value.apiPriceEquivalentUsd, 0),
+    quotaWeightedApiPriceEquivalentUsd: nonNegative(
+      value.quotaWeightedApiPriceEquivalentUsd,
+      null
+    ),
+    fastMode: normalizeFastMode(value.fastMode),
+    speedWeighting: normalizeSpeedWeighting(value.speedWeighting),
     pricingCoverage: {
       fullyPricedEvents: count(value?.pricingCoverage?.fullyPricedEvents, 0),
       partiallyPricedEvents: count(value?.pricingCoverage?.partiallyPricedEvents, 0),
@@ -1939,6 +2058,8 @@ function normalizePricing(pricing = {}) {
       }));
   return {
     totalCostUsd: finite(pricing?.totalCostUsd ?? pricing?.estimatedApiCostUsd ?? pricing?.total_usd, null),
+    quotaWeightedTotalCostUsd: nonNegative(pricing?.quotaWeightedTotalCostUsd, null),
+    fastMode: normalizeFastMode(pricing?.fastMode),
     periodLabel: text(pricing?.periodLabel ?? pricing?.label, "Recorded period"),
     coveragePercent: finite(pricing?.coveragePercent ?? pricing?.pricedCoveragePercent ?? pricing?.pricedEventCoveragePercent, null),
     eventCount: finite(pricing?.eventCount ?? pricing?.pricedEventCount, null),
@@ -2403,6 +2524,47 @@ export class LocalCompanionClient {
         reason: "user_request"
       })
     );
+  }
+
+  /**
+   * The owner's stated Codex speed mode. Codex records no speed field, so an
+   * unreadable statement reads back as the Standard default rather than an
+   * invented Fast attribution.
+   */
+  async fastModePreference() {
+    try {
+      const response = await this.fetchImpl(
+        `${LOCAL_ROOT}/accounting/fast-mode-preference`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!response.ok) return normalizeFastModePreference(null);
+      return normalizeFastModePreference(
+        await response.json().catch(() => null)
+      );
+    } catch {
+      return normalizeFastModePreference(null);
+    }
+  }
+
+  async selectFastModePreference(mode) {
+    if (!FAST_MODE_PREFERENCES.includes(mode)) {
+      throw new TypeError("Unsupported Fast-mode preference.");
+    }
+    const response = await this.fetchImpl(
+      `${LOCAL_ROOT}/accounting/fast-mode-preference`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ mode })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw localCompanionRequestError(response, payload);
+    return normalizeFastModePreference(payload);
   }
 
   async contributionSyncPreview() {

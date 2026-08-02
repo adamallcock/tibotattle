@@ -53,6 +53,8 @@ let contributionSyncExactReview = null;
 let contributionSyncBusy = false;
 let automaticContributionStatus = null;
 let automaticContributionBusy = false;
+let fastModePreference = null;
+let fastModePreferenceBusy = false;
 let pendingAutomaticContributionConsent = null;
 let participantContributionAdmission = null;
 let localOnboarding = null;
@@ -732,8 +734,24 @@ function renderQuotaCards(data) {
 
 function renderPricing(data) {
   const pricing = data.pricing;
+  const fastMode = pricing.fastMode;
   $("#cost-period").textContent = pricing.periodLabel;
-  $("#cost-total").textContent = formatMoney(pricing.totalCostUsd, 2);
+  // The headline is the quota-weighted figure whenever a weighting exists;
+  // when nothing can be weighted legitimately the label falls back to the
+  // Standard-rate name rather than presenting an unweighted number under a
+  // weighted heading.
+  const weighted = pricing.quotaWeightedTotalCostUsd;
+  const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
+  $("#cost-metric-kicker").textContent = useWeighted
+    ? fastMode.metricLabel
+    : fastMode.standardMetricLabel;
+  $("#cost-metric-kicker").title = useWeighted
+    ? fastMode.metricExplainer
+    : "No usage in this period could be weighted, so the Standard-rate total is shown unchanged.";
+  $("#cost-total").textContent = formatMoney(
+    useWeighted ? weighted : pricing.totalCostUsd,
+    2
+  );
   const provenance = pricing.registryVersion
     ? ` · price registry ${pricing.registryVersion}${pricing.registryObservedAt ? ` (${formatLocal(pricing.registryObservedAt)})` : ""}`
     : "";
@@ -2002,8 +2020,17 @@ function renderAccounting(data) {
     accounting.replayExclusionDiagnostics?.forkReplayEventsExcluded,
     0
   );
+  const fastMode = accounting.fastMode;
+  const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
   for (const [label, value, note] of [
     ["Usage increments", compact(accounting.events), "Non-overlapping cumulative deltas"],
+    [
+      fastMode.metricShortLabel,
+      weighted === null ? "—" : formatApiMoney(weighted),
+      weighted === null
+        ? "No increment in this period could be weighted"
+        : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
+    ],
     ["Non-overlapping tokens", compact(accounting.totalTokens), accounting.periodLabel],
     ["Inherited replay excluded", compact(replayExcluded), "Removed across the cached scan window"],
     ["Model price coverage", formatPercent(pricedEvents / Math.max(1, accounting.events) * 100, 1), "Share of increments with a mapped price"]
@@ -2106,6 +2133,84 @@ function renderAccounting(data) {
     "empty-inline",
     "Reasoning-token counts are available, but the selected low/medium/high reasoning-effort setting is not retained in these usage snapshots."
   ));
+  renderFastModePreference();
+}
+
+function fastModeCoverageSentence(fastMode) {
+  const coverage = fastMode.coverage;
+  if (coverage.totalEvents === 0) {
+    return "No usage increments in this period, so there is no speed-mode attribution to report.";
+  }
+  const parts = [
+    `${compact(coverage.observedEvents)} observed in the logs`,
+    `${compact(coverage.assumedFromPreferenceEvents)} attributed from your stated mode`,
+    `${compact(coverage.inferredEvents)} inferred from calibration residuals`,
+    `${compact(coverage.unknownEvents)} still unknown`
+  ];
+  const share = coverage.unknownSharePercent === null
+    ? ""
+    : ` (${formatPercent(coverage.unknownSharePercent, 1)} of increments).`;
+  const unweighted = fastMode.unweightedUnknownApiPriceEquivalentUsd > 0
+    ? ` ${formatApiMoney(fastMode.unweightedUnknownApiPriceEquivalentUsd)} of Standard-rate cost could not be weighted and is excluded from the weighted total rather than counted at 1x.`
+    : "";
+  return `Of ${compact(coverage.totalEvents)} usage increments: ${parts.join(", ")}${share}${unweighted} Codex records the mode only when it is applied or changed, so turns before the first change in a session are never observed and a small structural error in the calibration cannot be engineered away.`;
+}
+
+function fastModeInferenceSentence(fastMode) {
+  const inference = fastMode.inference;
+  if (inference.status !== "inferred") {
+    return "Residual inference has not run: there is not yet enough matched calibration evidence to compare a window against a Standard reference.";
+  }
+  if (inference.inferredFastWindows === 0) {
+    return `Residual inference compared ${compact(inference.scoredWindowCount)} calibration windows against ${compact(inference.referenceWindowCount)} Standard references and marked none as Fast.`;
+  }
+  return `Residual inference marked ${compact(inference.inferredFastWindows)} of ${compact(inference.scoredWindowCount)} calibration windows as inferred Fast, against ${compact(inference.referenceWindowCount)} Standard references. Inference labels windows, never individual increments, so it is reported here and never folded into the weighted total.`;
+}
+
+function renderFastModePreference() {
+  const accounting = dashboard === null ? null : accountingPeriod(dashboard);
+  const stated = fastModePreference?.mode
+    ?? accounting?.fastMode?.preference
+    ?? "standard";
+  for (const control of $("#fast-mode-preference-controls").querySelectorAll("[data-fast-mode]")) {
+    const active = control.dataset.fastMode === stated;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+    control.disabled = fastModePreferenceBusy;
+  }
+  const coverage = $("#fast-mode-coverage");
+  if (accounting === null) {
+    coverage.textContent = "Awaiting local evidence.";
+    return;
+  }
+  coverage.textContent = `${fastModeCoverageSentence(accounting.fastMode)} ${fastModeInferenceSentence(accounting.fastMode)}`;
+}
+
+async function selectFastModePreference(mode) {
+  if (fastModePreferenceBusy) return;
+  const status = $("#fast-mode-preference-status");
+  fastModePreferenceBusy = true;
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = "Saving your Codex speed mode…";
+  renderFastModePreference();
+  try {
+    fastModePreference = await localClient.selectFastModePreference(mode);
+    status.textContent = fastModePreference.mode === "mixed_unknown"
+      ? "Saved. Increments with an observed tier keep it; the rest stay unknown unless residual inference can label their calibration window."
+      : `Saved. Increments with an observed tier keep it; the rest are now weighted as ${fastModePreference.mode === "fast" ? "Fast" : "Standard"}.`;
+    await refreshDashboardAfterFastModeChange();
+  } catch (error) {
+    showFailure(status, {
+      surface: "fast_mode_preference",
+      error,
+      fallback:
+        "Your Codex speed mode could not be saved. Nothing was assumed; check the local companion and try again."
+    });
+  } finally {
+    fastModePreferenceBusy = false;
+    renderFastModePreference();
+  }
 }
 
 function renderQuality(data) {
@@ -2152,6 +2257,16 @@ function renderQuality(data) {
         node("strong", "", item.title ?? item.dimension ?? "Unresolved coverage gap"),
         node("p", "", item.explanation ?? item.evidence ?? item.description ?? item.action ?? "Additional evidence is required.")
       );
+      // Fast-mode attribution is a share, not a yes/no. The counts are
+      // composed here from the normalized accounting projection so the row
+      // states the truth instead of a bare "not observed".
+      if (item.id === "fast_mode") {
+        copy.append(node(
+          "p",
+          "issue-detail",
+          fastModeCoverageSentence(accountingPeriod(data).fastMode)
+        ));
+      }
       issue.append(copy, node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")));
       issueList.append(issue);
     }
@@ -2722,14 +2837,20 @@ async function loadLocalDashboard() {
       ]);
       return { preview, status, automatic };
     })();
-    const [data, sync, localHealth, onboarding] = await Promise.all([
+    const [data, sync, localHealth, onboarding, speedPreference] = await Promise.all([
       localClient.load(),
       syncState,
       localClient.health().catch(() => null),
-      localClient.onboarding()
+      localClient.onboarding(),
+      localClient.fastModePreference()
     ]);
     localCompanionHealth = localHealth;
+    fastModePreference = speedPreference;
     renderDashboard(data);
+    // Health arrives after the first paint, and the sign-in controls are gated
+    // on a capability it carries. Without this re-render they keep the
+    // disabled state bootstrap gave them when the capability was still unknown.
+    renderHostedIdentity();
     renderPreparationIdentity(localHealth);
     renderContributionSyncStatus(sync.status);
     renderContributionSyncPreview(sync.preview);
@@ -2742,6 +2863,7 @@ async function loadLocalDashboard() {
       localClient.onboarding().catch(() => null),
     ]);
     localCompanionHealth = localHealth;
+    renderHostedIdentity();
     const backendOnly = localHealth === null
       && backendHealth?.checks?.database === "ok";
     dashboard = null;
@@ -2805,6 +2927,19 @@ async function loadQuickResultDashboard() {
   const data = await localClient.load();
   renderDashboard(data);
   if (localOnboarding) renderLocalOnboarding(localOnboarding);
+}
+
+/**
+ * The accounting projection is derived from the stated speed mode, so the
+ * overview is re-read after it changes. A failed re-read leaves the previous
+ * numbers on screen rather than blanking them.
+ */
+async function refreshDashboardAfterFastModeChange() {
+  try {
+    renderDashboard(await localClient.load());
+  } catch {
+    renderFastModePreference();
+  }
 }
 
 async function requestRefresh() {
@@ -3188,7 +3323,13 @@ const LOCAL_COMPANION_ERROR_COPY = {
   sync_failed:
     "The local companion could not complete the contribution pass. Anything not accepted stays queued locally.",
   refresh_in_progress:
-    "A local analysis is already running. Wait for it to finish before starting another."
+    "A local analysis is already running. Wait for it to finish before starting another.",
+  fast_mode_preference_unavailable:
+    "The local companion could not read or write your Codex speed mode. No mode was assumed and the accounting is unchanged.",
+  fast_mode_preference_invalid:
+    "That Codex speed mode is not one this build accepts. Nothing was stored.",
+  fast_mode_preference_not_authorized:
+    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored."
 };
 
 /**
@@ -5339,6 +5480,11 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
     control.setAttribute("aria-pressed", String(active));
   }
   renderAccounting(dashboard);
+});
+$("#fast-mode-preference-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-fast-mode]");
+  if (!button) return;
+  void selectFastModePreference(button.dataset.fastMode);
 });
 
 $("#contribution-file").addEventListener("change", async () => {

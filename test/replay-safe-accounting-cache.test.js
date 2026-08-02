@@ -205,6 +205,39 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
   assert.equal(latest.pricingCoverage.unpricedEvents, 1);
   assert.equal(latest.pricedEventFraction, 0.666667);
 
+  // The observed speed x published-Fast-family crossing is what lets the
+  // owner's stated mode be applied at read time without a cache rebuild. Its
+  // event counts must reconcile exactly with the speed and model dimensions,
+  // and an unrecognised model must land in "unsupported" rather than being
+  // given a Fast rate it has no published evidence for.
+  assert.deepEqual(
+    Object.entries(latest.speedWeighting).flatMap(([speed, families]) => (
+      Object.entries(families)
+        .filter(([, cell]) => cell.events > 0)
+        .map(([family, cell]) => [speed, family, cell.events])
+    )),
+    [
+      ["standard", "gpt-5.6", 1],
+      ["fast", "gpt-5.6", 1],
+      ["unknown", "unsupported", 1],
+    ],
+  );
+  assert.equal(
+    Object.values(latest.speedWeighting).reduce((total, families) => (
+      total + Object.values(families).reduce(
+        (subtotal, cell) => subtotal + cell.events,
+        0,
+      )
+    ), 0),
+    latest.events,
+  );
+  assert.equal(
+    latest.speedWeighting.fast["gpt-5.6"].apiPriceEquivalentUsd
+      + latest.speedWeighting.standard["gpt-5.6"].apiPriceEquivalentUsd
+      + latest.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd,
+    latest.apiPriceEquivalentUsd,
+  );
+
   assert.equal(latest.components.input_uncached_tokens, 2_000_100);
   assert.equal(latest.components.input_cache_read_tokens, 1_000_000);
   assert.equal(latest.components.output_text_tokens, 400_000);

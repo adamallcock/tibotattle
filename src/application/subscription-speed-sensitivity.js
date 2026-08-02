@@ -1,10 +1,12 @@
+import { fastModeQuotaMultiplier } from "@app-usagemonitor/accounting";
+
 import { isCodexSpeedMode } from "../providers/codex/logs.js";
 
+// Single source of truth: the published Fast credit rates and their provenance
+// live in the accounting package. This stays as the reviewed application-level
+// name so existing callers and their numbers are unchanged.
 export function fastQuotaMultiplier(model) {
-  if (typeof model !== "string") return null;
-  if (/^gpt-5\.(?:5|6)(?:$|-)/.test(model)) return 2.5;
-  if (/^gpt-5\.4(?:$|-)/.test(model)) return 2;
-  return null;
+  return fastModeQuotaMultiplier(model);
 }
 
 function roundUsd(value) {
