@@ -11,8 +11,8 @@ the artwork was rendered to every required icon size. It incorporates no
 third-party artwork, no typeface, no photograph, and no person's likeness.
 
 Rights: Created as an original work for this repository. All rights held by
-Adam Allcock, who reviewed the rendered artwork at full size and at 16- and
-32-pixel sizes and approved it for distribution with the v0.1.0 release on
-2026-08-01.
+Adam Allcock, who supplied the artwork and approved its distribution with the
+v0.1.0 release on 2026-08-01. Every required size renders from the single
+approved source; no size was drawn or retouched separately.
 
 License: MIT, under this repository's LICENSE file.
