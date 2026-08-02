@@ -522,40 +522,18 @@ describe("web Sign in with Apple", () => {
     expect(rows?.total).toBe(0);
   });
 
-  it("serves Apple's domain-association file verbatim, and 404s until it is configured", async () => {
+  it("keeps the retired Apple association filename out of the SPA fallback", async () => {
     const path = "/.well-known/apple-developer-domain-association.txt";
-    const association = "apple-developer-domain-association-token\nline-two\n";
-
-    const configured = await handleRequest(
-      new Request(`${ORIGIN}${path}`),
-      bindings({ APPLE_DOMAIN_ASSOCIATION: association }),
-    );
-    expect(configured.status).toBe(200);
-    expect(configured.headers.get("content-type"))
-      .toBe("text/plain; charset=utf-8");
-    expect(configured.headers.get("cache-control")).toBe("no-store");
-    expect(configured.headers.get("x-content-type-options")).toBe("nosniff");
-    // Apple compares the body byte for byte: no wrapping, no trimming.
-    expect(await configured.text()).toBe(association);
-
-    // Unset and empty both read as "not published yet" rather than as a fault.
-    for (const overrides of [{}, { APPLE_DOMAIN_ASSOCIATION: "" }]) {
-      const missing = await handleRequest(
-        new Request(`${ORIGIN}${path}`),
-        bindings(overrides),
+    for (const method of ["GET", "POST"]) {
+      const response = await handleRequest(
+        new Request(`${ORIGIN}${path}`, { method }),
+        bindings(),
       );
-      expect(missing.status, JSON.stringify(overrides)).toBe(404);
-      expect(await missing.json()).toMatchObject({
+      expect(response.status, method).toBe(404);
+      expect(await response.json()).toMatchObject({
         error: { code: "NOT_FOUND" },
       });
     }
-
-    const wrongMethod = await handleRequest(
-      new Request(`${ORIGIN}${path}`, { method: "POST" }),
-      bindings({ APPLE_DOMAIN_ASSOCIATION: association }),
-    );
-    expect(wrongMethod.status).toBe(405);
-    expect(wrongMethod.headers.get("allow")).toBe("GET");
   });
 
   it("accepts a private key whose newlines were flattened by a secret store", async () => {

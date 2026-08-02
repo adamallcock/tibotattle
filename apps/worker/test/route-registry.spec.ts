@@ -89,7 +89,8 @@ describe("Worker route registry", () => {
       "/index.html",
       "/api",
       "/apiary",
-      // Only the one exact well-known path is a Worker route.
+      // The retired association filename is the only well-known path
+      // intercepted by the Worker; all other well-known paths are assets.
       "/.well-known/apple-app-site-association",
       "/.well-known/apple-developer-domain-association.txt/",
     ]) {

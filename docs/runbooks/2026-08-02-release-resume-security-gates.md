@@ -70,9 +70,11 @@ and its bucket remains empty.
   deployment prerequisite: `/api/v1/admin/overview` returns the fail-closed
   `503 ADMIN_NOT_CONFIGURED` until the owner binds their actual pairwise
   identity-link key.
-- `https://tibotattle.com/.well-known/apple-developer-domain-association.txt`
-  currently returns `404`; Apple sign-in remains disabled until the exact
-  association text and Apple callback registration are supplied and verified.
+- Apple Service ID web registration is configured in the Apple portal with
+  `tibotattle.com` and the canonical callback URL. Apple does not require a
+  server association file for this registration; the historical
+  `/.well-known/apple-developer-domain-association.txt` path intentionally
+  returns `404` and is not a release gate.
 
 ## Required owner/configuration inputs
 
@@ -84,10 +86,7 @@ placeholders, and do not put the values in the repository.
    64-character pairwise identity-link key for the intended active admin
    participant. It is deliberately separate from `IDENTITY_LINK_SECRET`; do
    not generate a placeholder. This does not affect ordinary user flow.
-2. Provide the exact Apple domain-association text as the production
-   `APPLE_DOMAIN_ASSOCIATION` configuration and register the same
-   `tibotattle.com` callback URL with Apple.
-3. The bucket and custom-domain TLS are already provisioned; it contains no
+2. The bucket and custom-domain TLS are already provisioned; it contains no
    release object. Publish only through the reviewed update-feed publisher
    after the appcast is Sparkle-signed.
 
@@ -100,8 +99,8 @@ placeholders, and do not put the values in the repository.
    `npm --prefix apps/worker run production:deploy:dry`. Deploy the Worker
    separately only when a new reviewed service change requires it.
 3. Verify live `/api/health`, `/api/ready`, the exact custom-domain callback
-   boundary, the Apple domain-association response, and a full Google/Apple
-   sign-in completion without inspecting or logging provider tokens.
+   boundary, and a full Google/Apple sign-in completion without inspecting or
+   logging provider tokens.
 4. Build, Developer-ID sign, notarize, staple, and validate the macOS DMG from
    the tagged source. The release manifest must contain the matching commit
    and tag.

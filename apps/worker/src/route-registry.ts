@@ -4,9 +4,9 @@ interface WorkerRouteDefinition {
 }
 
 const EXACT_WORKER_ROUTE_DEFINITIONS = [
-  // Apple fetches this exact path to verify domain ownership. It is a Worker
-  // route rather than a static asset because single-page-application not-found
-  // handling would answer a dot-directory path with index.html.
+  // Services ID registration no longer requires a server association file.
+  // Intercept the historical filename only so SPA fallback cannot present
+  // index.html as a purported verification response; it always returns 404.
   {
     pathname: "/.well-known/apple-developer-domain-association.txt",
     id: "apple_domain_association",

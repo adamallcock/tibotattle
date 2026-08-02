@@ -76,8 +76,9 @@
     "binding": "ASSETS",
     "directory": "../web/public",
     "not_found_handling": "single-page-application",
-    // Mirrors production so the Apple domain-association route behaves the
-    // same under `wrangler dev` as it does on the live custom domain.
+    // Keep the retired Apple association filename out of the SPA fallback.
+    // Sign in with Apple web registration is configured in Apple's portal and
+    // does not read this path; the Worker always returns 404 for it.
     "run_worker_first": [
       "/api/*",
       "/.well-known/apple-developer-domain-association.txt"
@@ -193,12 +194,7 @@
         // and the audience the returned id_token is verified against.
         "APPLE_SERVICES_ID": "com.usagemonitor.web",
         "APPLE_KEY_ID": "L58X7J2J7A",
-        "APPLE_TEAM_ID": "43RTH622SB",
-        // Apple verifies domain ownership by fetching the exact contents of
-        // this value from /.well-known/apple-developer-domain-association.txt.
-        // Empty until the owner supplies Apple's file; the route 404s while it
-        // is unset rather than serving a placeholder.
-        "APPLE_DOMAIN_ASSOCIATION": ""
+        "APPLE_TEAM_ID": "43RTH622SB"
       },
       "secrets": {
         // The owner-specific ADMIN_IDENTITY_LINK_KEY is intentionally not a
@@ -267,9 +263,8 @@
         // tree: every file in that directory would otherwise be deployable.
         "directory": "../../.release-build/worker-assets",
         "not_found_handling": "single-page-application",
-        // The Apple domain-association file is served by the Worker, not by
-        // the asset router: single-page-application handling would otherwise
-        // answer this path with index.html instead of Apple's exact text.
+        // Prevent the legacy association filename from receiving the SPA
+        // fallback. It is deliberately a 404, not an Apple release gate.
         "run_worker_first": [
           "/api/*",
           "/.well-known/apple-developer-domain-association.txt"

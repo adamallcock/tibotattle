@@ -1015,31 +1015,13 @@ async function handleIdentityGoogleResult(
 }
 
 /**
- * Serves Apple's domain-association file. Apple fetches this exact path over
- * HTTPS to prove the domain belongs to the team behind the Services ID, and
- * it compares the body byte for byte, so the configured value is returned
- * verbatim with no wrapping, trimming, or caching.
- *
- * The contents are configuration, not a secret, but they are also not
- * something this service may invent: until the owner supplies Apple's file the
- * variable is empty and the path answers 404 exactly as an unconfigured route
- * would, rather than publishing a placeholder Apple would reject.
+ * Apple now records a Services ID's web domain and callback in its portal; it
+ * does not fetch a server association file. This historical filename stays
+ * worker-first solely to prevent SPA fallback from returning index.html with a
+ * misleading 200 response. It is not configuration and never a release gate.
  */
-function handleAppleDomainAssociation(request: Request, env: Env): Response {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const association = Reflect.get(env, "APPLE_DOMAIN_ASSOCIATION");
-  if (typeof association !== "string" || association.length === 0) {
-    throw new ApiError(404, "NOT_FOUND");
-  }
-  return new Response(association, {
-    status: 200,
-    headers: {
-      "cache-control": "no-store",
-      "content-type": "text/plain; charset=utf-8",
-      "referrer-policy": "no-referrer",
-      "x-content-type-options": "nosniff",
-    },
-  });
+function handleRetiredAppleDomainAssociation(): never {
+  throw new ApiError(404, "NOT_FOUND");
 }
 
 async function handleRecover(request: Request, env: Env): Promise<Response> {
@@ -2248,10 +2230,10 @@ async function routeApi(
   routeId: ApiWorkerRouteId,
 ): Promise<Response> {
   switch (routeId) {
-    // Not an /api route, but it is dispatched here so every Worker-served
-    // path stays in one exhaustively checked switch.
+    // This retired non-API path is dispatched here so it cannot fall through
+    // to SPA asset handling.
     case "apple_domain_association":
-      return handleAppleDomainAssociation(request, env);
+      return handleRetiredAppleDomainAssociation();
     case "enroll":
       return handleEnroll(request, env);
     case "identity_google_start":
