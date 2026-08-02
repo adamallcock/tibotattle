@@ -29,6 +29,13 @@ response, file path, or account identifier ever enters any derived artifact.
   explicit uncertainty band.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
+- **Fast-mode weighting** — Fast turns are counted at the provider's published
+  credit rates rather than as if they were Standard. Codex records the speed
+  mode only when it is applied or changed, so turns before the first change in
+  a session stay an explicit unknown and are excluded from the weighted total
+  instead of being quietly counted at 1x.
+- **A menu bar item** — where the allowance stands without opening the app,
+  including a Check for Updates entry in builds that ship the updater.
 
 ## Quick start (macOS, Apple Silicon)
 
@@ -66,6 +73,9 @@ resumable.
 - Contribution to the optional hosted community-aggregate service is **off by
   default**, requires an explicit review of the exact retained metadata, and is
   pseudonymous and content-free. Hosted deletion is always available.
+- Contributing requires signing in with Google or Apple so that one person
+  counts once. The service stores only an irreversible hash of that sign-in,
+  never your name or email, and local-only use needs no account at all.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
 
