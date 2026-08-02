@@ -108,6 +108,9 @@ test("local refresh requests a bounded recent index and returns only safe progre
   assert.equal(options.backfillSinceAt, "2026-07-16T12:00:00.000Z");
   assert.equal(options.signal, controller.signal);
   assert.equal(options.maximumRecentRunBytes, 64 * 1024 * 1024);
+  assert.equal(options.maximumRecentTailBytes, 4 * 1024 * 1024);
+  assert.equal(options.maximumRecentPreludeBytes, 512 * 1024);
+  assert.equal(options.maximumBufferedLineBytes, 1024 * 1024);
   assert.equal(progress.length, 2);
   assert.deepEqual(progress[0], COMPLETE_INDEX);
   assert.deepEqual(progress[1], {
@@ -685,8 +688,32 @@ test("an early bounded pass publishes a useful headline before the normal contin
     64 * 1024 * 1024,
   );
   assert.equal(
+    collectorOptions[0].maximumRecentTailBytes,
+    4 * 1024 * 1024,
+  );
+  assert.equal(
+    collectorOptions[0].maximumRecentPreludeBytes,
+    512 * 1024,
+  );
+  assert.equal(
+    collectorOptions[0].maximumBufferedLineBytes,
+    1024 * 1024,
+  );
+  assert.equal(
     Object.hasOwn(collectorOptions[1], "maximumRecentRunBytes"),
     false,
+  );
+  assert.equal(
+    Object.hasOwn(collectorOptions[1], "maximumRecentTailBytes"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(collectorOptions[1], "maximumRecentPreludeBytes"),
+    false,
+  );
+  assert.equal(
+    collectorOptions[1].maximumBufferedLineBytes,
+    16 * 1024 * 1024,
   );
   assert.deepEqual(progress, [{
     ...earlyPausedIndex,
@@ -860,8 +887,32 @@ test("a bounded continuation keeps the early headline and skips deep accounting"
     64 * 1024 * 1024,
   );
   assert.equal(
+    collectorOptions[0].maximumRecentTailBytes,
+    4 * 1024 * 1024,
+  );
+  assert.equal(
+    collectorOptions[0].maximumRecentPreludeBytes,
+    512 * 1024,
+  );
+  assert.equal(
+    collectorOptions[0].maximumBufferedLineBytes,
+    1024 * 1024,
+  );
+  assert.equal(
     Object.hasOwn(collectorOptions[1], "maximumRecentRunBytes"),
     false,
+  );
+  assert.equal(
+    Object.hasOwn(collectorOptions[1], "maximumRecentTailBytes"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(collectorOptions[1], "maximumRecentPreludeBytes"),
+    false,
+  );
+  assert.equal(
+    collectorOptions[1].maximumBufferedLineBytes,
+    16 * 1024 * 1024,
   );
   assert.deepEqual(progress, [{
     ...earlyPausedIndex,

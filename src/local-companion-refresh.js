@@ -14,6 +14,14 @@ const PUBLIC_REFRESH_ERROR_CODES = new Set([
 ]);
 const RECENT_INDEX_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
 const EARLY_HEADLINE_RECENT_RUN_BYTES = 64 * 1024 * 1024;
+// The first pass exists to make the dashboard useful quickly on machines with
+// a large Codex history. Keep one individual rollout bounded as well as the
+// whole pass: otherwise a single multi-gigabyte rollout can consume the entire
+// headline budget before the UI receives either a result or a useful progress
+// update. The normal resumable pass retains the wider collector limits.
+const EARLY_HEADLINE_RECENT_TAIL_BYTES = 4 * 1024 * 1024;
+const EARLY_HEADLINE_RECENT_PRELUDE_BYTES = 512 * 1024;
+const EARLY_HEADLINE_BUFFERED_LINE_BYTES = 1024 * 1024;
 const MAX_REUSABLE_ACCOUNTING_CACHE_AGE_MS = 30 * 60 * 1_000;
 const INDEXING_MODES = new Set(["recent_7d", "prospective"]);
 const INDEXING_STATUSES = new Set([
@@ -264,6 +272,9 @@ export function createLocalCollectorRefreshRunner({
     let result = await runCollector({
       ...collectorOptions,
       maximumRecentRunBytes: EARLY_HEADLINE_RECENT_RUN_BYTES,
+      maximumRecentTailBytes: EARLY_HEADLINE_RECENT_TAIL_BYTES,
+      maximumRecentPreludeBytes: EARLY_HEADLINE_RECENT_PRELUDE_BYTES,
+      maximumBufferedLineBytes: EARLY_HEADLINE_BUFFERED_LINE_BYTES,
     });
     let headlinePublished = false;
     const publishHeadline = async (indexing) => {
