@@ -421,6 +421,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         let openDashboard: () -> Void
         let showWindow: () -> Void
         let quit: () -> Void
+        /// Absent in a build with no updater, which omits the row rather than
+        /// offering a check that can never find anything.
+        var checkForUpdates: (() -> Void)?
     }
 
     /// Background cadence while the companion is idle. The companion treats
@@ -441,6 +444,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let openDashboardItem = NSMenuItem()
     private let analyzeItem = NSMenuItem()
     private let showWindowItem = NSMenuItem()
+    private let checkForUpdatesItem = NSMenuItem()
     private let quitItem = NSMenuItem()
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
@@ -484,6 +488,15 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         menu.addItem(openDashboardItem)
         menu.addItem(analyzeItem)
         menu.addItem(showWindowItem)
+        if actions.checkForUpdates != nil {
+            configure(
+                checkForUpdatesItem,
+                "Check for Updates…",
+                #selector(checkForUpdates)
+            )
+            checkForUpdatesItem.isEnabled = true
+            menu.addItem(checkForUpdatesItem)
+        }
         menu.addItem(.separator())
 
         configure(quitItem, "Quit \(productName)", #selector(quit))
@@ -589,6 +602,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
     @objc private func quit() {
         actions.quit()
+    }
+
+    @objc private func checkForUpdates() {
+        actions.checkForUpdates?()
     }
 
     // MARK: - Polling

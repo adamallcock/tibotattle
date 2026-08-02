@@ -2074,7 +2074,7 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
       stagedAppRoot,
       captures,
     );
-    assert.equal(stagedRows.length, 17);
+    assert.equal(stagedRows.length, 18);
     const stagedInventory = [];
     for (const capture of captures) {
       for (const file of capture.files) {

@@ -177,6 +177,7 @@ export const MACOS_ACCOUNTING_RUNTIME_FILES = Object.freeze([
   "src/cost-ledger.js",
   "src/local-api-pricing.js",
   "src/price-registry.js",
+  "src/subscription-speed.js",
 ]);
 const IDENTITY_CORE_PACKAGE_NAME = "@app-usagemonitor/identity-core";
 const IDENTITY_CORE_PACKAGE_ROOT = join(

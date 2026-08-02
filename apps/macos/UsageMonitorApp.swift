@@ -1293,7 +1293,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             actions: MenuBarStatusController.Actions(
                 openDashboard: { [weak self] in self?.openDashboard() },
                 showWindow: { [weak self] in self?.showMainWindow() },
-                quit: { [weak self] in self?.quitApplication() }
+                quit: { [weak self] in self?.quitApplication() },
+                // The menu bar is the only surface always on screen, so it is
+                // where an update check has to be reachable. A build with no
+                // updater passes nothing and the row is left out.
+                checkForUpdates: updater.isAvailable
+                    ? { [weak self] in self?.updater.checkForUpdates(nil) }
+                    : nil
             )
         )
     }
