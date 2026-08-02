@@ -487,6 +487,68 @@ async function sourceBoundary(secret, path, prefixBytes) {
   }
 }
 
+// A complete index already contains an HMAC of the source's terminal record.
+// That HMAC is expensive to recompute for every unchanged source because
+// finding the terminal newline may read up to 16 MiB. A nofollow metadata
+// proof with matching identity, size, and kernel-managed nanosecond ctime
+// proves that the stored record's validated contents have not changed.
+// Anything that cannot satisfy that proof deliberately takes the ordinary
+// prefix-and-boundary path below.
+async function reuseUnchangedSourceProjection(info, prior) {
+  if (prior === undefined
+      || !sameIdentity(prior, info)
+      || Number(prior.fileSize) !== Number(info.size)) {
+    return null;
+  }
+  let handle;
+  try {
+    handle = await open(
+      info.path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    );
+    const metadata = await handle.stat({ bigint: true });
+    // Node's BigIntStats birthtimeMs may truncate a sub-millisecond timestamp
+    // differently from the ordinary Stats value persisted by discovery. Keep
+    // the established ordinary-Stats identity comparison and use BigIntStats
+    // only for the nanosecond ctime that it uniquely exposes.
+    const identityMetadata = await handle.stat();
+    const fileSize = Number(metadata.size);
+    if (!metadata.isFile()
+        || metadata.isSymbolicLink()
+        || Number(metadata.nlink) !== 1
+        || !Number.isSafeInteger(fileSize)
+        || fileSize !== Number(info.size)
+        || !sameIdentity(prior, identityMetadata)
+        || typeof metadata.ctimeNs !== "bigint"
+        || metadata.ctimeNs < 0n
+        || metadata.ctimeNs.toString() !== prior.ctimeNs
+        || (typeof process.getuid === "function"
+          && Number(metadata.uid) !== process.getuid())) {
+      return null;
+    }
+    return {
+      info,
+      sourceKey: prior.sourceKey,
+      dev: info.dev,
+      ino: info.ino,
+      birthtimeMs: Math.trunc(info.birthtimeMs),
+      fileSize: info.size,
+      prefixBytes: prior.prefixBytes,
+      mtimeMs: info.mtimeMs,
+      ctimeMs: info.ctimeMs,
+      boundaryStart: prior.boundaryStart,
+      boundaryHmac: prior.boundaryHmac,
+      ctimeNs: prior.ctimeNs,
+    };
+  } catch {
+    // Keep the current full reader's error semantics for inaccessible or
+    // racing files. This optimization is never allowed to weaken them.
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
 async function mapWithConcurrency(values, concurrency, callback) {
   const results = new Array(values.length);
   let cursor = 0;
@@ -504,12 +566,27 @@ async function mapWithConcurrency(values, concurrency, callback) {
   return results;
 }
 
-async function projectSources(infos, secret, signal) {
+async function projectSources(
+  infos,
+  secret,
+  signal,
+  existingByKey = new Map(),
+) {
+  let reusedCount = 0;
   const complete = await mapWithConcurrency(
     infos,
     32,
     async (info) => {
       throwIfAborted(signal);
+      const sourceKeyValue = sourceKey(secret, info);
+      const reused = await reuseUnchangedSourceProjection(
+        info,
+        existingByKey.get(sourceKeyValue),
+      );
+      if (reused !== null) {
+        reusedCount += 1;
+        return reused;
+      }
       const prefixBytes = await completeLinePrefix(info.path, info.size);
       const boundary = await sourceBoundary(
         secret,
@@ -518,7 +595,7 @@ async function projectSources(infos, secret, signal) {
       );
       return {
         info,
-        sourceKey: sourceKey(secret, info),
+        sourceKey: sourceKeyValue,
         dev: info.dev,
         ino: info.ino,
         birthtimeMs: Math.trunc(info.birthtimeMs),
@@ -536,7 +613,7 @@ async function projectSources(infos, secret, signal) {
       keyBySession.set(source.info.lineage.sessionId, source.sourceKey);
     }
   }
-  return complete.map((source, ordinal) => {
+  const sources = complete.map((source, ordinal) => {
     const parentId = source.info.lineage?.parentId;
     const classification = source.info.lineage?.surfaceClassification ?? {};
     return {
@@ -555,6 +632,7 @@ async function projectSources(infos, secret, signal) {
         classification.lineageDisposition ?? "unknown",
     };
   });
+  return { sources, reusedCount };
 }
 
 function configureDatabase(
@@ -2005,13 +2083,6 @@ export async function refreshLocalAnalysisIndex({
     endAt,
     signal,
   });
-  const sources = await projectSources(infos, secret, signal);
-  phaseWallMs.discoveryProjection =
-    performance.now() - discoveryStartedAt;
-  const currentByKey = new Map(sources.map((source) => [
-    source.sourceKey,
-    source,
-  ]));
   let existing = null;
   try {
     existing = openExistingIndex(indexFile);
@@ -2025,6 +2096,14 @@ export async function refreshLocalAnalysisIndex({
     ? new Map()
     : readStoredSources(existing.database);
   existing?.database.close();
+  const { sources, reusedCount: sourceProjectionReusedCount } =
+    await projectSources(infos, secret, signal, existingByKey);
+  phaseWallMs.discoveryProjection =
+    performance.now() - discoveryStartedAt;
+  const currentByKey = new Map(sources.map((source) => [
+    source.sourceKey,
+    source,
+  ]));
 
   const removed = new Set(
     [...existingByKey.keys()].filter((key) => !currentByKey.has(key)),
@@ -2067,6 +2146,28 @@ export async function refreshLocalAnalysisIndex({
     ...[...resetKeys].filter((key) => currentByKey.has(key)),
     ...append,
   ]);
+  // With a verified complete index and no changed, appended, or removed
+  // sources, copying a potentially large SQLite file just to record a
+  // zero-byte refresh provides no new durable fact. Leave the complete,
+  // verified generation in place and return the same indexed result.
+  if (existing !== null && changedKeys.size === 0 && removed.size === 0) {
+    return {
+      status: "reused",
+      indexFile,
+      sources,
+      sourceCount: sources.length,
+      sourceBytes: sources.reduce(
+        (sum, source) => sum + source.prefixBytes,
+        0,
+      ),
+      scanBytes: 0,
+      workerCount,
+      sourceProjectionReusedCount,
+      wallMs: performance.now() - startedAt,
+      phaseWallMs,
+      streamedScanResult: null,
+    };
+  }
   const stageFile = `${indexFile}.building-${process.pid}-${randomBytes(6).toString("hex")}`;
   let database;
   let scanBytes = 0;
@@ -2239,6 +2340,7 @@ export async function refreshLocalAnalysisIndex({
       ),
       scanBytes,
       workerCount,
+      sourceProjectionReusedCount,
       wallMs: performance.now() - startedAt,
       phaseWallMs,
       streamedScanResult,

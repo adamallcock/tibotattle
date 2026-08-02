@@ -351,9 +351,28 @@ test("persistent local index preserves replay-safe accounting and appends only n
     assert.equal(bytes.includes(Buffer.from(canary)), false);
   }
 
+  const indexCtimeBeforeReuse = (await stat(indexFile, { bigint: true }))
+    .ctimeNs;
   assert.deepEqual(await receipt(indexedScan, codexHome), legacy);
   const reused = await inspectLocalAnalysisIndex({ indexFile });
-  assert.equal(reused.lastScan.bytes, 0);
+  assert.equal(reused.lastScan.bytes, first.lastScan.bytes);
+  assert.equal(
+    (await stat(indexFile, { bigint: true })).ctimeNs,
+    indexCtimeBeforeReuse,
+  );
+
+  const verifiedReuse = await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 2,
+    chunkBytes: 4 * 1024 * 1024,
+  });
+  assert.equal(verifiedReuse.status, "reused");
+  assert.equal(verifiedReuse.scanBytes, 0);
+  assert.equal(verifiedReuse.sourceProjectionReusedCount, 2);
 
   const beforeAppendSize = (await stat(childPath)).size;
   await appendFile(childPath, `${token(

@@ -382,6 +382,50 @@ test("loopback server exposes only fixed API, static, and report routes", async 
   }
 });
 
+test("local companion remains usable before Codex is installed", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: join(files.root, "no-codex-home-yet"),
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const onboarding = await fetch(
+      `http://127.0.0.1:${app.port}/api/local/onboarding`,
+    );
+    assert.equal(onboarding.status, 200);
+    assert.deepEqual(await onboarding.json(), {
+      schemaVersion: "local-onboarding-v0.2",
+      status: "needs_attention",
+      source: {
+        status: "codex_home_missing",
+        sessionsReadable: false,
+        archivedSessionsReadable: false,
+        rolloutFilesPresent: false,
+        rolloutFilesObserved: 0,
+        rolloutFilesObservedCapped: false,
+      },
+      state: {
+        status: "ready",
+        writable: true,
+      },
+      capabilities: {
+        explicitRefresh: true,
+        customCodexHomeConfigured: false,
+        rawContentExposed: false,
+        arbitraryPathAccess: false,
+      },
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("automatic contribution endpoints require exact consent and remain foreground-only", async () => {
   const files = await fixture();
   let now = Date.parse("2026-07-29T12:00:00.000Z");
