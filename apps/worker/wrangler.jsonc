@@ -201,11 +201,14 @@
         "APPLE_DOMAIN_ASSOCIATION": ""
       },
       "secrets": {
+        // The owner-specific ADMIN_IDENTITY_LINK_KEY is intentionally not a
+        // deployment prerequisite. Without it every admin route fails closed
+        // with ADMIN_NOT_CONFIGURED, while essential public security updates
+        // and schema-compatible Worker deployments remain possible.
         "required": [
           "ENVELOPE_PRIVATE_JWK",
           "ENVELOPE_PUBLIC_JWK",
           "IDENTITY_LINK_SECRET",
-          "ADMIN_IDENTITY_LINK_KEY",
           "APPLE_PRIVATE_KEY",
           // The Google OAuth client is a Web application client whose one
           // registered redirect URI is this service's own

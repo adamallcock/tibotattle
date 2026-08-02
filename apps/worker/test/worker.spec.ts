@@ -32,6 +32,13 @@ interface TestBindings extends Env {
   TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
 }
 
+// Production deliberately permits deployment without an owner allowlist. The
+// Worker treats this binding as optional and keeps every admin endpoint at
+// ADMIN_NOT_CONFIGURED until the owner supplies their pairwise identity key.
+interface OptionalAdminBinding {
+  ADMIN_IDENTITY_LINK_KEY?: string;
+}
+
 interface EnrollmentResponse {
   participantId: string;
   recoveryCode: string;
@@ -47,7 +54,7 @@ function recoveryAttemptId(): string {
   return `um_recovery_attempt_${encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-function testBindings(overrides: Partial<Env> = {}): Env {
+function testBindings(overrides: Partial<Env & OptionalAdminBinding> = {}): Env {
   const bindings = env as TestBindings;
   return {
     ASSETS: bindings.ASSETS,

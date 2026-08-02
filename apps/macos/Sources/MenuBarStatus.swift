@@ -496,6 +496,140 @@ final class LocalCompanionEvidenceReader {
     }
 }
 
+/// A compact native summary that gives the status menu an intentional first
+/// surface rather than two unrelated disabled lines. It deliberately uses
+/// AppKit controls and system colours: status values remain readable in dark
+/// mode, increased contrast, and the user's chosen accent colour.
+@MainActor
+private final class MenuBarSummaryView: NSView {
+    static let preferredWidth: CGFloat = 338
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let allowanceLabel = NSTextField(labelWithString: "")
+    private let evidenceLabel = NSTextField(labelWithString: "")
+    private let progress = NSProgressIndicator()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        nameLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        nameLabel.textColor = .labelColor
+        allowanceLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        allowanceLabel.textColor = .secondaryLabelColor
+        evidenceLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        evidenceLabel.textColor = .tertiaryLabelColor
+        progress.style = .bar
+        progress.controlSize = .small
+        progress.minValue = 0
+        progress.maxValue = 100
+        progress.isIndeterminate = false
+        for view in [nameLabel, allowanceLabel, evidenceLabel, progress] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: Self.preferredWidth),
+            heightAnchor.constraint(equalToConstant: 76),
+            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            nameLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 9),
+            allowanceLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            allowanceLabel.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
+            allowanceLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 3),
+            evidenceLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            evidenceLabel.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
+            evidenceLabel.topAnchor.constraint(equalTo: allowanceLabel.bottomAnchor, constant: 2),
+            progress.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            progress.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
+            progress.topAnchor.constraint(equalTo: evidenceLabel.bottomAnchor, constant: 5),
+            progress.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func render(
+        productName: String,
+        snapshot: MenuBarStatusSnapshot
+    ) {
+        nameLabel.stringValue = productName
+        allowanceLabel.stringValue = snapshot.allowanceSummary
+        evidenceLabel.stringValue = snapshot.evidenceSummary
+        guard snapshot.evidence == .live, let lane = snapshot.primaryLane
+        else {
+            progress.isHidden = true
+            return
+        }
+        progress.isHidden = false
+        progress.doubleValue = lane.remainingPercent
+    }
+}
+
+/// A quota row uses the same familiar label/value/reset hierarchy as the app
+/// dashboard. The progress bar is omitted for stale evidence so visual polish
+/// never turns historic values into a present-tense claim.
+@MainActor
+private final class MenuBarQuotaLaneView: NSView {
+    private let label = NSTextField(labelWithString: "")
+    private let value = NSTextField(labelWithString: "")
+    private let detail = NSTextField(labelWithString: "")
+    private let progress = NSProgressIndicator()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .labelColor
+        value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        value.textColor = .labelColor
+        value.alignment = .right
+        detail.font = .systemFont(ofSize: 10, weight: .regular)
+        detail.textColor = .secondaryLabelColor
+        detail.lineBreakMode = .byTruncatingTail
+        progress.style = .bar
+        progress.controlSize = .small
+        progress.minValue = 0
+        progress.maxValue = 100
+        progress.isIndeterminate = false
+        for view in [label, value, detail, progress] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: MenuBarSummaryView.preferredWidth),
+            heightAnchor.constraint(equalToConstant: 55),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            value.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            value.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 12),
+            value.firstBaselineAnchor.constraint(equalTo: label.firstBaselineAnchor),
+            progress.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            progress.trailingAnchor.constraint(equalTo: value.trailingAnchor),
+            progress.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 4),
+            detail.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            detail.trailingAnchor.constraint(equalTo: value.trailingAnchor),
+            detail.topAnchor.constraint(equalTo: progress.bottomAnchor, constant: 3),
+            detail.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func render(lane: ObservedQuotaLane, snapshot: MenuBarStatusSnapshot) {
+        label.stringValue = lane.label
+        detail.stringValue = snapshot.laneSummary(lane)
+        guard snapshot.evidence == .live else {
+            value.stringValue = "Not current"
+            progress.isHidden = true
+            return
+        }
+        value.stringValue = "\(lane.roundedRemainingPercent)% left"
+        progress.isHidden = false
+        progress.doubleValue = lane.remainingPercent
+    }
+}
+
 /// Owns the `NSStatusItem`, its menu, and the bounded polling that keeps the
 /// compact title honest. Actions are injected so the launcher keeps sole
 /// ownership of the companion lifecycle and the shutdown path.
@@ -526,6 +660,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let reader = LocalCompanionEvidenceReader()
     private let allowanceItem = NSMenuItem()
     private let evidenceItem = NSMenuItem()
+    private let summaryView = MenuBarSummaryView(frame: .zero)
     private let menu = NSMenu()
     private let quotaSeparator = NSMenuItem.separator()
     private let actionSeparator = NSMenuItem.separator()
@@ -554,9 +689,14 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         // actions must reflect the companion's real state, not AppKit's guess.
         menu.autoenablesItems = false
         menu.delegate = self
+        menu.minimumWidth = MenuBarSummaryView.preferredWidth
 
         allowanceItem.isEnabled = false
         evidenceItem.isEnabled = false
+        allowanceItem.view = summaryView
+        // The rich summary owns both strings. Keep the second item as a
+        // VoiceOver-readable fallback title rather than duplicating text.
+        evidenceItem.isHidden = true
         menu.addItem(allowanceItem)
         menu.addItem(evidenceItem)
         menu.addItem(quotaSeparator)
@@ -754,6 +894,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private func render() {
         allowanceItem.title = snapshot.allowanceSummary
         evidenceItem.title = snapshot.evidenceSummary
+        summaryView.render(productName: productName, snapshot: snapshot)
         renderQuotaLanes()
         openTiboTattleItem.isEnabled = true
         analyzeItem.title = snapshot.analysisActionTitle
@@ -797,6 +938,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         let items = snapshot.lanes.map { lane in
             let item = NSMenuItem(title: snapshot.laneSummary(lane), action: nil, keyEquivalent: "")
             item.isEnabled = false
+            let view = MenuBarQuotaLaneView(frame: .zero)
+            view.render(lane: lane, snapshot: snapshot)
+            item.view = view
             return item
         }
         for (offset, item) in items.enumerated() {
