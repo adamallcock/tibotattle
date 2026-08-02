@@ -76,6 +76,23 @@ export const OBSERVED_SPEED_MODE_KEYS = Object.freeze([
   "unknown",
 ]);
 
+// What the Codex configuration file can and cannot prove about the baseline.
+// `~/.codex/config.toml` holds a top-level `service_tier` key with the CURRENT
+// setting - the only place a session baseline exists at all. The Codex UI
+// rewrites that file on every toggle, so the key proves the value at READ TIME
+// and nothing more. It is therefore recorded as a timestamped observation and
+// resolved only over the interval it covers; it never backfills history and
+// never overrides the rollout log.
+export const CODEX_SPEED_MODE_DECLARATION = Object.freeze({
+  provenance: "declared_codex_config",
+  source: "codex_config_service_tier_key",
+  retainedKeys: Object.freeze(["service_tier"]),
+  appliesTo: "turns_at_or_after_the_moment_the_key_was_read",
+  neverBackfillsHistory: true,
+  reason:
+    "the Codex UI rewrites the configuration file on every toggle, so the key proves only the value at the moment it was read",
+});
+
 // The user preference is the only way a current Codex log can be attributed to
 // a speed mode at all, because the provider stopped recording it.
 export const FAST_MODE_PREFERENCE_VALUES = Object.freeze([
@@ -85,10 +102,12 @@ export const FAST_MODE_PREFERENCE_VALUES = Object.freeze([
 ]);
 export const DEFAULT_FAST_MODE_PREFERENCE = "standard";
 
-// How an event's effective mode was decided. These four are distinct
-// everywhere they surface; "inferred" is never presented as "observed".
+// How an event's effective mode was decided. These five are distinct
+// everywhere they surface; neither "declared_codex_config" nor "inferred" is
+// ever presented as "observed".
 export const SPEED_MODE_PROVENANCE_VALUES = Object.freeze([
   "observed",
+  "declared_codex_config",
   "assumed_from_preference",
   "inferred",
   "unknown",
@@ -199,22 +218,33 @@ export function isFastModePreference(value) {
 /**
  * Resolution order, strongest evidence first:
  *   1. observed          - the rollout log carried a `thread_settings_applied`
- *                          tier at or before this turn. This ALWAYS wins; the
- *                          preference can never overwrite or bypass it.
- *   2. assumed_from_preference - the turn precedes the first tier observation
- *                          in its session, so the log holds no tier for it and
- *                          the owner's stated mode is the only attribution.
- *   3. inferred          - only when the owner explicitly said mixed_unknown,
+ *                          tier at or before this turn. This ALWAYS wins;
+ *                          nothing below can overwrite or bypass it.
+ *   2. declared_codex_config - the Codex configuration's `service_tier` key was
+ *                          read at a moment that covers this turn. It recovers
+ *                          the session baseline the log never writes, but only
+ *                          forward from the reading; callers must not pass a
+ *                          declaration for a turn the reading does not cover.
+ *   3. assumed_from_preference - no log tier and no covering reading, so the
+ *                          owner's stated mode is the only attribution left.
+ *   4. inferred          - only when the owner explicitly said mixed_unknown,
  *                          so inference can never override a stated preference.
- *   4. unknown           - nothing legitimate to say; never a silent Standard.
+ *   5. unknown           - nothing legitimate to say; never a silent Standard.
  */
 export function resolveEffectiveSpeedMode({
   observedMode = "unknown",
+  declaredMode = "unknown",
   preference = DEFAULT_FAST_MODE_PREFERENCE,
   inferredMode = "unknown",
 } = {}) {
   if (observedMode === "standard" || observedMode === "fast") {
     return Object.freeze({ mode: observedMode, provenance: "observed" });
+  }
+  if (declaredMode === "standard" || declaredMode === "fast") {
+    return Object.freeze({
+      mode: declaredMode,
+      provenance: "declared_codex_config",
+    });
   }
   if (preference === "standard" || preference === "fast") {
     return Object.freeze({
@@ -293,9 +323,56 @@ function crossingCell(crossing, speed, family) {
   };
 }
 
+// Both crossings round money independently, so a declared cell may exceed the
+// unobserved cell it describes by a rounding hair. Anything past this is a real
+// inconsistency, not float noise.
+const DECLARED_CROSSING_USD_TOLERANCE = 1e-5;
+
+/**
+ * Split the unobserved cell of one model family into the part a declared
+ * baseline covers and the part still unattributed.
+ *
+ * A declaration only ever REDESCRIBES turns the rollout log left unobserved, so
+ * it can never claim more events or dollars than that cell holds. A crossing
+ * that does is discarded whole rather than trusted in part, which degrades to
+ * exactly the pre-declaration behaviour instead of inventing an attribution.
+ */
+function declaredUnobservedSplit(declaredSpeedWeighting, family, unobserved) {
+  const parts = [];
+  let events = 0;
+  let usd = 0;
+  for (const mode of ["standard", "fast"]) {
+    const cell = crossingCell(declaredSpeedWeighting, mode, family);
+    if (cell.events === 0 && cell.apiPriceEquivalentUsd === 0) continue;
+    parts.push({ cell, mode });
+    events += cell.events;
+    usd += cell.apiPriceEquivalentUsd;
+  }
+  if (events > unobserved.events
+      || usd > unobserved.apiPriceEquivalentUsd
+        + DECLARED_CROSSING_USD_TOLERANCE) {
+    return { parts: [], residual: unobserved };
+  }
+  return {
+    parts,
+    residual: {
+      events: unobserved.events - events,
+      apiPriceEquivalentUsd: Math.max(
+        0,
+        unobserved.apiPriceEquivalentUsd - usd,
+      ),
+    },
+  };
+}
+
 /**
  * Fold a Standard-priced speed x model-family crossing into the quota-weighted
  * metric plus an honest coverage split.
+ *
+ * `declaredSpeedWeighting` is the same crossing shape, holding only the
+ * unobserved events a timestamped `service_tier` reading actually covers. The
+ * caller is responsible for the coverage test, because only it knows each
+ * event's timestamp; this function enforces the precedence, never the dates.
  *
  * `inferredFastEvents` is a secondary, window-level count. It reclassifies
  * events out of "unknown" into "inferred" for reporting only: a window-level
@@ -304,6 +381,7 @@ function crossingCell(crossing, speed, family) {
  */
 export function summarizeQuotaWeightedAccounting({
   speedWeighting,
+  declaredSpeedWeighting = null,
   preference = DEFAULT_FAST_MODE_PREFERENCE,
   inferredFastEvents = 0,
   inference = null,
@@ -316,41 +394,68 @@ export function summarizeQuotaWeightedAccounting({
   let unweightedUnknownUsd = 0;
   let totalEvents = 0;
   let observedEvents = 0;
+  let declaredEvents = 0;
   let assumedEvents = 0;
   let unknownEvents = 0;
   const appliedMultipliers = {};
 
+  const attribute = (cell, resolved, family) => {
+    if (cell.events === 0 && cell.apiPriceEquivalentUsd === 0) return;
+    standardApiPriceEquivalentUsd += cell.apiPriceEquivalentUsd;
+    totalEvents += cell.events;
+    if (resolved.provenance === "observed") observedEvents += cell.events;
+    else if (resolved.provenance === "declared_codex_config") {
+      declaredEvents += cell.events;
+    } else if (resolved.provenance === "assumed_from_preference") {
+      assumedEvents += cell.events;
+    } else unknownEvents += cell.events;
+    if (resolved.mode === "standard") {
+      weightedUsd += cell.apiPriceEquivalentUsd;
+      return;
+    }
+    if (resolved.mode === "fast") {
+      const multiplier = family === "unsupported"
+        ? null
+        : FAST_MODE_QUOTA_MULTIPLIERS[family];
+      if (multiplier === null) {
+        unweightedUnknownUsd += cell.apiPriceEquivalentUsd;
+        return;
+      }
+      appliedMultipliers[family] = multiplier;
+      weightedUsd += cell.apiPriceEquivalentUsd * multiplier;
+      return;
+    }
+    unweightedUnknownUsd += cell.apiPriceEquivalentUsd;
+  };
+
   for (const speed of OBSERVED_SPEED_MODE_KEYS) {
     for (const family of FAST_MODE_MODEL_FAMILY_KEYS) {
       const cell = crossingCell(speedWeighting, speed, family);
-      if (cell.events === 0 && cell.apiPriceEquivalentUsd === 0) continue;
-      standardApiPriceEquivalentUsd += cell.apiPriceEquivalentUsd;
-      totalEvents += cell.events;
-      const resolved = resolveEffectiveSpeedMode({
-        observedMode: speed,
+      if (speed !== "unknown") {
+        // An observed tier is decided by the log alone; no declaration is even
+        // offered to the resolver for these events.
+        attribute(cell, resolveEffectiveSpeedMode({
+          observedMode: speed,
+          preference: selectedPreference,
+        }), family);
+        continue;
+      }
+      const split = declaredUnobservedSplit(
+        declaredSpeedWeighting,
+        family,
+        cell,
+      );
+      for (const part of split.parts) {
+        attribute(part.cell, resolveEffectiveSpeedMode({
+          observedMode: "unknown",
+          declaredMode: part.mode,
+          preference: selectedPreference,
+        }), family);
+      }
+      attribute(split.residual, resolveEffectiveSpeedMode({
+        observedMode: "unknown",
         preference: selectedPreference,
-      });
-      if (resolved.provenance === "observed") observedEvents += cell.events;
-      else if (resolved.provenance === "assumed_from_preference") {
-        assumedEvents += cell.events;
-      } else unknownEvents += cell.events;
-      if (resolved.mode === "standard") {
-        weightedUsd += cell.apiPriceEquivalentUsd;
-        continue;
-      }
-      if (resolved.mode === "fast") {
-        const multiplier = family === "unsupported"
-          ? null
-          : FAST_MODE_QUOTA_MULTIPLIERS[family];
-        if (multiplier === null) {
-          unweightedUnknownUsd += cell.apiPriceEquivalentUsd;
-          continue;
-        }
-        appliedMultipliers[family] = multiplier;
-        weightedUsd += cell.apiPriceEquivalentUsd * multiplier;
-        continue;
-      }
-      unweightedUnknownUsd += cell.apiPriceEquivalentUsd;
+      }), family);
     }
   }
 
@@ -366,6 +471,7 @@ export function summarizeQuotaWeightedAccounting({
   return Object.freeze({
     metric: QUOTA_WEIGHTED_API_PRICE_METRIC,
     multiplierSource: FAST_MODE_MULTIPLIER_SOURCE,
+    declarationSource: CODEX_SPEED_MODE_DECLARATION,
     preference: selectedPreference,
     standardApiPriceEquivalentUsd: roundUsd(standardApiPriceEquivalentUsd),
     quotaWeightedApiPriceEquivalentUsd: weightingStatus === "unknown"
@@ -377,6 +483,10 @@ export function summarizeQuotaWeightedAccounting({
     coverage: Object.freeze({
       totalEvents,
       observedEvents,
+      // Turns the log left unobserved that a timestamped `service_tier`
+      // reading covers. Kept separate from both observed and assumed so no
+      // surface can present a declaration as an observation.
+      declaredFromConfigEvents: declaredEvents,
       assumedFromPreferenceEvents: assumedEvents,
       inferredEvents: reportableInferred,
       unknownEvents: remainingUnknownEvents,

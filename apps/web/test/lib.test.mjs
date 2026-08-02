@@ -3393,11 +3393,227 @@ test("weekly defaults to high-confidence evidence and partial diagnostics are op
   );
   assert.match(
     appSource,
-    /matureValue: observedSpanPp !== null && observedSpanPp >= 80 \? value : null/u,
+    /matureValue: aboveWeeklySpanThreshold\(observedSpanPp\) \? value : null/u,
+  );
+  assert.match(
+    appSource,
+    /provisionalValue: aboveWeeklySpanThreshold\(observedSpanPp\) \? null : value/u,
   );
   assert.match(
     appSource,
     /showWeeklyPartialDiagnostics = button\.dataset\.evidence === "all"/u,
+  );
+});
+
+test("the weekly span threshold is a visible adjustable control defaulting above 50 pp", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+  assert.match(appSource, /const DEFAULT_WEEKLY_SPAN_THRESHOLD_PP = 50;/u);
+  assert.match(
+    appSource,
+    /let weeklySpanThresholdPp = DEFAULT_WEEKLY_SPAN_THRESHOLD_PP;/u,
+  );
+  // Strictly greater than the threshold, and an unrecorded span can never be
+  // shown to clear it, so it stays a diagnostic instead of headline evidence.
+  const thresholdMatch = appSource.match(
+    /function aboveWeeklySpanThreshold\(observedSpanPp\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(thresholdMatch, "aboveWeeklySpanThreshold is available for contract review");
+  assert.match(
+    thresholdMatch[1],
+    /return observedSpanPp !== null && observedSpanPp > weeklySpanThresholdPp;/u,
+  );
+  // The threshold is never a hidden constant: the slider, the readout, the
+  // filter button label and the table's partial-diagnostic rule all read it.
+  const slider = html.match(/<input[\s\S]*?id="weekly-span-threshold"[\s\S]*?>/u)?.[0] ?? "";
+  assert.match(slider, /type="range"/u);
+  assert.match(slider, /min="0"/u);
+  assert.match(slider, /max="100"/u);
+  assert.match(slider, /value="50"/u);
+  assert.match(html, /<label for="weekly-span-threshold">Minimum observed span<\/label>/u);
+  assert.match(html, /<output id="weekly-span-threshold-value"/u);
+  assert.match(appSource, /function renderWeeklySpanThresholdControls/u);
+  assert.match(
+    appSource,
+    /\$\("#weekly-evidence-controls"\)\.querySelector\('\[data-evidence="mature"\]'\)\s*\.textContent = `> \$\{formatPp\(weeklySpanThresholdPp, 0\)\} only`/u,
+  );
+  assert.match(appSource, /const belowThreshold = !aboveWeeklySpanThreshold\(span\);/u);
+  assert.match(appSource, /\$\("#weekly-span-threshold"\)\.addEventListener\("input"/u);
+  assert.doesNotMatch(appSource, /observedSpanPp >= 80|span < 80/u);
+  assert.match(styles, /\.span-threshold input\[type="range"\]:focus-visible/u);
+});
+
+test("weekly points carry per-week error bars and state the percentage points they represent", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+  // Each fit gets its own within-reset range, not one band standing in for
+  // every week; the across-reset band stays, because it is a different claim.
+  assert.match(
+    appSource,
+    /errorBars: \{\s*low: "low",\s*high: "high",\s*className: "chart-error-bar-weekly",\s*label: "Within-reset sensitivity",\s*\}/u,
+  );
+  assert.match(
+    appSource,
+    /confidence: \{ low: "acrossResetLow", high: "acrossResetHigh" \}/u,
+  );
+  assert.match(
+    appSource,
+    /if \(errorBars\) values\.push\([\s\S]*?errorBars\.low[\s\S]*?errorBars\.high/u,
+  );
+  const detailMatch = appSource.match(
+    /function weeklyPointDetail\(point\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(detailMatch, "weeklyPointDetail is available for contract review");
+  assert.match(
+    detailMatch[1],
+    /represents \$\{formatPp\(point\.observedSpanPp\)\} of the 100-point allowance/u,
+  );
+  assert.match(detailMatch[1], /observed span not recorded/u);
+  assert.match(detailMatch[1], /within-reset sensitivity \$\{formatMoney\(point\.low\)\}/u);
+  assert.match(appSource, /detail: weeklyPointDetail,/u);
+  // A hover title is mouse-only, so the same sentence must reach the keyboard
+  // and assistive technology on the marker itself.
+  assert.match(appSource, /marker\.setAttribute\("tabindex", "0"\);/u);
+  assert.match(appSource, /marker\.setAttribute\("aria-label", caption\);/u);
+  assert.match(appSource, /focusable: true,/u);
+  assert.match(styles, /\.chart-point:focus-visible/u);
+  assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
+  assert.match(html, /legend-dot weekly-error/u);
+  assert.match(html, /Per-week within-reset sensitivity/u);
+});
+
+test("calibration zoom moves in bounded granular steps on every input device", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  assert.match(appSource, /const TIMELINE_WHEEL_ZOOM_STEP = 1\.12;/u);
+  assert.match(appSource, /const TIMELINE_BUTTON_ZOOM_STEP = 1\.25;/u);
+  assert.match(appSource, /const TIMELINE_MAXIMUM_ZOOM_STEP = 1\.25;/u);
+  assert.match(appSource, /const TIMELINE_MINIMUM_SPAN_MS = 15 \* 60_000;/u);
+  // A trackpad emits many small deltas per gesture, so the step is scaled by
+  // the fraction of a mouse notch each event actually reports.
+  const wheelMatch = appSource.match(
+    /function wheelZoomFactor\(event\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(wheelMatch, "wheelZoomFactor is available for contract review");
+  assert.match(
+    wheelMatch[1],
+    /TIMELINE_WHEEL_ZOOM_STEP \*\* \(pixels \/ TIMELINE_WHEEL_NOTCH_PIXELS\)/u,
+  );
+  assert.match(wheelMatch[1], /event\.deltaMode === 1/u);
+  assert.match(wheelMatch[1], /event\.deltaMode === 2/u);
+  // No single event may outrun one button press, and no zoom may pass the
+  // minimum useful span or the full extent of the loaded evidence.
+  const zoomMatch = appSource.match(
+    /function zoomTimeline\(points, factor, anchorRatio = \.5\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(zoomMatch, "zoomTimeline is available for contract review");
+  assert.match(
+    zoomMatch[1],
+    /Math\.max\(\s*1 \/ TIMELINE_MAXIMUM_ZOOM_STEP,\s*Math\.min\(TIMELINE_MAXIMUM_ZOOM_STEP, factor\),\s*\)/u,
+  );
+  assert.match(
+    zoomMatch[1],
+    /Math\.min\(\s*bounds\.endMs - bounds\.startMs,\s*Math\.max\(minimumTimelineSpanMs\(bounds\), span \* step\),\s*\)/u,
+  );
+  assert.match(appSource, /zoomTimeline\(points, wheelZoomFactor\(event\), ratio\);/u);
+  assert.match(appSource, /zoomTimeline\(points, 1 \/ TIMELINE_BUTTON_ZOOM_STEP\)/u);
+  assert.match(appSource, /zoomTimeline\(points, TIMELINE_BUTTON_ZOOM_STEP\)/u);
+  assert.doesNotMatch(appSource, /zoomTimeline\([^)]*1\.35|zoomTimeline\([^)]*\.74/u);
+  // The zoom level itself has to be readable without seeing the chart.
+  assert.match(
+    appSource,
+    /a span of \$\{formatSpanLength\(viewport\.endMs - viewport\.startMs\)\}/u,
+  );
+});
+
+test("residuals span the calibration range and show uncomputable windows as gaps", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  // Rows with no computable residual are kept, so a shorter run of computable
+  // residuals can never silently shorten the axis.
+  const rowsMatch = appSource.match(
+    /function residualRows\(data, points\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(rowsMatch, "residualRows is available for contract review");
+  assert.doesNotMatch(rowsMatch[1], /return row\.residual !== null/u);
+  assert.match(appSource, /const domain = viewport \?\? timelineBounds\(points\);/u);
+  assert.match(appSource, /xDomain: domain,/u);
+  assert.match(
+    appSource,
+    /statusIntervals: domain === null\s*\?\s*\[\]\s*: timelineStatusIntervals\(residuals, domain\),/u,
+  );
+  assert.match(
+    appSource,
+    /const computed = residuals\.filter\(\(row\) => row\.residual !== null\);/u,
+  );
+  assert.match(appSource, /function residualGapReasons/u);
+  assert.match(appSource, /never as zero/u);
+  assert.match(html, /id="residual-coverage"/u);
+  assert.match(html, /windows that cannot be differenced are shaded gaps, never zeros/u);
+});
+
+test("the weekly allowance chart leads the dashboard", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+  assert.ok(
+    html.indexOf('id="weekly"') < html.indexOf('id="timeline"'),
+    "the weekly allowance section precedes the timeline section",
+  );
+  assert.ok(
+    html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="timeline"'),
+    "primary navigation follows the same order as the sections",
+  );
+  assert.match(html, /<p class="eyebrow">02 · Weekly allowance<\/p>/u);
+  assert.match(html, /<p class="eyebrow">03 · Timeline<\/p>/u);
+  assert.match(html, /class="dashboard-section lead-section" id="weekly"/u);
+  assert.match(html, /class="panel weekly-history-panel lead-chart-panel"/u);
+  assert.match(styles, /\.lead-chart-panel \.weekly-history-chart svg \{ height: 470px; \}/u);
+});
+
+test("monitoring gaps lead with what changes the number and keep the rest in full", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+
+  // The default view is a short list of gaps that change how the number reads.
+  assert.match(appSource, /const MATERIAL_GAP_LIMIT = 4;/u);
+  assert.match(appSource, /const MATERIAL_GAP_STATUSES = Object\.freeze\(\[/u);
+  assert.match(appSource, /\.slice\(MATERIAL_GAP_LIMIT\)|\.slice\(0, MATERIAL_GAP_LIMIT\)/u);
+  assert.match(appSource, /function briefGapExplanation/u);
+  assert.doesNotMatch(appSource, /\.slice\(0, 18\)/u);
+  // Nothing honest is deleted: every recorded limitation stays, in full, one
+  // disclosure away from the short list.
+  assert.match(appSource, /const inventory = \$\("#blind-spot-inventory"\);/u);
+  assert.match(appSource, /node\("p", "", gapExplanation\(item\)\)/u);
+  assert.match(html, /id="blind-spot-inventory"/u);
+  assert.match(html, /Full inventory and per-signal coverage/u);
+  assert.match(html, /id="blind-spot-count"/u);
+  // The Fast-mode row keeps its four-way split rather than a bare status.
+  const shortMatch = appSource.match(
+    /function fastModeShortCoverage\(fastMode\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(shortMatch, "fastModeShortCoverage is available for contract review");
+  for (const bucket of [
+    "coverage.observedEvents",
+    "coverage.assumedFromPreferenceEvents",
+    "coverage.inferredEvents",
+    "coverage.unknownEvents",
+  ]) {
+    assert.ok(
+      shortMatch[1].includes(bucket),
+      `the short Fast-mode line reports ${bucket}`,
+    );
+  }
+  assert.match(appSource, /fastModeShortCoverage\(accountingPeriod\(data\)\.fastMode\)/u);
+  // The full Fast-mode sentence stays with the control that changes it.
+  assert.match(
+    appSource,
+    /coverage\.textContent = `\$\{fastModeCoverageSentence\(accounting\.fastMode\)\}/u,
   );
 });
 

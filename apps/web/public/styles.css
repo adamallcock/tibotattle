@@ -753,6 +753,10 @@ h2 {
 .chart-line-value { fill: none; stroke: var(--blue); stroke-width: 2.5; vector-effect: non-scaling-stroke; }
 .chart-point { vector-effect: non-scaling-stroke; }
 .chart-point.chart-line-value { fill: var(--white); stroke: var(--blue); }
+.chart-point:focus-visible { outline: 3px solid rgba(38, 107, 91, .55); outline-offset: 3px; }
+.chart-error-bar-line, .chart-error-bar-cap { vector-effect: non-scaling-stroke; }
+.chart-error-bar-weekly .chart-error-bar-line { stroke: rgba(49, 95, 132, .78); stroke-width: 1.8; }
+.chart-error-bar-weekly .chart-error-bar-cap { stroke: rgba(49, 95, 132, .78); stroke-width: 1.8; }
 .chart-line-weekly-center {
   fill: none;
   stroke: var(--green);
@@ -862,6 +866,41 @@ tbody tr:last-child td { border-bottom: 0; }
   border-radius: 50%;
   background: var(--white);
 }
+.legend-dot.weekly-error { width: 3px; height: 16px; background: rgba(49, 95, 132, .78); }
+
+/* The weekly allowance chart is the lead chart of the dashboard, so its
+   section and panel carry more weight than the sections that support it.
+   Both selectors are doubled so the later shared .panel and .dashboard-section
+   overrides in this file cannot flatten the lead treatment back out. */
+.dashboard-section.lead-section { padding-top: 40px; border-top: 0; }
+.lead-section .section-heading > p { color: var(--text); font-size: .95rem; }
+.panel.lead-chart-panel {
+  border-color: var(--green-2, var(--line));
+  box-shadow: 0 18px 46px rgba(31, 45, 39, .09);
+}
+.lead-chart-panel .weekly-history-chart svg { height: 470px; }
+.span-threshold {
+  display: grid;
+  grid-template-columns: auto minmax(140px, 260px) auto;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: .35rem;
+  background: var(--paper-soft);
+}
+.span-threshold label {
+  color: var(--muted);
+  font-size: .64rem;
+  font-weight: 800;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.span-threshold input[type="range"] { width: 100%; min-height: 30px; accent-color: var(--green); }
+.span-threshold input[type="range"]:focus-visible { outline: 3px solid rgba(38, 107, 91, .36); outline-offset: 3px; }
+.span-threshold output { font-size: .82rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.span-threshold .annotation { grid-column: 1 / -1; margin: 0; }
 
 .accounting-disclosure { margin-top: -12px; }
 .accounting-summary { grid-template-columns: repeat(4, 1fr); }
@@ -888,7 +927,6 @@ tbody tr:last-child td { border-bottom: 0; }
 .dimension-row span { color: var(--muted); font-size: .65rem; }
 .dimension-row .dimension-share { flex: 0 0 auto; color: var(--green); font-weight: 800; }
 
-.coverage-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .coverage-total { font-family: var(--serif); font-size: 2.2rem; font-weight: 500; }
 .coverage-list { display: grid; gap: 17px; }
 .coverage-row { display: grid; grid-template-columns: 145px 1fr 52px; gap: 12px; align-items: center; font-size: .73rem; }
@@ -911,6 +949,26 @@ tbody tr:last-child td { border-bottom: 0; }
 .issue p { margin: 2px 0 0; color: var(--muted); font-size: .69rem; }
 .issue-priority { color: var(--muted); font-size: .62rem; text-transform: uppercase; }
 .issue p.issue-detail { margin-top: 6px; color: var(--text); font-variant-numeric: tabular-nums; }
+.coverage-inventory { margin-top: 18px; }
+.coverage-inventory .coverage-list { margin-bottom: 20px; }
+.coverage-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+.coverage-heading .annotation { margin: 0; }
+.inventory-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.inventory-row:last-child { border-bottom: 0; }
+.inventory-row strong { font-size: .76rem; }
+.inventory-row p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .69rem; }
 .fast-mode-preference .segmented-control { margin-top: 10px; }
 .fast-mode-preference .annotation { margin-top: 8px; }
 .empty-inline { color: var(--muted); font-size: .76rem; }
@@ -1338,7 +1396,7 @@ footer {
   .page-heading { padding-top: 38px; }
   .freshness-card { min-width: 0; }
   .dashboard-section { padding: 44px 0; }
-  .metric-grid, .two-column, .coverage-layout, .privacy-lists, .result-metrics, .coverage-counts, .pricing-basis-grid, .backend-facts, .history-facts, .snapshot-quality-grid { grid-template-columns: 1fr; }
+  .metric-grid, .two-column, .span-threshold, .privacy-lists, .result-metrics, .coverage-counts, .pricing-basis-grid, .backend-facts, .history-facts, .snapshot-quality-grid { grid-template-columns: 1fr; }
   .accounting-dimensions, .schema-grid { grid-template-columns: 1fr; }
   .metric-grid > :last-child { grid-column: auto; }
   .panel { padding: 21px; }

@@ -10,6 +10,8 @@ import {
 import * as platform from "../src/platform/index.js";
 
 const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
+  "CODEX_CONFIG_RETAINED_KEYS",
+  "CODEX_CONFIG_SERVICE_TIER_STATUSES",
   "ClaudeCallbackLifecycleError",
   "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES",
   "ExportIdentityKeychainError",
@@ -60,6 +62,7 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "readBoundedJsonLines",
   "readBoundedUtf8LineEntries",
   "readBoundedUtf8Lines",
+  "readCodexConfigServiceTier",
   "readExportCompatibilityArtifactSet",
   "readOwnerOnlyLocalMetadataBundlePair",
   "rotateParticipantSecret",

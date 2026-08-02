@@ -254,9 +254,19 @@ export type ObservedSpeedMode = "standard" | "fast" | "unknown";
 export type FastModePreference = "standard" | "fast" | "mixed_unknown";
 export type SpeedModeProvenance =
   | "observed"
+  | "declared_codex_config"
   | "assumed_from_preference"
   | "inferred"
   | "unknown";
+
+export interface CodexSpeedModeDeclaration {
+  provenance: "declared_codex_config";
+  source: "codex_config_service_tier_key";
+  retainedKeys: readonly ["service_tier"];
+  appliesTo: string;
+  neverBackfillsHistory: true;
+  reason: string;
+}
 
 export interface QuotaWeightedApiPriceMetric {
   key: "quotaWeightedApiPriceEquivalentUsd";
@@ -279,6 +289,7 @@ export type SpeedWeightingCrossing = Record<
 export interface QuotaWeightedAccountingSummary {
   metric: QuotaWeightedApiPriceMetric;
   multiplierSource: Readonly<Record<string, string>>;
+  declarationSource: CodexSpeedModeDeclaration;
   preference: FastModePreference;
   standardApiPriceEquivalentUsd: number;
   quotaWeightedApiPriceEquivalentUsd: number | null;
@@ -288,6 +299,7 @@ export interface QuotaWeightedAccountingSummary {
   coverage: {
     totalEvents: number;
     observedEvents: number;
+    declaredFromConfigEvents: number;
     assumedFromPreferenceEvents: number;
     inferredEvents: number;
     unknownEvents: number;
@@ -358,6 +370,7 @@ export const OBSERVED_SPEED_MODE_KEYS: readonly ObservedSpeedMode[];
 export const FAST_MODE_PREFERENCE_VALUES: readonly FastModePreference[];
 export const DEFAULT_FAST_MODE_PREFERENCE: FastModePreference;
 export const SPEED_MODE_PROVENANCE_VALUES: readonly SpeedModeProvenance[];
+export const CODEX_SPEED_MODE_DECLARATION: CodexSpeedModeDeclaration;
 export const QUOTA_WEIGHTED_API_PRICE_METRIC: QuotaWeightedApiPriceMetric;
 export const FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS: Readonly<
   Record<string, number>
@@ -371,6 +384,7 @@ export function isFastModePreference(value: unknown): value is FastModePreferenc
 export function emptySpeedWeightingCrossing(): SpeedWeightingCrossing;
 export function resolveEffectiveSpeedMode(input?: {
   observedMode?: string;
+  declaredMode?: string;
   preference?: string;
   inferredMode?: string;
 }): { mode: ObservedSpeedMode; provenance: SpeedModeProvenance };
@@ -381,6 +395,7 @@ export function quotaWeightedApiPriceEquivalent(input?: {
 }): { usd: number | null; multiplier: number | null; status: string };
 export function summarizeQuotaWeightedAccounting(input?: {
   speedWeighting?: SpeedWeightingCrossing | null;
+  declaredSpeedWeighting?: SpeedWeightingCrossing | null;
   preference?: string;
   inferredFastEvents?: number;
   inference?: FastModeInferenceResult | null;

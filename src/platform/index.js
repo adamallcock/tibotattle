@@ -4,6 +4,11 @@ export {
   readBoundedUtf8Lines,
 } from "./bounded-jsonl-reader.js";
 export { readBoundedDirectoryEntries } from "./bounded-directory-reader.js";
+export {
+  CODEX_CONFIG_RETAINED_KEYS,
+  CODEX_CONFIG_SERVICE_TIER_STATUSES,
+  readCodexConfigServiceTier,
+} from "./codex-config-service-tier.js";
 export { createLocalCodexLogPorts } from "./local-codex-log-ports.js";
 export {
   createLocalExportSourcePorts,

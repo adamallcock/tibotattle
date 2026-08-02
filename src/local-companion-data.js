@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import {
   APP_PRICE_REGISTRY_MANIFEST,
+  CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
   DEFAULT_FAST_MODE_PREFERENCE,
   FAST_MODE_MODEL_FAMILY_KEYS,
@@ -18,6 +19,7 @@ import {
   priceCodexUsageEvent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
+import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   defaultReplaySafeAccountingCachePath,
   readReplaySafeAccountingCache,
@@ -643,7 +645,7 @@ function emptyDimension(keys) {
   ]));
 }
 
-function usageProjection(record) {
+function usageProjection(record, declaredSpeed = "unknown") {
   const components = emptyComponents();
   addComponents(components, record.components);
   if (components.output_combined_tokens > 0
@@ -683,6 +685,7 @@ function usageProjection(record) {
       ? priced.coverageStatus
       : "unpriced",
     speed: safeSpeed(record.tierSemantics?.codexSpeedMode),
+    declaredSpeed,
     apiServiceTier: safeEnum(record.tierSemantics?.apiServiceTier, KNOWN_API_TIERS),
     surface: safeEnum(record.surfaceClassification?.surface, KNOWN_SURFACES),
     agentScope: safeEnum(record.surfaceClassification?.agentScope, KNOWN_AGENT_SCOPES),
@@ -719,6 +722,9 @@ function newUsagePeriod(id, label) {
     // Observed speed mode crossed with the model's published Fast credit rate
     // family, so the owner's Fast-mode preference can be applied at read time.
     speedWeighting: emptySpeedWeightingCrossing(),
+    // The same crossing, holding only the events the log left UNOBSERVED that
+    // a timestamped Codex `service_tier` reading actually covers.
+    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
     accountAttribution: {
       attributedPseudonymousEvents: 0,
       unattributedEvents: 0,
@@ -729,6 +735,17 @@ function newUsagePeriod(id, label) {
 function addSpeedWeighting(crossing, projection) {
   const speed = crossing[projection.speed] ? projection.speed : "unknown";
   const cell = crossing[speed][fastModeModelFamilyKey(projection.model)];
+  cell.events += 1;
+  cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+}
+
+function addDeclaredSpeedWeighting(crossing, projection) {
+  // Only a declaration that resolved to a real mode is recorded, and only for
+  // events the log left unobserved; everything else is left unattributed.
+  if (projection.declaredSpeed !== "standard"
+      && projection.declaredSpeed !== "fast") return;
+  const cell =
+    crossing[projection.declaredSpeed][fastModeModelFamilyKey(projection.model)];
   cell.events += 1;
   cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
 }
@@ -790,6 +807,7 @@ function addUsageToPeriod(period, projection) {
   period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
   addDimension(period.bySpeed, projection.speed, projection);
   addSpeedWeighting(period.speedWeighting, projection);
+  addDeclaredSpeedWeighting(period.declaredSpeedWeighting, projection);
   addDimension(period.byApiServiceTier, projection.apiServiceTier, projection);
   addDimension(period.bySurface, projection.surface, projection);
   addDimension(period.byAgentScope, projection.agentScope, projection);
@@ -834,6 +852,9 @@ function finalizeUsagePeriod(period) {
     byLineage: finalizeDimension(period.byLineage),
     byReasoningEffort: finalizeDimension(period.byReasoningEffort),
     speedWeighting: finalizeSpeedWeighting(period.speedWeighting),
+    declaredSpeedWeighting: finalizeSpeedWeighting(
+      period.declaredSpeedWeighting,
+    ),
   };
 }
 
@@ -1114,7 +1135,7 @@ function cachedCollectorProjection(value, nowMs) {
 async function readCollectorProjection(
   path,
   nowMs,
-  { summarizeUsageEvents = true } = {},
+  { summarizeUsageEvents = true, declaredSpeedBaselines = [] } = {},
 ) {
   let metadata;
   try {
@@ -1258,7 +1279,15 @@ async function readCollectorProjection(
         latestExportableRecordAt = observedMs;
       }
       if (summarizeUsageEvents) {
-        const projection = usageProjection(value);
+        const observedSpeed = safeSpeed(value.tierSemantics?.codexSpeedMode);
+        // An observed tier always wins, so a declaration is only ever looked
+        // up for the turns the rollout log left unobserved.
+        const projection = usageProjection(
+          value,
+          observedSpeed === "unknown"
+            ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
+            : "unknown",
+        );
         for (const period of periods) {
           if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
         }
@@ -1594,6 +1623,7 @@ function inferredFastEventsInPeriod(inference, periodId, nowMs) {
 function fastModeProjection(period, { preference, inference, nowMs }) {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: safeSpeedWeighting(period?.speedWeighting),
+    declaredSpeedWeighting: safeSpeedWeighting(period?.declaredSpeedWeighting),
     preference,
     inferredFastEvents: inferredFastEventsInPeriod(
       inference,
@@ -1610,6 +1640,9 @@ function fastModeProjection(period, { preference, inference, nowMs }) {
     // preference attributes only the turns that precede the first observation
     // in their session.
     logObservability: { ...CODEX_SPEED_MODE_OBSERVABILITY },
+    // The Codex configuration's `service_tier` key recovers the baseline the
+    // log never writes, but only forward from the moment it was read.
+    declarationSource: { ...CODEX_SPEED_MODE_DECLARATION },
     metricKey: QUOTA_WEIGHTED_API_PRICE_METRIC.key,
     metricLabel: QUOTA_WEIGHTED_API_PRICE_METRIC.label,
     metricShortLabel: QUOTA_WEIGHTED_API_PRICE_METRIC.shortLabel,
@@ -1657,6 +1690,11 @@ export async function buildLocalCompanionSnapshot({
   // Owner-stated Codex speed mode. The composition root reads it from
   // owner-only local state; an unrecognised value never becomes a silent Fast.
   fastModePreference = DEFAULT_FAST_MODE_PREFERENCE,
+  // Timestamped Codex `service_tier` readings from the owner-only declared
+  // baseline ledger. Each covers only the interval it was observed over, so a
+  // reading never reaches back before it happened, and an observed tier always
+  // wins over it. An absent or unreadable ledger is simply no coverage.
+  codexSpeedBaselines = [],
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
@@ -1689,6 +1727,9 @@ export async function buildLocalCompanionSnapshot({
     projectArtifact(root, "quality"),
     readCollectorProjection(collectorFile, nowMs, {
       summarizeUsageEvents: replaySafeCache === null,
+      declaredSpeedBaselines: Array.isArray(codexSpeedBaselines)
+        ? codexSpeedBaselines
+        : [],
     }),
     reportProjection(root),
   ]);

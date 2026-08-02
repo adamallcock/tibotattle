@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   createIndexedCodexLogScan,
   defaultLocalAnalysisIndexSecretPath,
@@ -225,6 +226,11 @@ function newPeriod(id, label) {
     // family. The crossing is what lets the owner's Fast-mode preference be
     // applied at read time without rebuilding this cache.
     speedWeighting: emptySpeedWeightingCrossing(),
+    // The same crossing, holding only the events the log left UNOBSERVED that
+    // a timestamped Codex `service_tier` reading actually covers. Kept apart
+    // from the observed crossing so a declaration can never be read back as an
+    // observation.
+    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
   };
 }
 
@@ -614,6 +620,17 @@ function addSpeedWeighting(crossing, event) {
   cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
 }
 
+function addDeclaredSpeedWeighting(crossing, event) {
+  // Only a declaration that resolved to a real mode is recorded, and only for
+  // events the log left unobserved; everything else is left unattributed.
+  if (event.declaredSpeed !== "standard" && event.declaredSpeed !== "fast") {
+    return;
+  }
+  const cell = crossing[event.declaredSpeed][fastModeModelFamilyKey(event.model)];
+  cell.events += 1;
+  cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+}
+
 function finalizeSpeedWeighting(crossing) {
   return Object.fromEntries(Object.entries(crossing).map(([speed, families]) => [
     speed,
@@ -653,6 +670,7 @@ function addEvent(period, event) {
   ] += 1;
   addDimension(period.bySpeed, event.speed, event);
   addSpeedWeighting(period.speedWeighting, event);
+  addDeclaredSpeedWeighting(period.declaredSpeedWeighting, event);
   addDimension(period.byApiServiceTier, event.apiServiceTier, event);
   addDimension(period.bySurface, event.surface, event);
   addDimension(period.byAgentScope, event.agentScope, event);
@@ -711,6 +729,9 @@ function finalizePeriod(period) {
     byAgentScope: finalizeDimension(period.byAgentScope),
     byLineage: finalizeDimension(period.byLineage),
     speedWeighting: finalizeSpeedWeighting(period.speedWeighting),
+    declaredSpeedWeighting: finalizeSpeedWeighting(
+      period.declaredSpeedWeighting,
+    ),
   };
 }
 
@@ -801,6 +822,10 @@ export async function buildReplaySafeAccountingCache({
   windowDays = DEFAULT_WINDOW_DAYS,
   scan = scanCodexLogEvents,
   signal = null,
+  // Timestamped Codex `service_tier` readings. Each covers only the interval
+  // it was actually observed over, so a reading can never reach back before it
+  // happened. An absent or unreadable ledger is simply no coverage.
+  declaredSpeedBaselines = [],
   transitionResourceLimits: requestedTransitionResourceLimits = null,
   rss = () => process.memoryUsage().rss,
   maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
@@ -817,6 +842,9 @@ export async function buildReplaySafeAccountingCache({
       || maximumRssBytes < 1) {
     throw new TypeError("Replay-safe accounting options are invalid");
   }
+  const baselines = Array.isArray(declaredSpeedBaselines)
+    ? declaredSpeedBaselines
+    : [];
   const checkRuntimeMemory = () => {
     const currentRss = rss();
     if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
@@ -897,6 +925,11 @@ export async function buildReplaySafeAccountingCache({
         if (observedMs < startMs || observedMs > endMs + 5 * 60_000) return;
         const event = eventProjection(rawEvent, price);
         if (event === null) return;
+        // An observed tier always wins, so a declaration is only ever looked
+        // up for the turns the rollout log left unobserved.
+        event.declaredSpeed = event.speed === "unknown"
+          ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
+          : "unknown";
         reserveTransitionInput("usage");
         rawUsageEvents.push(transitionUsageProjection(rawEvent, event));
         for (const [id, period] of periods) {

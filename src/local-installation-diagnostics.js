@@ -178,6 +178,11 @@ export function localCompanionStatePaths(stateRoot) {
       "private",
       "fast-mode-preference-v0.1.json",
     ),
+    codexSpeedBaselineFile: join(
+      selected,
+      "private",
+      "codex-speed-baseline-v0.1.json",
+    ),
     preparedSpoolDirectory: join(
       selected,
       "local-contribution-prepared-v0.1",

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
   DEFAULT_FAST_MODE_PREFERENCE,
   FAST_MODE_MULTIPLIER_SOURCE,
@@ -26,6 +27,14 @@ import {
   FastModePreferenceError,
   createFastModePreferenceController,
 } from "../src/fast-mode-preference.js";
+import {
+  CODEX_SPEED_BASELINE_SCHEMA_VERSION,
+  createCodexSpeedBaselineController,
+  declaredSpeedModeAt,
+} from "../src/codex-speed-baseline.js";
+import {
+  readCodexConfigServiceTier,
+} from "../src/platform/index.js";
 
 function crossing(cells) {
   const value = emptySpeedWeightingCrossing();
@@ -222,6 +231,7 @@ test("coverage reports observed, assumed, inferred and remaining unknown shares"
   assert.deepEqual({ ...summary.coverage }, {
     totalEvents: 10,
     observedEvents: 4,
+    declaredFromConfigEvents: 0,
     assumedFromPreferenceEvents: 0,
     inferredEvents: 4,
     unknownEvents: 2,
@@ -393,4 +403,315 @@ test("the owner-only preference round-trips and refuses unknown values", async (
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Declared Codex speed-mode baseline.
+//
+// Codex writes the mode to the rollout log only when it is applied or changed,
+// so a session's baseline is unobservable there. `~/.codex/config.toml` holds a
+// top-level `service_tier` key with the current setting, but the Codex UI
+// rewrites that file on every toggle, so it proves the value only at the moment
+// it is read. These tests pin the three properties that makes safe: it never
+// reaches backwards, it never beats an observation, and it fails closed.
+// ---------------------------------------------------------------------------
+
+const CONFIG_WITH_SECRETS = [
+  "# Codex configuration",
+  'model = "gpt-5.6"',
+  'service_tier = "priority"',
+  "",
+  "[mcp_servers.internal]",
+  'command = "/usr/local/bin/secret-tool"',
+  'env = { API_TOKEN = "sk-do-not-read-me" }',
+  'service_tier = "default"',
+  "",
+  "[profiles.work]",
+  'approval_policy = "never"',
+  "",
+].join("\n");
+
+async function configRoot(contents) {
+  const root = await mkdtemp(join(tmpdir(), "codex-speed-baseline-"));
+  const configFile = join(root, "config.toml");
+  if (contents !== null) {
+    await writeFile(configFile, contents, { mode: 0o600 });
+  }
+  return { configFile, ledgerFile: join(root, "private", "baseline.json"), root };
+}
+
+test("only the root-table service_tier key is ever read from the Codex config", async () => {
+  const { configFile, root } = await configRoot(CONFIG_WITH_SECRETS);
+  try {
+    const declaration = await readCodexConfigServiceTier({ configFile });
+    // Exactly three content-free fields, and the only value carried out of the
+    // file is the tier token itself.
+    assert.deepEqual(Object.keys(declaration).sort(), [
+      "retainedKeys",
+      "serviceTier",
+      "status",
+    ]);
+    assert.equal(declaration.status, "declared");
+    assert.equal(declaration.serviceTier, "priority");
+    assert.deepEqual([...declaration.retainedKeys], ["service_tier"]);
+    // No model name, no MCP command, no token, no path - and specifically not
+    // the `service_tier` that lives inside an MCP table, which is out of scope
+    // by construction because the scan stops at the first table header.
+    const serialized = JSON.stringify(declaration);
+    for (const forbidden of [
+      "gpt-5.6",
+      "secret-tool",
+      "sk-do-not-read-me",
+      "API_TOKEN",
+      "mcp_servers",
+      "approval_policy",
+      "default",
+      root,
+    ]) {
+      assert.equal(serialized.includes(forbidden), false, forbidden);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a missing, unreadable, or unrecognised declaration fails closed", async () => {
+  const missing = await configRoot(null);
+  try {
+    assert.deepEqual(
+      await readCodexConfigServiceTier({ configFile: missing.configFile }),
+      { status: "missing", serviceTier: null, retainedKeys: ["service_tier"] },
+    );
+    // A directory in place of the file, and a nonsense path, are both refused
+    // without guessing a default.
+    assert.equal(
+      (await readCodexConfigServiceTier({ configFile: missing.root })).status,
+      "unreadable",
+    );
+    assert.equal(
+      (await readCodexConfigServiceTier({ configFile: "" })).status,
+      "unreadable",
+    );
+  } finally {
+    await rm(missing.root, { recursive: true, force: true });
+  }
+
+  for (const [label, contents] of [
+    ["no key at all", 'model = "gpt-5.6"\n'],
+    ["key only inside a table", '[profile]\nservice_tier = "priority"\n'],
+    ["unquoted value", "service_tier = priority\n"],
+    ["non-scalar value", 'service_tier = { name = "priority" }\n'],
+    ["empty file", ""],
+  ]) {
+    const fixture = await configRoot(contents);
+    try {
+      const declaration = await readCodexConfigServiceTier({
+        configFile: fixture.configFile,
+      });
+      assert.equal(declaration.status, "absent", label);
+      assert.equal(declaration.serviceTier, null, label);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+
+  // An unrecognised token is never coerced into a mode, so a renamed or new
+  // provider tier can never be silently read as Standard.
+  const renamed = await configRoot('service_tier = "turbo"\n');
+  try {
+    const controller = createCodexSpeedBaselineController({
+      ledgerFile: renamed.ledgerFile,
+      configFile: renamed.configFile,
+      now: () => new Date("2026-08-01T10:00:00.000Z"),
+    });
+    const recorded = await controller.record();
+    assert.equal(recorded.status, "undeclared");
+    assert.deepEqual([...recorded.windows], []);
+    assert.equal(await readFile(renamed.ledgerFile, "utf8").catch(() => null), null);
+  } finally {
+    await rm(renamed.root, { recursive: true, force: true });
+  }
+});
+
+test("a declared baseline never applies to turns before it was read", async () => {
+  const { configFile, ledgerFile, root } = await configRoot(CONFIG_WITH_SECRETS);
+  try {
+    let clock = new Date("2026-08-01T12:00:00.000Z");
+    const controller = createCodexSpeedBaselineController({
+      ledgerFile,
+      configFile,
+      now: () => clock,
+    });
+
+    const first = await controller.record();
+    assert.equal(first.status, "opened");
+    assert.equal(first.declaredMode, "fast");
+    assert.equal(first.appliesTo, "turns_at_or_after_the_moment_the_key_was_read");
+    assert.equal(first.neverBackfillsHistory, true);
+    assert.deepEqual([...first.windows], [{
+      firstSeenAt: "2026-08-01T12:00:00.000Z",
+      lastSeenAt: "2026-08-01T12:00:00.000Z",
+      mode: "fast",
+    }]);
+
+    // The reading proves nothing about any earlier turn, however close.
+    assert.equal(
+      declaredSpeedModeAt(first.windows, Date.parse("2026-08-01T11:59:59.999Z")),
+      null,
+    );
+    assert.equal(
+      declaredSpeedModeAt(first.windows, Date.parse("2026-08-01T12:00:00.000Z")),
+      "fast",
+    );
+    // Nor about a turn after the reading but before the next one confirms it.
+    assert.equal(
+      declaredSpeedModeAt(first.windows, Date.parse("2026-08-01T12:00:00.001Z")),
+      null,
+    );
+
+    clock = new Date("2026-08-01T13:00:00.000Z");
+    const extended = await controller.record();
+    assert.equal(extended.status, "extended");
+    assert.equal(extended.windows.length, 1);
+    // The value held at both ends, and any change between them would itself be
+    // in the rollout log, so the whole interval is now covered.
+    assert.equal(
+      declaredSpeedModeAt(extended.windows, Date.parse("2026-08-01T12:30:00.000Z")),
+      "fast",
+    );
+    assert.equal(
+      declaredSpeedModeAt(extended.windows, Date.parse("2026-08-01T13:00:00.001Z")),
+      null,
+    );
+
+    // A changed value opens a new window; the gap in which it might have
+    // changed is left uncovered rather than assigned to either side.
+    await writeFile(configFile, 'service_tier = "default"\n', { mode: 0o600 });
+    clock = new Date("2026-08-01T14:00:00.000Z");
+    const opened = await controller.record();
+    assert.equal(opened.status, "opened");
+    assert.deepEqual([...opened.windows], [
+      {
+        firstSeenAt: "2026-08-01T12:00:00.000Z",
+        lastSeenAt: "2026-08-01T13:00:00.000Z",
+        mode: "fast",
+      },
+      {
+        firstSeenAt: "2026-08-01T14:00:00.000Z",
+        lastSeenAt: "2026-08-01T14:00:00.000Z",
+        mode: "standard",
+      },
+    ]);
+    assert.equal(
+      declaredSpeedModeAt(opened.windows, Date.parse("2026-08-01T13:30:00.000Z")),
+      null,
+    );
+    assert.equal(
+      declaredSpeedModeAt(opened.windows, Date.parse("2026-08-01T14:00:00.000Z")),
+      "standard",
+    );
+
+    // Only the mode and the two instants are ever stored.
+    const stored = JSON.parse(await readFile(ledgerFile, "utf8"));
+    assert.equal(stored.schemaVersion, CODEX_SPEED_BASELINE_SCHEMA_VERSION);
+    assert.deepEqual(Object.keys(stored).sort(), ["schemaVersion", "windows"]);
+    for (const window of stored.windows) {
+      assert.deepEqual(Object.keys(window).sort(), [
+        "firstSeenAt",
+        "lastSeenAt",
+        "mode",
+      ]);
+    }
+    assert.equal(JSON.stringify(stored).includes("priority"), false);
+
+    // A malformed ledger is an explicit failure, and the non-throwing reader
+    // degrades to no coverage rather than inventing one.
+    await writeFile(ledgerFile, "{\"windows\":[]}\n", { mode: 0o600 });
+    await assert.rejects(
+      () => controller.inspect(),
+      (error) => error.code === "codex_speed_baseline_unavailable",
+    );
+    assert.deepEqual(await controller.readWindows(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an observation always beats a declared baseline", () => {
+  // Resolution order, one step at a time.
+  assert.deepEqual(
+    { ...resolveEffectiveSpeedMode({
+      observedMode: "standard",
+      declaredMode: "fast",
+      preference: "fast",
+    }) },
+    { mode: "standard", provenance: "observed" },
+  );
+  assert.deepEqual(
+    { ...resolveEffectiveSpeedMode({
+      observedMode: "unknown",
+      declaredMode: "fast",
+      preference: "standard",
+    }) },
+    { mode: "fast", provenance: "declared_codex_config" },
+  );
+  assert.deepEqual(
+    { ...resolveEffectiveSpeedMode({
+      observedMode: "unknown",
+      declaredMode: "unknown",
+      preference: "fast",
+    }) },
+    { mode: "fast", provenance: "assumed_from_preference" },
+  );
+  assert.equal(CODEX_SPEED_MODE_DECLARATION.neverBackfillsHistory, true);
+  assert.deepEqual(
+    [...CODEX_SPEED_MODE_DECLARATION.retainedKeys],
+    ["service_tier"],
+  );
+
+  // The same precedence holds through the aggregate. Four observed-Fast events
+  // stay Fast even though the declaration says Standard, and the six
+  // unobserved events are attributed by the declaration instead of by the
+  // owner's stated Standard preference.
+  const summary = summarizeQuotaWeightedAccounting({
+    speedWeighting: crossing([
+      ["fast", "gpt-5.6", 4, 8],
+      ["unknown", "gpt-5.6", 6, 12],
+    ]),
+    declaredSpeedWeighting: crossing([["fast", "gpt-5.6", 6, 12]]),
+    preference: "standard",
+  });
+  assert.equal(summary.coverage.observedEvents, 4);
+  assert.equal(summary.coverage.declaredFromConfigEvents, 6);
+  assert.equal(summary.coverage.assumedFromPreferenceEvents, 0);
+  assert.equal(summary.coverage.unknownEvents, 0);
+  assert.equal(summary.weightingStatus, "complete");
+  // Every one of the 20 Standard-priced dollars is weighted at the published
+  // 2.5x, because observation and declaration both say Fast.
+  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 50);
+
+  // A declaration covering only part of the unobserved remainder leaves the
+  // rest to the stated preference; nothing is silently extended to it.
+  const partial = summarizeQuotaWeightedAccounting({
+    speedWeighting: crossing([["unknown", "gpt-5.4", 10, 20]]),
+    declaredSpeedWeighting: crossing([["fast", "gpt-5.4", 4, 8]]),
+    preference: "mixed_unknown",
+  });
+  assert.equal(partial.coverage.declaredFromConfigEvents, 4);
+  assert.equal(partial.coverage.unknownEvents, 6);
+  // 8 USD at the published 2.0x; the uncovered 12 USD stays unweighted.
+  assert.equal(partial.quotaWeightedApiPriceEquivalentUsd, 16);
+  assert.equal(partial.unweightedUnknownApiPriceEquivalentUsd, 12);
+  assert.equal(partial.weightingStatus, "partial");
+
+  // A declared crossing claiming more than the log left unobserved is
+  // inconsistent, so it is discarded whole rather than trusted in part.
+  const overclaimed = summarizeQuotaWeightedAccounting({
+    speedWeighting: crossing([["unknown", "gpt-5.6", 2, 4]]),
+    declaredSpeedWeighting: crossing([["fast", "gpt-5.6", 5, 10]]),
+    preference: "mixed_unknown",
+  });
+  assert.equal(overclaimed.coverage.declaredFromConfigEvents, 0);
+  assert.equal(overclaimed.coverage.unknownEvents, 2);
+  assert.equal(overclaimed.quotaWeightedApiPriceEquivalentUsd, null);
 });

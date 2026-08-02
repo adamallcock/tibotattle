@@ -22,6 +22,9 @@ import {
 import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
+import {
+  createCodexSpeedBaselineController,
+} from "../../src/codex-speed-baseline.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
   LocalCompanionRefreshController,
@@ -1835,6 +1838,15 @@ function createPreparedLocalCompanionServer({
   fastModePreference = createFastModePreferenceController({
     settingsFile: statePaths.fastModePreferenceFile,
   }),
+  // The declared Codex speed-mode baseline. Codex records the mode only when
+  // it is applied or changed, never at session start, so the baseline lives
+  // nowhere but the configuration's top-level `service_tier` key - and only
+  // that key is ever read from that file. Each reading is stamped with the
+  // moment it happened and attributes only turns from then on.
+  codexSpeedBaseline = createCodexSpeedBaselineController({
+    ledgerFile: statePaths.codexSpeedBaselineFile,
+    configFile: join(codexHome, "config.toml"),
+  }),
   dataStore = new LocalCompanionDataStore({
     builder: async () => buildLocalCompanionSnapshot({
       root: resourceRoot,
@@ -1848,6 +1860,10 @@ function createPreparedLocalCompanionServer({
       // tier always wins. A missing or unreadable statement degrades to the
       // Standard default rather than inventing a Fast attribution.
       fastModePreference: await fastModePreference.readMode(),
+      // Timestamped declared baselines. They fill only the turns the rollout
+      // log left unobserved and that a reading actually covers; an observed
+      // tier always wins, and an unreadable ledger is simply no coverage.
+      codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
     }),
   }),
   refreshRunner = createLocalCollectorRefreshRunner({
@@ -1860,6 +1876,9 @@ function createPreparedLocalCompanionServer({
       statePaths.accountObservationLockFile,
     refreshAccounting: refreshReplaySafeAccountingCache,
     accountingCacheFile: statePaths.accountingCacheFile,
+    recordCodexSpeedBaseline: async () => (
+      (await codexSpeedBaseline.record()).windows
+    ),
   }),
   onboardingProvider = () => inspectLocalOnboarding({
     codexHome,

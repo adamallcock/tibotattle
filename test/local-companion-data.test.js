@@ -250,6 +250,7 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
+      declaredFromConfigEvents: 0,
       assumedFromPreferenceEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
@@ -352,6 +353,7 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
     assert.deepEqual(fast.overview.accounting.fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
+      declaredFromConfigEvents: 0,
       assumedFromPreferenceEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
@@ -390,6 +392,95 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
     assert.equal(
       hostile.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
       10,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a declared Codex baseline fills only the turns it actually covers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-declared-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    const usage = (observedAt, codexSpeedMode) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.4",
+      components: {
+        input_uncached_tokens: 1_000_000,
+        input_cache_read_tokens: 0,
+        input_cache_write_tokens: 0,
+        output_text_tokens: 0,
+        output_reasoning_tokens: 0,
+      },
+      tierSemantics: { codexSpeedMode },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        // Before the configuration was ever read: the declaration must not
+        // reach back to it, however close.
+        usage("2026-07-25T09:00:00.000Z", "unknown"),
+        // Inside the covered interval, but observed Standard in the log, so
+        // the declaration must not touch it either.
+        usage("2026-07-25T10:30:00.000Z", "standard"),
+        // Inside the covered interval and unobserved: the only turn the
+        // declaration is allowed to attribute.
+        usage("2026-07-25T10:45:00.000Z", "unknown"),
+        // After the newest reading: uncovered again until the next reading.
+        usage("2026-07-25T11:30:00.000Z", "unknown"),
+      ].map((line) => `${line}\n`).join(""),
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      // "not sure" removes the stated preference as an attribution route, so
+      // anything attributed here came from the declaration alone.
+      fastModePreference: "mixed_unknown",
+      codexSpeedBaselines: [{
+        mode: "fast",
+        firstSeenAt: "2026-07-25T10:00:00.000Z",
+        lastSeenAt: "2026-07-25T11:00:00.000Z",
+      }],
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+
+    const fastMode = snapshot.overview.accounting.fastMode;
+    assert.equal(fastMode.coverage.totalEvents, 4);
+    assert.equal(fastMode.coverage.observedEvents, 1);
+    assert.equal(fastMode.coverage.declaredFromConfigEvents, 1);
+    assert.equal(fastMode.coverage.assumedFromPreferenceEvents, 0);
+    assert.equal(fastMode.coverage.unknownEvents, 2);
+    // Each event prices to $5 of Standard-rate API equivalent: $5 observed
+    // Standard plus $5 declared Fast at GPT-5.4's published 2x, with the two
+    // uncovered events left explicitly unweighted rather than counted at 1x.
+    assert.equal(snapshot.overview.accounting.apiPriceEquivalentUsd, 20);
+    assert.equal(
+      snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      15,
+    );
+    assert.equal(fastMode.unweightedUnknownApiPriceEquivalentUsd, 10);
+    assert.equal(fastMode.weightingStatus, "partial");
+    assert.equal(fastMode.declarationSource.neverBackfillsHistory, true);
+    assert.deepEqual(
+      [...fastMode.declarationSource.retainedKeys],
+      ["service_tier"],
+    );
+
+    // With no declarations at all the same ledger attributes nothing extra.
+    const undeclared = await buildLocalCompanionSnapshot({
+      root,
+      fastModePreference: "mixed_unknown",
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(
+      undeclared.overview.accounting.fastMode.coverage.declaredFromConfigEvents,
+      0,
+    );
+    assert.equal(
+      undeclared.overview.accounting.fastMode.coverage.unknownEvents,
+      3,
     );
   } finally {
     await rm(root, { recursive: true });

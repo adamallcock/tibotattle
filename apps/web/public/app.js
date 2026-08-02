@@ -43,6 +43,11 @@ let activeCalibrationRangeDays = 7;
 let activeUsageGrouping = "hour";
 let activeAccountingPeriod = "7d";
 let activeWeeklyRangeDays = 31;
+// The observed percentage-point span a reset-series fit must exceed before it
+// counts as headline evidence. It is a visible, adjustable control, not a
+// hidden constant: the reader can see and move the bar the numbers clear.
+const DEFAULT_WEEKLY_SPAN_THRESHOLD_PP = 50;
+let weeklySpanThresholdPp = DEFAULT_WEEKLY_SPAN_THRESHOLD_PP;
 let showWeeklyPartialDiagnostics = false;
 let timelineViewport = null;
 let timelinePointerStart = null;
@@ -470,6 +475,14 @@ function formatTimeRemaining(value) {
   if (days > 0) return `${days}d ${hours}h remaining`;
   if (hours > 0) return `${hours}h ${minutes}m remaining`;
   return `${minutes}m remaining`;
+}
+
+function formatSpanLength(spanMs) {
+  const minutes = Math.max(1, Math.round(spanMs / 60_000));
+  if (minutes < 90) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = minutes / 60;
+  if (hours < 48) return `${hours.toFixed(hours < 10 ? 1 : 0)} hours`;
+  return `${(hours / 24).toFixed(1)} days`;
 }
 
 function clear(element) {
@@ -951,13 +964,31 @@ function resetTimelineViewport() {
   timelineViewport = null;
 }
 
+// Zoom is a ratio applied per step, so one step feels the same at every scale.
+// A wheel step is one mouse notch — trackpads emit many small deltas per
+// gesture, and each one moves only its own fraction of that step.
+const TIMELINE_WHEEL_ZOOM_STEP = 1.12;
+const TIMELINE_WHEEL_NOTCH_PIXELS = 100;
+const TIMELINE_BUTTON_ZOOM_STEP = 1.25;
+// No single wheel event, however large, may move more than one button press.
+const TIMELINE_MAXIMUM_ZOOM_STEP = 1.25;
+const TIMELINE_MINIMUM_SPAN_MS = 15 * 60_000;
+const TIMELINE_FLOOR_SPAN_MS = 60_000;
+
+function minimumTimelineSpanMs(bounds) {
+  return Math.min(
+    TIMELINE_MINIMUM_SPAN_MS,
+    Math.max(TIMELINE_FLOOR_SPAN_MS, (bounds.endMs - bounds.startMs) / 200),
+  );
+}
+
 function updateTimelineViewport(points, update) {
   const bounds = timelineBounds(points);
   const current = normalizeTimelineViewport(points);
   if (bounds === null || current === null) return;
   const next = update({ ...current }, bounds);
   if (!next || !Number.isFinite(next.startMs) || !Number.isFinite(next.endMs)) return;
-  const minimumSpanMs = Math.min(15 * 60_000, Math.max(60_000, (bounds.endMs - bounds.startMs) / 200));
+  const minimumSpanMs = minimumTimelineSpanMs(bounds);
   const startMs = Math.max(bounds.startMs, Math.min(next.startMs, bounds.endMs - minimumSpanMs));
   const endMs = Math.min(bounds.endMs, Math.max(next.endMs, startMs + minimumSpanMs));
   timelineViewport = endMs - startMs >= bounds.endMs - bounds.startMs - 1
@@ -966,14 +997,33 @@ function updateTimelineViewport(points, update) {
   if (dashboard) renderTimeline(dashboard);
 }
 
+function wheelZoomFactor(event) {
+  // deltaMode 1 reports lines and 2 reports pages; both are converted to the
+  // pixel delta a mouse notch reports so one notch is one step on any device.
+  const pixels = event.deltaMode === 1
+    ? event.deltaY * 16
+    : event.deltaMode === 2
+      ? event.deltaY * 400
+      : event.deltaY;
+  return TIMELINE_WHEEL_ZOOM_STEP ** (pixels / TIMELINE_WHEEL_NOTCH_PIXELS);
+}
+
 function zoomTimeline(points, factor, anchorRatio = .5) {
+  const step = Math.max(
+    1 / TIMELINE_MAXIMUM_ZOOM_STEP,
+    Math.min(TIMELINE_MAXIMUM_ZOOM_STEP, factor),
+  );
+  const anchorAt = Math.max(0, Math.min(1, anchorRatio));
   updateTimelineViewport(points, (current, bounds) => {
     const span = current.endMs - current.startMs;
-    const nextSpan = Math.min(bounds.endMs - bounds.startMs, Math.max(60_000, span * factor));
-    const anchor = current.startMs + span * Math.max(0, Math.min(1, anchorRatio));
+    const nextSpan = Math.min(
+      bounds.endMs - bounds.startMs,
+      Math.max(minimumTimelineSpanMs(bounds), span * step),
+    );
+    const anchor = current.startMs + span * anchorAt;
     return {
-      startMs: anchor - nextSpan * anchorRatio,
-      endMs: anchor + nextSpan * (1 - anchorRatio),
+      startMs: anchor - nextSpan * anchorAt,
+      endMs: anchor + nextSpan * (1 - anchorAt),
     };
   });
 }
@@ -1336,13 +1386,13 @@ function bindTimelineInteractions(shell, points, viewport) {
   shell.tabIndex = 0;
   shell.setAttribute("aria-label", `Interactive quota timeline in ${USER_TIME_ZONE}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.`);
   const status = $("#timeline-zoom-status");
-  status.textContent = `Timeline shows ${formatLocal(new Date(viewport.startMs).toISOString())} through ${formatLocal(new Date(viewport.endMs).toISOString())}.`;
+  status.textContent = `Timeline shows ${formatLocal(new Date(viewport.startMs).toISOString())} through ${formatLocal(new Date(viewport.endMs).toISOString())}, a span of ${formatSpanLength(viewport.endMs - viewport.startMs)}.`;
   shell.onwheel = (event) => {
     if (!event.deltaY) return;
     event.preventDefault();
     const bounds = shell.getBoundingClientRect();
     const ratio = bounds.width > 0 ? (event.clientX - bounds.left) / bounds.width : .5;
-    zoomTimeline(points, event.deltaY > 0 ? 1.35 : .74, ratio);
+    zoomTimeline(points, wheelZoomFactor(event), ratio);
   };
   shell.onpointerdown = (event) => {
     timelinePointerStart = { x: event.clientX };
@@ -1368,10 +1418,10 @@ function bindTimelineInteractions(shell, points, viewport) {
   shell.onkeydown = (event) => {
     if (["+", "="].includes(event.key)) {
       event.preventDefault();
-      zoomTimeline(points, .74);
+      zoomTimeline(points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
     } else if (["-", "_"].includes(event.key)) {
       event.preventDefault();
-      zoomTimeline(points, 1.35);
+      zoomTimeline(points, TIMELINE_BUTTON_ZOOM_STEP);
     } else if (event.key === "ArrowLeft") {
       event.preventDefault();
       panTimeline(points, -.2);
@@ -1441,22 +1491,55 @@ function residualRows(data, points) {
   const source = visibleArtifactResiduals.length
     ? visibleArtifactResiduals
     : pointResiduals;
+  // Windows that cannot be differenced are kept with a null residual so the
+  // chart spans the same history as the calibration chart and shows the gap,
+  // instead of quietly starting at the first computable point.
   return source
     .filter((row) => {
       const timestamp = Date.parse(row.timestamp);
-      return row.residual !== null
-        && Number.isFinite(timestamp)
+      return Number.isFinite(timestamp)
         && (visibleBounds === null
           || (timestamp >= visibleBounds.startMs && timestamp <= visibleBounds.endMs));
     })
     .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
+function residualGapReasons(rows) {
+  const counts = new Map();
+  for (const row of rows) {
+    if (row.residual !== null) continue;
+    const label = row.status
+      ? timelineStatusLabel(row.status)
+      : "no recorded evidence state";
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([label, total]) => `${total} ${label.toLowerCase()}`);
+}
+
+function renderResidualCoverage(rows, computed) {
+  const element = $("#residual-coverage");
+  const missing = rows.length - computed.length;
+  element.classList.toggle("low", rows.length > 0 && missing > computed.length);
+  if (!rows.length) {
+    element.textContent = "No windows fall inside this date range.";
+  } else if (missing === 0) {
+    element.textContent = `All ${rows.length} window${rows.length === 1 ? "" : "s"} in this range have a computable residual.`;
+  } else {
+    element.textContent = `${computed.length} of ${rows.length} windows in this range have a computable residual. The other ${missing} are shown as shaded gaps on the same axis, never as zero: ${residualGapReasons(rows).join(", ")}.`;
+  }
+}
+
 function renderResiduals(data, points, viewport = null) {
   const residuals = residualRows(data, points);
+  const computed = residuals.filter((row) => row.residual !== null);
+  // The residual axis is pinned to the calibration chart's own domain so a
+  // shorter run of computable residuals cannot silently shorten the history.
+  const domain = viewport ?? timelineBounds(points);
   const empty = $("#residual-empty");
   const shell = $("#residual-chart");
-  if (!residuals.length) {
+  if (!computed.length) {
     empty.hidden = false;
     shell.hidden = true;
   } else {
@@ -1467,17 +1550,21 @@ function renderResiduals(data, points, viewport = null) {
       series: [{ key: "residual", className: "chart-line-value", label: "Residual" }],
       yLabel: "Percentage points",
       title: "Quota movement residuals",
-      description: "Observed quota change minus the API-cost-implied change.",
+      description: "Observed quota change minus the API-cost-implied change, over the same date range as the calibration chart. Windows with no computable residual are left as shaded gaps.",
       includeZero: true,
-      xDomain: viewport,
+      xDomain: domain,
+      statusIntervals: domain === null
+        ? []
+        : timelineStatusIntervals(residuals, domain),
     }));
   }
+  renderResidualCoverage(residuals, computed);
   const table = $("#residual-table");
   clear(table);
   const unmatched = points
     .filter((point) => point.timestamp && point.status && point.status !== "matched")
     .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
-  const largest = [...residuals]
+  const largest = [...computed]
     .sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual));
   const inspection = [...unmatched, ...largest]
     .filter((row, index, rows) => rows.findIndex((candidate) => candidate.timestamp === row.timestamp) === index)
@@ -1514,6 +1601,7 @@ function lineChart({
   description,
   includeZero = false,
   confidence = null,
+  errorBars = null,
   xDomain = null,
   statusIntervals = [],
   secondarySeries = [],
@@ -1525,6 +1613,7 @@ function lineChart({
   const margin = { top: 24, right: hasSecondary ? 64 : 22, bottom: 50, left: 58 };
   const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
   if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
+  if (errorBars) values.push(...points.flatMap((point) => [finite(point[errorBars.low]), finite(point[errorBars.high])].filter((value) => value !== null)));
   if (includeZero) values.push(0);
   let min = Math.min(...values);
   let max = Math.max(...values);
@@ -1649,6 +1738,27 @@ function lineChart({
     }
   }
 
+  if (errorBars) {
+    const format = errorBars.format ?? formatMoney;
+    points.forEach((point, index) => {
+      const low = finite(point[errorBars.low]);
+      const high = finite(point[errorBars.high]);
+      if (low === null || high === null) return;
+      const position = x(index, point);
+      const group = document.createElementNS(svg.namespaceURI, "g");
+      group.setAttribute("class", errorBars.className);
+      group.append(
+        svgLine(position, y(low), position, y(high), "chart-error-bar-line"),
+        svgLine(position - 5, y(low), position + 5, y(low), "chart-error-bar-cap"),
+        svgLine(position - 5, y(high), position + 5, y(high), "chart-error-bar-cap"),
+      );
+      const barTitle = document.createElementNS(svg.namespaceURI, "title");
+      barTitle.textContent = `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`;
+      group.append(barTitle);
+      svg.append(group);
+    });
+  }
+
   for (const interval of statusIntervals) {
     if (!Number.isFinite(interval.startMs) || !Number.isFinite(interval.endMs)
         || interval.endMs <= interval.startMs) continue;
@@ -1686,6 +1796,7 @@ function lineChart({
       svg.append(path);
     }
     if (item.markers === true) {
+      const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
         if (value === null) return;
@@ -1694,10 +1805,22 @@ function lineChart({
         marker.setAttribute("cy", String(y(value)));
         marker.setAttribute("r", String(item.markerRadius ?? 4));
         marker.setAttribute("class", `${item.className} chart-point`);
-        const markerTitle = document.createElementNS(svg.namespaceURI, "title");
         const timestamp = point.timestamp ?? point.date;
-        markerTitle.textContent = `${item.label}: ${formatMoney(value)}${timestamp ? ` · ${formatLocal(timestamp)}` : ""}`;
+        const caption = [
+          `${item.label}: ${format(value)}`,
+          item.detail?.(point),
+          timestamp ? formatLocal(timestamp) : null,
+        ].filter(Boolean).join(" · ");
+        const markerTitle = document.createElementNS(svg.namespaceURI, "title");
+        markerTitle.textContent = caption;
         marker.append(markerTitle);
+        // A hover title alone is mouse-only, so focusable markers carry the
+        // identical sentence to the keyboard and to assistive technology.
+        if (item.focusable === true) {
+          marker.setAttribute("tabindex", "0");
+          marker.setAttribute("role", "img");
+          marker.setAttribute("aria-label", caption);
+        }
         svg.append(marker);
       });
     }
@@ -1748,7 +1871,38 @@ function svgText(x, y, value, className, anchor = "start") {
   return element;
 }
 
+function aboveWeeklySpanThreshold(observedSpanPp) {
+  // An unrecorded span cannot be shown to clear the threshold, so it stays a
+  // diagnostic instead of being promoted to headline evidence.
+  return observedSpanPp !== null && observedSpanPp > weeklySpanThresholdPp;
+}
+
+function weeklyThresholdLabel() {
+  return `more than ${formatPp(weeklySpanThresholdPp, 0)}`;
+}
+
+function weeklyPointDetail(point) {
+  return [
+    point.observedSpanPp === null
+      ? "observed span not recorded"
+      : `represents ${formatPp(point.observedSpanPp)} of the 100-point allowance`,
+    point.low === null || point.high === null
+      ? "no within-reset sensitivity range"
+      : `within-reset sensitivity ${formatMoney(point.low)}–${formatMoney(point.high)}`,
+  ].join(" · ");
+}
+
+function renderWeeklySpanThresholdControls() {
+  const slider = $("#weekly-span-threshold");
+  slider.value = String(weeklySpanThresholdPp);
+  slider.setAttribute("aria-valuetext", `${weeklySpanThresholdPp} percentage points`);
+  $("#weekly-span-threshold-value").textContent = `> ${formatPp(weeklySpanThresholdPp, 0)}`;
+  $("#weekly-evidence-controls").querySelector('[data-evidence="mature"]')
+    .textContent = `> ${formatPp(weeklySpanThresholdPp, 0)} only`;
+}
+
 function renderWeekly(data) {
+  renderWeeklySpanThresholdControls();
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
@@ -1763,7 +1917,7 @@ function renderWeekly(data) {
   $("#evidence-label").textContent = qualifying < 3 ? "Insufficient" : qualifying < 8 ? "Developing" : qualifying < 14 ? "Moderate" : "Substantial";
   const attributionLabel = data.weekly.accountAttribution?.label;
   const evidenceExplanation = qualifying
-    ? `Historical median across ${qualifying} qualifying reset-series fits. The headline chart starts with fits observed across at least 80 percentage points; partial extrapolations remain available as diagnostics. This is an API-price-equivalent calibration, not a published dollar cap.`
+    ? `Historical median across ${qualifying} qualifying reset-series fits. The headline chart shows fits observed across ${weeklyThresholdLabel()} of the allowance; that threshold is adjustable and shorter-span extrapolations remain available as diagnostics. This is an API-price-equivalent calibration, not a published dollar cap.`
     : "The estimate will appear when enough quota transitions can be matched to priced usage.";
   $("#weekly-explanation").textContent = attributionLabel
     ? `${evidenceExplanation} ${attributionLabel}.`
@@ -1783,8 +1937,8 @@ function renderWeekly(data) {
     historicalMedian: estimate,
     acrossResetLow: lower,
     acrossResetHigh: upper,
-    matureValue: observedSpanPp !== null && observedSpanPp >= 80 ? value : null,
-    provisionalValue: observedSpanPp === null || observedSpanPp < 80 ? value : null,
+    matureValue: aboveWeeklySpanThreshold(observedSpanPp) ? value : null,
+    provisionalValue: aboveWeeklySpanThreshold(observedSpanPp) ? null : value,
     index
     };
   }).filter((row) => row.timestamp && row.value !== null)
@@ -1807,7 +1961,7 @@ function renderWeekly(data) {
     shell.hidden = true;
     empty.textContent = showWeeklyPartialDiagnostics
       ? "No weekly estimates loaded."
-      : "No ≥80 percentage-point reset fits fall inside this date range.";
+      : `No reset fits observed across ${weeklyThresholdLabel()} fall inside this date range.`;
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -1822,10 +1976,12 @@ function renderWeekly(data) {
         {
           key: "matureValue",
           className: "chart-point-weekly-mature",
-          label: "Fit observed across at least 80 percentage points",
+          label: `Fit observed across ${weeklyThresholdLabel()}`,
           connect: false,
           markers: true,
           markerRadius: 5,
+          focusable: true,
+          detail: weeklyPointDetail,
         },
         {
           key: "provisionalValue",
@@ -1834,12 +1990,20 @@ function renderWeekly(data) {
           connect: false,
           markers: true,
           markerRadius: 5,
+          focusable: true,
+          detail: weeklyPointDetail,
         },
       ],
       confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
+      errorBars: {
+        low: "low",
+        high: "high",
+        className: "chart-error-bar-weekly",
+        label: "Within-reset sensitivity",
+      },
       yLabel: "API-equivalent USD",
       title: "Seven-day allowance estimate history",
-      description: `Historical median and independent reset-series fits plotted on the date each estimate became available in ${USER_TIME_ZONE}.`
+      description: `Historical median and independent reset-series fits plotted on the date each estimate became available in ${USER_TIME_ZONE}. Each fit carries its own within-reset sensitivity bar.`
     }));
   }
   renderWeeklyStats(summary, chartValues);
@@ -1915,12 +2079,15 @@ function renderWeeklyTable(values) {
     const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
     const observedCost = span === null ? null : row.value * span / 100;
     const speedCoverage = finite(row.known_speed_fraction);
-    const evidence = span !== null && span < 80
+    const belowThreshold = !aboveWeeklySpanThreshold(span);
+    const evidence = belowThreshold
       ? "Partial diagnostic"
       : transitions < 25 ? "Low" : transitions < 75 ? "Moderate" : "Higher";
     const prior = finite(row.prior_prediction_mae_pp);
-    const caveat = span !== null && span < 80
-      ? `Observed ${formatPp(span)}; extrapolated to 100 pp`
+    const caveat = belowThreshold
+      ? span === null
+        ? "Observed span not recorded; extrapolated to 100 pp"
+        : `Observed ${formatPp(span)}; extrapolated to 100 pp`
       : prior === null
         ? "First estimate; no prior forecast"
         : prior < 3 ? "Prior forecast tracked closely" : prior < 7 ? "Meaningful model error" : "High-error period";
@@ -2213,6 +2380,51 @@ async function selectFastModePreference(mode) {
   }
 }
 
+// Statuses that change how a reader should trust the headline number, most
+// material first. Anything else is a coverage note and stays in the inventory.
+const MATERIAL_GAP_STATUSES = Object.freeze([
+  "missing",
+  "not_observed",
+  "insufficient_evidence",
+  "mostly_unknown",
+  "unattributed",
+  "unsupported",
+  "unsupported_or_partial",
+  "unavailable",
+  "excluded",
+  "uncertain",
+  "partial"
+]);
+const MATERIAL_GAP_LIMIT = 4;
+
+function materialGapRank(item) {
+  const index = MATERIAL_GAP_STATUSES.indexOf(item.status ?? item.priority ?? "");
+  return index === -1 ? MATERIAL_GAP_STATUSES.length : index;
+}
+
+function gapExplanation(item) {
+  return item.explanation ?? item.evidence ?? item.description ?? item.action
+    ?? "Additional evidence is required.";
+}
+
+function briefGapExplanation(item) {
+  const source = String(gapExplanation(item)).trim();
+  const end = source.indexOf(". ");
+  return end === -1 ? source : source.slice(0, end + 1);
+}
+
+function gapTitle(item) {
+  return item.title ?? item.dimension ?? "Unresolved coverage gap";
+}
+
+function fastModeShortCoverage(fastMode) {
+  const coverage = fastMode.coverage;
+  if (coverage.totalEvents === 0) {
+    return "No usage increments in this period, so there is nothing to attribute.";
+  }
+  return `Of ${compact(coverage.totalEvents)} increments: ${compact(coverage.observedEvents)} observed, ${compact(coverage.assumedFromPreferenceEvents)} from your stated mode, ${compact(coverage.inferredEvents)} inferred, ${compact(coverage.unknownEvents)} unknown.`;
+}
+
 function renderQuality(data) {
   const coverage = data.quality.coverage;
   const summary = data.quality.summary ?? {};
@@ -2243,33 +2455,70 @@ function renderQuality(data) {
     ...data.monitoringGaps,
     ...data.quality.opportunities,
     ...data.quality.blindSpots
-  ].slice(0, 18);
+  ];
+  const ranked = issues
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => materialGapRank(item) < MATERIAL_GAP_STATUSES.length)
+    .sort((left, right) => (
+      materialGapRank(left.item) - materialGapRank(right.item)
+      || left.index - right.index
+    ))
+    .map(({ item }) => item);
+  const material = ranked.slice(0, MATERIAL_GAP_LIMIT);
+
   const issueList = $("#blind-spot-list");
   clear(issueList);
   if (!issues.length) {
     issueList.append(node("div", "empty-inline", "No blind-spot inventory was returned."));
+  } else if (!material.length) {
+    issueList.append(node(
+      "div",
+      "empty-inline",
+      "Nothing in the current inventory changes how the headline number should be read."
+    ));
   } else {
-    for (const item of issues) {
+    for (const item of material) {
       const issue = node("div", "issue");
       issue.append(node("span", "issue-icon", "!"));
       const copy = node("div");
       copy.append(
-        node("strong", "", item.title ?? item.dimension ?? "Unresolved coverage gap"),
-        node("p", "", item.explanation ?? item.evidence ?? item.description ?? item.action ?? "Additional evidence is required.")
+        node("strong", "", gapTitle(item)),
+        node("p", "", briefGapExplanation(item))
       );
-      // Fast-mode attribution is a share, not a yes/no. The counts are
-      // composed here from the normalized accounting projection so the row
-      // states the truth instead of a bare "not observed".
+      // Fast-mode attribution is a share, not a yes/no, so this row carries
+      // the four-way split rather than a bare status. The full sentence lives
+      // with the preference control that changes it.
       if (item.id === "fast_mode") {
         copy.append(node(
           "p",
           "issue-detail",
-          fastModeCoverageSentence(accountingPeriod(data).fastMode)
+          fastModeShortCoverage(accountingPeriod(data).fastMode)
         ));
       }
       issue.append(copy, node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")));
       issueList.append(issue);
     }
+  }
+
+  $("#blind-spot-count").textContent = !issues.length
+    ? ""
+    : ranked.length > material.length
+      ? `Showing the ${material.length} most material of ${ranked.length} gaps that change how the number should be read, from an inventory of ${issues.length}.`
+      : `${ranked.length} of ${issues.length} inventory items change how the number should be read.`;
+  const inventory = $("#blind-spot-inventory");
+  clear(inventory);
+  if (!issues.length) {
+    inventory.append(node("div", "empty-inline", "No blind-spot inventory was returned."));
+    return;
+  }
+  for (const item of issues) {
+    const row = node("div", "inventory-row");
+    row.append(
+      node("strong", "", gapTitle(item)),
+      node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")),
+      node("p", "", gapExplanation(item))
+    );
+    inventory.append(row);
   }
 }
 
@@ -5419,11 +5668,11 @@ $("#calibration-range-controls").addEventListener("click", (event) => {
 });
 $("#timeline-zoom-in").addEventListener("click", () => {
   if (!dashboard) return;
-  zoomTimeline(selectedTimelinePoints(dashboard).points, .74);
+  zoomTimeline(selectedTimelinePoints(dashboard).points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
 });
 $("#timeline-zoom-out").addEventListener("click", () => {
   if (!dashboard) return;
-  zoomTimeline(selectedTimelinePoints(dashboard).points, 1.35);
+  zoomTimeline(selectedTimelinePoints(dashboard).points, TIMELINE_BUTTON_ZOOM_STEP);
 });
 $("#timeline-pan-back").addEventListener("click", () => {
   if (!dashboard) return;
@@ -5458,6 +5707,13 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
     control.setAttribute("aria-pressed", String(active));
   }
   renderWeekly(dashboard);
+});
+$("#weekly-span-threshold").addEventListener("input", (event) => {
+  const threshold = Number(event.target.value);
+  if (!Number.isFinite(threshold)) return;
+  weeklySpanThresholdPp = Math.max(0, Math.min(100, threshold));
+  if (dashboard) renderWeekly(dashboard);
+  else renderWeeklySpanThresholdControls();
 });
 $("#weekly-evidence-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-evidence]");

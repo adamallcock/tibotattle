@@ -163,6 +163,13 @@ export function createLocalCollectorRefreshRunner({
   readAccountingCache = readReplaySafeAccountingCache,
   refreshAccounting = null,
   accountingCacheFile = null,
+  // Collection-time capture of the Codex speed-mode baseline. Codex writes the
+  // mode to the rollout log only when it is applied or changed, so a session's
+  // baseline exists nowhere but the configuration's `service_tier` key - and
+  // that key is rewritten on every toggle, so it proves only the value at the
+  // moment it is read. Reading it here stamps it with that moment; it is never
+  // used to backfill anything earlier. Returns the covering windows.
+  recordCodexSpeedBaseline = null,
   clock = () => Date.now(),
   recentIndexWindowMs = RECENT_INDEX_WINDOW_MS,
 } = {}) {
@@ -175,6 +182,10 @@ export function createLocalCollectorRefreshRunner({
   }
   if (refreshAccounting !== null && typeof refreshAccounting !== "function") {
     throw new TypeError("refreshAccounting must be a function or null");
+  }
+  if (recordCodexSpeedBaseline !== null
+      && typeof recordCodexSpeedBaseline !== "function") {
+    throw new TypeError("recordCodexSpeedBaseline must be a function or null");
   }
   for (const [name, value] of Object.entries({
     dataFile,
@@ -200,6 +211,19 @@ export function createLocalCollectorRefreshRunner({
   } = {}) {
     if (onProgress !== null && typeof onProgress !== "function") {
       throw new TypeError("onProgress must be a function");
+    }
+    // Record the declared baseline before the pass reads any usage, so the
+    // reading is stamped no later than the turns it may attribute. A failure
+    // here is never allowed to block collection: it simply leaves those turns
+    // to the stated preference, or unknown.
+    let declaredSpeedBaselines = [];
+    if (recordCodexSpeedBaseline !== null) {
+      try {
+        const recorded = await recordCodexSpeedBaseline();
+        if (Array.isArray(recorded)) declaredSpeedBaselines = recorded;
+      } catch {
+        declaredSpeedBaselines = [];
+      }
     }
     let selection;
     try {
@@ -310,6 +334,7 @@ export function createLocalCollectorRefreshRunner({
           ...(accountingCacheFile === null ? {} : { cacheFile: accountingCacheFile }),
           now: clock,
           windowDays: 31,
+          declaredSpeedBaselines,
           signal,
         });
         accountingRefreshStatus = "rebuilt";
