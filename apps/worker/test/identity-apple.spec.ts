@@ -295,6 +295,69 @@ describe("web Sign in with Apple", () => {
     expect(remaining?.total).toBe(0);
   });
 
+  it("expires a successfully filled handoff that nobody collected in time", async () => {
+    const started = await startSignIn();
+    const landed = await callback(new URLSearchParams({
+      code: "apple-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The token exchange completed and the row was filled, but the page
+    // that started the flow never came back to collect it before the
+    // five-minute handoff window closed.
+    await bindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE apple_signin_handoffs SET expires_at = ? WHERE state = ?",
+    ).bind(new Date(Date.now() - 60_000).toISOString(), started.state).run();
+
+    const result = await json("/api/v1/identity/apple/result", {
+      state: started.state,
+    });
+    // A completed-but-stale handoff must read as invalid, not as still
+    // pending — a client must never be told to keep polling for a result
+    // that can no longer be delivered.
+    expect(result.status).toBe(401);
+    expect(await result.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+  });
+
+  it("refuses a second callback against an already-filled handoff, without a second Apple exchange", async () => {
+    const started = await startSignIn();
+    const first = await callback(new URLSearchParams({
+      code: "first-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(first.status).toBe(200);
+    expect(await first.text()).toContain("Signed in");
+    expect(tokenCalls).toHaveLength(1);
+
+    const second = await callback(new URLSearchParams({
+      code: "second-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(second.status).toBe(200);
+    expect(await second.text()).toContain("Sign-in was not completed.");
+    // The already-filled row short-circuits before a second token exchange
+    // is ever attempted, so Apple's one-time code is never spent twice.
+    expect(tokenCalls).toHaveLength(1);
+
+    const stored = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT id_token AS idToken FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ idToken: string }>();
+    expect(stored?.idToken).toBe(APPLE_ID_TOKEN);
+
+    const result = await json("/api/v1/identity/apple/result", {
+      state: started.state,
+    });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({
+      schemaVersion: "identity-apple-result-v0.1",
+      idToken: APPLE_ID_TOKEN,
+    });
+  });
+
   it("ignores an unknown, malformed, errored, or replayed callback", async () => {
     const started = await startSignIn();
 

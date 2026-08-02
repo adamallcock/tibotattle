@@ -561,6 +561,41 @@ async function seedSealedSuppressedSnapshot(): Promise<void> {
   ).run();
 }
 
+/**
+ * A minimally valid *published* snapshot (empty cells) with revision 1.
+ * Cheap alternative to sealing a real 20-participant cohort when a test only
+ * needs `readParticipantCommunityComparison` to see a published snapshot, not
+ * to exercise cohort aggregation itself — that function resolves the caller's
+ * own plan cohort before it ever looks at `cells`.
+ */
+async function seedPublishedSnapshotWithNoCells(): Promise<void> {
+  const payload = JSON.stringify({
+    schemaVersion: "community-weekly-snapshot-v0.2",
+    snapshotId: "community-weekly:2026-07-20",
+    snapshotRevision: 1,
+    releaseStatus: "published",
+    immutable: true,
+    nonOverlapping: true,
+    cells: [],
+  });
+  await testBindings().USAGE_MONITOR_DB.prepare(
+    `INSERT INTO community_weekly_snapshots (
+      snapshot_id, week_start, week_end, ingestion_cutoff_at, released_at,
+      policy_version, payload_json, payload_sha256, release_state, sealed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'published', ?)`,
+  ).bind(
+    "community-weekly:2026-07-20",
+    "2026-07-20T00:00:00.000Z",
+    "2026-07-27T00:00:00.000Z",
+    "2026-07-29T00:00:00.000Z",
+    "2026-07-29T00:00:00.000Z",
+    "community-weekly-v0.1",
+    payload,
+    await sha256Hex(payload),
+    "2026-07-29T00:00:00.000Z",
+  ).run();
+}
+
 beforeAll(async () => {
   const pairResult = await crypto.subtle.generateKey(
     {
@@ -3234,6 +3269,146 @@ describe("synthetic usage monitor service", () => {
     ).resolves.toMatchObject({
       state: "existing",
       snapshotId: "community-weekly:2026-07-20:r2",
+    });
+  });
+
+  it("keeps an absent-plan cohort explicitly unknown, published separately from a known plan cohort", async () => {
+    // Two disjoint 20-participant cohorts sharing the same provider and
+    // model: one with the usual quota evidence ("pro"/"pro-20x"), one whose
+    // quota evidence is pushed outside the aggregation window so it has no
+    // in-window plan reading at all. If cohorts were ever blended by
+    // omitting plan from the grouping key, this would collapse into a single
+    // 40-participant cell instead of two 20-participant cells.
+    //
+    // Community eligibility requires a redeemed invite grant (see
+    // participant_community_eligibility's insert trigger), and 40
+    // enrollments would exceed the shared enrollment rate limit this late in
+    // the suite — so this reuses the exact grant-and-unmetered-limiter
+    // pattern the "seals, serves, protects, and withdraws" test above uses
+    // for its own bulk enrollment.
+    const unmeteredLimiter = {
+      limit: async () => ({ success: true }),
+    } as unknown as RateLimit;
+    const bulkEnrollBindings = inviteOnlyBindings({
+      ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
+    });
+    async function enrollEligible(): Promise<EnrollmentResponse> {
+      const grant = await issueTestGrant();
+      const enrolled = await enrollWithGrant(grant, bulkEnrollBindings);
+      expect(enrolled.status).toBe(201);
+      return enrollmentFrom(enrolled);
+    }
+
+    for (let index = 0; index < 20; index += 1) {
+      const known = await enrollEligible();
+      const knownUpload = await uploadEnvelope(
+        known,
+        await encrypt(telemetryFixture("a"), true),
+      );
+      expect(knownUpload.status).toBe(202);
+      const knownBody = await knownUpload.json<{ contributionId: string }>();
+      await testBindings().USAGE_MONITOR_DB.prepare(
+        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+      ).bind("2026-07-28T23:59:59.000Z", knownBody.contributionId).run();
+
+      const unknown = await enrollEligible();
+      const unknownUpload = await uploadEnvelope(
+        unknown,
+        await encrypt(telemetryFixture("a"), true),
+      );
+      expect(unknownUpload.status).toBe(202);
+      const unknownBody = await unknownUpload.json<{ contributionId: string }>();
+      await testBindings().USAGE_MONITOR_DB.batch([
+        testBindings().USAGE_MONITOR_DB.prepare(
+          "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+        ).bind("2026-07-28T23:59:59.000Z", unknownBody.contributionId),
+        // No in-window quota evidence for this participant: their usage
+        // event stays in-window, but their quota snapshot is pushed years
+        // outside it, so participant_plans finds nothing to COALESCE from.
+        testBindings().USAGE_MONITOR_DB.prepare(
+          `UPDATE telemetry_records SET observed_at = '2000-01-01T00:00:00.000Z'
+            WHERE participant_id = ? AND record_kind = 'quota'`,
+        ).bind(unknown.participantId),
+      ]);
+    }
+
+    const scheduledTime = Date.parse("2026-07-29T00:00:00.000Z");
+    await expect(buildCommunityWeeklySnapshot(
+      testBindings().USAGE_MONITOR_DB,
+      scheduledTime,
+    )).resolves.toMatchObject({ state: "built" });
+
+    const response = await api("/api/v1/stats/aggregate");
+    const body = await response.json<{
+      releaseStatus: string;
+      cells: Array<Record<string, unknown>>;
+    }>();
+    expect(body.releaseStatus).toBe("published");
+    expect(body.cells).toHaveLength(2);
+
+    const knownCell = body.cells.find((cell) => cell.planType === "pro");
+    const unknownCell = body.cells.find((cell) => cell.planType === "unknown");
+    expect(knownCell).toMatchObject({
+      provider: "openai_codex",
+      planType: "pro",
+      planVariant: "pro-20x",
+      modelId: "gpt-5.6-sol",
+      metrics: { usageEvents: { status: "released", value: 20 } },
+    });
+    expect(unknownCell).toMatchObject({
+      provider: "openai_codex",
+      planType: "unknown",
+      planVariant: "unknown",
+      modelId: "gpt-5.6-sol",
+      metrics: { usageEvents: { status: "released", value: 20 } },
+    });
+  });
+
+  it("resolves a participant's own plan cohort to unknown when in-window quota evidence conflicts", async () => {
+    await seedPublishedSnapshotWithNoCells();
+    const participant = await enrollTelemetry();
+
+    const first = await uploadEnvelope(
+      participant,
+      await encrypt(telemetryFixture("a"), true),
+    );
+    expect(first.status).toBe(202);
+    const firstBody = await first.json<{ contributionId: string }>();
+
+    const conflictingFixture = telemetryFixture("b");
+    const conflictingQuota = Reflect.get(conflictingFixture, "quotaSnapshots") as
+      Array<Record<string, unknown>>;
+    Reflect.set(conflictingQuota[0]!, "planType", "team");
+    Reflect.set(conflictingQuota[0]!, "planVariant", "unknown");
+    const second = await uploadEnvelope(
+      participant,
+      await encrypt(conflictingFixture, true),
+    );
+    expect(second.status).toBe(202);
+    const secondBody = await second.json<{ contributionId: string }>();
+
+    await testBindings().USAGE_MONITOR_DB.batch([
+      testBindings().USAGE_MONITOR_DB.prepare(
+        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+      ).bind("2026-07-28T23:59:59.000Z", firstBody.contributionId),
+      testBindings().USAGE_MONITOR_DB.prepare(
+        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+      ).bind("2026-07-28T23:59:59.000Z", secondBody.contributionId),
+    ]);
+
+    const stats = await api("/api/v1/me/stats", {
+      headers: personalHeaders(participant),
+    });
+    expect(stats.status).toBe(200);
+    const body = await stats.json<{
+      communityComparison: {
+        status: string;
+        participantPlanCohort: { planType: string; planVariant: string };
+      };
+    }>();
+    expect(body.communityComparison).toMatchObject({
+      status: "ready",
+      participantPlanCohort: { planType: "unknown", planVariant: "unknown" },
     });
   });
 
