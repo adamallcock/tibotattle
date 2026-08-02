@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { scanCodexLogEvents } from "../src/codex-log-scan.js";
 import {
   createIndexedCodexLogScan,
@@ -228,6 +229,68 @@ test("persistent local index preserves replay-safe accounting and appends only n
     updated.lastScan.bytes <= (await stat(childPath)).size - beforeAppendSize,
     true,
   );
+});
+
+test("same-size prefix rewrites invalidate a cached index even when millisecond metadata collides", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  // Keep the terminal 4 KiB unchanged: a tail-only boundary HMAC cannot see
+  // a rewrite to the first token record by itself.
+  await appendFile(parentPath, `${JSON.stringify({
+    type: "synthetic_padding",
+    padding: "x".repeat(10 * 1024),
+  })}\n`);
+  const indexFile = join(root, "local-analysis-index-v3.sqlite");
+  const secretFile = join(root, "local-analysis-index-secret-v3");
+  const indexedScan = createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 2,
+    chunkBytes: 4 * 1024 * 1024,
+  });
+
+  const initial = await receipt(indexedScan, codexHome);
+  const initialSize = (await stat(parentPath)).size;
+  const original = await readFile(parentPath, "utf8");
+  const rewritten = original.replace('"used_percent":10', '"used_percent":11');
+  assert.notEqual(rewritten, original);
+  assert.equal(Buffer.byteLength(rewritten), Buffer.byteLength(original));
+  await writeFile(parentPath, rewritten);
+  const rewrittenMetadata = await stat(parentPath);
+  const rewrittenCtimeNs = (await stat(parentPath, { bigint: true }))
+    .ctimeNs.toString();
+
+  // Model a filesystem whose exposed millisecond timestamp has collided. The
+  // durable index still has the original ctime_ns, which must force a reset.
+  const database = new DatabaseSync(indexFile);
+  try {
+    const source = database.prepare(`
+      SELECT source_key, ctime_ns FROM sources
+      WHERE file_size = ?
+      ORDER BY ordinal
+      LIMIT 1
+    `).get(initialSize);
+    assert.ok(source);
+    assert.notEqual(source.ctime_ns, rewrittenCtimeNs);
+    database.prepare(`
+      UPDATE sources
+      SET mtime_ms = ?, ctime_ms = ?
+      WHERE source_key = ?
+    `).run(
+      rewrittenMetadata.mtimeMs,
+      rewrittenMetadata.ctimeMs,
+      source.source_key,
+    );
+  } finally {
+    database.close();
+  }
+
+  const [legacy, refreshed] = await Promise.all([
+    receipt(scanCodexLogEvents, codexHome),
+    receipt(indexedScan, codexHome),
+  ]);
+  assert.equal((await inspectLocalAnalysisIndex({ indexFile })).lastScan.bytes > 0, true);
+  assert.deepEqual(refreshed, legacy);
+  assert.notDeepEqual(refreshed, initial);
 });
 
 test("committed index projection recovers a malformed compatibility cache", async () => {

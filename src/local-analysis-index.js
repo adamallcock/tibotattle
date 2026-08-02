@@ -30,7 +30,7 @@ import {
 import { stableJson } from "./export/index.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
-  "local-analysis-index-v2";
+  "local-analysis-index-v3";
 // Bumped when extraction changes what the index can hold. v3 gated quota
 // admission; v4 stops the chunk reader from rebuilding a record out of a reused
 // buffer, so every index built before it is missing whichever records happened
@@ -39,7 +39,7 @@ export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
   "parallel-jsonl-accounting-v4";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
-const INDEX_USER_VERSION = 2;
+const INDEX_USER_VERSION = 3;
 const DEFAULT_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_WORKERS = 10;
 const BOUNDARY_BYTES = 4 * 1024;
@@ -337,6 +337,10 @@ function exactSourceState(left, right) {
     && Number(left.prefixBytes) === Number(right.prefixBytes)
     && Number(left.mtimeMs) === Number(right.mtimeMs)
     && Number(left.ctimeMs) === Number(right.ctimeMs)
+    // Millisecond timestamps can collide on a same-size rewrite. ctime is
+    // kernel-managed, so its nanosecond value is the durable zero-byte reuse
+    // boundary without retaining any source content.
+    && left.ctimeNs === right.ctimeNs
     && left.boundaryHmac === right.boundaryHmac;
 }
 
@@ -445,6 +449,19 @@ async function sourceBoundary(secret, path, prefixBytes) {
       path,
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
     );
+    const metadata = await handle.stat({ bigint: true });
+    const fileSize = Number(metadata.size);
+    if (!metadata.isFile()
+        || metadata.isSymbolicLink()
+        || Number(metadata.nlink) !== 1
+        || !Number.isSafeInteger(fileSize)
+        || fileSize < prefixBytes
+        || (typeof process.getuid === "function"
+          && Number(metadata.uid) !== process.getuid())
+        || typeof metadata.ctimeNs !== "bigint"
+        || metadata.ctimeNs < 0n) {
+      throw fixedError("local_analysis_source_changed");
+    }
     const buffer = Buffer.allocUnsafe(length);
     if (length > 0) {
       const { bytesRead } = await handle.read(buffer, 0, length, start);
@@ -459,6 +476,7 @@ async function sourceBoundary(secret, path, prefixBytes) {
         "local-analysis-source-boundary",
         buffer,
       ),
+      ctimeNs: metadata.ctimeNs.toString(),
     };
   } catch (error) {
     if (typeof error?.code === "string"
@@ -610,6 +628,7 @@ function initializeSchema(database) {
       prefix_bytes INTEGER NOT NULL CHECK(prefix_bytes >= 0),
       mtime_ms REAL NOT NULL,
       ctime_ms REAL NOT NULL,
+      ctime_ns TEXT NOT NULL CHECK(length(ctime_ns) BETWEEN 1 AND 20),
       boundary_start INTEGER NOT NULL CHECK(boundary_start >= 0),
       boundary_hmac TEXT NOT NULL CHECK(length(boundary_hmac) = 64),
       surface TEXT NOT NULL,
@@ -751,7 +770,7 @@ function readStoredSources(database) {
   return new Map([...database.prepare(`
     SELECT source_key, parent_source_key, ordinal, is_fork, parent_missing,
            device, inode, birthtime_ms, file_size, prefix_bytes, mtime_ms,
-           ctime_ms, boundary_start, boundary_hmac, surface, thread_source,
+           ctime_ms, ctime_ns, boundary_start, boundary_hmac, surface, thread_source,
            agent_scope, lineage_disposition, current_model,
            current_model_seen, previous_totals_json, previous_presence_json
     FROM sources
@@ -768,6 +787,7 @@ function readStoredSources(database) {
     prefixBytes: Number(row.prefix_bytes),
     mtimeMs: Number(row.mtime_ms),
     ctimeMs: Number(row.ctime_ms),
+    ctimeNs: row.ctime_ns,
     boundaryStart: Number(row.boundary_start),
     boundaryHmac: row.boundary_hmac,
     surface: row.surface,
@@ -971,9 +991,9 @@ function insertOrUpdateSources(database, sources) {
     INSERT INTO sources(
       source_key, parent_source_key, ordinal, is_fork, parent_missing,
       device, inode, birthtime_ms, file_size, prefix_bytes, mtime_ms,
-      ctime_ms, boundary_start, boundary_hmac, surface, thread_source,
+      ctime_ms, ctime_ns, boundary_start, boundary_hmac, surface, thread_source,
       agent_scope, lineage_disposition
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(source_key) DO UPDATE SET
       parent_source_key=excluded.parent_source_key,
       ordinal=excluded.ordinal,
@@ -986,6 +1006,7 @@ function insertOrUpdateSources(database, sources) {
       prefix_bytes=excluded.prefix_bytes,
       mtime_ms=excluded.mtime_ms,
       ctime_ms=excluded.ctime_ms,
+      ctime_ns=excluded.ctime_ns,
       boundary_start=excluded.boundary_start,
       boundary_hmac=excluded.boundary_hmac,
       surface=excluded.surface,
@@ -1007,6 +1028,7 @@ function insertOrUpdateSources(database, sources) {
       source.prefixBytes,
       source.mtimeMs,
       source.ctimeMs,
+      source.ctimeNs,
       source.boundaryStart,
       source.boundaryHmac,
       source.surface,
@@ -2016,8 +2038,11 @@ export async function refreshLocalAnalysisIndex({
     } else if (exactSourceState(prior, source)) {
       // Reuse the complete durable prefix.
     } else if (sameIdentity(prior, source)
-        && source.prefixBytes >= prior.prefixBytes
-        && source.fileSize >= prior.fileSize
+        // Appending must advance at least one observed byte boundary. A
+        // same-size rewrite is never an append, even if its terminal boundary
+        // happens to match the old prefix.
+        && (source.prefixBytes > prior.prefixBytes
+          || source.fileSize > prior.fileSize)
         && source.boundaryStart <= prior.prefixBytes
         && prior.boundaryHmac === (await sourceBoundary(
           secret,
