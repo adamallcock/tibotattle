@@ -1525,6 +1525,11 @@ async function compileLauncher(destination, updater, swiftSources) {
     "AppKit",
     "-framework",
     "Foundation",
+    // The dashboard is hosted in-app. WebKit is a system framework, so this
+    // adds no bundled binary and no new outbound reach: the embedded view is
+    // pinned to the loopback companion origin by its navigation delegate.
+    "-framework",
+    "WebKit",
   ];
   if (updater.enabled) {
     arguments_.push(

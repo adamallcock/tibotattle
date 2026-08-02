@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f5f1e8">
+    <!--
+      This is the public website surface. It shows exactly two things: how to
+      install the Mac app, and the published community snapshot. Everything
+      that needs the local companion — the personal dashboard, contribution
+      preparation and upload, and hosted sign-in — lives in the app itself, so
+      no control here can render dead.
+
+      Release packaging replaces every empty release slot below only after it
+      verifies the selected installer and social-preview artifacts. Keeping any
+      slot empty makes the page say that no download is published instead of
+      inventing one.
+    -->
+    <meta name="usage-monitor-installer-url" content="">
+    <meta name="usage-monitor-installer-version" content="">
+    <meta name="usage-monitor-installer-sha256" content="">
+    <meta name="usage-monitor-installer-bytes" content="">
+    <meta name="usage-monitor-minimum-macos" content="">
+    <meta name="usage-monitor-architectures" content="">
+    <meta name="usage-monitor-release-notes-url" content="">
+    <meta name="usage-monitor-privacy-url" content="">
+    <meta name="usage-monitor-security-url" content="">
+    <meta name="usage-monitor-support-url" content="">
+    <meta name="usage-monitor-semantic-open-target" content="__USAGE_MONITOR_SEMANTIC_OPEN_TARGET__">
+    <link rel="canonical" href="">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="TiboTattle">
+    <meta
+      property="og:description"
+      content="Private, local-first monitoring for AI usage. Install the Mac app, or read the published community snapshot."
+    >
+    <meta property="og:url" content="">
+    <meta property="og:image" content="">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="TiboTattle local-first allowance dashboard">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="TiboTattle">
+    <meta
+      name="twitter:description"
+      content="Private, local-first monitoring for AI usage. Install the Mac app, or read the published community snapshot."
+    >
+    <meta name="twitter:image" content="">
+    <meta
+      name="description"
+      content="TiboTattle measures your Codex allowance locally on your Mac. Install the app, or read the privacy-safe weekly community snapshot."
+    >
+    <title>TiboTattle</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./community.js"></script>
+  </head>
+  <body class="community-site">
+    <a class="skip-link" href="#main">Skip to install and community</a>
+
+    <header class="topbar">
+      <a class="brand" href="#install" aria-label="TiboTattle home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>TiboTattle</span>
+      </a>
+      <nav class="primary-nav" aria-label="Site sections">
+        <a href="#install">Install</a>
+        <a href="#community">Community</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow">Local-first allowance monitoring</p>
+          <h1>Your Codex allowance, measured on your own Mac.</h1>
+          <p class="lede">
+            TiboTattle reads content-free Codex metadata locally and shows what
+            your allowance is actually doing. The dashboard lives inside the Mac
+            app, because only the app can read your local files. This site has
+            two jobs: hand you the app, and publish what the community has
+            chosen to share.
+          </p>
+        </div>
+      </div>
+
+      <section class="companion-setup" id="install" aria-labelledby="install-title">
+        <div class="companion-setup-copy">
+          <p class="eyebrow">Get the app</p>
+          <h2 id="install-title">Install TiboTattle for Mac</h2>
+          <p>
+            A website cannot read Codex files, and TiboTattle does not ask it
+            to. The Mac app runs a private loopback companion, reads metadata
+            locally, and shows the full dashboard inside its own window. Nothing
+            is uploaded unless you explicitly choose to contribute.
+          </p>
+        </div>
+        <ol class="companion-steps">
+          <li>
+            <strong>Download the signed Mac app</strong>
+            <a class="button button-primary" id="installer-link" href="" hidden>
+              Download TiboTattle for Mac
+            </a>
+            <div class="installer-details" id="installer-details" hidden>
+              <span id="installer-version"></span>
+              <span id="installer-compatibility"></span>
+              <span id="installer-size"></span>
+              <span id="installer-sha256"></span>
+            </div>
+            <nav class="installer-links" id="installer-links" aria-label="Release information" hidden>
+              <a id="release-notes-link" href="" hidden>Release notes</a>
+              <a id="privacy-link" href="" hidden>Privacy</a>
+              <a id="security-link" href="" hidden>Security</a>
+              <a id="support-link" href="" hidden>Support</a>
+            </nav>
+            <span class="installer-unavailable" id="installer-unavailable">
+              A public installer is not configured for this build. If you
+              already received the app, open it from Applications.
+            </span>
+          </li>
+          <li>
+            <strong>Open it from Applications</strong>
+            <a class="button button-secondary" id="open-installed-app" href="">
+              Open installed app
+            </a>
+            <span>
+              Already installed? This link asks macOS to bring TiboTattle
+              forward.
+            </span>
+          </li>
+          <li>
+            <strong>Everything else happens in the app</strong>
+            <span>
+              Your usage, weekly limit estimate, calibration, and the optional
+              contribution controls are all inside the app window. They are
+              deliberately absent from this site, because no website can produce
+              them honestly.
+            </span>
+          </li>
+        </ol>
+        <div class="companion-setup-actions">
+          <p id="open-installed-app-status" role="status" hidden></p>
+        </div>
+      </section>
+
+      <section class="dashboard-section" id="community" aria-labelledby="community-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Delayed community evidence</p>
+            <h2 id="community-title">What the community has published</h2>
+          </div>
+        </div>
+        <p class="lede">
+          These are privacy-safe activity totals from people who chose to
+          contribute from the app. They are delayed, support-gated, clipped per
+          participant, and rounded down. They are not an average, not a cost,
+          and not a limit estimate.
+        </p>
+        <article class="panel community-result-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Delayed community evidence</p>
+              <h3>Published weekly snapshot</h3>
+            </div>
+            <span class="evidence-chip neutral" id="community-service-state" role="status">
+              Checking service
+            </span>
+          </div>
+          <div class="result-summary" id="community-result">
+            <p>Checking for the latest delayed weekly snapshot…</p>
+          </div>
+          <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
+            <summary>
+              <span><strong>How this snapshot is produced</strong></span>
+            </summary>
+            <div class="service-detail-body">
+              <div id="community-snapshot-service-detail"></div>
+              <p class="annotation">
+                Community values use a fixed delay, independent per-cell support,
+                participant-level clipping, and coarse rounding. A sealed
+                revision is never rewritten; privacy-affecting deletion withdraws
+                it and schedules a replacement revision without the deleted
+                source.
+              </p>
+            </div>
+          </details>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <p>TiboTattle · evidence, uncertainty, and privacy boundaries kept visible.</p>
+      <p class="footer-disclaimer">
+        Named with affection for the Codex community. Not affiliated with or
+        endorsed by OpenAI or Thibault Sottiaux — and we will happily rename if
+        asked. Your tokens tattle only to you.
+      </p>
+    </footer>
+
+    <noscript>
+      <div class="noscript">
+        JavaScript is required to show the verified download details and the
+        published community snapshot. Nothing on this page is hidden from you
+        deliberately: both are only shown after their fixed shape is checked.
+      </div>
+    </noscript>
+  </body>
+</html>

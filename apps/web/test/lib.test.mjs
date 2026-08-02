@@ -3220,16 +3220,29 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(html, /id="community-contribution-disclosure"/u);
   assert.match(html, /Closed until you choose it/u);
 
-  assert.match(appSource, /function configuredInstallerUrl\(\)/u);
-  assert.match(appSource, /function configuredInstallerMetadata\(/u);
-  assert.match(appSource, /function configuredInstallerRelease\(\)/u);
-  assert.match(appSource, /function configuredSemanticOpenTarget\(\)/u);
-  assert.match(appSource, /const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget\(\);/u);
+  // The install call to action is one shared module used by both browser
+  // entry points, so these guarantees are asserted where they now live.
+  const installSource = await readFile(
+    new URL("../public/install-cta.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(installSource, /function configuredInstallerUrl\(documentRef\)/u);
+  assert.match(installSource, /function configuredInstallerMetadata\(/u);
+  assert.match(
+    installSource,
+    /export function configuredInstallerRelease\(documentRef\)/u,
+  );
+  assert.match(
+    installSource,
+    /export function configuredSemanticOpenTarget\(documentRef\)/u,
+  );
+  assert.match(appSource, /from "\.\/install-cta\.js"/u);
+  assert.match(appSource, /const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget\(document\);/u);
   assert.match(appSource, /installedAppLink\.href = SEMANTIC_OPEN_TARGET/u);
   assert.doesNotMatch(appSource, /usagemonitor:\/\/open/u);
-  assert.match(appSource, /SHA-256 \$\{release\.sha256\}/u);
-  assert.match(appSource, /Requires macOS \$\{release\.minimumMacos\} or later/u);
-  assert.match(appSource, /selected\.protocol === "https:"/u);
+  assert.match(installSource, /SHA-256 \$\{release\.sha256\}/u);
+  assert.match(installSource, /Requires macOS \$\{release\.minimumMacos\} or later/u);
+  assert.match(installSource, /selected\.protocol === "https:"/u);
   assert.doesNotMatch(appSource, /loopbackHttp/u);
   assert.match(appSource, /function openInstalledApp\(\)/u);
   assert.match(appSource, /function localAnalysisAllowed\(/u);
@@ -3993,7 +4006,13 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
   assert.match(appSource, /void enrollment\.recoveryCode;/);
   assert.doesNotMatch(appSource, /showRecoveryCodeOnce/);
-  assert.match(appSource, /normalizeCommunitySnapshot\(payload\)/);
+  // The community snapshot renderer is shared with the public site entry, so
+  // its normalization boundary is asserted in the module that owns it.
+  assert.match(
+    await readFile(new URL("../public/community-view.js", import.meta.url), "utf8"),
+    /normalizeCommunitySnapshot\(payload\)/,
+  );
+  assert.match(appSource, /renderSharedCommunitySnapshot\(\{/u);
   assert.match(appSource, /normalizeParticipantStats\(payload\)/);
   assert.match(appSource, /function renderBackendHealth\(health, readiness, \{ configured = true \} = \{\}\)/);
   assert.match(appSource, /Collection contained/);
@@ -4009,11 +4028,20 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.match(appSource, /Encrypted object scheduled for deletion after/);
   assert.match(appSource, /does not delete the canonical metadata/);
   assert.match(appSource, /This is not an average, percentile, bill, or provider allowance/);
-  assert.match(appSource, /A replacement revision may be pending/);
+  // Fixed, non-speculative copy for every community-snapshot state now lives
+  // in the shared renderer both surfaces use.
+  const communityViewSource = await readFile(
+    new URL("../public/community-view.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(communityViewSource, /A replacement revision may be pending/);
+  assert.match(communityViewSource, /published_partial/);
+  assert.match(
+    communityViewSource,
+    /We do not disclose why or how close the cohort was/,
+  );
   assert.match(appSource, /Not testable/);
   assert.match(appSource, /for \(const smoothingHours of \[1, 2, 3\]\)/);
-  assert.match(appSource, /published_partial/);
-  assert.match(appSource, /We do not disclose why or how close the cohort was/);
   assert.doesNotMatch(appSource, /Current eligible count|payload\.participantCount/);
 });
 
@@ -4494,17 +4522,19 @@ test("result panels show the number and its caveat, not the service plumbing", a
   assert.match(provenance, /id="community-snapshot-service-detail"/u);
 
   // The default view keeps only what a reader needs to interpret the number.
-  const detailBody = appSource.match(
-    /const detail = \$\("#community-snapshot-service-detail"\);([\s\S]*?)\n\}\n/u,
-  )?.[1];
-  assert.ok(detailBody, "the snapshot renderer is available");
+  // Both entry points render this from one shared module.
+  const detailBody = await readFile(
+    new URL("../public/community-view.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(appSource, /from "\.\/community-view\.js"/u);
   assert.match(
     detailBody,
     /container\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*`Activity totals for the week above/u,
   );
   assert.match(
     detailBody,
-    /container\.append\(node\("p", "snapshot-partial", "Some metrics were not released/u,
+    /container\.append\(node\(\s*"p",\s*"snapshot-partial",\s*"Some metrics were not released/u,
   );
   // Contract version, ingestion cutoff, release timing, clipping mechanics and
   // the next-contract statement all moved into the disclosure.

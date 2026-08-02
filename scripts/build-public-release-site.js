@@ -46,6 +46,23 @@ const REQUIRED_TELEMETRY_MODULE_BASENAMES = Object.freeze([
 ]);
 const SOCIAL_PREVIEW_FILENAME = "social-preview.png";
 const ROBOTS_FILENAME = "robots.txt";
+/**
+ * The public site is built from the community entry, not from the dashboard
+ * entry. The dashboard is the Mac app's own interface: every control in it
+ * needs the loopback companion, so publishing it puts dead controls on a page
+ * that can never make them work.
+ */
+const SITE_INDEX_SOURCE_BASENAME = "community.html";
+/**
+ * Exact, reviewed absence ledger for the in-app dashboard surface. Names, not
+ * patterns: adding a shared module must never silently drop it from the site,
+ * and retiring a dashboard module must be a visible edit here.
+ */
+const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
+  "app.js",
+  "index.html",
+  "navigation.js",
+]);
 const MAXIMUM_SOCIAL_PREVIEW_BYTES = 10 * 1024 * 1024;
 const SEMANTIC_OPEN_TARGET_META_NAME = "usage-monitor-semantic-open-target";
 const REQUIRED_META = Object.freeze({
@@ -509,7 +526,11 @@ export async function buildPublicReleaseSite(rawArgs, {
   const telemetryMirror = verifiedMirrorRecord(await readVerifiedMirror({
     outputFile: requiredTelemetryModules[0],
   }));
-  const sourceIndex = join(options.source, "index.html");
+  const sourceIndex = join(options.source, SITE_INDEX_SOURCE_BASENAME);
+  await regularFile(
+    sourceIndex,
+    `Release-site index source ${SITE_INDEX_SOURCE_BASENAME}`,
+  );
   const sourceHtml = await readFile(sourceIndex, "utf8");
   const installerStats = await regularFile(
     options.installerPath,
@@ -534,6 +555,14 @@ export async function buildPublicReleaseSite(rawArgs, {
     installerBytes: installerStats.size,
   };
   const releaseHtml = injectReleaseMetadata(sourceHtml, releaseValues);
+  // The community entry becomes the site index, so its own file is not copied
+  // a second time under its source name.
+  const unpublishedSourceFiles = new Set([
+    requiredTelemetryModules[0],
+    resolve(sourceIndex),
+    ...APP_ONLY_SOURCE_BASENAMES.map((basename) =>
+      resolve(join(options.source, basename))),
+  ]);
   await fileManifest(options.source, {
     excludedFiles: new Set([requiredTelemetryModules[0]]),
   });
@@ -551,7 +580,7 @@ export async function buildPublicReleaseSite(rawArgs, {
     force: false,
     verbatimSymlinks: true,
     filter(source) {
-      return resolve(source) !== requiredTelemetryModules[0];
+      return !unpublishedSourceFiles.has(resolve(source));
     },
   });
   await writeFile(
@@ -575,6 +604,21 @@ export async function buildPublicReleaseSite(rawArgs, {
     { encoding: "utf8", mode: 0o644 },
   );
   const files = await fileManifest(options.output);
+  const publishedNames = new Set(files.map(({ path }) => path));
+  // `index.html` is the rendered community entry, so it is checked by content
+  // below rather than by name; every other dashboard-only file must be absent.
+  for (
+    const withheld of [
+      ...APP_ONLY_SOURCE_BASENAMES.filter((name) => name !== "index.html"),
+      SITE_INDEX_SOURCE_BASENAME,
+    ]
+  ) {
+    if (publishedNames.has(withheld)) {
+      throw new Error(
+        `Release output published the in-app dashboard surface: ${withheld}`,
+      );
+    }
+  }
   const stagedMirror = files.find(({ path }) =>
     path === TELEMETRY_BROWSER_MIRROR_BASENAME);
   if (stagedMirror === undefined
@@ -622,6 +666,16 @@ export async function buildPublicReleaseSite(rawArgs, {
   );
 
   const verifiedHtml = await readFile(join(options.output, "index.html"), "utf8");
+  if (verifiedHtml !== releaseHtml) {
+    throw new Error("Release output index did not keep the rendered community entry");
+  }
+  for (const name of APP_ONLY_SOURCE_BASENAMES) {
+    if (verifiedHtml.includes(`./${name}`)) {
+      throw new Error(
+        `Release output index referenced the in-app dashboard surface: ${name}`,
+      );
+    }
+  }
   for (const name of Object.keys(REQUIRED_META)) {
     if (verifiedHtml.includes(`<meta name="${name}" content="">`)) {
       throw new Error(`Release output retained empty ${name} metadata`);

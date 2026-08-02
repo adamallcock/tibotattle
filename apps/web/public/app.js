@@ -29,6 +29,23 @@ import {
 import {
   mountDashboardNavigation,
 } from "./navigation.js";
+import {
+  COMMUNITY_METRIC_LABELS,
+  renderCommunitySnapshot as renderSharedCommunitySnapshot,
+} from "./community-view.js";
+import {
+  configuredSemanticOpenTarget,
+  renderInstallerJourney as renderSharedInstallerJourney,
+} from "./install-cta.js";
+import {
+  compact,
+  createDomHelpers,
+  finite,
+  formatAge,
+  formatLocal,
+  localCalendarParts,
+  USER_TIME_ZONE,
+} from "./ui-format.js";
 
 const localClient = new LocalCompanionClient();
 let communitySession = null;
@@ -82,67 +99,18 @@ let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
-const USER_TIME_ZONE =
-  Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
-const USER_TIME_ZONE_OPTION = USER_TIME_ZONE === "local time"
-  ? {}
-  : { timeZone: USER_TIME_ZONE };
-const LOCAL_CALENDAR_PARTS = new Intl.DateTimeFormat("en-US", {
-  ...USER_TIME_ZONE_OPTION,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit"
-});
+const LOCAL_CALENDAR_PARTS = localCalendarParts();
 
 const $ = (selector) => document.querySelector(selector);
+const { clear, node } = createDomHelpers(document);
 
-function configuredSemanticOpenTarget() {
-  const target = document
-    .querySelector('meta[name="usage-monitor-semantic-open-target"]')
-    ?.getAttribute("content")
-    ?.trim();
-  return target && /^[a-z][a-z0-9+.-]*:\/\/open$/iu.test(target)
-    ? target
-    : null;
-}
-
-const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget();
+const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget(document);
 const installedAppLink = $("#open-installed-app");
 if (SEMANTIC_OPEN_TARGET) {
   installedAppLink.href = SEMANTIC_OPEN_TARGET;
 } else {
   installedAppLink.removeAttribute("href");
   installedAppLink.setAttribute("aria-disabled", "true");
-}
-
-function configuredInstallerUrl() {
-  const raw = document
-    .querySelector('meta[name="usage-monitor-installer-url"]')
-    ?.getAttribute("content")
-    ?.trim();
-  if (!raw) return null;
-  try {
-    const selected = new URL(raw);
-    return selected.protocol === "https:"
-      && !selected.username
-      && !selected.password
-      && !selected.port
-      && !selected.search
-      && !selected.hash
-      && selected.pathname.toLowerCase().endsWith(".dmg")
-      ? selected.href
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function configuredInstallerMetadata(name, pattern) {
-  const value = document
-    .querySelector(`meta[name="${name}"]`)
-    ?.getAttribute("content")
-    ?.trim();
-  return value && pattern.test(value) ? value : null;
 }
 
 function configuredGoogleClientId() {
@@ -153,148 +121,6 @@ function configuredGoogleClientId() {
   return value && /^[A-Za-z0-9][A-Za-z0-9._-]{7,255}$/u.test(value)
     ? value
     : null;
-}
-
-function configuredReleaseUrl(name) {
-  const raw = document
-    .querySelector(`meta[name="${name}"]`)
-    ?.getAttribute("content")
-    ?.trim();
-  if (!raw) return null;
-  try {
-    const selected = new URL(raw);
-    return selected.protocol === "https:"
-      && !selected.username
-      && !selected.password
-      && !selected.port
-      && !selected.search
-      && !selected.hash
-      ? selected.href
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function configuredInstallerRelease() {
-  const installerUrl = configuredInstallerUrl();
-  const version = configuredInstallerMetadata(
-    "usage-monitor-installer-version",
-    /^[0-9]+(?:\.[0-9]+){2,3}$/u,
-  );
-  const sha256 = configuredInstallerMetadata(
-    "usage-monitor-installer-sha256",
-    /^[a-f0-9]{64}$/u,
-  );
-  const byteText = configuredInstallerMetadata(
-    "usage-monitor-installer-bytes",
-    /^[1-9][0-9]{0,15}$/u,
-  );
-  const minimumMacos = configuredInstallerMetadata(
-    "usage-monitor-minimum-macos",
-    /^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u,
-  );
-  const architectureText = configuredInstallerMetadata(
-    "usage-monitor-architectures",
-    /^(?:arm64|x86_64)(?:,(?:arm64|x86_64))?$/u,
-  );
-  const architectures = architectureText?.split(",") ?? [];
-  const links = {
-    releaseNotes: configuredReleaseUrl("usage-monitor-release-notes-url"),
-    privacy: configuredReleaseUrl("usage-monitor-privacy-url"),
-    security: configuredReleaseUrl("usage-monitor-security-url"),
-    support: configuredReleaseUrl("usage-monitor-support-url"),
-  };
-  const bytes = byteText === null ? null : Number(byteText);
-  if (!installerUrl
-      || !version
-      || !sha256
-      || !Number.isSafeInteger(bytes)
-      || bytes <= 0
-      || !minimumMacos
-      || architectures.length === 0
-      || new Set(architectures).size !== architectures.length
-      || Object.values(links).some((value) => value === null)) {
-    return null;
-  }
-  return {
-    installerUrl,
-    version,
-    sha256,
-    bytes,
-    minimumMacos,
-    architectures,
-    links,
-  };
-}
-
-function formatInstallerSize(bytes) {
-  if (bytes < 1024 * 1024) {
-    return `${Math.ceil(bytes / 1024)} KiB download`;
-  }
-  const mebibytes = bytes / (1024 * 1024);
-  return `${new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: mebibytes >= 10 ? 0 : 1,
-  }).format(mebibytes)} MiB download`;
-}
-
-function renderInstallerJourney() {
-  const release = configuredInstallerRelease();
-  const link = $("#installer-link");
-  const details = $("#installer-details");
-  const releaseLinks = $("#installer-links");
-  const unavailable = $("#installer-unavailable");
-  if (release) {
-    const architectureLabel = release.architectures.length === 2
-      ? "Apple silicon and Intel"
-      : release.architectures[0] === "arm64"
-        ? "Apple silicon"
-        : "Intel";
-    link.href = release.installerUrl;
-    link.hidden = false;
-    $("#installer-version").textContent = `Version ${release.version}`;
-    $("#installer-compatibility").textContent =
-      `Requires macOS ${release.minimumMacos} or later · ${architectureLabel}`;
-    $("#installer-size").textContent = formatInstallerSize(release.bytes);
-    $("#installer-sha256").textContent = `SHA-256 ${release.sha256}`;
-    details.hidden = false;
-    for (const [id, url] of [
-      ["release-notes-link", release.links.releaseNotes],
-      ["privacy-link", release.links.privacy],
-      ["security-link", release.links.security],
-      ["support-link", release.links.support],
-    ]) {
-      const item = $(`#${id}`);
-      item.href = url;
-      item.hidden = false;
-    }
-    releaseLinks.hidden = false;
-    unavailable.hidden = true;
-    return;
-  }
-  link.removeAttribute("href");
-  link.hidden = true;
-  details.hidden = true;
-  for (const id of [
-    "installer-version",
-    "installer-compatibility",
-    "installer-size",
-    "installer-sha256",
-  ]) {
-    $(`#${id}`).textContent = "";
-  }
-  for (const id of [
-    "release-notes-link",
-    "privacy-link",
-    "security-link",
-    "support-link",
-  ]) {
-    const item = $(`#${id}`);
-    item.removeAttribute("href");
-    item.hidden = true;
-  }
-  releaseLinks.hidden = true;
-  unavailable.hidden = false;
 }
 
 function openInstalledApp() {
@@ -379,12 +205,6 @@ async function sha256Hex(value) {
     .join("");
 }
 
-function finite(value, fallback = null) {
-  if (value === null || value === undefined || value === "" || typeof value === "boolean") return fallback;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
 function formatMoney(value, digits = 0) {
   const number = finite(value);
   return number === null
@@ -419,26 +239,11 @@ function formatPp(value, digits = 1) {
   return number === null ? "—" : `${number.toFixed(digits)} pp`;
 }
 
-function compact(value) {
-  const number = finite(value);
-  return number === null
-    ? "—"
-    : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(number);
-}
-
 function formatUtc(value, { dateOnly = false } = {}) {
   if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
   return new Intl.DateTimeFormat("en-US", dateOnly
     ? { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }
     : { timeZone: "UTC", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
-  ).format(new Date(value));
-}
-
-function formatLocal(value, { dateOnly = false } = {}) {
-  if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
-  return new Intl.DateTimeFormat("en-US", dateOnly
-    ? { ...USER_TIME_ZONE_OPTION, month: "short", day: "numeric", year: "numeric" }
-    : { ...USER_TIME_ZONE_OPTION, month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
   ).format(new Date(value));
 }
 
@@ -453,15 +258,6 @@ const COMPONENT_LABELS = Object.freeze({
 
 function componentLabel(value) {
   return COMPONENT_LABELS[value] ?? humanize(value);
-}
-
-function formatAge(value) {
-  const seconds = finite(value);
-  if (seconds === null) return "Unknown age";
-  if (seconds < 90) return "Less than 2 minutes ago";
-  if (seconds < 7200) return `${Math.round(seconds / 60)} minutes ago`;
-  if (seconds < 172800) return `${(seconds / 3600).toFixed(1)} hours ago`;
-  return `${(seconds / 86400).toFixed(1)} days ago`;
 }
 
 function formatTimeRemaining(value) {
@@ -484,17 +280,6 @@ function formatSpanLength(spanMs) {
   const hours = minutes / 60;
   if (hours < 48) return `${hours.toFixed(hours < 10 ? 1 : 0)} hours`;
   return `${(hours / 24).toFixed(1)} days`;
-}
-
-function clear(element) {
-  element.replaceChildren();
-}
-
-function node(tag, className, text) {
-  const element = document.createElement(tag);
-  if (className) element.className = className;
-  if (text !== undefined) element.textContent = String(text);
-  return element;
 }
 
 function setGlobalState(state, { companionReachable = false } = {}) {
@@ -5545,17 +5330,6 @@ function renderParticipantQuotaMovement(container, movement) {
   container.append(section);
 }
 
-const COMMUNITY_METRIC_LABELS = Object.freeze({
-  usageEvents: "Usage events",
-  inputUncachedTokens: "Input uncached",
-  inputCacheReadTokens: "Cache read",
-  inputCacheWriteTokens: "Cache write",
-  outputTextTokens: "Output text",
-  outputReasoningTokens: "Reasoning output",
-  outputCombinedTokens: "Combined output",
-  toolUnits: "Tool units"
-});
-
 const COMMUNITY_COMPARISON_REASONS = Object.freeze({
   stable_snapshot_unavailable: "No stable released community week is available yet.",
   community_snapshot_not_released: "The latest community week is withdrawn or privacy-suppressed, so no personal comparison is shown.",
@@ -5804,125 +5578,12 @@ function renderContributionHistory(container, payload) {
  * publish — is relocated into the collapsed provenance disclosure beside it.
  */
 function renderCommunitySnapshot(container, payload) {
-  clear(container);
-  const detail = $("#community-snapshot-service-detail");
-  clear(detail);
-  const snapshot = normalizeCommunitySnapshot(payload);
-  if (snapshot.state === "service_unavailable") {
-    container.append(node("p", "", "The central service is unavailable. This is separate from whether a weekly snapshot exists."));
-    const quality = node("dl", "snapshot-quality-grid");
-    for (const [term, value] of [
-      ["Released snapshot", "Not loaded"],
-      ["Cohort limit estimate", "Not in current contract"],
-      ["Matched quota coverage", "Not in current contract"],
-      ["Change confidence", "Not in current contract"]
-    ]) {
-      const item = node("div");
-      item.append(node("dt", "", term), node("dd", "", value));
-      quality.append(item);
-    }
-    detail.append(quality);
-    detail.append(node(
-      "p",
-      "snapshot-disclosure",
-      "No community capacity or change claim is inferred from aggregate activity alone. The next contract must publish replay exclusions, matched quota coverage, uncertainty, and cohort support together."
-    ));
-    return;
-  }
-  if (snapshot.state === "development_unsafe") {
-    container.append(node("p", "", "Live cumulative community totals are development-only and are not displayed."));
-    return;
-  }
-  if (snapshot.state === "unsupported_schema") {
-    container.append(node("p", "", "The service returned an unsupported community-snapshot contract. No values were displayed."));
-    return;
-  }
-  if (snapshot.state === "not_yet_published") {
-    container.append(node("p", "", "No stable weekly snapshot is available yet."));
-    return;
-  }
-  if (snapshot.state === "withdrawn") {
-    container.append(node("p", "", "This weekly revision was withdrawn for privacy or quality reasons. A replacement revision may be pending."));
-    return;
-  }
-  if (snapshot.state === "suppressed") {
-    container.append(node("p", "", "This week did not pass the fixed privacy release policy. We do not disclose why or how close the cohort was."));
-    return;
-  }
-
-  const heading = node("div", "snapshot-heading");
-  heading.append(
-    node("strong", "", `${formatLocal(snapshot.period.startAt, { dateOnly: true })} – ${formatLocal(snapshot.period.endAt, { dateOnly: true })}`)
-  );
-  container.append(heading);
-  // The one sentence a reader needs to know what these numbers are and are
-  // not. The mechanism that produces them lives in the disclosure below.
-  container.append(node(
-    "p",
-    "snapshot-disclosure",
-    `Activity totals for the week above, from people who chose to contribute. A figure appears only when at least ${compact(snapshot.minimumIndependentParticipants)} different participants used that provider and model, and every figure is rounded down — so this is not everyone's usage, not an average, and not a cost.`
-  ));
-  if (snapshot.state === "published_partial") {
-    container.append(node("p", "snapshot-partial", "Some metrics were not released because their independent support was insufficient."));
-  }
-
-  const quality = node("dl", "snapshot-quality-grid");
-  for (const [term, value] of [
-    ["Contract", snapshot.schemaVersion],
-    ["Released model cells", compact(snapshot.cells.length)],
-    ["Minimum support", `≥${compact(snapshot.minimumIndependentParticipants)} participants per cell`],
-    ["Ingestion cutoff", formatLocal(snapshot.ingestionCutoffAt)],
-    ["Released", formatLocal(snapshot.releasedAt)],
-    ["Snapshot age", formatAge(Math.max(0, (Date.now() - Date.parse(snapshot.releasedAt)) / 1_000))],
-    ["Coverage state", snapshot.state === "published_partial" ? "Partially released" : "All contracted cells released"]
-  ]) {
-    const item = node("div");
-    item.append(node("dt", "", term), node("dd", "", value));
-    quality.append(item);
-  }
-  detail.append(quality);
-  detail.append(node(
-    "p",
-    "snapshot-disclosure",
-    `Each value is clipped per participant, independently support-gated at ${compact(snapshot.minimumIndependentParticipants)} or more participants, and rounded down. A sealed revision is never rewritten; deletion creates a replacement revision.`
-  ));
-  detail.append(node(
-    "p",
-    "snapshot-disclosure",
-    "This release currently reports privacy-safe activity totals. Cohort weekly-limit estimates, matched quota coverage, replay exclusions, and change confidence require the next community contract before they can be shown honestly."
-  ));
-
-  const wrap = node("div", "table-wrap snapshot-table");
-  const table = document.createElement("table");
-  const caption = node("caption", "sr-only", "Privacy-safe delayed weekly community metrics");
-  const thead = document.createElement("thead");
-  const header = document.createElement("tr");
-  for (const label of ["Provider / model", ...Object.values(COMMUNITY_METRIC_LABELS)]) {
-    const th = document.createElement("th");
-    th.scope = "col";
-    th.textContent = label;
-    header.append(th);
-  }
-  thead.append(header);
-  const tbody = document.createElement("tbody");
-  for (const cell of snapshot.cells) {
-    const row = document.createElement("tr");
-    const identity = document.createElement("th");
-    identity.scope = "row";
-    identity.textContent = `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`;
-    row.append(identity);
-    for (const metricName of Object.keys(COMMUNITY_METRIC_LABELS)) {
-      const td = document.createElement("td");
-      const metric = cell.metrics[metricName];
-      td.textContent = metric.status === "released" ? compact(metric.value) : "Not released";
-      if (metric.status !== "released") td.className = "suppressed-value";
-      row.append(td);
-    }
-    tbody.append(row);
-  }
-  table.append(caption, thead, tbody);
-  wrap.append(table);
-  container.append(wrap);
+  return renderSharedCommunitySnapshot({
+    documentRef: document,
+    container,
+    detail: $("#community-snapshot-service-detail"),
+    payload,
+  });
 }
 
 async function loadCommunityResults() {
@@ -6462,7 +6123,7 @@ mountDashboardNavigation({
 });
 
 async function bootstrapDashboard() {
-  renderInstallerJourney();
+  renderSharedInstallerJourney(document);
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();

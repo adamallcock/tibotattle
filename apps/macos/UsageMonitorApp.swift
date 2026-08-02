@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import WebKit
 #if canImport(Sparkle)
 import Sparkle
 #endif
@@ -207,6 +208,8 @@ private enum LauncherError: LocalizedError {
     case companionLaunch(String)
     case companionTimeout
     case codexHomeSettingsWrite
+    case dashboardDownloadFailed
+    case dashboardWebViewUnavailable
     case dataErase
     case firstRunStateWrite
     case healthCheck
@@ -239,6 +242,10 @@ private enum LauncherError: LocalizedError {
             return "The local companion did not become ready in time."
         case .codexHomeSettingsWrite:
             return "The selected Codex folder could not be saved privately."
+        case .dashboardDownloadFailed:
+            return "The dashboard could not save that file to your Downloads folder."
+        case .dashboardWebViewUnavailable:
+            return "The in-app dashboard view could not be displayed."
         case .dataErase:
             return "The local \(BundledProduct.displayName) data could not be moved to Trash."
         case .firstRunStateWrite:
@@ -280,6 +287,10 @@ private enum LauncherError: LocalizedError {
             return "UM_MACOS_COMPANION_START_TIMEOUT"
         case .codexHomeSettingsWrite:
             return "UM_MACOS_CODEX_HOME_SETTINGS_WRITE_FAILED"
+        case .dashboardDownloadFailed:
+            return "UM_MACOS_DASHBOARD_DOWNLOAD_FAILED"
+        case .dashboardWebViewUnavailable:
+            return "UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE"
         case .dataErase:
             return "UM_MACOS_LOCAL_DATA_ERASE_FAILED"
         case .firstRunStateWrite:
@@ -308,6 +319,10 @@ private enum LauncherError: LocalizedError {
         case .invalidHome, .invalidStateDirectory, .codexHomeSettingsWrite,
              .firstRunStateWrite:
             return "Check access to your home and Application Support folders, then retry."
+        case .dashboardDownloadFailed:
+            return "Check access to your Downloads folder, then save the file again."
+        case .dashboardWebViewUnavailable:
+            return "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
         case .companionExited, .companionLaunch, .companionTimeout,
              .healthCheck:
             return "Choose Retry. If it repeats, copy Data & Diagnostics for support."
@@ -959,6 +974,290 @@ private struct LocalKeychainResetResult: Decodable {
     }
 }
 
+/// The dashboard is hosted inside the app, so this web view is the product's
+/// primary surface. It is deliberately the narrowest possible browser: it may
+/// load exactly one origin — the loopback companion this launcher started —
+/// and every other destination is cancelled and handed to the user's own
+/// browser instead. The app therefore gains no network reach it did not
+/// already have: the companion still binds to loopback only, and nothing here
+/// can fetch a remote origin.
+@MainActor
+private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelegate,
+    WKDownloadDelegate {
+    private let onLoaded: () -> Void
+    private let onFailure: (String) -> Void
+    private let onDownloadFailure: () -> Void
+    private let openExternally: (URL, Bool) -> Void
+    private var allowedPort: Int?
+    /// False while the view holds no dashboard, so the blank page loaded on
+    /// teardown can never be reported as a dashboard that opened.
+    private var hasDashboardTarget = false
+    let webView: WKWebView
+
+    init(
+        onLoaded: @escaping () -> Void,
+        onFailure: @escaping (String) -> Void,
+        onDownloadFailure: @escaping () -> Void,
+        openExternally: @escaping (URL, Bool) -> Void
+    ) {
+        self.onLoaded = onLoaded
+        self.onFailure = onFailure
+        self.onDownloadFailure = onDownloadFailure
+        self.openExternally = openExternally
+        let configuration = WKWebViewConfiguration()
+        // Nothing this surface stores survives the app. The hosted sign-in
+        // token is already memory-only by design; a non-persistent store keeps
+        // loopback cookies and local storage off disk as well.
+        configuration.websiteDataStore = .nonPersistent()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = false
+        webView.setAccessibilityLabel("Local dashboard")
+        webView.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    func load(_ url: URL) {
+        guard url.scheme?.lowercased() == "http",
+              url.host == loopbackHost,
+              let port = url.port
+        else {
+            onFailure(LauncherError.healthCheck.failureCode)
+            return
+        }
+        allowedPort = port
+        hasDashboardTarget = true
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        webView.load(request)
+    }
+
+    func stop() {
+        allowedPort = nil
+        hasDashboardTarget = false
+        webView.stopLoading()
+        webView.loadHTMLString("", baseURL: nil)
+    }
+
+    private func isCompanionURL(_ url: URL) -> Bool {
+        guard let allowedPort else { return false }
+        return url.scheme?.lowercased() == "http"
+            && url.host == loopbackHost
+            && url.port == allowedPort
+            && url.user == nil
+            && url.password == nil
+    }
+
+    // MARK: - Navigation policy
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
+        let scheme = url.scheme?.lowercased() ?? ""
+        if isCompanionURL(url) || scheme == "about" || scheme == "blob" {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        openExternally(url, false)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard hasDashboardTarget else { return }
+        onLoaded()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        reportNavigationFailure(error)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        reportNavigationFailure(error)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard hasDashboardTarget else { return }
+        hasDashboardTarget = false
+        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+    }
+
+    private func reportNavigationFailure(_ error: Error) {
+        // A navigation this delegate cancelled on purpose is not a failure.
+        let failure = error as NSError
+        guard hasDashboardTarget,
+              failure.domain != NSURLErrorDomain
+                || failure.code != NSURLErrorCancelled
+        else {
+            return
+        }
+        hasDashboardTarget = false
+        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+    }
+
+    // MARK: - Window, dialog, and file affordances
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        // The dashboard only opens a second window for hosted sign-in, which
+        // is a remote origin this app will not load. It is handed to the
+        // user's browser with an explanation rather than silently dropped.
+        if let url = navigationAction.request.url {
+            openExternally(url, true)
+        }
+        return nil
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = BundledProduct.displayName
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        completionHandler()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        // The dashboard confirms destructive actions this way, so a web view
+        // without this panel would silently answer "no" to a deletion the user
+        // asked for. It must be a real question.
+        let alert = NSAlert()
+        alert.messageText = BundledProduct.displayName
+        alert.informativeText = message
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        completionHandler(alert.runModal() == .alertFirstButtonReturn)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping ([URL]?) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.resolvesAliases = true
+        completionHandler(panel.runModal() == .OK ? panel.urls : nil)
+    }
+
+    // MARK: - Downloads
+
+    func webView(
+        _ webView: WKWebView,
+        navigationAction: WKNavigationAction,
+        didBecome download: WKDownload
+    ) {
+        download.delegate = self
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        navigationResponse: WKNavigationResponse,
+        didBecome download: WKDownload
+    ) {
+        download.delegate = self
+    }
+
+    func download(
+        _ download: WKDownload,
+        decideDestinationUsing response: URLResponse,
+        suggestedFilename: String,
+        completionHandler: @escaping (URL?) -> Void
+    ) {
+        completionHandler(Self.downloadsDestination(for: suggestedFilename))
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        // A file that could not be saved is not a dashboard that failed, so
+        // the open page is left exactly as it is.
+        onDownloadFailure()
+    }
+
+    /// A page-supplied filename is untrusted, so only a bounded, separator-free
+    /// basename is ever used, and an existing file is never overwritten.
+    static func downloadsDestination(for suggestedFilename: String) -> URL? {
+        let allowed = CharacterSet(charactersIn:
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        let cleaned = String(
+            suggestedFilename.unicodeScalars.filter(allowed.contains)
+        )
+        let stripped = cleaned.drop(while: { $0 == "." })
+        let candidate = stripped.isEmpty
+            ? "tibotattle-download"
+            : String(stripped.prefix(120))
+        guard let downloads = try? FileManager.default.url(
+            for: .downloadsDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) else {
+            return nil
+        }
+        let base = URL(fileURLWithPath: candidate)
+        let stem = base.deletingPathExtension().lastPathComponent
+        let suffix = base.pathExtension
+        for attempt in 0...50 {
+            let name = attempt == 0
+                ? candidate
+                : suffix.isEmpty
+                    ? "\(stem)-\(attempt)"
+                    : "\(stem)-\(attempt).\(suffix)"
+            let destination = downloads.appendingPathComponent(
+                name,
+                isDirectory: false
+            )
+            if !FileManager.default.fileExists(atPath: destination.path) {
+                return destination
+            }
+        }
+        return nil
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let semanticOpenTarget: SemanticOpenTarget
@@ -1019,11 +1318,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         target: self,
         action: #selector(openCodex)
     )
+    private lazy var openInBrowserButton = NSButton(
+        title: "Open in Browser",
+        target: self,
+        action: #selector(openDashboardInBrowser)
+    )
     private lazy var quitButton = NSButton(
         title: "Quit",
         target: self,
         action: #selector(quitApplication)
     )
+    private let statusStack = NSStackView()
+    private let dashboardContainer = NSView()
+    private var dashboardWebHost: DashboardWebHost?
+    private var dashboardWebViewShowing = false
+
     init(semanticOpenTarget: SemanticOpenTarget) {
         self.semanticOpenTarget = semanticOpenTarget
         super.init()
@@ -1107,7 +1416,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         detailLabel.stringValue =
             "Preparing the private local dashboard. No Codex metadata is scanned until you ask."
         openButton.isEnabled = false
+        openInBrowserButton.isEnabled = false
         retryButton.isEnabled = false
+        hideDashboardWebView()
         menuBarStatus?.companionStarting()
         let process = CompanionProcess(
             centralService: centralService,
@@ -1161,124 +1472,254 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func createWindow() {
-        let content = NSView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-
         statusLabel.font = .systemFont(ofSize: 20, weight: .semibold)
         statusLabel.textColor = .labelColor
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         detailLabel.font = .systemFont(ofSize: 13)
         detailLabel.textColor = .secondaryLabelColor
-        detailLabel.maximumNumberOfLines = 3
-        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.maximumNumberOfLines = 4
 
         privacyLabel.font = .systemFont(ofSize: 11, weight: .medium)
         privacyLabel.textColor = .tertiaryLabelColor
-        privacyLabel.translatesAutoresizingMaskIntoConstraints = false
 
         openButton.bezelStyle = .rounded
         openButton.keyEquivalent = "\r"
         openButton.isEnabled = false
-        openButton.translatesAutoresizingMaskIntoConstraints = false
 
         retryButton.bezelStyle = .rounded
         retryButton.isEnabled = false
-        retryButton.translatesAutoresizingMaskIntoConstraints = false
 
-        diagnosticsButton.bezelStyle = .rounded
-        diagnosticsButton.translatesAutoresizingMaskIntoConstraints = false
+        openInBrowserButton.bezelStyle = .rounded
+        openInBrowserButton.isEnabled = false
+        openInBrowserButton.toolTip =
+            "Open the same local dashboard in your default browser."
 
-        codexHomeButton.bezelStyle = .rounded
-        codexHomeButton.translatesAutoresizingMaskIntoConstraints = false
+        for button in [
+            diagnosticsButton,
+            codexHomeButton,
+            lifecycleHelpButton,
+            openCodexButton,
+            quitButton,
+        ] {
+            button.bezelStyle = .rounded
+        }
 
-        lifecycleHelpButton.bezelStyle = .rounded
-        lifecycleHelpButton.translatesAutoresizingMaskIntoConstraints = false
+        // The status stack collapses while the dashboard is on screen and
+        // returns whenever the dashboard cannot be shown, so the lifecycle
+        // message is never replaced by a blank web view.
+        statusStack.orientation = .vertical
+        statusStack.alignment = .leading
+        statusStack.spacing = 12
+        statusStack.setHuggingPriority(.defaultHigh, for: .vertical)
+        for label in [statusLabel, detailLabel, privacyLabel] {
+            statusStack.addArrangedSubview(label)
+            label.setContentCompressionResistancePriority(
+                .defaultLow,
+                for: .horizontal
+            )
+        }
 
-        openCodexButton.bezelStyle = .rounded
-        openCodexButton.translatesAutoresizingMaskIntoConstraints = false
+        dashboardContainer.translatesAutoresizingMaskIntoConstraints = false
+        dashboardContainer.isHidden = true
+        dashboardContainer.setContentHuggingPriority(.defaultLow, for: .vertical)
 
-        quitButton.bezelStyle = .rounded
-        quitButton.translatesAutoresizingMaskIntoConstraints = false
+        // The action row is always visible, dashboard or not. Quit, Retry, and
+        // diagnostics therefore stay reachable even if the web view never
+        // loads a single byte.
+        let actionRow = NSStackView()
+        actionRow.orientation = .horizontal
+        actionRow.spacing = 10
+        actionRow.setHuggingPriority(.defaultHigh, for: .vertical)
+        for button in [
+            quitButton,
+            diagnosticsButton,
+            codexHomeButton,
+            lifecycleHelpButton,
+        ] {
+            actionRow.addView(button, in: .leading)
+        }
+        for button in [
+            openCodexButton,
+            retryButton,
+            openInBrowserButton,
+            openButton,
+        ] {
+            actionRow.addView(button, in: .trailing)
+        }
 
-        content.addSubview(statusLabel)
-        content.addSubview(detailLabel)
-        content.addSubview(privacyLabel)
-        content.addSubview(openButton)
-        content.addSubview(retryButton)
-        content.addSubview(diagnosticsButton)
-        content.addSubview(codexHomeButton)
-        content.addSubview(lifecycleHelpButton)
-        content.addSubview(openCodexButton)
-        content.addSubview(quitButton)
+        let layout = NSStackView()
+        layout.orientation = .vertical
+        layout.alignment = .leading
+        layout.spacing = 16
+        layout.edgeInsets = NSEdgeInsets(
+            top: 24,
+            left: 28,
+            bottom: 24,
+            right: 28
+        )
+        layout.translatesAutoresizingMaskIntoConstraints = false
+        layout.addArrangedSubview(statusStack)
+        layout.addArrangedSubview(dashboardContainer)
+        layout.addArrangedSubview(actionRow)
 
+        let content = NSView()
+        content.addSubview(layout)
         NSLayoutConstraint.activate([
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
-            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
-            statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 30),
-            detailLabel.leadingAnchor.constraint(equalTo: statusLabel.leadingAnchor),
-            detailLabel.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            detailLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
-            privacyLabel.leadingAnchor.constraint(equalTo: statusLabel.leadingAnchor),
-            privacyLabel.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            privacyLabel.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 12),
-            quitButton.leadingAnchor.constraint(equalTo: statusLabel.leadingAnchor),
-            quitButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -26),
-            diagnosticsButton.leadingAnchor.constraint(
-                equalTo: quitButton.trailingAnchor,
-                constant: 10
+            layout.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            layout.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            layout.topAnchor.constraint(equalTo: content.topAnchor),
+            layout.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            statusStack.widthAnchor.constraint(
+                equalTo: layout.widthAnchor,
+                constant: -56
             ),
-            diagnosticsButton.bottomAnchor.constraint(
-                equalTo: quitButton.bottomAnchor
+            dashboardContainer.widthAnchor.constraint(
+                equalTo: layout.widthAnchor,
+                constant: -56
             ),
-            codexHomeButton.leadingAnchor.constraint(
-                equalTo: diagnosticsButton.trailingAnchor,
-                constant: 10
+            actionRow.widthAnchor.constraint(
+                equalTo: layout.widthAnchor,
+                constant: -56
             ),
-            codexHomeButton.bottomAnchor.constraint(
-                equalTo: quitButton.bottomAnchor
-            ),
-            lifecycleHelpButton.leadingAnchor.constraint(
-                equalTo: codexHomeButton.trailingAnchor,
-                constant: 10
-            ),
-            lifecycleHelpButton.bottomAnchor.constraint(
-                equalTo: quitButton.bottomAnchor
-            ),
-            lifecycleHelpButton.trailingAnchor.constraint(
-                lessThanOrEqualTo: openCodexButton.leadingAnchor,
-                constant: -10
-            ),
-            openCodexButton.trailingAnchor.constraint(
-                equalTo: retryButton.leadingAnchor,
-                constant: -10
-            ),
-            openCodexButton.bottomAnchor.constraint(
-                equalTo: quitButton.bottomAnchor
-            ),
-            retryButton.trailingAnchor.constraint(
-                equalTo: openButton.leadingAnchor,
-                constant: -10
-            ),
-            retryButton.bottomAnchor.constraint(equalTo: quitButton.bottomAnchor),
-            openButton.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            openButton.bottomAnchor.constraint(equalTo: quitButton.bottomAnchor),
         ])
 
         let newWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 980, height: 300),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 1_180, height: 860),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         newWindow.title = BundledProduct.displayName
         newWindow.contentView = content
+        newWindow.contentMinSize = NSSize(width: 900, height: 420)
         newWindow.isReleasedWhenClosed = false
         newWindow.delegate = self
         newWindow.center()
         newWindow.makeKeyAndOrderFront(nil)
         window = newWindow
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// The dashboard runs inside this window. A web view that fails to load
+    /// never becomes the only thing on screen: the status stack and the whole
+    /// action row — Retry, Quit, diagnostics — come straight back.
+    private func showDashboardWebView(_ url: URL) {
+        let host = dashboardWebHost ?? {
+            let created = DashboardWebHost(
+                onLoaded: { [weak self] in self?.dashboardWebViewLoaded() },
+                onFailure: { [weak self] code in
+                    self?.dashboardWebViewFailed(code: code)
+                },
+                onDownloadFailure: { [weak self] in
+                    self?.reportDashboardDownloadFailure()
+                },
+                openExternally: { [weak self] link, explain in
+                    self?.openExternalDashboardLink(link, explain: explain)
+                }
+            )
+            dashboardContainer.addSubview(created.webView)
+            NSLayoutConstraint.activate([
+                created.webView.leadingAnchor.constraint(
+                    equalTo: dashboardContainer.leadingAnchor
+                ),
+                created.webView.trailingAnchor.constraint(
+                    equalTo: dashboardContainer.trailingAnchor
+                ),
+                created.webView.topAnchor.constraint(
+                    equalTo: dashboardContainer.topAnchor
+                ),
+                created.webView.bottomAnchor.constraint(
+                    equalTo: dashboardContainer.bottomAnchor
+                ),
+                created.webView.heightAnchor.constraint(
+                    greaterThanOrEqualToConstant: 320
+                ),
+            ])
+            dashboardWebHost = created
+            return created
+        }()
+        statusLabel.stringValue = "Opening the dashboard…"
+        detailLabel.stringValue =
+            "Loading the private local dashboard from this Mac only."
+        host.load(url)
+    }
+
+    private func dashboardWebViewLoaded() {
+        dashboardWebViewShowing = true
+        dashboardContainer.isHidden = false
+        statusStack.isHidden = true
+        lastLifecycleStatus = "Dashboard open"
+        openInBrowserButton.isEnabled = true
+    }
+
+    /// A save that failed keeps the dashboard on screen and says so in a
+    /// dialog, because the page below it is still perfectly usable.
+    private func reportDashboardDownloadFailure() {
+        let failure = LauncherError.dashboardDownloadFailed
+        lastFailureCode = failure.failureCode
+        lastRecoverySuggestion = failure.recoverySuggestion
+        let alert = NSAlert()
+        alert.messageText = "Nothing was saved"
+        alert.informativeText =
+            "\(failure.errorDescription ?? "") Code: \(failure.failureCode). \(failure.recoverySuggestion)"
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private func dashboardWebViewFailed(code: String) {
+        dashboardWebViewShowing = false
+        dashboardContainer.isHidden = true
+        statusStack.isHidden = false
+        let failure = LauncherError.dashboardWebViewUnavailable
+        lastLifecycleStatus = "Dashboard unavailable"
+        lastFailureCode = failure.failureCode
+        lastRecoverySuggestion = failure.recoverySuggestion
+        statusLabel.stringValue = "Dashboard didn’t open"
+        detailLabel.stringValue =
+            "\(failure.errorDescription ?? "") Code: \(failure.failureCode). \(failure.recoverySuggestion)"
+        openButton.isEnabled = dashboardURL != nil
+        openInBrowserButton.isEnabled = dashboardURL != nil
+        retryButton.isEnabled = retryAllowed && firstRunAcknowledged
+    }
+
+    private func hideDashboardWebView() {
+        dashboardWebViewShowing = false
+        dashboardContainer.isHidden = true
+        statusStack.isHidden = false
+        openInBrowserButton.isEnabled = false
+        dashboardWebHost?.stop()
+    }
+
+    /// A link the embedded dashboard cannot load itself. Only credential-free
+    /// public HTTPS is handed to the user's browser; the app opens nothing
+    /// else, and loads nothing remote itself.
+    private func openExternalDashboardLink(_ url: URL, explain: Bool) {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host,
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil
+        else {
+            return
+        }
+        guard explain else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        // Hosted sign-in finishes at the service, which this app deliberately
+        // will not load. Saying so is better than a window that never appears.
+        let alert = NSAlert()
+        alert.messageText = "Finish this step in your browser"
+        alert.informativeText = """
+        \(BundledProduct.displayName) keeps its own window on this Mac only, so it will not load \(host).
+
+        Choose Continue to open that page and this same local dashboard in your default browser, and finish there. Nothing about your local analysis changes.
+        """
+        alert.addButton(withTitle: "Continue in Browser")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        NSWorkspace.shared.open(url)
+        openDashboardInBrowser()
     }
 
     // The status item is an additional affordance, never a replacement: the
@@ -1334,10 +1775,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 "Open the dashboard and start a bounded scan. Contribution stays off until explicit consent and a reviewed first send; a six-hour while-open schedule can then be enabled."
         }
         openButton.isEnabled = true
+        openInBrowserButton.isEnabled = true
         retryButton.isEnabled = false
         // The same validated loopback URL the window's Open Dashboard uses.
         menuBarStatus?.companionReady(dashboardURL: url)
-        if pendingDashboardOpen {
+        // A companion restart moves to a new ephemeral port, so a dashboard
+        // that is already on screen is reloaded rather than left stale.
+        if pendingDashboardOpen || dashboardWebViewShowing {
             pendingDashboardOpen = false
             openDashboard()
         }
@@ -1357,6 +1801,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         startupTimeout?.cancel()
         startupTimeout = nil
         dashboardURL = nil
+        // The companion origin is gone, so the embedded dashboard goes with
+        // it and the always-available status controls come back.
+        hideDashboardWebView()
         lastLifecycleStatus = "Could not start"
         let launcherError = error as? LauncherError
             ?? LauncherError.companionLaunch("unexpected")
@@ -1366,6 +1813,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         detailLabel.stringValue =
             "\(launcherError.errorDescription ?? "The local dashboard could not be started.") Code: \(launcherError.failureCode). \(launcherError.recoverySuggestion)"
         openButton.isEnabled = false
+        openInBrowserButton.isEnabled = false
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
         menuBarStatus?.companionUnavailable(
             summary:
@@ -1373,7 +1821,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         )
     }
 
+    // The app is the interface: Open Dashboard shows the loopback dashboard in
+    // this window. The browser remains an explicit, separate choice, which is
+    // what the hosted sign-in handoff needs.
     @objc private func openDashboard() {
+        guard let dashboardURL,
+              dashboardURL.scheme == "http",
+              dashboardURL.host == loopbackHost
+        else {
+            return
+        }
+        showDashboardWebView(dashboardURL)
+    }
+
+    @objc private func openDashboardInBrowser() {
         guard let dashboardURL,
               dashboardURL.scheme == "http",
               dashboardURL.host == loopbackHost
@@ -1674,6 +2135,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             "Restarting the foreground-only local companion with the validated source."
         openButton.isEnabled = false
         retryButton.isEnabled = false
+        // This status has to be readable, so the embedded dashboard yields.
+        hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
         let previous = companion
@@ -1789,6 +2252,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             "Stopping the foreground companion before the exact local Keychain transaction."
         openButton.isEnabled = false
         retryButton.isEnabled = false
+        // This status has to be readable, so the embedded dashboard yields.
+        hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
         let previous = companion
@@ -1908,6 +2373,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             "The local companion is stopping before its exact owner-only state directory is moved."
         openButton.isEnabled = false
         retryButton.isEnabled = false
+        // This status has to be readable, so the embedded dashboard yields.
+        hideDashboardWebView()
         launchGeneration += 1
         let previous = companion
         companion = nil
