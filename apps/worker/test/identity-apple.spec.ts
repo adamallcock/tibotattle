@@ -219,7 +219,10 @@ describe("web Sign in with Apple", () => {
     expect(landed.headers.get("content-security-policy"))
       .toContain("default-src 'none'");
     const page = await landed.text();
-    expect(page).toContain("Signed in — return to the TiboTattle tab.");
+    // The copy names no surface: the dashboard that started the sign-in
+    // collects the result itself, whether it is a browser tab or the macOS
+    // app's own window, so nobody is asked to carry anything back.
+    expect(page).toContain("Signed in — return to TiboTattle.");
     for (const secret of [
       "apple-one-time-code",
       APPLE_ID_TOKEN,

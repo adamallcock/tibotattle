@@ -171,8 +171,11 @@
           "ENVELOPE_PUBLIC_JWK",
           "IDENTITY_LINK_SECRET",
           "APPLE_PRIVATE_KEY",
-          // Google issues Desktop/installed OAuth clients a client secret and
-          // requires it on the token exchange even with PKCE.
+          // The Google OAuth client is a Web application client whose one
+          // registered redirect URI is this service's own
+          // /api/v1/identity/google/callback. Google requires its client
+          // secret on the token exchange even with PKCE, so the exchange stays
+          // server-side and the secret never leaves the Worker.
           "GOOGLE_OIDC_CLIENT_SECRET"
         ]
       },

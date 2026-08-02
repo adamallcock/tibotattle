@@ -144,8 +144,10 @@ const PARTICIPANT_CONSENT_VERSIONS = new Set([
   "ongoing-privacy-safe-telemetry-v0.1",
   "ongoing-privacy-safe-telemetry-v0.2"
 ]);
-export const IDENTITY_GOOGLE_EXCHANGE_SCHEMA_VERSION =
-  "identity-google-exchange-v0.1";
+export const IDENTITY_GOOGLE_START_SCHEMA_VERSION =
+  "identity-google-start-v0.1";
+export const IDENTITY_GOOGLE_RESULT_SCHEMA_VERSION =
+  "identity-google-result-v0.1";
 export const IDENTITY_APPLE_START_SCHEMA_VERSION =
   "identity-apple-start-v0.1";
 export const IDENTITY_APPLE_RESULT_SCHEMA_VERSION =
@@ -159,13 +161,39 @@ const HOSTED_IDENTITY_ERROR_CODES = new Set([
   "IDENTITY_RESULT_PENDING"
 ]);
 const MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH = 16_384;
-const GOOGLE_LOOPBACK_REDIRECT_URI =
-  /^http:\/\/127\.0\.0\.1:\d{1,5}\/oauth\/google\/callback$/u;
-const GOOGLE_PKCE_CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/u;
-const APPLE_SIGNIN_STATE = /^[A-Za-z0-9_-]{43,128}$/u;
-// The only URL this page will ever hand to window.open for Apple sign-in.
+const HOSTED_SIGNIN_STATE = /^[A-Za-z0-9_-]{43,128}$/u;
+// The only two URLs this page will ever hand to window.open for sign-in. The
+// service builds them; this is the check that it built the one it claimed to.
 const APPLE_AUTHORIZE_URL_PREFIX =
   "https://appleid.apple.com/auth/authorize?";
+const GOOGLE_AUTHORIZE_URL_PREFIX =
+  "https://accounts.google.com/o/oauth2/v2/auth?";
+const HOSTED_IDENTITY_LABELS = Object.freeze({
+  apple: "Apple",
+  google: "Google"
+});
+const HOSTED_IDENTITY_START_ROUTES = Object.freeze({
+  apple: Object.freeze({
+    path: "/identity/apple/start",
+    schemaVersion: IDENTITY_APPLE_START_SCHEMA_VERSION,
+    authorizePrefix: APPLE_AUTHORIZE_URL_PREFIX
+  }),
+  google: Object.freeze({
+    path: "/identity/google/start",
+    schemaVersion: IDENTITY_GOOGLE_START_SCHEMA_VERSION,
+    authorizePrefix: GOOGLE_AUTHORIZE_URL_PREFIX
+  })
+});
+const HOSTED_IDENTITY_RESULT_ROUTES = Object.freeze({
+  apple: Object.freeze({
+    path: "/identity/apple/result",
+    schemaVersion: IDENTITY_APPLE_RESULT_SCHEMA_VERSION
+  }),
+  google: Object.freeze({
+    path: "/identity/google/result",
+    schemaVersion: IDENTITY_GOOGLE_RESULT_SCHEMA_VERSION
+  })
+});
 const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
@@ -266,6 +294,74 @@ function hostedIdentityRequestError(response, payload) {
   }
   return attachServiceRequestId(error, payload);
 }
+
+/**
+ * Starts a hosted sign-in. Both providers work the same way: the service owns
+ * the redirect target and the client secret, so this page only ever learns an
+ * unguessable state and the authorize URL to open. No authorization code, PKCE
+ * verifier, or redirect URI is ever held here.
+ */
+async function startHostedSignIn(fetchImpl, provider) {
+  const { path, schemaVersion, authorizePrefix } =
+    HOSTED_IDENTITY_START_ROUTES[provider];
+  const response = await fetchImpl(`${CENTRAL_ROOT}${path}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw hostedIdentityRequestError(response, payload);
+  }
+  if (payload?.schemaVersion !== schemaVersion
+      || typeof payload?.state !== "string"
+      || !HOSTED_SIGNIN_STATE.test(payload.state)
+      || typeof payload?.authorizeUrl !== "string"
+      || !payload.authorizeUrl.startsWith(authorizePrefix)) {
+    throw new Error(
+      `The service did not return a usable ${HOSTED_IDENTITY_LABELS[provider]} sign-in request.`
+    );
+  }
+  return Object.freeze({
+    state: payload.state,
+    authorizeUrl: payload.authorizeUrl
+  });
+}
+
+/**
+ * Reads a completed sign-in back exactly once. A pending sign-in surfaces as
+ * IDENTITY_RESULT_PENDING so the caller can keep polling without treating it
+ * as a failure.
+ */
+async function readHostedSignInResult(fetchImpl, provider, state) {
+  const { path, schemaVersion } = HOSTED_IDENTITY_RESULT_ROUTES[provider];
+  if (typeof state !== "string" || !HOSTED_SIGNIN_STATE.test(state)) {
+    throw new TypeError(
+      `${HOSTED_IDENTITY_LABELS[provider]} sign-in state is invalid.`
+    );
+  }
+  const response = await fetchImpl(`${CENTRAL_ROOT}${path}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ state })
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw hostedIdentityRequestError(response, payload);
+  }
+  if (payload?.schemaVersion !== schemaVersion
+      || typeof payload?.idToken !== "string"
+      || payload.idToken.length === 0
+      || payload.idToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
+    throw new Error(
+      `The service did not return a verifiable ${HOSTED_IDENTITY_LABELS[provider]} sign-in token.`
+    );
+  }
+  return Object.freeze({ provider, idToken: payload.idToken });
+}
+
 
 export function normalizeLocalOnboarding(payload) {
   const unavailable = Object.freeze({
@@ -2827,97 +2923,30 @@ export class CommunityClient {
     return payload;
   }
 
-  async identityGoogleExchange({ code, codeVerifier, redirectUri } = {}) {
-    if (typeof code !== "string"
-        || code.length === 0
-        || code.length > 2_048
-        || !GOOGLE_PKCE_CODE_VERIFIER.test(codeVerifier ?? "")
-        || typeof redirectUri !== "string"
-        || !GOOGLE_LOOPBACK_REDIRECT_URI.test(redirectUri)) {
-      throw new TypeError("Google sign-in exchange inputs are invalid.");
-    }
-    const fetchImpl = this.fetchImpl;
-    const response = await fetchImpl(
-      `${CENTRAL_ROOT}/identity/google/exchange`,
-      {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify({ code, codeVerifier, redirectUri })
-      }
-    );
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw hostedIdentityRequestError(response, payload);
-    }
-    if (payload?.schemaVersion !== IDENTITY_GOOGLE_EXCHANGE_SCHEMA_VERSION
-        || payload?.provider !== "google"
-        || typeof payload?.idToken !== "string"
-        || payload.idToken.length === 0
-        || payload.idToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
-      throw new Error("The service did not return a verifiable Google sign-in token.");
-    }
-    return Object.freeze({ provider: "google", idToken: payload.idToken });
+  /**
+   * Starts hosted Google sign-in. Google's Web application client requires its
+   * client secret on the token exchange even with PKCE, so the service owns
+   * both the redirect and the verifier; this page never sees either.
+   */
+  async identityGoogleStart() {
+    return startHostedSignIn(this.fetchImpl, "google");
+  }
+
+  async identityGoogleResult(state) {
+    return readHostedSignInResult(this.fetchImpl, "google", state);
   }
 
   /**
    * Starts hosted Sign in with Apple. Apple refuses loopback redirects and
    * answers with response_mode=form_post, so the service owns both the
-   * redirect target and the client secret; this page only learns an
-   * unguessable state and the authorize URL to open.
+   * redirect target and the client secret.
    */
   async identityAppleStart() {
-    const fetchImpl = this.fetchImpl;
-    const response = await fetchImpl(`${CENTRAL_ROOT}/identity/apple/start`, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({})
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw hostedIdentityRequestError(response, payload);
-    }
-    if (payload?.schemaVersion !== IDENTITY_APPLE_START_SCHEMA_VERSION
-        || typeof payload?.state !== "string"
-        || !APPLE_SIGNIN_STATE.test(payload.state)
-        || typeof payload?.authorizeUrl !== "string"
-        || !payload.authorizeUrl.startsWith(APPLE_AUTHORIZE_URL_PREFIX)) {
-      throw new Error("The service did not return a usable Apple sign-in request.");
-    }
-    return Object.freeze({
-      state: payload.state,
-      authorizeUrl: payload.authorizeUrl
-    });
+    return startHostedSignIn(this.fetchImpl, "apple");
   }
 
-  /**
-   * Reads a completed Apple sign-in back exactly once. A pending sign-in
-   * surfaces as IDENTITY_RESULT_PENDING so the caller can keep polling
-   * without treating it as a failure.
-   */
   async identityAppleResult(state) {
-    if (typeof state !== "string" || !APPLE_SIGNIN_STATE.test(state)) {
-      throw new TypeError("Apple sign-in state is invalid.");
-    }
-    const fetchImpl = this.fetchImpl;
-    const response = await fetchImpl(`${CENTRAL_ROOT}/identity/apple/result`, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ state })
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw hostedIdentityRequestError(response, payload);
-    }
-    if (payload?.schemaVersion !== IDENTITY_APPLE_RESULT_SCHEMA_VERSION
-        || typeof payload?.idToken !== "string"
-        || payload.idToken.length === 0
-        || payload.idToken.length > MAXIMUM_HOSTED_IDENTITY_TOKEN_LENGTH) {
-      throw new Error("The service did not return a verifiable Apple sign-in token.");
-    }
-    return Object.freeze({ provider: "apple", idToken: payload.idToken });
+    return readHostedSignInResult(this.fetchImpl, "apple", state);
   }
 
   async recover(recoveryCode) {

@@ -13,7 +13,9 @@ const EXACT_ROUTES = [
   ["/api/health", "health"],
   ["/api/ready", "ready"],
   ["/api/v1/enroll", "enroll"],
-  ["/api/v1/identity/google/exchange", "identity_google_exchange"],
+  ["/api/v1/identity/google/start", "identity_google_start"],
+  ["/api/v1/identity/google/callback", "identity_google_callback"],
+  ["/api/v1/identity/google/result", "identity_google_result"],
   ["/api/v1/identity/apple/start", "identity_apple_start"],
   ["/api/v1/identity/apple/callback", "identity_apple_callback"],
   ["/api/v1/identity/apple/result", "identity_apple_result"],
@@ -41,7 +43,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(28);
+    expect(EXACT_ROUTES).toHaveLength(30);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );

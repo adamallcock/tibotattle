@@ -1098,18 +1098,32 @@ test("participant relay supports explicit loopback development with exact forwar
     });
     assert.equal(exported.status, 200);
     assert.equal((await exported.arrayBuffer()).byteLength > 4 * 1024 * 1024, true);
-    assert.equal((await fetch(`${base}/api/v1/identity/google/exchange`, {
+    // Hosted sign-in crosses this relay as a start and a polled result only.
+    // Neither carries a code, a verifier, or a redirect: the contribution
+    // service owns all three.
+    assert.equal((await fetch(`${base}/api/v1/identity/google/start`, {
       method: "POST",
       headers: {
         Origin: base,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        code: "one-time-authorization-code",
-        codeVerifier: "A".repeat(43),
-        redirectUri: `http://127.0.0.1:${app.port}/oauth/google/callback`,
-      }),
+      body: "{}",
     })).status, 200);
+    assert.equal((await fetch(`${base}/api/v1/identity/google/result`, {
+      method: "POST",
+      headers: {
+        Origin: base,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ state: "S".repeat(64) }),
+    })).status, 200);
+    // The provider callback is never relayed: it is delivered straight to the
+    // contribution service over HTTPS.
+    assert.equal((await fetch(`${base}/api/v1/identity/google/callback`, {
+      method: "POST",
+      headers: { Origin: base, "Content-Type": "application/json" },
+      body: "{}",
+    })).status, 404);
 
     assert.equal(forwarded[0].url, "http://127.0.0.1:8792/api/v1/enroll");
     assert.equal(forwarded[0].headers.Origin, "http://127.0.0.1:8792");
@@ -1129,13 +1143,17 @@ test("participant relay supports explicit loopback development with exact forwar
     assert.equal(forwarded[5].url, "http://127.0.0.1:8792/api/v1/me/export");
     assert.equal(
       forwarded[6].url,
-      "http://127.0.0.1:8792/api/v1/identity/google/exchange",
+      "http://127.0.0.1:8792/api/v1/identity/google/start",
     );
     assert.equal(Object.hasOwn(forwarded[6].headers, "Cookie"), false);
+    assert.equal(forwarded[6].body, "{}");
     assert.equal(
-      forwarded[6].body.includes("one-time-authorization-code"),
-      true,
+      forwarded[7].url,
+      "http://127.0.0.1:8792/api/v1/identity/google/result",
     );
+    assert.equal(Object.hasOwn(forwarded[7].headers, "Cookie"), false);
+    assert.equal(forwarded[7].body.includes("SSSS"), true);
+    assert.equal(forwarded.length, 8);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -2885,7 +2903,13 @@ test("configured CLI exits after its declared parent disappears", async () => {
   }
 });
 
-test("Google sign-in callback serves one inline query-tolerant page only", async () => {
+// Hosted sign-in used to redirect back to a loopback callback served here,
+// which handed the one-time code to the dashboard through localStorage. Both
+// providers now redirect to the contribution service's own callback, so this
+// origin must receive no provider redirect at all: the route is gone, and the
+// blanket refusal of query strings — which that route was the sole exception
+// to — covers every path again.
+test("no provider redirect can land on the loopback companion", async () => {
   const files = await fixture();
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
@@ -2898,43 +2922,43 @@ test("Google sign-in callback serves one inline query-tolerant page only", async
   });
   try {
     const base = `http://127.0.0.1:${app.port}`;
-    const response = await fetch(
+    const carrying = await fetch(
       `${base}/oauth/google/callback?code=CANARY-code&state=CANARY-state`,
     );
-    assert.equal(response.status, 200);
-    assert.match(response.headers.get("content-type"), /^text\/html/u);
-    assert.match(
-      response.headers.get("content-security-policy"),
-      /script-src 'self' 'unsafe-inline'/u,
+    assert.equal(carrying.status, 400);
+    assert.equal((await carrying.text()).includes("CANARY"), false);
+    assert.equal(
+      (await fetch(`${base}/oauth/google/callback`)).status,
+      404,
     );
-    assert.equal(response.headers.get("cache-control"), "no-store");
-    const body = await response.text();
-    assert.match(body, /tibotattle-google-oauth-result/u);
-    // The relay key is written for the cross-tab storage event and removed in
-    // the same turn, so the one-time code never persists in browser storage.
-    assert.match(body, /localStorage\.removeItem/u);
-    assert.match(
-      body,
-      /Signed in — return to the TiboTattle dashboard tab\./u,
-    );
-    // Entirely self-contained: no external script, style, image, link, or
-    // navigation reference, and nothing from the query string is reflected.
-    assert.doesNotMatch(body, /\bsrc=|\bhref=|<link|<img|https?:\/\//iu);
-    assert.equal(body.includes("CANARY"), false);
     assert.equal((await fetch(`${base}/oauth/google/callback`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
-    })).status, 405);
+    })).status, 404);
     assert.equal(
       (await fetch(`${base}/oauth/google/callback/extra`)).status,
       404,
+    );
+    assert.equal(
+      (await fetch(`${base}/api/v1/identity/google/callback?code=CANARY-code`))
+        .status,
+      400,
     );
     assert.equal((await fetch(`${base}/?code=CANARY-code`)).status, 400);
     assert.equal(
       (await fetch(`${base}/api/local/health?code=CANARY-code`)).status,
       400,
     );
+
+    // Nothing served by this companion mentions the retired localStorage relay
+    // key, so no page here can complete a sign-in out of browser storage.
+    const source = await readFile(
+      new URL("./server.js", import.meta.url),
+      "utf8",
+    );
+    assert.equal(source.includes("tibotattle-google-oauth-result"), false);
+    assert.equal(source.includes("/oauth/google/callback"), false);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

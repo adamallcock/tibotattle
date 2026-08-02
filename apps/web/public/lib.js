@@ -17,7 +17,6 @@ export {
   createTelemetryEnvelope,
   validateSyntheticFixture,
 } from "./telemetry-envelope.js";
-import { bytesToBase64Url } from "./telemetry-envelope.js";
 
 const JSON_WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
 const JSON_SIMPLE_ESCAPES = Object.freeze({
@@ -386,105 +385,6 @@ export function safeFilename(participantId) {
     ? participantId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32)
     : "participant";
   return `usage-monitor-${suffix || "participant"}-export.json`;
-}
-
-const GOOGLE_AUTHORIZATION_ENDPOINT =
-  "https://accounts.google.com/o/oauth2/v2/auth";
-export const GOOGLE_OAUTH_RESULT_STORAGE_KEY =
-  "tibotattle-google-oauth-result";
-const GOOGLE_OAUTH_CALLBACK_SUFFIX = "/oauth/google/callback";
-const MAXIMUM_GOOGLE_AUTHORIZATION_CODE_LENGTH = 2_048;
-
-/**
- * Build one PKCE Google sign-in authorization request.
- *
- * The verifier and state are fresh WebCrypto randomness; only the S256
- * challenge and the state travel to the provider. Scope is fixed to
- * "openid": no email, name, or profile scope is ever requested, matching
- * the service's irreversible-hash-only identity storage.
- */
-export async function createGoogleSignInRequest({
-  clientId,
-  redirectUri,
-  cryptoImpl = globalThis.crypto
-} = {}) {
-  if (typeof clientId !== "string"
-      || clientId.length === 0
-      || clientId.length > 256
-      || typeof redirectUri !== "string"
-      || !redirectUri.endsWith(GOOGLE_OAUTH_CALLBACK_SUFFIX)) {
-    throw new TypeError("Google sign-in request inputs are invalid.");
-  }
-  const codeVerifier = bytesToBase64Url(
-    cryptoImpl.getRandomValues(new Uint8Array(48))
-  );
-  const state = bytesToBase64Url(
-    cryptoImpl.getRandomValues(new Uint8Array(32))
-  );
-  const digest = await cryptoImpl.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(codeVerifier)
-  );
-  const url = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
-  url.searchParams.set("client_id", clientId);
-  url.searchParams.set("redirect_uri", redirectUri);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", "openid");
-  url.searchParams.set(
-    "code_challenge",
-    bytesToBase64Url(new Uint8Array(digest))
-  );
-  url.searchParams.set("code_challenge_method", "S256");
-  url.searchParams.set("state", state);
-  return Object.freeze({
-    url: url.href,
-    state,
-    codeVerifier,
-    redirectUri
-  });
-}
-
-/**
- * Validate the JSON the loopback callback page wrote to localStorage.
- *
- * Fails closed on shape drift, a missing or mismatched state, and stale or
- * future timestamps, so a leftover result from an earlier attempt can never
- * complete a newer sign-in. Error messages never include the code or state.
- */
-export function parseGoogleSignInResult(serialized, {
-  expectedState,
-  nowMs = Date.now(),
-  maximumAgeMs = 10 * 60 * 1_000
-} = {}) {
-  if (typeof expectedState !== "string" || expectedState.length === 0) {
-    throw new TypeError("Google sign-in state is required.");
-  }
-  let payload;
-  try {
-    payload = JSON.parse(typeof serialized === "string" ? serialized : "");
-  } catch {
-    throw new Error("The Google sign-in result could not be read. Sign in again.");
-  }
-  const shapeValid = payload
-    && typeof payload === "object"
-    && !Array.isArray(payload)
-    && Object.keys(payload).sort().join("\u0000")
-      === "code\u0000receivedAt\u0000state";
-  const receivedAtMs = shapeValid ? Date.parse(payload.receivedAt) : Number.NaN;
-  if (!shapeValid
-      || typeof payload.code !== "string"
-      || payload.code.length === 0
-      || payload.code.length > MAXIMUM_GOOGLE_AUTHORIZATION_CODE_LENGTH
-      || typeof payload.state !== "string"
-      || !Number.isFinite(receivedAtMs)
-      || receivedAtMs > nowMs + 60_000
-      || nowMs - receivedAtMs > maximumAgeMs) {
-    throw new Error("The Google sign-in result was invalid or expired. Sign in again.");
-  }
-  if (payload.state !== expectedState) {
-    throw new Error("The Google sign-in result did not match this dashboard tab. Sign in again.");
-  }
-  return Object.freeze({ code: payload.code });
 }
 
 export function safeApiError(payload, fallback) {

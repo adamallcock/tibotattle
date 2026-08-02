@@ -11,8 +11,16 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "app.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/community-view.js": Object.freeze({
+    file: "community-view.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/data-client.js": Object.freeze({
     file: "data-client.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/install-cta.js": Object.freeze({
+    file: "install-cta.js",
     type: "text/javascript; charset=utf-8",
   }),
   "/lib.js": Object.freeze({
@@ -29,6 +37,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
   }),
   "/telemetry-envelope.js": Object.freeze({
     file: "telemetry-envelope.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/ui-format.js": Object.freeze({
+    file: "ui-format.js",
     type: "text/javascript; charset=utf-8",
   }),
   "/styles.css": Object.freeze({

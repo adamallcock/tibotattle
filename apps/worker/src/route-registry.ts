@@ -14,7 +14,16 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   { pathname: "/api/health", id: "health" },
   { pathname: "/api/ready", id: "ready" },
   { pathname: "/api/v1/enroll", id: "enroll" },
-  { pathname: "/api/v1/identity/google/exchange", id: "identity_google_exchange" },
+  // Both hosted providers use the same three-route handoff: the dashboard
+  // starts a sign-in, the provider redirects to this service's own callback,
+  // and the dashboard reads the one-time result back keyed by an unguessable
+  // state. Nothing about a sign-in ever returns to a client-owned redirect.
+  { pathname: "/api/v1/identity/google/start", id: "identity_google_start" },
+  {
+    pathname: "/api/v1/identity/google/callback",
+    id: "identity_google_callback",
+  },
+  { pathname: "/api/v1/identity/google/result", id: "identity_google_result" },
   { pathname: "/api/v1/identity/apple/start", id: "identity_apple_start" },
   {
     pathname: "/api/v1/identity/apple/callback",

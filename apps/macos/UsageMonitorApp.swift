@@ -1706,20 +1706,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             NSWorkspace.shared.open(url)
             return
         }
-        // Hosted sign-in finishes at the service, which this app deliberately
-        // will not load. Saying so is better than a window that never appears.
+        // Hosted sign-in authenticates at the provider, which this app
+        // deliberately will not load. The browser is where that step happens
+        // and nowhere else; the dashboard in this window then collects the
+        // one-time result from the contribution service itself, so the browser
+        // hands nothing back and this window is the only place to return to.
+        // Open in Browser remains on the status view as a separate choice, but
+        // it is no longer part of signing in.
         let alert = NSAlert()
-        alert.messageText = "Finish this step in your browser"
+        alert.messageText = "Finish signing in in your browser"
         alert.informativeText = """
         \(BundledProduct.displayName) keeps its own window on this Mac only, so it will not load \(host).
 
-        Choose Continue to open that page and this same local dashboard in your default browser, and finish there. Nothing about your local analysis changes.
+        Choose Continue to sign in there, then come back to this window — it finishes the sign-in on its own. Nothing about your local analysis changes.
         """
         alert.addButton(withTitle: "Continue in Browser")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         NSWorkspace.shared.open(url)
-        openDashboardInBrowser()
     }
 
     // The status item is an additional affordance, never a replacement: the
@@ -1822,8 +1826,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     // The app is the interface: Open Dashboard shows the loopback dashboard in
-    // this window. The browser remains an explicit, separate choice, which is
-    // what the hosted sign-in handoff needs.
+    // this window. The browser remains an explicit, separate choice the user
+    // may make for their own reasons; hosted sign-in no longer requires it,
+    // because the dashboard collects its own result from the contribution
+    // service wherever it is running.
     @objc private func openDashboard() {
         guard let dashboardURL,
               dashboardURL.scheme == "http",
@@ -2506,8 +2512,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 // Sign in with Apple is deliberately absent from this app. Apple provisions
 // the entitlement only for Ad hoc, App Store Connect, and Development
 // distribution, never Developer ID, and a Developer ID build carrying it is
-// terminated by the kernel at launch. Hosted Apple sign-in runs entirely in
-// the browser against the contribution service instead.
+// terminated by the kernel at launch. Both hosted providers instead
+// authenticate in the user's own browser against the contribution service,
+// which owns the redirect; the dashboard in this window polls that service for
+// the one-time result, so no provider host is ever asked of this web view and
+// no browser tab has to be kept open to finish.
 
 private func endpointReportsReady(_ url: URL) -> Bool {
     let completed = DispatchSemaphore(value: 0)

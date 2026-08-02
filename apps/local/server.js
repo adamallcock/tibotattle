@@ -156,8 +156,6 @@ const DIAGNOSTIC_SERVICE_REQUEST_ID =
 const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
 const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
-const GOOGLE_OAUTH_CALLBACK_PATH = "/oauth/google/callback";
-const GOOGLE_OAUTH_RESULT_STORAGE_KEY = "tibotattle-google-oauth-result";
 
 function developmentIdentityConfigurationError() {
   const error = new TypeError(
@@ -252,112 +250,6 @@ const API_ROUTES = new Set([
   "/api/local/accounting/fast-mode-preference",
 ]);
 
-// Served for the provider's loopback redirect. The page is entirely inline:
-// it references no external script, style, image, or navigation target, and
-// the server never parses the ?code or ?state values it arrives with. The
-// inline script hands them to the already-open dashboard tab through one
-// fixed localStorage key, then removes the key in the same turn — the
-// dashboard consumes the storage event's newValue, so nothing persists in
-// browser storage — and scrubs the query from this tab's history.
-//
-// Having handed the result over, the tab has no further purpose, so it asks to
-// close itself. A browser is entitled to refuse that for a tab its own script
-// did not open, and refusal is silent: window.close() neither throws nor
-// reports. The page therefore always renders the finished card first and, if it
-// is still running a moment later, says plainly that the tab can be closed by
-// hand. The mark is drawn with CSS so the page keeps loading nothing at all.
-const GOOGLE_OAUTH_CALLBACK_SELF_CLOSE_DELAY_MS = 400;
-const GOOGLE_OAUTH_CALLBACK_HTML = Buffer.from(`<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${PRODUCT_BRAND.displayName} sign-in</title>
-    <style>
-      body {
-        display: grid;
-        place-items: center;
-        min-height: 100vh;
-        margin: 0;
-        padding: 1.5rem;
-        color: #17211e;
-        background: #f5f1e8;
-        font: 15px/1.55 -apple-system, system-ui, sans-serif;
-      }
-      .card {
-        box-sizing: border-box;
-        width: min(30rem, 100%);
-        padding: 2rem 1.75rem;
-        background: #fffef9;
-        border: 1px solid rgba(23, 33, 30, .14);
-        border-radius: .5rem;
-        box-shadow: 0 18px 50px rgba(31, 45, 39, .08);
-        text-align: center;
-      }
-      .mark {
-        display: grid;
-        place-items: center;
-        width: 44px;
-        height: 44px;
-        margin: 0 auto 1rem;
-        color: #174f45;
-        background: #dfece6;
-        border-radius: 50%;
-        font-size: 1.3rem;
-      }
-      h1 { margin: 0 0 .5rem; font-size: 1.15rem; }
-      p { margin: 0; color: #65706b; font-size: .87rem; }
-      p + p { margin-top: .65rem; }
-    </style>
-  </head>
-  <body>
-    <main class="card">
-      <p class="mark" id="signin-mark" aria-hidden="true">…</p>
-      <h1 id="signin-heading">Google sign-in</h1>
-      <p id="signin-status">Handing the one-time sign-in code to the ${PRODUCT_BRAND.displayName} dashboard tab…</p>
-      <p id="signin-hint" hidden></p>
-    </main>
-    <script>
-      (() => {
-        const mark = document.getElementById("signin-mark");
-        const heading = document.getElementById("signin-heading");
-        const status = document.getElementById("signin-status");
-        const hint = document.getElementById("signin-hint");
-        try {
-          const parameters = new URLSearchParams(window.location.search);
-          window.localStorage.setItem(
-            "${GOOGLE_OAUTH_RESULT_STORAGE_KEY}",
-            JSON.stringify({
-              code: parameters.get("code") ?? "",
-              state: parameters.get("state") ?? "",
-              receivedAt: new Date().toISOString(),
-            }),
-          );
-          window.localStorage.removeItem(
-            "${GOOGLE_OAUTH_RESULT_STORAGE_KEY}",
-          );
-          window.history.replaceState(null, "", "${GOOGLE_OAUTH_CALLBACK_PATH}");
-          mark.textContent = "✓";
-          heading.textContent = "You can close this tab";
-          status.textContent =
-            "Signed in — return to the ${PRODUCT_BRAND.displayName} dashboard tab.";
-          window.setTimeout(() => {
-            hint.textContent =
-              "This tab asked to close itself and your browser kept it open, which is normal. Closing it changes nothing: the dashboard already has the result.";
-            hint.hidden = false;
-          }, ${GOOGLE_OAUTH_CALLBACK_SELF_CLOSE_DELAY_MS});
-          window.close();
-        } catch {
-          mark.textContent = "!";
-          heading.textContent = "Sign-in was not handed over";
-          status.textContent =
-            "The sign-in result could not be handed to the dashboard tab. Return to the ${PRODUCT_BRAND.displayName} dashboard tab and start the sign-in again.";
-        }
-      })();
-    </script>
-  </body>
-</html>
-`);
 
 function jsonBody(value) {
   return Buffer.from(JSON.stringify(value));
@@ -2242,23 +2134,11 @@ function createPreparedLocalCompanionServer({
         return;
       }
       const path = url.pathname;
-      if (path === GOOGLE_OAUTH_CALLBACK_PATH) {
-        // The provider redirect legitimately carries ?code and ?state. This
-        // is the only route that accepts a query string, and the server never
-        // reads it: the inline page passes the values to the dashboard tab.
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        send(
-          response,
-          200,
-          GOOGLE_OAUTH_CALLBACK_HTML,
-          "text/html; charset=utf-8",
-          { report: true },
-        );
-        return;
-      }
+      // No route here accepts a query string. Hosted sign-in used to redirect
+      // back to a loopback callback on this companion, which was the one
+      // exception; both providers now redirect to the contribution service's
+      // own callback and the dashboard collects the result over the relay, so
+      // nothing on this origin ever receives a provider's ?code again.
       if (url.search !== "" || url.hash !== "") {
         sendError(response, 400, "invalid_request");
         return;

@@ -75,6 +75,13 @@ import {
   appleSignInConfiguration,
   exchangeAppleAuthorizationCode,
 } from "./identity-apple";
+import {
+  GOOGLE_SIGNIN_STATE_PATTERN,
+  exchangeGoogleAuthorizationCode,
+  googleAuthorizeUrl,
+  googleCodeChallenge,
+  googleSignInConfiguration,
+} from "./identity-google";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
 import {
   clearPendingQuarantineObject,
@@ -411,98 +418,33 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
-/**
- * Exchanges a Google authorization code (PKCE, loopback redirect from the
- * local companion) for an ID token, server-side so the browser never talks
- * to Google's token endpoint. Only the id_token is returned; access and
- * refresh tokens from the response are discarded in-request and no identity
- * state is persisted here — enrollment performs verification and linking.
- *
- * The OAuth client is a Desktop/installed client, so Google's token endpoint
- * requires client_secret in addition to the PKCE verifier. That is the whole
- * reason the exchange is server-side: the secret stays in the Worker, is sent
- * only to Google, and is never logged, returned, or named in an error. A
- * deployment missing it fails closed with the same configuration error as a
- * missing client id, which discloses nothing about which value is absent.
- */
-async function handleIdentityGoogleExchange(
-  request: Request,
-  env: Env,
-): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  assertSameOrigin(request);
-  assertAdmissionBindings(env);
-  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
-  const clientId = Reflect.get(env, "GOOGLE_OIDC_CLIENT_ID");
-  const clientSecret = Reflect.get(env, "GOOGLE_OIDC_CLIENT_SECRET");
-  if (typeof clientId !== "string" || clientId.length === 0
-      || typeof clientSecret !== "string" || clientSecret.length === 0) {
-    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
-  }
-  const body = await readBoundedJson(request);
-  const value = body.value;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const code = Reflect.get(value, "code");
-  const codeVerifier = Reflect.get(value, "codeVerifier");
-  const redirectUri = Reflect.get(value, "redirectUri");
-  const keys = Object.keys(value);
-  const loopbackRedirect = typeof redirectUri === "string"
-    && /^http:\/\/127\.0\.0\.1:\d{1,5}\/oauth\/google\/callback$/u.test(redirectUri);
-  if (keys.some((key) => !["code", "codeVerifier", "redirectUri"].includes(key))
-      || typeof code !== "string" || code.length === 0 || code.length > 2048
-      || typeof codeVerifier !== "string"
-      || !/^[A-Za-z0-9._~-]{43,128}$/u.test(codeVerifier)
-      || !loopbackRedirect) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: clientId,
-      client_secret: clientSecret,
-      code,
-      code_verifier: codeVerifier,
-      redirect_uri: redirectUri as string,
-    }),
-  });
-  if (!tokenResponse.ok) throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
-  let tokenBody: unknown;
-  try {
-    tokenBody = await tokenResponse.json();
-  } catch {
-    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
-  }
-  const idToken = Reflect.get(tokenBody as object, "id_token");
-  if (typeof idToken !== "string" || idToken.length === 0 || idToken.length > 16_384) {
-    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
-  }
-  return jsonResponse({
-    schemaVersion: "identity-google-exchange-v0.1",
-    provider: "google",
-    idToken,
-  });
-}
-
-const APPLE_SIGNIN_HANDOFF_TTL_MILLISECONDS = 5 * 60 * 1000;
+const SIGNIN_HANDOFF_TTL_MILLISECONDS = 5 * 60 * 1000;
 const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
+// Google returns its authorization code in the redirect's query string. The
+// code itself is bounded by the exchange, and this bounds the whole callback
+// URL so an oversized redirect is refused before anything is looked up.
+const MAX_GOOGLE_CALLBACK_URL_LENGTH = 8 * 1024;
+const SIGNIN_COMPLETED_MESSAGE = "Signed in — return to TiboTattle.";
+const SIGNIN_NOT_COMPLETED_MESSAGE =
+  "Sign-in was not completed. Return to TiboTattle and start the sign-in again.";
 
 /**
- * Apple rejects loopback redirect URIs, so the redirect target is this
- * Worker's own callback route, derived from the request origin rather than
- * from anything a caller supplies. It must be HTTPS: Apple will not register
- * or honor anything else, and the same absolute string has to be replayed on
- * the token exchange.
+ * Both hosted providers redirect to this Worker rather than to the page that
+ * started the sign-in, so the redirect target is derived from the request
+ * origin and never from anything a caller supplies. It must be HTTPS: Apple
+ * will not register or honor anything else, Google's Web application client
+ * type registers exactly this absolute string, and both replay it on the token
+ * exchange.
  */
-function appleCallbackUrl(request: Request): string {
+function signInCallbackUrl(
+  request: Request,
+  provider: "apple" | "google",
+): string {
   const url = new URL(request.url);
   if (url.protocol !== "https:") {
     throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
   }
-  return `${url.origin}/api/v1/identity/apple/callback`;
+  return `${url.origin}/api/v1/identity/${provider}/callback`;
 }
 
 async function deleteExpiredAppleHandoffs(
@@ -514,10 +456,22 @@ async function deleteExpiredAppleHandoffs(
   ).bind(nowIso).run();
 }
 
-function appleCallbackPage(message: string): Response {
+async function deleteExpiredGoogleHandoffs(
+  db: D1Database,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    "DELETE FROM google_signin_handoffs WHERE expires_at <= ?",
+  ).bind(nowIso).run();
+}
+
+function signInCallbackPage(message: string): Response {
   // Entirely inline and asset-free: no script, no style, no image, no link,
   // and no value from the request is interpolated. The authorization code,
   // the id_token, and Apple's optional user payload never reach this markup.
+  // The copy names no surface: the dashboard that started the sign-in may be
+  // a browser tab or the macOS app's own window, and it collects the result
+  // itself either way, so this page never asks anyone to carry anything back.
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -560,7 +514,7 @@ async function handleIdentityAppleStart(
   assertAdmissionBindings(env);
   await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
   const configuration = appleSignInConfiguration(env);
-  const redirectUri = appleCallbackUrl(request);
+  const redirectUri = signInCallbackUrl(request, "apple");
   const body = await readBoundedJson(request);
   const value = body.value;
   if (typeof value !== "object"
@@ -580,7 +534,7 @@ async function handleIdentityAppleStart(
   ).bind(
     state,
     nowIso,
-    new Date(nowMs + APPLE_SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+    new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
   ).run();
   return jsonResponse({
     schemaVersion: "identity-apple-start-v0.1",
@@ -603,13 +557,11 @@ async function handleIdentityAppleCallback(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const redirectUri = appleCallbackUrl(request);
+  const redirectUri = signInCallbackUrl(request, "apple");
   const form = await readBoundedForm(request, MAX_APPLE_CALLBACK_BYTES);
   const state = form.get("state");
   const code = form.get("code");
-  const failure = appleCallbackPage(
-    "Sign-in was not completed. Return to the TiboTattle tab and start the sign-in again.",
-  );
+  const failure = signInCallbackPage(SIGNIN_NOT_COMPLETED_MESSAGE);
   if (typeof state !== "string"
       || !APPLE_SIGNIN_STATE_PATTERN.test(state)
       || form.get("error") !== null
@@ -643,7 +595,7 @@ async function handleIdentityAppleCallback(
         AND expires_at > ?`,
   ).bind(idToken, state, new Date().toISOString()).run();
   if (stored.meta.changes !== 1) return failure;
-  return appleCallbackPage("Signed in — return to the TiboTattle tab.");
+  return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE);
 }
 
 /**
@@ -691,6 +643,177 @@ async function handleIdentityAppleResult(
   }
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM apple_signin_handoffs
+      WHERE state = ?
+        AND id_token IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).first<{ state: string }>();
+  if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
+  throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+}
+
+/**
+ * Starts a hosted Google sign-in, in the same shape as Apple's: the state row
+ * is the whole handoff. It is created empty here with its PKCE verifier,
+ * filled by Google's redirect, and read back exactly once by the page that
+ * started the flow. No participant, session, or provider identifier is
+ * involved at this point, and the verifier never leaves this service.
+ */
+async function handleIdentityGoogleStart(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(env.ENROLLMENT_RATE_LIMIT, "enrollment");
+  const configuration = googleSignInConfiguration(env);
+  const redirectUri = signInCallbackUrl(request, "google");
+  const body = await readBoundedJson(request);
+  const value = body.value;
+  if (typeof value !== "object"
+      || value === null
+      || Array.isArray(value)
+      || Object.keys(value).length !== 0) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  // 48 random bytes render as 64 base64url characters, which satisfies both
+  // the state pattern and RFC 7636's 43-128 character verifier range.
+  const state = randomSecret(48);
+  const codeVerifier = randomSecret(48);
+  await env.USAGE_MONITOR_DB.prepare(
+    `INSERT INTO google_signin_handoffs
+       (state, code_verifier, id_token, created_at, expires_at, consumed_at)
+       VALUES (?, ?, NULL, ?, ?, NULL)`,
+  ).bind(
+    state,
+    codeVerifier,
+    nowIso,
+    new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+  ).run();
+  return jsonResponse({
+    schemaVersion: "identity-google-start-v0.1",
+    state,
+    authorizeUrl: googleAuthorizeUrl(
+      configuration,
+      redirectUri,
+      state,
+      await googleCodeChallenge(codeVerifier),
+    ),
+  });
+}
+
+/**
+ * Google's redirect callback. Like Apple's, this request is cross-site by
+ * construction — it is a top-level navigation from accounts.google.com — so
+ * same-origin enforcement cannot apply. The unguessable state row is what
+ * authorizes it: a request whose state is unknown, already filled, already
+ * consumed, or expired is answered with a fixed page and nothing else happens,
+ * so an unsolicited callback can neither mint a token exchange nor overwrite a
+ * pending sign-in. The PKCE verifier is read from that same row, so a callback
+ * that did not come from a start this service issued has no verifier to spend.
+ */
+async function handleIdentityGoogleCallback(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  const redirectUri = signInCallbackUrl(request, "google");
+  const failure = signInCallbackPage(SIGNIN_NOT_COMPLETED_MESSAGE);
+  if (request.url.length > MAX_GOOGLE_CALLBACK_URL_LENGTH) return failure;
+  const parameters = new URL(request.url).searchParams;
+  const state = parameters.get("state");
+  const code = parameters.get("code");
+  if (typeof state !== "string"
+      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)
+      || parameters.get("error") !== null
+      || typeof code !== "string"
+      || code.length === 0) {
+    return failure;
+  }
+  const nowIso = new Date().toISOString();
+  const pending = await env.USAGE_MONITOR_DB.prepare(
+    `SELECT code_verifier AS codeVerifier FROM google_signin_handoffs
+      WHERE state = ?
+        AND id_token IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).first<{ codeVerifier: string }>();
+  if (!pending) return failure;
+  let idToken: string;
+  try {
+    idToken = await exchangeGoogleAuthorizationCode(
+      env,
+      code,
+      pending.codeVerifier,
+      redirectUri,
+    );
+  } catch {
+    return failure;
+  }
+  // Re-checked against the time the exchange finished, not the time it
+  // started, so a handoff that expired mid-exchange is never filled.
+  const stored = await env.USAGE_MONITOR_DB.prepare(
+    `UPDATE google_signin_handoffs
+        SET id_token = ?
+      WHERE state = ?
+        AND id_token IS NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?`,
+  ).bind(idToken, state, new Date().toISOString()).run();
+  if (stored.meta.changes !== 1) return failure;
+  return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE);
+}
+
+/**
+ * Reads the completed Google sign-in back exactly once, on the same terms as
+ * Apple's: the conditional UPDATE both claims and marks the row, so two
+ * concurrent reads cannot both win, and a replayed read after success is
+ * indistinguishable from an expired one.
+ *
+ * This route is deliberately not attempt-limited: the page polls it on a fixed
+ * short schedule while the user finishes at Google, and it discloses nothing
+ * to anyone who does not already hold the unguessable state.
+ */
+async function handleIdentityGoogleResult(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertSameOrigin(request);
+  const body = await readBoundedJson(request);
+  const value = body.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const state = Reflect.get(value, "state");
+  if (Object.keys(value).length !== 1
+      || typeof state !== "string"
+      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)) {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const nowIso = new Date().toISOString();
+  await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
+  const claimed = await env.USAGE_MONITOR_DB.prepare(
+    `UPDATE google_signin_handoffs
+        SET consumed_at = ?
+      WHERE state = ?
+        AND id_token IS NOT NULL
+        AND consumed_at IS NULL
+        AND expires_at > ?
+      RETURNING id_token AS idToken`,
+  ).bind(nowIso, state, nowIso).first<{ idToken: string }>();
+  if (claimed) {
+    return jsonResponse({
+      schemaVersion: "identity-google-result-v0.1",
+      idToken: claimed.idToken,
+    });
+  }
+  const pending = await env.USAGE_MONITOR_DB.prepare(
+    `SELECT state FROM google_signin_handoffs
       WHERE state = ?
         AND id_token IS NULL
         AND consumed_at IS NULL
@@ -1753,8 +1876,12 @@ async function routeApi(
       return handleAppleDomainAssociation(request, env);
     case "enroll":
       return handleEnroll(request, env);
-    case "identity_google_exchange":
-      return handleIdentityGoogleExchange(request, env);
+    case "identity_google_start":
+      return handleIdentityGoogleStart(request, env);
+    case "identity_google_callback":
+      return handleIdentityGoogleCallback(request, env);
+    case "identity_google_result":
+      return handleIdentityGoogleResult(request, env);
     case "identity_apple_start":
       return handleIdentityAppleStart(request, env);
     case "identity_apple_callback":

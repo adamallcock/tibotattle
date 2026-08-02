@@ -8,17 +8,14 @@ import {
 } from "./data-client.js";
 import {
   DIAGNOSTIC_REFERENCE_PATTERN,
-  GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   contributionBatchAdmission,
   createDiagnosticReference,
-  createGoogleSignInRequest,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   createTelemetryEnvelope,
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
-  parseGoogleSignInResult,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
@@ -89,10 +86,10 @@ let communityConnectBusy = false;
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
 let hostedIdentityBusy = false;
-let pendingGoogleSignIn = null;
-// Only the contribution service knows whether hosted Apple sign-in is
-// configured, so this stays false until a start attempt says otherwise.
+// Only the contribution service knows whether each hosted provider is
+// configured, so these stay false until a start attempt says otherwise.
 let appleSignInUnavailable = false;
+let googleSignInUnavailable = false;
 let activeContributionLookbackHours = 24;
 let localActionBusy = false;
 let localRefreshInProgress = false;
@@ -113,6 +110,12 @@ if (SEMANTIC_OPEN_TARGET) {
   installedAppLink.setAttribute("aria-disabled", "true");
 }
 
+// The release-slot marker for "this build is paired with a hosted contribution
+// service". It is read as a build signal only: the client id itself no longer
+// travels anywhere from this page, because the service now builds the
+// authorization request. It stays here because it is the one fact a build
+// carries about whether hosted participation — and therefore mandatory
+// sign-in — applies at all.
 function configuredGoogleClientId() {
   const value = document
     .querySelector('meta[name="usage-monitor-google-client-id"]')
@@ -698,26 +701,43 @@ function renderCalibrationRate({ capacity, lower, upper }) {
 // ---------------------------------------------------------------------------
 
 const SHARE_CARD_WIDTH = 1200;
-const SHARE_CARD_HEIGHT = 675;
+// 3:2. Three figures, the history behind them, every qualification that
+// applies and the identifier line do not fit in 16:9 at a size a feed can
+// still resolve, and shrinking the type was the wrong lever: the smallest
+// copy is already the first thing to break when a timeline scales the image.
+const SHARE_CARD_HEIGHT = 800;
 // Drawn at twice the posted size so the text stays clean after a feed
 // resamples it, and legible once a timeline scales it down.
 const SHARE_CARD_PIXEL_SCALE = 2;
 const SHARE_CARD_MAX_CAVEATS = 5;
 const SHARE_CARD_MAX_CAVEAT_LINES = 7;
+// One type size for all three figures, reduced until the longest of them fits
+// its column. A figure is never cut off: "Not estimable" and a seven-figure
+// total both overrun the column at the full size, and an ellipsis in the
+// largest type on the card is unreadable and easy to misread.
+const SHARE_CARD_VALUE_SIZE = 54;
+const SHARE_CARD_VALUE_MIN_SIZE = 34;
+// The plotted history. Fewer than three fits is a scatter, not a history, and
+// beyond two dozen the points crowd at the width a feed shows.
+const SHARE_CARD_TREND_MIN_POINTS = 3;
+const SHARE_CARD_TREND_MAX_POINTS = 26;
+const SHARE_CARD_TREND_MIN_HEIGHT = 88;
+const SHARE_CARD_TREND_MAX_HEIGHT = 210;
 // Identifier-shaped only, exactly as a diagnostic code is: no space, no
 // slash, no separator that could carry a path or a folder name.
 const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
 const SHARE_CARD_APP_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
 const SHARE_CARD_HOME_PATTERN =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/u;
-// The exact period names this product emits. An unrecognized one is replaced
-// rather than printed, so a renamed or injected label can never reach a post.
-const SHARE_CARD_PERIOD_LABELS = new Set([
-  "All retained evidence",
-  "Last 24 hours",
-  "Last 30 days",
-  "Last 7 days",
-  "Recorded period",
+// The exact period names this product emits, each paired with the phrase the
+// card prints mid-sentence. An unrecognized one is replaced rather than
+// printed, so a renamed or injected label can never reach a post.
+const SHARE_CARD_PERIOD_PHRASES = new Map([
+  ["All retained evidence", "all retained evidence"],
+  ["Last 24 hours", "the last 24 hours"],
+  ["Last 30 days", "the last 30 days"],
+  ["Last 7 days", "the last 7 days"],
+  ["Recorded period", "the recorded period"],
 ]);
 // Fixed window names, keyed on the observed window duration rather than on the
 // companion's own label field.
@@ -801,9 +821,72 @@ function shareCardWindow(windows) {
 }
 
 function shareCardPeriodLabel(candidate) {
-  return SHARE_CARD_PERIOD_LABELS.has(candidate)
-    ? candidate
-    : SHARE_CARD_UNKNOWN_PERIOD;
+  return SHARE_CARD_PERIOD_PHRASES.get(candidate) ?? SHARE_CARD_UNKNOWN_PERIOD;
+}
+
+/**
+ * How far back the plotted history runs, stated as a duration.
+ *
+ * Computed from a count of days, never from a date: a card carries when the
+ * evidence spans, not when its owner was at the keyboard.
+ */
+function shareCardSpanLabel(days) {
+  if (days >= 14) return `${Math.round(days / 7)} weeks earlier`;
+  if (days >= 2) return `${days} days earlier`;
+  return "earliest fit";
+}
+
+/**
+ * The history the card plots: one point per qualifying reset-series fit, each
+ * with the within-reset sensitivity bar the weekly panel draws.
+ *
+ * Only fits observed across more than the fixed default span threshold are
+ * plotted — the evidence that panel leads with — and the threshold is read
+ * from the constant rather than from the on-screen control, so a posted card
+ * never depends on where a reader happened to leave a slider. Timestamps are
+ * read as numbers, to place a point and to say how long the history runs; no
+ * date is printed.
+ */
+function shareCardTrend(rows) {
+  const points = (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      at: Date.parse(row?.last_observed_at ?? row?.first_observed_at ?? ""),
+      value: finite(row?.value_usd ?? row?.value),
+      low: finite(row?.pairwise_p10_usd),
+      high: finite(row?.pairwise_p90_usd),
+      spanPp: finite(row?.displayed_span_pp),
+    }))
+    .filter((point) =>
+      Number.isFinite(point.at)
+      && point.value !== null
+      && point.value > 0
+      && point.spanPp !== null
+      && point.spanPp > DEFAULT_WEEKLY_SPAN_THRESHOLD_PP)
+    .sort((left, right) => left.at - right.at)
+    .slice(-SHARE_CARD_TREND_MAX_POINTS)
+    .map((point) => Object.freeze({
+      at: point.at,
+      value: point.value,
+      // A sensitivity bound that is missing or the wrong side of the fit
+      // collapses onto the fit rather than drawing a bar it cannot support.
+      low: point.low !== null && point.low > 0 && point.low < point.value
+        ? point.low
+        : point.value,
+      high: point.high !== null && point.high > point.value
+        ? point.high
+        : point.value,
+    }));
+  if (points.length < SHARE_CARD_TREND_MIN_POINTS) return null;
+  const days = Math.round(
+    (points[points.length - 1].at - points[0].at) / 86_400_000,
+  );
+  return Object.freeze({
+    points: Object.freeze(points),
+    low: Math.min(...points.map((point) => point.low)),
+    high: Math.max(...points.map((point) => point.high)),
+    count: points.length,
+    span: shareCardSpanLabel(days),
+  });
 }
 
 /**
@@ -923,8 +1006,20 @@ function buildShareCard(data, {
     reference,
     isDemo,
     title: "Where my Codex allowance stands",
-    subtitle: "Measured on my own Mac. Nothing left it.",
+    // The strongest claim on the card is the one a fixture must not borrow.
+    // A demo card says so in the line under the title and in a mark beside the
+    // wordmark, not only in the smallest copy on the image, because a reader
+    // scrolling a timeline reads the title and the figures and nothing else.
+    subtitle: isDemo
+      ? "Illustrative demo data. Not a measurement."
+      : "Measured on my own Mac. Nothing left it.",
+    badge: isDemo ? "DEMO DATA" : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
+    trend: shareCardTrend(data?.weekly?.weeklyValues),
+    trendLabel: "Seven-day fits, each with its own sensitivity bar",
+    trendEmpty: "Not enough qualifying resets yet to plot a history.",
+    trendEmptyDetail:
+      "Each reset observed across most of the allowance adds one fit, with the sensitivity bar that fit carries.",
     caveats: Object.freeze(caveats),
     identifierLine: identifiers.join(" · "),
     contractVersion,
@@ -945,10 +1040,21 @@ function shareCardText(card) {
   return [
     `TiboTattle — ${card.title}. ${card.subtitle}`,
     figures,
+    shareCardTrendText(card),
     card.caveats.join(" "),
     `${trailer}.`,
     card.home === "" ? "" : `More at ${card.home}`,
   ].filter((line) => line !== "").join("\n");
+}
+
+/**
+ * The plotted history as a sentence. The picture may not say anything the
+ * text beside it does not.
+ */
+function shareCardTrendText(card) {
+  return card.trend === null
+    ? `${card.trendLabel}: ${card.trendEmpty} ${card.trendEmptyDetail}`
+    : `${card.trendLabel}: ${card.trend.count} fits from ${card.trend.span} to the latest, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every sensitivity bar.`;
 }
 
 function shareCardFont(weight, size, family = "sans") {
@@ -1019,6 +1125,137 @@ function drawShareCardPanel(context, x, y, width, height) {
 }
 
 /**
+ * The one type size every figure on the card is drawn at.
+ *
+ * The row reads as a single scale, and the size is chosen so the longest
+ * figure fits its column whole: a seven-figure total and a spelled-out "Not
+ * estimable" both overrun the column at the full size, and a figure cut off
+ * mid-word in the largest type on the card is unreadable at a glance and easy
+ * to misread as a smaller number.
+ */
+function shareCardValueSize(context, values, maxWidth) {
+  let size = SHARE_CARD_VALUE_SIZE;
+  while (size > SHARE_CARD_VALUE_MIN_SIZE) {
+    context.font = shareCardFont(500, size, "serif");
+    if (values.every((value) => context.measureText(value).width <= maxWidth)) {
+      break;
+    }
+    size -= 1;
+  }
+  return size;
+}
+
+/**
+ * Draw a demo card's mark: the one qualification a reader must not miss, at
+ * the top of the card rather than in the caveats.
+ */
+function drawShareCardBadge(context, badge, x, y) {
+  context.save();
+  context.font = shareCardFont(750, 15);
+  const width = context.measureText(badge).width + 26;
+  context.fillStyle = "#8c2f1d";
+  context.beginPath();
+  context.roundRect(x, y - 17, width, 26, 13);
+  context.fill();
+  context.fillStyle = "#fdf6f2";
+  context.fillText(badge, x + 13, y);
+  context.restore();
+  return width;
+}
+
+/**
+ * Plot the reset-series fits and their sensitivity bars.
+ *
+ * Independent estimates, so they are drawn as points and never joined into a
+ * line the model does not claim. Only numbers reach the canvas here: each
+ * point's position comes from a parsed timestamp and a dollar figure, and the
+ * axis is labelled with formatted money and a fixed duration phrase.
+ */
+function drawShareCardTrend(context, card, x, y, width, height) {
+  drawShareCardPanel(context, x, y, width, height);
+  context.save();
+  if (card.trend === null) {
+    // Two lines rather than one: an empty plot area should say what will fill
+    // it, not read as a panel that failed to draw.
+    context.textAlign = "center";
+    context.fillStyle = "#17211e";
+    context.font = shareCardFont(600, 19);
+    context.fillText(card.trendEmpty, x + width / 2, y + height / 2 - 4);
+    context.fillStyle = "#65706b";
+    context.font = shareCardFont(500, 17);
+    context.fillText(card.trendEmptyDetail, x + width / 2, y + height / 2 + 24);
+    context.restore();
+    return;
+  }
+  const { points, low, high } = card.trend;
+  const padTop = 20;
+  const padBottom = 30;
+  const padLeft = 22;
+  // The value axis is labelled inside the panel on the right, so the plot
+  // keeps the full width at the left where the earliest fits sit.
+  context.font = shareCardFont(600, 14);
+  const axisWidth = Math.max(
+    context.measureText(formatMoney(high, 0)).width,
+    context.measureText(formatMoney(low, 0)).width,
+  ) + 18;
+  const plotLeft = x + padLeft;
+  const plotRight = x + width - axisWidth - 12;
+  const plotTop = y + padTop;
+  const plotBottom = y + height - padBottom;
+  const span = points[points.length - 1].at - points[0].at;
+  const range = high - low;
+  const positionX = (point) => points.length === 1 || span <= 0
+    ? (plotLeft + plotRight) / 2
+    : plotLeft + (point.at - points[0].at) / span * (plotRight - plotLeft);
+  const positionY = (value) => range <= 0
+    ? (plotTop + plotBottom) / 2
+    : plotBottom - (value - low) / range * (plotBottom - plotTop);
+
+  context.strokeStyle = "rgba(23, 33, 30, .12)";
+  context.lineWidth = 1;
+  for (const value of [low, high]) {
+    const gridY = Math.round(positionY(value)) + .5;
+    context.beginPath();
+    context.moveTo(plotLeft - 6, gridY);
+    context.lineTo(plotRight + 6, gridY);
+    context.stroke();
+  }
+
+  for (const point of points) {
+    const pointX = Math.round(positionX(point)) + .5;
+    context.strokeStyle = "rgba(23, 79, 69, .38)";
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(pointX, positionY(point.high));
+    context.lineTo(pointX, positionY(point.low));
+    context.stroke();
+    context.lineWidth = 1.5;
+    for (const bound of [point.high, point.low]) {
+      const capY = Math.round(positionY(bound)) + .5;
+      context.beginPath();
+      context.moveTo(pointX - 4, capY);
+      context.lineTo(pointX + 4, capY);
+      context.stroke();
+    }
+    context.fillStyle = "#174f45";
+    context.beginPath();
+    context.arc(pointX, positionY(point.value), 4.5, 0, Math.PI * 2);
+    context.fill();
+  }
+
+  context.fillStyle = "#65706b";
+  context.font = shareCardFont(600, 14);
+  context.textAlign = "right";
+  context.fillText(formatMoney(high, 0), x + width - 14, positionY(high) + 5);
+  context.fillText(formatMoney(low, 0), x + width - 14, positionY(low) + 5);
+  context.textAlign = "left";
+  context.fillText(card.trend.span, plotLeft - 6, y + height - 11);
+  context.textAlign = "right";
+  context.fillText("latest", plotRight + 6, y + height - 11);
+  context.restore();
+}
+
+/**
  * Paint the card. Every string drawn here comes from the composed model.
  */
 function drawShareCard(canvas, card) {
@@ -1045,6 +1282,14 @@ function drawShareCard(canvas, card) {
   context.fillStyle = "#17211e";
   context.font = shareCardFont(800, 25);
   context.fillText("TiboTattle", margin + 52, 77);
+  if (card.badge !== "") {
+    drawShareCardBadge(
+      context,
+      card.badge,
+      margin + 68 + context.measureText("TiboTattle").width,
+      75,
+    );
+  }
 
   context.textAlign = "right";
   context.font = shareCardFont(700, 20);
@@ -1065,11 +1310,16 @@ function drawShareCard(canvas, card) {
   const columnWidth = (inner - gap * 2) / 3;
   const statTop = 222;
   const statHeight = 178;
+  const padding = 20;
+  const textWidth = columnWidth - padding * 2;
+  const valueSize = shareCardValueSize(
+    context,
+    card.stats.map((stat) => stat.value),
+    textWidth,
+  );
   card.stats.forEach((stat, index) => {
     const x = margin + index * (columnWidth + gap);
     drawShareCardPanel(context, x, statTop, columnWidth, statHeight);
-    const padding = 20;
-    const textWidth = columnWidth - padding * 2;
     context.fillStyle = "#65706b";
     context.font = shareCardFont(750, 15);
     const labelLines = shareCardWrap(
@@ -1079,7 +1329,7 @@ function drawShareCard(canvas, card) {
       context.fillText(line, x + padding, statTop + 34 + lineIndex * 19);
     });
     context.fillStyle = "#174f45";
-    context.font = shareCardFont(500, 54, "serif");
+    context.font = shareCardFont(500, valueSize, "serif");
     context.fillText(
       shareCardFit(context, stat.value, textWidth),
       x + padding,
@@ -1094,17 +1344,38 @@ function drawShareCard(canvas, card) {
 
   // The qualifications are laid out from the bottom up, so a card with one
   // caveat and a card with several both sit against the same rule instead of
-  // leaving the strongest qualification stranded in white space.
+  // leaving the strongest qualification stranded in white space. The history
+  // above them then takes exactly the space they leave, so the card is never
+  // hollow in the middle and never crowds a qualification out.
   context.font = shareCardFont(500, 17);
   const caveatLines = card.caveats
     .slice(0, SHARE_CARD_MAX_CAVEATS)
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  let caveatY = Math.max(
-    438,
-    566 - (caveatLines.length - 1) * caveatStep,
+  const ruleY = SHARE_CARD_HEIGHT - 82.5;
+  const caveatTop = ruleY - 22 - (caveatLines.length - 1) * caveatStep;
+  const trendTop = statTop + statHeight + 44;
+  const trendHeight = Math.min(
+    SHARE_CARD_TREND_MAX_HEIGHT,
+    Math.max(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop),
   );
+  context.fillStyle = "#65706b";
+  context.font = shareCardFont(750, 15);
+  context.fillText(card.trendLabel.toUpperCase(), margin, trendTop - 14);
+  if (card.trend !== null) {
+    context.textAlign = "right";
+    context.fillText(
+      `${card.trend.count} qualifying resets`,
+      SHARE_CARD_WIDTH - margin,
+      trendTop - 14,
+    );
+    context.textAlign = "left";
+  }
+  drawShareCardTrend(context, card, margin, trendTop, inner, trendHeight);
+
+  context.font = shareCardFont(500, 17);
+  let caveatY = caveatTop;
   context.fillStyle = "rgba(23, 79, 69, .3)";
   context.fillRect(
     margin,
@@ -1121,8 +1392,8 @@ function drawShareCard(canvas, card) {
   context.strokeStyle = "rgba(23, 33, 30, .16)";
   context.lineWidth = 1;
   context.beginPath();
-  context.moveTo(margin, 592.5);
-  context.lineTo(SHARE_CARD_WIDTH - margin, 592.5);
+  context.moveTo(margin, ruleY);
+  context.lineTo(SHARE_CARD_WIDTH - margin, ruleY);
   context.stroke();
 
   context.fillStyle = "#17211e";
@@ -1130,7 +1401,7 @@ function drawShareCard(canvas, card) {
   context.fillText(
     shareCardFit(context, card.identifierLine, inner),
     margin,
-    621,
+    ruleY + 28.5,
   );
   context.fillStyle = "#65706b";
   context.font = shareCardFont(500, 16);
@@ -1141,7 +1412,7 @@ function drawShareCard(canvas, card) {
       inner,
     ),
     margin,
-    645,
+    ruleY + 52.5,
   );
   return true;
 }
@@ -1174,6 +1445,7 @@ function renderShareCardReadout(card) {
   const readout = $("#share-card-readout");
   const rows = [
     ...card.stats.map((stat) => [stat.label, `${stat.value} — ${stat.detail}`, true]),
+    ["Plotted history", shareCardTrendText(card), false],
     ["How to read it", card.caveats.join(" "), false],
     ["Traceable reference", card.reference, false],
     [
@@ -1213,6 +1485,8 @@ function renderShareCard(data) {
     finite(data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd, 0),
     finite(data?.gradient?.summary?.capacity_usd
       ?? data?.gradient?.summary?.capacityUsd),
+    // The plotted history is on the image too, so a new fit is a new card.
+    shareCardTrend(data?.weekly?.weeklyValues)?.points ?? null,
   ]);
   if (signature !== shareCardSignature || shareCardReference === "") {
     shareCardSignature = signature;
@@ -4097,21 +4371,22 @@ function renderHostedIdentity() {
   const chip = $("#identity-signin-state");
   const googleUnavailable = $("#identity-google-unavailable");
   const appleUnavailable = $("#identity-apple-unavailable");
-  // Both providers complete through the contribution service: Google needs it
-  // to exchange its authorization code, Apple needs it to start and claim the
-  // hosted flow. A build with no service configured therefore cannot sign in
-  // at all, so the controls say so instead of failing after the click.
+  // Both providers complete through the contribution service: it owns the
+  // redirect target, the client secret, and the one-time result each sign-in
+  // is read back from. A build with no service configured therefore cannot
+  // sign in at all, so the controls say so instead of failing after the click.
   const serviceConfigured =
     localCompanionHealth?.capabilities?.contributionDevicePairing === true;
-  const googleConfigured = configuredGoogleClientId() !== null
-    && serviceConfigured;
   const signedIn = hostedIdentity !== null;
   const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider]
     ?? HOSTED_IDENTITY_PROVIDERS.google;
+  const googleUnavailableNow = googleSignInUnavailable
+    || configuredGoogleClientId() === null
+    || !serviceConfigured;
   googleButton.disabled = hostedIdentityBusy
     || signedIn
-    || !googleConfigured;
-  googleUnavailable.hidden = googleConfigured || signedIn;
+    || googleUnavailableNow;
+  googleUnavailable.hidden = !googleUnavailableNow || signedIn;
   googleUnavailable.textContent = serviceConfigured
     ? "Hosted sign-in is not configured for this build."
     : "This build has no contribution service, so hosted sign-in is unavailable.";
@@ -4147,7 +4422,6 @@ function renderHostedIdentity() {
 function signOutHostedIdentity() {
   if (hostedIdentityBusy || hostedIdentity === null) return;
   hostedIdentity = null;
-  pendingGoogleSignIn = null;
   setCommunitySession(null);
   $("#participant-controls").hidden = true;
   const status = $("#identity-signin-status");
@@ -4158,118 +4432,94 @@ function signOutHostedIdentity() {
   renderHostedIdentity();
 }
 
-async function beginGoogleSignIn() {
-  if (hostedIdentityBusy || hostedIdentity !== null) return;
-  const clientId = configuredGoogleClientId();
-  if (clientId === null) return;
-  const status = $("#identity-signin-status");
-  hostedIdentityBusy = true;
-  renderHostedIdentity();
-  status.hidden = false;
-  status.className = "participant-action-status";
-  try {
-    const request = await createGoogleSignInRequest({
-      clientId,
-      redirectUri: `${window.location.origin}/oauth/google/callback`
-    });
-    pendingGoogleSignIn = request;
-    // `window.open` always resolves to null when "noopener" is requested, so
-    // its result cannot report whether the tab opened. Keep the isolation and
-    // tell the user what to do if no tab appears instead.
-    window.open(request.url, "_blank", "noopener,noreferrer");
-    status.textContent =
-      "Finish signing in with Google in the new tab, then return here. If no tab opened, allow pop-ups for this local dashboard and try again. Only the openid scope is requested; no email or name is asked for.";
-  } catch (error) {
-    showFailure(status, {
-      surface: "hosted_identity",
-      error,
-      fallback: error instanceof Error && error.status === undefined
-        ? error.message
-        : "Google sign-in could not be started."
-    });
-  } finally {
-    hostedIdentityBusy = false;
-    renderHostedIdentity();
+// The service holds a completed sign-in for five minutes, so the poll stops
+// exactly when the handoff can no longer be delivered rather than earlier: the
+// user is authenticating in a separate browser window and may be typing a
+// password and a second factor.
+const HOSTED_SIGNIN_POLL_ATTEMPTS = 150;
+const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
+
+// One shape for both providers. Neither can complete inside this page: Apple
+// provisions Sign in with Apple only for distributions this Developer ID build
+// cannot use, refuses loopback redirects, and answers with
+// response_mode=form_post; Google's Web application client requires its client
+// secret on the token exchange. In both cases the contribution service owns
+// the redirect and the secret, this page opens the authorize URL it is given,
+// and the sign-in is read back here through the unguessable state.
+//
+// That is also what lets the dashboard complete a sign-in while it is running
+// inside the macOS app, whose web view will not load a provider host: the
+// browser that finishes the sign-in hands nothing back to this page, and this
+// page asks the service for the result instead.
+const HOSTED_SIGNIN_FLOWS = {
+  google: {
+    label: "Google",
+    start: () => communityClient.identityGoogleStart(),
+    result: (state) => communityClient.identityGoogleResult(state),
+    waiting:
+      "Finish signing in with Google in your browser, then come back here — this page collects the result itself and no tab needs to stay open. Only a stable account identifier is requested; no email or name is asked for. If no window opened, allow pop-ups and try again.",
+    signedIn:
+      "Signed in with Google. The sign-in token stays in this page's memory; the service keeps only an irreversible hash, never your email or name.",
+    timedOut:
+      "Google sign-in did not finish in time. Nothing was stored. Press Sign in with Google again to start a fresh sign-in.",
+    unconfigured: "Hosted Google sign-in is not configured for this build.",
+    failed: "Google sign-in could not be completed. Sign in again.",
+    markUnavailable: () => {
+      googleSignInUnavailable = true;
+    },
+  },
+  apple: {
+    label: "Apple",
+    start: () => communityClient.identityAppleStart(),
+    result: (state) => communityClient.identityAppleResult(state),
+    waiting:
+      "Finish signing in with Apple in your browser, then come back here — this page collects the result itself and no tab needs to stay open. No name or email is requested. If no window opened, allow pop-ups and try again.",
+    signedIn:
+      "Signed in with Apple. The sign-in token stays in this page's memory; the service keeps only an irreversible hash, never your email or name.",
+    timedOut:
+      "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in.",
+    unconfigured: "Hosted Apple sign-in is not configured for this build.",
+    failed: "Apple sign-in could not be completed. Sign in again.",
+    markUnavailable: () => {
+      appleSignInUnavailable = true;
+    },
+  },
+};
+
+async function beginHostedSignIn(providerId) {
+  const flow = HOSTED_SIGNIN_FLOWS[providerId];
+  if (flow === undefined || hostedIdentityBusy || hostedIdentity !== null) {
+    return;
   }
-}
-
-async function completeGoogleSignIn(serialized) {
-  const pending = pendingGoogleSignIn;
-  if (pending === null || hostedIdentityBusy || hostedIdentity !== null) return;
   const status = $("#identity-signin-status");
   hostedIdentityBusy = true;
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = "Completing Google sign-in…";
+  status.textContent = `Starting ${flow.label} sign-in…`;
   try {
-    const result = parseGoogleSignInResult(serialized, {
-      expectedState: pending.state
-    });
-    hostedIdentity = await communityClient.identityGoogleExchange({
-      code: result.code,
-      codeVerifier: pending.codeVerifier,
-      redirectUri: pending.redirectUri
-    });
-    pendingGoogleSignIn = null;
-    status.textContent =
-      "Signed in with Google. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
-  } catch (error) {
-    showFailure(status, {
-      surface: "hosted_identity",
-      error,
-      fallback: hostedIdentityErrorCopy(error)
-        ?? (error instanceof Error && error.status === undefined
-          ? error.message
-          : "Google sign-in could not be completed. Sign in again.")
-    });
-  } finally {
-    hostedIdentityBusy = false;
-    renderHostedIdentity();
-  }
-}
-
-const APPLE_SIGNIN_POLL_ATTEMPTS = 30;
-const APPLE_SIGNIN_POLL_INTERVAL_MS = 2_000;
-
-// Hosted Sign in with Apple. The native path is impossible: Apple provisions
-// the Sign in with Apple entitlement only for Ad hoc, App Store Connect, and
-// Development distribution, so a Developer ID build carrying it is terminated
-// at launch. Apple also rejects loopback redirects and answers with
-// response_mode=form_post, so the contribution service owns the redirect and
-// the client secret; this page opens the authorize URL and then polls for the
-// one-time result keyed by the unguessable state it was given.
-async function beginAppleSignIn() {
-  if (hostedIdentityBusy || hostedIdentity !== null) return;
-  const status = $("#identity-signin-status");
-  hostedIdentityBusy = true;
-  renderHostedIdentity();
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Starting Apple sign-in…";
-  try {
-    const request = await communityClient.identityAppleStart();
-    // Opened with noopener so the Apple tab gets no handle on this one. That
-    // makes the return value null by specification, so it is not a usable
+    const request = await flow.start();
+    // Opened with noopener so the provider window gets no handle on this one.
+    // That makes the return value null by specification, so it is not a usable
     // signal for a blocked pop-up; the waiting copy says so instead, and an
-    // unopened tab simply runs out the bounded poll below.
+    // unopened window simply runs out the bounded poll below. Inside the macOS
+    // app this is the point the request leaves for the user's own browser: the
+    // app's web view refuses every remote origin and hands it over.
     window.open(request.authorizeUrl, "_blank", "noopener,noreferrer");
-    status.textContent =
-      "Finish signing in with Apple in the new tab, then return here. No name or email is requested. If no tab opened, allow pop-ups for this dashboard and try again.";
-    for (let attempt = 0; attempt < APPLE_SIGNIN_POLL_ATTEMPTS; attempt += 1) {
+    status.textContent = flow.waiting;
+    for (let attempt = 0; attempt < HOSTED_SIGNIN_POLL_ATTEMPTS; attempt += 1) {
       await new Promise((resolveWait) => {
-        window.setTimeout(resolveWait, APPLE_SIGNIN_POLL_INTERVAL_MS);
+        window.setTimeout(resolveWait, HOSTED_SIGNIN_POLL_INTERVAL_MS);
       });
       let identity = null;
       try {
-        identity = await communityClient.identityAppleResult(request.state);
+        identity = await flow.result(request.state);
       } catch (error) {
         if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
       }
       if (identity !== null) {
         hostedIdentity = identity;
-        status.textContent =
-          "Signed in with Apple. The sign-in token stays in this tab's memory; the service keeps only an irreversible hash, never your email or name.";
+        status.textContent = flow.signedIn;
         return;
       }
     }
@@ -4278,25 +4528,21 @@ async function beginAppleSignIn() {
     showFailure(status, {
       surface: "hosted_identity",
       error: null,
-      fallback:
-        "Apple sign-in did not finish in time. Nothing was stored. Press Sign in with Apple again to start a fresh sign-in."
+      fallback: flow.timedOut,
     });
   } catch (error) {
     const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
-    if (unconfigured) appleSignInUnavailable = true;
+    if (unconfigured) flow.markUnavailable();
     showFailure(status, {
       surface: "hosted_identity",
       error,
       messages: unconfigured
-        ? {
-          IDENTITY_CONFIGURATION_INVALID:
-            "Hosted Apple sign-in is not configured for this build."
-        }
+        ? { IDENTITY_CONFIGURATION_INVALID: flow.unconfigured }
         : {},
       fallback: hostedIdentityErrorCopy(error)
         ?? (error instanceof Error && error.status === undefined
           ? error.message
-          : "Apple sign-in could not be completed. Sign in again.")
+          : flow.failed),
     });
   } finally {
     hostedIdentityBusy = false;
@@ -5903,21 +6149,12 @@ $("#contribution-lookback-controls").addEventListener("click", (event) => {
   renderContributionPreparationEstimate();
 });
 $("#identity-google-signin").addEventListener("click", () => {
-  void beginGoogleSignIn();
+  void beginHostedSignIn("google");
 });
 $("#identity-apple-signin").addEventListener("click", () => {
-  void beginAppleSignIn();
+  void beginHostedSignIn("apple");
 });
 $("#identity-signout").addEventListener("click", signOutHostedIdentity);
-// The loopback callback page writes exactly one fixed key; a storage event
-// from the same origin is the only completion signal this tab listens for.
-window.addEventListener("storage", (event) => {
-  if (event.key === GOOGLE_OAUTH_RESULT_STORAGE_KEY
-      && typeof event.newValue === "string"
-      && event.newValue.length > 0) {
-    void completeGoogleSignIn(event.newValue);
-  }
-});
 $("#community-connect-consent").addEventListener(
   "change",
   updateCommunityConnectButton

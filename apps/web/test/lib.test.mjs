@@ -9,7 +9,6 @@ import {
 import {
   DIAGNOSTIC_REFERENCE_PATTERN,
   DIAGNOSTIC_SURFACES,
-  GOOGLE_OAUTH_RESULT_STORAGE_KEY,
   buildSyntheticFixture,
   bytesToBase64Url,
   contributionBatchAdmission,
@@ -18,12 +17,10 @@ import {
   diagnosticReferenceSentence,
   diagnosticSurface,
   serviceRequestId,
-  createGoogleSignInRequest,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
-  parseGoogleSignInResult,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
   runReviewedContributionGate,
@@ -1931,127 +1928,184 @@ test("community enrollment can atomically request one upload-only device pairing
   });
 });
 
-test("Google sign-in request uses PKCE S256 with the openid scope only", async () => {
-  const first = await createGoogleSignInRequest({
-    clientId: "test-client.apps.googleusercontent.com",
-    redirectUri: "http://127.0.0.1:8787/oauth/google/callback",
-    cryptoImpl: webcrypto
-  });
-  const url = new URL(first.url);
-  assert.equal(url.origin, "https://accounts.google.com");
-  assert.equal(url.pathname, "/o/oauth2/v2/auth");
-  assert.equal(
-    url.searchParams.get("client_id"),
-    "test-client.apps.googleusercontent.com"
-  );
-  assert.equal(
-    url.searchParams.get("redirect_uri"),
-    "http://127.0.0.1:8787/oauth/google/callback"
-  );
-  assert.equal(url.searchParams.get("response_type"), "code");
-  assert.equal(url.searchParams.get("scope"), "openid");
-  assert.equal(url.searchParams.get("code_challenge_method"), "S256");
-  assert.equal(url.searchParams.get("state"), first.state);
-  assert.match(first.codeVerifier, /^[A-Za-z0-9._~-]{43,128}$/u);
-  assert.match(first.state, /^[A-Za-z0-9_-]{43}$/u);
-  const digest = await webcrypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(first.codeVerifier)
-  );
-  assert.equal(
-    url.searchParams.get("code_challenge"),
-    bytesToBase64Url(new Uint8Array(digest))
-  );
-  const second = await createGoogleSignInRequest({
-    clientId: "test-client.apps.googleusercontent.com",
-    redirectUri: "http://127.0.0.1:8787/oauth/google/callback",
-    cryptoImpl: webcrypto
-  });
-  assert.notEqual(second.state, first.state);
-  assert.notEqual(second.codeVerifier, first.codeVerifier);
-  await assert.rejects(
-    createGoogleSignInRequest({
-      clientId: "",
-      redirectUri: "http://127.0.0.1:8787/oauth/google/callback",
-      cryptoImpl: webcrypto
-    }),
-    TypeError
-  );
-  await assert.rejects(
-    createGoogleSignInRequest({
-      clientId: "test-client.apps.googleusercontent.com",
-      redirectUri: "https://attacker.example/steal",
-      cryptoImpl: webcrypto
-    }),
-    TypeError
-  );
-});
-
-test("Google sign-in callback results fail closed before any exchange", () => {
-  assert.equal(
-    GOOGLE_OAUTH_RESULT_STORAGE_KEY,
-    "tibotattle-google-oauth-result"
-  );
-  const nowMs = Date.parse("2026-07-31T12:00:00.000Z");
-  const valid = JSON.stringify({
-    code: "one-time-code",
-    state: "expected-state",
-    receivedAt: "2026-07-31T11:59:30.000Z"
-  });
-  assert.deepEqual(
-    parseGoogleSignInResult(valid, { expectedState: "expected-state", nowMs }),
-    { code: "one-time-code" }
-  );
-  assert.throws(
-    () => parseGoogleSignInResult(valid, { expectedState: "other-state", nowMs }),
-    /did not match this dashboard tab/u
-  );
-  assert.throws(
-    () => parseGoogleSignInResult(valid, {
-      expectedState: "expected-state",
-      nowMs: nowMs + 11 * 60 * 1_000
-    }),
-    /invalid or expired/u
-  );
-  assert.throws(
-    () => parseGoogleSignInResult("{not json", {
-      expectedState: "expected-state",
-      nowMs
-    }),
-    /could not be read/u
-  );
-  for (const tampered of [
-    { code: "", state: "expected-state", receivedAt: "2026-07-31T11:59:30.000Z" },
-    { code: "one-time-code", state: "expected-state", receivedAt: "not-a-time" },
-    {
-      code: "one-time-code",
-      state: "expected-state",
-      receivedAt: "2026-07-31T12:05:00.000Z"
-    },
-    {
-      code: "one-time-code",
-      state: "expected-state",
-      receivedAt: "2026-07-31T11:59:30.000Z",
-      extra: true
-    }
-  ]) {
-    assert.throws(
-      () => parseGoogleSignInResult(JSON.stringify(tampered), {
-        expectedState: "expected-state",
-        nowMs
-      }),
-      /invalid or expired/u
-    );
-  }
-  assert.throws(() => parseGoogleSignInResult(valid, { nowMs }), TypeError);
-});
-
-test("hosted identity is exchanged same-origin and enrolls with fixed error codes", async () => {
+test("hosted Google sign-in starts, polls, and refuses anything but Google's authorize URL", async () => {
   const calls = [];
+  const state = "G".repeat(64);
   let responseStatus = 200;
   let responsePayload = () => ({
-    schemaVersion: "identity-google-exchange-v0.1",
+    schemaVersion: "identity-google-start-v0.1",
+    state,
+    authorizeUrl:
+      `https://accounts.google.com/o/oauth2/v2/auth?client_id=test.apps.googleusercontent.com&state=${state}`
+  });
+  const client = new CommunityClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify(responsePayload()), {
+        status: responseStatus,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+
+  const started = await client.identityGoogleStart();
+  assert.equal(started.state, state);
+  assert.equal(
+    started.authorizeUrl.startsWith(
+      "https://accounts.google.com/o/oauth2/v2/auth?"
+    ),
+    true
+  );
+  assert.equal(calls[0].url, "/api/v1/identity/google/start");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.credentials, "same-origin");
+  // The start request carries nothing at all: no client id, no redirect, no
+  // PKCE verifier. The service owns every one of them.
+  assert.deepEqual(JSON.parse(calls[0].options.body), {});
+
+  // A tampered authorize URL is never handed to window.open.
+  for (const authorizeUrl of [
+    "https://attacker.example/o/oauth2/v2/auth?client_id=x",
+    "https://accounts.google.com.attacker.example/o/oauth2/v2/auth?a=b",
+    "https://accounts.google.com/o/oauth2/v2/authorize?a=b",
+    "javascript:alert(1)",
+    "https://accounts.google.com/o/oauth2/v2/auth"
+  ]) {
+    responsePayload = () => ({
+      schemaVersion: "identity-google-start-v0.1",
+      state,
+      authorizeUrl
+    });
+    await assert.rejects(
+      client.identityGoogleStart(),
+      /usable Google sign-in request/u
+    );
+  }
+  responsePayload = () => ({
+    schemaVersion: "identity-google-start-v0.1",
+    state: "too-short",
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth?a=b"
+  });
+  await assert.rejects(
+    client.identityGoogleStart(),
+    /usable Google sign-in request/u
+  );
+  // An Apple start payload can never satisfy a Google start.
+  responsePayload = () => ({
+    schemaVersion: "identity-apple-start-v0.1",
+    state,
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth?a=b"
+  });
+  await assert.rejects(
+    client.identityGoogleStart(),
+    /usable Google sign-in request/u
+  );
+
+  responsePayload = () => ({
+    schemaVersion: "identity-google-result-v0.1",
+    idToken: "header.payload.signature"
+  });
+  const identity = await client.identityGoogleResult(state);
+  assert.deepEqual(identity, {
     provider: "google",
+    idToken: "header.payload.signature"
+  });
+  const resultCall = calls.at(-1);
+  assert.equal(resultCall.url, "/api/v1/identity/google/result");
+  assert.equal(resultCall.options.credentials, "same-origin");
+  assert.deepEqual(JSON.parse(resultCall.options.body), { state });
+
+  await assert.rejects(client.identityGoogleResult("short"), TypeError);
+  await assert.rejects(client.identityGoogleResult(null), TypeError);
+
+  // A pending sign-in is a signal to keep polling, not a failure.
+  responseStatus = 404;
+  responsePayload = () => ({ error: { code: "IDENTITY_RESULT_PENDING" } });
+  await assert.rejects(
+    client.identityGoogleResult(state),
+    (error) => error.status === 404
+      && error.code === "IDENTITY_RESULT_PENDING"
+  );
+  // A consumed, replayed, or expired state is refused outright.
+  responseStatus = 401;
+  responsePayload = () => ({ error: { code: "IDENTITY_TOKEN_INVALID" } });
+  await assert.rejects(
+    client.identityGoogleResult(state),
+    (error) => error.status === 401 && error.code === "IDENTITY_TOKEN_INVALID"
+  );
+  responseStatus = 503;
+  responsePayload = () => ({ error: { code: "IDENTITY_CONFIGURATION_INVALID" } });
+  await assert.rejects(
+    client.identityGoogleStart(),
+    (error) => error.status === 503
+      && error.code === "IDENTITY_CONFIGURATION_INVALID"
+  );
+  responseStatus = 401;
+  responsePayload = () => ({ error: { code: "PRIVATE_DETAIL_MUST_NOT_PASS" } });
+  await assert.rejects(
+    client.identityGoogleResult(state),
+    (error) => error.status === 401 && error.code === undefined
+  );
+  responseStatus = 200;
+  responsePayload = () => ({
+    schemaVersion: "identity-google-result-v0.1",
+    idToken: ""
+  });
+  await assert.rejects(
+    client.identityGoogleResult(state),
+    /verifiable Google sign-in token/u
+  );
+});
+
+// The client-side authorization request is gone, not merely unused. It built a
+// provider URL in the page, kept a PKCE verifier there, and read the result out
+// of a loopback callback's localStorage write — a completion signal the
+// dashboard cannot receive when it runs inside the macOS app, whose web view
+// refuses every remote origin and shares no storage with the browser that
+// finishes the sign-in. Leaving any of it reachable would leave two ways to
+// turn a code into an identity, one of them client-controlled.
+test("no client-side Google authorization path survives in the shipped modules", async () => {
+  const [libSource, appSource, clientSource] = await Promise.all([
+    readFile(new URL("../public/lib.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/data-client.js", import.meta.url), "utf8"),
+  ]);
+  for (const [name, source] of [
+    ["lib.js", libSource],
+    ["app.js", appSource],
+    ["data-client.js", clientSource],
+  ]) {
+    for (const retired of [
+      "createGoogleSignInRequest",
+      "parseGoogleSignInResult",
+      "GOOGLE_OAUTH_RESULT_STORAGE_KEY",
+      "tibotattle-google-oauth-result",
+      "identityGoogleExchange",
+      "identity/google/exchange",
+      "oauth/google/callback",
+      "code_challenge",
+      "codeVerifier",
+      "localStorage",
+    ]) {
+      assert.equal(source.includes(retired), false, `${name}: ${retired}`);
+    }
+  }
+  // The only provider URL any of these modules names is the one the service is
+  // required to have built, checked before it is opened.
+  assert.equal(
+    (clientSource.match(/https:\/\/accounts\.google\.com/gu) ?? []).length,
+    1
+  );
+  assert.equal(libSource.includes("accounts.google.com"), false);
+  assert.equal(appSource.includes("accounts.google.com"), false);
+});
+
+test("a hosted identity enrolls same-origin with fixed error codes", async () => {
+  const calls = [];
+  const state = "G".repeat(64);
+  let responseStatus = 200;
+  let responsePayload = () => ({
+    schemaVersion: "identity-google-result-v0.1",
     idToken: "header.payload.signature"
   });
   const client = new CommunityClient({
@@ -2063,20 +2117,15 @@ test("hosted identity is exchanged same-origin and enrolls with fixed error code
       });
     }
   });
-  const exchangeRequest = {
-    code: "one-time-code",
-    codeVerifier: "A".repeat(43),
-    redirectUri: "http://127.0.0.1:8787/oauth/google/callback"
-  };
-  const identity = await client.identityGoogleExchange(exchangeRequest);
+  const identity = await client.identityGoogleResult(state);
   assert.deepEqual(identity, {
     provider: "google",
     idToken: "header.payload.signature"
   });
-  assert.equal(calls[0].url, "/api/v1/identity/google/exchange");
+  assert.equal(calls[0].url, "/api/v1/identity/google/result");
   assert.equal(calls[0].options.method, "POST");
   assert.equal(calls[0].options.credentials, "same-origin");
-  assert.deepEqual(JSON.parse(calls[0].options.body), exchangeRequest);
+  assert.deepEqual(JSON.parse(calls[0].options.body), { state });
 
   await client.enroll(null, "telemetry-contribution-v0.1", {
     deviceBootstrap: true,
@@ -2110,57 +2159,13 @@ test("hosted identity is exchanged same-origin and enrolls with fixed error code
     }),
     TypeError
   );
-  await assert.rejects(
-    client.identityGoogleExchange({
-      ...exchangeRequest,
-      redirectUri: "https://attacker.example/oauth/google/callback"
-    }),
-    TypeError
-  );
-  await assert.rejects(
-    client.identityGoogleExchange({
-      ...exchangeRequest,
-      codeVerifier: "too-short"
-    }),
-    TypeError
-  );
   assert.equal(calls.length, 3);
 
-  responseStatus = 401;
-  responsePayload = () => ({ error: { code: "IDENTITY_TOKEN_INVALID" } });
-  await assert.rejects(
-    client.identityGoogleExchange(exchangeRequest),
-    (error) => error.status === 401
-      && error.code === "IDENTITY_TOKEN_INVALID"
-  );
-  responseStatus = 503;
-  responsePayload = () => ({ error: { code: "IDENTITY_CONFIGURATION_INVALID" } });
-  await assert.rejects(
-    client.identityGoogleExchange(exchangeRequest),
-    (error) => error.status === 503
-      && error.code === "IDENTITY_CONFIGURATION_INVALID"
-  );
   responseStatus = 401;
   responsePayload = () => ({ error: { code: "IDENTITY_REQUIRED" } });
   await assert.rejects(
     client.enroll(null, "telemetry-contribution-v0.1", { identity: null }),
     (error) => error.status === 401 && error.code === "IDENTITY_REQUIRED"
-  );
-  responseStatus = 401;
-  responsePayload = () => ({ error: { code: "PRIVATE_DETAIL_MUST_NOT_PASS" } });
-  await assert.rejects(
-    client.identityGoogleExchange(exchangeRequest),
-    (error) => error.status === 401 && error.code === undefined
-  );
-  responseStatus = 200;
-  responsePayload = () => ({
-    schemaVersion: "identity-google-exchange-v0.1",
-    provider: "google",
-    idToken: ""
-  });
-  await assert.rejects(
-    client.identityGoogleExchange(exchangeRequest),
-    /verifiable Google sign-in token/u
   );
 });
 
@@ -2404,10 +2409,13 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(appSource, /function configuredGoogleClientId\(\)/u);
   assert.match(appSource, /function hostedSignInRequired\(\)/u);
   assert.match(appSource, /hostedSignInRequired\(\)\s*\|\|/u);
-  assert.match(appSource, /GOOGLE_OAUTH_RESULT_STORAGE_KEY/u);
-  assert.match(appSource, /window\.addEventListener\("storage"/u);
   assert.match(appSource, /identity: hostedIdentity/u);
-  assert.match(appSource, /communityClient\.identityGoogleExchange\(/u);
+  // Both providers run the same server-owned handoff: a start that returns an
+  // unguessable state, and a bounded poll for the one-time result. Neither
+  // completes through a client-side redirect, so neither depends on the page
+  // that started it still being the page that receives anything.
+  assert.match(appSource, /communityClient\.identityGoogleStart\(\)/u);
+  assert.match(appSource, /communityClient\.identityGoogleResult\(/u);
   assert.match(appSource, /communityClient\.identityAppleStart\(\)/u);
   assert.match(appSource, /communityClient\.identityAppleResult\(/u);
   assert.match(appSource, /IDENTITY_RESULT_PENDING/u);
@@ -2415,16 +2423,34 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource,
     /Hosted Apple sign-in is not configured for this build\./u
   );
+  assert.match(
+    appSource,
+    /Hosted Google sign-in is not configured for this build\./u
+  );
   assert.equal(/takeAppleIdentityToken/u.test(appSource), false);
   assert.equal(/api\/local\/identity\/apple/u.test(appSource), false);
   assert.match(appSource, /IDENTITY_REQUIRED/u);
   assert.match(appSource, /IDENTITY_TOKEN_INVALID/u);
   assert.match(appSource, /IDENTITY_CONFIGURATION_INVALID/u);
-  // The dashboard consumes the one-time result from the storage event's
-  // newValue only; the existing storage-free app.js guard elsewhere in this
-  // suite proves no web-storage API is ever called by the dashboard itself.
-  assert.match(appSource, /typeof event\.newValue === "string"/u);
   assert.match(appSource, /let hostedIdentity = null;/u);
+
+  // One poll loop serves both providers, and it stops exactly when the
+  // service's five-minute handoff expires rather than earlier: the user is
+  // authenticating in a separate browser window, which inside the macOS app is
+  // the only place a provider host can be loaded at all.
+  const pollBody =
+    appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
+  assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
+  assert.match(pollBody, /window\.open\(request\.authorizeUrl, "_blank", "noopener,noreferrer"\)/u);
+  const attempts = Number(
+    appSource.match(/const HOSTED_SIGNIN_POLL_ATTEMPTS = (\d+);/u)?.[1]
+  );
+  const interval = Number(
+    appSource.match(/const HOSTED_SIGNIN_POLL_INTERVAL_MS = ([\d_]+);/u)?.[1]
+      ?.replace(/_/gu, "")
+  );
+  assert.equal(attempts * interval, 5 * 60 * 1_000);
 
   // Signing out is page-local: it forgets the memory-only identity and the
   // pseudonymous session it enrolled, so the next sign-in can be a different
@@ -2433,7 +2459,6 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource.match(/function signOutHostedIdentity\(\)\s*\{[\s\S]*?\n\}/u)?.[0]
       ?? "";
   assert.match(signOutBody, /hostedIdentity = null;/u);
-  assert.match(signOutBody, /pendingGoogleSignIn = null;/u);
   assert.match(signOutBody, /setCommunitySession\(null\);/u);
   assert.match(signOutBody, /renderHostedIdentity\(\);/u);
   assert.match(signOutBody, /nothing was deleted/u);
@@ -4657,5 +4682,365 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(
     html,
     /~\/Library\/Application Support\/app-usagemonitor\/diagnostics-v0\.1\.log/u,
+  );
+});
+
+// The shareable card is the one surface whose output is meant to leave the
+// machine as a picture, where nothing can be unshared and no reader can audit
+// what produced it. These two tests hold the properties that make posting it
+// safe: it can only paint fixed copy and formatted figures, and it always
+// carries a reference in the format the diagnostic log records.
+function shareCardSource(appSource) {
+  const start = appSource.indexOf("// Shareable results card");
+  const end = appSource.indexOf("function groupRolling(");
+  assert.ok(start !== -1 && end > start, "the results-card section is available");
+  return appSource.slice(start, end);
+}
+
+/**
+ * The first argument of every `call` in `source`, whitespace-normalized.
+ *
+ * Scanning for the argument rather than matching a line catches a painted
+ * value however it is formatted, including one wrapped across lines.
+ */
+function firstArguments(source, call) {
+  const found = [];
+  for (
+    let index = source.indexOf(call);
+    index !== -1;
+    index = source.indexOf(call, index + call.length)
+  ) {
+    const start = index + call.length;
+    let depth = 0;
+    let cursor = start;
+    for (; cursor < source.length; cursor += 1) {
+      const character = source[cursor];
+      if (character === "(" || character === "[") depth += 1;
+      else if (character === ")" || character === "]") {
+        if (depth === 0) break;
+        depth -= 1;
+      } else if (character === "," && depth === 0) break;
+    }
+    found.push(source.slice(start, cursor).trim().replace(/\s+/gu, " "));
+  }
+  return found;
+}
+
+test("a posted results card can carry only fixed copy and formatted figures", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  // Everything painted onto the image. Each entry is either a literal written
+  // here, a formatted number, or a field of the frozen card model, so a
+  // payload string cannot reach the canvas without failing this list. A
+  // prompt, a response, a file path, a folder name, a URL, an account
+  // identifier or an email would all have to arrive as one of these.
+  assert.deepEqual(
+    [...new Set(firstArguments(section, "context.fillText("))].sort(),
+    [
+      "\"TiboTattle\"",
+      "\"latest\"",
+      "`${card.trend.count} qualifying resets`",
+      "badge",
+      "card.home",
+      "card.trend.span",
+      "card.trendEmpty",
+      "card.trendEmptyDetail",
+      "card.trendLabel.toUpperCase()",
+      "formatMoney(high, 0)",
+      "formatMoney(low, 0)",
+      "line",
+      "shareCardFit( context, \"Local-first measurement. No prompts, files, folder names, or account details leave the Mac.\", inner, )",
+      "shareCardFit(context, card.identifierLine, inner)",
+      "shareCardFit(context, card.subtitle, inner)",
+      "shareCardFit(context, card.title, inner)",
+      "shareCardFit(context, stat.value, textWidth)",
+    ],
+  );
+
+  // The whole of the dashboard the card is allowed to see. Everything here is
+  // a number, a fixed enumeration, or a version identifier; no field carries
+  // user text, and a card that started reading one would fail this list.
+  assert.deepEqual(
+    [...new Set(
+      [...section.matchAll(/data\??\.[A-Za-z]+(?:\?\.[A-Za-z]+)*/gu)].map((match) => match[0]),
+    )].sort(),
+    [
+      "data?.gradient?.summary",
+      "data?.gradient?.summary?.capacity",
+      "data?.gradient?.summary?.capacityUsd",
+      "data?.mode",
+      "data?.pricing",
+      "data?.pricing?.coveragePercent",
+      "data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd",
+      "data?.pricing?.fastMode?.weightingStatus",
+      "data?.pricing?.quotaWeightedTotalCostUsd",
+      "data?.pricing?.registryVersion",
+      "data?.pricing?.totalCostUsd",
+      "data?.quotaWindows",
+      "data?.schemaVersion",
+      "data?.weekly?.weeklyValues",
+    ],
+  );
+
+  // The plotted history reads five numeric fields per fit and nothing else.
+  // A timestamp is parsed to a number to place a point and to count days; it
+  // is never carried into a string, so the image cannot say when its owner was
+  // at the keyboard.
+  const trend = section.match(
+    /function shareCardTrend\(rows\) \{[\s\S]*?\n\}/u,
+  )?.[0];
+  assert.ok(trend, "the plotted history builder is available");
+  assert.deepEqual(
+    [...new Set([...trend.matchAll(/row\?\.[A-Za-z0-9_]+/gu)].map((match) => match[0]))].sort(),
+    [
+      "row?.displayed_span_pp",
+      "row?.first_observed_at",
+      "row?.last_observed_at",
+      "row?.pairwise_p10_usd",
+      "row?.pairwise_p90_usd",
+      "row?.value",
+      "row?.value_usd",
+    ],
+  );
+  assert.match(trend, /at: Date\.parse\(row\?\.last_observed_at \?\? row\?\.first_observed_at \?\? ""\)/u);
+  assert.doesNotMatch(
+    section,
+    /toLocaleString|toLocaleDateString|toLocaleTimeString|toISOString|DateTimeFormat|formatLocal|USER_TIME_ZONE/u,
+  );
+  // The duration phrase is built from a count of days, never from a date.
+  assert.match(
+    section,
+    /function shareCardSpanLabel\(days\) \{\s*\n\s*if \(days >= 14\) return `\$\{Math\.round\(days \/ 7\)\} weeks earlier`;/u,
+  );
+  // Which fits qualify is fixed in the build, not read from the on-screen
+  // control, so two readers of the same evidence post the same picture.
+  assert.match(trend, /point\.spanPp > DEFAULT_WEEKLY_SPAN_THRESHOLD_PP/u);
+  assert.doesNotMatch(section, /weeklySpanThresholdPp|showWeeklyPartialDiagnostics/u);
+
+  // The three free-form strings that do arrive are each replaced before use.
+  // A window's own label is never printed: the name is recomputed from the
+  // observed duration, so a renamed or injected label cannot be posted.
+  assert.match(
+    section,
+    /function shareCardWindowKind\(window\) \{\s*\n\s*const minutes = finite\(window\?\.durationMinutes\);/u,
+  );
+  assert.deepEqual(
+    [...new Set(
+      [...section.matchAll(/\b(?:window|allowanceWindow)\??\.[A-Za-z]+/gu)].map((match) => match[0]),
+    )].sort(),
+    [
+      "allowanceWindow?.remainingPercent",
+      "window?.durationMinutes",
+      "window?.remainingPercent",
+    ],
+  );
+  // A period name is looked up in the product's own vocabulary and the phrase
+  // written here is printed. The arriving string is matched, never rendered,
+  // so even a recognized label reaches the image only as fixed copy.
+  assert.match(
+    section,
+    /function shareCardPeriodLabel\(candidate\) \{\s*\n\s*return SHARE_CARD_PERIOD_PHRASES\.get\(candidate\) \?\? SHARE_CARD_UNKNOWN_PERIOD;/u,
+  );
+  const phrases = section.match(
+    /const SHARE_CARD_PERIOD_PHRASES = new Map\(\[([\s\S]*?)\]\);/u,
+  )?.[1];
+  assert.ok(phrases, "the period vocabulary is available");
+  assert.deepEqual(
+    [...phrases.matchAll(/\["([^"]+)", "([^"]+)"\]/gu)].map((match) => match[1]),
+    [
+      "All retained evidence",
+      "Last 24 hours",
+      "Last 30 days",
+      "Last 7 days",
+      "Recorded period",
+    ],
+  );
+  assert.match(section, /const period = shareCardPeriodLabel\(pricing\.periodLabel\);/u);
+  assert.equal(
+    section.match(/pricing\.periodLabel/gu).length,
+    1,
+    "the period label is read only through the fixed vocabulary",
+  );
+  // Both version identifiers are accepted only in a shape that cannot hold a
+  // path, a sentence, or a quoted value.
+  assert.match(
+    section,
+    /const SHARE_CARD_REGISTRY_VERSION_PATTERN = \/\^\[A-Za-z0-9\]\[A-Za-z0-9\._-\]\{0,47\}\$\/u;/u,
+  );
+  assert.match(
+    section,
+    /const SHARE_CARD_APP_VERSION_PATTERN = \/\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$\/u;/u,
+  );
+  assert.match(
+    section,
+    /return typeof candidate === "string"\s*\n\s*&& SHARE_CARD_REGISTRY_VERSION_PATTERN\.test\(candidate\)/u,
+  );
+  assert.match(
+    section,
+    /return SHARE_CARD_APP_VERSION_PATTERN\.test\(value \?\? ""\) \? value : "";/u,
+  );
+
+  // The link prints a host and nothing else, so no path, query or fragment
+  // from the page's own canonical URL can be carried into a post.
+  assert.match(
+    section,
+    /const host = new URL\(canonical\)\.hostname\.replace\(\/\^www\\\.\/u, ""\);\s*\n\s*return SHARE_CARD_HOME_PATTERN\.test\(host\) \? host : fallback;/u,
+  );
+  assert.doesNotMatch(section, /\.pathname|\.search|\.hash|location\.href/u);
+
+  // Composed once and frozen, so nothing can be appended to a card between
+  // composition and painting.
+  assert.match(section, /return Object\.freeze\(\{\s*\n\s*reference,/u);
+  assert.match(section, /stats: Object\.freeze\(stats\.map\(\(stat\) => Object\.freeze\(\{ \.\.\.stat \}\)\)\)/u);
+
+  // The image, the accessible label and the visible readout are all rendered
+  // from that one frozen card, so the picture cannot say more than the text a
+  // user can read first.
+  assert.match(section, /canvas\.setAttribute\("aria-label", shareCardText\(shareCard\)\);/u);
+  assert.match(section, /renderShareCardReadout\(shareCard\);/u);
+  assert.match(section, /if \(!drawShareCard\(canvas, shareCard\)\)/u);
+
+  // The page makes the same promise beside the card.
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="share-panel"/u);
+  assert.match(
+    html,
+    /It carries no prompts, responses, file\s*\n?\s*paths, URLs, project or folder names, account identifiers, or\s*\n?\s*email/u,
+  );
+});
+
+test("a posted results card always carries a diagnostic-format reference", async () => {
+  // The reference is minted by the same helper the diagnostic surfaces use, so
+  // a card someone posts can be matched against the local log.
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const reference = createDiagnosticReference(webcrypto);
+    assert.match(reference, DIAGNOSTIC_REFERENCE_PATTERN);
+    assert.match(reference, /^TT-[0-9A-Z]{6}$/u);
+    assert.doesNotMatch(reference, /[ILOU]/u);
+  }
+
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  // No card is composed at all without a reference in that format, so an image
+  // can never be saved or copied untraceable.
+  assert.match(
+    section,
+    /if \(!DIAGNOSTIC_REFERENCE_PATTERN\.test\(reference \?\? ""\)\) \{\s*\n\s*throw new TypeError\("A results card requires a minted reference\."\);/u,
+  );
+  assert.match(section, /shareCardReference = createDiagnosticReference\(\);/u);
+  assert.doesNotMatch(section, /Math\.random|Date\.now|new Date\(/u);
+
+  // One image and one reference always describe the same figures: the
+  // reference is re-minted whenever any printed figure changes.
+  const signature = section.match(
+    /const signature = JSON\.stringify\(\[([\s\S]*?)\]\);/u,
+  )?.[1];
+  assert.ok(signature, "the figure signature is available");
+  for (const figure of [
+    "data?.mode",
+    "shareCardWindowKind(allowanceWindow)",
+    "finite(allowanceWindow?.remainingPercent)",
+    "finite(data?.pricing?.quotaWeightedTotalCostUsd)",
+    "finite(data?.pricing?.totalCostUsd)",
+    "finite(data?.pricing?.coveragePercent)",
+    "shareCardTrend(data?.weekly?.weeklyValues)?.points",
+  ]) {
+    assert.ok(signature.includes(figure), `${figure} re-mints the reference`);
+  }
+  assert.match(
+    section,
+    /if \(signature !== shareCardSignature \|\| shareCardReference === ""\) \{/u,
+  );
+
+  // It is printed on the image itself, first in the identifier line, and it
+  // names the saved file so a downloaded card stays matched to it.
+  assert.match(section, /const identifiers = \[\s*\n\s*reference,/u);
+  assert.match(section, /`TiboTattle \$\{appVersion\}`/u);
+  assert.match(section, /`prices \$\{registryVersion\}`/u);
+  assert.match(
+    section,
+    /return `tibotattle-results-\$\{card\.reference\}\.png`;/u,
+  );
+  assert.match(
+    section,
+    /Reference \$\{card\.reference\} is printed on the image/u,
+  );
+
+  // And it is readable as text beside the card, not only as pixels.
+  assert.match(section, /\["Traceable reference", card\.reference, false\]/u);
+  assert.match(section, /\$\("#share-card-reference"\)\.textContent = shareCard\.reference;/u);
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="share-card-reference"/u);
+});
+
+test("a posted results card states a figure in full and marks a fixture as one", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  // One type size for the whole row, chosen so the longest figure fits its
+  // column whole. "Not estimable" and a seven-figure total both overrun the
+  // column at the full size, and a figure cut off mid-word in the largest type
+  // on the card is unreadable at a glance and easy to misread as a smaller
+  // number.
+  assert.match(
+    section,
+    /function shareCardValueSize\(context, values, maxWidth\) \{[\s\S]*?if \(values\.every\(\(value\) => context\.measureText\(value\)\.width <= maxWidth\)\) \{/u,
+  );
+  assert.match(
+    section,
+    /const valueSize = shareCardValueSize\(\s*\n\s*context,\s*\n\s*card\.stats\.map\(\(stat\) => stat\.value\),\s*\n\s*textWidth,\s*\n\s*\);/u,
+  );
+  assert.match(section, /context\.font = shareCardFont\(500, valueSize, "serif"\);/u);
+  assert.doesNotMatch(section, /shareCardFont\(500, 54, "serif"\)/u);
+  // Every value the card can print for missing evidence is spelled out, so the
+  // size that fits them is the size the row is drawn at.
+  for (const empty of ["Not observed", "Not available", "Not estimable"]) {
+    assert.ok(section.includes(`"${empty}"`), `${empty} is one of the fixed figures`);
+  }
+
+  // A fixture is marked where a reader scrolling a timeline will see it: in
+  // the line under the title and on a mark beside the wordmark, not only in
+  // the smallest copy on the image.
+  assert.match(
+    section,
+    /subtitle: isDemo\s*\n\s*\? "Illustrative demo data\. Not a measurement\."\s*\n\s*: "Measured on my own Mac\. Nothing left it\.",/u,
+  );
+  assert.match(section, /badge: isDemo \? "DEMO DATA" : "",/u);
+  assert.match(section, /if \(card\.badge !== ""\) \{\s*\n\s*drawShareCardBadge\(/u);
+  // The mark is drawn in the header, above the figures it qualifies.
+  assert.ok(
+    section.indexOf("drawShareCardBadge(\n      context,")
+      < section.indexOf("card.stats.forEach"),
+    "the demo mark is drawn before the figures",
+  );
+  // And the caveat that says the same thing stays, first in the list.
+  assert.match(
+    section,
+    /if \(isDemo\) \{\s*\n\s*caveats\.push\(\s*\n\s*"Labeled demo data: an illustrative fixture, not measured usage\.",/u,
+  );
+
+  // The history takes exactly the room the qualifications leave, so the card
+  // is neither hollow in the middle nor crowded when every caveat applies.
+  assert.match(
+    section,
+    /const caveatTop = ruleY - 22 - \(caveatLines\.length - 1\) \* caveatStep;/u,
+  );
+  assert.match(
+    section,
+    /const trendHeight = Math\.min\(\s*\n\s*SHARE_CARD_TREND_MAX_HEIGHT,\s*\n\s*Math\.max\(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop\),\s*\n\s*\);/u,
+  );
+  // Every qualification still fits: the caveat cap is unchanged.
+  assert.match(appSource, /const SHARE_CARD_MAX_CAVEATS = 5;/u);
+  assert.match(appSource, /const SHARE_CARD_MAX_CAVEAT_LINES = 7;/u);
+
+  // The posted image and the preview element describe the same picture.
+  assert.match(appSource, /const SHARE_CARD_WIDTH = 1200;/u);
+  assert.match(appSource, /const SHARE_CARD_HEIGHT = 800;/u);
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(
+    html,
+    /<canvas\s+id="share-card-canvas"[\s\S]*?width="1200"\s*\n\s*height="800"/u,
   );
 });

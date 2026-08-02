@@ -770,22 +770,19 @@ describe("configuration failures", () => {
     }
   });
 
-  // NOTE: every other configuration failure in this file surfaces as 503
-  // (a direct `new ApiError(503, "IDENTITY_CONFIGURATION_INVALID")`). This
-  // one path is routed through the `identityError` helper instead, which is
-  // hardcoded to 401 for every caller-facing token failure. The result is
-  // that the very same error code answers with two different HTTP statuses
-  // depending on which check tripped it. IDENTITY_TEST_JWKS_JSON is a
-  // test-only escape hatch never set in deployed configuration, so this is
-  // unreachable in production — but it is a real inconsistency in
-  // src/identity-oidc.ts worth a deliberate look. See the final report.
-  it("documents the current (inconsistent) status code for a malformed IDENTITY_TEST_JWKS_JSON", async () => {
+  // One error code, one status. A malformed IDENTITY_TEST_JWKS_JSON is a
+  // deployment fault — no request can set or shape that variable — so it
+  // answers 503 like every other IDENTITY_CONFIGURATION_INVALID here, not 401
+  // via the `identityError` helper that exists for token failures the caller
+  // did present. Pinning the status stops the helper from being reintroduced
+  // on this path and turning the same code into two different answers.
+  it("answers a malformed IDENTITY_TEST_JWKS_JSON with the same 503 as every other configuration fault", async () => {
     const token = await rs256Token(header(), googlePayload(), primary.privateKey);
     await expect(verifyHostedIdentity(
       bindings({ IDENTITY_TEST_JWKS_JSON: "{not-json" }),
       { provider: "google", idToken: token },
       { jwksFetcher: poisonFetcher, nowMs: NOW_MS },
-    )).rejects.toMatchObject({ status: 401, code: "IDENTITY_CONFIGURATION_INVALID" });
+    )).rejects.toMatchObject({ status: 503, code: "IDENTITY_CONFIGURATION_INVALID" });
   });
 });
 
