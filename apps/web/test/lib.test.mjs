@@ -2183,6 +2183,24 @@ test("a hosted identity enrolls same-origin with fixed error codes", async () =>
     client.enroll(null, "telemetry-contribution-v0.1", { identity: null }),
     (error) => error.status === 401 && error.code === "IDENTITY_REQUIRED"
   );
+
+  // Enrollment errors are not hosted-identity endpoint errors. Preserve the
+  // service's fixed code and request id so the connection view can tell the
+  // user whether storage, enrollment policy, or another specific boundary
+  // failed rather than showing a generic retry sentence.
+  const requestId = "00000000-0000-4000-8000-000000000007";
+  responseStatus = 503;
+  responsePayload = () => ({
+    error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId }
+  });
+  await assert.rejects(
+    client.enroll(null, "telemetry-contribution-v0.1", {
+      identity: { provider: "google", proof: "P".repeat(64) }
+    }),
+    (error) => error.status === 503
+      && error.code === "BACKEND_STORAGE_UNAVAILABLE"
+      && error.requestId === requestId
+  );
 });
 
 test("hosted Apple sign-in starts, polls, and refuses anything but Apple's authorize URL", async () => {
@@ -2458,7 +2476,20 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
   assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
-  assert.match(pollBody, /window\.open\(request\.authorizeUrl, "_blank", "noopener,noreferrer"\)/u);
+  assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
+  assert.match(pollBody, /foregroundNativeDashboardAfterSignIn\(\)/u);
+  const handoffBody =
+    appSource.match(/function openHostedSignInInBrowser\([\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(handoffBody, /runsInsideNativeDashboard\(\)/u);
+  assert.match(handoffBody, /window\.location\.assign\(authorizeUrl\)/u);
+  assert.match(
+    handoffBody,
+    /window\.open\(authorizeUrl, "_blank", "noopener,noreferrer"\)/u,
+  );
+  const foregroundBody =
+    appSource.match(/function foregroundNativeDashboardAfterSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(foregroundBody, /SEMANTIC_OPEN_TARGET/u);
+  assert.match(foregroundBody, /window\.location\.assign\(SEMANTIC_OPEN_TARGET\)/u);
   const attempts = Number(
     appSource.match(/const HOSTED_SIGNIN_POLL_ATTEMPTS = (\d+);/u)?.[1]
   );
@@ -3846,7 +3877,19 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   assert.match(appSource, /async function connectCommunityContribution\(\)/u);
   assert.match(
     appSource,
+    /let enrollmentAttemptedWithHostedIdentity = false;\s*\n\s*let enrollmentEstablished = false;/u,
+  );
+  assert.match(
+    appSource,
     /\{ deviceBootstrap: true, identity: hostedIdentity \}/u,
+  );
+  assert.match(
+    appSource,
+    /enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;\s*\n\s*const enrollment = await communityClient\.enroll/u,
+  );
+  assert.match(
+    appSource,
+    /setCommunitySession\(\{[\s\S]*?\}\);\s*\n\s*enrollmentEstablished = true;/u,
   );
   assert.match(appSource, /localClient\.pairContributionDevice\(pairing\.pairingCode\)/u);
   assert.match(appSource, /void enrollment\.recoveryCode;/u);
@@ -4648,6 +4691,27 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(
     connect,
     /The cause was not reported in a form this page can explain/u,
+  );
+  for (const code of [
+    "BODY_INVALID",
+    "CONTENT_TYPE_INVALID",
+    "NOT_FOUND",
+    "central_participant_request_not_authorized",
+    "central_participant_response_too_large",
+  ]) {
+    assert.match(appSource, new RegExp(`${code}:`, "u"));
+  }
+  assert.match(
+    connect,
+    /const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity\s*\n\s*&& !enrollmentEstablished\s*\n\s*&& hostedIdentity !== null;/u,
+  );
+  assert.match(
+    connect,
+    /hostedIdentity = null;\s*\n\s*renderHostedIdentity\(\);/u,
+  );
+  assert.match(
+    connect,
+    /For safety, this page discarded the one-time sign-in; sign in again before retrying\./u,
   );
   assert.match(
     connect,

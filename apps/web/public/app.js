@@ -4185,6 +4185,12 @@ const SERVICE_ERROR_COPY = {
     "The contribution service rejected this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
   CSRF_INVALID:
     "This browser session expired while the request was in flight. Reload the local dashboard, then try again. Nothing was uploaded.",
+  BODY_INVALID:
+    "TiboTattle and the contribution service did not agree on this connection request. Nothing was uploaded; install the current signed build, then sign in again.",
+  CONTENT_TYPE_INVALID:
+    "The contribution service rejected this connection request before processing it. Nothing was uploaded; install the current signed build, then sign in again.",
+  NOT_FOUND:
+    "This build points to a contribution-service route that is unavailable. Nothing was uploaded; install the current signed build before trying again.",
   ATTEMPT_LIMIT_REACHED:
     "Too many attempts were made in a short window. Wait a few minutes before trying again. Nothing was uploaded.",
   BACKEND_STORAGE_UNAVAILABLE:
@@ -4236,6 +4242,16 @@ const SERVICE_ERROR_COPY = {
 // Fixed local companion codes. These describe this Mac, not the service, so
 // they must never send the user looking at the network or the invitation.
 const LOCAL_COMPANION_ERROR_COPY = {
+  central_participant_request_not_authorized:
+    "The local dashboard request was not accepted by this Mac. Reload TiboTattle, then sign in again. Nothing was uploaded.",
+  central_participant_relay_not_configured:
+    "This build is not configured to connect to a contribution service, so there is nothing to pair with. Local reporting is unaffected.",
+  central_participant_service_unavailable:
+    "TiboTattle could not reach the contribution service. Nothing was uploaded; check your connection and try again.",
+  central_participant_response_invalid:
+    "The contribution service returned an unexpected response. Nothing was uploaded; try again shortly.",
+  central_participant_response_too_large:
+    "The contribution service returned more data than TiboTattle accepts for a connection. Nothing was uploaded; try again shortly.",
   contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_pairing_not_configured:
@@ -4415,6 +4431,35 @@ function signOutHostedIdentity() {
 const HOSTED_SIGNIN_POLL_ATTEMPTS = 150;
 const HOSTED_SIGNIN_POLL_INTERVAL_MS = 2_000;
 
+// The packaged Mac app stamps this fixed marker before any dashboard script
+// runs. A normal browser keeps the dashboard page open in a second tab while
+// it polls for the result; the packaged app instead makes a main-frame
+// navigation. Its WebKit navigation policy hands the remote URL straight to
+// the default browser, without first showing the app's "continue" pop-up.
+function runsInsideNativeDashboard() {
+  return document.documentElement.classList.contains("native-dashboard")
+    || document.body?.classList.contains("native-dashboard");
+}
+
+function openHostedSignInInBrowser(authorizeUrl) {
+  if (runsInsideNativeDashboard()) {
+    window.location.assign(authorizeUrl);
+    return;
+  }
+  // A regular browser needs to keep this dashboard alive so its bounded poll
+  // can collect the one-time result. The callback page still offers the same
+  // safe return link to the installed app.
+  window.open(authorizeUrl, "_blank", "noopener,noreferrer");
+}
+
+function foregroundNativeDashboardAfterSignIn() {
+  if (runsInsideNativeDashboard() && SEMANTIC_OPEN_TARGET) {
+    // The native host accepts only the exact fixed app link and brings this
+    // already-running window forward. No provider value travels through it.
+    window.location.assign(SEMANTIC_OPEN_TARGET);
+  }
+}
+
 // One shape for both providers. Neither can complete inside this page: Apple
 // provisions Sign in with Apple only for distributions this Developer ID build
 // cannot use, refuses loopback redirects, and answers with
@@ -4433,7 +4478,7 @@ const HOSTED_SIGNIN_FLOWS = {
     start: () => communityClient.identityGoogleStart(),
     result: (state) => communityClient.identityGoogleResult(state),
     waiting:
-      "Finish signing in with Google in your browser, then come back here — this page collects the result itself and no tab needs to stay open. Only a stable account identifier is requested; no email or name is asked for. If no window opened, allow pop-ups and try again.",
+      "Finish signing in with Google in your browser. TiboTattle collects the result itself and returns to the front when it is ready; you can close the callback tab. Only a stable account identifier is requested; no email or name is asked for. If no browser tab opened, try again.",
     signedIn:
       "Signed in with Google. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
@@ -4449,7 +4494,7 @@ const HOSTED_SIGNIN_FLOWS = {
     start: () => communityClient.identityAppleStart(),
     result: (state) => communityClient.identityAppleResult(state),
     waiting:
-      "Finish signing in with Apple in your browser, then come back here — this page collects the result itself and no tab needs to stay open. No name or email is requested. If no window opened, allow pop-ups and try again.",
+      "Finish signing in with Apple in your browser. TiboTattle collects the result itself and returns to the front when it is ready; you can close the callback tab. No name or email is requested. If no browser tab opened, try again.",
     signedIn:
       "Signed in with Apple. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
@@ -4475,13 +4520,7 @@ async function beginHostedSignIn(providerId) {
   status.textContent = `Starting ${flow.label} sign-in…`;
   try {
     const request = await flow.start();
-    // Opened with noopener so the provider window gets no handle on this one.
-    // That makes the return value null by specification, so it is not a usable
-    // signal for a blocked pop-up; the waiting copy says so instead, and an
-    // unopened window simply runs out the bounded poll below. Inside the macOS
-    // app this is the point the request leaves for the user's own browser: the
-    // app's web view refuses every remote origin and hands it over.
-    window.open(request.authorizeUrl, "_blank", "noopener,noreferrer");
+    openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let attempt = 0; attempt < HOSTED_SIGNIN_POLL_ATTEMPTS; attempt += 1) {
       await new Promise((resolveWait) => {
@@ -4496,6 +4535,7 @@ async function beginHostedSignIn(providerId) {
       if (identity !== null) {
         hostedIdentity = identity;
         status.textContent = flow.signedIn;
+        foregroundNativeDashboardAfterSignIn();
         return;
       }
     }
@@ -4704,6 +4744,13 @@ async function connectCommunityContribution() {
     return;
   }
   let pairing = null;
+  // A hosted proof is intentionally one-use. If enrollment itself fails, do
+  // not leave the page claiming that the same proof can safely be retried:
+  // drop it from this memory-only page and make the next action a fresh
+  // browser sign-in. Failures after a session is established are different —
+  // the user can retry those local pairing steps without authenticating again.
+  let enrollmentAttemptedWithHostedIdentity = false;
+  let enrollmentEstablished = false;
   communityConnectBusy = true;
   status.hidden = false;
   status.className = "participant-action-status";
@@ -4724,6 +4771,7 @@ async function connectCommunityContribution() {
       // Production enrollment is open, so this page never collects or sends an
       // invitation code. The client keeps the parameter because the service
       // still supports an invite-only mode for private pilots.
+      enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
       const enrollment = await communityClient.enroll(
         null,
         "telemetry-contribution-v0.1",
@@ -4742,6 +4790,7 @@ async function connectCommunityContribution() {
         participantId: enrollment.participantId ?? null,
         consentVersion: "privacy-safe-telemetry-v0.1"
       });
+      enrollmentEstablished = true;
       // The ordinary contribution product has no recovery journey. The server
       // still returns this legacy capability, but the browser intentionally
       // neither displays nor persists it.
@@ -4766,14 +4815,24 @@ async function connectCommunityContribution() {
     if (contributionDeviceRecoveryIsRequired(error)) {
       renderContributionDeviceRecovery(status, { error });
     } else {
+      const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
+        && !enrollmentEstablished
+        && hostedIdentity !== null;
+      if (retryNeedsFreshSignIn) {
+        hostedIdentity = null;
+        renderHostedIdentity();
+      }
       // The fallback is reached only when the cause is genuinely unknown, so
       // it must not assert which of several unrelated things to go and check.
-      showFailure(status, {
+      const described = showFailure(status, {
         surface: "contribution_connect",
         error,
         fallback:
           "This Mac could not be connected, and no evidence was uploaded. The cause was not reported in a form this page can explain; retrying is safe."
       });
+      if (retryNeedsFreshSignIn) {
+        status.textContent = `${described.text} For safety, this page discarded the one-time sign-in; sign in again before retrying.`;
+      }
     }
   } finally {
     pairing = null;

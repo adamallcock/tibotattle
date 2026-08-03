@@ -1017,7 +1017,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private let onLoaded: () -> Void
     private let onFailure: (String) -> Void
     private let onDownloadFailure: () -> Void
-    private let openExternally: (URL, Bool) -> Void
+    private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
     private var allowedPort: Int?
     /// False while the view holds no dashboard, so the blank page loaded on
@@ -1029,7 +1029,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         onLoaded: @escaping () -> Void,
         onFailure: @escaping (String) -> Void,
         onDownloadFailure: @escaping () -> Void,
-        openExternally: @escaping (URL, Bool) -> Void,
+        openExternally: @escaping (URL) -> Void,
         onNavigation: @escaping (String) -> Void
     ) {
         self.onLoaded = onLoaded
@@ -1125,7 +1125,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             return
         }
         decisionHandler(.cancel)
-        openExternally(url, false)
+        openExternally(url)
     }
 
     func webView(
@@ -1188,11 +1188,11 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        // The dashboard only opens a second window for hosted sign-in, which
-        // is a remote origin this app will not load. It is handed to the
-        // user's browser with an explanation rather than silently dropped.
+        // A provider may request a new browser window. The app never embeds
+        // remote origins, so hand it straight to the user's default browser
+        // without a second native confirmation dialog.
         if let url = navigationAction.request.url {
-            openExternally(url, true)
+            openExternally(url)
         }
         return nil
     }
@@ -1908,8 +1908,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 onDownloadFailure: { [weak self] in
                     self?.reportDashboardDownloadFailure()
                 },
-                openExternally: { [weak self] link, explain in
-                    self?.openExternalDashboardLink(link, explain: explain)
+                openExternally: { [weak self] link in
+                    self?.openExternalDashboardLink(link)
                 },
                 onNavigation: { [weak self] rawDestination in
                     self?.selectNativeDashboardDestination(rawDestination)
@@ -2216,7 +2216,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     /// A link the embedded dashboard cannot load itself. Only credential-free
     /// public HTTPS is handed to the user's browser; the app opens nothing
     /// else, and loads nothing remote itself.
-    private func openExternalDashboardLink(_ url: URL, explain: Bool) {
+    private func openExternalDashboardLink(_ url: URL) {
+        // The completed hosted-sign-in callback can use only this fixed custom
+        // URL to bring the already-running dashboard back to the foreground.
+        // It carries no OAuth data, so the browser never hands an account,
+        // token, or callback value to the app.
+        if semanticOpenTarget.accepts(url) {
+            window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
         guard url.scheme?.lowercased() == "https",
               let host = url.host,
               !host.isEmpty,
@@ -2225,27 +2234,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         else {
             return
         }
-        guard explain else {
-            NSWorkspace.shared.open(url)
-            return
-        }
-        // Hosted sign-in authenticates at the provider, which this app
-        // deliberately will not load. The browser is where that step happens
-        // and nowhere else; the dashboard in this window then collects the
-        // one-time result from the contribution service itself, so the browser
-        // hands nothing back and this window is the only place to return to.
-        // Open in Browser remains on the status view as a separate choice, but
-        // it is no longer part of signing in.
-        let alert = NSAlert()
-        alert.messageText = "Finish signing in in your browser"
-        alert.informativeText = """
-        \(BundledProduct.displayName) keeps its own window on this Mac only, so it will not load \(host).
-
-        Choose Continue to sign in there, then come back to this window — it finishes the sign-in on its own. Nothing about your local analysis changes.
-        """
-        alert.addButton(withTitle: "Continue in Browser")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
         NSWorkspace.shared.open(url)
     }
 

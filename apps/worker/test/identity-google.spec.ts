@@ -194,6 +194,10 @@ describe("hosted Google sign-in", () => {
       .toContain("default-src 'none'");
     const page = await landed.text();
     expect(page).toContain("Signed in — return to TiboTattle.");
+    expect(page).toContain('content="0; url=usagemonitor://open"');
+    expect(page).toContain('href="usagemonitor://open"');
+    expect(page).toContain("Open TiboTattle");
+    expect(page).not.toContain("<script");
     for (const secret of [
       "google-one-time-code",
       GOOGLE_ID_TOKEN,
@@ -276,7 +280,9 @@ describe("hosted Google sign-in", () => {
       state: started.state,
     }).toString());
     expect(late.status).toBe(200);
-    expect(await late.text()).toContain("Sign-in was not completed.");
+    const page = await late.text();
+    expect(page).toContain("Sign-in was not completed.");
+    expect(page).not.toContain('http-equiv="refresh"');
     expect(tokenCalls).toHaveLength(0);
 
     const result = await json("/api/v1/identity/google/result", {

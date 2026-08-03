@@ -671,18 +671,19 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
   assert.match(
     source,
-    /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url, false\)/u,
+    /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url\)/u,
   );
-  // A second window is never opened in-app; the target is handed to the
-  // user's own browser and this delegate returns nothing.
+  // A second window is never opened in-app; its target is handed straight to
+  // the user's browser and this delegate returns nothing.
   assert.match(
     source,
-    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternally\(url, true\)\s*\n\s*\}\s*\n\s*return nil/u,
+    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternally\(url\)\s*\n\s*\}\s*\n\s*return nil/u,
   );
   assert.match(
     source,
-    /private func openExternalDashboardLink\(_ url: URL, explain: Bool\) \{[\s\S]*?url\.scheme\?\.lowercased\(\) == "https"[\s\S]*?url\.user == nil,\s*\n\s*url\.password == nil/u,
+    /private func openExternalDashboardLink\(_ url: URL\) \{[\s\S]*?semanticOpenTarget\.accepts\(url\)[\s\S]*?NSApp\.activate\(ignoringOtherApps: true\)[\s\S]*?url\.scheme\?\.lowercased\(\) == "https"[\s\S]*?url\.user == nil,\s*\n\s*url\.password == nil/u,
   );
+  assert.doesNotMatch(source, /Finish signing in in your browser/u);
   assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);
   for (const forbidden of [
     "WKWebsiteDataStore.default()",

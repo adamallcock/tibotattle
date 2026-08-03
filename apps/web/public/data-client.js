@@ -2907,18 +2907,12 @@ export class CommunityClient {
       };
     }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
-    const fetchImpl = this.fetchImpl;
-    const response = await fetchImpl(`${CENTRAL_ROOT}/enroll`, {
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/enroll`, {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw hostedIdentityRequestError(response, payload);
-    }
-    return payload;
   }
 
   /**

@@ -225,6 +225,10 @@ describe("web Sign in with Apple", () => {
     // collects the result itself, whether it is a browser tab or the macOS
     // app's own window, so nobody is asked to carry anything back.
     expect(page).toContain("Signed in — return to TiboTattle.");
+    expect(page).toContain('content="0; url=usagemonitor://open"');
+    expect(page).toContain('href="usagemonitor://open"');
+    expect(page).toContain("Open TiboTattle");
+    expect(page).not.toContain("<script");
     for (const secret of [
       "apple-one-time-code",
       APPLE_ID_TOKEN,
@@ -297,7 +301,9 @@ describe("web Sign in with Apple", () => {
       state: started.state,
     }).toString());
     expect(late.status).toBe(200);
-    expect(await late.text()).toContain("Sign-in was not completed.");
+    const page = await late.text();
+    expect(page).toContain("Sign-in was not completed.");
+    expect(page).not.toContain('http-equiv="refresh"');
     expect(tokenCalls).toHaveLength(0);
 
     const result = await json("/api/v1/identity/apple/result", {

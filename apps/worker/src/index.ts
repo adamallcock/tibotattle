@@ -458,6 +458,11 @@ const SIGNIN_HANDOFF_PROOF_PATTERN = /^[A-Za-z0-9_-]{64}$/u;
 const SIGNIN_COMPLETED_MESSAGE = "Signed in — return to TiboTattle.";
 const SIGNIN_NOT_COMPLETED_MESSAGE =
   "Sign-in was not completed. Return to TiboTattle and start the sign-in again.";
+// This is the fixed, registered macOS application URL from the signed bundle.
+// It is deliberately not derived from a callback request, state, code, or
+// provider payload, so returning to the app reveals nothing from the OAuth
+// exchange.
+const SIGNIN_CALLBACK_APP_OPEN_URL = "usagemonitor://open";
 
 /**
  * Production sign-in is deliberately pinned to one configured HTTPS origin.
@@ -635,23 +640,52 @@ async function purgeExpiredIdentityHandoffs(
   };
 }
 
-function signInCallbackPage(message: string): Response {
-  // Entirely inline and asset-free: no script, no style, no image, no link,
-  // and no value from the request is interpolated. The authorization code,
-  // the id_token, and Apple's optional user payload never reach this markup.
-  // The copy names no surface: the dashboard that started the sign-in may be
-  // a browser tab or the macOS app's own window, and it collects the result
-  // itself either way, so this page never asks anyone to carry anything back.
+function signInCallbackPage(
+  message: string,
+  { completed = false }: { completed?: boolean } = {},
+): Response {
+  // The page stays entirely self-contained: no script, external asset, or
+  // request value reaches this markup. The authorization code, id_token,
+  // Apple's optional user payload, state, and proof remain server-side. The
+  // one fixed app link is both a graceful manual fallback and an automatic
+  // return on a completed sign-in.
+  const title = completed
+    ? "You're signed in"
+    : "Sign-in was not completed";
+  const detail = completed
+    ? "TiboTattle is opening now. You can close this browser tab."
+    : "No data was uploaded. Open TiboTattle and start the sign-in again.";
+  const refresh = completed
+    ? `<meta http-equiv="refresh" content="0; url=${SIGNIN_CALLBACK_APP_OPEN_URL}">`
+    : "";
   const html = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+${refresh}
 <title>TiboTattle sign-in</title>
+<style>
+:root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+* { box-sizing: border-box; }
+body { align-items: center; background: #f5f3ec; color: #16211d; display: flex; justify-content: center; margin: 0; min-height: 100vh; padding: 28px; }
+main { background: #fffefa; border: 1px solid #d7d5cc; border-radius: 20px; box-shadow: 0 18px 54px rgba(24, 39, 32, .14); max-width: 34rem; padding: 38px; width: 100%; }
+.brand { color: #176052; font-size: .78rem; font-weight: 750; letter-spacing: .12em; margin: 0 0 18px; text-transform: uppercase; }
+h1 { font-family: ui-serif, Georgia, serif; font-size: clamp(2rem, 7vw, 3.1rem); letter-spacing: -.035em; line-height: 1.04; margin: 0 0 16px; }
+p { color: #52625b; font-size: 1rem; line-height: 1.55; margin: 0; }
+.action { background: #155f51; border-radius: 11px; color: #fff; display: inline-block; font-weight: 700; margin-top: 28px; padding: 13px 18px; text-decoration: none; }
+.hint { color: #718078; font-size: .9rem; margin-top: 16px; }
+@media (prefers-color-scheme: dark) { body { background: #16201d; color: #f5f4ed; } main { background: #202b27; border-color: #425048; box-shadow: none; } p { color: #c1cbc4; } .hint { color: #9dab9f; } }
+</style>
 </head>
 <body>
-<h1>TiboTattle sign-in</h1>
+<main>
+<p class="brand">TiboTattle</p>
+<h1>${title}</h1>
 <p>${message}</p>
+<p class="hint">${detail}</p>
+<a class="action" href="${SIGNIN_CALLBACK_APP_OPEN_URL}">Open TiboTattle</a>
+</main>
 </body>
 </html>
 `;
@@ -661,7 +695,7 @@ function signInCallbackPage(message: string): Response {
       "cache-control": "no-store",
       "content-type": "text/html; charset=utf-8",
       "content-security-policy":
-        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
       "permissions-policy": "camera=(), microphone=(), geolocation=()",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
@@ -775,7 +809,7 @@ async function handleIdentityAppleCallback(
         AND expires_at > ?`,
   ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
   if (stored.meta.changes !== 1) return failure;
-  return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE);
+  return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }
 
 /**
@@ -956,7 +990,7 @@ async function handleIdentityGoogleCallback(
         AND expires_at > ?`,
   ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
   if (stored.meta.changes !== 1) return failure;
-  return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE);
+  return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }
 
 /**
