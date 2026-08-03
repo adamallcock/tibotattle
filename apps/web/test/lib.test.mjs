@@ -3409,7 +3409,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /Calculating usage and allowance/);
   assert.match(html, /id="calibration-range-controls"/);
   assert.match(html, /id="weekly-range-controls"/);
-  assert.match(html, /id="weekly-evidence-controls"/);
+  assert.match(html, /id="weekly-partial-legend"/);
   assert.match(html, /id="contribution-lookback-controls"/);
   assert.match(html, /Prepare and review last 24 hours/);
   assert.ok(
@@ -3421,7 +3421,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     "rolling window controls stay inside advanced calibration",
   );
   assert.match(appSource, /row\.last_observed_at \?\? row\.first_observed_at/);
-  assert.match(appSource, /Partial diagnostic extrapolated to 100 percentage points/);
+  assert.match(appSource, /label: "Short observation"/);
   assert.match(appSource, /lookbackHours: activeContributionLookbackHours/);
   assert.match(styles, /interactive-chart/);
   assert.match(styles, /chart-status-missing/);
@@ -3454,14 +3454,14 @@ test("default calibration view explains the fitted rate and uncertainty plainly"
   assert.match(appSource, /not a provider-published dollar cap/);
 });
 
-test("weekly view gives a plain-language change conclusion", async () => {
+test("weekly view keeps the default surface to the estimate and its reset history", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(html, /id="weekly-trend"/);
-  assert.match(html, /Has the inferred limit changed/);
-  assert.match(appSource, /function renderWeeklyTrend/);
-  assert.match(appSource, /no convincing change detected/);
-  assert.match(appSource, /possible accounting or allowance shift/);
+  assert.doesNotMatch(html, /id="weekly-trend"/);
+  assert.doesNotMatch(html, /id="weekly-stats"/);
+  assert.match(html, /<summary>See individual measurements<\/summary>/);
+  assert.doesNotMatch(appSource, /function renderWeeklyTrend/);
+  assert.doesNotMatch(appSource, /function renderWeeklyStats/);
 });
 
 test("weekly view states the exact price epoch and whether the July repricing is included", async () => {
@@ -3480,90 +3480,50 @@ test("weekly view states the exact price epoch and whether the July repricing is
   assert.match(styles, /\.weekly-pricing-receipt/u);
 });
 
-test("weekly defaults to high-confidence evidence and partial diagnostics are opt-in", async () => {
+test("weekly keeps every fit visible and marks short observations separately", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const allFitsControl =
-    html.match(/<button[^>]*data-evidence="all"[^>]*>/u)?.[0] ?? "";
-  const matureControl =
-    html.match(/<button[^>]*data-evidence="mature"[^>]*>/u)?.[0] ?? "";
-
-  assert.doesNotMatch(allFitsControl, /\bactive\b|aria-pressed="true"/u);
-  assert.match(matureControl, /\bactive\b/u);
-  assert.match(matureControl, /aria-pressed="true"/u);
-  assert.match(appSource, /let showWeeklyPartialDiagnostics = false;/u);
+  assert.doesNotMatch(html, /id="weekly-evidence-controls"/u);
   assert.match(
     appSource,
-    /const chartValues = showWeeklyPartialDiagnostics[\s\S]*?\? rangedValues[\s\S]*?: rangedValues\.filter\(\(row\) => row\.matureValue !== null\);/u,
+    /const chartValues = rangedValues;/u,
   );
   assert.match(
     appSource,
-    /matureValue: aboveWeeklySpanThreshold\(observedSpanPp\) \? value : null/u,
+    /matureValue: isWellObservedWeeklyFit\(observedSpanPp\) \? value : null/u,
   );
   assert.match(
     appSource,
-    /provisionalValue: aboveWeeklySpanThreshold\(observedSpanPp\) \? null : value/u,
+    /provisionalValue: isWellObservedWeeklyFit\(observedSpanPp\) \? null : value/u,
   );
-  assert.match(
-    appSource,
-    /showWeeklyPartialDiagnostics = button\.dataset\.evidence === "all"/u,
-  );
+  assert.match(appSource, /weekly-partial-legend"\)\.hidden = !chartValues\.some/u);
+  assert.doesNotMatch(appSource, /showWeeklyPartialDiagnostics/u);
 });
 
-test("the weekly span threshold is a visible adjustable control defaulting above 50 pp", async () => {
+test("the weekly evidence boundary is fixed and cannot create an empty slider state", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
-
-  assert.match(appSource, /const DEFAULT_WEEKLY_SPAN_THRESHOLD_PP = 50;/u);
-  assert.match(
-    appSource,
-    /let weeklySpanThresholdPp = DEFAULT_WEEKLY_SPAN_THRESHOLD_PP;/u,
-  );
-  // Strictly greater than the threshold, and an unrecorded span can never be
-  // shown to clear it, so it stays a diagnostic instead of headline evidence.
+  assert.match(appSource, /const WEEKLY_WELL_OBSERVED_SPAN_PP = 50;/u);
   const thresholdMatch = appSource.match(
-    /function aboveWeeklySpanThreshold\(observedSpanPp\) \{([\s\S]*?)\n\}/u,
+    /function isWellObservedWeeklyFit\(observedSpanPp\) \{([\s\S]*?)\n\}/u,
   );
-  assert.ok(thresholdMatch, "aboveWeeklySpanThreshold is available for contract review");
+  assert.ok(thresholdMatch, "isWellObservedWeeklyFit is available for contract review");
   assert.match(
     thresholdMatch[1],
-    /return observedSpanPp !== null && observedSpanPp > weeklySpanThresholdPp;/u,
+    /return observedSpanPp !== null && observedSpanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP;/u,
   );
-  // The threshold is never a hidden constant: the slider, the readout, the
-  // filter button label and the table's partial-diagnostic rule all read it.
-  const slider = html.match(/<input[\s\S]*?id="weekly-span-threshold"[\s\S]*?>/u)?.[0] ?? "";
-  assert.match(slider, /type="range"/u);
-  assert.match(slider, /min="0"/u);
-  // The wording is strictly "more than", so 100 would make an impossible
-  // always-empty filter. 99 still admits only a genuinely complete 100 pp fit.
-  assert.match(slider, /max="99"/u);
-  assert.match(slider, /step="1"/u);
-  assert.match(slider, /value="50"/u);
-  assert.match(html, /<label for="weekly-span-threshold">Minimum observed span<\/label>/u);
-  assert.match(html, /<output id="weekly-span-threshold-value"/u);
-  assert.match(appSource, /function renderWeeklySpanThresholdControls/u);
-  assert.match(
-    appSource,
-    /\$\("#weekly-evidence-controls"\)\.querySelector\('\[data-evidence="mature"\]'\)\s*\.textContent = `> \$\{formatPp\(weeklySpanThresholdPp, 0\)\} only`/u,
-  );
-  assert.match(appSource, /const belowThreshold = !aboveWeeklySpanThreshold\(span\);/u);
-  assert.match(appSource, /\$\("#weekly-span-threshold"\)\.addEventListener\("input"/u);
-  assert.match(appSource, /Math\.max\(0, Math\.min\(99, threshold\)\)/u);
-  assert.doesNotMatch(appSource, /observedSpanPp >= 80|span < 80/u);
-  assert.match(styles, /\.span-threshold input\[type="range"\]:focus-visible/u);
+  assert.doesNotMatch(html, /weekly-span-threshold|weekly-evidence-controls/u);
+  assert.doesNotMatch(appSource, /weeklySpanThresholdPp|Math\.min\(99, threshold\)/u);
 });
 
-test("weekly points carry per-week error bars and state the percentage points they represent", async () => {
+test("weekly points carry measured ranges without mouse-only detail popovers", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
-  // Each fit gets its own within-reset range, not one band standing in for
-  // every week; the across-reset band stays, because it is a different claim.
   assert.match(
     appSource,
-    /errorBars: \{\s*low: "low",\s*high: "high",\s*className: "chart-error-bar-weekly",\s*label: "Within-reset sensitivity",\s*\}/u,
+    /errorBars: \{\s*low: "low",\s*high: "high",\s*className: "chart-error-bar-weekly",\s*label: "Measured range",\s*tooltip: false,/u,
   );
   assert.match(
     appSource,
@@ -3573,33 +3533,14 @@ test("weekly points carry per-week error bars and state the percentage points th
     appSource,
     /if \(errorBars\) values\.push\([\s\S]*?errorBars\.low[\s\S]*?errorBars\.high/u,
   );
-  const detailMatch = appSource.match(
-    /function weeklyPointDetail\(point\) \{([\s\S]*?)\n\}/u,
-  );
-  assert.ok(detailMatch, "weeklyPointDetail is available for contract review");
-  assert.match(
-    detailMatch[1],
-    /represents \$\{formatPp\(point\.observedSpanPp\)\} of the 100-point allowance/u,
-  );
-  assert.match(detailMatch[1], /observed span not recorded/u);
-  assert.match(detailMatch[1], /marker intensity shows observed-span coverage, not statistical confidence/u);
-  assert.match(detailMatch[1], /within-reset sensitivity \$\{formatMoney\(point\.low\)\}/u);
-  assert.match(appSource, /function weeklySpanVisualStrength\(observedSpanPp\)/u);
-  assert.match(appSource, /spanVisualStrength: weeklySpanVisualStrength\(observedSpanPp\)/u);
-  assert.match(appSource, /markerRadius: \(point\) => 3 \+ point\.spanVisualStrength \* 3/u);
-  assert.match(appSource, /markerOpacity: \(point\) => point\.spanVisualStrength/u);
-  assert.match(appSource, /item\.markerOpacity/u);
-  assert.match(appSource, /detail: weeklyPointDetail,/u);
-  // A hover title is mouse-only, so the same sentence must reach the keyboard
-  // and assistive technology on the marker itself.
-  assert.match(appSource, /marker\.setAttribute\("tabindex", "0"\);/u);
-  assert.match(appSource, /marker\.setAttribute\("aria-label", caption\);/u);
-  assert.match(appSource, /focusable: true,/u);
-  assert.match(styles, /\.chart-point:focus-visible/u);
+  const weeklyMatch = appSource.match(/function renderWeekly\(data\) \{([\s\S]*?)\n\}/u)?.[1] ?? "";
+  assert.match(weeklyMatch, /tooltip: false,/u);
+  assert.doesNotMatch(weeklyMatch, /focusable: true|weeklyPointDetail|markerOpacity|markerRadius/u);
+  assert.match(appSource, /if \(item\.tooltip !== false \|\| item\.focusable === true\)/u);
+  assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
-  assert.match(html, /legend-dot weekly-error/u);
-  assert.match(html, /Per-week within-reset sensitivity/u);
-  assert.match(html, /Neither visual is a formal confidence interval/u);
+  assert.match(html, /vertical bar shows the range supported/u);
+  assert.doesNotMatch(html, /Per-week within-reset sensitivity|Scroll horizontally on a narrow screen/u);
 });
 
 test("calibration zoom moves in bounded granular steps on every input device", async () => {
@@ -3689,7 +3630,11 @@ test("the weekly allowance chart leads the dashboard", async () => {
   assert.match(html, /<p class="eyebrow">03 · Timeline<\/p>/u);
   assert.match(html, /class="dashboard-section lead-section" id="weekly"/u);
   assert.match(html, /class="panel weekly-history-panel lead-chart-panel"/u);
-  assert.match(styles, /\.lead-chart-panel \.weekly-history-chart svg \{ height: 470px; \}/u);
+  // The lead chart must use the available page width instead of introducing a
+  // second horizontal scrollbar for a handful of reset estimates.
+  assert.match(styles, /\.weekly-history-chart \{ overflow: visible; \}/u);
+  assert.match(styles, /\.weekly-history-chart svg \{ min-width: 0; height: clamp\(300px, 34vw, 420px\); \}/u);
+  assert.match(styles, /\.lead-chart-panel \.weekly-history-chart svg \{ height: clamp\(320px, 38vw, 460px\); \}/u);
 });
 
 test("estimate caveats show only the few gaps that materially change the result", async () => {
@@ -3710,22 +3655,23 @@ test("estimate caveats show only the few gaps that materially change the result"
   assert.doesNotMatch(html, /id="fast-mode-preference-controls"/u);
 });
 
-test("weekly trend is derived from the selected displayed evidence only", async () => {
+test("weekly details keep reset evidence concise and do not present speed coverage as known", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(appSource, /renderWeeklyTrend\(chartValues\);/u);
+  const tableMatch = appSource.match(
+    /function renderWeeklyTable\(values\) \{([\s\S]*?)\n\}/u,
+  );
+  assert.ok(tableMatch, "renderWeeklyTable source is available for contract review");
+  const tableSource = tableMatch[1];
 
-  const trendMatch = appSource.match(
-    /function renderWeeklyTrend\(([^)]*)\) \{([\s\S]*?)\n\}\n\nfunction renderWeeklyStats/u,
-  );
-  assert.ok(trendMatch, "renderWeeklyTrend source is available for contract review");
-  const [, parameters, trendSource] = trendMatch;
-  assert.equal(parameters.trim(), "values");
-  assert.match(trendSource, /values\.slice\(0, 3\)/u);
-  assert.match(trendSource, /values\.slice\(-3\)/u);
-  assert.doesNotMatch(
-    trendSource,
-    /gradient|early_three_median_usd|recent_three_median_usd|early_to_recent_change/u,
-  );
+  assert.match(html, /<summary>See individual measurements<\/summary>/u);
+  assert.match(html, /<th scope="col">Observed<\/th>[\s\S]*?<th scope="col">Observed span<\/th>[\s\S]*?<th scope="col">Estimate<\/th>[\s\S]*?<th scope="col">Measured range<\/th>[\s\S]*?<th scope="col">Status<\/th>/u);
+  assert.doesNotMatch(html, /Evidence available \/ reset due|Speed known|Known speed coverage/u);
+  assert.doesNotMatch(tableSource, /resetDueAt|speedCoverage|known_speed_fraction/u);
+  assert.match(tableSource, /Well observed/u);
+  assert.match(tableSource, /Short observation/u);
+  assert.match(appSource, /function isWellObservedWeeklyFit\(observedSpanPp\)/u);
+  assert.doesNotMatch(appSource, /function renderWeeklyTrend|function renderWeeklyStats/u);
 });
 
 test("live timeline uses the primary Codex weekly track and live weekly median first", async () => {
@@ -3815,7 +3761,8 @@ test("local contribution preparation exposes fixed lookbacks and fails dense wee
 test("return visits schedule one bounded checkpoint refresh after cached results render", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /function scheduleReturningUserRefresh\(\)/u);
-  assert.match(appSource, /document\.body\.classList\.contains\("native-dashboard"\)/u);
+  assert.match(appSource, /if \(runsInsideNativeDashboard\(\)\) return;/u);
+  assert.match(appSource, /document\.documentElement\.classList\.contains\("native-dashboard"\)/u);
   assert.match(appSource, /returnRefreshDeferrals < 20/u);
   assert.match(appSource, /Cached results are ready/u);
   assert.match(appSource, /checking for new local evidence from the last verified checkpoint/u);
@@ -4889,7 +4836,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.match(section, /context\.fillText\(point\.dateLabel, positionX\(point\), plotBottom \+ 21\);/u);
   // Which fits qualify is fixed in the build, not read from the on-screen
   // control, so two readers of the same evidence post the same picture.
-  assert.match(trend, /point\.spanPp > DEFAULT_WEEKLY_SPAN_THRESHOLD_PP/u);
+  assert.match(trend, /point\.spanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP/u);
   assert.doesNotMatch(section, /weeklySpanThresholdPp|showWeeklyPartialDiagnostics/u);
 
   // The three free-form strings that do arrive are each replaced before use.

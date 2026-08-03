@@ -80,8 +80,12 @@ function partitionKey(row, { includeSlot = true } = {}) {
   ].filter((value) => value !== null).join("|");
 }
 
-function exactResetKey(row) {
+function slotResetKey(row) {
   return `${partitionKey(row)}|${row.resetsAt}`;
+}
+
+function logicalResetKey(row) {
+  return `${partitionKey(row, { includeSlot: false })}|${row.resetsAt}`;
 }
 
 function isEligible(row) {
@@ -643,37 +647,171 @@ function fitReset(rows, candidate) {
   };
 }
 
-function selectResetGroups(transitions) {
-  const exact = new Map();
-  for (const row of transitions.filter((item) => item.windowDurationMins === WEEKLY_WINDOW_MINS && item.limitId === "codex")) {
-    const values = exact.get(exactResetKey(row)) ?? [];
+function observedTimestamp(row, field) {
+  const parsed = Date.parse(row[field] ?? row.eventTime);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function groupInterval(rows) {
+  const timestamps = rows.flatMap((row) => [
+    observedTimestamp(row, "lastPriorObservedAt"),
+    observedTimestamp(row, "firstNextObservedAt"),
+    observedTimestamp(row, "eventTime"),
+  ]).filter(Number.isFinite);
+  return {
+    start: timestamps.length > 0 ? Math.min(...timestamps) : null,
+    end: timestamps.length > 0 ? Math.max(...timestamps) : null,
+  };
+}
+
+function rangesOverlap(left, right) {
+  return Number.isFinite(left.start)
+    && Number.isFinite(left.end)
+    && Number.isFinite(right.start)
+    && Number.isFinite(right.end)
+    && Math.max(left.start, right.start) < Math.min(left.end, right.end);
+}
+
+function sameObservationTimestamp(left, right) {
+  const timestamps = new Set(left.flatMap((row) => [
+    observedTimestamp(row, "lastPriorObservedAt"),
+    observedTimestamp(row, "firstNextObservedAt"),
+    observedTimestamp(row, "eventTime"),
+  ]).filter(Number.isFinite));
+  return right.some((row) => [
+    observedTimestamp(row, "lastPriorObservedAt"),
+    observedTimestamp(row, "firstNextObservedAt"),
+    observedTimestamp(row, "eventTime"),
+  ].some((timestamp) => Number.isFinite(timestamp) && timestamps.has(timestamp)));
+}
+
+function hasSimultaneousSlotConflict(rows) {
+  const bySlot = new Map();
+  for (const row of rows) {
+    const values = bySlot.get(row.slot) ?? [];
     values.push(row);
-    exact.set(exactResetKey(row), values);
+    bySlot.set(row.slot, values);
   }
-  const summarized = [...exact.values()].map((rows) => ({
-    rows: rows.sort((left, right) => left.eventTime.localeCompare(right.eventTime)),
-    eligibleCount: rows.filter(isEligible).length,
-    first: rows[0],
-  }));
-  const byPartition = new Map();
-  for (const group of summarized) {
-    const values = byPartition.get(partitionKey(group.first)) ?? [];
+  const slots = [...bySlot.values()];
+  for (let left = 0; left < slots.length; left += 1) {
+    for (let right = left + 1; right < slots.length; right += 1) {
+      if (sameObservationTimestamp(slots[left], slots[right])
+          || rangesOverlap(groupInterval(slots[left]), groupInterval(slots[right]))) return true;
+    }
+  }
+  return false;
+}
+
+function summarizeResetGroup(rows) {
+  const ordered = [...rows].sort((left, right) => left.eventTime.localeCompare(right.eventTime)
+    || String(left.slot).localeCompare(String(right.slot)));
+  const eligible = ordered.filter(isEligible);
+  const percentages = eligible.flatMap((row) => [row.priorUsedPercent, row.nextUsedPercent])
+    .filter(Number.isFinite);
+  return {
+    rows: ordered,
+    eligibleCount: eligible.length,
+    observedSpanPp: percentages.length > 0 ? Math.max(...percentages) - Math.min(...percentages) : 0,
+    interval: groupInterval(ordered),
+    first: ordered[0],
+  };
+}
+
+function compareResetGroupStrength(left, right) {
+  return right.eligibleCount - left.eligibleCount
+    || right.observedSpanPp - left.observedSpanPp
+    || right.rows.length - left.rows.length
+    || left.first.resetsAt - right.first.resetsAt
+    || left.first.eventTime.localeCompare(right.first.eventTime);
+}
+
+function groupEvidenceWeight(group) {
+  return group.eligibleCount * 1_000_000 + group.observedSpanPp * 1_000 + group.rows.length;
+}
+
+function selectNonOverlappingGroups(groups) {
+  const ordered = [...groups].sort((left, right) => left.interval.end - right.interval.end
+    || left.interval.start - right.interval.start
+    || compareResetGroupStrength(left, right));
+  const compatible = ordered.map((group, index) => {
+    for (let prior = index - 1; prior >= 0; prior -= 1) {
+      if (ordered[prior].interval.end <= group.interval.start) return prior;
+    }
+    return -1;
+  });
+  const best = [];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const group = ordered[index];
+    const include = groupEvidenceWeight(group) + (compatible[index] >= 0 ? best[compatible[index]].weight : 0);
+    const exclude = index > 0 ? best[index - 1].weight : 0;
+    if (include > exclude) {
+      best.push({ weight: include, indices: [...(compatible[index] >= 0 ? best[compatible[index]].indices : []), index] });
+      continue;
+    }
+    if (include < exclude) {
+      best.push(index > 0 ? best[index - 1] : { weight: 0, indices: [] });
+      continue;
+    }
+    const included = [...(compatible[index] >= 0 ? best[compatible[index]].indices : []), index];
+    const excluded = index > 0 ? best[index - 1].indices : [];
+    const includeFirst = included.map((candidate) => ordered[candidate]).sort(compareResetGroupStrength)[0];
+    const excludeFirst = excluded.map((candidate) => ordered[candidate]).sort(compareResetGroupStrength)[0];
+    best.push(!excludeFirst || compareResetGroupStrength(includeFirst, excludeFirst) < 0
+      ? { weight: include, indices: included }
+      : (index > 0 ? best[index - 1] : { weight: 0, indices: [] }));
+  }
+  return best.length === 0 ? [] : best.at(-1).indices.map((index) => ordered[index]);
+}
+
+function selectResetGroups(transitions) {
+  const bySlotReset = new Map();
+  for (const row of transitions.filter((item) => item.windowDurationMins === WEEKLY_WINDOW_MINS && item.limitId === "codex")) {
+    const values = bySlotReset.get(slotResetKey(row)) ?? [];
+    values.push(row);
+    bySlotReset.set(slotResetKey(row), values);
+  }
+  const byLogicalReset = new Map();
+  for (const rows of bySlotReset.values()) {
+    const key = logicalResetKey(rows[0]);
+    const values = byLogicalReset.get(key) ?? [];
+    values.push(...rows);
+    byLogicalReset.set(key, values);
+  }
+  const suppressed = [];
+  const logicalGroups = [];
+  for (const rows of byLogicalReset.values()) {
+    const group = summarizeResetGroup(rows);
+    if (hasSimultaneousSlotConflict(group.rows)) {
+      suppressed.push({
+        resetsAt: group.first.resetsAt,
+        selectedResetsAt: null,
+        partition: partitionKey(group.first, { includeSlot: false }),
+        reason: "simultaneous_slot_conflict",
+      });
+      continue;
+    }
+    logicalGroups.push(group);
+  }
+  const byContinuityTrack = new Map();
+  for (const group of logicalGroups) {
+    const key = partitionKey(group.first, { includeSlot: false });
+    const values = byContinuityTrack.get(key) ?? [];
     values.push(group);
-    byPartition.set(partitionKey(group.first), values);
+    byContinuityTrack.set(key, values);
   }
   const selected = [];
-  const suppressed = [];
-  for (const groups of byPartition.values()) {
+  for (const groups of byContinuityTrack.values()) {
     groups.sort((left, right) => left.first.resetsAt - right.first.resetsAt);
     let cluster = [];
     const flush = () => {
       if (cluster.length === 0) return;
-      cluster.sort((left, right) => right.eligibleCount - left.eligibleCount || right.rows.length - left.rows.length);
+      cluster.sort(compareResetGroupStrength);
       selected.push(cluster[0]);
       for (const duplicate of cluster.slice(1)) suppressed.push({
         resetsAt: duplicate.first.resetsAt,
         selectedResetsAt: cluster[0].first.resetsAt,
-        partition: partitionKey(duplicate.first),
+        partition: partitionKey(duplicate.first, { includeSlot: false }),
+        reason: "near_duplicate_reset_identity_with_less_evidence",
       });
       cluster = [];
     };
@@ -683,8 +821,37 @@ function selectResetGroups(transitions) {
     }
     flush();
   }
-  selected.sort((left, right) => left.rows[0].eventTime.localeCompare(right.rows[0].eventTime));
-  return { selected, suppressed, exactGroupCount: summarized.length };
+  const nonOverlapping = [];
+  const selectedByTrack = new Map();
+  for (const group of selected) {
+    const key = partitionKey(group.first, { includeSlot: false });
+    const values = selectedByTrack.get(key) ?? [];
+    values.push(group);
+    selectedByTrack.set(key, values);
+  }
+  for (const groups of selectedByTrack.values()) {
+    const retained = selectNonOverlappingGroups(groups);
+    const retainedIds = new Set(retained);
+    nonOverlapping.push(...retained);
+    for (const group of groups) {
+      if (retainedIds.has(group)) continue;
+      const winner = retained.filter((candidate) => rangesOverlap(candidate.interval, group.interval))
+        .sort(compareResetGroupStrength)[0] ?? null;
+      suppressed.push({
+        resetsAt: group.first.resetsAt,
+        selectedResetsAt: winner?.first.resetsAt ?? null,
+        partition: partitionKey(group.first, { includeSlot: false }),
+        reason: "overlapping_observation_window",
+      });
+    }
+  }
+  nonOverlapping.sort((left, right) => left.rows[0].eventTime.localeCompare(right.rows[0].eventTime));
+  return {
+    selected: nonOverlapping,
+    suppressed,
+    exactGroupCount: bySlotReset.size,
+    logicalGroupCount: logicalGroups.length,
+  };
 }
 
 function speedCounts(rows) {

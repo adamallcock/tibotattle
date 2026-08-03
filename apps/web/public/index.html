@@ -358,11 +358,7 @@
             <p class="eyebrow">02 · Weekly allowance</p>
             <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
           </div>
-          <p>
-            The lead chart. Historical reset-series fits, plotted when each
-            estimate became observable, each carrying its own uncertainty bar
-            and with partial extrapolations kept visibly separate.
-          </p>
+          <p>One dot per distinct reset.</p>
         </div>
 
         <div class="weekly-hero">
@@ -371,13 +367,7 @@
             <strong id="weekly-estimate">—</strong>
             <small id="weekly-range">No evidence interval available</small>
           </div>
-          <div class="confidence-meter">
-            <div class="confidence-label"><span>Evidence strength</span><strong id="evidence-label">Insufficient</strong></div>
-            <div class="meter-track"><i id="evidence-meter" style="width:0%"></i></div>
-            <p id="weekly-explanation">
-              The estimate will appear when enough quota transitions can be matched to priced usage.
-            </p>
-          </div>
+          <p id="weekly-explanation">The estimate will appear when local usage can be matched to quota changes.</p>
         </div>
 
         <aside class="weekly-pricing-receipt" id="weekly-pricing-receipt" aria-live="polite">
@@ -394,109 +384,44 @@
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">History</p>
-              <h3>Seven-day allowance estimates by observation date</h3>
+              <h3>Allowance estimate history</h3>
             </div>
             <div class="weekly-chart-controls">
               <div class="segmented-control" id="weekly-range-controls" aria-label="Weekly history date range">
                 <button type="button" data-days="7">7d</button>
-                <button type="button" data-days="14">14d</button>
                 <button type="button" data-days="31" class="active" aria-pressed="true">31d</button>
-                <button type="button" data-days="90">90d</button>
                 <button type="button" data-days="36500">All</button>
-              </div>
-              <div class="segmented-control" id="weekly-evidence-controls" aria-label="Weekly estimate evidence filter">
-                <button type="button" data-evidence="all" aria-pressed="false">All fits</button>
-                <button type="button" data-evidence="mature" class="active" aria-pressed="true">&gt; 50 pp only</button>
               </div>
             </div>
           </div>
-          <div class="span-threshold">
-            <label for="weekly-span-threshold">Minimum observed span</label>
-            <input
-              type="range"
-              id="weekly-span-threshold"
-              min="0"
-              max="99"
-              step="1"
-              value="50"
-              aria-describedby="weekly-span-threshold-help"
-            >
-            <output id="weekly-span-threshold-value" for="weekly-span-threshold">&gt; 50 pp</output>
-            <p class="annotation" id="weekly-span-threshold-help">
-              A fit is headline evidence only when the reset series it was
-              measured on moved more percentage points than this. Below it, the
-              value is an extrapolation to a full 100-point allowance and is
-              shown only as a diagnostic.
-            </p>
-          </div>
           <div class="legend weekly-legend" aria-label="Weekly estimate chart legend">
-            <span><i class="legend-dot weekly-center"></i>Historical median</span>
-            <span><i class="legend-dot weekly-range"></i>Across-reset 80% range</span>
-            <span><i class="legend-dot weekly-error"></i>Per-week within-reset sensitivity</span>
-            <span><i class="legend-dot weekly-mature"></i>Fit above the span threshold</span>
-            <span><i class="legend-dot weekly-partial"></i>Partial diagnostic extrapolated to 100 pp</span>
+            <span><i class="legend-dot weekly-center"></i>Typical estimate</span>
+            <span><i class="legend-dot weekly-mature"></i>Observed across 50+ points</span>
+            <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
           </div>
           <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
           <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
           <p class="annotation">
-            Points are independent reset-series fits, not a continuous balance.
-            The bar on each point is that week's own within-reset sensitivity,
-            while point intensity shows how much of that reset was observed.
-            The shaded band behind them is the separate spread across reset
-            series. Neither visual is a formal confidence interval. Hover or
-            focus a point for its value, observed span, and sensitivity range.
-            Scroll horizontally on a narrow screen.
-          </p>
-        </article>
-
-        <article class="panel weekly-validation-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Validation</p>
-              <h3>How wrong was the estimate?</h3>
-            </div>
-          </div>
-          <div class="weekly-stats" id="weekly-stats"></div>
-          <div class="weekly-trend" id="weekly-trend" role="status">
-            <strong>Has the inferred limit changed?</strong>
-            <p>There is not yet enough comparable weekly evidence to call a change.</p>
-          </div>
-          <p class="annotation" id="weekly-caveat">
-            The change statement follows the date and evidence filters above. Error metrics use all qualifying held-out observations when available.
+            Each dot is a separate reset estimate. Its vertical bar shows the range supported by that reset’s observations.
           </p>
         </article>
 
         <details class="panel weekly-table-panel evidence-disclosure">
-          <summary>View week-by-week evidence and caveats</summary>
-          <p class="annotation">
-            Each row matches API-price-equivalent usage to a decrease in the
-            provider-reported seven-day allowance, then scales that movement to
-            an inferred full 100 percentage-point allowance. Partial rows are
-            diagnostics and must not be read as completed weeks.
-          </p>
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Week-by-week evidence</p>
-              <h3>What changed, and how certain are we?</h3>
-            </div>
-          </div>
+          <summary>See individual measurements</summary>
           <div class="table-wrap">
             <table>
-              <caption class="sr-only">Weekly allowance estimates and uncertainty</caption>
+              <caption class="sr-only">Individual seven-day reset estimates</caption>
               <thead>
                 <tr>
-                  <th scope="col">Evidence available / reset due</th>
-                  <th scope="col">Observed API equivalent</th>
-                  <th scope="col">Quota decrease</th>
-                  <th scope="col">Implied full allowance</th>
-                  <th scope="col">Within-reset sensitivity</th>
-                  <th scope="col">Usable observations</th>
-                  <th scope="col">Coverage quality</th>
-                  <th scope="col">Caveats</th>
+                  <th scope="col">Observed</th>
+                  <th scope="col">Observed span</th>
+                  <th scope="col">Estimate</th>
+                  <th scope="col">Measured range</th>
+                  <th scope="col">Status</th>
                 </tr>
               </thead>
               <tbody id="weekly-table">
-                <tr><td colspan="8" class="empty-cell">No weekly evidence loaded.</td></tr>
+                <tr><td colspan="5" class="empty-cell">No weekly evidence loaded.</td></tr>
               </tbody>
             </table>
           </div>

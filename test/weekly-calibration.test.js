@@ -66,6 +66,7 @@ function resetTransitions({
   weightedCost = null,
   accountScopeId = "scope-a",
   planVariant = "pro-20x",
+  slot = reset < 1_800_000_000 ? "secondary" : "primary",
 }) {
   const percentages = Array.from({ length: 21 }, (_, index) => index);
   const standard = (percent) => percent * capacityUsd / 100;
@@ -78,7 +79,7 @@ function resetTransitions({
       provider: "openai_codex",
       planType: "pro",
       limitId: "codex",
-      slot: reset < 1_800_000_000 ? "secondary" : "primary",
+      slot,
       windowDurationMins: 10_080,
       resetsAt: reset,
       eventTime: new Date((reset - 100_000 + index * 60) * 1000).toISOString(),
@@ -103,6 +104,52 @@ function resetTransitions({
     };
   });
 }
+
+test("weekly calibration merges a sequential primary-to-secondary slot move into one reset", () => {
+  const reset = 1_785_000_000;
+  const transitions = resetTransitions({ reset, slot: "primary" }).map((row, index) => ({
+    ...row,
+    slot: index < 10 ? "primary" : "secondary",
+  }));
+  const report = analyzeWeeklyCalibration(dataset(transitions));
+
+  assert.equal(report.resetValues.length, 1);
+  assert.equal(report.quality.exactResetGroups, 2);
+  assert.equal(report.quality.selectedResetGroups, 1);
+  assert.equal(report.quality.duplicateResetGroupsSuppressed, 0);
+});
+
+test("weekly calibration refuses simultaneous slots for one logical reset", () => {
+  const reset = 1_785_000_000;
+  const transitions = [
+    ...resetTransitions({ reset, slot: "primary" }),
+    ...resetTransitions({ reset, slot: "secondary" }),
+  ];
+  const report = analyzeWeeklyCalibration(dataset(transitions));
+
+  assert.equal(report.resetValues.length, 0);
+  assert.equal(report.quality.duplicateResetGroupsSuppressed, 1);
+  assert.equal(report.duplicateResetGroupsSuppressed[0].reason, "simultaneous_slot_conflict");
+});
+
+test("weekly calibration keeps only non-overlapping observation windows in a continuity track", () => {
+  const firstReset = 1_785_000_000;
+  const resets = [
+    firstReset,
+    firstReset + 100,
+    firstReset + 604_800,
+    firstReset + 1_209_600,
+  ];
+  const report = analyzeWeeklyCalibration(dataset(resets.flatMap((reset, index) => resetTransitions({
+    reset,
+    capacityUsd: 600 + index * 10,
+  }))));
+
+  assert.equal(report.resetValues.length, 3);
+  assert.ok(report.duplicateResetGroupsSuppressed.some((row) => row.reason === "overlapping_observation_window"));
+  assert.ok(report.resetValues.every((row, index) => index === 0
+    || report.resetValues[index - 1].lastObservedAt <= row.firstObservedAt));
+});
 
 function dataset(transitions) {
   return {

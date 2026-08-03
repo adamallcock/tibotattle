@@ -57,12 +57,10 @@ let activeCalibrationRangeDays = 7;
 let activeUsageGrouping = "hour";
 let activeAccountingPeriod = "7d";
 let activeWeeklyRangeDays = 31;
-// The observed percentage-point span a reset-series fit must exceed before it
-// counts as headline evidence. It is a visible, adjustable control, not a
-// hidden constant: the reader can see and move the bar the numbers clear.
-const DEFAULT_WEEKLY_SPAN_THRESHOLD_PP = 50;
-let weeklySpanThresholdPp = DEFAULT_WEEKLY_SPAN_THRESHOLD_PP;
-let showWeeklyPartialDiagnostics = false;
+// A full seven-day reset is rarely observed end-to-end. Fits based on at least
+// half of its percentage display are shown as the primary evidence; shorter
+// readings stay visible as outlined diagnostics rather than being filtered out.
+const WEEKLY_WELL_OBSERVED_SPAN_PP = 50;
 let timelineViewport = null;
 let timelinePointerStart = null;
 let localCompanionHealth = null;
@@ -861,10 +859,8 @@ function shareCardDateLabel(timestamp) {
  * The history the card plots: one point per qualifying reset-series fit, each
  * with the within-reset sensitivity bar the weekly panel draws.
  *
- * Only fits observed across more than the fixed default span threshold are
- * plotted — the evidence that panel leads with — and the threshold is read
- * from the constant rather than from the on-screen control, so a posted card
- * never depends on where a reader happened to leave a slider. The horizontal
+ * Only fits observed across at least the fixed primary-evidence span are
+ * plotted. The horizontal
  * axis carries date-only labels for the derived estimate availability, never a
  * raw-log timestamp or a time of day.
  */
@@ -882,7 +878,7 @@ function shareCardTrend(rows) {
       && point.value !== null
       && point.value > 0
       && point.spanPp !== null
-      && point.spanPp > DEFAULT_WEEKLY_SPAN_THRESHOLD_PP)
+      && point.spanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP)
     .sort((left, right) => left.at - right.at)
     .slice(-SHARE_CARD_TREND_MAX_POINTS)
     .map((point) => Object.freeze({
@@ -2520,9 +2516,11 @@ function lineChart({
         svgLine(position - 5, y(low), position + 5, y(low), "chart-error-bar-cap"),
         svgLine(position - 5, y(high), position + 5, y(high), "chart-error-bar-cap"),
       );
-      const barTitle = document.createElementNS(svg.namespaceURI, "title");
-      barTitle.textContent = `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`;
-      group.append(barTitle);
+      if (errorBars.tooltip !== false) {
+        const barTitle = document.createElementNS(svg.namespaceURI, "title");
+        barTitle.textContent = `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`;
+        group.append(barTitle);
+      }
       svg.append(group);
     });
   }
@@ -2585,21 +2583,25 @@ function lineChart({
           );
         }
         marker.setAttribute("class", `${item.className} chart-point`);
-        const timestamp = point.timestamp ?? point.date;
-        const caption = [
-          `${item.label}: ${format(value)}`,
-          item.detail?.(point),
-          timestamp ? formatLocal(timestamp) : null,
-        ].filter(Boolean).join(" · ");
-        const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-        markerTitle.textContent = caption;
-        marker.append(markerTitle);
-        // A hover title alone is mouse-only, so focusable markers carry the
-        // identical sentence to the keyboard and to assistive technology.
-        if (item.focusable === true) {
-          marker.setAttribute("tabindex", "0");
-          marker.setAttribute("role", "img");
-          marker.setAttribute("aria-label", caption);
+        if (item.tooltip !== false || item.focusable === true) {
+          const timestamp = point.timestamp ?? point.date;
+          const caption = [
+            `${item.label}: ${format(value)}`,
+            item.detail?.(point),
+            timestamp ? formatLocal(timestamp) : null,
+          ].filter(Boolean).join(" · ");
+          if (item.tooltip !== false) {
+            const markerTitle = document.createElementNS(svg.namespaceURI, "title");
+            markerTitle.textContent = caption;
+            marker.append(markerTitle);
+          }
+          // A hover title alone is mouse-only, so focusable markers carry the
+          // identical sentence to the keyboard and to assistive technology.
+          if (item.focusable === true) {
+            marker.setAttribute("tabindex", "0");
+            marker.setAttribute("role", "img");
+            marker.setAttribute("aria-label", caption);
+          }
         }
         svg.append(marker);
       });
@@ -2651,52 +2653,10 @@ function svgText(x, y, value, className, anchor = "start") {
   return element;
 }
 
-function aboveWeeklySpanThreshold(observedSpanPp) {
-  // An unrecorded span cannot be shown to clear the threshold, so it stays a
-  // diagnostic instead of being promoted to headline evidence.
-  return observedSpanPp !== null && observedSpanPp > weeklySpanThresholdPp;
-}
-
-function weeklyThresholdLabel() {
-  return `more than ${formatPp(weeklySpanThresholdPp, 0)}`;
-}
-
-function weeklyPointDetail(point) {
-  return [
-    point.observedSpanPp === null
-      ? "observed span not recorded"
-      : `represents ${formatPp(point.observedSpanPp)} of the 100-point allowance`,
-    point.observedSpanPp === null
-      ? "coverage strength unavailable"
-      : "marker intensity shows observed-span coverage, not statistical confidence",
-    point.low === null || point.high === null
-      ? "no within-reset sensitivity range"
-      : `within-reset sensitivity ${formatMoney(point.low)}–${formatMoney(point.high)}`,
-  ].join(" · ");
-}
-
-/**
- * The vertical bar and observed span answer different questions. The bar is
- * a direct sensitivity diagnostic from alternate boundary pairs; widening it
- * a second time for an incomplete series would double-count the span effect.
- * Span still matters, so it gets an independent visual channel. A 40-point
- * fit is visibly quieter than a full-series fit without pretending either is
- * a calibrated confidence interval.
- */
-function weeklySpanVisualStrength(observedSpanPp) {
-  const normalized = observedSpanPp === null
-    ? 0
-    : Math.max(0, Math.min(100, observedSpanPp)) / 100;
-  return 0.34 + normalized * 0.66;
-}
-
-function renderWeeklySpanThresholdControls() {
-  const slider = $("#weekly-span-threshold");
-  slider.value = String(weeklySpanThresholdPp);
-  slider.setAttribute("aria-valuetext", `${weeklySpanThresholdPp} percentage points`);
-  $("#weekly-span-threshold-value").textContent = `> ${formatPp(weeklySpanThresholdPp, 0)}`;
-  $("#weekly-evidence-controls").querySelector('[data-evidence="mature"]')
-    .textContent = `> ${formatPp(weeklySpanThresholdPp, 0)} only`;
+function isWellObservedWeeklyFit(observedSpanPp) {
+  // An unrecorded span cannot be promoted to primary evidence. It remains an
+  // outlined diagnostic so a missing measurement is never silently discarded.
+  return observedSpanPp !== null && observedSpanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP;
 }
 
 function renderWeeklyPricingReceipt(data) {
@@ -2723,30 +2683,27 @@ function renderWeeklyPricingReceipt(data) {
   const julyThirtyRepricing = pricing.registryVersion === "app-official-api-prices-v0.2"
     ? " It includes the lower GPT-5.6 Terra and Luna prices effective July 30."
     : "";
-  copy.textContent = `All displayed seven-day fits — old and recent — were repriced using ${registryVersion}, ${reviewedAt}; this is not a stale pre-change calculation.${julyThirtyRepricing} It is a comparable current-price measure, not a historical invoice.${rebuiltAt}`;
+  copy.textContent = `Every visible fit, including the newest, uses ${registryVersion}, ${reviewedAt}; this is not a stale pre-change calculation.${julyThirtyRepricing}${rebuiltAt}`;
 }
 
 function renderWeekly(data) {
-  renderWeeklySpanThresholdControls();
   renderWeeklyPricingReceipt(data);
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
   const upper = finite(summary.upper_80_across_resets_usd ?? summary.upper80Usd);
   const qualifying = finite(summary.qualifying_resets ?? summary.qualifyingResets, 0);
-  const strength = Math.min(100, Math.round(qualifying / 14 * 100));
   $("#weekly-estimate").textContent = estimate === null ? "Insufficient evidence" : `${formatMoney(estimate)} API equivalent`;
   $("#weekly-range").textContent = lower === null || upper === null
     ? "No evidence interval available"
     : `80% across-reset range: ${formatMoney(lower)}–${formatMoney(upper)}`;
-  $("#evidence-meter").style.width = `${strength}%`;
-  $("#evidence-label").textContent = qualifying < 3 ? "Insufficient" : qualifying < 8 ? "Developing" : qualifying < 14 ? "Moderate" : "Substantial";
-  const attributionLabel = data.weekly.accountAttribution?.label;
+  const accountAttributionIsUnavailable =
+    data.weekly.accountAttribution?.status === "historical_unattributed";
   const evidenceExplanation = qualifying
-    ? `Historical median across ${qualifying} qualifying reset-series fits. The headline chart shows fits observed across ${weeklyThresholdLabel()} of the allowance; that threshold is adjustable and shorter-span extrapolations remain available as diagnostics. This is an API-price-equivalent calibration, not a published dollar cap.`
+    ? `${qualifying} reset estimates. Filled dots have ${WEEKLY_WELL_OBSERVED_SPAN_PP}+ observed percentage points; outlined dots are shorter observations.`
     : "The estimate will appear when enough quota transitions can be matched to priced usage.";
-  $("#weekly-explanation").textContent = attributionLabel
-    ? `${evidenceExplanation} ${attributionLabel}.`
+  $("#weekly-explanation").textContent = accountAttributionIsUnavailable
+    ? `${evidenceExplanation} Account attribution is unavailable for these historical fits.`
     : evidenceExplanation;
 
   const values = data.weekly.weeklyValues.map((row, index) => {
@@ -2763,9 +2720,8 @@ function renderWeekly(data) {
     historicalMedian: estimate,
     acrossResetLow: lower,
     acrossResetHigh: upper,
-    spanVisualStrength: weeklySpanVisualStrength(observedSpanPp),
-    matureValue: aboveWeeklySpanThreshold(observedSpanPp) ? value : null,
-    provisionalValue: aboveWeeklySpanThreshold(observedSpanPp) ? null : value,
+    matureValue: isWellObservedWeeklyFit(observedSpanPp) ? value : null,
+    provisionalValue: isWellObservedWeeklyFit(observedSpanPp) ? null : value,
     index
     };
   }).filter((row) => row.timestamp && row.value !== null)
@@ -2778,17 +2734,14 @@ function renderWeekly(data) {
     ? latestObservedMs - activeWeeklyRangeDays * 24 * 60 * 60 * 1_000
     : Number.NEGATIVE_INFINITY;
   const rangedValues = values.filter((row) => Date.parse(row.timestamp) >= cutoffMs);
-  const chartValues = showWeeklyPartialDiagnostics
-    ? rangedValues
-    : rangedValues.filter((row) => row.matureValue !== null);
+  const chartValues = rangedValues;
+  $("#weekly-partial-legend").hidden = !chartValues.some((row) => row.provisionalValue !== null);
   const empty = $("#weekly-empty");
   const shell = $("#weekly-chart");
   if (!chartValues.length) {
     empty.hidden = false;
     shell.hidden = true;
-    empty.textContent = showWeeklyPartialDiagnostics
-      ? "No weekly estimates loaded."
-      : `No reset fits observed across ${weeklyThresholdLabel()} fall inside this date range.`;
+    empty.textContent = "No weekly estimates loaded.";
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -2803,24 +2756,18 @@ function renderWeekly(data) {
         {
           key: "matureValue",
           className: "chart-point-weekly-mature",
-          label: `Fit observed across ${weeklyThresholdLabel()}`,
+          label: `Observed across ${WEEKLY_WELL_OBSERVED_SPAN_PP}+ points`,
           connect: false,
           markers: true,
-          markerRadius: (point) => 3 + point.spanVisualStrength * 3,
-          markerOpacity: (point) => point.spanVisualStrength,
-          focusable: true,
-          detail: weeklyPointDetail,
+          tooltip: false,
         },
         {
           key: "provisionalValue",
           className: "chart-point-weekly-partial",
-          label: "Partial diagnostic extrapolated to 100 percentage points",
+          label: "Short observation",
           connect: false,
           markers: true,
-          markerRadius: (point) => 3 + point.spanVisualStrength * 3,
-          markerOpacity: (point) => point.spanVisualStrength,
-          focusable: true,
-          detail: weeklyPointDetail,
+          tooltip: false,
         },
       ],
       confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
@@ -2828,68 +2775,15 @@ function renderWeekly(data) {
         low: "low",
         high: "high",
         className: "chart-error-bar-weekly",
-        label: "Within-reset sensitivity",
+        label: "Measured range",
+        tooltip: false,
       },
       yLabel: "API-equivalent USD",
       title: "Seven-day allowance estimate history",
-      description: `Historical median and independent reset-series fits plotted on the date each estimate became available in ${USER_TIME_ZONE}. Each fit carries its own within-reset sensitivity bar; point intensity encodes the observed span, not statistical confidence.`
+      description: `One dot per distinct seven-day reset estimate, plotted when observed in ${USER_TIME_ZONE}. Filled dots use at least ${WEEKLY_WELL_OBSERVED_SPAN_PP} displayed percentage points; outlined dots are shorter observations. Each vertical bar is that reset's measured range.`
     }));
   }
-  renderWeeklyStats(summary, chartValues);
-  renderWeeklyTrend(chartValues);
   renderWeeklyTable(values);
-}
-
-function medianValue(values) {
-  const sorted = values.filter(Number.isFinite).toSorted((left, right) => left - right);
-  if (!sorted.length) return null;
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2
-    ? sorted[middle]
-    : (sorted[middle - 1] + sorted[middle]) / 2;
-}
-
-function renderWeeklyTrend(values) {
-  const container = $("#weekly-trend");
-  const enoughRows = values.length >= 6;
-  const early = enoughRows
-    ? medianValue(values.slice(0, 3).map((row) => row.value))
-    : null;
-  const recent = enoughRows
-    ? medianValue(values.slice(-3).map((row) => row.value))
-    : null;
-  const change = early !== null && early > 0 && recent !== null
-    ? recent / early - 1
-    : null;
-  const heading = node("strong", "", "Has the inferred limit changed?");
-  let conclusion;
-  if (change === null || early === null || recent === null) {
-    conclusion = "Not enough comparable resets yet. We need at least three early and three recent weekly estimates before making even a descriptive comparison.";
-  } else {
-    const magnitude = Math.abs(change);
-    const direction = change >= 0 ? "higher" : "lower";
-    const comparison = `The recent three-reset median is ${formatPercent(magnitude * 100, 1)} ${direction} than the early three-reset median (${formatMoney(early)} → ${formatMoney(recent)} API equivalent).`;
-    conclusion = magnitude < 0.15
-      ? `${comparison} That is not a clear regime change given the observed uncertainty, so the practical conclusion is “no convincing change detected.”`
-      : `${comparison} This is a possible accounting or allowance shift, but not proof: it must persist across later resets and remain after plan, account, model, and Fast-mode differences are controlled.`;
-  }
-  container.replaceChildren(heading, node("p", "", conclusion));
-}
-
-function renderWeeklyStats(summary, values) {
-  const stats = [
-    ["Fits shown", values.length],
-    ["Held-out MAE", formatPp(summary.selected_holdout_mae_pp)],
-    ["Prior-reset MAE", formatPp(summary.prior_reset_mae_pp)],
-    ["80th pct error", formatPp(summary.prior_reset_p80_absolute_error_pp)]
-  ];
-  const container = $("#weekly-stats");
-  clear(container);
-  for (const [label, value] of stats) {
-    const card = node("div", "weekly-stat");
-    card.append(node("span", "", label), node("strong", "", value));
-    container.append(card);
-  }
 }
 
 function renderWeeklyTable(values) {
@@ -2898,42 +2792,24 @@ function renderWeeklyTable(values) {
   if (!values.length) {
     const row = node("tr");
     const cell = node("td", "empty-cell", "No weekly evidence loaded.");
-    cell.colSpan = 8;
+    cell.colSpan = 5;
     row.append(cell);
     table.append(row);
     return;
   }
   for (const row of values.slice(-14).reverse()) {
-    const transitions = finite(row.eligible_transitions, 0);
     const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
-    const observedCost = span === null ? null : row.value * span / 100;
-    const speedCoverage = finite(row.known_speed_fraction);
-    const belowThreshold = !aboveWeeklySpanThreshold(span);
-    const evidence = belowThreshold
-      ? "Partial diagnostic"
-      : transitions < 25 ? "Low" : transitions < 75 ? "Moderate" : "Higher";
-    const prior = finite(row.prior_prediction_mae_pp);
-    const caveat = belowThreshold
-      ? span === null
-        ? "Observed span not recorded; extrapolated to 100 pp"
-        : `Observed ${formatPp(span)}; extrapolated to 100 pp`
-      : prior === null
-        ? "First estimate; no prior forecast"
-        : prior < 3 ? "Prior forecast tracked closely" : prior < 7 ? "Meaningful model error" : "High-error period";
+    const status = isWellObservedWeeklyFit(span)
+      ? "Well observed"
+      : span === null ? "Span not recorded" : "Short observation";
     const evidenceDate = formatLocal(row.timestamp, { dateOnly: true });
-    const resetDate = row.resetDueAt
-      ? formatLocal(row.resetDueAt, { dateOnly: true })
-      : "unknown";
     const tr = node("tr");
     tr.append(
-      node("td", "", `${evidenceDate} / ${resetDate}`),
-      node("td", "", formatApiMoney(observedCost)),
+      node("td", "", evidenceDate),
       node("td", "", formatPp(span)),
       node("td", "", formatMoney(row.value)),
       node("td", "", row.low === null || row.high === null ? "—" : `${formatMoney(row.low)}–${formatMoney(row.high)}`),
-      node("td", "", `${transitions} transitions`),
-      node("td", "", `${evidence}${speedCoverage === null ? "" : ` · ${formatPercent(speedCoverage * 100)} speed known`}`),
-      node("td", "", caveat)
+      node("td", "", status),
     );
     table.append(tr);
   }
@@ -4160,7 +4036,7 @@ function scheduleReturningUserRefresh() {
   // The native macOS shell owns the foreground cadence. Running both the web
   // return-visit timer and the native timer races the same bounded companion
   // request, which can surface a harmless 409 as a confusing dashboard error.
-  if (document.body.classList.contains("native-dashboard")) return;
+  if (runsInsideNativeDashboard()) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt
@@ -6272,26 +6148,6 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
   if (!button || !dashboard) return;
   activeWeeklyRangeDays = Number(button.dataset.days);
   for (const control of $("#weekly-range-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  renderWeekly(dashboard);
-});
-$("#weekly-span-threshold").addEventListener("input", (event) => {
-  const threshold = Number(event.target.value);
-  if (!Number.isFinite(threshold)) return;
-  // The predicate is deliberately strict ("more than"). A 100 pp maximum
-  // therefore makes an impossible, always-empty filter state reachable.
-  weeklySpanThresholdPp = Math.max(0, Math.min(99, threshold));
-  if (dashboard) renderWeekly(dashboard);
-  else renderWeeklySpanThresholdControls();
-});
-$("#weekly-evidence-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-evidence]");
-  if (!button || !dashboard) return;
-  showWeeklyPartialDiagnostics = button.dataset.evidence === "all";
-  for (const control of $("#weekly-evidence-controls").querySelectorAll("button")) {
     const active = control === button;
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));

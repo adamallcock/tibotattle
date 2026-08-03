@@ -939,8 +939,8 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .weekly-hero {
   display: grid;
-  grid-template-columns: minmax(300px, .8fr) minmax(0, 1.2fr);
-  gap: 60px;
+  grid-template-columns: minmax(280px, .8fr) minmax(0, 1.2fr);
+  gap: 36px;
   align-items: center;
   margin-bottom: 18px;
   padding: 34px;
@@ -951,11 +951,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .weekly-hero > div:first-child { display: flex; flex-direction: column; }
 .weekly-hero span, .weekly-hero small { color: rgba(255,255,255,.7); font-size: .72rem; }
 .weekly-hero > div:first-child strong { margin: .2rem 0; font-family: var(--serif); font-size: clamp(3rem, 6vw, 5rem); font-weight: 400; line-height: 1; }
-.confidence-label { display: flex; justify-content: space-between; }
-.confidence-label strong { font-size: .76rem; }
-.meter-track { height: 9px; margin: 9px 0 12px; overflow: hidden; border-radius: 9px; background: rgba(255,255,255,.18); }
-.meter-track i { display: block; height: 100%; border-radius: inherit; background: #e6bd79; }
-.confidence-meter p { margin: 0; color: rgba(255,255,255,.76); font-size: .78rem; }
+.weekly-hero > p { max-width: 55ch; margin: 0; color: rgba(255,255,255,.8); font-size: .86rem; line-height: 1.5; }
 .weekly-pricing-receipt {
   display: grid;
   grid-template-columns: minmax(190px, .42fr) minmax(0, 1fr);
@@ -971,16 +967,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .weekly-pricing-receipt .panel-kicker { margin: 0 0 .35rem; }
 .weekly-pricing-receipt h3 { margin: 0; font-size: 1rem; }
 .weekly-pricing-receipt > p { margin: 0; color: var(--muted); font-size: .82rem; line-height: 1.55; }
-.weekly-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-.weekly-stat { padding: 17px; border: 1px solid var(--line); border-radius: .35rem; }
-.weekly-stat span { display: block; color: var(--muted); font-size: .65rem; text-transform: uppercase; }
-.weekly-stat strong { display: block; margin-top: 5px; font-family: var(--serif); font-size: 1.55rem; font-weight: 500; }
-.weekly-trend { margin-top: 1rem; padding: .9rem 1rem; border: 1px solid var(--line); border-radius: .35rem; background: var(--paper-soft); }
-.weekly-trend strong { display: block; margin-bottom: .35rem; }
-.weekly-trend p { margin: 0; color: var(--muted); line-height: 1.55; }
 .weekly-table-panel { margin-top: 18px; }
-.weekly-history-panel,
-.weekly-validation-panel { margin-top: 18px; }
+.weekly-history-panel { margin-top: 18px; }
 .weekly-history-panel .panel-heading { align-items: flex-start; }
 .weekly-chart-controls {
   display: flex;
@@ -989,10 +977,8 @@ tbody tr:last-child td { border-bottom: 0; }
   gap: 7px;
 }
 .weekly-legend { margin: 4px 0 10px; }
-.weekly-history-chart svg { min-width: 1100px; height: 420px; }
-.weekly-validation-panel .weekly-stats {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
+.weekly-history-chart { overflow: visible; }
+.weekly-history-chart svg { min-width: 0; height: clamp(300px, 34vw, 420px); }
 .legend-dot.weekly-center { background: var(--green); }
 .legend-dot.weekly-range { height: 9px; background: rgba(49, 95, 132, .2); }
 .legend-dot.weekly-mature {
@@ -1008,7 +994,6 @@ tbody tr:last-child td { border-bottom: 0; }
   border-radius: 50%;
   background: var(--white);
 }
-.legend-dot.weekly-error { width: 3px; height: 16px; background: rgba(49, 95, 132, .78); }
 
 /* The weekly allowance chart is the lead chart of the dashboard, so its
    section and panel carry more weight than the sections that support it.
@@ -1020,29 +1005,7 @@ tbody tr:last-child td { border-bottom: 0; }
   border-color: var(--green-2, var(--line));
   box-shadow: 0 18px 46px rgba(31, 45, 39, .09);
 }
-.lead-chart-panel .weekly-history-chart svg { height: 470px; }
-.span-threshold {
-  display: grid;
-  grid-template-columns: auto minmax(140px, 260px) auto;
-  gap: 12px;
-  align-items: center;
-  margin-bottom: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: .35rem;
-  background: var(--paper-soft);
-}
-.span-threshold label {
-  color: var(--muted);
-  font-size: .64rem;
-  font-weight: 800;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-}
-.span-threshold input[type="range"] { width: 100%; min-height: 30px; accent-color: var(--green); }
-.span-threshold input[type="range"]:focus-visible { outline: 3px solid rgba(38, 107, 91, .36); outline-offset: 3px; }
-.span-threshold output { font-size: .82rem; font-weight: 800; font-variant-numeric: tabular-nums; }
-.span-threshold .annotation { grid-column: 1 / -1; margin: 0; }
+.lead-chart-panel .weekly-history-chart svg { height: clamp(320px, 38vw, 460px); }
 
 .accounting-disclosure { margin-top: -12px; }
 .accounting-summary { grid-template-columns: repeat(4, 1fr); }
@@ -1551,7 +1514,7 @@ footer {
   .page-heading { padding-top: 38px; }
   .freshness-card { min-width: 0; }
   .dashboard-section { padding: 44px 0; }
-  .metric-grid, .two-column, .span-threshold, .privacy-lists, .result-metrics, .coverage-counts, .pricing-basis-grid, .backend-facts, .history-facts, .snapshot-quality-grid { grid-template-columns: 1fr; }
+  .metric-grid, .two-column, .privacy-lists, .result-metrics, .coverage-counts, .pricing-basis-grid, .backend-facts, .history-facts, .snapshot-quality-grid { grid-template-columns: 1fr; }
   .accounting-dimensions, .schema-grid { grid-template-columns: 1fr; }
   .metric-grid > :last-child { grid-column: auto; }
   .panel { padding: 21px; }
