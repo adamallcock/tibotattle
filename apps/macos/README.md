@@ -48,15 +48,13 @@ a clean-profile smoke all succeed.
    folder picker, or restore `~/.codex`. The selection is revalidated at every
    launch and stored only in the owner-only app state; copied diagnostics expose
    only `default` or `custom`, never the path.
-9. Choose **Open Codex** to open Codex in the ChatGPT desktop app. If the app is
-   unavailable, Usage Monitor offers the official help page.
-10. Choose **Version & Updates…** to check a signed production appcast. Developer
+9. Choose **Version & Updates…** to check a signed production appcast. Developer
    and ad-hoc builds contain no updater framework and perform no update
    networking.
-11. A trusted website or browser bookmark may use `usagemonitor://open` to
+10. A trusted website or browser bookmark may use `usagemonitor://open` to
    activate the app and open its loopback dashboard. All other hosts, paths,
    credentials, queries, and fragments in that custom scheme are rejected.
-12. Closing or quitting the native app stops the companion. No daemon or login
+11. Closing or quitting the native app stops the companion. No daemon or login
    item is installed. After an explicit reviewed first contribution, the user
    may enable six-hour contribution while the app remains open.
 
@@ -278,7 +276,7 @@ disposable-VM rehearsal:
 4. launch it without Terminal, Control-click bypasses, or privacy-setting
    exceptions;
 5. verify the calm Ready state, Retry path, diagnostics copy and failure code,
-   default/custom Codex source selection, Open Codex/help action, exact
+   default/custom Codex source selection, exact
    configured app-open link, first scan, first reviewed contribution,
    opt-in six-hour contribution schedule, **Check for Updates**, quit,
    relaunch, and uninstall journey;

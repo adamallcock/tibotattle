@@ -56,7 +56,6 @@ private enum BundledProduct {
 private let loopbackHost = "127.0.0.1"
 private let readyLinePattern =
     #"^USAGE_MONITOR_READY http://127\.0\.0\.1:([0-9]{1,5})/$"#
-private let codexHelpURL = URL(string: "https://learn.chatgpt.com/docs/app")!
 private let launcherSettingsSchema = "usage-monitor-launcher-settings-v1"
 private let launcherSettingsFileName = "launcher-settings-v1.json"
 private let firstRunReceiptSchema = "usage-monitor-first-run-v1"
@@ -1352,11 +1351,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         target: self,
         action: #selector(showLifecycleHelp)
     )
-    private lazy var openCodexButton = NSButton(
-        title: "Open \(BundledProduct.monitoredAppDisplayName)",
-        target: self,
-        action: #selector(openCodex)
-    )
     private lazy var openInBrowserButton = NSButton(
         title: "Open in Browser",
         target: self,
@@ -1540,7 +1534,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             diagnosticsButton,
             codexHomeButton,
             lifecycleHelpButton,
-            openCodexButton,
             quitButton,
         ] {
             button.bezelStyle = NSButton.BezelStyle.rounded
@@ -1579,7 +1572,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             actionRow.addView(button, in: .leading)
         }
         for button in [
-            openCodexButton,
             retryButton,
             openButton,
         ] {
@@ -2451,39 +2443,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             }
         } else {
             startCompanion()
-        }
-    }
-
-    @objc private func openCodex() {
-        guard let appURL = NSWorkspace.shared.urlForApplication(
-            withBundleIdentifier: BundledProduct.monitoredAppBundleIdentifier
-        ) else {
-            showCodexHelp()
-            return
-        }
-        NSWorkspace.shared.openApplication(
-            at: appURL,
-            configuration: NSWorkspace.OpenConfiguration()
-        ) { [weak self] _, error in
-            if error != nil {
-                DispatchQueue.main.async {
-                    self?.showCodexHelp()
-                }
-            }
-        }
-    }
-
-    private func showCodexHelp() {
-        let alert = NSAlert()
-        alert.messageText =
-            "\(BundledProduct.monitoredAppDisplayName) is not available on this Mac"
-        alert.informativeText = """
-        \(BundledProduct.monitoredAppDisplayName) now lives in the ChatGPT desktop app. Install or open it, sign in, create or resume one task, then return to \(BundledProduct.displayName).
-        """
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Open Official Help")
-        if alert.runModal() == .alertSecondButtonReturn {
-            NSWorkspace.shared.open(codexHelpURL)
         }
     }
 

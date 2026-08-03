@@ -462,15 +462,14 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /title: "Data & Diagnostics…"/u);
   assert.match(source, /title: "Codex Folder…"/u);
   assert.match(source, /title: "Version & Updates…"/u);
-  assert.match(
+  assert.doesNotMatch(
     source,
     /title: "Open \\\(BundledProduct\.monitoredAppDisplayName\)"/u,
   );
-  assert.match(
+  assert.doesNotMatch(
     source,
     /withBundleIdentifier: BundledProduct\.monitoredAppBundleIdentifier/u,
   );
-  assert.match(source, /https:\/\/learn\.chatgpt\.com\/docs\/app/u);
   assert.match(source, /Copy Diagnostics/u);
   assert.match(source, /usage-monitor-macos-diagnostics-v1/u);
   assert.match(source, /UM_MACOS_COMPANION_START_TIMEOUT/u);
