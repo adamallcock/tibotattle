@@ -3472,7 +3472,10 @@ test("the weekly span threshold is a visible adjustable control defaulting above
   const slider = html.match(/<input[\s\S]*?id="weekly-span-threshold"[\s\S]*?>/u)?.[0] ?? "";
   assert.match(slider, /type="range"/u);
   assert.match(slider, /min="0"/u);
-  assert.match(slider, /max="100"/u);
+  // The wording is strictly "more than", so 100 would make an impossible
+  // always-empty filter. 99 still admits only a genuinely complete 100 pp fit.
+  assert.match(slider, /max="99"/u);
+  assert.match(slider, /step="1"/u);
   assert.match(slider, /value="50"/u);
   assert.match(html, /<label for="weekly-span-threshold">Minimum observed span<\/label>/u);
   assert.match(html, /<output id="weekly-span-threshold-value"/u);
@@ -3483,6 +3486,7 @@ test("the weekly span threshold is a visible adjustable control defaulting above
   );
   assert.match(appSource, /const belowThreshold = !aboveWeeklySpanThreshold\(span\);/u);
   assert.match(appSource, /\$\("#weekly-span-threshold"\)\.addEventListener\("input"/u);
+  assert.match(appSource, /Math\.max\(0, Math\.min\(99, threshold\)\)/u);
   assert.doesNotMatch(appSource, /observedSpanPp >= 80|span < 80/u);
   assert.match(styles, /\.span-threshold input\[type="range"\]:focus-visible/u);
 });
@@ -3515,7 +3519,13 @@ test("weekly points carry per-week error bars and state the percentage points th
     /represents \$\{formatPp\(point\.observedSpanPp\)\} of the 100-point allowance/u,
   );
   assert.match(detailMatch[1], /observed span not recorded/u);
+  assert.match(detailMatch[1], /marker intensity shows observed-span coverage, not statistical confidence/u);
   assert.match(detailMatch[1], /within-reset sensitivity \$\{formatMoney\(point\.low\)\}/u);
+  assert.match(appSource, /function weeklySpanVisualStrength\(observedSpanPp\)/u);
+  assert.match(appSource, /spanVisualStrength: weeklySpanVisualStrength\(observedSpanPp\)/u);
+  assert.match(appSource, /markerRadius: \(point\) => 3 \+ point\.spanVisualStrength \* 3/u);
+  assert.match(appSource, /markerOpacity: \(point\) => point\.spanVisualStrength/u);
+  assert.match(appSource, /item\.markerOpacity/u);
   assert.match(appSource, /detail: weeklyPointDetail,/u);
   // A hover title is mouse-only, so the same sentence must reach the keyboard
   // and assistive technology on the marker itself.
@@ -3526,6 +3536,7 @@ test("weekly points carry per-week error bars and state the percentage points th
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
   assert.match(html, /legend-dot weekly-error/u);
   assert.match(html, /Per-week within-reset sensitivity/u);
+  assert.match(html, /Neither visual is a formal confidence interval/u);
 });
 
 test("calibration zoom moves in bounded granular steps on every input device", async () => {
@@ -3608,7 +3619,7 @@ test("the weekly allowance chart leads the dashboard", async () => {
     "the weekly allowance section precedes the timeline section",
   );
   assert.ok(
-    html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="timeline"'),
+    html.indexOf('data-nav="weekly"') < html.indexOf('data-nav="trends"'),
     "primary navigation follows the same order as the sections",
   );
   assert.match(html, /<p class="eyebrow">02 · Weekly allowance<\/p>/u);

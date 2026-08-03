@@ -175,8 +175,8 @@ struct MenuBarStatusSnapshot: Equatable {
     }
 
     /// The local analysis action names the state it will enter or is already
-    /// in. It never starts work automatically; the controller still accepts
-    /// only an explicit menu click while the companion is ready.
+    /// in. First launch remains explicit; later stale evidence can be refreshed
+    /// by the bounded while-open scheduler below.
     var analysisActionTitle: String {
         switch phase {
         case .analyzing:
@@ -647,11 +647,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         var checkForUpdates: (() -> Void)?
     }
 
-    /// Background cadence while the companion is idle. The companion treats
-    /// its own evidence as live for thirty minutes, so a five-minute tick is
-    /// far finer than the underlying resolution while staying negligible on
-    /// loopback. Opening the menu always reads on demand as well.
-    private static let idlePollSeconds = 300
+    /// Background cadence while the companion is idle. A minute is cheap on
+    /// loopback and means a cached observation cannot sit visibly stale for
+    /// several minutes before the automatic updater notices it.
+    private static let idlePollSeconds = 60
     /// Cadence while an explicit pass is running, so the menu bar returns to a
     /// real number promptly once the pass finishes.
     private static let activePollSeconds = 5
@@ -662,6 +661,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let reader = LocalCompanionEvidenceReader()
     private let allowanceItem = NSMenuItem()
     private let evidenceItem = NSMenuItem()
+    private let summaryView = MenuBarSummaryView()
     private let menu = NSMenu()
     private let quotaSeparator = NSMenuItem.separator()
     private let actionSeparator = NSMenuItem.separator()
@@ -675,6 +675,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
     private var pendingPoll: DispatchWorkItem?
+    private var lastAutomaticRefreshAt: Date?
+    private var automaticRefreshInFlight = false
     private var stopped = false
 
     init(productName: String, actions: Actions) {
@@ -694,7 +696,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.minimumWidth = MenuBarSummaryView.preferredWidth
 
+        allowanceItem.view = summaryView
         allowanceItem.isEnabled = false
+        // The custom summary replaces the previous pair of dim, disabled
+        // text rows. Keep this semantic item as a spacer so the menu remains
+        // predictable for keyboard navigation.
+        evidenceItem.isHidden = true
         evidenceItem.isEnabled = false
         menu.addItem(allowanceItem)
         menu.addItem(evidenceItem)
@@ -734,7 +741,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
         statusItem.menu = menu
         if let button = statusItem.button {
-            button.image = Self.appIcon(productName: productName)
+            button.image = Self.statusGlyph(productName: productName)
             button.imagePosition = .imageLeading
             // Monospaced digits keep the item from jittering as the percentage
             // changes width.
@@ -876,6 +883,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             self.snapshot.evidence = LocalCompanionOverviewProjection
                 .evidence(for: overview)
             self.render()
+            self.refreshStaleEvidenceIfNeeded()
         }
     }
 
@@ -905,6 +913,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private func render() {
         allowanceItem.title = "\(productName) · \(snapshot.title) allowance"
         evidenceItem.title = snapshot.evidenceSummary
+        summaryView.render(productName: productName, snapshot: snapshot)
         renderQuotaLanes()
         openTiboTattleItem.isEnabled = true
         analyzeItem.title = snapshot.analysisActionTitle
@@ -947,6 +956,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         let insertionIndex = menu.index(of: actionSeparator)
         let items = snapshot.lanes.map { lane in
             let item = NSMenuItem(title: snapshot.laneSummary(lane), action: nil, keyEquivalent: "")
+            let view = MenuBarQuotaLaneView()
+            view.render(lane: lane, snapshot: snapshot)
+            item.view = view
             item.isEnabled = false
             return item
         }
@@ -956,15 +968,56 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         quotaLaneItems = items
     }
 
-    /// Use the product's real bundle icon rather than a generic gauge. The
-    /// menu bar remains legible because macOS applies its own selected-menu
-    /// treatment to the item title; the image itself is intentionally branded.
-    private static func appIcon(productName: String) -> NSImage? {
-        let image = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
-            .flatMap(NSImage.init(contentsOf:))
-        image?.size = NSSize(width: 18, height: 18)
-        image?.isTemplate = false
+    /// A status item is smaller than a normal app icon. Use a high-contrast
+    /// template glyph here; the real TiboTattle mark stays on the dashboard
+    /// and share card, where it is large enough to be recognised.
+    private static func statusGlyph(productName: String) -> NSImage? {
+        let image = NSImage(
+            systemSymbolName: "chart.bar.fill",
+            accessibilityDescription: productName
+        )
+        image?.size = NSSize(width: 15, height: 15)
+        image?.isTemplate = true
         image?.accessibilityDescription = productName
         return image
+    }
+
+    /// First launch still requires an explicit Analyze action. Once a real
+    /// local observation exists, however, keeping the app open should not
+    /// make the menu quietly become stale and force a manual repair. One
+    /// shared companion controller prevents a competing pass; the cooldown
+    /// limits retries if a source is temporarily unavailable.
+    private func refreshStaleEvidenceIfNeeded() {
+        guard !stopped,
+              !automaticRefreshInFlight,
+              snapshot.phase == .ready,
+              snapshot.evidence == .stale,
+              !snapshot.lanes.isEmpty,
+              let dashboardURL
+        else { return }
+        let now = Date()
+        if let lastAutomaticRefreshAt,
+           now.timeIntervalSince(lastAutomaticRefreshAt)
+            < Double(Self.idlePollSeconds) {
+            return
+        }
+        lastAutomaticRefreshAt = now
+        automaticRefreshInFlight = true
+        snapshot.phase = .analyzing
+        render()
+        reader.startAnalysis(base: dashboardURL) { [weak self] result in
+            guard let self, !self.stopped else { return }
+            self.automaticRefreshInFlight = false
+            switch result {
+            case .started, .alreadyRunning:
+                self.snapshot.phase = .analyzing
+            case .rejected, .unreachable:
+                self.snapshot.phase = self.dashboardURL == nil
+                    ? .unavailable
+                    : .ready
+            }
+            self.render()
+            self.pollNow()
+        }
     }
 }

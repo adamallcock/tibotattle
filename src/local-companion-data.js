@@ -1795,6 +1795,11 @@ export async function buildLocalCompanionSnapshot({
       `Replay-safe cost accounting is ${Math.round((replaySafeAccounting.ageSeconds ?? 0) / 60)} minutes old and is shown as stale until refreshed.`,
     );
   }
+  if (replaySafeAccounting.errorCode === "cache_price_registry_outdated") {
+    warnings.push(
+      "Official API prices changed. Cached price estimates are withheld until the next local replay rebuilds them with the current registry.",
+    );
+  }
   if (replaySafeCache === null && (displayUsage?.events ?? 0) > 0) {
     warnings.push(
       "Recent cost accounting is using the legacy collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",

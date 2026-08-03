@@ -1186,6 +1186,11 @@ function validCache(value) {
       || canonicalInstant(value.coveredAt?.endAt) === null
       || value.accountingMethod
         !== "lineage_aware_cumulative_snapshot_replay_exclusion"
+      // A replay-safe total is meaningful only under the exact price registry
+      // that produced it. Never let an older, higher price card silently
+      // survive a registry correction just because its JSON shape is valid.
+      || value.priceRegistryVersion !== APP_PRICE_REGISTRY_MANIFEST.version
+      || value.priceRegistryObservedAt !== APP_PRICE_REGISTRY_MANIFEST.observedAt
       || !Array.isArray(value.periods)
       || !Array.isArray(value.timeline)
       || !validQuotaTimeline(value.quotaTimeline, value.coveredAt)
@@ -1270,7 +1275,16 @@ export async function readReplaySafeAccountingCache({
     }
   }
   if (parsed !== null && !validCache(parsed)) {
-    unavailableErrorCode = "cache_invalid";
+    unavailableErrorCode = (
+      parsed?.priceRegistryVersion !== undefined
+      || parsed?.priceRegistryObservedAt !== undefined
+    ) && (
+      parsed?.priceRegistryVersion !== APP_PRICE_REGISTRY_MANIFEST.version
+      || parsed?.priceRegistryObservedAt
+        !== APP_PRICE_REGISTRY_MANIFEST.observedAt
+    )
+      ? "cache_price_registry_outdated"
+      : "cache_invalid";
     parsed = null;
   }
   if (parsed === null) {

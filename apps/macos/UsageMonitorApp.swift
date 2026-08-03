@@ -1379,6 +1379,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
+        installApplicationMenu()
         createWindow()
         // Installed before any early return below so a launch that fails still
         // leaves a visible, quittable presence in the menu bar.
@@ -1688,6 +1689,58 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         statusStack.isHidden = true
         lastLifecycleStatus = "Dashboard open"
         openInBrowserButton.isEnabled = true
+        // WKWebView follows the normal responder chain only once it owns focus.
+        // This makes Cmd-C / Cmd-A act on selected dashboard text, just as they
+        // do in a browser, instead of silently targeting the launcher window.
+        if let webView = dashboardWebHost?.webView {
+            window?.makeFirstResponder(webView)
+        }
+    }
+
+    /// The launcher has a native window as well as a web dashboard. Supplying
+    /// a standard Edit menu gives WebKit's responder chain its expected Copy
+    /// and Select All commands, including their familiar keyboard shortcuts.
+    private func installApplicationMenu() {
+        let mainMenu = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: BundledProduct.displayName)
+        let about = NSMenuItem(
+            title: "About \(BundledProduct.displayName)",
+            action: #selector(showAbout),
+            keyEquivalent: ""
+        )
+        about.target = self
+        appMenu.addItem(about)
+        appMenu.addItem(.separator())
+        let quit = NSMenuItem(
+            title: "Quit \(BundledProduct.displayName)",
+            action: #selector(quitApplication),
+            keyEquivalent: "q"
+        )
+        quit.target = self
+        appMenu.addItem(quit)
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        let selectAll = NSMenuItem(
+            title: "Select All",
+            action: Selector(("selectAll:")),
+            keyEquivalent: "a"
+        )
+        selectAll.target = nil
+        let copy = NSMenuItem(
+            title: "Copy",
+            action: Selector(("copy:")),
+            keyEquivalent: "c"
+        )
+        copy.target = nil
+        editMenu.addItem(selectAll)
+        editMenu.addItem(copy)
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
     }
 
     /// A save that failed keeps the dashboard on screen and says so in a

@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import {
-  mountDashboardNavigation,
-} from "../public/navigation.js";
+import { mountDashboardNavigation } from "../public/navigation.js";
 
 class FakeClassList {
   #values = new Set();
@@ -18,41 +16,44 @@ class FakeClassList {
   }
 }
 
-function fakeLink(nav, { active = false } = {}) {
-  const attributes = new Map();
-  const classList = new FakeClassList();
-  if (active) {
-    classList.toggle("active", true);
-    attributes.set("aria-current", "location");
-  }
+function fakeLink(nav) {
+  const attributes = new Map([["href", `#${nav}`]]);
+  const listeners = new Map();
   return {
     attributes,
-    classList,
+    classList: new FakeClassList(),
     dataset: { nav },
-    removeAttribute(name) {
-      attributes.delete(name);
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    removeAttribute(name) { attributes.delete(name); },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type);
     },
-    setAttribute(name, value) {
-      attributes.set(name, value);
+    setAttribute(name, value) { attributes.set(name, value); },
+    click() {
+      let prevented = false;
+      listeners.get("click")?.({
+        currentTarget: this,
+        preventDefault() { prevented = true; },
+      });
+      return prevented;
     },
   };
 }
 
+function fakePage(name) {
+  return { dataset: { dashboardPage: name }, hidden: false };
+}
+
 function fakeBrowser({ hash = "" } = {}) {
-  const links = [
-    fakeLink("overview", { active: true }),
-    fakeLink("timeline"),
-    fakeLink("community"),
-    fakeLink("data"),
-  ];
-  const sections = [
-    { id: "overview" },
-    { id: "timeline" },
-    { id: "community" },
-    { id: "data" },
-  ];
+  const links = ["overview", "weekly", "trends", "community", "data"]
+    .map(fakeLink);
+  const pages = ["overview", "weekly", "trends", "community", "data"]
+    .map(fakePage);
   const disclosure = { open: false };
   const listeners = new Map();
+  const pushed = [];
+  const scrolls = [];
   const documentRef = {
     querySelector(selector) {
       assert.equal(selector, "#community-contribution-disclosure");
@@ -60,163 +61,68 @@ function fakeBrowser({ hash = "" } = {}) {
     },
     querySelectorAll(selector) {
       if (selector === "[data-nav]") return links;
-      assert.equal(
-        selector,
-        ".dashboard-section, [data-nav-target]",
-      );
-      return sections;
+      assert.equal(selector, "[data-dashboard-page]");
+      return pages;
     },
   };
   const windowRef = {
+    history: { pushState(_state, _title, hashValue) { pushed.push(hashValue); windowRef.location.hash = hashValue; } },
     location: { hash },
-    addEventListener(type, listener) {
-      listeners.set(type, listener);
-    },
+    scrollTo(options) { scrolls.push(options); },
+    addEventListener(type, listener) { listeners.set(type, listener); },
     removeEventListener(type, listener) {
       if (listeners.get(type) === listener) listeners.delete(type);
     },
   };
-  class FakeIntersectionObserver {
-    static instances = [];
-
-    constructor(callback, options) {
-      this.callback = callback;
-      this.options = options;
-      this.observed = [];
-      this.disconnected = false;
-      FakeIntersectionObserver.instances.push(this);
-    }
-
-    disconnect() {
-      this.disconnected = true;
-    }
-
-    observe(target) {
-      this.observed.push(target);
-    }
-  }
-  return {
-    disclosure,
-    documentRef,
-    IntersectionObserverRef: FakeIntersectionObserver,
-    links,
-    listeners,
-    sections,
-    windowRef,
-  };
+  return { disclosure, documentRef, links, listeners, pages, pushed, scrolls, windowRef };
 }
 
-function assertActiveNavigation(links, expected) {
-  for (const link of links) {
+function assertActivePage(browser, expected) {
+  for (const page of browser.pages) {
+    assert.equal(page.hidden, page.dataset.dashboardPage !== expected, page.dataset.dashboardPage);
+  }
+  for (const link of browser.links) {
     const active = link.dataset.nav === expected;
     assert.equal(link.classList.contains("active"), active, link.dataset.nav);
-    assert.equal(
-      link.attributes.get("aria-current"),
-      active ? "location" : undefined,
-      link.dataset.nav,
-    );
+    assert.equal(link.attributes.get("aria-current"), active ? "page" : undefined, link.dataset.nav);
   }
 }
 
-test("hash navigation preserves disclosure and exact primary-link semantics", () => {
-  const browser = fakeBrowser({ hash: "#history" });
+test("hashes preserve deep links while selecting their owning top-level page", () => {
+  const browser = fakeBrowser({ hash: "#accounting" });
   mountDashboardNavigation(browser);
-
-  assert.equal(browser.disclosure.open, true);
-  assertActiveNavigation(browser.links, null);
+  assertActivePage(browser, "weekly");
 
   browser.windowRef.location.hash = "#community";
   browser.listeners.get("hashchange")();
   assert.equal(browser.disclosure.open, true);
-  assertActiveNavigation(browser.links, "community");
-
-  browser.windowRef.location.hash = "";
-  browser.listeners.get("hashchange")();
-  assertActiveNavigation(browser.links, "community");
+  assertActivePage(browser, "community");
 
   browser.windowRef.location.hash = "#backend";
-  browser.listeners.get("hashchange")();
+  browser.listeners.get("popstate")();
   assert.equal(browser.disclosure.open, true);
-  assertActiveNavigation(browser.links, null);
+  assertActivePage(browser, "data");
 });
 
-test("intersection navigation observes the exact targets and selects the highest visible ratio", () => {
+test("page links prevent long-document anchor scrolling and retain normal history", () => {
   const browser = fakeBrowser();
   mountDashboardNavigation(browser);
-  const [observer] = browser.IntersectionObserverRef.instances;
+  assertActivePage(browser, "overview");
 
-  assert.deepEqual(observer.options, {
-    rootMargin: "-25% 0px -65% 0px",
-    threshold: [0, .2, .7],
-  });
-  assert.deepEqual(observer.observed, browser.sections);
-
-  observer.callback([
-    {
-      intersectionRatio: .3,
-      isIntersecting: true,
-      target: browser.sections[0],
-    },
-    {
-      intersectionRatio: .7,
-      isIntersecting: true,
-      target: browser.sections[1],
-    },
-    {
-      intersectionRatio: 1,
-      isIntersecting: false,
-      target: browser.sections[2],
-    },
-  ]);
-  assertActiveNavigation(browser.links, "timeline");
-
-  observer.callback([
-    {
-      intersectionRatio: .9,
-      isIntersecting: true,
-      target: browser.sections[0],
-    },
-  ]);
-  assertActiveNavigation(browser.links, "overview");
-
-  observer.callback([
-    {
-      intersectionRatio: .4,
-      isIntersecting: true,
-      target: browser.sections[2],
-    },
-  ]);
-  assertActiveNavigation(browser.links, "overview");
-
-  observer.callback([
-    {
-      intersectionRatio: 0,
-      isIntersecting: false,
-      target: browser.sections[0],
-    },
-  ]);
-  assertActiveNavigation(browser.links, "timeline");
-
-  observer.callback([
-    {
-      intersectionRatio: 1,
-      isIntersecting: false,
-      target: browser.sections[2],
-    },
-  ]);
-  assertActiveNavigation(browser.links, "timeline");
+  const trends = browser.links.find((link) => link.dataset.nav === "trends");
+  assert.equal(trends.click(), true);
+  assert.deepEqual(browser.pushed, ["#trends"]);
+  assert.deepEqual(browser.scrolls, [{ top: 0, behavior: "instant" }]);
+  assertActivePage(browser, "trends");
 });
 
-test("teardown disconnects observation and removes hash synchronization", () => {
+test("teardown removes page and history listeners", () => {
   const browser = fakeBrowser({ hash: "#overview" });
   const teardown = mountDashboardNavigation(browser);
-  const [observer] = browser.IntersectionObserverRef.instances;
-  assertActiveNavigation(browser.links, "overview");
-
   teardown();
 
-  assert.equal(observer.disconnected, true);
   assert.equal(browser.listeners.has("hashchange"), false);
-  browser.windowRef.location.hash = "#community";
-  assertActiveNavigation(browser.links, "overview");
+  assert.equal(browser.listeners.has("popstate"), false);
+  assert.equal(browser.links[1].click(), false);
+  assertActivePage(browser, "overview");
 });
