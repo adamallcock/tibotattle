@@ -2162,6 +2162,7 @@ function normalizePricing(pricing = {}) {
     subscriptionSpeedIsSeparate: pricing?.subscriptionSpeedIsSeparate === true,
     registryVersion: text(pricing?.registryVersion, ""),
     registryObservedAt: text(pricing?.registryObservedAt, ""),
+    priceEpochBasis: text(pricing?.priceEpochBasis, ""),
     components: componentRows.slice(0, 12).map((row) => ({
       name: text(row?.name ?? row?.component, "Unknown"),
       tokens: finite(row?.tokens ?? row?.value, 0),

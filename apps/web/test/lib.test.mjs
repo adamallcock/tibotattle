@@ -741,6 +741,22 @@ test("local dashboard normalizer accepts artifact rows and keeps stale state exp
   assert.equal(result.gradient.rollingHistory.length, 1);
 });
 
+test("local dashboard retains the pricing epoch required to explain allowance fits", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    pricing: {
+      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+      registryVersion: "app-official-api-prices-v0.2",
+      registryObservedAt: "2026-08-01T13:47:00Z",
+    },
+  });
+  assert.equal(
+    result.pricing.priceEpochBasis,
+    "current_price_sensitivity_at_registry_observation",
+  );
+  assert.equal(result.pricing.registryVersion, "app-official-api-prices-v0.2");
+});
+
 test("missing numeric evidence stays missing instead of becoming zero", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
@@ -3415,6 +3431,22 @@ test("weekly view gives a plain-language change conclusion", async () => {
   assert.match(appSource, /function renderWeeklyTrend/);
   assert.match(appSource, /no convincing change detected/);
   assert.match(appSource, /possible accounting or allowance shift/);
+});
+
+test("weekly view states the exact price epoch and whether the July repricing is included", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+  assert.match(html, /id="weekly-pricing-receipt"/u);
+  assert.match(html, /Price basis used for every fit/u);
+  assert.match(appSource, /function renderWeeklyPricingReceipt/u);
+  assert.match(appSource, /current_price_sensitivity_at_registry_observation/u);
+  assert.match(appSource, /Current official prices are applied to every fit/u);
+  assert.match(appSource, /lower GPT-5\.6 Terra and Luna prices effective July 30/u);
+  assert.match(appSource, /this is not a stale pre-change calculation/u);
+  assert.match(appSource, /renderWeeklyPricingReceipt\(data\);/u);
+  assert.match(styles, /\.weekly-pricing-receipt/u);
 });
 
 test("weekly defaults to high-confidence evidence and partial diagnostics are opt-in", async () => {

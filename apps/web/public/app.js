@@ -2646,8 +2646,36 @@ function renderWeeklySpanThresholdControls() {
     .textContent = `> ${formatPp(weeklySpanThresholdPp, 0)} only`;
 }
 
+function renderWeeklyPricingReceipt(data) {
+  const pricing = data.pricing ?? {};
+  const registryVersion = pricing.registryVersion || "reviewed official price table";
+  const reviewedAt = pricing.registryObservedAt
+    ? `reviewed ${formatLocal(pricing.registryObservedAt, { dateOnly: true })}`
+    : "with no review date returned";
+  const rebuiltAt = data.artifactStatus?.weekly?.generatedAt
+    ? ` The fits were last rebuilt ${formatLocal(data.artifactStatus.weekly.generatedAt)}.`
+    : "";
+  const currentPriceSensitivity = pricing.priceEpochBasis
+    === "current_price_sensitivity_at_registry_observation";
+  const title = $("#weekly-pricing-receipt-title");
+  const copy = $("#weekly-pricing-receipt-copy");
+
+  if (!currentPriceSensitivity) {
+    title.textContent = "Price epoch was not verified";
+    copy.textContent = `This build returned ${registryVersion}, ${reviewedAt}, but not the price epoch used for the fits. The app will not claim that a recent price change was applied until that evidence is present.${rebuiltAt}`;
+    return;
+  }
+
+  title.textContent = "Current official prices are applied to every fit";
+  const julyThirtyRepricing = pricing.registryVersion === "app-official-api-prices-v0.2"
+    ? " It includes the lower GPT-5.6 Terra and Luna prices effective July 30."
+    : "";
+  copy.textContent = `All displayed seven-day fits — old and recent — were repriced using ${registryVersion}, ${reviewedAt}; this is not a stale pre-change calculation.${julyThirtyRepricing} It is a comparable current-price measure, not a historical invoice.${rebuiltAt}`;
+}
+
 function renderWeekly(data) {
   renderWeeklySpanThresholdControls();
+  renderWeeklyPricingReceipt(data);
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);

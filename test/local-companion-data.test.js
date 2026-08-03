@@ -275,6 +275,10 @@ test("local companion builds a closed real-data projection without identifiers o
       snapshot.overview.pricing.totalCostUsd,
       snapshot.overview.accounting.apiPriceEquivalentUsd,
     );
+    assert.equal(
+      snapshot.overview.pricing.priceEpochBasis,
+      "current_price_sensitivity_at_registry_observation",
+    );
     assert.equal(fastMode.inference.appliedToWeighting, false);
     assert.equal(fastMode.inference.status, "insufficient_signal");
     assert.equal(snapshot.gradient.datasets.summary[0].private_field, undefined);

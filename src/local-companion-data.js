@@ -1976,6 +1976,11 @@ export async function buildLocalCompanionSnapshot({
         subscriptionSpeedIsSeparate: true,
         registryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
         registryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+        // This is deliberately part of the closed dashboard projection. The
+        // displayed seven-day fits use the same current-price sensitivity as
+        // the rest of the local cost view, rather than silently retaining an
+        // older card for a recent-looking fit.
+        priceEpochBasis: "current_price_sensitivity_at_registry_observation",
         accountingSource: replaySafeCache === null
           ? "legacy_collector_unverified"
           : replaySafeCache.accountingMethod,
