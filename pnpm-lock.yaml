@@ -46,6 +46,8 @@ importers:
         specifier: 0.2.1
         version: 0.2.1
 
+  packages/i18n: {}
+
   packages/identity-core: {}
 
   packages/quota-analysis: {}

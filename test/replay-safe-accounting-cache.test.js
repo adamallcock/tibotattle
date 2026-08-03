@@ -655,6 +655,26 @@ test("cache validation requires the bounded quota timeline so older cache shapes
   );
 });
 
+test("a replay cache from an older official price registry is withheld", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-pricing-cache-"));
+  const cacheFile = join(directory, "accounting.json");
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  await writeFile(cacheFile, JSON.stringify({
+    ...cache,
+    priceRegistryVersion: "superseded-price-registry",
+  }));
+
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_price_registry_outdated",
+    cache: null,
+  });
+});
+
 test("refresh forwards AbortSignal and never writes an aborted projection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-abort-"));
   const cacheFile = join(directory, "accounting.json");

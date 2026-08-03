@@ -434,9 +434,10 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
 }
 
 test("native launcher keeps the requested foreground-only lifecycle", async () => {
-  const [source, semanticOpenTargetSource] = await Promise.all([
+  const [source, semanticOpenTargetSource, menuBarStatusSource] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(SEMANTIC_OPEN_TARGET_SOURCE, "utf8"),
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
   ]);
   assert.match(source, /import AppKit/u);
   assert.match(source, /"USAGE_MONITOR_PORT": "0"/u);
@@ -581,10 +582,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   // policy stay, and the window remains the primary surface.
   assert.match(source, /application\.setActivationPolicy\(\.regular\)/u);
   assert.match(source, /installMenuBarStatus\(\)/u);
+  assert.match(source, /installApplicationMenu\(\)/u);
+  assert.match(source, /Selector\(\("copy:"\)\)/u);
+  assert.match(source, /Selector\(\("selectAll:"\)\)/u);
+  assert.match(source, /window\?\.makeFirstResponder\(webView\)/u);
   assert.match(
     source,
     /MenuBarStatusController\(\s*productName: BundledProduct\.displayName/u,
   );
+  assert.match(menuBarStatusSource, /private static let idlePollSeconds = 60/u);
+  assert.match(menuBarStatusSource, /refreshStaleEvidenceIfNeeded\(\)/u);
+  assert.match(menuBarStatusSource, /systemSymbolName: "chart\.bar\.fill"/u);
+  assert.match(menuBarStatusSource, /image\?\.isTemplate = true/u);
   // The menu bar has one primary app destination. It reuses the in-app
   // dashboard path and leaves the browser as the separate explicit control.
   assert.match(source, /openTiboTattle: \{ \[weak self\] in self\?\.openTiboTattle\(\) \}/u);
@@ -732,14 +741,15 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
   const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
   assert.match(source, /import AppKit/u);
-  // Variable-length item with the actual product icon rather than a generic
-  // status symbol.
+  // Variable-length item with a legible, native template glyph. The full
+  // product icon remains for dashboard/share-card scale, not a 15px status bar.
   assert.match(
     source,
     /NSStatusBar\.system\.statusItem\(\s*withLength: NSStatusItem\.variableLength\s*\)/u,
   );
-  assert.match(source, /url\(forResource: "AppIcon", withExtension: "icns"\)/u);
-  assert.match(source, /image\?\.isTemplate = false/u);
+  assert.match(source, /systemSymbolName: "chart\.bar\.fill"/u);
+  assert.match(source, /image\?\.isTemplate = true/u);
+  assert.doesNotMatch(source, /url\(forResource: "AppIcon", withExtension: "icns"\)/u);
   assert.match(source, /setAccessibilityLabel\(/u);
   assert.match(source, /image\?\.accessibilityDescription = productName/u);
   assert.match(source, /"Settings…"/u);
@@ -773,9 +783,12 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
   );
 
-  // Menu contract: disabled information rows, the existing actions, and a
-  // separator before Quit.
+  // Menu contract: native summary/lane views retain the disabled information
+  // semantics while making the compact status readable, followed by the
+  // existing actions and a separator before Quit.
   assert.match(source, /menu\.autoenablesItems = false/u);
+  assert.match(source, /allowanceItem\.view = summaryView/u);
+  assert.match(source, /summaryView\.render\(productName: productName, snapshot: snapshot\)/u);
   assert.match(source, /allowanceItem\.isEnabled = false/u);
   assert.match(source, /evidenceItem\.isEnabled = false/u);
   assert.match(source, /"Open \\\(productName\)"/u);
@@ -786,6 +799,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /"Quit \\\(productName\)"/u);
   assert.match(source, /private var quotaLaneItems: \[NSMenuItem\] = \[\]/u);
   assert.match(source, /func renderQuotaLanes\(\)/u);
+  assert.match(source, /let view = MenuBarQuotaLaneView\(\)/u);
   assert.match(source, /menu\.insertItem\(item, at: insertionIndex \+ offset\)/u);
   assert.doesNotMatch(source, /showWindowItem/u);
   assert.doesNotMatch(source, /openDashboardItem/u);
@@ -800,12 +814,15 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /forHTTPHeaderField: "Origin"/u);
   assert.match(source, /case 409:\s*\n\s*result = \.alreadyRunning/u);
 
-  // Loopback only, ephemeral, size-capped, and not aggressive.
+  // Loopback only, ephemeral, size-capped, and bounded. A minute cadence
+  // permits stale evidence to trigger one while-open refresh without a daemon.
   assert.match(source, /URLSessionConfiguration\.ephemeral/u);
   assert.match(source, /host == "127\.0\.0\.1" \|\| host == "localhost"/u);
   assert.match(source, /components\.scheme == "http"/u);
   assert.match(source, /maximumResponseBytes/u);
-  assert.match(source, /idlePollSeconds = 300/u);
+  assert.match(source, /idlePollSeconds = 60/u);
+  assert.match(source, /func refreshStaleEvidenceIfNeeded\(\)/u);
+  assert.match(source, /!snapshot\.lanes\.isEmpty/u);
   assert.match(source, /func menuWillOpen\(_ menu: NSMenu\)/u);
   for (const forbidden of [
     "URLSessionConfiguration.background",

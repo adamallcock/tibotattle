@@ -67,7 +67,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   z-index: 20;
   top: 0;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   min-height: 76px;
   padding: 0 max(24px, calc((100vw - 1320px) / 2));
@@ -90,15 +90,34 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   height: 30px;
   border-radius: 50%;
 }
-.primary-nav { display: flex; min-width: 0; justify-content: center; gap: clamp(.55rem, 1.6vw, 1.25rem); }
+.dashboard-shell {
+  display: grid;
+  grid-template-columns: 205px minmax(0, 1fr);
+  width: min(1520px, 100%);
+  min-height: calc(100vh - 76px);
+  margin-inline: auto;
+}
+.dashboard-sidebar {
+  position: sticky;
+  top: 76px;
+  align-self: start;
+  min-height: calc(100vh - 76px);
+  padding: 2rem 1rem;
+  border-right: 1px solid var(--line);
+}
+.primary-nav { display: grid; gap: .3rem; }
 .primary-nav a {
-  padding: .5rem .25rem;
+  padding: .65rem .75rem;
+  border-radius: .45rem;
   color: var(--muted);
   font-size: .76rem;
   font-weight: 700;
   text-decoration: none;
 }
-.primary-nav a:hover, .primary-nav a.active { color: var(--green); }
+.primary-nav a:hover, .primary-nav a.active { color: var(--green); background: var(--green-soft); }
+.primary-nav a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.dashboard-content { min-width: 0; -webkit-user-select: text; user-select: text; }
+[data-dashboard-page][hidden] { display: none !important; }
 .top-actions { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: .55rem; }
 .state-pill, .evidence-chip {
   display: inline-flex;
@@ -1413,29 +1432,24 @@ footer {
 
 @media (max-width: 1050px) {
   .topbar { grid-template-columns: auto 1fr; padding-inline: 24px; }
-  .primary-nav { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; overflow-x: auto; border-top: 1px solid var(--line); }
   .top-actions { justify-self: end; }
-  html { scroll-padding-top: 125px; }
+  .dashboard-shell { display: block; min-height: 0; }
+  .dashboard-sidebar {
+    position: static;
+    min-height: 0;
+    padding: .65rem 24px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .primary-nav {
+    display: flex;
+    gap: .25rem;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .primary-nav a { flex: 0 0 auto; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .metric-grid > :last-child { grid-column: 1 / -1; }
-}
-
-@media (max-width: 1440px) and (min-width: 1051px) {
-  .topbar {
-    grid-template-columns: auto minmax(0, 1fr);
-    row-gap: .4rem;
-    min-height: 0;
-    padding-block: .55rem;
-    padding-inline: 24px;
-  }
-  .primary-nav { justify-content: flex-start; }
-  .top-actions {
-    grid-column: 1 / -1;
-    grid-row: 2;
-    justify-self: end;
-    gap: .4rem;
-  }
-  .top-actions .button.compact { padding-inline: .55rem; }
 }
 
 @media (max-width: 760px) {
@@ -1449,7 +1463,7 @@ footer {
     A consent control must never become unreachable.
   */
   .topbar .button.compact { display: none; }
-  .primary-nav { gap: 1rem; }
+  .dashboard-sidebar { padding-inline: 14px; }
   .page-heading, .section-heading, .section-heading.split, .weekly-hero, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
   .companion-setup-actions { grid-column: 1; }
   .journey-disclosure > summary { align-items: flex-start; flex-direction: column; }
@@ -1510,13 +1524,6 @@ footer {
     gap: 0;
     overflow: hidden;
     font-size: 0;
-  }
-  .primary-nav {
-    display: flex;
-    gap: .25rem;
-    width: 100%;
-    overflow-x: auto;
-    scrollbar-width: thin;
   }
   .primary-nav a {
     flex: 0 0 auto;

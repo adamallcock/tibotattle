@@ -2518,7 +2518,19 @@ function lineChart({
         const marker = document.createElementNS(svg.namespaceURI, "circle");
         marker.setAttribute("cx", String(x(index, point)));
         marker.setAttribute("cy", String(y(value)));
-        marker.setAttribute("r", String(item.markerRadius ?? 4));
+        const markerRadius = typeof item.markerRadius === "function"
+          ? item.markerRadius(point)
+          : item.markerRadius ?? 4;
+        const markerOpacity = typeof item.markerOpacity === "function"
+          ? item.markerOpacity(point)
+          : item.markerOpacity;
+        marker.setAttribute("r", String(markerRadius));
+        if (Number.isFinite(markerOpacity)) {
+          marker.setAttribute(
+            "opacity",
+            String(Math.max(0, Math.min(1, markerOpacity))),
+          );
+        }
         marker.setAttribute("class", `${item.className} chart-point`);
         const timestamp = point.timestamp ?? point.date;
         const caption = [
@@ -2601,10 +2613,28 @@ function weeklyPointDetail(point) {
     point.observedSpanPp === null
       ? "observed span not recorded"
       : `represents ${formatPp(point.observedSpanPp)} of the 100-point allowance`,
+    point.observedSpanPp === null
+      ? "coverage strength unavailable"
+      : "marker intensity shows observed-span coverage, not statistical confidence",
     point.low === null || point.high === null
       ? "no within-reset sensitivity range"
       : `within-reset sensitivity ${formatMoney(point.low)}–${formatMoney(point.high)}`,
   ].join(" · ");
+}
+
+/**
+ * The vertical bar and observed span answer different questions. The bar is
+ * a direct sensitivity diagnostic from alternate boundary pairs; widening it
+ * a second time for an incomplete series would double-count the span effect.
+ * Span still matters, so it gets an independent visual channel. A 40-point
+ * fit is visibly quieter than a full-series fit without pretending either is
+ * a calibrated confidence interval.
+ */
+function weeklySpanVisualStrength(observedSpanPp) {
+  const normalized = observedSpanPp === null
+    ? 0
+    : Math.max(0, Math.min(100, observedSpanPp)) / 100;
+  return 0.34 + normalized * 0.66;
 }
 
 function renderWeeklySpanThresholdControls() {
@@ -2652,6 +2682,7 @@ function renderWeekly(data) {
     historicalMedian: estimate,
     acrossResetLow: lower,
     acrossResetHigh: upper,
+    spanVisualStrength: weeklySpanVisualStrength(observedSpanPp),
     matureValue: aboveWeeklySpanThreshold(observedSpanPp) ? value : null,
     provisionalValue: aboveWeeklySpanThreshold(observedSpanPp) ? null : value,
     index
@@ -2694,7 +2725,8 @@ function renderWeekly(data) {
           label: `Fit observed across ${weeklyThresholdLabel()}`,
           connect: false,
           markers: true,
-          markerRadius: 5,
+          markerRadius: (point) => 3 + point.spanVisualStrength * 3,
+          markerOpacity: (point) => point.spanVisualStrength,
           focusable: true,
           detail: weeklyPointDetail,
         },
@@ -2704,7 +2736,8 @@ function renderWeekly(data) {
           label: "Partial diagnostic extrapolated to 100 percentage points",
           connect: false,
           markers: true,
-          markerRadius: 5,
+          markerRadius: (point) => 3 + point.spanVisualStrength * 3,
+          markerOpacity: (point) => point.spanVisualStrength,
           focusable: true,
           detail: weeklyPointDetail,
         },
@@ -2718,7 +2751,7 @@ function renderWeekly(data) {
       },
       yLabel: "API-equivalent USD",
       title: "Seven-day allowance estimate history",
-      description: `Historical median and independent reset-series fits plotted on the date each estimate became available in ${USER_TIME_ZONE}. Each fit carries its own within-reset sensitivity bar.`
+      description: `Historical median and independent reset-series fits plotted on the date each estimate became available in ${USER_TIME_ZONE}. Each fit carries its own within-reset sensitivity bar; point intensity encodes the observed span, not statistical confidence.`
     }));
   }
   renderWeeklyStats(summary, chartValues);
@@ -6104,7 +6137,9 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
 $("#weekly-span-threshold").addEventListener("input", (event) => {
   const threshold = Number(event.target.value);
   if (!Number.isFinite(threshold)) return;
-  weeklySpanThresholdPp = Math.max(0, Math.min(100, threshold));
+  // The predicate is deliberately strict ("more than"). A 100 pp maximum
+  // therefore makes an impossible, always-empty filter state reachable.
+  weeklySpanThresholdPp = Math.max(0, Math.min(99, threshold));
   if (dashboard) renderWeekly(dashboard);
   else renderWeeklySpanThresholdControls();
 });
@@ -6188,7 +6223,6 @@ $("#contribution-history").addEventListener("click", (event) => {
 mountDashboardNavigation({
   documentRef: document,
   windowRef: window,
-  IntersectionObserverRef: IntersectionObserver,
 });
 
 async function bootstrapDashboard() {
