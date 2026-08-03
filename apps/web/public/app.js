@@ -758,6 +758,12 @@ const SHARE_CARD_WINDOW_LABELS = Object.freeze({
   seven_day: "seven-day allowance",
 });
 const SHARE_CARD_UNKNOWN_PERIOD = "the recorded period";
+const SHARE_CARD_DATE_FORMAT = new Intl.DateTimeFormat("en-US", {
+  ...(USER_TIME_ZONE === "local time" ? {} : { timeZone: USER_TIME_ZONE }),
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
 
 let shareCard = null;
 let shareCardReference = "";
@@ -844,15 +850,11 @@ function shareCardPeriodLabel(candidate) {
 }
 
 /**
- * How far back the plotted history runs, stated as a duration.
- *
- * Computed from a count of days, never from a date: a card carries when the
- * evidence spans, not when its owner was at the keyboard.
+ * A date-only label for a derived reset estimate. The card deliberately omits
+ * a time of day and any raw-log timestamp.
  */
-function shareCardSpanLabel(days) {
-  if (days >= 14) return `${Math.round(days / 7)} weeks earlier`;
-  if (days >= 2) return `${days} days earlier`;
-  return "earliest fit";
+function shareCardDateLabel(timestamp) {
+  return Number.isFinite(timestamp) ? SHARE_CARD_DATE_FORMAT.format(timestamp) : "";
 }
 
 /**
@@ -862,9 +864,9 @@ function shareCardSpanLabel(days) {
  * Only fits observed across more than the fixed default span threshold are
  * plotted — the evidence that panel leads with — and the threshold is read
  * from the constant rather than from the on-screen control, so a posted card
- * never depends on where a reader happened to leave a slider. Timestamps are
- * read as numbers, to place a point and to say how long the history runs; no
- * date is printed.
+ * never depends on where a reader happened to leave a slider. The horizontal
+ * axis carries date-only labels for the derived estimate availability, never a
+ * raw-log timestamp or a time of day.
  */
 function shareCardTrend(rows) {
   const points = (Array.isArray(rows) ? rows : [])
@@ -885,6 +887,7 @@ function shareCardTrend(rows) {
     .slice(-SHARE_CARD_TREND_MAX_POINTS)
     .map((point) => Object.freeze({
       at: point.at,
+      dateLabel: shareCardDateLabel(point.at),
       value: point.value,
       // A sensitivity bound that is missing or the wrong side of the fit
       // collapses onto the fit rather than drawing a bar it cannot support.
@@ -896,15 +899,13 @@ function shareCardTrend(rows) {
         : point.value,
     }));
   if (points.length < SHARE_CARD_TREND_MIN_POINTS) return null;
-  const days = Math.round(
-    (points[points.length - 1].at - points[0].at) / 86_400_000,
-  );
   return Object.freeze({
     points: Object.freeze(points),
     low: Math.min(...points.map((point) => point.low)),
     high: Math.max(...points.map((point) => point.high)),
     count: points.length,
-    span: shareCardSpanLabel(days),
+    firstDateLabel: points[0].dateLabel,
+    lastDateLabel: points[points.length - 1].dateLabel,
   });
 }
 
@@ -1073,7 +1074,7 @@ function shareCardText(card) {
 function shareCardTrendText(card) {
   return card.trend === null
     ? `${card.trendLabel}: ${card.trendEmpty} ${card.trendEmptyDetail}`
-    : `${card.trendLabel}: ${card.trend.count} fits from ${card.trend.span} to the latest, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every sensitivity bar.`;
+    : `${card.trendLabel}: ${card.trend.count} fits observed from ${card.trend.firstDateLabel} to ${card.trend.lastDateLabel}. The vertical axis is API-price equivalent USD, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every sensitivity bar.`;
 }
 
 function shareCardFont(weight, size, family = "sans") {
@@ -1177,8 +1178,33 @@ function drawShareCardBadge(context, badge, x, y) {
  * Independent estimates, so they are drawn as points and never joined into a
  * line the model does not claim. Only numbers reach the canvas here: each
  * point's position comes from a parsed timestamp and a dollar figure, and the
- * axis is labelled with formatted money and a fixed duration phrase.
+ * axis is labelled with formatted money and date-only observation labels.
  */
+function shareCardTrendAxis(low, high) {
+  const observedRange = Math.max(
+    high - low,
+    Math.max(Math.abs(low), Math.abs(high), 1) * .1,
+  );
+  const paddedLow = Math.max(0, low - observedRange * .08);
+  const paddedHigh = high + observedRange * .08;
+  const desiredStep = Math.max((paddedHigh - paddedLow) / 4, Number.MIN_VALUE);
+  const magnitude = 10 ** Math.floor(Math.log10(desiredStep));
+  const normalized = desiredStep / magnitude;
+  const multiple = [1, 2, 2.5, 5, 10].find((candidate) => candidate >= normalized) ?? 10;
+  const step = multiple * magnitude;
+  const axisLow = Math.max(0, Math.floor(paddedLow / step) * step);
+  const axisHigh = Math.ceil(paddedHigh / step) * step;
+  const ticks = [];
+  for (let value = axisHigh; value >= axisLow - step / 1_000; value -= step) {
+    ticks.push(Number(value.toFixed(8)));
+  }
+  return Object.freeze({
+    low: axisLow,
+    high: axisHigh,
+    ticks: Object.freeze(ticks),
+  });
+}
+
 function drawShareCardTrend(context, card, x, y, width, height) {
   drawShareCardPanel(context, x, y, width, height);
   context.save();
@@ -1196,38 +1222,45 @@ function drawShareCardTrend(context, card, x, y, width, height) {
     return;
   }
   const { points, low, high } = card.trend;
+  const axis = shareCardTrendAxis(low, high);
+  const xAxisLabel = "Reset estimate availability (local date)";
+  const yAxisLabel = "API-price equivalent (USD)";
   const padTop = 20;
-  const padBottom = 30;
-  const padLeft = 22;
-  // The value axis is labelled inside the panel on the right, so the plot
-  // keeps the full width at the left where the earliest fits sit.
+  const padBottom = 54;
+  const padLeft = 92;
+  const padRight = 20;
   context.font = shareCardFont(600, 14);
-  const axisWidth = Math.max(
-    context.measureText(formatMoney(high, 0)).width,
-    context.measureText(formatMoney(low, 0)).width,
-  ) + 18;
+  const axisDigits = axis.high < 100 ? 2 : 0;
   const plotLeft = x + padLeft;
-  const plotRight = x + width - axisWidth - 12;
+  const plotRight = x + width - padRight;
   const plotTop = y + padTop;
   const plotBottom = y + height - padBottom;
   const span = points[points.length - 1].at - points[0].at;
-  const range = high - low;
+  const range = axis.high - axis.low;
   const positionX = (point) => points.length === 1 || span <= 0
     ? (plotLeft + plotRight) / 2
     : plotLeft + (point.at - points[0].at) / span * (plotRight - plotLeft);
   const positionY = (value) => range <= 0
     ? (plotTop + plotBottom) / 2
-    : plotBottom - (value - low) / range * (plotBottom - plotTop);
+    : plotBottom - (value - axis.low) / range * (plotBottom - plotTop);
 
   context.strokeStyle = "rgba(23, 33, 30, .12)";
   context.lineWidth = 1;
-  for (const value of [low, high]) {
+  for (const value of axis.ticks) {
     const gridY = Math.round(positionY(value)) + .5;
     context.beginPath();
-    context.moveTo(plotLeft - 6, gridY);
-    context.lineTo(plotRight + 6, gridY);
+    context.moveTo(plotLeft, gridY);
+    context.lineTo(plotRight, gridY);
     context.stroke();
   }
+
+  context.strokeStyle = "rgba(23, 33, 30, .28)";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(plotLeft, plotTop);
+  context.lineTo(plotLeft, plotBottom);
+  context.lineTo(plotRight, plotBottom);
+  context.stroke();
 
   for (const point of points) {
     const pointX = Math.round(positionX(point)) + .5;
@@ -1254,12 +1287,32 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   context.fillStyle = "#65706b";
   context.font = shareCardFont(600, 14);
   context.textAlign = "right";
-  context.fillText(formatMoney(high, 0), x + width - 14, positionY(high) + 5);
-  context.fillText(formatMoney(low, 0), x + width - 14, positionY(low) + 5);
-  context.textAlign = "left";
-  context.fillText(card.trend.span, plotLeft - 6, y + height - 11);
-  context.textAlign = "right";
-  context.fillText("latest", plotRight + 6, y + height - 11);
+  for (const value of axis.ticks) {
+    context.fillText(
+      formatMoney(value, axisDigits),
+      plotLeft - 10,
+      positionY(value) + 5,
+    );
+  }
+  context.save();
+  context.translate(x + 20, (plotTop + plotBottom) / 2);
+  context.rotate(-Math.PI / 2);
+  context.textAlign = "center";
+  context.fillText(yAxisLabel, 0, 0);
+  context.restore();
+
+  const dateIndexes = points.length < 3
+    ? [0, points.length - 1]
+    : [0, Math.floor((points.length - 1) / 2), points.length - 1];
+  for (const index of [...new Set(dateIndexes)]) {
+    const point = points[index];
+    const alignment = index === 0 ? "left" : index === points.length - 1 ? "right" : "center";
+    context.textAlign = alignment;
+    context.fillText(point.dateLabel, positionX(point), plotBottom + 21);
+  }
+  context.font = shareCardFont(600, 13);
+  context.textAlign = "center";
+  context.fillText(xAxisLabel, (plotLeft + plotRight) / 2, y + height - 11);
   context.restore();
 }
 

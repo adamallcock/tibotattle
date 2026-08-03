@@ -4801,22 +4801,22 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [...new Set(firstArguments(section, "context.fillText("))].sort(),
     [
       "\"TiboTattle\"",
-      "\"latest\"",
       "`${card.trend.count} qualifying resets`",
       "badge",
       "card.home",
-      "card.trend.span",
       "card.trendEmpty",
       "card.trendEmptyDetail",
       "card.trendLabel.toUpperCase()",
-      "formatMoney(high, 0)",
-      "formatMoney(low, 0)",
+      "formatMoney(value, axisDigits)",
       "line",
+      "point.dateLabel",
       "shareCardFit( context, \"Local-first measurement. No prompts, files, folder names, or account details leave the Mac.\", inner, )",
       "shareCardFit(context, card.identifierLine, inner)",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
+      "xAxisLabel",
+      "yAxisLabel",
     ],
   );
 
@@ -4846,9 +4846,8 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   );
 
   // The plotted history reads five numeric fields per fit and nothing else.
-  // A timestamp is parsed to a number to place a point and to count days; it
-  // is never carried into a string, so the image cannot say when its owner was
-  // at the keyboard.
+  // A timestamp is parsed to a number before a date-only local label is made;
+  // neither a raw timestamp nor a time of day can reach the image.
   const trend = section.match(
     /function shareCardTrend\(rows\) \{[\s\S]*?\n\}/u,
   )?.[0];
@@ -4866,15 +4865,28 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     ],
   );
   assert.match(trend, /at: Date\.parse\(row\?\.last_observed_at \?\? row\?\.first_observed_at \?\? ""\)/u);
+  assert.match(trend, /dateLabel: shareCardDateLabel\(point\.at\),/u);
+  assert.match(trend, /firstDateLabel: points\[0\]\.dateLabel,/u);
+  assert.match(trend, /lastDateLabel: points\[points\.length - 1\]\.dateLabel,/u);
   assert.doesNotMatch(
     section,
-    /toLocaleString|toLocaleDateString|toLocaleTimeString|toISOString|DateTimeFormat|formatLocal|USER_TIME_ZONE/u,
+    /toLocaleString|toLocaleDateString|toLocaleTimeString|toISOString|formatLocal/u,
   );
-  // The duration phrase is built from a count of days, never from a date.
+  // The only date formatter is a fixed month/day/year representation in the
+  // viewer's time zone. It accepts the parsed number, not a source string.
   assert.match(
     section,
-    /function shareCardSpanLabel\(days\) \{\s*\n\s*if \(days >= 14\) return `\$\{Math\.round\(days \/ 7\)\} weeks earlier`;/u,
+    /const SHARE_CARD_DATE_FORMAT = new Intl\.DateTimeFormat\("en-US", \{[\s\S]*?month: "short",[\s\S]*?day: "numeric",[\s\S]*?year: "numeric",/u,
   );
+  assert.match(
+    section,
+    /function shareCardDateLabel\(timestamp\) \{\s*\n\s*return Number\.isFinite\(timestamp\) \? SHARE_CARD_DATE_FORMAT\.format\(timestamp\) : "";/u,
+  );
+  assert.match(section, /const yAxisLabel = "API-price equivalent \(USD\)";/u);
+  assert.match(section, /const xAxisLabel = "Reset estimate availability \(local date\)";/u);
+  assert.match(section, /function shareCardTrendAxis\(low, high\) \{/u);
+  assert.match(section, /for \(const value of axis\.ticks\) \{[\s\S]*?formatMoney\(value, axisDigits\)/u);
+  assert.match(section, /context\.fillText\(point\.dateLabel, positionX\(point\), plotBottom \+ 21\);/u);
   // Which fits qualify is fixed in the build, not read from the on-screen
   // control, so two readers of the same evidence post the same picture.
   assert.match(trend, /point\.spanPp > DEFAULT_WEEKLY_SPAN_THRESHOLD_PP/u);
