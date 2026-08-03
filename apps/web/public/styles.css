@@ -605,6 +605,12 @@ h1 {
 .provider-button-apple { color: #fff; background: #000; border-color: #000; }
 .provider-mark { flex: none; width: 18px; height: 18px; }
 .provider-button-apple .provider-mark { width: 17px; height: 17px; margin-top: -2px; }
+.identity-signin-pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
 .identity-account {
   display: flex;
   flex-wrap: wrap;

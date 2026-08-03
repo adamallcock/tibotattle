@@ -1090,6 +1090,17 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         webView.loadHTMLString("", baseURL: nil)
     }
 
+    /// The fixed app URL never carries provider data. It is only a wake-up
+    /// signal from the browser callback, so the already-loaded local document
+    /// can collect the opaque result without being reloaded and losing its
+    /// in-memory sign-in state.
+    func notifyHostedSignInReturn() {
+        guard hasDashboardTarget else { return }
+        webView.evaluateJavaScript(
+            "window.dispatchEvent(new Event('tibotattle:hosted-sign-in-return'));"
+        )
+    }
+
     private func isCompanionURL(_ url: URL) -> Bool {
         guard let allowedPort else { return false }
         return url.scheme?.lowercased() == "http"
@@ -2222,6 +2233,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         // It carries no OAuth data, so the browser never hands an account,
         // token, or callback value to the app.
         if semanticOpenTarget.accepts(url) {
+            dashboardWebHost?.notifyHostedSignInReturn()
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -3169,9 +3181,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        pendingDashboardOpen = true
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // A hosted sign-in callback lands here after the browser has already
+        // finished. Reloading the loopback document at this point would erase
+        // its unpersisted state/proof and make a completed sign-in appear to
+        // do nothing. Keep the existing dashboard alive and ask it to poll
+        // immediately instead.
+        if dashboardWebViewShowing {
+            dashboardWebHost?.notifyHostedSignInReturn()
+            return
+        }
+        pendingDashboardOpen = true
         if dashboardURL != nil {
             pendingDashboardOpen = false
             openDashboard()

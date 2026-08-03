@@ -83,6 +83,10 @@ let communityConnectBusy = false;
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
 let hostedIdentityBusy = false;
+// A single page-local attempt owns the short polling loop. It is never stored
+// with the opaque proof and lets the user cancel a stalled browser handoff
+// without waiting for the server's five-minute expiry.
+let activeHostedSignIn = null;
 // Only the contribution service knows whether each hosted provider is
 // configured, so these stay false until a start attempt says otherwise.
 let appleSignInUnavailable = false;
@@ -4289,6 +4293,9 @@ const HOSTED_IDENTITY_PROVIDERS = {
 function renderHostedIdentity() {
   const googleButton = $("#identity-google-signin");
   const appleButton = $("#identity-apple-signin");
+  const pendingActions = $("#identity-signin-pending-actions");
+  const checkButton = $("#identity-signin-check");
+  const cancelButton = $("#identity-signin-cancel");
   const chip = $("#identity-signin-state");
   const googleUnavailable = $("#identity-google-unavailable");
   const appleUnavailable = $("#identity-apple-unavailable");
@@ -4324,6 +4331,9 @@ function renderHostedIdentity() {
   $("#identity-signin-choices").hidden = signedIn;
   $("#identity-account").hidden = !signedIn;
   $("#identity-signout").disabled = hostedIdentityBusy || !signedIn;
+  pendingActions.hidden = !hostedIdentityBusy || signedIn;
+  checkButton.disabled = !hostedIdentityBusy || signedIn;
+  cancelButton.disabled = !hostedIdentityBusy || signedIn;
   $("#identity-account-provider").textContent = provider.label;
   $("#identity-account-mark").setAttribute("href", provider.mark);
   chip.textContent = signedIn
@@ -4389,6 +4399,56 @@ function foregroundNativeDashboardAfterSignIn() {
   }
 }
 
+function wakeHostedSignInPoll(attempt) {
+  if (activeHostedSignIn !== attempt || attempt.cancelled) return;
+  attempt.returnedToApp = true;
+  if (typeof attempt.wake === "function") {
+    attempt.wake();
+  } else {
+    attempt.pollImmediately = true;
+  }
+}
+
+function waitForHostedSignInPoll(attempt) {
+  return new Promise((resolveWait) => {
+    if (activeHostedSignIn !== attempt || attempt.cancelled) {
+      resolveWait();
+      return;
+    }
+    let timeoutId = null;
+    const resume = () => {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (attempt.wake === resume) attempt.wake = null;
+      resolveWait();
+    };
+    attempt.wake = resume;
+    if (attempt.pollImmediately) {
+      attempt.pollImmediately = false;
+      resume();
+      return;
+    }
+    timeoutId = window.setTimeout(resume, HOSTED_SIGNIN_POLL_INTERVAL_MS);
+  });
+}
+
+function checkHostedSignInNow() {
+  if (activeHostedSignIn !== null) wakeHostedSignInPoll(activeHostedSignIn);
+}
+
+function cancelHostedSignIn() {
+  const attempt = activeHostedSignIn;
+  if (attempt === null) return;
+  attempt.cancelled = true;
+  activeHostedSignIn = null;
+  hostedIdentityBusy = false;
+  attempt.wake?.();
+  const status = $("#identity-signin-status");
+  status.hidden = false;
+  status.className = "participant-action-status";
+  status.textContent = `${attempt.label} sign-in was cancelled. Nothing was uploaded.`;
+  renderHostedIdentity();
+}
+
 // One shape for both providers. Neither can complete inside this page: Apple
 // provisions Sign in with Apple only for distributions this Developer ID build
 // cannot use, refuses loopback redirects, and answers with
@@ -4442,6 +4502,14 @@ async function beginHostedSignIn(providerId) {
     return;
   }
   const status = $("#identity-signin-status");
+  const attempt = {
+    cancelled: false,
+    label: flow.label,
+    pollImmediately: false,
+    returnedToApp: false,
+    wake: null,
+  };
+  activeHostedSignIn = attempt;
   hostedIdentityBusy = true;
   renderHostedIdentity();
   status.hidden = false;
@@ -4451,10 +4519,8 @@ async function beginHostedSignIn(providerId) {
     const request = await flow.start();
     openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
-    for (let attempt = 0; attempt < HOSTED_SIGNIN_POLL_ATTEMPTS; attempt += 1) {
-      await new Promise((resolveWait) => {
-        window.setTimeout(resolveWait, HOSTED_SIGNIN_POLL_INTERVAL_MS);
-      });
+    for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
+      if (attempt.cancelled || activeHostedSignIn !== attempt) return;
       let identity = null;
       try {
         identity = await flow.result(request.state);
@@ -4462,10 +4528,17 @@ async function beginHostedSignIn(providerId) {
         if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
       }
       if (identity !== null) {
+        if (attempt.cancelled || activeHostedSignIn !== attempt) return;
         hostedIdentity = identity;
+        activeHostedSignIn = null;
+        hostedIdentityBusy = false;
         status.textContent = flow.signedIn;
+        renderHostedIdentity();
         foregroundNativeDashboardAfterSignIn();
         return;
+      }
+      if (poll + 1 < HOSTED_SIGNIN_POLL_ATTEMPTS) {
+        await waitForHostedSignInPoll(attempt);
       }
     }
     // A bounded poll that ran out is still a failed action from the user's
@@ -4476,6 +4549,7 @@ async function beginHostedSignIn(providerId) {
       fallback: flow.timedOut,
     });
   } catch (error) {
+    if (attempt.cancelled || activeHostedSignIn !== attempt) return;
     const unconfigured = error?.code === "IDENTITY_CONFIGURATION_INVALID";
     if (unconfigured) flow.markUnavailable();
     showFailure(status, {
@@ -4483,15 +4557,23 @@ async function beginHostedSignIn(providerId) {
       error,
       messages: unconfigured
         ? { IDENTITY_CONFIGURATION_INVALID: flow.unconfigured }
-        : {},
+        : error?.code === "IDENTITY_TOKEN_INVALID" && attempt.returnedToApp
+          ? {
+            IDENTITY_TOKEN_INVALID:
+              `${flow.label} did not confirm the sign-in. Nothing was uploaded; try again.`,
+          }
+          : {},
       fallback: hostedIdentityErrorCopy(error)
         ?? (error instanceof Error && error.status === undefined
           ? error.message
           : flow.failed),
     });
   } finally {
-    hostedIdentityBusy = false;
-    renderHostedIdentity();
+    if (activeHostedSignIn === attempt) {
+      activeHostedSignIn = null;
+      hostedIdentityBusy = false;
+      renderHostedIdentity();
+    }
   }
 }
 
@@ -6047,6 +6129,9 @@ $("#identity-apple-signin").addEventListener("click", () => {
   void beginHostedSignIn("apple");
 });
 $("#identity-signout").addEventListener("click", signOutHostedIdentity);
+$("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
+$("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
+window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
 $("#community-connect-consent").addEventListener(
   "change",
   updateCommunityConnectButton

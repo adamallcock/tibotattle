@@ -654,10 +654,11 @@ function signInCallbackPage(
     : "Sign-in was not completed";
   const detail = completed
     ? "TiboTattle is opening now. You can close this browser tab."
-    : "No data was uploaded. Open TiboTattle and start the sign-in again.";
-  const refresh = completed
-    ? `<meta http-equiv="refresh" content="0; url=${SIGNIN_CALLBACK_APP_OPEN_URL}">`
-    : "";
+    : "No data was uploaded. TiboTattle is reopening so you can try again.";
+  // The app link is fixed and carries no provider material. Returning to the
+  // app after either outcome prevents a failed callback from leaving the user
+  // stranded in a browser tab while the dashboard continues to wait.
+  const refresh = `<meta http-equiv="refresh" content="${completed ? "0" : "2"}; url=${SIGNIN_CALLBACK_APP_OPEN_URL}">`;
   const html = `<!doctype html>
 <html lang="en">
 <head>

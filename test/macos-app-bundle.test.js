@@ -671,6 +671,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
   assert.match(
     source,
+    /func notifyHostedSignInReturn\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:hosted-sign-in-return'\)\)/u,
+  );
+  assert.match(
+    source,
     /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url\)/u,
   );
   // A second window is never opened in-app; its target is handed straight to
@@ -682,6 +686,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(
     source,
     /private func openExternalDashboardLink\(_ url: URL\) \{[\s\S]*?semanticOpenTarget\.accepts\(url\)[\s\S]*?NSApp\.activate\(ignoringOtherApps: true\)[\s\S]*?url\.scheme\?\.lowercased\(\) == "https"[\s\S]*?url\.user == nil,\s*\n\s*url\.password == nil/u,
+  );
+  assert.match(
+    source,
+    /func application\([\s\S]*?open urls: \[URL\][\s\S]*?if dashboardWebViewShowing \{[\s\S]*?dashboardWebHost\?\.notifyHostedSignInReturn\(\)[\s\S]*?return[\s\S]*?openDashboard\(\)/u,
   );
   assert.doesNotMatch(source, /Finish signing in in your browser/u);
   assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);

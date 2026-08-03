@@ -2420,6 +2420,9 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     "identity-account-mark",
     "identity-account-provider",
     "identity-signout",
+    "identity-signin-pending-actions",
+    "identity-signin-check",
+    "identity-signin-cancel",
   ]) {
     assert.match(html, new RegExp(`id="${id}"`, "u"));
   }
@@ -2477,6 +2480,7 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
   assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
+  assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
   assert.match(pollBody, /foregroundNativeDashboardAfterSignIn\(\)/u);
   const handoffBody =
     appSource.match(/function openHostedSignInInBrowser\([\s\S]*?\n\}/u)?.[0] ?? "";
@@ -2498,6 +2502,25 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
       ?.replace(/_/gu, "")
   );
   assert.equal(attempts * interval, 5 * 60 * 1_000);
+
+  // A browser handoff remains recoverable: the callback can wake the bounded
+  // poll immediately, and the person can check or cancel without waiting for
+  // the server-side expiry.
+  assert.match(appSource, /function checkHostedSignInNow\(\)/u);
+  assert.match(appSource, /function cancelHostedSignIn\(\)/u);
+  assert.match(appSource, /Nothing was uploaded\./u);
+  assert.match(
+    appSource,
+    /window\.addEventListener\("tibotattle:hosted-sign-in-return", checkHostedSignInNow\);/u,
+  );
+  assert.match(
+    appSource,
+    /\$\("#identity-signin-check"\)\.addEventListener\("click", checkHostedSignInNow\);/u,
+  );
+  assert.match(
+    appSource,
+    /\$\("#identity-signin-cancel"\)\.addEventListener\("click", cancelHostedSignIn\);/u,
+  );
 
   // Signing out is page-local: it forgets the memory-only identity and the
   // pseudonymous session it enrolled, so the next sign-in can be a different

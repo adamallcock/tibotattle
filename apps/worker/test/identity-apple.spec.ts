@@ -303,7 +303,7 @@ describe("web Sign in with Apple", () => {
     expect(late.status).toBe(200);
     const page = await late.text();
     expect(page).toContain("Sign-in was not completed.");
-    expect(page).not.toContain('http-equiv="refresh"');
+    expect(page).toContain('content="2; url=usagemonitor://open"');
     expect(tokenCalls).toHaveLength(0);
 
     const result = await json("/api/v1/identity/apple/result", {
