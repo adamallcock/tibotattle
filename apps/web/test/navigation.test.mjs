@@ -46,9 +46,9 @@ function fakePage(name) {
 }
 
 function fakeBrowser({ hash = "" } = {}) {
-  const links = ["overview", "weekly", "trends", "community", "data"]
+  const links = ["overview", "weekly", "trends", "method", "community", "data"]
     .map(fakeLink);
-  const pages = ["overview", "weekly", "trends", "community", "data"]
+  const pages = ["overview", "weekly", "trends", "method", "community", "data"]
     .map(fakePage);
   const disclosure = { open: false };
   const listeners = new Map();
@@ -91,11 +91,11 @@ function assertActivePage(browser, expected) {
 test("hashes preserve deep links while selecting their owning top-level page", () => {
   const browser = fakeBrowser({ hash: "#accounting" });
   mountDashboardNavigation(browser);
-  assertActivePage(browser, "weekly");
+  assertActivePage(browser, "method");
 
   browser.windowRef.location.hash = "#community";
   browser.listeners.get("hashchange")();
-  assert.equal(browser.disclosure.open, true);
+  assert.equal(browser.disclosure.open, false);
   assertActivePage(browser, "community");
 
   browser.windowRef.location.hash = "#backend";

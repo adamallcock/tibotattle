@@ -541,7 +541,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /--app-link-smoke-test/u);
   assert.match(
     source,
-    /No Codex metadata is scanned until you open the dashboard and ask/iu,
+    /updates local \\\(BundledProduct\.monitoredAppDisplayName\) metadata while the app is open/iu,
   );
   assert.match(
     source,
@@ -551,7 +551,8 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /first-run-v1\.json/u);
   assert.match(source, /usage-monitor-first-run-v1/u);
   assert.match(source, /Community contribution is optional/iu);
-  assert.match(source, /six-hour while-open contribution schedule/iu);
+  assert.match(source, /Community contribution is optional/iu);
+  assert.doesNotMatch(source, /six-hour while-open contribution schedule/iu);
   assert.match(source, /Keep the app open while analysis runs/iu);
   assert.match(
     source,
@@ -573,10 +574,19 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /install them when you quit the app/iu);
   assert.match(source, /This development build contains no updater framework/iu);
   assert.match(source, /move \\\(BundledProduct\.bundleName\) to Trash/iu);
-  assert.match(source, /explicit bounded scan/iu);
+  assert.match(source, /Updating local usage while the app is open/iu);
   assert.match(source, /Large histories may need several passes/iu);
   assert.match(source, /Nothing leaves this Mac/iu);
+  assert.match(source, /private final class NativeDashboardChrome/u);
+  assert.match(source, /NSSplitView\(\)/u);
+  assert.match(source, /configureBadge\(modeButton, symbol: "lock\.fill"\)/u);
+  assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
+  assert.match(source, /nativeRefreshIntervalSeconds = 300/u);
+  assert.match(source, /private func scheduleNativeRefresh\(\)/u);
+  assert.match(source, /LocalCompanionEvidenceReader/u);
+  assert.match(source, /LaunchAgent, or daemon/iu);
   assert.match(source, /title: "Quit"/u);
+  assert.match(source, /title: "Settings…"[\s\S]*keyEquivalent: ","/u);
   // The menu-bar item is additive: the Dock icon and the regular activation
   // policy stay, and the window remains the primary surface.
   assert.match(source, /application\.setActivationPolicy\(\.regular\)/u);
@@ -657,6 +667,8 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
     /private func isCompanionURL\(_ url: URL\) -> Bool \{[\s\S]*?url\.scheme\?\.lowercased\(\) == "http"[\s\S]*?url\.host == loopbackHost[\s\S]*?url\.port == allowedPort[\s\S]*?url\.user == nil[\s\S]*?url\.password == nil/u,
   );
   assert.match(source, /configuration\.websiteDataStore = \.nonPersistent\(\)/u);
+  assert.match(source, /WKUserScript\([\s\S]*injectionTime: \.atDocumentStart/u);
+  assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
   assert.match(
     source,
     /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url, false\)/u,
@@ -708,7 +720,7 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
 
   // A failed web view never becomes the only thing on screen: the status
-  // stack returns and Retry, Quit, and diagnostics were never hidden.
+  // stack and the native recovery controls return together.
   assert.match(
     source,
     /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
@@ -721,7 +733,8 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
     source,
     /private func showFailure\(_ error: Error\) \{[\s\S]*?hideDashboardWebView\(\)/u,
   );
-  assert.equal(source.includes("actionRow.isHidden"), false);
+  assert.match(source, /actionRow\.isHidden = true/u);
+  assert.match(source, /actionRow\.isHidden = false/u);
   assert.match(source, /layout\.addArrangedSubview\(actionRow\)/u);
   // The browser remains an explicit, separate choice rather than the default.
   assert.match(source, /title: "Open in Browser"/u);

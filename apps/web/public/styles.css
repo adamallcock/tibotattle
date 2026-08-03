@@ -118,6 +118,57 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .primary-nav a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .dashboard-content { min-width: 0; -webkit-user-select: text; user-select: text; }
 [data-dashboard-page][hidden] { display: none !important; }
+
+/* The packaged Mac app supplies a real AppKit header and sidebar. Keep this
+   document focused on the selected, readable report instead of rendering a
+   second browser-shaped navigation system inside the native shell. */
+html.native-dashboard body,
+body.native-dashboard {
+  min-height: 100%;
+  background: var(--paper);
+}
+html.native-dashboard .topbar,
+html.native-dashboard .dashboard-sidebar,
+body.native-dashboard .topbar,
+body.native-dashboard .dashboard-sidebar { display: none; }
+html.native-dashboard .dashboard-shell,
+body.native-dashboard .dashboard-shell {
+  display: block;
+  width: 100%;
+  min-height: 0;
+}
+html.native-dashboard main,
+html.native-dashboard footer,
+body.native-dashboard main,
+body.native-dashboard footer {
+  width: min(1180px, calc(100% - 52px));
+}
+html.native-dashboard .page-heading,
+body.native-dashboard .page-heading {
+  gap: 32px;
+  padding-top: 30px;
+}
+html.native-dashboard h1,
+html.native-dashboard h2,
+body.native-dashboard h1,
+body.native-dashboard h2 {
+  font-family: var(--sans);
+  font-weight: 700;
+  letter-spacing: -.035em;
+  line-height: 1.05;
+}
+html.native-dashboard h1,
+body.native-dashboard h1 { font-size: clamp(2.1rem, 3.6vw, 3rem); }
+html.native-dashboard h2,
+body.native-dashboard h2 { font-size: clamp(1.8rem, 3vw, 2.5rem); }
+/* The persistent AppKit control owns refresh in the installed app. Keep the
+   report's setup card descriptive instead of offering a competing sync path. */
+html.native-dashboard #setup-refresh,
+html.native-dashboard #refresh-button,
+html.native-dashboard #cancel-refresh,
+body.native-dashboard #setup-refresh,
+body.native-dashboard #refresh-button,
+body.native-dashboard #cancel-refresh { display: none; }
 .top-actions { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: .55rem; }
 .state-pill, .evidence-chip {
   display: inline-flex;
@@ -600,6 +651,13 @@ h1 {
   padding-top: 14px;
   border-top: 1px solid var(--line);
 }
+.automatic-contribution-status > summary {
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+.automatic-contribution-status[open] > summary { color: var(--green); }
 .automatic-contribution-status > div {
   display: flex;
   gap: 12px;

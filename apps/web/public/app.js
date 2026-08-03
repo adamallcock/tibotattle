@@ -4076,6 +4076,10 @@ async function checkLocalSetup() {
 }
 
 function scheduleReturningUserRefresh() {
+  // The native macOS shell owns the foreground cadence. Running both the web
+  // return-visit timer and the native timer races the same bounded companion
+  // request, which can surface a harmless 409 as a confusing dashboard error.
+  if (document.body.classList.contains("native-dashboard")) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt

@@ -3752,6 +3752,7 @@ test("local contribution preparation exposes fixed lookbacks and fails dense wee
 test("return visits schedule one bounded checkpoint refresh after cached results render", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /function scheduleReturningUserRefresh\(\)/u);
+  assert.match(appSource, /document\.body\.classList\.contains\("native-dashboard"\)/u);
   assert.match(appSource, /returnRefreshDeferrals < 20/u);
   assert.match(appSource, /Cached results are ready/u);
   assert.match(appSource, /checking for new local evidence from the last verified checkpoint/u);
@@ -3802,7 +3803,7 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   ]) {
     assert.match(html, new RegExp(`id="${id}"`, "u"));
   }
-  assert.match(html, /Contribute an anonymous result/u);
+  assert.match(html, /Share one anonymous summary/u);
   assert.match(html, /reviewed, content-free result/u);
   assert.match(html, /I consent to review and submit this metadata/u);
   assert.match(html, /Review contribution/u);
@@ -3833,8 +3834,8 @@ test("post-results contribution CTA is explicit while technical and deletion con
   const dataPosition = html.indexOf('id="data"');
   assert.ok(coveragePosition >= 0 && coveragePosition < ctaPosition);
   assert.ok(ctaPosition < dataPosition);
-  assert.match(html, /What would be contributed\?/u);
-  assert.match(html, /No message content, reasoning text, filenames, URLs, commands/u);
+  assert.match(html, /What leaves this Mac — and what never does/u);
+  assert.match(html, /Never shared: prompts, responses, reasoning, files, paths/u);
   assert.match(html, /id="contribution-not-now"/u);
   assert.match(html, /id="automatic-contribution-status"/u);
   assert.match(html, /id="automatic-contribution-toggle"[\s\S]*hidden/u);

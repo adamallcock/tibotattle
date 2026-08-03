@@ -1018,6 +1018,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private let onFailure: (String) -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL, Bool) -> Void
+    private let onNavigation: (String) -> Void
     private var allowedPort: Int?
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
@@ -1028,17 +1029,36 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         onLoaded: @escaping () -> Void,
         onFailure: @escaping (String) -> Void,
         onDownloadFailure: @escaping () -> Void,
-        openExternally: @escaping (URL, Bool) -> Void
+        openExternally: @escaping (URL, Bool) -> Void,
+        onNavigation: @escaping (String) -> Void
     ) {
         self.onLoaded = onLoaded
         self.onFailure = onFailure
         self.onDownloadFailure = onDownloadFailure
         self.openExternally = openExternally
+        self.onNavigation = onNavigation
         let configuration = WKWebViewConfiguration()
         // Nothing this surface stores survives the app. The hosted sign-in
         // token is already memory-only by design; a non-persistent store keeps
         // loopback cookies and local storage off disk as well.
         configuration.websiteDataStore = .nonPersistent()
+        // The AppKit frame owns navigation and refresh in the installed app.
+        // Install this fixed marker before any dashboard script runs so the
+        // public-web header cannot flash, or remain visible if WebKit delays a
+        // didFinish callback behind local dashboard work.
+        let nativeShellMarker = """
+        document.documentElement.classList.add('native-dashboard');
+        document.addEventListener('DOMContentLoaded', function () {
+          if (document.body) document.body.classList.add('native-dashboard');
+        }, { once: true });
+        """
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: nativeShellMarker,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
         webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         webView.navigationDelegate = self
@@ -1096,6 +1116,11 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         }
         let scheme = url.scheme?.lowercased() ?? ""
         if isCompanionURL(url) || scheme == "about" || scheme == "blob" {
+            if isCompanionURL(url),
+               let fragment = url.fragment,
+               !fragment.isEmpty {
+                onNavigation(fragment)
+            }
             decisionHandler(.allow)
             return
         }
@@ -1113,6 +1138,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard hasDashboardTarget else { return }
+        // The local page keeps its public-web navigation when opened in a
+        // browser. In the app, AppKit owns navigation and status so the
+        // document can concentrate on the current page.
+        webView.evaluateJavaScript("document.body.classList.add('native-dashboard')")
         onLoaded()
     }
 
@@ -1289,6 +1318,234 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
 }
 
 @MainActor
+private enum NativeDashboardDestination: String, CaseIterable {
+    case overview
+    case weekly
+    case trends
+    case method
+    case community
+    case data
+
+    var title: String {
+        switch self {
+        case .overview: return "Overview"
+        case .weekly: return "Allowance"
+        case .trends: return "Trends"
+        case .method: return "How it works"
+        case .community: return "Community"
+        case .data: return "Data & Privacy"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .overview: return "rectangle.grid.1x2"
+        case .weekly: return "chart.bar.xaxis"
+        case .trends: return "chart.xyaxis.line"
+        case .method: return "function"
+        case .community: return "person.3"
+        case .data: return "lock.shield"
+        }
+    }
+}
+
+/// The native frame for the loopback dashboard.  WebKit remains responsible
+/// for the rich charts and accessible, selectable report content; AppKit owns
+/// the navigation, lifecycle status, and refresh control that should feel like
+/// part of a Mac app rather than a webpage inside one.
+@MainActor
+private final class NativeDashboardChrome: NSView {
+    private let header = NSVisualEffectView()
+    private let sidebar = NSVisualEffectView()
+    private let titleLabel = NSTextField(labelWithString: BundledProduct.displayName)
+    private let modeButton = NSButton(title: "Local only", target: nil, action: nil)
+    private let freshnessButton = NSButton(title: "Starting…", target: nil, action: nil)
+    private let refreshButton = NSButton(
+        title: "Refresh usage",
+        target: nil,
+        action: nil
+    )
+    private var pageButtons: [NativeDashboardDestination: NSButton] = [:]
+
+    var onNavigate: ((NativeDashboardDestination) -> Void)?
+    var onRefresh: (() -> Void)?
+
+    init(webView: WKWebView) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        header.material = .headerView
+        header.blendingMode = .withinWindow
+        header.state = .active
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .withinWindow
+        sidebar.state = .active
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textColor = .labelColor
+
+        configureBadge(modeButton, symbol: "lock.fill")
+        modeButton.toolTip = "Analysis and cached results stay on this Mac. Community contribution is optional."
+        configureBadge(freshnessButton, symbol: "checkmark.circle.fill")
+        freshnessButton.toolTip = "The current local evidence state."
+
+        refreshButton.bezelStyle = .rounded
+        refreshButton.image = NSImage(
+            systemSymbolName: "arrow.clockwise",
+            accessibilityDescription: "Refresh local usage"
+        )
+        refreshButton.imagePosition = .imageLeading
+        refreshButton.target = self
+        refreshButton.action = #selector(requestRefresh)
+        refreshButton.toolTip = "Update local usage now. This reads only the selected Codex folders on this Mac."
+
+        let headerContent = NSStackView(views: [
+            titleLabel,
+            NSView(),
+            modeButton,
+            freshnessButton,
+            refreshButton,
+        ])
+        headerContent.orientation = .horizontal
+        headerContent.alignment = .centerY
+        headerContent.spacing = 10
+        headerContent.translatesAutoresizingMaskIntoConstraints = false
+        headerContent.setCustomSpacing(18, after: titleLabel)
+        header.addSubview(headerContent)
+
+        let pageStack = NSStackView()
+        pageStack.orientation = .vertical
+        pageStack.alignment = .leading
+        pageStack.spacing = 3
+        pageStack.edgeInsets = NSEdgeInsets(top: 18, left: 12, bottom: 18, right: 12)
+        pageStack.translatesAutoresizingMaskIntoConstraints = false
+        for destination in NativeDashboardDestination.allCases {
+            let button = NSButton(
+                title: destination.title,
+                target: self,
+                action: #selector(selectDestination(_:))
+            )
+            button.identifier = NSUserInterfaceItemIdentifier(destination.rawValue)
+            button.image = NSImage(
+                systemSymbolName: destination.symbolName,
+                accessibilityDescription: destination.title
+            )
+            button.imagePosition = .imageLeading
+            button.alignment = .left
+            button.isBordered = false
+            button.bezelStyle = .recessed
+            button.contentTintColor = .secondaryLabelColor
+            button.font = .systemFont(ofSize: 13, weight: .medium)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            button.widthAnchor.constraint(equalToConstant: 192).isActive = true
+            pageStack.addArrangedSubview(button)
+            pageButtons[destination] = button
+        }
+        sidebar.addSubview(pageStack)
+
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.translatesAutoresizingMaskIntoConstraints = false
+        split.addArrangedSubview(sidebar)
+        split.addArrangedSubview(webView)
+        split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        split.setPosition(216, ofDividerAt: 0)
+
+        addSubview(header)
+        addSubview(split)
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor),
+            header.topAnchor.constraint(equalTo: topAnchor),
+            header.heightAnchor.constraint(equalToConstant: 58),
+            headerContent.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+            headerContent.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+            headerContent.topAnchor.constraint(equalTo: header.topAnchor),
+            headerContent.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            pageStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            pageStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            pageStack.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            split.leadingAnchor.constraint(equalTo: leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: trailingAnchor),
+            split.topAnchor.constraint(equalTo: header.bottomAnchor),
+            split.bottomAnchor.constraint(equalTo: bottomAnchor),
+            sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 190),
+            sidebar.widthAnchor.constraint(lessThanOrEqualToConstant: 250),
+        ])
+        select(.overview)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func select(_ destination: NativeDashboardDestination) {
+        for (candidate, button) in pageButtons {
+            let selected = candidate == destination
+            button.state = selected ? .on : .off
+            button.contentTintColor = selected
+                ? .controlAccentColor
+                : .secondaryLabelColor
+            button.font = .systemFont(
+                ofSize: 13,
+                weight: selected ? .semibold : .medium
+            )
+        }
+    }
+
+    func updateSyncStatus(
+        title: String,
+        isRefreshing: Bool,
+        refreshEnabled: Bool
+    ) {
+        freshnessButton.title = title
+        freshnessButton.image = NSImage(
+            systemSymbolName: isRefreshing
+                ? "arrow.triangle.2.circlepath.circle.fill"
+                : "checkmark.circle.fill",
+            accessibilityDescription: title
+        )
+        freshnessButton.contentTintColor = isRefreshing
+            ? .controlAccentColor
+            : .systemGreen
+        refreshButton.title = isRefreshing ? "Updating…" : "Refresh usage"
+        refreshButton.isEnabled = refreshEnabled && !isRefreshing
+    }
+
+    private func configureBadge(_ button: NSButton, symbol: String) {
+        button.isBordered = false
+        button.bezelStyle = .recessed
+        button.font = .systemFont(ofSize: 12, weight: .semibold)
+        button.image = NSImage(
+            systemSymbolName: symbol,
+            accessibilityDescription: button.title
+        )
+        button.imagePosition = .imageLeading
+        button.contentTintColor = .secondaryLabelColor
+        button.isEnabled = true
+    }
+
+    @objc private func requestRefresh() {
+        onRefresh?()
+    }
+
+    @objc private func selectDestination(_ sender: NSButton) {
+        guard let rawValue = sender.identifier?.rawValue,
+              let destination = NativeDashboardDestination(rawValue: rawValue)
+        else {
+            return
+        }
+        select(destination)
+        onNavigate?(destination)
+    }
+}
+
+@MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let semanticOpenTarget: SemanticOpenTarget
     private let updater = AppUpdater()
@@ -1312,10 +1569,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var settingsWindow: NSWindow?
     private var settingsTabs: NSTabViewController?
     private weak var settingsCodexHomeLabel: NSTextField?
+    private let nativeEvidenceReader = LocalCompanionEvidenceReader()
+    private var nativeDashboardChrome: NativeDashboardChrome?
+    private var nativeRefreshPoll: DispatchWorkItem?
+    private var nativeRefreshSchedule: DispatchWorkItem?
+    private var nativeRefreshInFlight = false
+    private static let nativeRefreshIntervalSeconds = 300
     private let statusLabel = NSTextField(labelWithString: "Starting locally…")
     private let detailLabel = NSTextField(
         wrappingLabelWithString:
-            "No Codex metadata is scanned until you open the dashboard and ask."
+            "Preparing the private local dashboard and its bounded foreground update."
     )
     private let privacyLabel = NSTextField(
         labelWithString:
@@ -1363,6 +1626,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     )
     private let statusStack = NSStackView()
     private let dashboardContainer = NSView()
+    private let actionRow = NSStackView()
     private var dashboardWebHost: DashboardWebHost?
     private var dashboardWebViewShowing = false
 
@@ -1418,17 +1682,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let alert = NSAlert()
         alert.messageText = "Welcome to \(BundledProduct.displayName)"
         alert.informativeText = """
-        \(BundledProduct.displayName) works locally with \(BundledProduct.monitoredAppDisplayName) metadata after you explicitly choose Analyze in the dashboard.
+        \(BundledProduct.displayName) updates local \(BundledProduct.monitoredAppDisplayName) metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.
 
         Reads: timestamps, model and speed labels, token counters, tool categories, and quota snapshots from the selected \(BundledProduct.monitoredAppDisplayName) sessions folders.
 
         Stores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only \(BundledProduct.displayName) app-data folder.
 
-        Community contribution is optional. It stays off until you review the content-free fields and explicitly send the first contribution. You may then enable a six-hour while-open contribution schedule; it can be disabled at any time.
+        Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
 
         Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
 
-        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.
+        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints. TiboTattle installs no login item, LaunchAgent, or daemon.
         """
         alert.addButton(withTitle: "Get Started")
         alert.addButton(withTitle: "Quit")
@@ -1448,7 +1712,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         lastRecoverySuggestion = nil
         statusLabel.stringValue = "Starting locally…"
         detailLabel.stringValue =
-            "Preparing the private local dashboard. No Codex metadata is scanned until you ask."
+            "Preparing the private local dashboard and its bounded foreground update."
         openButton.isEnabled = false
         openInBrowserButton.isEnabled = false
         retryButton.isEnabled = false
@@ -1558,10 +1822,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         dashboardContainer.isHidden = true
         dashboardContainer.setContentHuggingPriority(.defaultLow, for: .vertical)
 
-        // The action row is always visible, dashboard or not. Quit, Retry, and
-        // diagnostics therefore stay reachable even if the web view never
-        // loads a single byte.
-        let actionRow = NSStackView()
+        // The recovery controls are visible while starting or recovering. A
+        // ready dashboard owns the whole content area; Quit and Settings
+        // remain in the normal macOS menu and the status item rather than
+        // being repeated in a browser-style footer.
         actionRow.orientation = .horizontal
         actionRow.spacing = 10
         actionRow.setHuggingPriority(.defaultHigh, for: .vertical)
@@ -1631,9 +1895,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// The dashboard runs inside this window. A web view that fails to load
-    /// never becomes the only thing on screen: the status stack and the whole
-    /// action row — Retry, Quit, diagnostics — come straight back.
+    /// The dashboard runs inside a native AppKit shell.  The HTML stays a
+    /// local report surface, while page selection and refresh are normal Mac
+    /// controls rather than more web chrome inside a launcher.
     private func showDashboardWebView(_ url: URL) {
         let host = dashboardWebHost ?? {
             let created = DashboardWebHost(
@@ -1646,32 +1910,54 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 },
                 openExternally: { [weak self] link, explain in
                     self?.openExternalDashboardLink(link, explain: explain)
+                },
+                onNavigation: { [weak self] rawDestination in
+                    self?.selectNativeDashboardDestination(rawDestination)
                 }
             )
-            dashboardContainer.addSubview(created.webView)
+            let chrome = NativeDashboardChrome(webView: created.webView)
+            chrome.onNavigate = { [weak self] destination in
+                self?.navigateNativeDashboard(to: destination)
+            }
+            chrome.onRefresh = { [weak self] in
+                self?.refreshLocalUsage(automatic: false)
+            }
+            dashboardContainer.addSubview(chrome)
             NSLayoutConstraint.activate([
-                created.webView.leadingAnchor.constraint(
+                chrome.leadingAnchor.constraint(
                     equalTo: dashboardContainer.leadingAnchor
                 ),
-                created.webView.trailingAnchor.constraint(
+                chrome.trailingAnchor.constraint(
                     equalTo: dashboardContainer.trailingAnchor
                 ),
-                created.webView.topAnchor.constraint(
+                chrome.topAnchor.constraint(
                     equalTo: dashboardContainer.topAnchor
                 ),
-                created.webView.bottomAnchor.constraint(
+                chrome.bottomAnchor.constraint(
                     equalTo: dashboardContainer.bottomAnchor
                 ),
-                created.webView.heightAnchor.constraint(
+                chrome.heightAnchor.constraint(
                     greaterThanOrEqualToConstant: 320
                 ),
             ])
             dashboardWebHost = created
+            nativeDashboardChrome = chrome
             return created
         }()
         statusLabel.stringValue = "Opening the dashboard…"
         detailLabel.stringValue =
             "Loading the private local dashboard from this Mac only."
+        nativeDashboardChrome?.updateSyncStatus(
+            title: nativeRefreshInFlight ? "Updating…" : "Starting…",
+            isRefreshing: nativeRefreshInFlight,
+            refreshEnabled: true
+        )
+        // Show the native frame before WebKit completes the report document.
+        // If the loopback page fails, dashboardWebViewFailed restores the
+        // status surface; otherwise didFinish makes the report first responder.
+        dashboardContainer.isHidden = false
+        statusStack.isHidden = true
+        actionRow.isHidden = true
         host.load(url)
     }
 
@@ -1679,6 +1965,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         dashboardWebViewShowing = true
         dashboardContainer.isHidden = false
         statusStack.isHidden = true
+        actionRow.isHidden = true
         lastLifecycleStatus = "Dashboard open"
         openInBrowserButton.isEnabled = true
         // WKWebView follows the normal responder chain only once it owns focus.
@@ -1687,6 +1974,146 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if let webView = dashboardWebHost?.webView {
             window?.makeFirstResponder(webView)
         }
+    }
+
+    private func navigateNativeDashboard(to destination: NativeDashboardDestination) {
+        nativeDashboardChrome?.select(destination)
+        guard let webView = dashboardWebHost?.webView else { return }
+        // Destinations are a closed enum, so interpolation cannot introduce
+        // page-provided script content into this privileged bridge.
+        let hash = destination.rawValue
+        webView.evaluateJavaScript("""
+        if (window.location.hash !== '#\(hash)') {
+          window.location.hash = '#\(hash)';
+        } else {
+          window.dispatchEvent(new HashChangeEvent('hashchange'));
+        }
+        window.scrollTo({ top: 0, behavior: 'instant' });
+        """)
+    }
+
+    private func selectNativeDashboardDestination(_ rawDestination: String) {
+        guard let destination = NativeDashboardDestination(
+            rawValue: rawDestination
+        ) else {
+            return
+        }
+        nativeDashboardChrome?.select(destination)
+    }
+
+    /// Updates are automatic while the app is open, never through a login
+    /// item, daemon, or background URL session.  The same bounded loopback
+    /// refresh route remains the only reader, so a manual click and the
+    /// foreground cadence cannot start two scans at once.
+    private func refreshLocalUsage(automatic: Bool) {
+        guard !quitting,
+              !nativeRefreshInFlight,
+              let dashboardURL
+        else {
+            return
+        }
+        cancelNativeRefreshSchedule()
+        nativeRefreshInFlight = true
+        nativeDashboardChrome?.updateSyncStatus(
+            title: automatic ? "Updating automatically…" : "Updating…",
+            isRefreshing: true,
+            refreshEnabled: false
+        )
+        nativeEvidenceReader.startAnalysis(base: dashboardURL) { [weak self] result in
+            guard let self, !self.quitting else { return }
+            switch result {
+            case .started, .alreadyRunning:
+                self.pollNativeRefresh(base: dashboardURL, remainingAttempts: 120)
+            case .rejected:
+                self.finishNativeRefresh(
+                    title: "Update unavailable",
+                    refreshEnabled: true
+                )
+            case .unreachable:
+                self.finishNativeRefresh(
+                    title: "Local companion unavailable",
+                    refreshEnabled: false
+                )
+            }
+        }
+    }
+
+    private func pollNativeRefresh(base: URL, remainingAttempts: Int) {
+        cancelNativeRefreshPoll()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.quitting, self.nativeRefreshInFlight else {
+                return
+            }
+            self.nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
+                guard let self, !self.quitting, self.nativeRefreshInFlight else {
+                    return
+                }
+                if activity == .running, remainingAttempts > 0 {
+                    self.pollNativeRefresh(
+                        base: base,
+                        remainingAttempts: remainingAttempts - 1
+                    )
+                    return
+                }
+                self.nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
+                    guard let self, !self.quitting else { return }
+                    let title: String
+                    if let overview,
+                       LocalCompanionOverviewProjection.evidence(
+                        for: overview
+                       ) == .live {
+                        title = "Up to date"
+                    } else if overview?.lanes.isEmpty == false {
+                        title = "Needs attention"
+                    } else {
+                        title = "No allowance observed yet"
+                    }
+                    self.finishNativeRefresh(title: title, refreshEnabled: true)
+                }
+            }
+        }
+        nativeRefreshPoll = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(750),
+            execute: work
+        )
+    }
+
+    private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
+        nativeRefreshInFlight = false
+        cancelNativeRefreshPoll()
+        nativeDashboardChrome?.updateSyncStatus(
+            title: title,
+            isRefreshing: false,
+            refreshEnabled: refreshEnabled
+        )
+        scheduleNativeRefresh()
+    }
+
+    private func cancelNativeRefreshPoll() {
+        nativeRefreshPoll?.cancel()
+        nativeRefreshPoll = nil
+    }
+
+    /// The foreground app keeps its own local evidence current without a
+    /// login item or worker. A five-minute cadence is intentionally modest:
+    /// it observes new Codex rollouts while avoiding a permanent parser loop.
+    private func scheduleNativeRefresh() {
+        cancelNativeRefreshSchedule()
+        guard !quitting, dashboardURL != nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.refreshLocalUsage(automatic: true)
+        }
+        nativeRefreshSchedule = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .seconds(Self.nativeRefreshIntervalSeconds),
+            execute: work
+        )
+    }
+
+    private func cancelNativeRefreshSchedule() {
+        nativeRefreshSchedule?.cancel()
+        nativeRefreshSchedule = nil
     }
 
     /// The launcher has a native window as well as a web dashboard. Supplying
@@ -1703,6 +2130,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         )
         about.target = self
         appMenu.addItem(about)
+        let settings = NSMenuItem(
+            title: "Settings…",
+            action: #selector(showSettingsWindow),
+            keyEquivalent: ","
+        )
+        settings.target = self
+        appMenu.addItem(settings)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
             title: "Quit \(BundledProduct.displayName)",
@@ -1750,9 +2184,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func dashboardWebViewFailed(code: String) {
+        cancelNativeRefreshSchedule()
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
+        actionRow.isHidden = false
         let failure = LauncherError.dashboardWebViewUnavailable
         lastLifecycleStatus = "Dashboard unavailable"
         lastFailureCode = failure.failureCode
@@ -1766,10 +2202,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func hideDashboardWebView() {
+        cancelNativeRefreshSchedule()
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
+        actionRow.isHidden = false
         openInBrowserButton.isEnabled = false
+        cancelNativeRefreshPoll()
+        nativeRefreshInFlight = false
         dashboardWebHost?.stop()
     }
 
@@ -1864,25 +2304,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         lastLifecycleStatus = "Ready"
         lastFailureCode = nil
         lastRecoverySuggestion = nil
-        statusLabel.stringValue = "Ready"
+        statusLabel.stringValue = "Preparing your local view…"
         if centralServiceMode == nil {
             detailLabel.stringValue =
-                "Open the dashboard and start an explicit bounded scan. Large histories may need several passes. Nothing leaves this Mac."
+                "Updating local usage while the app is open. Large histories may need several passes. Nothing leaves this Mac."
         } else {
             detailLabel.stringValue =
-                "Open the dashboard and start a bounded scan. A reviewed contribution remains an explicit manual choice."
+                "Updating local usage while the app is open. A reviewed contribution remains an explicit manual choice."
         }
         openButton.isEnabled = true
         openInBrowserButton.isEnabled = true
         retryButton.isEnabled = false
         // The same validated loopback URL the window's Open Dashboard uses.
         menuBarStatus?.companionReady(dashboardURL: url)
-        // A companion restart moves to a new ephemeral port, so a dashboard
-        // that is already on screen is reloaded rather than left stale.
-        if pendingDashboardOpen || dashboardWebViewShowing {
-            pendingDashboardOpen = false
-            openDashboard()
-        }
+        // A companion restart moves to a new ephemeral port, so the native
+        // dashboard is always reloaded rather than leaving a stale launcher
+        // on screen. This also starts the bounded foreground refresh without
+        // making someone hunt for a dashboard button.
+        pendingDashboardOpen = false
+        openDashboard()
+        refreshLocalUsage(automatic: true)
     }
 
     private func companionExited(
@@ -1981,6 +2422,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return label
     }
 
+    private func externalLinkButton(title: String, address: String) -> NSButton {
+        let button = NSButton(
+            title: title,
+            target: self,
+            action: #selector(openExternalLink(_:))
+        )
+        button.bezelStyle = .rounded
+        button.image = NSImage(
+            systemSymbolName: "arrow.up.forward.app",
+            accessibilityDescription: title
+        )
+        button.imagePosition = .imageLeading
+        button.identifier = NSUserInterfaceItemIdentifier(address)
+        return button
+    }
+
+    @objc private func openExternalLink(_ sender: NSButton) {
+        guard let address = sender.identifier?.rawValue,
+              let url = URL(string: address),
+              url.scheme == "https",
+              url.user == nil,
+              url.password == nil
+        else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     private func settingsPage(
         title: String,
         summary: String,
@@ -2034,7 +2503,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     @objc private func showAbout() {
-        showSettings(selecting: 2)
+        showSettings(selecting: 1)
     }
 
     private func showSettings(selecting index: Int) {
@@ -2089,18 +2558,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         )
         let general = settingsPage(
             title: "General",
-            summary: "Local analysis runs only when you choose it. TiboTattle does not install a login item or scan raw logs in the background.",
+            summary: "TiboTattle refreshes local usage while it is open. It does not install a login item, LaunchAgent, or daemon; raw logs never leave this Mac.",
             views: [sourceSection, openDashboardFromSettings]
-        )
-
-        let privacy = settingsPage(
-            title: "Privacy",
-            summary: "Your dashboard and local index stay on this Mac. Sharing with the community is optional and always shows a content-free result for review first.",
-            views: [NSButton(
-                title: "Data & Diagnostics…",
-                target: self,
-                action: #selector(showDiagnostics)
-            )]
         )
 
         let version = Bundle.main.object(
@@ -2112,29 +2571,51 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let updateMessage = updater.isAvailable
             ? "Signed updates are available for this release."
             : "This development copy does not check for updates. A signed release installs in Applications."
+        let projectLinks = NSStackView(views: [
+            externalLinkButton(
+                title: "TiboTattle website",
+                address: "https://tibotattle.com"
+            ),
+            externalLinkButton(
+                title: "GitHub",
+                address: "https://github.com/adamallcock"
+            ),
+            externalLinkButton(
+                title: "X / Twitter",
+                address: "https://x.com/adamallcock"
+            ),
+        ])
+        projectLinks.orientation = .horizontal
+        projectLinks.spacing = 8
         let about = settingsPage(
             title: "About TiboTattle",
             summary: "TiboTattle \(version) (\(build))\n\n\(updateMessage)",
-            views: [NSButton(
-                title: "Version & Updates…",
-                target: self,
-                action: #selector(showLifecycleHelp)
-            )]
+            views: [
+                projectLinks,
+                NSButton(
+                    title: "Version & Updates…",
+                    target: self,
+                    action: #selector(showLifecycleHelp)
+                ),
+            ]
         )
 
-        for controller in [general, privacy, about] {
+        for controller in [general, about] {
             controller.title = "TiboTattle Settings"
         }
 
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
-        for (label, controller) in [
-            ("General", general),
-            ("Privacy", privacy),
-            ("About", about),
+        for (label, symbol, controller) in [
+            ("General", "gearshape", general),
+            ("About", "info.circle", about),
         ] {
             let item = NSTabViewItem(identifier: label)
             item.label = label
+            item.image = NSImage(
+                systemSymbolName: symbol,
+                accessibilityDescription: label
+            )
             item.viewController = controller
             tabs.addTabViewItem(item)
         }
@@ -2753,6 +3234,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     func applicationWillTerminate(_ notification: Notification) {
         startupTimeout?.cancel()
+        cancelNativeRefreshPoll()
+        cancelNativeRefreshSchedule()
+        nativeEvidenceReader.invalidate()
         // Released here so the status item can never outlive the companion it
         // reports on. The companion itself is stopped by the graceful
         // `applicationShouldTerminate` path above, which every Quit control

@@ -1,8 +1,9 @@
 const PAGE_BY_TARGET = new Map([
   ["overview", "overview"],
   ["weekly", "weekly"],
-  ["accounting", "weekly"],
-  ["coverage", "weekly"],
+  ["accounting", "method"],
+  ["coverage", "method"],
+  ["method", "method"],
   ["timeline", "trends"],
   ["community", "community"],
   ["history", "data"],
@@ -43,7 +44,7 @@ export function mountDashboardNavigation({ documentRef, windowRef }) {
 
   function syncNavigationFromHash() {
     const target = targetFromHash(windowRef);
-    if (["community", "history", "backend"].includes(target)) {
+    if (["history", "backend"].includes(target)) {
       const disclosure = documentRef.querySelector(
         "#community-contribution-disclosure",
       );
