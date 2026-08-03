@@ -173,6 +173,10 @@ async function fixture() {
   );
   await writeFile(join(staticRoot, "styles.css"), "body { color: black; }");
   await writeFile(
+    join(staticRoot, "tibotattle-icon.png"),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+  );
+  await writeFile(
     join(resourceRoot, "2026-07-24-simple-quota-gradient-report.html"),
     "<!doctype html><title>Gradient detail</title>",
   );
@@ -356,6 +360,9 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       await telemetryEnvelope.text(),
       "export const envelope = true;",
     );
+    const brandIcon = await fetch(`${base}/tibotattle-icon.png`);
+    assert.equal(brandIcon.status, 200);
+    assert.equal(brandIcon.headers.get("content-type"), "image/png");
 
     const report = await fetch(`${base}/reports/gradient`);
     assert.equal(report.status, 200);

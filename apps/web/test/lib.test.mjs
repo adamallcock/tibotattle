@@ -3093,7 +3093,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
     "Community",
     "Data &amp; privacy",
     "How the estimate was calculated",
-    "Monitoring gaps",
+    "When to treat this as an estimate",
     "Your contribution receipt",
     "Community backend readiness"
   ]) {
@@ -3105,11 +3105,11 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="accounting"/);
   assert.match(html, /id="accounting-models"/);
   assert.match(html, /Usage increments/);
-  assert.match(html, /Percentages are Standard-rate API-price-equivalent cost shares/);
-  // The Fast-mode preference is the only attribution current Codex evidence
-  // has, so it must stay reachable from the accounting section itself.
-  assert.match(html, /id="fast-mode-preference-controls"/);
-  assert.match(html, /data-fast-mode="mixed_unknown"/);
+  assert.match(html, /API pricing is a measuring stick, not your bill/);
+  // The dashboard does not ask the user to supply a speed assumption; only
+  // recorded log evidence is shown in the primary experience.
+  assert.doesNotMatch(html, /id="fast-mode-preference-controls"/);
+  assert.doesNotMatch(html, /data-fast-mode="mixed_unknown"/);
   assert.match(html, /Quota-weighted API-price equivalent/);
   assert.match(html, /id="community"/);
   assert.match(html, /id="history"/);
@@ -3290,7 +3290,7 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /rolloutFilesObservedCapped/u);
   assert.match(appSource, /setup-check-again.*checkLocalSetup/su);
   assert.match(appSource, /setJourneyState\(ready \? "local-ready" : "needs-local-setup"\)/u);
-  assert.match(appSource, /setup: "Local setup needed"/u);
+  assert.match(appSource, /setup: "Set up this Mac"/u);
   assert.match(appSource, /if \(!ready\) setGlobalState\("setup"/u);
   assert.doesNotMatch(appSource, /product laboratory/u);
   assert.match(styles, /body\.first-run \[data-requires-evidence\]/u);
@@ -3314,8 +3314,8 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /Verified existing results were kept/u);
   assert.match(appSource, /preserving a resumable local checkpoint/u);
   assert.match(appSource, /refresh_resource_limited/u);
-  assert.match(appSource, /Deep analysis stopped at a safety limit/u);
-  assert.match(appSource, /previously verified results remain usable/u);
+  assert.match(appSource, /This scan paused to protect your Mac/u);
+  assert.match(appSource, /No partial result replaced your existing results/u);
   assert.match(appSource, /Deep analysis paused after two bounded continuations/u);
 });
 
@@ -3618,45 +3618,22 @@ test("the weekly allowance chart leads the dashboard", async () => {
   assert.match(styles, /\.lead-chart-panel \.weekly-history-chart svg \{ height: 470px; \}/u);
 });
 
-test("monitoring gaps lead with what changes the number and keep the rest in full", async () => {
+test("estimate caveats show only the few gaps that materially change the result", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 
   // The default view is a short list of gaps that change how the number reads.
-  assert.match(appSource, /const MATERIAL_GAP_LIMIT = 4;/u);
+  assert.match(appSource, /const MATERIAL_GAP_LIMIT = 2;/u);
   assert.match(appSource, /const MATERIAL_GAP_STATUSES = Object\.freeze\(\[/u);
   assert.match(appSource, /\.slice\(MATERIAL_GAP_LIMIT\)|\.slice\(0, MATERIAL_GAP_LIMIT\)/u);
   assert.match(appSource, /function briefGapExplanation/u);
   assert.doesNotMatch(appSource, /\.slice\(0, 18\)/u);
-  // Nothing honest is deleted: every recorded limitation stays, in full, one
-  // disclosure away from the short list.
-  assert.match(appSource, /const inventory = \$\("#blind-spot-inventory"\);/u);
-  assert.match(appSource, /node\("p", "", gapExplanation\(item\)\)/u);
-  assert.match(html, /id="blind-spot-inventory"/u);
-  assert.match(html, /Full inventory and per-signal coverage/u);
-  assert.match(html, /id="blind-spot-count"/u);
-  // The Fast-mode row keeps its four-way split rather than a bare status.
-  const shortMatch = appSource.match(
-    /function fastModeShortCoverage\(fastMode\) \{([\s\S]*?)\n\}/u,
-  );
-  assert.ok(shortMatch, "fastModeShortCoverage is available for contract review");
-  for (const bucket of [
-    "coverage.observedEvents",
-    "coverage.assumedFromPreferenceEvents",
-    "coverage.inferredEvents",
-    "coverage.unknownEvents",
-  ]) {
-    assert.ok(
-      shortMatch[1].includes(bucket),
-      `the short Fast-mode line reports ${bucket}`,
-    );
-  }
-  assert.match(appSource, /fastModeShortCoverage\(accountingPeriod\(data\)\.fastMode\)/u);
-  // The full Fast-mode sentence stays with the control that changes it.
-  assert.match(
-    appSource,
-    /coverage\.textContent = `\$\{fastModeCoverageSentence\(accounting\.fastMode\)\}/u,
-  );
+  // Technical inventories no longer crowd the reader's main journey.
+  assert.doesNotMatch(html, /id="blind-spot-inventory"/u);
+  assert.doesNotMatch(html, /Full inventory and per-signal coverage/u);
+  assert.doesNotMatch(html, /id="blind-spot-count"/u);
+  assert.doesNotMatch(html, /Archived technical reports/u);
+  assert.doesNotMatch(html, /id="fast-mode-preference-controls"/u);
 });
 
 test("weekly trend is derived from the selected displayed evidence only", async () => {
@@ -3804,7 +3781,7 @@ test("contribution preflight explains estimated work and blocks over 100 batches
   assert.match(appSource, /No preparation or upload started/u);
 });
 
-test("primary contribution journey connects the Mac without exposing a pairing code", async () => {
+test("primary contribution journey connects the Mac for one reviewed send without exposing a pairing code", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   for (const id of [
@@ -3814,15 +3791,14 @@ test("primary contribution journey connects the Mac without exposing a pairing c
   ]) {
     assert.match(html, new RegExp(`id="${id}"`, "u"));
   }
-  assert.match(html, /Help map Codex limits/u);
-  assert.match(html, /content-free pseudonymous metadata/u);
-  assert.match(html, /I consent to contribute this metadata and keep it current/u);
-  assert.match(html, /Contribute and keep it current/u);
+  assert.match(html, /Contribute an anonymous result/u);
+  assert.match(html, /reviewed, content-free result/u);
+  assert.match(html, /I consent to review and submit this metadata/u);
+  assert.match(html, /Review contribution/u);
   const consentTag =
     html.match(/<input id="community-connect-consent"[^>]*>/u)?.[0] ?? "";
   assert.doesNotMatch(consentTag, /\bchecked\b/u);
-  assert.match(html, /every 6 hours while the app is open/u);
-  assert.match(html, /This is off until I choose it/u);
+  assert.doesNotMatch(html, /every 6 hours while the app is open/u);
   assert.match(appSource, /async function connectCommunityContribution\(\)/u);
   assert.match(
     appSource,
@@ -3830,13 +3806,12 @@ test("primary contribution journey connects the Mac without exposing a pairing c
   );
   assert.match(appSource, /localClient\.pairContributionDevice\(pairing\.pairingCode\)/u);
   assert.match(appSource, /void enrollment\.recoveryCode;/u);
-  assert.match(appSource, /armAutomaticContributionAfterReviewedSend/u);
-  assert.match(appSource, /pendingAutomaticContributionConsent = binding/u);
+  assert.doesNotMatch(appSource, /armAutomaticContributionAfterReviewedSend/u);
   assert.match(appSource, /inspectNextContribution/u);
   assert.match(appSource, /pairing = null;/u);
   assert.match(
     appSource,
-    /Automatic contribution remains off until that exact reviewed send is accepted/u,
+    /Nothing will repeat automatically/u,
   );
 });
 
@@ -3879,7 +3854,7 @@ test("post-results contribution CTA is explicit while technical and deletion con
   );
 });
 
-test("automatic contribution is enabled only after the exact reviewed first send is accepted", async () => {
+test("the primary contribution journey never enables a recurring schedule", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const connectBody = appSource.match(
     /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}/u,
@@ -3887,38 +3862,13 @@ test("automatic contribution is enabled only after the exact reviewed first send
   const runBody = appSource.match(
     /async function runContributionSyncAction\(action\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
-  assert.match(connectBody, /armAutomaticContributionAfterReviewedSend\(\)/u);
+  assert.doesNotMatch(connectBody, /armAutomaticContributionAfterReviewedSend\(\)/u);
   assert.doesNotMatch(connectBody, /enableAutomaticContributionAfterReviewedSend\(\)/u);
-  assert.match(runBody, /runReviewedContributionGate\(\{/u);
-  assert.match(runBody, /acceptedContribution = gate\.accepted/u);
-  assert.match(
-    runBody,
-    /hasPendingAutomaticConsent:[\s\S]*Boolean\(pendingAutomaticContributionConsent\)[\s\S]*enableAutomaticContribution:[\s\S]*enableAutomaticContributionAfterReviewedSend/u,
-  );
-  assert.match(
-    appSource,
-    /Consent is held only in this open tab\. Automatic contribution remains off until your exact reviewed first send is accepted/u,
-  );
-  assert.match(
-    appSource,
-    /gate\.automaticError\?\.code[\s\S]*=== "automatic_contribution_first_review_required"/u,
-  );
+  assert.match(runBody, /localClient\.runContributionSyncOnce\(/u);
+  assert.doesNotMatch(runBody, /enableAutomaticContributionAfterReviewedSend/u);
+  assert.doesNotMatch(appSource, /Automatic contribution is now on every 6 hours/u);
   assert.doesNotMatch(appSource, /sessionStorage|localStorage/u);
-  for (const explanation of [
-    "five-minute abort deadline",
-    "local pseudonymous identity is unavailable",
-    "privacy verification failed",
-    "service rejected part of the exact prepared set",
-    "local preparation or maintenance failed",
-    "delivery failed without a safe retry signal",
-  ]) {
-    assert.match(appSource, new RegExp(explanation, "u"));
-  }
-  assert.match(
-    appSource,
-    /value\.lastOutcome\?\.code[\s\S]*replaceAll\("_", " "\)/u,
-  );
-  assert.match(appSource, /No retry is scheduled/u);
+  assert.match(appSource, /Turn off automatic contribution/u);
 });
 
 test("stale local device conflicts name the leftover credential and offer the repair", async () => {
@@ -4024,7 +3974,9 @@ test("real contribution UI encrypts before sending and renders delayed snapshots
   assert.doesNotMatch(appSource, /\brenderStats\(/);
   assert.match(appSource, /communityClient\.createDevicePairing\(/);
   assert.match(appSource, /localClient\.automaticContributionStatus\(\)/);
-  assert.match(appSource, /localClient\.enableAutomaticContribution\(/);
+  // New contributions are explicit reviewed sends. A legacy schedule can
+  // still be turned off, but this client no longer creates one.
+  assert.doesNotMatch(appSource, /localClient\.enableAutomaticContribution\(/);
   assert.match(appSource, /localClient\.disableAutomaticContribution\(\)/);
   // Enrollment is open, so the dashboard always passes a null invitation code;
   // the client keeps the parameter for the service's invite-only mode.
@@ -4094,7 +4046,7 @@ test("foreground sync results expose all bounded outcomes and flag zero-accept p
   );
   assert.match(
     appSource,
-    /acceptedContribution = gate\.accepted[\s\S]*if \(acceptedContribution && pendingAutomaticContributionConsent\)[\s\S]*if \(acceptedContribution\) await loadCommunityResults\(\)/u,
+    /acceptedContribution = result\.status === "completed"[\s\S]*if \(acceptedContribution\) await loadCommunityResults\(\)/u,
   );
 });
 
@@ -4680,13 +4632,11 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     assert.ok(surfaces.includes(journey), `${journey} reports failures`);
   }
 
-  // The page states where the log lives so a reference can actually be found.
+  // The noisy implementation-path note stays out of the primary contribution
+  // panel while the bounded diagnostic recorder remains available to support.
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  assert.match(html, /id="diagnostics-log-location"/u);
-  assert.match(
-    html,
-    /~\/Library\/Application Support\/app-usagemonitor\/diagnostics-v0\.1\.log/u,
-  );
+  assert.doesNotMatch(html, /id="diagnostics-log-location"/u);
+  assert.match(appSource, /localClient\.recordDiagnosticNote\(/u);
 });
 
 // The shareable card is the one surface whose output is meant to leave the
@@ -4898,11 +4848,10 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.match(section, /return Object\.freeze\(\{\s*\n\s*reference,/u);
   assert.match(section, /stats: Object\.freeze\(stats\.map\(\(stat\) => Object\.freeze\(\{ \.\.\.stat \}\)\)\)/u);
 
-  // The image, the accessible label and the visible readout are all rendered
-  // from that one frozen card, so the picture cannot say more than the text a
-  // user can read first.
+  // The image and its accessible label are rendered from that one frozen card.
+  // The redundant text transcript is intentionally absent from the primary UI.
   assert.match(section, /canvas\.setAttribute\("aria-label", shareCardText\(shareCard\)\);/u);
-  assert.match(section, /renderShareCardReadout\(shareCard\);/u);
+  assert.doesNotMatch(section, /renderShareCardReadout\(shareCard\);/u);
   assert.match(section, /if \(!drawShareCard\(canvas, shareCard\)\)/u);
 
   // The page makes the same promise beside the card.
@@ -4910,7 +4859,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.match(html, /id="share-panel"/u);
   assert.match(
     html,
-    /It carries no prompts, responses, file\s*\n?\s*paths, URLs, project or folder names, account identifiers, or\s*\n?\s*email/u,
+    /It contains no\s*\n?\s*prompts, responses, paths, account details, or raw activity/u,
   );
 });
 
@@ -4972,11 +4921,12 @@ test("a posted results card always carries a diagnostic-format reference", async
     /Reference \$\{card\.reference\} is printed on the image/u,
   );
 
-  // And it is readable as text beside the card, not only as pixels.
-  assert.match(section, /\["Traceable reference", card\.reference, false\]/u);
+  // The same reference remains visible beside the card without duplicating a
+  // full transcript of an image that is already the share surface.
   assert.match(section, /\$\("#share-card-reference"\)\.textContent = shareCard\.reference;/u);
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(html, /id="share-card-reference"/u);
+  assert.doesNotMatch(html, /id="share-card-readout"/u);
 });
 
 test("a posted results card states a figure in full and marks a fixture as one", async () => {

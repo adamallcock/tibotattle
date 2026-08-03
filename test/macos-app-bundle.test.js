@@ -457,8 +457,9 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /fchmod\(descriptor, 0o700\)/u);
   assert.match(source, /title: "Open Dashboard"/u);
   assert.match(source, /title: "Retry"/u);
+  assert.match(source, /title: "Settings…"/u);
   assert.match(source, /title: "Data & Diagnostics…"/u);
-  assert.match(source, /title: "Codex Source…"/u);
+  assert.match(source, /title: "Codex Folder…"/u);
   assert.match(source, /title: "Version & Updates…"/u);
   assert.match(
     source,
@@ -475,6 +476,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /companionStartupTimeoutSeconds/u);
   assert.match(source, /NSOpenPanel/u);
   assert.match(source, /launcher-settings-v1\.json/u);
+  assert.match(source, /Default location \(~\/\.codex\)/u);
+  assert.match(source, /title: "About TiboTattle"/u);
+  assert.match(source, /case companionAlreadyRunning/u);
+  assert.match(source, /UM_MACOS_COMPANION_ALREADY_RUNNING/u);
+  assert.match(source, /automatic_contribution_instance_active/u);
+  assert.match(
+    source,
+    /anotherInstanceIsActive\s*\? LauncherError\.companionAlreadyRunning/u,
+  );
   assert.match(source, /--confirm-local-keychain-reset/u);
   assert.match(source, /Reset exactly two local Keychain capabilities now/iu);
   assert.match(source, /Hosted service: no registered device is revoked/iu);
@@ -722,16 +732,19 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
   const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
   assert.match(source, /import AppKit/u);
-  // Variable-length item with a template-rendered glyph, so it adapts to
-  // light and dark menu bars without shipping a hashed asset.
+  // Variable-length item with the actual product icon rather than a generic
+  // status symbol.
   assert.match(
     source,
     /NSStatusBar\.system\.statusItem\(\s*withLength: NSStatusItem\.variableLength\s*\)/u,
   );
-  assert.match(source, /systemSymbolName: "gauge"/u);
-  assert.match(source, /isTemplate = true/u);
+  assert.match(source, /url\(forResource: "AppIcon", withExtension: "icns"\)/u);
+  assert.match(source, /image\?\.isTemplate = false/u);
   assert.match(source, /setAccessibilityLabel\(/u);
-  assert.match(source, /accessibilityDescription: description/u);
+  assert.match(source, /image\?\.accessibilityDescription = productName/u);
+  assert.match(source, /"Settings…"/u);
+  assert.match(source, /configure\(aboutItem,/u);
+  assert.match(source, /#selector\(showAbout\)/u);
 
   // The compact title shows a number only for live evidence; stale, absent,
   // starting, failed, and analyzing states all collapse to a placeholder.
@@ -1883,6 +1896,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
+    "apps/web/public/tibotattle-icon.png",
     "apps/web/public/ui-format.js",
   ]);
   assert.deepEqual(

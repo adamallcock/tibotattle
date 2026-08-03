@@ -18,7 +18,6 @@ import {
   diagnosticSurface,
   parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
-  runReviewedContributionGate,
   safeApiError,
   serviceRequestId,
   validateContributionForUpload
@@ -234,7 +233,20 @@ function formatApiMoney(value) {
 
 function formatPercent(value, digits = 0) {
   const number = finite(value);
-  return number === null ? "—" : `${number.toFixed(digits)}%`;
+  if (number === null) return "—";
+  return `${Number.isInteger(number) ? number.toFixed(0) : number.toFixed(digits)}%`;
+}
+
+function informationLabel(label, explanation) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(document.createTextNode(label));
+  const button = node("button", "info-button", "i");
+  button.type = "button";
+  button.tabIndex = 0;
+  button.title = explanation;
+  button.setAttribute("aria-label", `${label}: ${explanation}`);
+  fragment.append(button);
+  return fragment;
 }
 
 function formatPp(value, digits = 1) {
@@ -287,12 +299,12 @@ function formatSpanLength(spanMs) {
 
 function setGlobalState(state, { companionReachable = false } = {}) {
   const labels = {
-    live: "Live local evidence",
-    updating: "Updating local evidence",
-    stale: "Stale local evidence",
-    insufficient: "Insufficient evidence",
-    setup: "Local setup needed",
-    offline: companionReachable ? "Ready to analyze" : "Mac app not connected",
+    live: "Up to date",
+    updating: "Updating",
+    stale: "Needs refresh",
+    insufficient: "More data needed",
+    setup: "Set up this Mac",
+    offline: companionReachable ? "Ready to analyze" : "Open the Mac app",
     demo: "Labeled demo data"
   };
   const pill = $("#global-state");
@@ -485,7 +497,6 @@ function renderDashboard(data) {
   renderAccounting(data);
   renderQuality(data);
   renderCollector(data);
-  renderReports(data);
   renderContributionPreparationEstimate();
 }
 
@@ -752,6 +763,14 @@ let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
 let shareCardBusy = false;
+// The posted image uses the same bundled mark as the dashboard and macOS app.
+// If it loads after a card has been drawn, repaint the existing card rather
+// than leaving an approximated logo in the image.
+const shareCardBrandImage = new Image();
+shareCardBrandImage.addEventListener("load", () => {
+  if (shareCard !== null) drawShareCard($("#share-card-canvas"), shareCard);
+});
+shareCardBrandImage.src = "./tibotattle-icon.png";
 
 function shareCardRegistryVersion(candidate) {
   return typeof candidate === "string"
@@ -1097,19 +1116,8 @@ function shareCardFit(context, value, maxWidth) {
 }
 
 function drawShareCardBrand(context, x, y) {
-  context.save();
-  context.strokeStyle = "rgba(23, 79, 69, .34)";
-  context.lineWidth = 1.5;
-  context.beginPath();
-  context.arc(x + 19, y, 19, 0, Math.PI * 2);
-  context.stroke();
-  context.fillStyle = "#174f45";
-  for (const [index, height] of [11, 20, 15].entries()) {
-    context.beginPath();
-    context.roundRect(x + 11 + index * 6, y + 10 - height, 3.5, height, 2);
-    context.fill();
-  }
-  context.restore();
+  if (!shareCardBrandImage.complete || shareCardBrandImage.naturalWidth === 0) return;
+  context.drawImage(shareCardBrandImage, x, y - 19, 38, 38);
 }
 
 function drawShareCardPanel(context, x, y, width, height) {
@@ -1435,34 +1443,9 @@ function updateShareCardActions() {
   for (const id of [
     "share-card-download",
     "share-card-copy",
-    "share-card-copy-text",
   ]) {
     $(`#${id}`).disabled = !ready;
   }
-}
-
-function renderShareCardReadout(card) {
-  const readout = $("#share-card-readout");
-  const rows = [
-    ...card.stats.map((stat) => [stat.label, `${stat.value} — ${stat.detail}`, true]),
-    ["Plotted history", shareCardTrendText(card), false],
-    ["How to read it", card.caveats.join(" "), false],
-    ["Traceable reference", card.reference, false],
-    [
-      "Version",
-      card.contractVersion === ""
-        ? card.identifierLine
-        : `${card.identifierLine} · contract ${card.contractVersion}`,
-      false,
-    ],
-    ["Link", card.home === "" ? "No published home is configured." : card.home, false],
-  ];
-  readout.replaceChildren(...rows.map(([term, description, figure], index) => {
-    const row = node("div", index >= card.stats.length ? "share-card-readout-wide" : "");
-    const value = node("dd", figure ? "share-card-figure" : "", description);
-    row.append(node("dt", "", term), value);
-    return row;
-  }));
 }
 
 /**
@@ -1501,7 +1484,6 @@ function renderShareCard(data) {
   });
   $("#share-card-reference").textContent = shareCard.reference;
   canvas.setAttribute("aria-label", shareCardText(shareCard));
-  renderShareCardReadout(shareCard);
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
     setShareCardStatus(
@@ -1997,14 +1979,32 @@ function renderUsageTimeline(data) {
   const events = points.reduce((sum, row) => sum + row.usageEvents, 0);
   const replayExcluded = data.accounting.replayExclusionDiagnostics
     ?.forkReplayEventsExcluded ?? 0;
-  for (const [name, value] of [
-    ["Replay-safe buckets", compact(points.length)],
-    ["API-price equivalent", formatApiMoney(total)],
-    ["Usage increments", compact(events)],
-    ["Inherited replay excluded", compact(replayExcluded)]
+  for (const [name, explanation, value] of [
+    [
+      "Time buckets",
+      "Time intervals with repeated history removed, so one piece of work is not counted twice.",
+      compact(points.length)
+    ],
+    [
+      "API-price equivalent",
+      "A public API-price measuring stick for the local usage observed here, not a bill.",
+      formatApiMoney(total)
+    ],
+    [
+      "Usage increments",
+      "Separate measured changes in usage, rather than messages or raw log rows.",
+      compact(events)
+    ],
+    [
+      "Repeated history removed",
+      "Inherited parent-rollout records excluded to avoid counting the same work twice.",
+      compact(replayExcluded)
+    ]
   ]) {
     const item = node("div");
-    item.append(node("span", "", name), node("strong", "", value));
+    const label = node("span");
+    label.append(informationLabel(name, explanation));
+    item.append(label, node("strong", "", value));
     summary.append(item);
   }
 }
@@ -2904,22 +2904,45 @@ function renderAccounting(data) {
   );
   const fastMode = accounting.fastMode;
   const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
-  for (const [label, value, note] of [
-    ["Usage increments", compact(accounting.events), "Non-overlapping cumulative deltas"],
+  for (const [label, explanation, value, note] of [
+    [
+      "Usage increments",
+      "Separate measured changes in usage. Repeated history is removed before this count is calculated.",
+      compact(accounting.events),
+      "Measured changes, not messages or log rows"
+    ],
     [
       fastMode.metricShortLabel,
+      "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
       weighted === null ? "—" : formatApiMoney(weighted),
       weighted === null
         ? "No increment in this period could be weighted"
         : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
     ],
-    ["Non-overlapping tokens", compact(accounting.totalTokens), accounting.periodLabel],
-    ["Inherited replay excluded", compact(replayExcluded), "Removed across the cached scan window"],
-    ["Model price coverage", formatPercent(pricedEvents / Math.max(1, accounting.events) * 100, 1), "Share of increments with a mapped price"]
+    [
+      "Tokens measured",
+      "The tokens attached to those measured changes during the selected time period.",
+      compact(accounting.totalTokens),
+      accounting.periodLabel
+    ],
+    [
+      "Repeated history removed",
+      "Events inherited from a parent rollout that would otherwise count the same work twice.",
+      compact(replayExcluded),
+      "Excluded before totals are calculated"
+    ],
+    [
+      "Price coverage",
+      "The share of measured changes with a known public API price. Unknown prices are left out rather than guessed.",
+      formatPercent(pricedEvents / Math.max(1, accounting.events) * 100, 1),
+      "Measured changes with a mapped price"
+    ]
   ]) {
     const card = node("article", "metric-card compact-metric");
+    const metricLabel = node("span", "metric-name");
+    metricLabel.append(informationLabel(label, explanation));
     card.append(
-      node("span", "metric-name", label),
+      metricLabel,
       node("strong", "metric-value", value),
       node("p", "", note)
     );
@@ -2980,42 +3003,6 @@ function renderAccounting(data) {
     }
   }
 
-  renderAccountingDimension("#accounting-speed", accounting.bySpeed, {
-    unknownLabel: "Not recorded"
-  });
-  renderAccountingDimension("#accounting-surface", accounting.bySurface, {
-    unknownLabel: "Unclassified",
-    labels: {
-      extension_or_ide: "Codex desktop / IDE",
-      scheduled_task: "Scheduled task",
-      cli_exec: "Codex CLI",
-      subagent: "Subagent"
-    }
-  });
-  renderAccountingDimension("#accounting-lineage", accounting.byLineage, {
-    unknownLabel: "Lineage unavailable"
-  });
-  const toolDimension = Object.fromEntries(
-    Object.entries(data.accounting.toolClasses?.counts ?? {}).map(([key, events]) => [
-      key,
-      { events, totalTokens: 0, apiPriceEquivalentUsd: 0 }
-    ])
-  );
-  renderAccountingDimension("#accounting-tools", toolDimension, {
-    emptyMessage: "No coarse tool-class calls are retained.",
-    eventNoun: "calls"
-  });
-  $("#accounting-tier").replaceChildren(node(
-    "p",
-    "empty-inline",
-    "Subscription logs do not expose an API billing tier. Standard API pricing is an explicit counterfactual, not an observation."
-  ));
-  $("#accounting-effort").replaceChildren(node(
-    "p",
-    "empty-inline",
-    "Reasoning-token counts are available, but the selected low/medium/high reasoning-effort setting is not retained in these usage snapshots."
-  ));
-  renderFastModePreference();
 }
 
 function fastModeCoverageSentence(fastMode) {
@@ -3050,17 +3037,19 @@ function fastModeInferenceSentence(fastMode) {
 }
 
 function renderFastModePreference() {
+  const controls = $("#fast-mode-preference-controls");
+  const coverage = $("#fast-mode-coverage");
+  if (!controls || !coverage) return;
   const accounting = dashboard === null ? null : accountingPeriod(dashboard);
   const stated = fastModePreference?.mode
     ?? accounting?.fastMode?.preference
     ?? "standard";
-  for (const control of $("#fast-mode-preference-controls").querySelectorAll("[data-fast-mode]")) {
+  for (const control of controls.querySelectorAll("[data-fast-mode]")) {
     const active = control.dataset.fastMode === stated;
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
     control.disabled = fastModePreferenceBusy;
   }
-  const coverage = $("#fast-mode-coverage");
   if (accounting === null) {
     coverage.textContent = "Awaiting local evidence.";
     return;
@@ -3110,7 +3099,7 @@ const MATERIAL_GAP_STATUSES = Object.freeze([
   "uncertain",
   "partial"
 ]);
-const MATERIAL_GAP_LIMIT = 4;
+const MATERIAL_GAP_LIMIT = 2;
 
 function materialGapRank(item) {
   const index = MATERIAL_GAP_STATUSES.indexOf(item.status ?? item.priority ?? "");
@@ -3141,31 +3130,6 @@ function fastModeShortCoverage(fastMode) {
 }
 
 function renderQuality(data) {
-  const coverage = data.quality.coverage;
-  const summary = data.quality.summary ?? {};
-  const list = $("#coverage-list");
-  clear(list);
-  const rows = coverage.length ? coverage : [
-    { dimension: "Fit-eligible transitions", coverage_fraction: summary.fit_eligible_fraction },
-    { dimension: "Known speed tier", coverage_fraction: summary.known_speed_fraction }
-  ].filter((row) => finite(row.coverage_fraction) !== null);
-  $("#coverage-total").textContent = `${rows.length} signals`;
-  if (!rows.length) {
-    list.append(node("p", "empty-inline", "No coverage dimensions were returned."));
-  } else {
-    for (const item of rows) {
-      const fraction = Math.max(0, Math.min(1, finite(item.coverage_fraction ?? item.coverageFraction, 0)));
-      const row = node("div", "coverage-row");
-      row.append(node("span", "", item.dimension ?? item.label ?? "Coverage"));
-      const track = node("div", "coverage-track");
-      const fill = node("i");
-      fill.style.width = `${fraction * 100}%`;
-      track.append(fill);
-      row.append(track, node("strong", "", formatPercent(fraction * 100)));
-      list.append(row);
-    }
-  }
-
   const issues = [
     ...data.monitoringGaps,
     ...data.quality.opportunities,
@@ -3200,40 +3164,9 @@ function renderQuality(data) {
         node("strong", "", gapTitle(item)),
         node("p", "", briefGapExplanation(item))
       );
-      // Fast-mode attribution is a share, not a yes/no, so this row carries
-      // the four-way split rather than a bare status. The full sentence lives
-      // with the preference control that changes it.
-      if (item.id === "fast_mode") {
-        copy.append(node(
-          "p",
-          "issue-detail",
-          fastModeShortCoverage(accountingPeriod(data).fastMode)
-        ));
-      }
       issue.append(copy, node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")));
       issueList.append(issue);
     }
-  }
-
-  $("#blind-spot-count").textContent = !issues.length
-    ? ""
-    : ranked.length > material.length
-      ? `Showing the ${material.length} most material of ${ranked.length} gaps that change how the number should be read, from an inventory of ${issues.length}.`
-      : `${ranked.length} of ${issues.length} inventory items change how the number should be read.`;
-  const inventory = $("#blind-spot-inventory");
-  clear(inventory);
-  if (!issues.length) {
-    inventory.append(node("div", "empty-inline", "No blind-spot inventory was returned."));
-    return;
-  }
-  for (const item of issues) {
-    const row = node("div", "inventory-row");
-    row.append(
-      node("strong", "", gapTitle(item)),
-      node("span", "issue-priority", humanize(item.status ?? item.priority ?? "Open")),
-      node("p", "", gapExplanation(item))
-    );
-    inventory.append(row);
   }
 }
 
@@ -3468,6 +3401,7 @@ function renderAutomaticContributionStatus(status) {
     failed:
       `Automatic contribution has stopped because its local settings are unavailable. No retry is scheduled; repair the local app state, then review the current consent before turning it on again.${last}${outcome}`
   };
+  $("#automatic-contribution-status").hidden = !value.enabled;
   $("#automatic-contribution-description").textContent = awaitingReviewedSend
     ? "Consent is held only in this open tab. Automatic contribution remains off until your exact reviewed first send is accepted."
     : descriptions[value.state] ?? descriptions.unavailable;
@@ -3693,38 +3627,15 @@ async function runContributionSyncAction(action) {
       if (contributionSyncExactReview?.state !== "ready") {
         throw new Error("exact review required");
       }
-      const gate = await runReviewedContributionGate({
-        reviewToken: contributionSyncExactReview.reviewToken,
-        hasPendingAutomaticConsent:
-          Boolean(pendingAutomaticContributionConsent),
-        runReviewedSend: (reviewToken) =>
-          localClient.runContributionSyncOnce(reviewToken),
-        enableAutomaticContribution:
-          enableAutomaticContributionAfterReviewedSend
-      });
-      const { result } = gate;
+      const result = await localClient.runContributionSyncOnce(
+        contributionSyncExactReview.reviewToken
+      );
       if (result.status === "unavailable") throw new Error("sync unavailable");
       const outcome = contributionSyncPassResult(result);
-      acceptedContribution = gate.accepted;
+      acceptedContribution = result.status === "completed"
+        && Number.isSafeInteger(result.accepted)
+        && result.accepted > 0;
       showContributionSyncAction(outcome.message, outcome.needsAttention);
-      if (acceptedContribution && pendingAutomaticContributionConsent) {
-        if (gate.automaticError === null) {
-          showContributionSyncAction(
-            `${outcome.message} Automatic contribution is now on every 6 hours while TiboTattle is open.`
-          );
-          renderAutomaticContributionStatus(gate.automatic);
-        } else {
-          const firstReviewNotConfirmed =
-            gate.automaticError?.code
-              === "automatic_contribution_first_review_required";
-          showContributionSyncAction(
-            firstReviewNotConfirmed
-              ? `${outcome.message} Automatic contribution remains off because the local companion did not confirm the exact reviewed-send gate. Consent is retained only in this tab; inspect and send again to retry.`
-              : `${outcome.message} The reviewed contribution was accepted, but automatic contribution could not be enabled. It remains off; consent is retained only in this tab so you can retry.`,
-            true
-          );
-        }
-      }
     } else {
       const status = await localClient.setContributionSyncPaused(action === "pause");
       if (status.state === "unavailable") throw new Error("control unavailable");
@@ -4048,8 +3959,8 @@ async function requestRefresh() {
       button.textContent = "Loading saved results…";
       await loadLocalDashboard();
       showConnectionNotice({
-        title: "Deep analysis stopped at a safety limit",
-        copy: "Your available headline and previously verified results remain usable. TiboTattle stopped before reading or retaining more local data than its fixed safety limits allow; no partial accounting result replaced them.",
+        title: "This scan paused to protect your Mac",
+        copy: "Your last verified results are still shown. This unusually large history reached TiboTattle’s fixed local safety limit, so it paused before exceeding it. No partial result replaced your existing results, and nothing left this Mac.",
         kind: "warning",
       });
       return;
@@ -4553,23 +4464,14 @@ async function beginHostedSignIn(providerId) {
 function updateCommunityConnectButton() {
   const button = $("#connect-community");
   const consent = $("#community-connect-consent");
-  const awaitingReviewedSend = Boolean(pendingAutomaticContributionConsent);
-  consent.disabled = automaticContributionStatus?.enabled
-    || awaitingReviewedSend;
+  consent.disabled = false;
   button.disabled = communityConnectBusy
-    || automaticContributionBusy
-    || automaticContributionStatus?.enabled
-    || awaitingReviewedSend
     || hostedSignInRequired()
     || !consent.checked;
   if (!communityConnectBusy) {
-    button.textContent = awaitingReviewedSend
-      ? "Review first contribution below"
-      : automaticContributionStatus?.enabled
-      ? "Automatic contribution is on"
-      : hostedSignInRequired()
+    button.textContent = hostedSignInRequired()
       ? "Sign in above to contribute"
-      : "Contribute and keep it current";
+      : "Review contribution";
   }
 }
 
@@ -4692,60 +4594,8 @@ function openContributionReview() {
   const disclosure = $("#community-contribution-disclosure");
   disclosure.open = true;
   const queue = $(".sync-status-panel");
+  queue.hidden = false;
   queue.open = true;
-}
-
-function automaticContributionConsentBinding(status) {
-  const required = status?.requiredConsent;
-  return required?.destinationOrigin
-    ? Object.freeze({
-        telemetrySchemaVersion: required.telemetrySchemaVersion,
-        fieldDictionaryVersion: required.fieldDictionaryVersion,
-        privacyContractVersion: required.privacyContractVersion,
-        destinationOrigin: required.destinationOrigin
-      })
-    : null;
-}
-
-async function armAutomaticContributionAfterReviewedSend() {
-  let current = automaticContributionStatus;
-  if (!current || current.state === "unavailable") {
-    current = await refreshAutomaticContributionStatus();
-  }
-  if (current.enabled) {
-    pendingAutomaticContributionConsent = null;
-    return current;
-  }
-  const binding = automaticContributionConsentBinding(current);
-  if (!binding) {
-    throw new Error("Automatic contribution is not configured.");
-  }
-  pendingAutomaticContributionConsent = binding;
-  renderAutomaticContributionStatus(current);
-  return current;
-}
-
-async function enableAutomaticContributionAfterReviewedSend() {
-  const binding = pendingAutomaticContributionConsent;
-  if (!binding) {
-    throw new Error("No live automatic-contribution consent is pending.");
-  }
-  automaticContributionBusy = true;
-  renderAutomaticContributionStatus(automaticContributionStatus);
-  try {
-    const enabled = await localClient.enableAutomaticContribution(
-      binding
-    );
-    if (!enabled.enabled) {
-      throw new Error("Automatic contribution was not enabled.");
-    }
-    pendingAutomaticContributionConsent = null;
-    renderAutomaticContributionStatus(enabled);
-    return enabled;
-  } finally {
-    automaticContributionBusy = false;
-    renderAutomaticContributionStatus(automaticContributionStatus);
-  }
 }
 
 async function disableAutomaticContribution() {
@@ -4834,26 +4684,15 @@ async function connectCommunityContribution() {
       pairing = enrollment.pairing;
       await finishCommunityDevicePairing(pairing, status);
     }
-    let automatic = automaticContributionStatus;
-    let automaticArmFailed = false;
-    try {
-      automatic = await armAutomaticContributionAfterReviewedSend();
-    } catch {
-      automaticArmFailed = true;
-      await refreshAutomaticContributionStatus();
-      automatic = automaticContributionStatus;
-    }
+    pendingAutomaticContributionConsent = null;
     $("#community-connect-consent").checked = false;
     openContributionReview();
     await Promise.all([
       refreshContributionSyncControls(),
       loadCommunityResults(),
     ]);
-    status.textContent = automatic?.enabled
-      ? "Connected. Automatic contribution was already on."
-      : automaticArmFailed
-        ? "Connected for a reviewed contribution, but recurring consent could not be armed. Nothing will repeat unless you consent and try again."
-        : "Connected. Review and send the first contribution below. Automatic contribution remains off until that exact reviewed send is accepted.";
+    status.textContent =
+      "Connected. Review the content-free result below before deciding whether to send it. Nothing will repeat automatically.";
     await prepareLocalContribution();
     if (contributionSyncPreview?.state === "ready") {
       await inspectNextContribution();
@@ -6291,12 +6130,6 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
   }
   renderAccounting(dashboard);
 });
-$("#fast-mode-preference-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-fast-mode]");
-  if (!button) return;
-  void selectFastModePreference(button.dataset.fastMode);
-});
-
 $("#contribution-file").addEventListener("change", async () => {
   contributionSelectionRevision += 1;
   const selectionRevision = contributionSelectionRevision;
@@ -6343,7 +6176,6 @@ $("#contribution-consent").addEventListener("change", () => {
 });
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
-$("#share-card-copy-text").addEventListener("click", copyShareCardText);
 $("#contribution-form").addEventListener("submit", submitContribution);
 $("#delete-participant").addEventListener("click", deleteParticipantData);
 $("#contribution-history").addEventListener("click", (event) => {

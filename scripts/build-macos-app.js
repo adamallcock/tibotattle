@@ -110,6 +110,7 @@ export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([
   "apps/macos/reset-local-keychain.js",
   "apps/web/public/index.html",
   "apps/web/public/styles.css",
+  "apps/web/public/tibotattle-icon.png",
 ]);
 
 const ALLOWED_GENERATED_RUNTIME_FILES = new Set([

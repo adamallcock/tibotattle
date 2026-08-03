@@ -73,7 +73,7 @@
 
     <header class="topbar">
       <a class="brand" href="#overview" aria-label="TiboTattle dashboard">
-        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <img class="brand-icon" src="./tibotattle-icon.png" alt="">
         <span>TiboTattle</span>
       </a>
       <nav class="primary-nav" aria-label="Dashboard sections">
@@ -84,7 +84,7 @@
         <a href="#data" data-nav="data">Data &amp; privacy</a>
       </nav>
       <div class="top-actions">
-        <span class="state-pill state-connecting" id="central-state" data-requires-evidence>
+        <span class="state-pill state-connecting" id="central-state" data-requires-evidence hidden>
           <span class="state-dot" aria-hidden="true"></span>
           Community checking
         </span>
@@ -323,14 +323,8 @@
             <span class="evidence-chip" id="share-card-reference">Reference pending</span>
           </div>
           <p class="annotation">
-            One image carrying the three headline figures above, the uncertainty
-            each is stated with, the history of seven-day fits behind them,
-            this build's version identifiers, and a
-            reference you can quote. It carries no prompts, responses, file
-            paths, URLs, project or folder names, account identifiers, or
-            email — only aggregate numbers already shown on this page. Every
-            field on the card is written out underneath it, so nothing is
-            shared that you cannot first read as text.
+            A ready-to-post image of the three headline figures. It contains no
+            prompts, responses, paths, account details, or raw activity.
           </p>
           <div class="share-preview">
             <canvas
@@ -348,17 +342,8 @@
             <button class="button button-secondary" id="share-card-copy" type="button" disabled>
               Copy image
             </button>
-            <button class="button button-quiet" id="share-card-copy-text" type="button" disabled>
-              Copy as text
-            </button>
           </div>
           <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
-          <dl class="share-card-readout" id="share-card-readout">
-            <div>
-              <dt>Card</dt>
-              <dd>Waiting for local evidence.</dd>
-            </div>
-          </dl>
         </article>
       </section>
 
@@ -657,34 +642,6 @@
             </p>
           </div>
         </div>
-        <!--
-          Codex writes the speed mode only when it is applied or changed, never
-          at session start, so turns before the first change in a session carry
-          no recorded tier. This control attributes exactly those turns. It is
-          a statement by the owner, kept deliberately close to the numbers it
-          changes, and it never overrides a tier the log actually recorded.
-        -->
-        <div class="notice notice-info fast-mode-preference" id="fast-mode-preference">
-          <div>
-            <strong>Which Codex speed mode do you usually run?</strong>
-            <p id="fast-mode-preference-copy">
-              Codex records the speed mode only when you apply or change it, so
-              a session where you never switched carries no recorded mode.
-              Wherever the log did record one, that observed value is always
-              used and this setting is ignored. For the rest, your answer is the
-              only attribution available &mdash; and it matters, because Fast
-              consumes quota at 2.5&times; the Standard rate on GPT-5.6 and
-              GPT-5.5, and 2&times; on GPT-5.4.
-            </p>
-            <div class="segmented-control" id="fast-mode-preference-controls" aria-label="Codex speed mode">
-              <button type="button" data-fast-mode="standard">Standard</button>
-              <button type="button" data-fast-mode="fast">Fast</button>
-              <button type="button" data-fast-mode="mixed_unknown">Mixed / not sure</button>
-            </div>
-            <p class="participant-action-status" id="fast-mode-preference-status" role="status" hidden></p>
-            <p class="annotation" id="fast-mode-coverage">Awaiting local evidence.</p>
-          </div>
-        </div>
         <div class="metric-grid accounting-summary" id="accounting-summary"></div>
         <div class="two-column">
           <article class="panel">
@@ -720,74 +677,31 @@
             </p>
           </article>
         </div>
-        <div class="accounting-dimensions primary-dimensions">
-          <article class="panel"><p class="panel-kicker">Subscription speed</p><h3>As recorded in the logs</h3><p class="annotation">Percentages are Standard-rate API-price-equivalent cost shares, before any Fast weighting; counts are non-overlapping usage increments. Not recorded means the turn came before the first speed-mode change in its session, so the log holds no tier for it; it is never inferred as Standard.</p><div id="accounting-speed"></div></article>
-          <article class="panel"><p class="panel-kicker">Surface</p><h3>Where replay-safe usage ran</h3><p class="annotation">Percentages are Standard-rate API-price-equivalent cost shares; counts are non-overlapping usage increments, not messages, turns, or every raw log row.</p><div id="accounting-surface"></div></article>
-        </div>
-        <details class="advanced-diagnostics">
-          <summary>Advanced metadata coverage</summary>
-          <p class="annotation">
-            These fields audit the estimator; they are not provider billing
-            categories and may be absent in current logs.
-          </p>
-          <div class="accounting-dimensions">
-            <article class="panel"><p class="panel-kicker">Lineage</p><h3>Root and child-rollout coverage</h3><div id="accounting-lineage"></div></article>
-            <article class="panel"><p class="panel-kicker">Tool classes</p><h3>Coarse calls, not token usage</h3><div id="accounting-tools"></div></article>
-            <article class="panel"><p class="panel-kicker">API service tier</p><h3>Not exposed by subscription logs</h3><div id="accounting-tier"></div></article>
-            <article class="panel"><p class="panel-kicker">Reasoning effort</p><h3>Not exposed in usage snapshots</h3><div id="accounting-effort"></div></article>
-          </div>
-        </details>
       </section>
 
       <section class="dashboard-section" id="coverage" aria-labelledby="coverage-title" data-requires-evidence>
         <div class="section-heading">
           <div>
-            <p class="eyebrow">05 · Monitoring gaps</p>
-            <h2 id="coverage-title">What this monitor can actually see</h2>
+            <p class="eyebrow">05 · Reading the estimate</p>
+            <h2 id="coverage-title">When to treat this as an estimate</h2>
           </div>
           <p>
-            Only the gaps that should change how you read the number are shown
-            here. The complete inventory stays one click away rather than being
-            dropped.
+            TiboTattle shows only the few conditions that materially affect the
+            allowance estimate. Everything else stays in local diagnostics.
           </p>
         </div>
 
         <article class="panel blind-spots">
           <div class="panel-heading">
             <div>
-              <p class="panel-kicker">Read the number with these in mind</p>
-              <h3>What could move the estimate</h3>
+              <p class="panel-kicker">Good to know</p>
+              <h3>What could change this estimate</h3>
             </div>
           </div>
           <div id="blind-spot-list" class="issue-list">
             <div class="empty-inline">No quality artifact loaded.</div>
           </div>
-          <p class="annotation" id="blind-spot-count"></p>
-          <details class="coverage-inventory evidence-disclosure">
-            <summary>Full inventory and per-signal coverage</summary>
-            <div class="coverage-heading">
-              <p class="annotation">
-                Every recorded limitation, in full, plus each independent
-                signal's coverage. The count is a number of signals, not an
-                overall percentage score.
-              </p>
-              <strong class="coverage-total" id="coverage-total">—</strong>
-            </div>
-            <div class="coverage-list" id="coverage-list"></div>
-            <div class="issue-list" id="blind-spot-inventory"></div>
-          </details>
         </article>
-
-        <details class="panel report-panel evidence-disclosure">
-          <summary>Archived technical reports</summary>
-          <p class="annotation">
-            These links open separately generated diagnostic HTML in a new tab.
-            They stay on this computer and do not collect additional telemetry.
-          </p>
-          <div class="report-links" id="report-links">
-            <span class="empty-inline">No reports advertised by the local companion.</span>
-          </div>
-        </details>
       </section>
 
       <section
@@ -797,12 +711,12 @@
         data-requires-evidence
       >
         <div class="contribution-cta-copy">
-          <p class="eyebrow">Help improve the estimate</p>
-          <h2 id="contribution-cta-title">Help map Codex limits</h2>
+          <p class="eyebrow">Optional</p>
+          <h2 id="contribution-cta-title">Contribute an anonymous result</h2>
           <p>
-            Contribute content-free pseudonymous metadata so the community can
-            measure how Codex limits differ over time. Prompts, responses,
-            commands, paths, account names and credentials never leave this Mac.
+            Share one reviewed, content-free result to improve community
+            estimates. Prompts, responses, commands, paths, account names and
+            credentials never leave this Mac.
           </p>
           <details class="contribution-categories">
             <summary>What would be contributed?</summary>
@@ -894,33 +808,22 @@
           <label class="consent-row contribution-primary-consent">
             <input id="community-connect-consent" type="checkbox">
             <span>
-              <strong>I consent to contribute this metadata and keep it current.</strong>
+              <strong>I consent to review and submit this metadata.</strong>
               <small>
-                The first contribution waits for my review. After that, Usage
-                Monitor may contribute new content-free pseudonymous metadata
-                every 6 hours while the app is open. This is off until I choose it.
+                The result is shown for review before anything is sent.
               </small>
             </span>
           </label>
           <div class="contribution-cta-buttons">
             <button class="button button-primary" id="connect-community" type="button" disabled>
-              Contribute and keep it current
+              Review contribution
             </button>
             <button class="button button-quiet" id="contribution-not-now" type="button">
               Not now
             </button>
           </div>
           <p class="participant-action-status" id="community-connect-status" role="status" hidden></p>
-          <p class="annotation" id="diagnostics-log-location">
-            If something fails, the message carries a short reference such as
-            <code>TT-7QF3K2</code>. The same reference is appended to this Mac's
-            local diagnostics log — by default
-            <code>~/Library/Application Support/app-usagemonitor/diagnostics-v0.1.log</code>
-            — so you can quote it when asking for help. The log records only
-            the reference, which action failed, a fixed error code, and the
-            service's own request id.
-          </p>
-          <div class="automatic-contribution-status" id="automatic-contribution-status" aria-live="polite">
+          <div class="automatic-contribution-status" id="automatic-contribution-status" aria-live="polite" hidden>
             <div>
               <strong>Automatic contribution</strong>
               <span class="evidence-chip neutral" id="automatic-contribution-state">Off</span>
@@ -1180,7 +1083,7 @@
           </article>
         </div>
 
-        <details class="panel sync-status-panel" aria-labelledby="sync-status-title">
+        <details class="panel sync-status-panel" aria-labelledby="sync-status-title" hidden>
           <summary class="sync-panel-summary">
             <div>
               <p class="panel-kicker">Contribution activity</p>

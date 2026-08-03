@@ -204,6 +204,7 @@ private enum LauncherError: LocalizedError {
     case invalidHome
     case invalidResource(String)
     case invalidStateDirectory
+    case companionAlreadyRunning
     case companionExited
     case companionLaunch(String)
     case companionTimeout
@@ -234,6 +235,8 @@ private enum LauncherError: LocalizedError {
             return "The bundled local companion is incomplete."
         case .invalidStateDirectory:
             return "The private \(BundledProduct.displayName) data directory is unavailable."
+        case .companionAlreadyRunning:
+            return "Another \(BundledProduct.displayName) window is already using this Mac's local data."
         case .companionExited:
             return "The local companion stopped before it became ready."
         case .companionLaunch:
@@ -279,6 +282,8 @@ private enum LauncherError: LocalizedError {
             return "UM_MACOS_BUNDLE_INCOMPLETE"
         case .invalidStateDirectory:
             return "UM_MACOS_APP_STATE_UNAVAILABLE"
+        case .companionAlreadyRunning:
+            return "UM_MACOS_COMPANION_ALREADY_RUNNING"
         case .companionExited:
             return "UM_MACOS_COMPANION_EXITED"
         case .companionLaunch:
@@ -323,6 +328,8 @@ private enum LauncherError: LocalizedError {
             return "Check access to your Downloads folder, then save the file again."
         case .dashboardWebViewUnavailable:
             return "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
+        case .companionAlreadyRunning:
+            return "Open the existing TiboTattle window, or quit it before starting another copy."
         case .companionExited, .companionLaunch, .companionTimeout,
              .healthCheck:
             return "Choose Retry. If it repeats, copy Data & Diagnostics for support."
@@ -400,15 +407,20 @@ private func regularFile(_ url: URL) -> Bool {
     }
 }
 
-private func defaultCodexHome() throws -> URL {
-    guard let home = ProcessInfo.processInfo.environment["HOME"],
-          home.hasPrefix("/"),
-          !home.contains("\0")
-    else {
+private func currentUserHomeDirectory() throws -> URL {
+    let environmentHome = ProcessInfo.processInfo.environment["HOME"]
+    let candidate = environmentHome.flatMap { value -> URL? in
+        guard value.hasPrefix("/"), !value.contains("\0") else { return nil }
+        return URL(fileURLWithPath: value, isDirectory: true).standardizedFileURL
+    } ?? FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
+    guard candidate.path.hasPrefix("/"), candidate.path != "/" else {
         throw LauncherError.invalidHome
     }
-    return URL(fileURLWithPath: home, isDirectory: true)
-        .standardizedFileURL
+    return candidate
+}
+
+private func defaultCodexHome() throws -> URL {
+    try currentUserHomeDirectory()
         .appendingPathComponent(".codex", isDirectory: true)
 }
 
@@ -649,14 +661,7 @@ private func markFirstRunCompleted(stateRoot: URL) throws {
 }
 
 private func ownerOnlyStateRoot() throws -> URL {
-    guard let home = ProcessInfo.processInfo.environment["HOME"],
-          home.hasPrefix("/"),
-          !home.contains("\0")
-    else {
-        throw LauncherError.invalidHome
-    }
-
-    let homeURL = URL(fileURLWithPath: home, isDirectory: true).standardizedFileURL
+    let homeURL = try currentUserHomeDirectory()
     let stateRoot = homeURL
         .appendingPathComponent("Library", isDirectory: true)
         .appendingPathComponent("Application Support", isDirectory: true)
@@ -741,17 +746,19 @@ private final class CompanionProcess {
     private let codexHome: URL
     private let lock = NSLock()
     private var pendingOutput = ""
+    private var pendingStandardError = ""
+    private var activeInstanceDetected = false
     private var process: Process?
     private var stopCompletions: [() -> Void] = []
     private var stopped = false
-    private let onExit: (Bool) -> Void
+    private let onExit: (Bool, Bool) -> Void
     private let onReady: (URL) -> Void
 
     init(
         centralService: CentralServiceConfiguration?,
         codexHome: URL,
         onReady: @escaping (URL) -> Void,
-        onExit: @escaping (Bool) -> Void
+        onExit: @escaping (Bool, Bool) -> Void
     ) {
         self.centralService = centralService
         self.codexHome = codexHome
@@ -775,6 +782,7 @@ private final class CompanionProcess {
     func launch() throws {
         let resources = try CompanionResources.bundled()
         let stateRoot = try ownerOnlyStateRoot()
+        let homeDirectory = try currentUserHomeDirectory()
         let child = Process()
         let standardOutput = Pipe()
         let standardError = Pipe()
@@ -788,7 +796,7 @@ private final class CompanionProcess {
 
         let inherited = ProcessInfo.processInfo.environment
         var environment: [String: String] = [
-            "HOME": inherited["HOME"] ?? stateRoot.path,
+            "HOME": homeDirectory.path,
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "NODE_ENV": "production",
             "USAGE_MONITOR_PARENT_PID": String(getpid()),
@@ -814,9 +822,11 @@ private final class CompanionProcess {
             if data.isEmpty { return }
             self?.consumeStandardOutput(data)
         }
-        standardError.fileHandleForReading.readabilityHandler = { handle in
+        standardError.fileHandleForReading.readabilityHandler = { [weak self] handle in
             // Drain bounded local diagnostic output without writing it to disk.
-            _ = handle.availableData
+            // Only a fixed, non-content-bearing lock code can alter native
+            // recovery guidance; all other companion output remains private.
+            self?.consumeStandardError(handle.availableData)
         }
         child.terminationHandler = { [weak self] terminated in
             standardOutput.fileHandleForReading.readabilityHandler = nil
@@ -827,6 +837,9 @@ private final class CompanionProcess {
         lock.lock()
         process = child
         stopped = false
+        pendingOutput = ""
+        pendingStandardError = ""
+        activeInstanceDetected = false
         lock.unlock()
         do {
             try child.run()
@@ -870,17 +883,35 @@ private final class CompanionProcess {
         }
     }
 
+    private func consumeStandardError(_ data: Data) {
+        guard !data.isEmpty,
+              let text = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        lock.lock()
+        pendingStandardError.append(text)
+        if pendingStandardError.utf8.count > 8_192 {
+            pendingStandardError = String(pendingStandardError.suffix(4_096))
+        }
+        if pendingStandardError.contains("automatic_contribution_instance_active") {
+            activeInstanceDetected = true
+        }
+        lock.unlock()
+    }
+
     private func didTerminate(success: Bool) {
         lock.lock()
         process = nil
         let completions = stopCompletions
         stopCompletions.removeAll()
         let wasStopped = stopped
+        let anotherInstanceIsActive = activeInstanceDetected
         lock.unlock()
         for completion in completions {
             completion()
         }
-        onExit(success && wasStopped)
+        onExit(success && wasStopped, anotherInstanceIsActive)
     }
 
     func stop(completion: @escaping () -> Void) {
@@ -1279,6 +1310,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var lastFailureCode: String?
     private var lastRecoverySuggestion: String?
     private var menuBarStatus: MenuBarStatusController?
+    private var settingsWindow: NSWindow?
+    private var settingsTabs: NSTabViewController?
+    private weak var settingsCodexHomeLabel: NSTextField?
     private let statusLabel = NSTextField(labelWithString: "Starting locally…")
     private let detailLabel = NSTextField(
         wrappingLabelWithString:
@@ -1298,13 +1332,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         target: self,
         action: #selector(retryCompanion)
     )
+    private lazy var settingsButton = NSButton(
+        title: "Settings…",
+        target: self,
+        action: #selector(showSettingsWindow)
+    )
     private lazy var diagnosticsButton = NSButton(
         title: "Data & Diagnostics…",
         target: self,
         action: #selector(showDiagnostics)
     )
     private lazy var codexHomeButton = NSButton(
-        title: "Codex Source…",
+        title: "Codex Folder…",
         target: self,
         action: #selector(showCodexHomeOptions)
     )
@@ -1431,10 +1470,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                     )
                 }
             },
-            onExit: { [weak self] requested in
+            onExit: { [weak self] requested, anotherInstanceIsActive in
                 DispatchQueue.main.async {
                     self?.companionExited(
                         requested: requested,
+                        anotherInstanceIsActive: anotherInstanceIsActive,
                         generation: selectedGeneration
                     )
                 }
@@ -1495,13 +1535,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             "Open the same local dashboard in your default browser."
 
         for button in [
+            settingsButton,
             diagnosticsButton,
             codexHomeButton,
             lifecycleHelpButton,
             openCodexButton,
             quitButton,
         ] {
-            button.bezelStyle = .rounded
+            button.bezelStyle = NSButton.BezelStyle.rounded
         }
 
         // The status stack collapses while the dashboard is on screen and
@@ -1532,16 +1573,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         actionRow.setHuggingPriority(.defaultHigh, for: .vertical)
         for button in [
             quitButton,
-            diagnosticsButton,
-            codexHomeButton,
-            lifecycleHelpButton,
+            settingsButton,
         ] {
             actionRow.addView(button, in: .leading)
         }
         for button in [
             openCodexButton,
             retryButton,
-            openInBrowserButton,
             openButton,
         ] {
             actionRow.addView(button, in: .trailing)
@@ -1737,6 +1775,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             productName: BundledProduct.displayName,
             actions: MenuBarStatusController.Actions(
                 openTiboTattle: { [weak self] in self?.openTiboTattle() },
+                showSettings: { [weak self] in self?.showSettingsWindow() },
+                showAbout: { [weak self] in self?.showAbout() },
                 quit: { [weak self] in self?.quitApplication() },
                 // The menu bar is the only surface always on screen, so it is
                 // where an update check has to be reachable. A build with no
@@ -1785,7 +1825,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 "Open the dashboard and start an explicit bounded scan. Large histories may need several passes. Nothing leaves this Mac."
         } else {
             detailLabel.stringValue =
-                "Open the dashboard and start a bounded scan. Contribution stays off until explicit consent and a reviewed first send; a six-hour while-open schedule can then be enabled."
+                "Open the dashboard and start a bounded scan. A reviewed contribution remains an explicit manual choice."
         }
         openButton.isEnabled = true
         openInBrowserButton.isEnabled = true
@@ -1800,14 +1840,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
     }
 
-    private func companionExited(requested: Bool, generation: Int) {
+    private func companionExited(
+        requested: Bool,
+        anotherInstanceIsActive: Bool,
+        generation: Int
+    ) {
         guard generation == launchGeneration else { return }
         startupTimeout?.cancel()
         startupTimeout = nil
         if quitting || requested { return }
         dashboardURL = nil
         companion = nil
-        showFailure(LauncherError.companionExited)
+        showFailure(
+            anotherInstanceIsActive
+                ? LauncherError.companionAlreadyRunning
+                : LauncherError.companionExited
+        )
     }
 
     private func showFailure(_ error: Error) {
@@ -1873,6 +1921,190 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             companion = nil
             startCompanion()
         }
+    }
+
+    private func settingsLabel(
+        _ text: String,
+        font: NSFont,
+        color: NSColor
+    ) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = font
+        label.textColor = color
+        label.maximumNumberOfLines = 0
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }
+
+    private func settingsPage(
+        title: String,
+        summary: String,
+        views: [NSView]
+    ) -> NSViewController {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 28, left: 32, bottom: 28, right: 32)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(settingsLabel(
+            title,
+            font: .systemFont(ofSize: 22, weight: .semibold),
+            color: .labelColor
+        ))
+        stack.addArrangedSubview(settingsLabel(
+            summary,
+            font: .systemFont(ofSize: 13),
+            color: .secondaryLabelColor
+        ))
+        for view in views {
+            stack.addArrangedSubview(view)
+        }
+        let root = NSView()
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: root.topAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor),
+            stack.widthAnchor.constraint(equalTo: root.widthAnchor),
+        ])
+        let controller = NSViewController()
+        controller.view = root
+        return controller
+    }
+
+    private func codexHomeSettingsSummary() -> String {
+        codexHomeConfiguration?.mode == .custom
+            ? "Custom folder selected"
+            : "Default location (~/.codex)"
+    }
+
+    private func updateSettingsCodexHomeSummary() {
+        settingsCodexHomeLabel?.stringValue = codexHomeSettingsSummary()
+    }
+
+    @objc private func showSettingsWindow() {
+        showSettings(selecting: 0)
+    }
+
+    @objc private func showAbout() {
+        showSettings(selecting: 2)
+    }
+
+    private func showSettings(selecting index: Int) {
+        if let settingsWindow, let settingsTabs {
+            settingsTabs.selectedTabViewItemIndex = index
+            updateSettingsCodexHomeSummary()
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let sourceStatus = settingsLabel(
+            codexHomeSettingsSummary(),
+            font: .systemFont(ofSize: 13, weight: .medium),
+            color: .labelColor
+        )
+        settingsCodexHomeLabel = sourceStatus
+        let chooseSource = NSButton(
+            title: "Choose Codex Folder…",
+            target: self,
+            action: #selector(showCodexHomeOptions)
+        )
+        let useDefaultSource = NSButton(
+            title: "Use Default",
+            target: self,
+            action: #selector(useDefaultCodexHome)
+        )
+        let sourceActions = NSStackView(views: [chooseSource, useDefaultSource])
+        sourceActions.orientation = .horizontal
+        sourceActions.spacing = 8
+        let sourceSection = NSStackView(views: [
+            settingsLabel(
+                "Codex folder",
+                font: .systemFont(ofSize: 14, weight: .semibold),
+                color: .labelColor
+            ),
+            sourceStatus,
+            settingsLabel(
+                "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else.",
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            ),
+            sourceActions,
+        ])
+        sourceSection.orientation = .vertical
+        sourceSection.alignment = .leading
+        sourceSection.spacing = 7
+        let openDashboardFromSettings = NSButton(
+            title: "Open Dashboard",
+            target: self,
+            action: #selector(openDashboard)
+        )
+        let general = settingsPage(
+            title: "General",
+            summary: "Local analysis runs only when you choose it. TiboTattle does not install a login item or scan raw logs in the background.",
+            views: [sourceSection, openDashboardFromSettings]
+        )
+
+        let privacy = settingsPage(
+            title: "Privacy",
+            summary: "Your dashboard and local index stay on this Mac. Sharing with the community is optional and always shows a content-free result for review first.",
+            views: [NSButton(
+                title: "Data & Diagnostics…",
+                target: self,
+                action: #selector(showDiagnostics)
+            )]
+        )
+
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "unknown"
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "unknown"
+        let updateMessage = updater.isAvailable
+            ? "Signed updates are available for this release."
+            : "This development copy does not check for updates. A signed release installs in Applications."
+        let about = settingsPage(
+            title: "About TiboTattle",
+            summary: "TiboTattle \(version) (\(build))\n\n\(updateMessage)",
+            views: [NSButton(
+                title: "Version & Updates…",
+                target: self,
+                action: #selector(showLifecycleHelp)
+            )]
+        )
+
+        for controller in [general, privacy, about] {
+            controller.title = "TiboTattle Settings"
+        }
+
+        let tabs = NSTabViewController()
+        tabs.tabStyle = .toolbar
+        for (label, controller) in [
+            ("General", general),
+            ("Privacy", privacy),
+            ("About", about),
+        ] {
+            let item = NSTabViewItem(identifier: label)
+            item.label = label
+            item.viewController = controller
+            tabs.addTabViewItem(item)
+        }
+        tabs.selectedTabViewItemIndex = index
+        let newWindow = NSWindow(contentViewController: tabs)
+        newWindow.title = "TiboTattle Settings"
+        newWindow.styleMask = [.titled, .closable, .miniaturizable]
+        newWindow.setContentSize(NSSize(width: 620, height: 390))
+        newWindow.contentMinSize = NSSize(width: 560, height: 350)
+        newWindow.isReleasedWhenClosed = false
+        newWindow.center()
+        settingsWindow = newWindow
+        settingsTabs = tabs
+        newWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func diagnosticText() -> String {
@@ -2081,10 +2313,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     @objc private func showCodexHomeOptions() {
         let current =
             codexHomeConfiguration?.mode == .custom
-            ? "Custom Codex source"
-            : "Default ~/.codex source"
+            ? "Custom Codex folder"
+            : "Default Codex folder (~/.codex)"
         let alert = NSAlert()
-        alert.messageText = "Codex source"
+        alert.messageText = "Codex folder"
         alert.informativeText = """
         Current: \(current)
 
@@ -2125,6 +2357,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 selected,
                 stateRoot: ownerOnlyStateRoot()
             )
+            updateSettingsCodexHomeSummary()
             retryAllowed = true
             restartCompanionAfterCodexHomeChange()
         } catch {
@@ -2132,11 +2365,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
     }
 
-    private func useDefaultCodexHome() {
+    @objc private func useDefaultCodexHome() {
         do {
             codexHomeConfiguration = try clearCodexHomeConfiguration(
                 stateRoot: ownerOnlyStateRoot()
             )
+            updateSettingsCodexHomeSummary()
             retryAllowed = true
             restartCompanionAfterCodexHomeChange()
         } catch {
@@ -2145,7 +2379,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func restartCompanionAfterCodexHomeChange() {
-        statusLabel.stringValue = "Codex source updated"
+        statusLabel.stringValue = "Codex folder updated"
         detailLabel.stringValue =
             "Restarting the foreground-only local companion with the validated source."
         openButton.isEnabled = false
@@ -2289,6 +2523,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         do {
             let resources = try CompanionResources.bundled()
             let stateRoot = try ownerOnlyStateRoot()
+            let homeDirectory = try currentUserHomeDirectory()
             let child = Process()
             let standardOutput = Pipe()
             let standardError = Pipe()
@@ -2303,7 +2538,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             child.standardError = standardError
             let inherited = ProcessInfo.processInfo.environment
             var environment: [String: String] = [
-                "HOME": inherited["HOME"] ?? stateRoot.path,
+                "HOME": homeDirectory.path,
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 "NODE_ENV": "production",
                 "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
@@ -2595,7 +2830,7 @@ private enum SmokeTest {
                 stateLock.unlock()
                 ready.signal()
             },
-            onExit: { requested in
+            onExit: { requested, _ in
                 if !requested {
                     stateLock.lock()
                     exitedEarly = true
@@ -2727,7 +2962,7 @@ private enum WatchdogSmokeTest {
                 stateLock.unlock()
                 ready.signal()
             },
-            onExit: { requested in
+            onExit: { requested, _ in
                 if !requested {
                     stateLock.lock()
                     exitedEarly = true

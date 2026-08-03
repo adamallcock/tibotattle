@@ -47,6 +47,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "styles.css",
     type: "text/css; charset=utf-8",
   }),
+  "/tibotattle-icon.png": Object.freeze({
+    file: "tibotattle-icon.png",
+    type: "image/png",
+  }),
 });
 
 export function createLocalCompanionReportRoutes(reportFiles) {

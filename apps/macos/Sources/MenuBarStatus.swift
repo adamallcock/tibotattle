@@ -639,6 +639,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         /// Brings the actual TiboTattle window forward and opens its embedded
         /// dashboard when the loopback companion is ready.
         let openTiboTattle: () -> Void
+        let showSettings: () -> Void
+        let showAbout: () -> Void
         let quit: () -> Void
         /// Absent in a build with no updater, which omits the row rather than
         /// offering a check that can never find anything.
@@ -660,13 +662,14 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let reader = LocalCompanionEvidenceReader()
     private let allowanceItem = NSMenuItem()
     private let evidenceItem = NSMenuItem()
-    private let summaryView = MenuBarSummaryView(frame: .zero)
     private let menu = NSMenu()
     private let quotaSeparator = NSMenuItem.separator()
     private let actionSeparator = NSMenuItem.separator()
     private var quotaLaneItems: [NSMenuItem] = []
     private let openTiboTattleItem = NSMenuItem()
     private let analyzeItem = NSMenuItem()
+    private let settingsItem = NSMenuItem()
+    private let aboutItem = NSMenuItem()
     private let checkForUpdatesItem = NSMenuItem()
     private let quitItem = NSMenuItem()
     private var snapshot = MenuBarStatusSnapshot()
@@ -693,10 +696,6 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
         allowanceItem.isEnabled = false
         evidenceItem.isEnabled = false
-        allowanceItem.view = summaryView
-        // The rich summary owns both strings. Keep the second item as a
-        // VoiceOver-readable fallback title rather than duplicating text.
-        evidenceItem.isHidden = true
         menu.addItem(allowanceItem)
         menu.addItem(evidenceItem)
         menu.addItem(quotaSeparator)
@@ -723,6 +722,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             checkForUpdatesItem.isEnabled = true
             menu.addItem(checkForUpdatesItem)
         }
+        configure(settingsItem, "Settings…", #selector(showSettings))
+        configure(aboutItem, "About \(productName)", #selector(showAbout))
+        menu.addItem(settingsItem)
+        menu.addItem(aboutItem)
         menu.addItem(.separator())
 
         configure(quitItem, "Quit \(productName)", #selector(quit))
@@ -731,7 +734,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
         statusItem.menu = menu
         if let button = statusItem.button {
-            button.image = Self.templateGlyph(productName: productName)
+            button.image = Self.appIcon(productName: productName)
             button.imagePosition = .imageLeading
             // Monospaced digits keep the item from jittering as the percentage
             // changes width.
@@ -826,6 +829,14 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         actions.quit()
     }
 
+    @objc private func showSettings() {
+        actions.showSettings()
+    }
+
+    @objc private func showAbout() {
+        actions.showAbout()
+    }
+
     @objc private func checkForUpdates() {
         actions.checkForUpdates?()
     }
@@ -892,9 +903,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     // MARK: - Rendering
 
     private func render() {
-        allowanceItem.title = snapshot.allowanceSummary
+        allowanceItem.title = "\(productName) · \(snapshot.title) allowance"
         evidenceItem.title = snapshot.evidenceSummary
-        summaryView.render(productName: productName, snapshot: snapshot)
         renderQuotaLanes()
         openTiboTattleItem.isEnabled = true
         analyzeItem.title = snapshot.analysisActionTitle
@@ -938,9 +948,6 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         let items = snapshot.lanes.map { lane in
             let item = NSMenuItem(title: snapshot.laneSummary(lane), action: nil, keyEquivalent: "")
             item.isEnabled = false
-            let view = MenuBarQuotaLaneView(frame: .zero)
-            view.render(lane: lane, snapshot: snapshot)
-            item.view = view
             return item
         }
         for (offset, item) in items.enumerated() {
@@ -949,30 +956,15 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         quotaLaneItems = items
     }
 
-    /// Template rendering is what makes the glyph correct on light menu bars,
-    /// dark menu bars, and under increased contrast without shipping any
-    /// additional asset for the build to hash.
-    private static func templateGlyph(productName: String) -> NSImage? {
-        let description = "\(productName) seven-day allowance"
-        if let symbol = NSImage(
-            systemSymbolName: "gauge",
-            accessibilityDescription: description
-        ) {
-            symbol.isTemplate = true
-            return symbol
-        }
-        let image = NSImage(
-            size: NSSize(width: 15, height: 15),
-            flipped: false
-        ) { rect in
-            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 2, dy: 2))
-            ring.lineWidth = 1.5
-            NSColor.black.setStroke()
-            ring.stroke()
-            return true
-        }
-        image.isTemplate = true
-        image.accessibilityDescription = description
+    /// Use the product's real bundle icon rather than a generic gauge. The
+    /// menu bar remains legible because macOS applies its own selected-menu
+    /// treatment to the item title; the image itself is intentionally branded.
+    private static func appIcon(productName: String) -> NSImage? {
+        let image = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
+            .flatMap(NSImage.init(contentsOf:))
+        image?.size = NSSize(width: 18, height: 18)
+        image?.isTemplate = false
+        image?.accessibilityDescription = productName
         return image
     }
 }
