@@ -35,6 +35,10 @@ import {
 } from "../public/lib.js";
 import {
   AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
+  CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  CODEX_PRIMARY_LIMIT_ID,
+  CODEX_SPARK_LIMIT_ID,
+  CODEX_WEEKLY_ALLOWANCE_MINUTES,
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
   CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION,
@@ -63,6 +67,8 @@ import {
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION,
+  isPrimaryCodexQuotaWindow,
+  isPrimaryCodexWeeklyQuotaWindow,
   SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
   SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS
 } from "../public/data-client.js";
@@ -950,17 +956,57 @@ test("live weekly calibration keeps its explicit multi-account ambiguity label",
   assert.match(result.weekly.accountAttribution.label, /may combine multiple accounts/);
 });
 
-test("same-duration provider tracks stay distinguishable without inventing account labels", () => {
+test("normal Codex allowance selection uses stable identifiers, not labels", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
     status: "live",
     quotaWindows: [
-      { limitId: "codex", durationMinutes: 10080, usedPercent: 39 },
-      { limitId: "codex_bengalfox", durationMinutes: 10080, usedPercent: 0 }
+      {
+        limitId: CODEX_PRIMARY_LIMIT_ID,
+        durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
+        label: "Límite semanal",
+        usedPercent: 39
+      },
+      {
+        limitId: CODEX_SPARK_LIMIT_ID,
+        durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
+        label: "GPT-5.3-Codex-Spark limit",
+        usedPercent: 0
+      },
+      {
+        limitId: "Seven-day allowance",
+        durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
+        label: "Seven-day allowance",
+        usedPercent: 0
+      }
     ]
   });
+  assert.equal(CODEX_PRIMARY_LIMIT_ID, "codex");
   assert.equal(result.quotaWindows[0].label, "Seven-day allowance");
-  assert.equal(result.quotaWindows[1].label, "Secondary observed allowance");
+  assert.equal(result.quotaWindows[1].label, "Other observed allowance");
+  assert.equal(result.quotaWindows[2].label, "Other observed allowance");
+  assert.equal(result.quotaWindows[0].limitId, CODEX_PRIMARY_LIMIT_ID);
+  assert.equal(result.quotaWindows[1].limitId, CODEX_SPARK_LIMIT_ID);
+  assert.equal(result.quotaWindows[2].limitId, "unknown");
+  assert.equal(isPrimaryCodexQuotaWindow(result.quotaWindows[0]), true);
+  assert.equal(isPrimaryCodexQuotaWindow(result.quotaWindows[1]), false);
+  assert.equal(isPrimaryCodexQuotaWindow(result.quotaWindows[2]), false);
+  assert.equal(
+    isPrimaryCodexQuotaWindow({
+      limitId: CODEX_PRIMARY_LIMIT_ID,
+      durationMinutes: CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+      label: "Límite de cinco horas"
+    }),
+    true
+  );
+  assert.equal(
+    isPrimaryCodexWeeklyQuotaWindow({
+      limitId: CODEX_PRIMARY_LIMIT_ID,
+      durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
+      label: "Weekly allowance"
+    }),
+    true
+  );
   assert.doesNotMatch(result.quotaWindows.map((row) => row.label).join(" "), /bengalfox/);
   assert.doesNotMatch(result.quotaWindows.map((row) => row.label).join(" "), /Account/);
 });
@@ -1013,6 +1059,7 @@ test("demo data is labeled demo at the contract root and has multiple useful sec
   assert.equal(result.mode, "demo");
   assert.equal(result.state, "demo");
   assert.ok(result.quotaWindows.length >= 2);
+  assert.ok(result.quotaWindows.every(isPrimaryCodexQuotaWindow));
   assert.ok(result.gradient.rolling.length > 20);
   assert.deepEqual(
     [...new Set(result.gradient.rolling.map((row) => row.smoothing_hours))].sort(),
@@ -3787,8 +3834,9 @@ test("live timeline uses the primary Codex weekly track and live weekly median f
   const trackSource = trackMatch[1];
   assert.match(
     trackSource,
-    /row\.limitId === "codex" && row\.durationMinutes === 10_080/u,
+    /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u,
   );
+  assert.doesNotMatch(trackSource, /row\.limitId|row\.durationMinutes/u);
   assert.match(trackSource, /row\.slot === "primary"/u);
   assert.match(trackSource, /if \(primary\.length\) return primary;/u);
 
@@ -3801,13 +3849,24 @@ test("live timeline uses the primary Codex weekly track and live weekly median f
     liveSource,
     /data\.weekly\.summary\?\.median_weekly_value_usd[\s\S]*?\?\? data\.gradient\.summary\?\.capacity_usd/u,
   );
-  assert.match(
-    liveSource,
-    /const weeklyQuota = mainWeeklyQuotaTrack\(data\.timeline\.quota\);/u,
+  assert.match(liveSource, /const quota = mainWeeklyQuotaTrack\(data\.timeline\.quota\);/u);
+  assert.doesNotMatch(liveSource, /weeklyQuota|: data\.timeline\.quota/u);
+
+  const usageMatch = appSource.match(
+    /function usagePointsWithAllowance\(data, points\) \{([\s\S]*?)\n\}\n\nfunction renderUsageTimeline/u,
   );
+  assert.ok(usageMatch, "usage allowance source is available for contract review");
+  const usageSource = usageMatch[1];
+  assert.match(usageSource, /const quota = mainWeeklyQuotaTrack\(data\.timeline\.quota\);/u);
+  assert.doesNotMatch(usageSource, /fallback|data\.timeline\.quota\.filter/u);
+
+  const quotaCardsMatch = appSource.match(
+    /function renderQuotaCards\(data\) \{([\s\S]*?)\n\}\n\nfunction renderPricing/u,
+  );
+  assert.ok(quotaCardsMatch, "quota-card source is available for contract review");
   assert.match(
-    liveSource,
-    /const quota = \(weeklyQuota\.length \? weeklyQuota : data\.timeline\.quota\)/u,
+    quotaCardsMatch[1],
+    /data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u,
   );
 });
 
@@ -4953,11 +5012,15 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.doesNotMatch(section, /weeklySpanThresholdPp|showWeeklyPartialDiagnostics/u);
 
   // The three free-form strings that do arrive are each replaced before use.
-  // A window's own label is never printed: the name is recomputed from the
-  // observed duration, so a renamed or injected label cannot be posted.
+  // A window's own label is never printed and an allowance is selected only
+  // through the stable normal-Codex quota predicate, not its translated label.
   assert.match(
     section,
-    /function shareCardWindowKind\(window\) \{\s*\n\s*const minutes = finite\(window\?\.durationMinutes\);/u,
+    /function shareCardWindowKind\(window\) \{\s*\n\s*if \(!isPrimaryCodexQuotaWindow\(window\)\) return "other";\s*\n\s*const minutes = finite\(window\?\.durationMinutes\);/u,
+  );
+  assert.match(
+    section,
+    /isPrimaryCodexQuotaWindow\(window\)[\s\S]*?shareCardWindowKind\(window\) === "seven_day"/u,
   );
   assert.deepEqual(
     [...new Set(

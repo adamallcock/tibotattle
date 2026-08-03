@@ -866,19 +866,23 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
-  assert.match(source, /No verified quota lanes observed yet/u);
+  assert.match(source, /No verified Codex allowance observed yet/u);
   assert.match(source, /Allowance values and reset countdowns are hidden/u);
   assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
   assert.match(source, /guard companionReachable, evidence == \.live else/u);
 
-  // Every supported observed lane is projected with a fixed privacy-safe
-  // label; the weekly primary remains only the compact-title preference.
+  // Only the normal Codex allowance track is projected with fixed
+  // privacy-safe labels; a separate product can never become the title.
   assert.match(source, /private let weeklyWindowDurationMinutes = 10_080/u);
-  assert.match(source, /let lanes = rows\.enumerated\(\)\.compactMap/u);
+  assert.match(source, /private let codexPrimaryLimitId = "codex"/u);
+  assert.match(source, /private let supportedCodexAllowanceWindowDurations: Set<Int>/u);
+  assert.match(source, /let lanes = rows\.compactMap/u);
+  assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
   assert.match(source, /return "Five-hour allowance"/u);
-  assert.match(source, /return "Secondary observed allowance"/u);
-  assert.match(source, /Observed quota lane/u);
-  assert.match(source, /isPrimary: limitId == "codex"/u);
+  assert.match(source, /return "Seven-day allowance"/u);
+  assert.match(source, /isPrimary: duration == weeklyWindowDurationMinutes/u);
+  assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
+  assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
   assert.match(
     source,
     /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,

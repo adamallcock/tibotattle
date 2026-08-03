@@ -27,6 +27,18 @@
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
 export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
+// Provider quota identifiers are protocol values, not display copy. Keep the
+// normal Codex allowance selection bound to the exact technical identifier so
+// a translated UI label (or another product's weekly-looking window) can never
+// be mistaken for it.
+export const CODEX_PRIMARY_LIMIT_ID = "codex";
+export const CODEX_SPARK_LIMIT_ID = "codex_bengalfox";
+export const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
+export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
+const PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES = new Set([
+  CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  CODEX_WEEKLY_ALLOWANCE_MINUTES
+]);
 // A sealed snapshot is immutable by design: the database refuses to rewrite a
 // released revision, so a week published under an earlier contract keeps being
 // served forever. A reader that accepted only the newest contract would turn
@@ -228,6 +240,42 @@ function canonicalInstant(value) {
   return Number.isFinite(epoch) && new Date(epoch).toISOString() === value
     ? value
     : null;
+}
+
+function normalizeQuotaLimitId(value) {
+  const candidate = text(value, "");
+  return candidate === CODEX_PRIMARY_LIMIT_ID || candidate === CODEX_SPARK_LIMIT_ID
+    ? candidate
+    : "unknown";
+}
+
+/**
+ * True only for the provider's normal Codex allowance track. `primary` here
+ * names the limit identifier, not its UI slot: either provider slot can carry
+ * a valid normal Codex window. This deliberately does not inspect labels.
+ */
+export function isPrimaryCodexQuotaWindow(window) {
+  return window?.limitId === CODEX_PRIMARY_LIMIT_ID
+    && PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES.has(
+      finite(window?.durationMinutes)
+    );
+}
+
+export function isPrimaryCodexWeeklyQuotaWindow(window) {
+  return window?.limitId === CODEX_PRIMARY_LIMIT_ID
+    && finite(window?.durationMinutes) === CODEX_WEEKLY_ALLOWANCE_MINUTES;
+}
+
+function quotaWindowLabel(limitId, durationMinutes) {
+  if (limitId === CODEX_PRIMARY_LIMIT_ID
+      && durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
+    return "Five-hour allowance";
+  }
+  if (limitId === CODEX_PRIMARY_LIMIT_ID
+      && durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return "Seven-day allowance";
+  }
+  return "Other observed allowance";
 }
 
 function count(value, fallback = null) {
@@ -1981,9 +2029,7 @@ function normalizeLocalTimeline(value = {}) {
       remainingPercent,
       durationMinutes,
       resetAt,
-      limitId: ["codex", "codex_bengalfox", "unknown"].includes(row?.limitId)
-        ? row.limitId
-        : "unknown",
+      limitId: normalizeQuotaLimitId(row?.limitId),
       slot: ["primary", "secondary", "unknown"].includes(row?.slot)
         ? row.slot
         : "unknown",
@@ -2166,21 +2212,14 @@ function normalizeQuota(window, index) {
   const used = finite(window?.usedPercent ?? window?.used_percent ?? window?.used, null);
   const remaining = finite(window?.remainingPercent ?? window?.remaining_percent, used === null ? null : 100 - used);
   const durationMinutes = finite(window?.durationMinutes ?? window?.duration_minutes ?? window?.windowMinutes, null);
-  const limitId = text(window?.limitId, "unknown");
-  const defaultLabel = durationMinutes === 300
-    ? "Five-hour allowance"
-    : limitId === "codex"
-      ? "Seven-day allowance"
-      : limitId === "codex_bengalfox"
-        ? "Secondary observed allowance"
-        : durationMinutes === 10080
-          ? "Provider-reported seven-day window"
-          : "Quota window";
+  const limitId = normalizeQuotaLimitId(window?.limitId);
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),
     limitId,
     slot: text(window?.slot, "unknown"),
-    label: text(window?.label, defaultLabel),
+    // Labels are fixed product copy. The raw label can be localized or
+    // provider-controlled, so it is never used to name or select a window.
+    label: quotaWindowLabel(limitId, durationMinutes),
     durationMinutes,
     usedPercent: used,
     remainingPercent: remaining,
@@ -3432,8 +3471,8 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
     generatedAt: nowIso,
     freshness: { status: "demo", latestObservedAt: nowIso, ageSeconds: 0 },
     quotaWindows: [
-      { id: "weekly", label: "Seven-day allowance", durationMinutes: 10080, usedPercent: 39, remainingPercent: 61, resetAt: iso(lastResetMs + 7 * DAY), observedAt: nowIso, planType: "pro", status: "demo" },
-      { id: "primary", label: "Five-hour allowance", durationMinutes: 300, usedPercent: 18, remainingPercent: 82, resetAt: iso(nowMs + 2 * HOUR + 11 * 60_000), observedAt: nowIso, planType: "pro", status: "demo" }
+      { id: "weekly", limitId: CODEX_PRIMARY_LIMIT_ID, durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES, usedPercent: 39, remainingPercent: 61, resetAt: iso(lastResetMs + 7 * DAY), observedAt: nowIso, planType: "pro", status: "demo" },
+      { id: "primary", limitId: CODEX_PRIMARY_LIMIT_ID, durationMinutes: CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, usedPercent: 18, remainingPercent: 82, resetAt: iso(nowMs + 2 * HOUR + 11 * 60_000), observedAt: nowIso, planType: "pro", status: "demo" }
     ],
     activity: { eventCount: 8120, safeRecordCount: 11432, lastScanAt: nowIso },
     timeline: {

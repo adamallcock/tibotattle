@@ -1,5 +1,7 @@
 import {
   CommunityClient,
+  isPrimaryCodexQuotaWindow,
+  isPrimaryCodexWeeklyQuotaWindow,
   LocalCompanionClient,
   demoDashboard,
   normalizeCommunitySnapshot,
@@ -557,13 +559,13 @@ function renderDashboard(data) {
 function renderQuotaCards(data) {
   const container = $("#quota-cards");
   clear(container);
-  const windows = data.quotaWindows;
+  const windows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
     card.innerHTML = `
       <div class="metric-card-header"><span class="metric-name">Quota observations</span><span class="evidence-chip">Insufficient</span></div>
       <strong class="metric-value">—</strong>
-      <p>The local companion has not exposed a current allowance window.</p>
+      <p>The local companion has not exposed a current normal Codex allowance window.</p>
     `;
     container.append(card);
     return;
@@ -879,6 +881,7 @@ function shareCardHome() {
 }
 
 function shareCardWindowKind(window) {
+  if (!isPrimaryCodexQuotaWindow(window)) return "other";
   const minutes = finite(window?.durationMinutes);
   if (minutes === 10_080) return "seven_day";
   if (minutes === 300) return "five_hour";
@@ -888,18 +891,18 @@ function shareCardWindowKind(window) {
 /**
  * Choose the one allowance window the card reports.
  *
- * The seven-day window is the headline the rest of the page leads with; when
- * it is absent the longest observed window stands in, so the card never has to
- * pick between two figures a reader could confuse.
+ * The seven-day normal Codex window is the headline the rest of the page leads
+ * with. A five-hour normal Codex window is used only when that weekly window is
+ * absent. Other observed quota products never stand in for either figure.
  */
 function shareCardWindow(windows) {
   const observed = (Array.isArray(windows) ? windows : [])
-    .filter((window) => finite(window?.remainingPercent) !== null);
+    .filter((window) => (
+      isPrimaryCodexQuotaWindow(window)
+      && finite(window?.remainingPercent) !== null
+    ));
   return observed.find((window) => shareCardWindowKind(window) === "seven_day")
-    ?? [...observed].sort(
-      (left, right) =>
-        finite(right?.durationMinutes, 0) - finite(left?.durationMinutes, 0),
-    )[0]
+    ?? observed.find((window) => shareCardWindowKind(window) === "five_hour")
     ?? null;
 }
 
@@ -1760,7 +1763,7 @@ function groupRolling(rows, hours) {
 
 function latestTimelineObservationMs(data) {
   const latest = data.timeline.usage.at(-1)?.endAt
-    ?? data.timeline.quota.at(-1)?.observedAt
+    ?? mainWeeklyQuotaTrack(data.timeline.quota).at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
   return Number.isFinite(latestMs) ? latestMs : null;
@@ -1914,9 +1917,7 @@ function timelineStatusIntervals(points, viewport) {
 }
 
 function mainWeeklyQuotaTrack(rows) {
-  const weeklyCodex = rows.filter(
-    (row) => row.limitId === "codex" && row.durationMinutes === 10_080,
-  );
+  const weeklyCodex = rows.filter(isPrimaryCodexWeeklyQuotaWindow);
   if (!weeklyCodex.length) return [];
   const primary = weeklyCodex.filter((row) => row.slot === "primary");
   if (primary.length) return primary;
@@ -1949,8 +1950,7 @@ function liveTimelinePoints(
   if (!usage.length) return [];
   const windowMs = windowHours * 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, rangeDays);
-  const weeklyQuota = mainWeeklyQuotaTrack(data.timeline.quota);
-  const quota = (weeklyQuota.length ? weeklyQuota : data.timeline.quota);
+  const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
   const points = [];
   let startIndex = 0;
@@ -2057,11 +2057,7 @@ function groupedUsageTimeline(data) {
 }
 
 function usagePointsWithAllowance(data, points) {
-  const preferred = mainWeeklyQuotaTrack(data.timeline.quota);
-  const fallback = data.timeline.quota.filter(
-    (row) => row.durationMinutes === 10_080 || row.limitId === "codex"
-  );
-  const quota = preferred.length ? preferred : fallback;
+  const quota = mainWeeklyQuotaTrack(data.timeline.quota);
   const quotaLookup = createQuotaTimelineLookup(quota);
   const maximumObservationAgeMs = {
     hour: 6 * 60 * 60 * 1_000,

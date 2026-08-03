@@ -22,6 +22,7 @@ struct ObservedQuotaLane: Equatable {
     let label: String
     let remainingPercent: Double
     let resetAt: Date?
+    let observedAt: Date?
     let isPrimary: Bool
 
     /// Whole-percent rendering matches the dashboard quota cards.
@@ -113,10 +114,9 @@ struct MenuBarStatusSnapshot: Equatable {
     var observedAt: Date?
     var failureSummary: String?
 
-    /// Mirrors the dashboard's primary selection while leaving every observed
-    /// lane visible in the expanded menu. When the companion has no primary
-    /// slot, the first observed lane is still a real local observation rather
-    /// than a fabricated fallback.
+    /// Mirrors the dashboard's primary selection across the normal Codex
+    /// allowance track. Other provider products are rejected while decoding,
+    /// so they cannot become a fallback for the compact title.
     var primaryLane: ObservedQuotaLane? {
         lanes.first(where: \.isPrimary) ?? lanes.first
     }
@@ -147,12 +147,12 @@ struct MenuBarStatusSnapshot: Equatable {
     /// First disabled information row, and the tooltip's first line.
     var allowanceSummary: String {
         guard !lanes.isEmpty else {
-            return "No verified quota lanes observed yet"
+            return "No verified Codex allowance observed yet"
         }
         guard companionReachable, evidence == .live else {
             return "Quota lanes were last observed, but are not current"
         }
-        return "\(lanes.count) verified quota lane\(lanes.count == 1 ? "" : "s")"
+        return "\(lanes.count) verified Codex allowance\(lanes.count == 1 ? "" : "s")"
     }
 
     /// Second disabled information row: why the title says what it says.
@@ -223,7 +223,13 @@ struct MenuBarStatusSnapshot: Equatable {
 
 private let analyzingPlaceholder = "…"
 private let unknownPlaceholder = "–"
+private let codexPrimaryLimitId = "codex"
+private let fiveHourWindowDurationMinutes = 300
 private let weeklyWindowDurationMinutes = 10_080
+private let supportedCodexAllowanceWindowDurations: Set<Int> = [
+    fiveHourWindowDurationMinutes,
+    weeklyWindowDurationMinutes
+]
 private let defaultStaleAfterSeconds: Double = 30 * 60
 
 /// Deterministic, locale-independent age wording. Deliberately coarse: the
@@ -287,7 +293,7 @@ enum LocalCompanionOverviewProjection {
         let rows = root["quotaWindows"] as? [[String: Any]]
             ?? quota?["windows"] as? [[String: Any]]
             ?? []
-        let lanes = rows.enumerated().compactMap { index, row -> ObservedQuotaLane? in
+        let lanes = rows.compactMap { row -> ObservedQuotaLane? in
             guard let number = row["remainingPercent"] as? NSNumber else {
                 return nil
             }
@@ -297,25 +303,28 @@ enum LocalCompanionOverviewProjection {
             }
             let limitId = row["limitId"] as? String ?? "unknown"
             let duration = (row["durationMinutes"] as? NSNumber)?.intValue
-            let slot = row["slot"] as? String
+            guard Self.isSupportedCodexAllowance(
+                limitId: limitId,
+                durationMinutes: duration
+            ), let duration else {
+                return nil
+            }
             return ObservedQuotaLane(
-                label: laneLabel(
-                    limitId: limitId,
-                    durationMinutes: duration,
-                    index: index
-                ),
+                label: laneLabel(durationMinutes: duration),
                 remainingPercent: remaining,
                 resetAt: timestamp(row["resetAt"]),
-                isPrimary: limitId == "codex"
-                    && duration == weeklyWindowDurationMinutes
-                    && slot == "primary"
+                observedAt: timestamp(row["observedAt"]),
+                // The seven-day base Codex limit is the primary status item
+                // regardless of the provider's transient slot label.
+                isPrimary: duration == weeklyWindowDurationMinutes
             )
         }.sorted { left, right in
             if left.isPrimary != right.isPrimary { return left.isPrimary }
             return left.label.localizedStandardCompare(right.label) == .orderedAscending
         }
-        let observedAt = timestamp(quota?["observedAt"])
-            ?? rows.compactMap { timestamp($0["observedAt"]) }.max()
+        // Never borrow the aggregate timestamp from a separate quota product:
+        // freshness must be evidence from the normal Codex allowance itself.
+        let observedAt = lanes.compactMap(\.observedAt).max()
         let staleAfter = freshness?["staleAfterSeconds"] as? Double
         return LocalCompanionOverview(
             lanes: lanes,
@@ -341,24 +350,26 @@ enum LocalCompanionOverviewProjection {
     }
 
     /// The overview intentionally carries no free-form labels. This fixed
-    /// vocabulary gives every supported observed lane a readable, privacy-safe
+    /// vocabulary gives the normal Codex allowance a readable, privacy-safe
     /// name without surfacing provider/account identifiers from raw records.
-    private static func laneLabel(
+    private static func isSupportedCodexAllowance(
         limitId: String,
-        durationMinutes: Int?,
-        index: Int
+        durationMinutes: Int?
+    ) -> Bool {
+        guard limitId == codexPrimaryLimitId,
+              let durationMinutes else {
+            return false
+        }
+        return supportedCodexAllowanceWindowDurations.contains(durationMinutes)
+    }
+
+    private static func laneLabel(
+        durationMinutes: Int
     ) -> String {
-        if durationMinutes == 300 { return "Five-hour allowance" }
-        if limitId == "codex" && durationMinutes == weeklyWindowDurationMinutes {
-            return "Seven-day allowance"
+        if durationMinutes == fiveHourWindowDurationMinutes {
+            return "Five-hour allowance"
         }
-        if limitId == "codex_bengalfox" {
-            return "Secondary observed allowance"
-        }
-        if durationMinutes == weeklyWindowDurationMinutes {
-            return "Observed seven-day allowance"
-        }
-        return "Observed quota lane \(index + 1)"
+        return "Seven-day allowance"
     }
 }
 
