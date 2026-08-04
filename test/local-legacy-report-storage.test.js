@@ -3,6 +3,7 @@ import {
   appendFile,
   mkdtemp,
   mkdir,
+  readdir,
   readFile,
   rm,
   stat,
@@ -17,6 +18,7 @@ import {
   inspectLocalLegacyReportMigration,
   localLegacyReportPath,
   migrateLocalLegacyReports,
+  writeLocalLegacyReport,
   resolveLocalLegacyReportReadPath,
 } from "../src/local-legacy-report-storage.js";
 
@@ -103,6 +105,25 @@ test("read resolution prefers the canonical report but preserves old root report
   }
 });
 
+test("canonical report writes replace atomically, remain owner-only, and clean their exact staging file", async () => {
+  const root = await fixtureRoot();
+  const destination = localLegacyReportPath(root, "artifact.json");
+  const reportDirectory = join(root, ".usage-monitor", "legacy-reports");
+  try {
+    assert.equal(await writeLocalLegacyReport(root, "artifact.json", "first\n"), destination);
+    assert.equal(await readFile(destination, "utf8"), "first\n");
+    assert.equal((await stat(destination)).mode & 0o777, 0o600);
+    assert.deepEqual(await readdir(reportDirectory), ["artifact.json"]);
+
+    assert.equal(await writeLocalLegacyReport(root, "artifact.json", "second\n"), destination);
+    assert.equal(await readFile(destination, "utf8"), "second\n");
+    assert.equal((await stat(destination)).mode & 0o777, 0o600);
+    assert.deepEqual(await readdir(reportDirectory), ["artifact.json"]);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("canonical final and ancestor symlinks are rejected before a report read or write", async () => {
   const root = await fixtureRoot();
   const outside = await fixtureRoot();
@@ -118,6 +139,10 @@ test("canonical final and ancestor symlinks are rejected before a report read or
       { code: "unsafe_report_path" },
     );
     await assert.rejects(ensureLocalLegacyReportDirectory(root), { code: "unsafe_report_path" });
+    await assert.rejects(
+      writeLocalLegacyReport(root, "artifact.json", "must not publish\n"),
+      { code: "unsafe_report_path" },
+    );
     assert.equal(await readFile(outsideSecret, "utf8"), "must remain private\n");
 
     await rm(join(root, ".usage-monitor"), { force: true, recursive: true });
@@ -127,6 +152,10 @@ test("canonical final and ancestor symlinks are rejected before a report read or
       { code: "unsafe_report_path" },
     );
     await assert.rejects(ensureLocalLegacyReportDirectory(root), { code: "unsafe_report_path" });
+    await assert.rejects(
+      writeLocalLegacyReport(root, "artifact.json", "must not publish\n"),
+      { code: "unsafe_report_path" },
+    );
     assert.equal(await readFile(outsideSecret, "utf8"), "must remain private\n");
   } finally {
     await rm(root, { force: true, recursive: true });

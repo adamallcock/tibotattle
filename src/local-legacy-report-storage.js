@@ -1,13 +1,14 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   link,
   lstat,
   mkdir,
   open,
+  rename,
   unlink,
 } from "node:fs/promises";
-import { join, parse, relative, resolve, sep } from "node:path";
+import { basename, join, parse, relative, resolve, sep } from "node:path";
 import {
   assertOwnerControlledDirectory,
   syncDirectory,
@@ -18,6 +19,7 @@ const LOCAL_STATE_DIRECTORY = ".usage-monitor";
 const LOCAL_LEGACY_REPORT_DIRECTORY_NAME = "legacy-reports";
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const DIRECTORY = constants.O_DIRECTORY ?? 0;
+const WRITE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW;
 
 export const LOCAL_LEGACY_REPORT_FILENAMES = Object.freeze([
   "2026-07-23-codex-weekly-limit-history-report.html",
@@ -110,6 +112,275 @@ async function assertSafePathComponents(path, label, options = {}) {
   return inspected;
 }
 
+function identityFingerprint(metadata) {
+  return Object.freeze({
+    dev: String(metadata.dev),
+    ino: String(metadata.ino),
+  });
+}
+
+function sameIdentity(left, right) {
+  return left?.dev === right?.dev && left?.ino === right?.ino;
+}
+
+function reportContentBytes(content) {
+  if (typeof content === "string") return Buffer.from(content, "utf8");
+  if (Buffer.isBuffer(content) || content instanceof Uint8Array) return Buffer.from(content);
+  throw new TypeError("Legacy report content must be a string, Buffer, or Uint8Array");
+}
+
+function reportPathAnchor(path, anchor) {
+  return anchor === null ? parse(resolve(path)).root : resolve(anchor);
+}
+
+async function assertReportDirectory(path, anchor, expectedIdentity = null) {
+  const inspected = await assertSafePathComponents(path, "Legacy report directory", { anchor });
+  if (inspected.status !== "present"
+      || !inspected.metadata.isDirectory()
+      || inspected.metadata.isSymbolicLink()
+      || !isOwner(inspected.metadata)
+      || (process.platform !== "win32" && (inspected.metadata.mode & 0o077) !== 0)) {
+    throw ownError("unsafe_directory", "Legacy report directory must be a private owner directory.");
+  }
+  const identity = identityFingerprint(inspected.metadata);
+  if (expectedIdentity !== null && !sameIdentity(identity, expectedIdentity)) {
+    throw ownError("unsafe_directory", "Legacy report directory changed during report publication.");
+  }
+  return { identity, metadata: inspected.metadata };
+}
+
+async function syncLegacyReportDirectory(path, anchor, expectedIdentity) {
+  await assertReportDirectory(path, anchor, expectedIdentity);
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | DIRECTORY | NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isDirectory() || opened.isSymbolicLink() || !isOwner(opened)
+        || !sameIdentity(identityFingerprint(opened), expectedIdentity)) {
+      throw ownError("unsafe_directory", "Legacy report directory changed during durability sync.");
+    }
+    await handle.sync();
+    const after = await handle.stat();
+    if (!after.isDirectory() || after.isSymbolicLink() || !isOwner(after)
+        || !sameIdentity(identityFingerprint(after), expectedIdentity)) {
+      throw ownError("unsafe_directory", "Legacy report directory changed during durability sync.");
+    }
+    await assertReportDirectory(path, anchor, expectedIdentity);
+  } catch (error) {
+    if (error?.code === "ELOOP" || error?.code === "ENOTDIR" || error?.code === "ENOENT") {
+      throw ownError("unsafe_directory", "Legacy report directory path is unsafe.");
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function inspectReportDestination(path, anchor, label) {
+  const inspected = await assertSafePathComponents(path, label, { anchor });
+  if (inspected.status === "missing") return null;
+  if (!inspected.metadata.isFile() || inspected.metadata.isSymbolicLink()
+      || !isOwner(inspected.metadata) || inspected.metadata.nlink !== 1) {
+    throw ownError("unsafe_report_path", "Canonical legacy report must be an owner-only regular file.");
+  }
+  return identityFingerprint(inspected.metadata);
+}
+
+async function assertStagedReport(path, anchor, expectedIdentity, expectedBytes) {
+  const inspected = await assertSafePathComponents(path, "Staged legacy report path", { anchor });
+  if (inspected.status !== "present"
+      || !inspected.metadata.isFile()
+      || inspected.metadata.isSymbolicLink()
+      || !isOwner(inspected.metadata)
+      || inspected.metadata.nlink !== 1
+      || inspected.metadata.size !== expectedBytes
+      || !sameIdentity(identityFingerprint(inspected.metadata), expectedIdentity)) {
+    throw ownError("unsafe_destination", "Staged legacy report path changed during publication.");
+  }
+  return inspected.metadata;
+}
+
+async function unlinkExactStagedReport(path, expectedIdentity, directory, anchor, expectedDirectoryIdentity) {
+  if (expectedIdentity === null) return;
+  try {
+    await assertReportDirectory(directory, anchor, expectedDirectoryIdentity);
+    const stagedPath = await assertSafePathComponents(path, "Staged legacy report path", { anchor });
+    if (stagedPath.status !== "present") return;
+    const current = await lstat(path);
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
+        || !isOwner(current) || !sameIdentity(identityFingerprint(current), expectedIdentity)) return;
+    await unlink(path);
+  } catch (error) {
+    if (error?.code !== "ENOENT") return;
+  }
+}
+
+/**
+ * Writes one owner-only report through a private same-directory staging file.
+ * The pathname checks and final revalidation intentionally remain in addition
+ * to O_NOFOLLOW: Node does not expose renameat/openat, so a hostile same-UID
+ * process can still rename an ancestor between the last check and rename.
+ */
+async function writeSafeLegacyReportPath(path, content, {
+  anchor = null,
+  label = "Legacy report path",
+  ensureDirectory = false,
+} = {}) {
+  const absolutePath = resolve(path);
+  const pathAnchor = reportPathAnchor(absolutePath, anchor);
+  const directory = parse(absolutePath).dir;
+  const bytes = reportContentBytes(content);
+
+  if (NOFOLLOW === 0) {
+    throw ownError("unsafe_destination", "Legacy report publication requires no-follow filesystem support.");
+  }
+  if (ensureDirectory) await ensureLocalLegacyReportDirectory(pathAnchor);
+
+  const directoryState = await assertReportDirectory(directory, pathAnchor);
+  await inspectReportDestination(absolutePath, pathAnchor, label);
+
+  const stagedPath = join(
+    directory,
+    `.${basename(absolutePath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let handle;
+  let stagedIdentity = null;
+  let published = false;
+  try {
+    const stagedBeforeOpen = await assertSafePathComponents(
+      stagedPath,
+      "Staged legacy report path",
+      { anchor: pathAnchor },
+    );
+    if (stagedBeforeOpen.status !== "missing") {
+      throw ownError("unsafe_destination", "Staged legacy report path already exists.");
+    }
+    handle = await open(stagedPath, WRITE_FLAGS, 0o600);
+    const created = await handle.stat();
+    stagedIdentity = identityFingerprint(created);
+    if (!created.isFile() || created.isSymbolicLink() || !isOwner(created) || created.nlink !== 1) {
+      throw ownError("unsafe_destination", "Staged legacy report is not an owner-only regular file.");
+    }
+    await handle.chmod(0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    const written = await handle.stat();
+    if (!written.isFile() || written.isSymbolicLink() || !isOwner(written)
+        || written.nlink !== 1 || written.size !== bytes.byteLength
+        || (process.platform !== "win32" && (written.mode & 0o077) !== 0)
+        || !sameIdentity(identityFingerprint(written), stagedIdentity)) {
+      throw ownError("unsafe_destination", "Staged legacy report failed validation.");
+    }
+    await assertStagedReport(stagedPath, pathAnchor, stagedIdentity, bytes.byteLength);
+    await assertReportDirectory(directory, pathAnchor, directoryState.identity);
+    await inspectReportDestination(absolutePath, pathAnchor, label);
+    await handle.close();
+    handle = null;
+    // Re-check the staged pathname after closing the descriptor and immediately
+    // before rename; no-follow on the initial open cannot protect a later
+    // pathname replacement by another same-UID process.
+    await assertStagedReport(stagedPath, pathAnchor, stagedIdentity, bytes.byteLength);
+    await assertReportDirectory(directory, pathAnchor, directoryState.identity);
+    await inspectReportDestination(absolutePath, pathAnchor, label);
+
+    try {
+      await rename(stagedPath, absolutePath);
+    } catch (error) {
+      if (error?.code === "ELOOP" || error?.code === "ENOTDIR") {
+        throw ownError("unsafe_report_path", "Legacy report destination path is unsafe.");
+      }
+      throw error;
+    }
+    published = true;
+    const publishedMetadata = await assertSafePathComponents(
+      absolutePath,
+      label,
+      { anchor: pathAnchor },
+    );
+    if (publishedMetadata.status !== "present"
+        || !publishedMetadata.metadata.isFile()
+        || publishedMetadata.metadata.isSymbolicLink()
+        || !isOwner(publishedMetadata.metadata)
+        || publishedMetadata.metadata.nlink !== 1
+        || publishedMetadata.metadata.size !== bytes.byteLength
+        || (process.platform !== "win32" && (publishedMetadata.metadata.mode & 0o077) !== 0)
+        || !sameIdentity(identityFingerprint(publishedMetadata.metadata), stagedIdentity)) {
+      throw ownError("unsafe_report_path", "Published legacy report failed validation.");
+    }
+    await syncLegacyReportDirectory(directory, pathAnchor, directoryState.identity);
+    return absolutePath;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (!published) {
+      await unlinkExactStagedReport(
+        stagedPath,
+        stagedIdentity,
+        directory,
+        pathAnchor,
+        directoryState.identity,
+      );
+    }
+    if (error?.code === "ELOOP" || error?.code === "ENOTDIR") {
+      throw ownError("unsafe_report_path", "Legacy report destination path is unsafe.");
+    }
+    throw error;
+  }
+}
+
+async function readSafeLegacyReportPath(path, {
+  anchor = null,
+  label = "Legacy report path",
+} = {}) {
+  if (NOFOLLOW === 0) {
+    throw ownError("unsafe_report_path", "Legacy report reads require no-follow filesystem support.");
+  }
+  const absolutePath = resolve(path);
+  const pathAnchor = reportPathAnchor(absolutePath, anchor);
+  const inspected = await assertSafePathComponents(absolutePath, label, { anchor: pathAnchor });
+  if (inspected.status !== "present") {
+    const error = ownError("report_not_found", "Legacy report does not exist.");
+    error.path = absolutePath;
+    throw error;
+  }
+  if (!inspected.metadata.isFile() || inspected.metadata.isSymbolicLink()) {
+    throw ownError("unsafe_report_path", "Legacy report must be a regular file.");
+  }
+  let handle;
+  try {
+    handle = await open(absolutePath, constants.O_RDONLY | NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.isSymbolicLink()) {
+      throw ownError("unsafe_report_path", "Legacy report must be a regular file.");
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat();
+    if (!sameIdentity(identityFingerprint(after), identityFingerprint(opened))
+        || after.size !== opened.size) {
+      throw ownError("unsafe_report_path", "Legacy report changed during read.");
+    }
+    const pathAfterRead = await assertSafePathComponents(absolutePath, label, { anchor: pathAnchor });
+    if (pathAfterRead.status !== "present"
+        || !pathAfterRead.metadata.isFile()
+        || pathAfterRead.metadata.isSymbolicLink()
+        || !sameIdentity(identityFingerprint(pathAfterRead.metadata), identityFingerprint(opened))) {
+      throw ownError("unsafe_report_path", "Legacy report path changed during read.");
+    }
+    return bytes.toString("utf8");
+  } catch (error) {
+    if (error?.code === "ELOOP" || error?.code === "ENOTDIR") {
+      throw ownError("unsafe_report_path", "Legacy report path is unsafe.");
+    }
+    if (error?.code === "ENOENT") {
+      const notFound = ownError("report_not_found", "Legacy report does not exist.");
+      notFound.path = absolutePath;
+      throw notFound;
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
 async function chmodOwnerOnlyDirectory(path, anchor) {
   let handle;
   try {
@@ -197,6 +468,46 @@ export function localLegacyReportRelativePath(filename) {
 export function localLegacyReportPath(root, filename) {
   assertKnownFilename(filename);
   return join(localLegacyReportDirectory(root), filename);
+}
+
+/**
+ * Publishes a canonical legacy report atomically into the owner-only report
+ * directory. Every canonical report builder uses this entry point rather than
+ * writing the destination pathname directly.
+ */
+export async function writeLocalLegacyReport(root, filename, content) {
+  assertKnownFilename(filename);
+  const ownerRoot = canonicalRoot(root);
+  return writeSafeLegacyReportPath(localLegacyReportPath(root, filename), content, {
+    anchor: ownerRoot,
+    label: "Canonical legacy report path",
+    ensureDirectory: true,
+  });
+}
+
+/**
+ * Safely rewrites an explicitly supplied report path. The parent must already
+ * be a private owner directory; callers cannot accidentally turn a symlink
+ * into a followed write.
+ */
+export async function writeLegacyReportPath(path, content, options = {}) {
+  return writeSafeLegacyReportPath(path, content, options);
+}
+
+export async function readLegacyReportPath(path, options = {}) {
+  return readSafeLegacyReportPath(path, options);
+}
+
+export async function readLocalLegacyReport(root, filename) {
+  assertKnownFilename(filename);
+  const ownerRoot = canonicalRoot(root);
+  const sourcePath = await resolveLocalLegacyReportReadPath(root, filename);
+  return readSafeLegacyReportPath(sourcePath, {
+    anchor: ownerRoot,
+    label: sourcePath === localLegacyReportPath(root, filename)
+      ? "Canonical legacy report path"
+      : "Legacy report path",
+  });
 }
 
 export function legacyRootReportPath(root, filename) {

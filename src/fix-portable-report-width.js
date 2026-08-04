@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
-import { chmod, readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import {
   localLegacyReportPath,
+  readLegacyReportPath,
+  readLocalLegacyReport,
+  writeLegacyReportPath,
+  writeLocalLegacyReport,
 } from "./local-legacy-report-storage.js";
 
 const STYLE = `<style data-app-usagemonitor-width-fix>
@@ -27,15 +30,16 @@ export function applyPortableWidthFix(html) {
 }
 
 async function main() {
-  const target = process.argv[2]
-    ? resolve(process.argv[2])
-    : localLegacyReportPath(
-      process.cwd(),
-      "2026-07-24-codex-work-account-usage-report.html",
-    );
-  const html = await readFile(target, "utf8");
-  await writeFile(target, applyPortableWidthFix(html), "utf8");
-  await chmod(target, 0o600);
+  const root = process.cwd();
+  const filename = "2026-07-24-codex-work-account-usage-report.html";
+  const explicitTarget = process.argv[2] ? resolve(process.argv[2]) : null;
+  const target = explicitTarget ?? localLegacyReportPath(root, filename);
+  const html = explicitTarget
+    ? await readLegacyReportPath(explicitTarget)
+    : await readLocalLegacyReport(root, filename);
+  const fixed = applyPortableWidthFix(html);
+  if (explicitTarget) await writeLegacyReportPath(explicitTarget, fixed);
+  else await writeLocalLegacyReport(root, filename, fixed);
   console.log(`Portable width fix applied to ${target}`);
 }
 

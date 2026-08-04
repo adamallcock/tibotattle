@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   analyzeFastDiagnostic,
@@ -8,8 +8,8 @@ import {
   summarizeSlotSemantics,
 } from "./simple-quota-gradient.js";
 import {
-  ensureLocalLegacyReportDirectory,
   localLegacyReportPath,
+  writeLocalLegacyReport,
 } from "./local-legacy-report-storage.js";
 
 const root = process.cwd();
@@ -789,7 +789,5 @@ const artifact = {
   ],
 };
 
-await ensureLocalLegacyReportDirectory(root);
-await writeFile(outputPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-await chmod(outputPath, 0o600);
+await writeLocalLegacyReport(root, "2026-07-24-simple-quota-gradient-artifact.json", `${JSON.stringify(artifact, null, 2)}\n`);
 process.stdout.write(`${JSON.stringify({ outputPath, generatedAt, selectedReset: selected, gradient, history: historySummary }, null, 2)}\n`);

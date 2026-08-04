@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
-  ensureLocalLegacyReportDirectory,
   localLegacyReportPath,
-  resolveLocalLegacyReportReadPath,
+  readLocalLegacyReport,
+  writeLocalLegacyReport,
 } from "./local-legacy-report-storage.js";
 
 const root = process.cwd();
-const artifactPath = await resolveLocalLegacyReportReadPath(root, "artifact.json");
 const outputPath = localLegacyReportPath(root, "artifact.json");
 const crosscheckPath = resolve(root, ".usage-monitor/provider-crosscheck-v0.1.json");
 const planPath = resolve(root, ".usage-monitor/account-plan-timeline-v0.1.json");
 
-const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
+const artifact = JSON.parse(await readLocalLegacyReport(root, "artifact.json"));
 const crosscheck = JSON.parse(await readFile(crosscheckPath, "utf8"));
 const planTimeline = JSON.parse(await readFile(planPath, "utf8"));
 
@@ -514,7 +513,5 @@ artifact.manifest.description = artifact.manifest.description.endsWith(` ${exten
   ? artifact.manifest.description
   : `${artifact.manifest.description} ${extensionDescription}`;
 
-await ensureLocalLegacyReportDirectory(root);
-await writeFile(outputPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-await chmod(outputPath, 0o600);
+await writeLocalLegacyReport(root, "artifact.json", `${JSON.stringify(artifact, null, 2)}\n`);
 console.log(`Extended portable artifact written to ${outputPath}`);

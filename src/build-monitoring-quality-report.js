@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
-  ensureLocalLegacyReportDirectory,
   localLegacyReportPath,
+  writeLocalLegacyReport,
 } from "./local-legacy-report-storage.js";
 
 const root = process.cwd();
@@ -351,7 +351,5 @@ const artifact = {
   ],
 };
 
-await ensureLocalLegacyReportDirectory(root);
-await writeFile(outputPath, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-await chmod(outputPath, 0o600);
+await writeLocalLegacyReport(root, "2026-07-24-monitoring-quality-artifact.json", `${JSON.stringify(artifact, null, 2)}\n`);
 process.stdout.write(`${JSON.stringify({ outputPath, generatedAt, charts: artifact.manifest.charts.length, tables: artifact.manifest.tables.length }, null, 2)}\n`);
