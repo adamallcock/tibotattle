@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import {
   mkdtemp,
   mkdir,
@@ -247,6 +248,53 @@ function buildFixtureSite(args, overrides = {}) {
   });
 }
 
+async function serveReleaseOutput(output) {
+  const routeFiles = new Map([
+    ["/", "index.html"],
+    ["/community", "community.html"],
+    ["/community/", "community.html"],
+    ["/privacy", "privacy.html"],
+    ["/privacy/", "privacy.html"],
+    ["/docs", "docs.html"],
+    ["/docs/", "docs.html"],
+  ]);
+  const server = createServer(async (request, response) => {
+    if (request.method !== "GET") {
+      response.writeHead(405, { "content-type": "text/plain; charset=utf-8" });
+      response.end("method_not_allowed");
+      return;
+    }
+    const pathname = new URL(
+      request.url ?? "/",
+      "http://release-site.test",
+    ).pathname;
+    const knownRoute = routeFiles.has(pathname);
+    const filename = routeFiles.get(pathname) ?? "404.html";
+    try {
+      const body = await readFile(join(output, filename));
+      response.writeHead(knownRoute ? 200 : 404, {
+        "content-type": "text/html; charset=utf-8",
+      });
+      response.end(body);
+    } catch {
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      response.end("release_route_missing");
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    }),
+  };
+}
+
 test("release-site build verifies artifacts and materializes complete public metadata", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
@@ -264,7 +312,7 @@ test("release-site build verifies artifacts and materializes complete public met
     },
   });
 
-  assert.equal(result.fileCount, 10);
+  assert.equal(result.fileCount, 12);
   assert.deepEqual(validatedArtifacts, [[
     value.installerPath,
     { production: true },
@@ -349,7 +397,9 @@ test("release-site build verifies artifacts and materializes complete public met
   assert.deepEqual(
     manifest.files.map(({ path }) => path),
     [
+      "404.html",
       "community-view.js",
+      "community.html",
       "community.js",
       "index.html",
       "localization.js",
@@ -406,6 +456,93 @@ test("no-installer release-site build succeeds without installer claims and disa
     JSON.stringify(manifest),
     /verified(?:FromLocalArtifact|SignedReleaseEvidence)/u,
   );
+});
+
+test("public static routes keep root, community, privacy, and fallback out of the loopback dashboard", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const noInstallerArgs = {
+    ...releaseArgs(value),
+    source: PUBLIC_SOURCE,
+  };
+  for (const key of [
+    "installerPath",
+    "installerReleaseManifest",
+    "installerUrl",
+    "installerVersion",
+    "installerSha256",
+    "minimumMacos",
+    "architectures",
+  ]) {
+    delete noInstallerArgs[key];
+  }
+  await buildFixtureSite(noInstallerArgs);
+  const routeServer = await serveReleaseOutput(value.output);
+  t.after(() => routeServer.close());
+
+  const responses = new Map();
+  for (const [route, expectedStatus] of [
+    ["/", 200],
+    ["/community", 200],
+    ["/privacy", 200],
+    ["/unknown/fallback", 404],
+  ]) {
+    const response = await fetch(`${routeServer.baseUrl}${route}`);
+    assert.equal(response.status, expectedStatus, route);
+    responses.set(route, await response.text());
+  }
+
+  const root = responses.get("/");
+  const community = responses.get("/community");
+  const privacy = responses.get("/privacy");
+  const fallback = responses.get("/unknown/fallback");
+  for (const [route, html] of responses) {
+    assert.match(html, /TiboTattle/u, route);
+    assert.doesNotMatch(
+      html,
+      /community allowance|best guess|automatic updates?/iu,
+      route,
+    );
+    for (const forbidden of [
+      'src="./app.js"',
+      'src="./data-client.js"',
+      'src="./navigation.js"',
+      'id="refresh-button"',
+      'id="contribution-form"',
+      'id="identity-signin"',
+      'class="dashboard-shell"',
+      "data-dashboard-page=",
+      "/api/local/",
+    ]) {
+      assert.equal(html.includes(forbidden), false, `${route}: ${forbidden}`);
+    }
+  }
+  assert.match(root, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
+  assert.match(root, /id="community-result"/u);
+  assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
+  assert.match(root, /Signed release coming soon\./u);
+  assert.equal(community, root, "the community route must use the public entry alias");
+  assert.match(privacy, /<h1>Your dashboard belongs on your Mac\.<\/h1>/u);
+  assert.match(privacy, /This website cannot read local Codex files\./u);
+  assert.doesNotMatch(privacy, /<script\b/iu);
+  assert.equal(fallback, root, "the fallback must return the public entry, not the dashboard");
+
+  for (const forbiddenAsset of [
+    "app.js",
+    "data-client.js",
+    "lib.js",
+    "navigation.js",
+    "telemetry-envelope.js",
+    "telemetry-shared.generated.js",
+  ]) {
+    const response = await fetch(`${routeServer.baseUrl}/${forbiddenAsset}`);
+    assert.equal(response.status, 404, forbiddenAsset);
+    assert.doesNotMatch(await response.text(), /LocalCompanionClient|id="refresh-button"/u);
+  }
+
+  const loopbackDashboard = await readFile(join(PUBLIC_SOURCE, "index.html"), "utf8");
+  assert.match(loopbackDashboard, /<script type="module" src="\.\/app\.js"><\/script>/u);
+  assert.match(loopbackDashboard, /id="refresh-button"/u);
 });
 
 test("arbitrary text fixture with a matching caller hash cannot enable installer metadata", async (t) => {
@@ -501,7 +638,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 18);
+  assert.equal(result.fileCount, 20);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -510,9 +647,11 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.deepEqual(
     manifest.files.map(({ path }) => path),
     [
+      "404.html",
       "apple.svg",
       "community-data.js",
       "community-view.js",
+      "community.html",
       "community.js",
       "docs.html",
       "github.svg",
@@ -639,6 +778,44 @@ test("release-site build rejects an unreviewed script reference", async (t) => {
   await assert.rejects(
     buildFixtureSite(releaseArgs(value)),
     /Public HTML may load only community\.js/u,
+  );
+});
+
+test("release-site build fails closed before staging dashboard-only source", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  await writeFile(
+    join(value.source, "data-client.js"),
+    "export const localOnly = true;\n",
+  );
+  await writeFile(
+    join(value.source, "community.js"),
+    'import "./data-client.js";\nexport const publicEntry = true;\n',
+  );
+  await assert.rejects(
+    buildFixtureSite(releaseArgs(value)),
+    /dashboard-only source: data-client\.js/u,
+  );
+  await assert.rejects(
+    readFile(join(value.output, "release-site-manifest.json")),
+    { code: "ENOENT" },
+  );
+
+  await writeFile(
+    join(value.source, "community.js"),
+    'export const publicEntry = true;\n',
+  );
+  await writeFile(
+    join(value.source, "community.html"),
+    `${sourceHtml()}<section class="dashboard-shell"></section>\n`,
+  );
+  await assert.rejects(
+    buildFixtureSite(releaseArgs(value)),
+    /local-only route or control: class="dashboard-shell"/u,
+  );
+  await assert.rejects(
+    readFile(join(value.output, "release-site-manifest.json")),
+    { code: "ENOENT" },
   );
 });
 
