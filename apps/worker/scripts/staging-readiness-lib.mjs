@@ -58,9 +58,12 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0024_apple_signin_nonce_binding.sql",
     "0025_device_lifecycle.sql",
     "0026_signin_start_admission.sql",
+    "0027_identity_reenrollment_cooldown_guard.sql",
+    "0028_identity_link_secret_configuration.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
+    "0002_identity_reenrollment_cooldown.sql",
   ]),
 });
 export const REQUIRED_RATE_LIMITS = Object.freeze([
@@ -83,6 +86,7 @@ export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   UPLOAD_INGRESS_BURST: "16",
   UPLOAD_INGRESS_LEASE_SECONDS: "90",
   SIGN_IN_START_MAX_PER_MINUTE: "5",
+  IDENTITY_LINK_SECRET_VERSION: "staging-v1",
 });
 export const REQUIRED_INGRESS_DURABLE_OBJECT_BINDING = Object.freeze({
   name: "UPLOAD_INGRESS_BUDGET",
@@ -94,6 +98,157 @@ export const REQUIRED_INGRESS_DURABLE_OBJECT_MIGRATION = Object.freeze({
 });
 export const GENERATED_WORKER_ASSET_DIRECTORY =
   "../../.release-build/worker-assets";
+
+const PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
+  cooldownTable: "primary_cooldown_table",
+  participantCooldownDigestColumn: "primary_participant_cooldown_digest",
+  cooldownDigestColumn: "primary_cooldown_digest",
+  cooldownSchemaVersionColumn: "primary_cooldown_schema_version",
+  cooldownDeletedAtColumn: "primary_cooldown_deleted_at",
+  cooldownRetainUntilColumn: "primary_cooldown_retain_until",
+  cooldownRetentionIndex: "primary_cooldown_retention_index",
+  cooldownRetentionIndexShape: "primary_cooldown_retention_index_shape",
+  cooldownGuardTrigger: "primary_cooldown_guard_trigger",
+});
+
+const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
+  tombstoneTable: "deletion_tombstone_table",
+  tombstoneParticipantDigestColumn: "deletion_tombstone_participant_digest",
+  tombstoneSchemaVersionColumn: "deletion_tombstone_schema_version",
+  tombstoneDeletedAtColumn: "deletion_tombstone_deleted_at",
+  tombstoneRetainUntilColumn: "deletion_tombstone_retain_until",
+  tombstoneRetentionIndex: "deletion_tombstone_retention_index",
+  tombstoneRetentionIndexShape: "deletion_tombstone_retention_index_shape",
+  cooldownTable: "deletion_cooldown_table",
+  cooldownDigestColumn: "deletion_cooldown_digest",
+  cooldownSchemaVersionColumn: "deletion_cooldown_schema_version",
+  cooldownDeletedAtColumn: "deletion_cooldown_deleted_at",
+  cooldownRetainUntilColumn: "deletion_cooldown_retain_until",
+  cooldownRetentionIndex: "deletion_cooldown_retention_index",
+  cooldownRetentionIndexShape: "deletion_cooldown_retention_index_shape",
+});
+
+const PRIMARY_IDENTITY_PROTECTION_SCHEMA_SQL = `
+SELECT
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_reenrollment_cooldowns'
+  ) AS primary_cooldown_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('participants')
+     WHERE name = 'identity_cooldown_digest'
+  ) AS primary_participant_cooldown_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'identity_cooldown_digest'
+  ) AS primary_cooldown_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'schema_version'
+  ) AS primary_cooldown_schema_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'deleted_at'
+  ) AS primary_cooldown_deleted_at,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'retain_until'
+  ) AS primary_cooldown_retain_until,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'index'
+       AND name = 'identity_reenrollment_cooldowns_retention'
+  ) AS primary_cooldown_retention_index,
+  COALESCE((
+    SELECT group_concat(name, ',')
+      FROM (
+        SELECT name
+          FROM pragma_index_info('identity_reenrollment_cooldowns_retention')
+         ORDER BY seqno
+      )
+  ), '') = 'retain_until,identity_cooldown_digest'
+    AS primary_cooldown_retention_index_shape,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'trigger'
+       AND name = 'participants_identity_reenrollment_cooldown_guard'
+  ) AS primary_cooldown_guard_trigger;
+`;
+
+const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_SQL = `
+SELECT
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'deletion_tombstones'
+  ) AS deletion_tombstone_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'participant_digest'
+  ) AS deletion_tombstone_participant_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'schema_version'
+  ) AS deletion_tombstone_schema_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'deleted_at'
+  ) AS deletion_tombstone_deleted_at,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'retain_until'
+  ) AS deletion_tombstone_retain_until,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'index'
+       AND name = 'deletion_tombstones_retention'
+  ) AS deletion_tombstone_retention_index,
+  COALESCE((
+    SELECT group_concat(name, ',')
+      FROM (
+        SELECT name
+          FROM pragma_index_info('deletion_tombstones_retention')
+         ORDER BY seqno
+      )
+  ), '') = 'retain_until,participant_digest'
+    AS deletion_tombstone_retention_index_shape,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_reenrollment_cooldowns'
+  ) AS deletion_cooldown_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'identity_cooldown_digest'
+  ) AS deletion_cooldown_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'schema_version'
+  ) AS deletion_cooldown_schema_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'deleted_at'
+  ) AS deletion_cooldown_deleted_at,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'retain_until'
+  ) AS deletion_cooldown_retain_until,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'index'
+       AND name = 'identity_reenrollment_cooldowns_retention'
+  ) AS deletion_cooldown_retention_index,
+  COALESCE((
+    SELECT group_concat(name, ',')
+      FROM (
+        SELECT name
+          FROM pragma_index_info('identity_reenrollment_cooldowns_retention')
+         ORDER BY seqno
+      )
+  ), '') = 'retain_until,identity_cooldown_digest'
+    AS deletion_cooldown_retention_index_shape;
+`;
 const ALLOWED_WORKER_FIRST_ROUTES = Object.freeze([
   "/api/*",
   "/.well-known/apple-developer-domain-association.txt",
@@ -439,13 +594,6 @@ function parseJson(value) {
   }
 }
 
-function collectionControlRow(value) {
-  const statements = Array.isArray(value) ? value : [];
-  return statements.findLast(
-    (entry) => Array.isArray(entry?.results) && entry.results.length === 1,
-  )?.results?.[0] ?? null;
-}
-
 function migrationNames(value) {
   if (!Array.isArray(value) || value.length !== 1
       || !Array.isArray(value[0]?.results)) {
@@ -490,6 +638,208 @@ function classifyMigrationProbe(result, expectedNames) {
 const READ_ONLY_MIGRATION_PROBE_SQL =
   "SELECT name FROM d1_migrations ORDER BY id;";
 
+function collectionControlRow(value) {
+  const statements = Array.isArray(value) ? value : [];
+  return statements.findLast(
+    (entry) => Array.isArray(entry?.results) && entry.results.length === 1,
+  )?.results?.[0] ?? null;
+}
+
+function schemaProbeValues(result, fields) {
+  const row = result.ok
+    ? collectionControlRow(parseJson(result.stdout))
+    : null;
+  return Object.fromEntries(
+    Object.entries(fields).map(([name, field]) => {
+      const value = row?.[field];
+      return [name, value === 1 || value === true
+        ? true
+        : value === 0 || value === false
+          ? false
+          : null];
+    }),
+  );
+}
+
+function schemaEvidenceStatus(values) {
+  const statuses = Object.values(values);
+  return statuses.every((value) => value === true)
+    ? "verified"
+    : statuses.some((value) => value === null)
+      ? "unknown"
+      : "incomplete";
+}
+
+function primaryIdentityProtectionSchemaEvidence(result) {
+  const values = schemaProbeValues(
+    result,
+    PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS,
+  );
+  const status = schemaEvidenceStatus(values);
+  return {
+    status,
+    verified: status === "verified",
+    tables: {
+      identityReenrollmentCooldowns: values.cooldownTable,
+    },
+    columns: {
+      participantCooldownDigest: values.participantCooldownDigestColumn,
+      cooldownDigest: values.cooldownDigestColumn,
+      schemaVersion: values.cooldownSchemaVersionColumn,
+      deletedAt: values.cooldownDeletedAtColumn,
+      retainUntil: values.cooldownRetainUntilColumn,
+    },
+    indexes: {
+      retention: values.cooldownRetentionIndex,
+      retentionShape: values.cooldownRetentionIndexShape,
+    },
+    triggers: {
+      reenrollmentCooldownGuard: values.cooldownGuardTrigger,
+    },
+  };
+}
+
+function deletionLedgerIdentityProtectionSchemaEvidence(result) {
+  const values = schemaProbeValues(
+    result,
+    DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS,
+  );
+  const status = schemaEvidenceStatus(values);
+  return {
+    status,
+    verified: status === "verified",
+    tables: {
+      deletionTombstones: values.tombstoneTable,
+      identityReenrollmentCooldowns: values.cooldownTable,
+    },
+    columns: {
+      participantDigest: values.tombstoneParticipantDigestColumn,
+      tombstoneSchemaVersion: values.tombstoneSchemaVersionColumn,
+      tombstoneDeletedAt: values.tombstoneDeletedAtColumn,
+      tombstoneRetainUntil: values.tombstoneRetainUntilColumn,
+      cooldownDigest: values.cooldownDigestColumn,
+      cooldownSchemaVersion: values.cooldownSchemaVersionColumn,
+      cooldownDeletedAt: values.cooldownDeletedAtColumn,
+      cooldownRetainUntil: values.cooldownRetainUntilColumn,
+    },
+    indexes: {
+      tombstoneRetention: values.tombstoneRetentionIndex,
+      tombstoneRetentionShape: values.tombstoneRetentionIndexShape,
+      cooldownRetention: values.cooldownRetentionIndex,
+      cooldownRetentionShape: values.cooldownRetentionIndexShape,
+    },
+  };
+}
+
+function identityProtectionSchemaEvidence(
+  primaryResult = { ok: false },
+  deletionLedgerResult = { ok: false },
+) {
+  const primary = primaryIdentityProtectionSchemaEvidence(primaryResult);
+  const deletionLedger = deletionLedgerIdentityProtectionSchemaEvidence(
+    deletionLedgerResult,
+  );
+  const statuses = [primary.status, deletionLedger.status];
+  const status = statuses.every((value) => value === "verified")
+    ? "verified"
+    : statuses.some((value) => value === "unknown")
+      ? "unknown"
+      : "incomplete";
+  return {
+    status,
+    verified: status === "verified",
+    primary,
+    deletionLedger,
+  };
+}
+
+function schemaProtectionBlocker(status, prefix) {
+  return status === "verified"
+    ? null
+    : `REMOTE_${prefix}_SCHEMA_${status === "unknown" ? "UNKNOWN" : "INCOMPLETE"}`;
+}
+
+export function identityProtectionSchemaVerified(readiness) {
+  return readiness?.checks?.identityProtectionSchemaCurrent === true
+    && readiness?.evidence?.identityProtectionSchema?.status === "verified"
+    && readiness.evidence.identityProtectionSchema.verified === true;
+}
+
+function safeSchemaEvidence(value) {
+  const status = ["verified", "incomplete", "unknown"].includes(value?.status)
+    ? value.status
+    : null;
+  if (status === null) return null;
+  const booleanOrNull = (candidate) =>
+    candidate === true || candidate === false || candidate === null
+      ? candidate
+      : null;
+  const side = (candidate, { tables, columns, indexes, triggers = null }) => {
+    const sideStatus = ["verified", "incomplete", "unknown"].includes(
+      candidate?.status,
+    )
+      ? candidate.status
+      : null;
+    if (sideStatus === null) return null;
+    const safeSide = {
+      status: sideStatus,
+      verified: sideStatus === "verified",
+      tables: Object.fromEntries(
+        tables.map((key) => [key, booleanOrNull(candidate?.tables?.[key])]),
+      ),
+      columns: Object.fromEntries(
+        columns.map((key) => [key, booleanOrNull(candidate?.columns?.[key])]),
+      ),
+      indexes: Object.fromEntries(
+        indexes.map((key) => [key, booleanOrNull(candidate?.indexes?.[key])]),
+      ),
+    };
+    if (triggers !== null) {
+      safeSide.triggers = Object.fromEntries(
+        triggers.map((key) => [key, booleanOrNull(candidate?.triggers?.[key])]),
+      );
+    }
+    return safeSide;
+  };
+  const primary = side(value.primary, {
+    tables: ["identityReenrollmentCooldowns"],
+    columns: [
+      "participantCooldownDigest",
+      "cooldownDigest",
+      "schemaVersion",
+      "deletedAt",
+      "retainUntil",
+    ],
+    indexes: ["retention", "retentionShape"],
+    triggers: ["reenrollmentCooldownGuard"],
+  });
+  const deletionLedger = side(value.deletionLedger, {
+    tables: ["deletionTombstones", "identityReenrollmentCooldowns"],
+    columns: [
+      "participantDigest",
+      "tombstoneSchemaVersion",
+      "tombstoneDeletedAt",
+      "tombstoneRetainUntil",
+      "cooldownDigest",
+      "cooldownSchemaVersion",
+      "cooldownDeletedAt",
+      "cooldownRetainUntil",
+    ],
+    indexes: [
+      "tombstoneRetention",
+      "tombstoneRetentionShape",
+      "cooldownRetention",
+      "cooldownRetentionShape",
+    ],
+  });
+  if (primary === null || deletionLedger === null) return null;
+  return {
+    status,
+    verified: status === "verified",
+    primary,
+    deletionLedger,
+  };
+}
 export function stagingOperationReceipt(
   operation,
   evidence,
@@ -510,6 +860,9 @@ export function stagingOperationReceipt(
     "migrationInventoryCurrent",
     "migrationsCurrent",
     "pilotSchemaCurrent",
+    "primaryReenrollmentSchemaCurrent",
+    "deletionLedgerSchemaCurrent",
+    "identityProtectionSchemaCurrent",
     "collectionContained",
     "secretsInstalled",
     "healthContained",
@@ -519,6 +872,10 @@ export function stagingOperationReceipt(
       .filter((key) => typeof evidence?.[key] === "boolean")
       .map((key) => [key, evidence[key]]),
   );
+  const safeIdentitySchema = safeSchemaEvidence(evidence?.identityProtectionSchema);
+  if (safeIdentitySchema !== null) {
+    fixedEvidence.identityProtectionSchema = safeIdentitySchema;
+  }
   if (typeof evidence?.lifecycleReadiness === "string"
       && ["ready", "not_ready"].includes(evidence.lifecycleReadiness)) {
     fixedEvidence.lifecycleReadiness = evidence.lifecycleReadiness;
@@ -553,10 +910,14 @@ export function probeStagingLive({
     remoteMigrationInventoryCurrent: false,
     migrationsCurrent: false,
     pilotSchemaCurrent: false,
+    primaryReenrollmentSchemaCurrent: false,
+    deletionLedgerSchemaCurrent: false,
+    identityProtectionSchemaCurrent: false,
     collectionContained: false,
   };
-  const blockers = [...configuration.blockers];
   let migrationProof = [];
+  let identitySchemaEvidence = identityProtectionSchemaEvidence();
+  const blockers = [...configuration.blockers];
 
   if (configuration.state === "unsafe_configuration") {
     return {
@@ -567,6 +928,9 @@ export function probeStagingLive({
       state: "unsafe_configuration",
       collectionAuthorized: false,
       migrationInventory: configuration.migrationInventory,
+      evidence: {
+        identityProtectionSchema: identitySchemaEvidence,
+      },
       checks: {
         ...configuration.checks,
         ...checks,
@@ -730,6 +1094,50 @@ export function probeStagingLive({
         blockers.push("REMOTE_PILOT_SCHEMA_INCOMPLETE");
       }
 
+      const primaryIdentitySchemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "USAGE_MONITOR_DB",
+          "--remote", "--env", "staging",
+          "--command", PRIMARY_IDENTITY_PROTECTION_SCHEMA_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      const deletionLedgerIdentitySchemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "DELETION_LEDGER",
+          "--remote", "--env", "staging",
+          "--command", DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      identitySchemaEvidence = identityProtectionSchemaEvidence(
+        primaryIdentitySchemaProbe,
+        deletionLedgerIdentitySchemaProbe,
+      );
+      checks.primaryReenrollmentSchemaCurrent =
+        identitySchemaEvidence.primary.verified;
+      checks.deletionLedgerSchemaCurrent =
+        identitySchemaEvidence.deletionLedger.verified;
+      checks.identityProtectionSchemaCurrent = identitySchemaEvidence.verified;
+      const primarySchemaBlocker = schemaProtectionBlocker(
+        identitySchemaEvidence.primary.status,
+        "IDENTITY_REENROLLMENT",
+      );
+      if (primarySchemaBlocker) blockers.push(primarySchemaBlocker);
+      const deletionLedgerSchemaBlocker = schemaProtectionBlocker(
+        identitySchemaEvidence.deletionLedger.status,
+        "DELETION_LEDGER",
+      );
+      if (deletionLedgerSchemaBlocker) {
+        blockers.push(deletionLedgerSchemaBlocker);
+      }
+
       const control = runWrangler(
         wrangler,
         workerDirectory,
@@ -780,6 +1188,9 @@ export function probeStagingLive({
     checks: {
       ...configuration.checks,
       ...checks,
+    },
+    evidence: {
+      identityProtectionSchema: identitySchemaEvidence,
     },
     blockers: uniqueBlockers,
   };

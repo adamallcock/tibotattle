@@ -5,6 +5,7 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
 import {
+  identityProtectionSchemaVerified,
   probeStagingLive,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
@@ -162,8 +163,10 @@ export async function runDisabledStagingDeployment({
     (code) => code !== "REQUIRED_STAGING_SECRETS_MISSING",
   );
   if (predeployBlockers.length > 0
+      || !readiness.checks.remoteMigrationInventoryCurrent
       || !readiness.checks.migrationsCurrent
-      || !readiness.checks.collectionContained) {
+      || !readiness.checks.collectionContained
+      || !identityProtectionSchemaVerified(readiness)) {
     return {
       ok: false,
       code: "STAGING_READINESS_BLOCKED",
@@ -252,8 +255,18 @@ export async function runDisabledStagingDeployment({
       originMatchedWranglerOutput: true,
       remoteResourcesVerified: readiness.checks.d1ResourcesExist
         && readiness.checks.r2ResourceExists,
+      remoteReadOnlyProof: true,
+      migrationInventoryCurrent:
+        readiness.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: readiness.checks.migrationsCurrent,
       pilotSchemaCurrent: readiness.checks.pilotSchemaCurrent,
+      primaryReenrollmentSchemaCurrent:
+        readiness.checks.primaryReenrollmentSchemaCurrent,
+      deletionLedgerSchemaCurrent:
+        readiness.checks.deletionLedgerSchemaCurrent,
+      identityProtectionSchemaCurrent:
+        readiness.checks.identityProtectionSchemaCurrent,
+      identityProtectionSchema: readiness.evidence.identityProtectionSchema,
       collectionContained: readiness.checks.collectionContained,
       healthContained: true,
       lifecycleReadiness: lifecycle.status,

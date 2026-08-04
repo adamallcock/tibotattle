@@ -27,13 +27,12 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
   assert.equal(result.checks.assetsClosed, true);
   assert.equal(result.checks.migrationInventorySafe, true);
   assert.deepEqual(
-    result.migrationInventory.USAGE_MONITOR_DB.slice(-4),
-    [
-      "0023_community_aggregate_safety.sql",
-      "0024_apple_signin_nonce_binding.sql",
-      "0025_device_lifecycle.sql",
-      "0026_signin_start_admission.sql",
-    ],
+    result.migrationInventory.USAGE_MONITOR_DB.slice(-6),
+    EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-6),
+  );
+  assert.deepEqual(
+    result.migrationInventory.DELETION_LEDGER,
+    EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER,
   );
   assert.equal(result.checks.resourceIdentifiersConfigured, false);
   assert.deepEqual(result.blockers, [
@@ -56,12 +55,22 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   });
 
   const extra = structuredClone(EXPECTED_STAGING_MIGRATIONS);
-  extra.USAGE_MONITOR_DB.push("0027_unreviewed.sql");
+  extra.USAGE_MONITOR_DB.push("0029_unreviewed.sql");
   extra.USAGE_MONITOR_DB.sort();
   assert.deepEqual(validateStagingMigrationInventory(extra), {
     ok: false,
     code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
   });
+
+  const missing = assessStagingConfiguration(checkedInConfig, {
+    workerDirectory: "/definitely-missing-staging-worker-directory",
+  });
+  assert.equal(missing.state, "unsafe_configuration");
+  assert.equal(missing.checks.migrationInventorySafe, false);
+  assert.equal(
+    missing.blockers.includes("LOCAL_MIGRATION_INVENTORY_DRIFT"),
+    true,
+  );
 });
 
 test("staging readiness rejects production resources and custom-domain targets", () => {
@@ -169,8 +178,21 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
   assert.equal(result.liveProof, true);
   assert.equal(result.checks.remoteMigrationInventoryCurrent, true);
   assert.equal(Object.values(result.checks).every(Boolean), true);
+  assert.equal(result.checks.primaryReenrollmentSchemaCurrent, true);
+  assert.equal(result.checks.deletionLedgerSchemaCurrent, true);
+  assert.equal(result.checks.identityProtectionSchemaCurrent, true);
+  assert.equal(result.evidence.identityProtectionSchema.status, "verified");
+  assert.equal(result.evidence.identityProtectionSchema.verified, true);
+  assert.equal(
+    result.evidence.identityProtectionSchema.primary.columns.participantCooldownDigest,
+    true,
+  );
+  assert.equal(
+    result.evidence.identityProtectionSchema.deletionLedger.columns.participantDigest,
+    true,
+  );
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 5);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 7);
   assert.equal(calls.some((args) => args.includes("migrations")), false);
   assert.equal(
     calls.filter((args) => args.some((value) =>
@@ -180,37 +202,6 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
   const serialized = JSON.stringify(result);
   assert.equal(serialized.includes(config.env.staging.d1_databases[0].database_id), false);
   assert.equal(serialized.includes(config.env.staging.r2_buckets[0].bucket_name), false);
-});
-
-test("live readiness reports R2 account enablement without leaking command output", () => {
-  const calls = [];
-  const spawn = (_command, args) => {
-    calls.push(args);
-    if (args.join(" ") === "whoami") {
-      return { status: 0, stdout: "private account details", stderr: "" };
-    }
-    if (args.join(" ") === "d1 list --json") {
-      return { status: 0, stdout: "[]", stderr: "" };
-    }
-    if (args.join(" ") === "r2 bucket list") {
-      return {
-        status: 1,
-        stdout: "",
-        stderr: "Please enable R2 through the Dashboard. [code: 10042]",
-      };
-    }
-    throw new Error("Unexpected fake Wrangler call");
-  };
-  const result = probeStagingLive({
-    config: checkedInConfig,
-    wrangler: "/fake/wrangler",
-    workerDirectory,
-    spawn,
-  });
-  assert.equal(result.state, "blocked");
-  assert.equal(result.blockers.includes("R2_NOT_ENABLED"), true);
-  assert.equal(JSON.stringify(result).includes("private account details"), false);
-  assert.equal(JSON.stringify(result).includes("Dashboard"), false);
 });
 
 test("live readiness rejects an unreviewed remote migration inventory", () => {
@@ -226,7 +217,7 @@ test("live readiness rejects an unreviewed remote migration inventory", () => {
         stdout: JSON.stringify([{
           results: [
             ...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.map((name) => ({ name })),
-            { name: "0027_unreviewed.sql" },
+            { name: "0029_unreviewed.sql" },
           ],
         }]),
         stderr: "private remote output",
@@ -245,7 +236,7 @@ test("live readiness rejects an unreviewed remote migration inventory", () => {
   assert.equal(result.blockers.includes(
     "REMOTE_MIGRATION_INVENTORY_DRIFT",
   ), true);
-  assert.equal(JSON.stringify(result).includes("0027_unreviewed.sql"), false);
+  assert.equal(JSON.stringify(result).includes("0029_unreviewed.sql"), false);
   assert.equal(JSON.stringify(result).includes("private remote output"), false);
 });
 
@@ -277,4 +268,95 @@ test("operation receipts keep evidence fixed and non-secret", () => {
   assert.deepEqual(receipt.evidence, { resourcesVerified: true });
   assert.equal(JSON.stringify(receipt).includes("do-not-record"), false);
   assert.equal(JSON.stringify(receipt).includes("private command output"), false);
+});
+
+test("live readiness blocks missing identity protection schema in either database", () => {
+  for (const scenario of [
+    {
+      name: "primary re-enrollment protection",
+      options: { missingPrimarySchema: true },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+    },
+    {
+      name: "deletion-ledger cooldown protection",
+      options: { missingDeletionLedgerSchema: true },
+      check: "deletionLedgerSchemaCurrent",
+      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
+      side: "deletionLedger",
+    },
+  ]) {
+    const config = provisionedConfig();
+    const result = probeStagingLive({
+      config,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn: successSpawn(config, [], scenario.options),
+    });
+    assert.equal(result.state, "blocked", scenario.name);
+    assert.equal(result.checks[scenario.check], false, scenario.name);
+    assert.equal(result.checks.identityProtectionSchemaCurrent, false);
+    assert.equal(
+      result.evidence.identityProtectionSchema.status,
+      "incomplete",
+      scenario.name,
+    );
+    assert.equal(
+      result.evidence.identityProtectionSchema[scenario.side].status,
+      "incomplete",
+      scenario.name,
+    );
+    assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
+  }
+});
+
+test("live readiness marks an unavailable schema probe unknown without leaking output", () => {
+  const config = provisionedConfig();
+  const result = probeStagingLive({
+    config,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: successSpawn(config, [], { primarySchemaError: true }),
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.primaryReenrollmentSchemaCurrent, false);
+  assert.equal(result.evidence.identityProtectionSchema.status, "unknown");
+  assert.equal(result.evidence.identityProtectionSchema.primary.status, "unknown");
+  assert.equal(
+    result.blockers.includes("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_UNKNOWN"),
+    true,
+  );
+  assert.equal(JSON.stringify(result).includes("provider-secret"), false);
+});
+
+test("live readiness reports R2 account enablement without leaking command output", () => {
+  const calls = [];
+  const spawn = (_command, args) => {
+    calls.push(args);
+    if (args.join(" ") === "whoami") {
+      return { status: 0, stdout: "private account details", stderr: "" };
+    }
+    if (args.join(" ") === "d1 list --json") {
+      return { status: 0, stdout: "[]", stderr: "" };
+    }
+    if (args.join(" ") === "r2 bucket list") {
+      return {
+        status: 1,
+        stdout: "",
+        stderr: "Please enable R2 through the Dashboard. [code: 10042]",
+      };
+    }
+    throw new Error("Unexpected fake Wrangler call");
+  };
+  const result = probeStagingLive({
+    config: checkedInConfig,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn,
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.blockers.includes("R2_NOT_ENABLED"), true);
+  assert.equal(JSON.stringify(result).includes("private account details"), false);
+  assert.equal(JSON.stringify(result).includes("Dashboard"), false);
 });

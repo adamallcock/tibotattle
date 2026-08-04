@@ -5,6 +5,7 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
 import {
+  identityProtectionSchemaVerified,
   probeStagingLive,
   REQUIRED_D1_BINDINGS,
   STAGING_PROOF_TYPES,
@@ -59,7 +60,9 @@ export function prepareDisabledStaging({
       "REMOTE_MIGRATION_STATE_UNINITIALIZED",
       "REMOTE_COLLECTION_NOT_CONTAINED",
       "REQUIRED_STAGING_SECRETS_MISSING",
-    ].includes(code));
+    ].includes(code)
+      && !code.startsWith("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_")
+      && !code.startsWith("REMOTE_DELETION_LEDGER_SCHEMA_"));
   if (before.state === "unsafe_configuration"
       || !infrastructureReady
       || migrationPreflightBlockers.length > 0) {
@@ -67,6 +70,19 @@ export function prepareDisabledStaging({
       ok: false,
       code: "STAGING_INFRASTRUCTURE_BLOCKED",
       blockers: migrationPreflightBlockers,
+    };
+  }
+  if (before.checks.migrationsCurrent
+      && !identityProtectionSchemaVerified(before)) {
+    const schemaBlockers = before.blockers.filter((code) =>
+      code.startsWith("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_")
+      || code.startsWith("REMOTE_DELETION_LEDGER_SCHEMA_"));
+    return {
+      ok: false,
+      code: "STAGING_SCHEMA_PROTECTION_BLOCKED",
+      blockers: schemaBlockers.length > 0
+        ? schemaBlockers
+        : ["REMOTE_IDENTITY_PROTECTION_SCHEMA_UNVERIFIED"],
     };
   }
 
@@ -103,6 +119,7 @@ export function prepareDisabledStaging({
   );
   if (!afterMigrations.checks.migrationsCurrent
       || !afterMigrations.checks.pilotSchemaCurrent
+      || !identityProtectionSchemaVerified(afterMigrations)
       || migrationVerificationBlockers.length > 0) {
     return {
       ok: false,
@@ -154,7 +171,8 @@ UPDATE collection_controls
   );
   if (remainingBlockers.length > 0
       || !after.checks.migrationsCurrent
-      || !after.checks.collectionContained) {
+      || !after.checks.collectionContained
+      || !identityProtectionSchemaVerified(after)) {
     return {
       ok: false,
       code: "STAGING_PREPARATION_UNVERIFIED",
@@ -175,6 +193,13 @@ UPDATE collection_controls
       migrationInventoryCurrent: after.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: after.checks.migrationsCurrent,
       pilotSchemaCurrent: after.checks.pilotSchemaCurrent,
+      primaryReenrollmentSchemaCurrent:
+        after.checks.primaryReenrollmentSchemaCurrent,
+      deletionLedgerSchemaCurrent:
+        after.checks.deletionLedgerSchemaCurrent,
+      identityProtectionSchemaCurrent:
+        after.checks.identityProtectionSchemaCurrent,
+      identityProtectionSchema: after.evidence.identityProtectionSchema,
       collectionContained: after.checks.collectionContained,
       secretsInstalled: after.checks.requiredSecretsInstalled,
     }),

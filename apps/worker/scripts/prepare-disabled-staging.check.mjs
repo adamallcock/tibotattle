@@ -10,7 +10,10 @@ import {
   successSpawn,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
-import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
+import {
+  EXPECTED_STAGING_MIGRATIONS,
+  STAGING_PROOF_TYPES,
+} from "./staging-readiness-lib.mjs";
 
 test("preparation requires exact confirmation before inspection or mutation", () => {
   const calls = [];
@@ -131,6 +134,40 @@ test("preparation applies both migrations, contains collection, and rechecks", (
             admission_counter: 1,
             quarantine_reconciliation: 1,
             lifecycle_status: 1,
+            primary_cooldown_table: 1,
+            primary_participant_cooldown_digest: 1,
+            primary_cooldown_digest: 1,
+            primary_cooldown_schema_version: 1,
+            primary_cooldown_deleted_at: 1,
+            primary_cooldown_retain_until: 1,
+            primary_cooldown_retention_index: 1,
+            primary_cooldown_retention_index_shape: 1,
+            primary_cooldown_guard_trigger: 1,
+          }],
+        }]),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 execute DELETION_LEDGER ")
+        && joined.includes("sqlite_master")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: [{
+            deletion_tombstone_table: 1,
+            deletion_tombstone_participant_digest: 1,
+            deletion_tombstone_schema_version: 1,
+            deletion_tombstone_deleted_at: 1,
+            deletion_tombstone_retain_until: 1,
+            deletion_tombstone_retention_index: 1,
+            deletion_tombstone_retention_index_shape: 1,
+            deletion_cooldown_table: 1,
+            deletion_cooldown_digest: 1,
+            deletion_cooldown_schema_version: 1,
+            deletion_cooldown_deleted_at: 1,
+            deletion_cooldown_retain_until: 1,
+            deletion_cooldown_retention_index: 1,
+            deletion_cooldown_retention_index_shape: 1,
           }],
         }]),
         stderr: "",
@@ -174,6 +211,10 @@ test("preparation applies both migrations, contains collection, and rechecks", (
     result.receipt.schemaVersion,
     "usage-monitor-staging-operation-receipt-v0.1",
   );
+  assert.equal(
+    result.receipt.evidenceType,
+    STAGING_PROOF_TYPES.OPERATION_RECEIPT,
+  );
   assert.equal(result.receipt.operation, "disabled_staging_prepared");
   assert.equal(result.receipt.activationState, "not_authorized");
   assert.equal(result.receipt.collectionAuthorized, false);
@@ -184,6 +225,51 @@ test("preparation applies both migrations, contains collection, and rechecks", (
     migrationInventoryCurrent: true,
     migrationsCurrent: true,
     pilotSchemaCurrent: true,
+    primaryReenrollmentSchemaCurrent: true,
+    deletionLedgerSchemaCurrent: true,
+    identityProtectionSchemaCurrent: true,
+    identityProtectionSchema: {
+      status: "verified",
+      verified: true,
+      primary: {
+        status: "verified",
+        verified: true,
+        tables: { identityReenrollmentCooldowns: true },
+        columns: {
+          participantCooldownDigest: true,
+          cooldownDigest: true,
+          schemaVersion: true,
+          deletedAt: true,
+          retainUntil: true,
+        },
+        indexes: { retention: true, retentionShape: true },
+        triggers: { reenrollmentCooldownGuard: true },
+      },
+      deletionLedger: {
+        status: "verified",
+        verified: true,
+        tables: {
+          deletionTombstones: true,
+          identityReenrollmentCooldowns: true,
+        },
+        columns: {
+          participantDigest: true,
+          tombstoneSchemaVersion: true,
+          tombstoneDeletedAt: true,
+          tombstoneRetainUntil: true,
+          cooldownDigest: true,
+          cooldownSchemaVersion: true,
+          cooldownDeletedAt: true,
+          cooldownRetainUntil: true,
+        },
+        indexes: {
+          tombstoneRetention: true,
+          tombstoneRetentionShape: true,
+          cooldownRetention: true,
+          cooldownRetentionShape: true,
+        },
+      },
+    },
     collectionContained: true,
     secretsInstalled: true,
   });
@@ -229,4 +315,42 @@ test("preparation does not contain until applied migrations are proven exact", (
   assert.equal(applyCount, 2);
   assert.equal(calls.some((args) => args.some((value) =>
     typeof value === "string" && value.includes("UPDATE collection_controls"))), false);
+});
+
+test("preparation refuses missing identity protection before any mutation", () => {
+  for (const scenario of [
+    {
+      name: "primary re-enrollment protection",
+      options: { missingPrimarySchema: true },
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+    },
+    {
+      name: "deletion-ledger cooldown protection",
+      options: { missingDeletionLedgerSchema: true },
+      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
+    },
+  ]) {
+    const config = provisionedConfig();
+    const calls = [];
+    const result = prepareDisabledStaging({
+      config,
+      confirmation: PREPARE_CONFIRMATION,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn: successSpawn(config, calls, scenario.options),
+    });
+    assert.equal(result.ok, false, scenario.name);
+    assert.equal(result.code, "STAGING_SCHEMA_PROTECTION_BLOCKED", scenario.name);
+    assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
+    assert.equal(calls.some((args) => args.includes("apply")), false, scenario.name);
+    assert.equal(
+      calls.some((args) =>
+        args[0] === "d1"
+        && args[1] === "execute"
+        && args.includes("--command")
+        && !args.includes("--json")),
+      false,
+      scenario.name,
+    );
+  }
 });

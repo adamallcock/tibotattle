@@ -239,6 +239,15 @@ test("deployment runs only after live readiness and verifies contained health", 
   assert.equal(result.receipt.operation, "disabled_staging_deployed");
   assert.equal(result.receipt.activationState, "not_authorized");
   assert.equal(result.receipt.evidence.pilotSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.remoteReadOnlyProof, true);
+  assert.equal(result.receipt.evidence.migrationInventoryCurrent, true);
+  assert.equal(result.receipt.evidence.primaryReenrollmentSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.deletionLedgerSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.identityProtectionSchemaCurrent, true);
+  assert.equal(
+    result.receipt.evidence.identityProtectionSchema.status,
+    "verified",
+  );
   assert.equal(result.receipt.evidence.healthContained, true);
   assert.equal(result.receipt.evidence.lifecycleReadiness, "not_ready");
   assert.deepEqual(calls.at(-1), [
@@ -248,6 +257,44 @@ test("deployment runs only after live readiness and verifies contained health", 
   assert.equal(requested[0].options.redirect, "error");
   assert.equal(requested[1].url, `${stagingOrigin}/api/ready`);
   assert.equal(requested[1].options.redirect, "error");
+});
+
+test("deployment refuses missing identity protection before Wrangler deploy", async (t) => {
+  for (const scenario of [
+    {
+      name: "primary re-enrollment protection",
+      options: { missingPrimarySchema: true },
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+    },
+    {
+      name: "deletion-ledger cooldown protection",
+      options: { missingDeletionLedgerSchema: true },
+      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const config = provisionedConfig();
+      const calls = [];
+      let fetchCalled = false;
+      const result = await runDeployment({
+        config,
+        origin: stagingOrigin,
+        confirmation: DEPLOY_CONFIRMATION,
+        wrangler: "/fake/wrangler",
+        workerDirectory,
+        spawn: successSpawn(config, calls, scenario.options),
+        fetchImpl: async () => {
+          fetchCalled = true;
+          return containedFetch();
+        },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.code, "STAGING_READINESS_BLOCKED");
+      assert.equal(result.blockers.includes(scenario.blocker), true);
+      assert.equal(calls.some((args) => args[0] === "deploy"), false);
+      assert.equal(fetchCalled, false);
+    });
+  }
 });
 
 test("deployment refuses a health response with any collection path enabled", async () => {
