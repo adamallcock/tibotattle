@@ -576,6 +576,7 @@ test("automatic contribution endpoints require exact consent and remain foregrou
     },
     automaticContributionOptions: {
       now: () => new Date(now),
+      ditherRandom: () => 0,
       setTimeoutImpl(callback, delay) {
         const id = nextTimer;
         nextTimer += 1;
@@ -868,6 +869,7 @@ test("shutdown retains the automatic-contribution lock until an aborted run fini
     }),
     automaticContributionOptions: {
       now: () => new Date(now),
+      ditherRandom: () => 0,
     },
     port: 0,
   };

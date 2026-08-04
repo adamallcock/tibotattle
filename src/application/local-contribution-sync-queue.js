@@ -28,6 +28,7 @@ const RETRY_BACKOFF_POLICY = Object.freeze({
   jitterMinimumMultiplier: 0.75,
   jitterMaximumMultiplier: 1.25,
 });
+const MAXIMUM_SERVER_RETRY_DITHER_MILLISECONDS = 60_000;
 const MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024;
 const DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024 * 1024;
 const MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 256 * 1024 * 1024;
@@ -430,7 +431,11 @@ function boundedErrorCode(error, fallback) {
   return fallback;
 }
 
-function retryDelayMilliseconds(attemptCount, random) {
+function retryDelayMilliseconds(
+  attemptCount,
+  random,
+  retryAfterMilliseconds = null,
+) {
   const base = Math.min(
     RETRY_BACKOFF_POLICY.maximumDelayMilliseconds,
     RETRY_BACKOFF_POLICY.initialDelayMilliseconds
@@ -442,10 +447,23 @@ function retryDelayMilliseconds(attemptCount, random) {
       RETRY_BACKOFF_POLICY.jitterMaximumMultiplier
       - RETRY_BACKOFF_POLICY.jitterMinimumMultiplier
     ));
-  return Math.max(
+  const localDelay = Math.max(
     RETRY_BACKOFF_POLICY.minimumDelayMilliseconds,
     Math.round(base * jitter),
   );
+  if (!Number.isSafeInteger(retryAfterMilliseconds)
+      || retryAfterMilliseconds <= 0) {
+    return localDelay;
+  }
+  // RFC Retry-After is a lower bound. Add only a small positive per-client
+  // spread so a shared server deadline cannot become a second herd boundary.
+  const serverDither = Math.round(
+    Math.min(
+      MAXIMUM_SERVER_RETRY_DITHER_MILLISECONDS,
+      retryAfterMilliseconds * 0.25,
+    ) * boundedRandom,
+  );
+  return Math.max(localDelay, retryAfterMilliseconds + serverDither);
 }
 
 function entryForJob(set, job) {
@@ -876,6 +894,7 @@ async function runContributionSyncQueueOnce({
         const failureAt = queueTimestamp(failureAtMs);
         const interrupted = signal?.aborted === true;
         const deviceUnavailable = error?.deviceUnavailable === true;
+        const retryAfterExceedsMaximum = error?.retryAfterExceedsMaximum === true;
         const mayRetry = interrupted || deviceUnavailable
           || error?.retryable === true;
         const exhausted = job.attempt_count >= maximumAttempts;
@@ -885,11 +904,21 @@ async function runContributionSyncQueueOnce({
           : exhausted && mayRetry
             ? "retry_exhausted"
             : boundedErrorCode(error, "local_failure");
+        const retryAfterMilliseconds = error?.retryAfterMilliseconds;
+        // Cancellation must not turn a response that already supplied
+        // Retry-After into an immediate retry. A plain interruption remains
+        // eligible for immediate recovery; a service floor always wins.
         const nextAttemptAt = state === "retryable"
           ? queueTimestamp(
             interrupted
+              && (!Number.isSafeInteger(retryAfterMilliseconds)
+                || retryAfterMilliseconds <= 0)
               ? failureAtMs
-              : failureAtMs + retryDelayMilliseconds(job.attempt_count, random),
+              : failureAtMs + retryDelayMilliseconds(
+                job.attempt_count,
+                random,
+                retryAfterMilliseconds,
+              ),
           )
           : null;
         repository.finishFailed(job, {
@@ -897,15 +926,20 @@ async function runContributionSyncQueueOnce({
           errorCode,
           nextAttemptAt,
           timestamp: failureAt,
-          pause: deviceUnavailable,
+          // An over-horizon Retry-After is safer as an explicit pause than a
+          // truncated deadline that would violate the server's retry floor.
+          pause: deviceUnavailable || retryAfterExceedsMaximum,
         });
         if (state === "retryable") result.retryable += 1;
         else result.rejected += 1;
-        if (deviceUnavailable || interrupted) break;
+        if (deviceUnavailable || retryAfterExceedsMaximum || interrupted) break;
       }
     }
     const completedAt = iso(now());
     const queue = repository.status(completedAt);
+    const retryNotBeforeAt = selectedPreparedSetId === null
+      ? null
+      : repository.preparedSetNextAttemptAt(selectedPreparedSetId);
     return Object.freeze({
       status: queue.paused
         ? "paused"
@@ -916,6 +950,7 @@ async function runContributionSyncQueueOnce({
       enqueued: enqueued.inserted,
       ...result,
       queue,
+      retryNotBeforeAt,
       preparedSet: selectedPreparedSetId === null
         ? null
         : repository.preparedSetStatus(selectedPreparedSetId),

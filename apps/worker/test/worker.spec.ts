@@ -69,6 +69,19 @@ function testBindings(overrides: Partial<Env & OptionalAdminBinding> = {}): Env 
     QUARANTINE: bindings.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: bindings.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: bindings.RECOVERY_RATE_LIMIT,
+    UPLOAD_AUTHORIZATION_RATE_LIMIT: bindings.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    UPLOAD_PRINCIPAL_RATE_LIMIT: bindings.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    UPLOAD_INGRESS_REQUEST_RATE_LIMIT:
+      bindings.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+    UPLOAD_INGRESS_CLIENT_RATE_LIMIT:
+      bindings.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    UPLOAD_INGRESS_BUDGET: bindings.UPLOAD_INGRESS_BUDGET,
+    UPLOAD_INGRESS_QUEUE_MODE: bindings.UPLOAD_INGRESS_QUEUE_MODE,
+    UPLOAD_INGRESS_MAX_CONCURRENT: bindings.UPLOAD_INGRESS_MAX_CONCURRENT,
+    UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE:
+      bindings.UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE,
+    UPLOAD_INGRESS_BURST: bindings.UPLOAD_INGRESS_BURST,
+    UPLOAD_INGRESS_LEASE_SECONDS: bindings.UPLOAD_INGRESS_LEASE_SECONDS,
     USAGE_MONITOR_DB: bindings.USAGE_MONITOR_DB,
     ...overrides,
   } as Env;
@@ -311,6 +324,7 @@ async function encryptRaw(
 async function registerUpload(
   participant: EnrollmentResponse,
   rawEnvelope: string,
+  runtimeEnv = testBindings(),
 ): Promise<{ uploadAuthorization: string; expiresAt: string }> {
   const response = await api("/api/v1/me/upload-authorizations", {
     method: "POST",
@@ -323,7 +337,7 @@ async function registerUpload(
       contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
       contentType: "application/json",
     }),
-  });
+  }, runtimeEnv);
   expect(response.status).toBe(201);
   return response.json<{ uploadAuthorization: string; expiresAt: string }>();
 }
@@ -1713,6 +1727,225 @@ describe("synthetic usage monitor service", () => {
     expect(attemptsTable?.total).toBe(0);
   });
 
+  it("limits upload authorization before parsing the body and never places a participant identifier in the rate key", async () => {
+    const participant = await enroll();
+    const limiterKeys: string[] = [];
+    const allowedLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: true };
+      },
+    } satisfies RateLimit;
+    const blockedPrincipalLimiter = {
+      async limit(input: { key: string }): Promise<{ success: boolean }> {
+        limiterKeys.push(input.key);
+        return { success: false };
+      },
+    } satisfies RateLimit;
+
+    const response = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      // A limiter rejection must win over this malformed request body.
+      body: "{",
+    }, testBindings({
+      UPLOAD_AUTHORIZATION_RATE_LIMIT: allowedLimiter,
+      UPLOAD_PRINCIPAL_RATE_LIMIT: blockedPrincipalLimiter,
+      IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
+    }));
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("60");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_ADMISSION_LIMIT_REACHED" },
+    });
+    expect(limiterKeys).toEqual([
+      "usage-monitor:upload_authorization:global",
+      expect.stringMatching(
+        /^usage-monitor:upload_authorization:participant:[0-9a-f]{64}$/u,
+      ),
+    ]);
+    expect(limiterKeys.join("\n")).not.toContain(participant.cookie);
+    expect(limiterKeys.join("\n")).not.toContain(participant.participantId);
+  });
+
+  it("returns the shared-ingress retry deadline without consuming a token that could not enter", async () => {
+    const participant = await enroll();
+    const rawEnvelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const authorization = await registerUpload(participant, rawEnvelope);
+    const blockedBudget = {
+      getByName() {
+        return {
+          async acquire() {
+            return {
+              allowed: false,
+              leaseId: null,
+              retryAfterSeconds: 23,
+            };
+          },
+          async release() {},
+        };
+      },
+    } as unknown as Env["UPLOAD_INGRESS_BUDGET"];
+
+    const rejected = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    }, testBindings({ UPLOAD_INGRESS_BUDGET: blockedBudget }));
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("retry-after")).toBe("23");
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_INGRESS_LIMIT_REACHED" },
+    });
+
+    const replay = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(replay.status).toBe(202);
+    await expect(replay.json()).resolves.toMatchObject({
+      status: "accepted_synthetic",
+    });
+  });
+
+  it("sheds a valid-looking public upload before its body is consumed or token claimed", async () => {
+    const participant = await enroll();
+    const rawEnvelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const authorization = await registerUpload(participant, rawEnvelope);
+    const allowedLimiter = {
+      async limit(): Promise<{ success: boolean }> { return { success: true }; },
+    } satisfies RateLimit;
+    const blockedLimiter = {
+      async limit(): Promise<{ success: boolean }> { return { success: false }; },
+    } satisfies RateLimit;
+    const rawRequest = new Request("https://example.test/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+        "cf-connecting-ip": "203.0.113.7",
+      },
+      body: rawEnvelope,
+    });
+    let bodyReaderRequested = false;
+    const request = new Proxy(rawRequest, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property !== "body" || value === null) {
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return new Proxy(value as ReadableStream<Uint8Array>, {
+          get(stream, streamProperty) {
+            const streamValue = Reflect.get(stream, streamProperty, stream);
+            if (streamProperty === "getReader") {
+              return (...args: unknown[]) => {
+                bodyReaderRequested = true;
+                return Reflect.apply(
+                  streamValue as (...inner: unknown[]) => unknown,
+                  stream,
+                  args,
+                );
+              };
+            }
+            return typeof streamValue === "function"
+              ? streamValue.bind(stream) : streamValue;
+          },
+        });
+      },
+    }) as Request;
+    const rejected = await handleRequest(request, testBindings({
+      UPLOAD_INGRESS_REQUEST_RATE_LIMIT: allowedLimiter,
+      UPLOAD_INGRESS_CLIENT_RATE_LIMIT: blockedLimiter,
+      IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
+    }));
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("retry-after")).toBe("60");
+    expect(bodyReaderRequested).toBe(false);
+
+    const retry = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${authorization.uploadAuthorization}`,
+        "content-type": "application/json",
+      },
+      body: rawEnvelope,
+    });
+    expect(retry.status).toBe(202);
+  });
+
+  it("does not issue upload tokens or report traffic ready when ingress is misconfigured", async () => {
+    const participant = await enroll();
+    const broken = testBindings({
+      UPLOAD_INGRESS_QUEUE_MODE: "queues" as unknown as Env["UPLOAD_INGRESS_QUEUE_MODE"],
+    });
+    const registration = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        envelopeDigest: "a".repeat(64),
+        contentLengthBytes: 10,
+        contentType: "application/json",
+      }),
+    }, broken);
+    expect(registration.status).toBe(503);
+    await expect(registration.json()).resolves.toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
+    const ready = await api("/api/ready", {}, broken);
+    expect(ready.status).toBe(503);
+    await expect(ready.json()).resolves.toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
+  });
+
+  it("maps a failed upload admission binding to a retryable service response", async () => {
+    const participant = await enroll();
+    const unavailable = {
+      async limit(): Promise<{ success: boolean }> {
+        throw new Error("rate binding unavailable");
+      },
+    } satisfies RateLimit;
+    const response = await api("/api/v1/me/upload-authorizations", {
+      method: "POST",
+      headers: {
+        ...personalHeaders(participant, { csrf: true }),
+        "content-type": "application/json",
+      },
+      body: "{",
+    }, testBindings({
+      UPLOAD_AUTHORIZATION_RATE_LIMIT: unavailable,
+    }));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("60");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_INGRESS_UNAVAILABLE" },
+    });
+  });
+
+  it("fails health closed if Queue ingress is enabled before its protocol is implemented", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      UPLOAD_INGRESS_QUEUE_MODE: "queues" as unknown as Env["UPLOAD_INGRESS_QUEUE_MODE"],
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "ADMISSION_CONFIGURATION_INVALID" },
+    });
+  });
+
   it("publishes the configured public key and a non-sensitive health result", async () => {
     const key = await api("/api/v1/envelope-key");
     expect(key.status).toBe(200);
@@ -2340,7 +2573,9 @@ describe("synthetic usage monitor service", () => {
       },
       body: "{",
     });
-    expect(malformedJson.status).toBe(400);
+    // An unauthenticated header is rejected before a public request's JSON is
+    // parsed; malformed bodies cannot become an unlimited CPU work surface.
+    expect(malformedJson.status).toBe(401);
 
     const extraEnvelope = {
       ...(await encrypt(syntheticFixture())),

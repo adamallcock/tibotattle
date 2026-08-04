@@ -1,6 +1,7 @@
 # Hosted running costs at 100, 1,000, 10,000, and 100,000 users
 
-> Written 2026-08-02 against `main` at `d160b72`. Cloudflare rates were read
+> Written 2026-08-02 against `main` at `d160b72`. Amended 2026-08-04 for the
+> public-upload admission controls. Cloudflare rates were read
 > from `developers.cloudflare.com` on 2026-08-01 and are cited inline. This
 > document answers one question: **can the owner afford to open the hosted
 > side to the public, and what breaks first if he does?**
@@ -133,7 +134,7 @@ will be far lower, which is where the first assumption enters.
 ### 2.1 What is bound
 
 **MEASURED** from `apps/worker/wrangler.jsonc` (production environment,
-lines 132-226):
+lines 240-380):
 
 - one Worker on custom domains `tibotattle.com` and `www.tibotattle.com`, plus
   the `workers.dev` origin;
@@ -142,10 +143,13 @@ lines 132-226):
 - static assets served from `apps/web/public` through the `ASSETS` binding;
 - one hourly cron trigger, `"0 * * * *"`;
 - observability enabled at `head_sampling_rate: 1`;
-- two rate-limit namespaces.
-
-There is no KV, no Durable Object, no Queue, no Hyperdrive, and no Logpush
-destination.
+- eight edge Rate Limit bindings: coarse and participant-keyed
+  upload-authorization guards plus coarse and client-keyed pre-body upload
+  ingress guards;
+- one named `UploadIngressBudget` Durable Object namespace, used as an
+  environment-wide upload start/in-flight budget; and
+- no Queue, KV, Hyperdrive, or Logpush destination. Queue ingress is
+  deliberately disabled pending an R2-pointer and idempotent-consumer design.
 
 **MEASURED.** The v0.2 account-scoped contract exists but is switched off:
 `TELEMETRY_V02_ENABLED = false` (`apps/worker/src/telemetry-v0.2.ts:16`) and
@@ -509,8 +513,12 @@ Two caveats carried forward from that reading:
   two rows written: one to the table itself, and one to the index."
 - **The rate-limiting binding has no published meter.** Cloudflare's docs are
   silent on whether `ratelimits` is billed separately. This model assumes it is
-  bundled into standard Workers pricing, which is **unverified**. Two
-  namespaces at 20 requests/60 s are unlikely to be material either way.
+  bundled into standard Workers pricing, which is **unverified**. The eight
+  current bindings are unlikely to be material either way.
+- **This pre-admission cost model now excludes Durable Object RPC/storage.**
+  One short-lived lease is acquired and released for each accepted upload. Do
+  not use the numeric totals here as a public capacity ceiling until that
+  addition has been measured against the deployed plan and traffic shape.
 
 ### Where each resource crosses from free into paid
 

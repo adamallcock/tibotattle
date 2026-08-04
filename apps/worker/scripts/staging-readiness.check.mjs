@@ -75,6 +75,24 @@ test("unsafe staging admission configuration fails closed", () => {
   assert.equal(result.blockers.includes("CONFIG_ENROLLMENT_DISABLED"), true);
 });
 
+test("staging readiness rejects a missing ingress budget binding or migration", () => {
+  const withoutBinding = structuredClone(checkedInConfig);
+  withoutBinding.env.staging.durable_objects.bindings = [];
+  const bindingResult = assessStagingConfiguration(withoutBinding);
+  assert.equal(bindingResult.state, "unsafe_configuration");
+  assert.equal(bindingResult.blockers.includes(
+    "CONFIG_INGRESS_BUDGET_BINDING_SAFE",
+  ), true);
+
+  const withoutMigration = structuredClone(checkedInConfig);
+  withoutMigration.migrations = [];
+  const migrationResult = assessStagingConfiguration(withoutMigration);
+  assert.equal(migrationResult.state, "unsafe_configuration");
+  assert.equal(migrationResult.blockers.includes(
+    "CONFIG_INGRESS_BUDGET_MIGRATION_SAFE",
+  ), true);
+});
+
 test("live readiness proves resources, secrets, migrations, and containment", () => {
   const config = provisionedConfig();
   const calls = [];

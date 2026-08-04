@@ -20,7 +20,17 @@
   "vars": {
     "ENVIRONMENT": "synthetic-development",
     "ENROLLMENT_MODE": "local_open",
-    "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
+    "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+    // Queue ingestion is deliberately deferred: a 2 MiB envelope requires an
+    // R2-pointer/consumer-receipt protocol rather than a direct Queue body.
+    "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
+    // Synthetic tests are sequentially isolated at the database layer but
+    // intentionally share the Durable Object runtime. Keep this above the
+    // full suite's fixture count; targeted budget tests pass their own policy.
+    "UPLOAD_INGRESS_MAX_CONCURRENT": "64",
+    "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "1200",
+    "UPLOAD_INGRESS_BURST": "1200",
+    "UPLOAD_INGRESS_LEASE_SECONDS": "90"
   },
   "secrets": {
     "required": [
@@ -50,6 +60,40 @@
       "name": "PUBLIC_READ_RATE_LIMIT",
       "namespace_id": "1004",
       "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+      "namespace_id": "1005",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
+      "namespace_id": "1006",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+      "namespace_id": "1007",
+      "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+      "namespace_id": "1008",
+      "simple": { "limit": 1000, "period": 60 }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "UPLOAD_INGRESS_BUDGET",
+        "class_name": "UploadIngressBudget"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "upload-ingress-budget-v1",
+      "new_sqlite_classes": ["UploadIngressBudget"]
     }
   ],
   "d1_databases": [
@@ -103,7 +147,12 @@
       "vars": {
         "ENVIRONMENT": "staging",
         "ENROLLMENT_MODE": "disabled",
-        "ACCOUNT_SCOPED_INGEST_MODE": "disabled"
+        "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
+        "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
+        "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
+        "UPLOAD_INGRESS_BURST": "16",
+        "UPLOAD_INGRESS_LEASE_SECONDS": "90"
       },
       "secrets": {
         "required": [
@@ -131,8 +180,36 @@
           "name": "PUBLIC_READ_RATE_LIMIT",
           "namespace_id": "2004",
           "simple": { "limit": 120, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+          "namespace_id": "2005",
+          "simple": { "limit": 300, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
+          "namespace_id": "2006",
+          "simple": { "limit": 6, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+          "namespace_id": "2007",
+          "simple": { "limit": 240, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+          "namespace_id": "2008",
+          "simple": { "limit": 20, "period": 60 }
         }
       ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "UPLOAD_INGRESS_BUDGET",
+            "class_name": "UploadIngressBudget"
+          }
+        ]
+      },
       "d1_databases": [
         {
           "binding": "USAGE_MONITOR_DB",
@@ -188,6 +265,11 @@
         "PUBLIC_ORIGIN": "https://tibotattle.com",
         "ENROLLMENT_MODE": "open",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
+        "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
+        "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
+        "UPLOAD_INGRESS_BURST": "16",
+        "UPLOAD_INGRESS_LEASE_SECONDS": "90",
         "GOOGLE_OIDC_CLIENT_ID": "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com",
         // Web Sign in with Apple. APPLE_SERVICES_ID is the Apple Services ID:
         // it is the OAuth client_id, the subject of the ES256 client secret,
@@ -234,8 +316,36 @@
           "name": "PUBLIC_READ_RATE_LIMIT",
           "namespace_id": "3004",
           "simple": { "limit": 120, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+          "namespace_id": "3005",
+          "simple": { "limit": 300, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_PRINCIPAL_RATE_LIMIT",
+          "namespace_id": "3006",
+          "simple": { "limit": 6, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+          "namespace_id": "3007",
+          "simple": { "limit": 240, "period": 60 }
+        },
+        {
+          "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+          "namespace_id": "3008",
+          "simple": { "limit": 20, "period": 60 }
         }
       ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "UPLOAD_INGRESS_BUDGET",
+            "class_name": "UploadIngressBudget"
+          }
+        ]
+      },
       "d1_databases": [
         {
           "binding": "USAGE_MONITOR_DB",

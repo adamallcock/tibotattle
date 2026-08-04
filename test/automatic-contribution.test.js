@@ -25,7 +25,7 @@ import {
   AUTOMATIC_CONTRIBUTION_LIMITS,
   acquireAutomaticContributionInstanceLock,
   automaticContributionRequiredConsent,
-  createAutomaticContributionController,
+  createAutomaticContributionController as createAutomaticContributionControllerWithRuntimeDither,
 } from "../src/automatic-contribution.js";
 import * as automaticContribution from "../src/automatic-contribution.js";
 import {
@@ -53,6 +53,16 @@ const AUTOMATIC_COVERAGE = Object.freeze({
   startAt: "2026-07-29T11:00:00.000Z",
   endAt: "2026-07-29T18:00:00.000Z",
 });
+
+// Most controller tests assert exact clock values. Production keeps the
+// default random schedule phase; these unit tests opt into a zero phase except
+// where they are specifically proving the dither behavior.
+function createAutomaticContributionController(options = {}) {
+  return createAutomaticContributionControllerWithRuntimeDither({
+    ditherRandom: () => 0,
+    ...options,
+  });
+}
 
 test("root retains its exact public API and policy alias identities", () => {
   assert.deepEqual(Object.keys(automaticContribution).sort(), [
@@ -608,7 +618,7 @@ test("same-destination relaunch preserves consent, due time, and runs overdue wo
     });
     const overdue = await third.start();
     assert.equal(overdue.status, "scheduled");
-    assert.equal(overdue.nextAttemptAt, "2026-07-29T18:00:00.000Z");
+    assert.equal(overdue.nextAttemptAt, "2026-07-29T19:00:00.000Z");
     assert.deepEqual(thirdTimers.delays(), [0]);
     thirdTimers.fireFirst(0);
     await waitFor(() => uploadRequests.length === 1);
@@ -623,6 +633,123 @@ test("same-destination relaunch preserves consent, due time, and runs overdue wo
     await first.stop();
     await second?.stop();
     await third?.stop();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a persisted client dither spreads opt-in and overdue relaunches", async () => {
+  const files = await fixture();
+  let first;
+  let second;
+  try {
+    first = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async (request) => successfulPreparation(request),
+      uploadRunner: async () => completedUpload(),
+      now: () => new Date(START),
+      ditherRandom: () => 0.5,
+      ...fakeTimers(),
+    });
+    await first.start();
+    await enableAfterCompletedReview(first);
+    const scheduled = await first.inspect();
+    assert.equal(scheduled.nextAttemptAt, "2026-07-29T18:30:00.000Z");
+    const persisted = JSON.parse(await readFile(files.settingsFile, "utf8"));
+    assert.equal(persisted.scheduleDitherMilliseconds, 30 * 60 * 1_000);
+    assert.equal(persisted.nextAttemptAt, "2026-07-29T18:30:00.000Z");
+    await first.stop();
+
+    const timers = fakeTimers();
+    second = createAutomaticContributionController({
+      settingsFile: files.settingsFile,
+      destinationOrigin: CENTRAL_ORIGIN,
+      prepareRunner: async (request) => successfulPreparation(request),
+      uploadRunner: async () => completedUpload(),
+      now: () => new Date(START + 7 * 60 * 60 * 1_000),
+      ditherRandom: () => 0,
+      ...timers,
+    });
+    const overdue = await second.start();
+    assert.equal(overdue.nextAttemptAt, "2026-07-29T19:30:00.000Z");
+    assert.deepEqual(timers.delays(), [30 * 60 * 1_000]);
+  } finally {
+    await first?.stop();
+    await second?.stop();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a queue retry checkpoint overrides the regular automatic cadence", async () => {
+  const files = await fixture();
+  let now = START;
+  const retryAt = "2026-07-29T18:02:30.000Z";
+  const unrelatedQueueRetryAt = "2026-07-29T18:00:10.000Z";
+  const controller = createAutomaticContributionController({
+    settingsFile: files.settingsFile,
+    destinationOrigin: CENTRAL_ORIGIN,
+    prepareRunner: async (request) => successfulPreparation(request),
+    uploadRunner: async () => ({
+      status: "completed",
+      accepted: 0,
+      processed: 1,
+      retryable: 1,
+      rejected: 0,
+      // Queue status remains intentionally global for the UI. This earlier
+      // deadline belongs to another prepared set and must not re-run ours.
+      queue: { paused: false, nextAttemptAt: unrelatedQueueRetryAt },
+      retryNotBeforeAt: retryAt,
+      preparedSet: preparedSetStatus({ acceptedJobs: 0, retryableJobs: 1 }),
+    }),
+    now: () => new Date(now),
+    ...fakeTimers(),
+  });
+  try {
+    await controller.start();
+    await enableAfterCompletedReview(controller);
+    now += 6 * 60 * 60 * 1_000;
+    const status = await controller.runDue();
+    assert.equal(status.status, "scheduled");
+    assert.equal(status.nextAttemptAt, retryAt);
+    assert.deepEqual(status.lastOutcome, {
+      status: "failed",
+      code: "retry_scheduled",
+      at: "2026-07-29T18:00:00.000Z",
+    });
+    const persisted = JSON.parse(await readFile(files.settingsFile, "utf8"));
+    assert.equal(persisted.nextAttemptAt, retryAt);
+  } finally {
+    await controller.stop();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a thrown retryable upload adapter error preserves its Retry-After floor", async () => {
+  const files = await fixture();
+  let now = START;
+  const retryAt = "2026-07-29T18:01:00.000Z";
+  const controller = createAutomaticContributionController({
+    settingsFile: files.settingsFile,
+    destinationOrigin: CENTRAL_ORIGIN,
+    prepareRunner: async (request) => successfulPreparation(request),
+    uploadRunner: async () => {
+      const error = new Error("temporary upload failure");
+      error.retryable = true;
+      error.retryAfterMilliseconds = 60_000;
+      throw error;
+    },
+    now: () => new Date(now),
+    ...fakeTimers(),
+  });
+  try {
+    await controller.start();
+    await enableAfterCompletedReview(controller);
+    now += 6 * 60 * 60 * 1_000;
+    const status = await controller.runDue();
+    assert.equal(status.status, "scheduled");
+    assert.equal(status.nextAttemptAt, retryAt);
+  } finally {
+    await controller.stop();
     await rm(files.root, { recursive: true });
   }
 });
@@ -773,6 +900,8 @@ test("a mismatched write-ahead claim makes settings unavailable before any runne
     },
     lastAttemptAt: "2026-07-29T12:00:00.000Z",
     lastSuccessAt: null,
+    nextAttemptAt: "2026-07-29T18:00:00.000Z",
+    scheduleDitherMilliseconds: 0,
     lastOutcome: null,
   })}\n`, { mode: 0o600 });
   let preparations = 0;
@@ -1200,12 +1329,14 @@ test("an unexpected upload failure pauses while an explicitly retryable collisio
       retryable: false,
       expectedStatus: "paused",
       expectedNextAttemptAt: null,
+      expectedCode: "upload_failed",
     },
     {
       name: "retryable collision",
       retryable: true,
       expectedStatus: "scheduled",
       expectedNextAttemptAt: "2026-07-30T00:00:00.000Z",
+      expectedCode: "retry_scheduled",
     },
   ]) {
     await t.test(scenario.name, async () => {
@@ -1238,7 +1369,7 @@ test("an unexpected upload failure pauses while an explicitly retryable collisio
         assert.equal(status.nextAttemptAt, scenario.expectedNextAttemptAt);
         assert.deepEqual(status.lastOutcome, {
           status: "failed",
-          code: "upload_failed",
+          code: scenario.expectedCode,
           at: "2026-07-29T18:00:00.000Z",
         });
       } finally {

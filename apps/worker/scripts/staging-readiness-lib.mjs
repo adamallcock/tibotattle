@@ -23,7 +23,29 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "RECOVERY_RATE_LIMIT", limit: 20 }),
   Object.freeze({ name: "CLIENT_ATTEMPT_RATE_LIMIT", limit: 5 }),
   Object.freeze({ name: "PUBLIC_READ_RATE_LIMIT", limit: 120 }),
+  Object.freeze({ name: "UPLOAD_AUTHORIZATION_RATE_LIMIT", limit: 300 }),
+  Object.freeze({ name: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 6 }),
+  Object.freeze({ name: "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", limit: 240 }),
+  Object.freeze({ name: "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", limit: 20 }),
 ]);
+export const REQUIRED_STAGING_VARIABLES = Object.freeze({
+  ENVIRONMENT: "staging",
+  ENROLLMENT_MODE: "disabled",
+  ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+  UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+  UPLOAD_INGRESS_MAX_CONCURRENT: "8",
+  UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
+  UPLOAD_INGRESS_BURST: "16",
+  UPLOAD_INGRESS_LEASE_SECONDS: "90",
+});
+export const REQUIRED_INGRESS_DURABLE_OBJECT_BINDING = Object.freeze({
+  name: "UPLOAD_INGRESS_BUDGET",
+  className: "UploadIngressBudget",
+});
+export const REQUIRED_INGRESS_DURABLE_OBJECT_MIGRATION = Object.freeze({
+  tag: "upload-ingress-budget-v1",
+  className: "UploadIngressBudget",
+});
 export const GENERATED_WORKER_ASSET_DIRECTORY =
   "../../.release-build/worker-assets";
 const ALLOWED_WORKER_FIRST_ROUTES = Object.freeze([
@@ -54,6 +76,15 @@ function exactStringSet(value, expected) {
     && value.every((entry) => typeof entry === "string")
     && new Set(value).size === value.length
     && expected.every((entry) => value.includes(entry));
+}
+
+function exactStringMap(value, expected) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length === Object.keys(expected).length
+    && Object.entries(expected).every(([key, expectedValue]) =>
+      value[key] === expectedValue);
 }
 
 function validStagingName(value) {
@@ -110,6 +141,24 @@ function safeRateLimits(value) {
     });
 }
 
+function safeIngressDurableObjectBinding(value) {
+  return exactNamedMembers(
+    value,
+    [REQUIRED_INGRESS_DURABLE_OBJECT_BINDING.name],
+    "name",
+  ) && value[0]?.class_name === REQUIRED_INGRESS_DURABLE_OBJECT_BINDING.className;
+}
+
+function safeIngressDurableObjectMigration(value) {
+  return Array.isArray(value) && value.some((migration) => (
+    migration?.tag === REQUIRED_INGRESS_DURABLE_OBJECT_MIGRATION.tag
+    && Array.isArray(migration.new_sqlite_classes)
+    && migration.new_sqlite_classes.length === 1
+    && migration.new_sqlite_classes[0]
+      === REQUIRED_INGRESS_DURABLE_OBJECT_MIGRATION.className
+  ));
+}
+
 function safeD1Bindings(value) {
   if (!exactNamedMembers(
     value,
@@ -161,8 +210,10 @@ export function assessStagingConfiguration(config) {
       && environment?.vars?.ENROLLMENT_MODE === "disabled",
     accountScopedIngestDisabled:
       environment?.vars?.ACCOUNT_SCOPED_INGEST_MODE === "disabled",
-    noUnexpectedVariables: environment?.vars
-      && Object.keys(environment.vars).length === 3,
+    noUnexpectedVariables: exactStringMap(
+      environment?.vars,
+      REQUIRED_STAGING_VARIABLES,
+    ),
     requiredSecretsDeclared: exactStringSet(
       environment?.secrets?.required,
       REQUIRED_STAGING_SECRETS,
@@ -174,6 +225,12 @@ export function assessStagingConfiguration(config) {
       ).size === REQUIRED_D1_BINDINGS.length,
     r2BindingSafe: safeR2Binding(environment?.r2_buckets),
     rateLimitsSafe: safeRateLimits(environment?.ratelimits),
+    ingressBudgetBindingSafe: safeIngressDurableObjectBinding(
+      environment?.durable_objects?.bindings,
+    ),
+    ingressBudgetMigrationSafe: safeIngressDurableObjectMigration(
+      config?.migrations,
+    ),
     assetsClosed: oneApiAssetRoute(environment?.assets),
     deployableAssetsClosed: deployableAssetRoutesClosed(config),
     resourceIdentifiersConfigured:

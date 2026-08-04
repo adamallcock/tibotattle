@@ -285,6 +285,9 @@ hours and quarantine retention, deletion-ledger restore replay, pending
 aggregate rebuilds, and quarantine reconciliation are all complete. Retention
 and reconciliation must also record the same maintenance-cycle timestamp, so a
 termination between the two passes cannot reuse an older successful status.
+It also validates the upload ingress bindings and performs a non-consuming
+`UploadIngressBudget` Durable Object probe, so readiness cannot remain `200`
+when public upload admission is unavailable.
 
 `DELETION_LEDGER` has its own migration directory and must be backed up and
 restored independently from `USAGE_MONITOR_DB`. Participant deletion first

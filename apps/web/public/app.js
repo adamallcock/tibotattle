@@ -4674,6 +4674,14 @@ const SERVICE_ERROR_COPY = {
     "This build points to a contribution-service route that is unavailable. Nothing was uploaded; install the current signed build before trying again.",
   ATTEMPT_LIMIT_REACHED:
     "Too many attempts were made in a short window. Wait a few minutes before trying again. Nothing was uploaded.",
+  ADMISSION_CONFIGURATION_INVALID:
+    "The contribution service is not ready to accept uploads. Nothing was uploaded; try again shortly.",
+  UPLOAD_ADMISSION_LIMIT_REACHED:
+    "Too many upload authorizations were requested in a short window. Wait a minute before trying again. Nothing was uploaded.",
+  UPLOAD_INGRESS_LIMIT_REACHED:
+    "The contribution service is temporarily busy. Wait for the stated retry time before trying again. Nothing was uploaded.",
+  UPLOAD_INGRESS_UNAVAILABLE:
+    "The contribution service cannot admit uploads right now. Nothing was uploaded; try again shortly.",
   BACKEND_STORAGE_UNAVAILABLE:
     "The contribution service could not reach its own storage. Nothing was uploaded; try again shortly.",
   COLLECTION_CONTROL_UNAVAILABLE:

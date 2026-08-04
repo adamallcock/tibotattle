@@ -2,9 +2,20 @@ import {
   assertAdmissionBindings,
   assertAttemptAllowed,
   assertPublicAggregateReadAllowed,
+  assertUploadAuthorizationBindings,
+  assertUploadAuthorizationAllowed,
+  assertUploadIngressRateLimitBindings,
+  assertUploadIngressRequestAllowed,
   configuredEnrollmentMode,
   parseInviteGrant,
 } from "./admission";
+import {
+  acquireUploadIngressLease,
+  assertUploadIngressConfiguration,
+  probeUploadIngressBudget,
+  releaseUploadIngressLease,
+  startUploadIngressLeaseHeartbeat,
+} from "./upload-ingress-admission";
 import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
@@ -147,6 +158,10 @@ import {
   telemetryRecordsForContribution,
 } from "./telemetry-repository";
 
+// Wrangler discovers Durable Object classes through the Worker module's named
+// exports. The class itself owns only opaque short-lived admission leases.
+export { UploadIngressBudget } from "./ingress-budget";
+
 function telemetryContributionLimitError(
   admission: TelemetryContributionAdmission,
   nowEpoch = Date.now(),
@@ -226,6 +241,39 @@ async function readBoundedJson(request: Request): Promise<{
   } catch {
     throw new ApiError(400, "BODY_INVALID");
   }
+}
+
+const UPLOAD_AUTHORIZATION_HEADER =
+  /^Upload um_(?:device_)?upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
+
+/**
+ * Reject requests that cannot possibly be a contribution before spending a
+ * Rate Limit key or shared ingress slot. The bound reader rechecks these
+ * fields before consuming the body; this is a cheap pre-body fence only.
+ */
+function contributionRequestPreflight(request: Request): string {
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  const authorization = request.headers.get("authorization");
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > MAX_REQUEST_BYTES) throw new ApiError(413, "BODY_TOO_LARGE");
+  }
+  if (!request.body) throw new ApiError(400, "BODY_INVALID");
+  if (typeof authorization !== "string"
+      || !UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
+    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+  }
+  return authorization;
 }
 
 /**
@@ -1226,12 +1274,22 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
 
 async function handleUploadAuthorization(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertAdmissionBindings(env);
+  assertUploadAuthorizationBindings(env);
+  assertUploadIngressConfiguration(env);
   await assertCollectionControl(
     env.USAGE_MONITOR_DB,
     "uploadRegistration",
   );
   const session = await personalSession(request, env);
   assertCsrf(request, session);
+  await assertUploadAuthorizationAllowed(
+    env.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    env.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    session.participantId,
+    env,
+  );
+  await probeUploadIngressBudget(env);
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
       || body.value === null
@@ -1327,6 +1385,9 @@ async function handleDeviceUploadAuthorization(
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
+  assertAdmissionBindings(env);
+  assertUploadAuthorizationBindings(env);
+  assertUploadIngressConfiguration(env);
   await assertCollectionControl(
     env.USAGE_MONITOR_DB,
     "uploadRegistration",
@@ -1339,6 +1400,13 @@ async function handleDeviceUploadAuthorization(
   if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
+  await assertUploadAuthorizationAllowed(
+    env.UPLOAD_AUTHORIZATION_RATE_LIMIT,
+    env.UPLOAD_PRINCIPAL_RATE_LIMIT,
+    device.participantId,
+    env,
+  );
+  await probeUploadIngressBudget(env);
   const body = await readBoundedJson(request);
   if (typeof body.value !== "object"
       || body.value === null
@@ -1692,28 +1760,48 @@ async function handleTelemetryContribution(
 
 async function handleContribution(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
-  await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
-  if (hasSessionCookie(request.headers.get("cookie"))) {
-    throw new ApiError(401, "UPLOAD_AUTH_INVALID");
-  }
-  const body = await readBoundedJson(request);
-  const contentType = request.headers.get("content-type")?.trim() ?? "";
-  const bodyBytes = body.bytes.byteLength;
-  const scopeDigest = await sha256Hex(body.bytes);
-  const authorizationHeader = request.headers.get("authorization");
-  const claimed = authorizationHeader?.startsWith("Upload um_device_upload_")
-    ? await claimDeviceUploadAuthorization(
-      env.USAGE_MONITOR_DB,
-      authorizationHeader,
-      { envelopeDigest: scopeDigest, bodyBytes, contentType },
-    )
-    : await claimUploadAuthorization(
-      env.USAGE_MONITOR_DB,
-      authorizationHeader,
-      { envelopeDigest: scopeDigest, bodyBytes, contentType },
-    );
+  assertUploadIngressConfiguration(env);
+  assertUploadIngressRateLimitBindings(env);
+  const authorizationHeader = contributionRequestPreflight(request);
+  await assertUploadIngressRequestAllowed(
+    env.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+    env.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    request,
+    env,
+  );
+  // This lease intentionally begins before body consumption. A public request
+  // with a syntactically valid bearer header can otherwise force 2 MiB reads,
+  // JSON parsing, hashing, or a D1 token lookup without entering the shared
+  // budget. Rejections do not consume the one-use authorization, so a client
+  // can honor Retry-After and retry the exact prepared envelope.
+  const ingressLease = await acquireUploadIngressLease(env);
+  const heartbeat = startUploadIngressLeaseHeartbeat(env, ingressLease);
   let completed = false;
+  let claimed: {
+    authorizationId: string;
+    participantId: string;
+    authorizationKind: "session" | "device";
+  } | null = null;
   try {
+    const body = await readBoundedJson(request);
+    await heartbeat.assertActive();
+    const contentType = request.headers.get("content-type")?.trim() ?? "";
+    const bodyBytes = body.bytes.byteLength;
+    const scopeDigest = await sha256Hex(body.bytes);
+    await heartbeat.assertActive();
+    await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
+    claimed = authorizationHeader.startsWith("Upload um_device_upload_")
+      ? await claimDeviceUploadAuthorization(
+        env.USAGE_MONITOR_DB,
+        authorizationHeader,
+        { envelopeDigest: scopeDigest, bodyBytes, contentType },
+      )
+      : await claimUploadAuthorization(
+        env.USAGE_MONITOR_DB,
+        authorizationHeader,
+        { envelopeDigest: scopeDigest, bodyBytes, contentType },
+      );
+    await heartbeat.assertActive();
     if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
       throw new ApiError(400, "ENVELOPE_INVALID");
     }
@@ -1728,9 +1816,11 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     if (await hasDeletionTombstone(env.DELETION_LEDGER, participant.id)) {
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     }
+    await heartbeat.assertActive();
     const response = Reflect.get(body.value, "schemaVersion") === "telemetry-envelope-v0.1"
       ? await handleTelemetryContribution(request, body, participant, claimed, env)
       : await handleSyntheticContribution(body, participant, claimed, env);
+    await heartbeat.assertActive();
     const receipt = await response.clone().json<{ contributionId?: unknown }>();
     if (typeof receipt.contributionId !== "string") {
       throw new ApiError(500, "INTERNAL_ERROR");
@@ -1751,17 +1841,32 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     completed = true;
     return response;
   } finally {
-    if (!completed) {
-      if (claimed.authorizationKind === "device") {
-        await abandonDeviceUploadAuthorization(
-          env.USAGE_MONITOR_DB,
-          claimed.authorizationId,
-        );
-      } else {
-        await abandonUploadAuthorization(
-          env.USAGE_MONITOR_DB,
-          claimed.authorizationId,
-        );
+    try {
+      if (!completed && claimed !== null) {
+        if (claimed.authorizationKind === "device") {
+          await abandonDeviceUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
+        } else {
+          await abandonUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
+        }
+      }
+    } catch {
+      // Preserve the original client-visible status and leave a redacted
+      // operational signal if the best-effort token revocation itself fails.
+      console.error(JSON.stringify({
+        level: "error",
+        event: "upload_authorization_abandon_failed",
+      }));
+    } finally {
+      await heartbeat.stop();
+      try {
+        await releaseUploadIngressLease(env, ingressLease);
+      } catch {
+        // The renewals leave a finite availability backstop. Do not turn an
+        // already committed contribution into a client failure.
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "upload_ingress_lease_release_failed",
+        }));
       }
     }
   }
@@ -2268,6 +2373,11 @@ async function handleReady(
   nowEpoch = Date.now(),
 ): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
+  assertAdmissionBindings(env);
+  assertUploadAuthorizationBindings(env);
+  assertUploadIngressRateLimitBindings(env);
+  assertUploadIngressConfiguration(env);
+  await probeUploadIngressBudget(env);
   const retention = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state, last_completed_at, maintenance_run_at,
             quarantine_retention_complete, restore_replay_complete
@@ -2396,6 +2506,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method !== "GET") methodNotAllowed(["GET"]);
       const enrollmentMode = configuredEnrollmentMode(env);
       assertAdmissionBindings(env);
+      assertUploadAuthorizationBindings(env);
+      assertUploadIngressRateLimitBindings(env);
+      assertUploadIngressConfiguration(env);
+      await probeUploadIngressBudget(env);
       const collectionControls = await readCollectionControls(
         env.USAGE_MONITOR_DB,
       );

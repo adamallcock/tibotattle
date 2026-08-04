@@ -13,7 +13,10 @@ export const COMMUNITY_WEEKLY_LEASE_MILLISECONDS = 5 * 60 * 1000;
 export const COMMUNITY_WEEKLY_MAX_CELLS = 100;
 export const SESSION_TTL_MILLISECONDS = 30 * 60 * 1000;
 export const UPLOAD_AUTHORIZATION_TTL_MILLISECONDS = 5 * 60 * 1000;
-export const UPLOAD_CONSUME_LEASE_MILLISECONDS = 60 * 1000;
+// This must cover every allowed ingress lease. The Durable Object may renew a
+// live request for up to the configured five-minute maximum, and canonical
+// D1 insert triggers must not expire its one-use authorization earlier.
+export const UPLOAD_CONSUME_LEASE_MILLISECONDS = 5 * 60 * 1000;
 export const DEVICE_PAIRING_TTL_MILLISECONDS = 10 * 60 * 1000;
 export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;
