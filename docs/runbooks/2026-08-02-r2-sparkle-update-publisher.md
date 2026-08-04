@@ -81,10 +81,11 @@ key, exact XML content type/cache-control, bounded candidate bytes, candidate
 SHA-256, and expected current state/hash (and optional current HTTP etag).
 
 The owner-only Worker independently parses the candidate and active appcasts,
-requires one unambiguous latest full enclosure with a strictly higher bundle
-version (or the explicit empty-state bootstrap), and checks its canonical
-content-addressed URL, immutable R2 metadata, exact bytes/length/hash, and
-Sparkle Ed25519 signature. It reads the stable public key only from the named
+requires exactly one item with exactly one full `.dmg` enclosure (rejecting all
+delta enclosures and older/history entries), with a strictly higher bundle
+version (or the explicit empty-state bootstrap), and checks every referenced
+artifact's canonical content-addressed URL, immutable R2 metadata, exact
+bytes/length/hash, and Sparkle Ed25519 signature. It reads the stable public key only from the named
 owner-provisioned public configuration and checks its SHA-256 fingerprint; the
 private key never enters the Worker. It then reads the current appcast,
 verifies that state, and calls R2 `put(..., { onlyIf: { etagMatches } })` (or the
@@ -146,8 +147,11 @@ passed to or stored by this publisher. The appcast and its referenced DMG are
 validated before any Wrangler command can run. Supply the matching public key
 through `--sparkle-public-ed-key`; it is compared with the release manifest's
 public-key SHA-256 fingerprint and used for local Ed25519 verification.
-The candidate release must satisfy the canonical one-item/full-DMG contract
-above. No history or delta enclosure is preserved or uploaded.
+The canonical stable guard policy is deliberately narrower than historical
+appcast compatibility: the candidate must contain exactly one full `.dmg`
+enclosure in exactly one item. Delta enclosures and older/history entries are
+rejected, so every published appcast reference is independently checked by the
+Worker before the CAS write.
 
 ## Publish procedure
 

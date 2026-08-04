@@ -253,12 +253,20 @@ async function appcastBytes(
   artifactBytes = ARTIFACT_BYTES,
   enclosureSuffix = "",
 ): Promise<Uint8Array> {
-  const digest = await sha256Hex(artifactBytes);
-  const signature = await sparkleSignature(artifactBytes);
+  const enclosure = await appcastEnclosure(version, artifactBytes);
   return encoder.encode(`<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
-<enclosure url="https://updates.tibotattle.com/${artifactKey(version, digest)}" length="${artifactBytes.byteLength}" sparkle:version="${version}" sparkle:edSignature="${signature}" />${enclosureSuffix}
+${enclosure}${enclosureSuffix}
 </item></channel></rss>`);
+}
+
+async function appcastEnclosure(
+  version: string,
+  artifactBytes = ARTIFACT_BYTES,
+): Promise<string> {
+  const digest = await sha256Hex(artifactBytes);
+  const signature = await sparkleSignature(artifactBytes);
+  return `<enclosure url="https://updates.tibotattle.com/${artifactKey(version, digest)}" length="${artifactBytes.byteLength}" sparkle:version="${version}" sparkle:edSignature="${signature}" />`;
 }
 
 async function installArtifact(
@@ -509,6 +517,45 @@ describe("Sparkle appcast atomic guard", () => {
     );
     expect(mismatchedResponse.status).toBe(422);
     expect(mismatched.putCalls).toBe(0);
+  });
+
+  it("rejects a valid-looking older entry when its artifact is missing", async () => {
+    const bucket = new FakeR2Bucket();
+    const missingOlderArtifact = encoder.encode("signed-but-not-uploaded-older-artifact");
+    const candidate = encoder.encode(
+      new TextDecoder().decode(await appcastBytes("2"))
+        .replace(
+          "</item>",
+          `${await appcastEnclosure("1", missingOlderArtifact)}</item>`,
+        ),
+    );
+    await installArtifact(bucket, "2");
+    const response = await invoke(
+      await signedRequest(await payload({ candidate })),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(422);
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("rejects delta enclosures even when the full artifact-looking data is signed", async () => {
+    const bucket = new FakeR2Bucket();
+    const candidate = encoder.encode(
+      new TextDecoder().decode(await appcastBytes("2"))
+        .replace("TiboTattle.dmg", "TiboTattle.delta")
+        .replace(
+          'sparkle:version="2"',
+          'sparkle:version="2" sparkle:deltaFrom="1"',
+        ),
+    );
+    const response = await invoke(
+      await signedRequest(await payload({ candidate })),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(422);
+    expect(bucket.putCalls).toBe(0);
   });
 
   it("rejects equal and lower active versions", async () => {

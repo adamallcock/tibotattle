@@ -77,8 +77,9 @@ notarization, Worker guard, R2 mutation, public read-back, or clean-profile
 update rehearsal gates have passed.
 
 The disabled appcast guard now has a local server-side verification boundary:
-when owner-provisioned, it independently checks the canonical stable enclosure,
-monotonic version, immutable R2 artifact metadata/bytes, and Sparkle Ed25519
+when owner-provisioned, it independently checks exactly one full stable `.dmg`
+enclosure/item, rejects all delta/history entries, enforces monotonic version,
+and verifies the referenced R2 artifact metadata/bytes and Sparkle Ed25519
 signature before the existing nonce/CAS write. The checked-in Worker remains
 disabled and unprovisioned; code validation is not channel readiness, and real
 readiness still requires owner review of the stable public-key fingerprint,

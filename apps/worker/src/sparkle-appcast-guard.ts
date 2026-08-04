@@ -39,7 +39,7 @@ const ED25519_SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/u;
 const BUNDLE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SAFE_ARTIFACT_FILE_NAME_PATTERN =
-  /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:dmg|delta)$/u;
+  /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.dmg$/u;
 const TOKEN_PATTERN = /^[^\u0000-\u001f\u007f]{32,256}$/u;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
@@ -447,11 +447,7 @@ function parseSparkleEnclosure(attributes: Map<string, string>): SparkleAppcastE
   }
   const object = parseSparkleArtifactURL(url, version);
   const deltaFrom = attributes.get("sparkle:deltaFrom");
-  if (deltaFrom !== undefined
-      && (!BUNDLE_VERSION_PATTERN.test(deltaFrom)
-        || compareBundleVersions(deltaFrom, version) >= 0)) {
-    invalidCandidate();
-  }
+  if (deltaFrom !== undefined) invalidCandidate();
   return {
     deltaFrom,
     length: Number(length),
@@ -473,7 +469,7 @@ function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
   let index = 0;
   let rootSeen = false;
   let channelSeen = false;
-  let itemSeen = false;
+  let itemCount = 0;
   while (index < text.length) {
     if (text[index] !== "<") {
       const next = text.indexOf("<", index);
@@ -527,7 +523,7 @@ function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
     }
     if (name === "item") {
       if (parent !== "channel" || selfClosing) invalidCandidate();
-      itemSeen = true;
+      itemCount += 1;
     }
     if (name === "enclosure") {
       if (parent !== "item" || !selfClosing) invalidCandidate();
@@ -537,21 +533,11 @@ function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
     }
     index = end + 1;
   }
-  if (!rootSeen || !channelSeen || !itemSeen || stack.length !== 0
-      || enclosures.length === 0) invalidCandidate();
-  let latestVersion = enclosures[0]?.version;
-  if (latestVersion === undefined) invalidCandidate();
-  for (const enclosure of enclosures) {
-    if (compareBundleVersions(enclosure.version, latestVersion) > 0) {
-      latestVersion = enclosure.version;
-    }
-  }
-  const latest = enclosures.filter(
-    (enclosure) => enclosure.version === latestVersion,
-  );
-  if (latest.length !== 1 || latest[0] === undefined
-      || latest[0].deltaFrom !== undefined) invalidCandidate();
-  return { enclosures, latest: latest[0] };
+  if (!rootSeen || !channelSeen || itemCount !== 1 || stack.length !== 0
+      || enclosures.length !== 1) invalidCandidate();
+  const latest = enclosures[0];
+  if (latest === undefined || latest.deltaFrom !== undefined) invalidCandidate();
+  return { enclosures, latest };
 }
 
 function invalidCandidate(): never {
@@ -846,11 +832,9 @@ export async function handleSparkleAppcastGuard(
     }
   }
   const publicKey = await configuredSparklePublicKey(configuration);
-  await verifyCandidateArtifact(
-    configuration.bucket,
-    candidateAppcast.latest,
-    publicKey,
-  );
+  for (const enclosure of candidateAppcast.enclosures) {
+    await verifyCandidateArtifact(configuration.bucket, enclosure, publicKey);
+  }
 
   const onlyIf = current.head === null
     ? { etagDoesNotMatch: "*" }
