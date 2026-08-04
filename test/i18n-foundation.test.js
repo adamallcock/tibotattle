@@ -6,16 +6,20 @@ import {
   CATALOGS,
   DEFAULT_LOCALE,
   EN_US_CATALOG,
+  ES_CATALOG,
   SUPPORTED_LOCALES,
+  ZH_HANS_CATALOG,
   formatDate,
   formatNumber,
+  formatPercent,
   getMessage,
   interpolateMessage,
   negotiateLocale,
+  resolveLocalePreference,
   translate,
 } from "../packages/i18n/index.js";
 
-test("i18n is a dependency-free workspace package with an en-US catalog", async () => {
+test("i18n is a dependency-free workspace package with complete initial catalogs", async () => {
   const manifest = JSON.parse(
     await readFile(new URL("../packages/i18n/package.json", import.meta.url), "utf8"),
   );
@@ -28,15 +32,31 @@ test("i18n is a dependency-free workspace package with an en-US catalog", async 
   assert.deepEqual(manifest.files, ["index.d.ts", "index.js"]);
   assert.equal(Object.hasOwn(manifest, "dependencies"), false);
   assert.equal(DEFAULT_LOCALE, "en-US");
-  assert.deepEqual(SUPPORTED_LOCALES, ["en-US"]);
+  assert.deepEqual(SUPPORTED_LOCALES, ["en-US", "zh-Hans", "es"]);
   assert.equal(CATALOGS[DEFAULT_LOCALE], EN_US_CATALOG);
+  assert.equal(CATALOGS["zh-Hans"], ZH_HANS_CATALOG);
+  assert.equal(CATALOGS.es, ES_CATALOG);
   assert.equal(EN_US_CATALOG["app.name"], "TiboTattle");
+  const keys = Object.keys(EN_US_CATALOG).sort();
+  for (const [locale, catalog] of Object.entries(CATALOGS)) {
+    assert.deepEqual(Object.keys(catalog).sort(), keys, `${locale} key parity`);
+    assert.equal(
+      Object.values(catalog).every((value) => value.trim().length > 0),
+      true,
+      `${locale} contains no blank catalog value`,
+    );
+  }
 });
 
 test("locale negotiation prefers exact and language matches before fallback", () => {
   assert.equal(negotiateLocale("en-US"), "en-US");
   assert.equal(negotiateLocale("EN-us"), "en-US");
   assert.equal(negotiateLocale("en"), "en-US");
+  assert.equal(negotiateLocale("zh-CN"), "zh-Hans");
+  assert.equal(negotiateLocale("zh-SG"), "zh-Hans");
+  assert.equal(negotiateLocale("zh-TW"), "en-US");
+  assert.equal(negotiateLocale("zh-Hant"), "en-US");
+  assert.equal(negotiateLocale("es-MX"), "es");
   assert.equal(negotiateLocale(["fr-FR", "en-US"]), "en-US");
   assert.equal(negotiateLocale("fr-FR"), "en-US");
   assert.equal(
@@ -55,12 +75,22 @@ test("locale negotiation prefers exact and language matches before fallback", ()
     () => negotiateLocale("en-US", ["invalid_locale"]),
     RangeError,
   );
+  assert.equal(resolveLocalePreference("system", ["es-MX"]), "es");
+  assert.equal(resolveLocalePreference("zh-Hans", ["es-MX"]), "zh-Hans");
 });
 
 test("message lookup and interpolation keep missing content visible", () => {
   assert.equal(
     getMessage(EN_US_CATALOG, "usage.events"),
     "Usage events: {count}",
+  );
+  assert.equal(
+    translate("usage.events", { count: 12 }, { locale: "zh-Hans" }),
+    "使用事件：12",
+  );
+  assert.equal(
+    translate("usage.events", { count: 12 }, { locale: "es" }),
+    "Eventos de uso: 12",
   );
   assert.equal(
     getMessage(EN_US_CATALOG, "missing.key"),
@@ -110,6 +140,8 @@ test("number and date formatting uses Intl locale conventions and safe defaults"
     "$12.50",
   );
   assert.equal(formatNumber(1234.5, "invalid_locale"), "1,234.5");
+  assert.equal(formatPercent(0.125, "en-US"), "13%");
+  assert.match(formatPercent(0.125, "es"), /13/u);
 
   const instant = new Date("2026-01-02T15:04:05.000Z");
   assert.equal(formatDate(instant, "en-US"), "Jan 2, 2026");

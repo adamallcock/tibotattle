@@ -38,6 +38,9 @@ import {
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
 import {
+  createBrowserLocalization,
+} from "./localization.js";
+import {
   compact,
   createDomHelpers,
   finite,
@@ -45,9 +48,19 @@ import {
   formatLocal,
   formatNumber,
   formatReportingTime,
-  reportingCalendarParts,
+  getFormattingLocale,
+  localCalendarParts,
+  setFormattingLocale,
+  setMessageLocale,
   REPORTING_TIME_ZONE,
+  USER_TIME_ZONE,
 } from "./ui-format.js";
+
+const localization = createBrowserLocalization();
+setFormattingLocale(localization.formatLocale());
+setMessageLocale(localization.locale());
+const t = localization.t;
+const tPlural = localization.tPlural;
 
 const localClient = new LocalCompanionClient();
 let communitySession = null;
@@ -103,10 +116,37 @@ let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
-const REPORTING_CALENDAR_PARTS = reportingCalendarParts();
+let globalState = null;
+let visibleConnectionNotice = null;
+let dashboardUnavailableState = null;
 
 const $ = (selector) => document.querySelector(selector);
 const { clear, node } = createDomHelpers(document);
+
+// Product-owned legacy copy stays explicitly registered with the bounded
+// migration bridge. Values originating in a local report, provider response,
+// file, or user choice use the raw helpers instead, so localization can never
+// reinterpret them just because they happen to equal an English UI label.
+function setProductText(element, englishText) {
+  element.removeAttribute("data-i18n-skip");
+  localization.setLegacyText(element, englishText);
+}
+
+function setRawText(element, value) {
+  element.setAttribute("data-i18n-skip", "");
+  element.textContent = value == null ? "" : String(value);
+}
+
+function setLocalizedText(element, key, values = {}) {
+  element.removeAttribute("data-i18n-skip");
+  element.textContent = t(key, values);
+}
+
+function rawNode(tag, className, value) {
+  const element = node(tag, className, value == null ? "" : String(value));
+  element.setAttribute("data-i18n-skip", "");
+  return element;
+}
 
 const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget(document);
 const installedAppLink = $("#open-installed-app");
@@ -116,6 +156,27 @@ if (SEMANTIC_OPEN_TARGET) {
   installedAppLink.removeAttribute("href");
   installedAppLink.setAttribute("aria-disabled", "true");
 }
+
+// A language change redraws browser-generated values using the same display
+// locale and leaves data, timestamps, and request ownership untouched. The
+// native host dispatches the same event after its Settings picker changes, so
+// the existing WebView is updated rather than reloaded.
+window.addEventListener("tibotattle:locale-change", (event) => {
+  setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
+  setMessageLocale(event.detail?.locale ?? localization.locale());
+  renderSharedInstallerJourney(document, {
+    formatLocale: getFormattingLocale(),
+    translateMessage: t,
+  });
+  if (dashboard) {
+    renderDashboard(dashboard);
+  } else if (dashboardUnavailableState) {
+    renderDashboardUnavailableState(dashboardUnavailableState);
+  } else if (globalState) {
+    renderGlobalState();
+  }
+  localization.localizeTree();
+});
 
 // The release-slot marker for "this build is paired with a hosted contribution
 // service". It is read as a build signal only: the client id itself no longer
@@ -220,29 +281,50 @@ function formatMoney(value, digits = 0) {
   return number === null
     ? "—"
     : formatNumber(number, {
-        style: "currency",
-        currency: "USD",
-        minimumFractionDigits: digits,
-        maximumFractionDigits: digits
-      });
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
 }
 
 function formatApiMoney(value) {
   const number = finite(value);
   if (number === null) return "—";
-  if (number > 0 && number < .01) return "<$0.01";
+  if (number > 0 && number < .01) {
+    return `<${formatNumber(.01, {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+  }
   return formatNumber(number, {
     style: "currency",
     currency: "USD",
     minimumFractionDigits: 2,
-    maximumFractionDigits: 2
+    maximumFractionDigits: 2,
   });
 }
 
 function formatPercent(value, digits = 0) {
   const number = finite(value);
   if (number === null) return "—";
-  return `${Number.isInteger(number) ? number.toFixed(0) : number.toFixed(digits)}%`;
+  return new Intl.NumberFormat(getFormattingLocale(), {
+    maximumFractionDigits: Number.isInteger(number) ? 0 : digits,
+    minimumFractionDigits: 0,
+    style: "percent",
+  }).format(number / 100);
+}
+
+function formatDecimal(value, digits = 0) {
+  const number = finite(value);
+  return number === null
+    ? "—"
+    : new Intl.NumberFormat(getFormattingLocale(), {
+      maximumFractionDigits: digits,
+      minimumFractionDigits: digits,
+    }).format(number);
 }
 
 let activeInformationPopover = null;
@@ -299,7 +381,7 @@ function informationLabel(label, explanation) {
   const button = node("button", "info-button", "i");
   button.type = "button";
   button.dataset.informationExplanation = explanation;
-  button.setAttribute("aria-label", `More information about ${label}`);
+  button.setAttribute("aria-label", t("aria.moreInformation", { label }));
   button.setAttribute("aria-expanded", "false");
   button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -311,7 +393,7 @@ function informationLabel(label, explanation) {
 
 function formatPp(value, digits = 1) {
   const number = finite(value);
-  return number === null ? "—" : `${number.toFixed(digits)} pp`;
+  return number === null ? "—" : `${formatDecimal(number, digits)} pp`;
 }
 
 const COMPONENT_LABELS = Object.freeze({
@@ -329,59 +411,145 @@ function componentLabel(value) {
 
 function formatTimeRemaining(value) {
   const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "Time remaining unavailable";
+  if (!Number.isFinite(timestamp)) return t("format.timeUnavailable");
   const remainingMs = timestamp - Date.now();
-  if (remainingMs <= 0) return "Reset due or recently passed";
+  if (remainingMs <= 0) return t("format.resetDue");
   const totalMinutes = Math.ceil(remainingMs / 60_000);
   const days = Math.floor(totalMinutes / 1_440);
   const hours = Math.floor((totalMinutes % 1_440) / 60);
   const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}d ${hours}h remaining`;
-  if (hours > 0) return `${hours}h ${minutes}m remaining`;
-  return `${minutes}m remaining`;
+  if (days > 0) return t("format.remainingDays", { days, hours });
+  if (hours > 0) return t("format.remainingHours", { hours, minutes });
+  return t("format.remainingMinutes", { minutes });
 }
 
 function formatSpanLength(spanMs) {
   const minutes = Math.max(1, Math.round(spanMs / 60_000));
-  if (minutes < 90) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  if (minutes < 90) return tPlural("format.durationMinute", minutes);
   const hours = minutes / 60;
-  if (hours < 48) return `${hours.toFixed(hours < 10 ? 1 : 0)} hours`;
-  return `${(hours / 24).toFixed(1)} days`;
+  if (hours < 48) {
+    const value = Number(hours.toFixed(hours < 10 ? 1 : 0));
+    return tPlural("format.durationHour", value, {
+      count: formatDecimal(value, hours < 10 ? 1 : 0),
+    });
+  }
+  const value = Number((hours / 24).toFixed(1));
+  return tPlural("format.durationDay", value, { count: formatDecimal(value, 1) });
 }
 
 function setGlobalState(state, { companionReachable = false } = {}) {
-  const labels = {
-    live: "Up to date",
-    updating: "Updating",
-    stale: "Needs refresh",
-    insufficient: "More data needed",
-    setup: "Set up this Mac",
-    offline: companionReachable ? "Ready to analyze" : "Open the Mac app",
-    demo: "Labeled demo data"
+  globalState = { companionReachable, state };
+  renderGlobalState();
+}
+
+function renderGlobalState() {
+  if (!globalState) return;
+  const keys = {
+    live: "status.upToDate",
+    updating: "status.updating",
+    stale: "status.needsRefresh",
+    insufficient: "status.moreDataNeeded",
+    setup: "status.setUpMac",
+    offline: globalState.companionReachable
+      ? "status.readyToAnalyze"
+      : "status.openMacApp",
+    demo: "status.labeledDemoData",
   };
   const pill = $("#global-state");
-  pill.className = `state-pill state-${state}`;
-  pill.replaceChildren(node("span", "state-dot"), document.createTextNode(labels[state] ?? "Unknown state"));
+  pill.className = `state-pill state-${globalState.state}`;
+  pill.replaceChildren(
+    node("span", "state-dot"),
+    document.createTextNode(t(keys[globalState.state] ?? "status.unknown")),
+  );
 }
 
 function showConnectionNotice({
   title,
+  titleKey = null,
   copy,
+  copyKey = null,
   kind = "warning",
   showDemo = false,
   showCheck = false,
 }) {
+  visibleConnectionNotice = {
+    copy,
+    copyKey,
+    kind,
+    showCheck,
+    showDemo,
+    title,
+    titleKey,
+  };
+  renderConnectionNotice();
+}
+
+function renderConnectionNotice() {
+  if (!visibleConnectionNotice) return;
+  const {
+    copy,
+    copyKey,
+    kind,
+    showCheck,
+    showDemo,
+    title,
+    titleKey,
+  } = visibleConnectionNotice;
   const notice = $("#connection-notice");
   notice.className = `notice notice-${kind}`;
-  $("#connection-title").textContent = title;
-  $("#connection-copy").textContent = copy;
+  if (titleKey) {
+    setLocalizedText($("#connection-title"), titleKey);
+  } else {
+    setProductText($("#connection-title"), title);
+  }
+  if (copyKey) {
+    setLocalizedText($("#connection-copy"), copyKey);
+  } else {
+    setProductText($("#connection-copy"), copy);
+  }
   $("#connection-check").hidden = !showCheck;
   $("#demo-button").hidden = !showDemo;
   notice.hidden = false;
 }
 
 function hideConnectionNotice() {
+  visibleConnectionNotice = null;
   $("#connection-notice").hidden = true;
+}
+
+function renderDashboardUnavailableState(kind) {
+  const variants = {
+    "backend-only": {
+      latestObservation: "dashboard.unavailable.backendOnlyOrigin",
+      title: "dashboard.unavailable.backendOnlyTitle",
+      copy: "dashboard.unavailable.backendOnlyCopy",
+    },
+    "dashboard-unavailable": {
+      latestObservation: "dashboard.unavailable.companionUnavailable",
+      title: "dashboard.unavailable.dashboardTitle",
+      copy: "dashboard.unavailable.dashboardCopy",
+    },
+    "companion-unavailable": {
+      latestObservation: "dashboard.unavailable.companionUnavailable",
+      title: "dashboard.unavailable.companionTitle",
+      copy: "dashboard.unavailable.companionCopy",
+    },
+  };
+  const selected = variants[kind] ?? variants["companion-unavailable"];
+  dashboardUnavailableState = Object.hasOwn(variants, kind)
+    ? kind
+    : "companion-unavailable";
+  setGlobalState("offline");
+  setLocalizedText($("#latest-observation"), selected.latestObservation);
+  setLocalizedText($("#data-source"), "dashboard.unavailable.noRealUsage");
+  showConnectionNotice({
+    titleKey: selected.title,
+    copyKey: selected.copy,
+    kind: "error",
+    showDemo: true,
+    showCheck: true,
+  });
+  renderDashboardSkeleton();
 }
 
 function onboardingSourceGuidance(value) {
@@ -499,6 +667,7 @@ function renderLocalOnboarding(value) {
 }
 
 function renderDashboard(data) {
+  dashboardUnavailableState = null;
   dashboard = data;
   if (data.mode === "demo") {
     setJourneyState("demo-mode");
@@ -513,7 +682,9 @@ function renderDashboard(data) {
   $("#data-source").textContent = data.mode === "demo"
     ? "Illustrative fixture — not your usage"
     : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
-  $("#schema-version").textContent = `Dashboard contract: ${data.schemaVersion}`;
+  $("#schema-version").textContent = t("dashboard.contract", {
+    version: data.schemaVersion,
+  });
 
   if (data.mode === "demo") {
     showConnectionNotice({
@@ -558,11 +729,16 @@ function renderQuotaCards(data) {
   const windows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
-    card.innerHTML = `
-      <div class="metric-card-header"><span class="metric-name">Quota observations</span><span class="evidence-chip">Insufficient</span></div>
-      <strong class="metric-value">—</strong>
-      <p>The local companion has not exposed a current normal Codex allowance window.</p>
-    `;
+    const header = node("div", "metric-card-header");
+    const name = node("span", "metric-name");
+    name.textContent = t("dashboard.quota.observations");
+    const chip = node("span", "evidence-chip");
+    chip.textContent = t("dashboard.quota.insufficient");
+    const value = node("strong", "metric-value", "—");
+    const copy = node("p");
+    copy.textContent = t("dashboard.quota.noCurrent");
+    header.append(name, chip);
+    card.append(header, value, copy);
     container.append(card);
     return;
   }
@@ -570,29 +746,58 @@ function renderQuotaCards(data) {
     const remaining = finite(window.remainingPercent);
     const card = node("article", `metric-card ${window.status === "stale" ? "stale" : ""}`);
     const header = node("div", "metric-card-header");
+    const name = rawNode("span", "metric-name", window.label);
+    const plan = node("span", "evidence-chip");
+    if (window.planType) {
+      setRawText(plan, window.planType);
+    } else {
+      plan.textContent = data.mode === "demo"
+        ? t("dashboard.quota.demo")
+        : t("dashboard.quota.observed");
+    }
     header.append(
-      node("span", "metric-name", window.label),
-      node("span", "evidence-chip", window.planType || (data.mode === "demo" ? "Demo" : "Observed"))
+      name,
+      plan,
     );
     const value = node("strong", "metric-value");
-    value.textContent = remaining === null ? "—" : `${remaining.toFixed(window.precision ?? 0)}%`;
-    value.append(node("small", "", " remaining"));
+    value.textContent = t("dashboard.quota.remaining", {
+      value: remaining === null
+        ? "—"
+        : formatPercent(remaining, window.precision ?? 0),
+    });
     const progress = node("div", "mini-progress");
     const fill = node("i");
     fill.style.width = `${Math.max(0, Math.min(100, remaining ?? 0))}%`;
     progress.append(fill);
     const meta = node("div", "metric-meta");
     meta.append(
-      node("span", "", window.usedPercent === null ? "Used unknown" : `${formatPercent(window.usedPercent)} used`),
-      node("span", "", window.resetAt ? `Resets ${formatLocal(window.resetAt)}` : "Reset unknown")
+      node(
+        "span",
+        "",
+        window.usedPercent === null
+          ? t("dashboard.quota.usedUnknown")
+          : t("dashboard.quota.used", {
+            value: formatPercent(window.usedPercent),
+          }),
+      ),
+      node(
+        "span",
+        "",
+        window.resetAt
+          ? t("dashboard.quota.resets", { time: formatLocal(window.resetAt) })
+          : t("dashboard.quota.resetUnknown"),
+      ),
     );
     card.append(header, value, progress, meta);
     if (window.resetAt) card.append(node("p", "", formatTimeRemaining(window.resetAt)));
     if (window.observedAt) {
       const attribution = window.accountAttribution === "attributed_pseudonymous"
-        ? "pseudonymous account attributed"
-        : "account unattributed";
-      card.append(node("p", "", `Observed ${formatLocal(window.observedAt)} · ${attribution}`));
+        ? t("dashboard.quota.attributionPseudonymous")
+        : t("dashboard.quota.attributionUnavailable");
+      card.append(node("p", "", t("dashboard.quota.observedAt", {
+        attribution,
+        time: formatLocal(window.observedAt),
+      })));
     }
     container.append(card);
   }
@@ -601,41 +806,57 @@ function renderQuotaCards(data) {
 function renderPricing(data) {
   const pricing = data.pricing;
   const fastMode = pricing.fastMode;
-  $("#cost-period").textContent = pricing.periodLabel;
+  setRawText($("#cost-period"), pricing.periodLabel);
   // The headline is the quota-weighted figure whenever a weighting exists;
   // when nothing can be weighted legitimately the label falls back to the
   // Standard-rate name rather than presenting an unweighted number under a
   // weighted heading.
   const weighted = pricing.quotaWeightedTotalCostUsd;
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
-  $("#cost-metric-kicker").textContent = useWeighted
+  setRawText($("#cost-metric-kicker"), useWeighted
     ? fastMode.metricLabel
-    : fastMode.standardMetricLabel;
+    : fastMode.standardMetricLabel);
   $("#cost-metric-kicker").title = useWeighted
     ? fastMode.metricExplainer
-    : "No usage in this period could be weighted, so the Standard-rate total is shown unchanged.";
+    : t("dashboard.pricing.noWeightedTitle");
   $("#cost-total").textContent = formatMoney(
     useWeighted ? weighted : pricing.totalCostUsd,
     2
   );
   const provenance = pricing.registryVersion
-    ? ` · price registry ${pricing.registryVersion}${pricing.registryObservedAt ? ` (${formatLocal(pricing.registryObservedAt)})` : ""}`
+    ? t("dashboard.pricing.registryProvenance", {
+      observedAt: pricing.registryObservedAt
+        ? t("dashboard.pricing.registryObservedAt", {
+          time: formatLocal(pricing.registryObservedAt),
+        })
+        : "",
+      version: pricing.registryVersion,
+    })
     : "";
   const replay = pricing.replayExclusionDiagnostics?.forkReplayEventsExcluded ?? 0;
   const accountingMethod = pricing.accountingSource
     === "lineage_aware_cumulative_snapshot_replay_exclusion"
-    ? `${pricing.accountingCacheStatus === "stale" ? "stale replay-safe cache" : "replay-safe"} · ${compact(replay)} inherited child snapshots excluded`
-    : "legacy projection; replay exclusion has not been verified";
+    ? t(
+      pricing.accountingCacheStatus === "stale"
+        ? "dashboard.pricing.staleReplaySafe"
+        : "dashboard.pricing.replaySafe",
+      { count: compact(replay) },
+    )
+    : t("dashboard.pricing.legacyProjection");
   $("#cost-coverage").textContent = pricing.coveragePercent === null
-    ? "Price coverage is not available"
-    : `${formatPercent(pricing.coveragePercent, 1)} priced · ${accountingMethod}${provenance}`;
+    ? t("dashboard.pricing.noCoverage")
+    : t("dashboard.pricing.coverage", {
+      method: accountingMethod,
+      percent: formatPercent(pricing.coveragePercent, 1),
+      provenance,
+    });
   const list = $("#cost-components");
   clear(list);
   const components = pricing.components.filter(
     (row) => finite(row.costUsd, 0) > 0 || finite(row.tokens, 0) > 0
   );
   if (!components.length) {
-    list.append(node("p", "empty-inline", "No token-component accounting was returned."));
+    list.append(node("p", "empty-inline", t("dashboard.pricing.noComponents")));
     return;
   }
   const max = Math.max(...components.map((row) => row.costUsd ?? 0), .01);
@@ -649,17 +870,22 @@ function renderPricing(data) {
     const hasUnpricedTokens = finite(component.unpricedTokens, 0) > 0;
     const hasPricedTokens = finite(component.pricedTokens, 0) > 0;
     const costLabel = hasUnpricedTokens && !hasPricedTokens
-      ? "Unpriced"
+      ? t("dashboard.pricing.unpriced")
       : hasUnpricedTokens
-        ? `${formatApiMoney(component.costUsd)} + unpriced`
+        ? t("dashboard.pricing.partiallyPriced", {
+          amount: formatApiMoney(component.costUsd),
+        })
         : formatApiMoney(component.costUsd);
     row.append(
       track,
       node("strong", "", costLabel)
     );
     row.title = hasUnpricedTokens
-      ? `${compact(component.tokens)} tokens · ${compact(component.unpricedTokens)} unpriced`
-      : `${compact(component.tokens)} tokens`;
+      ? t("dashboard.pricing.tokensWithUnpriced", {
+        tokens: compact(component.tokens),
+        unpriced: compact(component.unpricedTokens),
+      })
+      : t("dashboard.pricing.tokens", { count: compact(component.tokens) });
     list.append(row);
   }
 }
@@ -705,8 +931,11 @@ function renderComparison(data) {
   const chip = $("#fit-chip");
   renderCalibrationRate({ capacity, lower, upper });
   if (!pair || pair.observed === null || pair.expected === null) {
-    chip.textContent = "Insufficient";
-    $("#comparison-result").textContent = "There is not yet a matched quota-and-cost window to compare.";
+    setProductText(chip, "Insufficient");
+    setProductText(
+      $("#comparison-result"),
+      "There is not yet a matched quota-and-cost window to compare.",
+    );
     return;
   }
   const max = Math.max(Math.abs(pair.observed), Math.abs(pair.expected), 1);
@@ -717,8 +946,18 @@ function renderComparison(data) {
     row.querySelector("strong").textContent = formatPp(values[index]);
   });
   const residual = pair.residual ?? pair.observed - pair.expected;
-  chip.textContent = mae === null ? "Matched window" : `MAE ${mae.toFixed(1)} pp`;
-  $("#comparison-result").textContent = `${formatPp(Math.abs(residual))} separates the observed and cost-implied movement in the latest matched window.${within === null ? "" : ` Across the series, ${formatPercent(within * 100)} of points fall inside the modeled 80% band.`}`;
+  chip.textContent = mae === null
+    ? t("dashboard.comparison.matchedWindow")
+    : t("dashboard.comparison.mae", { value: formatDecimal(mae, 1) });
+  const latestMovement = t("dashboard.comparison.latestMovement", {
+    residual: formatPp(Math.abs(residual)),
+  });
+  const seriesBand = within === null
+    ? ""
+    : ` ${t("dashboard.comparison.seriesBand", {
+      percent: formatPercent(within * 100),
+    })}`;
+  $("#comparison-result").textContent = latestMovement + seriesBand;
 }
 
 function renderCalibrationRate({ capacity, lower, upper }) {
@@ -727,24 +966,35 @@ function renderCalibrationRate({ capacity, lower, upper }) {
   const example = $("#calibration-example");
   const explanation = $("#calibration-explanation");
   if (capacity === null || capacity <= 0) {
-    rate.textContent = "Not estimable";
-    range.textContent = "Not estimable";
-    example.textContent = "Not estimable";
-    explanation.textContent =
-      "There is not yet enough matched cost and quota evidence for a positive fitted rate. API prices remain a measuring stick, not a subscription charge.";
+    setProductText(rate, "Not estimable");
+    setProductText(range, "Not estimable");
+    setProductText(example, "Not estimable");
+    explanation.textContent = t("dashboard.calibration.noRate");
     return;
   }
   const perPoint = capacity / 100;
   const movementForHundred = 10_000 / capacity;
-  rate.textContent = `${formatMoney(perPoint, 2)} API equivalent per 1 percentage point`;
+  rate.textContent = t("dashboard.calibration.perPoint", {
+    amount: formatMoney(perPoint, 2),
+  });
   range.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? `${formatMoney(lower / 100, 2)}–${formatMoney(upper / 100, 2)} per point`
-    : "Range unavailable";
-  example.textContent =
-    `$100 of recorded API-price-equivalent usage corresponds to about ${movementForHundred.toFixed(1)} percentage points`;
+    ? t("dashboard.calibration.range", {
+      lower: formatMoney(lower / 100, 2),
+      upper: formatMoney(upper / 100, 2),
+    })
+    : t("dashboard.calibration.rangeUnavailable");
+  example.textContent = t("dashboard.calibration.example", {
+    points: formatDecimal(movementForHundred, 1),
+  });
   explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
-    ? `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent. The 80% range (${formatMoney(lower, 0)}–${formatMoney(upper, 0)}) describes variation across qualifying reset periods; it is not an 80% probability or a provider-published dollar cap.`
-    : `The central fit implies a full 100-point allowance near ${formatMoney(capacity, 0)} API equivalent, but there is not yet a usable across-reset range. This is not a provider-published dollar cap.`;
+    ? t("dashboard.calibration.withRange", {
+      amount: formatMoney(capacity, 0),
+      lower: formatMoney(lower, 0),
+      upper: formatMoney(upper, 0),
+    })
+    : t("dashboard.calibration.withoutRange", {
+      amount: formatMoney(capacity, 0),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -796,24 +1046,23 @@ const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u
 const SHARE_CARD_APP_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+$/u;
 const SHARE_CARD_HOME_PATTERN =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/u;
-// The exact period names this product emits, each paired with the phrase the
-// card prints mid-sentence. An unrecognized one is replaced rather than
-// printed, so a renamed or injected label can never reach a post.
-const SHARE_CARD_PERIOD_PHRASES = new Map([
-  ["All retained evidence", "all retained evidence"],
-  ["Last 24 hours", "the last 24 hours"],
-  ["Last 30 days", "the last 30 days"],
-  ["Last 7 days", "the last 7 days"],
-  ["Recorded period", "the recorded period"],
+// The exact period names this product emits, each mapped to an owned message
+// key. An unrecognized source value is replaced rather than printed, so a
+// renamed or injected label can never reach a shared card.
+const SHARE_CARD_PERIOD_KEYS = new Map([
+  ["All retained evidence", "share.period.allRetained"],
+  ["Last 24 hours", "share.period.lastDay"],
+  ["Last 30 days", "share.period.lastThirtyDays"],
+  ["Last 7 days", "share.period.lastSevenDays"],
+  ["Recorded period", "share.period.recorded"],
 ]);
 // Fixed window names, keyed on the observed window duration rather than on the
 // companion's own label field.
-const SHARE_CARD_WINDOW_LABELS = Object.freeze({
-  five_hour: "five-hour allowance",
-  other: "observed allowance window",
-  seven_day: "seven-day allowance",
+const SHARE_CARD_WINDOW_KEYS = Object.freeze({
+  five_hour: "share.window.fiveHour",
+  other: "share.window.other",
+  seven_day: "share.window.sevenDay",
 });
-const SHARE_CARD_UNKNOWN_PERIOD = "the recorded period";
 let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
@@ -896,7 +1145,11 @@ function shareCardWindow(windows) {
 }
 
 function shareCardPeriodLabel(candidate) {
-  return SHARE_CARD_PERIOD_PHRASES.get(candidate) ?? SHARE_CARD_UNKNOWN_PERIOD;
+  return t(SHARE_CARD_PERIOD_KEYS.get(candidate) ?? "share.period.recorded");
+}
+
+function shareCardWindowLabel(kind) {
+  return t(SHARE_CARD_WINDOW_KEYS[kind] ?? SHARE_CARD_WINDOW_KEYS.other);
 }
 
 /**
@@ -904,9 +1157,13 @@ function shareCardPeriodLabel(candidate) {
  * a time of day and any raw-log timestamp.
  */
 function shareCardDateLabel(timestamp) {
-  return Number.isFinite(timestamp)
-    ? formatReportingTime(timestamp, { dateOnly: true })
-    : "";
+  if (!Number.isFinite(timestamp)) return "";
+  return new Intl.DateTimeFormat(getFormattingLocale(), {
+    ...(USER_TIME_ZONE === "local time" ? {} : { timeZone: USER_TIME_ZONE }),
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(timestamp);
 }
 
 /**
@@ -993,9 +1250,7 @@ function buildShareCard(data, {
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
   const remaining = finite(allowanceWindow?.remainingPercent);
-  const windowLabel =
-    SHARE_CARD_WINDOW_LABELS[shareCardWindowKind(allowanceWindow)]
-    ?? SHARE_CARD_WINDOW_LABELS.other;
+  const windowLabel = shareCardWindowLabel(shareCardWindowKind(allowanceWindow));
 
   const weighted = finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
@@ -1019,36 +1274,39 @@ function buildShareCard(data, {
 
   const stats = [
     {
-      label: "Allowance left",
-      value: remaining === null ? "Not observed" : formatPercent(remaining),
+      label: t("share.stat.allowanceLeft"),
+      value: remaining === null ? t("share.value.notObserved") : formatPercent(remaining),
       detail: remaining === null
-        ? "no current allowance window was observed"
-        : `of the ${windowLabel}`,
+        ? t("share.detail.noCurrentAllowance")
+        : t("share.detail.ofWindow", { window: windowLabel }),
     },
     {
       // This is the complete rolling ledger selection, not a single weekly
       // allowance. The label must make the different denominator clear on the
       // image itself: an activity total can legitimately exceed one estimated
       // allowance without being a billing error or an allowance overrun.
-      label: "Recorded activity",
-      value: spend === null ? "Not available" : formatMoney(spend, 0),
+      label: t("share.stat.recordedActivity"),
+      value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
       detail: spend === null
-        ? "no priced usage was recorded"
-        : `${period} · event-time API equivalent`,
+        ? t("share.detail.noPricedUsage")
+        : t("share.detail.activityPeriod", { period }),
     },
     {
-      label: "Estimated 7-day allowance",
-      value: hasCapacity ? formatMoney(capacity, 0) : "Not estimable",
+      label: t("share.stat.estimatedAllowance"),
+      value: hasCapacity ? formatMoney(capacity, 0) : t("share.value.notEstimable"),
       detail: hasRange
-        ? `Observed reset range ${formatMoney(lower, 0)}–${formatMoney(upper, 0)}`
+        ? t("share.detail.resetRange", {
+          lower: formatMoney(lower, 0),
+          upper: formatMoney(upper, 0),
+        })
         : hasCapacity
-          ? "no across-reset range yet"
-          : "not enough matched windows yet",
+          ? t("share.detail.noAcrossResetRange")
+          : t("share.detail.notEnoughMatchedWindows"),
     },
   ];
 
   const relationshipNote = spend !== null && hasCapacity
-    ? `Activity sums all events in ${period}; the estimate is one seven-day allowance.`
+    ? t("share.relationship", { period })
     : "";
 
   // Assembled from the same state the panels report, strongest qualification
@@ -1056,54 +1314,49 @@ function buildShareCard(data, {
   // under the figures above, so it is never displaced by a shorter caveat.
   const caveats = [];
   if (isDemo) {
-    caveats.push(
-      "Labeled demo data: an illustrative fixture, not measured usage.",
-    );
+    caveats.push(t("share.caveat.demo"));
   }
   if (excluded > 0) {
-    caveats.push(
-      `Not a complete total: ${formatMoney(excluded, 2)} of Standard-rate cost could not be speed-weighted and is excluded rather than counted at 1x.`,
-    );
+    caveats.push(t("share.caveat.unweighted", {
+      amount: formatMoney(excluded, 2),
+    }));
   }
   if (fastMode.weightingStatus === "unknown") {
-    caveats.push(
-      "No usage could be speed-weighted, so this is the unchanged Standard-rate total.",
-    );
+    caveats.push(t("share.caveat.noWeighted"));
   } else if (fastMode.weightingStatus !== "complete") {
-    caveats.push(
-      "Fast-mode attribution is partial: Codex records the speed mode only when it changes, never at session start.",
-    );
+    caveats.push(t("share.caveat.fastPartial"));
   }
   const coverage = finite(pricing.coveragePercent);
   if (coverage !== null && coverage < 100) {
-    caveats.push(
-      `${formatPercent(coverage, 1)} of recorded usage could be priced; the rest is left unpriced rather than estimated.`,
-    );
+    caveats.push(t("share.caveat.coverage", {
+      percent: formatPercent(coverage, 1),
+    }));
   }
   const identifiers = [
-    `Debug: ${reference}`,
-    appVersion === "" ? "unversioned" : `v${appVersion}`,
+    t("share.identifier.debug", { reference }),
+    appVersion === "" ? t("share.identifier.unversioned") : t("share.identifier.version", {
+      version: appVersion,
+    }),
   ].filter((part) => part !== "");
 
   return Object.freeze({
     reference,
     isDemo,
-    title: "Where my Codex allowance stands",
+    title: t("share.title"),
     // The strongest claim on the card is the one a fixture must not borrow.
     // A demo card says so in the line under the title and in a mark beside the
     // wordmark, not only in the smallest copy on the image, because a reader
     // scrolling a timeline reads the title and the figures and nothing else.
     subtitle: isDemo
-      ? "Illustrative demo data. Not a measurement."
-      : "Measured on my own Mac. Nothing left it.",
-    badge: isDemo ? "DEMO DATA" : "",
+      ? t("share.subtitle.demo")
+      : t("share.subtitle.local"),
+    badge: isDemo ? t("share.badge.demo") : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     relationshipNote,
     trend: shareCardTrend(history),
-    trendLabel: "7-day allowance estimates",
-    trendEmpty: "Not enough observed reset history yet.",
-    trendEmptyDetail:
-      "A completed reset becomes a point once enough of its allowance was observed.",
+    trendLabel: t("share.trend.label"),
+    trendEmpty: t("share.trend.empty"),
+    trendEmptyDetail: t("share.trend.emptyDetail"),
     caveats: Object.freeze(caveats),
     identifierLine: identifiers.join(" · "),
     contractVersion,
@@ -1116,18 +1369,21 @@ function buildShareCard(data, {
  */
 function shareCardText(card) {
   const figures = card.stats
-    .map((stat) => `${stat.label}: ${stat.value} — ${stat.detail}.`)
+    .map((stat) => t("share.text.figure", stat))
     .join(" ");
   const trailer = card.contractVersion === ""
     ? card.identifierLine
-    : `${card.identifierLine} · contract ${card.contractVersion}`;
+    : t("share.text.contract", {
+      identifier: card.identifierLine,
+      version: card.contractVersion,
+    });
   return [
-    `TiboTattle — ${card.title}. ${card.subtitle}`,
+    t("share.text.header", { subtitle: card.subtitle, title: card.title }),
     figures,
     shareCardTrendText(card),
     card.caveats.join(" "),
-    `${trailer}.`,
-    card.home === "" ? "" : `More at ${card.home}`,
+    t("share.text.trailer", { trailer }),
+    card.home === "" ? "" : t("share.text.more", { home: card.home }),
   ].filter((line) => line !== "").join("\n");
 }
 
@@ -1137,8 +1393,19 @@ function shareCardText(card) {
  */
 function shareCardTrendText(card) {
   return card.trend === null
-    ? `${card.trendLabel}: ${card.trendEmpty} ${card.trendEmptyDetail}`
-    : `${card.trendLabel}: ${card.trend.count} fits observed from ${card.trend.firstDateLabel} to ${card.trend.lastDateLabel}. The vertical axis is API equivalent in dollars, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every measured range.`;
+    ? t("share.text.trendEmpty", {
+      detail: card.trendEmptyDetail,
+      empty: card.trendEmpty,
+      label: card.trendLabel,
+    })
+    : t("share.text.trendPopulated", {
+      end: card.trend.lastDateLabel,
+      fits: tPlural("share.resetFit", card.trend.count),
+      high: formatMoney(card.trend.high, 0),
+      label: card.trendLabel,
+      low: formatMoney(card.trend.low, 0),
+      start: card.trend.firstDateLabel,
+    });
 }
 
 function shareCardFont(weight, size, family = "sans") {
@@ -1156,8 +1423,17 @@ function shareCardFont(weight, size, family = "sans") {
 function shareCardWrap(context, value, maxWidth, maxLines) {
   const lines = [];
   let current = "";
-  for (const word of String(value).split(" ")) {
-    const candidate = current === "" ? word : `${current} ${word}`;
+  const source = String(value).trim();
+  const words = /\s/u.test(source)
+    ? source.split(/\s+/u)
+    : typeof Intl.Segmenter === "function"
+      ? [...new Intl.Segmenter(localization.locale(), {
+        granularity: "grapheme",
+      }).segment(source)].map(({ segment }) => segment)
+      : Array.from(source);
+  const separator = /\s/u.test(source) ? " " : "";
+  for (const word of words) {
+    const candidate = current === "" ? word : `${current}${separator}${word}`;
     if (current !== "" && context.measureText(candidate).width > maxWidth) {
       lines.push(current);
       current = word;
@@ -1172,12 +1448,12 @@ function shareCardWrap(context, value, maxWidth, maxLines) {
 
 function shareCardFit(context, value, maxWidth) {
   if (context.measureText(value).width <= maxWidth) return value;
-  let text = value;
-  while (text.length > 1
-    && context.measureText(`${text}…`).width > maxWidth) {
-    text = text.slice(0, -1);
+  const units = Array.from(String(value));
+  while (units.length > 1
+    && context.measureText(`${units.join("")}…`).width > maxWidth) {
+    units.pop();
   }
-  return `${text}…`;
+  return `${units.join("")}…`;
 }
 
 function drawShareCardBrand(context, x, y) {
@@ -1253,8 +1529,8 @@ function drawShareCardTrend(context, card, x, y, width, height) {
     return;
   }
   const { points, axis, xTicks } = card.trend;
-  const xAxisLabel = "Reset estimate date";
-  const yAxisLabel = "7-day allowance ($)";
+  const xAxisLabel = t("share.axis.resetEstimateDate");
+  const yAxisLabel = t("share.axis.allowance");
   const padTop = 40;
   const padBottom = 54;
   const padLeft = 92;
@@ -1444,7 +1720,7 @@ function drawShareCard(canvas, card) {
     context.fillStyle = "#65706b";
     context.font = shareCardFont(750, 15);
     const labelLines = shareCardWrap(
-      context, stat.label.toUpperCase(), textWidth, 2,
+      context, stat.label.toLocaleUpperCase(localization.locale()), textWidth, 2,
     );
     labelLines.forEach((line, lineIndex) => {
       context.fillText(line, x + padding, statTop + 34 + lineIndex * 19);
@@ -1502,11 +1778,15 @@ function drawShareCard(canvas, card) {
   );
   context.fillStyle = "#65706b";
   context.font = shareCardFont(750, 15);
-  context.fillText(card.trendLabel.toUpperCase(), margin, trendTop - 14);
+  context.fillText(
+    card.trendLabel.toLocaleUpperCase(localization.locale()),
+    margin,
+    trendTop - 14,
+  );
   if (card.trend !== null) {
     context.textAlign = "right";
     context.fillText(
-      `${card.trend.count} reset fits`,
+      tPlural("share.resetFit", card.trend.count),
       SHARE_CARD_WIDTH - margin,
       trendTop - 14,
     );
@@ -1550,7 +1830,7 @@ function drawShareCard(canvas, card) {
   context.fillText(
     shareCardFit(
       context,
-      "Local measurement · API equivalent, not a bill.",
+      t("share.footer"),
       inner,
     ),
     margin,
@@ -2005,7 +2285,7 @@ function groupedUsageTimeline(data) {
       key = `hour:${sortMs}`;
     } else {
       const parts = Object.fromEntries(
-        REPORTING_CALENDAR_PARTS.formatToParts(timestamp)
+        localCalendarParts().formatToParts(timestamp)
           .filter((part) => part.type !== "literal")
           .map((part) => [part.type, part.value])
       );
@@ -2162,35 +2442,50 @@ function renderTimeline(data) {
     (point) => point.observed !== null && point.expected !== null,
   );
   const windowLabel = activeWindowHours === 0.25
-    ? "15-minute"
-    : `${activeWindowHours}-hour`;
-  $("#timeline-chart-title").textContent = `${windowLabel} rolling quota change versus cost-implied change`;
+    ? t("dashboard.timeWindow.fifteenMinutes")
+    : t("dashboard.timeWindow.hours", { count: activeWindowHours });
+  $("#timeline-chart-title").textContent = t("dashboard.timeline.title", {
+    window: windowLabel,
+  });
   $("#timeline-chart-copy").textContent = usingLive
-    ? `Replay-safe local increments · ${REPORTING_TIME_ZONE} chart axis · all displayed times use this reporting zone`
-    : `Historical local calibration artifact from ${formatLocal(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
+    ? t("dashboard.timeline.liveCopy", { timeZone: USER_TIME_ZONE })
+    : t("dashboard.timeline.historicalCopy", {
+      generatedAt: formatLocal(data.artifactStatus.gradient.generatedAt),
+      window: windowLabel,
+    });
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
   if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
     empty.querySelector("strong").textContent = visiblePoints.length
-      ? "Not comparable yet"
-      : `No ${windowLabel} series loaded`;
+      ? t("dashboard.timeline.notComparableYet")
+      : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
     empty.querySelector("p").textContent = visiblePoints.length
-      ? `Cost history exists, but quota observations do not bracket any ${windowLabel} window in this date range. The calculated line is hidden until there is measured evidence to compare it with.`
-      : "This is a missing-data state, not a zero-usage period.";
+      ? t("dashboard.timeline.noBracket", { window: windowLabel })
+      : t("dashboard.timeline.missingData");
   } else {
     empty.hidden = true;
     shell.hidden = false;
     shell.replaceChildren(lineChart({
       points: visiblePoints,
       series: [
-        { key: "observed", className: "chart-line-observed", label: "Observed quota change" },
-        { key: "expected", className: "chart-line-expected", label: "Expected from API cost" }
+        {
+          key: "observed",
+          className: "chart-line-observed",
+          label: t("dashboard.timeline.observedQuota"),
+        },
+        {
+          key: "expected",
+          className: "chart-line-expected",
+          label: t("dashboard.timeline.expectedCost"),
+        }
       ],
-      yLabel: "Percentage points",
-      title: `${windowLabel} rolling quota movement`,
-      description: `Observed quota movement compared with movement implied by priced token usage. The horizontal axis is ${REPORTING_TIME_ZONE}.`,
+      yLabel: t("dashboard.timeline.percentagePoints"),
+      title: t("dashboard.timeline.movementTitle", { window: windowLabel }),
+      description: t("dashboard.timeline.chartDescription", {
+        timeZone: USER_TIME_ZONE,
+      }),
       includeZero: true,
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
@@ -2213,26 +2508,46 @@ function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport)
     && (viewport.startMs !== full.startMs || viewport.endMs !== full.endMs);
   element.classList.toggle("low", matched < 3 || excluded > matched);
   if (!visiblePoints.length) {
-    element.textContent = "No points fall inside this zoomed interval. Reset the view to return to the available evidence.";
+    setProductText(
+      element,
+      "No points fall inside this zoomed interval. Reset the view to return to the available evidence.",
+    );
   } else if (!usingLive) {
-    element.textContent = "This historical calibration view has no per-window reset annotations. Treat it as diagnostic evidence, not a live allowance reading.";
+    setProductText(
+      element,
+      "This historical calibration view has no per-window reset annotations. Treat it as diagnostic evidence, not a live allowance reading.",
+    );
   } else if (matched < 3) {
-    element.textContent = `Low confidence: only ${matched} matched quota window${matched === 1 ? "" : "s"} is visible; ${excluded} window${excluded === 1 ? " is" : "s are"} excluded for missing or ambiguous quota evidence.`;
+    element.textContent = t("dashboard.timeline.lowConfidence", {
+      visible: tPlural("dashboard.timeline.visibleWindow", matched),
+      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+    });
   } else if (excluded > 0) {
-    element.textContent = `${matched} matched windows are shown. ${excluded} excluded window${excluded === 1 ? " is" : "s are"} shaded above; do not read them as zero usage.`;
+    element.textContent = t("dashboard.timeline.excludedShown", {
+      shown: tPlural("dashboard.timeline.shownWindow", matched),
+      excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
+    });
   } else {
-    element.textContent = `${matched} matched quota windows are visible. This compares observed percentage-point movement with a priced-token estimate; it is not a provider-published allowance.`;
+    element.textContent = t("dashboard.timeline.allMatched", {
+      visible: tPlural("dashboard.timeline.visibleWindow", matched),
+    });
   }
-  if (zoomed) element.textContent += " Use Reset view to return to the selected date range.";
+  if (zoomed) element.textContent += ` ${t("dashboard.timeline.resetView")}`;
 }
 
 function bindTimelineInteractions(shell, points, viewport) {
   if (viewport === null) return;
   shell.classList.add("interactive-chart");
   shell.tabIndex = 0;
-  shell.setAttribute("aria-label", `Interactive quota timeline in ${REPORTING_TIME_ZONE}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.`);
+  shell.setAttribute("aria-label", t("dashboard.timeline.aria", {
+    timeZone: USER_TIME_ZONE,
+  }));
   const status = $("#timeline-zoom-status");
-  status.textContent = `Timeline shows ${formatLocal(new Date(viewport.startMs).toISOString())} through ${formatLocal(new Date(viewport.endMs).toISOString())}, a span of ${formatSpanLength(viewport.endMs - viewport.startMs)}.`;
+  status.textContent = t("dashboard.timeline.status", {
+    start: formatLocal(new Date(viewport.startMs).toISOString()),
+    end: formatLocal(new Date(viewport.endMs).toISOString()),
+    span: formatSpanLength(viewport.endMs - viewport.startMs),
+  });
   shell.onwheel = (event) => {
     if (!event.deltaY) return;
     event.preventDefault();
@@ -2369,11 +2684,16 @@ function renderResidualCoverage(rows, computed) {
   const missing = rows.length - computed.length;
   element.classList.toggle("low", rows.length > 0 && missing > computed.length);
   if (!rows.length) {
-    element.textContent = "No windows fall inside this date range.";
+    setProductText(element, "No windows fall inside this date range.");
   } else if (missing === 0) {
-    element.textContent = `All ${rows.length} window${rows.length === 1 ? "" : "s"} in this range have a computable residual.`;
+    element.textContent = tPlural("dashboard.residual.allComputable", rows.length);
   } else {
-    element.textContent = `${computed.length} of ${rows.length} windows in this range have a computable residual. The other ${missing} are shown as shaded gaps on the same axis, never as zero: ${residualGapReasons(rows).join(", ")}.`;
+    element.textContent = t("dashboard.residual.partial", {
+      computed: computed.length,
+      total: rows.length,
+      missing,
+      reasons: residualGapReasons(rows).join(", "),
+    });
   }
 }
 
@@ -2508,9 +2828,9 @@ function lineChart({
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("role", "img");
   const titleNode = document.createElementNS(svg.namespaceURI, "title");
-  titleNode.textContent = title;
+  setRawText(titleNode, title);
   const descNode = document.createElementNS(svg.namespaceURI, "desc");
-  descNode.textContent = description;
+  setRawText(descNode, description);
   svg.append(titleNode, descNode);
 
   for (let index = 0; index < 5; index += 1) {
@@ -2630,7 +2950,10 @@ function lineChart({
       );
       if (errorBars.tooltip !== false) {
         const barTitle = document.createElementNS(svg.namespaceURI, "title");
-        barTitle.textContent = `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`;
+        setRawText(
+          barTitle,
+          `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`,
+        );
         group.append(barTitle);
       }
       svg.append(group);
@@ -2651,7 +2974,7 @@ function lineChart({
     rect.setAttribute("height", String(height - margin.top - margin.bottom));
     rect.setAttribute("class", `chart-status-${interval.status === "reset_or_track_change" ? "reset" : interval.status === "missing_quota_bracket" ? "missing" : "ambiguous"}`);
     const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
-    intervalTitle.textContent = timelineStatusLabel(interval.status);
+    setRawText(intervalTitle, timelineStatusLabel(interval.status));
     rect.append(intervalTitle);
     svg.append(rect);
   }
@@ -2704,7 +3027,7 @@ function lineChart({
           ].filter(Boolean).join(" · ");
           if (item.tooltip !== false) {
             const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-            markerTitle.textContent = caption;
+            setRawText(markerTitle, caption);
             marker.append(markerTitle);
           }
           // A hover title alone is mouse-only, so focusable markers carry the
@@ -2761,6 +3084,10 @@ function svgText(x, y, value, className, anchor = "start") {
   element.setAttribute("y", y);
   element.setAttribute("class", className);
   element.setAttribute("text-anchor", anchor);
+  // Chart text can include source-derived labels and values. It arrives
+  // already formatted by the caller and is never eligible for exact-text
+  // translation.
+  element.setAttribute("data-i18n-skip", "");
   element.textContent = value;
   return element;
 }
@@ -2773,12 +3100,17 @@ function isWellObservedWeeklyFit(observedSpanPp) {
 
 function renderWeeklyPricingReceipt(data) {
   const pricing = data.pricing ?? {};
-  const registryVersion = pricing.registryVersion || "reviewed official price table";
+  const registryVersion = pricing.registryVersion
+    || t("dashboard.priceEpoch.defaultRegistryVersion");
   const reviewedAt = pricing.registryObservedAt
-    ? `reviewed ${formatLocal(pricing.registryObservedAt, { dateOnly: true })}`
-    : "with no review date returned";
+    ? t("dashboard.priceEpoch.reviewedAt", {
+      date: formatLocal(pricing.registryObservedAt, { dateOnly: true }),
+    })
+    : t("dashboard.priceEpoch.noReviewDate");
   const rebuiltAt = data.artifactStatus?.weekly?.generatedAt
-    ? ` The fits were last rebuilt ${formatLocal(data.artifactStatus.weekly.generatedAt)}.`
+    ? t("dashboard.priceEpoch.rebuiltAt", {
+      date: formatLocal(data.artifactStatus.weekly.generatedAt),
+    })
     : "";
   const eventTimeHistoricalPricing = pricing.priceEpochBasis
     === "event_time_when_registry_has_effective_evidence";
@@ -2786,14 +3118,18 @@ function renderWeeklyPricingReceipt(data) {
   const copy = $("#weekly-pricing-receipt-copy");
 
   if (!eventTimeHistoricalPricing) {
-    title.textContent = "Price epoch was not verified";
-    copy.textContent = `This build returned ${registryVersion}, ${reviewedAt}, but not event-time historical card selection for the fits.${rebuiltAt}`;
+    setProductText(title, "Price epoch was not verified");
+    copy.textContent = t("dashboard.priceEpoch.unverified", {
+      registryVersion,
+      reviewedAt,
+      rebuiltAt,
+    });
     return;
   }
 
   title.textContent = pricing.mixedPriceCardWindows
-    ? "Historical event-time prices span card windows"
-    : "Historical event-time prices used for each fit";
+    ? t("dashboard.priceEpoch.mixedTitle")
+    : t("dashboard.priceEpoch.singleTitle");
   const priceCardIds = Array.isArray(pricing.priceCardIds)
     ? pricing.priceCardIds
     : [];
@@ -2802,17 +3138,26 @@ function renderWeeklyPricingReceipt(data) {
     && id.includes("-from-2026-07-30:")
   ));
   const julyThirtyPricing = priceCardIds.length === 0
-    ? " No per-card provenance was returned, so this build does not claim whether the July 30 GPT-5.6 Terra/Luna change affects these fits."
+    ? t("dashboard.priceEpoch.noCardProvenance")
     : hasPostJulyThirtyTerraOrLunaCard
-      ? " The lower official GPT-5.6 Terra/Luna cards effective July 30 are being used for retained events on or after that date; earlier events keep their earlier cards."
-      : " No retained event in these fits uses the GPT-5.6 Terra/Luna post-July 30 card, so that lower-price change does not affect this view.";
+      ? t("dashboard.priceEpoch.postJulyCard")
+      : t("dashboard.priceEpoch.noPostJulyCard");
   const mixedWindows = pricing.mixedPriceCardWindows
-    ? " At least one fit uses mixed official card windows."
+    ? t("dashboard.priceEpoch.mixedWindows")
     : "";
   const historicalTotal = pricing.eventTimeHistoricalTotalUsdExact
-    ? ` The retained event-time historical total is ${pricing.eventTimeHistoricalTotalUsdExact} USD; no current-card sensitivity total is claimed for this view.`
-    : " No separate event-time historical total was returned for this view.";
-  copy.textContent = `Each fit selects the official card effective at each usage event timestamp from ${registryVersion}, ${reviewedAt}.${julyThirtyPricing}${mixedWindows}${historicalTotal}${rebuiltAt}`;
+    ? t("dashboard.priceEpoch.historicalTotal", {
+      amount: pricing.eventTimeHistoricalTotalUsdExact,
+    })
+    : t("dashboard.priceEpoch.noHistoricalTotal");
+  copy.textContent = t("dashboard.priceEpoch.verified", {
+    registryVersion,
+    reviewedAt,
+    julyThirtyPricing,
+    mixedWindows,
+    historicalTotal,
+    rebuiltAt,
+  });
 }
 
 /**
@@ -3550,32 +3895,56 @@ function renderAccounting(data) {
 function fastModeCoverageSentence(fastMode) {
   const coverage = fastMode.coverage;
   if (coverage.totalEvents === 0) {
-    return "No usage increments in this period, so there is no speed-mode attribution to report.";
+    return t("accounting.fastMode.noUsage");
   }
   const parts = [
-    `${compact(coverage.observedEvents)} observed in the logs`,
-    `${compact(coverage.assumedFromPreferenceEvents)} attributed from your stated mode`,
-    `${compact(coverage.inferredEvents)} inferred from calibration residuals`,
-    `${compact(coverage.unknownEvents)} still unknown`
+    t("accounting.fastMode.observed", {
+      count: compact(coverage.observedEvents),
+    }),
+    t("accounting.fastMode.stated", {
+      count: compact(coverage.assumedFromPreferenceEvents),
+    }),
+    t("accounting.fastMode.inferred", {
+      count: compact(coverage.inferredEvents),
+    }),
+    t("accounting.fastMode.unknown", {
+      count: compact(coverage.unknownEvents),
+    })
   ];
   const share = coverage.unknownSharePercent === null
     ? ""
-    : ` (${formatPercent(coverage.unknownSharePercent, 1)} of increments).`;
+    : t("accounting.fastMode.unknownShare", {
+      percent: formatPercent(coverage.unknownSharePercent, 1),
+    });
   const unweighted = fastMode.unweightedUnknownApiPriceEquivalentUsd > 0
-    ? ` ${formatApiMoney(fastMode.unweightedUnknownApiPriceEquivalentUsd)} of Standard-rate cost could not be weighted and is excluded from the weighted total rather than counted at 1x.`
+    ? t("accounting.fastMode.unweighted", {
+      amount: formatApiMoney(fastMode.unweightedUnknownApiPriceEquivalentUsd),
+    })
     : "";
-  return `Of ${compact(coverage.totalEvents)} usage increments: ${parts.join(", ")}${share}${unweighted} Codex records the mode only when it is applied or changed, so turns before the first change in a session are never observed and a small structural error in the calibration cannot be engineered away.`;
+  return t("accounting.fastMode.coverage", {
+    total: compact(coverage.totalEvents),
+    parts: parts.join(", "),
+    share,
+    unweighted,
+  });
 }
 
 function fastModeInferenceSentence(fastMode) {
   const inference = fastMode.inference;
   if (inference.status !== "inferred") {
-    return "Residual inference has not run: there is not yet enough matched calibration evidence to compare a window against a Standard reference.";
+    return t("accounting.fastMode.inferenceNotRun");
   }
   if (inference.inferredFastWindows === 0) {
-    return `Residual inference compared ${compact(inference.scoredWindowCount)} calibration windows against ${compact(inference.referenceWindowCount)} Standard references and marked none as Fast.`;
+    return t("accounting.fastMode.inferenceNone", {
+      scored: compact(inference.scoredWindowCount),
+      reference: compact(inference.referenceWindowCount),
+    });
   }
-  return `Residual inference marked ${compact(inference.inferredFastWindows)} of ${compact(inference.scoredWindowCount)} calibration windows as inferred Fast, against ${compact(inference.referenceWindowCount)} Standard references. Inference labels windows, never individual increments, so it is reported here and never folded into the weighted total.`;
+  return t("accounting.fastMode.inferenceSome", {
+    fast: compact(inference.inferredFastWindows),
+    scored: compact(inference.scoredWindowCount),
+    reference: compact(inference.referenceWindowCount),
+  });
 }
 
 function renderFastModePreference() {
@@ -3593,10 +3962,13 @@ function renderFastModePreference() {
     control.disabled = fastModePreferenceBusy;
   }
   if (accounting === null) {
-    coverage.textContent = "Awaiting local evidence.";
+    setProductText(coverage, "Awaiting local evidence.");
     return;
   }
-  coverage.textContent = `${fastModeCoverageSentence(accounting.fastMode)} ${fastModeInferenceSentence(accounting.fastMode)}`;
+  coverage.textContent = [
+    fastModeCoverageSentence(accounting.fastMode),
+    fastModeInferenceSentence(accounting.fastMode),
+  ].join(" ");
 }
 
 async function selectFastModePreference(mode) {
@@ -4134,7 +4506,7 @@ function renderContributionSyncExactReview(value) {
     payloadBytes: value.payloadBytes,
     reviewToken: value.reviewToken,
   };
-  $("#sync-exact-review-json").textContent = JSON.stringify(value.payload, null, 2);
+  setRawText($("#sync-exact-review-json"), JSON.stringify(value.payload, null, 2));
   $("#sync-exact-review-state").textContent =
     `Verified · ${compact(value.payloadBytes)} bytes`;
   $("#sync-exact-review").hidden = false;
@@ -4289,27 +4661,13 @@ async function loadLocalDashboard() {
     renderAutomaticContributionStatus(null);
     renderPreparationIdentity(null);
     renderLocalOnboarding(onboarding);
-    setGlobalState("offline");
-    $("#latest-observation").textContent = backendOnly
-      ? "Backend-only origin"
-      : "Companion unavailable";
-    $("#data-source").textContent = "No real usage is displayed";
-    showConnectionNotice({
-      title: backendOnly
-        ? "This address is the backend-only service"
+    renderDashboardUnavailableState(
+      backendOnly
+        ? "backend-only"
         : localHealth
-          ? "The companion could not load the local dashboard"
-          : "The local companion is not available",
-      copy: backendOnly
-        ? "This service accepts optional community requests but cannot read this Mac. Open TiboTattle from Applications and use its in-app window."
-        : localHealth
-          ? "The Mac app is running, but its in-app dashboard could not be loaded. Quit and reopen TiboTattle, then open the dashboard in its window and check again."
-          : "Open TiboTattle from Applications, wait for Ready, then open the dashboard in its window. If no installer is published below, this build is not yet available for a new installation.",
-      kind: "error",
-      showDemo: true,
-      showCheck: true,
-    });
-    renderDashboardSkeleton();
+          ? "dashboard-unavailable"
+          : "companion-unavailable",
+    );
   } finally {
     localActionBusy = previousBusy;
     updateLocalActionButtons();
@@ -4335,8 +4693,15 @@ function renderDashboardSkeleton() {
   clear(container);
   const card = node("article", "metric-card insufficient");
   const header = node("div", "metric-card-header");
-  header.append(node("span", "metric-name", "No local evidence"), node("span", "evidence-chip", "Offline"));
-  card.append(header, node("strong", "metric-value", "—"), node("p", "", "This empty state is intentional. Demo values are never substituted automatically."));
+  header.append(
+    node("span", "metric-name", t("dashboard.unavailable.noLocalEvidence")),
+    node("span", "evidence-chip", t("dashboard.unavailable.offline")),
+  );
+  card.append(
+    header,
+    node("strong", "metric-value", "—"),
+    node("p", "", t("dashboard.unavailable.emptyState")),
+  );
   container.append(card);
 }
 
@@ -4890,7 +5255,7 @@ function renderHostedIdentity() {
   pendingActions.hidden = !hostedIdentityBusy || signedIn;
   checkButton.disabled = !hostedIdentityBusy || signedIn;
   cancelButton.disabled = !hostedIdentityBusy || signedIn;
-  $("#identity-account-provider").textContent = provider.label;
+  setRawText($("#identity-account-provider"), provider.label);
   $("#identity-account-mark").setAttribute("href", provider.mark);
   chip.textContent = signedIn
     ? "Signed in"
@@ -5001,7 +5366,9 @@ function cancelHostedSignIn() {
   const status = $("#identity-signin-status");
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = `${attempt.label} sign-in was cancelled. Nothing was uploaded.`;
+  status.textContent = t("contribution.signInCancelled", {
+    provider: attempt.label,
+  });
   renderHostedIdentity();
 }
 
@@ -5070,7 +5437,9 @@ async function beginHostedSignIn(providerId) {
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = `Starting ${flow.label} sign-in…`;
+  status.textContent = t("contribution.signInStarting", {
+    provider: flow.label,
+  });
   try {
     const request = await flow.start();
     openHostedSignInInBrowser(request.authorizeUrl);
@@ -5089,8 +5458,9 @@ async function beginHostedSignIn(providerId) {
         if (attempt.returnedToApp) {
           status.hidden = false;
           status.className = "participant-action-status";
-          status.textContent =
-            `${flow.label} sign-in did not complete. Nothing was uploaded. You can try again.`;
+          status.textContent = t("contribution.signInIncomplete", {
+            provider: flow.label,
+          });
           return;
         }
       }
@@ -5409,7 +5779,9 @@ async function connectCommunityContribution() {
           "This Mac could not be connected, and no evidence was uploaded. The cause was not reported in a form this page can explain; retrying is safe."
       });
       if (retryNeedsFreshSignIn) {
-        status.textContent = `${described.text} For safety, this page discarded the one-time sign-in; sign in again before retrying.`;
+        status.textContent = t("contribution.signInDiscarded", {
+          message: described.text,
+        });
       }
     }
   } finally {
@@ -5645,12 +6017,14 @@ function renderSelectedContributionInspection(file, payload) {
   $("#selected-contribution-state").className = "evidence-chip";
   $("#selected-contribution-message").textContent =
     "The closed-schema browser preflight passed. Expand the review below before consenting.";
-  $("#selected-contribution-schema").textContent = payload.schemaVersion;
-  $("#selected-contribution-bytes").textContent =
-    `${formatNumber(file.size)} bytes`;
-  $("#selected-contribution-usage").textContent = compact(usageRows);
-  $("#selected-contribution-quota").textContent = compact(quotaRows);
-  $("#selected-contribution-json").textContent = JSON.stringify(payload, null, 2);
+  setRawText($("#selected-contribution-schema"), payload.schemaVersion);
+  setRawText(
+    $("#selected-contribution-bytes"),
+    `${new Intl.NumberFormat(getFormattingLocale()).format(file.size)} bytes`,
+  );
+  setRawText($("#selected-contribution-usage"), compact(usageRows));
+  setRawText($("#selected-contribution-quota"), compact(quotaRows));
+  setRawText($("#selected-contribution-json"), JSON.stringify(payload, null, 2));
 }
 
 function renderSelectedContributionError(error) {
@@ -5752,7 +6126,11 @@ async function submitContribution(event) {
       registration.uploadAuthorization
     );
     setCommunitySession({ ...communitySession, contributionId: receipt.contributionId });
-    status.textContent = `Accepted as ${receipt.contributionId}. The server reported ${compact(receipt.recordCounts?.deduplicated ?? 0)} deduplicated records.`;
+    const deduplicatedCount = receipt.recordCounts?.deduplicated ?? 0;
+    status.textContent = t("contribution.acceptedReceipt", {
+      id: receipt.contributionId,
+      records: tPlural("contribution.deduplicatedRecord", deduplicatedCount),
+    });
     await loadCommunityResults();
   } catch (error) {
     showFailure(status, {
@@ -6211,7 +6589,10 @@ function renderPrivateCommunityComparison(container, comparison) {
       const row = document.createElement("tr");
       const identity = document.createElement("th");
       identity.scope = "row";
-      identity.textContent = `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`;
+      setRawText(
+        identity,
+        `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`,
+      );
       row.append(identity, node("td", "", label));
       if (metric.status === "community_not_released") {
         row.append(
@@ -6635,8 +7016,14 @@ async function deleteParticipantData() {
     const uploadStatus = $("#upload-status");
     uploadStatus.hidden = false;
     uploadStatus.className = "upload-status";
-    uploadStatus.textContent = `Deleted ${compact(receipt?.contributionsDeleted ?? 0)} contribution batches and the pseudonymous hosted session.`;
-    status.textContent = "Your hosted content-free pseudonymous metadata was deleted.";
+    const contributionsDeleted = receipt?.contributionsDeleted ?? 0;
+    uploadStatus.textContent = t("contribution.deletedReceipt", {
+      batches: tPlural("contribution.batch", contributionsDeleted),
+    });
+    setProductText(
+      status,
+      "Your hosted content-free pseudonymous metadata was deleted.",
+    );
     $("#participant-controls").hidden = true;
     renderPersonalStats($("#personal-result"), null);
     renderContributionHistory($("#contribution-history"), null);
@@ -6830,7 +7217,14 @@ $("#contribution-file").addEventListener("change", async () => {
   const file = $("#contribution-file").files[0];
   const drop = $(".file-drop");
   drop.classList.toggle("selected", Boolean(file));
-  $("#file-help").textContent = file ? `${file.name} · ${compact(file.size)} bytes` : "Privacy-safe JSON export · 1.25 MB browser validation limit";
+  if (file) {
+    setRawText($("#file-help"), `${file.name} · ${compact(file.size)} bytes`);
+  } else {
+    setProductText(
+      $("#file-help"),
+      "Privacy-safe JSON export · 1.25 MB browser validation limit",
+    );
+  }
   resetSelectedContributionInspection();
   $("#contribution-consent").checked = false;
   $("#contribution-consent-title").textContent =
@@ -6904,7 +7298,10 @@ mountDashboardNavigation({
 });
 
 async function bootstrapDashboard() {
-  renderSharedInstallerJourney(document);
+  renderSharedInstallerJourney(document, {
+    formatLocale: getFormattingLocale(),
+    translateMessage: t,
+  });
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();

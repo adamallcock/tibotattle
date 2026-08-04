@@ -134,7 +134,7 @@ struct MenuBarStatusSnapshot: Equatable {
         guard phase == .ready, evidence == .live, let lane = primaryLane else {
             return unknownPlaceholder
         }
-        return "\(lane.roundedRemainingPercent)%"
+        return TiboTattleLocalization.percentString(lane.roundedRemainingPercent)
     }
 
     /// Spoken by VoiceOver in place of the glyph and the terse title. The
@@ -147,43 +147,55 @@ struct MenuBarStatusSnapshot: Equatable {
     /// First disabled information row, and the tooltip's first line.
     var allowanceSummary: String {
         guard !lanes.isEmpty else {
-            return "No verified Codex allowance observed yet"
+            return TiboTattleLocalization.string(.menuBarNoVerifiedAllowance)
         }
         guard companionReachable, evidence == .live else {
-            return "Quota lanes were last observed, but are not current"
+            return TiboTattleLocalization.string(
+                .menuBarLastObservationNotCurrent
+            )
         }
-        return "\(lanes.count) verified Codex allowance\(lanes.count == 1 ? "" : "s")"
+        return lanes.count == 1
+            ? TiboTattleLocalization.string(.menuBarVerifiedAllowanceOne)
+            : TiboTattleLocalization.format(
+                .menuBarVerifiedAllowanceMany,
+                lanes.count
+            )
     }
 
     /// Second disabled information row: why the title says what it says.
     var evidenceSummary: String {
         switch phase {
         case .starting:
-            return "Starting the local companion…"
+            return TiboTattleLocalization.string(.menuBarCompanionStarting)
         case .unavailable:
             guard let failureSummary, !failureSummary.isEmpty else {
-                return "The local companion is not running."
+                return TiboTattleLocalization.string(.menuBarCompanionNotRunning)
             }
             return failureSummary
         case .analyzing:
-            return "Analyzing local usage…"
+            return TiboTattleLocalization.string(.menuBarAnalyzingLocalUsage)
         case .ready:
             break
         }
         switch evidence {
         case .live:
             guard let observedAt else {
-                return "Observed locally · verified current evidence"
+                return TiboTattleLocalization.string(.menuBarCurrentEvidence)
             }
-            return "Observed \(relativeAge(observedAt)) · verified current evidence"
+            return TiboTattleLocalization.format(
+                .menuBarCurrentEvidenceWithAge,
+                relativeAge(observedAt)
+            )
         case .stale:
             guard let observedAt else {
-                return "Local evidence is stale. Allowance values and reset countdowns are hidden."
+                return TiboTattleLocalization.string(.menuBarLocalEvidenceStale)
             }
-            return "Last observed \(relativeAge(observedAt)) · stale. "
-                + "Allowance values and reset countdowns are hidden."
+            return TiboTattleLocalization.format(
+                .menuBarLocalEvidenceStaleWithAge,
+                relativeAge(observedAt)
+            )
         case .none:
-            return "No verified quota observation yet · choose Analyze Local Usage."
+            return TiboTattleLocalization.string(.menuBarNoVerifiedQuota)
         }
     }
 
@@ -193,13 +205,24 @@ struct MenuBarStatusSnapshot: Equatable {
     /// current claim.
     func laneSummary(_ lane: ObservedQuotaLane, now: Date = Date()) -> String {
         guard companionReachable, evidence == .live else {
-            return "\(lane.label): last observation is not current"
+            return TiboTattleLocalization.format(
+                .menuBarQuotaLastObserved,
+                lane.label
+            )
         }
-        let remaining = "\(lane.roundedRemainingPercent)% remaining"
         guard let reset = resetCountdown(lane.resetAt, now: now) else {
-            return "\(lane.label): \(remaining) · reset time unavailable"
+            return TiboTattleLocalization.format(
+                .menuBarQuotaResetUnavailable,
+                lane.label,
+                TiboTattleLocalization.percentString(lane.roundedRemainingPercent)
+            )
         }
-        return "\(lane.label): \(remaining) · resets \(reset)"
+        return TiboTattleLocalization.format(
+            .menuBarQuotaResets,
+            lane.label,
+            TiboTattleLocalization.percentString(lane.roundedRemainingPercent),
+            reset
+        )
     }
 
     /// The local analysis action names the state it will enter or is already
@@ -208,15 +231,15 @@ struct MenuBarStatusSnapshot: Equatable {
     var analysisActionTitle: String {
         switch phase {
         case .analyzing:
-            return "Analyzing Local Usage…"
+            return TiboTattleLocalization.string(.menuBarAnalyzingLocalUsage)
         case .ready:
             return evidence == .none
-                ? "Analyze Local Usage"
-                : "Update Local Usage"
+                ? TiboTattleLocalization.string(.menuBarAnalyzeLocalUsage)
+                : TiboTattleLocalization.string(.menuBarUpdateLocalUsage)
         case .starting:
-            return "Waiting to Analyze Local Usage"
+            return TiboTattleLocalization.string(.menuBarWaitingToAnalyze)
         case .unavailable:
-            return "Retry Local Analysis"
+            return TiboTattleLocalization.string(.menuBarRetryLocalAnalysis)
         }
     }
 }
@@ -237,17 +260,19 @@ private let defaultStaleAfterSeconds: Double = 30 * 60
 /// does not have.
 func relativeAge(_ date: Date, now: Date = Date()) -> String {
     let seconds = max(0, now.timeIntervalSince(date))
-    if seconds < 90 { return "just now" }
+    if seconds < 90 {
+        return TiboTattleLocalization.string(.menuBarJustNow)
+    }
     let minutes = Int((seconds / 60).rounded())
     if minutes < 60 {
-        return "\(minutes) minute\(minutes == 1 ? "" : "s") ago"
+        return TiboTattleLocalization.format(.menuBarMinutesAgo, minutes)
     }
     let hours = Int((seconds / 3_600).rounded())
     if hours < 48 {
-        return "\(hours) hour\(hours == 1 ? "" : "s") ago"
+        return TiboTattleLocalization.format(.menuBarHoursAgo, hours)
     }
     let days = Int((seconds / 86_400).rounded())
-    return "\(days) day\(days == 1 ? "" : "s") ago"
+    return TiboTattleLocalization.format(.menuBarDaysAgo, days)
 }
 
 /// Countdown wording is deliberately available only to a caller that has
@@ -261,9 +286,21 @@ func resetCountdown(_ date: Date?, now: Date = Date()) -> String? {
     let days = totalMinutes / (24 * 60)
     let hours = (totalMinutes % (24 * 60)) / 60
     let minutes = totalMinutes % 60
-    if days > 0 { return "in \(days)d \(hours)h" }
-    if hours > 0 { return "in \(hours)h \(minutes)m" }
-    return "in \(minutes)m"
+    if days > 0 {
+        return TiboTattleLocalization.format(
+            .menuBarResetDaysHours,
+            days,
+            hours
+        )
+    }
+    if hours > 0 {
+        return TiboTattleLocalization.format(
+            .menuBarResetHoursMinutes,
+            hours,
+            minutes
+        )
+    }
+    return TiboTattleLocalization.format(.menuBarResetMinutes, minutes)
 }
 
 /// Pure projection of the companion's overview payload. Kept free of AppKit so
@@ -367,9 +404,9 @@ enum LocalCompanionOverviewProjection {
         durationMinutes: Int
     ) -> String {
         if durationMinutes == fiveHourWindowDurationMinutes {
-            return "Five-hour allowance"
+            return TiboTattleLocalization.string(.menuBarFiveHourAllowance)
         }
-        return "Seven-day allowance"
+        return TiboTattleLocalization.string(.menuBarSevenDayAllowance)
     }
 }
 
@@ -591,8 +628,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// real number promptly once the pass finishes.
     private static let activePollSeconds = 5
     private static let menuMinimumWidth: CGFloat = 338
-    private static let deferredLaneTitle =
-        "Quota values are unavailable until a fresh local observation."
+    private static var deferredLaneTitle: String {
+        TiboTattleLocalization.string(.menuBarQuotaValuesUnavailable)
+    }
 
     private let statusItem: NSStatusItem
     private let actions: Actions
@@ -664,12 +702,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
         configure(
             openTiboTattleItem,
-            "Open \(productName)",
+            TiboTattleLocalization.format(.menuBarOpenProduct, productName),
             #selector(openTiboTattle)
         )
         configure(
             analyzeItem,
-            "Analyze Local Usage",
+            TiboTattleLocalization.string(.menuBarAnalyzeLocalUsage),
             #selector(analyzeLocalUsage)
         )
         analyzeItem.keyEquivalent = "r"
@@ -679,21 +717,33 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         if actions.checkForUpdates != nil {
             configure(
                 checkForUpdatesItem,
-                "Check for Updates…",
+                TiboTattleLocalization.string(.settingsCheckForUpdates) + "…",
                 #selector(checkForUpdates)
             )
             checkForUpdatesItem.isEnabled = true
             menu.addItem(checkForUpdatesItem)
         }
-        configure(settingsItem, "Settings…", #selector(showSettings))
+        configure(
+            settingsItem,
+            TiboTattleLocalization.string(.menuSettings),
+            #selector(showSettings)
+        )
         settingsItem.keyEquivalent = ","
         settingsItem.keyEquivalentModifierMask = [.command]
-        configure(aboutItem, "About \(productName)", #selector(showAbout))
+        configure(
+            aboutItem,
+            TiboTattleLocalization.format(.menuAboutProduct, productName),
+            #selector(showAbout)
+        )
         menu.addItem(settingsItem)
         menu.addItem(aboutItem)
         menu.addItem(.separator())
 
-        configure(quitItem, "Quit \(productName)", #selector(quit))
+        configure(
+            quitItem,
+            TiboTattleLocalization.format(.menuQuitProduct, productName),
+            #selector(quit)
+        )
         quitItem.keyEquivalent = "q"
         quitItem.keyEquivalentModifierMask = [.command]
         menu.addItem(quitItem)
@@ -785,6 +835,30 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         removeInteractionMonitoring()
         statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    /// Reuse the existing native controls so a language change does not reset
+    /// observation state, refresh scheduling, or menu keyboard shortcuts.
+    func refreshLocalization() {
+        guard !stopped else { return }
+        openTiboTattleItem.title = TiboTattleLocalization.format(
+            .menuBarOpenProduct,
+            productName
+        )
+        if actions.checkForUpdates != nil {
+            checkForUpdatesItem.title =
+                TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+        }
+        settingsItem.title = TiboTattleLocalization.string(.menuSettings)
+        aboutItem.title = TiboTattleLocalization.format(
+            .menuAboutProduct,
+            productName
+        )
+        quitItem.title = TiboTattleLocalization.format(
+            .menuQuitProduct,
+            productName
+        )
+        render()
     }
 
     /// Used only by the packaged AppKit smoke mode. The test instantiates the
@@ -942,7 +1016,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 self.invalidateObservedEvidence()
                 self.snapshot.phase = .unavailable
                 self.snapshot.failureSummary =
-                    "The local companion could not accept an analysis request."
+                    TiboTattleLocalization.string(
+                        .menuBarAnalysisRequestRejected
+                    )
             }
             self.render()
             self.pollNow()
@@ -1020,7 +1096,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 self.invalidateObservedEvidence()
                 self.snapshot.phase = .unavailable
                 self.snapshot.failureSummary =
-                    "Quota evidence is unavailable right now. Retry Local Analysis."
+                    TiboTattleLocalization.string(
+                        .menuBarQuotaEvidenceUnavailable
+                    )
                 self.render()
                 return
             }
@@ -1072,7 +1150,11 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
     private func render() {
         expireCachedEvidenceIfNeeded()
-        allowanceItem.title = "\(productName) · \(snapshot.title) allowance"
+        allowanceItem.title = TiboTattleLocalization.format(
+            .menuBarAllowanceTitle,
+            productName,
+            snapshot.title
+        )
         evidenceItem.title = snapshot.evidenceSummary
         renderQuotaLanes()
         openTiboTattleItem.isEnabled = true
@@ -1330,7 +1412,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private static func nativeBirdTemplate() -> NSImage? {
         let symbol = NSImage(
             systemSymbolName: "bird.fill",
-            accessibilityDescription: "TiboTattle status"
+            accessibilityDescription: TiboTattleLocalization.string(
+                .accessibilityMenuBarStatus
+            )
         )
         symbol?.isTemplate = true
         return symbol
@@ -1441,7 +1525,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 self.invalidateObservedEvidence()
                 self.snapshot.phase = .unavailable
                 self.snapshot.failureSummary =
-                    "The local companion could not accept an analysis request."
+                    TiboTattleLocalization.string(
+                        .menuBarAnalysisRequestRejected
+                    )
             }
             self.render()
             self.pollNow()

@@ -23,6 +23,14 @@ const APP_SOURCE = join(
   "macos",
   "UsageMonitorApp.swift",
 );
+const MENU_BAR_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarStatus.swift",
+);
+const NATIVE_RESOURCE_LOCALES = ["en", "es", "zh-Hans"];
 
 function parseStrings(source) {
   const entries = new Map();
@@ -35,44 +43,113 @@ function parseStrings(source) {
   return entries;
 }
 
-test("localization catalog is complete, English-backed, and system-default", async () => {
-  const [manifestText, stringsText, swiftSource, appSource] = await Promise.all([
-    readFile(join(RESOURCE_ROOT, "localization", "manifest.json"), "utf8"),
-    readFile(join(RESOURCE_ROOT, "en.lproj", "Localizable.strings"), "utf8"),
-    readFile(LOCALIZATION_SOURCE, "utf8"),
-    readFile(APP_SOURCE, "utf8"),
-  ]);
-  const manifest = JSON.parse(manifestText);
-  const strings = parseStrings(stringsText);
-  const keys = [...swiftSource.matchAll(/case \w+ = "([^"]+)"/gu)].map(
+function swiftLocalizationKeys(source) {
+  const keyEnum = source.match(
+    /enum Key: String, CaseIterable \{([\s\S]*?)\n    \}/u,
+  )?.[1];
+  assert.ok(keyEnum, "TiboTattleLocalization.Key must remain a closed inventory");
+  return [...keyEnum.matchAll(/case \w+ = "([^"]+)"/gu)].map(
     ([, key]) => key,
   );
+}
+
+function placeholderSignature(value) {
+  return [...value.matchAll(/%(?:\d+\$)?(?:@|d|D|i|u|f|g|s)/gu)]
+    .map(([token]) => token.replace(/%\d+\$/u, "%"))
+    .sort();
+}
+
+test("native catalogs have complete language parity and preserve placeholders", async () => {
+  const [manifestText, swiftSource, appSource, menuBarSource, ...catalogTexts] = await Promise.all([
+    readFile(join(RESOURCE_ROOT, "localization", "manifest.json"), "utf8"),
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+    readFile(APP_SOURCE, "utf8"),
+    readFile(MENU_BAR_SOURCE, "utf8"),
+    ...NATIVE_RESOURCE_LOCALES.map((locale) => readFile(
+      join(RESOURCE_ROOT, `${locale}.lproj`, "Localizable.strings"),
+      "utf8",
+    )),
+  ]);
+  const manifest = JSON.parse(manifestText);
+  const keys = swiftLocalizationKeys(swiftSource).sort();
+  const catalogs = new Map(NATIVE_RESOURCE_LOCALES.map((locale, index) => [
+    locale,
+    parseStrings(catalogTexts[index]),
+  ]));
+
   assert.deepEqual(manifest, {
-    schemaVersion: "tibotattle-localization-v1",
+    schemaVersion: "tibotattle-localization-v2",
     table: "Localizable",
-    fallbackLocale: "en",
-    defaultLocale: "en",
-    supportedLocales: ["en"],
-    preference: "system",
+    fallbackLocale: "en-US",
+    defaultLocale: "en-US",
+    supportedLocales: ["en-US", "zh-Hans", "es"],
+    preference: "system-or-user-override",
     webResourceRoot: "./localization",
   });
-  assert.deepEqual([...strings.keys()].sort(), [...keys].sort());
-  assert.equal([...strings.values()].every((value) => value.length > 0), true);
-  assert.equal(strings.get("settings.language"), "Language");
+  for (const [locale, catalog] of catalogs) {
+    assert.deepEqual([...catalog.keys()].sort(), keys, `${locale} key parity`);
+    assert.equal(
+      [...catalog.values()].every((value) => value.trim().length > 0),
+      true,
+      `${locale} contains no blank translation`,
+    );
+  }
+  const english = catalogs.get("en");
+  for (const locale of ["zh-Hans", "es"]) {
+    const catalog = catalogs.get(locale);
+    for (const key of keys) {
+      assert.deepEqual(
+        placeholderSignature(catalog.get(key)),
+        placeholderSignature(english.get(key)),
+        `${locale} preserves placeholders for ${key}`,
+      );
+    }
+  }
+  assert.equal(english.get("settings.language"), "Language");
   assert.equal(
-    strings.get("settings.languageSummary"),
-    "Uses the Mac language when available; regional formats follow this Mac.",
+    english.get("settings.languageSummary"),
+    "Uses your Mac language by default. Dates, numbers, and currency keep this Mac's regional format.",
   );
-  assert.equal(strings.get("settings.languageSystem"), "System");
+  assert.match(swiftSource, /LanguagePreference: String, CaseIterable/u);
+  assert.match(swiftSource, /UserDefaults\.standard\.set/u);
   assert.match(swiftSource, /Locale\.preferredLanguages/u);
   assert.match(swiftSource, /static var locale: Locale \{\s*\.current/u);
   assert.match(swiftSource, /fallbackLocalization = "en"/u);
   assert.match(appSource, /window\.__TIBOTATTLE_LOCALIZATION__/u);
-  assert.match(appSource, /"preferredLanguages": Locale\.preferredLanguages/u);
-  assert.match(appSource, /"resourceRoot": "\.\/localization"/u);
+  assert.match(appSource, /"host": "native"/u);
+  assert.match(appSource, /"supportedLocales": TiboTattleLocalization\.supportedWebLocales/u);
+  assert.match(appSource, /"formatLocale": Locale\.current\.identifier/u);
+  assert.match(appSource, /WKScriptMessageHandler/u);
+  assert.match(appSource, /name: "tibotattleLocalization"/u);
+  assert.match(appSource, /notifyLanguagePreferenceChange/u);
+  assert.match(appSource, /notifyHostedSignInReturn[\s\S]*?tibotattle:hosted-sign-in-return/u);
   assert.match(
     appSource,
-    /let localizationHandoff = Self\.localizationHandoffScript\(\)[\s\S]*?source: localizationHandoff,[\s\S]*?injectionTime: \.atDocumentStart/u,
+    /private static func addDocumentStartScripts[\s\S]*?source: localizationHandoffScript\(\),[\s\S]*?injectionTime: \.atDocumentStart/u,
+  );
+  assert.match(
+    appSource,
+    /private func refreshDocumentStartScripts\(\)[\s\S]*?removeAllUserScripts\(\)[\s\S]*?addDocumentStartScripts\(to: controller\)/u,
+  );
+  assert.match(
+    appSource,
+    /request\.cachePolicy = \.reloadIgnoringLocalCacheData[\s\S]*?refreshDocumentStartScripts\(\)[\s\S]*?webView\.load\(request\)/u,
+  );
+  const languageNotification = appSource.match(
+    /func notifyLanguagePreferenceChange\([\s\S]*?\n    \}/u,
+  )?.[0] ?? "";
+  assert.match(languageNotification, /tibotattle:locale-override/u);
+  assert.doesNotMatch(languageNotification, /webView\.load\(/u);
+  assert.match(appSource, /settingsUpdateDisclosureDevelopment/u);
+  assert.match(appSource, /launcherErrorInvalidCentralService/u);
+  assert.match(appSource, /launcherRecoveryReinstall/u);
+  assert.match(appSource, /nativeDashboardCurrentEvidenceTooltip/u);
+  assert.match(appSource, /settingsCodexFolderCustomSelected/u);
+  assert.match(menuBarSource, /menuBarAnalysisRequestRejected/u);
+  assert.match(menuBarSource, /accessibilityMenuBarStatus/u);
+  assert.doesNotMatch(
+    menuBarSource,
+    /"The local companion could not accept an analysis request\."/u,
   );
 });
 
@@ -80,7 +157,9 @@ test("localization resources stage for AppKit and the embedded dashboard", async
   const resources = await collectMacOSLocalizationResources();
   assert.deepEqual(resources.relativeFiles, [
     "en.lproj/Localizable.strings",
+    "es.lproj/Localizable.strings",
     "localization/manifest.json",
+    "zh-Hans.lproj/Localizable.strings",
   ]);
 
   const temporaryRoot = await mkdtemp(join(tmpdir(), "tibotattle-localization-"));
@@ -97,8 +176,16 @@ test("localization resources stage for AppKit and the embedded dashboard", async
         webRelativeFile: "localization/en.lproj/Localizable.strings",
       },
       {
+        relativeFile: "es.lproj/Localizable.strings",
+        webRelativeFile: "localization/es.lproj/Localizable.strings",
+      },
+      {
         relativeFile: "localization/manifest.json",
         webRelativeFile: "localization/manifest.json",
+      },
+      {
+        relativeFile: "zh-Hans.lproj/Localizable.strings",
+        webRelativeFile: "localization/zh-Hans.lproj/Localizable.strings",
       },
     ]);
     for (const relativeFile of resources.relativeFiles) {

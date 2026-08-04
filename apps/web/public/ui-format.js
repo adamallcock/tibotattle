@@ -1,39 +1,26 @@
-// Formatting and DOM helpers shared by both browser surfaces: the in-app
-// dashboard entry (app.js, served by the loopback companion) and the public
-// community entry (community.js, served by the release site). Neither surface
-// keeps a private copy, so a wording or rounding change lands in one place.
-//
-import {
-  DEFAULT_LOCALE,
-  SUPPORTED_LOCALES,
-  formatDate as formatLocaleDate,
-  formatNumber as formatLocaleNumber,
-  negotiateLocale,
-} from "./i18n.generated.js";
+// Formatting and DOM helpers shared by the local dashboard and the public
+// community surface. Translation language and regional formatting remain
+// separate: choosing Spanish or Simplified Chinese never changes an instant,
+// accounting value, or the browser/Mac regional number convention.
+import { DEFAULT_LOCALE, translate } from "./localization.js";
 
-const requestedLocales = typeof navigator !== "undefined"
-  ? navigator.languages?.length > 0
-    ? navigator.languages
-    : [navigator.language]
-  : [DEFAULT_LOCALE];
-
-export const USER_LOCALE = negotiateLocale(
-  requestedLocales,
-  SUPPORTED_LOCALES,
-  DEFAULT_LOCALE,
-);
-
-export function formatNumber(value, options) {
-  return formatLocaleNumber(value, USER_LOCALE, options);
+function canonicalLocale(value) {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  try {
+    return Intl.getCanonicalLocales(value.trim())[0] ?? null;
+  } catch {
+    return null;
+  }
 }
 
-export function formatDate(value, options) {
-  return formatLocaleDate(value, USER_LOCALE, options);
+function browserLocale() {
+  if (typeof navigator === "undefined") return DEFAULT_LOCALE;
+  const requested = navigator.languages?.find((value) =>
+    typeof value === "string" && value.trim() !== "",
+  ) ?? navigator.language;
+  return canonicalLocale(requested) ?? DEFAULT_LOCALE;
 }
 
-// Instants remain UTC in every local/hosted contract. This is the one display
-// policy for a person reading them: use the Mac/browser's configured zone, and
-// fall back to UTC only if the runtime cannot report a usable system zone.
 function systemTimeZone() {
   try {
     const value = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -43,16 +30,50 @@ function systemTimeZone() {
   }
 }
 
-export const REPORTING_TIME_ZONE = systemTimeZone();
+export const USER_TIME_ZONE = systemTimeZone();
+// Compatibility exports for existing browser modules. The values retain the
+// old reporting-time semantics while their formatting follows the live locale.
+export const REPORTING_TIME_ZONE = USER_TIME_ZONE;
+export let USER_LOCALE = browserLocale();
 
-const REPORTING_TIME_ZONE_OPTION = Object.freeze({
-  timeZone: REPORTING_TIME_ZONE,
-});
+let formattingLocale = USER_LOCALE;
+let messageLocale = DEFAULT_LOCALE;
+
+export function setFormattingLocale(value) {
+  formattingLocale = canonicalLocale(value) ?? browserLocale();
+  USER_LOCALE = formattingLocale;
+  return formattingLocale;
+}
+
+export function getFormattingLocale() {
+  return formattingLocale;
+}
+
+export function setMessageLocale(value) {
+  messageLocale = canonicalLocale(value) ?? DEFAULT_LOCALE;
+  return messageLocale;
+}
+
+export function getMessageLocale() {
+  return messageLocale;
+}
+
+const USER_TIME_ZONE_OPTION = Object.freeze({ timeZone: USER_TIME_ZONE });
 
 function instant(value) {
   if (value === null || value === undefined || value === "") return null;
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
   return Number.isNaN(date.valueOf()) ? null : date;
+}
+
+export function formatNumber(value, options = undefined) {
+  return new Intl.NumberFormat(formattingLocale, options).format(value);
+}
+
+export function formatDate(value, options = undefined) {
+  const date = instant(value);
+  if (date === null) throw new RangeError("A valid date is required");
+  return new Intl.DateTimeFormat(formattingLocale, options).format(date);
 }
 
 export function finite(value, fallback = null) {
@@ -69,49 +90,58 @@ export function compact(value) {
     });
 }
 
-export function formatReportingTime(value, { dateOnly = false } = {}) {
+export function formatLocal(value, { dateOnly = false } = {}) {
   const date = instant(value);
-  if (date === null) return "Unknown";
-  return formatDate(date, dateOnly
+  if (date === null) return translate("format.unknown", {}, messageLocale);
+  return new Intl.DateTimeFormat(formattingLocale, dateOnly
     ? {
-      ...REPORTING_TIME_ZONE_OPTION,
+      ...USER_TIME_ZONE_OPTION,
       month: "short",
       day: "numeric",
       year: "numeric",
     }
     : {
-      ...REPORTING_TIME_ZONE_OPTION,
+      ...USER_TIME_ZONE_OPTION,
       month: "short",
       day: "numeric",
       hour: "numeric",
       minute: "2-digit",
       timeZoneName: "short",
-    });
+    }).format(date);
 }
 
-// Existing dashboard imports use this name. It is deliberately an alias, not
-// a second browser-local formatter, so every visible timestamp follows the
-// same reporting-zone policy.
-export function formatLocal(value, options = {}) {
-  return formatReportingTime(value, options);
+// Existing browser imports use this name. Keep it as an alias so all
+// timestamp surfaces inherit the selected regional formatter.
+export function formatReportingTime(value, options = {}) {
+  return formatLocal(value, options);
 }
 
 export function formatAge(value) {
   const seconds = finite(value);
-  if (seconds === null) return "Unknown age";
-  if (seconds < 90) return "Less than 2 minutes ago";
-  if (seconds < 7200) return `${Math.round(seconds / 60)} minutes ago`;
-  if (seconds < 172800) return `${(seconds / 3600).toFixed(1)} hours ago`;
-  return `${(seconds / 86400).toFixed(1)} days ago`;
+  if (seconds === null) {
+    return translate("format.unknownAge", {}, messageLocale);
+  }
+  const formatter = new Intl.RelativeTimeFormat(messageLocale, {
+    numeric: "always",
+    style: "long",
+  });
+  if (seconds < 90) return formatter.format(-1, "minute");
+  if (seconds < 7200) return formatter.format(-Math.round(seconds / 60), "minute");
+  if (seconds < 172800) return formatter.format(-Number((seconds / 3600).toFixed(1)), "hour");
+  return formatter.format(-Number((seconds / 86400).toFixed(1)), "day");
 }
 
-export function reportingCalendarParts() {
-  return new Intl.DateTimeFormat(USER_LOCALE, {
-    ...REPORTING_TIME_ZONE_OPTION,
+export function localCalendarParts() {
+  return new Intl.DateTimeFormat(formattingLocale, {
+    ...USER_TIME_ZONE_OPTION,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   });
+}
+
+export function reportingCalendarParts() {
+  return localCalendarParts();
 }
 
 /**

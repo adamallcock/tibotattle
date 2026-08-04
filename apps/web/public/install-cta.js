@@ -8,7 +8,12 @@
 // call to action, and by the in-app dashboard entry (app.js), which uses the
 // same card when the local companion is not yet reachable.
 
-import { formatNumber } from "./ui-format.js";
+import { DEFAULT_LOCALE, translate } from "./localization.js";
+import { getFormattingLocale } from "./ui-format.js";
+
+function defaultMessage(key, values = {}) {
+  return translate(key, values, DEFAULT_LOCALE);
+}
 
 export function configuredSemanticOpenTarget(documentRef) {
   const target = documentRef
@@ -131,20 +136,28 @@ export function configuredInstallerRelease(documentRef) {
   };
 }
 
-export function formatInstallerSize(bytes) {
+export function formatInstallerSize(bytes, {
+  formatLocale = getFormattingLocale(),
+  translateMessage = defaultMessage,
+} = {}) {
   if (bytes < 1024 * 1024) {
-    return `${Math.ceil(bytes / 1024)} KiB download`;
+    return translateMessage("installer.downloadKiB", {
+      value: Math.ceil(bytes / 1024),
+    });
   }
   const mebibytes = bytes / (1024 * 1024);
-  return `${formatNumber(mebibytes, {
-    maximumFractionDigits: mebibytes >= 10 ? 0 : 1,
-  })} MiB download`;
+  return translateMessage("installer.downloadMiB", {
+    value: new Intl.NumberFormat(formatLocale, {
+      maximumFractionDigits: mebibytes >= 10 ? 0 : 1,
+    }).format(mebibytes),
+  });
 }
 
-export function renderInstallerJourney(
-  documentRef,
-  { showUnavailableAction = false } = {},
-) {
+export function renderInstallerJourney(documentRef, {
+  showUnavailableAction = false,
+  formatLocale = getFormattingLocale(),
+  translateMessage = defaultMessage,
+} = {}) {
   const select = (selector) => documentRef.querySelector(selector);
   const release = configuredInstallerRelease(documentRef);
   const link = select("#installer-link");
@@ -154,19 +167,31 @@ export function renderInstallerJourney(
   const unavailableAction = select("#installer-unavailable-action");
   if (release) {
     const architectureLabel = release.architectures.length === 2
-      ? "Apple silicon and Intel"
+      ? translateMessage("installer.appleSiliconAndIntel")
       : release.architectures[0] === "arm64"
-        ? "Apple silicon"
-        : "Intel";
+        ? translateMessage("installer.appleSilicon")
+        : translateMessage("installer.intel");
     link.href = release.installerUrl;
     link.hidden = false;
     link.removeAttribute("aria-disabled");
     if (unavailableAction) unavailableAction.hidden = true;
-    select("#installer-version").textContent = `Version ${release.version}`;
+    select("#installer-version").textContent = translateMessage(
+      "installer.version",
+      { version: release.version },
+    );
     select("#installer-compatibility").textContent =
-      `Requires macOS ${release.minimumMacos} or later · ${architectureLabel}`;
-    select("#installer-size").textContent = formatInstallerSize(release.bytes);
-    select("#installer-sha256").textContent = `SHA-256 ${release.sha256}`;
+      translateMessage("installer.requiresMacOS", {
+        architecture: architectureLabel,
+        version: release.minimumMacos,
+      });
+    select("#installer-size").textContent = formatInstallerSize(release.bytes, {
+      formatLocale,
+      translateMessage,
+    });
+    select("#installer-sha256").textContent = translateMessage(
+      "installer.sha256",
+      { value: release.sha256 },
+    );
     details.hidden = false;
     for (
       const [id, url] of [

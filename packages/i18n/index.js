@@ -6,7 +6,18 @@ const DEFAULT_DATE_FORMAT_OPTIONS = Object.freeze({
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
 export const DEFAULT_LOCALE = "en-US";
-export const SUPPORTED_LOCALES = Object.freeze([DEFAULT_LOCALE]);
+export const SYSTEM_LOCALE_PREFERENCE = "system";
+export const SUPPORTED_LOCALES = Object.freeze([
+  DEFAULT_LOCALE,
+  "zh-Hans",
+  "es",
+]);
+export const LANGUAGE_OPTIONS = Object.freeze([
+  Object.freeze({ id: SYSTEM_LOCALE_PREFERENCE, nativeLabel: "System" }),
+  Object.freeze({ id: "en-US", nativeLabel: "English" }),
+  Object.freeze({ id: "zh-Hans", nativeLabel: "简体中文" }),
+  Object.freeze({ id: "es", nativeLabel: "Español" }),
+]);
 
 export const EN_US_CATALOG = Object.freeze({
   "app.name": "TiboTattle",
@@ -19,10 +30,50 @@ export const EN_US_CATALOG = Object.freeze({
   "quota.remaining": "Remaining quota: {value}",
   "status.noData": "No usage data yet.",
   "status.error": "Something went wrong.",
+  "language.system": "System",
+  "language.english": "English",
+  "language.simplifiedChinese": "Simplified Chinese",
+  "language.spanish": "Spanish",
+});
+
+export const ZH_HANS_CATALOG = Object.freeze({
+  "app.name": "TiboTattle",
+  "common.loading": "正在加载…",
+  "common.refresh": "刷新",
+  "dashboard.title": "使用概览",
+  "dashboard.lastUpdated": "最后更新：{date}",
+  "usage.events": "使用事件：{count}",
+  "usage.tokens": "令牌：{count}",
+  "quota.remaining": "剩余额度：{value}",
+  "status.noData": "暂无使用数据。",
+  "status.error": "出现了问题。",
+  "language.system": "跟随系统",
+  "language.english": "English",
+  "language.simplifiedChinese": "简体中文",
+  "language.spanish": "Español",
+});
+
+export const ES_CATALOG = Object.freeze({
+  "app.name": "TiboTattle",
+  "common.loading": "Cargando…",
+  "common.refresh": "Actualizar",
+  "dashboard.title": "Resumen de uso",
+  "dashboard.lastUpdated": "Última actualización: {date}",
+  "usage.events": "Eventos de uso: {count}",
+  "usage.tokens": "Tokens: {count}",
+  "quota.remaining": "Cuota restante: {value}",
+  "status.noData": "Aún no hay datos de uso.",
+  "status.error": "Algo salió mal.",
+  "language.system": "Sistema",
+  "language.english": "English",
+  "language.simplifiedChinese": "Chino simplificado",
+  "language.spanish": "Español",
 });
 
 export const CATALOGS = Object.freeze({
   [DEFAULT_LOCALE]: EN_US_CATALOG,
+  "zh-Hans": ZH_HANS_CATALOG,
+  es: ES_CATALOG,
 });
 
 function canonicalizeLocale(value) {
@@ -32,6 +83,26 @@ function canonicalizeLocale(value) {
   } catch {
     return null;
   }
+}
+
+function localeParts(value) {
+  const canonical = canonicalizeLocale(value);
+  if (canonical === null) return null;
+  const parts = canonical.split("-");
+  const language = parts[0].toLowerCase();
+  const script = parts.find((part) => /^[A-Za-z]{4}$/u.test(part));
+  // The first subtag is the language itself (for example, `zh`), not a
+  // region. Looking across every subtag would incorrectly classify `zh-CN`
+  // as region `ZH` and could make the safe Hans negotiation fall back.
+  const region = parts.slice(1).find((part) => /^(?:[A-Za-z]{2}|\d{3})$/u.test(part));
+  return {
+    canonical,
+    language,
+    script: script
+      ? `${script.slice(0, 1).toUpperCase()}${script.slice(1).toLowerCase()}`
+      : null,
+    region: region?.toUpperCase() ?? null,
+  };
 }
 
 function requestedLocaleValues(requestedLocales) {
@@ -56,13 +127,9 @@ function normalizeSupportedLocales(supportedLocales) {
   return normalized;
 }
 
-function localeLanguage(locale) {
-  return locale.split("-")[0];
-}
-
 /**
- * Select the first exact or language-compatible supported locale, then use the
- * configured fallback. Invalid requested entries are ignored.
+ * Select an exact or safe language-compatible locale, then use the configured
+ * fallback. `zh-TW`/`zh-Hant` never select a Simplified Chinese catalog.
  */
 export function negotiateLocale(
   requestedLocales,
@@ -73,22 +140,43 @@ export function negotiateLocale(
   const fallback = canonicalizeLocale(fallbackLocale);
   const fallbackMatch = fallback === null
     ? null
-    : supported.find((locale) => locale === fallback)
-      ?? supported.find((locale) => localeLanguage(locale) === localeLanguage(fallback));
+    : supported.find((locale) => locale === fallback);
   const resolvedFallback = fallbackMatch ?? supported[0];
 
-  for (const requested of requestedLocaleValues(requestedLocales)) {
-    const canonical = canonicalizeLocale(requested);
-    if (canonical === null) continue;
-    const exactMatch = supported.find((locale) => locale === canonical);
-    if (exactMatch !== undefined) return exactMatch;
-    const languageMatch = supported.find(
-      (locale) => localeLanguage(locale) === localeLanguage(canonical),
-    );
+  for (const requestedValue of requestedLocaleValues(requestedLocales)) {
+    const requested = localeParts(requestedValue);
+    if (requested === null) continue;
+    if (supported.includes(requested.canonical)) return requested.canonical;
+
+    if (requested.language === "zh") {
+      const simplified = requested.script === "Hans"
+        || ["CN", "SG"].includes(requested.region);
+      if (simplified && supported.includes("zh-Hans")) return "zh-Hans";
+      continue;
+    }
+
+    const languageMatch = supported.find((locale) =>
+      localeParts(locale)?.language === requested.language);
     if (languageMatch !== undefined) return languageMatch;
   }
 
   return resolvedFallback;
+}
+
+export function resolveLocalePreference(
+  preference,
+  systemLocales,
+  supportedLocales = SUPPORTED_LOCALES,
+  fallbackLocale = DEFAULT_LOCALE,
+) {
+  if (preference === SYSTEM_LOCALE_PREFERENCE || preference == null) {
+    return negotiateLocale(systemLocales, supportedLocales, fallbackLocale);
+  }
+  return negotiateLocale(preference, supportedLocales, fallbackLocale);
+}
+
+export function isLanguagePreference(value) {
+  return value === SYSTEM_LOCALE_PREFERENCE || SUPPORTED_LOCALES.includes(value);
 }
 
 function assertCatalog(catalog) {
@@ -192,6 +280,13 @@ function formattingLocale(locales) {
  */
 export function formatNumber(value, locale = DEFAULT_LOCALE, options) {
   return new Intl.NumberFormat(formattingLocale(locale), options).format(value);
+}
+
+export function formatPercent(value, locale = DEFAULT_LOCALE, options = {}) {
+  return new Intl.NumberFormat(formattingLocale(locale), {
+    style: "percent",
+    ...options,
+  }).format(value);
 }
 
 /**

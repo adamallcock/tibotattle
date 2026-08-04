@@ -4,15 +4,35 @@ export type MessageCatalog = Readonly<Record<string, string>>;
 export type MessageCatalogs = Readonly<Record<string, MessageCatalog>>;
 
 export const DEFAULT_LOCALE: "en-US";
-export const SUPPORTED_LOCALES: readonly ["en-US"];
+export const SYSTEM_LOCALE_PREFERENCE: "system";
+export const SUPPORTED_LOCALES: readonly ["en-US", "zh-Hans", "es"];
+export const LANGUAGE_OPTIONS: readonly Readonly<{
+  id: "system" | "en-US" | "zh-Hans" | "es";
+  nativeLabel: string;
+}>[];
 export const EN_US_CATALOG: MessageCatalog;
-export const CATALOGS: Readonly<{ "en-US": MessageCatalog }>;
+export const ZH_HANS_CATALOG: MessageCatalog;
+export const ES_CATALOG: MessageCatalog;
+export const CATALOGS: Readonly<{
+  "en-US": MessageCatalog;
+  "zh-Hans": MessageCatalog;
+  es: MessageCatalog;
+}>;
 
 export function negotiateLocale(
   requestedLocales?: LocaleRequest,
   supportedLocales?: readonly string[],
   fallbackLocale?: string,
 ): string;
+
+export function resolveLocalePreference(
+  preference: string | null | undefined,
+  systemLocales?: LocaleRequest,
+  supportedLocales?: readonly string[],
+  fallbackLocale?: string,
+): string;
+
+export function isLanguagePreference(value: unknown): boolean;
 
 export function getMessage(
   catalog: MessageCatalog,
@@ -39,6 +59,12 @@ export function translate(
 
 export function formatNumber(
   value: number | bigint,
+  locale?: LocaleRequest,
+  options?: Intl.NumberFormatOptions,
+): string;
+
+export function formatPercent(
+  value: number,
   locale?: LocaleRequest,
   options?: Intl.NumberFormatOptions,
 ): string;

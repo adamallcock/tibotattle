@@ -446,11 +446,24 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
 }
 
 test("native launcher keeps the requested foreground-only lifecycle", async () => {
-  const [source, semanticOpenTargetSource, menuBarStatusSource, loginItemSource] = await Promise.all([
+  const [
+    source,
+    semanticOpenTargetSource,
+    menuBarStatusSource,
+    loginItemSource,
+    localizationSource,
+  ] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(SEMANTIC_OPEN_TARGET_SOURCE, "utf8"),
     readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
-    readFile(join(REPOSITORY_ROOT, "apps", "macos", "Sources", "LoginItemManager.swift"), "utf8"),
+    readFile(
+      join(REPOSITORY_ROOT, "apps", "macos", "Sources", "LoginItemManager.swift"),
+      "utf8",
+    ),
+    readFile(
+      join(REPOSITORY_ROOT, "apps", "macos", "Sources", "Localization.swift"),
+      "utf8",
+    ),
   ]);
   const firstRunDisclosureSource = source.slice(
     source.indexOf("private func showFirstRunDisclosure"),
@@ -474,11 +487,20 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /O_DIRECTORY \| O_NOFOLLOW/u);
   assert.match(source, /fchmod\(descriptor, 0o700\)/u);
-  assert.match(source, /title: "Open Dashboard"/u);
-  assert.match(source, /title: "Retry"/u);
-  assert.match(source, /title: "Settings…"/u);
-  assert.match(source, /title: "Data & Diagnostics…"/u);
-  assert.match(source, /title: "Codex Folder…"/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.settingsOpenDashboard\)/u,
+  );
+  assert.match(source, /title: TiboTattleLocalization\.string\(\.launcherRetry\)/u);
+  assert.match(source, /title: TiboTattleLocalization\.string\(\.menuSettings\)/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.launcherDataDiagnostics\)/u,
+  );
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.settingsChooseCodexFolder\)/u,
+  );
   assert.match(
     source,
     /title: TiboTattleLocalization\.format\([\s\S]*?\.menuAboutProduct[\s\S]*?BundledProduct\.displayName/u,
@@ -491,13 +513,16 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /withBundleIdentifier: BundledProduct\.monitoredAppBundleIdentifier/u,
   );
-  assert.match(source, /Copy Diagnostics/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.dialogCopyDiagnostics\)/u,
+  );
   assert.match(source, /usage-monitor-macos-diagnostics-v1/u);
   assert.match(source, /UM_MACOS_COMPANION_START_TIMEOUT/u);
   assert.match(source, /companionStartupTimeoutSeconds/u);
   assert.match(source, /NSOpenPanel/u);
   assert.match(source, /launcher-settings-v1\.json/u);
-  assert.match(source, /Default location \(~\/\.codex\)/u);
+  assert.match(source, /settingsCodexFolderDefaultLocation/u);
   assert.match(
     source,
     /title: TiboTattleLocalization\.format\([\s\S]*?\.settingsAboutProduct[\s\S]*?BundledProduct\.displayName/u,
@@ -510,12 +535,21 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /anotherInstanceIsActive\s*\? LauncherError\.companionAlreadyRunning/u,
   );
   assert.match(source, /--confirm-local-keychain-reset/u);
-  assert.match(source, /Reset exactly two local Keychain capabilities now/iu);
-  assert.match(source, /Hosted service: no registered device is revoked/iu);
-  assert.match(source, /Secure erasure is not claimed/iu);
-  assert.match(source, /Move Data to Trash/u);
   assert.match(
     source,
+    /TiboTattleLocalization\.string\(\s*\.dialogResetCapabilities\s*\)/u,
+  );
+  assert.match(
+    localizationSource,
+    /Hosted service: no registered device is revoked/iu,
+  );
+  assert.match(localizationSource, /Secure erasure is not claimed/iu);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.dialogMoveDataToTrash\)/u,
+  );
+  assert.match(
+    localizationSource,
     /App state: local indexes[\s\S]*Keychain: pseudonymous identity[\s\S]*Hosted service: sent community data/iu,
   );
   assert.match(source, /requiredString\("UsageMonitorAppOpenScheme"\)/u);
@@ -565,13 +599,12 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /--app-link-smoke-test/u);
   assert.match(
     source,
-    /updates local \\\(BundledProduct\.monitoredAppDisplayName\) metadata while the app is open/iu,
+    /TiboTattleLocalization\.format\([\s\S]*?\.launcherWelcome[\s\S]*?BundledProduct\.displayName/u,
   );
   assert.match(
     source,
-    /Welcome to \\\(BundledProduct\.displayName\)/u,
+    /addButton\(\s*withTitle:\s*TiboTattleLocalization\.string\(\s*\.launcherGetStarted\s*\)\s*\)/u,
   );
-  assert.match(source, /addButton\(withTitle: "Get Started"\)/u);
   assert.match(
     firstRunDisclosureSource,
     /checkboxWithTitle:[\s\S]*\.settingsStartAtLogin/u,
@@ -583,10 +616,10 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /first-run-v1\.json/u);
   assert.match(source, /usage-monitor-first-run-v1/u);
-  assert.match(source, /Community contribution is optional/iu);
-  assert.match(source, /Community contribution is optional/iu);
+  assert.match(localizationSource, /Community contribution is optional/iu);
+  assert.match(localizationSource, /Community contribution is optional/iu);
   assert.doesNotMatch(source, /six-hour while-open contribution schedule/iu);
-  assert.match(source, /Keep the app open while analysis runs/iu);
+  assert.match(localizationSource, /Keep the app open while analysis runs/iu);
   assert.match(
     source,
     /guard !quitting, retryAllowed, firstRunAcknowledged,[\s\S]*let codexHomeConfiguration/u,
@@ -608,23 +641,23 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /var firstRunUpdatesDisclosure: String[\s\S]*guard isAvailable else[\s\S]*development build does not include update checks/u,
+    /var firstRunUpdatesDisclosure: String[\s\S]*guard isAvailable else[\s\S]*settingsUpdateDisclosureDevelopment/u,
   );
   assert.match(
     source,
-    /if Self\.isPreviewDistribution[\s\S]*manual signed-update checks[\s\S]*does not check, download, or install updates automatically/u,
+    /if Self\.isPreviewDistribution[\s\S]*settingsUpdateDisclosurePreview/u,
   );
   assert.match(
     source,
-    /allowsAutomaticUpdateOptIn && automaticUpdatesEnabled[\s\S]*Signed app updates are checked automatically[\s\S]*Settings → General/u,
+    /allowsAutomaticUpdateOptIn && automaticUpdatesEnabled[\s\S]*settingsUpdateDisclosureAutomaticOn/u,
   );
   assert.equal(
-    firstRunDisclosureSource.includes("\\(updater.firstRunUpdatesDisclosure)"),
+    firstRunDisclosureSource.includes("updater.firstRunUpdatesDisclosure"),
     true,
   );
   assert.doesNotMatch(
     firstRunDisclosureSource,
-    /Signed app updates are checked automatically/u,
+    /settingsUpdateDisclosureAutomaticOn/u,
   );
   assert.match(source, /updater\.automaticallyDownloadsUpdates = enabled/u);
   assert.match(source, /NSSwitch\(\)/u);
@@ -651,9 +684,13 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /NSApp\.applicationIconImage/u);
   assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
   assert.doesNotMatch(source, /showLifecycleHelp/u);
-  assert.match(source, /Updating local usage while the app is open/iu);
-  assert.match(source, /Large histories may need several passes/iu);
-  assert.match(source, /Nothing leaves this Mac/iu);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\s*\.launcherUpdatingLocalUsage\s*\)/u,
+  );
+  assert.match(localizationSource, /Updating local usage while the app is open/iu);
+  assert.match(localizationSource, /Large histories may need several passes/iu);
+  assert.match(localizationSource, /Nothing leaves this Mac/iu);
   assert.match(source, /private final class NativeDashboardChrome/u);
   assert.match(source, /private final class NativeDashboardReportPane/u);
   assert.match(source, /NSSplitView\(\)/u);
@@ -706,8 +743,16 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   ]) {
     assert.equal(loginItemSource.includes(forbidden), false, forbidden);
   }
-  assert.match(source, /title: "Quit"/u);
-  assert.match(source, /title: "Settings…"[\s\S]*keyEquivalent: ","/u);
+  assert.match(localizationSource, /LaunchAgent or daemon/iu);
+  assert.doesNotMatch(localizationSource, /installs no login item/iu);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.format\([\s\S]*?\.menuQuitProduct[\s\S]*?BundledProduct\.displayName/u,
+  );
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.menuSettings\)[\s\S]*keyEquivalent: ","/u,
+  );
   // The menu-bar item is additive: the Dock icon and the regular activation
   // policy stay, and the window remains the primary surface.
   assert.match(source, /application\.setActivationPolicy\(\.regular\)/u);
@@ -884,7 +929,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /actionRow\.isHidden = false/u);
   assert.match(source, /layout\.addArrangedSubview\(actionRow\)/u);
   // The browser remains an explicit, separate choice rather than the default.
-  assert.match(source, /title: "Open in Browser"/u);
+  assert.match(
+    source,
+    /title: TiboTattleLocalization\.string\(\.launcherOpenInBrowser\)/u,
+  );
   assert.match(
     source,
     /@objc private func openDashboard\(\) \{[\s\S]*?showDashboardWebView\(dashboardURL\)/u,
@@ -970,8 +1018,8 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.doesNotMatch(source, /url\(forResource: "AppIcon", withExtension: "icns"\)/u);
   assert.match(source, /setAccessibilityLabel\(/u);
   assert.match(source, /glyph\.accessibilityDescription = "\\\(productName\) status"/u);
-  assert.match(source, /"Settings…"/u);
-  assert.match(source, /configure\(aboutItem,/u);
+  assert.match(source, /TiboTattleLocalization\.string\(\.menuSettings\)/u);
+  assert.match(source, /configure\(\s*aboutItem,/u);
   assert.match(source, /#selector\(showAbout\)/u);
 
   // The compact title shows a number only for live evidence; stale, absent,
@@ -983,8 +1031,14 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
-  assert.match(source, /No verified Codex allowance observed yet/u);
-  assert.match(source, /Allowance values and reset countdowns are hidden/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarNoVerifiedAllowance\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarLocalEvidenceStale\)/u,
+  );
   assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
   assert.match(source, /guard companionReachable, evidence == \.live else/u);
 
@@ -995,8 +1049,14 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /private let supportedCodexAllowanceWindowDurations: Set<Int>/u);
   assert.match(source, /let lanes = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
-  assert.match(source, /return "Five-hour allowance"/u);
-  assert.match(source, /return "Seven-day allowance"/u);
+  assert.match(
+    source,
+    /return TiboTattleLocalization\.string\(\.menuBarFiveHourAllowance\)/u,
+  );
+  assert.match(
+    source,
+    /return TiboTattleLocalization\.string\(\.menuBarSevenDayAllowance\)/u,
+  );
   assert.match(source, /isPrimary: duration == weeklyWindowDurationMinutes/u);
   assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
   assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
@@ -1017,13 +1077,31 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.doesNotMatch(source, /MenuBarSummaryView|MenuBarQuotaLaneView/u);
   assert.doesNotMatch(source, /\.view\s*=(?!=)/u);
   assert.doesNotMatch(source, /evidenceItem\.isHidden|allowanceItem\.isHidden/u);
-  assert.match(source, /"Open \\\(productName\)"/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.format\(\.menuBarOpenProduct, productName\)/u,
+  );
   assert.match(source, /openTiboTattleItem\.isEnabled = true/u);
-  assert.match(source, /"Analyze Local Usage"/u);
-  assert.match(source, /"Retry Local Analysis"/u);
-  assert.match(source, /"Update Local Usage"/u);
-  assert.match(source, /"Analyzing Local Usage…"/u);
-  assert.match(source, /"Quit \\\(productName\)"/u);
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarAnalyzeLocalUsage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarRetryLocalAnalysis\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarUpdateLocalUsage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.menuBarAnalyzingLocalUsage\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.format\(\.menuQuitProduct, productName\)/u,
+  );
   assert.match(source, /private var quotaLaneItems: \[NSMenuItem\] = \[\]/u);
   assert.match(source, /func renderQuotaLanes\(\)/u);
   assert.match(
@@ -2468,9 +2546,9 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/community-data.js",
     "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
-    "apps/web/public/i18n.generated.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
+    "apps/web/public/localization.js",
     "apps/web/public/navigation.js",
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
@@ -2491,7 +2569,9 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   const localizationResources = await collectMacOSLocalizationResources();
   assert.deepEqual(localizationResources.relativeFiles, [
     "en.lproj/Localizable.strings",
+    "es.lproj/Localizable.strings",
     "localization/manifest.json",
+    "zh-Hans.lproj/Localizable.strings",
   ]);
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
@@ -2499,10 +2579,10 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/community-data.js",
     "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
-    "apps/web/public/i18n.generated.js",
     "apps/web/public/index.html",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
+    "apps/web/public/localization.js",
     "apps/web/public/navigation.js",
     "apps/web/public/styles.css",
     "apps/web/public/telemetry-envelope.js",
@@ -3414,9 +3494,13 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     );
     for (const relativePath of [
       "Contents/Resources/en.lproj/Localizable.strings",
+      "Contents/Resources/es.lproj/Localizable.strings",
       "Contents/Resources/localization/manifest.json",
       "Contents/Resources/app/localization/en.lproj/Localizable.strings",
+      "Contents/Resources/app/localization/es.lproj/Localizable.strings",
       "Contents/Resources/app/localization/manifest.json",
+      "Contents/Resources/zh-Hans.lproj/Localizable.strings",
+      "Contents/Resources/app/localization/zh-Hans.lproj/Localizable.strings",
     ]) {
       assert.equal(
         bundleFiles.some(({ relativePath: bundledPath }) =>

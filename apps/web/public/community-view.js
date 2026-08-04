@@ -9,6 +9,7 @@ import {
   formatAge,
   formatLocal,
 } from "./ui-format.js";
+import { translate } from "./localization.js";
 
 export const COMMUNITY_METRIC_LABELS = Object.freeze({
   usageEvents: "Usage events",
@@ -40,12 +41,25 @@ export const COMMUNITY_SNAPSHOT_STATE_COPY = Object.freeze({
     "This week did not pass the privacy checks required for publication. We do not disclose why or how close the cohort was.",
 });
 
-const PENDING_CONTRACT_ROWS = Object.freeze([
-  Object.freeze(["Weekly snapshot", "Waiting for service"]),
-  Object.freeze(["Seven-day estimate", "Not available"]),
-  Object.freeze(["Matched quota coverage", "Not available"]),
-  Object.freeze(["Confidence range", "Not available"]),
-]);
+const COMMUNITY_SNAPSHOT_STATE_KEYS = Object.freeze({
+  service_unavailable: "community.state.serviceUnavailable",
+  development_unsafe: "community.state.developmentUnsafe",
+  unsupported_schema: "community.state.unsupportedSchema",
+  not_yet_published: "community.state.notYetPublished",
+  withdrawn: "community.state.withdrawn",
+  suppressed: "community.state.suppressed",
+});
+
+const COMMUNITY_METRIC_MESSAGE_KEYS = Object.freeze({
+  usageEvents: "community.metric.usageEvents",
+  inputUncachedTokens: "community.metric.inputUncached",
+  inputCacheReadTokens: "community.metric.cacheRead",
+  inputCacheWriteTokens: "community.metric.cacheWrite",
+  outputTextTokens: "community.metric.outputText",
+  outputReasoningTokens: "community.metric.reasoningOutput",
+  outputCombinedTokens: "community.metric.combinedOutput",
+  toolUnits: "community.metric.toolUnits",
+});
 
 /**
  * The current weekly contract publishes activity cells, not allowance
@@ -90,6 +104,48 @@ export const COMMUNITY_ESTIMATE_STATE_COPY = Object.freeze({
   }),
 });
 
+// Preserve the exported English copy above as a stable, non-localized
+// contract for callers and tests. Rendering always goes through these keys so
+// that the public first-visit estimate state changes language with the rest of
+// the page instead of leaving a misleading English-only status behind.
+const COMMUNITY_ESTIMATE_STATE_KEYS = Object.freeze({
+  service_unavailable: Object.freeze({
+    label: "community.estimate.serviceUnavailable.label",
+    hero: "community.estimate.serviceUnavailable.hero",
+    body: "community.estimate.serviceUnavailable.body",
+  }),
+  development_unsafe: Object.freeze({
+    label: "community.estimate.developmentUnsafe.label",
+    hero: "community.estimate.developmentUnsafe.hero",
+    body: "community.estimate.developmentUnsafe.body",
+  }),
+  unsupported_schema: Object.freeze({
+    label: "community.estimate.unsupportedSchema.label",
+    hero: "community.estimate.unsupportedSchema.hero",
+    body: "community.estimate.unsupportedSchema.body",
+  }),
+  not_yet_published: Object.freeze({
+    label: "community.estimate.notYetPublished.label",
+    hero: "community.estimate.notYetPublished.hero",
+    body: "community.estimate.notYetPublished.body",
+  }),
+  withdrawn: Object.freeze({
+    label: "community.estimate.withdrawn.label",
+    hero: "community.estimate.withdrawn.hero",
+    body: "community.estimate.withdrawn.body",
+  }),
+  suppressed: Object.freeze({
+    label: "community.estimate.suppressed.label",
+    hero: "community.estimate.suppressed.hero",
+    body: "community.estimate.suppressed.body",
+  }),
+  activity_only: Object.freeze({
+    label: "community.estimate.activityOnly.label",
+    hero: "community.estimate.activityOnly.hero",
+    body: "community.estimate.activityOnly.body",
+  }),
+});
+
 function estimateState(snapshot) {
   return Object.hasOwn(COMMUNITY_ESTIMATE_STATE_COPY, snapshot.state)
     ? snapshot.state
@@ -112,14 +168,21 @@ export function renderCommunityEstimate({
   const { clear, node } = createDomHelpers(documentRef);
   const state = estimateState(snapshot);
   const copy = COMMUNITY_ESTIMATE_STATE_COPY[state];
+  const localizedKeys = COMMUNITY_ESTIMATE_STATE_KEYS[state];
+  const locale = documentRef?.documentElement?.lang ?? "en-US";
+  const t = (key) => translate(key, {}, locale);
   if (container) {
     clear(container);
-    container.append(node("p", "estimate-status-copy", copy.body));
+    container.append(node(
+      "p",
+      "estimate-status-copy",
+      localizedKeys ? t(localizedKeys.body) : copy.body,
+    ));
   }
-  if (hero) hero.textContent = copy.hero;
+  if (hero) hero.textContent = localizedKeys ? t(localizedKeys.hero) : copy.hero;
   for (const item of [stateNode, ...stateNodes]) {
     if (!item) continue;
-    item.textContent = copy.label;
+    item.textContent = localizedKeys ? t(localizedKeys.label) : copy.label;
     item.className = "evidence-chip neutral";
   }
   return state;
@@ -144,6 +207,8 @@ export function renderCommunitySnapshot({
   now = Date.now(),
 }) {
   const { clear, node } = createDomHelpers(documentRef);
+  const locale = documentRef?.documentElement?.lang ?? "en-US";
+  const t = (key, values = {}) => translate(key, values, locale);
   clear(container);
   if (detail) clear(detail);
   const snapshot = normalizeCommunitySnapshot(payload);
@@ -158,11 +223,16 @@ export function renderCommunitySnapshot({
 
   if (snapshot.state === "service_unavailable") {
     container.append(
-      node("p", "", COMMUNITY_SNAPSHOT_STATE_COPY.service_unavailable),
+      node("p", "", t("community.state.serviceUnavailable")),
     );
     if (!detail) return snapshot.state;
     const quality = node("dl", "snapshot-quality-grid");
-    for (const [term, value] of PENDING_CONTRACT_ROWS) {
+    for (const [term, value] of [
+      [t("community.pending.releasedSnapshot"), t("community.pending.notLoaded")],
+      [t("community.pending.cohortLimit"), t("community.pending.notInContract")],
+      [t("community.pending.matchedQuota"), t("community.pending.notInContract")],
+      [t("community.pending.changeConfidence"), t("community.pending.notInContract")],
+    ]) {
       const item = node("div");
       item.append(node("dt", "", term), node("dd", "", value));
       quality.append(item);
@@ -171,14 +241,14 @@ export function renderCommunitySnapshot({
     detail.append(node(
       "p",
       "snapshot-disclosure",
-      "A community estimate needs matched quota coverage, replay checks, uncertainty, and enough independent contributors. Activity totals alone are never used as an estimate.",
+      t("community.noCapacityClaim"),
     ));
     return snapshot.state;
   }
 
   if (Object.hasOwn(COMMUNITY_SNAPSHOT_STATE_COPY, snapshot.state)) {
     container.append(
-      node("p", "", COMMUNITY_SNAPSHOT_STATE_COPY[snapshot.state]),
+      node("p", "", t(COMMUNITY_SNAPSHOT_STATE_KEYS[snapshot.state])),
     );
     return snapshot.state;
   }
@@ -197,15 +267,15 @@ export function renderCommunitySnapshot({
   container.append(node(
     "p",
     "snapshot-disclosure",
-    `Activity totals for the week above, from people who chose to contribute. A figure appears only when at least ${
-      compact(snapshot.minimumIndependentParticipants)
-    } different participants used that provider and model, and every figure is rounded down — so this is not everyone's usage, not an average, and not a cost.`,
+    t("community.weeklyActivity", {
+      count: compact(snapshot.minimumIndependentParticipants),
+    }),
   ));
   if (snapshot.state === "published_partial") {
     container.append(node(
       "p",
       "snapshot-partial",
-      "Some metrics were not released because their independent support was insufficient.",
+      t("community.partialMetrics"),
     ));
   }
 
@@ -213,23 +283,25 @@ export function renderCommunitySnapshot({
     const quality = node("dl", "snapshot-quality-grid");
     for (
       const [term, value] of [
-        ["Data format", snapshot.schemaVersion],
-        ["Released model cells", compact(snapshot.cells.length)],
+        [t("community.contract"), snapshot.schemaVersion],
+        [t("community.releasedModelCells"), compact(snapshot.cells.length)],
         [
-          "Minimum support",
-          `≥${compact(snapshot.minimumIndependentParticipants)} participants per cell`,
+          t("community.minimumSupport"),
+          t("community.participantsPerCell", {
+            count: compact(snapshot.minimumIndependentParticipants),
+          }),
         ],
-        ["Ingestion cutoff", formatLocal(snapshot.ingestionCutoffAt)],
-        ["Released", formatLocal(snapshot.releasedAt)],
+        [t("community.ingestionCutoff"), formatLocal(snapshot.ingestionCutoffAt)],
+        [t("community.released"), formatLocal(snapshot.releasedAt)],
         [
-          "Snapshot age",
+          t("community.snapshotAge"),
           formatAge(Math.max(0, (now - Date.parse(snapshot.releasedAt)) / 1_000)),
         ],
         [
-          "Coverage state",
+          t("community.coverageState"),
           snapshot.state === "published_partial"
-            ? "Partially released"
-            : "All contracted cells released",
+            ? t("community.partiallyReleased")
+            : t("community.allContractedCells"),
         ],
       ]
     ) {
@@ -241,14 +313,14 @@ export function renderCommunitySnapshot({
     detail.append(node(
       "p",
       "snapshot-disclosure",
-      `Each value is clipped per participant, independently support-gated at ${
-        compact(snapshot.minimumIndependentParticipants)
-      } or more participants, and rounded down. A sealed revision is never rewritten; deletion creates a replacement revision.`,
+      t("community.releaseMechanics", {
+        count: compact(snapshot.minimumIndependentParticipants),
+      }),
     ));
     detail.append(node(
       "p",
       "snapshot-disclosure",
-      "This snapshot reports privacy-safe activity totals only. A community estimate also needs matched quota coverage, replay checks, uncertainty, and confidence.",
+      t("community.currentReleaseScope"),
     ));
   }
 
@@ -260,7 +332,7 @@ export function renderCommunitySnapshot({
   summary.append(node(
     "span",
     "",
-    `View detailed activity by provider and model (${compact(snapshot.cells.length)} cells)`,
+    t("community.detailedActivity", { count: compact(snapshot.cells.length) }),
   ));
   breakdown.append(summary);
   const wrap = node("div", "table-wrap snapshot-table");
@@ -268,14 +340,15 @@ export function renderCommunitySnapshot({
   const caption = node(
     "caption",
     "sr-only",
-    "Privacy-safe delayed weekly community metrics",
+    t("community.metricsCaption"),
   );
   const thead = documentRef.createElement("thead");
   const header = documentRef.createElement("tr");
   for (
     const label of [
-      "Provider / model",
-      ...Object.values(COMMUNITY_METRIC_LABELS),
+      t("community.providerModel"),
+      ...Object.keys(COMMUNITY_METRIC_LABELS).map((metricName) =>
+        t(COMMUNITY_METRIC_MESSAGE_KEYS[metricName])),
     ]
   ) {
     const th = documentRef.createElement("th");
@@ -289,18 +362,24 @@ export function renderCommunitySnapshot({
     const row = documentRef.createElement("tr");
     const identity = documentRef.createElement("th");
     identity.scope = "row";
-    identity.textContent = `${cell.provider} · ${
+    // Provider/model identifiers are source data, not product copy. Keep
+    // them outside the exact-text localization bridge even if a future value
+    // happens to equal a translated UI label.
+    identity.setAttribute("data-i18n-skip", "");
+    identity.textContent = [
+      cell.provider,
       cell.planType === "unknown"
-        ? "plan unknown"
-        : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")
-    } · ${cell.modelId}`;
+        ? t("community.planUnknown")
+        : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : ""),
+      cell.modelId,
+    ].join(" · ");
     row.append(identity);
     for (const metricName of Object.keys(COMMUNITY_METRIC_LABELS)) {
       const td = documentRef.createElement("td");
       const metric = cell.metrics[metricName];
       td.textContent = metric.status === "released"
         ? compact(metric.value)
-        : "Not released";
+        : t("community.notReleased");
       if (metric.status !== "released") td.className = "suppressed-value";
       row.append(td);
     }

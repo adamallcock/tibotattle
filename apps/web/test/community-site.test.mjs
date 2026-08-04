@@ -77,6 +77,7 @@ class FakeElement {
 function fakeDocument(metaContent = {}) {
   const byId = new Map();
   return {
+    documentElement: { lang: "en-US" },
     createElement(tag) {
       return new FakeElement(tag);
     },
@@ -202,16 +203,21 @@ test("the public site presents only the install call to action and the community
     assert.equal(source.includes(companionOnlyModule), false, companionOnlyModule);
   }
 
-  // Accessibility: the site keeps the same skip link and named landmarks the
-  // dashboard uses, and the focus ring is global rather than per page.
+  // Accessibility: the site keeps a skip link, named landmarks, keyboard
+  // focus rings, and a language control for the public surface.
   assert.match(html, /<a class="skip-link" href="#main">/u);
-  assert.match(html, /<main id="main" tabindex="-1">/u);
-  assert.match(html, /<nav class="primary-nav" aria-label="Site sections">/u);
+  assert.match(html, /<main id="main" tabindex="-1" data-i18n-legacy-root>/u);
+  assert.match(html, /data-language-picker/u);
+  assert.match(html, /data-language-announcement[^>]*aria-live="polite"/u);
+  assert.match(
+    html,
+    /<nav\s+class="primary-nav"\s+aria-label="Site sections"(?:\s[^>]*)?>/u,
+  );
   assert.match(html, /aria-labelledby="install-title"/u);
   assert.match(html, /aria-labelledby="community-title"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
-    /button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible/u,
+    /button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visible/u,
   );
 
   // Release packaging materializes the site index from this page, so every
@@ -505,6 +511,20 @@ test("the named estimate gate never derives an allowance from the activity-only 
     assert.equal(stateNode.className, "evidence-chip neutral");
     assert.ok(COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState]);
   }
+});
+
+test("the generated community state follows the active UI language", () => {
+  const documentRef = fakeDocument();
+  documentRef.documentElement.lang = "zh-Hans";
+  const container = documentRef.createElement("div");
+  const detail = documentRef.createElement("div");
+
+  assert.equal(
+    renderCommunitySnapshot({ documentRef, container, detail, payload: null }),
+    "service_unavailable",
+  );
+  assert.match(container.text, /中心服务不可用/u);
+  assert.match(detail.text, /不在当前契约/u);
 });
 
 test("a published community week renders its support gate, provenance, and cells", () => {
