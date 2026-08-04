@@ -71,17 +71,17 @@
       </nav>
       <a class="header-download" href="#download">
         <img src="./apple.svg" alt="" width="14" height="14">
-        Download
+        <span id="header-download-label">Release status</span>
       </a>
     </header>
 
-    <main id="main">
+    <main id="main" tabindex="-1">
       <section class="product-hero" id="install" aria-labelledby="install-title">
         <div class="hero-copy">
           <h1 id="install-title">Understand your Codex week.</h1>
           <p class="hero-lede">
-            TiboTattle is a local-first Mac app that turns content-free usage
-            into a seven-day estimate and clear history. Your data stays on your Mac.
+            TiboTattle is a local-first Mac app that turns Codex usage metadata
+            into a seven-day estimate and clear history. Your dashboard stays on your Mac.
           </p>
 
           <div class="install-cluster" id="download" aria-label="Get TiboTattle for Mac">
@@ -89,17 +89,26 @@
               <a
                 class="button mac-download-button"
                 id="installer-link"
-                aria-describedby="installer-unavailable"
-                aria-disabled="true"
+                hidden
               >
                 <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
                 Download for macOS
               </a>
-              <span class="open-installed-copy">
+              <button
+                class="button mac-download-button"
+                id="installer-unavailable-action"
+                type="button"
+                aria-describedby="installer-unavailable"
+                disabled
+              >
+                <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
+                Download for macOS
+              </button>
+              <span class="open-installed-copy" hidden>
                 Already installed?
                 <a id="open-installed-app">Open TiboTattle</a>
               </span>
-              <span class="installer-unavailable" id="installer-unavailable" role="status">
+              <span class="installer-unavailable" id="installer-unavailable">
                 Signed release coming soon.
               </span>
             </div>
@@ -119,12 +128,9 @@
           </div>
 
           <a class="community-inline" href="#community">
-            <span class="community-dot" aria-hidden="true"></span>
+            <span class="community-dot" id="community-estimate-dot" aria-hidden="true"></span>
             <span>Community seven-day estimate</span>
             <strong id="community-estimate-hero">Checking evidence</strong>
-            <span class="evidence-chip neutral" id="community-estimate-state" role="status">
-              Checking
-            </span>
           </a>
         </div>
 
@@ -134,7 +140,7 @@
               <img src="./tibotattle-icon.png" alt="" width="32" height="32">
               <strong>TiboTattle</strong>
             </span>
-            <span class="preview-demo">Sample data</span>
+            <span class="preview-demo">Demo data</span>
           </div>
           <div class="product-window-content">
             <p class="preview-label" id="product-preview-title">Seven-day allowance estimate</p>
@@ -142,7 +148,7 @@
               <strong>$1,879</strong>
               <span>API equivalent<br>per 7 days</span>
             </div>
-            <p class="preview-qualification">From TiboTattle’s built-in demo.</p>
+            <p class="preview-qualification">Example only — not your usage or a bill.</p>
             <dl class="preview-stats">
               <div>
                 <dt>Observed resets</dt>
@@ -172,7 +178,7 @@
         </article>
         <article>
           <h2>Local by default</h2>
-          <p>Content-free metadata and your full dashboard stay on your Mac.</p>
+          <p>Your dashboard stays on your Mac. Community contribution is optional.</p>
         </article>
         <article>
           <h2>Evidence, not guesses</h2>
@@ -187,10 +193,10 @@
             <p>Built from delayed, aggregate-only data and shown only after privacy checks.</p>
           </div>
           <div class="community-estimate-summary">
-            <span class="evidence-chip neutral" id="community-estimate-panel-state" role="status">
+            <span class="evidence-chip neutral" id="community-estimate-panel-state">
               Checking evidence
             </span>
-            <div id="community-estimate-result">
+            <div id="community-estimate-result" role="status">
               <p>Checking whether matched evidence supports a public estimate…</p>
             </div>
           </div>
@@ -204,7 +210,7 @@
                 <h3>Community activity</h3>
                 <p>Shown separately from the seven-day estimate.</p>
               </div>
-              <span class="evidence-chip neutral" id="community-service-state" role="status">
+              <span class="evidence-chip neutral" id="community-service-state">
                 Checking service
               </span>
             </div>
@@ -235,13 +241,23 @@
         <p>Local-first and independent. Not affiliated with OpenAI.</p>
       </div>
       <nav class="footer-links" aria-label="Find TiboTattle online">
-        <a href="https://github.com/adamallcock" target="_blank" rel="noreferrer">
+        <a
+          href="https://github.com/adamallcock"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="GitHub (opens in a new tab)"
+        >
           <img src="./github.svg" alt="" width="16" height="16">
           GitHub
         </a>
-        <a href="https://x.com/adamallcock" target="_blank" rel="noreferrer">
+        <a
+          href="https://x.com/adamallcock"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="X (opens in a new tab)"
+        >
           <img src="./x.svg" alt="" width="15" height="15">
-          Twitter
+          X
         </a>
       </nav>
     </footer>

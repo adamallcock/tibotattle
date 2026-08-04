@@ -24,12 +24,14 @@ const communityClient = new CommunityClient();
 
 function bindInstalledAppLink() {
   const link = $("#open-installed-app");
+  const copy = $(".open-installed-copy");
   const target = configuredSemanticOpenTarget(document);
   if (target) {
     link.href = target;
+    copy.hidden = false;
   } else {
     link.removeAttribute("href");
-    link.setAttribute("aria-disabled", "true");
+    copy.hidden = true;
   }
   link.addEventListener("click", () => {
     if (!target) return;
@@ -64,7 +66,6 @@ async function loadCommunitySnapshot() {
     detail,
     estimateContainer: $("#community-estimate-result"),
     estimateHero: $("#community-estimate-hero"),
-    estimateState: $("#community-estimate-state"),
     estimateStates: [$("#community-estimate-panel-state")],
     payload,
   });
@@ -95,5 +96,10 @@ async function loadCommunitySnapshot() {
 }
 
 bindInstalledAppLink();
-renderInstallerJourney(document, { showUnavailableAction: true });
+const installerRelease = renderInstallerJourney(document, {
+  showUnavailableAction: true,
+});
+$("#header-download-label").textContent = installerRelease
+  ? "Download"
+  : "Release status";
 void loadCommunitySnapshot();

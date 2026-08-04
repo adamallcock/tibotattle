@@ -148,6 +148,7 @@ test("the public site presents only the install call to action and the community
 
   assert.match(html, /<script type="module" src="\.\/community\.js">/u);
   assert.match(html, /id="installer-link"/u);
+  assert.match(html, /id="installer-unavailable-action"/u);
   assert.match(html, /id="installer-details"/u);
   assert.match(html, /id="installer-unavailable"/u);
   assert.match(html, /id="open-installed-app"/u);
@@ -155,7 +156,6 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="community-snapshot-service-detail"/u);
   assert.match(html, /id="community-service-state"/u);
   assert.match(html, /id="community-estimate-result"/u);
-  assert.match(html, /id="community-estimate-state"/u);
 
   // Every control that cannot work without the local companion is absent from
   // the website. These are the dead controls the split exists to remove.
@@ -200,13 +200,13 @@ test("the public site presents only the install call to action and the community
   // Accessibility: the site keeps the same skip link and named landmarks the
   // dashboard uses, and the focus ring is global rather than per page.
   assert.match(html, /<a class="skip-link" href="#main">/u);
-  assert.match(html, /<main id="main">/u);
+  assert.match(html, /<main id="main" tabindex="-1">/u);
   assert.match(html, /<nav class="primary-nav" aria-label="Site sections">/u);
   assert.match(html, /aria-labelledby="install-title"/u);
   assert.match(html, /aria-labelledby="community-title"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
-    /button:focus-visible, input:focus-visible, a:focus-visible/u,
+    /button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible/u,
   );
 
   // Release packaging materializes the site index from this page, so every
@@ -240,7 +240,7 @@ test("the public site presents only the install call to action and the community
 test("the first visit leads with the product, combined Mac action, and named estimate gate", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
-  assert.match(html, /TiboTattle is a local-first Mac app that turns content-free usage/u);
+  assert.match(html, /TiboTattle is a local-first Mac app that turns Codex usage metadata/u);
   assert.match(html, /Download for macOS/u);
   assert.match(html, /Already installed\?/u);
   assert.match(html, /Open TiboTattle/u);
@@ -249,11 +249,12 @@ test("the first visit leads with the product, combined Mac action, and named est
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/tibotattle-weekly-preview\.jpg"/u);
   assert.match(html, /src="\.\/apple\.svg"/u);
-  assert.match(html, /Sample data/u);
-  assert.match(html, /From TiboTattle’s built-in demo\./u);
+  assert.match(html, /Demo data/u);
+  assert.match(html, /Example only — not your usage or a bill\./u);
   assert.match(html, /Your dashboard is calculated privately on your Mac\./u);
   assert.match(html, /href="https:\/\/github\.com\/adamallcock"/u);
   assert.match(html, /href="https:\/\/x\.com\/adamallcock"/u);
+  assert.match(html, />\s*X\s*<\/a>/u);
   assert.doesNotMatch(
     html,
     /github\.com\/adamallcock\/(?:app-usagemonitor|tibotattle-client)/u,
@@ -275,6 +276,18 @@ test("the first visit leads with the product, combined Mac action, and named est
     html,
     /Activity totals[^<]+are an allowance estimate/u,
   );
+});
+
+test("the public hero keeps equal columns and a bounded stacked preview", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  assert.match(
+    styles,
+    /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/u,
+  );
+  assert.match(styles, /@media \(max-width: 1120px\)/u);
+  assert.match(styles, /width: min\(100%, 620px\);/u);
+  assert.match(styles, /justify-self: center;/u);
+  assert.doesNotMatch(styles, /font-size: clamp\(3\.15rem, 16vw, 5\.2rem\);/u);
 });
 
 test("both browser entry points share one community renderer and one install card", async () => {
@@ -436,6 +449,7 @@ test("the install card refuses a partially injected release", () => {
   assert.equal(formatInstallerSize(12_582_912), "12 MiB download");
   assert.equal(renderInstallerJourney(ready)?.version, "1.2.3");
   assert.equal(ready.byId.get("installer-link").hidden, false);
+  assert.equal(ready.byId.get("installer-unavailable-action").hidden, true);
   assert.equal(
     ready.byId.get("installer-link").attributes.has("aria-disabled"),
     false,
@@ -460,6 +474,7 @@ test("the install card refuses a partially injected release", () => {
     assert.equal(configuredInstallerRelease(documentRef), null, `${name}=${hostile}`);
     assert.equal(renderInstallerJourney(documentRef), null);
     assert.equal(documentRef.byId.get("installer-link").hidden, true);
+    assert.equal(documentRef.byId.get("installer-unavailable-action").hidden, true);
     assert.equal(documentRef.byId.get("installer-unavailable").hidden, false);
     assert.equal(
       Object.hasOwn(documentRef.byId.get("installer-link"), "href"),
@@ -471,10 +486,10 @@ test("the install card refuses a partially injected release", () => {
       renderInstallerJourney(publicDocument, { showUnavailableAction: true }),
       null,
     );
-    assert.equal(publicDocument.byId.get("installer-link").hidden, false);
+    assert.equal(publicDocument.byId.get("installer-link").hidden, true);
     assert.equal(
-      publicDocument.byId.get("installer-link").attributes.get("aria-disabled"),
-      "true",
+      publicDocument.byId.get("installer-unavailable-action").hidden,
+      false,
     );
     assert.equal(
       Object.hasOwn(publicDocument.byId.get("installer-link"), "href"),

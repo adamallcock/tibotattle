@@ -151,6 +151,7 @@ export function renderInstallerJourney(
   const details = select("#installer-details");
   const releaseLinks = select("#installer-links");
   const unavailable = select("#installer-unavailable");
+  const unavailableAction = select("#installer-unavailable-action");
   if (release) {
     const architectureLabel = release.architectures.length === 2
       ? "Apple silicon and Intel"
@@ -160,6 +161,7 @@ export function renderInstallerJourney(
     link.href = release.installerUrl;
     link.hidden = false;
     link.removeAttribute("aria-disabled");
+    if (unavailableAction) unavailableAction.hidden = true;
     select("#installer-version").textContent = `Version ${release.version}`;
     select("#installer-compatibility").textContent =
       `Requires macOS ${release.minimumMacos} or later · ${architectureLabel}`;
@@ -183,12 +185,9 @@ export function renderInstallerJourney(
     return release;
   }
   link.removeAttribute("href");
-  link.hidden = !showUnavailableAction;
-  if (showUnavailableAction) {
-    link.setAttribute("aria-disabled", "true");
-  } else {
-    link.removeAttribute("aria-disabled");
-  }
+  link.removeAttribute("aria-disabled");
+  link.hidden = true;
+  if (unavailableAction) unavailableAction.hidden = !showUnavailableAction;
   details.hidden = true;
   for (
     const id of [

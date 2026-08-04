@@ -156,3 +156,33 @@ official repository distributes its SVG library under CC0-1.0. Bundling the
 files keeps the release site self-contained; the page does not contact an icon
 CDN at runtime. The approved `tibotattle-icon.png` remains the product icon,
 favicon, and app-preview identity.
+
+## Responsive and red-team revision
+
+Fresh desktop, tablet, and phone renders plus four read-only Luna reviews found
+that the chart itself preserved its 914:430 aspect ratio; the oversized tablet
+experience came from a 720px-wide, left-aligned stacked card and a 52px row gap.
+The desktop hero also used an intentionally unequal `.86fr / 1.14fr` split.
+
+The accepted layout policy is therefore:
+
+- equal desktop columns with a narrower gap;
+- stack before either column becomes cramped, at 1120px;
+- center and cap the stacked product preview at 620px, reducing its height
+  without cropping axes, distorting the chart, or hiding evidence labels;
+- reduce stacked padding and row gap, and remove the abrupt 16vw headline jump;
+- preserve the equal two-column summary stats at every supported width.
+
+The review also found several high-confidence truthfulness and accessibility
+issues. The unavailable installer will be a real disabled button rather than
+an anchor with no destination; the installed-app action will render only when
+the semantic app target exists; focus indicators will use a two-color ring;
+duplicate hero status announcements will be removed; the demo will say that it
+is not personal usage or a bill; and local-first copy will no longer imply that
+an optional, reviewed community contribution can never leave the Mac.
+
+Recommendations to invent a notification signup, hide the community evidence
+state entirely, or replace the real chart with a new mobile visualization are
+out of scope. The first two would add an unapproved product flow or weaken the
+public value proposition; the last would require a separately designed and
+source-checked data asset rather than a responsive CSS patch.
