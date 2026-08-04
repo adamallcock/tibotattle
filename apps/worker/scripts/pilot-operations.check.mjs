@@ -322,10 +322,17 @@ function fakeRemote({
           primary_cooldown_retention_index_shape: 1,
           primary_cooldown_guard_trigger: 1,
           primary_identity_link_secret_configuration_table: 1,
+          primary_identity_link_secret_configuration_columns_exact: 1,
           primary_identity_link_secret_configuration_singleton: 1,
+          primary_identity_link_secret_configuration_singleton_check: 1,
           primary_identity_link_secret_configuration_key_version: 1,
+          primary_identity_link_secret_configuration_key_version_check: 1,
           primary_identity_link_secret_configuration_secret_fingerprint: 1,
+          primary_identity_link_secret_configuration_fingerprint_check: 1,
           primary_identity_link_secret_configuration_recorded_at: 1,
+          primary_identity_link_secret_configuration_check_count: 1,
+          primary_identity_link_secret_configuration_strict: 1,
+          primary_identity_link_secret_configuration_no_extra_objects: 1,
         });
       }
       if (command.includes("FROM collection_controls")) {
