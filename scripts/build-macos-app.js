@@ -2852,6 +2852,38 @@ async function verifyExistingBuildTarget(output) {
   return true;
 }
 
+export async function assertMacOSExternalBuildOutputIsFresh(output) {
+  try {
+    await lstat(output);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  fail(
+    "External distribution builds require a fresh output app bundle",
+    "MACOS_EXTERNAL_OUTPUT_REPLACEMENT_FORBIDDEN",
+  );
+}
+
+export async function installMacOSExternalBuildOutput(stagedApp, output) {
+  try {
+    // Claim the final bundle path without replacement. If an output appears
+    // after the pre-build check, mkdir fails and the existing target remains.
+    await mkdir(output, { mode: 0o755 });
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      fail(
+        "External distribution builds require a fresh output app bundle",
+        "MACOS_EXTERNAL_OUTPUT_REPLACEMENT_FORBIDDEN",
+      );
+    }
+    throw error;
+  }
+  for (const entry of await readdir(stagedApp)) {
+    await rename(join(stagedApp, entry), join(output, entry));
+  }
+}
+
 export function validateMacOSPreviewOutputPath(
   output,
   { stagingRoot = DEFAULT_PREVIEW_STAGING_ROOT } = {},
@@ -3412,6 +3444,9 @@ export async function buildMacOSApp({
     channel: distribution.channel,
     previewStagingRoot,
   });
+  if (externalDistribution) {
+    await assertMacOSExternalBuildOutputIsFresh(selectedOutput);
+  }
   const temporaryRoot = await mkdtemp(
     join(outputParent, ".usage-monitor-macos-build-"),
   );
@@ -3428,19 +3463,23 @@ export async function buildMacOSApp({
       updater,
     });
     signApplicationBundle(stagedApp);
-    if (await verifyExistingBuildTarget(selectedOutput)) {
-      if (distribution.previewDistribution) {
-        if (replacePreviewOutput !== true) {
-          fail(
-            "Preview staging bundle already exists; rerun with --replace-preview-output after validation",
-            "MACOS_PREVIEW_REPLACE_REQUIRED",
-          );
+    if (externalDistribution) {
+      await installMacOSExternalBuildOutput(stagedApp, selectedOutput);
+    } else {
+      if (await verifyExistingBuildTarget(selectedOutput)) {
+        if (distribution.previewDistribution) {
+          if (replacePreviewOutput !== true) {
+            fail(
+              "Preview staging bundle already exists; rerun with --replace-preview-output after validation",
+              "MACOS_PREVIEW_REPLACE_REQUIRED",
+            );
+          }
+          await validateMacOSPreviewApp(selectedOutput);
         }
-        await validateMacOSPreviewApp(selectedOutput);
+        await rm(selectedOutput, { recursive: true, force: false });
       }
-      await rm(selectedOutput, { recursive: true, force: false });
+      await rename(stagedApp, selectedOutput);
     }
-    await rename(stagedApp, selectedOutput);
     return Object.freeze({
       output: selectedOutput,
       payloadSha256: manifest.payload.payloadSha256,

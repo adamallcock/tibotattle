@@ -69,6 +69,7 @@
 "settings.automaticUpdates" = "Actualizaciones automáticas";
 "settings.automaticUpdatesOff" = "Las actualizaciones automáticas están desactivadas. Aún puedes buscar actualizaciones manualmente.";
 "settings.automaticUpdatesOn" = "Las actualizaciones verificadas se descargan automáticamente y se instalan al salir.";
+"settings.automaticUpdatesReachable" = "La fuente de actualizaciones es accesible. La verificación de Sparkle aún está pendiente.";
 "settings.automaticUpdatesUnavailable" = "Las actualizaciones están disponibles en versiones firmadas instaladas en Aplicaciones.";
 "settings.automaticUpdatesTooltip" = "Descarga automáticamente actualizaciones firmadas de TiboTattle.";
 "settings.checkForUpdates" = "Buscar actualizaciones";

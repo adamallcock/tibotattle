@@ -197,9 +197,9 @@ private final class AppUpdater: NSObject {
                     .settingsUpdateDisclosurePreview
                 )
             }
-            return automaticUpdatesEnabled
-                ? TiboTattleLocalization.string(.settingsAutomaticUpdatesOn)
-                : TiboTattleLocalization.string(.settingsAutomaticUpdatesOff)
+            return TiboTattleLocalization.string(
+                .settingsAutomaticUpdatesReachable
+            )
         case .checking:
             return TiboTattleLocalization.string(.settingsCheckForUpdates)
                 + "…"
@@ -413,7 +413,7 @@ private final class AppUpdater: NSObject {
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
-        setState(.verifiedNoUpdate)
+        setState(.failed)
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater) {

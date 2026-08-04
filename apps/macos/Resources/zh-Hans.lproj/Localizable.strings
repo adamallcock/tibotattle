@@ -69,6 +69,7 @@
 "settings.automaticUpdates" = "自动更新";
 "settings.automaticUpdatesOff" = "自动更新已关闭。你仍可手动检查更新。";
 "settings.automaticUpdatesOn" = "已验证的更新会自动下载，并在你退出时安装。";
+"settings.automaticUpdatesReachable" = "更新源可访问。Sparkle 验证仍在等待中。";
 "settings.automaticUpdatesUnavailable" = "更新仅适用于安装在“应用程序”中的已签名发行版。";
 "settings.automaticUpdatesTooltip" = "自动下载已签名的 TiboTattle 更新。";
 "settings.checkForUpdates" = "检查更新";

@@ -20,6 +20,7 @@
 "settings.automaticUpdates" = "Automatic updates";
 "settings.automaticUpdatesOff" = "Automatic updates are off. You can still check for updates manually.";
 "settings.automaticUpdatesOn" = "Verified updates download automatically and install when you quit.";
+"settings.automaticUpdatesReachable" = "Update feed reachable. Sparkle verification is still pending.";
 "settings.automaticUpdatesUnavailable" = "Updates are available in signed releases installed in Applications.";
 "settings.automaticUpdatesTooltip" = "Download signed TiboTattle updates automatically.";
 "settings.checkForUpdates" = "Check for Updates";

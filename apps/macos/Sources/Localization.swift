@@ -208,6 +208,7 @@ enum TiboTattleLocalization {
         case settingsAutomaticUpdates = "settings.automaticUpdates"
         case settingsAutomaticUpdatesOff = "settings.automaticUpdatesOff"
         case settingsAutomaticUpdatesOn = "settings.automaticUpdatesOn"
+        case settingsAutomaticUpdatesReachable = "settings.automaticUpdatesReachable"
         case settingsAutomaticUpdatesUnavailable = "settings.automaticUpdatesUnavailable"
         case settingsAutomaticUpdatesTooltip = "settings.automaticUpdatesTooltip"
         case settingsCheckForUpdates = "settings.checkForUpdates"
@@ -641,6 +642,8 @@ enum TiboTattleLocalization {
                 "Automatic updates are off. You can still check for updates manually."
             case .settingsAutomaticUpdatesOn:
                 "Verified updates download automatically and install when you quit."
+            case .settingsAutomaticUpdatesReachable:
+                "Update feed reachable. Sparkle verification is still pending."
             case .settingsAutomaticUpdatesUnavailable:
                 "Updates are available in signed releases installed in Applications."
             case .settingsAutomaticUpdatesTooltip:

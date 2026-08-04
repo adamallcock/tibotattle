@@ -59,12 +59,14 @@ import {
   calculateMacOSSourceInputDigest,
   assertMacOSWebModuleInventory,
   assertMacOSWorkspaceRuntimePackageInventory,
+  assertMacOSExternalBuildOutputIsFresh,
   normalizeMacOSBundleVersion,
   normalizeMacOSBuildProfile,
   normalizeMacOSCentralOrigin,
   parseMacOSBuildArguments,
   stageMacOSWebModules,
   stageMacOSWorkspaceRuntimePackages,
+  installMacOSExternalBuildOutput,
   validateMacOSPreviewApp,
   validateMacOSPreviewOutputPath,
   validateMacOSDistributionConfiguration,
@@ -745,8 +747,28 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.launcherRetry\)\)/u);
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.commonCancel\)\)/u);
   assert.match(source, /alert\.runModal\(\) == \.alertFirstButtonReturn[\s\S]*checkForUpdates\(nil\)/u);
+  const updaterSummary = source.match(
+    /var settingsSummary: String \{([\s\S]*?)\n    \}\n\n    private func setState/u,
+  )?.[1];
+  assert.ok(updaterSummary, "updater summary source should be present");
+  const readySummary = updaterSummary.match(
+    /case \.ready:([\s\S]*?)case \.checking:/u,
+  )?.[1];
+  assert.ok(readySummary, "ready updater summary source should be present");
+  assert.match(readySummary, /settingsAutomaticUpdatesReachable/u);
+  assert.doesNotMatch(
+    readySummary,
+    /settingsAutomaticUpdatesOn|settingsAutomaticUpdatesOff/u,
+  );
   assert.match(source, /didFindValidUpdate[\s\S]*\.updateAvailable/u);
-  assert.match(source, /updaterDidNotFindUpdate[\s\S]*\.verifiedNoUpdate/u);
+  assert.match(
+    source,
+    /func updaterDidNotFindUpdate\(_ updater: SPUUpdater, error: Error\) \{\s*setState\(\.failed\)\s*\}/u,
+  );
+  assert.match(
+    source,
+    /func updaterDidNotFindUpdate\(_ updater: SPUUpdater\) \{\s*setState\(\.verifiedNoUpdate\)\s*\}/u,
+  );
   assert.match(source, /didAbortWithError[\s\S]*\.failed/u);
   assert.match(source, /controller\.checkForUpdates\(sender\)/u);
   assert.match(source, /runtimeStateDescription/u);
@@ -1555,6 +1577,39 @@ test("stable external builder refuses the direct continuity bypass", async () =>
       { code: "MACOS_STABLE_EXTERNAL_BUILD_RELEASE_GATE_REQUIRED" },
     );
     await assert.rejects(lstat(output), { code: "ENOENT" });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("external app output is fresh-only and rejects a TOCTOU target", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-external-output-safety-"),
+  );
+  const stagedApp = join(temporaryRoot, "staged", "TiboTattle.app");
+  const output = join(temporaryRoot, "output", "TiboTattle.app");
+  const sentinel = join(output, "sentinel.txt");
+  try {
+    await mkdir(join(stagedApp, "Contents"), { recursive: true });
+    await writeFile(join(stagedApp, "Contents", "marker.txt"), "staged");
+    await assertMacOSExternalBuildOutputIsFresh(output);
+
+    // Model a target appearing after the initial absence check. The no-
+    // replace claim must fail without touching that target.
+    await mkdir(output, { recursive: true });
+    await writeFile(sentinel, "preserve", { mode: 0o600 });
+    await assert.rejects(
+      installMacOSExternalBuildOutput(stagedApp, output),
+      { code: "MACOS_EXTERNAL_OUTPUT_REPLACEMENT_FORBIDDEN" },
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "preserve");
+
+    await rm(output, { recursive: true, force: false });
+    await installMacOSExternalBuildOutput(stagedApp, output);
+    assert.equal(
+      await readFile(join(output, "Contents", "marker.txt"), "utf8"),
+      "staged",
+    );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
