@@ -489,6 +489,42 @@ describe("quarantine crash reconciliation", () => {
     expect(activeRows?.total).toBe(1);
   });
 
+  it("purges expired primary and ledger identity cooldown markers independently", async () => {
+    const now = Date.now();
+    const deletedAt = new Date(now - 2 * 60 * 60 * 1_000).toISOString();
+    const retainUntil = new Date(now - 60 * 60 * 1_000).toISOString();
+    const digest = "c".repeat(64);
+    const insert = `INSERT INTO identity_reenrollment_cooldowns (
+      identity_cooldown_digest, schema_version, deleted_at, retain_until
+    ) VALUES (?, 'identity-reenrollment-cooldown-v0.1', ?, ?)`;
+    await bindings().USAGE_MONITOR_DB.prepare(insert).bind(
+      digest,
+      deletedAt,
+      retainUntil,
+    ).run();
+    await bindings().DELETION_LEDGER.prepare(insert).bind(
+      digest,
+      deletedAt,
+      retainUntil,
+    ).run();
+
+    const result = await runScheduledMaintenance(bindings(), now);
+    expect(result).toMatchObject({
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 1,
+      primaryIdentityReenrollmentCooldownPurgeComplete: true,
+      expiredIdentityReenrollmentCooldownsPurged: 1,
+      identityReenrollmentCooldownPurgeComplete: true,
+    });
+    const primary = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM identity_reenrollment_cooldowns",
+    ).first<{ total: number }>();
+    const ledger = await bindings().DELETION_LEDGER.prepare(
+      "SELECT COUNT(*) AS total FROM identity_reenrollment_cooldowns",
+    ).first<{ total: number }>();
+    expect(primary?.total).toBe(0);
+    expect(ledger?.total).toBe(0);
+  });
+
   it.each<QuarantineObjectKind>(["synthetic", "telemetry"])(
     "preserves a stale %s object referenced by a canonical table",
     async (objectKind) => {
@@ -1144,6 +1180,8 @@ describe("backend readiness and scheduled observability", () => {
       expiredIdentityHandoffPurgeComplete: true,
       expiredDeletionTombstonesPurged: 0,
       deletionTombstonePurgeComplete: true,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: true,
       expiredIdentityReenrollmentCooldownsPurged: 0,
       identityReenrollmentCooldownPurgeComplete: true,
       expiredSignInAdmissionsPurged: 0,
@@ -1199,6 +1237,8 @@ describe("backend readiness and scheduled observability", () => {
       expiredIdentityHandoffPurgeComplete: true,
       expiredDeletionTombstonesPurged: 0,
       deletionTombstonePurgeComplete: true,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: true,
       expiredIdentityReenrollmentCooldownsPurged: 0,
       identityReenrollmentCooldownPurgeComplete: true,
       expiredSignInAdmissionsPurged: 0,

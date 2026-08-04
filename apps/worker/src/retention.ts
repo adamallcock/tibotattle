@@ -177,11 +177,33 @@ export async function recordIdentityReenrollmentCooldown(
     secret,
     identityLinkKey,
   );
+  await recordIdentityReenrollmentCooldownFromDigest(
+    ledger,
+    cooldownDigest,
+    nowEpoch,
+  );
+}
+
+function assertIdentityReenrollmentCooldownDigest(
+  identityCooldownDigest: string,
+): void {
+  if (!/^[0-9a-f]{64}$/u.test(identityCooldownDigest)) {
+    throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+  }
+}
+
+async function recordIdentityReenrollmentCooldownAt(
+  database: D1Database,
+  identityCooldownDigest: string,
+  unavailableCode: "BACKEND_STORAGE_UNAVAILABLE" | "DELETION_LEDGER_UNAVAILABLE",
+  nowEpoch: number,
+): Promise<void> {
+  assertIdentityReenrollmentCooldownDigest(identityCooldownDigest);
   const deletedAt = canonicalInstant(nowEpoch);
   const retainUntil = canonicalInstant(
     nowEpoch + IDENTITY_REENROLLMENT_COOLDOWN_MILLISECONDS,
   );
-  await ledger.prepare(
+  await database.prepare(
     `INSERT INTO identity_reenrollment_cooldowns (
       identity_cooldown_digest, schema_version, deleted_at, retain_until
     ) VALUES (?, 'identity-reenrollment-cooldown-v0.1', ?, ?)
@@ -191,20 +213,64 @@ export async function recordIdentityReenrollmentCooldown(
           THEN excluded.retain_until
         ELSE identity_reenrollment_cooldowns.retain_until
       END`,
-  ).bind(cooldownDigest, deletedAt, retainUntil).run();
-  const row = await ledger.prepare(
+  ).bind(identityCooldownDigest, deletedAt, retainUntil).run();
+  const row = await database.prepare(
     `SELECT identity_cooldown_digest, retain_until
        FROM identity_reenrollment_cooldowns
       WHERE identity_cooldown_digest = ?`,
-  ).bind(cooldownDigest).first<{
+  ).bind(identityCooldownDigest).first<{
     identity_cooldown_digest: string;
     retain_until: string;
   }>();
-  if (row?.identity_cooldown_digest !== cooldownDigest
+  if (row?.identity_cooldown_digest !== identityCooldownDigest
       || typeof row.retain_until !== "string"
       || row.retain_until < retainUntil) {
-    throw new ApiError(503, "DELETION_LEDGER_UNAVAILABLE");
+    throw new ApiError(503, unavailableCode);
   }
+}
+
+/** Writes a primary-D1 marker before a hosted identity-link row is removed. */
+export function recordPrimaryIdentityReenrollmentCooldown(
+  db: D1Database,
+  identityCooldownDigest: string,
+  nowEpoch = Date.now(),
+): Promise<void> {
+  return recordIdentityReenrollmentCooldownAt(
+    db,
+    identityCooldownDigest,
+    "BACKEND_STORAGE_UNAVAILABLE",
+    nowEpoch,
+  );
+}
+
+/** Writes the independent-ledger copy from an already derived digest. */
+export function recordIdentityReenrollmentCooldownFromDigest(
+  ledger: D1Database,
+  identityCooldownDigest: string,
+  nowEpoch = Date.now(),
+): Promise<void> {
+  return recordIdentityReenrollmentCooldownAt(
+    ledger,
+    identityCooldownDigest,
+    "DELETION_LEDGER_UNAVAILABLE",
+    nowEpoch,
+  );
+}
+
+/** Reads a cooldown marker from either the primary D1 database or ledger. */
+export async function hasIdentityReenrollmentCooldownDigest(
+  database: D1Database,
+  identityCooldownDigest: string,
+  nowEpoch = Date.now(),
+): Promise<boolean> {
+  assertIdentityReenrollmentCooldownDigest(identityCooldownDigest);
+  const row = await database.prepare(
+    `SELECT 1 AS present
+       FROM identity_reenrollment_cooldowns
+      WHERE identity_cooldown_digest = ?
+        AND retain_until > ?`,
+  ).bind(identityCooldownDigest, canonicalInstant(nowEpoch)).first<{ present: number }>();
+  return row?.present === 1;
 }
 
 export async function hasIdentityReenrollmentCooldown(
@@ -218,13 +284,7 @@ export async function hasIdentityReenrollmentCooldown(
     secret,
     identityLinkKey,
   );
-  const row = await ledger.prepare(
-    `SELECT 1 AS present
-       FROM identity_reenrollment_cooldowns
-      WHERE identity_cooldown_digest = ?
-        AND retain_until > ?`,
-  ).bind(cooldownDigest, canonicalInstant(nowEpoch)).first<{ present: number }>();
-  return row?.present === 1;
+  return hasIdentityReenrollmentCooldownDigest(ledger, cooldownDigest, nowEpoch);
 }
 
 async function purgeExpiredLedgerRows(
@@ -284,6 +344,20 @@ export function purgeExpiredIdentityReenrollmentCooldowns(
 ): Promise<ExpiredLedgerPurgeResult> {
   return purgeExpiredLedgerRows(
     ledger,
+    "identity_reenrollment_cooldowns",
+    "identity_cooldown_digest",
+    nowEpoch,
+    IDENTITY_REENROLLMENT_COOLDOWN_DELETE_BATCH_SIZE,
+  );
+}
+
+/** Removes at most one bounded page of expired primary-D1 cooldown markers. */
+export function purgeExpiredPrimaryIdentityReenrollmentCooldowns(
+  db: D1Database,
+  nowEpoch = Date.now(),
+): Promise<ExpiredLedgerPurgeResult> {
+  return purgeExpiredLedgerRows(
+    db,
     "identity_reenrollment_cooldowns",
     "identity_cooldown_digest",
     nowEpoch,
@@ -361,11 +435,15 @@ async function suppressRestoredParticipant(
     if (!(allowMissingIdentityLinkSecret
       && (typeof rawIdentityLinkSecret !== "string"
         || rawIdentityLinkSecret.length < 32))) {
-      await recordIdentityReenrollmentCooldown(
-        ledger,
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        identityLinkSecret(rawIdentityLinkSecret),
         participant.identity_link_key,
-        rawIdentityLinkSecret,
       );
+      // The primary marker commits while the old unique identity-link row is
+      // still present. Together with the INSERT trigger this leaves no window
+      // in which deletion can remove the row and then admit a replacement.
+      await recordPrimaryIdentityReenrollmentCooldown(db, cooldownDigest);
+      await recordIdentityReenrollmentCooldownFromDigest(ledger, cooldownDigest);
     }
   }
   await finishParticipantDeletion(db, participantId);

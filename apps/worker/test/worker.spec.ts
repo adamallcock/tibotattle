@@ -21,10 +21,14 @@ import {
 import {
   hasDeletionTombstone,
   hasIdentityReenrollmentCooldown,
+  hasIdentityReenrollmentCooldownDigest,
+  identityReenrollmentCooldownDigest,
   participantDeletionDigest,
   purgeExpiredDeletionTombstones,
   purgeExpiredIdentityReenrollmentCooldowns,
+  purgeExpiredPrimaryIdentityReenrollmentCooldowns,
   recordDeletionTombstone,
+  recordPrimaryIdentityReenrollmentCooldown,
   runBackendLifecycle,
 } from "../src/retention";
 import {
@@ -1427,6 +1431,12 @@ describe("synthetic usage monitor service", () => {
       IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
       ...overrides,
     } as unknown as Partial<Env>);
+  }
+
+  function configuredIdentityLinkSecret(runtimeEnv: Env): string {
+    const secret = runtimeEnv.IDENTITY_LINK_SECRET;
+    if (typeof secret !== "string") throw new Error("identity test secret missing");
+    return secret;
   }
 
   async function deliveredHostedProof(
@@ -5098,10 +5108,16 @@ describe("synthetic usage monitor service", () => {
       const firstBody = await first.json<{ participantId: string; recoveryCode: string }>();
 
       const row = await testBindings().USAGE_MONITOR_DB.prepare(
-        "SELECT identity_link_key FROM participants WHERE id = ?",
-      ).bind(firstBody.participantId).first<{ identity_link_key: string }>();
+        `SELECT identity_link_key, identity_cooldown_digest
+           FROM participants
+          WHERE id = ?`,
+      ).bind(firstBody.participantId).first<{
+        identity_link_key: string;
+        identity_cooldown_digest: string | null;
+      }>();
       expect(row?.identity_link_key).toMatch(/^[0-9a-f]{64}$/u);
       expect(row?.identity_link_key.includes(subject)).toBe(false);
+      expect(row?.identity_cooldown_digest).toBeNull();
 
       const second = await identityEnroll(linkKey);
       expect(second.status).toBe(201);
@@ -5195,10 +5211,31 @@ describe("synthetic usage monitor service", () => {
       expect(cooldown?.deleted_at).toMatch(/Z$/u);
       expect(cooldown?.retain_until).toMatch(/Z$/u);
       expect(JSON.stringify(cooldown)).not.toContain(linkKey);
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        configuredIdentityLinkSecret(env),
+        linkKey,
+      );
+      expect(cooldown?.identity_cooldown_digest).toBe(cooldownDigest);
+      const primaryCooldown = await env.USAGE_MONITOR_DB.prepare(
+        `SELECT identity_cooldown_digest, deleted_at, retain_until
+           FROM identity_reenrollment_cooldowns`,
+      ).first<{
+        identity_cooldown_digest: string;
+        deleted_at: string;
+        retain_until: string;
+      }>();
+      expect(primaryCooldown?.identity_cooldown_digest).toBe(cooldownDigest);
+      expect(primaryCooldown?.deleted_at).toMatch(/Z$/u);
+      expect(primaryCooldown?.retain_until).toMatch(/Z$/u);
+      expect(JSON.stringify(primaryCooldown)).not.toContain(linkKey);
       await expect(hasIdentityReenrollmentCooldown(
         env.DELETION_LEDGER,
         linkKey,
         env.IDENTITY_LINK_SECRET,
+      )).resolves.toBe(true);
+      await expect(hasIdentityReenrollmentCooldownDigest(
+        env.USAGE_MONITOR_DB,
+        cooldownDigest,
       )).resolves.toBe(true);
 
       const immediate = await identityEnroll(linkKey, "google", env);
@@ -5208,6 +5245,13 @@ describe("synthetic usage monitor service", () => {
       });
 
       await env.DELETION_LEDGER.prepare(
+        `UPDATE identity_reenrollment_cooldowns
+            SET deleted_at = ?, retain_until = ?`,
+      ).bind(
+        "2026-01-01T00:00:00.000Z",
+        "2026-07-01T00:00:00.000Z",
+      ).run();
+      await env.USAGE_MONITOR_DB.prepare(
         `UPDATE identity_reenrollment_cooldowns
             SET deleted_at = ?, retain_until = ?`,
       ).bind(
@@ -5224,10 +5268,100 @@ describe("synthetic usage monitor service", () => {
         env.DELETION_LEDGER,
         Date.parse("2026-08-04T00:00:00.000Z"),
       )).resolves.toEqual({ purged: 1, complete: true });
+      await expect(purgeExpiredPrimaryIdentityReenrollmentCooldowns(
+        env.USAGE_MONITOR_DB,
+        Date.parse("2026-08-04T00:00:00.000Z"),
+      )).resolves.toEqual({ purged: 1, complete: true });
       const afterExpiry = await identityEnroll(linkKey, "google", env);
       expect(afterExpiry.status).toBe(201);
       const fresh = await afterExpiry.json<{ participantId: string }>();
       expect(fresh.participantId).not.toBe(participant.participantId);
+    });
+
+    it("enforces the primary cooldown at the participant INSERT boundary", async () => {
+      const env = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity\\0insert-boundary");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        configuredIdentityLinkSecret(env),
+        linkKey,
+      );
+
+      // Model the vulnerable interleaving precisely: the request observed an
+      // active participant, deletion then persisted its primary marker and
+      // removed the unique link row before the request reached enroll(). No
+      // external-ledger marker is present in this test, so only primary D1 can
+      // reject it.
+      await env.USAGE_MONITOR_DB.prepare(
+        "UPDATE participants SET state = 'deleting' WHERE id = ?",
+      ).bind(participant.participantId).run();
+      await recordPrimaryIdentityReenrollmentCooldown(
+        env.USAGE_MONITOR_DB,
+        cooldownDigest,
+      );
+      const { enroll: enrollParticipant, finishParticipantDeletion } =
+        await import("../src/repository");
+      await finishParticipantDeletion(
+        env.USAGE_MONITOR_DB,
+        participant.participantId,
+      );
+
+      await expect(enrollParticipant(
+        env.USAGE_MONITOR_DB,
+        "privacy-safe-telemetry-v0.1",
+        null,
+        {
+          identityLinkKey: linkKey,
+          identityCooldownDigest: cooldownDigest,
+        },
+      )).rejects.toThrow("identity reenrollment cooldown active");
+      const afterDirectInsert = await env.USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(afterDirectInsert?.total).toBe(0);
+
+      const throughHandler = await identityEnroll(linkKey, "google", env);
+      expect(throughHandler.status).toBe(409);
+      await expect(throughHandler.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_REENROLLMENT_COOLDOWN" },
+      });
+    });
+
+    it("writes both cooldown copies before restore replay removes a hosted link", async () => {
+      const env = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity\\0restore-replay");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+      const now = Date.now();
+      await recordDeletionTombstone(
+        env.DELETION_LEDGER,
+        participant.participantId,
+        now,
+      );
+
+      const lifecycle = await runBackendLifecycle(
+        env.USAGE_MONITOR_DB,
+        env.DELETION_LEDGER,
+        env.QUARANTINE,
+        now,
+        undefined,
+        configuredIdentityLinkSecret(env),
+        false,
+      );
+      expect(lifecycle.restoredParticipantsSuppressed).toBe(1);
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
+        configuredIdentityLinkSecret(env),
+        linkKey,
+      );
+      for (const database of [env.USAGE_MONITOR_DB, env.DELETION_LEDGER]) {
+        await expect(hasIdentityReenrollmentCooldownDigest(
+          database,
+          cooldownDigest,
+        )).resolves.toBe(true);
+      }
     });
 
     it("keeps the synthetic development identity path usable without the hosted secret", async () => {

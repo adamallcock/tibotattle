@@ -21,6 +21,7 @@ export const REQUIRED_PRIMARY_MIGRATIONS = Object.freeze([
   "0024_apple_signin_nonce_binding.sql",
   "0025_device_lifecycle.sql",
   "0026_signin_start_admission.sql",
+  "0027_identity_reenrollment_cooldown_guard.sql",
 ]);
 
 const DATABASES = Object.freeze([
@@ -40,17 +41,20 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["table", "device_credential_rotations"],
   ["table", "device_pairing_events"],
   ["table", "sign_in_start_admission_windows"],
+  ["table", "identity_reenrollment_cooldowns"],
   ["index", "community_aggregate_exclusions_participant"],
   ["index", "apple_signin_handoffs_expires_at"],
   ["index", "device_credentials_social_recheck"],
   ["index", "device_credential_rotations_retire"],
   ["index", "device_pairing_events_velocity"],
   ["index", "sign_in_start_admission_windows_retention"],
+  ["index", "identity_reenrollment_cooldowns_retention"],
   ["trigger", "community_snapshot_policy_changed"],
   ["trigger", "community_snapshot_policy_no_delete"],
   ["trigger", "community_aggregate_exclusion_inserted"],
   ["trigger", "community_aggregate_exclusion_changed"],
   ["trigger", "community_aggregate_exclusion_no_delete"],
+  ["trigger", "participants_identity_reenrollment_cooldown_guard"],
 ]);
 
 export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
@@ -61,6 +65,9 @@ export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
 ]);
 
 export const REQUIRED_COLUMNS = Object.freeze({
+  participants: Object.freeze([
+    "identity_cooldown_digest",
+  ]),
   apple_signin_handoffs: Object.freeze([
     "state",
     "nonce_hash",
@@ -120,6 +127,12 @@ export const REQUIRED_COLUMNS = Object.freeze({
     "window_started_at",
     "accepted_count",
     "last_accepted_at",
+  ]),
+  identity_reenrollment_cooldowns: Object.freeze([
+    "identity_cooldown_digest",
+    "schema_version",
+    "deleted_at",
+    "retain_until",
   ]),
 });
 
@@ -326,7 +339,7 @@ function baseReceipt(configChecks) {
     },
     blockers: [...configChecks.blockers],
     evidence: {
-      migrationWindow: "0023-0026",
+      migrationWindow: "0023-0027",
       database: "USAGE_MONITOR_DB",
       rollbackRestoreEquivalent: "isolated_cleanup",
     },

@@ -130,12 +130,15 @@ import {
   reconcilePendingQuarantineObjects,
 } from "./quarantine-reconciliation";
 import {
-  hasIdentityReenrollmentCooldown,
+  hasIdentityReenrollmentCooldownDigest,
   hasDeletionTombstone,
+  identityReenrollmentCooldownDigest,
   purgeExpiredDeletionTombstones,
   purgeExpiredIdentityReenrollmentCooldowns,
-  recordIdentityReenrollmentCooldown,
+  purgeExpiredPrimaryIdentityReenrollmentCooldowns,
+  recordIdentityReenrollmentCooldownFromDigest,
   recordDeletionTombstone,
+  recordPrimaryIdentityReenrollmentCooldown,
   runBackendLifecycle,
 } from "./retention";
 import {
@@ -461,12 +464,12 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   const verifiedIdentity = identityProvided
     ? await consumeHostedIdentityProof(env.USAGE_MONITOR_DB, identityValue)
     : null;
-  if (verifiedIdentity !== null) {
-    await assertIdentityReenrollmentAllowed(
+  const identityCooldownDigest = verifiedIdentity !== null
+    ? await assertIdentityReenrollmentAllowed(
       env,
       verifiedIdentity.linkKeyHex,
-    );
-  }
+    )
+    : null;
   if (deviceBootstrapRequested) {
     await assertCollectionControl(
       env.USAGE_MONITOR_DB,
@@ -474,6 +477,7 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
     );
   }
   const consentVersion = Reflect.get(body.value, "consentVersion") as string;
+  const syntheticOnly = Reflect.get(body.value, "syntheticOnly");
   const reattached = verifiedIdentity
     ? await reattachParticipantByLinkKey(
       env.USAGE_MONITOR_DB,
@@ -485,17 +489,34 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   const inviteGrant = reattached === null && mode === "invite_only"
     ? await parseInviteGrant(Reflect.get(body.value, "inviteCode"))
     : null;
-  const enrollment = reattached ?? await enroll(
-    env.USAGE_MONITOR_DB,
-    consentVersion,
-    inviteGrant,
-    {
-      deviceBootstrap: deviceBootstrapRequested,
-      openCommunityEligibility: mode === "open"
-        && Reflect.get(body.value, "syntheticOnly") === false,
-      identityLinkKey: verifiedIdentity?.linkKeyHex ?? null,
-    },
-  );
+  const enrollment = reattached ?? await (async () => {
+    try {
+      return await enroll(
+        env.USAGE_MONITOR_DB,
+        consentVersion,
+        inviteGrant,
+        {
+          deviceBootstrap: deviceBootstrapRequested,
+          openCommunityEligibility: mode === "open"
+            && syntheticOnly === false,
+          identityLinkKey: verifiedIdentity?.linkKeyHex ?? null,
+          identityCooldownDigest,
+        },
+      );
+    } catch (error) {
+      // The primary trigger is the linearization point for the active →
+      // deleting → removed race. Map its expected rejection without exposing
+      // a database error; any unrecognised write failure remains fail-closed.
+      if (identityCooldownDigest !== null
+          && await hasIdentityReenrollmentCooldownDigest(
+            env.USAGE_MONITOR_DB,
+            identityCooldownDigest,
+          )) {
+        throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
+      }
+      throw error;
+    }
+  })();
   return jsonResponse({
     schemaVersion: "participant-bootstrap-v0.1",
     state: enrollment.pairing ? "pairing_ready" : "enrolled",
@@ -640,39 +661,54 @@ async function consumeHostedIdentityProof(
  * A proof is consumed before this check, so a caller cannot replay one hosted
  * handoff while probing the cooldown. Existing active participants are
  * deliberately exempt: sign-in remains a reattachment operation, not a new
- * account generation. Deleted or deleting links are compared only through
- * the short-lived, purpose-separated ledger digest.
+ * account generation. Deleted or deleting links are compared only through a
+ * short-lived, purpose-separated digest. The primary-D1 copy is checked here
+ * for a clear user-facing result and enforced again by an INSERT trigger.
  */
 async function assertIdentityReenrollmentAllowed(
   env: Env,
   identityLinkKey: string,
-): Promise<void> {
+): Promise<string | null> {
   const state = await participantIdentityLinkState(
     env.USAGE_MONITOR_DB,
     identityLinkKey,
   );
-  if (state?.state === "active") return;
   // Do not fall through to a fresh enrollment when the deletion still owns
-  // the link.  Its cooldown is written to the independent ledger immediately
-  // before the primary row is removed; allowing this request to continue
-  // would leave a cross-database race where the first check sees `deleting`,
-  // the deletion commits, and reattach then sees no row.  The caller must
-  // start a new verified handoff after deletion reaches a stable outcome.
+  // the link. The caller must start a new verified handoff after deletion
+  // reaches a stable outcome.
   if (state?.state === "deleting") {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
   const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
-  if (!identityRequired(env)
-      && (typeof rawIdentityLinkSecret !== "string"
-        || rawIdentityLinkSecret.length < 32)) {
-    return;
+  if (typeof rawIdentityLinkSecret !== "string"
+      || rawIdentityLinkSecret.length < 32) {
+    if (identityRequired(env)) {
+      throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+    }
+    return null;
   }
-  const coolingDown = await hasIdentityReenrollmentCooldown(
-    env.DELETION_LEDGER,
-    identityLinkKey,
+  // Derive even for an active row. A deletion may complete after this state
+  // read and before reattachment; the value then reaches the atomic INSERT
+  // guard if a fresh enrollment is attempted.
+  const cooldownDigest = await identityReenrollmentCooldownDigest(
     rawIdentityLinkSecret,
+    identityLinkKey,
   );
-  if (coolingDown) throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
+  if (state?.state === "active") return cooldownDigest;
+  const [primaryCoolingDown, ledgerCoolingDown] = await Promise.all([
+    hasIdentityReenrollmentCooldownDigest(
+      env.USAGE_MONITOR_DB,
+      cooldownDigest,
+    ),
+    hasIdentityReenrollmentCooldownDigest(
+      env.DELETION_LEDGER,
+      cooldownDigest,
+    ),
+  ]);
+  if (primaryCoolingDown || ledgerCoolingDown) {
+    throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
+  }
+  return cooldownDigest;
 }
 
 /**
@@ -2135,13 +2171,26 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
   );
   if (identityLinkKey !== null) {
     const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
-    if (identityRequired(env)
-        || (typeof rawIdentityLinkSecret === "string"
-          && rawIdentityLinkSecret.length >= 32)) {
-      await recordIdentityReenrollmentCooldown(
-        env.DELETION_LEDGER,
-        identityLinkKey,
+    if (typeof rawIdentityLinkSecret !== "string"
+        || rawIdentityLinkSecret.length < 32) {
+      if (identityRequired(env)) {
+        throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
+      }
+    } else {
+      const cooldownDigest = await identityReenrollmentCooldownDigest(
         rawIdentityLinkSecret,
+        identityLinkKey,
+      );
+      // Persist the primary marker before dropping the old unique link key.
+      // The external ledger remains the independent restoration safeguard;
+      // this primary marker is what makes fresh INSERT admission atomic.
+      await recordPrimaryIdentityReenrollmentCooldown(
+        env.USAGE_MONITOR_DB,
+        cooldownDigest,
+      );
+      await recordIdentityReenrollmentCooldownFromDigest(
+        env.DELETION_LEDGER,
+        cooldownDigest,
       );
     }
   }
@@ -2292,6 +2341,10 @@ async function handleAdminAction(request: Request, env: Env): Promise<Response> 
           expiredIdentityHandoffPurgeComplete: result.expiredIdentityHandoffPurgeComplete,
           expiredDeletionTombstonesPurged: result.expiredDeletionTombstonesPurged,
           deletionTombstonePurgeComplete: result.deletionTombstonePurgeComplete,
+          expiredPrimaryIdentityReenrollmentCooldownsPurged:
+            result.expiredPrimaryIdentityReenrollmentCooldownsPurged,
+          primaryIdentityReenrollmentCooldownPurgeComplete:
+            result.primaryIdentityReenrollmentCooldownPurgeComplete,
           expiredIdentityReenrollmentCooldownsPurged:
             result.expiredIdentityReenrollmentCooldownsPurged,
           identityReenrollmentCooldownPurgeComplete:
@@ -2777,6 +2830,8 @@ interface ScheduledMaintenanceLog {
   expiredIdentityHandoffPurgeComplete: boolean;
   expiredDeletionTombstonesPurged: number;
   deletionTombstonePurgeComplete: boolean;
+  expiredPrimaryIdentityReenrollmentCooldownsPurged: number;
+  primaryIdentityReenrollmentCooldownPurgeComplete: boolean;
   expiredIdentityReenrollmentCooldownsPurged: number;
   identityReenrollmentCooldownPurgeComplete: boolean;
   expiredSignInAdmissionsPurged: number;
@@ -2858,6 +2913,8 @@ export async function runScheduledMaintenance(
   let expiredIdentityHandoffPurgeComplete = false;
   let expiredDeletionTombstonesPurged = 0;
   let deletionTombstonePurgeComplete = false;
+  let expiredPrimaryIdentityReenrollmentCooldownsPurged = 0;
+  let primaryIdentityReenrollmentCooldownPurgeComplete = false;
   let expiredIdentityReenrollmentCooldownsPurged = 0;
   let identityReenrollmentCooldownPurgeComplete = false;
   let expiredSignInAdmissionsPurged = 0;
@@ -2886,6 +2943,8 @@ export async function runScheduledMaintenance(
         expiredIdentityHandoffPurgeComplete,
         expiredDeletionTombstonesPurged,
         deletionTombstonePurgeComplete,
+        expiredPrimaryIdentityReenrollmentCooldownsPurged,
+        primaryIdentityReenrollmentCooldownPurgeComplete,
         expiredIdentityReenrollmentCooldownsPurged,
         identityReenrollmentCooldownPurgeComplete,
         expiredSignInAdmissionsPurged,
@@ -2920,6 +2979,14 @@ export async function runScheduledMaintenance(
     );
     expiredDeletionTombstonesPurged = deletionTombstonePurge.purged;
     deletionTombstonePurgeComplete = deletionTombstonePurge.complete;
+    const primaryIdentityReenrollmentCooldownPurge =
+      await purgeExpiredPrimaryIdentityReenrollmentCooldowns(
+        env.USAGE_MONITOR_DB,
+      );
+    expiredPrimaryIdentityReenrollmentCooldownsPurged =
+      primaryIdentityReenrollmentCooldownPurge.purged;
+    primaryIdentityReenrollmentCooldownPurgeComplete =
+      primaryIdentityReenrollmentCooldownPurge.complete;
     const identityReenrollmentCooldownPurge =
       await purgeExpiredIdentityReenrollmentCooldowns(
         env.DELETION_LEDGER,
@@ -2995,6 +3062,7 @@ export async function runScheduledMaintenance(
       && quarantineReconciliationComplete
       && expiredIdentityHandoffPurgeComplete
       && deletionTombstonePurgeComplete
+      && primaryIdentityReenrollmentCooldownPurgeComplete
       && identityReenrollmentCooldownPurgeComplete
       && signInAdmissionPurgeComplete
       && rebuildComplete;
@@ -3011,6 +3079,8 @@ export async function runScheduledMaintenance(
       expiredIdentityHandoffPurgeComplete,
       expiredDeletionTombstonesPurged,
       deletionTombstonePurgeComplete,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged,
+      primaryIdentityReenrollmentCooldownPurgeComplete,
       expiredIdentityReenrollmentCooldownsPurged,
       identityReenrollmentCooldownPurgeComplete,
       expiredSignInAdmissionsPurged,
@@ -3039,6 +3109,8 @@ export async function runScheduledMaintenance(
       expiredIdentityHandoffPurgeComplete,
       expiredDeletionTombstonesPurged,
       deletionTombstonePurgeComplete,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged,
+      primaryIdentityReenrollmentCooldownPurgeComplete,
       expiredIdentityReenrollmentCooldownsPurged,
       identityReenrollmentCooldownPurgeComplete,
       expiredSignInAdmissionsPurged,

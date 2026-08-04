@@ -128,6 +128,12 @@ export interface EnrollmentOptions {
    */
   identityLinkKey?: string | null;
   /**
+   * Purpose-separated short-lived anti-reissue digest. It is supplied only
+   * to the primary-D1 INSERT trigger and cleared from the participant row in
+   * the same enrollment transaction after admission succeeds.
+   */
+  identityCooldownDigest?: string | null;
+  /**
    * Open (non-invite) production enrollment still records community
    * eligibility through a server-issued, immediately redeemed grant so the
    * grant-backed eligibility trigger and audit trail hold for every cohort
@@ -201,8 +207,8 @@ export async function enroll(
     `INSERT INTO participants (
       id, access_token_id, access_token_hash, recovery_token_id,
       recovery_token_hash, state, consent_version, consented_at, created_at,
-      identity_link_key
-    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+      identity_link_key, identity_cooldown_digest
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
   ).bind(
     participantId,
     legacyAccessId,
@@ -213,9 +219,19 @@ export async function enroll(
     now,
     now,
     options.identityLinkKey ?? null,
+    options.identityCooldownDigest ?? null,
   );
+  const clearIdentityCooldownDigest = options.identityCooldownDigest === null
+    || options.identityCooldownDigest === undefined
+    ? []
+    : [db.prepare(
+      `UPDATE participants
+          SET identity_cooldown_digest = NULL
+        WHERE id = ? AND identity_cooldown_digest IS NOT NULL`,
+    ).bind(participantId)];
   const enrollmentStatements = [
     participantInsert,
+    ...clearIdentityCooldownDigest,
     sessionInsert(db, session),
     ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
   ];
@@ -231,6 +247,7 @@ export async function enroll(
       const eligibilityId = `eligibility:${crypto.randomUUID()}`;
       const results = await db.batch([
         participantInsert,
+        ...clearIdentityCooldownDigest,
         db.prepare(
           `INSERT INTO enrollment_grants (
             id, secret_hash, state, issued_at, expires_at
@@ -274,6 +291,7 @@ export async function enroll(
     try {
       const result = await db.batch([
         participantInsert,
+        ...clearIdentityCooldownDigest,
         db.prepare(
           `UPDATE enrollment_grants
               SET state = 'redeemed', redeemed_at = ?, redeemed_participant_id = ?
