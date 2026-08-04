@@ -78,8 +78,11 @@ migrations `0023`–`0028`, including the primary cooldown table, retention
 index, participant-insert guard, and pinned identity-link key configuration,
 plus the complete independent deletion-ledger stream. The release owner must
 also retain that redacted receipt and focused behavior-test evidence showing
-the isolated migration rehearsal verifies both cooldown copies and leaves
-collection contained. Together they must prove all of the following without a
+the isolated migration rehearsal queries the actual `collection_controls`
+singleton and fails closed for the migration's seeded operational row, as well
+as for missing or malformed rows. A contained-row fixture proves the semantic
+pass case. This is local source/rehearsal evidence only; it is not observed
+remote containment. Together they must prove all of the following without a
 live account or provider credential:
 
 1. Applying the migrations from an empty database succeeds.
@@ -194,8 +197,10 @@ order:
    deletion-ledger stream. Verify the primary cooldown table/trigger and the
    identity-link configuration table before any connected preview.
 4. Run the signed connected-preview journey and normal maintenance/ready
-   checks. A local `release:preflight` proves only a disposable rehearsal; it
-   does not replace the drain, active-revision, or remote-schema receipts.
+   checks. A local `release:preflight` proves only a disposable source
+   rehearsal, including the local singleton containment check; it does not
+   observe remote containment or replace the drain, active-revision, or
+   remote-schema receipts.
 
 Do not reverse steps 2 and 3. If their completion cannot be proven, leave
 enrollment disabled and treat the rollout as incomplete.

@@ -35,6 +35,13 @@ const DATABASES = Object.freeze([
 ]);
 
 const IDENTITY_LINK_SECRET_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const COLLECTION_CONTROLS_SCHEMA_VERSION = "collection-controls-v0.1";
+const COLLECTION_CONTROL_FLAGS = Object.freeze([
+  "enrollment_enabled",
+  "upload_registration_enabled",
+  "processing_enabled",
+  "publication_enabled",
+]);
 
 export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["table", "collection_controls"],
@@ -316,6 +323,44 @@ function hasColumns(rows, expected) {
   return expected.every((name) => actual.has(name));
 }
 
+function collectionControlProbeState(rows) {
+  if (!Array.isArray(rows)) return "unavailable";
+  if (rows.length === 0) return "missing";
+  if (rows.length !== 1) return "invalid";
+  const row = rows[0];
+  if (row?.singleton !== 1
+      || row.schema_version !== COLLECTION_CONTROLS_SCHEMA_VERSION
+      || !COLLECTION_CONTROL_FLAGS.every((field) => row[field] === 0 || row[field] === 1)
+      || !["operational", "degraded", "contained"].includes(row.control_state)
+      || !Number.isSafeInteger(row.revision)
+      || row.revision < 1) {
+    return "invalid";
+  }
+  const enabledCount = COLLECTION_CONTROL_FLAGS
+    .filter((field) => row[field] === 1)
+    .length;
+  if ((row.control_state === "operational" && enabledCount !== 4)
+      || (row.control_state === "contained" && enabledCount !== 0)
+      || (row.control_state === "degraded"
+        && (enabledCount === 0 || enabledCount === 4))) {
+    return "invalid";
+  }
+  return row.control_state === "contained" ? "contained" : "uncontained";
+}
+
+function collectionControlBlocker(state) {
+  switch (state) {
+    case "missing":
+      return "LOCAL_COLLECTION_CONTROLS_MISSING";
+    case "uncontained":
+      return "LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED";
+    case "unavailable":
+      return "LOCAL_COLLECTION_CONTROLS_UNAVAILABLE";
+    default:
+      return "LOCAL_COLLECTION_CONTROLS_INVALID";
+  }
+}
+
 function validOwnerOnlyDirectory(metadata) {
   return metadata.isDirectory()
     && !metadata.isSymbolicLink()
@@ -356,6 +401,7 @@ function baseReceipt(configChecks) {
       deletionLedgerMigrationsAppliedInOrder: false,
       requiredSchemaPresent: false,
       deletionLedgerSchemaPresent: false,
+      collectionControlsContained: false,
       localOnly: true,
       isolatedStateCleaned: false,
     },
@@ -485,6 +531,34 @@ export async function runReleasePreflight({
         && columnsPresent.every(Boolean);
       if (!receipt.checks.requiredSchemaPresent) {
         receipt.blockers.push("LOCAL_SCHEMA_INCOMPLETE");
+      }
+
+      // This probe is intentionally read-only. Preflight never repairs or
+      // contains the singleton to make the local gate pass.
+      const collectionControls = runQuery({
+        wrangler,
+        workerDirectory,
+        configPath,
+        stateDirectory,
+        binding: "USAGE_MONITOR_DB",
+        spawn,
+        sql: `
+SELECT singleton,
+       schema_version,
+       enrollment_enabled,
+       upload_registration_enabled,
+       processing_enabled,
+       publication_enabled,
+       control_state,
+       revision
+  FROM collection_controls
+ WHERE singleton = 1
+`,
+      });
+      const collectionControlState = collectionControlProbeState(collectionControls);
+      receipt.checks.collectionControlsContained = collectionControlState === "contained";
+      if (!receipt.checks.collectionControlsContained) {
+        receipt.blockers.push(collectionControlBlocker(collectionControlState));
       }
 
       const deletionLedgerObjects = runQuery({

@@ -77,6 +77,83 @@ async function removeState(state) {
   }
 }
 
+function containedCollectionControlRow() {
+  return {
+    singleton: 1,
+    schema_version: "collection-controls-v0.1",
+    enrollment_enabled: 0,
+    upload_registration_enabled: 0,
+    processing_enabled: 0,
+    publication_enabled: 0,
+    control_state: "contained",
+    revision: 1,
+  };
+}
+
+async function standardFixture({ collectionControlRows = [containedCollectionControlRow()] } = {}) {
+  const calls = [];
+  const primaryMigrations = await migrationNames("migrations");
+  const deletionLedgerMigrations = await migrationNames("deletion-ledger-migrations");
+  const schemaRows = REQUIRED_SCHEMA_OBJECTS.map(([type, name]) => ({ type, name }));
+  const deletionLedgerSchemaRows = REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS.map(
+    ([type, name]) => ({ type, name }),
+  );
+  const columnRows = Object.fromEntries(
+    Object.entries(REQUIRED_COLUMNS).map(([table, columns]) => [
+      table,
+      columns.map((name) => ({ name })),
+    ]),
+  );
+  const deletionLedgerColumnRows = Object.fromEntries(
+    Object.entries(REQUIRED_DELETION_LEDGER_COLUMNS).map(([table, columns]) => [
+      table,
+      columns.map((name) => ({ name })),
+    ]),
+  );
+  const spawn = (_wrangler, args) => {
+    calls.push(args);
+    assert.equal(args.includes("--remote"), false);
+    assert.equal(args.includes("deploy"), false);
+    assert.equal(args.includes("--local"), true);
+    if (args.includes("migrations")) {
+      return {
+        status: 0,
+        stdout: "provider-secret=must-not-escape",
+        stderr: "provider-secret=must-not-escape",
+      };
+    }
+    const sql = args[args.indexOf("--command") + 1];
+    if (sql.includes("d1_migrations")) {
+      const binding = args[2];
+      const names = binding === "USAGE_MONITOR_DB"
+        ? primaryMigrations
+        : deletionLedgerMigrations;
+      return {
+        status: 0,
+        stdout: jsonRows(names.map((name, index) => ({ id: index + 1, name }))),
+      };
+    }
+    if (sql.includes("FROM collection_controls")) {
+      assert.equal(/\b(?:INSERT|UPDATE|DELETE)\b/iu.test(sql), false);
+      return { status: 0, stdout: jsonRows(collectionControlRows) };
+    }
+    if (sql.includes("sqlite_master")) {
+      return {
+        status: 0,
+        stdout: jsonRows(args[2] === "DELETION_LEDGER"
+          ? deletionLedgerSchemaRows
+          : schemaRows),
+      };
+    }
+    const table = /PRAGMA table_info\('([^']+)'\)/u.exec(sql)?.[1];
+    const columns = args[2] === "DELETION_LEDGER"
+      ? deletionLedgerColumnRows
+      : columnRows;
+    return { status: 0, stdout: jsonRows(columns[table] ?? []) };
+  };
+  return { calls, primaryMigrations, spawn };
+}
+
 test("disabled enrollment config is required and reports booleans only", () => {
   const config = safeConfig();
   assert.deepEqual(assessDisabledEnrollmentConfiguration(config), {
@@ -104,63 +181,8 @@ test("disabled enrollment config is required and reports booleans only", () => {
 });
 
 test("release preflight applies both local migration streams, checks schema, and cleans state", async () => {
-  const calls = [];
-  const primaryMigrations = await migrationNames("migrations");
-  const deletionLedgerMigrations = await migrationNames("deletion-ledger-migrations");
-  const schemaRows = REQUIRED_SCHEMA_OBJECTS.map(([type, name]) => ({ type, name }));
-  const deletionLedgerSchemaRows = REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS.map(
-    ([type, name]) => ({ type, name }),
-  );
-  const columnRows = Object.fromEntries(
-    Object.entries(REQUIRED_COLUMNS).map(([table, columns]) => [
-      table,
-      columns.map((name) => ({ name })),
-    ]),
-  );
-  const deletionLedgerColumnRows = Object.fromEntries(
-    Object.entries(REQUIRED_DELETION_LEDGER_COLUMNS).map(([table, columns]) => [
-      table,
-      columns.map((name) => ({ name })),
-    ]),
-  );
+  const { calls, primaryMigrations, spawn } = await standardFixture();
   let statePath = null;
-  const spawn = (_wrangler, args) => {
-    calls.push(args);
-    assert.equal(args.includes("--remote"), false);
-    assert.equal(args.includes("deploy"), false);
-    assert.equal(args.includes("--local"), true);
-    if (args.includes("migrations")) {
-      return {
-        status: 0,
-        stdout: "provider-secret=must-not-escape",
-        stderr: "provider-secret=must-not-escape",
-      };
-    }
-    const sql = args[args.indexOf("--command") + 1];
-    if (sql.includes("d1_migrations")) {
-      const binding = args[2];
-      const names = binding === "USAGE_MONITOR_DB"
-        ? primaryMigrations
-        : deletionLedgerMigrations;
-      return {
-        status: 0,
-        stdout: jsonRows(names.map((name, index) => ({ id: index + 1, name }))),
-      };
-    }
-    if (sql.includes("sqlite_master")) {
-      return {
-        status: 0,
-        stdout: jsonRows(args[2] === "DELETION_LEDGER"
-          ? deletionLedgerSchemaRows
-          : schemaRows),
-      };
-    }
-    const table = /PRAGMA table_info\('([^']+)'\)/u.exec(sql)?.[1];
-    const columns = args[2] === "DELETION_LEDGER"
-      ? deletionLedgerColumnRows
-      : columnRows;
-    return { status: 0, stdout: jsonRows(columns[table] ?? []) };
-  };
   const result = await runReleasePreflight({
     config: safeConfig(),
     workerDirectory,
@@ -179,6 +201,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerMigrationsAppliedInOrder, true);
   assert.equal(result.checks.requiredSchemaPresent, true);
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
+  assert.equal(result.checks.collectionControlsContained, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
   assert.equal(result.evidence.migrationWindow, "0023-0029");
   assert.ok(statePath);
@@ -189,6 +212,40 @@ test("release preflight applies both local migration streams, checks schema, and
     true,
   );
 });
+
+for (const [label, collectionControlRows, blocker] of [
+  ["operational", [{
+    ...containedCollectionControlRow(),
+    enrollment_enabled: 1,
+    upload_registration_enabled: 1,
+    processing_enabled: 1,
+    publication_enabled: 1,
+    control_state: "operational",
+  }], "LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
+  ["missing", [], "LOCAL_COLLECTION_CONTROLS_MISSING"],
+  ["malformed", [{
+    ...containedCollectionControlRow(),
+    schema_version: "wrong-schema",
+  }], "LOCAL_COLLECTION_CONTROLS_INVALID"],
+]) {
+  test(`release preflight blocks ${label} collection controls without release-ready evidence`, async () => {
+    const { spawn } = await standardFixture({ collectionControlRows });
+    const result = await runReleasePreflight({
+      config: safeConfig(),
+      workerDirectory,
+      wrangler: "fake-wrangler",
+      spawn,
+      createState: disposableState,
+      cleanupState: removeState,
+    });
+    assert.equal(result.state, "blocked");
+    assert.equal(result.collectionAuthorized, false);
+    assert.equal(result.checks.collectionControlsContained, false);
+    assert.deepEqual(result.blockers, [blocker]);
+    assert.equal(JSON.stringify(result).includes('"state":"ready"'), false);
+    assert.equal(JSON.stringify(result).includes("release-ready"), false);
+  });
+}
 
 test("migration failure is content-free, local-only, and still cleans isolated state", async () => {
   let cleanupCalled = false;
@@ -229,6 +286,9 @@ test("missing deletion-ledger schema blocks the gate with a separate blocker", a
         status: 0,
         stdout: jsonRows(names.map((name, index) => ({ id: index + 1, name }))),
       };
+    }
+    if (sql.includes("FROM collection_controls")) {
+      return { status: 0, stdout: jsonRows([containedCollectionControlRow()]) };
     }
     if (sql.includes("sqlite_master")) {
       return {
