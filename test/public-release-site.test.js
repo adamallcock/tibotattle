@@ -295,6 +295,23 @@ async function serveReleaseOutput(output) {
   };
 }
 
+function assertPublicEntryClaimBoundary(html, label = "public entry") {
+  assert.match(html, /Community activity snapshot/u, label);
+  assert.match(html, /delayed, aggregate activity/u, label);
+  assert.doesNotMatch(
+    html,
+    /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks|privacy-safe community/u,
+    label,
+  );
+  for (const forbidden of [
+    'id="community-estimate-hero"',
+    'id="community-estimate-panel-state"',
+    'id="community-estimate-result"',
+  ]) {
+    assert.equal(html.includes(forbidden), false, `${label}: ${forbidden}`);
+  }
+}
+
 test("release-site build verifies artifacts and materializes complete public metadata", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
@@ -443,10 +460,13 @@ test("no-installer release-site build succeeds without installer claims and disa
   const result = await buildFixtureSite(noInstallerArgs);
   assert.equal(result.installer, null);
   const html = await readFile(join(value.output, "index.html"), "utf8");
+  assertPublicEntryClaimBoundary(html);
   assert.match(html, /Signed release coming soon\./u);
   assert.match(html, /id="installer-link"[^>]*hidden/u);
   assert.match(html, /id="installer-unavailable-action"[^>]*disabled/u);
   assert.match(html, /id="installer-unavailable"/u);
+  assert.doesNotMatch(html, /id="installer-link"[^>]*href=/u);
+  assert.doesNotMatch(html, /TiboTattle-[^"']+\.dmg/u);
   assert.doesNotMatch(html, /usage-monitor-installer-/u);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
@@ -496,13 +516,15 @@ test("public static routes keep root, community, privacy, and fallback out of th
   const community = responses.get("/community");
   const privacy = responses.get("/privacy");
   const fallback = responses.get("/unknown/fallback");
+  for (const [route, html] of [
+    ["/", root],
+    ["/community", community],
+    ["/unknown/fallback", fallback],
+  ]) {
+    assertPublicEntryClaimBoundary(html, route);
+  }
   for (const [route, html] of responses) {
     assert.match(html, /TiboTattle/u, route);
-    assert.doesNotMatch(
-      html,
-      /community allowance|best guess|automatic updates?/iu,
-      route,
-    );
     for (const forbidden of [
       'src="./app.js"',
       'src="./data-client.js"',
@@ -691,8 +713,13 @@ test("checked-in public source satisfies the complete release contract", async (
     );
   }
   const html = await readFile(join(value.output, "index.html"), "utf8");
+  const communityHtml = await readFile(join(value.output, "community.html"), "utf8");
+  const fallbackHtml = await readFile(join(value.output, "404.html"), "utf8");
   const docsHtml = await readFile(join(value.output, "docs.html"), "utf8");
   const privacyHtml = await readFile(join(value.output, "privacy.html"), "utf8");
+  assertPublicEntryClaimBoundary(html);
+  assert.equal(communityHtml, html, "the community route output stays identical to the index");
+  assert.equal(fallbackHtml, html, "the fallback output stays identical to the index");
   assert.match(html, /id="installer-compatibility"/u);
   assert.match(html, /id="release-notes-link"/u);
   assert.match(html, /href="\.\/docs\.html"/u);
@@ -707,6 +734,7 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="community-result"/u);
   assert.match(html, /src="\.\/community\.js"/u);
+  assert.match(html, /id="community-title">Community activity snapshot<\/h2>/u);
   const publishedHtml = [html, docsHtml, privacyHtml].join("\n");
   for (
     const dashboardOnly of [
@@ -745,6 +773,14 @@ test("checked-in public source satisfies the complete release contract", async (
         .map(({ path }) => readFile(join(value.output, path), "utf8")),
     )
   ).join("\n");
+  const publishedCommunityEntry = await readFile(
+    join(value.output, "community.js"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    publishedCommunityEntry,
+    /renderCommunityEstimate|estimateContainer|estimateHero|estimateStates|id="community-estimate/u,
+  );
   for (const privateCapability of [
     "/api/local",
     "/identity/",

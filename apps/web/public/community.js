@@ -91,11 +91,17 @@ export function setPublicSnapshotPresentation(documentRef, state, {
   failed = false,
 } = {}) {
   const chip = documentRef.querySelector("#community-service-state");
-  const title = documentRef.querySelector("#community-snapshot-title");
-  title.textContent = t("community.snapshotTitle");
+  const title = documentRef.querySelector("#community-title");
+  const hero = documentRef.querySelector("#community-snapshot-hero");
+  const panelState = documentRef.querySelector("#community-snapshot-panel-state");
+  const panelStatus = documentRef.querySelector("#community-snapshot-status");
+  if (title) title.textContent = t("community.snapshotTitle");
   if (failed || state === "service_unavailable") {
     chip.textContent = t("community.snapshotUnavailable");
     chip.className = "evidence-chip neutral";
+    for (const element of [hero, panelState, panelStatus]) {
+      if (element) element.textContent = t("community.snapshotUnavailable");
+    }
     return;
   }
   const presentation = {
@@ -109,6 +115,9 @@ export function setPublicSnapshotPresentation(documentRef, state, {
   }[state] ?? [t("community.snapshotUnavailableShort"), false];
   chip.textContent = presentation[0];
   chip.className = presentation[1] ? "evidence-chip" : "evidence-chip neutral";
+  for (const element of [hero, panelState, panelStatus]) {
+    if (element) element.textContent = presentation[0];
+  }
 }
 
 function renderPublicInstallerJourney() {
@@ -131,9 +140,6 @@ function renderCommunityResult({ payload, failure = null }) {
     documentRef: document,
     container,
     detail,
-    estimateContainer: $("#community-estimate-result"),
-    estimateHero: $("#community-estimate-hero"),
-    estimateStates: [$("#community-estimate-panel-state")],
     payload,
   });
   $("#community").dataset.communityState = state;
