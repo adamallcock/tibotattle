@@ -142,22 +142,56 @@ and support tickets.
 
 ## Disabled-mode staging gate
 
-Provisioning or migration work starts with collection disabled. The standard
-commands make that distinction explicit:
+Provisioning or migration work starts with collection disabled. Source
+validation, owner observation, and remote mutation are separate gates. The
+compatible Worker must be deployed and observed before any staging migration
+command is reachable:
 
 ```sh
 cd apps/worker
 npm run staging:check
 npm run staging:ready
+npm run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --phase pre_migration_compatibility \
+  --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+# Owner observes the exact remote revision and disabled/contained health,
+# then writes the bounded proof below outside the repository.
+npm run staging:prepare -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --confirm PREPARE_DISABLED_STAGING
+npm run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --confirm DEPLOY_DISABLED_STAGING
+npm run staging:ready
 ```
 
 `staging:check` validates the checked-in closed configuration and dry-run
-bundle; `staging:ready` is a read-only live-resource check. If remote storage
-must be created or updated, use only the reviewed contained-staging preparation
-procedure in the existing [invite pilot readiness runbook](./2026-07-29-invite-pilot-operational-readiness.md), with its exact confirmation string.
+bundle; `staging:ready` is a read-only live-resource check. The
+`pre_migration_compatibility` phase performs local/package/asset checks and the
+actual disabled Worker deploy, but deliberately does not claim live health or
+write a proof. The owner must observe the remote active revision and verify
+disabled enrollment plus contained controls before supplying the proof file.
+Only then can `staging:prepare` reach remote containment or migration commands.
+If remote storage must be created or updated, use only the reviewed
+contained-staging preparation procedure in the existing [invite pilot
+readiness runbook](./2026-07-29-invite-pilot-operational-readiness.md), with its
+exact confirmation string.
 Cloudflare D1 records applied migration state and rolls back a failed migration
 transaction; retain only the redacted result, not Wrangler output or resource
 identifiers. See [Cloudflare D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/).
+
+The proof is a local, non-secret JSON receipt with schema
+`tibotattle-worker-deployment-proof-v0.1`, operation
+`staging_disabled_worker_observed`, `environment: "staging"`,
+`channel: "staging"`, `phase: "pre_migration_compatibility"`, a fresh
+`observedAt`, the exact `workers.dev` origin, the observed opaque Worker
+revision, the reviewed source commit, `enrollmentMode: "disabled"`,
+`collectionControls: "contained"`, and all four owner-observation evidence
+flags. The command validates the structure, age, origin, and source commit; it
+does not manufacture this receipt from local deploy output. Missing, stale,
+malformed, open, or mismatched proof stops before migration.
 
 Required disabled-mode acceptance evidence:
 
@@ -188,12 +222,14 @@ order:
    five-minute handoff TTL plus the platform's documented request-drain window
    after the final open-enrollment revision is removed, and confirm no old
    Worker revision is still receiving identity traffic.
-2. Deploy the reviewed Worker revision while still disabled. Verify the active
-   revision and that no older Worker instance remains able to serve an identity
-   request. During this short compatibility window, a pre-schema identity
-   deletion may fail closed rather than remove a link without its primary
-   marker; do not enable enrollment or run a public cohort then.
-3. Only after step 2, apply primary migrations `0023`–`0028` and the reviewed
+2. Run the pre-migration compatibility staging deploy while still disabled.
+   The owner must observe the active revision and confirm no older Worker
+   instance remains able to serve an identity request, then retain the local
+   proof described above. During this short compatibility window, a pre-schema
+   identity deletion may fail closed rather than remove a link without its
+   primary marker; do not enable enrollment or run a public cohort then.
+3. Only after the proof is supplied and structurally accepted, apply primary
+   migrations `0023`–`0028` and the reviewed
    deletion-ledger stream. Verify the primary cooldown table/trigger and the
    identity-link configuration table before any connected preview.
 4. Run the signed connected-preview journey and normal maintenance/ready

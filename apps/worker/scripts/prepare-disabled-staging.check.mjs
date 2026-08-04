@@ -15,11 +15,17 @@ import {
   STAGING_PROOF_TYPES,
 } from "./staging-readiness-lib.mjs";
 
+const VALID_DEPLOYMENT_PROOF_CHECK = Object.freeze({
+  ok: true,
+  code: null,
+});
+
 test("preparation requires exact confirmation before inspection or mutation", () => {
   const calls = [];
   const result = prepareDisabledStaging({
     config: provisionedConfig(),
     confirmation: "yes",
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn: (_command, args) => {
@@ -48,6 +54,7 @@ test("preparation will not mutate unprovisioned infrastructure", () => {
   const result = prepareDisabledStaging({
     config: checkedInConfig,
     confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn,
@@ -211,6 +218,7 @@ test("preparation applies both migrations, contains collection, and rechecks", (
   const result = prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn,
@@ -322,6 +330,7 @@ test("preparation contains an existing active target before any migration", () =
   const result = prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn: successSpawn(config, calls, {
@@ -356,6 +365,7 @@ test("preparation stops at containment failure or crash before migration", () =>
     const result = prepareDisabledStaging({
       config,
       confirmation: PREPARE_CONFIRMATION,
+      deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
       wrangler: "/fake/wrangler",
       workerDirectory,
       spawn: successSpawn(config, calls, {
@@ -385,6 +395,7 @@ test("fresh bootstrap stops before any migration without an operational claim", 
   const result = prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn: successSpawn(config, calls, { freshTarget: true }),
@@ -428,6 +439,7 @@ test("preparation does not contain until applied migrations are proven exact", (
   const result = prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn,
@@ -440,6 +452,30 @@ test("preparation does not contain until applied migrations are proven exact", (
   assert.equal(applyCount, 2);
   assert.equal(calls.some((args) => args.some((value) =>
     typeof value === "string" && value.includes("UPDATE collection_controls"))), false);
+});
+
+test("preparation refuses absent or invalid compatible-worker proof before migration", () => {
+  for (const deploymentProofCheck of [
+    { ok: false, code: "DEPLOYMENT_PROOF_REQUIRED" },
+    { ok: false, code: "STAGING_DISABLED_WORKER_PROOF_MISMATCH" },
+    { ok: false, code: "DEPLOYMENT_PROOF_MALFORMED" },
+  ]) {
+    const calls = [];
+    const result = prepareDisabledStaging({
+      config: provisionedConfig(),
+      confirmation: PREPARE_CONFIRMATION,
+      deploymentProofCheck,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn: (_command, args) => {
+        calls.push(args);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.deepEqual(result, deploymentProofCheck);
+    assert.equal(calls.some((args) => args.includes("apply")), false);
+    assert.equal(calls.some((args) => args.includes("execute")), false);
+  }
 });
 
 test("preparation refuses missing identity protection before any mutation", () => {
@@ -460,6 +496,7 @@ test("preparation refuses missing identity protection before any mutation", () =
     const result = prepareDisabledStaging({
       config,
       confirmation: PREPARE_CONFIRMATION,
+      deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
       wrangler: "/fake/wrangler",
       workerDirectory,
       spawn: successSpawn(config, calls, scenario.options),

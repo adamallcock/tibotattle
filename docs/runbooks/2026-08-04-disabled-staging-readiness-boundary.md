@@ -61,16 +61,32 @@ remains a readiness observation rather than authorization to collect data.
 
 ## Explicit mutation gate
 
-Preparation is the only migration/containment mutation in this boundary and
-requires the exact confirmation before any Wrangler command:
+The pre-migration compatibility deploy is the only Worker deploy before schema
+mutation. It performs local checks, then the existing Wrangler deploy, and
+does not create live-proof evidence:
+
+```sh
+npm --prefix apps/worker run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --phase pre_migration_compatibility \
+  --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+```
+
+The owner must observe the active disabled revision and create the bounded
+local proof receipt. Only then can preparation reach remote containment or
+migration mutation, and it requires the exact confirmation plus that receipt:
 
 ```sh
 npm --prefix apps/worker run staging:prepare -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --receipt-file /owner-only/staging-disabled-worker-proof.json \
   --confirm PREPARE_DISABLED_STAGING
 ```
 
-Preparation refuses unsafe configuration, missing resources, remote migration
-inventory drift, and unverified migration application. On a fresh D1, the
+Preparation refuses absent, stale, malformed, open, or mismatched compatible
+Worker proof before migration. It also refuses unsafe configuration, missing
+resources, remote migration inventory drift, and unverified migration
+application. On a fresh D1, the
 preparation refuses to run any migration command when both D1 migration ledgers
 are uninitialized and `collection_controls` is absent. Wrangler applies the
 whole pending migration chain, and migration `0009_collection_controls.sql`

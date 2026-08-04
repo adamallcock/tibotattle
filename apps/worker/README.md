@@ -192,11 +192,26 @@ npm run keys:staging
 This creates ignored mode-0600 `.dev.vars.staging`, refuses overwrite, and
 never prints a key. It must not reuse `.dev.vars`.
 
-Prepare remote D1 only after `staging:ready` proves that the configured
-resources exist:
+After the owner has observed the exact staging target and configured resources,
+deploy the compatible disabled Worker before any migration:
 
 ```sh
-npm run staging:prepare -- --confirm PREPARE_DISABLED_STAGING
+npm run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST \
+  --phase pre_migration_compatibility \
+  --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+```
+
+The deploy step does not create live-proof evidence. The owner must observe the
+active opaque revision and disabled/contained health, then retain the local
+non-secret proof outside Git. Only after that proof is reviewed may preparation
+reach remote D1 mutation:
+
+```sh
+npm run staging:prepare -- \
+  --origin https://EXACT-STAGING-HOST \
+  --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --confirm PREPARE_DISABLED_STAGING
 ```
 
 This applies both migration streams and immediately forces enrollment, upload

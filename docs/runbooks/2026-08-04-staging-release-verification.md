@@ -104,16 +104,31 @@ substitute production for staging.
    ```
 
 2. After the owner has provisioned the isolated staging resources and confirmed
-   that the preconditions are met, apply the disabled staging migrations and
+   that the preconditions are met, deploy the compatible disabled Worker first:
+
+   ```sh
+   npm --prefix apps/worker run staging:deploy -- \
+     --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+     --phase pre_migration_compatibility \
+     --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+   ```
+
+   This is the live deploy step. It does not manufacture a readiness receipt.
+   The owner must observe the exact active revision and disabled/contained
+   health, then create the local non-secret proof required by preparation.
+
+3. Only after that proof is reviewed, apply the disabled staging migrations and
    containment:
 
    ```sh
    npm --prefix apps/worker run staging:prepare -- \
+     --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+     --receipt-file /owner-only/staging-disabled-worker-proof.json \
      --confirm PREPARE_DISABLED_STAGING
    ```
 
-3. Re-read staging readiness, then deploy only to the exact owner-confirmed
-   staging origin supplied by the owner:
+4. Re-read staging readiness, then run the final contained deployment only to
+   the exact owner-confirmed staging origin supplied by the owner:
 
    ```sh
    npm --prefix apps/worker run staging:deploy -- \
@@ -121,7 +136,7 @@ substitute production for staging.
      --confirm DEPLOY_DISABLED_STAGING
    ```
 
-4. Re-run the owner-only live staging readiness check:
+5. Re-run the owner-only live staging readiness check:
 
    ```sh
    npm --prefix apps/worker run staging:ready

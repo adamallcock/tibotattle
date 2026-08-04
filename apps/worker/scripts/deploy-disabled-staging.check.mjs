@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  COMPATIBLE_DEPLOY_CONFIRMATION,
   DEPLOY_CONFIRMATION,
   runDisabledStagingDeployment,
 } from "./deploy-disabled-staging.mjs";
@@ -109,6 +110,39 @@ test("deployment requires an exact confirmation before any command", async () =>
   });
   assert.deepEqual(result, { ok: false, code: "CONFIRMATION_REQUIRED" });
   assert.deepEqual(calls, []);
+});
+
+test("pre-migration compatibility phase deploys the disabled Worker without claiming live proof", async () => {
+  const config = provisionedConfig();
+  const calls = [];
+  let liveProbeCalled = false;
+  const result = await runDeployment({
+    config,
+    origin: stagingOrigin,
+    phase: "pre_migration_compatibility",
+    confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+    spawn: (_command, args) => {
+      calls.push(args);
+      if (args[0] === "deploy") {
+        return { status: 0, stdout: `Deployed ${stagingOrigin}`, stderr: "" };
+      }
+      liveProbeCalled = true;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+    fetchImpl: async () => {
+      liveProbeCalled = true;
+      return containedFetch();
+    },
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    code: "COMPATIBLE_DISABLED_STAGING_DEPLOYED",
+    collectionAuthorized: false,
+    receiptRequired: true,
+    liveContainmentObserved: false,
+  });
+  assert.deepEqual(calls, [["deploy", "--env", "staging", "--strict"]]);
+  assert.equal(liveProbeCalled, false);
 });
 
 test("deployment accepts only a bare HTTPS staging origin", async () => {

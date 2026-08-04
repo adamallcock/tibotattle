@@ -44,6 +44,20 @@ statuses, artifact byte count/digest, and pass/fail. Never record private keys,
 Keychain exports, provider tokens, OAuth codes/verifiers, account identifiers,
 raw appcast/artifact bytes, or raw logs.
 
+Worker deployment proof is a separate local JSON receipt, not a Wrangler log.
+For production, first run the read-only owner observation and retain its
+output; then record the observed opaque Worker revision in a receipt with
+schema `tibotattle-worker-deployment-proof-v0.1`, operation
+`production_containment_observed`, `environment: "production"`,
+`channel: "stable"`, `observationChannel: "production_containment_observer"`,
+`status: "remote_containment_observed"`, a fresh `observedAt`, the exact
+canonical production origin, the observer's matched endpoint-manifest fields,
+`enrollmentMode: "disabled"`, `collectionControls: "contained"`, and the four
+owner-observation evidence flags. The deploy wrapper validates the receipt's
+age, revision, containment, endpoint manifest, and channel before any local
+asset step or Wrangler call. It never treats checked-in configuration or
+staging evidence as production containment.
+
 ## Strict sequence
 
 Do not advance on a failed or merely unavailable gate. The only valid order is:
@@ -90,7 +104,14 @@ Only after the owner has independently identified and reviewed the exact,
 non-production staging origin and resources may the owner run the mutating lane:
 
 ```sh
+npm --prefix apps/worker run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --phase pre_migration_compatibility \
+  --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+# Observe the deployed disabled revision and create the local proof receipt.
 npm --prefix apps/worker run staging:prepare -- \
+  --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
+  --receipt-file /owner-only/staging-disabled-worker-proof.json \
   --confirm PREPARE_DISABLED_STAGING
 npm --prefix apps/worker run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
@@ -205,14 +226,25 @@ node apps/worker/scripts/release-readiness.mjs \
 
 Require fresh health/readiness evidence for the canonical production service:
 enrollment disabled, all collection controls contained, no external
-participants authorized, and no unexpected redirect. This is the containment
-fence. The current live posture is uncontained until this owner action proves
-otherwise, regardless of checked-in vars or staging receipts.
+participants authorized, and no unexpected redirect. This is the observation
+used to construct the containment proof. The current live posture is
+uncontained until this owner action proves otherwise, regardless of checked-in
+vars or staging receipts. The observer output alone is not a revision receipt;
+the owner must verify and record the active Worker revision in the bounded local
+proof file.
 
 Only after that fence is recorded may the owner use the separately reviewed
 production activation procedure: deploy the reviewed `invite_only` beta
-configuration through `npm --prefix apps/worker run production:deploy` (never a
-generic `wrangler deploy`), issue only reviewed one-use invitations, and verify
+configuration through the receipt-gated command (never a generic `wrangler
+deploy`):
+
+```sh
+npm --prefix apps/worker run production:deploy -- \
+  --receipt-file /owner-only/production-containment-proof.json \
+  --confirm DEPLOY_CONTAINED_PRODUCTION
+```
+
+Then issue only reviewed one-use invitations, and verify
 the exact live beta health/readiness and control receipt. The beta must remain
 non-public, publication-disabled, rate-bounded, and limited to the approved
 cohort. Do not put invitation secrets or OAuth material in receipts.

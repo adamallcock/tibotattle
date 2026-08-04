@@ -164,10 +164,19 @@ identifiers.
 
 ## Stage 3: prepare contained remote storage
 
-This is a remote mutation and requires the exact confirmation:
+Deploy the compatible disabled Worker first, observe its active revision and
+contained health, and retain the owner-supplied local proof. Only then is this
+remote migration mutation reachable and it requires the exact confirmation:
 
 ```sh
-npm run staging:prepare -- --confirm PREPARE_DISABLED_STAGING
+npm run staging:deploy -- \
+  --origin https://EXACT-STAGING-HOST \
+  --phase pre_migration_compatibility \
+  --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
+npm run staging:prepare -- \
+  --origin https://EXACT-STAGING-HOST \
+  --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --confirm PREPARE_DISABLED_STAGING
 ```
 
 The command applies both migration streams, forces all collection controls to
@@ -467,10 +476,14 @@ When collection integrity, privacy, billing, or lifecycle state is uncertain:
    fence, use the exact-revision fence-recovery command above. Otherwise, if
    the current pilot revision is known, run `pilot:control --action pause` with
    the exact pause confirmation. If the control state cannot be verified,
-   re-run the contained preparation command:
+   re-run the contained preparation command only with a fresh compatible
+   Worker proof:
 
    ```sh
-   npm run staging:prepare -- --confirm PREPARE_DISABLED_STAGING
+   npm run staging:prepare -- \
+     --origin https://EXACT-STAGING-HOST \
+     --receipt-file /owner-only/staging-disabled-worker-proof.json \
+     --confirm PREPARE_DISABLED_STAGING
    ```
 
 3. Confirm `/api/health` reports all four controls contained.

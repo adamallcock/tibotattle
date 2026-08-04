@@ -11,6 +11,10 @@ import {
   STAGING_PROOF_TYPES,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
+import {
+  readDeploymentProof,
+  validateDeploymentProof,
+} from "./deployment-proof.mjs";
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
 
@@ -121,6 +125,10 @@ function containAndVerify({
 export function prepareDisabledStaging({
   config,
   confirmation,
+  stagingOrigin,
+  deploymentProof,
+  expectedSourceCommit = null,
+  deploymentProofCheck = null,
   wrangler,
   workerDirectory,
   spawn = spawnSync,
@@ -128,6 +136,13 @@ export function prepareDisabledStaging({
   if (confirmation !== PREPARE_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
   }
+  const proofCheck = deploymentProofCheck ?? validateDeploymentProof({
+    proof: deploymentProof,
+    kind: "staging",
+    expectedOrigin: stagingOrigin,
+    expectedSourceCommit,
+  });
+  if (!proofCheck.ok) return proofCheck;
   let before;
   try {
     before = probeStagingLive({
@@ -291,9 +306,13 @@ export function prepareDisabledStaging({
 }
 
 async function main() {
-  if (process.argv.length !== 4 || process.argv[2] !== "--confirm") {
+  if (process.argv.length !== 8
+      || process.argv[2] !== "--origin"
+      || process.argv[4] !== "--receipt-file"
+      || process.argv[6] !== "--confirm") {
     process.stderr.write(
-      `Usage: prepare-disabled-staging.mjs --confirm ${PREPARE_CONFIRMATION}\n`,
+      "Usage: prepare-disabled-staging.mjs --origin https://HOST "
+        + `--receipt-file /owner-only/path --confirm ${PREPARE_CONFIRMATION}\n`,
     );
     process.exit(2);
   }
@@ -309,9 +328,26 @@ async function main() {
       ".bin",
       process.platform === "win32" ? "wrangler.cmd" : "wrangler",
     );
+    const sourceCommitResult = spawnSync(
+      "/usr/bin/git",
+      ["-C", dirname(workerDirectory), "rev-parse", "HEAD"],
+      { encoding: "utf8" },
+    );
+    const expectedSourceCommit = sourceCommitResult.status === 0
+      ? sourceCommitResult.stdout.trim()
+      : "source-revision-unavailable";
+    const deploymentProofCheck = await readDeploymentProof({
+      filename: process.argv[5],
+      kind: "staging",
+      expectedOrigin: process.argv[3],
+      expectedSourceCommit,
+    });
     result = prepareDisabledStaging({
       config,
-      confirmation: process.argv[3],
+      confirmation: process.argv[7],
+      stagingOrigin: process.argv[3],
+      expectedSourceCommit,
+      deploymentProofCheck,
       wrangler,
       workerDirectory,
     });

@@ -15,6 +15,8 @@ import {
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 
 export const DEPLOY_CONFIRMATION = "DEPLOY_DISABLED_STAGING";
+export const COMPATIBLE_DEPLOY_CONFIRMATION =
+  "DEPLOY_COMPATIBLE_DISABLED_STAGING";
 
 async function validStagingSecretsFile(filename) {
   if (!filename) return false;
@@ -112,6 +114,7 @@ export async function runDisabledStagingDeployment({
   config,
   origin,
   confirmation,
+  phase = "final",
   wrangler,
   workerDirectory,
   secretsFile = null,
@@ -120,7 +123,16 @@ export async function runDisabledStagingDeployment({
   checkWorkspacePackages = checkLocalWorkspacePackages,
   stageAssets = stageProductionAssets,
 }) {
-  if (confirmation !== DEPLOY_CONFIRMATION) {
+  if (![
+    "final",
+    "pre_migration_compatibility",
+  ].includes(phase)) {
+    return { ok: false, code: "STAGING_DEPLOY_PHASE_INVALID" };
+  }
+  const compatiblePhase = phase === "pre_migration_compatibility";
+  if (confirmation !== (compatiblePhase
+    ? COMPATIBLE_DEPLOY_CONFIRMATION
+    : DEPLOY_CONFIRMATION)) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
   }
   let parsedOrigin;
@@ -151,6 +163,33 @@ export async function runDisabledStagingDeployment({
     await stageAssets();
   } catch {
     return { ok: false, code: "STAGING_PUBLIC_ASSETS_INVALID" };
+  }
+
+  if (compatiblePhase) {
+    const deployment = spawn(
+      wrangler,
+      ["deploy", "--env", "staging", "--strict"],
+      {
+        cwd: workerDirectory,
+        encoding: "utf8",
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    );
+    if (deployment.error || deployment.status !== 0) {
+      return { ok: false, code: "STAGING_COMPATIBLE_DEPLOY_FAILED" };
+    }
+    if (!deployedWorkersDevOrigins(
+      `${deployment.stdout ?? ""}\n${deployment.stderr ?? ""}`,
+    ).includes(parsedOrigin.origin)) {
+      return { ok: false, code: "STAGING_DEPLOY_ORIGIN_MISMATCH" };
+    }
+    return {
+      ok: true,
+      code: "COMPATIBLE_DISABLED_STAGING_DEPLOYED",
+      collectionAuthorized: false,
+      receiptRequired: true,
+      liveContainmentObserved: false,
+    };
   }
 
   const readiness = probeStagingLive({
@@ -281,11 +320,16 @@ async function main() {
     if (!value || value.startsWith("--")) return null;
     return value;
   }
-  if (process.argv.length !== 6
+  if (![6, 8].includes(process.argv.length)
       || process.argv[2] !== "--origin"
-      || process.argv[4] !== "--confirm") {
+      || (process.argv.length === 6 && process.argv[4] !== "--confirm")
+      || (process.argv.length === 8
+        && (process.argv[4] !== "--phase"
+          || process.argv[6] !== "--confirm"))) {
     process.stderr.write(
-      `Usage: deploy-disabled-staging.mjs --origin https://HOST --confirm ${DEPLOY_CONFIRMATION}\n`,
+      "Usage: deploy-disabled-staging.mjs --origin https://HOST "
+        + `[--phase pre_migration_compatibility --confirm ${COMPATIBLE_DEPLOY_CONFIRMATION}`
+        + `|--confirm ${DEPLOY_CONFIRMATION}]\n`,
     );
     process.exit(2);
   }
@@ -302,6 +346,7 @@ async function main() {
     config,
     origin: option("--origin"),
     confirmation: option("--confirm"),
+    phase: option("--phase") ?? "final",
     wrangler,
     workerDirectory,
     secretsFile: join(workerDirectory, ".dev.vars.staging"),

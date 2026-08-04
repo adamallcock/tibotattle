@@ -246,7 +246,6 @@ export function validateWorkerDeploymentEndpointGates(workerPackage) {
   }
   for (const script of [
     "deploy:dry",
-    "production:deploy",
     "production:deploy:dry",
     "staging:check",
     "staging:deploy",
@@ -255,6 +254,12 @@ export function validateWorkerDeploymentEndpointGates(workerPackage) {
         || !scripts[script].includes("npm run deployment:endpoints:check")) {
       fail(`${script} must run the deployment endpoint checker before Wrangler`);
     }
+  }
+  if (scripts["production:deploy"]
+      !== "node ./scripts/production-deploy.mjs") {
+    fail(
+      "production:deploy must use the receipt-gated production deployment wrapper",
+    );
   }
   return Object.freeze({
     checkedScripts: Object.freeze([
