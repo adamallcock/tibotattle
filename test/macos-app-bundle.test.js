@@ -2261,6 +2261,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(swiftSources.relativeFiles, [
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
+    "apps/macos/Sources/QuotaNotifications.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
     "apps/macos/UsageMonitorApp.swift",
   ]);
@@ -3297,6 +3298,20 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     assert.match(
       menuBarSmoke.stdout,
       /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation$/mu,
+    );
+    const quotaNotificationSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--quota-notification-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      quotaNotificationSmoke.status,
+      0,
+      quotaNotificationSmoke.stderr || quotaNotificationSmoke.stdout,
+    );
+    assert.match(
+      quotaNotificationSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_QUOTA_NOTIFICATION_CONTRACT opt_in=true fresh_only=true first_sample=false threshold=true reset_schedule_suppressed=true reset_identity_gate=true dedupe=true opt_out=true$/mu,
     );
     const nativeDashboardLayoutSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

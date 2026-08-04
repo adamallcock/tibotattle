@@ -15,6 +15,10 @@ enum TiboTattleLocalization {
         case menuQuitProduct = "menu.quitProduct"
         case menuSelectAll = "menu.selectAll"
         case menuSettings = "menu.settings"
+        case notificationAllowanceThresholdBody = "notification.allowanceThresholdBody"
+        case notificationAllowanceTitle = "notification.allowanceTitle"
+        case notificationResetBody = "notification.resetBody"
+        case notificationResetTitle = "notification.resetTitle"
         case settingsAboutProduct = "settings.aboutProduct"
         case settingsAboutTab = "settings.aboutTab"
         case settingsAboutSummary = "settings.aboutSummary"
@@ -33,6 +37,36 @@ enum TiboTattleLocalization {
         case settingsLanguage = "settings.language"
         case settingsLanguageSummary = "settings.languageSummary"
         case settingsLanguageSystem = "settings.languageSystem"
+        case settingsNotifications = "settings.notifications"
+        case settingsNotificationsDetail = "settings.notificationsDetail"
+        case settingsNotificationsOff = "settings.notificationsOff"
+        case settingsNotificationsPermissionDenied = "settings.notificationsPermissionDenied"
+        case settingsNotificationsPermissionUnknown = "settings.notificationsPermissionUnknown"
+        case settingsNotificationsReasonInferred = "settings.notificationsReasonInferred"
+        case settingsNotificationsReasonLogDerived = "settings.notificationsReasonLogDerived"
+        case settingsNotificationsReasonMixedSource = "settings.notificationsReasonMixedSource"
+        case settingsNotificationsReasonProviderUnavailable = "settings.notificationsReasonProviderUnavailable"
+        case settingsNotificationsReasonRefreshFailed = "settings.notificationsReasonRefreshFailed"
+        case settingsNotificationsReasonResetProofMissing = "settings.notificationsReasonResetProofMissing"
+        case settingsNotificationsReasonSchemaChanged = "settings.notificationsReasonSchemaChanged"
+        case settingsNotificationsReasonStale = "settings.notificationsReasonStale"
+        case settingsNotificationsReasonUnknown = "settings.notificationsReasonUnknown"
+        case settingsNotificationsReasonUnobserved = "settings.notificationsReasonUnobserved"
+        case settingsNotificationsStatusDeliveryUnavailable = "settings.notificationsStatusDeliveryUnavailable"
+        case settingsNotificationsStatusDelivered = "settings.notificationsStatusDelivered"
+        case settingsNotificationsStatusFirstObservation = "settings.notificationsStatusFirstObservation"
+        case settingsNotificationsStatusFreshOnly = "settings.notificationsStatusFreshOnly"
+        case settingsNotificationsStatusIneligible = "settings.notificationsStatusIneligible"
+        case settingsNotificationsStatusNoCrossing = "settings.notificationsStatusNoCrossing"
+        case settingsNotificationsStatusStateUnavailable = "settings.notificationsStatusStateUnavailable"
+        case settingsNotificationsStatusWaitingPermission = "settings.notificationsStatusWaitingPermission"
+        case settingsNotificationsThresholds = "settings.notificationsThresholds"
+        case settingsNotificationsThresholdsEightyAndNinety = "settings.notificationsThresholdsEightyAndNinety"
+        case settingsNotificationsThresholdsNinety = "settings.notificationsThresholdsNinety"
+        case settingsNotificationsThresholdsOff = "settings.notificationsThresholdsOff"
+        case settingsNotificationsToggleTooltip = "settings.notificationsToggleTooltip"
+        case settingsNotificationsReset = "settings.notificationsReset"
+        case settingsNotificationsResetDetail = "settings.notificationsResetDetail"
         case settingsOpenDashboard = "settings.openDashboard"
         case settingsPreviewUpdatesPending = "settings.previewUpdatesPending"
         case settingsPreviewUpdatesPendingMessage = "settings.previewUpdatesPendingMessage"
@@ -59,6 +93,14 @@ enum TiboTattleLocalization {
                 "Select All"
             case .menuSettings:
                 "Settings…"
+            case .notificationAllowanceThresholdBody:
+                "A fresh provider-reported allowance observation crossed your %d%% usage alert. Open TiboTattle for details."
+            case .notificationAllowanceTitle:
+                "Allowance alert"
+            case .notificationResetBody:
+                "A fresh provider-reported allowance window changed. Open TiboTattle for details."
+            case .notificationResetTitle:
+                "New allowance window observed"
             case .settingsAboutProduct:
                 "About %@"
             case .settingsAboutTab:
@@ -95,6 +137,66 @@ enum TiboTattleLocalization {
                 "Uses the Mac language when available; regional formats follow this Mac."
             case .settingsLanguageSystem:
                 "System"
+            case .settingsNotifications:
+                "Local allowance notifications"
+            case .settingsNotificationsDetail:
+                "Optional and local-only. TiboTattle evaluates these only after its existing foreground refresh receives fresh provider-reported quota evidence; it adds no daemon, login item, timer, or network polling."
+            case .settingsNotificationsOff:
+                "Notifications are off. Turn this switch off at any time to stop future local alerts and clear their local pending state."
+            case .settingsNotificationsPermissionDenied:
+                "Enabled, but macOS notification permission is denied. No alerts will be sent. Change it in System Settings if you want alerts."
+            case .settingsNotificationsPermissionUnknown:
+                "Enabled, but macOS notification permission is unavailable or unknown. No alerts will be sent."
+            case .settingsNotificationsReasonInferred:
+                "the value was inferred rather than provider-reported"
+            case .settingsNotificationsReasonLogDerived:
+                "the value came from logs rather than the direct provider read"
+            case .settingsNotificationsReasonMixedSource:
+                "the evidence mixed sources"
+            case .settingsNotificationsReasonProviderUnavailable:
+                "the provider was unavailable"
+            case .settingsNotificationsReasonRefreshFailed:
+                "the foreground refresh did not finish"
+            case .settingsNotificationsReasonResetProofMissing:
+                "the provider did not prove a new reset identity"
+            case .settingsNotificationsReasonSchemaChanged:
+                "the provider receipt did not match the supported evidence schema"
+            case .settingsNotificationsReasonStale:
+                "the observation was stale"
+            case .settingsNotificationsReasonUnknown:
+                "the evidence was unknown"
+            case .settingsNotificationsReasonUnobserved:
+                "no fresh direct provider observation was available"
+            case .settingsNotificationsStatusDeliveryUnavailable:
+                "Enabled. The latest eligible alert could not be delivered, so TiboTattle will not retry it automatically."
+            case .settingsNotificationsStatusDelivered:
+                "Enabled. One local alert was delivered from the latest fresh provider observation."
+            case .settingsNotificationsStatusFirstObservation:
+                "Enabled. A fresh provider observation established the local baseline; first observations never notify."
+            case .settingsNotificationsStatusFreshOnly:
+                "Enabled. Waiting for a fresh direct provider observation from the next foreground refresh."
+            case .settingsNotificationsStatusIneligible:
+                "Enabled. No notification was sent because %@."
+            case .settingsNotificationsStatusNoCrossing:
+                "Enabled. The latest fresh provider observation did not newly cross an enabled threshold or prove a new reset identity."
+            case .settingsNotificationsStatusStateUnavailable:
+                "Notifications are unavailable because their owner-only local state could not be read or written."
+            case .settingsNotificationsStatusWaitingPermission:
+                "Enabled. macOS notification permission has not been granted, so no alerts will be sent."
+            case .settingsNotificationsThresholds:
+                "Usage alerts"
+            case .settingsNotificationsThresholdsEightyAndNinety:
+                "80% and 90%"
+            case .settingsNotificationsThresholdsNinety:
+                "90% only"
+            case .settingsNotificationsThresholdsOff:
+                "Off"
+            case .settingsNotificationsToggleTooltip:
+                "Enable optional local notifications from fresh provider-reported quota evidence."
+            case .settingsNotificationsReset:
+                "New allowance window (currently unavailable)"
+            case .settingsNotificationsResetDetail:
+                "The current provider receipt gives a reset schedule, not a reset identity, so reset alerts are unavailable. Scheduled times and percentage drops never trigger an alert."
             case .settingsOpenDashboard:
                 "Open Dashboard"
             case .settingsPreviewUpdatesPending:

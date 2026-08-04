@@ -52,10 +52,25 @@ a clean-profile smoke all succeed.
    production appcast. Automatic update downloads are controlled by one native
    switch in **Settings…** → **General**. Developer and ad-hoc builds contain
    no updater framework and perform no update networking.
-10. A trusted website or browser bookmark may use `usagemonitor://open` to
+10. **Settings…** → **General** also contains **Local allowance
+   notifications**. It is off by default; enabling it is the only action that
+   may request macOS notification permission. The first opt-in visibly selects
+   80% and 90% usage alerts. The new-window control remains visibly unavailable
+   because the current provider receipt supplies a reset schedule, not an
+   explicit reset identity; schedules and percentage drops never alert.
+   TiboTattle evaluates threshold alerts only
+   after the existing foreground refresh receives a fresh direct
+   `account/rateLimits/read` observation. Stale, inferred, mixed-source,
+   unobserved, unknown, forecast, time-only, and log-derived state never
+   alerts. Turn the same switch off to immediately stop future alerts and
+   clear only their local notification baseline, pending-request, and dedupe
+   state; it does not erase accounting evidence. This feature adds no daemon,
+   login item, timer, network polling, push service, or account identity that
+   leaves this Mac.
+11. A trusted website or browser bookmark may use `usagemonitor://open` to
    activate the app and open its loopback dashboard. All other hosts, paths,
    credentials, queries, and fragments in that custom scheme are rejected.
-11. Closing or quitting the native app stops the companion. No daemon or login
+12. Closing or quitting the native app stops the companion. No daemon or login
    item is installed. After an explicit reviewed first contribution, the user
    may enable six-hour contribution while the app remains open.
 
@@ -115,7 +130,7 @@ an invalid promise; the command records the resulting SHA-256 instead.
 ## Localization and regionalization foundation
 
 Native strings live in `Resources/en.lproj/Localizable.strings` under stable
-`menu.*` and `settings.*` keys. `Sources/Localization.swift` follows the
+`menu.*`, `settings.*`, and `notification.*` keys. `Sources/Localization.swift` follows the
 macOS preferred-language list, falls back to the English catalog when a locale
 or key is unavailable, and uses `Locale.current` for dates and numbers. Add a
 complete sibling locale such as `fr.lproj` only when its catalog and dashboard
@@ -381,8 +396,14 @@ disposable-VM rehearsal:
 5. verify the calm Ready state, Retry path, diagnostics copy and failure code,
    default/custom Codex source selection, exact
    configured app-open link, first scan, first reviewed contribution,
-   opt-in six-hour contribution schedule, **Check for Updates**, quit,
-   relaunch, and uninstall journey;
+   opt-in six-hour contribution schedule, **Check for Updates**, and the
+   notification Settings contract: off by default; permission requested only
+   after opting in; one controlled fresh direct-provider threshold crossing;
+   no alert for first, stale, inferred, mixed, unknown, unobserved, or failed
+   refresh evidence; confirm reset remains suppressed for the current
+   schedule-only provider receipt; and
+   opt-out stops future alerts without erasing accounting evidence; then quit,
+   relaunch, and complete the uninstall journey;
 6. verify no Login Item, LaunchAgent, daemon, unexpected network connection, or
    orphan companion remains; and
 7. retain the macOS version, hardware architecture, artifact SHA-256, elapsed

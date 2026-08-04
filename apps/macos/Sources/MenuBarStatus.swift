@@ -46,14 +46,14 @@ struct LocalCompanionOverview: Equatable {
 /// started it. The dashboard and the menu bar share one controller in the
 /// companion, so the menu bar can never start a second concurrent pass.
 enum LocalAnalysisActivity: Equatable {
-    case idle
-    case running
+    case idle(refreshID: String?)
+    case running(refreshID: String?)
 }
 
 /// Result of asking the companion to start the existing refresh pass.
 enum LocalAnalysisStart: Equatable {
-    case started
-    case alreadyRunning
+    case started(refreshID: String?)
+    case alreadyRunning(refreshID: String?)
     case rejected(String)
     case unreachable
 }
@@ -377,8 +377,11 @@ enum LocalCompanionOverviewProjection {
 /// short, size-capped, and never cached or written to disk. Results are
 /// delivered on the main queue so callers stay on one thread.
 final class LocalCompanionEvidenceReader {
-    private static let maximumResponseBytes = 32 * 1_024 * 1_024
-    private let session: URLSession
+    // Internal to the native source module so the fresh-only notification
+    // adapter can reuse this already-audited, loopback-only transport without
+    // opening a second session or adding any network route.
+    static let maximumResponseBytes = 32 * 1_024 * 1_024
+    let session: URLSession
 
     init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -452,12 +455,13 @@ final class LocalCompanionEvidenceReader {
         mutation.httpBody = Data(#"{"reason":"user_request"}"#.utf8)
         let task = session.dataTask(with: mutation) { data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode
+            let refreshID = data.flatMap(Self.decodeRefreshID)
             let result: LocalAnalysisStart
             switch status {
             case 202:
-                result = .started
+                result = .started(refreshID: refreshID)
             case 409:
-                result = .alreadyRunning
+                result = .alreadyRunning(refreshID: refreshID)
             case .some(let code):
                 let payload = data.flatMap {
                     try? JSONSerialization.jsonObject(with: $0)
@@ -476,7 +480,7 @@ final class LocalCompanionEvidenceReader {
         task.resume()
     }
 
-    private func request(_ url: URL, method: String) -> URLRequest {
+    func request(_ url: URL, method: String) -> URLRequest {
         var value = URLRequest(url: url)
         value.httpMethod = method
         value.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -487,7 +491,7 @@ final class LocalCompanionEvidenceReader {
     }
 
     /// Only ever addresses the loopback dashboard the companion published.
-    private func loopbackEndpoint(_ base: URL, path: String) -> URL? {
+    func loopbackEndpoint(_ base: URL, path: String) -> URL? {
         guard var components = URLComponents(
             url: base,
             resolvingAgainstBaseURL: false
@@ -510,7 +514,7 @@ final class LocalCompanionEvidenceReader {
         return "http://\(host):\(port)"
     }
 
-    private static func acceptedPayload(
+    static func acceptedPayload(
         _ data: Data?,
         _ response: URLResponse?
     ) -> Data? {
@@ -531,7 +535,30 @@ final class LocalCompanionEvidenceReader {
         else {
             return nil
         }
-        return ["running", "cancelling"].contains(status) ? .running : .idle
+        let refreshID = decodeRefreshID(refresh)
+        return ["running", "cancelling"].contains(status)
+            ? .running(refreshID: refreshID)
+            : .idle(refreshID: refreshID)
+    }
+
+    private static func decodeRefreshID(_ data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let refresh = root["refresh"] as? [String: Any]
+        else {
+            return nil
+        }
+        return decodeRefreshID(refresh)
+    }
+
+    private static func decodeRefreshID(_ refresh: [String: Any]) -> String? {
+        guard let value = refresh["refreshId"] as? String,
+              let uuid = UUID(uuidString: value),
+              uuid.uuidString.lowercased() == value
+        else {
+            return nil
+        }
+        return value
     }
 }
 
@@ -550,6 +577,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         /// Absent in a build with no updater, which omits the row rather than
         /// offering a check that can never find anything.
         var checkForUpdates: (() -> Void)?
+        /// Called exactly once when an existing companion refresh observed by
+        /// the menu reaches a terminal idle state. The app uses it only to
+        /// evaluate the just-finished receipt; it creates no new refresh.
+        var refreshFinished: ((String?) -> Void)? = nil
     }
 
     /// Background cadence while the companion is idle. A minute is cheap on
@@ -588,6 +619,11 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private var pendingPoll: DispatchWorkItem?
     private var lastAutomaticRefreshAt: Date?
     private var automaticRefreshInFlight = false
+    private var notificationEvaluationAwaitingRefresh = false
+    /// The opaque companion run token links a terminal receipt to the exact
+    /// existing refresh that this menu action observed. A missing or changed
+    /// token is deliberately passed on as `nil`, which suppresses alerts.
+    private var notificationEvaluationRefreshID: String?
     private var isMenuTracking = false
     private var refreshAfterMenuCloses = false
     private var structuralRebuildPending = false
@@ -689,6 +725,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         overviewResponseHealthy = false
         invalidateObservedEvidence()
         automaticRefreshInFlight = false
+        notificationEvaluationAwaitingRefresh = false
+        notificationEvaluationRefreshID = nil
         lastAutomaticRefreshAt = nil
         snapshot.phase = .ready
         snapshot.failureSummary = nil
@@ -704,6 +742,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         cancelPoll()
         overviewResponseHealthy = false
         automaticRefreshInFlight = false
+        notificationEvaluationAwaitingRefresh = false
+        notificationEvaluationRefreshID = nil
         lastAutomaticRefreshAt = nil
         invalidateObservedEvidence()
         snapshot.phase = .starting
@@ -721,6 +761,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         cancelPoll()
         overviewResponseHealthy = false
         automaticRefreshInFlight = false
+        notificationEvaluationAwaitingRefresh = false
+        notificationEvaluationRefreshID = nil
         lastAutomaticRefreshAt = nil
         invalidateObservedEvidence()
         snapshot.phase = .unavailable
@@ -733,6 +775,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         guard !stopped else { return }
         refreshAfterMenuCloses = false
         structuralRebuildPending = false
+        notificationEvaluationAwaitingRefresh = false
+        notificationEvaluationRefreshID = nil
         dismissMenu()
         stopped = true
         companionGeneration &+= 1
@@ -885,8 +929,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                   self.dashboardURL == dashboardURL
             else { return }
             switch result {
-            case .started, .alreadyRunning:
+            case let .started(refreshID), let .alreadyRunning(refreshID):
                 self.snapshot.phase = .analyzing
+                self.notificationEvaluationAwaitingRefresh = true
+                self.notificationEvaluationRefreshID = refreshID
             case .rejected:
                 self.snapshot.phase = self.dashboardURL == nil
                     ? .unavailable
@@ -940,9 +986,17 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             switch activity {
             case .running:
                 self.snapshot.phase = .analyzing
-            case .idle:
+            case let .idle(refreshID):
                 if self.overviewResponseHealthy {
                     self.snapshot.phase = .ready
+                }
+                if self.notificationEvaluationAwaitingRefresh {
+                    self.notificationEvaluationAwaitingRefresh = false
+                    let expectedRefreshID = self.notificationEvaluationRefreshID
+                    self.notificationEvaluationRefreshID = nil
+                    self.actions.refreshFinished?(
+                        refreshID == expectedRefreshID ? expectedRefreshID : nil
+                    )
                 }
             case .none:
                 break
@@ -1374,8 +1428,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             else { return }
             self.automaticRefreshInFlight = false
             switch result {
-            case .started, .alreadyRunning:
+            case let .started(refreshID), let .alreadyRunning(refreshID):
                 self.snapshot.phase = .analyzing
+                self.notificationEvaluationAwaitingRefresh = true
+                self.notificationEvaluationRefreshID = refreshID
             case .rejected:
                 self.snapshot.phase = self.dashboardURL == nil
                     ? .unavailable

@@ -373,7 +373,11 @@ No remaining gate below can be satisfied safely from this repository alone:
 - Intel Macs, Windows, and Linux consumer installers.
 - Automatic updates, silent downloads, login items, daemons, or background
   uploads.
-- Email or push notifications and the identity collection they require.
+- Email or remote push notifications and the identity collection they require.
+  This does not describe the later native macOS local-only allowance alert:
+  that opt-in feature has no email/push identity, no daemon, and evaluates only
+  fresh direct provider evidence while the app's existing foreground refresh
+  runs.
 - Automatic public community publication below its privacy threshold.
 - Claude collection in the consumer pilot.
 - Ordinary ChatGPT chat, Chat Voice, Excel, and other surfaces are not

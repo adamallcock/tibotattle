@@ -1470,7 +1470,12 @@ test("server rejects forged hosts and requires same-origin refresh authorization
       body: JSON.stringify({ reason: "user_request" }),
     });
     assert.equal(started.status, 202);
-    assert.equal((await started.json()).refresh.status, "running");
+    const startedPayload = await started.json();
+    assert.equal(startedPayload.refresh.status, "running");
+    assert.match(
+      startedPayload.refresh.refreshId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
 
     const duplicate = await fetch(`${base}/api/local/refresh`, {
       method: "POST",
@@ -1478,12 +1483,18 @@ test("server rejects forged hosts and requires same-origin refresh authorization
       body: "{}",
     });
     assert.equal(duplicate.status, 409);
+    const duplicatePayload = await duplicate.json();
+    assert.equal(
+      duplicatePayload.refresh.refreshId,
+      startedPayload.refresh.refreshId,
+    );
     resolveRefresh();
     await waitFor(async () => {
       const status = await fetch(`${base}/api/local/refresh`).then((response) => response.json());
       return status.refresh.status === "succeeded";
     });
     const completed = await fetch(`${base}/api/local/refresh`).then((response) => response.json());
+    assert.equal(completed.refresh.refreshId, startedPayload.refresh.refreshId);
     assert.deepEqual(completed.refresh.result, {
       rolloutRecordsWritten: 2,
       filesDiscovered: 3,

@@ -1835,11 +1835,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
     private weak var settingsAutomaticUpdatesDetailLabel: NSTextField?
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
+    private weak var settingsQuotaNotificationsSwitch: NSSwitch?
+    private weak var settingsQuotaNotificationThresholds: NSSegmentedControl?
+    private weak var settingsQuotaNotificationResetSwitch: NSSwitch?
+    private weak var settingsQuotaNotificationStatusLabel: NSTextField?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
+    private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    /// Opaque companion token for the particular refresh this surface started
+    /// or joined. It is never persisted or exposed in UI/notification text.
+    private var nativeRefreshID: String?
     private static let nativeRefreshIntervalSeconds = 300
     private let statusLabel = NSTextField(labelWithString: "Starting locally…")
     private let detailLabel = NSTextField(
@@ -1925,6 +1933,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 }
                 try markFirstRunCompleted(stateRoot: stateRoot)
             }
+            let notificationCoordinator = QuotaNotificationCoordinator(
+                stateStore: OwnerOnlyQuotaNotificationStateStore(
+                    stateRoot: stateRoot
+                ),
+                notificationCenter: UNUserNotificationCenterAdapter()
+            )
+            notificationCoordinator.onPresentationChange = { [weak self] in
+                self?.updateQuotaNotificationSettingsControls()
+            }
+            quotaNotificationCoordinator = notificationCoordinator
+            // This reads the current system setting only. The permission
+            // dialog is requested later, and only after a Settings opt-in.
+            notificationCoordinator.refreshAuthorization()
             firstRunAcknowledged = true
             // Sparkle is intentionally started only after the first-run
             // disclosure has been accepted, including for releases that
@@ -1943,6 +1964,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         startCompanion()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Read-only resynchronization after a user changes notification
+        // permission in System Settings. This path cannot prompt by itself.
+        quotaNotificationCoordinator?.refreshAuthorization()
+    }
+
     private func showFirstRunDisclosure() -> Bool {
         let alert = NSAlert()
         alert.messageText = "Welcome to \(BundledProduct.displayName)"
@@ -1954,6 +1981,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         Stores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only \(BundledProduct.displayName) app-data folder.
 
         Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
+
+        Local allowance notifications are also off by default. If you later enable them in Settings, threshold alerts stay on this Mac and evaluate only fresh provider-reported quota observations from the existing foreground refresh. Reset alerts remain unavailable until the provider supplies an explicit reset identity; reset schedules alone never alert. They do not add a timer, daemon, login item, or background network polling.
 
         \(updater.firstRunUpdatesDisclosure)
 
@@ -2294,14 +2323,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         nativeEvidenceReader.startAnalysis(base: dashboardURL) { [weak self] result in
             guard let self, !self.quitting else { return }
             switch result {
-            case .started, .alreadyRunning:
+            case let .started(refreshID), let .alreadyRunning(refreshID):
+                self.nativeRefreshID = refreshID
                 self.pollNativeRefresh(base: dashboardURL, remainingAttempts: 120)
             case .rejected:
+                self.quotaNotificationCoordinator?.recordIneligible(
+                    .refreshFailed
+                )
                 self.finishNativeRefresh(
                     title: "Update unavailable",
                     refreshEnabled: true
                 )
             case .unreachable:
+                self.quotaNotificationCoordinator?.recordIneligible(
+                    .providerUnavailable
+                )
                 self.finishNativeRefresh(
                     title: "Local companion unavailable",
                     refreshEnabled: false
@@ -2320,12 +2356,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 guard let self, !self.quitting, self.nativeRefreshInFlight else {
                     return
                 }
-                if activity == .running, remainingAttempts > 0 {
-                    self.pollNativeRefresh(
-                        base: base,
-                        remainingAttempts: remainingAttempts - 1
-                    )
-                    return
+                let terminalRefreshID: String?
+                switch activity {
+                case .running:
+                    terminalRefreshID = nil
+                    if remainingAttempts > 0 {
+                        self.pollNativeRefresh(
+                            base: base,
+                            remainingAttempts: remainingAttempts - 1
+                        )
+                        return
+                    }
+                case let .idle(refreshID):
+                    terminalRefreshID = refreshID
+                case .none:
+                    terminalRefreshID = nil
                 }
                 self.nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
                     guard let self, !self.quitting else { return }
@@ -2340,6 +2385,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                     } else {
                         title = "No allowance observed yet"
                     }
+                    let expectedRefreshID = terminalRefreshID == self.nativeRefreshID
+                        ? self.nativeRefreshID
+                        : nil
+                    self.evaluateQuotaNotificationsAfterRefresh(
+                        base: base,
+                        expectedRefreshID: expectedRefreshID
+                    )
                     self.finishNativeRefresh(title: title, refreshEnabled: true)
                 }
             }
@@ -2353,6 +2405,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
         nativeRefreshInFlight = false
+        nativeRefreshID = nil
         cancelNativeRefreshPoll()
         nativeDashboardChrome?.updateSyncStatus(
             title: title,
@@ -2360,6 +2413,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             refreshEnabled: refreshEnabled
         )
         scheduleNativeRefresh()
+    }
+
+    /// The notification coordinator only observes the terminal receipt from
+    /// this pre-existing foreground refresh. It never starts a refresh,
+    /// schedules a wake-up, or reads dashboard/ledger state as a substitute.
+    private func evaluateQuotaNotificationsAfterRefresh(
+        base: URL? = nil,
+        expectedRefreshID: String? = nil
+    ) {
+        guard !quitting,
+              let quotaNotificationCoordinator,
+              let refreshBase = base ?? dashboardURL
+        else {
+            return
+        }
+        guard let expectedRefreshID else {
+            quotaNotificationCoordinator.recordIneligible(.unobserved)
+            return
+        }
+        quotaNotificationCoordinator.evaluate(
+            using: nativeEvidenceReader,
+            base: refreshBase,
+            expectedRefreshID: expectedRefreshID
+        )
     }
 
     private func cancelNativeRefreshPoll() {
@@ -2488,6 +2565,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         openInBrowserButton.isEnabled = false
         cancelNativeRefreshPoll()
         nativeRefreshInFlight = false
+        nativeRefreshID = nil
         dashboardWebHost?.stop()
     }
 
@@ -2535,7 +2613,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 // updater passes nothing and the row is left out.
                 checkForUpdates: updater.isAvailable
                     ? { [weak self] in self?.updater.checkForUpdates(nil) }
-                    : nil
+                    : nil,
+                refreshFinished: { [weak self] refreshID in
+                    self?.evaluateQuotaNotificationsAfterRefresh(
+                        expectedRefreshID: refreshID
+                    )
+                }
             )
         )
     }
@@ -2792,6 +2875,149 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             automaticUpdatesSettingsSummary()
     }
 
+    private func quotaNotificationSettingsSummary() -> String {
+        guard let coordinator = quotaNotificationCoordinator else {
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusStateUnavailable
+            )
+        }
+        switch coordinator.presentation.status {
+        case .disabled:
+            return TiboTattleLocalization.string(.settingsNotificationsOff)
+        case .stateUnavailable:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusStateUnavailable
+            )
+        case .awaitingPermission:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusWaitingPermission
+            )
+        case .permissionDenied:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsPermissionDenied
+            )
+        case .permissionUnknown:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsPermissionUnknown
+            )
+        case .waitingForFreshProviderEvidence:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusFreshOnly
+            )
+        case let .ineligible(reason):
+            return TiboTattleLocalization.format(
+                .settingsNotificationsStatusIneligible,
+                quotaNotificationIneligibilitySummary(reason)
+            )
+        case .firstObservationStored:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusFirstObservation
+            )
+        case .noNewCrossing:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusNoCrossing
+            )
+        case .delivered:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusDelivered
+            )
+        case .deliveryUnavailable:
+            return TiboTattleLocalization.string(
+                .settingsNotificationsStatusDeliveryUnavailable
+            )
+        }
+    }
+
+    private func quotaNotificationIneligibilitySummary(
+        _ reason: QuotaNotificationIneligibility
+    ) -> String {
+        let key: TiboTattleLocalization.Key
+        switch reason {
+        case .refreshFailed:
+            key = .settingsNotificationsReasonRefreshFailed
+        case .providerUnavailable:
+            key = .settingsNotificationsReasonProviderUnavailable
+        case .stale:
+            key = .settingsNotificationsReasonStale
+        case .inferred:
+            key = .settingsNotificationsReasonInferred
+        case .mixedSource:
+            key = .settingsNotificationsReasonMixedSource
+        case .unobserved:
+            key = .settingsNotificationsReasonUnobserved
+        case .unknown:
+            key = .settingsNotificationsReasonUnknown
+        case .logDerived:
+            key = .settingsNotificationsReasonLogDerived
+        case .schemaChanged:
+            key = .settingsNotificationsReasonSchemaChanged
+        case .resetProofMissing:
+            key = .settingsNotificationsReasonResetProofMissing
+        }
+        return TiboTattleLocalization.string(key)
+    }
+
+    private func updateQuotaNotificationSettingsControls() {
+        guard let coordinator = quotaNotificationCoordinator else {
+            settingsQuotaNotificationsSwitch?.isEnabled = false
+            settingsQuotaNotificationThresholds?.isEnabled = false
+            settingsQuotaNotificationResetSwitch?.isEnabled = false
+            settingsQuotaNotificationStatusLabel?.stringValue =
+                quotaNotificationSettingsSummary()
+            return
+        }
+        let presentation = coordinator.presentation
+        settingsQuotaNotificationsSwitch?.isEnabled =
+            presentation.status != .stateUnavailable
+        settingsQuotaNotificationsSwitch?.state = presentation.enabled
+            ? .on
+            : .off
+        let selectedSegment: Int
+        switch presentation.thresholdMode {
+        case .off:
+            selectedSegment = 0
+        case .ninety:
+            selectedSegment = 1
+        case .eightyAndNinety:
+            selectedSegment = 2
+        }
+        settingsQuotaNotificationThresholds?.selectedSegment = selectedSegment
+        settingsQuotaNotificationThresholds?.isEnabled = presentation.enabled
+        settingsQuotaNotificationResetSwitch?.state = presentation.resetEnabled
+            ? .on
+            : .off
+        settingsQuotaNotificationResetSwitch?.isEnabled =
+            presentation.enabled && presentation.resetAvailable
+        settingsQuotaNotificationStatusLabel?.stringValue =
+            quotaNotificationSettingsSummary()
+    }
+
+    @objc private func toggleQuotaNotifications(_ sender: NSSwitch) {
+        quotaNotificationCoordinator?.setEnabled(sender.state == .on)
+        updateQuotaNotificationSettingsControls()
+    }
+
+    @objc private func selectQuotaNotificationThresholds(
+        _ sender: NSSegmentedControl
+    ) {
+        let mode: QuotaNotificationThresholdMode
+        switch sender.selectedSegment {
+        case 1:
+            mode = .ninety
+        case 2:
+            mode = .eightyAndNinety
+        default:
+            mode = .off
+        }
+        quotaNotificationCoordinator?.setThresholdMode(mode)
+        updateQuotaNotificationSettingsControls()
+    }
+
+    @objc private func toggleQuotaNotificationReset(_ sender: NSSwitch) {
+        quotaNotificationCoordinator?.setResetEnabled(sender.state == .on)
+        updateQuotaNotificationSettingsControls()
+    }
+
     @objc private func showSettingsWindow() {
         showSettings(selecting: 0)
     }
@@ -2805,6 +3031,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
+            quotaNotificationCoordinator?.refreshAuthorization()
+            updateQuotaNotificationSettingsControls()
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -2910,6 +3138,105 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         automaticUpdatesSection.orientation = .vertical
         automaticUpdatesSection.alignment = .leading
         automaticUpdatesSection.spacing = 6
+        let quotaNotificationsSwitch = NSSwitch()
+        quotaNotificationsSwitch.target = self
+        quotaNotificationsSwitch.action = #selector(toggleQuotaNotifications(_:))
+        quotaNotificationsSwitch.toolTip = TiboTattleLocalization.string(
+            .settingsNotificationsToggleTooltip
+        )
+        settingsQuotaNotificationsSwitch = quotaNotificationsSwitch
+        let quotaNotificationsHeading = settingsLabel(
+            TiboTattleLocalization.string(.settingsNotifications),
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor
+        )
+        let quotaNotificationsHeader = NSStackView(views: [
+            quotaNotificationsHeading,
+            quotaNotificationsSwitch,
+        ])
+        quotaNotificationsHeader.orientation = .horizontal
+        quotaNotificationsHeader.alignment = .centerY
+        quotaNotificationsHeader.spacing = 12
+        let quotaNotificationThresholds = NSSegmentedControl(
+            labels: [
+                TiboTattleLocalization.string(
+                    .settingsNotificationsThresholdsOff
+                ),
+                TiboTattleLocalization.string(
+                    .settingsNotificationsThresholdsNinety
+                ),
+                TiboTattleLocalization.string(
+                    .settingsNotificationsThresholdsEightyAndNinety
+                ),
+            ],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(selectQuotaNotificationThresholds(_:))
+        )
+        quotaNotificationThresholds.segmentStyle = .rounded
+        quotaNotificationThresholds.toolTip = TiboTattleLocalization.string(
+            .settingsNotificationsThresholds
+        )
+        settingsQuotaNotificationThresholds = quotaNotificationThresholds
+        let quotaNotificationThresholdRow = NSStackView(views: [
+            settingsLabel(
+                TiboTattleLocalization.string(.settingsNotificationsThresholds),
+                font: .systemFont(ofSize: 13, weight: .medium),
+                color: .labelColor
+            ),
+            quotaNotificationThresholds,
+        ])
+        quotaNotificationThresholdRow.orientation = .horizontal
+        quotaNotificationThresholdRow.alignment = .centerY
+        quotaNotificationThresholdRow.spacing = 12
+        let quotaNotificationResetSwitch = NSSwitch()
+        quotaNotificationResetSwitch.target = self
+        quotaNotificationResetSwitch.action = #selector(
+            toggleQuotaNotificationReset(_:)
+        )
+        quotaNotificationResetSwitch.toolTip = TiboTattleLocalization.string(
+            .settingsNotificationsResetDetail
+        )
+        settingsQuotaNotificationResetSwitch = quotaNotificationResetSwitch
+        let quotaNotificationResetRow = NSStackView(views: [
+            settingsLabel(
+                TiboTattleLocalization.string(.settingsNotificationsReset),
+                font: .systemFont(ofSize: 13, weight: .medium),
+                color: .labelColor
+            ),
+            quotaNotificationResetSwitch,
+        ])
+        quotaNotificationResetRow.orientation = .horizontal
+        quotaNotificationResetRow.alignment = .centerY
+        quotaNotificationResetRow.spacing = 12
+        let quotaNotificationStatus = settingsLabel(
+            quotaNotificationSettingsSummary(),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        quotaNotificationStatus.maximumNumberOfLines = 3
+        settingsQuotaNotificationStatusLabel = quotaNotificationStatus
+        let quotaNotificationsSection = NSStackView(views: [
+            quotaNotificationsHeader,
+            settingsLabel(
+                TiboTattleLocalization.string(.settingsNotificationsDetail),
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            ),
+            quotaNotificationThresholdRow,
+            quotaNotificationResetRow,
+            settingsLabel(
+                TiboTattleLocalization.string(
+                    .settingsNotificationsResetDetail
+                ),
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            ),
+            quotaNotificationStatus,
+        ])
+        quotaNotificationsSection.orientation = .vertical
+        quotaNotificationsSection.alignment = .leading
+        quotaNotificationsSection.spacing = 6
         let general = settingsPage(
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
@@ -2917,6 +3244,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 languageSection,
                 sourceSection,
                 automaticUpdatesSection,
+                quotaNotificationsSection,
                 openDashboardFromSettings,
             ]
         )
@@ -3019,12 +3347,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let newWindow = NSWindow(contentViewController: tabs)
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
-        newWindow.setContentSize(NSSize(width: 620, height: 390))
-        newWindow.contentMinSize = NSSize(width: 560, height: 350)
+        newWindow.setContentSize(NSSize(width: 660, height: 560))
+        newWindow.contentMinSize = NSSize(width: 600, height: 480)
         newWindow.isReleasedWhenClosed = false
         newWindow.center()
         settingsWindow = newWindow
         settingsTabs = tabs
+        updateQuotaNotificationSettingsControls()
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -4135,6 +4464,11 @@ private struct UsageMonitorMain {
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {
                 MenuBarContractSmokeTest.run()
+            })
+        }
+        if arguments.contains("--quota-notification-contract-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                QuotaNotificationContractSmokeTest.run()
             })
         }
         if arguments.contains("--native-dashboard-layout-smoke-test") {

@@ -70,6 +70,143 @@ const REUSABLE_ACCOUNTING_CACHE = Object.freeze({
   }),
 });
 
+const FRESH_NOTIFICATION_EVIDENCE = Object.freeze({
+  schemaVersion: "tibotattle-notification-evidence-v2",
+  status: "fresh_provider_observation",
+  provider: "openai_codex",
+  source: "app_server_read",
+  freshness: "fresh",
+  observedAt: "2026-07-23T12:00:00.000Z",
+  continuityKey: "a".repeat(43),
+  windows: Object.freeze([Object.freeze({
+    lane: "primary",
+    usedPercent: 84,
+    durationMinutes: 10080,
+    resetAt: "2026-07-30T12:00:00.000Z",
+    resetProofKind: "provider_reported_schedule_only",
+  })]),
+});
+
+test("local refresh exposes only the closed fresh direct-provider notification receipt", async (t) => {
+  const validRunner = createLocalCollectorRefreshRunner({
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 0,
+      refresh: {
+        attempted: true,
+        recordWritten: true,
+        errorCode: null,
+        notificationEvidence: FRESH_NOTIFICATION_EVIDENCE,
+      },
+    }),
+  });
+  const valid = await validRunner();
+  assert.deepEqual(valid.notificationEvidence, FRESH_NOTIFICATION_EVIDENCE);
+  assert.equal(JSON.stringify(valid).includes("account"), false);
+  assert.equal(JSON.stringify(valid).includes("/private/"), false);
+
+  const expiredRunner = createLocalCollectorRefreshRunner({
+    clock: () => Date.parse("2026-07-23T12:05:00.001Z"),
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 0,
+      refresh: {
+        attempted: true,
+        recordWritten: true,
+        errorCode: null,
+        notificationEvidence: FRESH_NOTIFICATION_EVIDENCE,
+      },
+    }),
+  });
+  assert.equal(
+    Object.hasOwn(await expiredRunner(), "notificationEvidence"),
+    false,
+  );
+
+  for (const [name, notificationEvidence] of [
+    ["stale", { ...FRESH_NOTIFICATION_EVIDENCE, freshness: "stale" }],
+    ["mixed source", { ...FRESH_NOTIFICATION_EVIDENCE, source: "ledger" }],
+    ["inferred", { ...FRESH_NOTIFICATION_EVIDENCE, status: "inferred" }],
+    ["unknown duration", {
+      ...FRESH_NOTIFICATION_EVIDENCE,
+      windows: [{
+        ...FRESH_NOTIFICATION_EVIDENCE.windows[0],
+        durationMinutes: 60,
+      }],
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const runner = createLocalCollectorRefreshRunner({
+        selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+        runCollector: async () => ({
+          rolloutRecordsWritten: 0,
+          filesDiscovered: 0,
+          refresh: {
+            attempted: true,
+            recordWritten: true,
+            errorCode: null,
+            notificationEvidence,
+          },
+        }),
+      });
+      const result = await runner();
+      assert.equal(Object.hasOwn(result, "notificationEvidence"), false);
+    });
+  }
+});
+
+test("refresh controller binds every terminal receipt to one opaque refresh run", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const refreshIds = [
+    "10000000-0000-4000-8000-000000000000",
+    "20000000-0000-4000-8000-000000000000",
+  ];
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => {
+      await gate;
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        quotaRefresh: { attempted: true, recordWritten: true, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      };
+    },
+    dataStore: { async reload() {} },
+    createRefreshId: () => refreshIds.shift(),
+  });
+
+  assert.equal(controller.start(), true);
+  const firstId = controller.getStatus().refreshId;
+  assert.equal(firstId, "10000000-0000-4000-8000-000000000000");
+  assert.equal(controller.start(), false);
+  assert.equal(controller.getStatus().refreshId, firstId);
+
+  release();
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "succeeded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(controller.getStatus().status, "succeeded");
+  assert.equal(controller.getStatus().refreshId, firstId);
+
+  assert.equal(controller.start(), true);
+  assert.equal(
+    controller.getStatus().refreshId,
+    "20000000-0000-4000-8000-000000000000",
+  );
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "succeeded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(controller.getStatus().status, "succeeded");
+});
+
 test("local refresh requests a bounded recent index and returns only safe progress", async () => {
   let options;
   const controller = new AbortController();

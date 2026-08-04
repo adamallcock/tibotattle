@@ -2776,7 +2776,15 @@ function createPreparedLocalCompanionServer({
           "refresh_not_authorized",
         )) return;
         if (!refresh.start()) {
-          sendError(response, 409, "refresh_in_progress");
+          // Keep the terminal receipt's opaque run identifier available to a
+          // first-party native caller that joined an already-running explicit
+          // refresh. It contains no account or evidence data and lets the
+          // caller reject a later, unrelated terminal receipt.
+          send(response, 409, {
+            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+            error: { code: "refresh_in_progress" },
+            refresh: refresh.getStatus(),
+          });
           return;
         }
         send(response, 202, {
