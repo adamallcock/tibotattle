@@ -1,4 +1,4 @@
-import { encodeBase64Url } from "./crypto";
+import { encodeBase64Url, randomSecret, sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 
 /**
@@ -40,12 +40,38 @@ const MAXIMUM_TOKEN_RESPONSE_BYTES = 64 * 1024;
 const MAXIMUM_ID_TOKEN_LENGTH = 16 * 1024;
 
 export const APPLE_SIGNIN_STATE_PATTERN = /^[A-Za-z0-9_-]{43,128}$/u;
+// Apple receives this value in the authorization request and echoes it in the
+// signed ID Token.  Keep the same bounded base64url shape as state; 32 random
+// bytes render as 43 characters, comfortably above Apple's minimum.
+export const APPLE_SIGNIN_NONCE_PATTERN = /^[A-Za-z0-9_-]{43,128}$/u;
+export const APPLE_SIGNIN_NONCE_HASH_PATTERN = /^[0-9a-f]{64}$/u;
 
 export interface AppleSignInConfiguration {
   readonly servicesId: string;
   readonly teamId: string;
   readonly keyId: string;
   readonly privateKeyDer: Uint8Array;
+}
+
+/**
+ * Mints the per-authorization nonce used to bind an Apple ID Token to the
+ * state row that started the transaction.  Callers must persist only the
+ * result of {@link hashAppleSignInNonce}; the raw nonce is request-scoped.
+ */
+export function generateAppleSignInNonce(): string {
+  return randomSecret(32);
+}
+
+/**
+ * Hashes an Apple authorization nonce for short-lived handoff storage.  The
+ * nonce is random and not a bearer credential, but retaining only this fixed
+ * digest limits disclosure if a handoff row is inspected or exported.
+ */
+export async function hashAppleSignInNonce(nonce: string): Promise<string> {
+  if (!APPLE_SIGNIN_NONCE_PATTERN.test(nonce)) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
+  return sha256Hex(nonce);
 }
 
 function configurationError(): never {
@@ -100,6 +126,7 @@ export function appleAuthorizeUrl(
   configuration: AppleSignInConfiguration,
   redirectUri: string,
   state: string,
+  nonce?: string,
 ): string {
   const parameters = new URLSearchParams({
     client_id: configuration.servicesId,
@@ -111,6 +138,11 @@ export function appleAuthorizeUrl(
     response_mode: "form_post",
     state,
   });
+  // Keep the optional argument for source compatibility with older callers;
+  // production start handlers always supply the freshly generated nonce.  Do
+  // not mint one here because the caller would then be unable to persist its
+  // corresponding expected digest.
+  if (nonce !== undefined) parameters.set("nonce", nonce);
   return `${APPLE_AUTHORIZE_URL}?${parameters.toString()}`;
 }
 

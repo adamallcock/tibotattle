@@ -746,10 +746,10 @@
               </span>
               <span class="identity-account-copy">
                 <strong id="identity-account-provider">Signed in with Google</strong>
-                <small>
-                  Signing out only forgets this sign-in on this page. It deletes
-                  nothing: metadata already contributed stays until you delete it
-                  in Hosted privacy controls.
+                <small id="identity-account-detail">
+                  Signing out revokes this browser's service session and forgets
+                  this sign-in. It deletes nothing: metadata already contributed
+                  stays until you delete it in Hosted privacy controls.
                 </small>
               </span>
               <!--
@@ -1110,6 +1110,21 @@
               Sending stays disabled until you open the exact local review for
               the current queued contribution.
             </p>
+            <div class="sync-device-disconnect">
+              <p class="annotation">
+                Stop this Mac's future uploads without deleting metadata already
+                contributed. Reconnecting later requires a fresh reviewed
+                contribution on this Mac.
+              </p>
+              <button
+                class="button button-danger"
+                id="sync-disconnect-device"
+                type="button"
+                hidden
+              >
+                Disconnect this Mac
+              </button>
+            </div>
             <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
             <details class="sync-exact-review" id="sync-exact-review" hidden>
               <summary>
@@ -1253,8 +1268,8 @@
               <div class="service-detail-body">
                 <div id="community-snapshot-service-detail"></div>
                 <p class="annotation">
-                  Community values use a fixed delay, independent per-cell support,
-                  participant-level clipping, and coarse rounding. A sealed
+                  Community values use a fixed delay, eligible provider-account
+                  support, account-level clipping, and coarse rounding. A sealed
                   revision is never rewritten; privacy-affecting deletion withdraws
                   it and schedules a replacement revision without the deleted
                   source.

@@ -83,6 +83,11 @@ const WEEKLY_WELL_OBSERVED_SPAN_PP = 50;
 let timelineViewport = null;
 let timelinePointerStart = null;
 let localCompanionHealth = null;
+// This is an optional, short-lived rendering hint from the public health
+// endpoint. The Worker remains authoritative; a missing or stale health read
+// never blocks a legitimate sign-in, while an explicit paused state avoids
+// sending somebody into an OAuth ceremony that the service will refuse.
+let communityServiceHealth = null;
 let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncExactReview = null;
@@ -4474,6 +4479,9 @@ function renderContributionSyncPreview(preview) {
 function updateContributionSyncButtons() {
   const available = contributionSyncPreview?.status === "available";
   const paused = contributionSyncStatus?.paused === true;
+  const disconnect = $("#sync-disconnect-device");
+  const disconnectAvailable =
+    localCompanionHealth?.capabilities?.contributionDeviceDisconnect === true;
   $("#sync-inspect").disabled = contributionSyncBusy;
   $("#sync-run-once").disabled = contributionSyncBusy
     || !available
@@ -4489,6 +4497,14 @@ function updateContributionSyncButtons() {
     || !available
     || contributionSyncStatus?.state === "unavailable"
     || !paused;
+  // This is intentionally not inferred from pairing or queue state. A
+  // service may support pairing but not the authenticated, two-sided revoke
+  // transaction; hiding the control is safer than suggesting a local-only
+  // action stopped remote uploads.
+  disconnect.hidden = !disconnectAvailable;
+  disconnect.disabled = contributionSyncBusy
+    || communityConnectBusy
+    || !disconnectAvailable;
 }
 
 function showContributionSyncAction(message, error = false) {
@@ -4643,6 +4659,48 @@ async function inspectNextContribution() {
       "The next contribution could not be inspected. Nothing was uploaded.",
       true
     );
+  } finally {
+    contributionSyncBusy = false;
+    updateContributionSyncButtons();
+  }
+}
+
+const DEVICE_DISCONNECT_CONFIRMATION =
+  "Disconnect this Mac from contribution?\n\nThis stops future uploads from this Mac, pauses local delivery, and removes this Mac's upload credential. Metadata already contributed is not deleted. You can reconnect later by reviewing a new contribution.";
+
+/**
+ * Stop only this installation's background upload capability. The hosted
+ * contribution account/session remains intact: sign-out and metadata deletion
+ * are separate controls with their own explicit confirmation.
+ */
+async function disconnectThisMacContributionDevice() {
+  if (contributionSyncBusy || communityConnectBusy) return;
+  if (!window.confirm(DEVICE_DISCONNECT_CONFIRMATION)) return;
+  contributionSyncBusy = true;
+  updateContributionSyncButtons();
+  showContributionSyncAction(
+    "Stopping future uploads from this Mac and removing its local upload credential…"
+  );
+  try {
+    const result = await localClient.disconnectContributionDevice();
+    if (result.status !== "disconnected"
+        || result.deliveryPaused !== true
+        || !["deleted", "already_missing"].includes(result.localCredential)
+        || result.localBinding !== "removed") {
+      throw new Error("The local companion did not confirm this Mac was disconnected.");
+    }
+    clearContributionSyncExactReview();
+    await refreshContributionSyncControls();
+    showContributionSyncAction(
+      "This Mac is disconnected: future uploads are stopped, local delivery is paused, and its upload credential was removed. Metadata already contributed was not deleted. You can reconnect later by reviewing a new contribution."
+    );
+  } catch (error) {
+    showContributionSyncAction(describeFailure({
+      surface: "contribution_send",
+      error,
+      fallback:
+        "This Mac could not be disconnected, so its local credential was not changed. Retry when the contribution service is reachable."
+    }).text, true);
   } finally {
     contributionSyncBusy = false;
     updateContributionSyncButtons();
@@ -5164,6 +5222,14 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "This build is not configured to connect to a contribution service, so there is nothing to pair with. Local reporting is unaffected.",
   contribution_device_pairing_failed:
     "The contribution service did not complete device pairing. Nothing was uploaded; try again shortly.",
+  contribution_device_disconnect_not_configured:
+    "This build is not configured to stop this Mac's contribution connection. Its local credential was not changed.",
+  contribution_device_disconnect_not_authorized:
+    "The local companion refused this request because it did not arrive from the local dashboard. This Mac remains connected.",
+  contribution_device_disconnect_cleanup_pending:
+    "The service stopped this Mac, but its local credential still needs to be cleared. Retry Disconnect this Mac; retrying is safe.",
+  contribution_device_disconnect_failed:
+    "TiboTattle could not confirm that this Mac was disconnected. Its local credential was not changed; retrying is safe.",
   automatic_contribution_first_review_required:
     "One contribution must be reviewed and accepted before automatic contribution can be armed. Nothing repeats until then.",
   automatic_contribution_not_configured:
@@ -5246,8 +5312,25 @@ function showFailure(status, options) {
 // stays disabled with fixed copy, hosted Apple sign-in remains available
 // whenever the service is configured for it, and the server stays the
 // authority on whether identity is required.
+function hasCommunitySession() {
+  return typeof communitySession?.csrfToken === "string"
+    && communitySession.csrfToken.length > 0;
+}
+
+function hostedEnrollmentIsPaused() {
+  // A server-authenticated existing participant may still pair an already
+  // authorised Mac while new enrollment is contained. Do not make a session
+  // holder repeat a social login merely because new enrollment is paused.
+  if (hasCommunitySession()) return false;
+  return communityServiceHealth?.collectionControls?.enrollment === false
+    || communityServiceHealth?.enrollmentMode === "disabled";
+}
+
 function hostedSignInRequired() {
-  return configuredGoogleClientId() !== null && hostedIdentity === null;
+  return configuredGoogleClientId() !== null
+    && hostedIdentity === null
+    && !hasCommunitySession()
+    && !hostedEnrollmentIsPaused();
 }
 
 // The provider is the only identity fact this page ever holds. No name, email,
@@ -5278,21 +5361,29 @@ function renderHostedIdentity() {
   // sign in at all, so the controls say so instead of failing after the click.
   const serviceConfigured =
     localCompanionHealth?.capabilities?.contributionDevicePairing === true;
-  const signedIn = hostedIdentity !== null;
-  const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider]
-    ?? HOSTED_IDENTITY_PROVIDERS.google;
+  const hasServerSession = hasCommunitySession();
+  const signedIn = hostedIdentity !== null || hasServerSession;
+  const provider = HOSTED_IDENTITY_PROVIDERS[hostedIdentity?.provider] ?? null;
+  const enrollmentPaused = hostedEnrollmentIsPaused();
   const googleUnavailableNow = googleSignInUnavailable
     || configuredGoogleClientId() === null
-    || !serviceConfigured;
+    || !serviceConfigured
+    || enrollmentPaused;
   googleButton.disabled = hostedIdentityBusy
     || signedIn
     || googleUnavailableNow;
   googleUnavailable.hidden = !googleUnavailableNow || signedIn;
-  googleUnavailable.textContent = serviceConfigured
-    ? "Hosted sign-in is not configured for this build."
-    : "This build has no contribution service, so hosted sign-in is unavailable.";
-  const appleUnavailableNow = appleSignInUnavailable || !serviceConfigured;
-  appleUnavailable.hidden = !appleUnavailableNow || signedIn;
+  googleUnavailable.textContent = enrollmentPaused
+    ? "New contribution enrollment is currently paused. Local reporting is unaffected."
+    : serviceConfigured
+      ? "Hosted sign-in is not configured for this build."
+      : "This build has no contribution service, so hosted sign-in is unavailable.";
+  const appleUnavailableNow = appleSignInUnavailable
+    || !serviceConfigured
+    || enrollmentPaused;
+  // When enrollment is paused, use one shared sentence instead of displaying
+  // the same global status below both provider buttons.
+  appleUnavailable.hidden = !appleUnavailableNow || signedIn || enrollmentPaused;
   appleUnavailable.textContent = serviceConfigured
     ? "Hosted Apple sign-in is not configured for this build."
     : "This build has no contribution service, so hosted sign-in is unavailable.";
@@ -5307,8 +5398,20 @@ function renderHostedIdentity() {
   pendingActions.hidden = !hostedIdentityBusy || signedIn;
   checkButton.disabled = !hostedIdentityBusy || signedIn;
   cancelButton.disabled = !hostedIdentityBusy || signedIn;
-  setRawText($("#identity-account-provider"), provider.label);
-  $("#identity-account-mark").setAttribute("href", provider.mark);
+  $("#identity-account-badge").hidden = provider === null;
+  setRawText(
+    $("#identity-account-provider"),
+    provider?.label ?? "Signed in for hosted contribution",
+  );
+  if (provider !== null) {
+    $("#identity-account-mark").setAttribute("href", provider.mark);
+  }
+  setProductText(
+    $("#identity-account-detail"),
+    provider !== null
+      ? "Signing out revokes this browser's service session and forgets this sign-in. It deletes nothing: metadata already contributed stays until you delete it in Hosted privacy controls."
+      : "This browser already has a service session. Signing out revokes it; it deletes nothing, and metadata already contributed stays until you delete it in Hosted privacy controls.",
+  );
   chip.textContent = signedIn
     ? "Signed in"
     : hostedIdentityBusy ? "Signing in…" : "Not signed in";
@@ -5318,22 +5421,43 @@ function renderHostedIdentity() {
   updateCommunityConnectButton();
 }
 
-// Signing out is entirely page-local. The sign-in token was never persisted,
-// so forgetting it needs no network call and destroys no hosted data; the
-// pseudonymous session is dropped alongside it so the next sign-in — with the
-// same account or a different one — enrolls under the identity just presented
-// rather than reusing the previous participant's session.
-function signOutHostedIdentity() {
-  if (hostedIdentityBusy || hostedIdentity === null) return;
-  hostedIdentity = null;
-  setCommunitySession(null);
-  $("#participant-controls").hidden = true;
+// A completed hosted handoff is memory-only, but enrollment also creates an
+// HttpOnly service session. When one exists, acknowledge its server-side
+// revocation before changing the UI: otherwise this page would say "signed
+// out" while the browser still held a usable session cookie. A proof that was
+// never enrolled has no session and can be forgotten locally.
+async function signOutHostedIdentity() {
+  if (hostedIdentityBusy || (hostedIdentity === null && !hasCommunitySession())) {
+    return;
+  }
   const status = $("#identity-signin-status");
+  const hadServerSession = Boolean(communitySession?.csrfToken);
+  hostedIdentityBusy = true;
+  renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent =
-    "Signed out on this page only. The in-memory sign-in was discarded and nothing was deleted: metadata you already contributed is unchanged, and Hosted privacy controls still export or delete it. Sign in again with any Google or Apple account.";
-  renderHostedIdentity();
+  status.textContent = hadServerSession
+    ? "Signing out securely…"
+    : "Forgetting this unfinished sign-in…";
+  try {
+    if (hadServerSession) await communityClient.logout();
+    hostedIdentity = null;
+    setCommunitySession(null);
+    $("#participant-controls").hidden = true;
+    status.textContent = hadServerSession
+      ? "Signed out. Your server session was revoked and this page forgot the sign-in. Metadata already contributed is unchanged; Hosted privacy controls still let you export or delete it. Sign in again with Google or Apple when you want to contribute."
+      : "This unfinished sign-in was forgotten. No server session or metadata was created. Sign in again with Google or Apple when you want to contribute.";
+  } catch (error) {
+    showFailure(status, {
+      surface: "hosted_identity",
+      error,
+      fallback:
+        "The service could not confirm sign-out, so you are still signed in. Nothing was changed; check your connection and try again."
+    });
+  } finally {
+    hostedIdentityBusy = false;
+    renderHostedIdentity();
+  }
 }
 
 // The service holds a completed sign-in for five minutes, so the poll stops
@@ -5569,14 +5693,18 @@ async function beginHostedSignIn(providerId) {
 function updateCommunityConnectButton() {
   const button = $("#connect-community");
   const consent = $("#community-connect-consent");
+  const enrollmentPaused = hostedEnrollmentIsPaused();
   consent.disabled = false;
   button.disabled = communityConnectBusy
+    || enrollmentPaused
     || hostedSignInRequired()
     || !consent.checked;
   if (!communityConnectBusy) {
-    button.textContent = hostedSignInRequired()
-      ? "Sign in above to contribute"
-      : "Review contribution";
+    button.textContent = enrollmentPaused
+      ? "New enrollment paused"
+      : hostedSignInRequired()
+        ? "Sign in above to contribute"
+        : "Review contribution";
   }
 }
 
@@ -5736,6 +5864,13 @@ async function disableAutomaticContribution() {
 async function connectCommunityContribution() {
   if (communityConnectBusy) return;
   const status = $("#community-connect-status");
+  if (hostedEnrollmentIsPaused()) {
+    status.hidden = false;
+    status.className = "participant-action-status error";
+    status.textContent =
+      "New contribution enrollment is currently paused. Local reporting is unaffected, and nothing was uploaded.";
+    return;
+  }
   if (hostedSignInRequired()) {
     status.hidden = false;
     status.className = "participant-action-status error";
@@ -5768,9 +5903,9 @@ async function connectCommunityContribution() {
       pairing = await communityClient.createDevicePairing(false);
       await finishCommunityDevicePairing(pairing, status);
     } else {
-      // Production enrollment is open, so this page never collects or sends an
-      // invitation code. The client keeps the parameter because the service
-      // still supports an invite-only mode for private pilots.
+      // This page never collects or sends an invitation code. The Worker is
+      // the authority on whether its current enrollment mode admits this
+      // hosted proof; a paused service fails before the browser OAuth start.
       enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
       const enrollment = await communityClient.enroll(
         null,
@@ -6822,6 +6957,8 @@ async function loadCommunityResults() {
     || localCompanionHealth?.capabilities?.centralServiceProxy === true;
   if (!centralConfigured) {
     participantContributionAdmission = null;
+    communityServiceHealth = null;
+    renderHostedIdentity();
     renderBackendHealth(null, null, { configured: false });
     service.textContent = "Local preparation available; community service not connected";
     service.className = "evidence-chip neutral";
@@ -6849,8 +6986,12 @@ async function loadCommunityResults() {
     const serviceReachable = healthResult.status === "fulfilled"
       || communityResult.status === "fulfilled"
       || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
+    communityServiceHealth = healthResult.status === "fulfilled"
+      ? healthResult.value
+      : null;
+    renderHostedIdentity();
     renderBackendHealth(
-      healthResult.status === "fulfilled" ? healthResult.value : null,
+      communityServiceHealth,
       readinessResult.status === "fulfilled" ? readinessResult.value : null,
       { configured: true },
     );
@@ -6876,6 +7017,8 @@ async function loadCommunityResults() {
     // this page collects no invitation code for any of those modes.
   } catch {
     participantContributionAdmission = null;
+    communityServiceHealth = null;
+    renderHostedIdentity();
     renderBackendHealth(null, null, { configured: true });
     service.textContent = "Community service unavailable";
     service.className = "evidence-chip neutral";
@@ -7040,6 +7183,12 @@ async function restoreCommunitySession() {
     });
   } catch {
     setCommunitySession(null);
+  } finally {
+    // A restored host-only session is already sufficient for protected
+    // browser actions and device pairing. Reflect it as a generic signed-in
+    // state instead of falsely showing a Google/Apple choice or asking for a
+    // redundant browser ceremony after every reload.
+    renderHostedIdentity();
   }
 }
 
@@ -7141,7 +7290,9 @@ $("#identity-google-signin").addEventListener("click", () => {
 $("#identity-apple-signin").addEventListener("click", () => {
   void beginHostedSignIn("apple");
 });
-$("#identity-signout").addEventListener("click", signOutHostedIdentity);
+$("#identity-signout").addEventListener("click", () => {
+  void signOutHostedIdentity();
+});
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
@@ -7174,6 +7325,10 @@ $("#sync-inspect").addEventListener("click", inspectNextContribution);
 $("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
 $("#sync-pause").addEventListener("click", () => runContributionSyncAction("pause"));
 $("#sync-resume").addEventListener("click", () => runContributionSyncAction("resume"));
+$("#sync-disconnect-device").addEventListener(
+  "click",
+  () => { void disconnectThisMacContributionDevice(); },
+);
 $("#window-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-hours]");
   if (!button || !dashboard) return;

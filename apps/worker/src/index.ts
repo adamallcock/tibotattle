@@ -69,7 +69,9 @@ import {
   claimDeviceUploadAuthorization,
   createDevicePairing,
   createDeviceUploadAuthorization,
+  disconnectAuthenticatedDevice,
   listParticipantDevices,
+  purgeStaleDeviceLifecycleRows,
   recordDeviceUploadReceipt,
   revokeParticipantDevice,
 } from "./device-auth";
@@ -100,6 +102,8 @@ import {
   appleAuthorizeUrl,
   appleSignInConfiguration,
   exchangeAppleAuthorizationCode,
+  generateAppleSignInNonce,
+  hashAppleSignInNonce,
 } from "./identity-apple";
 import {
   GOOGLE_SIGNIN_STATE_PATTERN,
@@ -109,6 +113,14 @@ import {
   googleSignInConfiguration,
 } from "./identity-google";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
+import {
+  completeAppleSignInHandoff,
+  deleteExpiredAppleSignInHandoffs,
+  deliverAppleSignInHandoff,
+  discardPendingAppleSignInHandoff,
+  insertAppleSignInHandoff,
+  readPendingAppleSignInHandoff,
+} from "./identity-handoff-repository";
 import {
   clearPendingQuarantineObject,
   putTrackedQuarantineObject,
@@ -120,6 +132,11 @@ import {
   recordDeletionTombstone,
   runBackendLifecycle,
 } from "./retention";
+import {
+  assertSignInStartAdmission,
+  assertSignInStartAdmissionConfiguration,
+  purgeExpiredSignInStartAdmissions,
+} from "./signin-admission";
 import {
   matchWorkerRoute,
   type ApiWorkerRouteId,
@@ -514,6 +531,23 @@ const SIGNIN_NOT_COMPLETED_MESSAGE =
 const SIGNIN_CALLBACK_APP_OPEN_URL = "usagemonitor://open";
 
 /**
+ * A disabled enrollment mode is an explicit release/incident containment
+ * state, not merely a final rejection at the enrollment write. Refuse before
+ * allocating a handoff row or redirecting a person to a provider: otherwise a
+ * disabled production service would still consume the global admission budget
+ * and lead people through an OAuth ceremony it cannot complete.
+ */
+async function assertHostedSignInStartAllowed(env: Env): Promise<void> {
+  if (configuredEnrollmentMode(env) === "disabled") {
+    throw new ApiError(503, "ENROLLMENT_DISABLED");
+  }
+  // The collection control is the other operator containment switch. Check it
+  // before an edge budget, coordinated admission slot, or provider redirect so
+  // a temporarily paused service cannot create stranded OAuth handoffs.
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+}
+
+/**
  * Production sign-in is deliberately pinned to one configured HTTPS origin.
  * In particular, no request-derived Workers hostname can become an OAuth
  * callback merely because it reaches this Worker. Local development keeps the
@@ -602,9 +636,10 @@ async function verifiedHostedCallbackIdentity(
   env: Env,
   provider: "apple" | "google",
   idToken: string,
+  options: { expectedNonceHash?: string } = {},
 ): Promise<{ provider: "apple" | "google"; linkKeyHex: string }> {
   if (identityRequired(env)) {
-    return verifyHostedIdentity(env, { provider, idToken });
+    return verifyHostedIdentity(env, { provider, idToken }, options);
   }
   return {
     provider,
@@ -626,16 +661,7 @@ async function deleteExpiredAppleHandoffs(
   nowIso: string,
   maximumRows = MAX_EXPIRED_SIGNIN_HANDOFFS_PER_PROVIDER,
 ): Promise<number> {
-  const result = await db.prepare(
-    `DELETE FROM apple_signin_handoffs
-      WHERE state IN (
-        SELECT state FROM apple_signin_handoffs
-         WHERE expires_at <= ?
-         ORDER BY expires_at, state
-         LIMIT ?
-      )`,
-  ).bind(nowIso, maximumRows).run();
-  return result.meta.changes;
+  return deleteExpiredAppleSignInHandoffs(db, nowIso, maximumRows);
 }
 
 async function deleteExpiredGoogleHandoffs(
@@ -667,14 +693,7 @@ async function discardPendingAppleHandoff(
   state: string,
   nowIso: string,
 ): Promise<void> {
-  await db.prepare(
-    `DELETE FROM apple_signin_handoffs
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).run();
+  await discardPendingAppleSignInHandoff(db, state, nowIso);
 }
 
 async function discardPendingGoogleHandoff(
@@ -802,6 +821,7 @@ async function handleIdentityAppleStart(
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
+  await assertHostedSignInStartAllowed(env);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
@@ -820,24 +840,24 @@ async function handleIdentityAppleStart(
       || Object.keys(value).length !== 0) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
   await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
   // 48 random bytes render as 64 base64url characters.
   const state = randomSecret(48);
-  await env.USAGE_MONITOR_DB.prepare(
-    `INSERT INTO apple_signin_handoffs
-       (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES (?, NULL, NULL, ?, ?, NULL)`,
-  ).bind(
+  const nonce = generateAppleSignInNonce();
+  const nonceHash = await hashAppleSignInNonce(nonce);
+  await insertAppleSignInHandoff(env.USAGE_MONITOR_DB, {
     state,
-    nowIso,
-    new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
-  ).run();
+    nonceHash,
+    createdAt: nowIso,
+    expiresAt: new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+  });
   return jsonResponse({
     schemaVersion: "identity-apple-start-v0.1",
     state,
-    authorizeUrl: appleAuthorizeUrl(configuration, redirectUri, state),
+    authorizeUrl: appleAuthorizeUrl(configuration, redirectUri, state, nonce),
   });
 }
 
@@ -870,19 +890,20 @@ async function handleIdentityAppleCallback(
     return failure;
   }
   if (typeof code !== "string" || code.length === 0) return failure;
-  const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT state FROM apple_signin_handoffs
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ state: string }>();
+  const pending = await readPendingAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    nowIso,
+  );
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
     const idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
-    verified = await verifiedHostedCallbackIdentity(env, "apple", idToken);
+    verified = await verifiedHostedCallbackIdentity(env, "apple", idToken, {
+      // The offline harness intentionally has no signed Apple token. Hosted
+      // deployments always bind the signed nonce claim to this state row.
+      expectedNonceHash: identityRequired(env) ? pending.nonceHash : undefined,
+    });
   } catch {
     // A provider code can be spent only once. Leaving this handoff pending
     // would make the desktop app poll a state that cannot ever complete.
@@ -895,16 +916,14 @@ async function handleIdentityAppleCallback(
   }
   // Re-checked against the time the exchange finished, not the time it
   // started, so a handoff that expired mid-exchange is never filled.
-  const stored = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE apple_signin_handoffs
-        SET identity_link_key = ?, proof = ?
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
-  if (stored.meta.changes !== 1) return failure;
+  const stored = await completeAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    verified.linkKeyHex,
+    randomSecret(48),
+    new Date().toISOString(),
+  );
+  if (!stored) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }
 
@@ -936,30 +955,22 @@ async function handleIdentityAppleResult(
   }
   const nowIso = new Date().toISOString();
   await deleteExpiredAppleHandoffs(env.USAGE_MONITOR_DB, nowIso);
-  const delivered = await env.USAGE_MONITOR_DB.prepare(
-    `UPDATE apple_signin_handoffs
-        SET delivered_at = ?
-      WHERE state = ?
-        AND identity_link_key IS NOT NULL
-        AND proof IS NOT NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?
-      RETURNING proof`,
-  ).bind(nowIso, state, nowIso).first<{ proof: string }>();
+  const delivered = await deliverAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    nowIso,
+  );
   if (delivered) {
     return jsonResponse({
       schemaVersion: "identity-apple-result-v0.1",
       proof: delivered.proof,
     });
   }
-  const pending = await env.USAGE_MONITOR_DB.prepare(
-    `SELECT state FROM apple_signin_handoffs
-      WHERE state = ?
-        AND identity_link_key IS NULL
-        AND proof IS NULL
-        AND delivered_at IS NULL
-        AND expires_at > ?`,
-  ).bind(state, nowIso).first<{ state: string }>();
+  const pending = await readPendingAppleSignInHandoff(
+    env.USAGE_MONITOR_DB,
+    state,
+    nowIso,
+  );
   if (pending) throw new ApiError(404, "IDENTITY_RESULT_PENDING");
   throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
 }
@@ -977,6 +988,7 @@ async function handleIdentityGoogleStart(
 ): Promise<Response> {
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertSameOrigin(request);
+  await assertHostedSignInStartAllowed(env);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
     env.ENROLLMENT_RATE_LIMIT,
@@ -995,6 +1007,7 @@ async function handleIdentityGoogleStart(
       || Object.keys(value).length !== 0) {
     throw new ApiError(400, "BODY_INVALID");
   }
+  await assertSignInStartAdmission(env.USAGE_MONITOR_DB, env);
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
   await deleteExpiredGoogleHandoffs(env.USAGE_MONITOR_DB, nowIso);
@@ -1426,6 +1439,47 @@ async function handleDeviceUploadAuthorization(
     Reflect.get(body.value, "envelopeDigest") as string,
     Reflect.get(body.value, "contentLengthBytes") as number,
   ), 201);
+}
+
+/**
+ * Let the Mac that holds an upload-only bearer stop itself even while public
+ * collection is contained. This deliberately does not use a browser cookie,
+ * CSRF token, or the upload-registration control: the presented device secret
+ * is the sole authority and a stopped client must always be able to revoke
+ * it. It is idempotent for a valid credential and revokes pending uploads too.
+ */
+async function handleDeviceDisconnect(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  // This endpoint intentionally accepts a device bearer without a browser
+  // session so a Mac can stop itself during a collection incident. Apply the
+  // existing coarse/per-client admission before the credential hash and D1
+  // lookup, so arbitrary plausible bearers cannot turn revocation into an
+  // unbounded public work amplifier.
+  assertAdmissionBindings(env);
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "device_disconnect",
+  );
+  if (request.headers.has("cookie")) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  if (request.headers.get("content-length") !== null
+      && request.headers.get("content-length") !== "0") {
+    throw new ApiError(400, "BODY_INVALID");
+  }
+  const disconnected = await disconnectAuthenticatedDevice(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+  );
+  return jsonResponse({
+    schemaVersion: "device-disconnect-v0.1",
+    disconnected: true,
+    deviceId: disconnected.deviceId,
+  });
 }
 
 async function handleDevices(request: Request, env: Env): Promise<Response> {
@@ -2377,6 +2431,7 @@ async function handleReady(
   assertUploadAuthorizationBindings(env);
   assertUploadIngressRateLimitBindings(env);
   assertUploadIngressConfiguration(env);
+  assertSignInStartAdmissionConfiguration(env);
   await probeUploadIngressBudget(env);
   const retention = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state, last_completed_at, maintenance_run_at,
@@ -2469,6 +2524,8 @@ async function routeApi(
       return handleDevicePairingClaim(request, env);
     case "device_upload_authorization":
       return handleDeviceUploadAuthorization(request, env);
+    case "device_disconnect":
+      return handleDeviceDisconnect(request, env);
     case "participant_devices":
       return handleDevices(request, env);
     case "participant_device_revocation":
@@ -2509,6 +2566,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       assertUploadAuthorizationBindings(env);
       assertUploadIngressRateLimitBindings(env);
       assertUploadIngressConfiguration(env);
+      assertSignInStartAdmissionConfiguration(env);
       await probeUploadIngressBudget(env);
       const collectionControls = await readCollectionControls(
         env.USAGE_MONITOR_DB,
@@ -2576,6 +2634,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           deletionSafeRestoreReplay: true,
           ongoingDeviceUploadRegistration:
             collectionControls.uploadRegistration,
+          coordinatedSignInAdmission: true,
         },
       }));
     }
@@ -2642,6 +2701,13 @@ interface ScheduledMaintenanceLog {
   quarantineReconciliationComplete: boolean;
   expiredIdentityHandoffsPurged: number;
   expiredIdentityHandoffPurgeComplete: boolean;
+  expiredSignInAdmissionsPurged: number;
+  signInAdmissionPurgeComplete: boolean;
+  staleDevicePairingsRevoked: number;
+  staleDeviceCredentialsRevoked: number;
+  staleDeviceUploadAuthorizationsRevoked: number;
+  expiredDeviceCredentialRotationsPurged: number;
+  expiredDevicePairingEventsPurged: number;
   aggregateRebuildComplete: boolean;
   publicationEnabled: boolean | null;
 }
@@ -2712,6 +2778,13 @@ export async function runScheduledMaintenance(
   let quarantineReconciliationComplete = false;
   let expiredIdentityHandoffsPurged = 0;
   let expiredIdentityHandoffPurgeComplete = false;
+  let expiredSignInAdmissionsPurged = 0;
+  let signInAdmissionPurgeComplete = false;
+  let staleDevicePairingsRevoked = 0;
+  let staleDeviceCredentialsRevoked = 0;
+  let staleDeviceUploadAuthorizationsRevoked = 0;
+  let expiredDeviceCredentialRotationsPurged = 0;
+  let expiredDevicePairingEventsPurged = 0;
   let rebuildComplete = false;
   let publicationEnabled: boolean | null = null;
   let maintenanceLease: string | null = null;
@@ -2729,6 +2802,13 @@ export async function runScheduledMaintenance(
         quarantineReconciliationComplete,
         expiredIdentityHandoffsPurged,
         expiredIdentityHandoffPurgeComplete,
+        expiredSignInAdmissionsPurged,
+        signInAdmissionPurgeComplete,
+        staleDevicePairingsRevoked,
+        staleDeviceCredentialsRevoked,
+        staleDeviceUploadAuthorizationsRevoked,
+        expiredDeviceCredentialRotationsPurged,
+        expiredDevicePairingEventsPurged,
         aggregateRebuildComplete: rebuildComplete,
         publicationEnabled,
       };
@@ -2749,6 +2829,19 @@ export async function runScheduledMaintenance(
     );
     expiredIdentityHandoffsPurged = handoffPurge.purged;
     expiredIdentityHandoffPurgeComplete = handoffPurge.complete;
+    const signInAdmissionPurge = await purgeExpiredSignInStartAdmissions(
+      env.USAGE_MONITOR_DB,
+    );
+    expiredSignInAdmissionsPurged = signInAdmissionPurge.purged;
+    signInAdmissionPurgeComplete = signInAdmissionPurge.complete;
+    const deviceLifecycle = await purgeStaleDeviceLifecycleRows(
+      env.USAGE_MONITOR_DB,
+    );
+    staleDevicePairingsRevoked = deviceLifecycle.pairingsRevoked;
+    staleDeviceCredentialsRevoked = deviceLifecycle.devicesRevoked;
+    staleDeviceUploadAuthorizationsRevoked = deviceLifecycle.uploadsRevoked;
+    expiredDeviceCredentialRotationsPurged = deviceLifecycle.rotationsPurged;
+    expiredDevicePairingEventsPurged = deviceLifecycle.pairingEventsPurged;
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const lifecycle = await runBackendLifecycle(
       env.USAGE_MONITOR_DB,
@@ -2800,6 +2893,7 @@ export async function runScheduledMaintenance(
     const complete = lifecycleComplete
       && quarantineReconciliationComplete
       && expiredIdentityHandoffPurgeComplete
+      && signInAdmissionPurgeComplete
       && rebuildComplete;
     const log: ScheduledMaintenanceLog = {
       level: "info",
@@ -2812,6 +2906,13 @@ export async function runScheduledMaintenance(
       quarantineReconciliationComplete,
       expiredIdentityHandoffsPurged,
       expiredIdentityHandoffPurgeComplete,
+      expiredSignInAdmissionsPurged,
+      signInAdmissionPurgeComplete,
+      staleDevicePairingsRevoked,
+      staleDeviceCredentialsRevoked,
+      staleDeviceUploadAuthorizationsRevoked,
+      expiredDeviceCredentialRotationsPurged,
+      expiredDevicePairingEventsPurged,
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };
@@ -2829,6 +2930,13 @@ export async function runScheduledMaintenance(
       quarantineReconciliationComplete,
       expiredIdentityHandoffsPurged,
       expiredIdentityHandoffPurgeComplete,
+      expiredSignInAdmissionsPurged,
+      signInAdmissionPurgeComplete,
+      staleDevicePairingsRevoked,
+      staleDeviceCredentialsRevoked,
+      staleDeviceUploadAuthorizationsRevoked,
+      expiredDeviceCredentialRotationsPurged,
+      expiredDevicePairingEventsPurged,
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };

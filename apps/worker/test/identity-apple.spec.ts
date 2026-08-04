@@ -3,7 +3,17 @@ import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { appleClientSecret } from "../src/identity-apple";
+import {
+  APPLE_SIGNIN_NONCE_PATTERN,
+  appleClientSecret,
+  hashAppleSignInNonce,
+} from "../src/identity-apple";
+import {
+  completeAppleSignInHandoff,
+  deliverAppleSignInHandoff,
+  insertAppleSignInHandoff,
+  readPendingAppleSignInHandoff,
+} from "../src/identity-handoff-repository";
 import { handleRequest } from "../src/index";
 
 interface TestBindings extends Env {
@@ -50,6 +60,7 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
     QUARANTINE: runtime.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     APPLE_SERVICES_ID: SERVICES_ID,
     APPLE_TEAM_ID: TEAM_ID,
@@ -164,6 +175,62 @@ afterEach(() => {
 });
 
 describe("web Sign in with Apple", () => {
+  it("keeps handoff storage digest-only and enforces callback/result one-use predicates", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const state = "repository-test-state";
+    const nonceHash = "a".repeat(64);
+    const linkKey = "b".repeat(64);
+    const proof = "c".repeat(64);
+    await insertAppleSignInHandoff(db, {
+      state,
+      nonceHash,
+      createdAt: nowIso,
+      expiresAt: new Date(nowMs + 60_000).toISOString(),
+    });
+    expect(await readPendingAppleSignInHandoff(db, state, nowIso)).toEqual({
+      state,
+      nonceHash,
+    });
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      linkKey,
+      proof,
+      nowIso,
+    )).toBe(true);
+    expect(await completeAppleSignInHandoff(
+      db,
+      state,
+      linkKey,
+      "d".repeat(64),
+      nowIso,
+    )).toBe(false);
+    expect(await deliverAppleSignInHandoff(db, state, nowIso)).toEqual({ proof });
+    expect(await deliverAppleSignInHandoff(db, state, nowIso)).toBeNull();
+
+    const stored = await db.prepare(
+      "SELECT nonce_hash AS nonceHash, identity_link_key AS linkKey, proof FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(state).first<{ nonceHash: string; linkKey: string; proof: string }>();
+    expect(stored).toEqual({ nonceHash, linkKey, proof });
+    expect(JSON.stringify(stored)).not.toContain("repository-test-raw-nonce");
+
+    // A pre-nonce handoff shape cannot be reintroduced after migration: rows
+    // without the digest fail at the storage boundary and must be restarted.
+    await expect(db.prepare(
+      `INSERT INTO apple_signin_handoffs
+         (state, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+    ).bind(
+      "legacy-shape",
+      linkKey,
+      "e".repeat(64),
+      nowIso,
+      new Date(nowMs + 60_000).toISOString(),
+    ).run()).rejects.toThrow();
+  });
+
   it("mints an ES256 client secret with Apple's required claims and leaks no key", async () => {
     const secret = await appleClientSecret(bindings(), 1_800_000_000_000);
     const [headerSegment, claimSegment, signatureSegment] = secret.split(".");
@@ -193,6 +260,9 @@ describe("web Sign in with Apple", () => {
     const authorize = new URL(started.authorizeUrl);
     expect(authorize.origin + authorize.pathname)
       .toBe("https://appleid.apple.com/auth/authorize");
+    const nonce = authorize.searchParams.get("nonce");
+    expect(nonce).toMatch(APPLE_SIGNIN_NONCE_PATTERN);
+    expect(nonce).toHaveLength(43);
     expect(Object.fromEntries(authorize.searchParams)).toEqual({
       client_id: SERVICES_ID,
       redirect_uri: CALLBACK_URL,
@@ -200,6 +270,7 @@ describe("web Sign in with Apple", () => {
       scope: "",
       response_mode: "form_post",
       state: started.state,
+      nonce,
     });
 
     const pending = await json("/api/v1/identity/apple/result", {
@@ -233,6 +304,7 @@ describe("web Sign in with Apple", () => {
       "apple-one-time-code",
       APPLE_ID_TOKEN,
       started.state,
+      nonce!,
       "Real",
       "Name",
     ]) {
@@ -269,24 +341,29 @@ describe("web Sign in with Apple", () => {
       error: { code: "IDENTITY_TOKEN_INVALID" },
     });
 
-    // Neither Apple's optional user payload nor the raw provider credential is
-    // persisted anywhere. The short-lived row contains an opaque proof only.
+    // Neither Apple's optional user payload, raw provider credential, nor raw
+    // nonce is persisted anywhere. The short-lived row contains only the
+    // nonce digest, verified link key, and opaque proof needed for handoff.
     const stored = await bindings().USAGE_MONITOR_DB.prepare(
-      `SELECT state, identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
+      `SELECT state, nonce_hash AS nonceHash, identity_link_key AS linkKey, proof, delivered_at AS deliveredAt
          FROM apple_signin_handoffs`,
     ).all<{
       state: string;
+      nonceHash: string;
       linkKey: string;
       proof: string;
       deliveredAt: string | null;
     }>();
     expect(stored.results).toHaveLength(1);
+    expect(stored.results[0]?.nonceHash).toBe(await hashAppleSignInNonce(nonce!));
+    expect(stored.results[0]?.nonceHash).not.toContain(nonce!);
     expect(stored.results[0]?.linkKey).toMatch(/^[0-9a-f]{64}$/u);
     expect(stored.results[0]?.proof).toMatch(/^[A-Za-z0-9_-]{64}$/u);
     expect(stored.results[0]?.deliveredAt).not.toBeNull();
     const serializedStored = JSON.stringify(stored.results);
     expect(serializedStored).not.toContain("Real");
     expect(serializedStored).not.toContain(APPLE_ID_TOKEN);
+    expect(serializedStored).not.toContain(nonce!);
   });
 
   it("expires an unread handoff and refuses the expired state", async () => {
@@ -558,6 +635,23 @@ describe("web Sign in with Apple", () => {
       "SELECT COUNT(*) AS total FROM apple_signin_handoffs",
     ).first<{ total: number }>();
     expect(rows?.total).toBe(0);
+  });
+
+  it("does not allocate an Apple handoff while enrollment mode is disabled", async () => {
+    const response = await json(
+      "/api/v1/identity/apple/start",
+      {},
+      bindings({ ENROLLMENT_MODE: "disabled" }),
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: { code: "ENROLLMENT_DISABLED" },
+    });
+    const rows = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM apple_signin_handoffs",
+    ).first<{ total: number }>();
+    expect(rows?.total).toBe(0);
+    expect(tokenCalls).toHaveLength(0);
   });
 
   it("keeps the retired Apple association filename out of the SPA fallback", async () => {

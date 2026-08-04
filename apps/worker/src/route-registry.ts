@@ -56,6 +56,10 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     id: "device_upload_authorization",
   },
   {
+    pathname: "/api/v1/device/disconnect",
+    id: "device_disconnect",
+  },
+  {
     pathname: "/api/v1/me/devices",
     id: "participant_devices",
   },

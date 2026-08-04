@@ -34,6 +34,7 @@ function bindings(overrides: Partial<Env> = {}): Env {
     ASSETS: runtime.ASSETS,
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
     CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
@@ -431,13 +432,15 @@ describe("quarantine crash reconciliation", () => {
     const activeAt = new Date(now + 60_000).toISOString();
     const db = bindings().USAGE_MONITOR_DB;
     const identityLinkKey = "a".repeat(64);
+    const nonceHash = "b".repeat(64);
     for (let index = 0; index < 101; index += 1) {
       await db.prepare(
         `INSERT INTO apple_signin_handoffs
-           (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, ?, NULL, ?, ?, NULL)`,
+           (state, nonce_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, ?, NULL, ?, ?, NULL)`,
       ).bind(
         `apple-expired-${index}`,
+        nonceHash,
         identityLinkKey,
         expiredAt,
         expiredAt,
@@ -445,9 +448,9 @@ describe("quarantine crash reconciliation", () => {
     }
     await db.prepare(
       `INSERT INTO apple_signin_handoffs
-         (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-       VALUES ('apple-active', ?, NULL, ?, ?, NULL)`,
-    ).bind(identityLinkKey, new Date(now).toISOString(), activeAt).run();
+         (state, nonce_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+       VALUES ('apple-active', ?, ?, NULL, ?, ?, NULL)`,
+    ).bind(nonceHash, identityLinkKey, new Date(now).toISOString(), activeAt).run();
     await db.prepare(
       `INSERT INTO google_signin_handoffs
          (state, code_verifier, identity_link_key, proof, created_at, expires_at, delivered_at)
@@ -1139,6 +1142,13 @@ describe("backend readiness and scheduled observability", () => {
       quarantineReconciliationComplete: true,
       expiredIdentityHandoffsPurged: 0,
       expiredIdentityHandoffPurgeComplete: true,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: true,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
       aggregateRebuildComplete: true,
       publicationEnabled: true,
     });
@@ -1183,6 +1193,13 @@ describe("backend readiness and scheduled observability", () => {
       quarantineReconciliationComplete: false,
       expiredIdentityHandoffsPurged: 0,
       expiredIdentityHandoffPurgeComplete: true,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: true,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
       aggregateRebuildComplete: false,
       publicationEnabled: null,
     });

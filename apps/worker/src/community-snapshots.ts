@@ -12,9 +12,25 @@ import { parseStoredJson } from "./stored-record";
 
 const DAY = 24 * 60 * 60 * 1000;
 const WEEK = 7 * DAY;
-const SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
+// v0.3 changes the public cohort claim: open-enrollment aggregates are gated
+// by distinct social-provider accounts and maturity controls, not independently
+// verified people. Sealed v0.2 payloads remain readable at the public edge,
+// while new builder output must carry the more precise contract version.
+const SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.3";
+const COMPARISON_SOURCE_SNAPSHOT_SCHEMA_VERSIONS = new Set([
+  "community-weekly-snapshot-v0.2",
+  SNAPSHOT_SCHEMA_VERSION,
+]);
 const COMPARISON_SCHEMA_VERSION = "participant-community-comparison-v0.2";
 const SNAPSHOT_ID_PATTERN = /^community-weekly:\d{4}-\d{2}-\d{2}(?::r[1-9]\d*)?$/u;
+const DEFAULT_COMMUNITY_SNAPSHOT_POLICY: CommunitySnapshotPolicy = Object.freeze({
+  maturityDays: 7,
+  minimumAcceptedCollectionDays: 2,
+  accountUsageEventsCap: 1_000,
+  accountTokenComponentsCap: 5_000_000,
+  accountToolUnitsCap: 1_000,
+  policyRevision: 1,
+});
 // Mirrors the closed planType/planVariant enums in
 // packages/telemetry-contract/schemas/v0.2/quota-snapshot.schema.json.
 // Allowance-relative aggregates must never blend plans, so every published
@@ -41,6 +57,44 @@ const METRICS = [
   ["outputCombinedTokens", "output_combined_tokens", 5_000_000, 100_000, "tokens"],
   ["toolUnits", "tool_units", 1_000, 10, "units"],
 ] as const;
+
+/**
+ * Release controls are stored in D1 so operators can only tighten the
+ * open-cohort maturity window and account-level caps without changing a
+ * Worker bundle. The optional override exists for deterministic tooling/tests
+ * and lets a caller pin an equally-or-more-conservative policy used by a
+ * rebuild.
+ */
+export interface CommunitySnapshotPolicy {
+  maturityDays: number;
+  minimumAcceptedCollectionDays: number;
+  accountUsageEventsCap: number;
+  accountTokenComponentsCap: number;
+  accountToolUnitsCap: number;
+  policyRevision: number;
+}
+
+export interface CommunitySnapshotPolicyOverride {
+  maturityDays?: number;
+  minimumAcceptedCollectionDays?: number;
+  accountUsageEventsCap?: number;
+  accountTokenComponentsCap?: number;
+  accountToolUnitsCap?: number;
+  policyRevision?: number;
+}
+
+interface CommunitySnapshotPolicyRow {
+  maturity_days: number;
+  minimum_accepted_collection_days: number;
+  account_usage_events_cap: number;
+  account_token_components_cap: number;
+  account_tool_units_cap: number;
+  policy_revision: number;
+}
+
+interface CommunitySnapshotPolicyEpochRow extends CommunitySnapshotPolicyRow {
+  mutation_epoch: number;
+}
 
 interface AggregatedCellRow {
   provider: string;
@@ -106,6 +160,103 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function validPolicyNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function validateCommunitySnapshotPolicy(
+  policy: CommunitySnapshotPolicy,
+): CommunitySnapshotPolicy {
+  if (!validPolicyNumber(policy.maturityDays) || policy.maturityDays < 7
+      || policy.maturityDays > 3650
+      || !validPolicyNumber(policy.minimumAcceptedCollectionDays)
+      || policy.minimumAcceptedCollectionDays < 2
+      || policy.minimumAcceptedCollectionDays > 366
+      || !validPolicyNumber(policy.accountUsageEventsCap)
+      || policy.accountUsageEventsCap < 1
+      || policy.accountUsageEventsCap > 1_000
+      || !validPolicyNumber(policy.accountTokenComponentsCap)
+      || policy.accountTokenComponentsCap < 1
+      || policy.accountTokenComponentsCap > 5_000_000
+      || !validPolicyNumber(policy.accountToolUnitsCap)
+      || policy.accountToolUnitsCap < 1
+      || policy.accountToolUnitsCap > 1_000
+      || !validPolicyNumber(policy.policyRevision)
+      || policy.policyRevision < 1) {
+    throw new Error("invalid community snapshot policy");
+  }
+  return policy;
+}
+
+function withPolicyOverride(
+  base: CommunitySnapshotPolicy,
+  override: CommunitySnapshotPolicyOverride | undefined,
+): CommunitySnapshotPolicy {
+  if (!override) return validateCommunitySnapshotPolicy(base);
+  return validateCommunitySnapshotPolicy({
+    ...base,
+    ...Object.fromEntries(Object.entries(override).filter(([, value]) => value !== undefined)),
+  } as CommunitySnapshotPolicy);
+}
+
+function policyFromRow(row: CommunitySnapshotPolicyRow | null): CommunitySnapshotPolicy {
+  if (row === null) return DEFAULT_COMMUNITY_SNAPSHOT_POLICY;
+  return {
+    maturityDays: Number(row.maturity_days),
+    minimumAcceptedCollectionDays: Number(row.minimum_accepted_collection_days),
+    accountUsageEventsCap: Number(row.account_usage_events_cap),
+    accountTokenComponentsCap: Number(row.account_token_components_cap),
+    accountToolUnitsCap: Number(row.account_tool_units_cap),
+    policyRevision: Number(row.policy_revision),
+  };
+}
+
+export async function readCommunitySnapshotPolicy(
+  db: D1Database,
+  override?: CommunitySnapshotPolicyOverride,
+): Promise<CommunitySnapshotPolicy> {
+  const row = await db.prepare(
+    `SELECT maturity_days, minimum_accepted_collection_days,
+            account_usage_events_cap, account_token_components_cap,
+            account_tool_units_cap, policy_revision
+       FROM community_snapshot_policy
+      WHERE singleton_id = 1`,
+  ).first<CommunitySnapshotPolicyRow>();
+  return withPolicyOverride(policyFromRow(row), override);
+}
+
+/**
+ * A snapshot must bind its policy and mutation epoch from one D1 read. If a
+ * semantic policy update races a build after this read, its trigger advances
+ * the epoch and the finalization predicate rejects the stale build. Reading
+ * the two values separately would leave a window where an old policy could
+ * be stamped with the new epoch.
+ */
+async function readCommunitySnapshotPolicySnapshot(
+  db: D1Database,
+  override?: CommunitySnapshotPolicyOverride,
+): Promise<{ policy: CommunitySnapshotPolicy; mutationEpoch: number }> {
+  const row = await db.prepare(
+    `SELECT p.maturity_days, p.minimum_accepted_collection_days,
+            p.account_usage_events_cap, p.account_token_components_cap,
+            p.account_tool_units_cap, p.policy_revision,
+            m.mutation_epoch
+       FROM community_snapshot_policy p
+       JOIN community_snapshot_mutation_control m
+         ON m.singleton_id = 1
+      WHERE p.singleton_id = 1`,
+  ).first<CommunitySnapshotPolicyEpochRow>();
+  if (!row
+      || !Number.isSafeInteger(Number(row.mutation_epoch))
+      || Number(row.mutation_epoch) < 0) {
+    throw new Error("community snapshot policy control unavailable");
+  }
+  return {
+    policy: withPolicyOverride(policyFromRow(row), override),
+    mutationEpoch: Number(row.mutation_epoch),
+  };
+}
+
 function participantComparisonUnavailable(
   reason: string,
   row?: SnapshotRow,
@@ -143,6 +294,7 @@ function basePayload(
   cutoffAt: string,
   revision: number,
   releasedAt: string,
+  policy: CommunitySnapshotPolicy,
 ): Record<string, unknown> {
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
@@ -158,13 +310,23 @@ function basePayload(
       key: "provider_planType_planVariant_modelId",
       unknownPolicy: "absent_or_mixed_in_window_stays_explicit_unknown",
     },
+    cohortEligibility: "provider_account_gated_open_cohort",
     privacyPolicy: {
       version: COMMUNITY_WEEKLY_POLICY_VERSION,
-      minimumIndependentParticipants: COMMUNITY_WEEKLY_MINIMUM_PARTICIPANTS,
+      minimumProviderAccountParticipants: COMMUNITY_WEEKLY_MINIMUM_PARTICIPANTS,
+      maturity: {
+        appliesTo: "open_provider_account_cohort",
+        maturityDays: policy.maturityDays,
+        minimumAcceptedCollectionDays: policy.minimumAcceptedCollectionDays,
+        acceptedCollectionDayBasis: "telemetry_contribution_created_at_before_cutoff",
+      },
       clipping: {
         usageEventsPerParticipantPerCell: 1_000,
         tokensPerComponentPerParticipantPerCell: 5_000_000,
         toolUnitsPerParticipantPerCell: 1_000,
+        usageEventsPerParticipantPerSnapshot: policy.accountUsageEventsCap,
+        tokensPerComponentPerParticipantPerSnapshot: policy.accountTokenComponentsCap,
+        toolUnitsPerParticipantPerSnapshot: policy.accountToolUnitsCap,
       },
       rounding: {
         usageEvents: 10,
@@ -191,11 +353,13 @@ function suppressedPayload(
 export async function buildCommunityWeeklySnapshot(
   db: D1Database,
   scheduledTime: number,
+  policyOverride?: CommunitySnapshotPolicyOverride,
 ): Promise<{ state: "built" | "existing" | "lease_unavailable"; snapshotId: string }> {
   return buildCommunityWeeklySnapshotForPeriod(
     db,
     communityWeekForScheduledTime(scheduledTime),
     scheduledTime,
+    policyOverride,
   );
 }
 
@@ -217,15 +381,15 @@ async function buildCommunityWeeklySnapshotForPeriod(
   db: D1Database,
   period: CommunityWeek,
   scheduledTime: number,
+  policyOverride?: CommunitySnapshotPolicyOverride,
 ): Promise<{ state: "built" | "existing" | "lease_unavailable"; snapshotId: string }> {
   validateCommunityWeek(period);
   if (!Number.isFinite(scheduledTime)) throw new Error("invalid scheduled time");
   const { startAt, endAt, cutoffAt } = period;
-  const epochRow = await db.prepare(
-    `SELECT mutation_epoch FROM community_snapshot_mutation_control
-      WHERE singleton_id = 1`,
-  ).first<{ mutation_epoch: number }>();
-  if (!epochRow) throw new Error("community snapshot mutation control unavailable");
+  const { policy, mutationEpoch } = await readCommunitySnapshotPolicySnapshot(
+    db,
+    policyOverride,
+  );
   const existing = await db.prepare(
     `SELECT snapshot_id, source_mutation_epoch
        FROM community_weekly_snapshots
@@ -235,7 +399,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
     snapshot_id: string;
     source_mutation_epoch: number;
   }>();
-  if (existing && existing.source_mutation_epoch >= epochRow.mutation_epoch) {
+  if (existing && existing.source_mutation_epoch >= mutationEpoch) {
     await db.prepare(
       `DELETE FROM community_weekly_snapshot_rebuilds
         WHERE week_start = ? AND requested_epoch <= ?`,
@@ -260,7 +424,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
   ).bind(
     startAt,
     owner,
-    epochRow.mutation_epoch,
+    mutationEpoch,
     leaseExpiresAt,
     now,
     now,
@@ -269,7 +433,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
     `SELECT owner_nonce, mutation_epoch FROM community_snapshot_builders
       WHERE week_start = ?`,
   ).bind(startAt).first<{ owner_nonce: string; mutation_epoch: number }>();
-  if (lease?.owner_nonce !== owner || lease.mutation_epoch !== epochRow.mutation_epoch) {
+  if (lease?.owner_nonce !== owner || lease.mutation_epoch !== mutationEpoch) {
     return {
       state: "lease_unavailable",
       snapshotId: existing?.snapshot_id ?? `community-weekly:${startAt.slice(0, 10)}`,
@@ -287,9 +451,45 @@ async function buildCommunityWeeklySnapshotForPeriod(
   const snapshotId = revision === 1
     ? `community-weekly:${startAt.slice(0, 10)}`
     : `community-weekly:${startAt.slice(0, 10)}:r${revision}`;
+  const maturityBeforeAt = new Date(
+    Date.parse(endAt) - policy.maturityDays * DAY,
+  ).toISOString();
 
   const cellRows = await db.prepare(
-    `WITH participant_plans AS (
+    `WITH caps AS (
+      SELECT ? AS account_usage_events_cap,
+             ? AS account_token_components_cap,
+             ? AS account_tool_units_cap
+    ), eligible_participants AS (
+      SELECT DISTINCT p.id AS participant_id
+        FROM participants p
+        JOIN participant_community_eligibility e
+          ON e.participant_id = p.id
+       WHERE p.state = 'active'
+         AND NOT EXISTS (
+           SELECT 1
+             FROM community_aggregate_exclusions x
+            WHERE x.participant_id = p.id
+              AND x.scope = 'community_weekly'
+              AND x.state = 'active'
+              AND x.effective_at < ?
+              AND (x.expires_at IS NULL OR x.expires_at > ?)
+         )
+         -- v0.3 is explicitly an open, provider-account-gated cohort. Do not
+         -- silently mix invite-only participants into a payload that makes
+         -- that public claim; invite cohorts need their own reviewed contract.
+         AND e.grant_id LIKE 'open:%'
+         AND p.identity_link_key IS NOT NULL
+         AND p.created_at <= ?
+         AND (
+           SELECT COUNT(DISTINCT substr(c.created_at, 1, 10))
+             FROM telemetry_contributions c
+            WHERE c.participant_id = p.id
+              AND c.status = 'accepted'
+              AND c.created_at >= ?
+              AND c.created_at < ?
+         ) >= ?
+    ), participant_plans AS (
       SELECT r.participant_id,
         CASE WHEN COUNT(DISTINCT COALESCE(r.plan_type, 'unknown')) = 1
              THEN MAX(COALESCE(r.plan_type, 'unknown'))
@@ -298,8 +498,8 @@ async function buildCommunityWeeklySnapshotForPeriod(
              THEN MAX(COALESCE(r.plan_variant, 'unknown'))
              ELSE 'unknown' END AS plan_variant
       FROM telemetry_records r
-      JOIN participants p
-        ON p.id = r.participant_id AND p.state = 'active'
+      JOIN eligible_participants ep
+        ON ep.participant_id = r.participant_id
       WHERE r.record_kind = 'quota'
         AND r.observed_at >= ? AND r.observed_at < ?
         AND EXISTS (
@@ -328,15 +528,11 @@ async function buildCommunityWeeklySnapshotForPeriod(
       FROM telemetry_records r
       LEFT JOIN participant_plans pp
         ON pp.participant_id = r.participant_id
-      JOIN participants p
-        ON p.id = r.participant_id AND p.state = 'active'
+      JOIN eligible_participants ep
+        ON ep.participant_id = r.participant_id
       WHERE r.record_kind = 'usage'
         AND r.observed_at >= ? AND r.observed_at < ?
         AND r.provider IN ('openai_codex', 'anthropic_claude_code')
-        AND EXISTS (
-          SELECT 1 FROM participant_community_eligibility e
-           WHERE e.participant_id = r.participant_id
-        )
         AND EXISTS (
           SELECT 1
             FROM telemetry_contribution_occurrences o
@@ -359,31 +555,126 @@ async function buildCommunityWeeklySnapshotForPeriod(
         SUM(tool_units) AS tool_units
       FROM qualified
       GROUP BY participant_id, provider, plan_type, plan_variant, model_id
+    ), per_cell_clipped AS (
+      SELECT p.*, c.account_usage_events_cap,
+        c.account_token_components_cap, c.account_tool_units_cap,
+        MIN(p.usage_events, 1000) AS usage_events_cell_clipped,
+        CASE WHEN p.input_uncached_tokens IS NULL THEN NULL
+             ELSE MIN(p.input_uncached_tokens, 5000000) END
+          AS input_uncached_tokens_cell_clipped,
+        CASE WHEN p.input_cache_read_tokens IS NULL THEN NULL
+             ELSE MIN(p.input_cache_read_tokens, 5000000) END
+          AS input_cache_read_tokens_cell_clipped,
+        CASE WHEN p.input_cache_write_tokens IS NULL THEN NULL
+             ELSE MIN(p.input_cache_write_tokens, 5000000) END
+          AS input_cache_write_tokens_cell_clipped,
+        CASE WHEN p.output_text_tokens IS NULL THEN NULL
+             ELSE MIN(p.output_text_tokens, 5000000) END
+          AS output_text_tokens_cell_clipped,
+        CASE WHEN p.output_reasoning_tokens IS NULL THEN NULL
+             ELSE MIN(p.output_reasoning_tokens, 5000000) END
+          AS output_reasoning_tokens_cell_clipped,
+        CASE WHEN p.output_combined_tokens IS NULL THEN NULL
+             ELSE MIN(p.output_combined_tokens, 5000000) END
+          AS output_combined_tokens_cell_clipped,
+        CASE WHEN p.tool_units IS NULL THEN NULL
+             ELSE MIN(p.tool_units, 1000) END
+          AS tool_units_cell_clipped
+      FROM per_participant p
+      CROSS JOIN caps c
+    ), account_clipped AS (
+      SELECT p.*,
+        CASE WHEN p.usage_events_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.usage_events_cell_clipped,
+          p.account_usage_events_cap - COALESCE(SUM(p.usage_events_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS usage_events_clipped,
+        CASE WHEN p.input_uncached_tokens_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.input_uncached_tokens_cell_clipped,
+          p.account_token_components_cap - COALESCE(SUM(p.input_uncached_tokens_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS input_uncached_tokens_clipped,
+        CASE WHEN p.input_cache_read_tokens_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.input_cache_read_tokens_cell_clipped,
+          p.account_token_components_cap - COALESCE(SUM(p.input_cache_read_tokens_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS input_cache_read_tokens_clipped,
+        CASE WHEN p.input_cache_write_tokens_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.input_cache_write_tokens_cell_clipped,
+          p.account_token_components_cap - COALESCE(SUM(p.input_cache_write_tokens_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS input_cache_write_tokens_clipped,
+        CASE WHEN p.output_text_tokens_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.output_text_tokens_cell_clipped,
+          p.account_token_components_cap - COALESCE(SUM(p.output_text_tokens_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS output_text_tokens_clipped,
+        CASE WHEN p.output_reasoning_tokens_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.output_reasoning_tokens_cell_clipped,
+          p.account_token_components_cap - COALESCE(SUM(p.output_reasoning_tokens_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS output_reasoning_tokens_clipped,
+        CASE WHEN p.output_combined_tokens_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.output_combined_tokens_cell_clipped,
+          p.account_token_components_cap - COALESCE(SUM(p.output_combined_tokens_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS output_combined_tokens_clipped,
+        CASE WHEN p.tool_units_cell_clipped IS NULL THEN NULL ELSE MAX(0, MIN(
+          p.tool_units_cell_clipped,
+          p.account_tool_units_cap - COALESCE(SUM(p.tool_units_cell_clipped)
+            OVER (PARTITION BY p.participant_id
+                  ORDER BY p.provider, p.plan_type, p.plan_variant, p.model_id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+        )) END AS tool_units_clipped
+      FROM per_cell_clipped p
     )
     SELECT provider, plan_type, plan_variant, model_id,
-      (SELECT COUNT(DISTINCT participant_id) FROM qualified) AS cohort_support,
+      (SELECT COUNT(*) FROM eligible_participants) AS cohort_support,
       COUNT(*) AS usage_events_support,
-      SUM(MIN(usage_events, 1000)) AS usage_events_clipped,
+      SUM(usage_events_clipped) AS usage_events_clipped,
       COUNT(input_uncached_tokens) AS input_uncached_tokens_support,
-      SUM(MIN(input_uncached_tokens, 5000000)) AS input_uncached_tokens_clipped,
+      SUM(input_uncached_tokens_clipped) AS input_uncached_tokens_clipped,
       COUNT(input_cache_read_tokens) AS input_cache_read_tokens_support,
-      SUM(MIN(input_cache_read_tokens, 5000000)) AS input_cache_read_tokens_clipped,
+      SUM(input_cache_read_tokens_clipped) AS input_cache_read_tokens_clipped,
       COUNT(input_cache_write_tokens) AS input_cache_write_tokens_support,
-      SUM(MIN(input_cache_write_tokens, 5000000)) AS input_cache_write_tokens_clipped,
+      SUM(input_cache_write_tokens_clipped) AS input_cache_write_tokens_clipped,
       COUNT(output_text_tokens) AS output_text_tokens_support,
-      SUM(MIN(output_text_tokens, 5000000)) AS output_text_tokens_clipped,
+      SUM(output_text_tokens_clipped) AS output_text_tokens_clipped,
       COUNT(output_reasoning_tokens) AS output_reasoning_tokens_support,
-      SUM(MIN(output_reasoning_tokens, 5000000)) AS output_reasoning_tokens_clipped,
+      SUM(output_reasoning_tokens_clipped) AS output_reasoning_tokens_clipped,
       COUNT(output_combined_tokens) AS output_combined_tokens_support,
-      SUM(MIN(output_combined_tokens, 5000000)) AS output_combined_tokens_clipped,
+      SUM(output_combined_tokens_clipped) AS output_combined_tokens_clipped,
       COUNT(tool_units) AS tool_units_support,
-      SUM(MIN(tool_units, 1000)) AS tool_units_clipped
-    FROM per_participant
+      SUM(tool_units_clipped) AS tool_units_clipped
+    FROM account_clipped
     GROUP BY provider, plan_type, plan_variant, model_id
     HAVING COUNT(*) >= ?
     ORDER BY provider, plan_type, plan_variant, model_id
     LIMIT ?`,
   ).bind(
+    policy.accountUsageEventsCap,
+    policy.accountTokenComponentsCap,
+    policy.accountToolUnitsCap,
+    endAt,
+    startAt,
+    maturityBeforeAt,
+    startAt,
+    cutoffAt,
+    policy.minimumAcceptedCollectionDays,
     startAt,
     endAt,
     cutoffAt,
@@ -402,6 +693,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
     cutoffAt,
     revision,
     now,
+    policy,
   );
   let releaseState: "published" | "suppressed" = "published";
   let payload: object;
@@ -472,7 +764,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
       startAt,
       endAt,
       revision,
-      epochRow.mutation_epoch,
+      mutationEpoch,
       cutoffAt,
       now,
       COMMUNITY_WEEKLY_POLICY_VERSION,
@@ -482,9 +774,9 @@ async function buildCommunityWeeklySnapshotForPeriod(
       now,
       startAt,
       owner,
-      epochRow.mutation_epoch,
+      mutationEpoch,
       now,
-      epochRow.mutation_epoch,
+      mutationEpoch,
       startAt,
     ),
     db.prepare(
@@ -501,9 +793,9 @@ async function buildCommunityWeeklySnapshotForPeriod(
           )`,
     ).bind(
       startAt,
-      epochRow.mutation_epoch,
+      mutationEpoch,
       snapshotId,
-      epochRow.mutation_epoch,
+      mutationEpoch,
     ),
   ]);
   if (results[0]?.meta.changes === 1) return { state: "built", snapshotId };
@@ -522,6 +814,7 @@ export async function rebuildPendingCommunityWeeklySnapshots(
   db: D1Database,
   scheduledTime: number,
   maximumRebuilds = 5,
+  policyOverride?: CommunitySnapshotPolicyOverride,
 ): Promise<{ processed: number; remaining: boolean; snapshotIds: string[] }> {
   if (!Number.isFinite(scheduledTime)
       || !Number.isSafeInteger(maximumRebuilds)
@@ -542,7 +835,7 @@ export async function rebuildPendingCommunityWeeklySnapshots(
       startAt: row.week_start,
       endAt: row.week_end,
       cutoffAt: row.ingestion_cutoff_at,
-    }, scheduledTime);
+    }, scheduledTime, policyOverride);
     if (result.state === "lease_unavailable") break;
     processed += 1;
     snapshotIds.push(result.snapshotId);
@@ -648,7 +941,9 @@ export async function readParticipantCommunityComparison(
 
   const payload = parseStoredJson<unknown>(row.payload_json);
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)
-      || Reflect.get(payload, "schemaVersion") !== SNAPSHOT_SCHEMA_VERSION
+      || !COMPARISON_SOURCE_SNAPSHOT_SCHEMA_VERSIONS.has(
+        Reflect.get(payload, "schemaVersion") as string,
+      )
       || Reflect.get(payload, "releaseStatus") !== "published"
       || Reflect.get(payload, "snapshotId") !== row.snapshot_id
       || Reflect.get(payload, "snapshotRevision") !== row.revision

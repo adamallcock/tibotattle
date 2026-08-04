@@ -60,6 +60,7 @@ function testBindings(overrides: Partial<Env & OptionalAdminBinding> = {}): Env 
     ASSETS: bindings.ASSETS,
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     ENROLLMENT_RATE_LIMIT: bindings.ENROLLMENT_RATE_LIMIT,
     CLIENT_ATTEMPT_RATE_LIMIT: bindings.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: privateJwkJson,
@@ -593,7 +594,7 @@ async function seedSealedSuppressedSnapshot(): Promise<void> {
  */
 async function seedPublishedSnapshotWithNoCells(): Promise<void> {
   const payload = JSON.stringify({
-    schemaVersion: "community-weekly-snapshot-v0.2",
+    schemaVersion: "community-weekly-snapshot-v0.3",
     snapshotId: "community-weekly:2026-07-20",
     snapshotRevision: 1,
     releaseStatus: "published",
@@ -1436,9 +1437,17 @@ describe("synthetic usage monitor service", () => {
     if (provider === "apple") {
       await runtimeEnv.USAGE_MONITOR_DB.prepare(
         `INSERT INTO apple_signin_handoffs
-           (state, identity_link_key, proof, created_at, expires_at, delivered_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).bind(state, linkKeyHex, proof, now.toISOString(), expiresAt, now.toISOString()).run();
+           (state, nonce_hash, identity_link_key, proof, created_at, expires_at, delivered_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        state,
+        "a".repeat(64),
+        linkKeyHex,
+        proof,
+        now.toISOString(),
+        expiresAt,
+        now.toISOString(),
+      ).run();
     } else {
       await runtimeEnv.USAGE_MONITOR_DB.prepare(
         `INSERT INTO google_signin_handoffs
@@ -1471,6 +1480,38 @@ describe("synthetic usage monitor service", () => {
         },
       }),
     }, effectiveEnv);
+  }
+
+  async function enrollMatureOpenCohortParticipant(
+    index: number,
+    runtimeEnv: Env,
+  ): Promise<EnrollmentResponse> {
+    const response = await identityEnroll(
+      await sha256Hex(`open-community-cohort-${index}`),
+      "google",
+      runtimeEnv,
+    );
+    expect(response.status).toBe(201);
+    const participant = await enrollmentFrom(response);
+    await runtimeEnv.USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET created_at = ? WHERE id = ?",
+    ).bind("2026-07-01T00:00:00.000Z", participant.participantId).run();
+    return participant;
+  }
+
+  async function uploadTelemetryAt(
+    participant: EnrollmentResponse,
+    telemetry: Record<string, unknown>,
+    createdAt: string,
+  ): Promise<{ contributionId: string }> {
+    Reflect.set(telemetry, "createdAt", createdAt);
+    const response = await uploadEnvelope(participant, await encrypt(telemetry, true));
+    expect(response.status).toBe(202);
+    const receipt = await response.json<{ contributionId: string }>();
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
+    ).bind(createdAt, receipt.contributionId).run();
+    return receipt;
   }
 
   it("enrolls open-mode production participants with grant-backed eligibility", async () => {
@@ -1696,6 +1737,18 @@ describe("synthetic usage monitor service", () => {
         CLIENT_ATTEMPT_RATE_LIMIT: allowedLimiter,
       }));
       expect(signInStart.status).toBe(503);
+      const deviceDisconnect = await api("/api/v1/device/disconnect", {
+        method: "POST",
+        headers: {
+          "cf-connecting-ip": "203.0.113.9",
+          authorization: "Device um_device_00000000-0000-4000-8000-000000000000.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+      }, testBindings({
+        RECOVERY_RATE_LIMIT: allowedLimiter,
+        CLIENT_ATTEMPT_RATE_LIMIT: clientBlockedLimiter,
+        IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
+      }));
+      expect(deviceDisconnect.status).toBe(429);
       const malformedPath = await api(
         "/api/v1/contributions/PRIVATE_PATH_CANARY",
         { headers: { authorization: "Bearer PRIVATE_CAPABILITY_CANARY" } },
@@ -1710,14 +1763,15 @@ describe("synthetic usage monitor service", () => {
     );
     expect(limiterKeys).toContain("usage-monitor:recovery:global");
     expect(limiterKeys).toContain("usage-monitor:sign_in_start:global");
+    expect(limiterKeys).toContain("usage-monitor:device_disconnect:global");
     const clientKeys = limiterKeys.filter((key) => key.includes(":client:"));
-    expect(clientKeys).toHaveLength(3);
+    expect(clientKeys).toHaveLength(4);
     for (const key of clientKeys) {
       expect(key).toMatch(/:client:[0-9a-f]{64}$/u);
       expect(key).not.toContain("PRIVATE_IP_CANARY");
       expect(key).not.toContain("203.0.113.9");
     }
-    expect(new Set(clientKeys).size).toBe(3);
+    expect(new Set(clientKeys).size).toBe(4);
     expect(warnings.join("\n")).not.toContain("PRIVATE_PATH_CANARY");
     expect(warnings.join("\n")).not.toContain("PRIVATE_CAPABILITY_CANARY");
     const attemptsTable = await testBindings().USAGE_MONITOR_DB.prepare(
@@ -1995,6 +2049,7 @@ describe("synthetic usage monitor service", () => {
         boundedQuarantineRetention: true,
         deletionSafeRestoreReplay: true,
         ongoingDeviceUploadRegistration: true,
+        coordinatedSignInAdmission: true,
       },
     });
   });
@@ -3186,7 +3241,7 @@ describe("synthetic usage monitor service", () => {
 
     const community = await api("/api/v1/community/insights");
     await expect(community.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -3468,7 +3523,7 @@ describe("synthetic usage monitor service", () => {
     expect(response.status).toBe(200);
     const body = await response.json<Record<string, unknown>>();
     expect(body).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -3601,30 +3656,36 @@ describe("synthetic usage monitor service", () => {
     let participantToDelete: EnrollmentResponse | null = null;
     let contributionToDelete = "";
     const cohort: EnrollmentResponse[] = [];
-    for (let index = 0; index < 20; index += 1) {
-      const grant = await issueTestGrant();
-      const enrolled = await enrollWithGrant(grant);
-      expect(enrolled.status).toBe(201);
-      const participant = await enrollmentFrom(enrolled);
-      cohort.push(participant);
-      participantToDelete ??= participant;
-      const contribution = await uploadEnvelope(
-        participant,
-        await encrypt(telemetryFixture("a"), true),
-      );
-      expect(contribution.status).toBe(202);
-      const contributionBody = await contribution.json<{ contributionId: string }>();
-      await testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind(
-        "2026-07-28T23:59:59.000Z",
-        contributionBody.contributionId,
-      ).run();
-      if (index === 0) contributionToDelete = contributionBody.contributionId;
-    }
     const unmeteredLimiter = {
       limit: async () => ({ success: true }),
     } as unknown as RateLimit;
+    const openCohortEnv = identityBindings({
+      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+      ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
+      CLIENT_ATTEMPT_RATE_LIMIT: unmeteredLimiter,
+    });
+    for (let index = 0; index < 20; index += 1) {
+      const participant = await enrollMatureOpenCohortParticipant(
+        index,
+        openCohortEnv,
+      );
+      cohort.push(participant);
+      participantToDelete ??= participant;
+      const contribution = await uploadTelemetryAt(
+        participant,
+        telemetryFixture("a"),
+        "2026-07-25T23:59:59.000Z",
+      );
+      // The second accepted day deliberately repeats the observed occurrence.
+      // It proves the participant's two-day contribution cadence without
+      // doubling the cell metric being exercised below.
+      await uploadTelemetryAt(
+        participant,
+        telemetryFixture("a"),
+        "2026-07-26T23:59:59.000Z",
+      );
+      if (index === 0) contributionToDelete = contribution.contributionId;
+    }
     for (let index = 0; index < 2; index += 1) {
       const grant = await issueTestGrant();
       const enrolled = await enrollWithGrant(grant, inviteOnlyBindings({
@@ -3691,7 +3752,7 @@ describe("synthetic usage monitor service", () => {
     const publishedText = await response.text();
     const published = JSON.parse(publishedText) as Record<string, unknown>;
     expect(published).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "published",
       immutable: true,
       nonOverlapping: true,
@@ -3834,7 +3895,7 @@ describe("synthetic usage monitor service", () => {
     const withdrawn = await api("/api/v1/stats/aggregate");
     const withdrawnText = await withdrawn.text();
     expect(JSON.parse(withdrawnText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "withdrawn",
       reason: "source_data_withdrawn",
       immutable: true,
@@ -3878,7 +3939,7 @@ describe("synthetic usage monitor service", () => {
     const rebuiltResponse = await api("/api/v1/stats/aggregate");
     const rebuiltText = await rebuiltResponse.text();
     expect(JSON.parse(rebuiltText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       snapshotId: "community-weekly:2026-07-20:r2",
       snapshotRevision: 2,
       releaseStatus: "suppressed",
@@ -3930,48 +3991,52 @@ describe("synthetic usage monitor service", () => {
     // omitting plan from the grouping key, this would collapse into a single
     // 40-participant cell instead of two 20-participant cells.
     //
-    // Community eligibility requires a redeemed invite grant (see
-    // participant_community_eligibility's insert trigger), and 40
-    // enrollments would exceed the shared enrollment rate limit this late in
-    // the suite — so this reuses the exact grant-and-unmetered-limiter
-    // pattern the "seals, serves, protects, and withdraws" test above uses
-    // for its own bulk enrollment.
+    // v0.3 public aggregates require distinct open-enrollment provider
+    // accounts, a mature account age, and two accepted collection days. Keep
+    // the test's large cohort explicit about each of those requirements.
     const unmeteredLimiter = {
       limit: async () => ({ success: true }),
     } as unknown as RateLimit;
-    const bulkEnrollBindings = inviteOnlyBindings({
+    const bulkEnrollBindings = identityBindings({
+      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
       ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
+      CLIENT_ATTEMPT_RATE_LIMIT: unmeteredLimiter,
     });
+    let identityIndex = 10_000;
     async function enrollEligible(): Promise<EnrollmentResponse> {
-      const grant = await issueTestGrant();
-      const enrolled = await enrollWithGrant(grant, bulkEnrollBindings);
-      expect(enrolled.status).toBe(201);
-      return enrollmentFrom(enrolled);
+      const participant = await enrollMatureOpenCohortParticipant(
+        identityIndex,
+        bulkEnrollBindings,
+      );
+      identityIndex += 1;
+      return participant;
     }
 
     for (let index = 0; index < 20; index += 1) {
       const known = await enrollEligible();
-      const knownUpload = await uploadEnvelope(
+      await uploadTelemetryAt(
         known,
-        await encrypt(telemetryFixture("a"), true),
+        telemetryFixture("a"),
+        "2026-07-25T23:59:59.000Z",
       );
-      expect(knownUpload.status).toBe(202);
-      const knownBody = await knownUpload.json<{ contributionId: string }>();
-      await testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind("2026-07-28T23:59:59.000Z", knownBody.contributionId).run();
+      await uploadTelemetryAt(
+        known,
+        telemetryFixture("a"),
+        "2026-07-26T23:59:59.000Z",
+      );
 
       const unknown = await enrollEligible();
-      const unknownUpload = await uploadEnvelope(
+      await uploadTelemetryAt(
         unknown,
-        await encrypt(telemetryFixture("a"), true),
+        telemetryFixture("a"),
+        "2026-07-25T23:59:59.000Z",
       );
-      expect(unknownUpload.status).toBe(202);
-      const unknownBody = await unknownUpload.json<{ contributionId: string }>();
+      await uploadTelemetryAt(
+        unknown,
+        telemetryFixture("a"),
+        "2026-07-26T23:59:59.000Z",
+      );
       await testBindings().USAGE_MONITOR_DB.batch([
-        testBindings().USAGE_MONITOR_DB.prepare(
-          "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-        ).bind("2026-07-28T23:59:59.000Z", unknownBody.contributionId),
         // No in-window quota evidence for this participant: their usage
         // event stays in-window, but their quota snapshot is pushed years
         // outside it, so participant_plans finds nothing to COALESCE from.
@@ -4127,7 +4192,7 @@ describe("synthetic usage monitor service", () => {
       inviteOnlyBindings(),
     );
     await expect(suppressed.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });
@@ -4152,7 +4217,7 @@ describe("synthetic usage monitor service", () => {
     );
     const communityText = await community.text();
     expect(JSON.parse(communityText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.2",
+      schemaVersion: "community-weekly-snapshot-v0.3",
       releaseStatus: "not_yet_published",
       reason: "stable_snapshot_unavailable",
     });

@@ -1,6 +1,10 @@
-import { ensureContributionDeviceCapability } from "./contribution-device-capability.js";
+import {
+  ensureContributionDeviceCapability,
+  withContributionDeviceSecret,
+} from "./contribution-device-capability.js";
 
 const PAIRING_PATTERN = /^um_pair_([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u;
+const DEVICE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const MAXIMUM_RESPONSE_BYTES = 16_384;
 
 const ERROR_CODES = new Set([
@@ -8,6 +12,7 @@ const ERROR_CODES = new Set([
   "pairing_invalid",
   "service_unavailable",
   "pairing_rejected",
+  "disconnect_rejected",
   "response_invalid",
 ]);
 
@@ -29,7 +34,7 @@ function normalizePairingCode(value) {
   return value;
 }
 
-async function boundedJsonResponse(response) {
+async function boundedJsonResponse(response, rejectionCode = "pairing_rejected") {
   if (!(response instanceof Response)) fail("response_invalid");
   const cacheControl = response.headers.get("cache-control");
   const contentType = response.headers.get("content-type") ?? "";
@@ -49,8 +54,16 @@ async function boundedJsonResponse(response) {
   } catch {
     fail("response_invalid");
   }
-  if (!response.ok) fail(response.status >= 500 ? "service_unavailable" : "pairing_rejected");
+  if (!response.ok) fail(response.status >= 500 ? "service_unavailable" : rejectionCode);
   return payload;
+}
+
+function canonicalOrigin(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    fail("invalid_configuration");
+  }
 }
 
 export async function claimContributionDevicePairing({
@@ -66,12 +79,7 @@ export async function claimContributionDevicePairing({
     fail("invalid_configuration");
   }
   const selectedPairing = normalizePairingCode(pairingCode);
-  let requestedOrigin;
-  try {
-    requestedOrigin = new URL(origin).origin;
-  } catch {
-    fail("invalid_configuration");
-  }
+  const requestedOrigin = canonicalOrigin(origin);
   const capability = await ensureCapability({ ...capabilityOptions, origin });
   if (!capability || capability.origin !== requestedOrigin
       || typeof capability.deviceId !== "string"
@@ -119,5 +127,72 @@ export async function claimContributionDevicePairing({
     deviceId: capability.deviceId,
     scope: "upload_registration",
     expiresAt: new Date(payload.expiresAt).toISOString(),
+  });
+}
+
+/**
+ * Revoke this Mac's upload-only device authority at the contribution service.
+ * The secret is leased only to this request and is never returned. Callers
+ * must remove the local Keychain/state binding only after this resolves with
+ * the same device id; that second, local operation intentionally lives in the
+ * companion so a failed network request cannot orphan the user's authority.
+ */
+export async function disconnectContributionDevice({
+  origin,
+  fetchImpl = globalThis.fetch,
+  withDeviceSecret = withContributionDeviceSecret,
+  capabilityOptions = {},
+} = {}) {
+  if (typeof fetchImpl !== "function" || typeof withDeviceSecret !== "function"
+      || !capabilityOptions || typeof capabilityOptions !== "object"
+      || Array.isArray(capabilityOptions)) {
+    fail("invalid_configuration");
+  }
+  const requestedOrigin = canonicalOrigin(origin);
+  const result = await withDeviceSecret({
+    ...capabilityOptions,
+    expectedOrigin: requestedOrigin,
+    operation: async (secret, binding) => {
+      if (!binding || binding.origin !== requestedOrigin
+          || !DEVICE_ID_PATTERN.test(binding.deviceId)) {
+        fail("invalid_configuration");
+      }
+      let response;
+      try {
+        response = await fetchImpl(
+          new URL("/api/v1/device/disconnect", binding.origin),
+          {
+            method: "POST",
+            credentials: "omit",
+            redirect: "error",
+            headers: {
+              Accept: "application/json",
+              Authorization:
+                `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`,
+            },
+          },
+        );
+      } catch {
+        fail("service_unavailable");
+      }
+      const payload = await boundedJsonResponse(response, "disconnect_rejected");
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)
+          || Object.keys(payload).sort().join("\0")
+            !== "deviceId\0disconnected\0schemaVersion"
+          || payload.schemaVersion !== "device-disconnect-v0.1"
+          || payload.disconnected !== true
+          || payload.deviceId !== binding.deviceId) {
+        fail("response_invalid");
+      }
+      return Object.freeze({ deviceId: binding.deviceId });
+    },
+  });
+  if (!result || typeof result !== "object" || !DEVICE_ID_PATTERN.test(result.deviceId)) {
+    fail("response_invalid");
+  }
+  return Object.freeze({
+    status: "disconnected",
+    origin: requestedOrigin,
+    deviceId: result.deviceId,
   });
 }

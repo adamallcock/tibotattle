@@ -64,7 +64,7 @@ export const PARTICIPANT_PROFILE_SCHEMA_VERSION = "participant-profile-v0.2";
 export const PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION =
   "participant-community-comparison-v0.2";
 // The comparison is derived from a sealed snapshot, so it inherits the same
-// immutability and the same two live contracts.
+// immutability and every released aggregate contract it can interpret.
 export const SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS =
   Object.freeze([
     "participant-community-comparison-v0.1",
@@ -111,6 +111,8 @@ export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
   "local-contribution-device-reset-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
+  "local-contribution-device-disconnect-v0.1";
 const DIAGNOSTIC_REFERENCE_PATTERN = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 // Both boundaries answer with fixed identifier-shaped codes: the Worker uses
 // SCREAMING_SNAKE, the local companion uses lower_snake. Neither shape can
@@ -1064,6 +1066,37 @@ export function normalizeLocalContributionDeviceReset(payload) {
     status: payload.status,
     credential: payload.credential,
     binding: payload.binding
+  };
+}
+
+/**
+ * Accept only the deliberately non-identifying result of stopping this Mac's
+ * upload authority. The local companion performs the authenticated remote
+ * revocation and clears its Keychain/state binding; the browser must never
+ * receive the device id or the bearer secret that made that possible.
+ */
+export function normalizeLocalContributionDeviceDisconnect(payload) {
+  const unavailable = {
+    status: "unavailable",
+    deliveryPaused: false,
+    localCredential: "unknown",
+    localBinding: "unknown",
+  };
+  if (payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION
+      || payload?.status !== "disconnected"
+      || payload?.deliveryPaused !== true
+      || !["deleted", "already_missing"].includes(payload?.localCredential)
+      || payload?.localBinding !== "removed"
+      || payload?.hostedDataDeleted !== false
+      || payload?.includesIdentifiers !== false
+      || payload?.includesCredentials !== false) {
+    return unavailable;
+  }
+  return {
+    status: "disconnected",
+    deliveryPaused: true,
+    localCredential: payload.localCredential,
+    localBinding: "removed",
   };
 }
 
@@ -2951,6 +2984,31 @@ export class LocalCompanionClient {
     const payload = await response.json().catch(() => null);
     if (!response.ok) throw localCompanionRequestError(response, payload);
     return normalizeLocalContributionDeviceReset(payload);
+  }
+
+  /**
+   * Stop this Mac's upload-only authority. Unlike the local repair above,
+   * this is a two-sided transaction: the companion first revokes the remote
+   * device bearer using the Keychain secret it alone can read, then pauses
+   * local delivery and clears that exact local binding. It does not delete
+   * already accepted hosted metadata or the browser's hosted session.
+   */
+  async disconnectContributionDevice() {
+    const response = await this.fetchImpl(
+      `${LOCAL_ROOT}/contribution/device-disconnect`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-Usage-Monitor-Local": "1"
+        },
+        body: JSON.stringify({ confirm: "disconnect_this_mac" })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw localCompanionRequestError(response, payload);
+    return normalizeLocalContributionDeviceDisconnect(payload);
   }
 
   contributionSyncExactReview() {

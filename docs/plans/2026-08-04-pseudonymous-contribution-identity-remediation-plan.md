@@ -2,10 +2,17 @@
 title: Pseudonymous Contribution Identity Remediation Plan
 date: 2026-08-04
 type: plan
-status: proposed
+status: superseded
 ---
 
 # Pseudonymous contribution identity remediation plan
+
+> Superseded on 2026-08-04 by
+> [the open-enrollment social identity remediation plan](2026-08-04-open-enrollment-social-identity-remediation-plan.md).
+> This plan assumed that social accounts were not an acceptable anti-Sybil
+> barrier. The later product decision accepts them as a proportionate barrier
+> for open enrollment, while retaining the same strict limits on what they
+> prove.
 
 ## Decision
 
