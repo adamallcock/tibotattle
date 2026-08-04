@@ -10,23 +10,50 @@ status: owner-run-internal-only
 This is an owner-run rehearsal for a disposable macOS profile. It is not a
 signing, notarization, Sparkle-feed publication, R2 write, deployment, or
 release-approval procedure. The verifier performs a **remote feed preflight**:
-it reads the candidate bundle's public metadata and, when `--live` is
-explicitly supplied, performs bounded credential-free HTTPS readback of the
-configured public endpoints. It does not verify the Sparkle signature and it
-does not prove that an installed client accepts the update.
+it reads both sealed channel identities from the candidate bundle and, when
+`--live` is explicitly supplied, performs bounded credential-free HTTPS
+readback. It does not verify the Sparkle signature and it does not prove that
+an installed client accepts the update.
+
+The `--channel` value is mandatory and must match both
+`Contents/Info.plist:UsageMonitorReleaseChannel` and
+`Contents/Resources/build-manifest.json:release.channelName`. A
+`preview_distribution` bundle is the preview/ad-hoc boundary only; it is not
+a signed dogfood or stable release bundle. `stable`, and a future configured
+`internal-dogfood`, are checked through the external-distribution bundle
+inspector and derive their central origin, appcast URL, and any reviewed
+public-key fingerprint from `config/release-channels.js`. The current
+`internal-dogfood` entry is deliberately unconfigured, so it fails locally
+with an actionable policy error before any network request. No endpoint flag
+may be used to bypass that policy.
+
+For the current unconfigured dogfood lane, an explicit check is expected to
+stop locally:
+
+```bash
+node scripts/verify-macos-preview-remote.js \
+  --app "/absolute/path/to/N+1/TiboTattle.app" \
+  --channel internal-dogfood
+```
+
+It must report that `internal-dogfood` needs reviewed dedicated endpoints and
+must make zero HTTPS requests. Do not substitute `stable` or a command-line
+endpoint override for that missing policy.
 
 `N` means the currently installed signed build in the disposable profile;
 `N+1` means the candidate build being rehearsed. Keep the signed `N` DMG (or
-the owner-approved recovery copy) available before starting. Do not use an
-ordinary development or ad-hoc build for the N to N+1 claim.
+the owner-approved recovery copy) available before starting. Only a signed
+`stable` or configured named dogfood bundle may participate in the owner-only
+installed-client rehearsal. A `preview_distribution` or `development` bundle
+may be inspected locally, but cannot be used as that proof.
 
 ## Gate meaning
 
-Run the verifier against the exact candidate app bundle. Endpoint values are
-explicit arguments from the reviewed release-channel metadata/config contract
-so a copied or stale bundle cannot silently redirect the rehearsal to a
-different service. The explicit central origin and appcast URL must match the
-candidate's embedded public metadata before any request is made.
+Run the verifier against the exact candidate bundle for the selected channel.
+For named release channels, endpoints are policy-derived and cannot be
+overridden. For the preview compatibility path, explicit public endpoint
+arguments remain cross-checked against the bundle metadata before any request
+is made.
 The only full update-acceptance proof is an owner-observed signed N to N+1
 rehearsal in this disposable profile; no verifier result or receipt can replace
 that observation.
@@ -37,16 +64,19 @@ remote feed preflight or updater proof:
 ```bash
 node scripts/verify-macos-preview-remote.js \
   --app "/absolute/path/to/N+1/TiboTattle.app" \
+  --channel preview_distribution \
   --central-origin "<reviewed channel central origin>" \
   --appcast-url "<reviewed channel appcast URL>" \
   --artifact-url "<reviewed channel artifact URL>" \
-  --production-claim \
+  --remote-feed-preflight \
   --receipt "/absolute/path/to/rehearsal/N+1-offline.json"
 ```
 
 Because `--live` is absent, this command must exit non-zero with a blocked
-production claim. The content-free receipt records that the remote feed
-preflight was not checked and contains no appcast or artifact payload.
+remote feed preflight. The preview bundle remains explicitly preview/ad-hoc;
+this command is not a signed dogfood rehearsal and cannot be used as one. The
+content-free receipt records that the remote feed preflight was not checked
+and contains no appcast or artifact payload.
 
 After the owner has confirmed that the public feed and artifact are intended
 to be exercised, run the bounded live remote feed preflight:
@@ -54,32 +84,36 @@ to be exercised, run the bounded live remote feed preflight:
 ```bash
 node scripts/verify-macos-preview-remote.js \
   --app "/absolute/path/to/N+1/TiboTattle.app" \
-  --central-origin "<reviewed channel central origin>" \
-  --appcast-url "<reviewed channel appcast URL>" \
-  --artifact-url "<reviewed channel artifact URL>" \
+  --channel stable \
   --live \
-  --production-claim \
+  --remote-feed-preflight \
   --receipt "/absolute/path/to/rehearsal/N+1-live.json"
 ```
 
-The live command intentionally exits non-zero when `--production-claim` is
-present: this verifier never turns remote readback into a passed production
-claim. A receipt may report `remotePublicationReadback.status` as `passed`
+The live command intentionally exits non-zero when
+`--remote-feed-preflight` is present: this verifier never turns remote
+readback into update acceptance. A receipt may report
+`remotePublicationReadback.status` as `passed`
 only when all of the following are true:
 
-- the candidate bundle is locally valid and remains in the preview boundary;
-- the explicit endpoints match the embedded public metadata;
+- the candidate bundle passes the selected channel's local boundary (the
+  preview/ad-hoc validator for `preview_distribution`, or the
+  external-distribution inspector for `stable`/configured dogfood);
+- the two sealed channel fields and the selected `--channel` match exactly;
+- named-channel endpoints match `config/release-channels.js` (preview
+  compatibility endpoints must match the embedded public metadata);
 - every configured central health/ready endpoint is healthy;
 - the appcast is a valid bounded Sparkle RSS/XML document, is not a 404/410,
   and contains exactly one content-addressed full `.dmg` N+1 enclosure; and
 - the remote response supplies `Content-Length` matching that enclosure before
   the bounded stream is consumed, and the streamed bytes have its SHA-256.
 
-The selected enclosure is the sole source of artifact identity. Optional
+The selected enclosure is the sole source of artifact identity. Preview-only
 artifact digest/length configuration is an exact cross-check only; it cannot
-select or replace the feed candidate. Delta enclosures, multiple full-DMG
-enclosures, missing `Content-Length`, mismatches, and ambiguous candidates are
-blocked.
+select or replace the feed candidate. Named release channels do not accept
+artifact endpoint, digest, length, or health-path overrides. Delta enclosures,
+multiple full-DMG enclosures, missing `Content-Length`, mismatches, and
+ambiguous candidates are blocked.
 
 An unavailable request, malformed XML, invalid enclosure metadata, mismatched
 URL, missing artifact, byte mismatch, missing/mismatched `Content-Length`, or
@@ -108,9 +142,10 @@ outside this lane:
 
 1. A Developer ID-signed, notarized, stapled build for `N`, installed only in
    the disposable profile, and the exact signed/notarized `N+1` candidate.
-2. The Sparkle-signed appcast and its immutable public artifact at the exact
-   URLs passed to the verifier. The feed must already be available; this lane
-   does not sign, publish, upload, or repair it.
+2. The Sparkle-signed appcast and its immutable public artifact at the
+   policy-derived named-channel URL (or the reviewed preview compatibility
+   URLs). The feed must already be available; this lane does not sign,
+   publish, upload, or repair it.
 3. A disposable macOS user profile or release VM with no existing TiboTattle
    state, Login Item, updater prompt, or retained account material.
 4. A recoverable copy of `N` and an owner-approved way to restore it if the
@@ -137,8 +172,8 @@ receipt and a pass/fail note for each step.
 2. **Preflight N+1.** Run the live verifier command above against the exact
    `N+1` bundle. A blocked `remotePublicationReadback`, `not_published`,
    `unavailable`, `invalid`, or `mismatched_url` result ends the attempt; do
-   not open an updater flow and do not make a production claim. Even a passed
-   remote preflight leaves `sparkleAcceptance` unverified.
+   not open an updater flow and do not make an update-acceptance claim. Even a
+   passed remote preflight leaves `sparkleAcceptance` unverified.
 3. **Cancellation path.** From N, start the manual update check and begin the
    N+1 download/install flow. Cancel while the operation is cancellable. Confirm
    that the app remains on N, the update is not reported as installed, and the
@@ -172,5 +207,5 @@ mismatch, an unexpected installed app identity, or a state change outside the
 rehearsal.
 Retry only with a fresh receipt filename after the owner has diagnosed the
 bounded failure. If the second attempt fails, use the retained N fallback and
-leave production claims blocked until the owner supplies fresh feed/artifact
+leave release publication blocked until the owner supplies fresh feed/artifact
 evidence and completes the real signed N to N+1 installed-client rehearsal.

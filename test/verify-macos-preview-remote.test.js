@@ -23,11 +23,19 @@ const ARTIFACT_SHA256 = createHash("sha256")
   .digest("hex");
 const ARTIFACT_URL =
   `https://updates.example.test/releases/${BUNDLE_VERSION}/${ARTIFACT_SHA256}/TiboTattle.dmg`;
+const STABLE_CENTRAL_ORIGIN = "https://stable-central.example.test";
+const STABLE_APPCAST_URL = "https://stable-updates.example.test/appcast.xml";
+const STABLE_ARTIFACT_URL =
+  `https://stable-updates.example.test/releases/${BUNDLE_VERSION}/${ARTIFACT_SHA256}/TiboTattle.dmg`;
 const PUBLIC_ED_KEY = Buffer.alloc(32, 4).toString("base64");
 const PUBLIC_ED_KEY_SHA256 = createHash("sha256")
   .update(Buffer.alloc(32, 4))
   .digest("hex");
 const SPARKLE_SIGNATURE = Buffer.alloc(64, 7).toString("base64");
+const STABLE_PUBLIC_ED_KEY = Buffer.alloc(32, 8).toString("base64");
+const STABLE_PUBLIC_ED_KEY_SHA256 = createHash("sha256")
+  .update(Buffer.alloc(32, 8))
+  .digest("hex");
 const VALID_APPCAST = `<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
@@ -37,6 +45,7 @@ const VALID_APPCAST = `<?xml version="1.0" encoding="utf-8"?>
     </item>
   </channel>
 </rss>`;
+const STABLE_APPCAST = VALID_APPCAST.replace(ARTIFACT_URL, STABLE_ARTIFACT_URL);
 const PLIST = Object.freeze({
   SUFeedURL: APPCAST_URL,
   SUPublicEDKey: PUBLIC_ED_KEY,
@@ -44,7 +53,42 @@ const PLIST = Object.freeze({
   UsageMonitorCentralOrigin: CENTRAL_ORIGIN,
   UsageMonitorCentralOriginMode: "production_https",
   UsageMonitorPreviewDistribution: true,
+  UsageMonitorReleaseChannel: "preview_distribution",
   UsageMonitorUpdaterEnabled: true,
+});
+const MANIFEST = Object.freeze({
+  release: {
+    channel: "preview_distribution",
+    channelName: "preview_distribution",
+  },
+});
+const STABLE_PLIST = Object.freeze({
+  SUFeedURL: STABLE_APPCAST_URL,
+  SUPublicEDKey: STABLE_PUBLIC_ED_KEY,
+  UsageMonitorBuildChannel: "production",
+  UsageMonitorCentralOrigin: STABLE_CENTRAL_ORIGIN,
+  UsageMonitorCentralOriginMode: "production_https",
+  UsageMonitorPublicWebsiteOrigin: "https://stable-web.example.test",
+  UsageMonitorReleaseChannel: "stable",
+  UsageMonitorUpdaterEnabled: true,
+});
+const STABLE_MANIFEST = Object.freeze({
+  release: {
+    channel: "production",
+    channelName: "stable",
+  },
+});
+const STABLE_POLICY = Object.freeze({
+  configured: true,
+  name: "stable",
+  publicWebsiteOrigin: "https://stable-web.example.test",
+  serviceOrigin: STABLE_CENTRAL_ORIGIN,
+  serviceOriginMode: "production_https",
+  sparkle: Object.freeze({
+    appcastURL: STABLE_APPCAST_URL,
+    objectPrefix: "releases",
+    publicEdKeySha256: STABLE_PUBLIC_ED_KEY_SHA256,
+  }),
 });
 const ENDPOINT_CONFIG = Object.freeze({
   appcastURL: APPCAST_URL,
@@ -107,6 +151,7 @@ function artifactResponse(
 
 function injectedDependencies(overrides = {}) {
   return {
+    readBuildManifest: async () => MANIFEST,
     readInfoPlist: async () => PLIST,
     validatePreviewApp: async () => ({
       bundleIdentifier: "com.usagemonitor.local",
@@ -121,10 +166,11 @@ function injectedDependencies(overrides = {}) {
 function strictOptions(overrides = {}) {
   return {
     appPath: APP_PATH,
+    channel: "preview_distribution",
     clock: clock(),
     endpointConfig: ENDPOINT_CONFIG,
     live: true,
-    productionClaim: true,
+    remoteFeedPreflight: true,
     ...injectedDependencies(),
     ...overrides,
   };
@@ -145,10 +191,11 @@ function healthyOrFeedResponse(url, appcastBody = VALID_APPCAST) {
 test("explicit endpoint CLI configuration remains opt-in and network-free by default", () => {
   const options = parseMacOSPreviewRemoteArguments([
     "--app", APP_PATH,
+    "--channel", "preview_distribution",
     "--central-origin", CENTRAL_ORIGIN,
     "--appcast-url", APPCAST_URL,
     "--artifact-url", ARTIFACT_URL,
-    "--production-claim",
+    "--remote-feed-preflight",
     "--receipt", "/tmp/tibotattle-update-rehearsal.json",
   ]);
   assert.deepEqual(options.endpointConfig, {
@@ -157,11 +204,155 @@ test("explicit endpoint CLI configuration remains opt-in and network-free by def
     centralOrigin: CENTRAL_ORIGIN,
   });
   assert.equal(options.live, false);
-  assert.equal(options.productionClaim, true);
+  assert.equal(options.channel, "preview_distribution");
+  assert.equal(options.remoteFeedPreflight, true);
   assert.equal(options.receiptPath, "/tmp/tibotattle-update-rehearsal.json");
+  assert.throws(
+    () => parseMacOSPreviewRemoteArguments([
+      "--channel", "preview_distribution", "--production-claim",
+    ]),
+    { code: "MACOS_PREVIEW_REMOTE_ARGUMENTS_INVALID" },
+  );
 });
 
-test("no-network production claim is blocked and receipt contains no payload content", async () => {
+test("named stable verification uses policy endpoints and never claims native acceptance", async () => {
+  const calls = [];
+  let inspectedOptions;
+  const result = await verifyMacOSPreviewRemote({
+    appPath: APP_PATH,
+    channel: "stable",
+    clock: clock(),
+    fetchImpl: async (url, options) => {
+      calls.push({ options, url });
+      if (url === `${STABLE_CENTRAL_ORIGIN}/api/health`) {
+        return response(200, '{"status":"ok"}', url, "application/json");
+      }
+      if (url === `${STABLE_CENTRAL_ORIGIN}/api/ready`) {
+        return response(200, '{"status":"ready"}', url, "application/json");
+      }
+      if (url === STABLE_APPCAST_URL) return response(200, STABLE_APPCAST, url);
+      if (url === STABLE_ARTIFACT_URL) return artifactResponse(url);
+      assert.fail(`unexpected policy URL: ${url}`);
+    },
+    getReleaseChannelImpl: (name) => {
+      assert.equal(name, "stable");
+      return STABLE_POLICY;
+    },
+    inspectMacOSAppImpl: async (path, options) => {
+      assert.equal(path, APP_PATH);
+      inspectedOptions = options;
+      return {
+        bundleIdentifier: "com.usagemonitor.local",
+        bundleVersion: BUNDLE_VERSION,
+      };
+    },
+    live: true,
+    readBuildManifest: async () => STABLE_MANIFEST,
+    readInfoPlist: async () => STABLE_PLIST,
+    remoteFeedPreflight: true,
+  });
+  assert.deepEqual(inspectedOptions, {
+    channel: "stable",
+    requireExternalDistribution: true,
+  });
+  assert.equal(result.metadata.channel, "stable");
+  assert.equal(result.metadata.centralOrigin, STABLE_CENTRAL_ORIGIN);
+  assert.equal(result.metadata.appcastURL, STABLE_APPCAST_URL);
+  assert.equal(result.appcast.valid, true);
+  assert.equal(result.artifact.valid, true);
+  assert.equal(result.remotePublicationReadback.passed, true);
+  assert.equal(result.sparkleAcceptance.cryptographicSignatureVerified, false);
+  assert.equal(result.sparkleAcceptance.nativeClientRehearsalVerified, false);
+  assert.equal(result.claim.passed, false);
+  assert.equal(result.overall, "remote_feed_preflight_passed");
+  assert.deepEqual(calls.map(({ url }) => url), [
+    `${STABLE_CENTRAL_ORIGIN}/api/health`,
+    `${STABLE_CENTRAL_ORIGIN}/api/ready`,
+    STABLE_APPCAST_URL,
+    STABLE_ARTIFACT_URL,
+  ]);
+});
+
+test("named release channels reject endpoint overrides before local or remote work", async () => {
+  let inspected = false;
+  let fetched = false;
+  await assert.rejects(
+    verifyMacOSPreviewRemote({
+      appPath: APP_PATH,
+      channel: "stable",
+      endpointConfig: {
+        appcastURL: APPCAST_URL,
+        centralOrigin: CENTRAL_ORIGIN,
+      },
+      fetchImpl: async () => {
+        fetched = true;
+        throw new Error("network must not be called");
+      },
+      getReleaseChannelImpl: () => STABLE_POLICY,
+      inspectMacOSAppImpl: async () => {
+        inspected = true;
+        return {};
+      },
+    }),
+    {
+      code: "MACOS_PREVIEW_REMOTE_CHANNEL_ENDPOINT_OVERRIDE_FORBIDDEN",
+    },
+  );
+  assert.equal(inspected, false);
+  assert.equal(fetched, false);
+});
+
+test("unconfigured internal-dogfood fails before any remote request", async () => {
+  let fetched = false;
+  await assert.rejects(
+    verifyMacOSPreviewRemote({
+      appPath: APP_PATH,
+      channel: "internal-dogfood",
+      fetchImpl: async () => {
+        fetched = true;
+        throw new Error("network must not be called");
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "MACOS_PREVIEW_REMOTE_CHANNEL_NOT_CONFIGURED");
+      assert.match(error.message, /config\/release-channels\.js/u);
+      return true;
+    },
+  );
+  assert.equal(fetched, false);
+});
+
+test("sealed channel fields are both required and must match the selected channel", async () => {
+  const mismatchedManifest = {
+    release: {
+      channel: "preview_distribution",
+      channelName: "stable",
+    },
+  };
+  await assert.rejects(
+    verifyMacOSPreviewRemote({
+      ...strictOptions({
+        fetchImpl: async () => assert.fail("network must not be called"),
+        readBuildManifest: async () => mismatchedManifest,
+      }),
+    }),
+    { code: "MACOS_PREVIEW_REMOTE_CHANNEL_METADATA_MISMATCH" },
+  );
+  await assert.rejects(
+    verifyMacOSPreviewRemote({
+      ...strictOptions({
+        fetchImpl: async () => assert.fail("network must not be called"),
+        readInfoPlist: async () => {
+          const { UsageMonitorReleaseChannel: _ignored, ...withoutChannel } = PLIST;
+          return withoutChannel;
+        },
+      }),
+    }),
+    { code: "MACOS_PREVIEW_REMOTE_CHANNEL_METADATA_MISMATCH" },
+  );
+});
+
+test("no-network remote feed preflight is blocked and receipt contains no payload content", async () => {
   let fetchCalls = 0;
   const result = await verifyMacOSPreviewRemote({
     ...strictOptions({ live: false, fetchImpl: async () => {
@@ -184,7 +375,7 @@ test("no-network production claim is blocked and receipt contains no payload con
   assert.equal(serialized.includes(ARTIFACT_BYTES.toString("utf8")), false);
 });
 
-test("HTTP 404 appcast is not published and blocks the production claim", async () => {
+test("HTTP 404 appcast is not published and blocks the remote feed preflight", async () => {
   const calls = [];
   const result = await verifyMacOSPreviewRemote(strictOptions({
     fetchImpl: async (url, options) => {
@@ -401,7 +592,7 @@ test("structurally valid arbitrary signature bytes only pass remote readback, ne
 
   const output = [];
   const cli = await runMacOSPreviewRemoteCLI(
-    ["--app", APP_PATH, "--live", "--production-claim"],
+    ["--app", APP_PATH, "--channel", "preview_distribution", "--live", "--remote-feed-preflight"],
     {
       stdout: (line) => output.push(line),
       stderr: (line) => output.push(`stderr:${line}`),
@@ -411,7 +602,7 @@ test("structurally valid arbitrary signature bytes only pass remote readback, ne
   assert.equal(cli.exitCode, 1);
   assert.equal(output.includes("Remote feed preflight: passed"), true);
   assert.equal(output.some((line) => line.includes("Sparkle update acceptance: not verified")), true);
-  assert.equal(output.some((line) => line.includes("Production claim: passed")), false);
+  assert.equal(output.some((line) => line.includes("Update acceptance gate: blocked")), true);
 });
 
 test("receipt writer is content-free and refuses to overwrite an attempt", async () => {

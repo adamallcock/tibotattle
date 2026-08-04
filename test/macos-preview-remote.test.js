@@ -20,7 +20,14 @@ const PLIST = Object.freeze({
   UsageMonitorCentralOrigin: CENTRAL_ORIGIN,
   UsageMonitorCentralOriginMode: "production_https",
   UsageMonitorPreviewDistribution: true,
+  UsageMonitorReleaseChannel: "preview_distribution",
   UsageMonitorUpdaterEnabled: true,
+});
+const MANIFEST = Object.freeze({
+  release: {
+    channel: "preview_distribution",
+    channelName: "preview_distribution",
+  },
 });
 
 const VALID_APPCAST = `<?xml version="1.0" encoding="utf-8"?>
@@ -55,6 +62,7 @@ function response(status, body = "", url = "") {
 
 function injectedDependencies(overrides = {}) {
   return {
+    readBuildManifest: async () => MANIFEST,
     readInfoPlist: async () => PLIST,
     validatePreviewApp: async () => ({
       bundleIdentifier: "com.usagemonitor.local",
@@ -67,16 +75,27 @@ function injectedDependencies(overrides = {}) {
 }
 
 test("CLI parsing is offline by default and bounds the opt-in timeout", () => {
-  const defaulted = parseMacOSPreviewRemoteArguments([], {});
+  assert.throws(
+    () => parseMacOSPreviewRemoteArguments([], {}),
+    { code: "MACOS_PREVIEW_REMOTE_CHANNEL_INVALID" },
+  );
+  const defaulted = parseMacOSPreviewRemoteArguments(
+    ["--channel", "preview_distribution"],
+    {},
+  );
   assert.match(
     defaulted.appPath,
     /\.release-build\/macos-preview\/current\/TiboTattle\.app$/u,
   );
   assert.equal(defaulted.live, false);
   assert.deepEqual(
-    parseMacOSPreviewRemoteArguments(["--app", APP_PATH]),
+    parseMacOSPreviewRemoteArguments([
+      "--app", APP_PATH,
+      "--channel", "preview_distribution",
+    ]),
     {
       appPath: APP_PATH,
+      channel: "preview_distribution",
       help: false,
       live: false,
       timeoutMs: 5_000,
@@ -86,6 +105,8 @@ test("CLI parsing is offline by default and bounds the opt-in timeout", () => {
     parseMacOSPreviewRemoteArguments([
       "--app",
       APP_PATH,
+      "--channel",
+      "preview_distribution",
       "--live",
       "--timeout-ms",
       "2500",
@@ -96,6 +117,8 @@ test("CLI parsing is offline by default and bounds the opt-in timeout", () => {
     () => parseMacOSPreviewRemoteArguments([
       "--app",
       APP_PATH,
+      "--channel",
+      "preview_distribution",
       "--timeout-ms",
       "30001",
     ]),
@@ -108,6 +131,7 @@ test("offline verification validates locally and never calls fetch", async () =>
   let fetchCalls = 0;
   const result = await verifyMacOSPreviewRemote({
     appPath: APP_PATH,
+    channel: "preview_distribution",
     fetchImpl: async () => {
       fetchCalls += 1;
       throw new Error("network must not be called");
@@ -139,6 +163,7 @@ test("live verification checks health and reports an unpublished appcast as bloc
   const calls = [];
   const result = await verifyMacOSPreviewRemote({
     appPath: APP_PATH,
+    channel: "preview_distribution",
     clock: clock(),
     fetchImpl: async (url, options) => {
       calls.push({ options, url });
@@ -185,6 +210,7 @@ test("valid Sparkle RSS/XML is distinguished from malformed or empty appcast con
 
   const result = await verifyMacOSPreviewRemote({
     appPath: APP_PATH,
+    channel: "preview_distribution",
     clock: clock(),
     fetchImpl: async (url) => {
       if (url.endsWith("/api/health")) return response(200, '{"status":"ok"}', url);
@@ -215,6 +241,7 @@ test("a bounded timeout blocks remote feed preflight without leaking response co
   };
   const result = await verifyMacOSPreviewRemote({
     appPath: APP_PATH,
+    channel: "preview_distribution",
     clock: timeoutClock,
     fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
       options.signal.addEventListener("abort", () => reject(new Error("aborted")));
@@ -237,7 +264,7 @@ test("a bounded timeout blocks remote feed preflight without leaking response co
 test("CLI reports blocked remote preflight without claiming release acceptance or printing the signing key", async () => {
   const output = [];
   const result = await runMacOSPreviewRemoteCLI(
-    ["--app", APP_PATH, "--live"],
+    ["--app", APP_PATH, "--channel", "preview_distribution", "--live"],
     {
       stdout: (line) => output.push(line),
       stderr: (line) => output.push(`stderr:${line}`),
@@ -263,7 +290,7 @@ test("CLI reports blocked remote preflight without claiming release acceptance o
   assert.equal(output.some((line) => line.includes(PUBLIC_ED_KEY)), false);
   assert.equal(output.some((line) => line.includes("Remote feed preflight: blocked")), true);
   assert.equal(output.some((line) => line.includes("Sparkle update acceptance: not verified")), true);
-  assert.equal(output.some((line) => line.includes("Production claim:")), false);
+  assert.equal(output.some((line) => line.includes("Update acceptance gate: passed")), false);
 });
 
 assert.deepEqual(MACOS_PREVIEW_REMOTE_HEALTH_PATHS, ["/api/health", "/api/ready"]);

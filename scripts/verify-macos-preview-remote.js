@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  getReleaseChannel,
+  INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  STABLE_RELEASE_CHANNEL,
+} from "../config/release-channels.js";
 import {
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
   normalizeMacOSCentralOrigin,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
 import { normalizeMacOSUpdaterMetadata } from "./macos-updater-core.js";
+import { inspectMacOSApp } from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -34,6 +40,23 @@ const SPARKLE_NAMESPACE =
   "http://www.andymatuschak.org/xml-namespaces/sparkle";
 const XML_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.:-]*$/u;
 const XML_ENTITY_PATTERN = /&(?:amp|lt|gt|apos|quot|#[0-9]+|#x[0-9A-Fa-f]+);/gu;
+const SAFE_PATH_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const MACOS_RELEASE_CHANNELS = Object.freeze([
+  STABLE_RELEASE_CHANNEL,
+  INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+]);
+const MACOS_SEALED_CHANNELS = Object.freeze([
+  STABLE_RELEASE_CHANNEL,
+  INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+  "development",
+]);
+const MACOS_LEGACY_CHANNELS = Object.freeze({
+  development: "development",
+  [INTERNAL_DOGFOOD_RELEASE_CHANNEL]: "internal-dogfood",
+  [MACOS_PREVIEW_DISTRIBUTION_CHANNEL]: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+  [STABLE_RELEASE_CHANNEL]: "production",
+});
 
 export const MACOS_PREVIEW_REMOTE_HEALTH_PATHS = Object.freeze([
   "/api/health",
@@ -55,6 +78,13 @@ export const MACOS_PREVIEW_REMOTE_CODES = Object.freeze({
   ARTIFACT_INVALID: "MACOS_PREVIEW_REMOTE_ARTIFACT_INVALID",
   FETCH_FAILED: "MACOS_PREVIEW_REMOTE_FETCH_FAILED",
   FETCH_REDIRECT: "MACOS_PREVIEW_REMOTE_FETCH_REDIRECT",
+  CHANNEL_ENDPOINT_OVERRIDE_FORBIDDEN:
+    "MACOS_PREVIEW_REMOTE_CHANNEL_ENDPOINT_OVERRIDE_FORBIDDEN",
+  CHANNEL_INVALID: "MACOS_PREVIEW_REMOTE_CHANNEL_INVALID",
+  CHANNEL_METADATA_MISMATCH: "MACOS_PREVIEW_REMOTE_CHANNEL_METADATA_MISMATCH",
+  CHANNEL_NOT_CONFIGURED: "MACOS_PREVIEW_REMOTE_CHANNEL_NOT_CONFIGURED",
+  CHANNEL_REMOTE_FORBIDDEN: "MACOS_PREVIEW_REMOTE_CHANNEL_REMOTE_FORBIDDEN",
+  CHANNEL_POLICY_INVALID: "MACOS_PREVIEW_REMOTE_CHANNEL_POLICY_INVALID",
   METADATA_INVALID: "MACOS_PREVIEW_REMOTE_METADATA_INVALID",
   PLIST_INVALID: "MACOS_PREVIEW_REMOTE_PLIST_INVALID",
   RECEIPT_EXISTS: "MACOS_PREVIEW_REMOTE_RECEIPT_EXISTS",
@@ -148,7 +178,8 @@ export function parseMacOSPreviewRemoteArguments(
   let live = false;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let help = false;
-  let productionClaim = false;
+  let channel = null;
+  let remoteFeedPreflight = false;
   let receiptPath = null;
   const endpointConfig = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -173,6 +204,22 @@ export function parseMacOSPreviewRemoteArguments(
       timeoutMs = parseTimeoutArgument(
         parseOptionValue(argv, index, "--timeout-ms"),
       );
+      index += 1;
+    } else if (argument === "--channel") {
+      const value = parseOptionValue(argv, index, "--channel");
+      if (channel !== null) {
+        throw remoteError(
+          MACOS_PREVIEW_REMOTE_CODES.ARGUMENTS_INVALID,
+          "--channel may be provided only once",
+        );
+      }
+      if (!MACOS_SEALED_CHANNELS.includes(value)) {
+        throw remoteError(
+          MACOS_PREVIEW_REMOTE_CODES.CHANNEL_INVALID,
+          `--channel must be one of ${MACOS_SEALED_CHANNELS.join(", ")}`,
+        );
+      }
+      channel = value;
       index += 1;
     } else if (argument === "--central-origin") {
       setUniqueOption(
@@ -228,14 +275,14 @@ export function parseMacOSPreviewRemoteArguments(
       }
       endpointConfig.healthPaths.push(path);
       index += 1;
-    } else if (argument === "--production-claim") {
-      if (productionClaim) {
+    } else if (argument === "--remote-feed-preflight") {
+      if (remoteFeedPreflight) {
         throw remoteError(
           MACOS_PREVIEW_REMOTE_CODES.ARGUMENTS_INVALID,
-          "--production-claim may be provided only once",
+          "--remote-feed-preflight may be provided only once",
         );
       }
-      productionClaim = true;
+      remoteFeedPreflight = true;
     } else if (argument === "--receipt" || argument === "--receipt-file") {
       if (receiptPath !== null) {
         throw remoteError(
@@ -259,8 +306,15 @@ export function parseMacOSPreviewRemoteArguments(
       );
     }
   }
+  if (!help && channel === null) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_INVALID,
+      "--channel is required; select the sealed bundle channel explicitly",
+    );
+  }
   const parsed = {
     appPath,
+    channel,
     help,
     live,
     timeoutMs,
@@ -268,7 +322,7 @@ export function parseMacOSPreviewRemoteArguments(
   if (Object.keys(endpointConfig).length > 0) {
     parsed.endpointConfig = Object.freeze(endpointConfig);
   }
-  if (productionClaim) parsed.productionClaim = true;
+  if (remoteFeedPreflight) parsed.remoteFeedPreflight = true;
   if (receiptPath !== null) parsed.receiptPath = receiptPath;
   return Object.freeze(parsed);
 }
@@ -319,28 +373,271 @@ export function readMacOSPreviewInfoPlist(appPath) {
   return parsePlistJSON(join(selected, "Contents", "Info.plist"));
 }
 
-function publicPreviewMetadata(plist) {
+export async function readMacOSPreviewBuildManifest(appPath) {
+  const selected = normalizeAppPath(appPath);
+  const manifestPath = join(
+    selected,
+    "Contents",
+    "Resources",
+    "build-manifest.json",
+  );
+  let source;
+  try {
+    source = await readFile(manifestPath, {
+      encoding: "utf8",
+      flag: "r",
+    });
+  } catch {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      "Application build manifest could not be read as public metadata",
+    );
+  }
+  if (Buffer.byteLength(source, "utf8") > PLIST_MAX_BYTES) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      "Application build manifest exceeds the bounded metadata limit",
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      "Application build manifest is not valid JSON metadata",
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      "Application build manifest must be a metadata object",
+    );
+  }
+  return parsed;
+}
+
+function sealedChannel(value, label) {
+  if (typeof value !== "string" || !MACOS_SEALED_CHANNELS.includes(value)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_METADATA_MISMATCH,
+      `${label} must be one of ${MACOS_SEALED_CHANNELS.join(", ")}`,
+    );
+  }
+  return value;
+}
+
+function publicHttpsOrigin(value, label) {
+  requiredString(value, label, MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID);
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      `${label} is not a public HTTPS origin`,
+    );
+  }
+  if (parsed.protocol !== "https:"
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.origin !== value) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      `${label} must be a public HTTPS origin`,
+    );
+  }
+  return parsed.origin;
+}
+
+function releaseChannelPolicy(channel, getReleaseChannelImpl) {
+  if (!MACOS_RELEASE_CHANNELS.includes(channel)) return null;
+  if (typeof getReleaseChannelImpl !== "function") {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      "A release-channel policy resolver is required",
+    );
+  }
+  let policy;
+  try {
+    policy = getReleaseChannelImpl(channel);
+  } catch (error) {
+    const code = error?.code === "RELEASE_CHANNEL_NOT_CONFIGURED"
+      || error?.code === "RELEASE_CHANNEL_DOGFOOD_NOT_CONFIGURED"
+      ? MACOS_PREVIEW_REMOTE_CODES.CHANNEL_NOT_CONFIGURED
+      : MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID;
+    throw remoteError(
+      code,
+      `Release channel ${channel} policy could not be read from config/release-channels.js`,
+    );
+  }
+  if (!policy || typeof policy !== "object" || policy.name !== channel) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      `Release channel ${channel} policy has an unexpected identity`,
+    );
+  }
+  if (policy.configured !== true) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_NOT_CONFIGURED,
+      `Release channel ${channel} is not configured; add its reviewed dedicated endpoints and public-key fingerprint to config/release-channels.js before networking`,
+    );
+  }
+  let serviceOrigin;
+  let appcastURL;
+  let websiteOrigin;
+  try {
+    serviceOrigin = publicHttpsOrigin(
+      policy.serviceOrigin,
+      `Release channel ${channel} service origin`,
+    );
+    appcastURL = publicHttpsURL(
+      policy.sparkle?.appcastURL,
+      `Release channel ${channel} appcast URL`,
+    );
+    websiteOrigin = publicHttpsOrigin(
+      policy.publicWebsiteOrigin,
+      `Release channel ${channel} website origin`,
+    );
+  } catch {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      `Release channel ${channel} policy contains invalid public endpoints`,
+    );
+  }
+  const fingerprint = policy.sparkle?.publicEdKeySha256;
+  if (fingerprint !== null
+      && (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(fingerprint))) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      `Release channel ${channel} policy contains an invalid public-key fingerprint`,
+    );
+  }
+  const objectPrefix = policy.sparkle?.objectPrefix;
+  if (typeof objectPrefix !== "string"
+      || objectPrefix.length === 0
+      || objectPrefix.startsWith("/")
+      || objectPrefix.endsWith("/")
+      || !objectPrefix.split("/").every((segment) =>
+        SAFE_PATH_SEGMENT_PATTERN.test(segment)
+        && segment !== "."
+        && segment !== "..")) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      `Release channel ${channel} policy contains an invalid artifact prefix`,
+    );
+  }
+  if (typeof policy.serviceOriginMode !== "string") {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      `Release channel ${channel} policy is missing its service origin mode`,
+    );
+  }
+  return Object.freeze({
+    appcastURL,
+    artifactPrefix: objectPrefix,
+    name: policy.name,
+    publicEdKeySha256: fingerprint,
+    serviceOrigin,
+    serviceOriginMode: policy.serviceOriginMode,
+    websiteOrigin,
+  });
+}
+
+function publicPreviewMetadata(
+  plist,
+  manifest,
+  { channel, channelPolicy },
+) {
   if (!plist || typeof plist !== "object" || Array.isArray(plist)) {
     throw remoteError(
       MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
       "Preview application public metadata is not an object",
     );
   }
-  if (plist.UsageMonitorBuildChannel !== MACOS_PREVIEW_DISTRIBUTION_CHANNEL
-      || plist.UsageMonitorPreviewDistribution !== true
-      || plist.UsageMonitorCentralOriginMode !== "production_https"
-      || plist.UsageMonitorUpdaterEnabled !== true) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
     throw remoteError(
       MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
-      "Preview application public metadata is outside the preview distribution boundary",
+      "Application build manifest is not an object",
+    );
+  }
+  const plistChannel = sealedChannel(
+    plist.UsageMonitorReleaseChannel,
+    "Info.plist UsageMonitorReleaseChannel",
+  );
+  const manifestChannel = sealedChannel(
+    manifest.release?.channelName,
+    "build-manifest.json release.channelName",
+  );
+  if (plistChannel !== manifestChannel || plistChannel !== channel) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_METADATA_MISMATCH,
+      "Info.plist UsageMonitorReleaseChannel, build-manifest.json release.channelName, and --channel must match exactly",
+    );
+  }
+  if (plist.UsageMonitorBuildChannel !== MACOS_LEGACY_CHANNELS[channel]
+      || manifest.release?.channel !== MACOS_LEGACY_CHANNELS[channel]) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_METADATA_MISMATCH,
+      `The sealed ${channel} bundle has unexpected legacy channel metadata`,
+    );
+  }
+  if (channel === "development") {
+    if (plist.UsageMonitorUpdaterEnabled !== false) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+        "Development application must have the updater disabled",
+      );
+    }
+    return Object.freeze({
+      appcastURL: null,
+      centralOrigin: null,
+      channel,
+      publicEdKeySha256: null,
+      serviceOriginMode: null,
+    });
+  }
+  const preview = channel === MACOS_PREVIEW_DISTRIBUTION_CHANNEL;
+  if (!preview
+      && (!channelPolicy
+        || channelPolicy.name !== channel
+        || typeof channelPolicy.serviceOriginMode !== "string")) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_POLICY_INVALID,
+      `Named ${channel} channel policy is required for metadata inspection`,
+    );
+  }
+  if (preview) {
+    if (plist.UsageMonitorPreviewDistribution !== true
+        || plist.UsageMonitorCentralOriginMode !== "production_https"
+        || plist.UsageMonitorUpdaterEnabled !== true) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+        "Preview application public metadata is outside the preview distribution boundary",
+      );
+    }
+  } else if (plist.UsageMonitorUpdaterEnabled !== true
+      || plist.UsageMonitorCentralOriginMode !== channelPolicy.serviceOriginMode) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
+      `Named ${channel} application public metadata is outside its signed updater boundary`,
     );
   }
   let centralService;
   let updater;
   try {
-    centralService = normalizeMacOSCentralOrigin(
-      plist.UsageMonitorCentralOrigin,
-    );
+    centralService = preview
+      ? normalizeMacOSCentralOrigin(plist.UsageMonitorCentralOrigin)
+      : {
+        mode: channelPolicy.serviceOriginMode,
+        origin: publicHttpsOrigin(
+          plist.UsageMonitorCentralOrigin,
+          "Application central origin",
+        ),
+      };
     updater = normalizeMacOSUpdaterMetadata({
       appcastURL: plist.SUFeedURL,
       publicEdKey: plist.SUPublicEDKey,
@@ -351,38 +648,78 @@ function publicPreviewMetadata(plist) {
       "Preview application public origin or appcast metadata is invalid",
     );
   }
-  if (centralService.mode !== "production_https") {
+  if (centralService.mode !== "production_https"
+      && centralService.mode !== channelPolicy?.serviceOriginMode) {
     throw remoteError(
       MACOS_PREVIEW_REMOTE_CODES.METADATA_INVALID,
-      "Preview application central origin is not a public HTTPS origin",
+      "Application central origin is not a public HTTPS origin",
+    );
+  }
+  const publicEdKeySha256 = createHash("sha256")
+    .update(Buffer.from(updater.publicEdKey, "base64"))
+    .digest("hex");
+  if (!preview
+      && (centralService.origin !== channelPolicy.serviceOrigin
+        || updater.appcastURL !== channelPolicy.appcastURL
+        || (channelPolicy.websiteOrigin !== null
+          && plist.UsageMonitorPublicWebsiteOrigin
+            !== channelPolicy.websiteOrigin)
+        || (channelPolicy.publicEdKeySha256 !== null
+          && publicEdKeySha256 !== channelPolicy.publicEdKeySha256))) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_METADATA_MISMATCH,
+      `Named ${channel} application endpoints or public-key fingerprint do not match config/release-channels.js`,
     );
   }
   return Object.freeze({
     appcastURL: updater.appcastURL,
     centralOrigin: centralService.origin,
+    channel,
     // This is a public-key fingerprint only. The remote observer never reads,
     // derives, or accepts a Sparkle private key.
-    publicEdKeySha256: createHash("sha256")
-      .update(Buffer.from(updater.publicEdKey, "base64"))
-      .digest("hex"),
+    publicEdKeySha256,
+    serviceOriginMode: centralService.mode,
   });
 }
 
 export async function readMacOSPreviewPublicMetadata(
   appPath,
-  { readInfoPlist = readMacOSPreviewInfoPlist } = {},
+  {
+    channel,
+    channelPolicy = null,
+    readBuildManifest = readMacOSPreviewBuildManifest,
+    readInfoPlist = readMacOSPreviewInfoPlist,
+  } = {},
 ) {
   const selected = normalizeAppPath(appPath);
-  return publicPreviewMetadata(await readInfoPlist(selected));
+  if (!MACOS_SEALED_CHANNELS.includes(channel)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_INVALID,
+      "A sealed bundle channel is required for metadata inspection",
+    );
+  }
+  return publicPreviewMetadata(
+    await readInfoPlist(selected),
+    await readBuildManifest(selected),
+    { channel, channelPolicy },
+  );
 }
 
-function validatorSummary(validation) {
+function validatorSummary(validation, channel) {
+  if (validation?.channel !== undefined && validation.channel !== channel) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_METADATA_MISMATCH,
+      "Local bundle validator reported a channel different from --channel",
+    );
+  }
   return Object.freeze({
     bundleIdentifier: validation?.bundleIdentifier ?? null,
     bundleVersion: validation?.bundleVersion ?? null,
-    channel: validation?.channel ?? MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+    channel,
     passed: true,
-    updaterEnabled: validation?.updaterEnabled === true,
+    updaterEnabled: validation?.updaterEnabled === true
+      || (validation?.updaterEnabled === undefined
+        && MACOS_RELEASE_CHANNELS.includes(channel)),
   });
 }
 
@@ -1251,26 +1588,36 @@ function publicArtifactURL(value) {
     && selected.href === value;
 }
 
-function contentAddressedArtifact(value) {
+function contentAddressedArtifact(value, { objectPrefix = "releases" } = {}) {
   if (!publicArtifactURL(value)) return null;
   const selected = new URL(value);
   const segments = selected.pathname.slice(1).split("/");
-  if (segments.length !== 4
-      || segments[0] !== "releases"
+  const prefixSegments = objectPrefix.split("/");
+  if (!prefixSegments.every((segment) =>
+    SAFE_PATH_SEGMENT_PATTERN.test(segment)
+    && segment !== "."
+    && segment !== "..")) {
+    return null;
+  }
+  const versionIndex = prefixSegments.length;
+  if (segments.length !== versionIndex + 3
+      || !prefixSegments.every((segment, index) => segments[index] === segment)
       || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u.test(
-        segments[1] ?? "",
+        segments[versionIndex] ?? "",
       )
-      || !/^[a-f0-9]{64}$/u.test(segments[2] ?? "")
+      || !/^[a-f0-9]{64}$/u.test(segments[versionIndex + 1] ?? "")
       || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:dmg|delta)$/u.test(
-        segments[3] ?? "",
+        segments[versionIndex + 2] ?? "",
       )) {
     return null;
   }
   return Object.freeze({
-    artifactType: segments[3].endsWith(".dmg") ? "full_dmg" : "delta",
-    bundleVersion: segments[1],
-    fileName: segments[3],
-    sha256: segments[2],
+    artifactType: segments[versionIndex + 2].endsWith(".dmg")
+      ? "full_dmg"
+      : "delta",
+    bundleVersion: segments[versionIndex],
+    fileName: segments[versionIndex + 2],
+    sha256: segments[versionIndex + 1],
   });
 }
 
@@ -1284,6 +1631,7 @@ function validSparkleSignatureShape(value) {
 function validateAppcastStructure(value, {
   expectedArtifactOrigin = null,
   expectedArtifactURL = null,
+  expectedArtifactPrefix = "releases",
   expectedBundleVersion = null,
   requireContentAddressed = false,
   requireSingleFullDmg = false,
@@ -1327,7 +1675,9 @@ function validateAppcastStructure(value, {
       const version = attributes.get("sparkle:version");
       const length = attributes.get("length");
       const lengthNumber = Number(length);
-      const contentAddress = contentAddressedArtifact(artifactURL);
+      const contentAddress = contentAddressedArtifact(artifactURL, {
+        objectPrefix: expectedArtifactPrefix,
+      });
       if (!publicArtifactURL(artifactURL)
           || !/^(?:0|[1-9][0-9]*)$/u.test(length ?? "")
           || !Number.isSafeInteger(lengthNumber)
@@ -1489,7 +1839,7 @@ async function checkAppcast(appcastURL, options) {
   });
 }
 
-function artifactNotChecked(reason = "production_claim_not_requested") {
+function artifactNotChecked(reason = "remote_feed_preflight_not_requested") {
   return Object.freeze({
     checked: false,
     bytes: null,
@@ -1675,19 +2025,19 @@ function remotePublicationReadbackResult(
   central,
   appcast,
   artifact,
-  { checked, productionClaim },
+  { checked, remoteFeedPreflight },
 ) {
   const passed = checked
     && central.passed
     && appcast.valid
-    && (!productionClaim || artifact.valid);
+    && (!remoteFeedPreflight || artifact.valid);
   const reason = !checked
     ? "remote_preflight_not_requested"
     : !central.passed
       ? "central_endpoint_not_healthy"
       : !appcast.valid
         ? `appcast_${appcast.reason}`
-        : productionClaim && !artifact.valid
+        : remoteFeedPreflight && !artifact.valid
           ? `artifact_${artifact.reason}`
           : "remote_publication_readback_verified";
   return Object.freeze({
@@ -1698,7 +2048,27 @@ function remotePublicationReadbackResult(
   });
 }
 
-function endpointConfigurationResult(metadata, endpointConfig, healthPaths) {
+function endpointConfigurationResult(
+  metadata,
+  endpointConfig,
+  healthPaths,
+  { channelPolicy = null } = {},
+) {
+  if (channelPolicy !== null) {
+    return Object.freeze({
+      appcastURL: channelPolicy.appcastURL,
+      artifactBytes: null,
+      artifactSha256: null,
+      artifactURL: null,
+      centralOrigin: channelPolicy.serviceOrigin,
+      configured: false,
+      healthPaths: Object.freeze([...healthPaths]),
+      matched: true,
+      mismatchFields: Object.freeze([]),
+      source: "release_channel_policy",
+      status: "matched",
+    });
+  }
   const mismatchFields = [];
   if (endpointConfig?.centralOrigin !== undefined
       && endpointConfig.centralOrigin !== metadata.centralOrigin) {
@@ -1730,7 +2100,7 @@ function localOnlyRemoteResult(
   metadata,
   {
     endpointConfiguration,
-    productionClaim = false,
+    remoteFeedPreflight = false,
     claimReason = "network_not_enabled",
   } = {},
 ) {
@@ -1751,20 +2121,24 @@ function localOnlyRemoteResult(
       passed: false,
       status: "not_checked",
     }),
-    artifact: artifactNotChecked(),
-    claim: claimResult(productionClaim, false, blockedReason),
+    artifact: artifactNotChecked(
+      remoteFeedPreflight
+        ? "network_not_enabled"
+        : "remote_feed_preflight_not_requested",
+    ),
+    claim: claimResult(remoteFeedPreflight, false, blockedReason),
     endpointConfiguration,
     live: false,
     local,
     metadata,
-    overall: productionClaim
+    overall: remoteFeedPreflight
       ? "remote_feed_preflight_unchecked"
       : "local_valid_remote_unchecked",
     remotePublicationReadback: remotePublicationReadbackResult(
       { passed: false },
       { valid: false, reason: "remote_preflight_not_requested" },
       artifactNotChecked(),
-      { checked: false, productionClaim },
+      { checked: false, remoteFeedPreflight },
     ),
     sparkleAcceptance: sparkleAcceptanceResult(),
   });
@@ -1772,64 +2146,107 @@ function localOnlyRemoteResult(
 
 export async function verifyMacOSPreviewRemote({
   appPath,
+  channel = null,
   clock = DEFAULT_CLOCK,
   endpointConfig = null,
   fetchImpl = globalThis.fetch,
   healthPaths = MACOS_PREVIEW_REMOTE_HEALTH_PATHS,
   live = false,
-  productionClaim = false,
+  remoteFeedPreflight = false,
+  getReleaseChannelImpl = getReleaseChannel,
+  inspectMacOSAppImpl = inspectMacOSApp,
   readInfoPlist = readMacOSPreviewInfoPlist,
+  readBuildManifest = readMacOSPreviewBuildManifest,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   validatePreviewApp = validateMacOSPreviewApp,
 } = {}) {
   const selectedAppPath = normalizeAppPath(appPath);
+  if (!MACOS_SEALED_CHANNELS.includes(channel)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_INVALID,
+      "A sealed bundle channel must be selected explicitly",
+    );
+  }
   if (typeof live !== "boolean") {
     throw remoteError(
       MACOS_PREVIEW_REMOTE_CODES.ARGUMENTS_INVALID,
       "live must be a boolean",
     );
   }
-  if (typeof productionClaim !== "boolean") {
+  if (typeof remoteFeedPreflight !== "boolean") {
     throw remoteError(
       MACOS_PREVIEW_REMOTE_CODES.ARGUMENTS_INVALID,
-      "productionClaim must be a boolean",
+      "remoteFeedPreflight must be a boolean",
     );
   }
   const boundedTimeout = normalizeTimeout(timeoutMs);
   const normalizedHealthPaths = normalizeHealthPaths(healthPaths);
-  const normalizedEndpointConfig =
-    normalizeMacOSPreviewEndpointConfiguration(endpointConfig);
-  const validation = await validatePreviewApp(selectedAppPath);
-  const local = validatorSummary(validation);
+  const channelPolicy = releaseChannelPolicy(channel, getReleaseChannelImpl);
+  const namedRelease = channelPolicy !== null;
+  if (namedRelease && endpointConfig !== null && endpointConfig !== undefined) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_ENDPOINT_OVERRIDE_FORBIDDEN,
+      `--channel ${channel} derives its endpoints and public-key policy from config/release-channels.js; endpoint overrides are forbidden`,
+    );
+  }
+  if (channel === "development"
+      && endpointConfig !== null
+      && endpointConfig !== undefined) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_ENDPOINT_OVERRIDE_FORBIDDEN,
+      "Development bundles do not have remote release endpoints; endpoint overrides are forbidden",
+    );
+  }
+  const normalizedEndpointConfig = namedRelease || channel === "development"
+    ? null
+    : normalizeMacOSPreviewEndpointConfiguration(endpointConfig);
+  const validation = channel === MACOS_PREVIEW_DISTRIBUTION_CHANNEL
+    ? await validatePreviewApp(selectedAppPath)
+    : await inspectMacOSAppImpl(selectedAppPath, {
+      channel,
+      requireExternalDistribution: namedRelease,
+    });
+  const local = validatorSummary(validation, channel);
   const metadata = await readMacOSPreviewPublicMetadata(selectedAppPath, {
+    channel,
+    channelPolicy,
+    readBuildManifest,
     readInfoPlist,
   });
   const endpointConfiguration = endpointConfigurationResult(
     metadata,
     normalizedEndpointConfig,
     normalizedHealthPaths,
+    { channelPolicy },
   );
-  const explicitClaimConfiguration = normalizedEndpointConfig !== null
+  const explicitPreflightConfiguration = normalizedEndpointConfig !== null
     && typeof normalizedEndpointConfig.centralOrigin === "string"
     && typeof normalizedEndpointConfig.appcastURL === "string";
-  if (productionClaim && !explicitClaimConfiguration) {
+  if (remoteFeedPreflight
+      && channel === "development") {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.CHANNEL_REMOTE_FORBIDDEN,
+      "Development bundles cannot perform a remote feed preflight",
+    );
+  }
+  if (remoteFeedPreflight && !namedRelease && !explicitPreflightConfiguration) {
     return localOnlyRemoteResult(local, metadata, {
       claimReason: "explicit_endpoint_configuration_required",
       endpointConfiguration,
-      productionClaim,
+      remoteFeedPreflight,
     });
   }
-  if (!endpointConfiguration.matched) {
+  if (!namedRelease && !endpointConfiguration.matched) {
     return localOnlyRemoteResult(local, metadata, {
       claimReason: "endpoint_urls_mismatch",
       endpointConfiguration,
-      productionClaim,
+      remoteFeedPreflight,
     });
   }
   if (!live) {
     return localOnlyRemoteResult(local, metadata, {
       endpointConfiguration,
-      productionClaim,
+      remoteFeedPreflight,
     });
   }
   const requestOptions = {
@@ -1860,17 +2277,24 @@ export async function verifyMacOSPreviewRemote({
     endpointConfiguration.appcastURL,
     {
       ...requestOptions,
-      expectedArtifactOrigin: productionClaim ? appcastOrigin : null,
-      expectedArtifactURL: normalizedEndpointConfig?.artifactURL
+      expectedArtifactOrigin: remoteFeedPreflight ? appcastOrigin : null,
+      expectedArtifactURL: namedRelease
+        ? null
+        : normalizedEndpointConfig?.artifactURL
         ?? null,
-      expectedBundleVersion: productionClaim ? local.bundleVersion : null,
-      requireContentAddressed: productionClaim,
-      requireSingleFullDmg: productionClaim,
+      expectedArtifactPrefix: namedRelease
+        ? channelPolicy.artifactPrefix
+        : "releases",
+      expectedBundleVersion: remoteFeedPreflight ? local.bundleVersion : null,
+      requireContentAddressed: remoteFeedPreflight,
+      requireSingleFullDmg: remoteFeedPreflight,
     },
   );
   let artifact = artifactNotChecked();
-  if (productionClaim && appcast.valid) {
-    const expectedArtifactURL = normalizedEndpointConfig.artifactURL ?? null;
+  if (remoteFeedPreflight && appcast.valid) {
+    const expectedArtifactURL = namedRelease
+      ? null
+      : normalizedEndpointConfig.artifactURL ?? null;
     const candidate = appcast.enclosures.find(
       (enclosure) => expectedArtifactURL === null
         ? enclosure.version === local.bundleVersion
@@ -1883,19 +2307,19 @@ export async function verifyMacOSPreviewRemote({
       fetchImpl,
       timeoutMs: boundedTimeout,
     });
-  } else if (productionClaim) {
+  } else if (remoteFeedPreflight) {
     artifact = artifactNotChecked("appcast_proof_missing");
   }
   const remotePublicationReadback = remotePublicationReadbackResult(
     central,
     appcast,
     artifact,
-    { checked: true, productionClaim },
+    { checked: true, remoteFeedPreflight },
   );
   const claim = claimResult(
-    productionClaim,
+    remoteFeedPreflight,
     false,
-    productionClaim
+    remoteFeedPreflight
       ? (remotePublicationReadback.passed
         ? "installed_client_rehearsal_required"
         : remotePublicationReadback.reason)
@@ -2150,6 +2574,7 @@ export function createMacOSPreviewRemoteReceipt(result, { recordedOn } = {}) {
     }),
     schemaVersion: MACOS_PREVIEW_REMOTE_RECEIPT_SCHEMA,
     sparkleAcceptance: Object.freeze({
+      cryptographicSignatureVerified: false,
       nativeClientRehearsalVerified: false,
       reason: "installed_client_rehearsal_required",
       status: "not_verified",
@@ -2234,9 +2659,14 @@ function httpStatusLabel(status) {
 }
 
 function renderResult(result, stdout) {
-  writeLine(stdout, "Preview application validation: passed");
-  writeLine(stdout, `Central origin: ${result.metadata.centralOrigin}`);
-  writeLine(stdout, `Sparkle appcast: ${result.metadata.appcastURL}`);
+  writeLine(stdout, "Local application validation: passed");
+  writeLine(stdout, `Sealed channel: ${result.metadata.channel}`);
+  if (result.metadata.centralOrigin !== null) {
+    writeLine(stdout, `Central origin: ${result.metadata.centralOrigin}`);
+  }
+  if (result.metadata.appcastURL !== null) {
+    writeLine(stdout, `Sparkle appcast: ${result.metadata.appcastURL}`);
+  }
   if (!result.live) {
     writeLine(
       stdout,
@@ -2289,7 +2719,7 @@ function renderResult(result, stdout) {
   if (result.claim?.requested) {
     writeLine(
       stdout,
-      "Production claim: blocked (remote feed readback is not update acceptance)",
+      "Update acceptance gate: blocked (remote feed readback is not update acceptance)",
     );
   }
 }
@@ -2308,14 +2738,15 @@ export async function runMacOSPreviewRemoteCLI(
     if (options.help) {
       writeLine(stdout, "Usage: node scripts/verify-macos-preview-remote.js [options]");
       writeLine(stdout, "  --app PATH          Preview TiboTattle.app to validate");
+      writeLine(stdout, "  --channel NAME      stable, internal-dogfood, preview_distribution, or development");
       writeLine(stdout, "  --live              Perform bounded remote feed preflight checks");
-      writeLine(stdout, "  --central-origin URL  Explicit public central-service origin");
-      writeLine(stdout, "  --appcast-url URL   Explicit public Sparkle appcast URL");
-      writeLine(stdout, "  --artifact-url URL  Expected public enclosure URL");
-      writeLine(stdout, "  --artifact-sha256 HEX64  Expected public artifact SHA-256");
-      writeLine(stdout, "  --artifact-bytes N  Expected public artifact byte length");
-      writeLine(stdout, "  --health-path PATH  Central health/ready path (repeatable)");
-      writeLine(stdout, "  --production-claim  Require feed/artifact preflight; acceptance remains blocked");
+      writeLine(stdout, "  --central-origin URL  Preview compatibility endpoint only");
+      writeLine(stdout, "  --appcast-url URL   Preview compatibility endpoint only");
+      writeLine(stdout, "  --artifact-url URL  Preview compatibility enclosure cross-check");
+      writeLine(stdout, "  --artifact-sha256 HEX64  Preview compatibility digest cross-check");
+      writeLine(stdout, "  --artifact-bytes N  Preview compatibility length cross-check");
+      writeLine(stdout, "  --health-path PATH  Preview compatibility health path (repeatable)");
+      writeLine(stdout, "  --remote-feed-preflight  Require bounded feed/artifact readback; acceptance remains blocked");
       writeLine(stdout, "  --receipt FILE      Write a content-free JSON receipt");
       writeLine(stdout, "  --timeout-ms N      Per-request timeout, 1..30000 (default 5000)");
       return Object.freeze({ exitCode: 0, result: null });
@@ -2326,7 +2757,7 @@ export async function runMacOSPreviewRemoteCLI(
       writeLine(stdout, "Content-free receipt: written");
     }
     renderResult(result, stdout);
-    const exitCode = options.productionClaim
+    const exitCode = options.remoteFeedPreflight
       ? (result.claim?.passed === true ? 0 : 1)
       : (options.live && result.remotePublicationReadback?.passed !== true ? 1 : 0);
     return Object.freeze({ exitCode, result });
