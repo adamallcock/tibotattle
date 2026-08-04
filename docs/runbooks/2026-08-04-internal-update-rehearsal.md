@@ -78,17 +78,25 @@ this command is not a signed dogfood rehearsal and cannot be used as one. The
 content-free receipt records that the remote feed preflight was not checked
 and contains no appcast or artifact payload.
 
-After the owner has confirmed that the public feed and artifact are intended
-to be exercised, run the bounded live remote feed preflight:
+After the owner has confirmed that the reviewed, dedicated internal-dogfood
+feed and artifact are intended to be exercised, run the bounded live remote
+feed preflight against that named channel:
 
 ```bash
 node scripts/verify-macos-preview-remote.js \
   --app "/absolute/path/to/N+1/TiboTattle.app" \
-  --channel stable \
+  --channel internal-dogfood \
   --live \
   --remote-feed-preflight \
   --receipt "/absolute/path/to/rehearsal/N+1-live.json"
 ```
+
+Until `config/release-channels.js` contains the separately reviewed dogfood
+endpoints, this exact command must fail closed with
+`RELEASE_CHANNEL_NOT_CONFIGURED` and make zero HTTPS requests. Do not
+substitute `stable` or a command-line endpoint override for the missing
+dogfood policy. The public `stable` preflight belongs only to the separately
+gated [public stable stage](./2026-08-04-owner-release-execution.md#5-public-stable-publish-observe-then-open-intake).
 
 The live command intentionally exits non-zero when
 `--remote-feed-preflight` is present: this verifier never turns remote

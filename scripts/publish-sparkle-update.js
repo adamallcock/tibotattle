@@ -36,6 +36,9 @@ export const CANONICAL_APPCAST_URL = STABLE_CHANNEL.sparkle.appcastURL;
 export const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
 export const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 export const APPCAST_CACHE_CONTROL = "public, max-age=300, must-revalidate";
+const PUBLICATION_STATUS_VALIDATED = "validated";
+const PUBLICATION_STATUS_PUBLISHED = "published";
+const PUBLICATION_STATUS_RESUMED_VERIFIED = "resumed_verified";
 
 const REQUIRED_RELEASE_ASSURANCES = Object.freeze([
   "appNotarizationAccepted",
@@ -422,6 +425,76 @@ function validateAppcast(text, {
     enclosure: matching[0],
     enclosures: Object.freeze(enclosures),
   });
+}
+
+function sameAppcastEnclosure(left, right) {
+  return left.deltaFrom === right.deltaFrom
+    && left.length === right.length
+    && left.objectKey === right.objectKey
+    && left.objectSha256 === right.objectSha256
+    && left.signature === right.signature
+    && left.url === right.url
+    && left.version === right.version;
+}
+
+function assertExactCandidateAppcast({
+  appcastBytes,
+  appcastUpdate,
+  currentAppcast,
+  channel,
+  dmg,
+  dmgBytes,
+  manifest,
+  objectKeys,
+  sparklePublicKey,
+}) {
+  if (currentAppcast === null
+      || currentAppcast.bytes !== appcastBytes.length
+      || currentAppcast.sha256 !== createHash("sha256")
+        .update(appcastBytes)
+        .digest("hex")
+      || !currentAppcast.content.equals(appcastBytes)) {
+    return false;
+  }
+
+  const observed = validateAppcast(currentAppcast.content.toString("utf8"), {
+    channel,
+    dmg,
+    dmgBytes,
+    manifest,
+    objectKeys,
+    sparklePublicKey,
+  });
+  const candidateVersionEnclosures = appcastUpdate.enclosures.filter(
+    (enclosure) => enclosure.version === manifest.bundleVersion,
+  );
+  const observedVersionEnclosures = observed.enclosures.filter(
+    (enclosure) => enclosure.version === manifest.bundleVersion,
+  );
+  if (candidateVersionEnclosures.length !== 1
+      || observedVersionEnclosures.length !== 1
+      || !sameAppcastEnclosure(
+        candidateVersionEnclosures[0],
+        appcastUpdate.enclosure,
+      )
+      || !sameAppcastEnclosure(
+        observedVersionEnclosures[0],
+        observed.enclosure,
+      )
+      || observed.artifactURL !== appcastUpdate.artifactURL
+      || observed.enclosures.length !== appcastUpdate.enclosures.length
+      || observed.enclosures.some(
+        (enclosure, index) => !sameAppcastEnclosure(
+          enclosure,
+          appcastUpdate.enclosures[index],
+        ),
+      )) {
+    fail(
+      "Live appcast has an ambiguous or non-canonical candidate publication state",
+      "SPARKLE_UPDATE_APPCAST_RECOVERY_MISMATCH",
+    );
+  }
+  return true;
 }
 
 function responseHeader(response, name) {
@@ -1089,9 +1162,13 @@ export async function publishSparkleUpdate({
       sha256: releaseManifestWithSha256.sha256,
     }),
     published: publish,
+    resumed: false,
+    status: publish ? "pending" : PUBLICATION_STATUS_VALIDATED,
+    verified: false,
   });
   if (!publish) return publication;
 
+  let resumedPublication = false;
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-r2-update-probe-"),
   );
@@ -1132,16 +1209,48 @@ export async function publishSparkleUpdate({
       runWrangler,
       temporaryRoot,
     });
-    if (currentAppcast !== null && !replaceAppcast) {
+    resumedPublication = assertExactCandidateAppcast({
+      appcastBytes,
+      appcastUpdate,
+      currentAppcast,
+      channel: releaseChannel,
+      dmg,
+      dmgBytes: dmgWithSha256.bytes,
+      manifest,
+      objectKeys,
+      sparklePublicKey: normalizedSparklePublicKey,
+    });
+    if (resumedPublication
+        && immutableObjects.some(({ remote }) => remote === null)) {
+      fail(
+        "Cannot resume a publication while an immutable candidate object is missing",
+        "SPARKLE_UPDATE_IMMUTABLE_OBJECT_MISSING",
+      );
+    }
+    if (currentAppcast !== null && !resumedPublication && !replaceAppcast) {
       fail("Refusing to replace appcast.xml without --replace-appcast", "SPARKLE_UPDATE_APPCAST_REPLACE_REQUIRED");
     }
-    if (currentAppcast !== null) {
+    if (currentAppcast !== null && !resumedPublication) {
+      const currentEnclosures = appcastEnclosures(
+        currentAppcast.content.toString("utf8"),
+        releaseChannel,
+      );
       const currentVersion = highestAppcastVersion(
         currentAppcast.content.toString("utf8"),
         releaseChannel,
       );
       if (currentVersion === null
           || compareBundleVersions(manifest.bundleVersion, currentVersion) <= 0) {
+        if (currentVersion !== null
+            && compareBundleVersions(manifest.bundleVersion, currentVersion) === 0
+            && currentEnclosures.filter(
+              (enclosure) => enclosure.version === manifest.bundleVersion,
+            ).length !== 1) {
+          fail(
+            "Live appcast has an ambiguous candidate-version publication state",
+            "SPARKLE_UPDATE_APPCAST_AMBIGUOUS",
+          );
+        }
         fail(
           `Candidate bundle version ${manifest.bundleVersion} is not newer than the live appcast version ${currentVersion ?? "unknown"}`,
           "SPARKLE_UPDATE_VERSION_NOT_NEWER",
@@ -1156,37 +1265,39 @@ export async function publishSparkleUpdate({
       sparklePublicKey: normalizedSparklePublicKey,
       temporaryRoot,
     });
-    for (const immutableObject of immutableObjects) {
-      if (immutableObject.remote !== null) continue;
+    if (!resumedPublication) {
+      for (const immutableObject of immutableObjects) {
+        if (immutableObject.remote !== null) continue;
+        await putObject({
+          bucket,
+          key: immutableObject.object.key,
+          path: immutableObject.object.path,
+          contentType: immutableObject.object.contentType,
+          cacheControl: immutableObject.object.cacheControl,
+          runWrangler,
+        });
+      }
+      const appcastBeforeWrite = await readRemoteObject({
+        bucket,
+        key: publication.appcast.key,
+        maximumBytes: MAX_APPCAST_BYTES,
+        runWrangler,
+        temporaryRoot,
+      });
+      assertAppcastStateUnchanged(
+        currentAppcast,
+        appcastBeforeWrite,
+        publication.appcast.key,
+      );
       await putObject({
         bucket,
-        key: immutableObject.object.key,
-        path: immutableObject.object.path,
-        contentType: immutableObject.object.contentType,
-        cacheControl: immutableObject.object.cacheControl,
+        key: publication.appcast.key,
+        path: publication.appcast.path,
+        contentType: publication.appcast.contentType,
+        cacheControl: publication.appcast.cacheControl,
         runWrangler,
       });
     }
-    const appcastBeforeWrite = await readRemoteObject({
-      bucket,
-      key: publication.appcast.key,
-      maximumBytes: MAX_APPCAST_BYTES,
-      runWrangler,
-      temporaryRoot,
-    });
-    assertAppcastStateUnchanged(
-      currentAppcast,
-      appcastBeforeWrite,
-      publication.appcast.key,
-    );
-    await putObject({
-      bucket,
-      key: publication.appcast.key,
-      path: publication.appcast.path,
-      contentType: publication.appcast.contentType,
-      cacheControl: publication.appcast.cacheControl,
-      runWrangler,
-    });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
@@ -1202,7 +1313,14 @@ export async function publishSparkleUpdate({
     publication,
     sparklePublicKey: normalizedSparklePublicKey,
   });
-  return publication;
+  return Object.freeze({
+    ...publication,
+    resumed: resumedPublication,
+    status: resumedPublication
+      ? PUBLICATION_STATUS_RESUMED_VERIFIED
+      : PUBLICATION_STATUS_PUBLISHED,
+    verified: true,
+  });
 }
 
 export function parseSparkleUpdatePublisherArguments(argv) {

@@ -238,6 +238,8 @@ test("validates an explicitly supplied canonical signed update without invoking 
     });
     const digest = publication.artifact.sha256;
     assert.equal(publication.published, false);
+    assert.equal(publication.status, "validated");
+    assert.equal(publication.verified, false);
     assert.equal(publication.appcast.url, CANONICAL_APPCAST_URL);
     assert.equal(
       publication.artifact.key,
@@ -280,6 +282,8 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
       validateDMG: async () => {},
     });
     assert.equal(publication.published, true);
+    assert.equal(publication.status, "published");
+    assert.equal(publication.verified, true);
     assert.equal(runner.calls.length, 7);
     assert.deepEqual(runner.calls.slice(0, 3).map((call) => call.slice(0, 4)), [
       ["r2", "object", "get", `${APPROVED_R2_BUCKET}/${publication.artifact.key}`],
@@ -344,6 +348,7 @@ test("retries after an artifact-only partial publication and resumes missing wor
 
     const publication = await publishSparkleUpdate(options);
     assert.equal(publication.published, true);
+    assert.equal(publication.status, "published");
     assert.deepEqual(
       runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
       [artifactObjectPath, manifestObjectPath, manifestObjectPath, appcastObjectPath],
@@ -388,11 +393,68 @@ test("retries after artifact and manifest publication and writes the appcast las
 
     const publication = await publishSparkleUpdate(options);
     assert.equal(publication.published, true);
+    assert.equal(publication.status, "published");
     assert.deepEqual(
       runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
       [artifactObjectPath, manifestObjectPath, appcastObjectPath, appcastObjectPath],
     );
     assert.deepEqual(runner.objects.get(appcastObjectPath), await readFile(fixture.appcastPath));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("recovers an appcast written before public readback failed without writing again", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
+  const appcastObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
+  const runner = statefulRemoteObjectRunner();
+  const publicReadback = publicReadbackFixture(fixture);
+  let failPublicReadback = true;
+  const fetchPublic = async (...arguments_) => {
+    if (failPublicReadback) {
+      failPublicReadback = false;
+      return new Response("transient readback failure", { status: 503 });
+    }
+    return publicReadback.fetch(...arguments_);
+  };
+  const options = {
+    appcastPath: fixture.appcastPath,
+    bucket: APPROVED_R2_BUCKET,
+    channel: "stable",
+    dmgPath: fixture.dmgPath,
+    publish: true,
+    releaseManifestPath: fixture.releaseManifestPath,
+    replaceAppcast: true,
+    sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    runWrangler: runner.run,
+    fetchPublic,
+    validateDMG: async () => {},
+  };
+  try {
+    await assert.rejects(publishSparkleUpdate(options), {
+      code: "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    });
+    assert.deepEqual(
+      runner.objects.get(appcastObjectPath),
+      await readFile(fixture.appcastPath),
+    );
+
+    const publication = await publishSparkleUpdate(options);
+    assert.equal(publication.published, true);
+    assert.equal(publication.status, "resumed_verified");
+    assert.equal(publication.resumed, true);
+    assert.equal(publication.verified, true);
+    assert.deepEqual(
+      runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
+      [artifactObjectPath, manifestObjectPath, appcastObjectPath],
+    );
+    assert.deepEqual(publicReadback.calls, [
+      { method: "GET", url: CANONICAL_APPCAST_URL },
+      { method: "GET", url: fixture.artifactURL },
+    ]);
   } finally {
     await fixture.cleanup();
   }
@@ -805,10 +867,10 @@ test("rejects a preserved enclosure whose signature does not match its R2 bytes"
   }
 });
 
-test("rejects a candidate that is not newer than the live appcast", async () => {
-  const previous = await createReleaseFixture({ bundleVersion: "2" });
+test("rejects a changed equal-version live appcast before any remote mutation", async () => {
   const candidate = await createReleaseFixture({ bundleVersion: "2" });
-  const currentAppcast = await readFile(previous.appcastPath);
+  const candidateAppcast = await readFile(candidate.appcastPath, "utf8");
+  const currentAppcast = Buffer.from(`${candidateAppcast} `);
   const runner = remoteObjectRunner(new Map([
     [`${APPROVED_R2_BUCKET}/appcast.xml`, currentAppcast],
   ]));
@@ -831,12 +893,44 @@ test("rejects a candidate that is not newer than the live appcast", async () => 
     assert.equal(
       runner.calls.some((call) => call[2] === "put"), false);
   } finally {
-    await previous.cleanup();
     await candidate.cleanup();
   }
 });
 
-test("does not overwrite or report success for a no-op retry", async () => {
+test("rejects an ambiguous equal-version live appcast before any remote mutation", async () => {
+  const candidate = await createReleaseFixture();
+  const candidateAppcast = await readFile(candidate.appcastPath, "utf8");
+  const duplicateItem = candidateAppcast.match(/<item>[\s\S]*?<\/item>/u)?.[0];
+  assert.equal(typeof duplicateItem, "string");
+  const currentAppcast = Buffer.from(
+    candidateAppcast.replace("</channel>", `${duplicateItem}</channel>`),
+  );
+  const runner = remoteObjectRunner(new Map([
+    [`${APPROVED_R2_BUCKET}/appcast.xml`, currentAppcast],
+  ]));
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: candidate.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: candidate.dmgPath,
+        publish: true,
+        releaseManifestPath: candidate.releaseManifestPath,
+        replaceAppcast: true,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_APPCAST_AMBIGUOUS" },
+    );
+    assert.equal(runner.calls.some((call) => call[2] === "put"), false);
+  } finally {
+    await candidate.cleanup();
+  }
+});
+
+test("verifies an exact appcast retry without overwriting or reporting a new publish", async () => {
   const fixture = await createReleaseFixture();
   const digest = sha256(fixture.dmgBytes);
   const runner = statefulRemoteObjectRunner({
@@ -846,23 +940,29 @@ test("does not overwrite or report success for a no-op retry", async () => {
       [`${APPROVED_R2_BUCKET}/appcast.xml`, await readFile(fixture.appcastPath)],
     ]),
   });
+  const publicReadback = publicReadbackFixture(fixture);
   try {
-    await assert.rejects(
-      publishSparkleUpdate({
-        appcastPath: fixture.appcastPath,
-        bucket: APPROVED_R2_BUCKET,
-        channel: "stable",
-        dmgPath: fixture.dmgPath,
-        publish: true,
-        releaseManifestPath: fixture.releaseManifestPath,
-        replaceAppcast: true,
-        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
-        runWrangler: runner.run,
-        validateDMG: async () => {},
-      }),
-      { code: "SPARKLE_UPDATE_VERSION_NOT_NEWER" },
-    );
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      replaceAppcast: true,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.status, "resumed_verified");
+    assert.equal(publication.resumed, true);
+    assert.equal(publication.verified, true);
     assert.equal(runner.calls.some((call) => call[2] === "put"), false);
+    assert.deepEqual(publicReadback.calls, [
+      { method: "GET", url: CANONICAL_APPCAST_URL },
+      { method: "GET", url: fixture.artifactURL },
+    ]);
   } finally {
     await fixture.cleanup();
   }
