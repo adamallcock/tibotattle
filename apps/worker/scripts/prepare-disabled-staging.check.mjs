@@ -7,6 +7,7 @@ import {
 import {
   checkedInConfig,
   provisionedConfig,
+  successSpawn,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
 
@@ -121,6 +122,40 @@ test("preparation applies both migrations, contains collection, and rechecks", (
             admission_counter: 1,
             quarantine_reconciliation: 1,
             lifecycle_status: 1,
+            primary_cooldown_table: 1,
+            primary_participant_cooldown_digest: 1,
+            primary_cooldown_digest: 1,
+            primary_cooldown_schema_version: 1,
+            primary_cooldown_deleted_at: 1,
+            primary_cooldown_retain_until: 1,
+            primary_cooldown_retention_index: 1,
+            primary_cooldown_retention_index_shape: 1,
+            primary_cooldown_guard_trigger: 1,
+          }],
+        }]),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 execute DELETION_LEDGER ")
+        && joined.includes("sqlite_master")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: [{
+            deletion_tombstone_table: 1,
+            deletion_tombstone_participant_digest: 1,
+            deletion_tombstone_schema_version: 1,
+            deletion_tombstone_deleted_at: 1,
+            deletion_tombstone_retain_until: 1,
+            deletion_tombstone_retention_index: 1,
+            deletion_tombstone_retention_index_shape: 1,
+            deletion_cooldown_table: 1,
+            deletion_cooldown_digest: 1,
+            deletion_cooldown_schema_version: 1,
+            deletion_cooldown_deleted_at: 1,
+            deletion_cooldown_retain_until: 1,
+            deletion_cooldown_retention_index: 1,
+            deletion_cooldown_retention_index_shape: 1,
           }],
         }]),
         stderr: "",
@@ -171,10 +206,91 @@ test("preparation applies both migrations, contains collection, and rechecks", (
     resourcesVerified: true,
     migrationsCurrent: true,
     pilotSchemaCurrent: true,
+    identityProtectionSchemaCurrent: true,
+    identityProtectionSchema: {
+      status: "verified",
+      verified: true,
+      primary: {
+        status: "verified",
+        verified: true,
+        tables: { identityReenrollmentCooldowns: true },
+        columns: {
+          participantCooldownDigest: true,
+          cooldownDigest: true,
+          schemaVersion: true,
+          deletedAt: true,
+          retainUntil: true,
+        },
+        indexes: { retention: true, retentionShape: true },
+        triggers: { reenrollmentCooldownGuard: true },
+      },
+      deletionLedger: {
+        status: "verified",
+        verified: true,
+        tables: {
+          deletionTombstones: true,
+          identityReenrollmentCooldowns: true,
+        },
+        columns: {
+          participantDigest: true,
+          tombstoneSchemaVersion: true,
+          tombstoneDeletedAt: true,
+          tombstoneRetainUntil: true,
+          cooldownDigest: true,
+          cooldownSchemaVersion: true,
+          cooldownDeletedAt: true,
+          cooldownRetainUntil: true,
+        },
+        indexes: {
+          tombstoneRetention: true,
+          tombstoneRetentionShape: true,
+          cooldownRetention: true,
+          cooldownRetentionShape: true,
+        },
+      },
+    },
     collectionContained: true,
     secretsInstalled: true,
   });
   assert.equal(Number.isFinite(Date.parse(result.receipt.generatedAt)), true);
   assert.equal(applyCount, 2);
   assert.equal(containmentApplied, true);
+});
+
+test("preparation refuses missing identity protection before any mutation", () => {
+  for (const scenario of [
+    {
+      name: "primary re-enrollment protection",
+      options: { missingPrimarySchema: true },
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+    },
+    {
+      name: "deletion-ledger cooldown protection",
+      options: { missingDeletionLedgerSchema: true },
+      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
+    },
+  ]) {
+    const config = provisionedConfig();
+    const calls = [];
+    const result = prepareDisabledStaging({
+      config,
+      confirmation: PREPARE_CONFIRMATION,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn: successSpawn(config, calls, scenario.options),
+    });
+    assert.equal(result.ok, false, scenario.name);
+    assert.equal(result.code, "STAGING_SCHEMA_PROTECTION_BLOCKED", scenario.name);
+    assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
+    assert.equal(calls.some((args) => args.includes("apply")), false, scenario.name);
+    assert.equal(
+      calls.some((args) =>
+        args[0] === "d1"
+        && args[1] === "execute"
+        && args.includes("--command")
+        && !args.includes("--json")),
+      false,
+      scenario.name,
+    );
+  }
 });

@@ -5,6 +5,7 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
 import {
+  identityProtectionSchemaVerified,
   probeStagingLive,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
@@ -163,7 +164,8 @@ export async function runDisabledStagingDeployment({
   );
   if (predeployBlockers.length > 0
       || !readiness.checks.migrationsCurrent
-      || !readiness.checks.collectionContained) {
+      || !readiness.checks.collectionContained
+      || !identityProtectionSchemaVerified(readiness)) {
     return {
       ok: false,
       code: "STAGING_READINESS_BLOCKED",
@@ -254,6 +256,9 @@ export async function runDisabledStagingDeployment({
         && readiness.checks.r2ResourceExists,
       migrationsCurrent: readiness.checks.migrationsCurrent,
       pilotSchemaCurrent: readiness.checks.pilotSchemaCurrent,
+      identityProtectionSchemaCurrent:
+        readiness.checks.identityProtectionSchemaCurrent,
+      identityProtectionSchema: readiness.evidence.identityProtectionSchema,
       collectionContained: readiness.checks.collectionContained,
       healthContained: true,
       lifecycleReadiness: lifecycle.status,
