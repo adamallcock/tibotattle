@@ -12,7 +12,7 @@ import {
   assertOwnerControlledDirectory,
   lstatIfExists,
   syncDirectory,
-} from "./platform/owner-only-filesystem.js";
+} from "./platform/index.js";
 
 const MAX_MIGRATABLE_REPORT_BYTES = 16 * 1024 * 1024;
 const LOCAL_STATE_DIRECTORY = ".usage-monitor";
