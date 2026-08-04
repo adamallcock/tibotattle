@@ -138,6 +138,16 @@ function fail(message, code = "MACOS_RELEASE_FAILED") {
   throw error;
 }
 
+function resolveOperationalReleaseChannel(channel = "stable") {
+  if (typeof channel !== "string") {
+    fail(
+      "Release inspection must select a named release channel",
+      "MACOS_RELEASE_CHANNEL_NAME_REQUIRED",
+    );
+  }
+  return resolveReleaseChannel(channel);
+}
+
 function stableValue(value) {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value === null || typeof value !== "object") return value;
@@ -888,7 +898,7 @@ export async function inspectMacOSApp(appPath, {
     await regularPath(join(selected, ...relativePath.split("/")));
   }
   if (requireExternalDistribution) {
-    const releaseChannel = resolveReleaseChannel(channel);
+    const releaseChannel = resolveOperationalReleaseChannel(channel);
     const centralOrigin = validateProductionOrigin(plist, {
       channel: releaseChannel.name,
       expectedMode: releaseChannel.serviceOriginMode,
@@ -907,6 +917,13 @@ export async function inspectMacOSApp(appPath, {
           !== releaseChannel.buildManifestChannel) {
       fail(
         `Release app build manifest is not marked for channel ${releaseChannel.name}`,
+        "MACOS_RELEASE_CHANNEL_MISMATCH",
+      );
+    }
+    if (plist.UsageMonitorReleaseChannel !== releaseChannel.name
+        || manifest.release?.channelName !== releaseChannel.name) {
+      fail(
+        `Release app does not expose the named ${releaseChannel.name} channel identity`,
         "MACOS_RELEASE_CHANNEL_MISMATCH",
       );
     }
@@ -983,7 +1000,7 @@ export function readMacOSReleaseBuildConfiguration(
   environment = process.env,
   channel = "stable",
 ) {
-  const releaseChannel = resolveReleaseChannel(channel);
+  const releaseChannel = resolveOperationalReleaseChannel(channel);
   const endpointSourceLabel = releaseChannel.name === "stable"
     ? "config/deployment-endpoints.js"
     : `the reviewed ${releaseChannel.name} channel`;
@@ -2058,6 +2075,8 @@ export async function releaseMacOSApp({
       "--central-origin",
       buildConfiguration.productionOrigin,
       "--external-distribution",
+      "--release-channel",
+      releaseChannel.name,
       "--bundle-version",
       buildConfiguration.bundleVersion,
       "--sparkle-framework",

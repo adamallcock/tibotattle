@@ -33,6 +33,13 @@ import {
 } from "../config/release-manifest.js";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import {
+  INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+  RELEASE_CHANNELS_SCHEMA_VERSION,
+  STABLE_RELEASE_CHANNEL,
+  assertReleaseChannelConfiguration,
+} from "../config/release-channels.js";
+import {
   MACOS_RUNTIME_STATIC_ASSETS,
   MACOS_ACCOUNTING_RUNTIME_FILES,
   MACOS_BUILD_PROFILES,
@@ -139,6 +146,32 @@ if (MACOS_TEST_LANES_ACTIVE
   throw new Error(
     "USAGE_MONITOR_MACOS_TEST_SCOPE must be one of all, source, or artifact",
   );
+}
+
+const SYNTHETIC_DOGFOOD_PUBLIC_KEY = Buffer.alloc(32, 7).toString("base64");
+const SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256 = createHash("sha256")
+  .update(Buffer.from(SYNTHETIC_DOGFOOD_PUBLIC_KEY, "base64"))
+  .digest("hex");
+
+function syntheticDogfoodReleaseChannel() {
+  return {
+    schemaVersion: RELEASE_CHANNELS_SCHEMA_VERSION,
+    name: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    configured: true,
+    buildManifestChannel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    serviceOriginMode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+    serviceOrigin: "https://dogfood.tibotattle.example",
+    publicWebsiteOrigin: "https://dogfood.tibotattle.example",
+    sparkle: {
+      origin: "https://updates.dogfood.tibotattle.example",
+      appcastURL:
+        "https://updates.dogfood.tibotattle.example/internal-dogfood/appcast.xml",
+      appcastObjectKey: "internal-dogfood/appcast.xml",
+      r2Bucket: "tibotattle-dogfood-updates",
+      objectPrefix: "internal-dogfood/releases",
+      publicEdKeySha256: SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256,
+    },
+  };
 }
 
 function macOSArtifactTest(name, options, body) {
@@ -1447,6 +1480,134 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   }
 });
 
+test("unconfigured dogfood is refused by builder and release configuration", async () => {
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--output",
+      ".release-build/macos-dogfood/TiboTattle.app",
+      "--external-distribution",
+      "--release-channel",
+      INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    ]),
+    { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
+  );
+  await assert.rejects(
+    buildMacOSApp({
+      output: join(tmpdir(), "usage-monitor-dogfood-unconfigured.app"),
+      externalDistribution: true,
+      releaseChannel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    }),
+    { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
+  );
+  assert.throws(
+    () => readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        SYNTHETIC_DOGFOOD_PUBLIC_KEY,
+    }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+    { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
+  );
+});
+
+test("stable external bundle inputs remain bound to the reviewed production policy", async () => {
+  const stable = normalizeMacOSCentralOrigin(DEPLOYMENT_ENDPOINTS.public.origin);
+  assert.deepEqual(
+    validateMacOSDistributionConfiguration({
+      centralService: stable,
+      externalDistribution: true,
+      releaseChannel: STABLE_RELEASE_CHANNEL,
+    }),
+    {
+      channel: "production",
+      externalDistribution: true,
+      previewDistribution: false,
+      productionOriginValidated: true,
+      previewOriginValidated: false,
+    },
+  );
+  assert.deepEqual(
+    readMacOSReleaseBuildConfiguration({
+      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
+      USAGE_MONITOR_SPARKLE_APPCAST_URL:
+        DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
+      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
+        Buffer.alloc(32, 1).toString("base64"),
+    }, STABLE_RELEASE_CHANNEL),
+    {
+      bundleVersion: "42.7",
+      productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      provisioningProfile: null,
+      sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+      sparkleFramework: "/tmp/Sparkle.framework",
+      sparklePublicEdKey: Buffer.alloc(32, 1).toString("base64"),
+    },
+  );
+});
+
+test("a separately configured synthetic dogfood policy models its mode and endpoints without network access", async () => {
+  const dogfood = syntheticDogfoodReleaseChannel();
+  assert.equal(assertReleaseChannelConfiguration(dogfood), dogfood);
+  await assert.rejects(
+    buildMacOSApp({
+      output: join(tmpdir(), "usage-monitor-synthetic-dogfood.app"),
+      externalDistribution: true,
+      releaseChannel: dogfood,
+    }),
+    { code: "MACOS_RELEASE_CHANNEL_NAME_REQUIRED" },
+  );
+  assert.deepEqual(
+    validateMacOSDistributionConfiguration({
+      centralService: {
+        configured: true,
+        mode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+        origin: dogfood.serviceOrigin,
+      },
+      externalDistribution: true,
+      releaseChannel: dogfood,
+    }),
+    {
+      channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+      externalDistribution: true,
+      previewDistribution: false,
+      productionOriginValidated: true,
+      previewOriginValidated: false,
+    },
+  );
+  assert.deepEqual(
+    {
+      channelName: dogfood.name,
+      serviceOriginMode: dogfood.serviceOriginMode,
+      serviceOrigin: dogfood.serviceOrigin,
+      publicWebsiteOrigin: dogfood.publicWebsiteOrigin,
+      sparkleAppcastURL: dogfood.sparkle.appcastURL,
+      sparklePublicEdKeySha256: dogfood.sparkle.publicEdKeySha256,
+    },
+    {
+      channelName: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+      serviceOriginMode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+      serviceOrigin: "https://dogfood.tibotattle.example",
+      publicWebsiteOrigin: "https://dogfood.tibotattle.example",
+      sparkleAppcastURL:
+        "https://updates.dogfood.tibotattle.example/internal-dogfood/appcast.xml",
+      sparklePublicEdKeySha256: SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256,
+    },
+  );
+});
+
+test("native central service accepts development, stable, and dogfood HTTPS modes", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  assert.match(source, /case developmentLoopback = "development_loopback"/u);
+  assert.match(source, /case productionHTTPS = "production_https"/u);
+  assert.match(source, /case internalDogfoodHTTPS = "internal_dogfood_https"/u);
+  assert.match(
+    source,
+    /case \.productionHTTPS, \.internalDogfoodHTTPS:/u,
+  );
+});
+
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), "1");
   for (const value of ["1", "1.2", "1.2.3", "0.0.0", "123456789"]) {
@@ -1459,7 +1620,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
       value,
     );
   }
-  const production = normalizeMacOSCentralOrigin("https://usage.example");
+  const production = normalizeMacOSCentralOrigin(DEPLOYMENT_ENDPOINTS.public.origin);
   assert.deepEqual(
     validateMacOSDistributionConfiguration({
       centralService: production,
@@ -1691,6 +1852,8 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     releaseSource,
     /USAGE_MONITOR_PRODUCTION_ORIGIN/u,
   );
+  assert.match(releaseSource, /"--release-channel"/u);
+  assert.match(releaseSource, /releaseChannel\.name/u);
   assert.match(
     releaseSource,
     /USAGE_MONITOR_BUNDLE_VERSION/u,
@@ -1770,6 +1933,14 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   assert.equal(preview.output.endsWith(
     "/.release-build/macos-preview/current/TiboTattle.app",
   ), true);
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+      "--release-channel",
+      INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    ], environment),
+    { code: "MACOS_RELEASE_CHANNEL_EXTERNAL_REQUIRED" },
+  );
   const defaultPreview = parseMacOSBuildArguments([
     "--preview-distribution",
   ], {});
@@ -2355,6 +2526,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         UsageMonitorCentralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
         UsageMonitorCentralOriginMode: "production_https",
         UsageMonitorPublicWebsiteOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+        UsageMonitorReleaseChannel: STABLE_RELEASE_CHANNEL,
         UsageMonitorAppOpenHost: PRODUCT_BRAND.appOpenHost,
         UsageMonitorAppOpenScheme: PRODUCT_BRAND.appOpenScheme,
         UsageMonitorAppOpenURL: PRODUCT_BRAND.appOpenURL,
@@ -2387,6 +2559,8 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
           appOpenHost: "open",
           appOpenScheme: "usagemonitor",
           appOpenURL: "usagemonitor://open",
+          channel: "production",
+          channelName: STABLE_RELEASE_CHANNEL,
           externalDistributionRequested: true,
           iconIncluded: true,
           iconSha256: createHash("sha256")
@@ -3489,6 +3663,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       appOpenScheme: "usagemonitor",
       appOpenURL: "usagemonitor://open",
       channel: "development",
+      channelName: "development",
       externalDistributionRequested: false,
       iconIncluded: true,
       iconSha256: await sha256File(
@@ -3750,6 +3925,10 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(developmentPlist.UsageMonitorUpdaterEnabled, false);
     assert.equal(
       developmentPlist.UsageMonitorBuildChannel,
+      "development",
+    );
+    assert.equal(
+      developmentPlist.UsageMonitorReleaseChannel,
       "development",
     );
     assert.equal(developmentPlist.UsageMonitorPreviewDistribution, false);
@@ -4555,6 +4734,10 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
     assert.equal(manifest.application.bundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
     assert.equal(manifest.application.bundleVersion, "42");
     assert.equal(manifest.release.channel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
+    assert.equal(
+      manifest.release.channelName,
+      MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+    );
     assert.equal(manifest.release.previewDistributionRequested, true);
     assert.equal(manifest.release.externalDistributionRequested, false);
     assert.equal(manifest.release.requiresDeveloperIDAndNotarization, false);
@@ -4582,6 +4765,10 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       DEPLOYMENT_ENDPOINTS.public.origin,
     );
     assert.equal(plist.UsageMonitorBuildChannel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
+    assert.equal(
+      plist.UsageMonitorReleaseChannel,
+      MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+    );
     assert.equal(plist.UsageMonitorPreviewDistribution, true);
     assert.equal(plist.UsageMonitorCentralOriginMode, "production_https");
     assert.equal(plist.UsageMonitorUpdaterEnabled, true);
@@ -4839,6 +5026,8 @@ test("build script itself does not admit private output trees", async () => {
   assert.match(source, /previewDistributionRequested/u);
   assert.match(source, /MACOS_PREVIEW_DISTRIBUTION_CHANNEL/u);
   assert.match(source, /UsageMonitorBuildChannel/u);
+  assert.match(source, /UsageMonitorReleaseChannel/u);
+  assert.match(source, /channelName/u);
   assert.match(source, /MACOS_PREVIEW_OUTPUT_FORBIDDEN/u);
   assert.match(source, /--preview-distribution/u);
   assert.match(source, /--validate-preview/u);

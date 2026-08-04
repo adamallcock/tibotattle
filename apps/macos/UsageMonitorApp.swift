@@ -454,6 +454,7 @@ extension AppUpdater: SPUUpdaterDelegate {}
 private enum CentralServiceMode: String {
     case developmentLoopback = "development_loopback"
     case productionHTTPS = "production_https"
+    case internalDogfoodHTTPS = "internal_dogfood_https"
 }
 
 private struct CentralServiceConfiguration {
@@ -495,7 +496,7 @@ private struct CentralServiceConfiguration {
             else {
                 throw LauncherError.invalidCentralService
             }
-        case .productionHTTPS:
+        case .productionHTTPS, .internalDogfoodHTTPS:
             guard scheme == "https",
                   !["127.0.0.1", "localhost", "::1"].contains(host)
             else {
