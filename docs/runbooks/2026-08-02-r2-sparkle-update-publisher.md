@@ -80,11 +80,17 @@ reviewed `stable` channel, exact `tibotattle-updates` bucket and `appcast.xml`
 key, exact XML content type/cache-control, bounded candidate bytes, candidate
 SHA-256, and expected current state/hash (and optional current HTTP etag).
 
-The owner-only Worker reads the current appcast, verifies that state, and calls
-R2 `put(..., { onlyIf: { etagMatches } })` (or the empty-object equivalent) with
-the candidate and HTTP metadata. Cloudflare documents that a failed R2
-conditional put returns `null`, which the guard reports as a distinct conflict;
-it performs no fallback ordinary put. See the [Workers R2 API
+The owner-only Worker independently parses the candidate and active appcasts,
+requires one unambiguous latest full enclosure with a strictly higher bundle
+version (or the explicit empty-state bootstrap), and checks its canonical
+content-addressed URL, immutable R2 metadata, exact bytes/length/hash, and
+Sparkle Ed25519 signature. It reads the stable public key only from the named
+owner-provisioned public configuration and checks its SHA-256 fingerprint; the
+private key never enters the Worker. It then reads the current appcast,
+verifies that state, and calls R2 `put(..., { onlyIf: { etagMatches } })` (or the
+empty-object equivalent) with the candidate and HTTP metadata. Cloudflare
+documents that a failed R2 conditional put returns `null`, which the guard
+reports as a distinct conflict; it performs no fallback ordinary put. See the [Workers R2 API
 reference](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/)
 and [R2 S3 API compatibility
 reference](https://developers.cloudflare.com/r2/api/s3/api/). The appcast is
@@ -106,16 +112,22 @@ following for the exact selected channel:
    `SPARKLE_APPCAST_GUARD_ENDPOINT_PATH=/api/v1/internal/release/appcast`,
    `SPARKLE_APPCAST_GUARD_CONTENT_TYPE=application/xml; charset=utf-8`,
    `SPARKLE_APPCAST_GUARD_CACHE_CONTROL=public, max-age=300, must-revalidate`,
-   and `SPARKLE_APPCAST_GUARD_MAX_XML_BYTES=1048576`.
+   and `SPARKLE_APPCAST_GUARD_MAX_XML_BYTES=1048576`. Also set the public-only
+   `SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY` and
+   `SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY_SHA256` to the exact reviewed stable
+   Sparkle verification key and its fingerprint used by the signed bundle.
 4. Store a fresh owner-only value of at least 32 characters as the
    `SPARKLE_APPCAST_GUARD_TOKEN` Worker secret. Never put its value in source,
    shell history, receipts, logs, or the appcast.
 5. Verify the explicit CLI endpoint is HTTPS, has no credentials/query/hash,
    and is exactly the selected channel service origin plus the fixed route.
 
-This is an owner provisioning checklist, not evidence that the binding,
-secret, route, endpoint, or D1 migration is deployed. Until all five items are
-reviewed and receipted, no live appcast publication is permitted.
+The public-key values are configuration inputs, not secrets; the checked-in
+Worker does not supply them and rejects enabled configuration when the key is
+missing or its fingerprint does not match. This is an owner provisioning
+checklist, not evidence that the binding, public key, secret, route, endpoint,
+or D1 migration is deployed. Until all five items are reviewed and receipted,
+no live appcast publication is permitted.
 
 ## Required manual signing gate
 

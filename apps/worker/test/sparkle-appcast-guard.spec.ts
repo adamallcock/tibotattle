@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   handleSparkleAppcastGuard,
@@ -9,7 +9,12 @@ import {
   SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
   SPARKLE_APPCAST_GUARD_CHANNEL,
   SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
+  SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL,
+  SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE,
   SPARKLE_APPCAST_GUARD_KEY,
+  SPARKLE_APPCAST_GUARD_OBJECT_PREFIX,
+  SPARKLE_APPCAST_GUARD_PUBLIC_KEY_ENV,
+  SPARKLE_APPCAST_GUARD_PUBLIC_KEY_SHA256_ENV,
   SPARKLE_APPCAST_GUARD_ROUTE,
   SPARKLE_APPCAST_GUARD_SCHEMA,
 } from "../src/sparkle-appcast-guard";
@@ -22,6 +27,11 @@ interface TestBindings extends Env {
 const TOKEN = "test-owner-release-guard-token-0123456789";
 const NOW = Date.parse("2026-08-04T22:00:00.000Z");
 const encoder = new TextEncoder();
+const ARTIFACT_FILE_NAME = "TiboTattle.dmg";
+const ARTIFACT_BYTES = encoder.encode("signed-dmg-artifact");
+let sparkleKeyPair: CryptoKeyPair;
+let sparklePublicEdKey = "";
+let sparklePublicEdKeySha256 = "";
 
 function base64Url(value: Uint8Array): string {
   let binary = "";
@@ -35,6 +45,21 @@ async function sha256Hex(value: Uint8Array): Promise<string> {
   return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function base64(value: Uint8Array): string {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function sparkleSignature(value: Uint8Array): Promise<string> {
+  const signature = new Uint8Array(await crypto.subtle.sign(
+    { name: "Ed25519" },
+    sparkleKeyPair.privateKey,
+    value,
+  ));
+  return base64(signature);
+}
+
 interface StoredObject {
   bytes: Uint8Array;
   etag: string;
@@ -43,43 +68,57 @@ interface StoredObject {
 }
 
 class FakeR2Bucket {
-  object: StoredObject | null = null;
+  private readonly objects = new Map<string, StoredObject>();
   putCalls = 0;
   mutateBeforePut = false;
 
-  private metadata(): R2Object {
-    if (this.object === null) throw new Error("object is absent");
+  get object(): StoredObject | null {
+    return this.objects.get(SPARKLE_APPCAST_GUARD_KEY) ?? null;
+  }
+
+  set object(value: StoredObject | null) {
+    if (value === null) this.objects.delete(SPARKLE_APPCAST_GUARD_KEY);
+    else this.objects.set(SPARKLE_APPCAST_GUARD_KEY, value);
+  }
+
+  setArtifact(key: string, value: StoredObject): void {
+    this.objects.set(key, value);
+  }
+
+  private metadata(key: string, object: StoredObject): R2Object {
     return {
-      key: SPARKLE_APPCAST_GUARD_KEY,
-      version: this.object.etag,
-      size: this.object.bytes.byteLength,
-      etag: this.object.etag,
-      httpEtag: `"${this.object.etag}"`,
+      key,
+      version: object.etag,
+      size: object.bytes.byteLength,
+      etag: object.etag,
+      httpEtag: `"${object.etag}"`,
       checksums: { toJSON: () => ({}) },
       uploaded: new Date(NOW),
       httpMetadata: {
-        contentType: this.object.contentType,
-        cacheControl: this.object.cacheControl,
+        contentType: object.contentType,
+        cacheControl: object.cacheControl,
       },
       storageClass: "Standard",
       writeHttpMetadata: () => {},
     };
   }
 
-  async head(): Promise<R2Object | null> {
-    return this.object === null ? null : this.metadata();
+  async head(key: string): Promise<R2Object | null> {
+    const object = this.objects.get(key);
+    return object === undefined ? null : this.metadata(key, object);
   }
 
-  async get(): Promise<R2ObjectBody | null> {
-    if (this.object === null) return null;
-    const metadata = this.metadata();
+  async get(key: string): Promise<R2ObjectBody | null> {
+    const object = this.objects.get(key);
+    if (object === undefined) return null;
+    const metadata = this.metadata(key, object);
     return {
       ...metadata,
-      arrayBuffer: async () => this.object!.bytes.slice().buffer,
-      bytes: async () => this.object!.bytes.slice(),
-      text: async () => new TextDecoder().decode(this.object!.bytes),
-      blob: async () => new Blob([this.object!.bytes]),
-      json: async () => JSON.parse(new TextDecoder().decode(this.object!.bytes)),
+      arrayBuffer: async () => object.bytes.slice().buffer,
+      bytes: async () => object.bytes.slice(),
+      text: async () => new TextDecoder().decode(object.bytes),
+      blob: async () => new Blob([object.bytes]),
+      json: async () => JSON.parse(new TextDecoder().decode(object.bytes)),
       get body() {
         return new ReadableStream<Uint8Array>();
       },
@@ -96,15 +135,18 @@ class FakeR2Bucket {
     this.putCalls += 1;
     if (this.mutateBeforePut) {
       this.mutateBeforePut = false;
-      this.object = {
+      this.objects.set(SPARKLE_APPCAST_GUARD_KEY, {
         bytes: encoder.encode("concurrent state"),
         etag: "concurrent",
         contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
         cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
-      };
+      });
     }
     const condition = options.onlyIf as R2Conditional;
-    const current = this.object === null ? null : this.metadata();
+    const currentObject = this.objects.get(_);
+    const current = currentObject === undefined
+      ? null
+      : this.metadata(_, currentObject);
     if (condition.etagMatches !== undefined
         && (current === null || current.httpEtag !== condition.etagMatches)) {
       return null;
@@ -118,13 +160,13 @@ class FakeR2Bucket {
     );
     const digest = await sha256Hex(bytes);
     const metadata = options.httpMetadata as R2HTTPMetadata;
-    this.object = {
+    this.objects.set(_, {
       bytes,
       etag: digest.slice(0, 16),
       contentType: metadata.contentType ?? "",
       cacheControl: metadata.cacheControl ?? "",
-    };
-    return this.metadata();
+    });
+    return this.metadata(_, this.objects.get(_) as StoredObject);
   }
 }
 
@@ -155,6 +197,8 @@ function bindings(bucket: FakeR2Bucket | null, overrides: Record<string, unknown
     SPARKLE_APPCAST_GUARD_CACHE_CONTROL: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
     SPARKLE_APPCAST_GUARD_MAX_XML_BYTES: "1048576",
     SPARKLE_APPCAST_GUARD_TOKEN: TOKEN,
+    [SPARKLE_APPCAST_GUARD_PUBLIC_KEY_ENV]: sparklePublicEdKey,
+    [SPARKLE_APPCAST_GUARD_PUBLIC_KEY_SHA256_ENV]: sparklePublicEdKeySha256,
     ...overrides,
   } as unknown as Env;
 }
@@ -200,12 +244,59 @@ interface PayloadOptions {
   channel?: string;
 }
 
+function artifactKey(version: string, digest: string): string {
+  return `${SPARKLE_APPCAST_GUARD_OBJECT_PREFIX}/${version}/${digest}/${ARTIFACT_FILE_NAME}`;
+}
+
+async function appcastBytes(
+  version: string,
+  artifactBytes = ARTIFACT_BYTES,
+  enclosureSuffix = "",
+): Promise<Uint8Array> {
+  const digest = await sha256Hex(artifactBytes);
+  const signature = await sparkleSignature(artifactBytes);
+  return encoder.encode(`<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+<enclosure url="https://updates.tibotattle.com/${artifactKey(version, digest)}" length="${artifactBytes.byteLength}" sparkle:version="${version}" sparkle:edSignature="${signature}" />${enclosureSuffix}
+</item></channel></rss>`);
+}
+
+async function installArtifact(
+  bucket: FakeR2Bucket,
+  version: string,
+  bytes = ARTIFACT_BYTES,
+  overrides: Partial<StoredObject> = {},
+): Promise<string> {
+  const digest = await sha256Hex(bytes);
+  const key = artifactKey(version, digest);
+  bucket.setArtifact(key, {
+    bytes,
+    etag: `${version}-artifact-etag`,
+    contentType: SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE,
+    cacheControl: SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL,
+    ...overrides,
+  });
+  return key;
+}
+
+async function seedAppcast(bucket: FakeR2Bucket, version: string): Promise<Uint8Array> {
+  const current = await appcastBytes(version);
+  bucket.object = {
+    bytes: current,
+    etag: `${version}-appcast-etag`,
+    contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
+    cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
+  };
+  return current;
+}
+
 async function payload({
-  candidate = encoder.encode("<?xml version=\"1.0\"?><rss><channel/></rss>"),
+  candidate,
   expectedCurrent = { state: "empty", bytes: 0, sha256: null, etag: null },
   key = SPARKLE_APPCAST_GUARD_KEY,
   channel = SPARKLE_APPCAST_GUARD_CHANNEL,
 }: PayloadOptions = {}): Promise<Record<string, unknown>> {
+  const candidateBytes = candidate ?? await appcastBytes("1");
   return {
     schemaVersion: SPARKLE_APPCAST_GUARD_SCHEMA,
     channel,
@@ -215,9 +306,9 @@ async function payload({
     cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
     expectedCurrent,
     candidate: {
-      bytes: candidate.byteLength,
-      sha256: await sha256Hex(candidate),
-      base64: base64Url(candidate),
+      bytes: candidateBytes.byteLength,
+      sha256: await sha256Hex(candidateBytes),
+      base64: base64Url(candidateBytes),
     },
   };
 }
@@ -237,6 +328,19 @@ async function invoke(request: Request, runtimeEnv: Env, nowEpoch = NOW): Promis
     throw error;
   }
 }
+
+beforeAll(async () => {
+  sparkleKeyPair = await crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  ) as CryptoKeyPair;
+  const publicBytes = new Uint8Array(
+    await crypto.subtle.exportKey("raw", sparkleKeyPair.publicKey) as ArrayBuffer,
+  );
+  sparklePublicEdKey = base64(publicBytes);
+  sparklePublicEdKeySha256 = await sha256Hex(publicBytes);
+});
 
 beforeEach(async () => {
   await reset();
@@ -283,8 +387,22 @@ describe("Sparkle appcast atomic guard", () => {
     expect(bucket.putCalls).toBe(0);
   });
 
+  it("rejects a public-key fingerprint mismatch before any R2 put", async () => {
+    const bucket = new FakeR2Bucket();
+    const response = await invoke(
+      await signedRequest(await payload(), TOKEN, Math.floor(NOW / 1000), "key-fingerprint-nonce-01"),
+      bindings(bucket, {
+        [SPARKLE_APPCAST_GUARD_PUBLIC_KEY_SHA256_ENV]: "0".repeat(64),
+      }),
+      NOW,
+    );
+    expect(response.status).toBe(503);
+    expect(bucket.putCalls).toBe(0);
+  });
+
   it("consumes a nonce once, so an identical signed request cannot replay", async () => {
     const bucket = new FakeR2Bucket();
+    await installArtifact(bucket, "1");
     const body = await payload();
     const first = await invoke(
       await signedRequest(body),
@@ -303,6 +421,7 @@ describe("Sparkle appcast atomic guard", () => {
 
   it("retains a nonce through the exact accepted timestamp boundary", async () => {
     const bucket = new FakeR2Bucket();
+    await installArtifact(bucket, "1");
     const body = await payload();
     const timestamp = Math.floor(NOW / 1000);
     const nonce = "boundary-nonce-0000001";
@@ -319,6 +438,155 @@ describe("Sparkle appcast atomic guard", () => {
     expect(first.status).toBe(200);
     expect(replayAtBoundary.status).toBe(401);
     expect(bucket.putCalls).toBe(1);
+  });
+
+  it("rejects arbitrary valid-looking XML without a canonical enclosure", async () => {
+    const bucket = new FakeR2Bucket();
+    const candidate = encoder.encode(`<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item><title>looks valid</title></item></channel></rss>`);
+    const response = await invoke(
+      await signedRequest(await payload({ candidate })),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(422);
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("rejects unsigned and bad-signature candidates before any appcast put", async () => {
+    const bucket = new FakeR2Bucket();
+    const signed = new TextDecoder().decode(await appcastBytes("1"));
+    const badSignature = encoder.encode(
+      signed.replace(/sparkle:edSignature="[^"]+"/u, `sparkle:edSignature="${"A".repeat(88)}"`),
+    );
+    await installArtifact(bucket, "1");
+    const badSignatureResponse = await invoke(
+      await signedRequest(await payload({ candidate: badSignature })),
+      bindings(bucket),
+      NOW,
+    );
+    const unsigned = encoder.encode(
+      signed.replace(/ sparkle:edSignature="[^"]+"/u, ""),
+    );
+    const unsignedResponse = await invoke(
+      await signedRequest(
+        await payload({ candidate: unsigned }),
+        TOKEN,
+        Math.floor(NOW / 1000),
+        "unsigned-candidate-nonce-01",
+      ),
+      bindings(bucket),
+      NOW,
+    );
+    expect(badSignatureResponse.status).toBe(422);
+    expect(unsignedResponse.status).toBe(422);
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("requires the content-addressed artifact and immutable R2 metadata", async () => {
+    const missing = new FakeR2Bucket();
+    const missingResponse = await invoke(
+      await signedRequest(await payload()),
+      bindings(missing),
+      NOW,
+    );
+    expect(missingResponse.status).toBe(422);
+    expect(missing.putCalls).toBe(0);
+
+    const mismatched = new FakeR2Bucket();
+    await installArtifact(mismatched, "1", ARTIFACT_BYTES, {
+      cacheControl: "public, max-age=60",
+    });
+    const mismatchedResponse = await invoke(
+      await signedRequest(
+        await payload(),
+        TOKEN,
+        Math.floor(NOW / 1000),
+        "mismatched-artifact-nonce-01",
+      ),
+      bindings(mismatched),
+      NOW,
+    );
+    expect(mismatchedResponse.status).toBe(422);
+    expect(mismatched.putCalls).toBe(0);
+  });
+
+  it("rejects equal and lower active versions", async () => {
+    for (const [version, nonce] of [["2", "equal-version-nonce-01"], ["1", "lower-version-nonce-01"]] as const) {
+      const bucket = new FakeR2Bucket();
+      const current = await seedAppcast(bucket, "2");
+      await installArtifact(bucket, version);
+      const response = await invoke(
+        await signedRequest(
+          await payload({
+            candidate: await appcastBytes(version),
+            expectedCurrent: {
+              state: "present",
+              bytes: current.byteLength,
+              sha256: await sha256Hex(current),
+              etag: null,
+            },
+          }),
+          TOKEN,
+          Math.floor(NOW / 1000),
+          nonce,
+        ),
+        bindings(bucket),
+        NOW,
+      );
+      expect(response.status).toBe(422);
+      expect(bucket.putCalls).toBe(0);
+    }
+  });
+
+  it("rejects malformed and multiple-current candidates", async () => {
+    const malformed = new FakeR2Bucket();
+    const malformedResponse = await invoke(
+      await signedRequest(await payload({ candidate: encoder.encode("<rss>") })),
+      bindings(malformed),
+      NOW,
+    );
+    expect(malformedResponse.status).toBe(422);
+
+    const one = new TextDecoder().decode(await appcastBytes("3"));
+    const enclosure = one.match(/<enclosure\b[^>]*\/>/u)?.[0];
+    expect(enclosure).toBeDefined();
+    const multiple = encoder.encode(one.replace(enclosure as string, `${enclosure}${enclosure}`));
+    const multipleResponse = await invoke(
+      await signedRequest(
+        await payload({ candidate: multiple }),
+        TOKEN,
+        Math.floor(NOW / 1000),
+        "multiple-current-nonce-01",
+      ),
+      bindings(malformed),
+      NOW,
+    );
+    expect(multipleResponse.status).toBe(422);
+    expect(malformed.putCalls).toBe(0);
+  });
+
+  it("commits a valid higher candidate after independently verifying its artifact", async () => {
+    const bucket = new FakeR2Bucket();
+    const current = await seedAppcast(bucket, "1");
+    await installArtifact(bucket, "2");
+    const candidate = await appcastBytes("2");
+    const response = await invoke(
+      await signedRequest(await payload({
+        candidate,
+        expectedCurrent: {
+          state: "present",
+          bytes: current.byteLength,
+          sha256: await sha256Hex(current),
+          etag: null,
+        },
+      })),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(200);
+    expect(bucket.putCalls).toBe(1);
+    expect(bucket.object?.bytes).toEqual(candidate);
   });
 
   it("rejects the wrong channel/key before any R2 mutation", async () => {
@@ -376,7 +644,8 @@ describe("Sparkle appcast atomic guard", () => {
 
   it("returns a distinct R2 conditional-write conflict", async () => {
     const bucket = new FakeR2Bucket();
-    const current = encoder.encode("current appcast");
+    const current = await appcastBytes("1");
+    await installArtifact(bucket, "2");
     bucket.object = {
       bytes: current,
       etag: "current-etag",
@@ -386,6 +655,7 @@ describe("Sparkle appcast atomic guard", () => {
     bucket.mutateBeforePut = true;
     const response = await invoke(
       await signedRequest(await payload({
+        candidate: await appcastBytes("2"),
         expectedCurrent: {
           state: "present",
           bytes: current.byteLength,
