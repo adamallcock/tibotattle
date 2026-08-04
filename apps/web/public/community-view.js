@@ -262,20 +262,33 @@ export function renderCommunitySnapshot({
     }`,
   ));
   container.append(heading);
+  const providerAccountCohort = snapshot.participantCohort === "provider_account";
+  const weeklyActivityKey = providerAccountCohort
+    ? "community.providerAccountWeeklyActivity"
+    : "community.weeklyActivity";
+  const partialMetricsKey = providerAccountCohort
+    ? "community.providerAccountPartialMetrics"
+    : "community.partialMetrics";
+  const supportKey = providerAccountCohort
+    ? "community.providerAccountsPerCell"
+    : "community.participantsPerCell";
+  const releaseMechanicsKey = providerAccountCohort
+    ? "community.providerAccountReleaseMechanics"
+    : "community.releaseMechanics";
   // The one sentence a reader needs to know what these numbers are and are
   // not. The mechanism that produces them lives in the disclosure below.
   container.append(node(
     "p",
     "snapshot-disclosure",
-    t("community.weeklyActivity", {
-      count: compact(snapshot.minimumIndependentParticipants),
+    t(weeklyActivityKey, {
+      count: compact(snapshot.minimumParticipants),
     }),
   ));
   if (snapshot.state === "published_partial") {
     container.append(node(
       "p",
       "snapshot-partial",
-      t("community.partialMetrics"),
+      t(partialMetricsKey),
     ));
   }
 
@@ -287,8 +300,8 @@ export function renderCommunitySnapshot({
         [t("community.releasedModelCells"), compact(snapshot.cells.length)],
         [
           t("community.minimumSupport"),
-          t("community.participantsPerCell", {
-            count: compact(snapshot.minimumIndependentParticipants),
+          t(supportKey, {
+            count: compact(snapshot.minimumParticipants),
           }),
         ],
         [t("community.ingestionCutoff"), formatLocal(snapshot.ingestionCutoffAt)],
@@ -313,8 +326,8 @@ export function renderCommunitySnapshot({
     detail.append(node(
       "p",
       "snapshot-disclosure",
-      t("community.releaseMechanics", {
-        count: compact(snapshot.minimumIndependentParticipants),
+      t(releaseMechanicsKey, {
+        count: compact(snapshot.minimumParticipants),
       }),
     ));
     detail.append(node(

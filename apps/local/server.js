@@ -46,12 +46,14 @@ import {
 } from "../../src/contribution-sync-queue.js";
 import {
   createProductionContributionDeviceBackend,
+  removeContributionDeviceCapability,
 } from "../../src/contribution-device-capability.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "../../src/platform/export-identity-keychain.js";
 import {
   claimContributionDevicePairing,
+  disconnectContributionDevice as disconnectContributionDeviceRemotely,
 } from "../../src/contribution-device-client.js";
 import {
   LOCAL_CONTRIBUTION_PREPARATION_ALLOWED_LOOKBACK_HOURS,
@@ -140,6 +142,8 @@ export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
   "local-contribution-device-reset-v0.1";
+export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
+  "local-contribution-device-disconnect-v0.1";
 const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 // Fixed journey names. Anything else is refused, so no free-form label can
@@ -249,6 +253,7 @@ const API_ROUTES = new Set([
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
   "/api/local/contribution/device-pair",
+  "/api/local/contribution/device-disconnect",
   "/api/local/contribution/device-credential-reset",
   "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/sync-once",
@@ -863,6 +868,30 @@ async function authorizeContributionDeviceCredentialReset(request, response) {
   // The one fixed confirmation this destructive local repair accepts.
   if (Object.keys(value).join("\0") !== "confirm"
       || value.confirm !== "reset_device_credential") {
+    sendError(response, 400, "invalid_request");
+    return false;
+  }
+  return true;
+}
+
+async function authorizeContributionDeviceDisconnect(request, response) {
+  if (!sameOrigin(request)
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "contribution_device_disconnect_not_authorized");
+    return false;
+  }
+  let value;
+  try {
+    value = await readBoundedJsonObject(request);
+  } catch (error) {
+    sendError(response, boundedRequestStatus(error), error.code ?? "invalid_request");
+    return false;
+  }
+  // This revokes a live remote bearer and then clears its exact local
+  // Keychain binding. It needs a distinct explicit confirmation from the
+  // local-only leftover-credential repair.
+  if (Object.keys(value).join("\0") !== "confirm"
+      || value.confirm !== "disconnect_this_mac") {
     sendError(response, 400, "invalid_request");
     return false;
   }
@@ -1835,6 +1864,7 @@ function createPreparedLocalCompanionServer({
     createProductionContributionDeviceBackend,
   contributionDevicePairingProvider = null,
   contributionDeviceCredentialResetRunner = null,
+  contributionDeviceDisconnectRunner = null,
   diagnosticNoteRecorder = null,
   clock = () => Date.now(),
   contributionSyncNextProvider = null,
@@ -1927,6 +1957,8 @@ function createPreparedLocalCompanionServer({
         && typeof contributionDevicePairingProvider !== "function")
       || (contributionDeviceCredentialResetRunner !== null
         && typeof contributionDeviceCredentialResetRunner !== "function")
+      || (contributionDeviceDisconnectRunner !== null
+        && typeof contributionDeviceDisconnectRunner !== "function")
       || (contributionSyncNextProvider !== null
         && typeof contributionSyncNextProvider !== "function")
       || (contributionSyncExactReviewProvider !== null
@@ -1969,6 +2001,64 @@ function createPreparedLocalCompanionServer({
       backend: contributionDeviceBackendFactory(),
       stateFile: statePaths.contributionDeviceStateFile,
     }));
+  // Disconnect revokes the remote bearer before removing its local binding.
+  // Serialize every delivery-affecting local mutation with that transition so
+  // a foreground or automatic sync cannot begin in the await between the
+  // initial idle check and remote revocation.
+  let contributionDeviceDisconnectInProgress = false;
+  const disconnectContributionDevice = contributionDeviceDisconnectRunner
+    ?? (contributionServiceOrigin === null
+      ? null
+      : async () => {
+        const backend = contributionDeviceBackendFactory();
+        let remoteConfirmed = false;
+        try {
+          const remote = await disconnectContributionDeviceRemotely({
+            origin: contributionServiceOrigin,
+            capabilityOptions: {
+              backend,
+              stateFile: statePaths.contributionDeviceStateFile,
+            },
+          });
+          if (remote?.status !== "disconnected"
+              || typeof remote.deviceId !== "string") {
+            throw new Error("remote contribution-device disconnect invalid");
+          }
+          remoteConfirmed = true;
+          // Once the remote bearer is gone, stop the local queue before
+          // erasing the exact credential. A pause persistence failure leaves
+          // the harmless stale local binding in place for a retry; it never
+          // leaves a live remote upload authority behind.
+          const queue = await setContributionPaused({ paused: true });
+          if (queue?.paused !== true) {
+            throw new Error("contribution delivery was not paused");
+          }
+          const removed = await removeContributionDeviceCapability({
+            backend,
+            stateFile: statePaths.contributionDeviceStateFile,
+            expectedOrigin: contributionServiceOrigin,
+            confirmDeviceId: remote.deviceId,
+            remoteRevocationConfirmed: true,
+          });
+          if (removed?.status !== "removed"
+              || removed.deviceId !== remote.deviceId) {
+            throw new Error("local contribution-device removal invalid");
+          }
+          return Object.freeze({
+            status: "disconnected",
+            deliveryPaused: true,
+            localCredential: removed.credential,
+            localBinding: "removed",
+          });
+        } catch (error) {
+          if (remoteConfirmed) {
+            const cleanupPending = new Error("local disconnect cleanup pending");
+            cleanupPending.code = "contribution_device_disconnect_cleanup_pending";
+            throw cleanupPending;
+          }
+          throw error;
+        }
+      });
   const recordDiagnosticNote = diagnosticNoteRecorder
     ?? ((note) => appendDiagnosticNote({
       file: diagnosticsLogFile,
@@ -2014,6 +2104,8 @@ function createPreparedLocalCompanionServer({
     || contributionSyncNextProvider !== null;
   const contributionDevicePairingConfigured =
     pairContributionDevice !== null;
+  const contributionDeviceDisconnectConfigured =
+    disconnectContributionDevice !== null;
   const syncExactReviewConfigured = preparedContributionDirectory !== null
     || contributionSyncExactReviewProvider !== null;
   const syncDeliveryConfigured =
@@ -2043,7 +2135,7 @@ function createPreparedLocalCompanionServer({
             }),
         })
       ),
-    });
+  });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
   const runAutomaticContributionRetirement =
@@ -2081,7 +2173,7 @@ function createPreparedLocalCompanionServer({
     signal,
     preparedSetId,
   }) => {
-    if (contributionSyncInProgress) {
+    if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
       const error = new Error("sync_in_progress");
       error.code = "sync_in_progress";
       error.retryable = true;
@@ -2258,6 +2350,8 @@ function createPreparedLocalCompanionServer({
             contributionSyncNext: syncPreviewConfigured,
             contributionDevicePairing:
               contributionDevicePairingConfigured,
+            contributionDeviceDisconnect:
+              contributionDeviceDisconnectConfigured,
             contributionSyncExactReview: syncExactReviewConfigured,
             contributionSyncActions: syncDeliveryConfigured,
             centralServiceProxy: centralProxy.enabled,
@@ -2590,6 +2684,10 @@ function createPreparedLocalCompanionServer({
           );
           return;
         }
+        if (contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
         try {
           const paired = await pairContributionDevice({ pairingCode });
           const expiresAt = nullableInstant(paired?.expiresAt);
@@ -2619,6 +2717,59 @@ function createPreparedLocalCompanionServer({
         }
         return;
       }
+      if (path === "/api/local/contribution/device-disconnect") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeContributionDeviceDisconnect(request, response)) return;
+        if (!contributionDeviceDisconnectConfigured) {
+          sendError(response, 409, "contribution_device_disconnect_not_configured");
+          return;
+        }
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
+        contributionDeviceDisconnectInProgress = true;
+        let disconnected;
+        try {
+          disconnected = await disconnectContributionDevice();
+        } catch (error) {
+          const cleanupPending = error?.code
+            === "contribution_device_disconnect_cleanup_pending";
+          sendError(
+            response,
+            cleanupPending ? 409 : 502,
+            cleanupPending
+              ? "contribution_device_disconnect_cleanup_pending"
+              : "contribution_device_disconnect_failed",
+          );
+          return;
+        } finally {
+          contributionDeviceDisconnectInProgress = false;
+        }
+        if (disconnected?.status !== "disconnected"
+            || disconnected.deliveryPaused !== true
+            || !["deleted", "already_missing"].includes(
+              disconnected.localCredential,
+            )
+            || disconnected.localBinding !== "removed") {
+          sendError(response, 500, "contribution_device_disconnect_failed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION,
+          status: "disconnected",
+          deliveryPaused: true,
+          localCredential: disconnected.localCredential,
+          localBinding: "removed",
+          includesIdentifiers: false,
+          includesCredentials: false,
+          hostedDataDeleted: false,
+        });
+        return;
+      }
       if (path === "/api/local/contribution/device-credential-reset") {
         if (request.method !== "POST") {
           sendError(response, 405, "method_not_allowed");
@@ -2628,6 +2779,10 @@ function createPreparedLocalCompanionServer({
           request,
           response,
         )) return;
+        if (contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
         let reset;
         try {
           reset = await resetContributionDeviceCredential();
@@ -2709,7 +2864,7 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "review_expired_or_changed");
           return;
         }
-        if (contributionSyncInProgress) {
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
@@ -2776,7 +2931,7 @@ function createPreparedLocalCompanionServer({
           response,
           "sync_control_not_authorized",
         )) return;
-        if (contributionSyncInProgress) {
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
           sendError(response, 409, "sync_in_progress");
           return;
         }

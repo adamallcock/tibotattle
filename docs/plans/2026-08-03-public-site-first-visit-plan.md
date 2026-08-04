@@ -28,12 +28,13 @@ Keychain/private keys, or replace an installed app.
 - The builder's app-only ledger withholds `app.js`, `index.html`, and
   `navigation.js`; the public source tests also reject dashboard controls and
   companion-only modules.
-- The current `community-weekly-snapshot-v0.1/v0.2` reader and Worker snapshot
+- The current `community-weekly-snapshot-v0.1/v0.2/v0.3` reader and Worker snapshot
   builder expose delayed, immutable, clipped, rounded activity cells. They do
   not expose a matched community allowance estimate, quota coverage, uncertainty
   interval, or change-confidence field.
-- The current release contract requires at least 20 independent participants
-  per released activity cell, but that threshold alone does not make an
+- The current release contract requires at least 20 eligible provider-account
+  participants per released activity cell; it is not an independence claim and
+  that threshold alone does not make an
   allowance estimate defensible.
 - A read-only check at 2026-08-03 20:44 EDT found `https://tibotattle.com/`
   serving the old dashboard entry (`app.js`, dashboard navigation, and local

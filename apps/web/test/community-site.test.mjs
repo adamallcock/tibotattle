@@ -116,9 +116,16 @@ function publishedSnapshot(overrides = {}) {
     releasedAt: "2026-07-22T00:00:00.000Z",
     immutable: true,
     nonOverlapping: true,
+    cohortEligibility: "provider_account_gated_open_cohort",
     privacyPolicy: {
       version: "community-weekly-v0.1",
-      minimumIndependentParticipants: 20,
+      minimumProviderAccountParticipants: 20,
+      maturity: {
+        appliesTo: "open_provider_account_cohort",
+        maturityDays: 7,
+        minimumAcceptedCollectionDays: 2,
+        acceptedCollectionDayBasis: "telemetry_contribution_created_at_before_cutoff",
+      },
     },
     cells: [{
       provider: "openai_codex",
@@ -539,7 +546,10 @@ test("a published community week renders its support gate, provenance, and cells
     now: Date.parse("2026-07-22T01:00:00.000Z"),
   });
   assert.equal(state, "published");
-  assert.match(container.text, /at least 20 different participants/u);
+  assert.match(
+    container.text,
+    /at least 20 distinct eligible social-provider accounts/u,
+  );
   assert.match(container.text, /not an average, and not a cost/u);
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a released week renders its cell table");
@@ -551,7 +561,7 @@ test("a published community week renders its support gate, provenance, and cells
     assert.equal(headerLabels.includes(label), true, label);
   }
   assert.match(detail.text, /community-weekly/u);
-  assert.match(detail.text, /clipped per participant/u);
+  assert.match(detail.text, /capped per eligible provider account/u);
 
   // The site can render the headline without the provenance container, and it
   // must not invent one.

@@ -1,5 +1,6 @@
 import * as oauth from "oauth4webapi";
 
+import { sha256Hex } from "./crypto";
 import { ApiError, type ErrorCode } from "./errors";
 import { isDevelopmentEnvironment } from "./admission";
 
@@ -27,6 +28,8 @@ const APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys";
 const MAXIMUM_TOKEN_BYTES = 16 * 1024;
 const MAXIMUM_JWKS_BYTES = 64 * 1024;
 const CLOCK_SKEW_SECONDS = 300;
+const MAXIMUM_NONCE_LENGTH = 256;
+const NONCE_HASH_PATTERN = /^[0-9a-f]{64}$/u;
 
 export interface VerifiedIdentity {
   provider: "google" | "apple";
@@ -185,6 +188,7 @@ async function validateWithOauth4WebApi(
   idToken: string,
   nowMs: number,
   jwksFetcher: JwksFetcher | undefined,
+  expectedNonce: string | undefined,
 ): Promise<Record<string, unknown>> {
   const response = idTokenResponse(idToken);
   const tokenResponse = await oauth.processAuthorizationCodeResponse(
@@ -192,9 +196,10 @@ async function validateWithOauth4WebApi(
     oidcClient(expectedAudience, nowMs),
     response,
     {
-      // Neither hosted authorization request sends a nonce. Requiring its
-      // absence rejects a token replayed from a different OIDC transaction.
-      expectedNonce: oauth.expectNoNonce,
+      // Google keeps the historical no-nonce contract. Apple transactions
+      // opt into an exact expected nonce below; requiring that claim rejects
+      // a token replayed from a different OIDC transaction.
+      expectedNonce: expectedNonce ?? oauth.expectNoNonce,
       requireIdToken: true,
     },
   );
@@ -216,6 +221,42 @@ async function validateWithOauth4WebApi(
   return oauth.getValidatedIdTokenClaims(tokenResponse) as Record<string, unknown>;
 }
 
+/**
+ * Reads only the unverified nonce claim needed to configure oauth4webapi's
+ * claim comparison.  Signature verification still happens immediately after
+ * processAuthorizationCodeResponse; this preliminary parse never authorizes
+ * an identity and is bound to the persisted digest below.  Keeping this
+ * helper local also prevents raw token/nonce material from entering logs.
+ */
+function unverifiedNonce(idToken: string): string {
+  const segments = idToken.split(".");
+  if (segments.length !== 3 || segments[1] === undefined) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  const encoded = segments[1]!.replaceAll("-", "+").replaceAll("_", "/");
+  if (encoded.length === 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded)) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=")));
+  } catch {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  if (typeof parsed !== "object"
+      || parsed === null
+      || Array.isArray(parsed)) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  const nonce = Reflect.get(parsed, "nonce");
+  if (typeof nonce !== "string"
+      || nonce.length === 0
+      || nonce.length > MAXIMUM_NONCE_LENGTH) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  return nonce;
+}
+
 export function identityRequired(env: Env): boolean {
   return !isDevelopmentEnvironment(env);
 }
@@ -223,7 +264,17 @@ export function identityRequired(env: Env): boolean {
 export async function verifyHostedIdentity(
   env: Env,
   identity: unknown,
-  options: { jwksFetcher?: JwksFetcher; nowMs?: number } = {},
+  options: {
+    jwksFetcher?: JwksFetcher;
+    nowMs?: number;
+    /** Raw request-scoped nonce, when a caller deliberately keeps it in memory. */
+    expectedNonce?: string;
+    /**
+     * SHA-256 hex digest of the nonce minted for this Apple transaction. The
+     * raw nonce is intentionally not persisted by the handoff repository.
+     */
+    expectedNonceHash?: string;
+  } = {},
 ): Promise<VerifiedIdentity> {
   if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
     identityError("IDENTITY_REQUIRED");
@@ -250,6 +301,30 @@ export async function verifyHostedIdentity(
     throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
   }
 
+  const expectedNonceHash = options.expectedNonceHash;
+  const suppliedExpectedNonce = options.expectedNonce;
+  if (suppliedExpectedNonce !== undefined
+      && (typeof suppliedExpectedNonce !== "string"
+        || suppliedExpectedNonce.length === 0
+        || suppliedExpectedNonce.length > MAXIMUM_NONCE_LENGTH)) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  if (expectedNonceHash !== undefined
+      && (provider !== "apple" || !NONCE_HASH_PATTERN.test(expectedNonceHash))) {
+    identityError("IDENTITY_TOKEN_INVALID");
+  }
+  if (suppliedExpectedNonce !== undefined && expectedNonceHash !== undefined) {
+    const suppliedNonceHash = await sha256Hex(suppliedExpectedNonce);
+    if (suppliedNonceHash !== expectedNonceHash) {
+      identityError("IDENTITY_TOKEN_INVALID");
+    }
+  }
+  // The only production flow that sends a nonce is Apple.  A missing digest
+  // retains the old no-nonce contract for direct callers and Google; the
+  // Apple callback integration always supplies the state-row digest.
+  const expectedNonce = suppliedExpectedNonce
+    ?? (expectedNonceHash === undefined ? undefined : unverifiedNonce(idToken));
+
   const testJwksFetcher = environmentJwksFetcher(env);
   const jwksFetcher = testJwksFetcher ?? options.jwksFetcher;
   const nowMs = options.nowMs ?? Date.now();
@@ -264,6 +339,7 @@ export async function verifyHostedIdentity(
           idToken,
           nowMs,
           jwksFetcher,
+          expectedNonce,
         );
         break;
       } catch (error) {
@@ -277,6 +353,26 @@ export async function verifyHostedIdentity(
     identityError("IDENTITY_TOKEN_INVALID");
   }
   if (claims === undefined) identityError("IDENTITY_TOKEN_INVALID");
+
+  if (expectedNonceHash !== undefined || suppliedExpectedNonce !== undefined) {
+    const nonce = claims.nonce;
+    if (typeof nonce !== "string"
+        || nonce.length === 0
+        || nonce.length > MAXIMUM_NONCE_LENGTH
+        || nonce !== expectedNonce) {
+      identityError("IDENTITY_TOKEN_INVALID");
+    }
+    // A raw nonce is already compared exactly above. Hash comparison is only
+    // meaningful for the persisted-digest path used by Apple's callback; do
+    // not reject an otherwise valid direct caller merely because it supplied
+    // the raw expected nonce rather than a storage digest.
+    if (expectedNonceHash !== undefined) {
+      const actualNonceHash = await sha256Hex(nonce);
+      if (actualNonceHash !== expectedNonceHash) {
+        identityError("IDENTITY_TOKEN_INVALID");
+      }
+    }
+  }
 
   const subject = claims.sub;
   if (typeof subject !== "string" || subject.length === 0 || subject.length > 256) {

@@ -38,6 +38,7 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
     ASSETS: runtime.ASSETS,
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     ENROLLMENT_MODE: runtime.ENROLLMENT_MODE,
+    SIGN_IN_START_MAX_PER_MINUTE: "1200",
     ENROLLMENT_RATE_LIMIT: runtime.ENROLLMENT_RATE_LIMIT,
     CLIENT_ATTEMPT_RATE_LIMIT: runtime.CLIENT_ATTEMPT_RATE_LIMIT,
     ENVELOPE_PRIVATE_JWK: "",
@@ -551,6 +552,37 @@ describe("hosted Google sign-in", () => {
       expect(serialized.includes(CLIENT_SECRET)).toBe(false);
       expect(serialized.includes("SECRET")).toBe(false);
     }
+    const rows = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM google_signin_handoffs",
+    ).first<{ total: number }>();
+    expect(rows?.total).toBe(0);
+    expect(tokenCalls).toHaveLength(0);
+  });
+
+  it("does not allocate a Google handoff while enrollment is contained", async () => {
+    const disabled = await json(
+      "/api/v1/identity/google/start",
+      {},
+      bindings({ ENROLLMENT_MODE: "disabled" }),
+    );
+    expect(disabled.status).toBe(503);
+    expect(await disabled.json()).toMatchObject({
+      error: { code: "ENROLLMENT_DISABLED" },
+    });
+
+    await bindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE collection_controls
+          SET enrollment_enabled = 0,
+              control_state = 'degraded',
+              revision = revision + 1
+        WHERE singleton = 1`,
+    ).run();
+    const paused = await json("/api/v1/identity/google/start", {});
+    expect(paused.status).toBe(503);
+    expect(await paused.json()).toMatchObject({
+      error: { code: "COLLECTION_ENROLLMENT_DISABLED" },
+    });
+
     const rows = await bindings().USAGE_MONITOR_DB.prepare(
       "SELECT COUNT(*) AS total FROM google_signin_handoffs",
     ).first<{ total: number }>();

@@ -36,7 +36,8 @@ key, so a mixed/unknown surface must be refused rather than pooled.
 
 ## Minimum successor contract
 
-A future `community-weekly-snapshot-v0.3` may publish a conditional estimate
+A future successor after the current activity-only
+`community-weekly-snapshot-v0.3` may publish a conditional estimate
 only when all of the following are true:
 
 1. collection is explicitly consented and externally enabled through a new,
@@ -45,7 +46,8 @@ only when all of the following are true:
 2. inputs are complete matched quota and server-priced usage evidence from one
    provider, plan, limit, surface, and policy cohort, with a true 10,080-minute
    window and eligible reset fits;
-3. each published cohort has at least 20 independent eligible participants;
+3. each published cohort has at least 20 eligible provider-account-backed
+   participants; this is a descriptive open cohort, not an independence claim;
 4. per-participant inputs are clipped, outputs are coarsely rounded and
    delayed/sealed, and deletion triggers withdrawal/rebuild; and
 5. output is a conditional API-price-equivalent median plus empirical

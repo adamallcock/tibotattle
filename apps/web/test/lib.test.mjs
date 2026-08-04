@@ -62,6 +62,7 @@ import {
   normalizeParticipantDeletionReceipt,
   normalizeParticipantHistory,
   normalizeParticipantStats,
+  normalizeLocalContributionDeviceDisconnect,
   normalizeLocalContributionDeviceReset,
   normalizeLocalDiagnosticNote,
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
@@ -435,9 +436,16 @@ function communitySnapshot() {
     releasedAt: "2026-07-22T00:00:00.000Z",
     immutable: true,
     nonOverlapping: true,
+    cohortEligibility: "provider_account_gated_open_cohort",
     privacyPolicy: {
       version: "community-weekly-v0.1",
-      minimumIndependentParticipants: 20
+      minimumProviderAccountParticipants: 20,
+      maturity: {
+        appliesTo: "open_provider_account_cohort",
+        maturityDays: 7,
+        minimumAcceptedCollectionDays: 2,
+        acceptedCollectionDayBasis: "telemetry_contribution_created_at_before_cutoff",
+      },
     },
     cells: [{
       provider: "openai_codex",
@@ -2629,8 +2637,8 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     /@media \(max-width: 760px\)[\s\S]*?\.topbar \.button\.compact \{ display: none; \}/u,
   );
   assert.match(html, />\s*Sign out\s*</u);
-  assert.match(html, /Signing out only forgets this sign-in on this page\./u);
-  assert.match(html, /metadata already contributed stays until you delete it/u);
+  assert.match(html, /Signing out revokes this browser's service session and forgets/u);
+  assert.match(html, /metadata already contributed\s+stays until you delete it/u);
   assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
 
   assert.match(appSource, /function configuredGoogleClientId\(\)/u);
@@ -2728,23 +2736,24 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     /IDENTITY_TOKEN_INVALID:\s*`\$\{flow\.label\} sign-in was cancelled or did not complete/u,
   );
 
-  // Signing out is page-local: it forgets the memory-only identity and the
-  // pseudonymous session it enrolled, so the next sign-in can be a different
-  // account, and it calls nothing that could delete hosted data.
+  // Signing out revokes the browser's server session before it changes the
+  // local signed-in state. It never deletes participant data or devices.
   const signOutBody =
-    appSource.match(/function signOutHostedIdentity\(\)\s*\{[\s\S]*?\n\}/u)?.[0]
+    appSource.match(/async function signOutHostedIdentity\(\)\s*\{[\s\S]*?\n\}/u)?.[0]
       ?? "";
+  assert.match(signOutBody, /await communityClient\.logout\(\);/u);
+  assert.match(signOutBody, /hostedIdentityBusy = true;/u);
   assert.match(signOutBody, /hostedIdentity = null;/u);
   assert.match(signOutBody, /setCommunitySession\(null\);/u);
   assert.match(signOutBody, /renderHostedIdentity\(\);/u);
-  assert.match(signOutBody, /nothing was deleted/u);
+  assert.match(signOutBody, /still signed in\. Nothing was changed/u);
   assert.doesNotMatch(
     signOutBody,
-    /communityClient\.|localClient\.|deleteParticipant|deleteContribution/u,
+    /localClient\.|deleteParticipant|deleteContribution|revokeDevice/u,
   );
   assert.match(
     appSource,
-    /\$\("#identity-signout"\)\.addEventListener\("click", signOutHostedIdentity\);/u,
+    /\$\("#identity-signout"\)\.addEventListener\("click", \(\) => \{\s*void signOutHostedIdentity\(\);\s*\}\);/u,
   );
   // Both states are driven from one render pass, so the buttons always return
   // to their signed-out form when the identity is dropped.
@@ -2958,7 +2967,8 @@ test("deletion receipts fail closed before the UI can claim success", async () =
 test("community snapshots fail closed and never disclose threshold distance", () => {
   const published = normalizeCommunitySnapshot(communitySnapshot());
   assert.equal(published.state, "published");
-  assert.equal(published.minimumIndependentParticipants, 20);
+  assert.equal(published.minimumParticipants, 20);
+  assert.equal(published.participantCohort, "provider_account");
   assert.equal(published.cells[0].metrics.usageEvents.value, 30);
 
   const partialPayload = structuredClone(communitySnapshot());
@@ -4631,16 +4641,110 @@ test("the device credential repair is explicit, local-only, and fails closed", a
   );
 });
 
-test("sealed snapshots stay readable across both released contracts", () => {
+test("disconnecting this Mac is a confirmed, non-identifying local transaction", async () => {
+  const calls = [];
+  const client = (payload, status = 200) => new LocalCompanionClient({
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify(payload), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  const disconnected = await client({
+    schemaVersion: "local-contribution-device-disconnect-v0.1",
+    status: "disconnected",
+    deliveryPaused: true,
+    localCredential: "deleted",
+    localBinding: "removed",
+    hostedDataDeleted: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  }).disconnectContributionDevice();
+  assert.deepEqual(disconnected, {
+    status: "disconnected",
+    deliveryPaused: true,
+    localCredential: "deleted",
+    localBinding: "removed",
+  });
+  assert.equal(calls[0].url, "/api/local/contribution/device-disconnect");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    confirm: "disconnect_this_mac",
+  });
+
+  // The browser has no business learning the remote device id or receiving a
+  // result that says its service data was deleted. Both claims fail closed.
+  for (const payload of [
+    {
+      schemaVersion: "local-contribution-device-disconnect-v0.1",
+      status: "disconnected",
+      deliveryPaused: true,
+      localCredential: "deleted",
+      localBinding: "removed",
+      hostedDataDeleted: false,
+      includesIdentifiers: true,
+      includesCredentials: false,
+    },
+    {
+      schemaVersion: "local-contribution-device-disconnect-v0.1",
+      status: "disconnected",
+      deliveryPaused: true,
+      localCredential: "deleted",
+      localBinding: "removed",
+      hostedDataDeleted: true,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    },
+    {
+      schemaVersion: "local-contribution-device-disconnect-v0.2",
+      status: "disconnected",
+      deliveryPaused: true,
+      localCredential: "deleted",
+      localBinding: "removed",
+      hostedDataDeleted: false,
+      includesIdentifiers: false,
+      includesCredentials: false,
+    },
+  ]) {
+    assert.equal(
+      normalizeLocalContributionDeviceDisconnect(payload).status,
+      "unavailable",
+    );
+  }
+  assert.equal(
+    normalizeLocalContributionDeviceDisconnect(null).status,
+    "unavailable",
+  );
+
+  await assert.rejects(
+    client({
+      schemaVersion: "local-companion-v0.1",
+      error: { code: "contribution_device_disconnect_cleanup_pending" },
+    }, 409).disconnectContributionDevice(),
+    (error) => error.status === 409
+      && error.code === "contribution_device_disconnect_cleanup_pending",
+  );
+});
+
+test("sealed snapshots stay readable across all released contracts", () => {
   assert.deepEqual(SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS, [
     "community-weekly-snapshot-v0.1",
     "community-weekly-snapshot-v0.2",
+    "community-weekly-snapshot-v0.3",
   ]);
 
   // A sealed revision is immutable by design, so a week published under the
   // earlier contract keeps being served and must keep rendering.
   const v01 = structuredClone(communitySnapshot());
   v01.schemaVersion = "community-weekly-snapshot-v0.1";
+  delete v01.cohortEligibility;
+  v01.privacyPolicy = {
+    version: "community-weekly-v0.1",
+    minimumIndependentParticipants: 20,
+  };
   delete v01.cells[0].planType;
   delete v01.cells[0].planVariant;
   const earlier = normalizeCommunitySnapshot(v01);
@@ -4652,7 +4756,8 @@ test("sealed snapshots stay readable across both released contracts", () => {
   assert.equal(earlier.cells[0].planType, "unknown");
   assert.equal(earlier.cells[0].planVariant, "unknown");
 
-  const v02 = structuredClone(communitySnapshot());
+  const v02 = structuredClone(v01);
+  v02.schemaVersion = "community-weekly-snapshot-v0.2";
   v02.cells[0].planType = "chatgpt_plus";
   v02.cells[0].planVariant = "standard";
   const current = normalizeCommunitySnapshot(v02);
@@ -4660,6 +4765,29 @@ test("sealed snapshots stay readable across both released contracts", () => {
   assert.equal(current.schemaVersion, "community-weekly-snapshot-v0.2");
   assert.equal(current.cells[0].planType, "chatgpt_plus");
   assert.equal(current.cells[0].planVariant, "standard");
+
+  const currentContract = normalizeCommunitySnapshot(communitySnapshot());
+  assert.equal(currentContract.state, "published");
+  assert.equal(currentContract.schemaVersion, "community-weekly-snapshot-v0.3");
+  assert.equal(currentContract.participantCohort, "provider_account");
+  assert.equal(currentContract.minimumParticipants, 20);
+
+  for (const mutate of [
+    (payload) => { payload.cohortEligibility = "independent_people"; },
+    (payload) => { payload.privacyPolicy.version = "community-weekly-v0.0"; },
+    (payload) => { delete payload.privacyPolicy.minimumProviderAccountParticipants; },
+    (payload) => { payload.privacyPolicy.minimumProviderAccountParticipants = 19; },
+    (payload) => { payload.privacyPolicy.maturity.appliesTo = "invite_cohort"; },
+    (payload) => { payload.privacyPolicy.maturity.maturityDays = 6; },
+    (payload) => { payload.privacyPolicy.maturity.minimumAcceptedCollectionDays = 1; },
+    (payload) => {
+      payload.privacyPolicy.maturity.acceptedCollectionDayBasis = "observed_at";
+    },
+  ]) {
+    const broken = structuredClone(communitySnapshot());
+    mutate(broken);
+    assert.equal(normalizeCommunitySnapshot(broken).state, "unsupported_schema");
+  }
 
   // A cell that claims a cohort under the earlier contract does not get one:
   // the contract, not the payload, decides whether the field means anything.
@@ -4687,7 +4815,7 @@ test("sealed snapshots stay readable across both released contracts", () => {
 
   // A contract nobody has released is still refused rather than guessed at.
   for (const version of [
-    "community-weekly-snapshot-v0.3",
+    "community-weekly-snapshot-v0.4",
     "community-weekly-snapshot",
     "participant-community-comparison-v0.2",
     "",
@@ -4820,7 +4948,7 @@ test("result panels show the number and its caveat, not the service plumbing", a
   assert.match(provenance, /How this snapshot is produced/u);
   assert.match(
     provenance,
-    /Community values use a fixed delay, independent per-cell support/u,
+    /Community values use a fixed delay, eligible provider-account\s+support/u,
   );
   assert.match(provenance, /A sealed\s+revision is never rewritten/u);
   assert.match(provenance, /id="community-snapshot-service-detail"/u);
@@ -4832,21 +4960,15 @@ test("result panels show the number and its caveat, not the service plumbing", a
     "utf8",
   );
   assert.match(appSource, /from "\.\/community-view\.js"/u);
-  assert.match(
-    detailBody,
-    /t\("community\.weeklyActivity", \{/u,
-  );
-  assert.match(
-    detailBody,
-    /t\("community\.partialMetrics"\)/u,
-  );
+  assert.match(detailBody, /community\.providerAccountWeeklyActivity/u);
+  assert.match(detailBody, /community\.providerAccountPartialMetrics/u);
   // Data-format version, ingestion cutoff, release timing, clipping mechanics
   // and the estimate-evidence boundary all moved into the disclosure.
   for (const relocated of [
     /detail\.append\(quality\);/u,
     /\[t\("community\.contract"\), snapshot\.schemaVersion\]/u,
     /\[t\("community\.ingestionCutoff"\), formatLocal\(snapshot\.ingestionCutoffAt\)\]/u,
-    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*t\("community\.releaseMechanics", \{/u,
+    /community\.providerAccountReleaseMechanics/u,
     /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*t\("community\.currentReleaseScope"\)/u,
   ]) {
     assert.match(detailBody, relocated);

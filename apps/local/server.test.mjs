@@ -299,6 +299,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       contributionSyncStatus: true,
       contributionSyncNext: true,
       contributionDevicePairing: false,
+      contributionDeviceDisconnect: false,
       contributionSyncExactReview: true,
       contributionSyncActions: false,
       centralServiceProxy: false,
@@ -3441,6 +3442,186 @@ test("a failed device credential reset reports one fixed code and deletes nothin
     assert.equal(payload.includes("/Users/private"), false);
     assert.equal(payload.includes("adamallcock"), false);
   } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("disconnecting this Mac requires a local confirmation and returns no device identifier", async () => {
+  const files = await fixture();
+  let calls = 0;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDeviceDisconnectRunner: async () => {
+      calls += 1;
+      return {
+        status: "disconnected",
+        deliveryPaused: true,
+        localCredential: "deleted",
+        localBinding: "removed",
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const path = "/api/local/contribution/device-disconnect";
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const health = await fetch(`${base}/api/local/health`).then((response) => response.json());
+    assert.equal(health.capabilities.contributionDeviceDisconnect, true);
+
+    const unauthorized = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+    });
+    assert.equal(unauthorized.status, 403);
+    assert.equal((await unauthorized.json()).error.code, "contribution_device_disconnect_not_authorized");
+
+    for (const body of ["{}", JSON.stringify({ confirm: "yes" })]) {
+      const rejected = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers,
+        body,
+      });
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).error.code, "invalid_request");
+    }
+    assert.equal(calls, 0);
+
+    const disconnected = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+    });
+    assert.equal(disconnected.status, 200);
+    const body = await disconnected.text();
+    assert.deepEqual(JSON.parse(body), {
+      schemaVersion: "local-contribution-device-disconnect-v0.1",
+      status: "disconnected",
+      deliveryPaused: true,
+      localCredential: "deleted",
+      localBinding: "removed",
+      includesIdentifiers: false,
+      includesCredentials: false,
+      hostedDataDeleted: false,
+    });
+    assert.equal(calls, 1);
+    assert.equal(body.includes("00000000-0000"), false);
+    assert.equal((await fetch(`${base}${path}`)).status, 405);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("disconnect serializes delivery-affecting mutations before remote revocation completes", async () => {
+  const files = await fixture();
+  const disconnectStarted = deferred();
+  const releaseDisconnect = deferred();
+  let disconnectCalls = 0;
+  let syncCalls = 0;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    contributionDeviceDisconnectRunner: async () => {
+      disconnectCalls += 1;
+      disconnectStarted.resolve();
+      await releaseDisconnect.promise;
+      return {
+        status: "disconnected",
+        deliveryPaused: true,
+        localCredential: "deleted",
+        localBinding: "removed",
+      };
+    },
+    contributionSyncExactReviewProvider: async () => ({
+      schemaVersion: "contribution-sync-exact-review-v0.1",
+      state: "ready",
+      networkActivity: false,
+      discoveredSets: 1,
+      enqueued: 0,
+      payloadBytes: 16,
+      payload: exactReviewContribution(),
+      reviewBinding: {
+        jobId: REVIEW_JOB_ID,
+        contributionSha256: REVIEW_SHA256,
+      },
+    }),
+    contributionSyncOnceRunner: async () => {
+      syncCalls += 1;
+      throw new Error("sync must not start while disconnect is pending");
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const review = await fetch(
+      `${base}/api/local/contribution/sync-inspect-exact`,
+      { method: "POST", headers, body: "{}" },
+    ).then((response) => response.json());
+    const disconnect = fetch(
+      `${base}/api/local/contribution/device-disconnect`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+      },
+    );
+    await disconnectStarted.promise;
+
+    const blockedSync = await fetch(
+      `${base}/api/local/contribution/sync-once`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewToken: review.reviewToken }),
+      },
+    );
+    assert.equal(blockedSync.status, 409);
+    assert.deepEqual(await blockedSync.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "sync_in_progress" },
+    });
+    assert.equal(syncCalls, 0);
+
+    const duplicate = await fetch(
+      `${base}/api/local/contribution/device-disconnect`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirm: "disconnect_this_mac" }),
+      },
+    );
+    assert.equal(duplicate.status, 409);
+    assert.deepEqual(await duplicate.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "sync_in_progress" },
+    });
+    assert.equal(disconnectCalls, 1);
+
+    releaseDisconnect.resolve();
+    assert.equal((await disconnect).status, 200);
+  } finally {
+    releaseDisconnect.resolve();
     await app.close();
     await rm(files.root, { recursive: true });
   }
