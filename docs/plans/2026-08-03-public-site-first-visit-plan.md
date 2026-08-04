@@ -186,3 +186,28 @@ state entirely, or replace the real chart with a new mobile visualization are
 out of scope. The first two would add an unapproved product flow or weaken the
 public value proposition; the last would require a separately designed and
 source-checked data asset rather than a responsive CSS patch.
+
+## Public module-boundary revision
+
+The privacy red-team also found that the previous exact release manifest still
+included `data-client.js`, `lib.js`, and the telemetry envelope modules. No
+local dashboard control rendered from them, but `data-client.js` exposed local
+companion, identity, contribution, and deletion methods that a public landing
+page does not need. That made the output broader than its stated boundary.
+
+The corrected release policy is an allowlist derived from the public entry:
+
+- `community-data.js` owns the closed snapshot normalizer and one read-only
+  `GET /api/v1/stats/aggregate` client;
+- `community.js` and `community-view.js` import that public-safe module rather
+  than the full app client or telemetry library;
+- the release builder copies only `community.js`'s verified static module graph
+  plus local assets explicitly referenced by `community.html` and its CSS;
+- unreviewed script references, dynamic module imports, source symlinks, and
+  unsupported local asset types fail the build; and
+- release tests inspect both the exact manifest and all published JavaScript
+  for local, identity, contribution, deletion, and telemetry capabilities.
+
+The app keeps `CommunityClient`, `LocalCompanionClient`, sign-in, contribution,
+and deletion behavior unchanged through `data-client.js`; it re-exports the
+shared snapshot normalizer so existing app imports remain compatible.

@@ -213,6 +213,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
 
 export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/app.js",
+  "apps/web/public/community-data.js",
   "apps/web/public/community-view.js",
   "apps/web/public/community.html",
   "apps/web/public/community.js",

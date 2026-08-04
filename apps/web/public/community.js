@@ -11,16 +11,31 @@
 // Every rendering routine below is imported, not copied: the install card and
 // the community table are the same modules the in-app dashboard entry uses.
 
-import { CommunityClient } from "./data-client.js";
+import { PublicCommunityClient } from "./community-data.js";
 import { renderCommunitySnapshot } from "./community-view.js";
 import {
   configuredSemanticOpenTarget,
   renderInstallerJourney,
 } from "./install-cta.js";
-import { diagnosticErrorCode, serviceRequestId } from "./lib.js";
 
 const $ = (selector) => document.querySelector(selector);
-const communityClient = new CommunityClient();
+const publicErrorCodePattern =
+  /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
+const publicRequestIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const communityClient = new PublicCommunityClient();
+
+function publicErrorCode(candidate) {
+  return typeof candidate === "string" && publicErrorCodePattern.test(candidate)
+    ? candidate
+    : "";
+}
+
+function publicRequestId(candidate) {
+  return typeof candidate === "string" && publicRequestIdPattern.test(candidate)
+    ? candidate
+    : "";
+}
 
 function bindInstalledAppLink() {
   const link = $("#open-installed-app");
@@ -82,8 +97,8 @@ async function loadCommunitySnapshot() {
   // Only the fixed, content-free identifiers the service itself returned are
   // repeated back. This page files no diagnostic note: there is no local
   // companion here to file one with.
-  const code = diagnosticErrorCode(failure?.code);
-  const requestId = serviceRequestId(failure?.requestId);
+  const code = publicErrorCode(failure?.code);
+  const requestId = publicRequestId(failure?.requestId);
   const sentences = [
     "The published snapshot could not be loaded. Nothing is inferred from a failed request.",
   ];

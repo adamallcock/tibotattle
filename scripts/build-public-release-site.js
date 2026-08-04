@@ -24,6 +24,13 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  PRODUCT_BRAND,
+  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+} from "../config/product-brand.js";
+import {
+  collectMacOSWebModuleGraph,
+} from "./build-macos-app.js";
+import {
   validateMacOSDMG,
   validateMacOSSignedReleaseArtifact,
 } from "./macos-release-core.js";
@@ -32,6 +39,7 @@ const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
 const SOCIAL_PREVIEW_FILENAME = "social-preview.png";
 const ROBOTS_FILENAME = "robots.txt";
+const SITE_ENTRY_MODULE_BASENAME = "community.js";
 /**
  * The public site is built from the community entry, not from the dashboard
  * entry. The dashboard is the Mac app's own interface: every control in it
@@ -40,28 +48,12 @@ const ROBOTS_FILENAME = "robots.txt";
  */
 const SITE_INDEX_SOURCE_BASENAME = "community.html";
 /**
- * Exact, reviewed allow-list for the public landing page. The source
- * directory also contains the loopback dashboard, admin surface, and
- * contribution-only browser modules; copying it recursively would publish
- * all of them. Keep this list aligned with the community entry's imports.
+ * Defense-in-depth absence ledger for the in-app dashboard surface. The
+ * release is selected from the public module and asset closures below; these
+ * exact names are checked again after staging so a future selection change
+ * cannot silently publish an app-only surface.
  */
-const PUBLIC_SITE_SOURCE_BASENAMES = Object.freeze([
-  "community.js",
-  "community-view.js",
-  "i18n.generated.js",
-  "styles.css",
-  // This is the reviewed, shipped application icon. Publishing the same
-  // mark with the landing page makes the download surface recognisably the
-  // same product without exposing any loopback/dashboard code.
-  "tibotattle-icon.png",
-  "ui-format.js",
-]);
-/**
- * Reviewed local/admin source names. The allow-list above is the primary
- * boundary; this ledger makes an accidental reintroduction fail visibly in
- * the generated output checks below.
- */
-const WITHHELD_SOURCE_BASENAMES = Object.freeze([
+const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
   "admin-client.js",
   "admin.css",
   "admin.html",
@@ -69,20 +61,15 @@ const WITHHELD_SOURCE_BASENAMES = Object.freeze([
   "app.js",
   "data-client.js",
   "index.html",
-  "install-cta.js",
+  "lib.js",
   "navigation.js",
-  // The operator page and its client are private service controls, not a
-  // public website surface. The reviewed TiboTattle icon is deliberately in
-  // the public allow-list above so the installer page visibly matches the
-  // downloaded app.
-  "admin-client.js",
-  "admin.css",
-  "admin.html",
-  "admin.js",
+  "telemetry-envelope.js",
+  "telemetry-shared.generated.js",
 ]);
 const MAXIMUM_SOCIAL_PREVIEW_BYTES = 10 * 1024 * 1024;
 const INSTALLER_FETCH_TIMEOUT_MS = 120_000;
 const MAXIMUM_INSTALLER_REDIRECTS = 5;
+const SEMANTIC_OPEN_TARGET_META_NAME = "usage-monitor-semantic-open-target";
 const INSTALLER_META = Object.freeze({
   "usage-monitor-installer-url": "installerUrl",
   "usage-monitor-installer-version": "installerVersion",
@@ -135,13 +122,8 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "/admin.html",
   '"admin.html"',
   "'admin.html'",
-  "./install-cta.js",
-  "/install-cta.js",
-  '"install-cta.js"',
-  "'install-cta.js'",
   'id="refresh-button"',
   'id="connect-community"',
-  'id="open-installed-app"',
   'id="contribution-form"',
   'id="identity-signin"',
   'id="identity-google-signin"',
@@ -161,9 +143,6 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   'href="#signin',
   'href="#admin',
   'href="#app-open',
-  "usage-monitor-semantic-open-target",
-  "usagemonitor://",
-  "/app-open",
   "/sign-in",
   "/signin",
   "/contribution",
@@ -642,6 +621,23 @@ function replaceExactlyOnce(html, token, replacement, label) {
 
 function injectReleaseMetadata(html, values) {
   let output = html;
+  const semanticPlaceholderCount =
+    output.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1;
+  if (semanticPlaceholderCount !== 1) {
+    throw new TypeError(
+      "Source must contain exactly one semantic open target placeholder",
+    );
+  }
+  const semanticMetaToken =
+    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
+    + `content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`;
+  output = replaceExactlyOnce(
+    output,
+    semanticMetaToken,
+    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
+      + `content="${htmlAttribute(PRODUCT_BRAND.appOpenURL)}">`,
+    "semantic open target meta placeholder",
+  );
   for (const [name, valueKey] of Object.entries(SITE_META)) {
     const token = `<meta name="${name}" content="">`;
     output = replaceExactlyOnce(
@@ -722,6 +718,66 @@ async function fileManifest(root, { excludedFiles = new Set() } = {}) {
   return rows;
 }
 
+function localPublicReferences(source, { css = false } = {}) {
+  const pattern = css
+    ? /url\(\s*["']?\.\/([^"'()?#]+)(?:[?#][^"'()]*)?["']?\s*\)/gu
+    : /\b(?:href|src)="\.\/([^"?#]+)(?:[?#][^"]*)?"/gu;
+  const references = new Set();
+  for (const match of source.matchAll(pattern)) {
+    const name = match[1];
+    if (!name
+        || name.includes("/")
+        || name.includes("\\")
+        || ![".css", ".ico", ".jpeg", ".jpg", ".js", ".png", ".svg", ".webp"]
+          .includes(extname(name).toLowerCase())) {
+      throw new TypeError(`Public source contains an unreviewed local reference: ${name}`);
+    }
+    if (extname(name).toLowerCase() === ".js"
+        && name !== SITE_ENTRY_MODULE_BASENAME) {
+      throw new TypeError(`Public HTML may load only ${SITE_ENTRY_MODULE_BASENAME}`);
+    }
+    references.add(name);
+  }
+  return references;
+}
+
+/**
+ * Select the exact public closure, rather than copying the mixed web source
+ * directory. HTML and CSS references are constrained locally; JavaScript is
+ * resolved through the same static module-graph checker used by the sealed
+ * macOS client. This makes both accidental app-client imports and symlink
+ * escapes release-time failures.
+ */
+async function collectPublicSourceFiles({ source, sourceHtml }) {
+  const sourceParent = dirname(source);
+  const entrypoint = `${relative(sourceParent, source).split(sep).join("/")}/${SITE_ENTRY_MODULE_BASENAME}`;
+  const moduleGraph = await collectMacOSWebModuleGraph({
+    allowedRoot: source,
+    entrypoints: [entrypoint],
+    repositoryRoot: sourceParent,
+  });
+  const files = new Set(moduleGraph.files.map((file) => resolve(file)));
+  const pending = [...localPublicReferences(sourceHtml)];
+  const inspected = new Set();
+  while (pending.length > 0) {
+    const name = pending.pop();
+    if (inspected.has(name)) continue;
+    inspected.add(name);
+    const path = resolve(join(source, name));
+    await regularFile(path, `Referenced public source ${name}`);
+    files.add(path);
+    if (extname(name).toLowerCase() === ".css") {
+      const css = await readFile(path, "utf8");
+      if (/@import\b/u.test(css)) {
+        throw new TypeError("Public CSS imports must be bundled before release");
+      }
+      pending.push(...localPublicReferences(css, { css: true }));
+    }
+  }
+  return [...files].sort((left, right) =>
+    relative(source, left).localeCompare(relative(source, right)));
+}
+
 export async function buildPublicReleaseSite(rawArgs, {
   validateInstallerArtifact = validateMacOSDMG,
   verifyPublishedInstaller = verifyPublishedInstallerRemote,
@@ -739,15 +795,13 @@ export async function buildPublicReleaseSite(rawArgs, {
     `Release-site index source ${SITE_INDEX_SOURCE_BASENAME}`,
   );
   const sourceHtml = await readFile(sourceIndex, "utf8");
-  const publicSourceFiles = [];
-  for (const basename of PUBLIC_SITE_SOURCE_BASENAMES) {
-    const sourcePath = join(options.source, basename);
-    if (!(await pathExists(sourcePath))) {
-      throw new TypeError(`Public release source ${basename} is required`);
-    }
-    await regularFile(sourcePath, `Public release source ${basename}`);
-    publicSourceFiles.push({ basename, sourcePath });
-  }
+  // Reject unsupported source entries before selecting the public closure.
+  // A symlink or special file may not hide alongside an otherwise valid entry.
+  await fileManifest(options.source);
+  const publicSourceFiles = await collectPublicSourceFiles({
+    source: options.source,
+    sourceHtml,
+  });
   let installerEvidence = null;
   if (options.installerConfigured) {
     installerEvidence = await validateMacOSSignedReleaseArtifact({
@@ -817,8 +871,13 @@ export async function buildPublicReleaseSite(rawArgs, {
   }
   await mkdir(dirname(options.output), { recursive: true });
   await mkdir(options.output, { recursive: true, mode: 0o755 });
-  for (const { basename, sourcePath } of publicSourceFiles) {
-    await copyFile(sourcePath, join(options.output, basename));
+  for (const sourceFile of publicSourceFiles) {
+    const outputFile = join(
+      options.output,
+      relative(options.source, sourceFile),
+    );
+    await mkdir(dirname(outputFile), { recursive: true });
+    await copyFile(sourceFile, outputFile);
   }
   await writeFile(join(options.output, "index.html"), releaseHtml, {
     encoding: "utf8",
@@ -837,10 +896,10 @@ export async function buildPublicReleaseSite(rawArgs, {
   );
   const files = await fileManifest(options.output);
   const publishedNames = new Set(files.map(({ path }) => path));
-  // `index.html` is the rendered community entry. No source entry point,
-  // admin file, or local-only asset may survive the generated allow-list.
+  // `index.html` is the rendered community entry. Every other app-only file
+  // must remain absent even if a future selection rule accidentally finds it.
   for (const withheld of [
-    ...WITHHELD_SOURCE_BASENAMES.filter((name) => name !== "index.html"),
+    ...APP_ONLY_SOURCE_BASENAMES.filter((name) => name !== "index.html"),
     SITE_INDEX_SOURCE_BASENAME,
   ]) {
     if (publishedNames.has(withheld)) {
@@ -850,7 +909,8 @@ export async function buildPublicReleaseSite(rawArgs, {
     }
   }
   const generatedNames = new Set([
-    ...PUBLIC_SITE_SOURCE_BASENAMES,
+    ...publicSourceFiles.map((sourceFile) =>
+      relative(options.source, sourceFile).split(sep).join("/")),
     "index.html",
     ROBOTS_FILENAME,
     SOCIAL_PREVIEW_FILENAME,
@@ -945,6 +1005,15 @@ export async function buildPublicReleaseSite(rawArgs, {
   } else if (Object.keys(INSTALLER_META).some((name) =>
     verifiedHtml.includes(`<meta name="${name}"`))) {
     throw new Error("No-installer release output retained installer metadata");
+  }
+  const semanticTargetMeta =
+    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
+    + `content="${htmlAttribute(PRODUCT_BRAND.appOpenURL)}">`;
+  if (verifiedHtml.includes(SEMANTIC_OPEN_TARGET_PLACEHOLDER)
+      || verifiedHtml.split(semanticTargetMeta).length - 1 !== 1) {
+    throw new Error(
+      "Release output did not contain exactly one configured semantic open target",
+    );
   }
   for (const token of [
     '<link rel="canonical" href="">',

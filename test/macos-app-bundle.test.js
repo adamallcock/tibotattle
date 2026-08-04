@@ -2305,6 +2305,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   // entry. The community entry itself is website-only and is not bundled.
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/app.js",
+    "apps/web/public/community-data.js",
     "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
     "apps/web/public/i18n.generated.js",
@@ -2333,6 +2334,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(runtimeAssets, [
     "apps/macos/reset-local-keychain.js",
     "apps/web/public/app.js",
+    "apps/web/public/community-data.js",
     "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
     "apps/web/public/i18n.generated.js",

@@ -24,9 +24,14 @@
  * responses, but never silently turn a failure into real-looking data.
  */
 
+export {
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+  SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
+  normalizeCommunitySnapshot,
+} from "./community-data.js";
+
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
-export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
 // Provider quota identifiers are protocol values, not display copy. Keep the
 // normal Codex allowance selection bound to the exact technical identifier so
 // a translated UI label (or another product's weekly-looking window) can never
@@ -38,20 +43,6 @@ export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
 const PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES = new Set([
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES
-]);
-// A sealed snapshot is immutable by design: the database refuses to rewrite a
-// released revision, so a week published under an earlier contract keeps being
-// served forever. A reader that accepted only the newest contract would turn
-// every version bump into "unsupported contract" for already-published weeks,
-// so both released contracts are accepted here. The only difference is the
-// plan-cohort fields, which v0.1 cells simply do not carry; every other check
-// stays exactly as strict for both.
-export const SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS = Object.freeze([
-  "community-weekly-snapshot-v0.1",
-  COMMUNITY_SNAPSHOT_SCHEMA_VERSION
-]);
-const COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS = new Set([
-  COMMUNITY_SNAPSHOT_SCHEMA_VERSION
 ]);
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
@@ -97,16 +88,6 @@ export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
 export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
 const MAXIMUM_ONBOARDING_ROLLOUT_FILES = 100;
 
-const COMMUNITY_METRIC_UNITS = Object.freeze({
-  usageEvents: "events_rounded_down",
-  inputUncachedTokens: "tokens_rounded_down",
-  inputCacheReadTokens: "tokens_rounded_down",
-  inputCacheWriteTokens: "tokens_rounded_down",
-  outputTextTokens: "tokens_rounded_down",
-  outputReasoningTokens: "tokens_rounded_down",
-  outputCombinedTokens: "tokens_rounded_down",
-  toolUnits: "tool_units_rounded_down"
-});
 const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
   usageEvents: "events",
   inputUncachedTokens: "tokens",
@@ -1083,114 +1064,6 @@ export function normalizeLocalContributionDeviceReset(payload) {
     status: payload.status,
     credential: payload.credential,
     binding: payload.binding
-  };
-}
-
-function snapshotMetric(value, expectedUnit) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  if (value.status === "suppressed") {
-    return { status: "suppressed", value: null, unit: expectedUnit };
-  }
-  const numeric = finite(value.value, null);
-  if (value.status !== "released"
-      || value.unit !== expectedUnit
-      || numeric === null
-      || !Number.isSafeInteger(numeric)
-      || numeric < 0) {
-    return null;
-  }
-  return { status: "released", value: numeric, unit: expectedUnit };
-}
-
-export function normalizeCommunitySnapshot(payload) {
-  if (!payload) return { state: "service_unavailable", cells: [] };
-  if (payload.publicationStatus === "development_diagnostic_not_publication_safe") {
-    return { state: "development_unsafe", cells: [] };
-  }
-  if (!SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS.includes(
-    payload.schemaVersion
-  )
-      || payload.immutable !== true
-      || payload.nonOverlapping !== true) {
-    return { state: "unsupported_schema", cells: [] };
-  }
-  const carriesPlanCohort = COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS.has(
-    payload.schemaVersion
-  );
-
-  const base = {
-    schemaVersion: payload.schemaVersion,
-    snapshotId: text(payload.snapshotId, ""),
-    period: {
-      startAt: text(payload.period?.startAt, ""),
-      endAt: text(payload.period?.endAt, "")
-    },
-    ingestionCutoffAt: text(payload.ingestionCutoffAt, ""),
-    releasedAt: text(payload.releasedAt, ""),
-    policyVersion: text(payload.privacyPolicy?.version, ""),
-    minimumIndependentParticipants: finite(
-      payload.privacyPolicy?.minimumIndependentParticipants,
-      null
-    ),
-    cells: []
-  };
-
-  if (payload.releaseStatus === "not_yet_published") {
-    return { ...base, state: "not_yet_published" };
-  }
-  if (payload.releaseStatus === "withdrawn") {
-    return { ...base, state: "withdrawn" };
-  }
-  if (payload.releaseStatus === "suppressed") {
-    return { ...base, state: "suppressed" };
-  }
-  if (payload.releaseStatus !== "published"
-      || !base.snapshotId
-      || !base.period.startAt
-      || !base.period.endAt
-      || !base.ingestionCutoffAt
-      || !base.releasedAt
-      || !base.policyVersion
-      || !Number.isSafeInteger(base.minimumIndependentParticipants)
-      || base.minimumIndependentParticipants < 3
-      || !Array.isArray(payload.cells)
-      || payload.cells.length > 100) {
-    return { ...base, state: "unsupported_schema" };
-  }
-
-  const cells = [];
-  let partial = false;
-  for (const candidate of payload.cells) {
-    const provider = text(candidate?.provider, "");
-    const modelId = text(candidate?.modelId, "");
-    if (!provider || !modelId || !candidate.metrics
-        || typeof candidate.metrics !== "object"
-        || Array.isArray(candidate.metrics)) {
-      return { ...base, state: "unsupported_schema" };
-    }
-    // Plan cohorts arrived with v0.2. A v0.1 cell has no cohort to report, so
-    // it is described as unknown rather than guessed at or rejected.
-    const planType = carriesPlanCohort
-      ? text(candidate?.planType, "unknown")
-      : "unknown";
-    const planVariant = carriesPlanCohort
-      ? text(candidate?.planVariant, "unknown")
-      : "unknown";
-    const metrics = {};
-    for (const [metricName, expectedUnit] of Object.entries(COMMUNITY_METRIC_UNITS)) {
-      const metric = snapshotMetric(candidate.metrics[metricName], expectedUnit);
-      if (!metric) return { ...base, state: "unsupported_schema" };
-      metrics[metricName] = metric;
-      partial ||= metric.status === "suppressed";
-    }
-    cells.push({ provider, planType, planVariant, modelId, metrics });
-  }
-  return {
-    ...base,
-    state: partial ? "published_partial" : "published",
-    cells
   };
 }
 

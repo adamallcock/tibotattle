@@ -11,6 +11,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "app.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/community-data.js": Object.freeze({
+    file: "community-data.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/community-view.js": Object.freeze({
     file: "community-view.js",
     type: "text/javascript; charset=utf-8",

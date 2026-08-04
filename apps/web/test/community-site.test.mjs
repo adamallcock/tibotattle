@@ -8,7 +8,8 @@ import {
 import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   normalizeCommunitySnapshot,
-} from "../public/data-client.js";
+  PublicCommunityClient,
+} from "../public/community-data.js";
 import {
   COMMUNITY_METRIC_LABELS,
   COMMUNITY_ESTIMATE_STATE_COPY,
@@ -186,6 +187,8 @@ test("the public site presents only the install call to action and the community
   for (
     const companionOnlyModule of [
       "./app.js",
+      "./data-client.js",
+      "./lib.js",
       "./navigation.js",
       "LocalCompanionClient",
       "createTelemetryEnvelope",
@@ -234,6 +237,55 @@ test("the public site presents only the install call to action and the community
   assert.equal(
     html.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1,
     1,
+  );
+});
+
+test("the public community client exposes one read-only aggregate request", async () => {
+  assert.deepEqual(
+    Object.getOwnPropertyNames(PublicCommunityClient.prototype).sort(),
+    ["communityStats", "constructor"],
+  );
+  const calls = [];
+  const payload = { releaseStatus: "not_yet_published" };
+  const client = new PublicCommunityClient({
+    fetchImpl: async (...args) => {
+      calls.push(args);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => payload,
+      };
+    },
+  });
+  assert.equal(await client.communityStats(), payload);
+  assert.deepEqual(calls, [[
+    "/api/v1/stats/aggregate",
+    { headers: { Accept: "application/json" } },
+  ]]);
+
+  const requestId = "12345678-1234-4123-8123-123456789abc";
+  const failing = new PublicCommunityClient({
+    fetchImpl: async () => ({
+      ok: false,
+      status: 503,
+      json: async () => ({
+        error: {
+          code: "AGGREGATE_UNAVAILABLE",
+          requestId,
+          privateDetail: "must not escape",
+        },
+      }),
+    }),
+  });
+  await assert.rejects(
+    failing.communityStats(),
+    (error) => {
+      assert.equal(error.message, "Request failed (503).");
+      assert.equal(error.code, "AGGREGATE_UNAVAILABLE");
+      assert.equal(error.requestId, requestId);
+      assert.equal(Object.hasOwn(error, "privateDetail"), false);
+      return true;
+    },
   );
 });
 
