@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assessStagingConfiguration,
+  EXPECTED_STAGING_MIGRATIONS,
   GENERATED_WORKER_ASSET_DIRECTORY,
   probeStagingLive,
+  STAGING_PROOF_TYPES,
+  stagingOperationReceipt,
+  validateStagingMigrationInventory,
 } from "./staging-readiness-lib.mjs";
 import {
   checkedInConfig,
@@ -16,14 +20,80 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
   const result = assessStagingConfiguration(checkedInConfig);
   assert.equal(result.state, "safe_unprovisioned");
   assert.equal(result.collectionAuthorized, false);
+  assert.equal(result.evidenceType, STAGING_PROOF_TYPES.STATIC_CONFIGURATION);
+  assert.equal(result.liveProof, false);
   assert.equal(result.checks.enrollmentDisabled, true);
   assert.equal(result.checks.accountScopedIngestDisabled, true);
   assert.equal(result.checks.assetsClosed, true);
+  assert.equal(result.checks.migrationInventorySafe, true);
+  assert.deepEqual(
+    result.migrationInventory.USAGE_MONITOR_DB.slice(-6),
+    EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-6),
+  );
+  assert.deepEqual(
+    result.migrationInventory.DELETION_LEDGER,
+    EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER,
+  );
   assert.equal(result.checks.resourceIdentifiersConfigured, false);
   assert.deepEqual(result.blockers, [
     "STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED",
   ]);
   assert.equal(JSON.stringify(result).includes("app-usagemonitor-staging"), false);
+});
+
+test("migration inventory is exact and rejects missing or unreviewed files", () => {
+  const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
+  assert.deepEqual(validateStagingMigrationInventory(inventory), {
+    ok: true,
+    code: null,
+  });
+
+  inventory.USAGE_MONITOR_DB.pop();
+  assert.deepEqual(validateStagingMigrationInventory(inventory), {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+  });
+
+  const extra = structuredClone(EXPECTED_STAGING_MIGRATIONS);
+  extra.USAGE_MONITOR_DB.push("0029_unreviewed.sql");
+  extra.USAGE_MONITOR_DB.sort();
+  assert.deepEqual(validateStagingMigrationInventory(extra), {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+  });
+
+  const missing = assessStagingConfiguration(checkedInConfig, {
+    workerDirectory: "/definitely-missing-staging-worker-directory",
+  });
+  assert.equal(missing.state, "unsafe_configuration");
+  assert.equal(missing.checks.migrationInventorySafe, false);
+  assert.equal(
+    missing.blockers.includes("LOCAL_MIGRATION_INVENTORY_DRIFT"),
+    true,
+  );
+});
+
+test("staging readiness rejects production resources and custom-domain targets", () => {
+  const productionResource = structuredClone(checkedInConfig);
+  productionResource.env.staging.d1_databases[0].database_name =
+    productionResource.env.production.d1_databases[0].database_name;
+  const productionResult = assessStagingConfiguration(productionResource);
+  assert.equal(productionResult.state, "unsafe_configuration");
+  assert.equal(productionResult.checks.d1BindingsSafe, false);
+  assert.equal(productionResult.blockers.includes(
+    "CONFIG_D1_BINDINGS_SAFE",
+  ), true);
+
+  const customDomain = structuredClone(checkedInConfig);
+  customDomain.env.staging.routes = [
+    { pattern: "tibotattle.com", custom_domain: true },
+  ];
+  const customDomainResult = assessStagingConfiguration(customDomain);
+  assert.equal(customDomainResult.state, "unsafe_configuration");
+  assert.equal(customDomainResult.checks.originBoundaryClosed, false);
+  assert.equal(customDomainResult.blockers.includes(
+    "CONFIG_ORIGIN_BOUNDARY_CLOSED",
+  ), true);
 });
 
 test("every deployable Worker asset environment uses the generated community tree", () => {
@@ -104,12 +174,160 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
   });
   assert.equal(result.state, "ready_for_disabled_deploy");
   assert.equal(result.collectionAuthorized, false);
+  assert.equal(result.evidenceType, STAGING_PROOF_TYPES.LIVE_REMOTE);
+  assert.equal(result.liveProof, true);
+  assert.equal(result.checks.remoteMigrationInventoryCurrent, true);
   assert.equal(Object.values(result.checks).every(Boolean), true);
+  assert.equal(result.checks.primaryReenrollmentSchemaCurrent, true);
+  assert.equal(result.checks.deletionLedgerSchemaCurrent, true);
+  assert.equal(result.checks.identityProtectionSchemaCurrent, true);
+  assert.equal(result.evidence.identityProtectionSchema.status, "verified");
+  assert.equal(result.evidence.identityProtectionSchema.verified, true);
+  assert.equal(
+    result.evidence.identityProtectionSchema.primary.columns.participantCooldownDigest,
+    true,
+  );
+  assert.equal(
+    result.evidence.identityProtectionSchema.deletionLedger.columns.participantDigest,
+    true,
+  );
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 5);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 7);
+  assert.equal(calls.some((args) => args.includes("migrations")), false);
+  assert.equal(
+    calls.filter((args) => args.some((value) =>
+      typeof value === "string" && value.includes("FROM d1_migrations"))).length,
+    2,
+  );
   const serialized = JSON.stringify(result);
   assert.equal(serialized.includes(config.env.staging.d1_databases[0].database_id), false);
   assert.equal(serialized.includes(config.env.staging.r2_buckets[0].bucket_name), false);
+});
+
+test("live readiness rejects an unreviewed remote migration inventory", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const baseSpawn = successSpawn(config, calls);
+  const spawn = (command, args, options) => {
+    if (args[2] === "USAGE_MONITOR_DB" && args.some((value) =>
+      typeof value === "string" && value.includes("FROM d1_migrations"))) {
+      calls.push(args);
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: [
+            ...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.map((name) => ({ name })),
+            { name: "0029_unreviewed.sql" },
+          ],
+        }]),
+        stderr: "private remote output",
+      };
+    }
+    return baseSpawn(command, args, options);
+  };
+  const result = probeStagingLive({
+    config,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn,
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.remoteMigrationInventoryCurrent, false);
+  assert.equal(result.blockers.includes(
+    "REMOTE_MIGRATION_INVENTORY_DRIFT",
+  ), true);
+  assert.equal(JSON.stringify(result).includes("0029_unreviewed.sql"), false);
+  assert.equal(JSON.stringify(result).includes("private remote output"), false);
+});
+
+test("unsafe target configuration stops before any live command", () => {
+  const config = structuredClone(checkedInConfig);
+  config.env.staging.vars.PUBLIC_ORIGIN = "https://tibotattle.com";
+  let called = false;
+  const result = probeStagingLive({
+    config,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: () => {
+      called = true;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.equal(result.state, "unsafe_configuration");
+  assert.equal(result.liveProof, false);
+  assert.equal(called, false);
+});
+
+test("operation receipts keep evidence fixed and non-secret", () => {
+  const receipt = stagingOperationReceipt("disabled_staging_prepared", {
+    resourcesVerified: true,
+    lifecycleReadiness: "unexpected",
+    secret: "do-not-record",
+    commandOutput: "private command output",
+  });
+  assert.deepEqual(receipt.evidence, { resourcesVerified: true });
+  assert.equal(JSON.stringify(receipt).includes("do-not-record"), false);
+  assert.equal(JSON.stringify(receipt).includes("private command output"), false);
+});
+
+test("live readiness blocks missing identity protection schema in either database", () => {
+  for (const scenario of [
+    {
+      name: "primary re-enrollment protection",
+      options: { missingPrimarySchema: true },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+    },
+    {
+      name: "deletion-ledger cooldown protection",
+      options: { missingDeletionLedgerSchema: true },
+      check: "deletionLedgerSchemaCurrent",
+      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
+      side: "deletionLedger",
+    },
+  ]) {
+    const config = provisionedConfig();
+    const result = probeStagingLive({
+      config,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn: successSpawn(config, [], scenario.options),
+    });
+    assert.equal(result.state, "blocked", scenario.name);
+    assert.equal(result.checks[scenario.check], false, scenario.name);
+    assert.equal(result.checks.identityProtectionSchemaCurrent, false);
+    assert.equal(
+      result.evidence.identityProtectionSchema.status,
+      "incomplete",
+      scenario.name,
+    );
+    assert.equal(
+      result.evidence.identityProtectionSchema[scenario.side].status,
+      "incomplete",
+      scenario.name,
+    );
+    assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
+  }
+});
+
+test("live readiness marks an unavailable schema probe unknown without leaking output", () => {
+  const config = provisionedConfig();
+  const result = probeStagingLive({
+    config,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: successSpawn(config, [], { primarySchemaError: true }),
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.primaryReenrollmentSchemaCurrent, false);
+  assert.equal(result.evidence.identityProtectionSchema.status, "unknown");
+  assert.equal(result.evidence.identityProtectionSchema.primary.status, "unknown");
+  assert.equal(
+    result.blockers.includes("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_UNKNOWN"),
+    true,
+  );
+  assert.equal(JSON.stringify(result).includes("provider-secret"), false);
 });
 
 test("live readiness reports R2 account enablement without leaking command output", () => {

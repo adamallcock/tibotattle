@@ -35,6 +35,7 @@ import {
   provisionedConfig,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
+import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 
 const STAGING_ORIGIN =
   "https://app-usagemonitor-staging.test-account.workers.dev";
@@ -294,6 +295,16 @@ function fakeRemote({
     if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
         && args.includes("--command")) {
       const command = args[args.indexOf("--command") + 1];
+      if (command.includes("FROM d1_migrations")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([{
+            results: EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB
+              .map((name) => ({ name })),
+          }]),
+          stderr: "",
+        };
+      }
       if (command.includes("sqlite_master")) {
         return d1Output({
           admission_table: 1,
@@ -301,10 +312,61 @@ function fakeRemote({
           admission_counter: 1,
           quarantine_reconciliation: 1,
           lifecycle_status: 1,
+          primary_cooldown_table: 1,
+          primary_participant_cooldown_digest: 1,
+          primary_cooldown_digest: 1,
+          primary_cooldown_schema_version: 1,
+          primary_cooldown_deleted_at: 1,
+          primary_cooldown_retain_until: 1,
+          primary_cooldown_retention_index: 1,
+          primary_cooldown_retention_index_shape: 1,
+          primary_cooldown_guard_trigger: 1,
         });
       }
       if (command.includes("FROM collection_controls")) {
         return d1Output({ ...controls });
+      }
+      return { status: 1, stdout: "", stderr: "unexpected probe" };
+    }
+    if (joined.startsWith("d1 execute DELETION_LEDGER ")
+        && args.includes("--command")) {
+      const command = args[args.indexOf("--command") + 1];
+      if (command.includes("FROM d1_migrations")) {
+        if (pendingDeletionLedgerMigration) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([{
+              results: [{ name: "0001_deletion_tombstones.sql" }],
+            }]),
+            stderr: "",
+          };
+        }
+        return {
+          status: 0,
+          stdout: JSON.stringify([{
+            results: EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER
+              .map((name) => ({ name })),
+          }]),
+          stderr: "",
+        };
+      }
+      if (command.includes("sqlite_master")) {
+        return d1Output({
+          deletion_tombstone_table: 1,
+          deletion_tombstone_participant_digest: 1,
+          deletion_tombstone_schema_version: 1,
+          deletion_tombstone_deleted_at: 1,
+          deletion_tombstone_retain_until: 1,
+          deletion_tombstone_retention_index: 1,
+          deletion_tombstone_retention_index_shape: 1,
+          deletion_cooldown_table: 1,
+          deletion_cooldown_digest: 1,
+          deletion_cooldown_schema_version: 1,
+          deletion_cooldown_deleted_at: 1,
+          deletion_cooldown_retain_until: 1,
+          deletion_cooldown_retention_index: 1,
+          deletion_cooldown_retention_index_shape: 1,
+        });
       }
       return { status: 1, stdout: "", stderr: "unexpected probe" };
     }

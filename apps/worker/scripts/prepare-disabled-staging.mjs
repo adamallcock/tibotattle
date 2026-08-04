@@ -5,20 +5,26 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
 import {
+  identityProtectionSchemaVerified,
   probeStagingLive,
   REQUIRED_D1_BINDINGS,
+  STAGING_PROOF_TYPES,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
 
 function run(spawn, wrangler, workerDirectory, args) {
-  const result = spawn(wrangler, args, {
-    cwd: workerDirectory,
-    encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
-  });
-  return !result.error && result.status === 0;
+  try {
+    const result = spawn(wrangler, args, {
+      cwd: workerDirectory,
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return !result.error && result.status === 0;
+  } catch {
+    return false;
+  }
 }
 
 export function prepareDisabledStaging({
@@ -31,25 +37,52 @@ export function prepareDisabledStaging({
   if (confirmation !== PREPARE_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
   }
-  const before = probeStagingLive({
-    config,
-    wrangler,
-    workerDirectory,
-    spawn,
-  });
+  let before;
+  try {
+    before = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "STAGING_READINESS_FAILED" };
+  }
   const infrastructureReady = before.checks.authenticated
     && before.checks.resourceIdentifiersConfigured
     && before.checks.d1ServiceReachable
     && before.checks.r2ServiceReachable
     && before.checks.d1ResourcesExist
     && before.checks.r2ResourceExists;
-  if (before.state === "unsafe_configuration" || !infrastructureReady) {
+  const migrationPreflightBlockers = before.blockers.filter((code) =>
+    ![
+      "REMOTE_MIGRATIONS_PENDING",
+      "REMOTE_MIGRATION_STATE_UNINITIALIZED",
+      "REMOTE_COLLECTION_NOT_CONTAINED",
+      "REQUIRED_STAGING_SECRETS_MISSING",
+    ].includes(code)
+      && !code.startsWith("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_")
+      && !code.startsWith("REMOTE_DELETION_LEDGER_SCHEMA_"));
+  if (before.state === "unsafe_configuration"
+      || !infrastructureReady
+      || migrationPreflightBlockers.length > 0) {
     return {
       ok: false,
       code: "STAGING_INFRASTRUCTURE_BLOCKED",
-      blockers: before.blockers.filter((code) =>
-        !["REMOTE_MIGRATIONS_PENDING", "REMOTE_COLLECTION_NOT_CONTAINED"]
-          .includes(code)),
+      blockers: migrationPreflightBlockers,
+    };
+  }
+  if (before.checks.migrationsCurrent
+      && !identityProtectionSchemaVerified(before)) {
+    const schemaBlockers = before.blockers.filter((code) =>
+      code.startsWith("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_")
+      || code.startsWith("REMOTE_DELETION_LEDGER_SCHEMA_"));
+    return {
+      ok: false,
+      code: "STAGING_SCHEMA_PROTECTION_BLOCKED",
+      blockers: schemaBlockers.length > 0
+        ? schemaBlockers
+        : ["REMOTE_IDENTITY_PROTECTION_SCHEMA_UNVERIFIED"],
     };
   }
 
@@ -65,6 +98,36 @@ export function prepareDisabledStaging({
     )) {
       return { ok: false, code: "STAGING_MIGRATION_FAILED" };
     }
+  }
+
+  let afterMigrations;
+  try {
+    afterMigrations = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "STAGING_MIGRATIONS_UNVERIFIED" };
+  }
+  const migrationVerificationBlockers = afterMigrations.blockers.filter(
+    (code) => ![
+      "REMOTE_COLLECTION_NOT_CONTAINED",
+      "REQUIRED_STAGING_SECRETS_MISSING",
+    ].includes(code),
+  );
+  if (!afterMigrations.checks.migrationsCurrent
+      || !afterMigrations.checks.pilotSchemaCurrent
+      || !identityProtectionSchemaVerified(afterMigrations)
+      || migrationVerificationBlockers.length > 0) {
+    return {
+      ok: false,
+      code: "STAGING_MIGRATIONS_UNVERIFIED",
+      blockers: migrationVerificationBlockers.length > 0
+        ? migrationVerificationBlockers
+        : ["REMOTE_MIGRATIONS_PENDING"],
+    };
   }
 
   const containmentSql = `
@@ -92,18 +155,24 @@ UPDATE collection_controls
     return { ok: false, code: "STAGING_CONTAINMENT_FAILED" };
   }
 
-  const after = probeStagingLive({
-    config,
-    wrangler,
-    workerDirectory,
-    spawn,
-  });
+  let after;
+  try {
+    after = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "STAGING_PREPARATION_UNVERIFIED" };
+  }
   const remainingBlockers = after.blockers.filter(
     (code) => code !== "REQUIRED_STAGING_SECRETS_MISSING",
   );
   if (remainingBlockers.length > 0
       || !after.checks.migrationsCurrent
-      || !after.checks.collectionContained) {
+      || !after.checks.collectionContained
+      || !identityProtectionSchemaVerified(after)) {
     return {
       ok: false,
       code: "STAGING_PREPARATION_UNVERIFIED",
@@ -118,8 +187,19 @@ UPDATE collection_controls
     receipt: stagingOperationReceipt("disabled_staging_prepared", {
       resourcesVerified: after.checks.d1ResourcesExist
         && after.checks.r2ResourceExists,
+      staticConfigurationChecked: after.evidenceType
+        === STAGING_PROOF_TYPES.LIVE_REMOTE,
+      remoteReadOnlyProof: true,
+      migrationInventoryCurrent: after.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: after.checks.migrationsCurrent,
       pilotSchemaCurrent: after.checks.pilotSchemaCurrent,
+      primaryReenrollmentSchemaCurrent:
+        after.checks.primaryReenrollmentSchemaCurrent,
+      deletionLedgerSchemaCurrent:
+        after.checks.deletionLedgerSchemaCurrent,
+      identityProtectionSchemaCurrent:
+        after.checks.identityProtectionSchemaCurrent,
+      identityProtectionSchema: after.evidence.identityProtectionSchema,
       collectionContained: after.checks.collectionContained,
       secretsInstalled: after.checks.requiredSecretsInstalled,
     }),

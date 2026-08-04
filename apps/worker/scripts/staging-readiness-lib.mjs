@@ -1,9 +1,17 @@
 import { spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const STAGING_READINESS_SCHEMA_VERSION =
   "usage-monitor-staging-readiness-v0.1";
 export const STAGING_OPERATION_RECEIPT_SCHEMA_VERSION =
   "usage-monitor-staging-operation-receipt-v0.1";
+export const STAGING_PROOF_TYPES = Object.freeze({
+  STATIC_CONFIGURATION: "static_configuration",
+  LIVE_REMOTE: "live_remote_probe",
+  OPERATION_RECEIPT: "operation_receipt",
+});
 export const REQUIRED_STAGING_SECRETS = Object.freeze([
   "ENVELOPE_PRIVATE_JWK",
   "ENVELOPE_PUBLIC_JWK",
@@ -11,13 +19,53 @@ export const REQUIRED_STAGING_SECRETS = Object.freeze([
 export const REQUIRED_D1_BINDINGS = Object.freeze([
   Object.freeze({
     binding: "USAGE_MONITOR_DB",
+    databaseName: "app-usagemonitor-staging",
     migrationsDir: "migrations",
   }),
   Object.freeze({
     binding: "DELETION_LEDGER",
+    databaseName: "app-usagemonitor-staging-deletion-ledger",
     migrationsDir: "deletion-ledger-migrations",
   }),
 ]);
+export const REQUIRED_STAGING_R2_BUCKET_NAME =
+  "app-usagemonitor-staging-quarantine";
+export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
+  USAGE_MONITOR_DB: Object.freeze([
+    "0001_initial.sql",
+    "0002_telemetry_ingest.sql",
+    "0003_enrollment_grants.sql",
+    "0004_web_sessions_and_upload_authorizations.sql",
+    "0005_community_weekly_snapshots.sql",
+    "0006_server_pricing.sql",
+    "0007_account_track_v0_2.sql",
+    "0008_device_upload_registration.sql",
+    "0009_collection_controls.sql",
+    "0010_retention_lifecycle.sql",
+    "0011_account_scoped_device_consent.sql",
+    "0012_revisioned_aggregate_rebuild.sql",
+    "0013_quarantine_reconciliation.sql",
+    "0014_bounded_contribution_admission.sql",
+    "0015_identity_link.sql",
+    "0016_apple_signin_handoff.sql",
+    "0017_google_signin_handoff.sql",
+    "0018_contribution_accepted_record_count.sql",
+    "0019_admin_operations.sql",
+    "0020_admin_operation_leases.sql",
+    "0021_replace_oidc_token_handoffs.sql",
+    "0022_historical_price_provenance.sql",
+    "0023_community_aggregate_safety.sql",
+    "0024_apple_signin_nonce_binding.sql",
+    "0025_device_lifecycle.sql",
+    "0026_signin_start_admission.sql",
+    "0027_identity_reenrollment_cooldown_guard.sql",
+    "0028_identity_link_secret_configuration.sql",
+  ]),
+  DELETION_LEDGER: Object.freeze([
+    "0001_deletion_tombstones.sql",
+    "0002_identity_reenrollment_cooldown.sql",
+  ]),
+});
 export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "ENROLLMENT_RATE_LIMIT", limit: 20 }),
   Object.freeze({ name: "RECOVERY_RATE_LIMIT", limit: 20 }),
@@ -37,6 +85,8 @@ export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
   UPLOAD_INGRESS_BURST: "16",
   UPLOAD_INGRESS_LEASE_SECONDS: "90",
+  SIGN_IN_START_MAX_PER_MINUTE: "5",
+  IDENTITY_LINK_SECRET_VERSION: "staging-v1",
 });
 export const REQUIRED_INGRESS_DURABLE_OBJECT_BINDING = Object.freeze({
   name: "UPLOAD_INGRESS_BUDGET",
@@ -48,6 +98,157 @@ export const REQUIRED_INGRESS_DURABLE_OBJECT_MIGRATION = Object.freeze({
 });
 export const GENERATED_WORKER_ASSET_DIRECTORY =
   "../../.release-build/worker-assets";
+
+const PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
+  cooldownTable: "primary_cooldown_table",
+  participantCooldownDigestColumn: "primary_participant_cooldown_digest",
+  cooldownDigestColumn: "primary_cooldown_digest",
+  cooldownSchemaVersionColumn: "primary_cooldown_schema_version",
+  cooldownDeletedAtColumn: "primary_cooldown_deleted_at",
+  cooldownRetainUntilColumn: "primary_cooldown_retain_until",
+  cooldownRetentionIndex: "primary_cooldown_retention_index",
+  cooldownRetentionIndexShape: "primary_cooldown_retention_index_shape",
+  cooldownGuardTrigger: "primary_cooldown_guard_trigger",
+});
+
+const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
+  tombstoneTable: "deletion_tombstone_table",
+  tombstoneParticipantDigestColumn: "deletion_tombstone_participant_digest",
+  tombstoneSchemaVersionColumn: "deletion_tombstone_schema_version",
+  tombstoneDeletedAtColumn: "deletion_tombstone_deleted_at",
+  tombstoneRetainUntilColumn: "deletion_tombstone_retain_until",
+  tombstoneRetentionIndex: "deletion_tombstone_retention_index",
+  tombstoneRetentionIndexShape: "deletion_tombstone_retention_index_shape",
+  cooldownTable: "deletion_cooldown_table",
+  cooldownDigestColumn: "deletion_cooldown_digest",
+  cooldownSchemaVersionColumn: "deletion_cooldown_schema_version",
+  cooldownDeletedAtColumn: "deletion_cooldown_deleted_at",
+  cooldownRetainUntilColumn: "deletion_cooldown_retain_until",
+  cooldownRetentionIndex: "deletion_cooldown_retention_index",
+  cooldownRetentionIndexShape: "deletion_cooldown_retention_index_shape",
+});
+
+const PRIMARY_IDENTITY_PROTECTION_SCHEMA_SQL = `
+SELECT
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_reenrollment_cooldowns'
+  ) AS primary_cooldown_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('participants')
+     WHERE name = 'identity_cooldown_digest'
+  ) AS primary_participant_cooldown_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'identity_cooldown_digest'
+  ) AS primary_cooldown_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'schema_version'
+  ) AS primary_cooldown_schema_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'deleted_at'
+  ) AS primary_cooldown_deleted_at,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'retain_until'
+  ) AS primary_cooldown_retain_until,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'index'
+       AND name = 'identity_reenrollment_cooldowns_retention'
+  ) AS primary_cooldown_retention_index,
+  COALESCE((
+    SELECT group_concat(name, ',')
+      FROM (
+        SELECT name
+          FROM pragma_index_info('identity_reenrollment_cooldowns_retention')
+         ORDER BY seqno
+      )
+  ), '') = 'retain_until,identity_cooldown_digest'
+    AS primary_cooldown_retention_index_shape,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'trigger'
+       AND name = 'participants_identity_reenrollment_cooldown_guard'
+  ) AS primary_cooldown_guard_trigger;
+`;
+
+const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_SQL = `
+SELECT
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'deletion_tombstones'
+  ) AS deletion_tombstone_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'participant_digest'
+  ) AS deletion_tombstone_participant_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'schema_version'
+  ) AS deletion_tombstone_schema_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'deleted_at'
+  ) AS deletion_tombstone_deleted_at,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('deletion_tombstones')
+     WHERE name = 'retain_until'
+  ) AS deletion_tombstone_retain_until,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'index'
+       AND name = 'deletion_tombstones_retention'
+  ) AS deletion_tombstone_retention_index,
+  COALESCE((
+    SELECT group_concat(name, ',')
+      FROM (
+        SELECT name
+          FROM pragma_index_info('deletion_tombstones_retention')
+         ORDER BY seqno
+      )
+  ), '') = 'retain_until,participant_digest'
+    AS deletion_tombstone_retention_index_shape,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_reenrollment_cooldowns'
+  ) AS deletion_cooldown_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'identity_cooldown_digest'
+  ) AS deletion_cooldown_digest,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'schema_version'
+  ) AS deletion_cooldown_schema_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'deleted_at'
+  ) AS deletion_cooldown_deleted_at,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_reenrollment_cooldowns')
+     WHERE name = 'retain_until'
+  ) AS deletion_cooldown_retain_until,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'index'
+       AND name = 'identity_reenrollment_cooldowns_retention'
+  ) AS deletion_cooldown_retention_index,
+  COALESCE((
+    SELECT group_concat(name, ',')
+      FROM (
+        SELECT name
+          FROM pragma_index_info('identity_reenrollment_cooldowns_retention')
+         ORDER BY seqno
+      )
+  ), '') = 'retain_until,identity_cooldown_digest'
+    AS deletion_cooldown_retention_index_shape;
+`;
 const ALLOWED_WORKER_FIRST_ROUTES = Object.freeze([
   "/api/*",
   "/.well-known/apple-developer-domain-association.txt",
@@ -59,6 +260,10 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const PLACEHOLDER_UUID_PATTERN =
   /^00000000-0000-4000-8000-0000000000[0-9a-f]{2}$/u;
+const MIGRATION_FILENAME_PATTERN = /^\d{4}_[a-z0-9][a-z0-9_]*\.sql$/u;
+const DEFAULT_WORKER_DIRECTORY = dirname(
+  dirname(fileURLToPath(import.meta.url)),
+);
 
 function exactNamedMembers(value, expectedNames, key) {
   if (!Array.isArray(value) || value.length !== expectedNames.length) {
@@ -87,9 +292,93 @@ function exactStringMap(value, expected) {
       value[key] === expectedValue);
 }
 
-function validStagingName(value) {
-  return typeof value === "string"
-    && /^app-usagemonitor-staging(?:-[a-z0-9-]+)?$/u.test(value);
+function validStagingName(value, expected) {
+  return typeof value === "string" && value === expected;
+}
+
+function sameStringArray(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function localMigrationNames(workerDirectory, migrationsDir) {
+  let entries;
+  try {
+    entries = readdirSync(join(workerDirectory, migrationsDir), {
+      withFileTypes: true,
+    });
+  } catch {
+    return null;
+  }
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
+    .map((entry) => entry.name)
+    .sort();
+}
+
+export function validateStagingMigrationInventory(
+  inventory,
+  expected = EXPECTED_STAGING_MIGRATIONS,
+) {
+  if (inventory === null || typeof inventory !== "object"
+      || Array.isArray(inventory)) {
+    return Object.freeze({
+      ok: false,
+      code: "LOCAL_MIGRATION_INVENTORY_UNAVAILABLE",
+    });
+  }
+  for (const binding of REQUIRED_D1_BINDINGS) {
+    const names = inventory[binding.binding];
+    const expectedNames = expected[binding.binding];
+    if (!Array.isArray(names) || !Array.isArray(expectedNames)) {
+      return Object.freeze({
+        ok: false,
+        code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+      });
+    }
+    if (!names.every((name) => MIGRATION_FILENAME_PATTERN.test(name))) {
+      return Object.freeze({
+        ok: false,
+        code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+      });
+    }
+    if (!sameStringArray(names, [...names].sort())
+        || !sameStringArray(names, expectedNames)) {
+      return Object.freeze({
+        ok: false,
+        code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+      });
+    }
+  }
+  return Object.freeze({ ok: true, code: null });
+}
+
+export function inspectStagingMigrationInventory({
+  workerDirectory = DEFAULT_WORKER_DIRECTORY,
+} = {}) {
+  const inventory = {};
+  for (const binding of REQUIRED_D1_BINDINGS) {
+    inventory[binding.binding] = localMigrationNames(
+      workerDirectory,
+      binding.migrationsDir,
+    );
+  }
+  const validation = validateStagingMigrationInventory(inventory);
+  return Object.freeze({
+    schemaVersion: "usage-monitor-staging-migration-inventory-v0.1",
+    ok: validation.ok,
+    code: validation.code,
+    inventory: Object.freeze({
+      USAGE_MONITOR_DB: Object.freeze([
+        ...(inventory.USAGE_MONITOR_DB ?? []),
+      ]),
+      DELETION_LEDGER: Object.freeze([
+        ...(inventory.DELETION_LEDGER ?? []),
+      ]),
+    }),
+  });
 }
 
 function oneApiAssetRoute(value) {
@@ -169,7 +458,7 @@ function safeD1Bindings(value) {
   }
   return REQUIRED_D1_BINDINGS.every((expected) => {
     const binding = value.find((entry) => entry.binding === expected.binding);
-    return validStagingName(binding?.database_name)
+    return validStagingName(binding?.database_name, expected.databaseName)
       && binding?.migrations_dir === expected.migrationsDir
       && typeof binding?.database_id === "string"
       && UUID_PATTERN.test(binding.database_id);
@@ -180,25 +469,41 @@ function safeR2Binding(value) {
   return Array.isArray(value)
     && value.length === 1
     && value[0]?.binding === "QUARANTINE"
-    && validStagingName(value[0]?.bucket_name)
-    && value[0].bucket_name.endsWith("-quarantine");
+    && value[0]?.bucket_name === REQUIRED_STAGING_R2_BUCKET_NAME;
 }
 
 function resourceIdentifiersConfigured(environment) {
-  const ids = environment.d1_databases?.map((entry) => entry.database_id) ?? [];
+  const ids = Array.isArray(environment?.d1_databases)
+    ? environment.d1_databases.map((entry) => entry?.database_id)
+    : [];
   return ids.length === REQUIRED_D1_BINDINGS.length
     && new Set(ids).size === ids.length
     && ids.every((entry) => UUID_PATTERN.test(entry)
       && !PLACEHOLDER_UUID_PATTERN.test(entry));
 }
 
-export function assessStagingConfiguration(config) {
+export function assessStagingConfiguration(
+  config,
+  { workerDirectory = DEFAULT_WORKER_DIRECTORY } = {},
+) {
   const environment = config?.env?.staging;
+  const migrationInventory = inspectStagingMigrationInventory({
+    workerDirectory,
+  });
+  const d1DatabaseNames = Array.isArray(environment?.d1_databases)
+    ? environment.d1_databases.map((entry) => entry?.database_name)
+    : [];
   const checks = {
     environmentDeclared:
       typeof environment === "object" && environment !== null,
-    publicNameSafe: validStagingName(environment?.name),
+    publicNameSafe: validStagingName(
+      environment?.name,
+      "app-usagemonitor-staging",
+    ),
     workersDevHttpsEnabled: environment?.workers_dev === true,
+    originBoundaryClosed: environment?.workers_dev === true
+      && !Object.hasOwn(environment ?? {}, "routes")
+      && !Object.hasOwn(environment?.vars ?? {}, "PUBLIC_ORIGIN"),
     previewUrlsDisabled: environment?.preview_urls === false,
     observabilityEnabled: environment?.observability?.enabled === true
       && environment?.observability?.head_sampling_rate === 1,
@@ -219,10 +524,8 @@ export function assessStagingConfiguration(config) {
       REQUIRED_STAGING_SECRETS,
     ),
     d1BindingsSafe: safeD1Bindings(environment?.d1_databases),
-    d1ResourcesDistinct:
-      new Set(
-        environment?.d1_databases?.map((entry) => entry.database_name) ?? [],
-      ).size === REQUIRED_D1_BINDINGS.length,
+    d1ResourcesDistinct: d1DatabaseNames.length === REQUIRED_D1_BINDINGS.length
+      && new Set(d1DatabaseNames).size === d1DatabaseNames.length,
     r2BindingSafe: safeR2Binding(environment?.r2_buckets),
     rateLimitsSafe: safeRateLimits(environment?.ratelimits),
     ingressBudgetBindingSafe: safeIngressDurableObjectBinding(
@@ -233,6 +536,7 @@ export function assessStagingConfiguration(config) {
     ),
     assetsClosed: oneApiAssetRoute(environment?.assets),
     deployableAssetsClosed: deployableAssetRoutesClosed(config),
+    migrationInventorySafe: migrationInventory.ok,
     resourceIdentifiersConfigured:
       resourceIdentifiersConfigured(environment ?? {}),
   };
@@ -243,6 +547,7 @@ export function assessStagingConfiguration(config) {
     .map((name) => `CONFIG_${name.replaceAll(/([A-Z])/gu, "_$1").toUpperCase()}`);
   const blockers = [
     ...safetyBlockers,
+    ...(!migrationInventory.ok ? [migrationInventory.code] : []),
     ...(!checks.resourceIdentifiersConfigured
       ? ["STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED"]
       : []),
@@ -250,28 +555,35 @@ export function assessStagingConfiguration(config) {
   return {
     schemaVersion: STAGING_READINESS_SCHEMA_VERSION,
     environment: "staging",
+    evidenceType: STAGING_PROOF_TYPES.STATIC_CONFIGURATION,
+    liveProof: false,
     state: safetyBlockers.length > 0
       ? "unsafe_configuration"
       : checks.resourceIdentifiersConfigured
         ? "configured_unverified"
         : "safe_unprovisioned",
     collectionAuthorized: false,
+    migrationInventory: migrationInventory.inventory,
     checks,
     blockers,
   };
 }
 
 function runWrangler(wrangler, workerDirectory, args, spawn = spawnSync) {
-  const result = spawn(wrangler, args, {
-    cwd: workerDirectory,
-    encoding: "utf8",
-    maxBuffer: 2 * 1024 * 1024,
-  });
-  return {
-    ok: !result.error && result.status === 0,
-    stdout: typeof result.stdout === "string" ? result.stdout : "",
-    stderr: typeof result.stderr === "string" ? result.stderr : "",
-  };
+  try {
+    const result = spawn(wrangler, args, {
+      cwd: workerDirectory,
+      encoding: "utf8",
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return {
+      ok: !result.error && result.status === 0,
+      stdout: typeof result.stdout === "string" ? result.stdout : "",
+      stderr: typeof result.stderr === "string" ? result.stderr : "",
+    };
+  } catch {
+    return { ok: false, stdout: "", stderr: "" };
+  }
 }
 
 function parseJson(value) {
@@ -282,15 +594,251 @@ function parseJson(value) {
   }
 }
 
-function migrationCurrent(output) {
-  return /No migrations to apply[.!]?/iu.test(output);
+function migrationNames(value) {
+  if (!Array.isArray(value) || value.length !== 1
+      || !Array.isArray(value[0]?.results)) {
+    return null;
+  }
+  const rows = value[0].results;
+  const names = rows.map((row) => row?.name);
+  return names.every((name) => typeof name === "string")
+    ? names
+    : null;
 }
+
+function classifyMigrationProbe(result, expectedNames) {
+  if (!result.ok) {
+    const output = `${result.stdout}${result.stderr}`;
+    if (/no such table[\s:]+.*d1_migrations|d1_migrations.*no such table/iu.test(
+      output,
+    )) {
+      return {
+        status: "uninitialized",
+        code: "REMOTE_MIGRATION_STATE_UNINITIALIZED",
+      };
+    }
+    return { status: "unavailable", code: "REMOTE_MIGRATION_STATE_UNAVAILABLE" };
+  }
+  const names = migrationNames(parseJson(result.stdout));
+  if (names === null) {
+    return { status: "invalid", code: "REMOTE_MIGRATION_STATE_INVALID" };
+  }
+  if (!sameStringArray(names, [...new Set(names)])) {
+    return { status: "drift", code: "REMOTE_MIGRATION_INVENTORY_DRIFT" };
+  }
+  if (sameStringArray(names, expectedNames)) {
+    return { status: "current", code: null };
+  }
+  if (names.every((name, index) => name === expectedNames[index])) {
+    return { status: "pending", code: "REMOTE_MIGRATIONS_PENDING" };
+  }
+  return { status: "drift", code: "REMOTE_MIGRATION_INVENTORY_DRIFT" };
+}
+
+const READ_ONLY_MIGRATION_PROBE_SQL =
+  "SELECT name FROM d1_migrations ORDER BY id;";
 
 function collectionControlRow(value) {
   const statements = Array.isArray(value) ? value : [];
   return statements.findLast(
     (entry) => Array.isArray(entry?.results) && entry.results.length === 1,
   )?.results?.[0] ?? null;
+}
+
+function schemaProbeValues(result, fields) {
+  const row = result.ok
+    ? collectionControlRow(parseJson(result.stdout))
+    : null;
+  return Object.fromEntries(
+    Object.entries(fields).map(([name, field]) => {
+      const value = row?.[field];
+      return [name, value === 1 || value === true
+        ? true
+        : value === 0 || value === false
+          ? false
+          : null];
+    }),
+  );
+}
+
+function schemaEvidenceStatus(values) {
+  const statuses = Object.values(values);
+  return statuses.every((value) => value === true)
+    ? "verified"
+    : statuses.some((value) => value === null)
+      ? "unknown"
+      : "incomplete";
+}
+
+function primaryIdentityProtectionSchemaEvidence(result) {
+  const values = schemaProbeValues(
+    result,
+    PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS,
+  );
+  const status = schemaEvidenceStatus(values);
+  return {
+    status,
+    verified: status === "verified",
+    tables: {
+      identityReenrollmentCooldowns: values.cooldownTable,
+    },
+    columns: {
+      participantCooldownDigest: values.participantCooldownDigestColumn,
+      cooldownDigest: values.cooldownDigestColumn,
+      schemaVersion: values.cooldownSchemaVersionColumn,
+      deletedAt: values.cooldownDeletedAtColumn,
+      retainUntil: values.cooldownRetainUntilColumn,
+    },
+    indexes: {
+      retention: values.cooldownRetentionIndex,
+      retentionShape: values.cooldownRetentionIndexShape,
+    },
+    triggers: {
+      reenrollmentCooldownGuard: values.cooldownGuardTrigger,
+    },
+  };
+}
+
+function deletionLedgerIdentityProtectionSchemaEvidence(result) {
+  const values = schemaProbeValues(
+    result,
+    DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS,
+  );
+  const status = schemaEvidenceStatus(values);
+  return {
+    status,
+    verified: status === "verified",
+    tables: {
+      deletionTombstones: values.tombstoneTable,
+      identityReenrollmentCooldowns: values.cooldownTable,
+    },
+    columns: {
+      participantDigest: values.tombstoneParticipantDigestColumn,
+      tombstoneSchemaVersion: values.tombstoneSchemaVersionColumn,
+      tombstoneDeletedAt: values.tombstoneDeletedAtColumn,
+      tombstoneRetainUntil: values.tombstoneRetainUntilColumn,
+      cooldownDigest: values.cooldownDigestColumn,
+      cooldownSchemaVersion: values.cooldownSchemaVersionColumn,
+      cooldownDeletedAt: values.cooldownDeletedAtColumn,
+      cooldownRetainUntil: values.cooldownRetainUntilColumn,
+    },
+    indexes: {
+      tombstoneRetention: values.tombstoneRetentionIndex,
+      tombstoneRetentionShape: values.tombstoneRetentionIndexShape,
+      cooldownRetention: values.cooldownRetentionIndex,
+      cooldownRetentionShape: values.cooldownRetentionIndexShape,
+    },
+  };
+}
+
+function identityProtectionSchemaEvidence(
+  primaryResult = { ok: false },
+  deletionLedgerResult = { ok: false },
+) {
+  const primary = primaryIdentityProtectionSchemaEvidence(primaryResult);
+  const deletionLedger = deletionLedgerIdentityProtectionSchemaEvidence(
+    deletionLedgerResult,
+  );
+  const statuses = [primary.status, deletionLedger.status];
+  const status = statuses.every((value) => value === "verified")
+    ? "verified"
+    : statuses.some((value) => value === "unknown")
+      ? "unknown"
+      : "incomplete";
+  return {
+    status,
+    verified: status === "verified",
+    primary,
+    deletionLedger,
+  };
+}
+
+function schemaProtectionBlocker(status, prefix) {
+  return status === "verified"
+    ? null
+    : `REMOTE_${prefix}_SCHEMA_${status === "unknown" ? "UNKNOWN" : "INCOMPLETE"}`;
+}
+
+export function identityProtectionSchemaVerified(readiness) {
+  return readiness?.checks?.identityProtectionSchemaCurrent === true
+    && readiness?.evidence?.identityProtectionSchema?.status === "verified"
+    && readiness.evidence.identityProtectionSchema.verified === true;
+}
+
+function safeSchemaEvidence(value) {
+  const status = ["verified", "incomplete", "unknown"].includes(value?.status)
+    ? value.status
+    : null;
+  if (status === null) return null;
+  const booleanOrNull = (candidate) =>
+    candidate === true || candidate === false || candidate === null
+      ? candidate
+      : null;
+  const side = (candidate, { tables, columns, indexes, triggers = null }) => {
+    const sideStatus = ["verified", "incomplete", "unknown"].includes(
+      candidate?.status,
+    )
+      ? candidate.status
+      : null;
+    if (sideStatus === null) return null;
+    const safeSide = {
+      status: sideStatus,
+      verified: sideStatus === "verified",
+      tables: Object.fromEntries(
+        tables.map((key) => [key, booleanOrNull(candidate?.tables?.[key])]),
+      ),
+      columns: Object.fromEntries(
+        columns.map((key) => [key, booleanOrNull(candidate?.columns?.[key])]),
+      ),
+      indexes: Object.fromEntries(
+        indexes.map((key) => [key, booleanOrNull(candidate?.indexes?.[key])]),
+      ),
+    };
+    if (triggers !== null) {
+      safeSide.triggers = Object.fromEntries(
+        triggers.map((key) => [key, booleanOrNull(candidate?.triggers?.[key])]),
+      );
+    }
+    return safeSide;
+  };
+  const primary = side(value.primary, {
+    tables: ["identityReenrollmentCooldowns"],
+    columns: [
+      "participantCooldownDigest",
+      "cooldownDigest",
+      "schemaVersion",
+      "deletedAt",
+      "retainUntil",
+    ],
+    indexes: ["retention", "retentionShape"],
+    triggers: ["reenrollmentCooldownGuard"],
+  });
+  const deletionLedger = side(value.deletionLedger, {
+    tables: ["deletionTombstones", "identityReenrollmentCooldowns"],
+    columns: [
+      "participantDigest",
+      "tombstoneSchemaVersion",
+      "tombstoneDeletedAt",
+      "tombstoneRetainUntil",
+      "cooldownDigest",
+      "cooldownSchemaVersion",
+      "cooldownDeletedAt",
+      "cooldownRetainUntil",
+    ],
+    indexes: [
+      "tombstoneRetention",
+      "tombstoneRetentionShape",
+      "cooldownRetention",
+      "cooldownRetentionShape",
+    ],
+  });
+  if (primary === null || deletionLedger === null) return null;
+  return {
+    status,
+    verified: status === "verified",
+    primary,
+    deletionLedger,
+  };
 }
 
 export function stagingOperationReceipt(
@@ -304,14 +852,44 @@ export function stagingOperationReceipt(
   ].includes(operation)) {
     throw new Error("Unsupported staging receipt operation");
   }
+  const allowedEvidence = [
+    "originMatchedWranglerOutput",
+    "remoteResourcesVerified",
+    "resourcesVerified",
+    "staticConfigurationChecked",
+    "remoteReadOnlyProof",
+    "migrationInventoryCurrent",
+    "migrationsCurrent",
+    "pilotSchemaCurrent",
+    "primaryReenrollmentSchemaCurrent",
+    "deletionLedgerSchemaCurrent",
+    "identityProtectionSchemaCurrent",
+    "collectionContained",
+    "secretsInstalled",
+    "healthContained",
+  ];
+  const fixedEvidence = Object.fromEntries(
+    allowedEvidence
+      .filter((key) => typeof evidence?.[key] === "boolean")
+      .map((key) => [key, evidence[key]]),
+  );
+  const safeIdentitySchema = safeSchemaEvidence(evidence?.identityProtectionSchema);
+  if (safeIdentitySchema !== null) {
+    fixedEvidence.identityProtectionSchema = safeIdentitySchema;
+  }
+  if (typeof evidence?.lifecycleReadiness === "string"
+      && ["ready", "not_ready"].includes(evidence.lifecycleReadiness)) {
+    fixedEvidence.lifecycleReadiness = evidence.lifecycleReadiness;
+  }
   return {
     schemaVersion: STAGING_OPERATION_RECEIPT_SCHEMA_VERSION,
     operation,
     environment: "staging",
+    evidenceType: STAGING_PROOF_TYPES.OPERATION_RECEIPT,
     generatedAt,
     collectionAuthorized: false,
     activationState: "not_authorized",
-    evidence,
+    evidence: fixedEvidence,
   };
 }
 
@@ -321,7 +899,7 @@ export function probeStagingLive({
   workerDirectory,
   spawn = spawnSync,
 }) {
-  const configuration = assessStagingConfiguration(config);
+  const configuration = assessStagingConfiguration(config, { workerDirectory });
   const environment = config?.env?.staging ?? {};
   const checks = {
     authenticated: false,
@@ -330,11 +908,37 @@ export function probeStagingLive({
     d1ResourcesExist: false,
     r2ResourceExists: false,
     requiredSecretsInstalled: false,
+    remoteMigrationInventoryCurrent: false,
     migrationsCurrent: false,
     pilotSchemaCurrent: false,
+    primaryReenrollmentSchemaCurrent: false,
+    deletionLedgerSchemaCurrent: false,
+    identityProtectionSchemaCurrent: false,
     collectionContained: false,
   };
+  let migrationProof = [];
+  let identitySchemaEvidence = identityProtectionSchemaEvidence();
   const blockers = [...configuration.blockers];
+
+  if (configuration.state === "unsafe_configuration") {
+    return {
+      schemaVersion: STAGING_READINESS_SCHEMA_VERSION,
+      environment: "staging",
+      evidenceType: STAGING_PROOF_TYPES.STATIC_CONFIGURATION,
+      liveProof: false,
+      state: "unsafe_configuration",
+      collectionAuthorized: false,
+      migrationInventory: configuration.migrationInventory,
+      evidence: {
+        identityProtectionSchema: identitySchemaEvidence,
+      },
+      checks: {
+        ...configuration.checks,
+        ...checks,
+      },
+      blockers: [...new Set(blockers)],
+    };
+  }
 
   const authenticated = runWrangler(
     wrangler,
@@ -411,19 +1015,38 @@ export function probeStagingLive({
       blockers.push("REQUIRED_STAGING_SECRETS_MISSING");
     }
 
-    const migrationResults = REQUIRED_D1_BINDINGS.map((entry) =>
-      runWrangler(
+    const migrationStates = REQUIRED_D1_BINDINGS.map((entry) => {
+      const result = runWrangler(
         wrangler,
         workerDirectory,
         [
-          "d1", "migrations", "list", entry.binding,
+          "d1", "execute", entry.binding,
           "--remote", "--env", "staging",
+          "--command", READ_ONLY_MIGRATION_PROBE_SQL,
+          "--json",
         ],
         spawn,
-      ));
-    checks.migrationsCurrent = migrationResults.every((result) =>
-      result.ok && migrationCurrent(`${result.stdout}${result.stderr}`));
-    if (!checks.migrationsCurrent) blockers.push("REMOTE_MIGRATIONS_PENDING");
+      );
+      const state = classifyMigrationProbe(
+        result,
+        EXPECTED_STAGING_MIGRATIONS[entry.binding],
+      );
+      return Object.freeze({
+        binding: entry.binding,
+        status: state.status,
+        code: state.code,
+      });
+    });
+    migrationProof = migrationStates;
+    checks.remoteMigrationInventoryCurrent = migrationStates.every(
+      (state) => state.status === "current",
+    );
+    checks.migrationsCurrent = checks.remoteMigrationInventoryCurrent;
+    blockers.push(
+      ...migrationStates
+        .map((state) => state.code)
+        .filter((code) => code !== null),
+    );
 
     if (checks.migrationsCurrent) {
       const schemaProbe = runWrangler(
@@ -472,6 +1095,50 @@ export function probeStagingLive({
         blockers.push("REMOTE_PILOT_SCHEMA_INCOMPLETE");
       }
 
+      const primaryIdentitySchemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "USAGE_MONITOR_DB",
+          "--remote", "--env", "staging",
+          "--command", PRIMARY_IDENTITY_PROTECTION_SCHEMA_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      const deletionLedgerIdentitySchemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "DELETION_LEDGER",
+          "--remote", "--env", "staging",
+          "--command", DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      identitySchemaEvidence = identityProtectionSchemaEvidence(
+        primaryIdentitySchemaProbe,
+        deletionLedgerIdentitySchemaProbe,
+      );
+      checks.primaryReenrollmentSchemaCurrent =
+        identitySchemaEvidence.primary.verified;
+      checks.deletionLedgerSchemaCurrent =
+        identitySchemaEvidence.deletionLedger.verified;
+      checks.identityProtectionSchemaCurrent = identitySchemaEvidence.verified;
+      const primarySchemaBlocker = schemaProtectionBlocker(
+        identitySchemaEvidence.primary.status,
+        "IDENTITY_REENROLLMENT",
+      );
+      if (primarySchemaBlocker) blockers.push(primarySchemaBlocker);
+      const deletionLedgerSchemaBlocker = schemaProtectionBlocker(
+        identitySchemaEvidence.deletionLedger.status,
+        "DELETION_LEDGER",
+      );
+      if (deletionLedgerSchemaBlocker) {
+        blockers.push(deletionLedgerSchemaBlocker);
+      }
+
       const control = runWrangler(
         wrangler,
         workerDirectory,
@@ -509,15 +1176,22 @@ export function probeStagingLive({
   return {
     schemaVersion: STAGING_READINESS_SCHEMA_VERSION,
     environment: "staging",
+    evidenceType: STAGING_PROOF_TYPES.LIVE_REMOTE,
+    liveProof: true,
     state: uniqueBlockers.length === 0
       ? "ready_for_disabled_deploy"
       : configuration.state === "unsafe_configuration"
         ? "unsafe_configuration"
         : "blocked",
     collectionAuthorized: false,
+    migrationInventory: configuration.migrationInventory,
+    migrationProof,
     checks: {
       ...configuration.checks,
       ...checks,
+    },
+    evidence: {
+      identityProtectionSchema: identitySchemaEvidence,
     },
     blockers: uniqueBlockers,
   };
