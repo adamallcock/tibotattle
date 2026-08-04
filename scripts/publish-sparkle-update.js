@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
+import { CANONICAL_STABLE_APPCAST_POLICY } from "../config/sparkle-appcast-policy.js";
 import {
   assertReleaseChannelPublication,
   resolveReleaseChannel,
@@ -459,6 +460,51 @@ function appcastEnclosures(text, channel) {
   });
 }
 
+function assertCanonicalStableAppcast(text, channel, enclosures) {
+  if (channel.name !== "stable") return;
+
+  const itemOpenings = [...text.matchAll(/<item\b[^>]*>/gu)]
+    .filter((match) => !match[0].endsWith("/>")).length;
+  const itemClosings = [...text.matchAll(/<\/item\s*>/gu)].length;
+  const itemBodies = [...text.matchAll(
+    /<item\b[^>]*>([\s\S]*?)<\/item\s*>/gu,
+  )];
+  if (itemOpenings !== CANONICAL_STABLE_APPCAST_POLICY.channelItemCount
+      || itemClosings !== CANONICAL_STABLE_APPCAST_POLICY.channelItemCount
+      || itemBodies.length !== CANONICAL_STABLE_APPCAST_POLICY.channelItemCount) {
+    fail(
+      "Stable appcast must contain exactly one RSS channel item; history is not retained",
+      "SPARKLE_UPDATE_APPCAST_HISTORY_UNSUPPORTED",
+    );
+  }
+  if (enclosures.length !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount
+      || [...(itemBodies[0]?.[1] ?? "").matchAll(
+        /<enclosure\b[^>]*\/>/gu,
+      )].length !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount) {
+    fail(
+      "Stable appcast must contain exactly one enclosure inside its sole item",
+      "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
+    );
+  }
+  const enclosure = enclosures[0];
+  if (!enclosure
+      || (CANONICAL_STABLE_APPCAST_POLICY.fullDmgOnly
+        && !enclosure.objectKey.endsWith(".dmg"))
+      || (!CANONICAL_STABLE_APPCAST_POLICY.allowDeltaFrom
+        && enclosure.deltaFrom !== undefined)) {
+    if (enclosure?.deltaFrom !== undefined) {
+      fail(
+        "The stable publisher only accepts one signed full candidate DMG; Sparkle delta publication is unsupported",
+        "SPARKLE_UPDATE_DELTA_UNSUPPORTED",
+      );
+    }
+    fail(
+      "Stable appcast must contain exactly one signed full DMG enclosure",
+      "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
+    );
+  }
+}
+
 function immutableObjectKeys({ bundleVersion, fileName, sha256, channel }) {
   const prefix = `${channel.sparkle.objectPrefix}/${bundleVersion}/${sha256}`;
   return Object.freeze({
@@ -476,6 +522,7 @@ function validateAppcast(text, {
   sparklePublicKey,
 }) {
   const enclosures = appcastEnclosures(text, channel);
+  assertCanonicalStableAppcast(text, channel, enclosures);
   const artifactURL = new URL(
     objectKeys.artifact,
     `${channel.sparkle.origin}/`,

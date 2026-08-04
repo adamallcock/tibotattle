@@ -29,6 +29,17 @@ policy-owned website, service, appcast, and public-key inputs. Endpoint flags
 remain compatibility inputs only: external builds compare them with the
 selected policy and never use them as an alternate source.
 
+Stable Sparkle publication also has an explicit canonical appcast policy in
+`config/sparkle-appcast-policy.js`: exactly one RSS channel item and exactly
+one signed full `.dmg` enclosure, with no `sparkle:deltaFrom`, retained history,
+or extra enclosure. It matches the owner-only Worker guard contract. The
+publisher rejects a violation before any R2 read or mutation; this prevents a
+local validation pass from producing a feed that the later guarded stable
+publication would reject. A one-item feed is sufficient for fresh bootstrap,
+replacement, and exact resume because each earlier client can receive the
+current full DMG directly. Replacement remains strictly forward-versioned and
+rollback remains a manual higher-version signed release.
+
 Every new bundle also exposes the named identity directly for verifiers:
 `Contents/Info.plist:UsageMonitorReleaseChannel` and
 `Contents/Resources/build-manifest.json:release.channelName` are identical.
@@ -60,4 +71,7 @@ The external prerequisite is owner provisioning of dedicated staging service,
 update-feed, DNS/R2 bucket, and the corresponding credentials/public key. This
 lane did not provision, publish, deploy, write R2, or access credentials. This
 local decision record does not evidence a signed artifact, released update
-feed, deployed service, or public channel operation.
+feed, deployed service, or public channel operation. Passing local code
+validation is not a live release or evidence that the owner-only signing,
+notarization, Worker guard, R2 mutation, public read-back, or clean-profile
+update rehearsal gates have passed.

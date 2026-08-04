@@ -35,6 +35,23 @@ accepted only while the live stable appcast is empty. Bootstrap is not a
 fallback for missing prior state, and an existing appcast cannot be bootstrapped
 over.
 
+Stable appcasts use the canonical single-item contract in
+`config/sparkle-appcast-policy.js`, matching the owner-only Worker guard: one
+RSS channel item, one signed full `.dmg` enclosure, no
+`sparkle:deltaFrom`, and no retained history or extra enclosures. This is a
+release-safety contract, not a formatting preference: a local publisher that
+accepted history or deltas could pass its own checks and then fail at the
+guard after immutable objects had already been uploaded. The internal-dogfood
+descriptor is currently unconfigured, so it cannot reach this stable publisher
+or guard; a future configured channel needs a separately reviewed policy.
+
+Fresh bootstrap and replacement both publish the current full DMG as the sole
+feed entry, so an older installed client can update directly without requiring
+retained feed history. Exact retry/resume recognizes only that same one-item
+candidate and never claims that older entries were retained. Replacement still
+requires an explicit flag and a strictly newer bundle version; rollback is a
+manual higher-version signed release, never a silent downgrade.
+
 The macOS bundle builder has a separate accident-prevention boundary: direct
 `build-macos-app.js --external-distribution --release-channel stable`
 invocation fails before it creates an output bundle. `release-macos-app.js`
@@ -117,11 +134,8 @@ passed to or stored by this publisher. The appcast and its referenced DMG are
 validated before any Wrangler command can run. Supply the matching public key
 through `--sparkle-public-ed-key`; it is compared with the release manifest's
 public-key SHA-256 fingerprint and used for local Ed25519 verification.
-The candidate release must have exactly one matching enclosure. The appcast may
-also retain older signed full or delta enclosures; before publication, each is
-read and cryptographically verified from R2. This publisher does not upload a
-new delta artifact, so a release containing one is accepted only when its
-immutable object was already safely published and verified.
+The candidate release must satisfy the canonical one-item/full-DMG contract
+above. No history or delta enclosure is preserved or uploaded.
 
 ## Publish procedure
 
@@ -156,15 +170,13 @@ with `--stable-bootstrap`.
 
 The default production verifier re-runs the signed/notarized DMG gate, checks
 the release-manifest SHA-256 and production assurances, requires the manifest's
-canonical feed URL, and verifies every appcast enclosure stays on the approved
-origin. It only accepts the current enclosure when it points to the
+canonical feed URL, and verifies the sole appcast enclosure stays on the
+approved origin. It only accepts that enclosure when it points to the
 content-addressed object path above and has the exact manifest byte length and
 bundle version. Validation-only mode remains local and does not contact R2.
 When `--publish` is supplied, the publisher performs an additional read-only
-R2 preflight before any upload: every preserved DMG or delta enclosure must
-exist at its content-addressed key with the advertised byte length and SHA-256,
-and any existing appcast must contain a lower highest bundle version than the
-candidate.
+R2 preflight before any upload and requires any existing canonical appcast to
+contain a lower bundle version than the candidate.
 
 After reviewing the printed plan, an owner-only caller may request `--publish`;
 the current CLI invocation below documents the required inputs but remains
@@ -205,11 +217,16 @@ calls the guard for the appcast-last atomic mutation with
 After publication, it fetches the canonical public appcast with cache bypass,
 requires the exact uploaded bytes and cache metadata, revalidates the current
 enclosure, streams the public DMG to verify its byte length and SHA-256, and
-checks the public length of any preserved enclosure entries. It does not report
-publication success when that public read-back fails. A failed later upload or
+does not report publication success when that public read-back fails. A failed later upload or
 read-back can leave immutable objects behind; the feed pointer is not
 automatically rolled back, so do not delete immutable release objects as
 recovery.
+
+Passing local code/tests validates this contract and the publisher's simulated
+R2/read-back seams only. It is not a live release: owner-only signing,
+notarization/stapling, clean-profile update rehearsal, Worker/guard
+provisioning, public R2/appcast mutation, and public read-back remain external
+release gates.
 
 ## Post-publication check
 
