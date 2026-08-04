@@ -8,15 +8,18 @@ import {
   RELEASE_MANIFEST,
   RELEASE_VERSION,
 } from "../config/release-manifest.js";
+import { createMacOSSignedReplacementContract } from "../scripts/macos-release-core.js";
+import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
 import { getReleaseChannel } from "../config/release-channels.js";
 import {
   APPROVED_R2_BUCKET,
+  APPCAST_ATOMIC_GUARD_SCHEMA,
   APPCAST_CACHE_CONTROL,
   CANONICAL_APPCAST_URL,
   CANONICAL_UPDATE_ORIGIN,
   IMMUTABLE_CACHE_CONTROL,
   parseSparkleUpdatePublisherArguments,
-  publishSparkleUpdate,
+  publishSparkleUpdate as publishSparkleUpdateRaw,
 } from "../scripts/publish-sparkle-update.js";
 
 const TEST_KEY_PAIR = generateKeyPairSync("ed25519");
@@ -31,6 +34,16 @@ const TEST_PUBLIC_ED_KEY_SHA256 = sha256(
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function publishSparkleUpdate(options) {
+  return publishSparkleUpdateRaw({
+    atomicAppcastGuard: options.atomicAppcastGuard
+      ?? options.runWrangler?.atomicAppcastGuard
+      ?? null,
+    stableBootstrap: true,
+    ...options,
+  });
 }
 
 async function createReleaseFixture({
@@ -73,6 +86,11 @@ async function createReleaseFixture({
         publicEdKeySha256: TEST_PUBLIC_ED_KEY_SHA256,
       },
     },
+    replacement: createMacOSSignedReplacementContract(),
+    source: {
+      commit: "a".repeat(40),
+      tag: "v0.1.0",
+    },
     assurances: {
       appNotarizationAccepted: true,
       appTicketStapled: true,
@@ -85,7 +103,15 @@ async function createReleaseFixture({
     },
     updater: {
       appcastURL,
+      afterUserOptIn: {
+        automaticDownload: true,
+        installOnQuit: true,
+      },
+      automaticChecks: true,
+      automaticUpdateOptInAvailable: true,
+      automaticUpdatesEnabledByDefault: true,
       enabled: true,
+      frameworkVersion: SPARKLE_VERSION,
       publicEdKeySha256: sha256(
         Buffer.from(TEST_PUBLIC_ED_KEY, "base64"),
       ),
@@ -162,6 +188,17 @@ function missingRemoteObjectRunner() {
   return remoteObjectRunner();
 }
 
+function nonMaterializedRemoteObjectRunner() {
+  const calls = [];
+  const run = async (arguments_) => {
+    calls.push(arguments_);
+    return { status: 0 };
+  };
+  const runner = { calls, objects: new Map(), run };
+  run.atomicAppcastGuard = createTestAtomicAppcastGuard(runner);
+  return runner;
+}
+
 function remoteObjectRunner(objects = new Map()) {
   const calls = [];
   const run = async (arguments_) => {
@@ -176,7 +213,9 @@ function remoteObjectRunner(objects = new Map()) {
     }
     return { status: 0 };
   };
-  return { calls, run };
+  const runner = { calls, objects, run };
+  run.atomicAppcastGuard = createTestAtomicAppcastGuard(runner);
+  return runner;
 }
 
 function statefulRemoteObjectRunner({
@@ -210,7 +249,56 @@ function statefulRemoteObjectRunner({
     }
     return { status: 1, stderr: `unsupported mocked operation: ${operation}` };
   };
-  return { calls, objects: remoteObjects, run };
+  const runner = { calls, objects: remoteObjects, run };
+  run.atomicAppcastGuard = createTestAtomicAppcastGuard(runner);
+  return runner;
+}
+
+function createTestAtomicAppcastGuard(runner, { beforeCompare = null } = {}) {
+  return {
+    schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+    ownerOnly: true,
+    compareAndSwap: async ({
+      bucket,
+      cacheControl,
+      contentType,
+      content,
+      expectedCurrent,
+      key,
+      path,
+    }) => {
+      if (beforeCompare) await beforeCompare({ bucket, key });
+      const objectPath = `${bucket}/${key}`;
+      const actual = runner.objects.get(objectPath) ?? null;
+      const matches = expectedCurrent === null
+        ? actual === null
+        : actual !== null
+          && actual.length === expectedCurrent.bytes
+          && sha256(actual) === expectedCurrent.sha256
+          && actual.equals(expectedCurrent.content);
+      if (!matches) return { status: "conflict" };
+      assert.deepEqual(content, await readFile(path));
+      const result = await runner.run([
+        "r2",
+        "object",
+        "put",
+        objectPath,
+        "--file",
+        path,
+        "--content-type",
+        contentType,
+        "--cache-control",
+        cacheControl,
+        "--remote",
+      ]);
+      if (result?.status !== 0) {
+        const error = new Error("simulated atomic appcast mutation failed");
+        error.code = "SPARKLE_UPDATE_WRANGLER_FAILED";
+        throw error;
+      }
+      return { status: "committed" };
+    },
+  };
 }
 
 function appcastEnclosure({ bytes, deltaFrom, signature, url, version }) {
@@ -264,6 +352,52 @@ test("validates an explicitly supplied canonical signed update without invoking 
   }
 });
 
+test("requires explicit stable continuity state even for validation-only publisher runs", async () => {
+  const fixture = await createReleaseFixture();
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        runWrangler: async () => assert.fail("continuity must fail before Wrangler"),
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        validateDMG: async () => {},
+      }),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_REQUIRED" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed before any remote mutation without the owner atomic appcast guard", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_ATOMIC_GUARD_REQUIRED" },
+    );
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("publishes only the three validated objects with cache-safe Wrangler metadata", async () => {
   const fixture = await createReleaseFixture();
   const runner = missingRemoteObjectRunner();
@@ -311,6 +445,47 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
       { method: "GET", url: CANONICAL_APPCAST_URL },
       { method: "GET", url: fixture.artifactURL },
     ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("rejects a concurrent appcast change through the owner atomic guard", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = statefulRemoteObjectRunner();
+  const atomicAppcastGuard = createTestAtomicAppcastGuard(runner, {
+    beforeCompare: async ({ bucket, key }) => {
+      runner.objects.set(
+        `${bucket}/${key}`,
+        Buffer.from("concurrent appcast state"),
+      );
+    },
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        atomicAppcastGuard,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_APPCAST_ATOMIC_CONFLICT" },
+    );
+    assert.equal(
+      runner.objects.get(`${APPROVED_R2_BUCKET}/appcast.xml`).toString(),
+      "concurrent appcast state",
+    );
+    assert.equal(
+      runner.calls.some((call) => call[2] === "put"
+        && call[3] === `${APPROVED_R2_BUCKET}/appcast.xml`),
+      false,
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -427,8 +602,10 @@ test("recovers an appcast written before public readback failed without writing 
     dmgPath: fixture.dmgPath,
     publish: true,
     releaseManifestPath: fixture.releaseManifestPath,
+    previousStableManifestPath: fixture.releaseManifestPath,
     replaceAppcast: true,
     sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    stableBootstrap: false,
     runWrangler: runner.run,
     fetchPublic,
     validateDMG: async () => {},
@@ -635,7 +812,7 @@ test("aborts on mismatched existing immutable bytes before appcast mutation", as
 
 test("fails closed on a successful remote read with no materialized object", async () => {
   const fixture = await createReleaseFixture();
-  const calls = [];
+  const runner = nonMaterializedRemoteObjectRunner();
   try {
     await assert.rejects(
       publishSparkleUpdate({
@@ -646,15 +823,12 @@ test("fails closed on a successful remote read with no materialized object", asy
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
-        runWrangler: async (arguments_) => {
-          calls.push(arguments_);
-          return { status: 0 };
-        },
+        runWrangler: runner.run,
         validateDMG: async () => {},
       }),
       { code: "SPARKLE_UPDATE_R2_OBJECT_INVALID" },
     );
-    assert.equal(calls.some((call) => call[2] === "put"), false);
+    assert.equal(runner.calls.some((call) => call[2] === "put"), false);
   } finally {
     await fixture.cleanup();
   }
@@ -675,7 +849,9 @@ test("requires an explicit appcast replacement after immutable preflight passes"
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
+        previousStableManifestPath: fixture.releaseManifestPath,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: false,
         runWrangler: runner.run,
         validateDMG: async () => {},
       }),
@@ -883,8 +1059,10 @@ test("rejects a changed equal-version live appcast before any remote mutation", 
         dmgPath: candidate.dmgPath,
         publish: true,
         releaseManifestPath: candidate.releaseManifestPath,
+        previousStableManifestPath: candidate.releaseManifestPath,
         replaceAppcast: true,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: false,
         runWrangler: runner.run,
         validateDMG: async () => {},
       }),
@@ -917,8 +1095,10 @@ test("rejects an ambiguous equal-version live appcast before any remote mutation
         dmgPath: candidate.dmgPath,
         publish: true,
         releaseManifestPath: candidate.releaseManifestPath,
+        previousStableManifestPath: candidate.releaseManifestPath,
         replaceAppcast: true,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: false,
         runWrangler: runner.run,
         validateDMG: async () => {},
       }),
@@ -949,8 +1129,10 @@ test("verifies an exact appcast retry without overwriting or reporting a new pub
       dmgPath: fixture.dmgPath,
       publish: true,
       releaseManifestPath: fixture.releaseManifestPath,
+      previousStableManifestPath: fixture.releaseManifestPath,
       replaceAppcast: true,
       sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      stableBootstrap: false,
       runWrangler: runner.run,
       fetchPublic: publicReadback.fetch,
       validateDMG: async () => {},

@@ -16,7 +16,11 @@ import {
   assertReleaseChannelPublication,
   resolveReleaseChannel,
 } from "../config/release-channels.js";
-import { validateMacOSDMG } from "./macos-release-core.js";
+import {
+  assertStableSparkleKeyContinuity,
+  readStableReleaseManifest,
+  validateMacOSDMG,
+} from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -36,6 +40,8 @@ export const CANONICAL_APPCAST_URL = STABLE_CHANNEL.sparkle.appcastURL;
 export const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
 export const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 export const APPCAST_CACHE_CONTROL = "public, max-age=300, must-revalidate";
+export const APPCAST_ATOMIC_GUARD_SCHEMA =
+  "usage-monitor-sparkle-appcast-atomic-guard-v1";
 const PUBLICATION_STATUS_VALIDATED = "validated";
 const PUBLICATION_STATUS_PUBLISHED = "published";
 const PUBLICATION_STATUS_RESUMED_VERIFIED = "resumed_verified";
@@ -1049,6 +1055,80 @@ async function putObject({ bucket, key, path, contentType, cacheControl, runWran
 }
 
 /**
+ * The installed Wrangler R2 CLI only exposes an unconditional PUT. The
+ * publisher therefore accepts a guard only through this owner-only seam; the
+ * owner implementation must perform the final mutation with a real remote
+ * conditional primitive (for example Workers R2 `onlyIf` or R2 S3
+ * `If-Match`/`If-None-Match`). A read followed by an ordinary PUT does not
+ * satisfy this contract.
+ */
+function normalizeAppcastAtomicGuard(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object"
+      || value.schemaVersion !== APPCAST_ATOMIC_GUARD_SCHEMA
+      || value.ownerOnly !== true
+      || typeof value.compareAndSwap !== "function") {
+    fail(
+      "The owner-provisioned appcast atomic guard is invalid",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_INVALID",
+    );
+  }
+  return value;
+}
+
+function appcastAtomicExpectation(currentAppcast) {
+  if (currentAppcast === null) return null;
+  return {
+    bytes: currentAppcast.bytes,
+    content: Buffer.from(currentAppcast.content),
+    sha256: currentAppcast.sha256,
+  };
+}
+
+async function putAppcastWithAtomicGuard({
+  atomicAppcastGuard,
+  bucket,
+  content,
+  expectedCurrent,
+  key,
+  path,
+  contentType,
+  cacheControl,
+}) {
+  let result;
+  try {
+    result = await atomicAppcastGuard.compareAndSwap({
+      bucket,
+      cacheControl,
+      contentType,
+      content: Buffer.from(content),
+      expectedCurrent: appcastAtomicExpectation(expectedCurrent),
+      key,
+      path,
+      schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+    });
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_WRANGLER_FAILED") throw error;
+    fail(
+      "The owner-provisioned appcast atomic guard failed",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_FAILED",
+    );
+  }
+  if (result?.status === "conflict") {
+    fail(
+      "The live appcast changed before the owner-provisioned atomic mutation",
+      "SPARKLE_UPDATE_APPCAST_ATOMIC_CONFLICT",
+    );
+  }
+  if (result?.status !== "committed") {
+    fail(
+      "The owner-provisioned appcast atomic guard did not commit",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_FAILED",
+    );
+  }
+}
+
+/**
  * Validate and, only when publish is explicitly true, publish one complete
  * Sparkle update. The publisher deliberately accepts no Sparkle private signing
  * key nor Cloudflare credentials; the operator performs signing separately and
@@ -1056,19 +1136,25 @@ async function putObject({ bucket, key, path, contentType, cacheControl, runWran
  * local authentication.
  */
 export async function publishSparkleUpdate({
+  atomicAppcastGuard = null,
   appcastPath,
   bucket,
   channel,
   dmgPath,
   publish = false,
   releaseManifestPath,
+  previousStableManifestPath = null,
   replaceAppcast = false,
   sparklePublicEdKey,
+  stableBootstrap = false,
   runWrangler = defaultRunWrangler,
   fetchPublic = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
 } = {}) {
   if (typeof publish !== "boolean" || typeof replaceAppcast !== "boolean"
+      || typeof stableBootstrap !== "boolean"
+      || (previousStableManifestPath !== null
+        && typeof previousStableManifestPath !== "string")
       || typeof runWrangler !== "function"
       || typeof fetchPublic !== "function"
       || typeof validateDMG !== "function") {
@@ -1076,7 +1162,12 @@ export async function publishSparkleUpdate({
   }
   const releaseChannel = resolveReleaseChannel(channel);
   normalizeBucket(bucket, releaseChannel);
-  const normalizedSparklePublicKey = normalizeSparklePublicKey(sparklePublicEdKey);
+  const normalizedAppcastAtomicGuard = normalizeAppcastAtomicGuard(
+    atomicAppcastGuard,
+  );
+  const normalizedSparklePublicKey = normalizeSparklePublicKey(
+    sparklePublicEdKey,
+  );
   const [dmg, appcast, releaseManifest] = await Promise.all([
     readRegularInput(dmgPath, { label: "--dmg", maximumBytes: MAX_DMG_BYTES }),
     readRegularInput(appcastPath, {
@@ -1134,6 +1225,16 @@ export async function publishSparkleUpdate({
       sparklePublicKey: normalizedSparklePublicKey,
     },
   );
+  const previousStableManifest = previousStableManifestPath === null
+    ? null
+    : await readStableReleaseManifest(previousStableManifestPath);
+  assertStableSparkleKeyContinuity({
+    candidateBundleVersion: manifest.bundleVersion,
+    candidatePublicEdKeySha256: normalizedSparklePublicKey.sha256,
+    channel: releaseChannel.name,
+    previousManifest: previousStableManifest,
+    stableBootstrap,
+  });
   const publication = Object.freeze({
     appcast: Object.freeze({
       cacheControl: APPCAST_CACHE_CONTROL,
@@ -1167,6 +1268,12 @@ export async function publishSparkleUpdate({
     verified: false,
   });
   if (!publish) return publication;
+  if (normalizedAppcastAtomicGuard === null) {
+    fail(
+      "Publishing requires an owner-provisioned atomic appcast guard; Wrangler's ordinary R2 PUT is not concurrency safe",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_REQUIRED",
+    );
+  }
 
   let resumedPublication = false;
   const temporaryRoot = await mkdtemp(
@@ -1257,6 +1364,12 @@ export async function publishSparkleUpdate({
         );
       }
     }
+    if (stableBootstrap && currentAppcast !== null) {
+      fail(
+        "Stable bootstrap requires an empty live appcast; retain the prior stable manifest for every later release",
+        "SPARKLE_UPDATE_STABLE_BOOTSTRAP_NOT_FIRST_RELEASE",
+      );
+    }
     await validatePublishedEnclosureObjects({
       appcastUpdate,
       bucket,
@@ -1289,13 +1402,15 @@ export async function publishSparkleUpdate({
         appcastBeforeWrite,
         publication.appcast.key,
       );
-      await putObject({
+      await putAppcastWithAtomicGuard({
+        atomicAppcastGuard: normalizedAppcastAtomicGuard,
         bucket,
+        cacheControl: publication.appcast.cacheControl,
+        contentType: publication.appcast.contentType,
+        content: appcastBytes,
+        expectedCurrent: currentAppcast,
         key: publication.appcast.key,
         path: publication.appcast.path,
-        contentType: publication.appcast.contentType,
-        cacheControl: publication.appcast.cacheControl,
-        runWrangler,
       });
     }
   } finally {
@@ -1331,8 +1446,10 @@ export function parseSparkleUpdatePublisherArguments(argv) {
     dmgPath: null,
     publish: false,
     releaseManifestPath: null,
+    previousStableManifestPath: null,
     replaceAppcast: false,
     sparklePublicEdKey: null,
+    stableBootstrap: false,
   };
   const flags = new Map([
     ["--appcast", "appcastPath"],
@@ -1340,6 +1457,7 @@ export function parseSparkleUpdatePublisherArguments(argv) {
     ["--channel", "channel"],
     ["--dmg", "dmgPath"],
     ["--release-manifest", "releaseManifestPath"],
+    ["--previous-stable-manifest", "previousStableManifestPath"],
     ["--sparkle-public-ed-key", "sparklePublicEdKey"],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
@@ -1354,12 +1472,35 @@ export function parseSparkleUpdatePublisherArguments(argv) {
       options.publish = true;
     } else if (argument === "--replace-appcast" && !options.replaceAppcast) {
       options.replaceAppcast = true;
+    } else if (argument === "--stable-bootstrap" && !options.stableBootstrap) {
+      options.stableBootstrap = true;
     } else {
       fail(`Unknown or repeated argument: ${argument}`);
     }
   }
-  for (const [flag, key] of flags) requiredOption(options[key], flag);
+  for (const [flag, key] of [
+    ["--appcast", "appcastPath"],
+    ["--bucket", "bucket"],
+    ["--channel", "channel"],
+    ["--dmg", "dmgPath"],
+    ["--release-manifest", "releaseManifestPath"],
+    ["--sparkle-public-ed-key", "sparklePublicEdKey"],
+  ]) requiredOption(options[key], flag);
   resolveReleaseChannel(options.channel);
+  if (options.channel !== "stable"
+      && (options.previousStableManifestPath !== null
+        || options.stableBootstrap)) {
+    fail(
+      "Stable continuity options are only valid for the stable channel",
+      "MACOS_STABLE_CONTINUITY_CHANNEL_INVALID",
+    );
+  }
+  if (options.previousStableManifestPath !== null && options.stableBootstrap) {
+    fail(
+      "--stable-bootstrap cannot be combined with --previous-stable-manifest",
+      "MACOS_STABLE_BOOTSTRAP_INVALID",
+    );
+  }
   if (options.replaceAppcast && !options.publish) {
     fail("--replace-appcast requires --publish");
   }

@@ -75,12 +75,14 @@ import {
 import {
   compareMacOSBundleVersions,
   createMacOSSignedReplacementContract,
+  assertStableSparkleKeyContinuity,
   developerIDSignMacOSApp,
   inspectMacOSApp,
   packageMacOSDMG,
   readMacOSReleaseSourceProvenance,
   readMacOSReleaseBuildConfiguration,
   readMacOSReleaseCredentials,
+  readStableReleaseManifest,
   submitToAppleNotary,
   validateNodeRuntimeEntitlements,
   validateMacOSSignedReplacementArtifacts,
@@ -2274,7 +2276,63 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     temporaryRoot,
     "UsageMonitor-candidate.dmg.release.json",
   );
+  const malformedPreviousManifestPath = join(
+    temporaryRoot,
+    "malformed-previous-stable.json",
+  );
   try {
+    assert.throws(
+      () => assertStableSparkleKeyContinuity({
+        candidateBundleVersion: candidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_REQUIRED" },
+    );
+    await assert.rejects(
+      readStableReleaseManifest(join(temporaryRoot, "missing-stable.json")),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID" },
+    );
+    await writeFile(malformedPreviousManifestPath, "not-json");
+    await assert.rejects(
+      readStableReleaseManifest(malformedPreviousManifestPath),
+      { code: "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID" },
+    );
+    assert.throws(
+      () => assertStableSparkleKeyContinuity({
+        candidateBundleVersion: candidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: changedSparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest,
+      }),
+      { code: "MACOS_STABLE_UPDATER_KEY_MISMATCH" },
+    );
+    assert.deepEqual(
+      assertStableSparkleKeyContinuity({
+        candidateBundleVersion: candidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest,
+      }),
+      {
+        mode: "previous_manifest",
+        policy: "previous_stable_manifest_required",
+        previousBundleVersion: "10",
+      },
+    );
+    assert.deepEqual(
+      assertStableSparkleKeyContinuity({
+        candidateBundleVersion: "1",
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        stableBootstrap: true,
+      }),
+      {
+        bootstrap: "explicit_owner_only",
+        mode: "bootstrap",
+        policy: "previous_stable_manifest_required",
+      },
+    );
     await writeFile(
       join(temporaryRoot, previousManifest.artifact.fileName),
       previousBytes,

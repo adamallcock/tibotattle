@@ -7,6 +7,9 @@ export const INTERNAL_DOGFOOD_RELEASE_CHANNEL = "internal-dogfood";
 export const STABLE_SERVICE_ORIGIN_MODE = "production_https";
 export const INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE =
   "internal_dogfood_https";
+export const STABLE_SPARKLE_KEY_CONTINUITY_MODE =
+  "previous_stable_manifest_required";
+export const STABLE_SPARKLE_BOOTSTRAP_MODE = "explicit_owner_only";
 
 const CHANNEL_NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -132,6 +135,10 @@ function stableChannelDefinition() {
       // compatibility. It is not an endpoint and therefore is not invented
       // or duplicated in this manifest.
       publicEdKeySha256: null,
+      keyContinuity: {
+        mode: STABLE_SPARKLE_KEY_CONTINUITY_MODE,
+        bootstrap: STABLE_SPARKLE_BOOTSTRAP_MODE,
+      },
     },
   };
 }
@@ -152,6 +159,7 @@ function unconfiguredDogfoodChannelDefinition() {
       r2Bucket: null,
       objectPrefix: null,
       publicEdKeySha256: null,
+      keyContinuity: null,
     },
   };
 }
@@ -204,7 +212,8 @@ function assertUnconfiguredDogfood(channel) {
       || channel.sparkle.appcastObjectKey !== null
       || channel.sparkle.r2Bucket !== null
       || channel.sparkle.objectPrefix !== null
-      || channel.sparkle.publicEdKeySha256 !== null) {
+      || channel.sparkle.publicEdKeySha256 !== null
+      || channel.sparkle.keyContinuity !== null) {
     fail(
       "internal-dogfood must remain fully unconfigured until dedicated endpoints are reviewed",
       "RELEASE_CHANNEL_DOGFOOD_NOT_CONFIGURED",
@@ -293,7 +302,11 @@ export function assertReleaseChannelConfiguration(channel) {
         || selected.sparkle.appcastObjectKey
           !== new URL(DEPLOYMENT_ENDPOINTS.sparkle.appcastURL).pathname.slice(1)
         || selected.sparkle.objectPrefix !== "releases"
-        || selected.sparkle.publicEdKeySha256 !== null) {
+        || selected.sparkle.publicEdKeySha256 !== null
+        || selected.sparkle.keyContinuity?.mode
+          !== STABLE_SPARKLE_KEY_CONTINUITY_MODE
+        || selected.sparkle.keyContinuity?.bootstrap
+          !== STABLE_SPARKLE_BOOTSTRAP_MODE) {
       fail(
         "stable release endpoints must come only from config/deployment-endpoints.js",
         "RELEASE_CHANNEL_STABLE_SOURCE_INVALID",

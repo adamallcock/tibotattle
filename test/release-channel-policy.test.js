@@ -58,6 +58,10 @@ test("stable channel remains exactly bound to the reviewed deployment manifest",
   assert.equal(STABLE.sparkle.r2Bucket, DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket);
   assert.equal(STABLE.sparkle.appcastObjectKey, "appcast.xml");
   assert.equal(STABLE.sparkle.objectPrefix, "releases");
+  assert.deepEqual(STABLE.sparkle.keyContinuity, {
+    mode: "previous_stable_manifest_required",
+    bootstrap: "explicit_owner_only",
+  });
 });
 
 test("internal dogfood is visible to observers but cannot resolve operationally without owner configuration", () => {
@@ -73,6 +77,7 @@ test("internal dogfood is visible to observers but cannot resolve operationally 
     r2Bucket: null,
     objectPrefix: null,
     publicEdKeySha256: null,
+    keyContinuity: null,
   });
   assert.throws(
     () => resolveReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL),
@@ -148,6 +153,21 @@ test("package and publisher CLIs require explicit named channel consent", () => 
     ]),
     { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
   );
+  const bootstrapRelease = parseReleaseArguments([
+    "--app", "TiboTattle.app",
+    "--channel", STABLE_RELEASE_CHANNEL,
+    "--stable-bootstrap",
+  ]);
+  assert.equal(bootstrapRelease.stableBootstrap, true);
+  assert.throws(
+    () => parseReleaseArguments([
+      "--app", "TiboTattle.app",
+      "--channel", STABLE_RELEASE_CHANNEL,
+      "--previous-stable-manifest", "previous.json",
+      "--stable-bootstrap",
+    ]),
+    /cannot be combined/u,
+  );
   const publisherArguments = [
     "--bucket", STABLE.sparkle.r2Bucket,
     "--dmg", "release.dmg",
@@ -165,6 +185,21 @@ test("package and publisher CLIs require explicit named channel consent", () => 
       "--channel", INTERNAL_DOGFOOD_RELEASE_CHANNEL,
     ]),
     { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
+  );
+  const bootstrapPublisher = parseSparkleUpdatePublisherArguments([
+    ...publisherArguments,
+    "--channel", STABLE_RELEASE_CHANNEL,
+    "--stable-bootstrap",
+  ]);
+  assert.equal(bootstrapPublisher.stableBootstrap, true);
+  assert.throws(
+    () => parseSparkleUpdatePublisherArguments([
+      ...publisherArguments,
+      "--channel", STABLE_RELEASE_CHANNEL,
+      "--previous-stable-manifest", "previous.json",
+      "--stable-bootstrap",
+    ]),
+    { code: "MACOS_STABLE_BOOTSTRAP_INVALID" },
   );
 });
 

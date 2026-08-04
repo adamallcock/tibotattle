@@ -2,7 +2,10 @@
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RELEASE_MANIFEST } from "../config/release-manifest.js";
-import { resolveReleaseChannel } from "../config/release-channels.js";
+import {
+  STABLE_RELEASE_CHANNEL,
+  resolveReleaseChannel,
+} from "../config/release-channels.js";
 import { releaseMacOSApp } from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -11,7 +14,9 @@ export function parseArguments(argv) {
   let appPath = null;
   let channel = null;
   let output = null;
+  let previousStableManifestPath = null;
   let replace = false;
+  let stableBootstrap = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--app" && appPath === null && index + 1 < argv.length) {
@@ -24,6 +29,12 @@ export function parseArguments(argv) {
         && output === null
         && index + 1 < argv.length) {
       output = resolve(argv[++index]);
+    } else if (argument === "--previous-stable-manifest"
+        && previousStableManifestPath === null
+        && index + 1 < argv.length) {
+      previousStableManifestPath = resolve(argv[++index]);
+    } else if (argument === "--stable-bootstrap" && !stableBootstrap) {
+      stableBootstrap = true;
     } else if (argument === "--replace" && !replace) {
       replace = true;
     } else {
@@ -36,7 +47,18 @@ export function parseArguments(argv) {
   if (!channel) {
     throw new Error("--channel is required; choose a named release channel explicitly");
   }
-  resolveReleaseChannel(channel);
+  const releaseChannel = resolveReleaseChannel(channel);
+  if (releaseChannel.name !== STABLE_RELEASE_CHANNEL
+      && (previousStableManifestPath !== null || stableBootstrap)) {
+    throw new Error(
+      "Stable continuity options are only valid for the stable channel",
+    );
+  }
+  if (previousStableManifestPath !== null && stableBootstrap) {
+    throw new Error(
+      "--stable-bootstrap cannot be combined with --previous-stable-manifest",
+    );
+  }
   const defaultOutput = channel === "stable"
     ? join(
       ".release-build",
@@ -53,7 +75,9 @@ export function parseArguments(argv) {
     appPath,
     channel,
     output: output ?? resolve(defaultOutput),
+    previousStableManifestPath,
     replace,
+    stableBootstrap,
   };
 }
 
