@@ -27,12 +27,17 @@ import {
   PRODUCT_BRAND,
   validateStateDirectoryName,
 } from "../config/product-brand.js";
+import {
+  RELEASE_MANIFEST,
+  RELEASE_VERSION,
+} from "../config/release-manifest.js";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import {
   MACOS_RUNTIME_STATIC_ASSETS,
   MACOS_ACCOUNTING_RUNTIME_FILES,
   MACOS_IDENTITY_CORE_RUNTIME_FILES,
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+  MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
   MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
   MACOS_WEB_MODULE_ENTRYPOINTS,
   buildMacOSApp,
@@ -456,6 +461,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /"CODEX_HOME": codexHome\.path/u);
   assert.match(source, /"USAGE_MONITOR_CENTRAL_ORIGIN"/u);
   assert.match(source, /UsageMonitorCentralOriginMode/u);
+  assert.match(source, /BundledProduct\.publicWebsiteOrigin/u);
   assert.match(
     source,
     /"USAGE_MONITOR_PARENT_PID": String\(getpid\(\)\)/u,
@@ -1505,10 +1511,13 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   const defaultPreview = parseMacOSBuildArguments([
     "--preview-distribution",
   ], {});
-  assert.equal(defaultPreview.centralOrigin, "https://tibotattle.com");
+  assert.equal(
+    defaultPreview.centralOrigin,
+    DEPLOYMENT_ENDPOINTS.public.origin,
+  );
   assert.equal(
     defaultPreview.sparkleAppcastURL,
-    "https://updates.tibotattle.com/appcast.xml",
+    DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
   );
   assert.equal(
     defaultPreview.sparklePublicEdKey,
@@ -1615,7 +1624,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     application: {
       bundleIdentifier: "com.usagemonitor.local",
       bundleVersion,
-      shortVersion: "0.1.0",
+      shortVersion: RELEASE_VERSION,
     },
     artifact: {
       bytes: bytes.length,
@@ -1624,7 +1633,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     },
     source: {
       commit: "a".repeat(40),
-      tag: "v0.1.0",
+      tag: RELEASE_MANIFEST.tag,
     },
     assurances: { ...assurances },
     updater: {
@@ -1809,14 +1818,14 @@ test("signed macOS releases require a clean, annotated source tag and minimal No
     execFileSync("/usr/bin/git", ["commit", "--quiet", "-m", "release input"], {
       cwd: temporaryRoot,
     });
-    execFileSync("/usr/bin/git", ["tag", "-a", "v0.1.0", "-m", "release"], {
+    execFileSync("/usr/bin/git", ["tag", "-a", RELEASE_MANIFEST.tag, "-m", "release"], {
       cwd: temporaryRoot,
     });
     const provenance = readMacOSReleaseSourceProvenance({
       repositoryRoot: temporaryRoot,
     });
     assert.match(provenance.commit, /^[0-9a-f]{40}$/u);
-    assert.equal(provenance.tag, "v0.1.0");
+    assert.equal(provenance.tag, RELEASE_MANIFEST.tag);
 
     await writeFile(join(temporaryRoot, "release-input.txt"), "dirty\n");
     assert.throws(
@@ -1929,8 +1938,9 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
           CFBundleURLName: "com.usagemonitor.local.open",
           CFBundleURLSchemes: ["usagemonitor"],
         }],
-        UsageMonitorCentralOrigin: "https://usage.example",
+        UsageMonitorCentralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
         UsageMonitorCentralOriginMode: "production_https",
+        UsageMonitorPublicWebsiteOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
         UsageMonitorAppOpenHost: PRODUCT_BRAND.appOpenHost,
         UsageMonitorAppOpenScheme: PRODUCT_BRAND.appOpenScheme,
         UsageMonitorAppOpenURL: PRODUCT_BRAND.appOpenURL,
@@ -1945,7 +1955,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         SUAllowsAutomaticUpdates: true,
         SUAutomaticallyUpdate: true,
         SUEnableAutomaticChecks: true,
-        SUFeedURL: "https://usage.example/appcast.xml",
+        SUFeedURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
         SUPublicEDKey: Buffer.alloc(32, 1).toString("base64"),
         SURequireSignedFeed: true,
         SUVerifyUpdateBeforeExtraction: true,
@@ -1976,7 +1986,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
             .digest("hex"),
           requiresDeveloperIDAndNotarization: true,
           updater: {
-            appcastURL: "https://usage.example/appcast.xml",
+            appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
             automaticChecks: true,
             automaticUpdateOptInAvailable: true,
             automaticUpdatesEnabledByDefault: true,
@@ -2209,6 +2219,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(graph.externalSpecifiers, [
     "@app-usagemonitor/accounting",
     "@app-usagemonitor/identity-core",
+    "@app-usagemonitor/quota-analysis",
     "@app-usagemonitor/telemetry-contract",
     "@github/keytar",
     "ajv",
@@ -2247,6 +2258,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/app.js",
     "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/i18n.generated.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
     "apps/web/public/navigation.js",
@@ -2274,6 +2286,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/app.js",
     "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
+    "apps/web/public/i18n.generated.js",
     "apps/web/public/index.html",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
@@ -2537,21 +2550,28 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
       name: "@app-usagemonitor/accounting",
       root: join(temporaryRoot, "packages", "accounting"),
       runtimeFiles: MACOS_ACCOUNTING_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
     },
     {
       inputDirectory: "packages/identity-core",
       name: "@app-usagemonitor/identity-core",
       root: join(temporaryRoot, "packages", "identity-core"),
       runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
     },
     {
       inputDirectory: "packages/telemetry-contract",
       name: "@app-usagemonitor/telemetry-contract",
       root: join(temporaryRoot, "packages", "telemetry-contract"),
       runtimeFiles: MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
+    },
+    {
+      inputDirectory: "packages/quota-analysis",
+      name: "@app-usagemonitor/quota-analysis",
+      root: join(temporaryRoot, "packages", "quota-analysis"),
+      runtimeFiles: MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
+      version: RELEASE_VERSION,
     },
   ];
   try {
@@ -2582,11 +2602,12 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
         return join(definition.root, "index.js");
       },
     });
-    assert.equal(captures.length, 3);
+    assert.equal(captures.length, 4);
     assert.equal(
       captures.reduce((total, capture) => total + capture.files.length, 0),
       MACOS_ACCOUNTING_RUNTIME_FILES.length
         + MACOS_IDENTITY_CORE_RUNTIME_FILES.length
+        + MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.length
         + MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.length,
     );
     assert.equal(Object.isFrozen(captures), true);
@@ -2638,6 +2659,7 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
     const mutations = [
       ["@app-usagemonitor/accounting", "src/cost-ledger.js"],
       ["@app-usagemonitor/identity-core", "src/pseudonym.js"],
+      ["@app-usagemonitor/quota-analysis", "src/quota-windows.js"],
       ["@app-usagemonitor/telemetry-contract", "src/envelope.js"],
     ];
     for (const [name, relativeFile] of mutations) {
@@ -2659,7 +2681,10 @@ test("macOS workspace package capture binds staged bytes, inventory, and digest 
       stagedAppRoot,
       captures,
     );
-    assert.equal(stagedRows.length, 18);
+    assert.equal(
+      stagedRows.length,
+      captures.reduce((total, capture) => total + capture.files.length, 0),
+    );
     const stagedInventory = [];
     for (const capture of captures) {
       for (const file of capture.files) {
@@ -2755,7 +2780,7 @@ test("macOS identity-core capture rejects resolver mismatch and unsafe runtime f
       name: "@app-usagemonitor/identity-core",
       root,
       runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
-      version: "0.1.0",
+      version: RELEASE_VERSION,
     };
   };
   try {
@@ -3081,15 +3106,19 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       [
         {
           name: "@app-usagemonitor/accounting",
-          version: "0.1.0",
+          version: RELEASE_VERSION,
         },
         {
           name: "@app-usagemonitor/identity-core",
-          version: "0.1.0",
+          version: RELEASE_VERSION,
+        },
+        {
+          name: "@app-usagemonitor/quota-analysis",
+          version: RELEASE_VERSION,
         },
         {
           name: "@app-usagemonitor/telemetry-contract",
-          version: "0.1.0",
+          version: RELEASE_VERSION,
         },
         { name: "@github/keytar", version: "7.10.6" },
         { name: "ajv", version: "8.20.0" },
@@ -3130,6 +3159,16 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
         .map((path) => path.slice(bundledIdentityCorePrefix.length)),
       MACOS_IDENTITY_CORE_RUNTIME_FILES,
     );
+    const bundledQuotaAnalysisPrefix =
+      "Contents/Resources/app/node_modules/"
+      + "@app-usagemonitor/quota-analysis/";
+    assert.deepEqual(
+      bundleFiles
+        .map(({ relativePath }) => relativePath)
+        .filter((path) => path.startsWith(bundledQuotaAnalysisPrefix))
+        .map((path) => path.slice(bundledQuotaAnalysisPrefix.length)),
+      MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
+    );
     const swiftSources = await collectMacOSSwiftSources();
     const localizationResources = await collectMacOSLocalizationResources();
     const sourceInputPaths = new Set([
@@ -3144,6 +3183,9 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       ),
       ...MACOS_IDENTITY_CORE_RUNTIME_FILES.map(
         (path) => `packages/identity-core/${path}`,
+      ),
+      ...MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.map(
+        (path) => `packages/quota-analysis/${path}`,
       ),
       "config/product-brand.js",
       "scripts/build-macos-app.js",
@@ -3556,6 +3598,10 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       plistJson.UsageMonitorMonitoredAppBundleIdentifier,
       PRODUCT_BRAND.monitoredAppBundleIdentifier,
     );
+    assert.equal(
+      plistJson.UsageMonitorPublicWebsiteOrigin,
+      DEPLOYMENT_ENDPOINTS.public.origin,
+    );
     assert.equal(plistJson.CFBundleIconFile, "AppIcon");
     assert.equal(Object.hasOwn(plistJson, "UsageMonitorCentralOrigin"), false);
     assert.equal(
@@ -3872,7 +3918,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       {
         bundleIdentifier: "com.usagemonitor.local",
         production: false,
-        shortVersion: "0.1.0",
+        shortVersion: RELEASE_VERSION,
       },
     );
 
@@ -4024,6 +4070,10 @@ test("preview distribution builds retain the normal identity and reject producti
       join(output, "Contents", "Info.plist"),
     ], { encoding: "utf8" }));
     assert.equal(plist.CFBundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(
+      plist.UsageMonitorPublicWebsiteOrigin,
+      DEPLOYMENT_ENDPOINTS.public.origin,
+    );
     assert.equal(plist.UsageMonitorBuildChannel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
     assert.equal(plist.UsageMonitorPreviewDistribution, true);
     assert.equal(plist.UsageMonitorCentralOriginMode, "production_https");

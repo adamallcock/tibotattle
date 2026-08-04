@@ -4,6 +4,7 @@ import {
   projectAdminAction,
   projectAdminOverview,
 } from "./admin-client.js";
+import { formatReportingTime } from "./ui-format.js";
 
 const state = { csrfToken: "", overview: null };
 const $ = (selector) => document.querySelector(selector);
@@ -17,9 +18,7 @@ function count(value, bounded = false) {
 }
 
 function formatTime(value) {
-  if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? text(value) : date.toLocaleString();
+  return value ? formatReportingTime(value) : "—";
 }
 
 function showNotice(message, kind = "warning") {

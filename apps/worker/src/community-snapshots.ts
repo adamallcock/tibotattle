@@ -8,6 +8,7 @@ import {
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
 import { sha256Hex } from "./crypto";
 import { TELEMETRY_MODEL_IDS } from "./telemetry-validation";
+import { parseStoredJson } from "./stored-record";
 
 const DAY = 24 * 60 * 60 * 1000;
 const WEEK = 7 * DAY;
@@ -571,19 +572,15 @@ function publishedSnapshotIsCacheable(row: SnapshotRow): boolean {
       || row.revision < 1) {
     return false;
   }
-  try {
-    const payload = JSON.parse(row.payload_json) as unknown;
-    return typeof payload === "object"
-      && payload !== null
-      && !Array.isArray(payload)
-      && Reflect.get(payload, "schemaVersion") === SNAPSHOT_SCHEMA_VERSION
-      && Reflect.get(payload, "releaseStatus") === "published"
-      && Reflect.get(payload, "snapshotId") === row.snapshot_id
-      && Reflect.get(payload, "snapshotRevision") === row.revision
-      && Reflect.get(payload, "immutable") === true;
-  } catch {
-    return false;
-  }
+  const payload = parseStoredJson<unknown>(row.payload_json);
+  return typeof payload === "object"
+    && payload !== null
+    && !Array.isArray(payload)
+    && Reflect.get(payload, "schemaVersion") === SNAPSHOT_SCHEMA_VERSION
+    && Reflect.get(payload, "releaseStatus") === "published"
+    && Reflect.get(payload, "snapshotId") === row.snapshot_id
+    && Reflect.get(payload, "snapshotRevision") === row.revision
+    && Reflect.get(payload, "immutable") === true;
 }
 
 export async function readLatestCommunityWeeklySnapshot(
@@ -649,12 +646,7 @@ export async function readParticipantCommunityComparison(
     return participantComparisonUnavailable("community_snapshot_not_released", row);
   }
 
-  let payload: unknown;
-  try {
-    payload = JSON.parse(row.payload_json) as unknown;
-  } catch {
-    return participantComparisonUnavailable("community_snapshot_contract_invalid", row);
-  }
+  const payload = parseStoredJson<unknown>(row.payload_json);
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)
       || Reflect.get(payload, "schemaVersion") !== SNAPSHOT_SCHEMA_VERSION
       || Reflect.get(payload, "releaseStatus") !== "published"

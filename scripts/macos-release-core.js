@@ -856,7 +856,16 @@ export async function inspectMacOSApp(appPath, {
     await regularPath(join(selected, ...relativePath.split("/")));
   }
   if (requireExternalDistribution) {
-    validateProductionOrigin(plist);
+    const centralOrigin = validateProductionOrigin(plist);
+    if (centralOrigin !== DEPLOYMENT_ENDPOINTS.public.origin
+        || plist.UsageMonitorPublicWebsiteOrigin
+          !== DEPLOYMENT_ENDPOINTS.public.origin
+        || plist.SUFeedURL !== DEPLOYMENT_ENDPOINTS.sparkle.appcastURL) {
+      fail(
+        "Release app is not sealed to the reviewed deployment endpoints",
+        "MACOS_RELEASE_ENDPOINTS_MISMATCH",
+      );
+    }
     if (manifest.release?.externalDistributionRequested !== true
         || manifest.release?.productionOriginValidated !== true
         || manifest.release?.requiresDeveloperIDAndNotarization !== true

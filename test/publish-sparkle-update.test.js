@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  RELEASE_MANIFEST,
+  RELEASE_VERSION,
+} from "../config/release-manifest.js";
+import {
   APPROVED_R2_BUCKET,
   APPCAST_CACHE_CONTROL,
   CANONICAL_APPCAST_URL,
@@ -33,7 +37,7 @@ async function createReleaseFixture({
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-r2-publisher-test-"),
   );
-  const fileName = "TiboTattle-0.1.0-macOS-arm64.dmg";
+  const fileName = RELEASE_MANIFEST.macOS.arm64DmgFileName;
   const dmgPath = join(root, fileName);
   const appcastPath = join(root, "appcast.xml");
   const releaseManifestPath = join(root, `${fileName}.release.json`);
@@ -46,7 +50,7 @@ async function createReleaseFixture({
     application: {
       bundleIdentifier: "com.usagemonitor.local",
       bundleVersion: "1",
-      shortVersion: "0.1.0",
+      shortVersion: RELEASE_VERSION,
     },
     artifact: { bytes: dmgbBytes.length, fileName, sha256: digest },
     assurances: {
@@ -118,7 +122,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
     assert.equal(publication.appcast.url, CANONICAL_APPCAST_URL);
     assert.equal(
       publication.artifact.key,
-      `releases/1/${digest}/TiboTattle-0.1.0-macOS-arm64.dmg`,
+      `releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`,
     );
     assert.equal(
       publication.manifest.key,

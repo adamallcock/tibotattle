@@ -1269,7 +1269,7 @@ function normalizeAccountScopedQuotaAnalysis(payload) {
     const windowDurationMinutes = count(continuity.windowDurationMinutes, null);
     if (
       !["openai_codex", "anthropic_claude_code"].includes(continuity.provider)
-      || ![300, 10_080].includes(windowDurationMinutes)
+      || !PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES.has(windowDurationMinutes)
     ) {
       return [];
     }
@@ -2327,6 +2327,121 @@ function normalizeGradient(payload = {}) {
   };
 }
 
+const WEEKLY_PACE_FORECAST_SCHEMA_VERSION = "local-weekly-pace-forecast-v0.1";
+const WEEKLY_PACE_FORECAST_STATUSES = new Set([
+  "unavailable",
+  "insufficient_observations",
+  "available",
+  "will_reach_reset_first"
+]);
+const WEEKLY_PACE_FORECAST_METHOD = "median_adjacent_quota_slope";
+
+function weeklyPaceNumber(value, {
+  minimum = Number.NEGATIVE_INFINITY,
+  maximum = Number.POSITIVE_INFINITY
+} = {}) {
+  if (value === null) return null;
+  return typeof value === "number"
+      && Number.isFinite(value)
+      && value >= minimum
+      && value <= maximum
+    ? value
+    : undefined;
+}
+
+function normalizeWeeklyPaceForecast(value) {
+  const expectedKeys = [
+    "schemaVersion",
+    "status",
+    "currentUsedPercent",
+    "remainingPercent",
+    "resetsAt",
+    "pace",
+    "observationCount",
+    "etaAt",
+    "hoursToExhaustion",
+    "hoursToReset"
+  ];
+  if (!hasExactKeys(value, expectedKeys)
+      || value.schemaVersion !== WEEKLY_PACE_FORECAST_SCHEMA_VERSION
+      || !WEEKLY_PACE_FORECAST_STATUSES.has(value.status)
+      || !hasExactKeys(value.pace, [
+        "method",
+        "sampleCount",
+        "elapsedHours",
+        "movementPp",
+        "percentagePointsPerHour"
+      ])) return null;
+  const currentUsedPercent = weeklyPaceNumber(value.currentUsedPercent, {
+    minimum: 0,
+    maximum: 100
+  });
+  const remainingPercent = weeklyPaceNumber(value.remainingPercent, {
+    minimum: 0,
+    maximum: 100
+  });
+  const elapsedHours = weeklyPaceNumber(value.pace.elapsedHours, { minimum: 0 });
+  const movementPp = weeklyPaceNumber(value.pace.movementPp, { minimum: 0 });
+  const percentagePointsPerHour = weeklyPaceNumber(
+    value.pace.percentagePointsPerHour,
+    { minimum: 0, maximum: 100 }
+  );
+  const hoursToExhaustion = weeklyPaceNumber(value.hoursToExhaustion, {
+    minimum: 0
+  });
+  const hoursToReset = weeklyPaceNumber(value.hoursToReset, { minimum: 0 });
+  const resetsAt = value.resetsAt === null ? null : canonicalInstant(value.resetsAt);
+  const etaAt = value.etaAt === null ? null : canonicalInstant(value.etaAt);
+  if (currentUsedPercent === undefined
+      || remainingPercent === undefined
+      || elapsedHours === undefined
+      || movementPp === undefined
+      || percentagePointsPerHour === undefined
+      || hoursToExhaustion === undefined
+      || hoursToReset === undefined
+      || (value.resetsAt !== null && resetsAt === null)
+      || (value.etaAt !== null && etaAt === null)
+      || (value.pace.method !== null
+        && value.pace.method !== WEEKLY_PACE_FORECAST_METHOD)
+      || !Number.isSafeInteger(value.pace.sampleCount)
+      || value.pace.sampleCount < 0
+      || value.pace.sampleCount >= 8_192
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0
+      || value.observationCount > 8_192) return null;
+  if (value.status === "available") {
+    if (currentUsedPercent === null
+        || remainingPercent === null
+        || resetsAt === null
+        || etaAt === null
+        || percentagePointsPerHour === null
+        || percentagePointsPerHour <= 0
+        || hoursToExhaustion === null
+        || hoursToReset === null
+        || Date.parse(etaAt) >= Date.parse(resetsAt)) return null;
+  } else if (etaAt !== null || hoursToExhaustion !== null) {
+    return null;
+  }
+  return {
+    schemaVersion: WEEKLY_PACE_FORECAST_SCHEMA_VERSION,
+    status: value.status,
+    currentUsedPercent,
+    remainingPercent,
+    resetsAt,
+    pace: {
+      method: value.pace.method,
+      sampleCount: value.pace.sampleCount,
+      elapsedHours,
+      movementPp,
+      percentagePointsPerHour
+    },
+    observationCount: value.observationCount,
+    etaAt,
+    hoursToExhaustion,
+    hoursToReset
+  };
+}
+
 function normalizeWeekly(payload = {}) {
   const envelope = payload?.weekly ?? payload;
   const source = artifactData(envelope);
@@ -2358,6 +2473,7 @@ function normalizeWeekly(payload = {}) {
     errorConcentration: array(source.errorConcentration ?? source.error_concentration),
     providerEpochs: array(source.providerEpochs ?? source.provider_epochs),
     dataClass: text(envelope?.dataClass, ""),
+    paceForecast: normalizeWeeklyPaceForecast(envelope?.paceForecast),
     accountAttribution: {
       status: text(envelope?.accountAttribution?.status, ""),
       maySpanMultipleAccounts:
@@ -3363,7 +3479,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       observedAt: iso(observedMs),
       usedPercent: Number((100 - remainingPercent).toFixed(1)),
       remainingPercent,
-      durationMinutes: 10_080,
+      durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
       resetAt: iso(sinceResetMs >= 0 ? lastResetMs + 7 * DAY : lastResetMs),
       limitId: "codex",
       slot: "primary",

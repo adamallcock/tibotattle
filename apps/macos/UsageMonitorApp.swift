@@ -3841,7 +3841,9 @@ private enum WatchdogSmokeTest {
 private enum LifecycleContractSmokeTest {
     static func diagnostics() -> Int32 {
         let rendered = LifecycleDiagnostics.render(
-            version: "0.1.0",
+            version: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String ?? "unknown",
             build: "1",
             lifecycle: "Could not start",
             failureCode: LauncherError.companionTimeout.failureCode,

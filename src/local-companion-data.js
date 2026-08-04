@@ -29,6 +29,10 @@ import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
 } from "./reporting/index.js";
 import { writeJsonOwnerOnlyAtomic } from "./storage.js";
+import {
+  projectWeeklyPaceForecast,
+  weeklyPaceSnapshotsFromCollectorRecord,
+} from "./weekly-pace-projection.js";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
@@ -85,8 +89,18 @@ const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
 const COLLECTOR_PROJECTION_SCHEMA_VERSION =
-  "collector-dashboard-projection-v1";
+  "collector-dashboard-projection-v2";
 const MAX_COLLECTOR_PROJECTION_BYTES = 16 * 1024 * 1024;
+const MAX_WEEKLY_PACE_OBSERVATIONS = 8_192;
+const WEEKLY_PACE_FORECAST_SCHEMA_VERSION =
+  "local-weekly-pace-forecast-v0.1";
+const WEEKLY_PACE_FORECAST_STATUSES = new Set([
+  "unavailable",
+  "insufficient_observations",
+  "available",
+  "will_reach_reset_first",
+]);
+const WEEKLY_PACE_FORECAST_METHOD = "median_adjacent_quota_slope";
 
 const REPORTS = Object.freeze([
   {
@@ -1103,6 +1117,123 @@ function cachedQuotaRow(value) {
   };
 }
 
+function cachedPaceNumber(value, {
+  minimum = Number.NEGATIVE_INFINITY,
+  maximum = Number.POSITIVE_INFINITY,
+} = {}) {
+  if (value === null) return null;
+  return typeof value === "number"
+      && Number.isFinite(value)
+      && value >= minimum
+      && value <= maximum
+    ? value
+    : undefined;
+}
+
+function cachedWeeklyPaceForecast(value) {
+  const expectedKeys = [
+    "schemaVersion",
+    "status",
+    "currentUsedPercent",
+    "remainingPercent",
+    "resetsAt",
+    "pace",
+    "observationCount",
+    "etaAt",
+    "hoursToExhaustion",
+    "hoursToReset",
+  ];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join("\0")
+        !== [...expectedKeys].sort().join("\0")
+      || value.schemaVersion !== WEEKLY_PACE_FORECAST_SCHEMA_VERSION
+      || !WEEKLY_PACE_FORECAST_STATUSES.has(value.status)
+      || !value.pace || typeof value.pace !== "object"
+      || Array.isArray(value.pace)
+      || Object.keys(value.pace).sort().join("\0")
+        !== [
+          "method",
+          "sampleCount",
+          "elapsedHours",
+          "movementPp",
+          "percentagePointsPerHour",
+        ].sort().join("\0")) {
+    return null;
+  }
+  const currentUsedPercent = cachedPaceNumber(value.currentUsedPercent, {
+    minimum: 0,
+    maximum: 100,
+  });
+  const remainingPercent = cachedPaceNumber(value.remainingPercent, {
+    minimum: 0,
+    maximum: 100,
+  });
+  const elapsedHours = cachedPaceNumber(value.pace.elapsedHours, { minimum: 0 });
+  const movementPp = cachedPaceNumber(value.pace.movementPp, { minimum: 0 });
+  const percentagePointsPerHour = cachedPaceNumber(
+    value.pace.percentagePointsPerHour,
+    { minimum: 0, maximum: 100 },
+  );
+  const hoursToExhaustion = cachedPaceNumber(value.hoursToExhaustion, {
+    minimum: 0,
+  });
+  const hoursToReset = cachedPaceNumber(value.hoursToReset, { minimum: 0 });
+  const resetsAt = value.resetsAt === null
+    ? null
+    : canonicalIndexInstant(value.resetsAt);
+  const etaAt = value.etaAt === null
+    ? null
+    : canonicalIndexInstant(value.etaAt);
+  if (currentUsedPercent === undefined
+      || remainingPercent === undefined
+      || elapsedHours === undefined
+      || movementPp === undefined
+      || percentagePointsPerHour === undefined
+      || hoursToExhaustion === undefined
+      || hoursToReset === undefined
+      || (value.resetsAt !== null && resetsAt === null)
+      || (value.etaAt !== null && etaAt === null)
+      || value.pace.method !== null
+        && value.pace.method !== WEEKLY_PACE_FORECAST_METHOD
+      || !Number.isSafeInteger(value.pace.sampleCount)
+      || value.pace.sampleCount < 0
+      || value.pace.sampleCount >= MAX_WEEKLY_PACE_OBSERVATIONS
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0
+      || value.observationCount > MAX_WEEKLY_PACE_OBSERVATIONS) {
+    return null;
+  }
+  if (value.status === "available") {
+    if (currentUsedPercent === null
+        || remainingPercent === null
+        || resetsAt === null
+        || etaAt === null
+        || hoursToExhaustion === null
+        || percentagePointsPerHour === null
+        || !(Date.parse(etaAt) < Date.parse(resetsAt))) return null;
+  } else if (etaAt !== null || hoursToExhaustion !== null) {
+    return null;
+  }
+  return {
+    schemaVersion: WEEKLY_PACE_FORECAST_SCHEMA_VERSION,
+    status: value.status,
+    currentUsedPercent,
+    remainingPercent,
+    resetsAt,
+    pace: {
+      method: value.pace.method,
+      sampleCount: value.pace.sampleCount,
+      elapsedHours,
+      movementPp,
+      percentagePointsPerHour,
+    },
+    observationCount: value.observationCount,
+    etaAt,
+    hoursToExhaustion,
+    hoursToReset,
+  };
+}
+
 function cachedCollectorProjection(value, nowMs) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "available") return null;
@@ -1165,6 +1296,8 @@ function cachedCollectorProjection(value, nowMs) {
     }))
     : null;
   if (quotaWindows === null || quotaWindows.includes(null)) return null;
+  const paceForecast = cachedWeeklyPaceForecast(value.paceForecast);
+  if (paceForecast === null) return null;
   return {
     status: "available",
     ...counts,
@@ -1210,6 +1343,7 @@ function cachedCollectorProjection(value, nowMs) {
       }),
     },
     recordCounts,
+    paceForecast,
   };
 }
 
@@ -1236,12 +1370,13 @@ async function readCollectorProjection(
         tools: summarizeToolClasses([]),
         timeline: { bucketMinutes: 15, usage: [], quota: [] },
         recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
+        paceForecast: projectWeeklyPaceForecast({ nowMs }),
       };
     }
     throw fixedError("collector_unavailable");
   }
   if (!metadata.isFile() || metadata.size > MAX_LEDGER_BYTES) throw fixedError("collector_invalid_size");
-  const projectionFile = `${path}.projection-v1.json`;
+  const projectionFile = `${path}.projection-v2.json`;
   if (!summarizeUsageEvents) {
     try {
       const cachedMetadata = await lstat(projectionFile);
@@ -1284,6 +1419,7 @@ async function readCollectorProjection(
   const recentStartMs = nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
   const timelineBuckets = new Map();
   const quotaTimeline = [];
+  const weeklyPaceSnapshots = [];
   let toolTotal = 0;
   let recordCount = 0;
   let malformedLines = 0;
@@ -1334,6 +1470,23 @@ async function readCollectorProjection(
       if (latestQuotaRecord === null
           || value.observedAt.localeCompare(latestQuotaRecord.observedAt) > 0) {
         latestQuotaRecord = value;
+      }
+      if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
+        weeklyPaceSnapshots.push(
+          ...weeklyPaceSnapshotsFromCollectorRecord(value),
+        );
+        if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS * 2) {
+          weeklyPaceSnapshots.sort((left, right) => (
+            left.observedAt.localeCompare(right.observedAt)
+            || left.receivedAt.localeCompare(right.receivedAt)
+            || left.accountTrackId.localeCompare(right.accountTrackId)
+            || left.slot.localeCompare(right.slot)
+          ));
+          weeklyPaceSnapshots.splice(
+            0,
+            weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
+          );
+        }
       }
       if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
         for (const window of Array.isArray(value.windows) ? value.windows : []) {
@@ -1393,6 +1546,23 @@ async function readCollectorProjection(
       toolTotal += 1;
     }
   }
+  if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS) {
+    weeklyPaceSnapshots.sort((left, right) => (
+      left.observedAt.localeCompare(right.observedAt)
+      || left.receivedAt.localeCompare(right.receivedAt)
+      || left.accountTrackId.localeCompare(right.accountTrackId)
+      || left.slot.localeCompare(right.slot)
+    ));
+    weeklyPaceSnapshots.splice(
+      0,
+      weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
+    );
+  }
+  const paceForecast = projectWeeklyPaceForecast({
+    currentRecord: latestQuotaRecord,
+    observations: weeklyPaceSnapshots,
+    nowMs,
+  });
   const projection = {
     status: "available",
     recordCount,
@@ -1418,6 +1588,7 @@ async function readCollectorProjection(
       quota: finalizeQuotaTimeline(quotaTimeline),
     },
     recordCounts,
+    paceForecast,
   };
   if (!summarizeUsageEvents) {
     await writeJsonOwnerOnlyAtomic(projectionFile, {
@@ -1818,13 +1989,21 @@ export async function buildLocalCompanionSnapshot({
     replaySafeCache,
     replaySafeAccounting.errorCode,
   );
-  const weekly = liveWeekly.status === "unavailable"
+  const weeklyBase = liveWeekly.status === "unavailable"
     && allowDevelopmentArtifactFallback
     ? {
       ...historicalWeekly,
       dataClass: "development_only_historical_artifact",
     }
     : liveWeekly;
+  // The historical calibration and this current-reset forecast deliberately
+  // have different evidence contracts. The latter is account-scoped app-server
+  // evidence only, and remains optional even when an older calibration view is
+  // available.
+  const weekly = {
+    ...weeklyBase,
+    paceForecast: collector.paceForecast,
+  };
   const latestRecordAt = collector.latestRecordAt;
   const indexing = await readCollectorIndexProjection(checkpointFile, collector);
   const latestEvidenceAt = latestRecordAt === null ? null : new Date(latestRecordAt).toISOString();

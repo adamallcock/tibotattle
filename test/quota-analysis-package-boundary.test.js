@@ -21,13 +21,27 @@ const ROLLING_EXPORTS = Object.freeze([
   "QUOTA_ROLLING_POLICY",
   "buildRollingQuotaComparisons",
 ]);
+const PACE_EXPORTS = Object.freeze([
+  "QUOTA_PACE_POLICY",
+  "analyzeQuotaPace",
+]);
+const WINDOW_EXPORTS = Object.freeze([
+  "FIVE_HOUR_WINDOW_MINUTES",
+  "SEVEN_DAY_WINDOW_MINUTES",
+  "SUPPORTED_QUOTA_WINDOW_DURATIONS",
+  "isSupportedQuotaWindowDuration",
+]);
 const SOURCE_HASHES = Object.freeze({
   "quota-calibration.js":
-    "3cfea0c59b3d381e696e471b25c44000abcc5e47eeaccf95ed9e54880c142c74",
+    "d8246bd3a290084315b90f2b8b1c0910ccde861ca0e30292512ed5594426461b",
   "quota-rolling.js":
-    "a1559a990b7d90ddc44b0362cca44206f84f103dd4528dbdcd3e476d94a32179",
+    "d86cbeaefc8c1a6d5836296f83d10af87dbb7ca8171dc5cc7522a21cfb005b1c",
   "quota-tracks.js":
-    "c6b9fce426d2665f002c9b62cfc48bb2c0e1a171a9bf3d50170d419528c08124",
+    "7f1790e98ffcad931bf85d4d390741d5eb38b2df2bf2748fe5b2abfc98820708",
+  "quota-windows.js":
+    "01b099579d811a30fd2e0543f89286fc9946e821a4db0dd3b07dd453f9c0381b",
+  "quota-pace-forecast.js":
+    "dcc2c7317ef96433f02eb300ef0d33d6f5985e0c51923dfa5bc09f9ec92ae648",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {
@@ -49,7 +63,13 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
   assert.equal(Object.hasOwn(manifest, "devDependencies"), false);
   assert.deepEqual(
     Object.keys(quotaAnalysis).sort(),
-    [...TRACK_EXPORTS, ...CALIBRATION_EXPORTS, ...ROLLING_EXPORTS].sort(),
+    [
+      ...TRACK_EXPORTS,
+      ...CALIBRATION_EXPORTS,
+      ...ROLLING_EXPORTS,
+      ...PACE_EXPORTS,
+      ...WINDOW_EXPORTS,
+    ].sort(),
   );
 });
 

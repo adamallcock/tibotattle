@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import { extractEsmImports } from "./lib/esm-imports.mjs";
 import { captureStableUtf8Source } from "./lib/captured-utf8-source.mjs";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const SCRIPT_DIRECTORY = dirname(SCRIPT_FILE);
@@ -71,7 +72,7 @@ const DYNAMIC_EXTERNAL_BY_FILE = Object.freeze({
 });
 const PINNED_RUNTIME_PACKAGES = Object.freeze({
   "@app-usagemonitor/identity-core": Object.freeze({
-    version: "0.1.0",
+    version: RELEASE_VERSION,
     license: "LicenseRef-Proprietary",
   }),
   "@github/keytar": Object.freeze({

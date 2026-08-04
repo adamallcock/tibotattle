@@ -2,6 +2,7 @@ import { readCollectionControls, type CollectionControls } from "./collection-co
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { readQuarantineReconciliationStatus } from "./quarantine-reconciliation";
+import { parseStoredJson } from "./stored-record";
 
 const ADMIN_IDENTITY_DOMAIN = "app-usagemonitor/admin-actor/v1\0";
 const DIAGNOSTIC_RETENTION_DAYS = 30;
@@ -583,7 +584,7 @@ export async function readAdminOverview(
     audit: adminAudit.results.map((row) => ({
       action: row.action,
       outcome: row.outcome,
-      details: JSON.parse(row.details_json) as unknown,
+      details: parseStoredJson(row.details_json),
       createdAt: row.created_at,
     })),
   };

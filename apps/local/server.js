@@ -73,6 +73,10 @@ import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
+  RELEASE_VERSION,
+  RELEASE_VERSION_PLACEHOLDER,
+} from "../../config/release-manifest.js";
+import {
   FAST_MODE_PREFERENCE_VALUES,
 } from "@app-usagemonitor/accounting";
 import {
@@ -1147,6 +1151,25 @@ function stampSemanticOpenTarget(body) {
       PRODUCT_BRAND.appOpenURL,
     ),
   );
+}
+
+function stampReleaseVersion(body) {
+  const source = body.toString("utf8");
+  const first = source.indexOf(RELEASE_VERSION_PLACEHOLDER);
+  if (first < 0) return Buffer.from(source);
+  if (source.indexOf(
+    RELEASE_VERSION_PLACEHOLDER,
+    first + RELEASE_VERSION_PLACEHOLDER.length,
+  ) >= 0) {
+    const error = new Error("not_found");
+    error.code = "not_found";
+    throw error;
+  }
+  return Buffer.from(source.replace(RELEASE_VERSION_PLACEHOLDER, RELEASE_VERSION));
+}
+
+function stampLocalDashboard(body) {
+  return stampReleaseVersion(stampSemanticOpenTarget(body));
 }
 
 function finiteNonNegativeInteger(value) {
@@ -2838,7 +2861,7 @@ function createPreparedLocalCompanionServer({
             MAX_STATIC_BYTES,
           );
           const body = staticFile.file === "index.html"
-            ? stampSemanticOpenTarget(source)
+            ? stampLocalDashboard(source)
             : source;
           send(response, 200, body, staticFile.type);
         } catch {

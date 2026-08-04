@@ -36,6 +36,7 @@ const RELEASE_MANIFEST_BASENAME = "release-site-manifest.json";
 const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "community-view.js",
   "community.js",
+  "i18n.generated.js",
   "index.html",
   "robots.txt",
   "social-preview.png",

@@ -18,6 +18,8 @@ export {
   validateSyntheticFixture,
 } from "./telemetry-envelope.js";
 
+import { formatNumber } from "./ui-format.js";
+
 const JSON_WHITESPACE = new Set([" ", "\t", "\n", "\r"]);
 const JSON_SIMPLE_ESCAPES = Object.freeze({
   '"': '"',
@@ -377,7 +379,7 @@ export function formatTokenTotal(usage) {
     + usage.inputCachedTokens
     + usage.outputTextTokens
     + usage.outputReasoningTokens;
-  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(total);
+  return formatNumber(total, { notation: "compact", maximumFractionDigits: 1 });
 }
 
 export function safeFilename(participantId) {

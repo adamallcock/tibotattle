@@ -26,6 +26,10 @@ import {
   priceCodexUsageEvent,
   APP_PRICE_REGISTRY_MANIFEST,
 } from "@app-usagemonitor/accounting";
+import {
+  analyzeQuotaPace,
+  SEVEN_DAY_WINDOW_MINUTES,
+} from "@app-usagemonitor/quota-analysis";
 import { writeJsonOwnerOnlyAtomic } from "./storage.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
@@ -43,7 +47,16 @@ const MAX_CACHE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_WINDOW_DAYS = 31;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
-const WEEKLY_WINDOW_MINUTES = 10_080;
+const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
+const PACE_CURRENT_MAX_AGE_MS = 30 * 60_000;
+const PACE_STATUSES = new Set([
+  "unavailable",
+  "insufficient_observations",
+  "available",
+  "will_reach_reset_first",
+]);
+const ACCOUNT_SCOPE_ID_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
+const ACCOUNT_TRACK_ID_PATTERN = /^account-track:v1:[a-f0-9]{64}$/u;
 const MAX_RETAINED_TRANSITION_BYTES = 320 * 1024 * 1024;
 const MAX_ACCOUNTING_RSS_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
 const ACCOUNTING_RSS_CHECK_INTERVAL = 2_048;
@@ -635,6 +648,204 @@ function finalizeWeeklyQuotaTimeline(buckets) {
     : rows.slice(rows.length - MAX_QUOTA_TIMELINE_ROWS);
 }
 
+function paceAccountTrackId(snapshot) {
+  const scope = snapshot?.accountScope;
+  if (scope?.status === "available"
+      && (ACCOUNT_SCOPE_ID_PATTERN.test(scope.scopeId ?? "")
+        || ACCOUNT_TRACK_ID_PATTERN.test(scope.scopeId ?? ""))) {
+    return scope.scopeId;
+  }
+  // A caller that has already projected the app-server marker may supply the
+  // opaque track directly. Never accept a session/source scope or an
+  // arbitrary string as an account identity.
+  const direct = snapshot?.accountTrackId;
+  return ACCOUNT_SCOPE_ID_PATTERN.test(direct ?? "")
+      || ACCOUNT_TRACK_ID_PATTERN.test(direct ?? "")
+    ? direct
+    : null;
+}
+
+function paceToken(value, fallback) {
+  return typeof value === "string"
+      && /^[a-z0-9][a-z0-9_.:-]{0,127}$/iu.test(value)
+    ? value
+    : fallback;
+}
+
+function weeklyPaceSnapshotProjection(snapshot) {
+  const window = snapshot?.window;
+  const accountTrackId = paceAccountTrackId(snapshot);
+  const observedAt = canonicalInstant(
+    snapshot?.observedAt ?? snapshot?.timestamp,
+  );
+  const receivedAt = canonicalInstant(
+    snapshot?.receivedAt ?? snapshot?.timestamp,
+  );
+  if (accountTrackId === null
+      || observedAt === null
+      || receivedAt === null
+      || !window
+      || typeof window !== "object"
+      || window.provider !== "openai_codex"
+      || window.limitId !== "codex"
+      || !QUOTA_SLOTS.has(window.slot)
+      || window.windowDurationMins !== WEEKLY_WINDOW_MINUTES
+      || !Number.isFinite(window.usedPercent)
+      || window.usedPercent < 0
+      || window.usedPercent > 100
+      || !Number.isSafeInteger(window.resetsAt)
+      || window.resetsAt <= 0
+      || Date.parse(receivedAt) < Date.parse(observedAt)) {
+    return null;
+  }
+  const resetDate = new Date(window.resetsAt * 1_000);
+  if (!Number.isFinite(resetDate.getTime())) return null;
+  return {
+    accountTrackId,
+    provider: "openai_codex",
+    planType: paceToken(window.planType, "unknown"),
+    planVariant: paceToken(
+      snapshot?.planVariant ?? window.planVariant,
+      "current-window",
+    ),
+    limitId: "codex",
+    slot: window.slot,
+    windowDurationMinutes: WEEKLY_WINDOW_MINUTES,
+    resetsAt: resetDate.toISOString(),
+    observedAt,
+    receivedAt,
+    usedPercent: Number(window.usedPercent.toFixed(3)),
+    policyEpoch: paceToken(
+      snapshot?.policyEpoch ?? window.policyEpoch,
+      "current-window",
+    ),
+  };
+}
+
+function paceTrackKey(row, includeReset = true) {
+  return [
+    row.accountTrackId,
+    row.provider,
+    row.planType,
+    row.planVariant,
+    row.limitId,
+    row.slot,
+    row.windowDurationMinutes,
+    ...(includeReset ? [row.resetsAt] : []),
+    row.policyEpoch,
+  ].join("\0");
+}
+
+function paceUnavailable(row, status = "unavailable") {
+  return {
+    status,
+    currentUsedPercent: Number(row.usedPercent.toFixed(3)),
+    remainingPercent: Number(Math.max(0, 100 - row.usedPercent).toFixed(3)),
+    resetsAt: row.resetsAt,
+    pace: { percentagePointsPerHour: null },
+    etaAt: null,
+    hoursToExhaustion: null,
+    hoursToReset: Number(
+      Math.max(0, Date.parse(row.resetsAt) - Date.parse(row.observedAt))
+        / (60 * 60 * 1_000),
+    ),
+  };
+}
+
+function sanitizeWeeklyPaceForecast(result) {
+  if (!result || typeof result !== "object"
+      || !PACE_STATUSES.has(result.status)
+      || !Number.isFinite(result.currentUsedPercent)
+      || result.currentUsedPercent < 0
+      || result.currentUsedPercent > 100
+      || !Number.isFinite(result.remainingPercent)
+      || result.remainingPercent < 0
+      || result.remainingPercent > 100
+      || result.remainingPercent
+        !== Number(Math.max(0, 100 - result.currentUsedPercent).toFixed(3))
+      || canonicalInstant(result.resetsAt) === null) {
+    return null;
+  }
+  const rate = result.pace?.percentagePointsPerHour;
+  const hoursToExhaustion = result.hoursToExhaustion;
+  const hoursToReset = result.hoursToReset;
+  const etaAt = result.etaAt === null ? null : canonicalInstant(result.etaAt);
+  if ((rate !== null
+        && (!Number.isFinite(rate) || rate < 0 || rate > 100))
+      || (hoursToExhaustion !== null
+        && (!Number.isFinite(hoursToExhaustion) || hoursToExhaustion < 0))
+      || (hoursToReset !== null
+        && (!Number.isFinite(hoursToReset) || hoursToReset < 0))
+      || (result.etaAt !== null && etaAt === null)) {
+    return null;
+  }
+  return {
+    status: result.status,
+    currentUsedPercent: Number(result.currentUsedPercent.toFixed(3)),
+    remainingPercent: Number(result.remainingPercent.toFixed(3)),
+    resetsAt: result.resetsAt,
+    pace: {
+      percentagePointsPerHour:
+        rate === null ? null : Number(rate.toFixed(6)),
+    },
+    etaAt,
+    hoursToExhaustion: hoursToExhaustion === null
+      ? null
+      : Number(hoursToExhaustion.toFixed(6)),
+    hoursToReset: hoursToReset === null ? null : Number(hoursToReset.toFixed(6)),
+  };
+}
+
+function projectWeeklyPaceForecast(rows, endMs) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const ordered = [...rows].sort((left, right) => (
+    left.observedAt.localeCompare(right.observedAt)
+    || left.receivedAt.localeCompare(right.receivedAt)
+    || left.usedPercent - right.usedPercent
+  ));
+  const latestMs = Date.parse(ordered.at(-1).observedAt);
+  const latest = ordered.filter(
+    (row) => Date.parse(row.observedAt) === latestMs,
+  );
+  const latestAccounts = new Set(latest.map((row) => row.accountTrackId));
+  if (latestAccounts.size !== 1) return null;
+  const latestScope = latest[0].accountTrackId;
+  const latestSlots = new Set(
+    latest.filter((row) => row.accountTrackId === latestScope)
+      .map((row) => row.slot),
+  );
+  // The provider labels either slot as valid for the seven-day limit. If both
+  // are present at the same instant, follow the dashboard's primary-slot
+  // preference; otherwise keep the only observed slot.
+  const selectedSlot = latestSlots.has("primary")
+    ? "primary"
+    : latestSlots.size === 1 ? [...latestSlots][0] : null;
+  if (selectedSlot === null) return null;
+  const currentCandidates = latest.filter((row) => (
+    row.accountTrackId === latestScope && row.slot === selectedSlot
+  ));
+  const currentKeys = new Set(currentCandidates.map((row) => paceTrackKey(row)));
+  if (currentKeys.size !== 1) return null;
+  const current = currentCandidates[0];
+  if (endMs - latestMs > PACE_CURRENT_MAX_AGE_MS) {
+    return sanitizeWeeklyPaceForecast(paceUnavailable(current));
+  }
+  const currentKey = paceTrackKey(current);
+  const observations = ordered.filter((row) => (
+    row.accountTrackId === latestScope
+    && paceTrackKey(row) === currentKey
+  ));
+  try {
+    const result = analyzeQuotaPace({
+      currentSnapshot: current,
+      observations,
+    });
+    return sanitizeWeeklyPaceForecast(result);
+  } catch {
+    return sanitizeWeeklyPaceForecast(paceUnavailable(current));
+  }
+}
+
 function addSpeedWeighting(crossing, event) {
   // "fast", "standard" and "unknown" are the only observed values; anything
   // else collapses to unknown rather than being treated as Standard.
@@ -928,6 +1139,7 @@ export async function buildReplaySafeAccountingCache({
   ]);
   const timeline = new Map();
   const weeklyQuotaTimelineBuckets = new Map();
+  const weeklyPaceSnapshots = [];
   const rawUsageEvents = [];
   const weeklyRateLimitSnapshots = [];
   const price = createAccountingPricer();
@@ -988,7 +1200,7 @@ export async function buildReplaySafeAccountingCache({
       },
       onRateLimitSnapshot: (snapshot) => {
         throwIfAborted(signal);
-        if (snapshot?.window?.windowDurationMins === 10_080) {
+        if (snapshot?.window?.windowDurationMins === WEEKLY_WINDOW_MINUTES) {
           const observedAt = canonicalInstant(snapshot.timestamp);
           const observedMs = observedAt === null
             ? Number.NaN
@@ -999,6 +1211,8 @@ export async function buildReplaySafeAccountingCache({
           reserveTransitionInput("snapshot");
           weeklyRateLimitSnapshots.push(weeklyRateLimitProjection(snapshot));
           retainWeeklyQuotaTimeline(weeklyQuotaTimelineBuckets, snapshot);
+          const paceSnapshot = weeklyPaceSnapshotProjection(snapshot);
+          if (paceSnapshot !== null) weeklyPaceSnapshots.push(paceSnapshot);
         }
       },
     });
@@ -1020,7 +1234,7 @@ export async function buildReplaySafeAccountingCache({
       rateLimitSnapshots: weeklyRateLimitSnapshots,
       diagnostics: scanned?.diagnostics ?? {},
       includeSnapshotIntervals: false,
-      windowDurationMins: 10_080,
+      windowDurationMins: WEEKLY_WINDOW_MINUTES,
       signal,
       consumeInputs: true,
       includeNormalizedInputs: false,
@@ -1059,6 +1273,7 @@ export async function buildReplaySafeAccountingCache({
     },
     transitions: transitionSeries.transitions,
   });
+  const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
   throwIfAborted(signal);
   return {
     schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
@@ -1079,6 +1294,9 @@ export async function buildReplaySafeAccountingCache({
     quotaTimeline: finalizeWeeklyQuotaTimeline(
       weeklyQuotaTimelineBuckets,
     ),
+    ...(paceForecast === null
+      ? {}
+      : { weekly: { paceForecast } }),
     weeklyCalibration,
     weeklyCalibrationInput: {
       status: "complete",
@@ -1224,6 +1442,58 @@ function validQuotaTimeline(value, coveredAt) {
   return true;
 }
 
+function validWeeklyPaceForecast(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== [
+        "currentUsedPercent",
+        "etaAt",
+        "hoursToExhaustion",
+        "hoursToReset",
+        "pace",
+        "remainingPercent",
+        "resetsAt",
+        "status",
+      ].sort().join("\0")
+      || !PACE_STATUSES.has(value.status)
+      || !Number.isFinite(value.currentUsedPercent)
+      || value.currentUsedPercent < 0
+      || value.currentUsedPercent > 100
+      || !Number.isFinite(value.remainingPercent)
+      || value.remainingPercent < 0
+      || value.remainingPercent > 100
+      || value.remainingPercent
+        !== Number(Math.max(0, 100 - value.currentUsedPercent).toFixed(3))
+      || canonicalInstant(value.resetsAt) === null
+      || !value.pace
+      || typeof value.pace !== "object"
+      || Array.isArray(value.pace)
+      || Object.keys(value.pace).sort().join("\0")
+        !== "percentagePointsPerHour"
+      || (value.pace.percentagePointsPerHour !== null
+        && (!Number.isFinite(value.pace.percentagePointsPerHour)
+          || value.pace.percentagePointsPerHour < 0
+          || value.pace.percentagePointsPerHour > 100))
+      || (value.etaAt !== null && canonicalInstant(value.etaAt) === null)
+      || (value.hoursToExhaustion !== null
+        && (!Number.isFinite(value.hoursToExhaustion)
+          || value.hoursToExhaustion < 0))
+      || (value.hoursToReset !== null
+        && (!Number.isFinite(value.hoursToReset) || value.hoursToReset < 0))) {
+    return false;
+  }
+  return true;
+}
+
+function validWeeklyPaceContainer(value) {
+  return value !== undefined
+    && value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length === 1
+    && Object.hasOwn(value, "paceForecast")
+    && validWeeklyPaceForecast(value.paceForecast);
+}
+
 function validPriceCardProvenance(row) {
   if (!Array.isArray(row?.priceCardIds)
       || row.priceCardIds.length > 32
@@ -1299,6 +1569,7 @@ function validCache(value) {
       || !Array.isArray(value.periods)
       || !Array.isArray(value.timeline)
       || !validQuotaTimeline(value.quotaTimeline, value.coveredAt)
+      || (value.weekly !== undefined && !validWeeklyPaceContainer(value.weekly))
       || !validWeeklyCalibrationInput(value.weeklyCalibrationInput)
       || value.weeklyCalibration?.schemaVersion
         !== "weekly-calibration-summary-v0.1"

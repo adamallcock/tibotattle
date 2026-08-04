@@ -1,3 +1,5 @@
+import { isSupportedQuotaWindowDuration } from "./quota-windows.js";
+
 const MINIMUM_BOUNDARIES = 8;
 const MINIMUM_SPAN_PP = 5;
 const MINIMUM_TRAIN_BOUNDARIES = 5;
@@ -99,7 +101,7 @@ function validateEvidence(row) {
       || !Array.isArray(row.boundaries)
       || !Array.isArray(row.quotaSeries)
       || !Array.isArray(row.usageSeries)
-      || ![300, 10_080].includes(row.windowDurationMinutes)
+      || !isSupportedQuotaWindowDuration(row.windowDurationMinutes)
       || !Number.isFinite(Date.parse(row.firstObservedAt))
       || !Number.isFinite(Date.parse(row.lastObservedAt))) invalidInput();
   const boundaries = row.boundaries.map((point) => {

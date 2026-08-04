@@ -11,6 +11,9 @@ importers:
       '@app-usagemonitor/accounting':
         specifier: workspace:*
         version: link:packages/accounting
+      '@app-usagemonitor/i18n':
+        specifier: workspace:*
+        version: link:packages/i18n
       '@app-usagemonitor/identity-core':
         specifier: workspace:*
         version: link:packages/identity-core

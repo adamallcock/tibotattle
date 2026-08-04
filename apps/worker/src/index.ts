@@ -50,6 +50,7 @@ import {
   randomSecret,
   sha256Hex,
 } from "./crypto";
+import { parseStoredRecordJson } from "./stored-record";
 import {
   abandonDeviceUploadAuthorization,
   authenticateDevice,
@@ -1857,10 +1858,10 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
       for (const item of page.rows) {
         yield serializeContribution({
           ...telemetryContributionMetadata(item.contribution),
-          records: item.records.map((record) => ({
-            kind: record.record_kind,
-            value: JSON.parse(record.record_json) as unknown,
-          })),
+          records: item.records.flatMap((record) => {
+            const value = parseStoredRecordJson(record.record_json);
+            return value ? [{ kind: record.record_kind, value }] : [];
+          }),
         });
       }
       cursor = page.nextCursor;
@@ -2187,10 +2188,10 @@ async function handleContributionResource(
     );
     return jsonResponse({
       ...telemetryContributionMetadata(row),
-      records: records.map((record) => ({
-        kind: record.record_kind,
-        value: JSON.parse(record.record_json) as unknown,
-      })),
+      records: records.flatMap((record) => {
+        const value = parseStoredRecordJson(record.record_json);
+        return value ? [{ kind: record.record_kind, value }] : [];
+      }),
     }, 200, { vary: "Cookie" });
   }
   if (!await markTelemetryContributionDeleting(

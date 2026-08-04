@@ -1,5 +1,7 @@
+import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+
 const SCHEMA_VERSION = "weekly-calibration-v0.2";
-const WEEKLY_WINDOW_MINS = 10_080;
+const WEEKLY_WINDOW_MINS = SEVEN_DAY_WINDOW_MINUTES;
 
 // Reporting owns this small runtime-neutral decimal helper so its projections
 // do not cross into the accounting owner just to aggregate provenance totals.

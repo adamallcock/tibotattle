@@ -25,9 +25,10 @@
       Not a release slot: this is the product version this dashboard build ships
       as, and it is filled in source so the packaged Mac app carries it too. A
       shared results card names it, so a posted figure can be tied back to the
-      build that produced it. A test keeps it equal to the package version.
+      build that produced it. The local companion and packaged app stamp it
+      from the release manifest.
     -->
-    <meta name="usage-monitor-app-version" content="0.1.0">
+    <meta name="usage-monitor-app-version" content="__USAGE_MONITOR_RELEASE_VERSION__">
     <!--
       The published home this build points at. A shared results card prints it
       so a reader can find the project; the release build's own canonical URL
@@ -473,7 +474,7 @@
           <div class="chart-heading">
             <div>
               <h3 id="timeline-chart-title">Observed quota change versus cost-implied change</h3>
-              <p id="timeline-chart-copy">Browser-local chart axis · exact local and UTC times are listed below</p>
+              <p id="timeline-chart-copy">Chart and table use this Mac’s reporting time zone.</p>
             </div>
             <div class="calibration-controls">
               <span class="control-label">Calibration window</span>
@@ -543,7 +544,7 @@
                 <caption class="sr-only">Largest unexplained quota movement periods</caption>
                 <thead>
                   <tr>
-                  <th scope="col">Exact local / UTC time</th>
+                  <th scope="col" id="residual-time-heading">Reported time</th>
                   <th scope="col">Observed</th>
                   <th scope="col">Expected</th>
                   <th scope="col">Difference</th>

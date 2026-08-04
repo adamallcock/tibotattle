@@ -111,7 +111,7 @@ const SOURCE_OWNER_ALLOWED_PACKAGES = new Map([
     "identity-core",
     "telemetry-contract",
   ])],
-  ["provider", new Set(["telemetry-contract"])],
+  ["provider", new Set(["quota-analysis", "telemetry-contract"])],
   ["reporting", new Set([
     "accounting",
     "quota-analysis",

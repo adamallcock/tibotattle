@@ -2,6 +2,7 @@ import {
   analyzeQuotaCalibration,
   buildResetEvidence,
   buildRollingQuotaComparisons,
+  isSupportedQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
 import type {
   PricingStatus,
@@ -13,10 +14,10 @@ import type {
   QuotaUsageEventInput,
   QuotaWindowDurationMinutes,
 } from "@app-usagemonitor/quota-analysis";
+import { parseStoredRecordJson } from "./stored-record";
 
 const MAX_DATASETS = 100;
 const MAX_ANALYSIS_RECORDS = 10_000;
-const SUPPORTED_DURATIONS = new Set([300, 10_080]);
 
 interface DatasetRow {
   dataset_id: string;
@@ -82,12 +83,7 @@ function seedKey(row: TrackSeed): string {
 }
 
 function quotaTransport(row: AnalysisRecordRow): QuotaTransportRecord | null {
-  try {
-    const value = JSON.parse(row.record_json) as QuotaTransportRecord;
-    return value && typeof value === "object" ? value : null;
-  } catch {
-    return null;
-  }
+  return parseStoredRecordJson(row.record_json) as QuotaTransportRecord | null;
 }
 
 function rollingForLatestForecast(
@@ -206,7 +202,7 @@ export async function accountScopedQuotaAnalysis(
   for (const row of quota) {
     if (!row.plan_type || !row.plan_variant || !row.limit_id
         || !row.window_duration_minutes
-        || !SUPPORTED_DURATIONS.has(row.window_duration_minutes)) continue;
+        || !isSupportedQuotaWindowDuration(row.window_duration_minutes)) continue;
     const seed = {
       accountTrackId: row.account_track_id,
       provider: row.provider,

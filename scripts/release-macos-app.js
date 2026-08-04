@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RELEASE_MANIFEST } from "../config/release-manifest.js";
 import { releaseMacOSApp } from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -23,10 +24,20 @@ function parseArguments(argv) {
       throw new Error(`Unknown or repeated argument: ${argument}`);
     }
   }
-  if (!appPath || !output) {
-    throw new Error("--app and --output are required");
+  if (!appPath) {
+    throw new Error("--app is required");
   }
-  return { appPath, output, replace };
+  return {
+    appPath,
+    output: output ?? resolve(
+      join(
+        ".release-build",
+        "macos-release",
+        RELEASE_MANIFEST.macOS.arm64DmgFileName,
+      ),
+    ),
+    replace,
+  };
 }
 
 export async function main(argv) {

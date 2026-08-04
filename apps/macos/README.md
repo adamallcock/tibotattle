@@ -268,18 +268,22 @@ process environment:
 ```bash
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION='Developer ID Application: APPROVED OWNER (TEAMID1234)'
 export USAGE_MONITOR_NOTARY_PROFILE='usage-monitor-notary'
-export USAGE_MONITOR_PRODUCTION_ORIGIN='https://REPLACE-WITH-APPROVED-HOST'
 export USAGE_MONITOR_BUNDLE_VERSION='1'
 export USAGE_MONITOR_SPARKLE_FRAMEWORK="$PWD/.release-deps/Sparkle.framework"
-export USAGE_MONITOR_SPARKLE_APPCAST_URL='https://REPLACE-WITH-APPROVED-HOST/appcast.xml'
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY='REPLACE_WITH_32_BYTE_BASE64_PUBLIC_KEY='
 npm run product:macos:release
 ```
 
+`config/deployment-endpoints.js` is the reviewed source for the public origin
+and Sparkle appcast. Legacy `USAGE_MONITOR_PRODUCTION_ORIGIN` and
+`USAGE_MONITOR_SPARKLE_APPCAST_URL` values are accepted only when they exactly
+match that manifest, so an independent release-time endpoint cannot slip in.
+
 The release command:
 
-1. requires the operator to repeat the exact approved origin and monotonic
-   bundle version independently of the candidate;
+1. derives the exact approved origin and appcast from the reviewed deployment
+   endpoint manifest and requires a monotonic bundle version independently of
+   the candidate;
 2. verifies every regular candidate payload file, mode, size, and digest against the
    build inventory, rejects unlisted entries and symbolic links, and
    normalizes only the three expected Mach-O signature envelopes;

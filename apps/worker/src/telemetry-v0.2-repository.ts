@@ -9,6 +9,7 @@ import {
   type TelemetryContributionV02,
 } from "./telemetry-v0.2";
 import { ApiError } from "./errors";
+import { parseStoredRecordJson } from "./stored-record";
 
 export interface TelemetryV02Insert {
   participantId: string;
@@ -105,12 +106,11 @@ async function assertOccurrenceCompatibility(
       record_json?: unknown;
     } | undefined;
     if (!found) continue;
-    let storedCanonical = "";
-    try {
-      storedCanonical = canonicalJson(JSON.parse(String(found.record_json)));
-    } catch {
+    const storedRecord = parseStoredRecordJson(found.record_json);
+    if (!storedRecord) {
       throw new ApiError(409, "TELEMETRY_OCCURRENCE_CONFLICT");
     }
+    const storedCanonical = canonicalJson(storedRecord);
     const expected = incoming[index]!;
     if (found.account_track_id !== expected.accountTrackId
         || found.policy_epoch !== expected.policyEpoch

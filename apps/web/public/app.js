@@ -3,6 +3,8 @@ import {
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
   LocalCompanionClient,
+  CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
   normalizeCommunitySnapshot,
   normalizeParticipantHistory,
@@ -41,8 +43,10 @@ import {
   finite,
   formatAge,
   formatLocal,
-  localCalendarParts,
-  USER_TIME_ZONE,
+  formatNumber,
+  formatReportingTime,
+  reportingCalendarParts,
+  REPORTING_TIME_ZONE,
 } from "./ui-format.js";
 
 const localClient = new LocalCompanionClient();
@@ -99,7 +103,7 @@ let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
-const LOCAL_CALENDAR_PARTS = localCalendarParts();
+const REPORTING_CALENDAR_PARTS = reportingCalendarParts();
 
 const $ = (selector) => document.querySelector(selector);
 const { clear, node } = createDomHelpers(document);
@@ -215,24 +219,24 @@ function formatMoney(value, digits = 0) {
   const number = finite(value);
   return number === null
     ? "—"
-    : new Intl.NumberFormat("en-US", {
+    : formatNumber(number, {
         style: "currency",
         currency: "USD",
         minimumFractionDigits: digits,
         maximumFractionDigits: digits
-      }).format(number);
+      });
 }
 
 function formatApiMoney(value) {
   const number = finite(value);
   if (number === null) return "—";
   if (number > 0 && number < .01) return "<$0.01";
-  return new Intl.NumberFormat("en-US", {
+  return formatNumber(number, {
     style: "currency",
     currency: "USD",
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
-  }).format(number);
+  });
 }
 
 function formatPercent(value, digits = 0) {
@@ -308,14 +312,6 @@ function informationLabel(label, explanation) {
 function formatPp(value, digits = 1) {
   const number = finite(value);
   return number === null ? "—" : `${number.toFixed(digits)} pp`;
-}
-
-function formatUtc(value, { dateOnly = false } = {}) {
-  if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
-  return new Intl.DateTimeFormat("en-US", dateOnly
-    ? { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }
-    : { timeZone: "UTC", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }
-  ).format(new Date(value));
 }
 
 const COMPONENT_LABELS = Object.freeze({
@@ -818,13 +814,6 @@ const SHARE_CARD_WINDOW_LABELS = Object.freeze({
   seven_day: "seven-day allowance",
 });
 const SHARE_CARD_UNKNOWN_PERIOD = "the recorded period";
-const SHARE_CARD_DATE_FORMAT = new Intl.DateTimeFormat("en-US", {
-  ...(USER_TIME_ZONE === "local time" ? {} : { timeZone: USER_TIME_ZONE }),
-  month: "short",
-  day: "numeric",
-  year: "numeric",
-});
-
 let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
@@ -883,8 +872,8 @@ function shareCardHome() {
 function shareCardWindowKind(window) {
   if (!isPrimaryCodexQuotaWindow(window)) return "other";
   const minutes = finite(window?.durationMinutes);
-  if (minutes === 10_080) return "seven_day";
-  if (minutes === 300) return "five_hour";
+  if (minutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "seven_day";
+  if (minutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "five_hour";
   return "other";
 }
 
@@ -915,7 +904,9 @@ function shareCardPeriodLabel(candidate) {
  * a time of day and any raw-log timestamp.
  */
 function shareCardDateLabel(timestamp) {
-  return Number.isFinite(timestamp) ? SHARE_CARD_DATE_FORMAT.format(timestamp) : "";
+  return Number.isFinite(timestamp)
+    ? formatReportingTime(timestamp, { dateOnly: true })
+    : "";
 }
 
 /**
@@ -2014,7 +2005,7 @@ function groupedUsageTimeline(data) {
       key = `hour:${sortMs}`;
     } else {
       const parts = Object.fromEntries(
-        LOCAL_CALENDAR_PARTS.formatToParts(timestamp)
+        REPORTING_CALENDAR_PARTS.formatToParts(timestamp)
           .filter((part) => part.type !== "literal")
           .map((part) => [part.type, part.value])
       );
@@ -2107,12 +2098,12 @@ function renderUsageTimeline(data) {
       }],
       secondaryYLabel: "Allowance remaining (%)",
       title: "Real local API-price-equivalent usage over time",
-      description: `Replay-safe local usage cost with provider-observed seven-day allowance remaining in ${USER_TIME_ZONE}.`,
+      description: `Replay-safe local usage cost with provider-observed seven-day allowance remaining in ${REPORTING_TIME_ZONE}.`,
       includeZero: true
     }));
   }
   $("#usage-timeline-copy").textContent =
-    `Replay-safe local increments · ${USER_TIME_ZONE} · event-time historical API cards`;
+    `Replay-safe local increments · ${REPORTING_TIME_ZONE} · event-time historical API cards`;
   const summary = $("#usage-timeline-summary");
   clear(summary);
   const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
@@ -2175,7 +2166,7 @@ function renderTimeline(data) {
     : `${activeWindowHours}-hour`;
   $("#timeline-chart-title").textContent = `${windowLabel} rolling quota change versus cost-implied change`;
   $("#timeline-chart-copy").textContent = usingLive
-    ? `Replay-safe local increments · ${USER_TIME_ZONE} chart axis · exact local and UTC times below`
+    ? `Replay-safe local increments · ${REPORTING_TIME_ZONE} chart axis · all displayed times use this reporting zone`
     : `Historical local calibration artifact from ${formatLocal(data.artifactStatus.gradient.generatedAt)} · recent quota snapshots are too sparse to bracket ${windowLabel} endpoints`;
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
@@ -2199,7 +2190,7 @@ function renderTimeline(data) {
       ],
       yLabel: "Percentage points",
       title: `${windowLabel} rolling quota movement`,
-      description: `Observed quota movement compared with movement implied by priced token usage. The horizontal axis is ${USER_TIME_ZONE}.`,
+      description: `Observed quota movement compared with movement implied by priced token usage. The horizontal axis is ${REPORTING_TIME_ZONE}.`,
       includeZero: true,
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
@@ -2239,7 +2230,7 @@ function bindTimelineInteractions(shell, points, viewport) {
   if (viewport === null) return;
   shell.classList.add("interactive-chart");
   shell.tabIndex = 0;
-  shell.setAttribute("aria-label", `Interactive quota timeline in ${USER_TIME_ZONE}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.`);
+  shell.setAttribute("aria-label", `Interactive quota timeline in ${REPORTING_TIME_ZONE}. Use plus or minus to zoom, arrow keys to pan, Home to reset, or drag horizontally.`);
   const status = $("#timeline-zoom-status");
   status.textContent = `Timeline shows ${formatLocal(new Date(viewport.startMs).toISOString())} through ${formatLocal(new Date(viewport.endMs).toISOString())}, a span of ${formatSpanLength(viewport.endMs - viewport.startMs)}.`;
   shell.onwheel = (event) => {
@@ -2387,6 +2378,10 @@ function renderResidualCoverage(rows, computed) {
 }
 
 function renderResiduals(data, points, viewport = null) {
+  const timeHeading = $("#residual-time-heading");
+  if (timeHeading) {
+    timeHeading.textContent = `Reported time (${REPORTING_TIME_ZONE})`;
+  }
   const residuals = residualRows(data, points);
   const computed = residuals.filter((row) => row.residual !== null);
   // The residual axis is pinned to the calibration chart's own domain so a
@@ -2438,7 +2433,7 @@ function renderResiduals(data, points, viewport = null) {
       ? null
       : item.residual;
     row.append(
-      node("td", "", `${formatLocal(item.timestamp)} · ${formatUtc(item.timestamp)}`),
+      node("td", "", formatReportingTime(item.timestamp)),
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
       node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? "Not comparable" : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
@@ -2570,7 +2565,7 @@ function lineChart({
         tick.alignment ?? "middle",
       ));
     }
-    svg.append(svgText(width / 2, height - 6, USER_TIME_ZONE, "chart-axis-label", "middle"));
+    svg.append(svgText(width / 2, height - 6, REPORTING_TIME_ZONE, "chart-axis-label", "middle"));
   } else {
     const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
     for (const index of labelIndexes) {
@@ -2979,12 +2974,291 @@ function renderAllowanceHistoryChart(history) {
     yTickFormat: (value, digits) => formatMoney(value, digits),
     yLabel: "7-day allowance ($)",
     title: "Seven-day allowance estimate history",
-    description: `One dot per distinct seven-day reset estimate, plotted when observed in ${USER_TIME_ZONE}. Filled dots use at least ${WEEKLY_WELL_OBSERVED_SPAN_PP} displayed percentage points; outlined dots are shorter observations. Each vertical bar is that reset's measured range.`,
+    description: `One dot per distinct seven-day reset estimate, plotted when observed in ${REPORTING_TIME_ZONE}. Filled dots use at least ${WEEKLY_WELL_OBSERVED_SPAN_PP} displayed percentage points; outlined dots are shorter observations. Each vertical bar is that reset's measured range.`,
   });
+}
+
+// The local pace engine is deliberately optional. Older companions and
+// community/demo payloads do not carry this field, so the card is mounted
+// lazily and remains hidden unless the engine returns current, safe weekly
+// allowance evidence. One clean observation gets a quiet collecting state;
+// this presentation never calls the allowance "tokens" and does not turn a
+// pace estimate into a probability.
+function firstFiniteForecastNumber(...values) {
+  for (const value of values) {
+    const number = finite(value);
+    if (number !== null) return number;
+  }
+  return null;
+}
+
+function forecastTimestamp(...values) {
+  for (const value of values) {
+    if (value instanceof Date && Number.isFinite(value.valueOf())) {
+      return value.valueOf();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.length > 0) {
+      const timestamp = Date.parse(value);
+      if (Number.isFinite(timestamp)) return timestamp;
+    }
+  }
+  return null;
+}
+
+function formatForecastDuration(hours) {
+  const value = finite(hours);
+  if (value === null || value <= 0) return null;
+  const totalMinutes = Math.max(1, Math.ceil(value * 60));
+  const days = Math.floor(totalMinutes / 1_440);
+  const remainingHours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${remainingHours}h`;
+  if (remainingHours > 0) return `${remainingHours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function ensureWeeklyPaceForecastCard() {
+  const hero = $(".weekly-hero");
+  if (!hero?.parentNode) return null;
+  let card = $("#weekly-pace-forecast");
+  if (!card) {
+    card = node("aside", "weekly-pace-forecast");
+    card.id = "weekly-pace-forecast";
+    card.setAttribute("aria-live", "polite");
+    card.setAttribute("aria-atomic", "true");
+    hero.parentNode.insertBefore(card, hero.nextSibling);
+  }
+  return card;
+}
+
+function weeklyPaceDirection(percentagePointsPerHour, baseline = null) {
+  const pace = finite(percentagePointsPerHour);
+  const steady = firstFiniteForecastNumber(
+    baseline,
+    // A seven-day allowance paced evenly across its full window is the only
+    // baseline this card can derive without inventing a user schedule.
+    100 / (CODEX_WEEKLY_ALLOWANCE_MINUTES / 60),
+  );
+  if (pace === null || steady === null || steady <= 0) return null;
+  if (pace > steady * 1.1) return "Recent pace is ahead of a steady weekly pace.";
+  if (pace < steady * .9) return "Recent pace is behind a steady weekly pace.";
+  return "Recent pace is close to a steady weekly pace.";
+}
+
+function renderWeeklyPaceForecast(data) {
+  const card = ensureWeeklyPaceForecastCard();
+  if (!card) return;
+  card.hidden = true;
+  card.className = "weekly-pace-forecast";
+  card.removeAttribute("aria-labelledby");
+  clear(card);
+
+  const forecast = data?.weekly?.paceForecast;
+  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return;
+  const pace = forecast.pace && typeof forecast.pace === "object"
+    ? forecast.pace
+    : {};
+  const rawStatus = String(forecast.status ?? forecast.state ?? "")
+    .trim()
+    .toLowerCase();
+  const status = rawStatus === "reset_before_exhaustion"
+    ? "will_reach_reset_first"
+    : rawStatus;
+  const resetAt = forecastTimestamp(
+    forecast.resetsAt,
+    forecast.resetAt,
+    forecast.reset_at,
+  );
+  const now = Date.now();
+  if (resetAt === null || resetAt <= now) return;
+
+  let remaining = firstFiniteForecastNumber(
+    forecast.remainingPercent,
+    forecast.remaining_percentage,
+    forecast.currentRemainingPercent,
+  );
+  const used = firstFiniteForecastNumber(
+    forecast.currentUsedPercent,
+    forecast.usedPercent,
+    forecast.current_used_percent,
+  );
+  if (remaining === null && used !== null) remaining = 100 - used;
+  if (remaining !== null && (remaining < 0 || remaining > 100)) remaining = null;
+
+  const percentagePointsPerHour = firstFiniteForecastNumber(
+    pace.percentagePointsPerHour,
+    pace.percentPerHour,
+    pace.pacePercentPerHour,
+    forecast.percentagePointsPerHour,
+    forecast.pacePercentPerHour,
+    forecast.pacePpPerHour,
+  );
+  const hoursToReset = firstFiniteForecastNumber(
+    (resetAt - now) / 3_600_000,
+    forecast.hoursToReset,
+    forecast.resetHours,
+  );
+  const suppliedHoursToExhaustion = firstFiniteForecastNumber(
+    forecast.hoursToExhaustion,
+    forecast.hoursToAllowance,
+    forecast.etaHours,
+  );
+  let etaAt = forecastTimestamp(
+    forecast.etaAt,
+    forecast.exhaustionAt,
+    forecast.allowanceAt,
+  );
+  if (etaAt === null && suppliedHoursToExhaustion !== null && suppliedHoursToExhaustion > 0) {
+    etaAt = now + suppliedHoursToExhaustion * 3_600_000;
+  }
+  const available = status === "available"
+    || (status === "" && etaAt !== null && percentagePointsPerHour !== null);
+  const reachesResetFirst = status === "will_reach_reset_first"
+    || status === "reset_before_exhaustion";
+  const paceIntervals = firstFiniteForecastNumber(pace.sampleCount);
+  const observations = firstFiniteForecastNumber(
+    forecast.observationCount,
+    forecast.observations,
+    forecast.sampleCount,
+    paceIntervals === null ? null : paceIntervals + 1,
+  );
+  const paceElapsedHours = firstFiniteForecastNumber(pace.elapsedHours);
+  // A single trusted snapshot cannot establish a rate, but it is useful to
+  // say why the forecast is not visible yet. Do not surface an unbounded or
+  // otherwise unusable engine result as a generic empty state.
+  const collectingEvidence = status === "insufficient_observations"
+    && observations === 1;
+  const earlyEstimate = available && (
+    (observations !== null && observations <= 2)
+    || (paceElapsedHours !== null && paceElapsedHours < 1)
+  );
+  // A contradiction between the status and dates is an integration error, not
+  // a reason to show a confident-looking card. Wait for the next refresh.
+  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return;
+  if (!available && !reachesResetFirst && !collectingEvidence) return;
+  if (collectingEvidence && remaining === null) return;
+  if (!collectingEvidence
+      && remaining === null
+      && percentagePointsPerHour === null
+      && !reachesResetFirst) return;
+
+  const title = node("h3", "weekly-pace-forecast-title");
+  const cardId = "weekly-pace-forecast-title";
+  title.id = cardId;
+  title.textContent = collectingEvidence
+    ? "Pace estimate ready after one more refresh"
+    : reachesResetFirst
+      ? "At the recent pace, the weekly allowance should last to reset"
+      : etaAt === null
+        ? "At this pace: weekly allowance exhaustion is approaching"
+        : `At this pace: reaches weekly allowance ${formatReportingTime(etaAt)}`;
+  card.setAttribute("aria-labelledby", cardId);
+
+  const heading = node("div", "weekly-pace-forecast-heading");
+  heading.append(
+    node(
+      "p",
+      "panel-kicker",
+      collectingEvidence ? "Collecting forecast evidence" : "Forecast from recent pace",
+    ),
+    node(
+      "span",
+      collectingEvidence
+        ? "evidence-chip weekly-pace-forecast-collecting-chip"
+        : earlyEstimate
+          ? "evidence-chip weekly-pace-forecast-early-chip"
+          : "evidence-chip",
+      collectingEvidence ? "One more refresh" : earlyEstimate ? "Early estimate" : "Observed pace",
+    ),
+  );
+
+  const direction = weeklyPaceDirection(
+    percentagePointsPerHour,
+    firstFiniteForecastNumber(
+      pace.steadyPercentagePointsPerHour,
+      forecast.steadyPercentagePointsPerHour,
+    ),
+  );
+  const copy = node("p", "weekly-pace-forecast-copy");
+  copy.textContent = collectingEvidence
+    ? "One clean weekly allowance observation is saved. The next fresh observation for this account and reset will establish its pace."
+    : earlyEstimate
+      ? "This is an early estimate from a small amount of recent evidence; it will settle as more observations arrive."
+      : direction ?? (reachesResetFirst
+        ? "Recent allowance movement is not fast enough to exhaust this window before its reset."
+        : "The estimate uses the latest clean allowance observations.");
+
+  const metrics = node("div", "weekly-pace-forecast-metrics");
+  if (remaining !== null) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric", "Allowance left"),
+    );
+    const item = metrics.lastElementChild;
+    item.replaceChildren(
+      node("span", "", "Allowance left"),
+      node("strong", "", formatPercent(remaining)),
+    );
+  }
+  const resetDuration = formatForecastDuration(hoursToReset);
+  if (resetDuration) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric"),
+    );
+    const item = metrics.lastElementChild;
+    item.append(
+      node("span", "", "Reset"),
+      node("strong", "", `in ${resetDuration}`),
+    );
+  }
+  if (collectingEvidence) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric"),
+    );
+    const item = metrics.lastElementChild;
+    item.append(
+      node("span", "", "Evidence"),
+      node("strong", "", "1 saved"),
+    );
+  } else if (percentagePointsPerHour !== null && percentagePointsPerHour > 0) {
+    metrics.append(
+      node("div", "weekly-pace-forecast-metric"),
+    );
+    const item = metrics.lastElementChild;
+    const digits = percentagePointsPerHour >= 10 ? 1 : 2;
+    item.append(
+      node("span", "", "Recent pace"),
+      node("strong", "", `${percentagePointsPerHour.toFixed(digits)} pp/hour`),
+    );
+  }
+
+  const observationDuration = formatForecastDuration(paceElapsedHours);
+  const evidence = observations !== null && observations >= 1
+    ? node(
+      "p",
+      "weekly-pace-forecast-evidence",
+      collectingEvidence
+        ? "One fresh allowance observation is saved for this weekly reset."
+        : `Based on ${Math.round(observations)} recent allowance observation${Math.round(observations) === 1 ? "" : "s"}${observationDuration ? ` over ${observationDuration}` : ""}.`,
+    )
+    : null;
+  card.className = [
+    "weekly-pace-forecast",
+    collectingEvidence
+      ? "is-insufficient"
+      : reachesResetFirst
+        ? "is-reset-first"
+        : "is-available",
+    earlyEstimate ? "is-early-estimate" : "",
+  ].filter(Boolean).join(" ");
+  card.append(heading, title, copy, metrics);
+  if (evidence) card.append(evidence);
+  card.hidden = false;
 }
 
 function renderWeekly(data) {
   renderWeeklyPricingReceipt(data);
+  renderWeeklyPaceForecast(data);
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
@@ -5365,7 +5639,7 @@ function renderSelectedContributionInspection(file, payload) {
     "The closed-schema browser preflight passed. Expand the review below before consenting.";
   $("#selected-contribution-schema").textContent = payload.schemaVersion;
   $("#selected-contribution-bytes").textContent =
-    `${new Intl.NumberFormat("en-US").format(file.size)} bytes`;
+    `${formatNumber(file.size)} bytes`;
   $("#selected-contribution-usage").textContent = compact(usageRows);
   $("#selected-contribution-quota").textContent = compact(quotaRows);
   $("#selected-contribution-json").textContent = JSON.stringify(payload, null, 2);
@@ -5652,7 +5926,7 @@ function renderAccountScopedQuotaAnalysis(container, analysis) {
   const grid = node("div", "pricing-basis-grid");
   for (const track of analysis.tracks) {
     const card = node("article", "basis-card");
-    const windowLabel = track.windowDurationMinutes === 10_080
+    const windowLabel = track.windowDurationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES
       ? "Seven-day allowance"
       : "Five-hour allowance";
     const estimate = track.latestCapacityUsd === null
@@ -5733,7 +6007,11 @@ function renderParticipantQuotaMovement(container, movement) {
   const title = node("div");
   title.append(
     node("h4", "", "Private rolling quota movement"),
-    node("p", "", "Observed quota decrease versus movement implied by server-repriced API equivalent, bucketed in UTC.")
+    node(
+      "p",
+      "",
+      `The server calculates fixed-duration windows from UTC instants; this report displays them in ${REPORTING_TIME_ZONE}.`,
+    )
   );
   heading.append(title, node("span", "private-chip", "Private result"));
   section.append(heading);
@@ -5799,11 +6077,11 @@ function renderParticipantQuotaMovement(container, movement) {
       const caption = node(
         "caption",
         "sr-only",
-        `${smoothingHours}-hour private rolling quota movement in UTC`
+        `${smoothingHours}-hour private rolling quota movement reported in ${REPORTING_TIME_ZONE}`
       );
       const thead = document.createElement("thead");
       const header = document.createElement("tr");
-      for (const label of ["Window ending (UTC)", "Observed", "Expected", "Difference", "API equivalent", "Events"]) {
+      for (const label of [`Window ending (${REPORTING_TIME_ZONE})`, "Observed", "Expected", "Difference", "API equivalent", "Events"]) {
         const th = document.createElement("th");
         th.scope = "col";
         th.textContent = label;

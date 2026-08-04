@@ -110,6 +110,7 @@ async function fixture() {
   await writeFile(join(source, "community.html"), sourceHtml());
   await writeFile(join(source, "community.js"), "console.log('safe');\n");
   await writeFile(join(source, "community-view.js"), "export const safeView = true;\n");
+  await writeFile(join(source, "i18n.generated.js"), "export const safeI18n = true;\n");
   await writeFile(join(source, "styles.css"), "body { color: green; }\n");
   await writeFile(join(source, "tibotattle-icon.png"), "reviewed public brand asset\n");
   await writeFile(join(source, "ui-format.js"), "export const safeFormat = true;\n");
@@ -245,7 +246,7 @@ test("release-site build verifies artifacts and materializes complete public met
     },
   });
 
-  assert.equal(result.fileCount, 9);
+  assert.equal(result.fileCount, 10);
   assert.deepEqual(validatedArtifacts, [[
     value.installerPath,
     { production: true },
@@ -326,6 +327,7 @@ test("release-site build verifies artifacts and materializes complete public met
     [
       "community-view.js",
       "community.js",
+      "i18n.generated.js",
       "index.html",
       "robots.txt",
       "social-preview.png",
@@ -344,6 +346,7 @@ test("release-site build verifies artifacts and materializes complete public met
     [
       "community-view.js",
       "community.js",
+      "i18n.generated.js",
       "index.html",
       "release-site-manifest.json",
       "robots.txt",
@@ -482,7 +485,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 9);
+  assert.equal(result.fileCount, 10);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -493,6 +496,7 @@ test("checked-in public source satisfies the complete release contract", async (
     [
       "community-view.js",
       "community.js",
+      "i18n.generated.js",
       "index.html",
       "robots.txt",
       "social-preview.png",

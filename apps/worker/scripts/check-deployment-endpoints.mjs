@@ -37,6 +37,12 @@ export const WORKER_TYPES_PATH = join(
   "worker",
   "worker-configuration.d.ts",
 );
+export const WORKER_PACKAGE_PATH = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "worker",
+  "package.json",
+);
 export const MACOS_BUILD_PATH = join(
   REPOSITORY_ROOT,
   "scripts",
@@ -160,6 +166,36 @@ export function validateDeploymentEndpointConsumers({
   });
 }
 
+export function validateWorkerDeploymentEndpointGates(workerPackage) {
+  const scripts = workerPackage?.scripts;
+  if (!scripts || typeof scripts !== "object"
+      || scripts["deployment:endpoints:check"]
+        !== "node ./scripts/check-deployment-endpoints.mjs") {
+    fail("Worker package must expose the deployment endpoint checker");
+  }
+  for (const script of [
+    "deploy:dry",
+    "production:deploy",
+    "production:deploy:dry",
+    "staging:check",
+    "staging:deploy",
+  ]) {
+    if (typeof scripts[script] !== "string"
+        || !scripts[script].includes("npm run deployment:endpoints:check")) {
+      fail(`${script} must run the deployment endpoint checker before Wrangler`);
+    }
+  }
+  return Object.freeze({
+    checkedScripts: Object.freeze([
+      "deploy:dry",
+      "production:deploy",
+      "production:deploy:dry",
+      "staging:check",
+      "staging:deploy",
+    ]),
+  });
+}
+
 function parseWranglerConfiguration(text) {
   const errors = [];
   const configuration = parse(text, errors, {
@@ -174,9 +210,23 @@ function parseWranglerConfiguration(text) {
   return configuration;
 }
 
+function parseWorkerPackage(text) {
+  try {
+    const workerPackage = JSON.parse(text);
+    if (!workerPackage || typeof workerPackage !== "object") {
+      fail("apps/worker/package.json must be a JSON object");
+    }
+    return workerPackage;
+  } catch (error) {
+    if (error?.code === "DEPLOYMENT_ENDPOINTS_MISMATCH") throw error;
+    fail("apps/worker/package.json is invalid JSON");
+  }
+}
+
 export async function checkDeploymentEndpointConsumers({
   wranglerConfigPath = WRANGLER_CONFIG_PATH,
   workerTypesPath = WORKER_TYPES_PATH,
+  workerPackagePath = WORKER_PACKAGE_PATH,
   macOSBuildPath = MACOS_BUILD_PATH,
   macOSReleaseCorePath = MACOS_RELEASE_CORE_PATH,
   macOSNativeSourcePath = MACOS_NATIVE_SOURCE_PATH,
@@ -186,6 +236,7 @@ export async function checkDeploymentEndpointConsumers({
   const [
     wranglerText,
     workerTypes,
+    workerPackageText,
     buildSource,
     macOSReleaseSource,
     nativeSource,
@@ -193,6 +244,7 @@ export async function checkDeploymentEndpointConsumers({
   ] = await Promise.all([
     readFile(wranglerConfigPath, "utf8"),
     readFile(workerTypesPath, "utf8"),
+    readFile(workerPackagePath, "utf8"),
     readFile(macOSBuildPath, "utf8"),
     readFile(macOSReleaseCorePath, "utf8"),
     readFile(macOSNativeSourcePath, "utf8"),
@@ -210,7 +262,10 @@ export async function checkDeploymentEndpointConsumers({
     workerTypes,
     endpoints,
   });
-  return Object.freeze({ ...consumers, worker });
+  const gates = validateWorkerDeploymentEndpointGates(
+    parseWorkerPackage(workerPackageText),
+  );
+  return Object.freeze({ ...consumers, gates, worker });
 }
 
 async function main() {

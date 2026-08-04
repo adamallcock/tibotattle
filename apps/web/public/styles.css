@@ -982,6 +982,98 @@ tbody tr:last-child td { border-bottom: 0; }
 .weekly-hero span, .weekly-hero small { color: rgba(255,255,255,.7); font-size: .72rem; }
 .weekly-hero > div:first-child strong { margin: .2rem 0; font-family: var(--serif); font-size: clamp(3rem, 6vw, 5rem); font-weight: 400; line-height: 1; }
 .weekly-hero > p { max-width: 55ch; margin: 0; color: rgba(255,255,255,.8); font-size: .86rem; line-height: 1.5; }
+.weekly-pace-forecast {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(250px, .65fr);
+  gap: 15px 24px;
+  align-items: start;
+  margin: 0 0 18px;
+  padding: 20px 22px;
+  border: 1px solid rgba(38, 107, 91, .26);
+  border-left: 4px solid var(--green);
+  border-radius: .5rem;
+  background: linear-gradient(100deg, rgba(221, 239, 233, .75), rgba(255, 253, 247, .94));
+}
+.weekly-pace-forecast[hidden] { display: none; }
+.weekly-pace-forecast.is-reset-first {
+  border-left-color: var(--blue);
+  border-color: rgba(49, 95, 132, .24);
+  background: linear-gradient(100deg, rgba(226, 235, 243, .76), rgba(255, 253, 247, .94));
+}
+.weekly-pace-forecast.is-insufficient {
+  border-left-color: var(--blue);
+  border-color: rgba(49, 95, 132, .24);
+  background: linear-gradient(100deg, rgba(226, 235, 243, .76), rgba(255, 253, 247, .94));
+}
+.weekly-pace-forecast-collecting-chip {
+  color: var(--blue);
+  border-color: rgba(49, 95, 132, .18);
+  background: var(--blue-soft);
+}
+.weekly-pace-forecast-early-chip {
+  color: var(--amber);
+  border-color: rgba(154, 106, 36, .2);
+  background: var(--amber-soft);
+}
+.weekly-pace-forecast-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  grid-column: 1 / -1;
+}
+.weekly-pace-forecast-heading .panel-kicker { margin: 0; }
+.weekly-pace-forecast-title {
+  grid-column: 1;
+  margin: 0;
+  font-size: clamp(1.15rem, 2vw, 1.55rem);
+  line-height: 1.25;
+}
+.weekly-pace-forecast-copy {
+  grid-column: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: .78rem;
+  line-height: 1.5;
+}
+.weekly-pace-forecast-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-column: 2;
+  grid-row: 2 / span 2;
+  gap: 8px;
+  align-self: stretch;
+}
+.weekly-pace-forecast-metric {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: .35rem;
+  background: rgba(255, 255, 255, .72);
+}
+.weekly-pace-forecast-metric span {
+  color: var(--muted);
+  font-size: .62rem;
+  line-height: 1.25;
+  text-transform: uppercase;
+  letter-spacing: .045em;
+}
+.weekly-pace-forecast-metric strong {
+  margin-top: 5px;
+  color: var(--ink);
+  font-size: .88rem;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.weekly-pace-forecast-evidence {
+  grid-column: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: .67rem;
+}
 .weekly-pricing-receipt {
   display: grid;
   grid-template-columns: minmax(190px, .42fr) minmax(0, 1fr);
@@ -1590,7 +1682,7 @@ footer {
   */
   .topbar .button.compact { display: none; }
   .dashboard-sidebar { padding-inline: 14px; }
-  .page-heading, .section-heading, .section-heading.split, .weekly-hero, .weekly-pricing-receipt, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
+  .page-heading, .section-heading, .section-heading.split, .weekly-hero, .weekly-pace-forecast, .weekly-pricing-receipt, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
   .companion-setup-actions { grid-column: 1; }
   .journey-disclosure > summary { align-items: flex-start; flex-direction: column; }
   .journey-disclosure > .data-panels,
@@ -1616,6 +1708,7 @@ footer {
   .comparison-row { grid-template-columns: 1fr auto; }
   .comparison-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
   .chart-summary-grid { grid-template-columns: 1fr 1fr; }
+  .weekly-pace-forecast-metrics { grid-column: 1; grid-row: auto; }
   .calibration-facts { grid-template-columns: 1fr; }
   .calibration-facts div { border-right: 0; border-bottom: 1px solid var(--line); }
   .calibration-facts div:last-child { border-bottom: 0; }

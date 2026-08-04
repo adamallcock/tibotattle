@@ -21,6 +21,13 @@ const DEFAULT_MAXIMUM_ATTEMPTS = 8;
 const DEFAULT_LEASE_MILLISECONDS = 10 * 60 * 1000;
 const DEFAULT_MAXIMUM_JOBS_PER_PASS = 25;
 const MAXIMUM_JOBS_PER_PASS = 100;
+const RETRY_BACKOFF_POLICY = Object.freeze({
+  initialDelayMilliseconds: 5_000,
+  maximumDelayMilliseconds: 3_600_000,
+  minimumDelayMilliseconds: 1_000,
+  jitterMinimumMultiplier: 0.75,
+  jitterMaximumMultiplier: 1.25,
+});
 const MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024;
 const DEFAULT_MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 16 * 1024 * 1024;
 const MAXIMUM_RESERVED_UPLOAD_BYTES_PER_PASS = 256 * 1024 * 1024;
@@ -424,9 +431,21 @@ function boundedErrorCode(error, fallback) {
 }
 
 function retryDelayMilliseconds(attemptCount, random) {
-  const base = Math.min(3_600_000, 5000 * (2 ** Math.max(0, attemptCount - 1)));
-  const jitter = 0.75 + (Math.min(1, Math.max(0, random())) * 0.5);
-  return Math.max(1000, Math.round(base * jitter));
+  const base = Math.min(
+    RETRY_BACKOFF_POLICY.maximumDelayMilliseconds,
+    RETRY_BACKOFF_POLICY.initialDelayMilliseconds
+      * (2 ** Math.max(0, attemptCount - 1)),
+  );
+  const boundedRandom = Math.min(1, Math.max(0, random()));
+  const jitter = RETRY_BACKOFF_POLICY.jitterMinimumMultiplier
+    + (boundedRandom * (
+      RETRY_BACKOFF_POLICY.jitterMaximumMultiplier
+      - RETRY_BACKOFF_POLICY.jitterMinimumMultiplier
+    ));
+  return Math.max(
+    RETRY_BACKOFF_POLICY.minimumDelayMilliseconds,
+    Math.round(base * jitter),
+  );
 }
 
 function entryForJob(set, job) {
@@ -995,6 +1014,7 @@ const CONTRIBUTION_SYNC_QUEUE_LIMITS = Object.freeze({
   leaseMilliseconds: DEFAULT_LEASE_MILLISECONDS,
   maximumJobsPerPass: DEFAULT_MAXIMUM_JOBS_PER_PASS,
   maximumJobsPerPassAllowed: MAXIMUM_JOBS_PER_PASS,
+  retryBackoffPolicy: RETRY_BACKOFF_POLICY,
   minimumReservedUploadBytesPerPass:
     MINIMUM_RESERVED_UPLOAD_BYTES_PER_PASS,
   maximumReservedUploadBytesPerPass:
@@ -1045,6 +1065,7 @@ export function createLocalContributionSyncQueueContext({
     CONTRIBUTION_SYNC_QUEUE_LIMITS,
     CONTRIBUTION_SYNC_QUEUE_SCHEMA,
     CONTRIBUTION_SYNC_STATUS_SCHEMA,
+    RETRY_BACKOFF_POLICY,
     ContributionSyncQueueError,
     conservativeUploadReservationBytes,
     defaultContributionSyncQueueFile: () =>

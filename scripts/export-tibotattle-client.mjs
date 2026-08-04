@@ -23,13 +23,14 @@ import {
 import { fileURLToPath } from "node:url";
 
 import { extractEsmImports } from "./lib/esm-imports.mjs";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
 export const CLIENT_EXPORT_SCHEMA = "tibotattle-client-export-v1";
 export const CLIENT_REPOSITORY_NAME = "tibotattle-client";
 export const CLIENT_PACKAGE_NAME = "app-usagemonitor";
-export const CLIENT_PACKAGE_VERSION = "0.1.0";
+export const CLIENT_PACKAGE_VERSION = RELEASE_VERSION;
 export const CLIENT_MANIFEST_FILE = "client-export-manifest.json";
 
 /**
@@ -41,7 +42,9 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "apps/local/server.js",
   "apps/local/static-assets.js",
   "apps/local/transport/participant-relay-routes.js",
+  "config/deployment-endpoints.js",
   "config/product-brand.js",
+  "config/release-manifest.js",
   "contracts/telemetry-v0.1/consent-status.json",
   "contracts/telemetry-v0.1/contract-status.json",
   "contracts/telemetry-v0.1/field-policy.json",
@@ -205,6 +208,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/storage.js",
   "src/telemetry-contribution-builder.js",
   "src/telemetry-prepared-set.js",
+  "src/weekly-pace-projection.js",
 ]);
 
 export const CLIENT_WEB_FILES = Object.freeze([
@@ -214,6 +218,7 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/community.js",
   "apps/web/public/data-client.js",
   "apps/web/public/index.html",
+  "apps/web/public/i18n.generated.js",
   "apps/web/public/install-cta.js",
   "apps/web/public/lib.js",
   "apps/web/public/navigation.js",
@@ -244,6 +249,9 @@ export const CLIENT_PACKAGE_FILES = Object.freeze([
   "packages/accounting/src/price-registry.js",
   "packages/accounting/src/subscription-speed.js",
   "packages/accounting/test/fixtures/accounting-parity-v0.1.json",
+  "packages/i18n/index.d.ts",
+  "packages/i18n/index.js",
+  "packages/i18n/package.json",
   "packages/identity-core/index.d.ts",
   "packages/identity-core/index.js",
   "packages/identity-core/package.json",
@@ -252,8 +260,10 @@ export const CLIENT_PACKAGE_FILES = Object.freeze([
   "packages/quota-analysis/index.js",
   "packages/quota-analysis/package.json",
   "packages/quota-analysis/src/quota-calibration.js",
+  "packages/quota-analysis/src/quota-pace-forecast.js",
   "packages/quota-analysis/src/quota-rolling.js",
   "packages/quota-analysis/src/quota-tracks.js",
+  "packages/quota-analysis/src/quota-windows.js",
   "packages/telemetry-contract/index.d.ts",
   "packages/telemetry-contract/index.js",
   "packages/telemetry-contract/package.json",
@@ -274,6 +284,7 @@ export const CLIENT_PACKAGE_FILES = Object.freeze([
 export const CLIENT_SCRIPT_FILES = Object.freeze([
   "scripts/build-macos-app.js",
   "scripts/build-native-network-audit.js",
+  "scripts/generate-i18n-browser-mirror.js",
   "scripts/generate-telemetry-browser-mirror.js",
   "scripts/generate-telemetry-contract.js",
   "scripts/lib/captured-utf8-source.mjs",
@@ -294,6 +305,7 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "apps/web/test/community-site.test.mjs",
   "apps/web/test/lib.test.mjs",
   "apps/web/test/navigation.test.mjs",
+  "apps/web/test/i18n-browser-parity.test.mjs",
   "apps/web/test/telemetry-shared-parity.test.mjs",
   "test/accounting-package-parity.test.js",
   "test/application-participant-identity.test.js",
@@ -753,6 +765,7 @@ function clientPackageManifest() {
     },
     dependencies: {
       "@app-usagemonitor/accounting": "workspace:*",
+      "@app-usagemonitor/i18n": "workspace:*",
       "@app-usagemonitor/identity-core": "workspace:*",
       "@app-usagemonitor/quota-analysis": "workspace:*",
       "@app-usagemonitor/telemetry-contract": "workspace:*",

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RELEASE_MANIFEST } from "../config/release-manifest.js";
 import {
   validateInstalledMacOSApp,
   validateMacOSDMG,
@@ -12,6 +13,7 @@ function parseArguments(argv) {
   let appPath = null;
   let dmgPath = null;
   let development = false;
+  let release = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--app" && appPath === null && index + 1 < argv.length) {
@@ -22,9 +24,27 @@ function parseArguments(argv) {
       dmgPath = resolve(argv[++index]);
     } else if (argument === "--development" && !development) {
       development = true;
+    } else if (argument === "--release" && !release) {
+      release = true;
     } else {
       throw new Error(`Unknown or repeated argument: ${argument}`);
     }
+  }
+  if (release && (appPath !== null || dmgPath !== null || development)) {
+    throw new Error("--release cannot be combined with an explicit target or --development");
+  }
+  if (release) {
+    return {
+      appPath: null,
+      dmgPath: resolve(
+        join(
+          ".release-build",
+          "macos-release",
+          RELEASE_MANIFEST.macOS.arm64DmgFileName,
+        ),
+      ),
+      production: true,
+    };
   }
   if ((appPath === null) === (dmgPath === null)) {
     throw new Error("Provide exactly one of --app or --dmg");

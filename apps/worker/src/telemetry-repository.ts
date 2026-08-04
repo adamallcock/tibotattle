@@ -13,6 +13,7 @@ import {
 } from "./server-pricing";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
 import { contributionQuarantineLifecycle } from "./contribution-lifecycle";
+import { parseStoredRecordJson } from "./stored-record";
 import type {
   TelemetryActivityMarker,
   TelemetryContribution,
@@ -1207,15 +1208,10 @@ export function buildRollingQuotaMovement(
     };
   }
   const quota = quotaRows.map((row) => {
-    let receivedAt = Number.NaN;
-    try {
-      const record = JSON.parse(row.record_json) as { receivedTime?: unknown };
-      receivedAt = typeof record.receivedTime === "string"
-        ? Date.parse(record.receivedTime)
-        : Number.NaN;
-    } catch {
-      receivedAt = Number.NaN;
-    }
+    const record = parseStoredRecordJson(row.record_json);
+    const receivedAt = typeof record?.receivedTime === "string"
+      ? Date.parse(record.receivedTime)
+      : Number.NaN;
     return {
       at: Date.parse(row.observed_at),
       receivedAt,
@@ -1683,7 +1679,10 @@ export async function personalStats(db: D1Database, participantId: string): Prom
         ? "server_repriced"
         : "server_repricing_unavailable_for_legacy_records",
     })),
-    latestQuota: latestQuota.results.map((row) => JSON.parse(row.record_json) as unknown),
+    latestQuota: latestQuota.results.flatMap((row) => {
+      const record = parseStoredRecordJson(row.record_json);
+      return record ? [record] : [];
+    }),
     rollingQuotaMovement: quotaMovement,
     accountScopedQuotaAnalysis: quotaAnalysis,
     quotaGradients: gradientRows.results.map((row) => {

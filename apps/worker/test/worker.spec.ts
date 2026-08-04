@@ -1929,6 +1929,24 @@ describe("synthetic usage monitor service", () => {
     });
     expect(audit?.details_json).toContain("maintenance");
 
+    // A damaged persisted audit payload must not take the owner dashboard
+    // down. The read path should return a bounded null detail instead.
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `UPDATE admin_action_audit
+          SET details_json = ?
+        WHERE action = ? AND outcome = ?`,
+    ).bind("{malformed", "set_collection_controls", "success").run();
+    const overviewWithCorruptAudit = await api(
+      "/api/v1/admin/overview",
+      { headers: personalHeaders(participant) },
+      ownerEnv,
+    );
+    expect(overviewWithCorruptAudit.status).toBe(200);
+    const corruptAuditBody = await overviewWithCorruptAudit.json<{
+      audit: Array<{ details: unknown }>;
+    }>();
+    expect(corruptAuditBody.audit[0]?.details).toBeNull();
+
     const conflict = await api(
       "/api/v1/admin/action",
       {

@@ -1,4 +1,6 @@
-const WEEKLY_WINDOW_MINS = 10_080;
+import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+
+const WEEKLY_WINDOW_MINS = SEVEN_DAY_WINDOW_MINUTES;
 
 function round(value, places = 6) {
   if (!Number.isFinite(value)) return null;

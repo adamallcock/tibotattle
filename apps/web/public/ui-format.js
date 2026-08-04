@@ -2,13 +2,58 @@
 // dashboard entry (app.js, served by the loopback companion) and the public
 // community entry (community.js, served by the release site). Neither surface
 // keeps a private copy, so a wording or rounding change lands in one place.
+//
+import {
+  DEFAULT_LOCALE,
+  SUPPORTED_LOCALES,
+  formatDate as formatLocaleDate,
+  formatNumber as formatLocaleNumber,
+  negotiateLocale,
+} from "./i18n.generated.js";
 
-export const USER_TIME_ZONE =
-  Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
+const requestedLocales = typeof navigator !== "undefined"
+  ? navigator.languages?.length > 0
+    ? navigator.languages
+    : [navigator.language]
+  : [DEFAULT_LOCALE];
 
-const USER_TIME_ZONE_OPTION = USER_TIME_ZONE === "local time"
-  ? {}
-  : { timeZone: USER_TIME_ZONE };
+export const USER_LOCALE = negotiateLocale(
+  requestedLocales,
+  SUPPORTED_LOCALES,
+  DEFAULT_LOCALE,
+);
+
+export function formatNumber(value, options) {
+  return formatLocaleNumber(value, USER_LOCALE, options);
+}
+
+export function formatDate(value, options) {
+  return formatLocaleDate(value, USER_LOCALE, options);
+}
+
+// Instants remain UTC in every local/hosted contract. This is the one display
+// policy for a person reading them: use the Mac/browser's configured zone, and
+// fall back to UTC only if the runtime cannot report a usable system zone.
+function systemTimeZone() {
+  try {
+    const value = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof value === "string" && value.length > 0 ? value : "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+export const REPORTING_TIME_ZONE = systemTimeZone();
+
+const REPORTING_TIME_ZONE_OPTION = Object.freeze({
+  timeZone: REPORTING_TIME_ZONE,
+});
+
+function instant(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  return Number.isNaN(date.valueOf()) ? null : date;
+}
 
 export function finite(value, fallback = null) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -18,29 +63,37 @@ export function compact(value) {
   const number = finite(value);
   return number === null
     ? "—"
-    : new Intl.NumberFormat("en-US", {
+    : formatNumber(number, {
       notation: "compact",
       maximumFractionDigits: 1,
-    }).format(number);
+    });
 }
 
-export function formatLocal(value, { dateOnly = false } = {}) {
-  if (!value || !Number.isFinite(Date.parse(value))) return "Unknown";
-  return new Intl.DateTimeFormat("en-US", dateOnly
+export function formatReportingTime(value, { dateOnly = false } = {}) {
+  const date = instant(value);
+  if (date === null) return "Unknown";
+  return formatDate(date, dateOnly
     ? {
-      ...USER_TIME_ZONE_OPTION,
+      ...REPORTING_TIME_ZONE_OPTION,
       month: "short",
       day: "numeric",
       year: "numeric",
     }
     : {
-      ...USER_TIME_ZONE_OPTION,
+      ...REPORTING_TIME_ZONE_OPTION,
       month: "short",
       day: "numeric",
       hour: "numeric",
       minute: "2-digit",
       timeZoneName: "short",
-    }).format(new Date(value));
+    });
+}
+
+// Existing dashboard imports use this name. It is deliberately an alias, not
+// a second browser-local formatter, so every visible timestamp follows the
+// same reporting-zone policy.
+export function formatLocal(value, options = {}) {
+  return formatReportingTime(value, options);
 }
 
 export function formatAge(value) {
@@ -52,9 +105,9 @@ export function formatAge(value) {
   return `${(seconds / 86400).toFixed(1)} days ago`;
 }
 
-export function localCalendarParts() {
-  return new Intl.DateTimeFormat("en-US", {
-    ...USER_TIME_ZONE_OPTION,
+export function reportingCalendarParts() {
+  return new Intl.DateTimeFormat(USER_LOCALE, {
+    ...REPORTING_TIME_ZONE_OPTION,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",

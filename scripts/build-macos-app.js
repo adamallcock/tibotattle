@@ -45,6 +45,10 @@ import {
 } from "./generate-telemetry-browser-mirror.js";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
 import { captureStableUtf8Source } from "./lib/captured-utf8-source.mjs";
+import {
+  RELEASE_VERSION,
+  RELEASE_VERSION_PLACEHOLDER,
+} from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -56,6 +60,12 @@ const PRODUCT_BRAND_CONFIG = join(
   "config",
   "product-brand.js",
 );
+const RELEASE_MANIFEST_CONFIG = join(
+  REPOSITORY_ROOT,
+  "config",
+  "release-manifest.js",
+);
+const PACKAGE_MANIFEST = join(REPOSITORY_ROOT, "package.json");
 const ENTRYPOINT = join(REPOSITORY_ROOT, "apps", "local", "server.js");
 const MACOS_SOURCE_ROOT = join(REPOSITORY_ROOT, "apps", "macos");
 const MACOS_RESOURCE_ROOT = join(MACOS_SOURCE_ROOT, "Resources");
@@ -70,7 +80,7 @@ const PINNED_NODE_ARCHITECTURE = "arm64";
 const MINIMUM_MACOS_VERSION = "13.0";
 const BUNDLE_VERSION = "1";
 const PACKAGE_NAME = "app-usagemonitor";
-const SHORT_VERSION = "0.1.0";
+const SHORT_VERSION = RELEASE_VERSION;
 const LOOPBACK_HOST = "127.0.0.1";
 const CENTRAL_ORIGIN_MODE_NONE = "not_configured";
 const CENTRAL_ORIGIN_MODE_HTTPS = "production_https";
@@ -159,6 +169,7 @@ const ALLOWED_GENERATED_RUNTIME_FILES = new Set([
 const EXPECTED_EXTERNAL_SPECIFIERS = Object.freeze([
   "@app-usagemonitor/accounting",
   "@app-usagemonitor/identity-core",
+  "@app-usagemonitor/quota-analysis",
   "@app-usagemonitor/telemetry-contract",
   "@github/keytar",
   "ajv",
@@ -173,9 +184,10 @@ const WORKSPACE_RUNTIME_PACKAGE_EXTERNALS = Object.freeze({
 });
 
 const PINNED_PACKAGES = Object.freeze({
-  "@app-usagemonitor/accounting": "0.1.0",
-  "@app-usagemonitor/identity-core": "0.1.0",
-  "@app-usagemonitor/telemetry-contract": "0.1.0",
+  "@app-usagemonitor/accounting": RELEASE_VERSION,
+  "@app-usagemonitor/identity-core": RELEASE_VERSION,
+  "@app-usagemonitor/quota-analysis": RELEASE_VERSION,
+  "@app-usagemonitor/telemetry-contract": RELEASE_VERSION,
   "@github/keytar": "7.10.6",
   ajv: "8.20.0",
   "fast-deep-equal": "3.1.3",
@@ -218,6 +230,21 @@ export const MACOS_ACCOUNTING_RUNTIME_FILES = Object.freeze([
   "src/price-registry.js",
   "src/subscription-speed.js",
 ]);
+const QUOTA_ANALYSIS_PACKAGE_NAME = "@app-usagemonitor/quota-analysis";
+const QUOTA_ANALYSIS_PACKAGE_ROOT = join(
+  REPOSITORY_ROOT,
+  "packages",
+  "quota-analysis",
+);
+export const MACOS_QUOTA_ANALYSIS_RUNTIME_FILES = Object.freeze([
+  "index.js",
+  "package.json",
+  "src/quota-calibration.js",
+  "src/quota-pace-forecast.js",
+  "src/quota-rolling.js",
+  "src/quota-tracks.js",
+  "src/quota-windows.js",
+]);
 const IDENTITY_CORE_PACKAGE_NAME = "@app-usagemonitor/identity-core";
 const IDENTITY_CORE_PACKAGE_ROOT = join(
   REPOSITORY_ROOT,
@@ -243,6 +270,13 @@ const MACOS_WORKSPACE_RUNTIME_PACKAGE_DEFINITIONS = Object.freeze([
     root: IDENTITY_CORE_PACKAGE_ROOT,
     runtimeFiles: MACOS_IDENTITY_CORE_RUNTIME_FILES,
     version: PINNED_PACKAGES[IDENTITY_CORE_PACKAGE_NAME],
+  }),
+  Object.freeze({
+    inputDirectory: "packages/quota-analysis",
+    name: QUOTA_ANALYSIS_PACKAGE_NAME,
+    root: QUOTA_ANALYSIS_PACKAGE_ROOT,
+    runtimeFiles: MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
+    version: PINNED_PACKAGES[QUOTA_ANALYSIS_PACKAGE_NAME],
   }),
   Object.freeze({
     inputDirectory: "packages/telemetry-contract",
@@ -1820,11 +1854,20 @@ async function copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules) 
       continue;
     }
     assertAllowedFirstPartyPath(join(REPOSITORY_ROOT, selected));
-    await copyRegularFile(
-      join(REPOSITORY_ROOT, ...selected.split("/")),
-      join(appRoot, ...selected.split("/")),
-      0o444,
-    );
+    const sourcePath = join(REPOSITORY_ROOT, ...selected.split("/"));
+    const destinationPath = join(appRoot, ...selected.split("/"));
+    if (selected === "apps/web/public/index.html") {
+      const source = await readFile(sourcePath, "utf8");
+      if (source.split(RELEASE_VERSION_PLACEHOLDER).length !== 2) {
+        fail("Dashboard HTML must contain exactly one release-version placeholder");
+      }
+      await writeGeneratedFile(
+        destinationPath,
+        source.replace(RELEASE_VERSION_PLACEHOLDER, RELEASE_VERSION),
+      );
+    } else {
+      await copyRegularFile(sourcePath, destinationPath, 0o444);
+    }
   }
   await writeGeneratedFile(
     join(appRoot, "package.json"),
@@ -2104,6 +2147,8 @@ export async function calculateMacOSSourceInputDigest({
     ...runtimeAssets.map((path) =>
       join(REPOSITORY_ROOT, ...path.split("/"))),
     PRODUCT_BRAND_CONFIG,
+    RELEASE_MANIFEST_CONFIG,
+    PACKAGE_MANIFEST,
     CAPTURED_UTF8_SOURCE_HELPER,
     SCRIPT_FILE,
     ...swiftSources.files,
@@ -2453,6 +2498,8 @@ export async function validateMacOSPreviewApp(appPath) {
       || plist.UsageMonitorAppOpenScheme !== PRODUCT_BRAND.appOpenScheme
       || plist.UsageMonitorAppOpenHost !== PRODUCT_BRAND.appOpenHost
       || plist.UsageMonitorAppOpenURL !== PRODUCT_BRAND.appOpenURL
+      || plist.UsageMonitorPublicWebsiteOrigin
+        !== DEPLOYMENT_ENDPOINTS.public.origin
       || plist.UsageMonitorBuildChannel !== DISTRIBUTION_CHANNEL_PREVIEW
       || plist.UsageMonitorPreviewDistribution !== true
       || plist.UsageMonitorCentralOriginMode !== CENTRAL_ORIGIN_MODE_HTTPS

@@ -8,6 +8,7 @@
 // control that cannot work.
 //
 import { renderCommunitySnapshot } from "./community-view.js";
+import { formatNumber } from "./ui-format.js";
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -127,9 +128,9 @@ function formatInstallerSize(bytes) {
     return `${Math.ceil(bytes / 1024)} KiB download`;
   }
   const mebibytes = bytes / (1024 * 1024);
-  return `${new Intl.NumberFormat("en-US", {
+  return `${formatNumber(mebibytes, {
     maximumFractionDigits: mebibytes >= 10 ? 0 : 1,
-  }).format(mebibytes)} MiB download`;
+  })} MiB download`;
 }
 
 /**

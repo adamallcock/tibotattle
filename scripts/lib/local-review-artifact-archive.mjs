@@ -17,6 +17,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { RELEASE_VERSION } from "../../config/release-manifest.js";
 
 const ARCHIVE_LIMIT_BYTES = 512 * 1024 * 1024;
 const ENTRY_LIMIT_BYTES = 256 * 1024 * 1024;
@@ -29,7 +30,7 @@ const EXPECTED_ROOT =
 const EXPECTED_COMPONENTS = Object.freeze([
   Object.freeze({
     name: "@app-usagemonitor/identity-core",
-    version: "0.1.0",
+    version: RELEASE_VERSION,
   }),
   Object.freeze({ name: "@github/keytar", version: "7.10.6" }),
   Object.freeze({ name: "ajv", version: "8.20.0" }),

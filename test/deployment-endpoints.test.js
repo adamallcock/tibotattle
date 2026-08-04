@@ -52,4 +52,11 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
     checked.worker.routeHosts,
     DEPLOYMENT_ENDPOINTS.public.routeHosts,
   );
+  assert.deepEqual(checked.gates.checkedScripts, [
+    "deploy:dry",
+    "production:deploy",
+    "production:deploy:dry",
+    "staging:check",
+    "staging:deploy",
+  ]);
 });

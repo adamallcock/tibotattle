@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { deriveOpenAIAccountScope, sanitizeAccountScope } from "./account-scope.js";
+import { RELEASE_VERSION } from "../../../config/release-manifest.js";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const ACCOUNT_HMAC_ENV = "APP_USAGEMONITOR_ACCOUNT_HMAC_KEY";
@@ -90,7 +91,7 @@ export class CodexAppServerClient extends EventEmitter {
       clientInfo: {
         name: "app_usagemonitor",
         title: "TiboTattle",
-        version: "0.1.0",
+        version: RELEASE_VERSION,
       },
       capabilities: {
         optOutNotificationMethods: ["remoteControl/status/changed"],

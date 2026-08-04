@@ -72,6 +72,48 @@ import {
   SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
   SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS
 } from "../public/data-client.js";
+import {
+  formatLocal,
+  formatReportingTime,
+  REPORTING_TIME_ZONE,
+  reportingCalendarParts,
+  USER_LOCALE,
+} from "../public/ui-format.js";
+
+test("browser reporting timestamps use one explicit system time zone", () => {
+  const timestamp = "2026-08-03T16:23:00.000Z";
+  const date = new Date(timestamp);
+  const dateOptions = {
+    timeZone: REPORTING_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  };
+  const timeOptions = {
+    timeZone: REPORTING_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  };
+  const expectedDate = new Intl.DateTimeFormat(USER_LOCALE, dateOptions).format(date);
+  const expectedTime = new Intl.DateTimeFormat(USER_LOCALE, timeOptions).format(date);
+
+  assert.equal(formatReportingTime(timestamp, { dateOnly: true }), expectedDate);
+  assert.equal(formatReportingTime(timestamp), expectedTime);
+  assert.equal(formatLocal(timestamp), expectedTime);
+  assert.equal(
+    reportingCalendarParts().format(date),
+    new Intl.DateTimeFormat(USER_LOCALE, {
+      timeZone: REPORTING_TIME_ZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(date),
+  );
+  assert.equal(formatReportingTime("not a timestamp"), "Unknown");
+});
 
 test("browser JSON preflight rejects duplicate object keys before parsing", () => {
   for (const serialized of [
@@ -3497,6 +3539,7 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
 test("timeline keeps time, uncertainty, and primary navigation explicit", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const adminSource = await readFile(new URL("../public/admin.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   for (const id of [
     "timeline-zoom-in",
@@ -3511,7 +3554,8 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   }
   assert.match(html, /data-nav="community"/);
   assert.match(html, /data-nav="data"/);
-  assert.match(html, /Exact local \/ UTC time/);
+  assert.match(html, /id="residual-time-heading">Reported time/);
+  assert.doesNotMatch(html, /Exact local \/ UTC time/);
   assert.match(html, /Missing quota bracket/);
   assert.match(appSource, /function selectedTimelinePoints/);
   assert.match(appSource, /function timelineStatusIntervals/);
@@ -3523,8 +3567,13 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /visibleArtifactResiduals\.length[\s\S]*pointResiduals/);
   assert.match(appSource, /renderResiduals\(data, visiblePoints, viewport\)/);
   assert.match(appSource, /safeDomainEndMs - domainStartMs/);
-  assert.match(appSource, /USER_TIME_ZONE/);
-  assert.match(appSource, /LOCAL_CALENDAR_PARTS/);
+  assert.match(appSource, /REPORTING_TIME_ZONE/);
+  assert.match(appSource, /REPORTING_CALENDAR_PARTS/);
+  assert.match(appSource, /formatReportingTime\(item\.timestamp\)/);
+  assert.match(appSource, /Window ending \(\$\{REPORTING_TIME_ZONE\}\)/);
+  assert.doesNotMatch(appSource, /function formatUtc/);
+  assert.match(adminSource, /formatReportingTime/);
+  assert.doesNotMatch(adminSource, /toLocaleString/);
   assert.match(appSource, /periodEndAt/);
   assert.match(appSource, /point\.periodEndAt \?\? point\.timestamp/);
   assert.match(appSource, /Unrecognized \/ unpriced overflow/);
@@ -4984,18 +5033,15 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.match(trend, /lastDateLabel: points\[points\.length - 1\]\.dateLabel,/u);
   assert.doesNotMatch(
     section,
-    /toLocaleString|toLocaleDateString|toLocaleTimeString|toISOString|formatLocal/u,
+    /toLocaleString|toLocaleDateString|toLocaleTimeString|toISOString/u,
   );
-  // The only date formatter is a fixed month/day/year representation in the
-  // viewer's time zone. It accepts the parsed number, not a source string.
+  // The card delegates to the same explicit reporting-zone formatter as the
+  // dashboard, and it receives a parsed number rather than a source string.
   assert.match(
     section,
-    /const SHARE_CARD_DATE_FORMAT = new Intl\.DateTimeFormat\("en-US", \{[\s\S]*?month: "short",[\s\S]*?day: "numeric",[\s\S]*?year: "numeric",/u,
+    /function shareCardDateLabel\(timestamp\) \{[\s\S]*?formatReportingTime\(timestamp, \{ dateOnly: true \}\)/u,
   );
-  assert.match(
-    section,
-    /function shareCardDateLabel\(timestamp\) \{\s*\n\s*return Number\.isFinite\(timestamp\) \? SHARE_CARD_DATE_FORMAT\.format\(timestamp\) : "";/u,
-  );
+  assert.doesNotMatch(section, /SHARE_CARD_DATE_FORMAT/u);
   assert.match(section, /const yAxisLabel = "7-day allowance \(\$\)";/u);
   assert.match(section, /const xAxisLabel = "Reset estimate date";/u);
   assert.match(section, /for \(const value of axis\.ticks\) \{[\s\S]*?formatMoney\(value, axisDigits\)/u);

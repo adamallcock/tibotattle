@@ -48,6 +48,7 @@ const SITE_INDEX_SOURCE_BASENAME = "community.html";
 const PUBLIC_SITE_SOURCE_BASENAMES = Object.freeze([
   "community.js",
   "community-view.js",
+  "i18n.generated.js",
   "styles.css",
   // This is the reviewed, shipped application icon. Publishing the same
   // mark with the landing page makes the download surface recognisably the

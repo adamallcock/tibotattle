@@ -8,6 +8,8 @@
 // call to action, and by the in-app dashboard entry (app.js), which uses the
 // same card when the local companion is not yet reachable.
 
+import { formatNumber } from "./ui-format.js";
+
 export function configuredSemanticOpenTarget(documentRef) {
   const target = documentRef
     .querySelector('meta[name="usage-monitor-semantic-open-target"]')
@@ -134,9 +136,9 @@ export function formatInstallerSize(bytes) {
     return `${Math.ceil(bytes / 1024)} KiB download`;
   }
   const mebibytes = bytes / (1024 * 1024);
-  return `${new Intl.NumberFormat("en-US", {
+  return `${formatNumber(mebibytes, {
     maximumFractionDigits: mebibytes >= 10 ? 0 : 1,
-  }).format(mebibytes)} MiB download`;
+  })} MiB download`;
 }
 
 export function renderInstallerJourney(documentRef) {

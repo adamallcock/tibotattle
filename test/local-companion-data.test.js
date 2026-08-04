@@ -748,7 +748,7 @@ test("live weekly cache replaces the repo artifact and labels historical account
     );
     assert.equal(snapshot.overview.tools.total, 1);
     const projectionBytes = await readFile(
-      `${collectorFile}.projection-v1.json`,
+      `${collectorFile}.projection-v2.json`,
     );
     assert.equal(
       projectionBytes.includes(

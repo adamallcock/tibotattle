@@ -20,6 +20,7 @@ import {
   inspectExactNextContributionSyncUpload,
   inspectContributionSyncQueue,
   inspectNextContributionSyncUpload,
+  RETRY_BACKOFF_POLICY,
   retireAcceptedContributionArtifacts,
   runContributionSyncQueueOnce,
   runContributionSyncQueueWatch,
@@ -51,6 +52,17 @@ import {
 const ORIGIN = "https://usage.example";
 const ACCEPTED_ID =
   "contribution:11111111-1111-4111-8111-111111111111";
+
+test("retry backoff policy is a named immutable contract", () => {
+  assert.equal(Object.isFrozen(RETRY_BACKOFF_POLICY), true);
+  assert.deepEqual(RETRY_BACKOFF_POLICY, {
+    initialDelayMilliseconds: 5_000,
+    maximumDelayMilliseconds: 3_600_000,
+    minimumDelayMilliseconds: 1_000,
+    jitterMinimumMultiplier: 0.75,
+    jitterMaximumMultiplier: 1.25,
+  });
+});
 
 function usage(index = 1) {
   return {
