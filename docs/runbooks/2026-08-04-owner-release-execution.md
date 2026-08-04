@@ -252,7 +252,11 @@ provenance on both manifests and requires the previous `N` and candidate `N+1`
 names to match exactly. A stable manifest cannot replace an internal-dogfood
 manifest, and neither may omit channel provenance. The provenance must also
 match the selected policy's service mode, endpoints, updater feed, bucket,
-object prefix, and reviewed public-key input; otherwise stop the release.
+object prefix, and public-key input; its Sparkle public-key fingerprint must
+match the updater fingerprint sealed in that same manifest. The previous `N`
+and candidate `N+1` updater fingerprints must then match exactly, even though
+stable intentionally has no statically configured fingerprint. Otherwise stop
+the release.
 
 The owner signs the exact stable DMG and validates the appcast locally with
 the complete existing publisher command, including `--channel stable`, using

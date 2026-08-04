@@ -1167,14 +1167,24 @@ function validateSignedReleaseChannel(manifest, label) {
       "MACOS_RELEASE_CHANNEL_PROVENANCE_REQUIRED",
     );
   }
+  let channelName;
   try {
-    return assertReleaseChannelPublication(channel.name, channel).name;
+    channelName = assertReleaseChannelPublication(channel.name, channel).name;
   } catch {
     fail(
       `${label} has channel provenance that does not match its named policy`,
       "MACOS_RELEASE_CHANNEL_MISMATCH",
     );
   }
+  // Stable has no configured static key; the sealed manifest is authoritative.
+  if (channel.sparkle.publicEdKeySha256
+      !== manifest.updater.publicEdKeySha256) {
+    fail(
+      `${label} channel provenance does not match its updater public-key fingerprint`,
+      "MACOS_RELEASE_UPDATER_KEY_MISMATCH",
+    );
+  }
+  return channelName;
 }
 
 function validateSignedReleaseManifest(manifest, label) {
@@ -1251,6 +1261,13 @@ export function validateMacOSSignedReplacementPair({
     fail(
       "Replacement and rollback manifests must use the same named release channel",
       "MACOS_RELEASE_CHANNEL_MISMATCH",
+    );
+  }
+  if (candidate.updater.publicEdKeySha256
+        !== previous.updater.publicEdKeySha256) {
+    fail(
+      "Replacement and rollback manifests must use the same Sparkle public key",
+      "MACOS_REPLACEMENT_UPDATER_KEY_MISMATCH",
     );
   }
   if (candidate.application.bundleIdentifier

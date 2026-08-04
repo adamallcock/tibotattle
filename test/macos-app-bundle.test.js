@@ -2214,6 +2214,12 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     dmgNotarizationAccepted: true,
     dmgTicketStapled: true,
   };
+  const sparklePublicKeySha256 = createHash("sha256")
+    .update(Buffer.alloc(32, 1))
+    .digest("hex");
+  const changedSparklePublicKeySha256 = createHash("sha256")
+    .update(Buffer.alloc(32, 2))
+    .digest("hex");
   const releaseManifest = (bundleVersion, fileName, bytes) => ({
     schemaVersion: "usage-monitor-macos-release-v0.2",
     application: {
@@ -2227,9 +2233,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       sha256: createHash("sha256").update(bytes).digest("hex"),
     },
     channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
-      publicEdKeySha256: createHash("sha256")
-        .update(Buffer.alloc(32, 1))
-        .digest("hex"),
+      publicEdKeySha256: sparklePublicKeySha256,
     }),
     source: {
       commit: "a".repeat(40),
@@ -2247,9 +2251,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       },
       enabled: true,
       frameworkVersion: SPARKLE_VERSION,
-      publicEdKeySha256: createHash("sha256")
-        .update(Buffer.alloc(32, 1))
-        .digest("hex"),
+      publicEdKeySha256: sparklePublicKeySha256,
       requiresSignedFeed: true,
     },
     replacement,
@@ -2303,6 +2305,16 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         automaticUpdaterPresent: true,
         hostedDataChanged: false,
       },
+    );
+    assert.equal(previousManifest.channel.name, STABLE_RELEASE_CHANNEL);
+    assert.equal(candidateManifest.channel.name, STABLE_RELEASE_CHANNEL);
+    assert.equal(
+      previousManifest.channel.sparkle.publicEdKeySha256,
+      previousManifest.updater.publicEdKeySha256,
+    );
+    assert.equal(
+      candidateManifest.channel.sparkle.publicEdKeySha256,
+      candidateManifest.updater.publicEdKeySha256,
     );
     const validatedArtifacts = [];
     const artifacts = await validateMacOSSignedReplacementArtifacts({
@@ -2370,6 +2382,107 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       }),
       { code: "MACOS_REPLACEMENT_MANIFEST_INVALID" },
     );
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest,
+        candidateManifest: {
+          ...candidateManifest,
+          channel: {
+            ...candidateManifest.channel,
+            sparkle: {
+              ...candidateManifest.channel.sparkle,
+              publicEdKeySha256: changedSparklePublicKeySha256,
+            },
+          },
+          updater: {
+            ...candidateManifest.updater,
+            publicEdKeySha256: changedSparklePublicKeySha256,
+          },
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_UPDATER_KEY_MISMATCH" },
+      "a same-channel replacement with a changed Sparkle key must fail",
+    );
+    for (const [label, previous, candidate] of [
+      [
+        "previous",
+        {
+          ...previousManifest,
+          channel: {
+            ...previousManifest.channel,
+            sparkle: {
+              ...previousManifest.channel.sparkle,
+              publicEdKeySha256: "c".repeat(64),
+            },
+          },
+        },
+        candidateManifest,
+      ],
+      [
+        "candidate",
+        previousManifest,
+        {
+          ...candidateManifest,
+          channel: {
+            ...candidateManifest.channel,
+            sparkle: {
+              ...candidateManifest.channel.sparkle,
+              publicEdKeySha256: "c".repeat(64),
+            },
+          },
+        },
+      ],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: previous,
+          candidateManifest: candidate,
+        }),
+        { code: "MACOS_RELEASE_UPDATER_KEY_MISMATCH" },
+        `${label} mismatched channel fingerprint must fail closed`,
+      );
+    }
+    for (const [label, publicEdKeySha256] of [
+      ["absent", undefined],
+      ["malformed", "not-a-sha256"],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest,
+          candidateManifest: {
+            ...candidateManifest,
+            channel: {
+              ...candidateManifest.channel,
+              sparkle: {
+                ...candidateManifest.channel.sparkle,
+                publicEdKeySha256,
+              },
+            },
+          },
+        }),
+        { code: "MACOS_RELEASE_CHANNEL_MISMATCH" },
+        `${label} channel fingerprint must fail closed`,
+      );
+    }
+    for (const [label, publicEdKeySha256] of [
+      ["absent", undefined],
+      ["malformed", "not-a-sha256"],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest,
+          candidateManifest: {
+            ...candidateManifest,
+            updater: {
+              ...candidateManifest.updater,
+              publicEdKeySha256,
+            },
+          },
+        }),
+        { code: "MACOS_REPLACEMENT_MANIFEST_INVALID" },
+        `${label} updater fingerprint must fail closed`,
+      );
+    }
     for (const [label, previous, candidate] of [
       [
         "previous",
