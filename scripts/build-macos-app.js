@@ -18,6 +18,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import {
   basename,
@@ -29,12 +30,15 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
+  SPARKLE_FRAMEWORK_SHA256,
   SPARKLE_MACH_O_PATHS,
   SPARKLE_VERSION,
   normalizeMacOSUpdaterConfiguration,
+  normalizeMacOSUpdaterMetadata,
 } from "./macos-updater-core.js";
 import {
   readVerifiedTelemetryBrowserMirror,
@@ -54,6 +58,7 @@ const PRODUCT_BRAND_CONFIG = join(
 );
 const ENTRYPOINT = join(REPOSITORY_ROOT, "apps", "local", "server.js");
 const MACOS_SOURCE_ROOT = join(REPOSITORY_ROOT, "apps", "macos");
+const MACOS_RESOURCE_ROOT = join(MACOS_SOURCE_ROOT, "Resources");
 const WEB_MODULE_ROOT = join(
   REPOSITORY_ROOT,
   "apps",
@@ -70,6 +75,9 @@ const LOOPBACK_HOST = "127.0.0.1";
 const CENTRAL_ORIGIN_MODE_NONE = "not_configured";
 const CENTRAL_ORIGIN_MODE_HTTPS = "production_https";
 const CENTRAL_ORIGIN_MODE_LOOPBACK = "development_loopback";
+const DISTRIBUTION_CHANNEL_DEVELOPMENT = "development";
+const DISTRIBUTION_CHANNEL_PREVIEW = "preview_distribution";
+const DISTRIBUTION_CHANNEL_PRODUCTION = "production";
 const FIXED_EPOCH_SECONDS = 946_684_800;
 const MAXIMUM_BUNDLE_BYTES = 512 * 1024 * 1024;
 const MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
@@ -101,6 +109,36 @@ const ICON_PROVENANCE = join(
   "Assets",
   "AppIcon.provenance.txt",
 );
+const DEFAULT_PREVIEW_STAGING_ROOT = join(
+  REPOSITORY_ROOT,
+  ".release-build",
+  "macos-preview",
+  "current",
+);
+const DEFAULT_PREVIEW_OUTPUT = join(
+  DEFAULT_PREVIEW_STAGING_ROOT,
+  PRODUCT_BRAND.bundleName,
+);
+const DEFAULT_PREVIEW_FRAMEWORK = join(
+  REPOSITORY_ROOT,
+  ".release-deps",
+  "Sparkle.framework",
+);
+
+// Preview clients are meant to exercise the same publicly deployed service
+// boundary as the installed app. These are public identifiers only: the
+// central origin, signed-feed URL, and Ed25519 *public* key contain no release
+// credential and cannot publish, sign, or install a production update. Keeping
+// them in the reviewed build path stops ordinary client QA from silently
+// falling back to a no-service development bundle.
+export const MACOS_PREVIEW_PUBLIC_CONFIGURATION = Object.freeze({
+  centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+  sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  sparklePublicEdKey: "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=",
+});
+
+export const MACOS_PREVIEW_DISTRIBUTION_CHANNEL =
+  DISTRIBUTION_CHANNEL_PREVIEW;
 
 export const MACOS_WEB_MODULE_ENTRYPOINTS = Object.freeze([
   "apps/web/public/app.js",
@@ -290,7 +328,10 @@ export function normalizeMacOSCentralOrigin(
       || selected.pathname !== "/" || selected.search || selected.hash) {
     fail("Central origin must not include credentials, a path, query, or fragment");
   }
-  const loopback = selected.hostname === LOOPBACK_HOST;
+  const hostname = selected.hostname.startsWith("[")
+    ? selected.hostname.slice(1, -1)
+    : selected.hostname;
+  const loopback = hostname === LOOPBACK_HOST;
   if (selected.protocol === "http:"
       && loopback
       && selected.port !== ""
@@ -303,6 +344,7 @@ export function normalizeMacOSCentralOrigin(
   }
   if (selected.protocol === "https:"
       && !["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname)
+      && isIP(hostname) === 0
       && !allowLoopbackCentralOrigin) {
     return Object.freeze({
       configured: true,
@@ -315,7 +357,7 @@ export function normalizeMacOSCentralOrigin(
       "Plain-HTTP loopback requires --allow-loopback-central-origin and an explicit port",
     );
   }
-  fail("Central origin must be HTTPS and non-loopback");
+  fail("Central origin must be an HTTPS DNS origin and non-loopback");
 }
 
 export function normalizeMacOSBundleVersion(value = BUNDLE_VERSION) {
@@ -332,23 +374,48 @@ export function normalizeMacOSBundleVersion(value = BUNDLE_VERSION) {
 export function validateMacOSDistributionConfiguration({
   centralService,
   externalDistribution = false,
+  previewDistribution = false,
 }) {
   if (typeof externalDistribution !== "boolean") {
     fail("externalDistribution must be a boolean");
   }
-  if (externalDistribution
-      && (!centralService?.configured
-        || centralService.mode !== CENTRAL_ORIGIN_MODE_HTTPS)) {
+  if (typeof previewDistribution !== "boolean") {
+    fail("previewDistribution must be a boolean");
+  }
+  if (externalDistribution && previewDistribution) {
     fail(
-      "External distribution requires a fixed non-loopback HTTPS central origin",
-      "MACOS_PRODUCTION_ORIGIN_REQUIRED",
+      "Production and preview distribution channels are mutually exclusive",
+      "MACOS_DISTRIBUTION_CHANNEL_CONFLICT",
     );
   }
+  const httpsOriginConfigured = centralService?.configured
+    && centralService.mode === CENTRAL_ORIGIN_MODE_HTTPS
+    && typeof centralService.origin === "string"
+    && centralService.origin.length > 0;
+  if ((externalDistribution || previewDistribution) && !httpsOriginConfigured) {
+    const code = previewDistribution
+      ? "MACOS_PREVIEW_ORIGIN_REQUIRED"
+      : "MACOS_PRODUCTION_ORIGIN_REQUIRED";
+    fail(
+      previewDistribution
+        ? "Preview distribution requires a fixed non-loopback HTTPS central origin"
+        : "External distribution requires a fixed non-loopback HTTPS central origin",
+      code,
+    );
+  }
+  const channel = previewDistribution
+    ? DISTRIBUTION_CHANNEL_PREVIEW
+    : externalDistribution
+      ? DISTRIBUTION_CHANNEL_PRODUCTION
+      : DISTRIBUTION_CHANNEL_DEVELOPMENT;
   return Object.freeze({
+    channel,
     externalDistribution,
+    previewDistribution,
     productionOriginValidated:
-      externalDistribution
-      && centralService.mode === CENTRAL_ORIGIN_MODE_HTTPS,
+      externalDistribution && httpsOriginConfigured,
+    previewOriginValidated:
+      previewDistribution && httpsOriginConfigured,
   });
 }
 
@@ -829,6 +896,96 @@ export async function collectMacOSSwiftSources({
         file,
         "macOS Swift source",
       ))),
+  });
+}
+
+const LOCALIZATION_RESOURCE_PATTERN =
+  /^(?:[^/]+\.lproj\/[^/]+\.(?:strings|stringsdict)|localization\/manifest\.json)$/u;
+
+/**
+ * Collect the reviewed native localization inputs separately from the
+ * JavaScript runtime graph. `.lproj` files are AppKit resources; the same
+ * bytes are mirrored into the embedded dashboard's web root during staging.
+ */
+export async function collectMacOSLocalizationResources({
+  repositoryRoot = REPOSITORY_ROOT,
+  resourceRoot = MACOS_RESOURCE_ROOT,
+} = {}) {
+  const selectedRepositoryRoot = resolve(repositoryRoot);
+  const selectedResourceRoot = resolve(resourceRoot);
+  reviewedRelative(
+    selectedRepositoryRoot,
+    selectedResourceRoot,
+    "macOS localization resource root",
+  );
+  await assertReviewedDirectory(
+    selectedRepositoryRoot,
+    selectedResourceRoot,
+    "macOS localization resource root",
+  );
+  const files = [];
+  async function visit(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        fail(
+          `Symbolic links are not allowed under the macOS localization resource root: ${
+            reviewedRelative(
+              selectedRepositoryRoot,
+              path,
+              "macOS localization resource",
+            )
+          }`,
+        );
+      }
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".")) continue;
+        await visit(path);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relativeFile = reviewedRelative(
+        selectedResourceRoot,
+        path,
+        "macOS localization resource",
+      );
+      if (!LOCALIZATION_RESOURCE_PATTERN.test(relativeFile)) {
+        fail(
+          `Unsupported macOS localization resource: ${
+            reviewedRelative(
+              selectedRepositoryRoot,
+              path,
+              "macOS localization resource",
+            )
+          }`,
+        );
+      }
+      if (selectedRepositoryRoot === REPOSITORY_ROOT) {
+        assertAllowedFirstPartyPath(path);
+      }
+      files.push(path);
+    }
+  }
+  await visit(selectedResourceRoot);
+  files.sort((left, right) =>
+    reviewedRelative(selectedResourceRoot, left, "macOS localization resource")
+      .localeCompare(
+        reviewedRelative(selectedResourceRoot, right, "macOS localization resource"),
+      ));
+  if (files.length === 0) {
+    fail("No macOS localization resources were found");
+  }
+  return Object.freeze({
+    files: Object.freeze(files),
+    relativeFiles: Object.freeze(files.map((file) =>
+      reviewedRelative(
+        selectedResourceRoot,
+        file,
+        "macOS localization resource",
+      ))),
+    root: selectedResourceRoot,
   });
 }
 
@@ -1314,9 +1471,13 @@ function xmlString(value) {
 
 function infoPlist(centralService, {
   bundleVersion,
+  distribution,
   iconIncluded,
   updater,
 }) {
+  const publicWebsiteConfiguration = `  <key>UsageMonitorPublicWebsiteOrigin</key>
+  <string>${xmlString(DEPLOYMENT_ENDPOINTS.public.origin)}</string>
+`;
   const centralServiceConfiguration = centralService.configured
     ? `  <key>UsageMonitorCentralOrigin</key>
   <string>${xmlString(centralService.origin)}</string>
@@ -1331,11 +1492,11 @@ function infoPlist(centralService, {
     : "";
   const updaterConfiguration = updater.enabled
     ? `  <key>SUEnableAutomaticChecks</key>
-  <true/>
+  <${updater.automaticChecks ? "true" : "false"}/>
   <key>SUAllowsAutomaticUpdates</key>
-  <true/>
+  <${updater.allowsAutomaticUpdateOptIn ? "true" : "false"}/>
   <key>SUAutomaticallyUpdate</key>
-  <false/>
+  <${updater.automaticUpdatesEnabledByDefault ? "true" : "false"}/>
   <key>SUFeedURL</key>
   <string>${xmlString(updater.appcastURL)}</string>
   <key>SUPublicEDKey</key>
@@ -1351,6 +1512,11 @@ function infoPlist(centralService, {
 `
     : `  <key>UsageMonitorUpdaterEnabled</key>
   <false/>
+`;
+  const distributionConfiguration = `  <key>UsageMonitorBuildChannel</key>
+  <string>${xmlString(distribution.channel)}</string>
+  <key>UsageMonitorPreviewDistribution</key>
+  <${distribution.previewDistribution ? "true" : "false"}/>
 `;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1415,8 +1581,10 @@ function infoPlist(centralService, {
   <key>NSHighResolutionCapable</key>
   <true/>
 ${iconConfiguration}
+${publicWebsiteConfiguration}
 ${centralServiceConfiguration}
 ${updaterConfiguration}
+${distributionConfiguration}
 </dict>
 </plist>
 `;
@@ -1671,6 +1839,59 @@ async function copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules) 
 }
 
 /**
+ * Stage AppKit's `.lproj` resources at the bundle root and mirror them under
+ * the loopback dashboard root. The mirror is deliberately derived from the
+ * same reviewed files, so a future dashboard localizer cannot drift to a
+ * second English catalog.
+ */
+export async function stageMacOSLocalizationResources(
+  contents,
+  appRoot,
+  resources,
+) {
+  if (resources === null
+      || typeof resources !== "object"
+      || !Array.isArray(resources.files)
+      || !Array.isArray(resources.relativeFiles)
+      || resources.files.length !== resources.relativeFiles.length
+      || typeof resources.root !== "string") {
+    fail("macOS localization resource capture is invalid");
+  }
+  const staged = [];
+  for (let index = 0; index < resources.files.length; index += 1) {
+    const source = resources.files[index];
+    const relativeFile = resources.relativeFiles[index];
+    const expectedRelative = reviewedRelative(
+      resources.root,
+      source,
+      "macOS localization resource",
+    );
+    if (expectedRelative !== relativeFile) {
+      fail(`macOS localization resource capture is inconsistent: ${relativeFile}`);
+    }
+    const nativeDestination = join(
+      contents,
+      "Resources",
+      ...relativeFile.split("/"),
+    );
+    const webRelativeFile = relativeFile.startsWith("localization/")
+      ? relativeFile
+      : join("localization", relativeFile).split(sep).join("/");
+    const webDestination = join(
+      appRoot,
+      ...webRelativeFile.split("/"),
+    );
+    await copyRegularFile(source, nativeDestination);
+    await copyRegularFile(source, webDestination);
+    staged.push(Object.freeze({
+      relativeFile,
+      webRelativeFile,
+    }));
+  }
+  return Object.freeze(staged);
+}
+
+/**
  * Stage the immutable source records retained by web-module discovery.
  *
  * Keeping this operation narrow and exported lets release tests prove that a
@@ -1864,6 +2085,7 @@ export async function calculateMacOSSourceInputDigest({
   graph,
   runtimeAssets,
   swiftSources,
+  localizationResources = null,
   iconAssets = null,
   updater = null,
   webModules = null,
@@ -1873,6 +2095,10 @@ export async function calculateMacOSSourceInputDigest({
   if (typeof readSource !== "function") {
     fail("readSource must be a function when provided");
   }
+  const localizationFiles = localizationResources?.files ?? [];
+  if (!Array.isArray(localizationFiles)) {
+    fail("macOS localization resource capture is invalid");
+  }
   const inputs = new Set([
     ...graph.files,
     ...runtimeAssets.map((path) =>
@@ -1881,6 +2107,7 @@ export async function calculateMacOSSourceInputDigest({
     CAPTURED_UTF8_SOURCE_HELPER,
     SCRIPT_FILE,
     ...swiftSources.files,
+    ...localizationFiles,
     ...(iconAssets
       ? [iconAssets.icon.path, iconAssets.provenance.path]
       : []),
@@ -2133,6 +2360,246 @@ async function privacyCheck(appBundle, updater) {
   }
 }
 
+function readMacOSInfoPlist(path) {
+  let parsed;
+  try {
+    parsed = JSON.parse(run("/usr/bin/plutil", [
+      "-convert",
+      "json",
+      "-o",
+      "-",
+      path,
+    ]));
+  } catch {
+    fail(
+      "Preview application Info.plist is invalid",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Re-check the on-disk preview artifact without requiring release credentials.
+ * The validator intentionally accepts only the preview marker and never
+ * writes an application or attempts an install into /Applications.
+ */
+export async function validateMacOSPreviewApp(appPath) {
+  if (typeof appPath !== "string"
+      || appPath.length === 0
+      || appPath.includes("\0")) {
+    fail(
+      "Preview application path must be a non-empty filesystem path",
+      "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID",
+    );
+  }
+  const selected = resolve(appPath);
+  if (basename(selected) !== PRODUCT_BRAND.bundleName) {
+    fail(
+      `Preview application must be named ${PRODUCT_BRAND.bundleName}`,
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const metadata = await lstat(selected).catch((error) => {
+    if (error.code === "ENOENT") {
+      fail("Preview application bundle is unavailable", "MACOS_PREVIEW_NOT_FOUND");
+    }
+    throw error;
+  });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    fail(
+      "Preview application must be a real bundle directory",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const resources = join(selected, "Contents", "Resources");
+  const manifestPath = join(resources, "build-manifest.json");
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  } catch {
+    fail(
+      "Preview application build manifest is invalid",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  if (manifest?.schemaVersion !== MANIFEST_SCHEMA
+      || manifest.application?.bundleIdentifier
+        !== PRODUCT_BRAND.bundleIdentifier) {
+    fail(
+      "Preview application build manifest has an unexpected identity",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const release = manifest.release;
+  if (release?.channel !== DISTRIBUTION_CHANNEL_PREVIEW
+      || release.previewDistributionRequested !== true
+      || release.externalDistributionRequested !== false
+      || release.previewOriginValidated !== true
+      || release.productionOriginValidated !== false
+      || release.requiresDeveloperIDAndNotarization !== false
+      || release.iconIncluded !== true
+      || manifest.application.signing !== "ad_hoc_developer_bundle") {
+    fail(
+      "Preview application is missing its non-production distribution boundary",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const plist = readMacOSInfoPlist(join(selected, "Contents", "Info.plist"));
+  if (plist.CFBundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
+      || plist.CFBundleDisplayName !== PRODUCT_BRAND.displayName
+      || plist.CFBundleName !== PRODUCT_BRAND.displayName
+      || plist.UsageMonitorBundleName !== PRODUCT_BRAND.bundleName
+      || plist.UsageMonitorAppOpenScheme !== PRODUCT_BRAND.appOpenScheme
+      || plist.UsageMonitorAppOpenHost !== PRODUCT_BRAND.appOpenHost
+      || plist.UsageMonitorAppOpenURL !== PRODUCT_BRAND.appOpenURL
+      || plist.UsageMonitorBuildChannel !== DISTRIBUTION_CHANNEL_PREVIEW
+      || plist.UsageMonitorPreviewDistribution !== true
+      || plist.UsageMonitorCentralOriginMode !== CENTRAL_ORIGIN_MODE_HTTPS
+      || plist.UsageMonitorUpdaterEnabled !== true
+      || plist.UsageMonitorUpdaterFrameworkVersion !== SPARKLE_VERSION
+      || plist.SUEnableAutomaticChecks !== false
+      || plist.SUAllowsAutomaticUpdates !== false
+      || plist.SUAutomaticallyUpdate !== false
+      || plist.SURequireSignedFeed !== true
+      || plist.SUVerifyUpdateBeforeExtraction !== true) {
+    fail(
+      "Preview application Info.plist has an incomplete distribution boundary",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const centralService = normalizeMacOSCentralOrigin(
+    plist.UsageMonitorCentralOrigin,
+  );
+  if (centralService.mode !== CENTRAL_ORIGIN_MODE_HTTPS) {
+    fail(
+      "Preview application is not sealed to a non-loopback HTTPS central origin",
+      "MACOS_PREVIEW_ORIGIN_REQUIRED",
+    );
+  }
+  const manifestUpdater = release?.updater;
+  if (manifestUpdater === null
+      || typeof manifestUpdater !== "object"
+      || Array.isArray(manifestUpdater)) {
+    fail(
+      "Preview application is missing its updater manifest",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const updaterMetadata = normalizeMacOSUpdaterMetadata({
+    appcastURL: plist.SUFeedURL,
+    publicEdKey: plist.SUPublicEDKey,
+  });
+  const frameworkPath = join(
+    selected,
+    ...SPARKLE_FRAMEWORK_PREFIX.split("/"),
+  );
+  const frameworkMetadata = await lstat(frameworkPath).catch((error) => {
+    if (error.code === "ENOENT") {
+      fail(
+        "Preview application is missing Sparkle.framework",
+        "MACOS_UPDATER_CONFIGURATION_INVALID",
+      );
+    }
+    throw error;
+  });
+  if (!frameworkMetadata.isDirectory() || frameworkMetadata.isSymbolicLink()) {
+    fail(
+      "Preview application Sparkle.framework must be a real directory",
+      "MACOS_UPDATER_CONFIGURATION_INVALID",
+    );
+  }
+  for (const [relativePath, target] of Object.entries(
+    SPARKLE_FRAMEWORK_LINKS,
+  )) {
+    const linkPath = join(frameworkPath, ...relativePath.split("/"));
+    const linkMetadata = await lstat(linkPath);
+    if (!linkMetadata.isSymbolicLink() || await readlink(linkPath) !== target) {
+      fail(
+        `Preview application Sparkle.framework has an unexpected link: ${relativePath}`,
+        "MACOS_UPDATER_CONFIGURATION_INVALID",
+      );
+    }
+  }
+  for (const relativePath of SPARKLE_MACH_O_PATHS) {
+    const binaryPath = join(frameworkPath, ...relativePath.split("/"));
+    const binaryMetadata = await lstat(binaryPath);
+    if (!binaryMetadata.isFile() || binaryMetadata.isSymbolicLink()) {
+      fail(
+        `Preview application Sparkle.framework is missing ${relativePath}`,
+        "MACOS_UPDATER_CONFIGURATION_INVALID",
+      );
+    }
+  }
+  const updater = Object.freeze({
+    appcastURL: updaterMetadata.appcastURL,
+    automaticChecks: false,
+    automaticUpdatesEnabledByDefault: false,
+    allowsAutomaticUpdateOptIn: false,
+    enabled: true,
+    framework: Object.freeze({
+      sha256: manifestUpdater.frameworkSha256,
+      version: SPARKLE_VERSION,
+    }),
+    publicEdKey: updaterMetadata.publicEdKey,
+    version: SPARKLE_VERSION,
+  });
+  if (manifestUpdater.enabled !== true
+      || manifestUpdater.automaticChecks !== updater.automaticChecks
+      || manifestUpdater.automaticUpdateOptInAvailable
+        !== updater.allowsAutomaticUpdateOptIn
+      || manifestUpdater.automaticUpdatesEnabledByDefault
+        !== updater.automaticUpdatesEnabledByDefault
+      || manifestUpdater.afterUserOptIn?.automaticDownload
+        !== updater.allowsAutomaticUpdateOptIn
+      || manifestUpdater.afterUserOptIn?.installOnQuit
+        !== updater.automaticUpdatesEnabledByDefault
+      || manifestUpdater.frameworkVersion !== SPARKLE_VERSION
+      || manifestUpdater.frameworkSha256 !== SPARKLE_FRAMEWORK_SHA256
+      || manifestUpdater.appcastURL !== updater.appcastURL
+      || manifestUpdater.publicEdKeySha256 !== sha256(
+        Buffer.from(updater.publicEdKey, "base64"),
+      )
+      || manifestUpdater.requiresSignedFeed !== true
+      || manifestUpdater.verifyBeforeExtraction !== true) {
+    fail(
+      "Preview application manifest does not match its verified updater inputs",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const iconPath = join(selected, "Contents", "Resources", "AppIcon.icns");
+  const provenancePath = join(
+    selected,
+    "Contents",
+    "Resources",
+    "licenses",
+    "app-icon-provenance.txt",
+  );
+  if (await sha256File(iconPath) !== release.iconSha256
+      || await sha256File(provenancePath) !== release.provenanceSha256) {
+    fail(
+      "Preview application icon or provenance does not match its manifest",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  await privacyCheck(selected, updater);
+  const payload = await bundleInventory(selected, manifestPath, updater);
+  if (stableJson(payload) !== stableJson(manifest.payload)) {
+    fail(
+      "Preview application payload does not match its build manifest",
+      "MACOS_PAYLOAD_INTEGRITY_FAILED",
+    );
+  }
+  run(CODESIGN_PATH, ["--verify", "--deep", "--strict", selected]);
+  return Object.freeze({
+    appPath: selected,
+    bundleIdentifier: plist.CFBundleIdentifier,
+    bundleVersion: plist.CFBundleVersion,
+    channel: DISTRIBUTION_CHANNEL_PREVIEW,
+    updaterEnabled: true,
+  });
+}
+
 async function verifyExistingBuildTarget(output) {
   let metadata;
   try {
@@ -2166,7 +2633,38 @@ async function verifyExistingBuildTarget(output) {
   return true;
 }
 
-async function prepareOutput(output) {
+export function validateMacOSPreviewOutputPath(
+  output,
+  { stagingRoot = DEFAULT_PREVIEW_STAGING_ROOT } = {},
+) {
+  if (typeof output !== "string"
+      || output.length === 0
+      || output.includes("\0")) {
+    fail(
+      "Preview output must be a non-empty filesystem path",
+      "MACOS_PREVIEW_OUTPUT_INVALID",
+    );
+  }
+  const selected = resolve(output);
+  if (typeof stagingRoot !== "string"
+      || stagingRoot.length === 0
+      || stagingRoot.includes("\0")) {
+    fail(
+      "Preview staging root must be a non-empty filesystem path",
+      "MACOS_PREVIEW_OUTPUT_INVALID",
+    );
+  }
+  const selectedStagingRoot = resolve(stagingRoot);
+  if (selected !== join(selectedStagingRoot, PRODUCT_BRAND.bundleName)) {
+    fail(
+      "Preview builds must use the reviewed staging bundle path",
+      "MACOS_PREVIEW_OUTPUT_FORBIDDEN",
+    );
+  }
+  return selected;
+}
+
+async function prepareOutput(output, { channel, previewStagingRoot }) {
   if (basename(output) !== PRODUCT_BRAND.bundleName) {
     fail(
       `Output must end with the exact bundle name ${PRODUCT_BRAND.bundleName}`,
@@ -2174,23 +2672,35 @@ async function prepareOutput(output) {
   }
   const parent = dirname(output);
   await mkdir(parent, { recursive: true, mode: 0o755 });
-  if (await realpath(parent) !== parent) {
+  const resolvedParent = await realpath(parent);
+  if (resolvedParent !== parent) {
     fail("Output parent must not traverse a symbolic link");
+  }
+  if (channel === DISTRIBUTION_CHANNEL_PREVIEW
+      && resolvedParent !== resolve(previewStagingRoot)) {
+    fail(
+      "Preview output parent must be the reviewed staging root",
+      "MACOS_PREVIEW_OUTPUT_FORBIDDEN",
+    );
   }
   return parent;
 }
 
-function parseArguments(argv) {
+export function parseMacOSBuildArguments(argv, environment = process.env) {
   let output = null;
   let centralOrigin = null;
   let centralOriginSeen = false;
   let allowLoopbackCentralOrigin = false;
   let externalDistribution = false;
+  let previewDistribution = false;
+  let replacePreviewOutput = false;
   let bundleVersion = BUNDLE_VERSION;
   let bundleVersionSeen = false;
   let sparkleFramework = null;
   let sparkleAppcastURL = null;
   let sparklePublicEdKey = null;
+  let validatePreview = false;
+  let appPath = null;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--output") {
@@ -2214,6 +2724,26 @@ function parseArguments(argv) {
         fail("--external-distribution must be provided at most once");
       }
       externalDistribution = true;
+    } else if (argument === "--preview-distribution") {
+      if (previewDistribution) {
+        fail("--preview-distribution must be provided at most once");
+      }
+      previewDistribution = true;
+    } else if (argument === "--replace-preview-output") {
+      if (replacePreviewOutput) {
+        fail("--replace-preview-output must be provided at most once");
+      }
+      replacePreviewOutput = true;
+    } else if (argument === "--validate-preview") {
+      if (validatePreview) {
+        fail("--validate-preview must be provided at most once");
+      }
+      validatePreview = true;
+    } else if (argument === "--app") {
+      if (appPath !== null || index + 1 >= argv.length) {
+        fail("--app must be provided at most once with a value");
+      }
+      appPath = resolve(argv[++index] ?? "");
     } else if (argument === "--bundle-version") {
       if (bundleVersionSeen || index + 1 >= argv.length) {
         fail("--bundle-version must be provided at most once with a value");
@@ -2239,12 +2769,62 @@ function parseArguments(argv) {
       fail(`Unknown argument: ${argument}`);
     }
   }
+  if (validatePreview) {
+    if (appPath === null
+        || output !== null
+        || centralOriginSeen
+        || allowLoopbackCentralOrigin
+        || externalDistribution
+        || previewDistribution
+        || replacePreviewOutput
+        || bundleVersionSeen
+        || sparkleFramework !== null
+        || sparkleAppcastURL !== null
+        || sparklePublicEdKey !== null) {
+      fail(
+        "--validate-preview requires exactly --app <path>",
+        "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID",
+      );
+    }
+    return { appPath, validatePreview };
+  }
+  if (appPath !== null) {
+    fail("--app is only valid with --validate-preview");
+  }
+  if (replacePreviewOutput && !previewDistribution) {
+    fail("--replace-preview-output requires --preview-distribution");
+  }
+  if (previewDistribution) {
+    const environmentOutput = environment.USAGE_MONITOR_PREVIEW_OUTPUT;
+    if (output !== null || environmentOutput !== undefined) {
+      fail(
+        "Preview distribution always builds into its reviewed staging path",
+        "MACOS_PREVIEW_OUTPUT_FORBIDDEN",
+      );
+    }
+    output = DEFAULT_PREVIEW_OUTPUT;
+    centralOrigin = centralOrigin
+      ?? environment.USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN
+      ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.centralOrigin;
+    const environmentFramework =
+      environment.USAGE_MONITOR_PREVIEW_SPARKLE_FRAMEWORK;
+    sparkleFramework = sparkleFramework
+      ?? resolve(environmentFramework ?? DEFAULT_PREVIEW_FRAMEWORK);
+    sparkleAppcastURL = sparkleAppcastURL
+      ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL
+      ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL;
+    sparklePublicEdKey = sparklePublicEdKey
+      ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY
+      ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparklePublicEdKey;
+  }
   if (!output) fail("--output is required");
   return {
     output,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
+    previewDistribution,
+    replacePreviewOutput,
     bundleVersion,
     sparkleFramework,
     sparkleAppcastURL,
@@ -2269,11 +2849,13 @@ async function buildApplication(stageApp, centralService, {
     graph,
     webModules,
     swiftSources,
+    localizationResources,
     workspaceRuntimePackages,
   ] = await Promise.all([
     collectMacOSRuntimeGraph(),
     collectVerifiedMacOSWebModuleGraph(),
     collectMacOSSwiftSources(),
+    collectMacOSLocalizationResources(),
     captureMacOSWorkspaceRuntimePackages(),
   ]);
   const runtimeAssets = Object.freeze([
@@ -2284,6 +2866,7 @@ async function buildApplication(stageApp, centralService, {
     join(contents, "Info.plist"),
     infoPlist(centralService, {
       bundleVersion,
+      distribution,
       iconIncluded: iconAssets !== null,
       updater,
     }),
@@ -2296,6 +2879,7 @@ async function buildApplication(stageApp, centralService, {
   );
   await copyPinnedSparkleFramework(contents, updater);
   const node = await copyPinnedNode(resources);
+  await stageMacOSLocalizationResources(contents, appRoot, localizationResources);
   await copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules);
   const dependencies = await copyRuntimeDependencies(
     appRoot,
@@ -2347,6 +2931,7 @@ async function buildApplication(stageApp, centralService, {
       appOpenHost: PRODUCT_BRAND.appOpenHost,
       appOpenScheme: PRODUCT_BRAND.appOpenScheme,
       appOpenURL: PRODUCT_BRAND.appOpenURL,
+      channel: distribution.channel,
       externalDistributionRequested: distribution.externalDistribution,
       iconIncluded: iconAssets !== null,
       iconSha256: iconAssets ? sha256(iconAssets.icon.bytes) : null,
@@ -2354,16 +2939,19 @@ async function buildApplication(stageApp, centralService, {
         ? sha256(Buffer.from(iconAssets.provenanceText, "utf8"))
         : null,
       productionOriginValidated: distribution.productionOriginValidated,
+      previewDistributionRequested: distribution.previewDistribution,
+      previewOriginValidated: distribution.previewOriginValidated,
       requiresDeveloperIDAndNotarization:
         distribution.externalDistribution,
       updater: {
         appcastURL: updater.appcastURL,
-        automaticChecks: updater.enabled,
-        automaticUpdateOptInAvailable: updater.enabled,
-        automaticUpdatesEnabledByDefault: false,
+        automaticChecks: updater.automaticChecks,
+        automaticUpdateOptInAvailable: updater.allowsAutomaticUpdateOptIn,
+        automaticUpdatesEnabledByDefault:
+          updater.automaticUpdatesEnabledByDefault,
         afterUserOptIn: {
-          automaticDownload: updater.enabled,
-          installOnQuit: updater.enabled,
+          automaticDownload: updater.allowsAutomaticUpdateOptIn,
+          installOnQuit: updater.automaticUpdatesEnabledByDefault,
         },
         enabled: updater.enabled,
         frameworkSha256: updater.framework?.sha256 ?? null,
@@ -2401,12 +2989,15 @@ async function buildApplication(stageApp, centralService, {
         graph,
         runtimeAssets,
         swiftSources,
+        localizationResources,
         iconAssets,
         updater,
         webModules,
         workspaceRuntimePackages,
       }),
       firstPartyFiles: graph.relativeFiles,
+      localizationResources: localizationResources.relativeFiles.map((path) =>
+        `apps/macos/Resources/${path}`),
       staticAssets: runtimeAssets,
       generatedRuntimeContracts: [...ALLOWED_GENERATED_RUNTIME_FILES].sort(),
       builtins: graph.builtins,
@@ -2441,6 +3032,9 @@ export async function buildMacOSApp({
   centralOrigin = null,
   allowLoopbackCentralOrigin = false,
   externalDistribution = false,
+  previewDistribution = false,
+  replacePreviewOutput = false,
+  previewStagingRoot = DEFAULT_PREVIEW_STAGING_ROOT,
   bundleVersion = BUNDLE_VERSION,
   sparkleFramework = null,
   sparkleAppcastURL = null,
@@ -2453,19 +3047,36 @@ export async function buildMacOSApp({
   const distribution = validateMacOSDistributionConfiguration({
     centralService,
     externalDistribution,
+    previewDistribution,
   });
   const updater = await normalizeMacOSUpdaterConfiguration({
     appcastURL: sparkleAppcastURL,
     externalDistribution: distribution.externalDistribution,
+    previewDistribution: distribution.previewDistribution,
     frameworkPath: sparkleFramework,
     publicEdKey: sparklePublicEdKey,
   });
+  if (distribution.externalDistribution
+      && (centralService.origin !== DEPLOYMENT_ENDPOINTS.public.origin
+        || updater.appcastURL !== DEPLOYMENT_ENDPOINTS.sparkle.appcastURL)) {
+    fail(
+      "External distribution endpoints must match config/deployment-endpoints.js",
+      "MACOS_DISTRIBUTION_ENDPOINTS_MISMATCH",
+    );
+  }
+  const selectedOutput = distribution.previewDistribution
+    ? validateMacOSPreviewOutputPath(output, {
+      stagingRoot: previewStagingRoot,
+    })
+    : resolve(output);
   assertBuildPlatform();
   const iconAssets = await loadIconAssets({
-    required: distribution.externalDistribution,
+    required: distribution.externalDistribution || distribution.previewDistribution,
   });
-  const selectedOutput = resolve(output);
-  const outputParent = await prepareOutput(selectedOutput);
+  const outputParent = await prepareOutput(selectedOutput, {
+    channel: distribution.channel,
+    previewStagingRoot,
+  });
   const temporaryRoot = await mkdtemp(
     join(outputParent, ".usage-monitor-macos-build-"),
   );
@@ -2479,6 +3090,15 @@ export async function buildMacOSApp({
     });
     signApplicationBundle(stagedApp);
     if (await verifyExistingBuildTarget(selectedOutput)) {
+      if (distribution.previewDistribution) {
+        if (replacePreviewOutput !== true) {
+          fail(
+            "Preview staging bundle already exists; rerun with --replace-preview-output after validation",
+            "MACOS_PREVIEW_REPLACE_REQUIRED",
+          );
+        }
+        await validateMacOSPreviewApp(selectedOutput);
+      }
       await rm(selectedOutput, { recursive: true, force: false });
     }
     await rename(stagedApp, selectedOutput);
@@ -2488,6 +3108,7 @@ export async function buildMacOSApp({
       totalBytes: manifest.payload.totalBytes,
       sourceSha256: manifest.inputs.sourceSha256,
       centralServiceMode: manifest.runtime.centralService.mode,
+      channel: manifest.release.channel,
       externalDistributionRequested:
         manifest.release.externalDistributionRequested,
       updaterEnabled: manifest.release.updater.enabled,
@@ -2499,20 +3120,35 @@ export async function buildMacOSApp({
 
 async function main(argv) {
   const {
+    appPath,
     output,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
+    previewDistribution,
+    replacePreviewOutput,
     bundleVersion,
     sparkleFramework,
     sparkleAppcastURL,
     sparklePublicEdKey,
-  } = parseArguments(argv);
+    validatePreview,
+  } = parseMacOSBuildArguments(argv);
+  if (validatePreview) {
+    const result = await validateMacOSPreviewApp(appPath);
+    console.log("Preview validation: passed");
+    console.log(`Bundle: ${result.bundleIdentifier}`);
+    console.log(`Bundle version: ${result.bundleVersion}`);
+    console.log(`Channel: ${result.channel}`);
+    console.log(`Updater: ${result.updaterEnabled ? "Sparkle 2.9.3" : "disabled"}`);
+    return;
+  }
   const result = await buildMacOSApp({
     output,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
+    previewDistribution,
+    replacePreviewOutput,
     bundleVersion,
     sparkleFramework,
     sparkleAppcastURL,
@@ -2523,6 +3159,7 @@ async function main(argv) {
   console.log(`Payload SHA-256: ${result.payloadSha256}`);
   console.log(`Source SHA-256: ${result.sourceSha256}`);
   console.log(`Payload bytes: ${result.totalBytes}`);
+  console.log(`Channel: ${result.channel}`);
   console.log(`Central service: ${result.centralServiceMode}`);
   console.log(
     `External distribution requested: ${result.externalDistributionRequested}`,

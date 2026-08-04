@@ -74,7 +74,7 @@
   ],
   "assets": {
     "binding": "ASSETS",
-    "directory": "../web/public",
+    "directory": "../../.release-build/worker-assets",
     "not_found_handling": "single-page-application",
     // Keep the retired Apple association filename out of the SPA fallback.
     // Sign in with Apple web registration is configured in Apple's portal and
@@ -155,7 +155,7 @@
       ],
       "assets": {
         "binding": "ASSETS",
-        "directory": "../web/public",
+        "directory": "../../.release-build/worker-assets",
         "not_found_handling": "single-page-application",
         "run_worker_first": ["/api/*"]
       }
@@ -258,9 +258,9 @@
       ],
       "assets": {
         "binding": "ASSETS",
-        // `production:stage-assets` accepts only tracked files from a clean
-        // release checkout. Do not point production at the mutable working
-        // tree: every file in that directory would otherwise be deployable.
+        // `production:stage-assets` accepts only the manifest-verified output
+        // of the public release builder. Do not point any environment at the
+        // mutable browser source tree: every file there would be deployable.
         "directory": "../../.release-build/worker-assets",
         "not_found_handling": "single-page-application",
         // Prevent the legacy association filename from receiving the SPA

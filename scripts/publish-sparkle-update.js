@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import { validateMacOSDMG } from "./macos-release-core.js";
 
@@ -25,10 +26,9 @@ const WRANGLER_PATH = join(
   "wrangler",
 );
 
-export const APPROVED_R2_BUCKET = "tibotattle-updates";
-export const CANONICAL_UPDATE_ORIGIN = "https://updates.tibotattle.com";
-export const CANONICAL_APPCAST_URL =
-  `${CANONICAL_UPDATE_ORIGIN}/appcast.xml`;
+export const APPROVED_R2_BUCKET = DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket;
+export const CANONICAL_UPDATE_ORIGIN = DEPLOYMENT_ENDPOINTS.sparkle.origin;
+export const CANONICAL_APPCAST_URL = DEPLOYMENT_ENDPOINTS.sparkle.appcastURL;
 export const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
 export const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 export const APPCAST_CACHE_CONTROL = "public, max-age=300, must-revalidate";

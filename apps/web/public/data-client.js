@@ -222,6 +222,14 @@ function text(value, fallback = "") {
   return typeof value === "string" && value.length <= 500 ? value : fallback;
 }
 
+function canonicalInstant(value) {
+  if (typeof value !== "string" || value.length > 32) return null;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value
+    ? value
+    : null;
+}
+
 function count(value, fallback = null) {
   const number = finite(value, fallback);
   return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
@@ -834,7 +842,7 @@ export function normalizeContributionSyncPreview(payload) {
         && /^(?:0|[1-9]\d*)\.\d{6}$/.test(estimatedCost)))
     && coverage !== null && coverage >= 0 && coverage <= 100
     && unknownModels !== null && unknownUnits !== null
-    && ["current_api_prices", "historical_api_prices", "unpriced"]
+    && ["current_api_prices", "historical_api_prices", "unpriced", "mixed_api_prices"]
       .includes(item?.accounting?.priceBasis)
     && item?.accounting?.verification === "client_declared_unverified"
     && preparedBytes !== null && reservedUploadBytes !== null
@@ -1496,10 +1504,35 @@ export function normalizeParticipantHistory(payload) {
     const serverPrice = priceVerification === "server_repriced"
       ? nonNegative(candidate?.serverAccounting?.apiPriceEquivalentUsd, null)
       : null;
+    const serverPriceBasis = candidate?.serverAccounting?.priceBasis === undefined
+      ? null
+      : text(candidate?.serverAccounting?.priceBasis, "");
+    const serverPriceEpochBasis = candidate?.serverAccounting?.priceEpochBasis === undefined
+      ? null
+      : text(candidate?.serverAccounting?.priceEpochBasis, "");
+    const serverEventTimeRange = candidate?.serverAccounting?.eventTimeRange;
+    const serverEventTimeStart = serverEventTimeRange === null
+      || serverEventTimeRange === undefined
+      ? null
+      : canonicalInstant(serverEventTimeRange?.startAt);
+    const serverEventTimeEnd = serverEventTimeRange === null
+      || serverEventTimeRange === undefined
+      ? null
+      : canonicalInstant(serverEventTimeRange?.endAt);
     if (!["server_repriced", "server_repricing_unavailable"].includes(priceVerification)
         || (priceVerification === "server_repriced" && serverPrice === null)
         || (priceVerification === "server_repricing_unavailable"
           && candidate?.serverAccounting?.apiPriceEquivalentUsd !== null)) {
+      return unavailable("invalid_contract");
+    }
+    if ((serverPriceBasis !== null
+      && !["historical_api_prices", "unpriced", "mixed_api_prices"].includes(serverPriceBasis))
+        || (serverPriceEpochBasis !== null
+          && serverPriceEpochBasis !== "event_time_when_registry_has_effective_evidence")
+        || (serverEventTimeRange !== null && serverEventTimeRange !== undefined
+          && (serverEventTimeStart === null
+            || serverEventTimeEnd === null
+            || Date.parse(serverEventTimeEnd) < Date.parse(serverEventTimeStart)))) {
       return unavailable("invalid_contract");
     }
 
@@ -1516,6 +1549,12 @@ export function normalizeParticipantHistory(payload) {
       recordCounts,
       serverAccounting: {
         apiPriceEquivalentUsd: serverPrice,
+        priceBasis: serverPriceBasis,
+        priceEpochBasis: serverPriceEpochBasis,
+        eventTimeRange: serverEventTimeRange === null
+          || serverEventTimeRange === undefined
+          ? null
+          : { startAt: serverEventTimeStart, endAt: serverEventTimeEnd },
         verification: priceVerification
       },
       quarantine: {
@@ -1984,6 +2023,20 @@ function normalizeLocalAccounting(value = {}) {
     events: count(value.events, 0),
     totalTokens: count(value.totalTokens, 0),
     apiPriceEquivalentUsd: nonNegative(value.apiPriceEquivalentUsd, 0),
+    priceCardIds: array(value.priceCardIds)
+      .filter((id) => typeof id === "string" && id.length > 0)
+      .slice(0, 32),
+    priceCardBreakdown: array(value.priceCardBreakdown)
+      .flatMap((item) => (
+        typeof item?.priceCardId === "string"
+          && Number.isSafeInteger(item.events)
+          && item.events >= 0
+          && typeof item.costUsd === "string"
+          && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+          ? [{ priceCardId: item.priceCardId, events: item.events, costUsd: item.costUsd }]
+          : []
+      ))
+      .slice(0, 32),
     quotaWeightedApiPriceEquivalentUsd: nonNegative(
       value.quotaWeightedApiPriceEquivalentUsd,
       null
@@ -2142,6 +2195,7 @@ function normalizeQuota(window, index) {
 
 function normalizePricing(pricing = {}) {
   const source = pricing?.components ?? pricing?.componentTotals ?? {};
+  const priceEpochBasis = text(pricing?.priceEpochBasis, "");
   const componentRows = Array.isArray(source)
     ? source
     : Object.entries(source).map(([name, value]) => ({
@@ -2162,7 +2216,32 @@ function normalizePricing(pricing = {}) {
     subscriptionSpeedIsSeparate: pricing?.subscriptionSpeedIsSeparate === true,
     registryVersion: text(pricing?.registryVersion, ""),
     registryObservedAt: text(pricing?.registryObservedAt, ""),
-    priceEpochBasis: text(pricing?.priceEpochBasis, ""),
+    priceEpochBasis,
+    eventTimeHistoricalTotalUsdExact: typeof pricing?.eventTimeHistoricalTotalUsdExact === "string"
+      && /^\d+(?:\.\d+)?$/u.test(pricing.eventTimeHistoricalTotalUsdExact)
+      ? pricing.eventTimeHistoricalTotalUsdExact
+      : null,
+    currentPriceSensitivityTotalUsdExact: priceEpochBasis === "event_time_when_registry_has_effective_evidence"
+      ? null
+      : typeof pricing?.currentPriceSensitivityTotalUsdExact === "string"
+      && /^\d+(?:\.\d+)?$/u.test(pricing.currentPriceSensitivityTotalUsdExact)
+      ? pricing.currentPriceSensitivityTotalUsdExact
+      : null,
+    priceCardIds: array(pricing?.priceCardIds)
+      .filter((id) => typeof id === "string" && id.length > 0)
+      .slice(0, 32),
+    priceCardBreakdown: array(pricing?.priceCardBreakdown)
+      .flatMap((item) => (
+        typeof item?.priceCardId === "string"
+          && Number.isSafeInteger(item.events)
+          && item.events >= 0
+          && typeof item.costUsd === "string"
+          && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+          ? [{ priceCardId: item.priceCardId, events: item.events, costUsd: item.costUsd }]
+          : []
+      ))
+      .slice(0, 32),
+    mixedPriceCardWindows: pricing?.mixedPriceCardWindows === true,
     components: componentRows.slice(0, 12).map((row) => ({
       name: text(row?.name ?? row?.component, "Unknown"),
       tokens: finite(row?.tokens ?? row?.value, 0),
@@ -2212,9 +2291,29 @@ function normalizeGradient(payload = {}) {
 function normalizeWeekly(payload = {}) {
   const envelope = payload?.weekly ?? payload;
   const source = artifactData(envelope);
+  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
+    .map((row) => ({
+      ...row,
+      priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
+        .filter((id) => typeof id === "string" && id.length > 0)
+        .slice(0, 32),
+      priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
+        .flatMap((item) => {
+          if (typeof item?.priceCardId !== "string"
+              || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
+              || !Number.isSafeInteger(item?.events)
+              || item.events < 0) return [];
+          return [{
+            priceCardId: item.priceCardId,
+            events: item.events,
+            costUsd: item.costUsd,
+          }];
+        })
+        .slice(0, 32),
+    }));
   return {
     summary: array(source.summary)[0] ?? source.summary ?? {},
-    weeklyValues: array(source.weeklyValues ?? source.weekly_values),
+    weeklyValues,
     valueSeries: array(source.valueSeries ?? source.value_series),
     holdoutSeries: array(source.holdoutSeries ?? source.holdout_series),
     errorConcentration: array(source.errorConcentration ?? source.error_concentration),
@@ -3379,7 +3478,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         { dimension: "Account scope known", coverage_fraction: .12 }
       ],
       opportunities: [
-        { priority: "P0", title: "Unknown model tokens", evidence: "Some historical events cannot be matched to a current API price card." },
+        { priority: "P0", title: "Unknown model tokens", evidence: "Some historical events cannot be matched to an official API price card." },
         { priority: "P0", title: "Integer quota display", evidence: "Quota observations are rounded to whole percentage points." },
         { priority: "P1", title: "Shared agentic surfaces", evidence: "Work, Workspace Agents, and Voice task work may draw from the same pool." },
         { priority: "P1", title: "Fast-mode attribution", evidence: "Historical records do not always identify the subscription speed tier." }

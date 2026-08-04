@@ -99,7 +99,7 @@
         "pricedEventCoveragePercent": { "type": "number", "minimum": 0, "maximum": 100 },
         "unknownModelEventCount": { "type": "integer", "minimum": 0 },
         "unknownBillableUnits": { "type": "integer", "minimum": 0 },
-        "priceBasis": { "enum": ["current_api_prices", "unpriced"] }
+        "priceBasis": { "enum": ["current_api_prices", "historical_api_prices", "unpriced", "mixed_api_prices"] }
       }
     }
   }

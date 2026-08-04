@@ -96,6 +96,10 @@ export interface UsageAccounting {
     | "unpriced";
 }
 
+export type TelemetryBatchPriceBasis =
+  | UsageAccounting["priceBasis"]
+  | "mixed_api_prices";
+
 export interface TelemetryUsageEvent {
   schemaVersion: "usage-event-v0.1";
   eventTime: string;
@@ -239,7 +243,7 @@ export interface TelemetryContribution {
     pricedEventCoveragePercent: number;
     unknownModelEventCount: number;
     unknownBillableUnits: number;
-    priceBasis: UsageAccounting["priceBasis"];
+    priceBasis: TelemetryBatchPriceBasis;
   };
 }
 
@@ -251,7 +255,7 @@ export type UsageAccountingDiagnosticV02 =
   Omit<UsageAccounting, "priceBasis"> & {
     status: "untrusted_diagnostic";
     sourceSchemaVersion: "telemetry-contribution-v0.1";
-    priceBasis: "current_api_prices" | "unpriced";
+    priceBasis: UsageAccounting["priceBasis"];
   };
 
 export type TelemetryUsageEventV02 =
@@ -300,7 +304,7 @@ export interface TelemetryContributionV02
     pricedEventCoveragePercent: number;
     unknownModelEventCount: number;
     unknownBillableUnits: number;
-    priceBasis: "current_api_prices" | "unpriced";
+    priceBasis: TelemetryBatchPriceBasis;
   };
 }
 

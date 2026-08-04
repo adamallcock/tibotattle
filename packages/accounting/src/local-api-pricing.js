@@ -5,7 +5,7 @@ import {
   APP_PRICE_REGISTRY_OBSERVED_AT,
 } from "./price-registry.js";
 
-export const LOCAL_API_PRICING_METHOD_VERSION = "provider-neutral-api-price-equivalent-v0.1";
+export const LOCAL_API_PRICING_METHOD_VERSION = "provider-neutral-api-price-equivalent-v0.2";
 
 const CODEX_TOOL_UNIT_MAPPING = Object.freeze({
   responses_web_search_call: Object.freeze({ name: "web_search_units", unit: "search" }),
@@ -17,11 +17,23 @@ const UNKNOWN_PROVIDER_TOOL_UNIT = Object.freeze({
   unit: "custom",
 });
 
+function canonicalEventTime(value) {
+  if (typeof value !== "string" || value.length > 32) return null;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value
+    ? value
+    : null;
+}
+
 function priceEpoch({ eventTime, priceEpochBasis }) {
   if (priceEpochBasis === "event_time") {
+    const pricedAt = canonicalEventTime(eventTime);
     return {
-      pricedAt: eventTime,
+      pricedAt,
       priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+      historicalPriceReasonCode: pricedAt === null
+        ? "historical_price_timestamp_missing"
+        : null,
     };
   }
   if (priceEpochBasis !== undefined && priceEpochBasis !== "current_price_sensitivity") {
@@ -53,7 +65,7 @@ function priceCardsAndManifest(priceCards) {
 
 export function priceCodexUsageEvent(event, {
   priceCards = null,
-  priceEpochBasis = "current_price_sensitivity",
+  priceEpochBasis = "event_time",
   apiServiceTier = "standard",
   region = null,
 } = {}) {
@@ -72,14 +84,17 @@ export function priceCodexUsageEvent(event, {
     componentAvailability: event.componentAvailability,
   }, {
     priceCards: registry.priceCards,
-    pricingContext: { priceEpochBasis: epoch.priceEpochBasis },
+    pricingContext: {
+      priceEpochBasis: epoch.priceEpochBasis,
+      ...(epoch.historicalPriceReasonCode ? { historicalPriceReasonCode: epoch.historicalPriceReasonCode } : {}),
+    },
   });
   return { ...result, methodVersion: LOCAL_API_PRICING_METHOD_VERSION, registry: registry.manifest };
 }
 
 export function priceClaudeUsageRecord(record, {
   priceCards = null,
-  priceEpochBasis = "current_price_sensitivity",
+  priceEpochBasis = "event_time",
   apiServiceTier = "standard",
   region = null,
 } = {}) {
@@ -105,7 +120,10 @@ export function priceClaudeUsageRecord(record, {
     },
   }, {
     priceCards: registry.priceCards,
-    pricingContext: { priceEpochBasis: epoch.priceEpochBasis },
+    pricingContext: {
+      priceEpochBasis: epoch.priceEpochBasis,
+      ...(epoch.historicalPriceReasonCode ? { historicalPriceReasonCode: epoch.historicalPriceReasonCode } : {}),
+    },
   });
   return { ...result, methodVersion: LOCAL_API_PRICING_METHOD_VERSION, registry: registry.manifest };
 }
@@ -150,10 +168,11 @@ export function codexProviderBillableToolUnits(serverBillableUnits) {
 
 export function priceCodexProviderToolUnits(serverBillableUnits, {
   priceCards = null,
-  priceEpochBasis = "current_price_sensitivity",
+  priceEpochBasis = "event_time",
+  eventTime = null,
 } = {}) {
   const registry = priceCardsAndManifest(priceCards);
-  const epoch = priceEpoch({ eventTime: null, priceEpochBasis });
+  const epoch = priceEpoch({ eventTime, priceEpochBasis });
   const result = priceUsageEvent({
     provider: "openai",
     model: "openai-provider-tools",
@@ -164,7 +183,10 @@ export function priceCodexProviderToolUnits(serverBillableUnits, {
     billableToolUnits: codexProviderBillableToolUnits(serverBillableUnits),
   }, {
     priceCards: registry.priceCards,
-    pricingContext: { priceEpochBasis: epoch.priceEpochBasis },
+    pricingContext: {
+      priceEpochBasis: epoch.priceEpochBasis,
+      ...(epoch.historicalPriceReasonCode ? { historicalPriceReasonCode: epoch.historicalPriceReasonCode } : {}),
+    },
   });
   return { ...result, methodVersion: LOCAL_API_PRICING_METHOD_VERSION, registry: registry.manifest };
 }

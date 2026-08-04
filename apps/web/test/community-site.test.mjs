@@ -3,14 +3,15 @@ import { test } from "node:test";
 import { readFile } from "node:fs/promises";
 
 import {
-  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-} from "../../../config/product-brand.js";
-import { COMMUNITY_SNAPSHOT_SCHEMA_VERSION } from "../public/data-client.js";
-import {
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   COMMUNITY_METRIC_LABELS,
   COMMUNITY_SNAPSHOT_STATE_COPY,
   renderCommunitySnapshot,
 } from "../public/community-view.js";
+import {
+  renderPublicInstallerJourney,
+  setPublicSnapshotPresentation,
+} from "../public/community.js";
 import {
   configuredInstallerRelease,
   configuredSemanticOpenTarget,
@@ -137,18 +138,37 @@ function publishedSnapshot(overrides = {}) {
   };
 }
 
-test("the public site presents only the install call to action and the community view", async () => {
+test("the public site presents the community snapshot first and a fail-closed download CTA", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
 
   assert.match(html, /<script type="module" src="\.\/community\.js">/u);
+  assert.match(html, /id="hero-title"/u);
+  assert.match(html, /id="community"/u);
+  assert.match(html, /id="download"/u);
+  assert.match(html, /id="faq"/u);
+  assert.match(html, /Download for Mac/u);
+  assert.match(html, /privacy-safe seven-day community snapshot/u);
+  assert.match(html, /community seven-day allowance estimate will appear only after/u);
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="installer-details"/u);
   assert.match(html, /id="installer-unavailable"/u);
-  assert.match(html, /id="open-installed-app"/u);
+  assert.match(html, /id="installer-steps" hidden/u);
+  assert.match(html, /id="download-nav-link"/u);
+  assert.match(html, /id="download-hero-link"/u);
   assert.match(html, /id="community-result"/u);
   assert.match(html, /id="community-snapshot-service-detail"/u);
   assert.match(html, /id="community-service-state"/u);
+  assert.match(html, /id="community-snapshot-title">Seven-day community snapshot/u);
+  assert.doesNotMatch(html, /Published seven-day snapshot/u);
+  assert.ok(
+    html.indexOf('id="community"') < html.indexOf('id="download"'),
+    "the community snapshot precedes the download section",
+  );
+  assert.doesNotMatch(
+    html,
+    /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\/open/u,
+  );
 
   // Every control that cannot work without the local companion is absent from
   // the website. These are the dead controls the split exists to remove.
@@ -180,23 +200,30 @@ test("the public site presents only the install call to action and the community
     const companionOnlyModule of [
       "./app.js",
       "./navigation.js",
+      "./admin.js",
+      "./admin-client.js",
+      "./data-client.js",
+      "./install-cta.js",
       "LocalCompanionClient",
       "createTelemetryEnvelope",
       "createGoogleSignInRequest",
       "registerUpload",
       "contributeSerialized",
+      "./lib.js",
     ]
   ) {
     assert.equal(source.includes(companionOnlyModule), false, companionOnlyModule);
   }
+  assert.match(html, /<img[^>]+src="\.\/tibotattle-icon\.png"/u);
 
-  // Accessibility: the site keeps the same skip link and named landmarks the
-  // dashboard uses, and the focus ring is global rather than per page.
+  // Accessibility: the site keeps a skip link, named landmarks, keyboard
+  // focus rings, and native details/summary FAQ disclosures.
   assert.match(html, /<a class="skip-link" href="#main">/u);
   assert.match(html, /<main id="main">/u);
   assert.match(html, /<nav class="primary-nav" aria-label="Site sections">/u);
-  assert.match(html, /aria-labelledby="install-title"/u);
   assert.match(html, /aria-labelledby="community-title"/u);
+  assert.match(html, /aria-labelledby="download-title"/u);
+  assert.match(html, /aria-labelledby="faq-title"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
     /button:focus-visible, input:focus-visible, a:focus-visible/u,
@@ -224,20 +251,19 @@ test("the public site presents only the install call to action and the community
       name,
     );
   }
-  assert.equal(
-    html.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1,
-    1,
-  );
+  assert.doesNotMatch(html, /semantic-open-target|open-installed-app/u);
 });
 
-test("both browser entry points share one community renderer and one install card", async () => {
+test("browser entry points share the renderer without shipping local app controls", async () => {
   const siteSource = await readFile(SITE_SOURCE, "utf8");
   const appSource = await readFile(APP_SOURCE, "utf8");
-  for (const shared of ["./community-view.js", "./install-cta.js"]) {
-    assert.match(siteSource, new RegExp(`from "${shared.replace(".", "\\.")}"`, "u"));
-    assert.match(appSource, new RegExp(`from "${shared.replace(".", "\\.")}"`, "u"));
-  }
-  // No forked copy: the dashboard entry no longer defines either renderer.
+  assert.match(siteSource, /from "\.\/community-view\.js"/u);
+  assert.match(appSource, /from "\.\/community-view\.js"/u);
+  assert.doesNotMatch(siteSource, /from "\.\/install-cta\.js"/u);
+  assert.match(appSource, /from "\.\/install-cta\.js"/u);
+  // No forked copy: the dashboard entry no longer defines the community
+  // renderer, while the public entry keeps its own companion-free install
+  // card instead of shipping the app-open helper.
   assert.doesNotMatch(appSource, /const COMMUNITY_METRIC_LABELS = Object\.freeze/u);
   assert.doesNotMatch(appSource, /function configuredInstallerRelease\(/u);
   assert.doesNotMatch(appSource, /function formatInstallerSize\(/u);
@@ -310,6 +336,11 @@ test("a published community week renders its support gate, provenance, and cells
   assert.match(container.text, /not an average, and not a cost/u);
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a released week renders its cell table");
+  const breakdown = container.descendants().find(({ tag, className }) => (
+    tag === "details" && className.includes("snapshot-breakdown")
+  ));
+  assert.ok(breakdown, "the detailed cell table is opt-in disclosure content");
+  assert.equal(breakdown.descendants().includes(table), true);
   const headerLabels = table
     .descendants()
     .filter(({ tag }) => tag === "th")
@@ -330,6 +361,61 @@ test("a published community week renders its support gate, provenance, and cells
   assert.equal(
     bare.descendants().some(({ tag }) => tag === "table"),
     true,
+  );
+  assert.equal(
+    bare.descendants().some(({ tag, className }) => (
+      tag === "details" && className.includes("snapshot-breakdown")
+    )),
+    true,
+  );
+});
+
+test("the public page names only a verified installer as a download", () => {
+  const complete = {
+    "usage-monitor-installer-url": "https://downloads.example.org/TiboTattle.dmg",
+    "usage-monitor-installer-version": "1.2.3",
+    "usage-monitor-installer-sha256": "a".repeat(64),
+    "usage-monitor-installer-bytes": "12582912",
+    "usage-monitor-minimum-macos": "13.0",
+    "usage-monitor-architectures": "arm64",
+    "usage-monitor-release-notes-url": "https://example.org/releases/1.2.3",
+    "usage-monitor-privacy-url": "https://example.org/privacy",
+    "usage-monitor-security-url": "https://example.org/security",
+    "usage-monitor-support-url": "https://example.org/support",
+  };
+  const unavailable = fakeDocument();
+  assert.equal(renderPublicInstallerJourney(unavailable), null);
+  assert.equal(unavailable.byId.get("installer-steps").hidden, true);
+  assert.equal(unavailable.byId.get("download-nav-link").textContent, "Mac app");
+  assert.equal(
+    unavailable.byId.get("download-hero-link").textContent,
+    "Mac app availability",
+  );
+
+  const ready = fakeDocument(complete);
+  assert.equal(renderPublicInstallerJourney(ready)?.version, "1.2.3");
+  assert.equal(ready.byId.get("installer-steps").hidden, false);
+  assert.equal(ready.byId.get("download-nav-link").textContent, "Download");
+  assert.equal(ready.byId.get("download-hero-link").textContent, "Download for Mac");
+});
+
+test("the public snapshot badge reports reader-facing snapshot state", () => {
+  const unavailable = fakeDocument();
+  setPublicSnapshotPresentation(unavailable, "service_unavailable", { failed: true });
+  assert.equal(
+    unavailable.byId.get("community-service-state").textContent,
+    "Snapshot temporarily unavailable",
+  );
+  assert.equal(
+    unavailable.byId.get("community-snapshot-title").textContent,
+    "Seven-day community snapshot",
+  );
+
+  const published = fakeDocument();
+  setPublicSnapshotPresentation(published, "published");
+  assert.equal(
+    published.byId.get("community-service-state").textContent,
+    "Snapshot available",
   );
 });
 

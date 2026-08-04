@@ -1,15 +1,155 @@
-// The community aggregate view. This is the only dashboard surface that needs
-// no local companion, so it is the one surface the public website can show
-// honestly. Both entry points render it from this single module: the in-app
-// dashboard (app.js) and the public site (community.js).
+// The community aggregate view. It needs no local companion, so the public
+// website can show it honestly. The local app and public site render it from
+// this single module.
 
-import { normalizeCommunitySnapshot } from "./data-client.js";
 import {
   compact,
   createDomHelpers,
   formatAge,
   formatLocal,
 } from "./ui-format.js";
+
+export const COMMUNITY_SNAPSHOT_SCHEMA_VERSION = "community-weekly-snapshot-v0.2";
+const SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS = Object.freeze([
+  "community-weekly-snapshot-v0.1",
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+]);
+const COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS = new Set([
+  COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+]);
+const COMMUNITY_METRIC_UNITS = Object.freeze({
+  usageEvents: "events_rounded_down",
+  inputUncachedTokens: "tokens_rounded_down",
+  inputCacheReadTokens: "tokens_rounded_down",
+  inputCacheWriteTokens: "tokens_rounded_down",
+  outputTextTokens: "tokens_rounded_down",
+  outputReasoningTokens: "tokens_rounded_down",
+  outputCombinedTokens: "tokens_rounded_down",
+  toolUnits: "tool_units_rounded_down",
+});
+
+function finite(value, fallback = null) {
+  if (value === null
+      || value === undefined
+      || value === ""
+      || typeof value === "boolean") {
+    return fallback;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function text(value, fallback = "") {
+  return typeof value === "string" && value.length <= 500 ? value : fallback;
+}
+
+function snapshotMetric(value, expectedUnit) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  if (value.status === "suppressed") {
+    return { status: "suppressed", value: null, unit: expectedUnit };
+  }
+  const numeric = finite(value.value, null);
+  if (value.status !== "released"
+      || value.unit !== expectedUnit
+      || numeric === null
+      || !Number.isSafeInteger(numeric)
+      || numeric < 0) {
+    return null;
+  }
+  return { status: "released", value: numeric, unit: expectedUnit };
+}
+
+function normalizeCommunitySnapshot(payload) {
+  if (!payload) return { state: "service_unavailable", cells: [] };
+  if (payload.publicationStatus === "development_diagnostic_not_publication_safe") {
+    return { state: "development_unsafe", cells: [] };
+  }
+  if (!SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS.includes(
+    payload.schemaVersion,
+  )
+      || payload.immutable !== true
+      || payload.nonOverlapping !== true) {
+    return { state: "unsupported_schema", cells: [] };
+  }
+  const carriesPlanCohort = COMMUNITY_SNAPSHOT_PLAN_COHORT_VERSIONS.has(
+    payload.schemaVersion,
+  );
+
+  const base = {
+    schemaVersion: payload.schemaVersion,
+    snapshotId: text(payload.snapshotId, ""),
+    period: {
+      startAt: text(payload.period?.startAt, ""),
+      endAt: text(payload.period?.endAt, ""),
+    },
+    ingestionCutoffAt: text(payload.ingestionCutoffAt, ""),
+    releasedAt: text(payload.releasedAt, ""),
+    policyVersion: text(payload.privacyPolicy?.version, ""),
+    minimumIndependentParticipants: finite(
+      payload.privacyPolicy?.minimumIndependentParticipants,
+      null,
+    ),
+    cells: [],
+  };
+
+  if (payload.releaseStatus === "not_yet_published") {
+    return { ...base, state: "not_yet_published" };
+  }
+  if (payload.releaseStatus === "withdrawn") {
+    return { ...base, state: "withdrawn" };
+  }
+  if (payload.releaseStatus === "suppressed") {
+    return { ...base, state: "suppressed" };
+  }
+  if (payload.releaseStatus !== "published"
+      || !base.snapshotId
+      || !base.period.startAt
+      || !base.period.endAt
+      || !base.ingestionCutoffAt
+      || !base.releasedAt
+      || !base.policyVersion
+      || !Number.isSafeInteger(base.minimumIndependentParticipants)
+      || base.minimumIndependentParticipants < 3
+      || !Array.isArray(payload.cells)
+      || payload.cells.length > 100) {
+    return { ...base, state: "unsupported_schema" };
+  }
+
+  const cells = [];
+  let partial = false;
+  for (const candidate of payload.cells) {
+    const provider = text(candidate?.provider, "");
+    const modelId = text(candidate?.modelId, "");
+    if (!provider
+        || !modelId
+        || !candidate.metrics
+        || typeof candidate.metrics !== "object"
+        || Array.isArray(candidate.metrics)) {
+      return { ...base, state: "unsupported_schema" };
+    }
+    const planType = carriesPlanCohort
+      ? text(candidate?.planType, "unknown")
+      : "unknown";
+    const planVariant = carriesPlanCohort
+      ? text(candidate?.planVariant, "unknown")
+      : "unknown";
+    const metrics = {};
+    for (const [metricName, expectedUnit] of Object.entries(COMMUNITY_METRIC_UNITS)) {
+      const metric = snapshotMetric(candidate.metrics[metricName], expectedUnit);
+      if (!metric) return { ...base, state: "unsupported_schema" };
+      metrics[metricName] = metric;
+      partial ||= metric.status === "suppressed";
+    }
+    cells.push({ provider, planType, planVariant, modelId, metrics });
+  }
+  return {
+    ...base,
+    state: partial ? "published_partial" : "published",
+    cells,
+  };
+}
 
 export const COMMUNITY_METRIC_LABELS = Object.freeze({
   usageEvents: "Usage events",
@@ -163,6 +303,17 @@ export function renderCommunitySnapshot({
     ));
   }
 
+  // A release can contain many provider/model cells. The public landing view
+  // stays a readable weekly snapshot; the complete activity breakdown remains
+  // available on demand without masquerading as a personal dashboard.
+  const breakdown = node("details", "journey-disclosure snapshot-breakdown");
+  const summary = node("summary");
+  summary.append(node(
+    "span",
+    "",
+    `View detailed activity by provider and model (${compact(snapshot.cells.length)} cells)`,
+  ));
+  breakdown.append(summary);
   const wrap = node("div", "table-wrap snapshot-table");
   const table = documentRef.createElement("table");
   const caption = node(
@@ -208,6 +359,7 @@ export function renderCommunitySnapshot({
   }
   table.append(caption, thead, tbody);
   wrap.append(table);
-  container.append(wrap);
+  breakdown.append(wrap);
+  container.append(breakdown);
   return snapshot.state;
 }

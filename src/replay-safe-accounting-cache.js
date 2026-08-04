@@ -19,6 +19,7 @@ import {
   ExportResourceLimitError,
 } from "./export-resource-policy.js";
 import {
+  addUsdStrings,
   costWarningCodes,
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
@@ -33,7 +34,10 @@ import {
 import { fastQuotaMultiplier } from "./application/index.js";
 
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.1";
+  "local-replay-safe-accounting-v0.2";
+
+const HISTORICAL_PRICE_EPOCH_BASIS =
+  "event_time_when_registry_has_effective_evidence";
 
 const MAX_CACHE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_WINDOW_DAYS = 31;
@@ -211,6 +215,9 @@ function newPeriod(id, label) {
     components: emptyComponents(),
     componentCosts: emptyComponentCosts(),
     apiPriceEquivalentUsd: 0,
+    apiPriceEquivalentUsdExact: "0",
+    priceCardIds: [],
+    priceCardBreakdown: {},
     pricingCoverage: {
       fullyPricedEvents: 0,
       partiallyPricedEvents: 0,
@@ -284,7 +291,11 @@ function createAccountingPricer() {
       Number(event.totalInputContextTokens) >= 272_000
         ? "long"
         : "short";
-    const key = `${event.model}\0${contextBand}`;
+    // Keep the effective date in the fast-plan key: official price cards may
+    // change by date, and a later plan must never price an earlier event.
+    const effectiveDate = canonicalInstant(event.timestamp)?.slice(0, 10)
+      ?? "missing_timestamp";
+    const key = `${event.model}\0${contextBand}\0${effectiveDate}`;
     let plan = plans.get(key);
     if (plan === undefined) {
       const templateComponents = Object.fromEntries(
@@ -300,7 +311,7 @@ function createAccountingPricer() {
         components: templateComponents,
       }, {
         apiServiceTier: "standard",
-        priceEpochBasis: "current_price_sensitivity",
+        priceEpochBasis: "event_time",
       });
       const rows = new Map(template.components.map((row) => [
         row.name,
@@ -329,10 +340,11 @@ function createAccountingPricer() {
         components,
       }, {
         apiServiceTier: "standard",
-        priceEpochBasis: "current_price_sensitivity",
+        priceEpochBasis: "event_time",
       });
     }
     const pricedComponents = [];
+    const priceCardBreakdown = new Map();
     let totalUsdScaled = 0;
     for (const name of COMPONENT_KEYS) {
       const quantity = components[name] ?? 0;
@@ -344,7 +356,7 @@ function createAccountingPricer() {
           components,
         }, {
           apiServiceTier: "standard",
-          priceEpochBasis: "current_price_sensitivity",
+          priceEpochBasis: "event_time",
         });
       }
       const unitPriceScaled = Math.round(
@@ -360,7 +372,7 @@ function createAccountingPricer() {
           components,
         }, {
           apiServiceTier: "standard",
-          priceEpochBasis: "current_price_sensitivity",
+          priceEpochBasis: "event_time",
         });
       }
       totalUsdScaled += costUsdScaled;
@@ -374,12 +386,23 @@ function createAccountingPricer() {
         costUsd: scaledUsdString(costUsdScaled),
         priceCardId: template.priceCardId,
       });
+      const card = priceCardBreakdown.get(template.priceCardId) ?? {
+        priceCardId: template.priceCardId,
+        events: 0,
+        costUsd: "0",
+      };
+      card.events = 1;
+      card.costUsd = addUsdStrings(card.costUsd, scaledUsdString(costUsdScaled));
+      priceCardBreakdown.set(template.priceCardId, card);
     }
     return {
       totalUsd: scaledUsdString(totalUsdScaled),
       coverageStatus: "fully_priced",
       components: pricedComponents,
       selectedPriceCardIds: plan.selectedPriceCardIds,
+      priceCardBreakdown: [...priceCardBreakdown.values()].sort(
+        (left, right) => left.priceCardId.localeCompare(right.priceCardId),
+      ),
       warnings: plan.warnings,
     };
   };
@@ -501,6 +524,7 @@ function transitionUsageProjection(event, projection) {
       .map((warning) => warning.code)
       .sort(),
     projection.priced.selectedPriceCardIds,
+    projection.priced.priceCardBreakdown ?? [],
   ];
 }
 
@@ -645,8 +669,25 @@ function addEvent(period, event) {
   period.events += 1;
   period.totalTokens += event.totalTokens;
   period.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
+  period.apiPriceEquivalentUsdExact = addUsdStrings(
+    period.apiPriceEquivalentUsdExact,
+    event.priced?.totalUsd ?? "0",
+  );
   addComponents(period.components, event.components);
   addComponentCosts(period.componentCosts, event.components, event.priced);
+  for (const id of event.priced?.selectedPriceCardIds ?? []) {
+    if (!period.priceCardIds.includes(id)) period.priceCardIds.push(id);
+  }
+  for (const item of event.priced?.priceCardBreakdown ?? []) {
+    const row = period.priceCardBreakdown[item.priceCardId] ?? {
+      priceCardId: item.priceCardId,
+      events: 0,
+      costUsd: "0",
+    };
+    row.events += item.events ?? 0;
+    row.costUsd = addUsdStrings(row.costUsd, item.costUsd ?? "0");
+    period.priceCardBreakdown[item.priceCardId] = row;
+  }
   const model = period.byModel[event.model] ??= {
     model: event.model,
     events: 0,
@@ -704,6 +745,10 @@ function finalizePeriod(period) {
   return {
     ...period,
     apiPriceEquivalentUsd: roundedMoney(period.apiPriceEquivalentUsd),
+    priceCardIds: [...period.priceCardIds].sort(),
+    priceCardBreakdown: Object.values(period.priceCardBreakdown).sort(
+      (left, right) => left.priceCardId.localeCompare(right.priceCardId),
+    ),
     pricedEventFraction: period.events === 0
       ? null
       : Number((priced / period.events).toFixed(6)),
@@ -816,7 +861,7 @@ export function defaultReplaySafeAccountingCachePath(
   return resolve(
     root,
     ".usage-monitor",
-    "local-replay-safe-accounting-v0.1.json",
+    "local-replay-safe-accounting-v0.2.json",
   );
 }
 
@@ -979,7 +1024,7 @@ export async function buildReplaySafeAccountingCache({
       signal,
       consumeInputs: true,
       includeNormalizedInputs: false,
-      inputEncoding: "accounting_prepriced_compact_v1",
+      inputEncoding: "accounting_prepriced_compact_v2",
       resourceCheck: checkRuntimeMemory,
     });
   } catch (error) {
@@ -1026,6 +1071,7 @@ export async function buildReplaySafeAccountingCache({
     accountingMethod:
       "lineage_aware_cumulative_snapshot_replay_exclusion",
     priceBasis: "official_api_price_equivalent_not_subscription_allowance",
+    priceEpochBasis: HISTORICAL_PRICE_EPOCH_BASIS,
     priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
     priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
     periods: [...periods.values()].map(finalizePeriod),
@@ -1036,7 +1082,7 @@ export async function buildReplaySafeAccountingCache({
     weeklyCalibration,
     weeklyCalibrationInput: {
       status: "complete",
-      encoding: "accounting_compact_v1",
+      encoding: "accounting_compact_v2",
       retainedUsageEvents,
       retainedWeeklySnapshots,
       estimatedRetainedBytes: retainedTransitionBytes,
@@ -1090,7 +1136,7 @@ export async function refreshReplaySafeAccountingCache({
 function validWeeklyCalibrationInput(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "complete"
-      || value.encoding !== "accounting_compact_v1"
+      || value.encoding !== "accounting_compact_v2"
       || !Number.isSafeInteger(value.retainedUsageEvents)
       || value.retainedUsageEvents < 0
       || !Number.isSafeInteger(value.retainedWeeklySnapshots)
@@ -1178,6 +1224,64 @@ function validQuotaTimeline(value, coveredAt) {
   return true;
 }
 
+function validPriceCardProvenance(row) {
+  if (!Array.isArray(row?.priceCardIds)
+      || row.priceCardIds.length > 32
+      || !row.priceCardIds.every((id) => (
+        typeof id === "string" && id.length > 0 && id.length <= 128
+      ))
+      || !Array.isArray(row?.priceCardBreakdown)
+      || row.priceCardBreakdown.length > 32) return false;
+  if (typeof row.apiPriceEquivalentUsdExact !== "string"
+      || !/^\d+(?:\.\d+)?$/u.test(row.apiPriceEquivalentUsdExact)) {
+    return false;
+  }
+  const ids = row.priceCardIds;
+  if (new Set(ids).size !== ids.length || [...ids].sort().some((id, index) => id !== ids[index])) {
+    return false;
+  }
+  let priorId = null;
+  let breakdownEvents = 0;
+  let breakdownCost = "0";
+  for (const item of row.priceCardBreakdown) {
+    if (!item || typeof item !== "object" || Array.isArray(item)
+        || typeof item.priceCardId !== "string"
+        || !ids.includes(item.priceCardId)
+        || (priorId !== null && item.priceCardId <= priorId)
+        || !Number.isSafeInteger(item.events)
+        || item.events < 0
+        || typeof item.costUsd !== "string"
+        || !/^\d+(?:\.\d+)?$/u.test(item.costUsd)) return false;
+    breakdownEvents += item.events;
+    try {
+      breakdownCost = addUsdStrings(breakdownCost, item.costUsd);
+    } catch {
+      return false;
+    }
+    priorId = item.priceCardId;
+  }
+  const coverage = row.pricingCoverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)
+      || !Number.isSafeInteger(coverage.fullyPricedEvents)
+      || !Number.isSafeInteger(coverage.partiallyPricedEvents)
+      || !Number.isSafeInteger(coverage.unpricedEvents)
+      || coverage.fullyPricedEvents < 0
+      || coverage.partiallyPricedEvents < 0
+      || coverage.unpricedEvents < 0
+      || coverage.fullyPricedEvents
+        + coverage.partiallyPricedEvents
+        + coverage.unpricedEvents !== row.events
+      || breakdownEvents !== coverage.fullyPricedEvents
+        + coverage.partiallyPricedEvents
+      || breakdownCost !== row.apiPriceEquivalentUsdExact) {
+    return false;
+  }
+  const exactNumber = Number(row.apiPriceEquivalentUsdExact);
+  return Number.isFinite(exactNumber)
+    && Number(row.apiPriceEquivalentUsd.toFixed(6))
+      === Number(exactNumber.toFixed(6));
+}
+
 function validCache(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
@@ -1186,6 +1290,7 @@ function validCache(value) {
       || canonicalInstant(value.coveredAt?.endAt) === null
       || value.accountingMethod
         !== "lineage_aware_cumulative_snapshot_replay_exclusion"
+      || value.priceEpochBasis !== HISTORICAL_PRICE_EPOCH_BASIS
       // A replay-safe total is meaningful only under the exact price registry
       // that produced it. Never let an older, higher price card silently
       // survive a registry correction just because its JSON shape is valid.
@@ -1221,6 +1326,7 @@ function validCache(value) {
       && typeof row.apiPriceEquivalentUsd === "number"
       && Number.isFinite(row.apiPriceEquivalentUsd)
       && row.apiPriceEquivalentUsd >= 0
+      && validPriceCardProvenance(row)
     ))
     && value.timeline.every((row) => (
       canonicalInstant(row?.startAt) !== null
@@ -1275,16 +1381,20 @@ export async function readReplaySafeAccountingCache({
     }
   }
   if (parsed !== null && !validCache(parsed)) {
-    unavailableErrorCode = (
+    const registryOutdated = (
       parsed?.priceRegistryVersion !== undefined
       || parsed?.priceRegistryObservedAt !== undefined
     ) && (
       parsed?.priceRegistryVersion !== APP_PRICE_REGISTRY_MANIFEST.version
       || parsed?.priceRegistryObservedAt
         !== APP_PRICE_REGISTRY_MANIFEST.observedAt
-    )
+    );
+    unavailableErrorCode = registryOutdated
       ? "cache_price_registry_outdated"
-      : "cache_invalid";
+      : parsed?.schemaVersion !== REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION
+        || parsed?.priceEpochBasis !== HISTORICAL_PRICE_EPOCH_BASIS
+        ? "cache_accounting_semantics_outdated"
+        : "cache_invalid";
     parsed = null;
   }
   if (parsed === null) {

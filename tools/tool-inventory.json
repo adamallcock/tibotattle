@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-07-30",
+  "reviewedAt": "2026-08-03",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -47,6 +47,7 @@
         "scripts/macos-release-core.js",
         "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
+        "test/public-release-site.test.js",
         "apps/local/README.md",
         "apps/macos/README.md"
       ],
@@ -176,6 +177,21 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "client_export",
+      "canonicalPath": "scripts/export-tibotattle-client.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Client boundary exporter is invoked directly with an output path and is not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/export-tibotattle-client.test.js"
+      ],
+      "decision": "retain_until_client_repository_cutover",
+      "provenance": "docs/decisions/2026-08-02-public-client-private-service-provenance-decision.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "repository_operations",
       "canonicalPath": "tools/operations/fix-doc-links.mjs",
       "stableAlias": "docs:links:fix",
@@ -267,6 +283,7 @@
         "scripts/build-local-review-artifact.js",
         "scripts/check-architecture-boundaries.mjs",
         "scripts/build-macos-app.js",
+        "scripts/export-tibotattle-client.mjs",
         "test/application-quota-sensitivity.test.js",
         "test/architecture-boundaries.test.js",
         "test/codex-local-usage-analysis-boundary.test.js",
@@ -328,7 +345,10 @@
         "scripts/package-macos-dmg.js",
         "scripts/release-macos-app.js",
         "scripts/validate-macos-install.js",
+        "scripts/build-public-release-site.js",
+        "scripts/publish-sparkle-update.js",
         "test/macos-app-bundle.test.js",
+        "test/public-release-site.test.js",
         "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
       ],
       "decision": "retain_as_internal_release_support",
@@ -348,6 +368,7 @@
         "scripts/macos-release-core.js",
         "scripts/build-macos-app.js",
         "test/macos-app-bundle.test.js",
+        "test/public-release-site.test.js",
         "test/macos-updater.test.js",
         "test/macos-updater-release.test.mjs",
         "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
@@ -421,6 +442,23 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "The Sparkle preparation command is test-covered, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/publish-sparkle-update.js",
+      "stableAlias": "product:macos:publish-update",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:publish-update",
+        "test/publish-sparkle-update.test.js",
+        "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {

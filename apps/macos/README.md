@@ -48,9 +48,10 @@ a clean-profile smoke all succeed.
    folder picker, or restore `~/.codex`. The selection is revalidated at every
    launch and stored only in the owner-only app state; copied diagnostics expose
    only `default` or `custom`, never the path.
-9. Choose **Version & Updates…** to check a signed production appcast. Developer
-   and ad-hoc builds contain no updater framework and perform no update
-   networking.
+9. Choose **About TiboTattle** → **Check for Updates** to check a signed
+   production appcast. Automatic update downloads are controlled by one native
+   switch in **Settings…** → **General**. Developer and ad-hoc builds contain
+   no updater framework and perform no update networking.
 10. A trusted website or browser bookmark may use `usagemonitor://open` to
    activate the app and open its loopback dashboard. All other hosts, paths,
    credentials, queries, and fragments in that custom scheme are rejected.
@@ -110,6 +111,109 @@ The DMG command fixes its volume name, layout, HFS+ filesystem, compression
 level, file ordering inputs, and timestamps. A Developer ID timestamp and
 Apple's disk-image tooling make byte-for-byte identity across release machines
 an invalid promise; the command records the resulting SHA-256 instead.
+
+## Localization and regionalization foundation
+
+Native strings live in `Resources/en.lproj/Localizable.strings` under stable
+`menu.*` and `settings.*` keys. `Sources/Localization.swift` follows the
+macOS preferred-language list, falls back to the English catalog when a locale
+or key is unavailable, and uses `Locale.current` for dates and numbers. Add a
+complete sibling locale such as `fr.lproj` only when its catalog and dashboard
+copy are ready together.
+
+The build records these resources in the source digest and copies them both to
+the app bundle root and to `Contents/Resources/app/localization/`, where the
+embedded loopback dashboard can consume the same catalog later. At document
+start, the WebKit host also exposes the versioned
+`window.__TIBOTATTLE_LOCALIZATION__` handoff with the preferred-language list
+and resource root; the current dashboard leaves it unused until its resolver
+is ready. The current release intentionally has no language picker: English is
+the only shipped translation, so the effective preference remains **System
+default** with a safe English fallback. The implementation/next-locale gate
+is recorded in
+[`docs/decisions/2026-08-03-macos-localization-foundation.md`](../../docs/decisions/2026-08-03-macos-localization-foundation.md).
+General settings exposes this current behavior as a read-only **Language —
+System** row; it has no picker or override while English is the only shipped
+translation.
+
+## Preview distribution build
+
+Use the explicit preview channel when a local test client must exercise an
+approved deployed HTTPS central service while retaining the normal
+`com.usagemonitor.local` bundle identity for OAuth callbacks. It is not a
+production release. The command stages the bundle at
+`.release-build/macos-preview/current/TiboTattle.app`, validates it, and
+reports its local path, integrity information, channel, and updater mode.
+
+The preview command prepares the pinned framework and, by default, uses the
+same public central-service origin, signed-feed URL, and Sparkle public key as
+the installed TiboTattle client. That makes the ordinary local QA build a real
+client of the deployed service rather than a no-service development bundle.
+No private release credential is embedded or read.
+
+An operator may override those **public** values only when deliberately testing
+another reviewed deployed environment:
+
+```bash
+export USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN='https://APPROVED-DEPLOYED-HOST'
+export USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL='https://APPROVED-DEPLOYED-HOST/appcast.xml'
+export USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY='BASE64_32_BYTE_PUBLIC_KEY='
+npm run product:macos:preview
+```
+
+To run the two bounded steps separately, use
+`npm run product:macos:preview:build` and then
+`npm run product:macos:preview:validate`. Preview output is deliberately fixed
+to the reviewed staging path; it cannot be redirected with an environment
+variable or `--output`. A different Sparkle framework can be supplied with
+`USAGE_MONITOR_PREVIEW_SPARKLE_FRAMEWORK`. The build rejects HTTP, IP-literal
+and loopback origins, credentials and URL decorations,
+malformed public keys, unverified Sparkle trees, and `/Applications` output
+paths. The private Sparkle update-signing key is not an input to this build and
+must never be placed in the repository or bundle.
+
+The resulting marker is `preview_distribution` in both the build manifest and
+`UsageMonitorBuildChannel`, with `UsageMonitorPreviewDistribution=true` and
+`externalDistributionRequested=false`. The central-service runtime key remains
+`production_https` so the existing launcher accepts the approved deployed
+origin; the separate channel marker prevents the artifact from being treated
+as a production release. Preview builds make **manual** updater checks only:
+they never automatically check, download, or install an update.
+
+After validation, install it only through the guarded replacement command:
+
+```bash
+npm run product:macos:preview:install
+```
+
+That command accepts only `/Applications/TiboTattle.app` (or an explicit
+per-user Applications target), validates the staged preview before and after
+copying it, and moves an existing app to a timestamped sibling backup rather
+than deleting it. It requires the explicit `--replace` flag; no preview build
+or validation command copies into `/Applications` on its own.
+
+Validate the staged preview without network access by default:
+
+```bash
+npm run product:macos:preview:remote
+```
+
+The opt-in live check is still credential-free and read-only: it GETs the
+configured public health, readiness, and appcast URLs with a five-second bound,
+does not follow redirects, and never starts, downloads, or installs an update.
+Run it only when checking the published service boundary:
+
+```bash
+npm run product:macos:preview:remote:live
+# or verify the installed preview directly
+node ./scripts/verify-macos-preview-remote.js \
+  --app "/Applications/TiboTattle.app" \
+  --live
+```
+
+If the central service is healthy but the appcast is not yet published, the
+command exits non-zero and says so plainly. That is an external release-input
+gap, not a claim that Sparkle has updated the preview client.
 
 ## External-distribution build gate
 
@@ -208,11 +312,10 @@ Production Usage Monitor builds use the pinned Sparkle 2.9.3 framework. Sparkle
 checks one exact HTTPS appcast automatically and exposes a user-initiated
 **Check for Updates** action. Every published artifact must carry an Ed25519
 signature made by the offline update key as well as the existing Developer ID
-and notarization assurances. Automatic download and install-on-quit are off by
-default. **Version & Updates… → Automatic Updates…** offers the user an
-explicit opt-in that enables both; the user can decline or later turn it off
-and continue with visible update prompts. A manual signed-DMG replacement
-remains the fallback.
+and notarization assurances. Automatic update downloads are on by default in a
+signed release. The user can turn them off with the native **Automatic
+updates** switch in **Settings…** → **General** and can always use **Check for
+Updates** from About. A manual signed-DMG replacement remains the fallback.
 
 Every new `usage-monitor-macos-release-v0.2` manifest records the fixed
 `usage-monitor-macos-signed-replacement-v1` contract:

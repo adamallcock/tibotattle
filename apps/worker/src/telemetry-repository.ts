@@ -6,6 +6,9 @@ import {
 import { ApiError } from "./errors";
 import {
   priceTelemetryUsageEvent,
+  type ServerContributionPriceBasis,
+  type ServerPriceBasis,
+  type ServerPriceEpochBasis,
   type ServerPricingResult,
 } from "./server-pricing";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
@@ -58,6 +61,10 @@ export interface TelemetryContributionRow {
   server_pricing_method_version?: string | null;
   server_price_registry_version?: string | null;
   server_price_registry_sha256?: string | null;
+  server_price_basis?: ServerContributionPriceBasis | null;
+  server_price_epoch_basis?: ServerPriceEpochBasis | null;
+  server_price_event_time_start?: string | null;
+  server_price_event_time_end?: string | null;
 }
 
 export interface TelemetryTransportMetadata {
@@ -217,6 +224,10 @@ async function repairUnfinishedTelemetryContribution(
               server_pricing_method_version,
               server_price_registry_version,
               server_price_registry_sha256,
+              server_price_basis,
+              server_price_epoch_basis,
+              server_price_event_time_start,
+              server_price_event_time_end,
               accepted_record_count
             ) = (
               SELECT
@@ -234,6 +245,44 @@ async function repairUnfinishedTelemetryContribution(
                   THEN r.server_price_registry_version END),
                 MAX(CASE WHEN r.record_kind = 'usage'
                   THEN r.server_price_registry_sha256 END),
+                CASE
+                  WHEN COUNT(CASE WHEN r.record_kind = 'usage' THEN 1 END) = 0
+                    THEN 'unpriced'
+                  WHEN SUM(CASE WHEN r.record_kind = 'usage'
+                    AND r.server_price_basis IS NULL THEN 1 ELSE 0 END) > 0
+                    THEN NULL
+                  WHEN COUNT(DISTINCT CASE WHEN r.record_kind = 'usage'
+                    THEN r.server_price_basis END) = 1
+                    THEN MAX(CASE WHEN r.record_kind = 'usage'
+                      THEN r.server_price_basis END)
+                  ELSE 'mixed_api_prices'
+                END,
+                CASE
+                  WHEN COUNT(CASE WHEN r.record_kind = 'usage' THEN 1 END) = 0
+                    OR SUM(CASE WHEN r.record_kind = 'usage'
+                      AND r.server_price_epoch_basis IS NULL THEN 1 ELSE 0 END) > 0
+                    OR COUNT(DISTINCT CASE WHEN r.record_kind = 'usage'
+                      THEN r.server_price_epoch_basis END) <> 1
+                    THEN NULL
+                  ELSE MAX(CASE WHEN r.record_kind = 'usage'
+                    THEN r.server_price_epoch_basis END)
+                END,
+                CASE
+                  WHEN COUNT(CASE WHEN r.record_kind = 'usage' THEN 1 END) = 0
+                    OR SUM(CASE WHEN r.record_kind = 'usage'
+                      AND r.server_price_event_time IS NULL THEN 1 ELSE 0 END) > 0
+                    THEN NULL
+                  ELSE MIN(CASE WHEN r.record_kind = 'usage'
+                    THEN r.server_price_event_time END)
+                END,
+                CASE
+                  WHEN COUNT(CASE WHEN r.record_kind = 'usage' THEN 1 END) = 0
+                    OR SUM(CASE WHEN r.record_kind = 'usage'
+                      AND r.server_price_event_time IS NULL THEN 1 ELSE 0 END) > 0
+                    THEN NULL
+                  ELSE MAX(CASE WHEN r.record_kind = 'usage'
+                    THEN r.server_price_event_time END)
+                END,
                 COUNT(*)
                 FROM telemetry_records r
                WHERE r.origin_contribution_id = telemetry_contributions.id
@@ -306,11 +355,13 @@ function usageStatement(
       server_unknown_billable_units, server_pricing_status, server_pricing_method_version,
       server_price_registry_version, server_price_registry_sha256, server_price_card_ids,
       server_unpriced_reason_codes, server_price_epoch_basis, server_tier_basis,
-      server_api_service_tier, dataset_id, account_track_id, policy_epoch, record_json
+      server_api_service_tier, server_price_basis, server_price_event_time,
+      dataset_id, account_track_id, policy_epoch, record_json
     ) VALUES (
       ?1, ?2, 'usage', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-      ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
+      ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41,
+      ?42, ?43
     )`,
   ).bind(
     contributionId,
@@ -350,6 +401,8 @@ function usageStatement(
     serverPricing.priceEpochBasis,
     serverPricing.tierBasis,
     serverPricing.apiServiceTier,
+    serverPricing.priceBasis,
+    serverPricing.priceEventTime,
     transport?.datasetId ?? null,
     transport?.accountTrackId ?? "unattributed",
     transport?.policyEpoch ?? null,
@@ -606,6 +659,10 @@ export async function insertTelemetryContribution(
             server_pricing_method_version = ?,
             server_price_registry_version = ?,
             server_price_registry_sha256 = ?,
+            server_price_basis = ?,
+            server_price_epoch_basis = ?,
+            server_price_event_time_start = ?,
+            server_price_event_time_end = ?,
             accepted_record_count = ?
       WHERE id = ? AND participant_id = ?`,
   ).bind(
@@ -616,6 +673,10 @@ export async function insertTelemetryContribution(
     serverPricing[0]?.methodVersion ?? null,
     serverPricing[0]?.registryVersion ?? null,
     serverPricing[0]?.registrySha256 ?? null,
+    accounting.priceBasis,
+    accounting.priceEpochBasis,
+    accounting.eventTimeStart,
+    accounting.eventTimeEnd,
     acceptedRecords,
     contributionId,
     participantId,
@@ -636,21 +697,35 @@ export async function insertTelemetryContribution(
  * removed `origin_contribution_id = ...` filter skipped it: its cost already
  * belongs to the contribution that first stored it.
  */
-function storedServerPricingTotals(
-  serverPricing: readonly ServerPricingResult[],
-  stored: readonly boolean[],
-): {
+interface StoredServerPricingTotals {
   costNanousd: number;
   fullyPricedEvents: number;
   partiallyPricedEvents: number;
   unpricedEvents: number;
-} {
-  const totals = {
+  priceBasis: ServerContributionPriceBasis;
+  priceEpochBasis: ServerPriceEpochBasis | null;
+  eventTimeStart: string | null;
+  eventTimeEnd: string | null;
+}
+
+function storedServerPricingTotals(
+  serverPricing: readonly ServerPricingResult[],
+  stored: readonly boolean[],
+): StoredServerPricingTotals {
+  const totals: StoredServerPricingTotals = {
     costNanousd: 0,
     fullyPricedEvents: 0,
     partiallyPricedEvents: 0,
     unpricedEvents: 0,
+    priceBasis: "unpriced",
+    priceEpochBasis: null,
+    eventTimeStart: null,
+    eventTimeEnd: null,
   };
+  const priceBases = new Set<ServerPriceBasis>();
+  const priceEpochBases = new Set<ServerPriceEpochBasis>();
+  const eventTimes: string[] = [];
+  let missingEventTime = false;
   for (const [index, pricing] of serverPricing.entries()) {
     if (!stored[index]) continue;
     totals.costNanousd += pricing.costNanousd;
@@ -658,7 +733,22 @@ function storedServerPricingTotals(
     else if (pricing.coverageStatus === "partially_priced") {
       totals.partiallyPricedEvents += 1;
     } else totals.unpricedEvents += 1;
+    priceBases.add(pricing.priceBasis);
+    priceEpochBases.add(pricing.priceEpochBasis);
+    if (pricing.priceEventTime === null) missingEventTime = true;
+    else eventTimes.push(pricing.priceEventTime);
   }
+  totals.priceBasis = priceBases.size === 0
+    ? "unpriced"
+    : priceBases.size === 1
+      ? [...priceBases][0]!
+      : "mixed_api_prices";
+  totals.priceEpochBasis = priceEpochBases.size === 1
+    ? [...priceEpochBases][0]!
+    : null;
+  eventTimes.sort();
+  totals.eventTimeStart = missingEventTime ? null : eventTimes[0] ?? null;
+  totals.eventTimeEnd = missingEventTime ? null : eventTimes.at(-1) ?? null;
   return totals;
 }
 
@@ -967,6 +1057,7 @@ export function telemetryContributionMetadata(row: TelemetryContributionRow): ob
       apiPriceEquivalentUsd: serverVerified
         ? formatNanousd(row.server_cost_nanousd ?? 0)
         : null,
+      ...serverPriceProvenance(row),
       fullyPricedEvents: row.server_priced_event_count ?? 0,
       partiallyPricedEvents: row.server_partially_priced_event_count ?? 0,
       unpricedEvents: row.server_unpriced_event_count ?? 0,
@@ -1009,6 +1100,7 @@ export function telemetryContributionHistoryMetadata(
       apiPriceEquivalentUsd: serverVerified
         ? formatNanousd(row.server_cost_nanousd ?? 0)
         : null,
+      ...serverPriceProvenance(row),
       verification: serverVerified ? "server_repriced" : "server_repricing_unavailable",
     },
     recordCounts: {
@@ -1029,6 +1121,24 @@ function formatNanousd(value: number): string {
   const whole = Math.floor(safe / 1_000_000_000);
   const fraction = String(safe % 1_000_000_000).padStart(9, "0").replace(/0+$/u, "");
   return fraction ? `${whole}.${fraction}` : String(whole);
+}
+
+export interface ServerPriceProvenance {
+  priceBasis: ServerContributionPriceBasis | null;
+  priceEpochBasis: ServerPriceEpochBasis | null;
+  eventTimeRange: { startAt: string; endAt: string } | null;
+}
+
+function serverPriceProvenance(row: TelemetryContributionRow): ServerPriceProvenance {
+  const startAt = row.server_price_event_time_start ?? null;
+  const endAt = row.server_price_event_time_end ?? null;
+  return {
+    priceBasis: row.server_price_basis ?? null,
+    priceEpochBasis: row.server_price_epoch_basis ?? null,
+    eventTimeRange: startAt !== null && endAt !== null
+      ? { startAt, endAt }
+      : null,
+  };
 }
 
 export interface CalibrationGroupRow extends Record<string, unknown> {

@@ -7,6 +7,11 @@ import {
   assessStagingConfiguration,
   probeStagingLive,
 } from "./staging-readiness-lib.mjs";
+import {
+  PRODUCTION_ASSET_DIRECTORY,
+  PRODUCTION_ASSET_SOURCE,
+  verifyGeneratedCommunityAssetTree,
+} from "./stage-production-assets.mjs";
 
 function usageError(message) {
   process.stderr.write(`${message}\n`);
@@ -63,8 +68,39 @@ const result = mode === "config"
   ? assessStagingConfiguration(config)
   : probeStagingLive({ config, wrangler, workerDirectory });
 
+let generatedCommunityAssetsValid = true;
+let sourceAssetRows = null;
+for (const directory of [
+  PRODUCTION_ASSET_SOURCE,
+  PRODUCTION_ASSET_DIRECTORY,
+]) {
+  try {
+    const rows = await verifyGeneratedCommunityAssetTree(directory);
+    if (sourceAssetRows === null) {
+      sourceAssetRows = rows;
+    } else if (JSON.stringify(sourceAssetRows) !== JSON.stringify(rows)) {
+      throw new Error("Generated source and Worker asset trees differ.");
+    }
+  } catch {
+    generatedCommunityAssetsValid = false;
+  }
+}
+if (!generatedCommunityAssetsValid) {
+  result.checks.generatedCommunityAssets = false;
+  result.blockers = [
+    ...new Set([...result.blockers, "GENERATED_COMMUNITY_ASSETS_INVALID"]),
+  ];
+  if (result.state !== "unsafe_configuration") result.state = "blocked";
+} else {
+  result.checks.generatedCommunityAssets = true;
+}
+
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 if (mode === "config") {
-  process.exit(result.state === "unsafe_configuration" ? 1 : 0);
+  process.exit(
+    ["safe_unprovisioned", "configured_unverified"].includes(result.state)
+      ? 0
+      : 1,
+  );
 }
 process.exit(result.state === "ready_for_disabled_deploy" ? 0 : 1);

@@ -403,9 +403,11 @@ download.**
 (`docs/runbooks/2026-07-31-v0.1.0-release-resume.md:36`). The generated
 `Info.plist` sets `SUEnableAutomaticChecks`, `SUAllowsAutomaticUpdates`,
 `SURequireSignedFeed`, and `SUVerifyUpdateBeforeExtraction`, with
-`SUAutomaticallyUpdate` false (`scripts/build-macos-app.js:1331-1349`). It does
-**not** set `SUScheduledCheckInterval`, so Sparkle's default applies —
-one appcast check per day.
+`SUAutomaticallyUpdate` true (`scripts/build-macos-app.js:1331-1349`), so a
+signed release downloads verified updates by default and installs them when the
+app quits. Users can turn that preference off in Settings. It does **not** set
+`SUScheduledCheckInterval`, so Sparkle's default applies — one appcast check
+per day.
 
 **Bandwidth per release**, assuming every installed copy takes the update:
 

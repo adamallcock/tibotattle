@@ -6,6 +6,7 @@ import {
   readdir,
   realpath,
 } from "node:fs/promises";
+import { isIP } from "node:net";
 import {
   basename,
   dirname,
@@ -176,13 +177,17 @@ function normalizeAppcastURL(value) {
   } catch {
     fail("Updater appcast URL must be an absolute HTTPS URL");
   }
+  const hostname = selected.hostname.startsWith("[")
+    ? selected.hostname.slice(1, -1)
+    : selected.hostname;
   if (selected.protocol !== "https:"
       || selected.username || selected.password
       || selected.search || selected.hash
       || ["localhost", "127.0.0.1", "[::1]"].includes(selected.hostname)
+      || isIP(hostname) !== 0
       || selected.pathname === "/"
       || selected.href !== value) {
-    fail("Updater appcast URL must be an exact non-loopback HTTPS URL");
+    fail("Updater appcast URL must be an exact HTTPS DNS URL");
   }
   return selected.href;
 }
@@ -197,18 +202,47 @@ function normalizePublicEdKey(value) {
   return value;
 }
 
+export function normalizeMacOSUpdaterMetadata({
+  appcastURL = null,
+  publicEdKey = null,
+} = {}) {
+  if (appcastURL === null || appcastURL === undefined || appcastURL === ""
+      || publicEdKey === null || publicEdKey === undefined
+      || publicEdKey === "") {
+    fail(
+      "Updater appcast URL and public Ed25519 key are required",
+      "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
+    );
+  }
+  return Object.freeze({
+    appcastURL: normalizeAppcastURL(appcastURL),
+    publicEdKey: normalizePublicEdKey(publicEdKey),
+  });
+}
+
 export async function normalizeMacOSUpdaterConfiguration({
   appcastURL = null,
   externalDistribution = false,
+  previewDistribution = false,
   frameworkPath = null,
   publicEdKey = null,
 } = {}) {
   if (typeof externalDistribution !== "boolean") {
     fail("externalDistribution must be a boolean");
   }
+  if (typeof previewDistribution !== "boolean") {
+    fail("previewDistribution must be a boolean");
+  }
+  if (externalDistribution && previewDistribution) {
+    fail(
+      "Production and preview updater channels are mutually exclusive",
+      "MACOS_UPDATER_CHANNEL_CONFLICT",
+    );
+  }
+  const distributionEnabled = externalDistribution || previewDistribution;
   const provided = [appcastURL, frameworkPath, publicEdKey]
     .some((value) => value !== null && value !== undefined && value !== "");
-  if (!externalDistribution) {
+  if (!distributionEnabled) {
     if (provided) {
       fail(
         "Updater inputs are forbidden in development and ad-hoc builds",
@@ -217,6 +251,9 @@ export async function normalizeMacOSUpdaterConfiguration({
     }
     return Object.freeze({
       appcastURL: null,
+      automaticChecks: false,
+      automaticUpdatesEnabledByDefault: false,
+      allowsAutomaticUpdateOptIn: false,
       enabled: false,
       framework: null,
       publicEdKey: null,
@@ -232,11 +269,21 @@ export async function normalizeMacOSUpdaterConfiguration({
     );
   }
   const framework = await inspectPinnedSparkleFramework(frameworkPath);
+  const metadata = normalizeMacOSUpdaterMetadata({
+    appcastURL,
+    publicEdKey,
+  });
   return Object.freeze({
-    appcastURL: normalizeAppcastURL(appcastURL),
+    appcastURL: metadata.appcastURL,
+    // A preview client shares the normal bundle identifier so it can exercise
+    // the same OAuth callback registration. It must never silently consume a
+    // production-signed update merely because it was opened for testing.
+    automaticChecks: externalDistribution,
+    automaticUpdatesEnabledByDefault: externalDistribution,
+    allowsAutomaticUpdateOptIn: externalDistribution,
     enabled: true,
     framework,
-    publicEdKey: normalizePublicEdKey(publicEdKey),
+    publicEdKey: metadata.publicEdKey,
     version: SPARKLE_VERSION,
   });
 }

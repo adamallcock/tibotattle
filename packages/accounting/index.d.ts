@@ -68,6 +68,12 @@ export interface UsageComponentResult {
   metadata?: Readonly<Record<string, unknown>>;
 }
 
+export interface PriceCardBreakdown {
+  priceCardId: string;
+  events: number;
+  costUsd: DecimalString;
+}
+
 export interface PriceUsageResult {
   schemaVersion: string;
   basis: string;
@@ -80,6 +86,7 @@ export interface PriceUsageResult {
     pricedAt: string | null;
     region: string | null;
     priceEpochBasis: string;
+    historicalPriceReasonCode?: string;
   };
   coverageStatus: PricingCoverageStatus;
   coverageCounts: {
@@ -91,6 +98,7 @@ export interface PriceUsageResult {
   components: UsageComponentResult[];
   selectedPriceCardId: string | null;
   selectedPriceCardIds: string[];
+  priceCardBreakdown: PriceCardBreakdown[];
   warnings: {
     coverage: AccountingWarning[];
     informational: AccountingWarning[];
@@ -115,6 +123,7 @@ export interface AggregateCostResult {
   };
   totalUsd: DecimalString;
   selectedPriceCardIds: string[];
+  priceCardBreakdown: PriceCardBreakdown[];
   warnings: {
     coverage: AccountingWarning[];
     informational: AccountingWarning[];
@@ -160,6 +169,7 @@ export interface PricingContext {
   totalInputTokens?: string | number | null;
   totalInputContextTokens?: string | number | null;
   priceEpochBasis?: string;
+  historicalPriceReasonCode?: string;
 }
 
 export interface PriceUsageOptions {
@@ -218,6 +228,7 @@ export interface LocalPricingOptions {
   priceEpochBasis?: "event_time" | "current_price_sensitivity";
   apiServiceTier?: string;
   region?: string | null;
+  eventTime?: string | Date | null;
 }
 
 export function priceCodexUsageEvent(
@@ -233,7 +244,7 @@ export function codexProviderBillableToolUnits(
 ): NormalizedUsageEvent["billableToolUnits"];
 export function priceCodexProviderToolUnits(
   serverBillableUnits: Readonly<Record<string, unknown>> | null | undefined,
-  options?: Pick<LocalPricingOptions, "priceCards" | "priceEpochBasis">,
+  options?: Pick<LocalPricingOptions, "priceCards" | "priceEpochBasis" | "eventTime">,
 ): PriceUsageResult;
 export function aggregateLocalApiPriceResults(
   results: readonly PriceUsageResult[],

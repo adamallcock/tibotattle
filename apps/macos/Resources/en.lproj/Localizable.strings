@@ -1,0 +1,39 @@
+/*
+ * TiboTattle's native source catalog.
+ *
+ * Keep keys stable across AppKit and the embedded dashboard. Add a sibling
+ * locale directory for a translation; do not translate the key names.
+ */
+"menu.aboutProduct" = "About %@";
+"menu.copy" = "Copy";
+"menu.edit" = "Edit";
+"menu.quitProduct" = "Quit %@";
+"menu.selectAll" = "Select All";
+"menu.settings" = "Settings…";
+"settings.aboutProduct" = "About %@";
+"settings.aboutTab" = "About";
+"settings.aboutSummary" = "Local Codex allowance, measured on your Mac.";
+"settings.automaticUpdates" = "Automatic updates";
+"settings.automaticUpdatesOff" = "Automatic updates are off. You can still check for updates manually.";
+"settings.automaticUpdatesOn" = "Verified updates download automatically and install when you quit.";
+"settings.automaticUpdatesUnavailable" = "Updates are available in signed releases installed in Applications.";
+"settings.automaticUpdatesTooltip" = "Download signed TiboTattle updates automatically.";
+"settings.checkForUpdates" = "Check for Updates";
+"settings.chooseCodexFolder" = "Choose Codex Folder…";
+"settings.codexFolder" = "Codex folder";
+"settings.codexFolderSummary" = "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else.";
+"settings.general" = "General";
+"settings.generalSummary" = "TiboTattle refreshes local usage while it is open. It does not install a login item, LaunchAgent, or daemon; raw logs never leave this Mac.";
+"settings.github" = "GitHub";
+"settings.language" = "Language";
+"settings.languageSummary" = "Uses the Mac language when available; regional formats follow this Mac.";
+"settings.languageSystem" = "System";
+"settings.openDashboard" = "Open Dashboard";
+"settings.previewUpdatesPending" = "This preview uses the live TiboTattle update feed. The first signed release has not been published yet, so updates cannot be discovered.";
+"settings.previewUpdatesPendingMessage" = "This preview is connected to the live TiboTattle service, but the signed update feed has not been published yet. Local analysis is unaffected. Check again after a signed release is available.";
+"settings.previewUpdatesPendingTitle" = "Updates aren't published yet";
+"settings.useDefault" = "Use Default";
+"settings.version" = "Version %@ (%@)";
+"settings.website" = "TiboTattle website";
+"settings.windowTitle" = "TiboTattle Settings";
+"settings.x" = "X / Twitter";

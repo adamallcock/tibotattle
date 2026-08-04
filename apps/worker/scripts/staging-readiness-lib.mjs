@@ -24,6 +24,14 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "CLIENT_ATTEMPT_RATE_LIMIT", limit: 5 }),
   Object.freeze({ name: "PUBLIC_READ_RATE_LIMIT", limit: 120 }),
 ]);
+export const GENERATED_WORKER_ASSET_DIRECTORY =
+  "../../.release-build/worker-assets";
+const ALLOWED_WORKER_FIRST_ROUTES = Object.freeze([
+  "/api/*",
+  "/.well-known/apple-developer-domain-association.txt",
+]);
+const FORBIDDEN_PUBLIC_ROUTE_PATTERN =
+  /(?:^|\/)(?:admin|app-open|contribution|sign-?in|signin)(?:\/|\*|$)/iu;
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -55,11 +63,33 @@ function validStagingName(value) {
 
 function oneApiAssetRoute(value) {
   return value?.binding === "ASSETS"
-    && value?.directory === "../web/public"
+    && value?.directory === GENERATED_WORKER_ASSET_DIRECTORY
     && value?.not_found_handling === "single-page-application"
     && Array.isArray(value?.run_worker_first)
     && value.run_worker_first.length === 1
-    && value.run_worker_first[0] === "/api/*";
+    && value.run_worker_first[0] === "/api/*"
+    && value.run_worker_first.every((route) =>
+      typeof route === "string" && !FORBIDDEN_PUBLIC_ROUTE_PATTERN.test(route));
+}
+
+function safeDeployableAssetRoute(value) {
+  return value?.binding === "ASSETS"
+    && value?.directory === GENERATED_WORKER_ASSET_DIRECTORY
+    && value?.not_found_handling === "single-page-application"
+    && Array.isArray(value?.run_worker_first)
+    && value.run_worker_first.length >= 1
+    && value.run_worker_first.every((route) =>
+      typeof route === "string"
+      && ALLOWED_WORKER_FIRST_ROUTES.includes(route)
+      && !FORBIDDEN_PUBLIC_ROUTE_PATTERN.test(route));
+}
+
+function deployableAssetRoutesClosed(config) {
+  return [
+    config?.assets,
+    config?.env?.staging?.assets,
+    config?.env?.production?.assets,
+  ].every((assets) => safeDeployableAssetRoute(assets));
 }
 
 function safeRateLimits(value) {
@@ -145,6 +175,7 @@ export function assessStagingConfiguration(config) {
     r2BindingSafe: safeR2Binding(environment?.r2_buckets),
     rateLimitsSafe: safeRateLimits(environment?.ratelimits),
     assetsClosed: oneApiAssetRoute(environment?.assets),
+    deployableAssetsClosed: deployableAssetRoutesClosed(config),
     resourceIdentifiersConfigured:
       resourceIdentifiersConfigured(environment ?? {}),
   };

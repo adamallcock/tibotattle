@@ -57,6 +57,34 @@ enum LocalAnalysisStart: Equatable {
     case unreachable
 }
 
+/// The status item keeps the product's bird mark at a glance, while the small
+/// meter carries only the state that the compact title is allowed to claim.
+/// Evidence state remains separate from the visual treatment so stale or
+/// unavailable data can never be made to look like a fresh percentage.
+private enum StatusGlyphState: Equatable {
+    case live(remainingPercent: Double)
+    case stale
+    case analyzing
+    case unavailable
+}
+
+/// A deliberately small observable contract for the native menu smoke test.
+/// It contains presentation facts only, never evidence values or an account
+/// identifier, so the packaged launcher can prove this surface without
+/// touching the local companion or a live quota response.
+struct NativeMenuPresentationContract: Equatable {
+    let informationRowsAreNative: Bool
+    let informationRowsHaveTitles: Bool
+    let unavailableRowHasTitle: Bool
+    let analyzeShortcut: String
+    let settingsShortcut: String
+    let quitShortcut: String
+    let usesNativeStatusItemMenu: Bool
+    let escapeDismissalMonitorInstalled: Bool
+    let sameAppClickAwayMonitorInstalled: Bool
+    let appDeactivationDismissalObserverInstalled: Bool
+}
+
 /// Everything the menu-bar surface renders, derived only from observed state.
 struct MenuBarStatusSnapshot: Equatable {
     enum Phase: Equatable {
@@ -188,7 +216,7 @@ struct MenuBarStatusSnapshot: Equatable {
         case .starting:
             return "Waiting to Analyze Local Usage"
         case .unavailable:
-            return "Local Analysis Unavailable"
+            return "Retry Local Analysis"
         }
     }
 }
@@ -496,140 +524,6 @@ final class LocalCompanionEvidenceReader {
     }
 }
 
-/// A compact native summary that gives the status menu an intentional first
-/// surface rather than two unrelated disabled lines. It deliberately uses
-/// AppKit controls and system colours: status values remain readable in dark
-/// mode, increased contrast, and the user's chosen accent colour.
-@MainActor
-private final class MenuBarSummaryView: NSView {
-    static let preferredWidth: CGFloat = 338
-    private let nameLabel = NSTextField(labelWithString: "")
-    private let allowanceLabel = NSTextField(labelWithString: "")
-    private let evidenceLabel = NSTextField(labelWithString: "")
-    private let progress = NSProgressIndicator()
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        nameLabel.font = .systemFont(ofSize: 14, weight: .semibold)
-        nameLabel.textColor = .labelColor
-        allowanceLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        allowanceLabel.textColor = .secondaryLabelColor
-        evidenceLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        evidenceLabel.textColor = .tertiaryLabelColor
-        progress.style = .bar
-        progress.controlSize = .small
-        progress.minValue = 0
-        progress.maxValue = 100
-        progress.isIndeterminate = false
-        for view in [nameLabel, allowanceLabel, evidenceLabel, progress] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(view)
-        }
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: Self.preferredWidth),
-            heightAnchor.constraint(equalToConstant: 76),
-            nameLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            nameLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 9),
-            allowanceLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            allowanceLabel.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
-            allowanceLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 3),
-            evidenceLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            evidenceLabel.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
-            evidenceLabel.topAnchor.constraint(equalTo: allowanceLabel.bottomAnchor, constant: 2),
-            progress.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            progress.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
-            progress.topAnchor.constraint(equalTo: evidenceLabel.bottomAnchor, constant: 5),
-            progress.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
-        ])
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    func render(
-        productName: String,
-        snapshot: MenuBarStatusSnapshot
-    ) {
-        nameLabel.stringValue = productName
-        allowanceLabel.stringValue = snapshot.allowanceSummary
-        evidenceLabel.stringValue = snapshot.evidenceSummary
-        guard snapshot.evidence == .live, let lane = snapshot.primaryLane
-        else {
-            progress.isHidden = true
-            return
-        }
-        progress.isHidden = false
-        progress.doubleValue = lane.remainingPercent
-    }
-}
-
-/// A quota row uses the same familiar label/value/reset hierarchy as the app
-/// dashboard. The progress bar is omitted for stale evidence so visual polish
-/// never turns historic values into a present-tense claim.
-@MainActor
-private final class MenuBarQuotaLaneView: NSView {
-    private let label = NSTextField(labelWithString: "")
-    private let value = NSTextField(labelWithString: "")
-    private let detail = NSTextField(labelWithString: "")
-    private let progress = NSProgressIndicator()
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        label.font = .systemFont(ofSize: 12, weight: .semibold)
-        label.textColor = .labelColor
-        value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        value.textColor = .labelColor
-        value.alignment = .right
-        detail.font = .systemFont(ofSize: 10, weight: .regular)
-        detail.textColor = .secondaryLabelColor
-        detail.lineBreakMode = .byTruncatingTail
-        progress.style = .bar
-        progress.controlSize = .small
-        progress.minValue = 0
-        progress.maxValue = 100
-        progress.isIndeterminate = false
-        for view in [label, value, detail, progress] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(view)
-        }
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: MenuBarSummaryView.preferredWidth),
-            heightAnchor.constraint(equalToConstant: 55),
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            label.topAnchor.constraint(equalTo: topAnchor, constant: 7),
-            value.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            value.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 12),
-            value.firstBaselineAnchor.constraint(equalTo: label.firstBaselineAnchor),
-            progress.leadingAnchor.constraint(equalTo: label.leadingAnchor),
-            progress.trailingAnchor.constraint(equalTo: value.trailingAnchor),
-            progress.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 4),
-            detail.leadingAnchor.constraint(equalTo: label.leadingAnchor),
-            detail.trailingAnchor.constraint(equalTo: value.trailingAnchor),
-            detail.topAnchor.constraint(equalTo: progress.bottomAnchor, constant: 3),
-            detail.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7),
-        ])
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    func render(lane: ObservedQuotaLane, snapshot: MenuBarStatusSnapshot) {
-        label.stringValue = lane.label
-        detail.stringValue = snapshot.laneSummary(lane)
-        guard snapshot.evidence == .live else {
-            value.stringValue = "Not current"
-            progress.isHidden = true
-            return
-        }
-        value.stringValue = "\(lane.roundedRemainingPercent)% left"
-        progress.isHidden = false
-        progress.doubleValue = lane.remainingPercent
-    }
-}
-
 /// Owns the `NSStatusItem`, its menu, and the bounded polling that keeps the
 /// compact title honest. Actions are injected so the launcher keeps sole
 /// ownership of the companion lifecycle and the shutdown path.
@@ -654,14 +548,17 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// Cadence while an explicit pass is running, so the menu bar returns to a
     /// real number promptly once the pass finishes.
     private static let activePollSeconds = 5
+    private static let menuMinimumWidth: CGFloat = 338
+    private static let deferredLaneTitle =
+        "Quota values are unavailable until a fresh local observation."
 
     private let statusItem: NSStatusItem
     private let actions: Actions
     private let productName: String
+    private let brandBirdTemplate: NSImage?
     private let reader = LocalCompanionEvidenceReader()
     private let allowanceItem = NSMenuItem()
     private let evidenceItem = NSMenuItem()
-    private let summaryView = MenuBarSummaryView()
     private let menu = NSMenu()
     private let quotaSeparator = NSMenuItem.separator()
     private let actionSeparator = NSMenuItem.separator()
@@ -674,14 +571,25 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let quitItem = NSMenuItem()
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
+    private var companionGeneration: UInt64 = 0
+    private var overviewResponseHealthy = false
+    private var observedEvidenceExpiresAt: Date?
     private var pendingPoll: DispatchWorkItem?
     private var lastAutomaticRefreshAt: Date?
     private var automaticRefreshInFlight = false
+    private var isMenuTracking = false
+    private var refreshAfterMenuCloses = false
+    private var structuralRebuildPending = false
+    private var renderedLaneLabels: [String] = []
+    private var escapeMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var appDeactivationObserver: NSObjectProtocol?
     private var stopped = false
 
     init(productName: String, actions: Actions) {
         self.productName = productName
         self.actions = actions
+        self.brandBirdTemplate = Self.makeBrandBirdTemplate()
         // Constructing the item touches only in-memory AppKit state: no
         // network, no disk, and no waiting. Every evidence read below is
         // asynchronous with a main-queue completion.
@@ -689,20 +597,19 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             withLength: NSStatusItem.variableLength
         )
         super.init()
+        installInteractionMonitoring()
 
         // Explicit enablement: information rows must stay unclickable, and
         // actions must reflect the companion's real state, not AppKit's guess.
         menu.autoenablesItems = false
         menu.delegate = self
-        menu.minimumWidth = MenuBarSummaryView.preferredWidth
+        menu.minimumWidth = Self.menuMinimumWidth
 
-        allowanceItem.view = summaryView
         allowanceItem.isEnabled = false
-        // The custom summary replaces the previous pair of dim, disabled
-        // text rows. Keep this semantic item as a spacer so the menu remains
-        // predictable for keyboard navigation.
-        evidenceItem.isHidden = true
         evidenceItem.isEnabled = false
+        // Keep both information rows as ordinary native menu items. AppKit
+        // sizes their titles itself, so a state transition can never leave a
+        // zero-frame custom view or an invisible fallback behind.
         menu.addItem(allowanceItem)
         menu.addItem(evidenceItem)
         menu.addItem(quotaSeparator)
@@ -718,6 +625,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             "Analyze Local Usage",
             #selector(analyzeLocalUsage)
         )
+        analyzeItem.keyEquivalent = "r"
+        analyzeItem.keyEquivalentModifierMask = [.command]
         menu.addItem(openTiboTattleItem)
         menu.addItem(analyzeItem)
         if actions.checkForUpdates != nil {
@@ -730,6 +639,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             menu.addItem(checkForUpdatesItem)
         }
         configure(settingsItem, "Settings…", #selector(showSettings))
+        settingsItem.keyEquivalent = ","
+        settingsItem.keyEquivalentModifierMask = [.command]
         configure(aboutItem, "About \(productName)", #selector(showAbout))
         menu.addItem(settingsItem)
         menu.addItem(aboutItem)
@@ -737,12 +648,18 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
         configure(quitItem, "Quit \(productName)", #selector(quit))
         quitItem.keyEquivalent = "q"
+        quitItem.keyEquivalentModifierMask = [.command]
         menu.addItem(quitItem)
 
         statusItem.menu = menu
         if let button = statusItem.button {
-            button.image = Self.statusGlyph(productName: productName)
+            button.image = Self.statusGlyph(
+                productName: productName,
+                state: Self.glyphState(for: snapshot),
+                brandBirdTemplate: brandBirdTemplate
+            )
             button.imagePosition = .imageLeading
+            button.imageScaling = .scaleProportionallyDown
             // Monospaced digits keep the item from jittering as the percentage
             // changes width.
             button.font = NSFont.monospacedDigitSystemFont(
@@ -756,7 +673,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// The companion published a loopback dashboard: start reading evidence.
     func companionReady(dashboardURL: URL) {
         guard !stopped else { return }
+        companionGeneration &+= 1
         self.dashboardURL = dashboardURL
+        overviewResponseHealthy = false
+        invalidateObservedEvidence()
+        automaticRefreshInFlight = false
+        lastAutomaticRefreshAt = nil
         snapshot.phase = .ready
         snapshot.failureSummary = nil
         render()
@@ -766,20 +688,30 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// The companion is starting, or restarting after an explicit retry.
     func companionStarting() {
         guard !stopped else { return }
+        companionGeneration &+= 1
         dashboardURL = nil
         cancelPoll()
+        overviewResponseHealthy = false
+        automaticRefreshInFlight = false
+        lastAutomaticRefreshAt = nil
+        invalidateObservedEvidence()
         snapshot.phase = .starting
         snapshot.failureSummary = nil
         render()
     }
 
-    /// The companion failed to start or exited unexpectedly. The last observed
-    /// window is kept only so the menu can say when it was observed; the
-    /// compact title drops back to the neutral placeholder.
+    /// The companion failed to start or exited unexpectedly. Numeric evidence
+    /// belongs to the old companion and is invalidated before the menu renders
+    /// the failure state.
     func companionUnavailable(summary: String?) {
         guard !stopped else { return }
+        companionGeneration &+= 1
         dashboardURL = nil
         cancelPoll()
+        overviewResponseHealthy = false
+        automaticRefreshInFlight = false
+        lastAutomaticRefreshAt = nil
+        invalidateObservedEvidence()
         snapshot.phase = .unavailable
         snapshot.failureSummary = summary
         render()
@@ -788,44 +720,172 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// Released on termination so the item never outlives the app.
     func shutDown() {
         guard !stopped else { return }
+        refreshAfterMenuCloses = false
+        structuralRebuildPending = false
+        dismissMenu()
         stopped = true
+        companionGeneration &+= 1
         cancelPoll()
         reader.invalidate()
+        removeInteractionMonitoring()
         statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    /// Used only by the packaged AppKit smoke mode. The test instantiates the
+    /// actual status item and menu, then verifies the rows AppKit will render
+    /// are ordinary titled menu items rather than zero-frame custom views.
+    func nativePresentationContract() -> NativeMenuPresentationContract {
+        let informationItems = [allowanceItem, evidenceItem]
+        return NativeMenuPresentationContract(
+            informationRowsAreNative: informationItems.allSatisfy {
+                $0.view == nil && !$0.isEnabled
+            },
+            informationRowsHaveTitles: informationItems.allSatisfy {
+                !$0.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            },
+            unavailableRowHasTitle: !evidenceItem.title
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty,
+            analyzeShortcut: analyzeItem.keyEquivalent,
+            settingsShortcut: settingsItem.keyEquivalent,
+            quitShortcut: quitItem.keyEquivalent,
+            usesNativeStatusItemMenu: statusItem.menu === menu,
+            escapeDismissalMonitorInstalled: escapeMonitor != nil,
+            sameAppClickAwayMonitorInstalled: localMouseMonitor != nil,
+            appDeactivationDismissalObserverInstalled:
+                appDeactivationObserver != nil
+        )
+    }
+
+    /// AppKit normally dismisses an `NSStatusItem` menu for both Escape and an
+    /// application switch. Keep those baseline interactions explicit as well:
+    /// the menu remains a native status-item menu, while the monitor and
+    /// notification only call AppKit's own tracking cancellation API.
+    private func installInteractionMonitoring() {
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak self] event in
+            guard event.keyCode == 53,
+                  let self,
+                  self.isMenuTracking
+            else {
+                return event
+            }
+            self.dismissMenu()
+            return nil
+        }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self,
+                  self.isMenuTracking,
+                  let eventWindow = event.window,
+                  NSApp.windows.contains(where: { $0 === eventWindow })
+            else {
+                return event
+            }
+            // The menu's own window is not an application window, so native
+            // menu-item clicks continue through AppKit. A click in any of the
+            // app's windows is an unambiguous same-app click-away.
+            self.dismissMenu()
+            return event
+        }
+        appDeactivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            self?.dismissMenu()
+        }
+    }
+
+    private func removeInteractionMonitoring() {
+        if let localMouseMonitor {
+            NSEvent.removeMonitor(localMouseMonitor)
+            self.localMouseMonitor = nil
+        }
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+            self.escapeMonitor = nil
+        }
+        if let appDeactivationObserver {
+            NotificationCenter.default.removeObserver(appDeactivationObserver)
+            self.appDeactivationObserver = nil
+        }
+    }
+
+    /// Ends the current native menu tracking session before focus or app
+    /// ownership changes. Calling this while the menu is already closed is
+    /// harmless and keeps every menu action on the same path.
+    private func dismissMenu() {
+        menu.cancelTracking()
+        isMenuTracking = false
     }
 
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
-        // On-demand read: the menu is always as fresh as the companion, which
-        // is why the background cadence can stay slow.
+        // Reconcile cached titles and any pending lane structure before AppKit
+        // begins tracking. Reads below are asynchronous; their completions may
+        // update existing titles but cannot mutate the open menu's structure.
+        isMenuTracking = false
+        structuralRebuildPending = false
+        render()
+        isMenuTracking = true
         pollNow()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuTracking = false
+        if structuralRebuildPending {
+            structuralRebuildPending = false
+            render()
+        }
+        guard refreshAfterMenuCloses else { return }
+        refreshAfterMenuCloses = false
+        refreshStaleEvidenceIfNeeded()
     }
 
     // MARK: - Actions
 
     @objc private func openTiboTattle() {
+        dismissMenu()
         actions.openTiboTattle()
     }
 
     @objc private func analyzeLocalUsage() {
-        guard !stopped, let dashboardURL, snapshot.phase == .ready else {
+        guard !stopped,
+              let dashboardURL,
+              snapshot.phase == .ready || snapshot.phase == .unavailable
+        else {
             return
         }
+        dismissMenu()
+        let generation = companionGeneration
         // Optimistic only in the direction that disables the control; the real
         // state is confirmed by the response and the poll that follows.
         snapshot.phase = .analyzing
         render()
         reader.startAnalysis(base: dashboardURL) { [weak self] result in
-            guard let self, !self.stopped else { return }
+            guard let self,
+                  !self.stopped,
+                  self.companionGeneration == generation,
+                  self.dashboardURL == dashboardURL
+            else { return }
             switch result {
             case .started, .alreadyRunning:
                 self.snapshot.phase = .analyzing
-            case .rejected, .unreachable:
+            case .rejected:
                 self.snapshot.phase = self.dashboardURL == nil
                     ? .unavailable
                     : .ready
+            case .unreachable:
+                self.overviewResponseHealthy = false
+                self.invalidateObservedEvidence()
+                self.snapshot.phase = .unavailable
+                self.snapshot.failureSummary =
+                    "The local companion could not accept an analysis request."
             }
             self.render()
             self.pollNow()
@@ -833,18 +893,22 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     }
 
     @objc private func quit() {
+        dismissMenu()
         actions.quit()
     }
 
     @objc private func showSettings() {
+        dismissMenu()
         actions.showSettings()
     }
 
     @objc private func showAbout() {
+        dismissMenu()
         actions.showAbout()
     }
 
     @objc private func checkForUpdates() {
+        dismissMenu()
         actions.checkForUpdates?()
     }
 
@@ -852,16 +916,23 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
 
     private func pollNow() {
         guard !stopped, let dashboardURL else { return }
+        let generation = companionGeneration
         cancelPoll()
         reader.readAnalysisActivity(base: dashboardURL) { [weak self] activity in
-            guard let self, !self.stopped, self.dashboardURL != nil else {
+            guard let self,
+                  !self.stopped,
+                  self.companionGeneration == generation,
+                  self.dashboardURL == dashboardURL
+            else {
                 return
             }
             switch activity {
             case .running:
                 self.snapshot.phase = .analyzing
             case .idle:
-                self.snapshot.phase = .ready
+                if self.overviewResponseHealthy {
+                    self.snapshot.phase = .ready
+                }
             case .none:
                 break
             }
@@ -869,19 +940,39 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             self.schedulePoll()
         }
         reader.readOverview(base: dashboardURL) { [weak self] overview in
-            guard let self, !self.stopped, self.dashboardURL != nil else {
+            guard let self,
+                  !self.stopped,
+                  self.companionGeneration == generation,
+                  self.dashboardURL == dashboardURL
+            else {
                 return
             }
             guard let overview else {
-                // A single unreadable response is not evidence of anything:
-                // keep the last honest projection and try again on the next
-                // tick rather than inventing a state change.
+                // An unreadable response cannot support the previous number.
+                // Clear it immediately and leave a retryable unavailable state
+                // rather than silently retaining live-looking evidence.
+                self.overviewResponseHealthy = false
+                self.invalidateObservedEvidence()
+                self.snapshot.phase = .unavailable
+                self.snapshot.failureSummary =
+                    "Quota evidence is unavailable right now. Retry Local Analysis."
+                self.render()
                 return
             }
+            self.overviewResponseHealthy = true
             self.snapshot.lanes = overview.lanes
             self.snapshot.observedAt = overview.observedAt
+            self.observedEvidenceExpiresAt = overview.observedAt.map {
+                $0.addingTimeInterval(
+                    overview.staleAfterSeconds ?? defaultStaleAfterSeconds
+                )
+            }
             self.snapshot.evidence = LocalCompanionOverviewProjection
                 .evidence(for: overview)
+            if self.snapshot.phase == .unavailable {
+                self.snapshot.phase = .ready
+                self.snapshot.failureSummary = nil
+            }
             self.render()
             self.refreshStaleEvidenceIfNeeded()
         }
@@ -893,8 +984,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         let seconds = snapshot.phase == .analyzing
             ? Self.activePollSeconds
             : Self.idlePollSeconds
+        let generation = companionGeneration
         let work = DispatchWorkItem { [weak self] in
-            self?.pollNow()
+            guard let self, self.companionGeneration == generation else {
+                return
+            }
+            self.pollNow()
         }
         pendingPoll = work
         DispatchQueue.main.asyncAfter(
@@ -911,21 +1006,42 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     // MARK: - Rendering
 
     private func render() {
+        expireCachedEvidenceIfNeeded()
         allowanceItem.title = "\(productName) · \(snapshot.title) allowance"
         evidenceItem.title = snapshot.evidenceSummary
-        summaryView.render(productName: productName, snapshot: snapshot)
         renderQuotaLanes()
         openTiboTattleItem.isEnabled = true
         analyzeItem.title = snapshot.analysisActionTitle
         analyzeItem.isEnabled = snapshot.phase == .ready
+            || (snapshot.phase == .unavailable && dashboardURL != nil)
         quitItem.isEnabled = true
         guard let button = statusItem.button else { return }
+        button.image = Self.statusGlyph(
+            productName: productName,
+            state: Self.glyphState(for: snapshot),
+            brandBirdTemplate: brandBirdTemplate
+        )
         button.title = snapshot.title
         button.toolTip =
             "\(snapshot.allowanceSummary)\n\(snapshot.evidenceSummary)"
         button.setAccessibilityLabel(
             snapshot.accessibilityLabel(productName: productName)
         )
+    }
+
+    private func invalidateObservedEvidence() {
+        snapshot.lanes = []
+        snapshot.observedAt = nil
+        snapshot.evidence = .none
+        observedEvidenceExpiresAt = nil
+    }
+
+    private func expireCachedEvidenceIfNeeded() {
+        guard snapshot.evidence == .live,
+              let observedEvidenceExpiresAt,
+              Date() > observedEvidenceExpiresAt
+        else { return }
+        snapshot.evidence = .stale
     }
 
     private func configure(
@@ -943,22 +1059,46 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// in the local overview. Stale lanes retain only their safe category and
     /// state wording; their historic percentage and reset remain hidden.
     private func renderQuotaLanes() {
+        let laneLabels = snapshot.lanes.map(\.label)
+        let structureChanged = laneLabels != renderedLaneLabels
+
+        if isMenuTracking && structureChanged {
+            // Structural menu edits while tracking can make AppKit lose its
+            // current item or paint an inconsistent menu. Neutralise any old
+            // rows in place, then rebuild them after menuDidClose.
+            structuralRebuildPending = true
+            for item in quotaLaneItems {
+                item.title = Self.deferredLaneTitle
+                item.isEnabled = false
+            }
+            return
+        }
+
+        if !structureChanged {
+            quotaSeparator.isHidden = snapshot.lanes.isEmpty
+            for (item, lane) in zip(quotaLaneItems, snapshot.lanes) {
+                item.title = snapshot.laneSummary(lane)
+                item.isEnabled = false
+            }
+            return
+        }
+
         for item in quotaLaneItems {
             menu.removeItem(item)
         }
         quotaLaneItems = []
-        guard !snapshot.lanes.isEmpty
-        else {
-            quotaSeparator.isHidden = true
+        quotaSeparator.isHidden = snapshot.lanes.isEmpty
+        guard !snapshot.lanes.isEmpty else {
+            renderedLaneLabels = laneLabels
             return
         }
-        quotaSeparator.isHidden = false
         let insertionIndex = menu.index(of: actionSeparator)
         let items = snapshot.lanes.map { lane in
-            let item = NSMenuItem(title: snapshot.laneSummary(lane), action: nil, keyEquivalent: "")
-            let view = MenuBarQuotaLaneView()
-            view.render(lane: lane, snapshot: snapshot)
-            item.view = view
+            let item = NSMenuItem(
+                title: snapshot.laneSummary(lane),
+                action: nil,
+                keyEquivalent: ""
+            )
             item.isEnabled = false
             return item
         }
@@ -966,20 +1106,222 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             menu.insertItem(item, at: insertionIndex + offset)
         }
         quotaLaneItems = items
+        renderedLaneLabels = laneLabels
+        structuralRebuildPending = false
     }
 
-    /// A status item is smaller than a normal app icon. Use a high-contrast
-    /// template glyph here; the real TiboTattle mark stays on the dashboard
-    /// and share card, where it is large enough to be recognised.
-    private static func statusGlyph(productName: String) -> NSImage? {
-        let image = NSImage(
-            systemSymbolName: "chart.bar.fill",
-            accessibilityDescription: productName
+    /// Keep the bird mark and quota meter in the same monochrome language as
+    /// native menu-bar symbols. A real percentage gets a filled track; every
+    /// other state gets an intentionally non-numeric treatment.
+    private static func statusGlyph(
+        productName: String,
+        state: StatusGlyphState,
+        brandBirdTemplate: NSImage?
+    ) -> NSImage? {
+        let base = brandBirdTemplate ?? nativeBirdTemplate()
+        guard let base else { return nil }
+
+        let glyphSize = NSSize(width: 16, height: 16)
+        let glyph = NSImage(size: glyphSize)
+        glyph.lockFocus()
+        let birdRect = NSRect(x: 0.5, y: 2.5, width: 15, height: 12.5)
+        let birdFraction: CGFloat = switch state {
+        case .live, .analyzing:
+            1
+        case .stale:
+            0.58
+        case .unavailable:
+            0.42
+        }
+        base.draw(
+            in: birdRect,
+            from: NSRect(origin: .zero, size: base.size),
+            operation: .sourceOver,
+            fraction: birdFraction
         )
-        image?.size = NSSize(width: 15, height: 15)
-        image?.isTemplate = true
-        image?.accessibilityDescription = productName
-        return image
+        drawMeter(for: state, in: NSRect(x: 1.5, y: 0.25, width: 13, height: 1.75))
+        glyph.unlockFocus()
+        glyph.size = glyphSize
+        glyph.isTemplate = true
+        glyph.accessibilityDescription = "\(productName) status"
+        return glyph
+    }
+
+    private static func glyphState(
+        for snapshot: MenuBarStatusSnapshot
+    ) -> StatusGlyphState {
+        if snapshot.phase == .analyzing { return .analyzing }
+        guard snapshot.phase == .ready else { return .unavailable }
+        guard snapshot.evidence == .live,
+              let lane = snapshot.primaryLane
+        else {
+            return snapshot.evidence == .stale ? .stale : .unavailable
+        }
+        return .live(remainingPercent: lane.remainingPercent)
+    }
+
+    /// Use a bold system bird first: SF Symbols supplies the crisp 16pt
+    /// geometry that a menu bar needs. If a restricted launch context cannot
+    /// resolve that symbol, derive the same mark from the approved app icon.
+    private static func makeBrandBirdTemplate() -> NSImage? {
+        if let native = nativeBirdTemplate() { return native }
+        return makeAssetBirdTemplate()
+    }
+
+    /// Extract only the bright bird from the approved app icon as a fallback.
+    /// The source artwork uses a deep-green plate behind a cream/amber mark;
+    /// turning that plate into transparency avoids ever shrinking the full
+    /// application icon into the status item.
+    private static func makeAssetBirdTemplate() -> NSImage? {
+        guard let source = NSApp.applicationIconImage,
+              let sourceCGImage = source.cgImage(
+                  forProposedRect: nil,
+                  context: nil,
+                  hints: nil
+              )
+        else {
+            return nativeBirdTemplate()
+        }
+
+        let sourceRep = NSBitmapImageRep(cgImage: sourceCGImage)
+        let sourceWidth = sourceRep.pixelsWide
+        let sourceHeight = sourceRep.pixelsHigh
+        guard sourceWidth > 0, sourceHeight > 0 else {
+            return nativeBirdTemplate()
+        }
+
+        // NSApp's icon is a square. This crop follows the bird's visible
+        // bounds, leaving the plate outside the compact status mark.
+        let crop = CGRect(
+            x: CGFloat(sourceWidth) * 0.14,
+            y: CGFloat(sourceHeight) * 0.14,
+            width: CGFloat(sourceWidth) * 0.72,
+            height: CGFloat(sourceHeight) * 0.72
+        )
+        let pixelSize = 64
+        guard let targetRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelSize,
+            pixelsHigh: pixelSize,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bitmapFormat: [],
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return nativeBirdTemplate()
+        }
+        targetRep.size = NSSize(width: pixelSize, height: pixelSize)
+
+        var retainedPixels = 0
+        for y in 0..<pixelSize {
+            for x in 0..<pixelSize {
+                let sourceX = min(
+                    sourceWidth - 1,
+                    max(
+                        0,
+                        Int(
+                            crop.minX
+                                + CGFloat(x) * crop.width / CGFloat(pixelSize)
+                        )
+                    )
+                )
+                let sourceY = min(
+                    sourceHeight - 1,
+                    max(
+                        0,
+                        Int(
+                            crop.minY
+                                + CGFloat(y) * crop.height / CGFloat(pixelSize)
+                        )
+                    )
+                )
+                let color = sourceRep.colorAt(x: sourceX, y: sourceY)?
+                    .usingColorSpace(.deviceRGB)
+                let red = color?.redComponent ?? 0
+                // The approved plate is substantially darker in red than
+                // the bird. Keep a soft edge instead of a binary cutout.
+                let alpha = min(1, max(0, (red - 0.16) / 0.26))
+                if alpha > 0.05 { retainedPixels += 1 }
+                var pixel = [255, 255, 255, Int((alpha * 255).rounded())]
+                pixel.withUnsafeMutableBufferPointer {
+                    targetRep.setPixel($0.baseAddress!, atX: x, y: y)
+                }
+            }
+        }
+        guard retainedPixels > 0 else { return nativeBirdTemplate() }
+
+        let template = NSImage(size: NSSize(width: pixelSize, height: pixelSize))
+        template.addRepresentation(targetRep)
+        template.isTemplate = true
+        return template
+    }
+
+    /// SF Symbols is a system-owned mark that matches TiboTattle's bird
+    /// branding without introducing another bundled artwork file.
+    private static func nativeBirdTemplate() -> NSImage? {
+        let symbol = NSImage(
+            systemSymbolName: "bird.fill",
+            accessibilityDescription: "TiboTattle status"
+        )
+        symbol?.isTemplate = true
+        return symbol
+    }
+
+    private static func drawMeter(
+        for state: StatusGlyphState,
+        in rect: NSRect
+    ) {
+        let radius = rect.height / 2
+        let track = NSBezierPath(
+            roundedRect: rect,
+            xRadius: radius,
+            yRadius: radius
+        )
+        switch state {
+        case let .live(remainingPercent):
+            NSColor.black.withAlphaComponent(0.24).setFill()
+            track.fill()
+            let percent = CGFloat(min(100, max(0, remainingPercent))) / 100
+            guard percent > 0 else { return }
+            let fillRect = NSRect(
+                x: rect.minX,
+                y: rect.minY,
+                width: max(0.8, rect.width * percent),
+                height: rect.height
+            )
+            NSColor.black.setFill()
+            NSBezierPath(
+                roundedRect: fillRect,
+                xRadius: radius,
+                yRadius: radius
+            ).fill()
+        case .analyzing:
+            NSColor.black.withAlphaComponent(0.3).setFill()
+            track.fill()
+            NSColor.black.setFill()
+            for position in [0.25, 0.5, 0.75] {
+                let dotSize: CGFloat = 1.2
+                let dot = NSRect(
+                    x: rect.minX + rect.width * position - dotSize / 2,
+                    y: rect.midY - dotSize / 2,
+                    width: dotSize,
+                    height: dotSize
+                )
+                NSBezierPath(ovalIn: dot).fill()
+            }
+        case .stale:
+            NSColor.black.withAlphaComponent(0.55).setStroke()
+            track.lineWidth = 0.8
+            track.stroke()
+        case .unavailable:
+            NSColor.black.withAlphaComponent(0.42).setStroke()
+            track.lineWidth = 0.8
+            track.stroke()
+        }
     }
 
     /// First launch still requires an explicit Analyze action. Once a real
@@ -995,6 +1337,13 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
               !snapshot.lanes.isEmpty,
               let dashboardURL
         else { return }
+        // AppKit does not like a menu changing beneath the pointer. Match the
+        // ordinary macOS pattern: reveal cached state while tracking, then
+        // start the one bounded catch-up pass immediately after it closes.
+        guard !isMenuTracking else {
+            refreshAfterMenuCloses = true
+            return
+        }
         let now = Date()
         if let lastAutomaticRefreshAt,
            now.timeIntervalSince(lastAutomaticRefreshAt)
@@ -1003,18 +1352,29 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         }
         lastAutomaticRefreshAt = now
         automaticRefreshInFlight = true
+        let generation = companionGeneration
         snapshot.phase = .analyzing
         render()
         reader.startAnalysis(base: dashboardURL) { [weak self] result in
-            guard let self, !self.stopped else { return }
+            guard let self,
+                  !self.stopped,
+                  self.companionGeneration == generation,
+                  self.dashboardURL == dashboardURL
+            else { return }
             self.automaticRefreshInFlight = false
             switch result {
             case .started, .alreadyRunning:
                 self.snapshot.phase = .analyzing
-            case .rejected, .unreachable:
+            case .rejected:
                 self.snapshot.phase = self.dashboardURL == nil
                     ? .unavailable
                     : .ready
+            case .unreachable:
+                self.overviewResponseHealthy = false
+                self.invalidateObservedEvidence()
+                self.snapshot.phase = .unavailable
+                self.snapshot.failureSummary =
+                    "The local companion could not accept an analysis request."
             }
             self.render()
             self.pollNow()

@@ -38,6 +38,9 @@ test("prepared dependency enables the complete external updater contract", async
   assert.equal(configured.publicEdKey, publicEdKey);
   assert.equal(configured.framework.sha256, SPARKLE_FRAMEWORK_SHA256);
   assert.equal(configured.version, SPARKLE_VERSION);
+  assert.equal(configured.automaticChecks, true);
+  assert.equal(configured.allowsAutomaticUpdateOptIn, true);
+  assert.equal(configured.automaticUpdatesEnabledByDefault, true);
 
   const reused = spawnSync(process.execPath, [
     join(REPOSITORY_ROOT, "scripts", "prepare-sparkle-framework.js"),
@@ -50,4 +53,38 @@ test("prepared dependency enables the complete external updater contract", async
   });
   assert.equal(reused.status, 0, reused.stderr || reused.stdout);
   assert.match(reused.stdout, /verified and reused/u);
+});
+
+test("prepared dependency enables the explicit preview updater contract", async () => {
+  const preparedFramework = join(
+    REPOSITORY_ROOT,
+    ".release-deps",
+    "Sparkle.framework",
+  );
+  const publicEdKey = Buffer.alloc(32, 8).toString("base64");
+  const configured = await normalizeMacOSUpdaterConfiguration({
+    appcastURL: "https://preview-updates.example.test/usage-monitor/appcast.xml",
+    frameworkPath: preparedFramework,
+    previewDistribution: true,
+    publicEdKey,
+  });
+  assert.equal(configured.enabled, true);
+  assert.equal(configured.appcastURL,
+    "https://preview-updates.example.test/usage-monitor/appcast.xml");
+  assert.equal(configured.publicEdKey, publicEdKey);
+  assert.equal(configured.framework.sha256, SPARKLE_FRAMEWORK_SHA256);
+  assert.equal(configured.version, SPARKLE_VERSION);
+  assert.equal(configured.automaticChecks, false);
+  assert.equal(configured.allowsAutomaticUpdateOptIn, false);
+  assert.equal(configured.automaticUpdatesEnabledByDefault, false);
+  await assert.rejects(
+    normalizeMacOSUpdaterConfiguration({
+      appcastURL: configured.appcastURL,
+      externalDistribution: true,
+      frameworkPath: preparedFramework,
+      previewDistribution: true,
+      publicEdKey,
+    }),
+    { code: "MACOS_UPDATER_CHANNEL_CONFLICT" },
+  );
 });

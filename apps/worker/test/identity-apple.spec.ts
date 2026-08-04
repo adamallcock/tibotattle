@@ -390,7 +390,7 @@ describe("web Sign in with Apple", () => {
     });
   });
 
-  it("ignores an unknown, malformed, errored, or replayed callback", async () => {
+  it("ignores an unknown, malformed, or replayed callback", async () => {
     const started = await startSignIn();
 
     for (const body of [
@@ -399,10 +399,6 @@ describe("web Sign in with Apple", () => {
       new URLSearchParams({ code: "c", state: `bad state ${"x".repeat(60)}` })
         .toString(),
       new URLSearchParams({ state: started.state }).toString(),
-      new URLSearchParams({
-        state: started.state,
-        error: "user_cancelled_authorize",
-      }).toString(),
       "",
     ]) {
       const ignored = await callback(body);
@@ -448,7 +444,39 @@ describe("web Sign in with Apple", () => {
     expect(row?.deliveredAt ?? null).toBeNull();
   });
 
-  it("keeps a failed Apple exchange from filling the handoff", async () => {
+  it("ends only the cancelled Apple handoff instead of leaving the app polling", async () => {
+    const cancelled = await startSignIn();
+    const stillPending = await startSignIn();
+
+    const landed = await callback(new URLSearchParams({
+      state: cancelled.state,
+      error: "user_cancelled_authorize",
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Sign-in was not completed.");
+    expect(tokenCalls).toHaveLength(0);
+
+    const cancelledResult = await json("/api/v1/identity/apple/result", {
+      state: cancelled.state,
+    });
+    expect(cancelledResult.status).toBe(401);
+    expect(await cancelledResult.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    const cancelledRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(cancelled.state).first<{ state: string }>();
+    expect(cancelledRow).toBeNull();
+    const pendingResult = await json("/api/v1/identity/apple/result", {
+      state: stillPending.state,
+    });
+    expect(pendingResult.status).toBe(404);
+    expect(await pendingResult.json()).toMatchObject({
+      error: { code: "IDENTITY_RESULT_PENDING" },
+    });
+  });
+
+  it("ends an unusable Apple handoff after its exchange fails", async () => {
     const started = await startSignIn();
     tokenResponder = () => new Response("invalid_client", { status: 400 });
     const failed = await callback(new URLSearchParams({
@@ -462,10 +490,14 @@ describe("web Sign in with Apple", () => {
     const result = await json("/api/v1/identity/apple/result", {
       state: started.state,
     });
-    expect(result.status).toBe(404);
+    expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
-      error: { code: "IDENTITY_RESULT_PENDING" },
+      error: { code: "IDENTITY_TOKEN_INVALID" },
     });
+    const failedRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM apple_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ state: string }>();
+    expect(failedRow).toBeNull();
   });
 
   it("requires same-origin starts, reads, and a well-formed result body", async () => {

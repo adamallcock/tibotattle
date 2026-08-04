@@ -92,6 +92,7 @@ test("release provenance binds both executable R7 worker scripts", () => {
     "packages/accounting/src/cost-ledger.js",
     "packages/accounting/src/local-api-pricing.js",
     "packages/accounting/src/price-registry.js",
+    "packages/accounting/src/subscription-speed.js",
     "packages/accounting/index.js",
     "packages/accounting/package.json",
   ]);

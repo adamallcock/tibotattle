@@ -69,6 +69,49 @@ test("strict package accepts and preserves the frozen golden contracts", () => {
   });
 });
 
+test("mixed event price bases are represented at batch level without relabeling rows", async () => {
+  const value = telemetryV01Golden();
+  const second = structuredClone(value.usageEvents[0]);
+  second.eventId = `event:v2:${"b".repeat(64)}`;
+  second.accounting = {
+    estimatedApiCostUsd: null,
+    pricingCoveragePercent: 0,
+    unknownBillableUnits: 0,
+    priceBasis: "historical_api_prices",
+  };
+  value.usageEvents.push(second);
+  value.accounting = {
+    estimatedApiCostUsd: "0.420000",
+    pricedEventCoveragePercent: 50,
+    unknownModelEventCount: 0,
+    unknownBillableUnits: 0,
+    priceBasis: "mixed_api_prices",
+  };
+  assert.equal(parseTelemetryContribution(value), value);
+  assert.equal(value.usageEvents[0].accounting.priceBasis, "current_api_prices");
+  assert.equal(value.usageEvents[1].accounting.priceBasis, "historical_api_prices");
+
+  const v02 = telemetryV02Golden();
+  const secondV02 = structuredClone(v02.usageEvents[0]);
+  secondV02.eventId = `event:v2:${"b".repeat(64)}`;
+  secondV02.accountingDiagnostic = {
+    ...secondV02.accountingDiagnostic,
+    estimatedApiCostUsd: null,
+    pricingCoveragePercent: 0,
+    priceBasis: "historical_api_prices",
+  };
+  v02.usageEvents.push(secondV02);
+  v02.accountingDiagnostic = {
+    ...v02.accountingDiagnostic,
+    pricedEventCoveragePercent: 50,
+    priceBasis: "mixed_api_prices",
+  };
+  const compiled = await compiledV02Schema();
+  assert.equal(compiled.validate(v02), true, JSON.stringify(compiled.validate.errors));
+  assert.equal(parseTelemetryContributionV02(v02), v02);
+  assert.equal(canonicalTelemetryContributionV01(v02).accounting.priceBasis, "mixed_api_prices");
+});
+
 test("runtime and JSON Schema deliberately preserve legacy 43-character ID compatibility", async () => {
   const legacy = telemetryV02LegacyIdGolden();
   assert.equal(parseTelemetryContributionV02(legacy), legacy);

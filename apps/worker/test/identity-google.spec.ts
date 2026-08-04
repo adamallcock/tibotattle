@@ -369,7 +369,7 @@ describe("hosted Google sign-in", () => {
     });
   });
 
-  it("ignores an unknown, malformed, errored, or oversized callback", async () => {
+  it("ignores an unknown, malformed, or oversized callback", async () => {
     const started = await startSignIn();
 
     for (const query of [
@@ -378,15 +378,6 @@ describe("hosted Google sign-in", () => {
       new URLSearchParams({ code: "c", state: `bad state ${"x".repeat(60)}` })
         .toString(),
       new URLSearchParams({ state: started.state }).toString(),
-      new URLSearchParams({
-        state: started.state,
-        error: "access_denied",
-      }).toString(),
-      new URLSearchParams({
-        code: "c",
-        state: started.state,
-        error: "access_denied",
-      }).toString(),
       `code=${"a".repeat(9_000)}&state=${started.state}`,
       "",
     ]) {
@@ -417,7 +408,39 @@ describe("hosted Google sign-in", () => {
     expect(row?.deliveredAt ?? null).toBeNull();
   });
 
-  it("keeps a failed Google exchange from filling the handoff", async () => {
+  it("ends only the cancelled Google handoff instead of leaving the app polling", async () => {
+    const cancelled = await startSignIn();
+    const stillPending = await startSignIn();
+
+    const landed = await callback(new URLSearchParams({
+      state: cancelled.state,
+      error: "access_denied",
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Sign-in was not completed.");
+    expect(tokenCalls).toHaveLength(0);
+
+    const cancelledResult = await json("/api/v1/identity/google/result", {
+      state: cancelled.state,
+    });
+    expect(cancelledResult.status).toBe(401);
+    expect(await cancelledResult.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    const cancelledRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM google_signin_handoffs WHERE state = ?",
+    ).bind(cancelled.state).first<{ state: string }>();
+    expect(cancelledRow).toBeNull();
+    const pendingResult = await json("/api/v1/identity/google/result", {
+      state: stillPending.state,
+    });
+    expect(pendingResult.status).toBe(404);
+    expect(await pendingResult.json()).toMatchObject({
+      error: { code: "IDENTITY_RESULT_PENDING" },
+    });
+  });
+
+  it("ends an unusable Google handoff after its exchange fails", async () => {
     const started = await startSignIn();
     tokenResponder = () => new Response("invalid_grant", { status: 400 });
     const failed = await callback(new URLSearchParams({
@@ -431,20 +454,37 @@ describe("hosted Google sign-in", () => {
     const result = await json("/api/v1/identity/google/result", {
       state: started.state,
     });
-    expect(result.status).toBe(404);
+    expect(result.status).toBe(401);
     expect(await result.json()).toMatchObject({
-      error: { code: "IDENTITY_RESULT_PENDING" },
+      error: { code: "IDENTITY_TOKEN_INVALID" },
     });
+    const failedRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM google_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ state: string }>();
+    expect(failedRow).toBeNull();
 
-    // A Google response with no id_token is an invalid token, not a fill.
+    // A fresh handoff also stops after a response with no id_token: its code
+    // is spent and therefore cannot be retried under the old state.
+    const retry = await startSignIn();
     tokenResponder = () => Response.json({ access_token: "no-id-token" });
     const missingIdToken = await callback(new URLSearchParams({
       code: "google-one-time-code",
-      state: started.state,
+      state: retry.state,
     }).toString());
     expect(missingIdToken.status).toBe(200);
     expect(await missingIdToken.text()).toContain("Sign-in was not completed.");
     expect(tokenCalls).toHaveLength(2);
+    const retryResult = await json("/api/v1/identity/google/result", {
+      state: retry.state,
+    });
+    expect(retryResult.status).toBe(401);
+    expect(await retryResult.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+    const missingIdTokenRow = await bindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM google_signin_handoffs WHERE state = ?",
+    ).bind(retry.state).first<{ state: string }>();
+    expect(missingIdTokenRow).toBeNull();
   });
 
   it("requires same-origin starts, reads, and a well-formed result body", async () => {

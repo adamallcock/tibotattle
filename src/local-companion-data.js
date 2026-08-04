@@ -3,6 +3,7 @@ import { lstat, readFile, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import {
+  addUsdStrings,
   APP_PRICE_REGISTRY_MANIFEST,
   CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
@@ -458,10 +459,32 @@ function validWeeklyReset(row) {
       || !finiteWeeklyNumber(
         row.holdoutMeanAbsoluteErrorPercentagePoints,
         { nullable: true, minimum: 0, maximum: 100 },
-      )) {
+      )
+      || (row.priceCardIds !== undefined
+        && (!Array.isArray(row.priceCardIds)
+          || row.priceCardIds.length > 32
+          || !row.priceCardIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 128)))
+      || !validPriceCardProvenance(row.priceCardBreakdown)) {
     return false;
   }
   return true;
+}
+
+function validPriceCardProvenance(value) {
+  return value === undefined || (
+    Array.isArray(value)
+    && value.length <= 32
+    && value.every((item) => item
+      && typeof item === "object"
+      && !Array.isArray(item)
+      && typeof item.priceCardId === "string"
+      && item.priceCardId.length > 0
+      && item.priceCardId.length <= 128
+      && Number.isSafeInteger(item.events)
+      && item.events >= 0
+      && typeof item.costUsd === "string"
+      && /^\d+(?:\.\d+)?$/u.test(item.costUsd))
+  );
 }
 
 function validSpeedEventCounts(value) {
@@ -551,6 +574,8 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
       cacheReadErrorCode === "cache_invalid"
         || cacheReadErrorCode === "cache_malformed"
         || cacheReadErrorCode === "cache_invalid_size"
+        || cacheReadErrorCode === "cache_price_registry_outdated"
+        || cacheReadErrorCode === "cache_accounting_semantics_outdated"
         ? "live_cache_invalid"
         : "live_cache_missing",
     );
@@ -609,6 +634,8 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
         known_speed_fraction: row.knownSpeedFraction,
         eligible_transitions: row.eligibleTransitions,
         unique_percentage_boundaries: row.uniqueBoundaries,
+        price_card_ids: row.priceCardIds ?? [],
+        price_card_breakdown: row.priceCardBreakdown ?? [],
       })),
     },
   };
@@ -670,17 +697,43 @@ function usageProjection(record, declaredSpeed = "unknown") {
       // Subscription speed and the API billing tier are separate concepts.
       // Standard is the explicit counterfactual until an API tier is observed.
       apiServiceTier: "standard",
-      priceEpochBasis: "current_price_sensitivity",
+      priceEpochBasis: "event_time",
     });
   } catch {
     priced = { totalUsd: "0", coverageStatus: "unpriced" };
   }
   const rawCost = Number(priced.totalUsd);
+  const priceCardIds = Array.isArray(priced.selectedPriceCardIds)
+    ? [...new Set(priced.selectedPriceCardIds.filter((id) => (
+      typeof id === "string" && id.length > 0 && id.length <= 128
+    )))].sort()
+    : [];
+  const priceCardBreakdown = Array.isArray(priced.priceCardBreakdown)
+    ? priced.priceCardBreakdown.filter((item) => (
+      item
+      && typeof item === "object"
+      && typeof item.priceCardId === "string"
+      && item.priceCardId.length > 0
+      && item.priceCardId.length <= 128
+      && Number.isSafeInteger(item.events)
+      && item.events >= 0
+      && typeof item.costUsd === "string"
+      && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
+    ))
+    : [];
   return {
     model,
     components,
     totalTokens,
     apiPriceEquivalentUsd: Number.isFinite(rawCost) ? rawCost : 0,
+    apiPriceEquivalentUsdExact: ["fully_priced", "partially_priced"].includes(
+      priced.coverageStatus,
+    ) && typeof priced.totalUsd === "string"
+        && /^\d+(?:\.\d+)?$/u.test(priced.totalUsd)
+      ? priced.totalUsd
+      : null,
+    priceCardIds,
+    priceCardBreakdown,
     pricingCoverageStatus: ["fully_priced", "partially_priced"].includes(priced.coverageStatus)
       ? priced.coverageStatus
       : "unpriced",
@@ -705,6 +758,9 @@ function newUsagePeriod(id, label) {
     totalTokens: 0,
     components: emptyComponents(),
     apiPriceEquivalentUsd: 0,
+    apiPriceEquivalentUsdExact: null,
+    priceCardIds: [],
+    priceCardBreakdown: {},
     pricingCoverage: {
       fullyPricedEvents: 0,
       partiallyPricedEvents: 0,
@@ -805,6 +861,27 @@ function addUsageToPeriod(period, projection) {
   modelSummary.totalTokens += projection.totalTokens;
   modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
   period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
+  if (projection.apiPriceEquivalentUsdExact !== null) {
+    period.apiPriceEquivalentUsdExact = period.apiPriceEquivalentUsdExact === null
+      ? projection.apiPriceEquivalentUsdExact
+      : addUsdStrings(
+        period.apiPriceEquivalentUsdExact,
+        projection.apiPriceEquivalentUsdExact,
+      );
+  }
+  for (const id of projection.priceCardIds) {
+    if (!period.priceCardIds.includes(id)) period.priceCardIds.push(id);
+  }
+  for (const item of projection.priceCardBreakdown) {
+    const row = period.priceCardBreakdown[item.priceCardId] ?? {
+      priceCardId: item.priceCardId,
+      events: 0,
+      costUsd: "0",
+    };
+    row.events += item.events;
+    row.costUsd = addUsdStrings(row.costUsd, item.costUsd);
+    period.priceCardBreakdown[item.priceCardId] = row;
+  }
   addDimension(period.bySpeed, projection.speed, projection);
   addSpeedWeighting(period.speedWeighting, projection);
   addDeclaredSpeedWeighting(period.declaredSpeedWeighting, projection);
@@ -841,6 +918,10 @@ function finalizeUsagePeriod(period) {
   return {
     ...period,
     apiPriceEquivalentUsd: Number(period.apiPriceEquivalentUsd.toFixed(6)),
+    priceCardIds: [...period.priceCardIds].sort(),
+    priceCardBreakdown: Object.values(period.priceCardBreakdown).sort(
+      (left, right) => left.priceCardId.localeCompare(right.priceCardId),
+    ),
     pricedEventFraction: period.events === 0 ? null : Number((priced / period.events).toFixed(6)),
     byModel: Object.values(period.byModel)
       .map((row) => ({ ...row, apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)) }))
@@ -1800,6 +1881,11 @@ export async function buildLocalCompanionSnapshot({
       "Official API prices changed. Cached price estimates are withheld until the next local replay rebuilds them with the current registry.",
     );
   }
+  if (replaySafeAccounting.errorCode === "cache_accounting_semantics_outdated") {
+    warnings.push(
+      "Historical event-time accounting changed. The prior cache is withheld until the next local replay rebuilds it.",
+    );
+  }
   if (replaySafeCache === null && (displayUsage?.events ?? 0) > 0) {
     warnings.push(
       "Recent cost accounting is using the legacy collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
@@ -1811,6 +1897,17 @@ export async function buildLocalCompanionSnapshot({
   if ((displayUsage?.pricingCoverage.unpricedEvents ?? 0) > 0) {
     warnings.push("Some usage events have an unknown model and are excluded from API-price-equivalent cost.");
   }
+  // Headline provenance must describe the same period as the numeric headline,
+  // not a separately selected set of weekly calibration fits. This is also the
+  // only safe source while an old replay cache is withheld and the collector
+  // temporarily provides the event-time projection.
+  const priceCardIds = Array.isArray(displayUsage?.priceCardIds)
+    ? displayUsage.priceCardIds
+    : [];
+  const priceCardBreakdown = Array.isArray(displayUsage?.priceCardBreakdown)
+    ? displayUsage.priceCardBreakdown
+    : [];
+  const mixedPriceCardWindows = priceCardIds.length > 1;
   return {
     schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
     mode: "real_local_evidence",
@@ -1916,6 +2013,8 @@ export async function buildLocalCompanionSnapshot({
           events: period.events,
           totalTokens: period.totalTokens,
           apiPriceEquivalentUsd: period.apiPriceEquivalentUsd,
+          priceCardIds: period.priceCardIds ?? [],
+          priceCardBreakdown: period.priceCardBreakdown ?? [],
           quotaWeightedApiPriceEquivalentUsd:
             periodFastMode.get(period.id)
               ?.quotaWeightedApiPriceEquivalentUsd ?? null,
@@ -1955,6 +2054,8 @@ export async function buildLocalCompanionSnapshot({
         coveragePercent: pricingCoveragePercent,
         eventCount: displayUsage?.events ?? 0,
         apiTier: "standard",
+        eventTimeHistoricalTotalUsdExact: displayUsage?.apiPriceEquivalentUsdExact ?? null,
+        currentPriceSensitivityTotalUsdExact: null,
         components: Object.entries(
           displayUsage?.componentCosts ?? displayUsage?.components ?? emptyComponents(),
         ).map(([name, value]) => ({
@@ -1976,11 +2077,13 @@ export async function buildLocalCompanionSnapshot({
         subscriptionSpeedIsSeparate: true,
         registryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
         registryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
-        // This is deliberately part of the closed dashboard projection. The
-        // displayed seven-day fits use the same current-price sensitivity as
-        // the rest of the local cost view, rather than silently retaining an
-        // older card for a recent-looking fit.
-        priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+        priceCardIds,
+        priceCardBreakdown,
+        mixedPriceCardWindows,
+        // Every retained event is resolved against the official card effective
+        // at that event's timestamp; a reset may therefore contain mixed
+        // historical card windows.
+        priceEpochBasis: "event_time_when_registry_has_effective_evidence",
         accountingSource: replaySafeCache === null
           ? "legacy_collector_unverified"
           : replaySafeCache.accountingMethod,

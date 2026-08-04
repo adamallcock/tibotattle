@@ -12,7 +12,7 @@ import parityFixture from "../../../packages/accounting/test/fixtures/accounting
 function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEvent {
   return {
     schemaVersion: "usage-event-v0.1",
-    eventTime: "2026-07-25T12:05:00.000Z",
+    eventTime: "2026-08-01T13:47:00.000Z",
     provider: "openai_codex",
     modelId: "gpt-5.6-sol",
     modelRecognition: "recognized",
@@ -65,10 +65,10 @@ function validateIngestibleEvent(event: TelemetryUsageEvent): TelemetryUsageEven
   const contribution = validateTelemetryContribution({
     schemaVersion: "telemetry-contribution-v0.1",
     synthetic: false,
-    createdAt: "2026-07-25T12:10:00.000Z",
+    createdAt: "2026-08-01T13:50:00.000Z",
     coveredAt: {
-      startAt: "2026-07-25T12:00:00.000Z",
-      endAt: "2026-07-25T12:06:00.000Z",
+      startAt: "2026-08-01T13:40:00.000Z",
+      endAt: "2026-08-01T13:50:00.000Z",
     },
     clientPlatform: "macos",
     providerPolicyEpoch: event.provider === "anthropic_claude_code"
@@ -316,5 +316,71 @@ describe("server pricing", () => {
     expect(priced.coverageStatus).toBe("unpriced");
     expect(priced.unpricedReasonCodes).toEqual(["unknown_model"]);
     expect(priced.selectedPriceCardIds).toEqual([]);
+  });
+
+  it("uses retained telemetry event time and fails closed when it is absent", () => {
+    const before = priceTelemetryUsageEvent(fixture({
+      eventTime: "2026-07-29T23:59:59.999Z",
+      modelId: "gpt-5.6-terra",
+    }));
+    const after = priceTelemetryUsageEvent(fixture({
+      eventTime: "2026-07-30T00:00:00.000Z",
+      modelId: "gpt-5.6-terra",
+    }));
+    const missing = priceTelemetryUsageEvent(fixture({ eventTime: undefined as unknown as string }));
+
+    expect(before.selectedPriceCardIds).toEqual([
+      "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+    ]);
+    expect(after.selectedPriceCardIds).toEqual([
+      "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+    ]);
+    expect(before).toMatchObject({
+      priceBasis: "historical_api_prices",
+      priceEventTime: "2026-07-29T23:59:59.999Z",
+    });
+    expect(after).toMatchObject({
+      priceBasis: "historical_api_prices",
+      priceEventTime: "2026-07-30T00:00:00.000Z",
+    });
+    expect(missing).toMatchObject({
+      exactCostUsd: "0",
+      coverageStatus: "unpriced",
+      priceBasis: "unpriced",
+      priceEventTime: null,
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+      unpricedReasonCodes: ["historical_price_timestamp_missing"],
+    });
+  });
+
+  it("keeps January pre-evidence usage honestly unpriced", () => {
+    const priced = priceTelemetryUsageEvent(fixture({
+      eventTime: "2026-01-15T12:00:00.000Z",
+    }));
+    expect(priced).toMatchObject({
+      exactCostUsd: "0",
+      costNanousd: 0,
+      coveragePercent: 0,
+      coverageStatus: "unpriced",
+      selectedPriceCardIds: [],
+      unpricedReasonCodes: ["historical_price_missing"],
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+    });
+  });
+
+  it("fails closed for date-only and noncanonical historical instants", () => {
+    for (const eventTime of [
+      "2026-07-30",
+      "2026-07-30T00:00:00Z",
+      "2026-07-30T00:00:00.000+00:00",
+    ]) {
+      const priced = priceTelemetryUsageEvent(fixture({ eventTime }));
+      expect(priced.exactCostUsd, eventTime).toBe("0");
+      expect(priced.coverageStatus, eventTime).toBe("unpriced");
+      expect(priced.selectedPriceCardIds, eventTime).toEqual([]);
+      expect(priced.unpricedReasonCodes, eventTime).toEqual([
+        "historical_price_timestamp_missing",
+      ]);
+    }
   });
 });

@@ -2655,7 +2655,8 @@ describe("synthetic usage monitor service", () => {
     const repriced = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT server_cost_usd, server_cost_nanousd, server_pricing_status,
               server_pricing_method_version, server_price_registry_sha256,
-              server_price_card_ids, server_tier_basis, server_api_service_tier,
+              server_price_card_ids, server_price_basis, server_price_epoch_basis,
+              server_price_event_time, server_tier_basis, server_api_service_tier,
               speed_mode, api_service_tier
          FROM telemetry_records
         WHERE participant_id = ? AND record_kind = 'usage'`,
@@ -2666,24 +2667,29 @@ describe("synthetic usage monitor service", () => {
       server_pricing_method_version: string;
       server_price_registry_sha256: string;
       server_price_card_ids: string;
+      server_price_basis: string;
+      server_price_epoch_basis: string;
+      server_price_event_time: string;
       server_tier_basis: string;
       server_api_service_tier: string;
       speed_mode: string;
       api_service_tier: string;
     }>();
     expect(repriced).toMatchObject({
-      server_cost_usd: "0.0032",
-      server_cost_nanousd: 3_200_000,
-      server_pricing_status: "fully_priced",
-      server_pricing_method_version: "server-api-price-equivalent-v0.1",
+      server_cost_usd: "0",
+      server_cost_nanousd: 0,
+      server_pricing_status: "unpriced",
+      server_pricing_method_version: "server-api-price-equivalent-v0.2",
+      server_price_basis: "unpriced",
+      server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
+      server_price_event_time: "2026-07-25T12:05:00.000Z",
       server_tier_basis: "subscription_standard_counterfactual",
       server_api_service_tier: "standard",
       speed_mode: "fast",
       api_service_tier: "priority",
     });
     expect(repriced?.server_price_registry_sha256).toMatch(/^[a-f0-9]{64}$/u);
-    expect(repriced?.server_price_card_ids).toContain(":standard:");
-    expect(repriced?.server_price_card_ids).not.toContain(":priority:");
+    expect(repriced?.server_price_card_ids).toBe("[]");
 
     const replay = await uploadEnvelope(participant, firstEnvelope);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
@@ -2721,7 +2727,7 @@ describe("synthetic usage monitor service", () => {
         quotaSnapshots: 1,
         activityMarkers: 1,
         inputCacheReadTokens: 900,
-        apiPriceEquivalentUsd: "0.0032",
+        apiPriceEquivalentUsd: "0",
         priceVerification: "server_repriced",
       },
       quotaGradients: [{
@@ -2754,6 +2760,14 @@ describe("synthetic usage monitor service", () => {
             endAt: "2026-07-25T12:30:00.000Z",
           },
           clientPlatform: "macos",
+          serverAccounting: {
+            priceBasis: "unpriced",
+            priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+            eventTimeRange: {
+              startAt: "2026-07-25T12:05:00.000Z",
+              endAt: "2026-07-25T12:05:00.000Z",
+            },
+          },
           recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
           quarantine: {
             state: "retained",
@@ -2773,7 +2787,9 @@ describe("synthetic usage monitor service", () => {
       `SELECT id, declared_record_count, accepted_record_count,
               server_priced_event_count,
               server_partially_priced_event_count,
-              server_unpriced_event_count
+              server_unpriced_event_count, server_price_basis,
+              server_price_epoch_basis, server_price_event_time_start,
+              server_price_event_time_end
          FROM telemetry_contributions
         WHERE participant_id = ?
         ORDER BY created_at, id`,
@@ -2784,13 +2800,22 @@ describe("synthetic usage monitor service", () => {
       server_priced_event_count: number;
       server_partially_priced_event_count: number;
       server_unpriced_event_count: number;
+      server_price_basis: string;
+      server_price_epoch_basis: string;
+      server_price_event_time_start: string;
+      server_price_event_time_end: string;
     }>();
     expect(contributionRows.results).toMatchObject([
       {
         id: accepted.contributionId,
         declared_record_count: 2,
         accepted_record_count: 2,
-        server_priced_event_count: 1,
+        server_priced_event_count: 0,
+        server_unpriced_event_count: 1,
+        server_price_basis: "unpriced",
+        server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
+        server_price_event_time_start: "2026-07-25T12:05:00.000Z",
+        server_price_event_time_end: "2026-07-25T12:05:00.000Z",
       },
       {
         id: secondAccepted.contributionId,
@@ -2846,7 +2871,7 @@ describe("synthetic usage monitor service", () => {
     for (const forbidden of [
       "r2_key", "plaintext_digest", "envelope_digest", "datasetId",
       "accountTrackId", "eligibilityUnitId", "recoveryCode", "csrfToken",
-      "\"accounting\"", "registrySha256", "priceBasis",
+      "\"accounting\"", "registrySha256",
     ]) {
       expect(profileText).not.toContain(forbidden);
     }
@@ -2951,6 +2976,77 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
+  it("persists January pre-evidence pricing as honestly unpriced with provenance", async () => {
+    const participant = await enrollTelemetry();
+    const january = telemetryFixture("e");
+    Reflect.set(january, "createdAt", "2026-01-15T12:30:00.000Z");
+    Reflect.set(january, "coveredAt", {
+      startAt: "2026-01-15T12:00:00.000Z",
+      endAt: "2026-01-15T12:30:00.000Z",
+    });
+    Reflect.set(january, "providerPolicyEpoch", "openai_pre_agentic_pool_2026_07_09");
+    const usage = Reflect.get(january, "usageEvents") as Array<Record<string, unknown>>;
+    usage[0]!.eventTime = "2026-01-15T12:05:00.000Z";
+    usage[0]!.accounting = {
+      estimatedApiCostUsd: null,
+      pricingCoveragePercent: 0,
+      unknownBillableUnits: 0,
+      priceBasis: "unpriced",
+    };
+    Reflect.set(january, "accounting", {
+      estimatedApiCostUsd: null,
+      pricedEventCoveragePercent: 0,
+      unknownModelEventCount: 0,
+      unknownBillableUnits: 0,
+      priceBasis: "unpriced",
+    });
+    const quota = Reflect.get(january, "quotaSnapshots") as Array<Record<string, unknown>>;
+    quota[0]!.observedTime = "2026-01-15T12:10:00.000Z";
+    quota[0]!.receivedTime = "2026-01-15T12:10:01.000Z";
+    quota[0]!.resetsAt = "2026-01-22T12:00:00.000Z";
+
+    const uploaded = await uploadEnvelope(
+      participant,
+      await encrypt(january, true),
+    );
+    expect(uploaded.status).toBe(202);
+    const row = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT server_cost_usd, server_pricing_status, server_price_basis,
+              server_price_epoch_basis, server_price_event_time
+         FROM telemetry_records
+        WHERE participant_id = ? AND record_kind = 'usage'`,
+    ).bind(participant.participantId).first<{
+      server_cost_usd: string;
+      server_pricing_status: string;
+      server_price_basis: string;
+      server_price_epoch_basis: string;
+      server_price_event_time: string;
+    }>();
+    expect(row).toEqual({
+      server_cost_usd: "0",
+      server_pricing_status: "unpriced",
+      server_price_basis: "unpriced",
+      server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
+      server_price_event_time: "2026-01-15T12:05:00.000Z",
+    });
+
+    const profile = await api("/api/v1/me", {
+      headers: personalHeaders(participant),
+    });
+    await expect(profile.json()).resolves.toMatchObject({
+      contributions: [{
+        serverAccounting: {
+          priceBasis: "unpriced",
+          priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+          eventTimeRange: {
+            startAt: "2026-01-15T12:05:00.000Z",
+            endAt: "2026-01-15T12:05:00.000Z",
+          },
+        },
+      }],
+    });
+  });
+
   it("refuses a rolling quota conversion when account continuity was not transmitted", async () => {
     const participant = await enrollTelemetry();
     const first = await uploadEnvelope(
@@ -2990,7 +3086,7 @@ describe("synthetic usage monitor service", () => {
         rows: unknown[];
       };
     }>();
-    expect(stats.totals.apiPriceEquivalentUsd).toBe("0.0064");
+    expect(stats.totals.apiPriceEquivalentUsd).toBe("0");
     expect(stats.rollingQuotaMovement).toMatchObject({
       status: "not_testable",
       reason: "account_continuity_not_transmitted",

@@ -267,11 +267,10 @@ An external-distribution build must provide all three reviewed inputs together:
 the exact pinned framework, one exact non-loopback HTTPS appcast URL, and one
 canonical 32-byte Ed25519 public key. It stamps signed-feed and
 verify-before-extraction requirements. Production automatic checks are
-available, but automatic download and install-on-quit are **off by default**.
-The user must opt in through **Version & Updates… → Automatic Updates…** and
-can turn that choice off later. **Check for Updates…** remains available, and
-the previous signed/notarized DMG plus release manifest remains the manual
-rollback path.
+available, and verified download/install-on-quit are **on by default**. The
+user can turn automatic updates off later with the switch in **Settings →
+General**. **Check for Updates…** remains available, and the previous
+signed/notarized DMG plus release manifest remains the manual rollback path.
 
 The release pipeline contains inside-out signing for Sparkle's Installer XPC,
 Downloader XPC with its entitlement, Autoupdate helper, Updater app, framework,

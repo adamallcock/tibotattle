@@ -85,6 +85,10 @@ function runDeployment(options) {
       packageCount: 2,
       packages: [],
     }),
+    stageAssets: async () => ({
+      directory: "fixture-generated-worker-assets",
+      files: 4,
+    }),
     ...options,
   });
 }
@@ -174,6 +178,29 @@ test("deployment fails closed on an unexpected package-check failure", async () 
   assert.deepEqual(result, {
     ok: false,
     code: "WORKSPACE_PACKAGES_CHECK_FAILED",
+  });
+  assert.equal(wranglerCalled, false);
+});
+
+test("deployment refuses unverified generated public assets before Wrangler", async () => {
+  let wranglerCalled = false;
+  const result = await runDeployment({
+    config: provisionedConfig(),
+    origin: stagingOrigin,
+    confirmation: DEPLOY_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    stageAssets: async () => {
+      throw new Error("generated public asset manifest is invalid");
+    },
+    spawn: () => {
+      wranglerCalled = true;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_PUBLIC_ASSETS_INVALID",
   });
   assert.equal(wranglerCalled, false);
 });

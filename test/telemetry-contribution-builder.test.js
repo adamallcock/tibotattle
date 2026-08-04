@@ -33,7 +33,7 @@ import { stableJson } from "../src/storage.js";
 function usage(index, overrides = {}) {
   return {
     schemaVersion: "usage-event-v0.1",
-    eventTime: "2026-07-24T23:00:06.717Z",
+    eventTime: "2026-07-26T23:00:06.717Z",
     provider: "openai_codex",
     modelId: "gpt-5.6-sol",
     modelRecognition: "recognized",
@@ -78,8 +78,8 @@ function usage(index, overrides = {}) {
 function quota(index) {
   return {
     schemaVersion: "quota-snapshot-v0.1",
-    observedTime: "2026-07-24T23:00:06.717Z",
-    receivedTime: "2026-07-24T23:00:06.717Z",
+    observedTime: "2026-07-26T23:00:06.717Z",
+    receivedTime: "2026-07-26T23:00:06.717Z",
     provider: "openai_codex",
     planType: "pro",
     planVariant: "unknown",
@@ -101,10 +101,10 @@ function quota(index) {
 function bundle({ usageEvents = [usage(1)], quotaSnapshots = [quota(1)] } = {}) {
   return {
     schemaVersion: "usage-metadata-bundle-v0.1",
-    createdAt: "2026-07-24T23:24:52.000Z",
+    createdAt: "2026-07-26T23:24:52.000Z",
     coveredAt: {
-      startAt: "2026-07-24T23:00:00.000Z",
-      endAt: "2026-07-24T23:24:52.000Z",
+      startAt: "2026-07-26T23:00:00.000Z",
+      endAt: "2026-07-26T23:24:52.000Z",
     },
     clientPlatform: "macos",
     records: {
@@ -187,7 +187,7 @@ test("builder removes private scopes, normalizes components, and prices usage", 
   assert.equal(contribution.providerPolicyEpoch, "openai_agentic_pool_2026_07_09");
   assert.equal(contribution.usageEvents[0].components.outputCombinedTokens, null);
   assert.match(contribution.usageEvents[0].accounting.estimatedApiCostUsd, /^\d+\.\d{6}$/u);
-  assert.equal(contribution.accounting.priceBasis, "current_api_prices");
+  assert.equal(contribution.accounting.priceBasis, "historical_api_prices");
   const serialized = JSON.stringify(contribution);
   for (const forbidden of [
     "accountScopeId",

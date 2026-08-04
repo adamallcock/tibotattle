@@ -49,6 +49,7 @@ function priceThroughLocalAdapter(kernelEvent) {
       components: kernelEvent.components,
     }, {
       apiServiceTier: kernelEvent.apiTier,
+      priceEpochBasis: "current_price_sensitivity",
     });
   }
   if (kernelEvent.provider === "anthropic") {
@@ -60,6 +61,7 @@ function priceThroughLocalAdapter(kernelEvent) {
       components: kernelEvent.components,
     }, {
       apiServiceTier: kernelEvent.apiTier,
+      priceEpochBasis: "current_price_sensitivity",
     });
   }
   throw new TypeError(`Unsupported parity-fixture provider: ${kernelEvent.provider}`);

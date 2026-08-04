@@ -497,6 +497,7 @@ function safeContributionProjection(payload) {
         "current_api_prices",
         "historical_api_prices",
         "unpriced",
+        "mixed_api_prices",
       ].includes(priceBasis)) {
     fail("queue_invalid");
   }

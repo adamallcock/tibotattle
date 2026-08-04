@@ -148,6 +148,15 @@ const CONTRIBUTION_ACCOUNTING_KEYS = Object.freeze([
   "unknownBillableUnits",
   "priceBasis",
 ]);
+const EVENT_PRICE_BASES = Object.freeze([
+  "current_api_prices",
+  "historical_api_prices",
+  "unpriced",
+]);
+const BATCH_PRICE_BASES = Object.freeze([
+  ...EVENT_PRICE_BASES,
+  "mixed_api_prices",
+]);
 
 function invalid(detailCode, message) {
   telemetryContractFailure(
@@ -162,11 +171,7 @@ function validateUsageAccounting(value) {
     && isTelemetryMoney(value.estimatedApiCostUsd)
     && isTelemetryBounded(value.pricingCoveragePercent, 0, 100)
     && isTelemetryInteger(value.unknownBillableUnits, 1_000_000_000)
-    && isTelemetryMember(value.priceBasis, [
-      "current_api_prices",
-      "historical_api_prices",
-      "unpriced",
-    ]);
+    && isTelemetryMember(value.priceBasis, EVENT_PRICE_BASES);
 }
 
 function validateUsage(value) {
@@ -529,11 +534,7 @@ export function parseTelemetryContribution(value, {
       value.accounting.unknownBillableUnits,
       1_000_000_000,
     )
-    || !isTelemetryMember(value.accounting.priceBasis, [
-      "current_api_prices",
-      "historical_api_prices",
-      "unpriced",
-    ])
+    || !isTelemetryMember(value.accounting.priceBasis, BATCH_PRICE_BASES)
   ) {
     invalid(
       "accounting_invalid",
@@ -596,6 +597,11 @@ export function parseTelemetryContribution(value, {
   const eventPriceBases = new Set(
     value.usageEvents.map((row) => row.accounting.priceBasis),
   );
+  const expectedBatchPriceBasis = eventPriceBases.size === 0
+    ? "unpriced"
+    : eventPriceBases.size === 1
+      ? [...eventPriceBases][0]
+      : "mixed_api_prices";
   const costMicros = value.usageEvents.reduce(
     (sum, row) => sum + (
       row.accounting.estimatedApiCostUsd === null
@@ -614,11 +620,7 @@ export function parseTelemetryContribution(value, {
     || Math.abs(
       value.accounting.pricedEventCoveragePercent - coverage,
     ) > 0.001
-    || eventPriceBases.size > 1
-    || (
-      eventPriceBases.size === 1
-      && !eventPriceBases.has(value.accounting.priceBasis)
-    )
+    || value.accounting.priceBasis !== expectedBatchPriceBasis
     || (
       batchCostMicros === null
         ? costMicros !== 0n

@@ -1,6 +1,7 @@
 import {
   addUsdStrings,
   apiPriceResolutionSummary,
+  aggregateLocalApiPriceResults,
   costWarningCodes,
   priceCodexProviderToolUnits,
   priceCodexUsageEvent,
@@ -43,12 +44,16 @@ export async function scanAndPriceCodexLogs({
 
   function onProviderToolObservation(observation) {
     if (!observation.serverBillableUnit) return;
-    const date = observation.timestamp.slice(0, 10);
+    const eventTime = typeof observation.timestamp === "string"
+      ? observation.timestamp
+      : null;
+    const date = eventTime?.slice(0, 10) ?? "unknown";
     const model = observation.model ?? "unknown";
     const surface = observation.surfaceClassification?.surface ?? "local_rollout_unclassified";
     const key = JSON.stringify([date, model, surface]);
     const group = providerToolGroups.get(key) ?? {
       date,
+      eventTime,
       model,
       surface,
       serverBillableUnits: {},
@@ -154,9 +159,17 @@ export async function scanAndPriceCodexLogs({
     excludeSessionIds,
   });
   const tokenSubscriptionSpeedSensitivity = subscriptionSpeedSensitivity(byModel);
-  const providerToolPricing = priceCodexProviderToolUnits(scanned.serverBillableUnits, { priceCards });
-  for (const group of providerToolGroups.values()) {
-    const priced = priceCodexProviderToolUnits(group.serverBillableUnits, { priceCards });
+  const providerToolPricedGroups = [...providerToolGroups.values()].map((group) => ({
+    group,
+    priced: priceCodexProviderToolUnits(group.serverBillableUnits, {
+      priceCards,
+      eventTime: group.eventTime,
+    }),
+  }));
+  const providerToolPricing = providerToolPricedGroups.length > 0
+    ? aggregateLocalApiPriceResults(providerToolPricedGroups.map(({ priced }) => priced))
+    : { totalUsd: "0", coverageStatus: "fully_priced", selectedPriceCardIds: [] };
+  for (const { group, priced } of providerToolPricedGroups) {
     const cost = Number(priced.totalUsd);
     const unitCount = Object.values(group.serverBillableUnits).reduce((sum, value) => sum + value, 0);
     const modelSummary = byModel[group.model] ??= {
@@ -297,7 +310,7 @@ export async function scanAndPriceCodexLogs({
       "token usage can be attributed to a model but not reliably to an individual user turn or tool",
       "tool calls are retained only as aggregate client-side classes and are not priced without a matching provider-billed unit",
       "Codex token_count logs do not expose API service tier; standard service-tier prices are used only as an explicit API-price-equivalent assumption",
-      "historical events use a current-price sensitivity at the checked-in registry observation unless an event-time price epoch is independently available",
+      "historical events use the official card effective at each usable event timestamp; events without usable timing remain explicitly unpriced",
       "typed provider web/file tool units are priced separately; client wrappers and hosted-container calls without exact billable units remain unpriced",
       "Codex Fast is tracked separately from API Priority/Flex/Batch; unknown speed emits sensitivity scenarios and selects neither",
     ],

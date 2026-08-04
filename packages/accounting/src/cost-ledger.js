@@ -56,6 +56,7 @@ const RUNCOST_COVERAGE_WARNING_CODES = new Set([
   "service_tier_unsupported",
   "long_context_rule_missing",
   "historical_price_missing",
+  "historical_price_timestamp_missing",
   "pricing_period_required",
   "pricing_period_unsupported",
   "billing_schedule_unsupported",
@@ -367,6 +368,51 @@ function dedupeWarnings(warnings) {
   return [...byKey.values()].sort((left, right) => left.code.localeCompare(right.code) || left.message.localeCompare(right.message));
 }
 
+function canonicalPriceInstant(value) {
+  if (typeof value !== "string" || value.length > 32) return null;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value
+    ? value
+    : null;
+}
+
+function usablePriceInstant(value) {
+  if (value instanceof Date) return Number.isFinite(value.getTime());
+  if (typeof value !== "string" && typeof value !== "number") return false;
+  return Number.isFinite(new Date(value).getTime());
+}
+
+function normalizePriceInstant(value) {
+  return usablePriceInstant(value) ? new Date(value).toISOString() : null;
+}
+
+function priceCardBreakdownFromComponents(components) {
+  const byCard = new Map();
+  for (const component of components) {
+    if (component.pricingStatus !== "priced" || !component.priceCardId || !positive(component.quantity)) continue;
+    const row = byCard.get(component.priceCardId) ?? { priceCardId: component.priceCardId, events: 0, costUsd: "0" };
+    // A row represents one priced event for this card, even when the event
+    // contains several components on the same card.
+    row.events = 1;
+    row.costUsd = addUsdStrings(row.costUsd, component.costUsd ?? "0");
+    byCard.set(component.priceCardId, row);
+  }
+  return [...byCard.values()].sort((left, right) => left.priceCardId.localeCompare(right.priceCardId));
+}
+
+function aggregatePriceCardBreakdowns(results) {
+  const byCard = new Map();
+  for (const result of results) {
+    for (const item of result.priceCardBreakdown ?? []) {
+      const row = byCard.get(item.priceCardId) ?? { priceCardId: item.priceCardId, events: 0, costUsd: "0" };
+      row.events += Number(item.events ?? 0);
+      row.costUsd = addUsdStrings(row.costUsd, item.costUsd ?? "0");
+      byCard.set(item.priceCardId, row);
+    }
+  }
+  return [...byCard.values()].sort((left, right) => left.priceCardId.localeCompare(right.priceCardId));
+}
+
 function coverageStatus(pricedPositiveCount, unpricedPositiveCount, unavailableCount = 0) {
   if (unpricedPositiveCount === 0 && unavailableCount === 0) return "fully_priced";
   return pricedPositiveCount > 0 ? "partially_priced" : "unpriced";
@@ -409,7 +455,11 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
   const explicitTier = event.serviceTier ?? event.apiTier ?? pricingContext.serviceTier ?? pricingContext.apiTier;
   const serviceTier = String(explicitTier ?? "standard").trim().toLowerCase();
   const tierSource = explicitTier === undefined || explicitTier === null ? "assumed_standard_counterfactual" : "observed_or_caller_supplied";
-  const pricedAt = event.pricedAt ?? event.timestamp ?? pricingContext.pricedAt ?? pricingContext.timestamp;
+  const historicalPricing = pricingContext.priceEpochBasis === "event_time_when_registry_has_effective_evidence";
+  const rawPricedAt = event.pricedAt ?? event.timestamp ?? pricingContext.pricedAt ?? pricingContext.timestamp;
+  const pricedAt = historicalPricing
+    ? canonicalPriceInstant(rawPricedAt)
+    : normalizePriceInstant(rawPricedAt);
   const region = event.region ?? pricingContext.region;
   const coverageWarnings = [];
   const informationalWarnings = [];
@@ -424,6 +474,18 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
       preUnpriced.push({ ...component, reasonCode: "unsupported_provider" });
       coverageWarnings.push(warning("unsupported_provider", `Provider ${provider} is not supported by the normalized cost ledger.`, { provider }));
     }
+  }
+
+  if (historicalPricing && !pricedAt) {
+    const reasonCode = pricingContext.historicalPriceReasonCode ?? "historical_price_timestamp_missing";
+    for (const component of candidates.splice(0)) {
+      preUnpriced.push({ ...component, reasonCode });
+    }
+    coverageWarnings.push(warning(
+      reasonCode,
+      "The event has no usable timestamp for historical price-card selection; its monetary components were not priced.",
+      { provider, model },
+    ));
   }
 
   const identity = { provider, model, surface };
@@ -445,7 +507,7 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     context: {
       service_tier: serviceTier,
       total_input_tokens: totalInputTokens,
-      ...(pricedAt ? { priced_at: new Date(pricedAt).toISOString() } : {}),
+      ...(pricedAt ? { priced_at: pricedAt } : {}),
       ...(region ? { region: String(region) } : {}),
     },
     components: candidates.map((component, index) => ({
@@ -480,9 +542,12 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
         metadata: { ...(priced.metadata ?? {}) },
       });
     } else {
+      const historicalPriceMissing = ledger.warnings.some((item) => item.code === "historical_price_missing");
       const reasonCode = !exactTierCardExists && serviceTier !== "standard"
         ? "service_tier_exact_card_missing"
-        : "component_price_missing";
+        : historicalPriceMissing
+          ? "historical_price_missing"
+          : "component_price_missing";
       components.push({
         name: requested.metadata?.original_component ?? requested.name,
         pricedAs: requested.name,
@@ -495,13 +560,15 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
         reasonCode,
         metadata: { ...(requested.metadata ?? {}) },
       });
-      coverageWarnings.push(warning(
-        reasonCode,
-        reasonCode === "service_tier_exact_card_missing"
-          ? `No exact ${serviceTier} price card declares the requested non-Standard tier.`
-          : `No monetary price covered ${requested.name}.`,
-        { component: requested.name, provider, model, serviceTier },
-      ));
+      if (!(historicalPriceMissing && reasonCode === "historical_price_missing")) {
+        coverageWarnings.push(warning(
+          reasonCode,
+          reasonCode === "service_tier_exact_card_missing"
+            ? `No exact ${serviceTier} price card declares the requested non-Standard tier.`
+            : `No monetary price covered ${requested.name}.`,
+          { component: requested.name, provider, model, serviceTier },
+        ));
+      }
     }
   }
   for (const component of preUnpriced) {
@@ -551,11 +618,16 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     pricingContext: {
       serviceTier,
       tierSource,
-      pricedAt: pricedAt ? new Date(pricedAt).toISOString() : null,
+      pricedAt,
       region: region ? String(region) : null,
       priceEpochBasis: pricingContext.priceEpochBasis ?? "caller_declared_or_unspecified",
+      ...(pricingContext.historicalPriceReasonCode
+        ? { historicalPriceReasonCode: pricingContext.historicalPriceReasonCode }
+        : {}),
     },
-    coverageStatus: coverageStatus(pricedPositiveCount, unpricedPositiveCount, unavailableCount),
+    coverageStatus: historicalPricing && !pricedAt
+      ? "unpriced"
+      : coverageStatus(pricedPositiveCount, unpricedPositiveCount, unavailableCount),
     coverageCounts: {
       pricedComponents: pricedPositiveCount,
       unpricedComponents: unpricedPositiveCount,
@@ -563,6 +635,7 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     },
     totalUsd: ledger.total,
     components,
+    priceCardBreakdown: priceCardBreakdownFromComponents(components),
     selectedPriceCardId: selectedPriceCardIds.length === 1 ? selectedPriceCardIds[0] : null,
     selectedPriceCardIds,
     warnings: {
@@ -605,6 +678,7 @@ export function aggregateCostResults(results) {
     },
     totalUsd: ledger.total,
     selectedPriceCardIds,
+    priceCardBreakdown: aggregatePriceCardBreakdowns(results),
     warnings: {
       coverage: dedupeWarnings(results.flatMap((result) => result.warnings?.coverage ?? [])),
       informational: dedupeWarnings(results.flatMap((result) => result.warnings?.informational ?? [])),

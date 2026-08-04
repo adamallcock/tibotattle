@@ -27,6 +27,7 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
@@ -757,7 +758,7 @@ async function validateUpdaterBoundary(appPath, plist, manifest, {
       || plist.UsageMonitorUpdaterFrameworkVersion !== SPARKLE_VERSION
       || plist.SUEnableAutomaticChecks !== true
       || plist.SUAllowsAutomaticUpdates !== true
-      || plist.SUAutomaticallyUpdate !== false
+      || plist.SUAutomaticallyUpdate !== true
       || plist.SURequireSignedFeed !== true
       || plist.SUVerifyUpdateBeforeExtraction !== true
       || typeof plist.SUFeedURL !== "string"
@@ -765,7 +766,7 @@ async function validateUpdaterBoundary(appPath, plist, manifest, {
       || updater?.enabled !== true
       || updater?.automaticChecks !== true
       || updater?.automaticUpdateOptInAvailable !== true
-      || updater?.automaticUpdatesEnabledByDefault !== false
+      || updater?.automaticUpdatesEnabledByDefault !== true
       || updater?.afterUserOptIn?.automaticDownload !== true
       || updater?.afterUserOptIn?.installOnQuit !== true
       || updater?.requiresSignedFeed !== true
@@ -928,24 +929,46 @@ export function readMacOSReleaseCredentials(environment = process.env) {
 export function readMacOSReleaseBuildConfiguration(
   environment = process.env,
 ) {
-  const productionOrigin = environment.USAGE_MONITOR_PRODUCTION_ORIGIN;
+  const configuredProductionOrigin =
+    environment.USAGE_MONITOR_PRODUCTION_ORIGIN;
   const bundleVersion = environment.USAGE_MONITOR_BUNDLE_VERSION;
   const sparkleFramework =
     environment.USAGE_MONITOR_SPARKLE_FRAMEWORK;
-  const sparkleAppcastURL =
+  const configuredSparkleAppcastURL =
     environment.USAGE_MONITOR_SPARKLE_APPCAST_URL;
   const sparklePublicEdKey =
     environment.USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY;
-  if (typeof productionOrigin !== "string") {
-    fail(
-      "USAGE_MONITOR_PRODUCTION_ORIGIN must name the exact approved HTTPS origin",
-      "MACOS_PRODUCTION_ORIGIN_REQUIRED",
-    );
+  const productionOrigin = DEPLOYMENT_ENDPOINTS.public.origin;
+  const sparkleAppcastURL = DEPLOYMENT_ENDPOINTS.sparkle.appcastURL;
+  if (configuredProductionOrigin !== undefined) {
+    if (typeof configuredProductionOrigin !== "string") {
+      fail(
+        "USAGE_MONITOR_PRODUCTION_ORIGIN must name the exact reviewed HTTPS origin",
+        "MACOS_PRODUCTION_ORIGIN_REQUIRED",
+      );
+    }
+    const normalizedConfiguredOrigin = validateProductionOrigin({
+      UsageMonitorCentralOrigin: configuredProductionOrigin,
+      UsageMonitorCentralOriginMode: "production_https",
+    });
+    if (normalizedConfiguredOrigin !== productionOrigin) {
+      fail(
+        "USAGE_MONITOR_PRODUCTION_ORIGIN must match config/deployment-endpoints.js",
+        "MACOS_RELEASE_ENDPOINTS_MISMATCH",
+      );
+    }
   }
   const normalizedOrigin = validateProductionOrigin({
     UsageMonitorCentralOrigin: productionOrigin,
     UsageMonitorCentralOriginMode: "production_https",
   });
+  if (configuredSparkleAppcastURL !== undefined
+      && configuredSparkleAppcastURL !== sparkleAppcastURL) {
+    fail(
+      "USAGE_MONITOR_SPARKLE_APPCAST_URL must match config/deployment-endpoints.js",
+      "MACOS_RELEASE_ENDPOINTS_MISMATCH",
+    );
+  }
   if (typeof bundleVersion !== "string"
       || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u
         .test(bundleVersion)) {
@@ -967,12 +990,10 @@ export function readMacOSReleaseBuildConfiguration(
   if (typeof sparkleFramework !== "string"
       || sparkleFramework.length === 0
       || sparkleFramework.includes("\0")
-      || typeof sparkleAppcastURL !== "string"
-      || sparkleAppcastURL.length === 0
       || typeof sparklePublicEdKey !== "string"
       || sparklePublicEdKey.length === 0) {
     fail(
-      "Release updater framework, appcast URL, and public Ed25519 key are required",
+      "Release updater framework and public Ed25519 key are required",
       "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
     );
   }
@@ -1017,13 +1038,13 @@ export function createMacOSSignedReplacementContract() {
     updateChecksPerformedByApp: true,
     manualUpdateCheckAvailable: true,
     automaticUpdateOptInAvailable: true,
-    automaticUpdatesEnabledByDefault: false,
+    automaticUpdatesEnabledByDefault: true,
     afterUserOptIn: Object.freeze({
       automaticDownload: true,
       installOnQuit: true,
     }),
     installProcedure:
-      "sparkle_user_choice_or_opted_in_install_on_quit_or_manual_dmg_replacement",
+      "sparkle_automatic_install_on_quit_or_manual_dmg_replacement",
     downloadPolicy: "pinned_https_appcast_and_eddsa_signed_artifact",
     state: Object.freeze({
       root:
@@ -1072,7 +1093,7 @@ function validateSignedReleaseManifest(manifest, label) {
       || manifest.updater?.frameworkVersion !== SPARKLE_VERSION
       || manifest.updater?.automaticChecks !== true
       || manifest.updater?.automaticUpdateOptInAvailable !== true
-      || manifest.updater?.automaticUpdatesEnabledByDefault !== false
+      || manifest.updater?.automaticUpdatesEnabledByDefault !== true
       || manifest.updater?.afterUserOptIn?.automaticDownload !== true
       || manifest.updater?.afterUserOptIn?.installOnQuit !== true
       || manifest.updater?.requiresSignedFeed !== true
@@ -1162,6 +1183,47 @@ async function readReplacementReleaseArtifact(
     );
   }
   return Object.freeze({ artifact, manifest });
+}
+
+/**
+ * Validate one exact public release artifact through the same manifest and
+ * platform gates used by signed replacement releases. Public-site packaging
+ * needs a single candidate, not a previous/candidate replacement pair, so
+ * keep the established single-manifest reader private and expose only this
+ * narrow, artifact-bound operation.
+ */
+export async function validateMacOSSignedReleaseArtifact({
+  releaseManifestPath,
+  artifactPath = null,
+  validateArtifact = validateMacOSDMG,
+} = {}) {
+  if (typeof releaseManifestPath !== "string"
+      || (artifactPath !== null && typeof artifactPath !== "string")
+      || typeof validateArtifact !== "function") {
+    fail(
+      "A macOS release manifest and artifact validator are required",
+      "MACOS_RELEASE_EVIDENCE_INVALID",
+    );
+  }
+  const candidate = await readReplacementReleaseArtifact(
+    releaseManifestPath,
+    "Public installer",
+  );
+  if (artifactPath !== null && resolve(artifactPath) !== candidate.artifact) {
+    fail(
+      "Public installer path does not match the release manifest artifact",
+      "MACOS_RELEASE_ARTIFACT_PATH_MISMATCH",
+    );
+  }
+  await validateArtifact(candidate.artifact, { production: true });
+  return Object.freeze({
+    artifact: Object.freeze({
+      path: candidate.artifact,
+      bytes: candidate.manifest.artifact.bytes,
+      sha256: candidate.manifest.artifact.sha256,
+    }),
+    manifest: candidate.manifest,
+  });
 }
 
 export async function validateMacOSSignedReplacementArtifacts({

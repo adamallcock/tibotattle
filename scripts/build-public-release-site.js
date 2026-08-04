@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-import { createReadStream } from "node:fs";
 import {
-  cp,
+  copyFile,
   lstat,
   mkdir,
   readFile,
@@ -24,26 +23,13 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
-
 import {
-  PRODUCT_BRAND,
-  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-} from "../config/product-brand.js";
-import {
-  TELEMETRY_BROWSER_MIRROR_FILE,
-  readVerifiedTelemetryBrowserMirror,
-} from "./generate-telemetry-browser-mirror.js";
+  validateMacOSDMG,
+  validateMacOSSignedReleaseArtifact,
+} from "./macos-release-core.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
-const TELEMETRY_BROWSER_MIRROR_BASENAME =
-  parse(TELEMETRY_BROWSER_MIRROR_FILE).base;
-const TELEMETRY_BROWSER_CRYPTO_ADAPTER_BASENAME =
-  "telemetry-envelope.js";
-const REQUIRED_TELEMETRY_MODULE_BASENAMES = Object.freeze([
-  TELEMETRY_BROWSER_MIRROR_BASENAME,
-  TELEMETRY_BROWSER_CRYPTO_ADAPTER_BASENAME,
-]);
 const SOCIAL_PREVIEW_FILENAME = "social-preview.png";
 const ROBOTS_FILENAME = "robots.txt";
 /**
@@ -54,29 +40,126 @@ const ROBOTS_FILENAME = "robots.txt";
  */
 const SITE_INDEX_SOURCE_BASENAME = "community.html";
 /**
- * Exact, reviewed absence ledger for the in-app dashboard surface. Names, not
- * patterns: adding a shared module must never silently drop it from the site,
- * and retiring a dashboard module must be a visible edit here.
+ * Exact, reviewed allow-list for the public landing page. The source
+ * directory also contains the loopback dashboard, admin surface, and
+ * contribution-only browser modules; copying it recursively would publish
+ * all of them. Keep this list aligned with the community entry's imports.
  */
-const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
+const PUBLIC_SITE_SOURCE_BASENAMES = Object.freeze([
+  "community.js",
+  "community-view.js",
+  "styles.css",
+  // This is the reviewed, shipped application icon. Publishing the same
+  // mark with the landing page makes the download surface recognisably the
+  // same product without exposing any loopback/dashboard code.
+  "tibotattle-icon.png",
+  "ui-format.js",
+]);
+/**
+ * Reviewed local/admin source names. The allow-list above is the primary
+ * boundary; this ledger makes an accidental reintroduction fail visibly in
+ * the generated output checks below.
+ */
+const WITHHELD_SOURCE_BASENAMES = Object.freeze([
+  "admin-client.js",
+  "admin.css",
+  "admin.html",
+  "admin.js",
   "app.js",
+  "data-client.js",
   "index.html",
+  "install-cta.js",
   "navigation.js",
 ]);
 const MAXIMUM_SOCIAL_PREVIEW_BYTES = 10 * 1024 * 1024;
-const SEMANTIC_OPEN_TARGET_META_NAME = "usage-monitor-semantic-open-target";
-const REQUIRED_META = Object.freeze({
+const INSTALLER_FETCH_TIMEOUT_MS = 120_000;
+const MAXIMUM_INSTALLER_REDIRECTS = 5;
+const INSTALLER_META = Object.freeze({
   "usage-monitor-installer-url": "installerUrl",
   "usage-monitor-installer-version": "installerVersion",
   "usage-monitor-installer-sha256": "installerSha256",
   "usage-monitor-installer-bytes": "installerBytes",
   "usage-monitor-minimum-macos": "minimumMacos",
   "usage-monitor-architectures": "architecturesText",
+});
+const SITE_META = Object.freeze({
   "usage-monitor-release-notes-url": "releaseNotesUrl",
   "usage-monitor-privacy-url": "privacyUrl",
   "usage-monitor-security-url": "securityUrl",
   "usage-monitor-support-url": "supportUrl",
 });
+const INSTALLER_OPTION_KEYS = Object.freeze([
+  "installerPath",
+  "installerReleaseManifest",
+  "installerUrl",
+  "installerVersion",
+  "installerSha256",
+  "minimumMacos",
+  "architectures",
+]);
+const PUBLIC_ROUTE_MARKERS = Object.freeze([
+  "./app.js",
+  "/app.js",
+  '"app.js"',
+  "'app.js'",
+  "./data-client.js",
+  "/data-client.js",
+  '"data-client.js"',
+  "'data-client.js'",
+  "./navigation.js",
+  "/navigation.js",
+  '"navigation.js"',
+  "'navigation.js'",
+  "./admin.js",
+  "/admin.js",
+  '"admin.js"',
+  "'admin.js'",
+  "./admin-client.js",
+  "/admin-client.js",
+  '"admin-client.js"',
+  "'admin-client.js'",
+  "./admin.css",
+  "/admin.css",
+  '"admin.css"',
+  "'admin.css'",
+  "./admin.html",
+  "/admin.html",
+  '"admin.html"',
+  "'admin.html'",
+  "./install-cta.js",
+  "/install-cta.js",
+  '"install-cta.js"',
+  "'install-cta.js'",
+  'id="refresh-button"',
+  'id="connect-community"',
+  'id="open-installed-app"',
+  'id="contribution-form"',
+  'id="identity-signin"',
+  'id="identity-google-signin"',
+  'id="identity-apple-signin"',
+  'id="sign-in"',
+  'id="signin"',
+  'id="admin"',
+  'id="app-open"',
+  'id="contribution-',
+  'id="identity-',
+  'id="sign-in-',
+  'id="admin-',
+  'id="app-open-',
+  'name="contribution',
+  'href="#contribution',
+  'href="#sign-in',
+  'href="#signin',
+  'href="#admin',
+  'href="#app-open',
+  "usage-monitor-semantic-open-target",
+  "usagemonitor://",
+  "/app-open",
+  "/sign-in",
+  "/signin",
+  "/contribution",
+  "/admin",
+]);
 const REQUIRED_STATIC_SOCIAL_TAGS = Object.freeze([
   '<meta property="og:type" content="website">',
   '<meta property="og:image:width" content="1200">',
@@ -91,17 +174,17 @@ function usage() {
     "  node scripts/build-public-release-site.js \\",
     "    --output /absolute/output/directory \\",
     "    --site-url https://approved.example/ \\",
-    "    --installer-path /absolute/path/to/notarized/UsageMonitor.dmg \\",
-    "    --installer-url https://downloads.approved.example/UsageMonitor.dmg \\",
-    "    --installer-version 1.2.3 \\",
-    "    --installer-sha256 <64 lowercase hex> \\",
-    "    --minimum-macos 13.0 \\",
-    "    --architectures arm64 \\",
     "    --release-notes-url https://approved.example/releases/1.2.3 \\",
     "    --privacy-url https://approved.example/privacy \\",
     "    --security-url https://approved.example/security \\",
     "    --support-url https://approved.example/support \\",
-    "    --social-image /absolute/path/to/1200x630.png [--replace]",
+    "    --social-image /absolute/path/to/1200x630.png \\",
+    "    [--installer-release-manifest /absolute/path/to/UsageMonitor.dmg.release.json \\",
+    "     --installer-path /absolute/path/to/UsageMonitor.dmg \\",
+    "     --installer-url https://downloads.approved.example/UsageMonitor.dmg \\",
+    "     --installer-version 1.2.3 \\",
+    "     --installer-sha256 <64 lowercase hex> \\",
+    "     --minimum-macos 13.0 --architectures arm64] [--replace]",
   ].join("\n");
 }
 
@@ -112,6 +195,7 @@ function parseArgs(argv) {
     "--source": "source",
     "--site-url": "siteUrl",
     "--installer-path": "installerPath",
+    "--installer-release-manifest": "installerReleaseManifest",
     "--installer-url": "installerUrl",
     "--installer-version": "installerVersion",
     "--installer-sha256": "installerSha256",
@@ -201,6 +285,125 @@ function validatedPublicHttpsUrl(
   return selected.href;
 }
 
+// A configured public download URL can legitimately redirect (for example,
+// from a GitHub Release to object storage). Each hop must nevertheless remain
+// public HTTPS. Query parameters are allowed here because signed object-store
+// redirects use them; the configured, visible URL itself stays stable.
+function validatedPublishedInstallerUrl(raw, base = undefined) {
+  let selected;
+  try {
+    selected = new URL(raw, base);
+  } catch {
+    throw new TypeError("Published installer redirect is not a valid URL");
+  }
+  if (selected.protocol !== "https:"
+      || !selected.hostname
+      || selected.username
+      || selected.password
+      || selected.port
+      || selected.hash
+      || rejectedPublicHostname(selected.hostname)) {
+    throw new TypeError(
+      "Published installer redirects must remain credential-free public HTTPS",
+    );
+  }
+  return selected;
+}
+
+/**
+ * A local DMG and its signed release manifest are necessary but insufficient:
+ * the public URL must serve those exact bytes before the landing page may call
+ * it a signed installer. Stream and hash the remote artifact rather than
+ * trusting a content-length, a filename, or a caller-provided URL.
+ */
+export async function verifyPublishedInstallerRemote({
+  installerUrl,
+  expectedBytes,
+  expectedSha256,
+  fetchImpl = globalThis.fetch,
+}) {
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("Published installer verification requires fetch support");
+  }
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 1
+      || !/^[a-f0-9]{64}$/u.test(expectedSha256)) {
+    throw new TypeError("Published installer verification received invalid signed evidence");
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    INSTALLER_FETCH_TIMEOUT_MS,
+  );
+  let target = validatedPublishedInstallerUrl(installerUrl);
+  try {
+    for (let redirects = 0; redirects <= MAXIMUM_INSTALLER_REDIRECTS; redirects += 1) {
+      let response;
+      try {
+        response = await fetchImpl(target, {
+          headers: { Accept: "application/octet-stream" },
+          method: "GET",
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new Error("Published installer verification timed out");
+        }
+        throw new Error(
+          `Published installer could not be fetched for verification: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (response.status >= 300 && response.status < 400) {
+        if (redirects === MAXIMUM_INSTALLER_REDIRECTS) {
+          throw new Error("Published installer exceeded the redirect limit");
+        }
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new Error("Published installer redirect omitted its location");
+        }
+        target = validatedPublishedInstallerUrl(location, target);
+        continue;
+      }
+      if (!response.ok || !response.body) {
+        throw new Error(
+          `Published installer verification returned HTTP ${response.status}`,
+        );
+      }
+      const declaredLength = response.headers.get("content-length");
+      if (declaredLength !== null) {
+        const declaredBytes = Number(declaredLength);
+        if (!/^(?:0|[1-9][0-9]*)$/u.test(declaredLength)
+            || !Number.isSafeInteger(declaredBytes)
+            || declaredBytes !== expectedBytes) {
+          throw new Error("Published installer byte length does not match signed evidence");
+        }
+      }
+      const hash = createHash("sha256");
+      let receivedBytes = 0;
+      for await (const chunk of response.body) {
+        const bytes = Buffer.from(chunk);
+        receivedBytes += bytes.length;
+        if (receivedBytes > expectedBytes) {
+          throw new Error("Published installer exceeds the signed byte length");
+        }
+        hash.update(bytes);
+      }
+      const receivedSha256 = hash.digest("hex");
+      if (receivedBytes !== expectedBytes || receivedSha256 !== expectedSha256) {
+        throw new Error("Published installer digest does not match signed evidence");
+      }
+      return Object.freeze({
+        bytes: receivedBytes,
+        finalUrl: target.href,
+        sha256: receivedSha256,
+      });
+    }
+    throw new Error("Published installer could not be resolved");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function normalizedArchitectures(raw) {
   if (typeof raw !== "string" || raw.length === 0) {
     throw new TypeError("Architectures are required");
@@ -214,15 +417,12 @@ function normalizedArchitectures(raw) {
 }
 
 function validateInputs(args) {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) {
+    throw new TypeError(`Release-site build options are required\n${usage()}`);
+  }
   const required = [
     "output",
     "siteUrl",
-    "installerPath",
-    "installerUrl",
-    "installerVersion",
-    "installerSha256",
-    "minimumMacos",
-    "architectures",
     "releaseNotesUrl",
     "privacyUrl",
     "securityUrl",
@@ -230,70 +430,70 @@ function validateInputs(args) {
     "socialImage",
   ];
   if (required.some((key) => !args[key])) {
-    throw new TypeError(`All release metadata and artifact paths are required\n${usage()}`);
+    throw new TypeError(`Site metadata and artifact paths are incomplete\n${usage()}`);
   }
-  if (!isAbsolute(args.output)
-      || !isAbsolute(args.installerPath)
-      || !isAbsolute(args.socialImage)) {
+  const installerConfigured = INSTALLER_OPTION_KEYS.some((key) => {
+    const value = args[key];
+    return value !== undefined && value !== null && value !== "";
+  });
+  const requiredInstallerMetadata = [
+    "installerReleaseManifest",
+    "installerUrl",
+    "installerVersion",
+    "minimumMacos",
+    "architectures",
+  ];
+  if (installerConfigured
+      && requiredInstallerMetadata.some((key) => !args[key])) {
     throw new TypeError(
-      "--output, --installer-path, and --social-image must be absolute paths",
+      `Installer metadata requires an exact signed macOS release manifest and complete metadata\n${usage()}`,
     );
   }
-  const source = resolve(args.source);
+  if (!isAbsolute(args.output) || !isAbsolute(args.socialImage)) {
+    throw new TypeError(
+      "--output and --social-image must be absolute paths",
+    );
+  }
+  const source = resolve(args.source ?? DEFAULT_SOURCE);
   const output = resolve(args.output);
-  const installerPath = resolve(args.installerPath);
+  const installerPath = args.installerPath ? resolve(args.installerPath) : null;
+  const installerReleaseManifest = args.installerReleaseManifest
+    ? resolve(args.installerReleaseManifest)
+    : null;
   const socialImage = resolve(args.socialImage);
+  const releaseInputs = [installerPath, installerReleaseManifest].filter(Boolean);
   if (output === source
       || output === REPOSITORY_ROOT
       || output === homedir()
       || output === parse(output).root
       || isWithin(output, source)
       || isWithin(source, output)
-      || isWithin(output, installerPath)
+      || releaseInputs.some((path) => isWithin(output, path))
       || isWithin(output, socialImage)) {
     throw new TypeError(
       "Output cannot replace or contain the source, repository, home, or release inputs",
     );
   }
-  if (isWithin(source, installerPath) || isWithin(source, socialImage)) {
+  if (releaseInputs.some((path) => isWithin(source, path))
+      || isWithin(source, socialImage)) {
     throw new TypeError(
-      "Installer and social preview inputs must stay outside the copied public source",
+      "Release and social preview inputs must stay outside the copied public source",
     );
-  }
-  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$/u.test(args.installerVersion)) {
-    throw new TypeError("Installer version must be a numeric three- or four-part version");
-  }
-  if (!/^[a-f0-9]{64}$/u.test(args.installerSha256)) {
-    throw new TypeError("Installer SHA-256 must be exactly 64 lowercase hexadecimal characters");
-  }
-  if (!/^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u
-    .test(args.minimumMacos)) {
-    throw new TypeError("Minimum macOS must be a canonical version such as 13.0");
   }
   if (extname(socialImage).toLowerCase() !== ".png") {
     throw new TypeError("Social preview must be a PNG file");
   }
-  const architectures = normalizedArchitectures(args.architectures);
   const siteUrl = validatedPublicHttpsUrl(args.siteUrl, "Site URL", {
     requireTrailingSlash: true,
   });
-  return {
+  const options = {
     source,
     output,
     installerPath,
+    installerReleaseManifest,
     socialImage,
     siteUrl,
     socialImageUrl: new URL(SOCIAL_PREVIEW_FILENAME, siteUrl).href,
-    installerUrl: validatedPublicHttpsUrl(
-      args.installerUrl,
-      "Installer URL",
-      { requiredSuffix: ".dmg" },
-    ),
-    installerVersion: args.installerVersion,
-    installerSha256: args.installerSha256,
-    minimumMacos: args.minimumMacos,
-    architectures,
-    architecturesText: architectures.join(","),
     releaseNotesUrl: validatedPublicHttpsUrl(
       args.releaseNotesUrl,
       "Release notes URL",
@@ -302,6 +502,40 @@ function validateInputs(args) {
     securityUrl: validatedPublicHttpsUrl(args.securityUrl, "Security URL"),
     supportUrl: validatedPublicHttpsUrl(args.supportUrl, "Support URL"),
     replace: args.replace,
+    installerConfigured,
+  };
+  if (!installerConfigured) return options;
+
+  if (args.installerPath && !isAbsolute(args.installerPath)) {
+    throw new TypeError("--installer-path must be an absolute path when supplied");
+  }
+  if (!isAbsolute(args.installerReleaseManifest)) {
+    throw new TypeError("--installer-release-manifest must be an absolute path");
+  }
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$/u.test(args.installerVersion)) {
+    throw new TypeError("Installer version must be a numeric three- or four-part version");
+  }
+  if (args.installerSha256 !== undefined
+      && !/^[a-f0-9]{64}$/u.test(args.installerSha256)) {
+    throw new TypeError("Installer SHA-256 must be exactly 64 lowercase hexadecimal characters");
+  }
+  if (!/^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u
+    .test(args.minimumMacos)) {
+    throw new TypeError("Minimum macOS must be a canonical version such as 13.0");
+  }
+  const architectures = normalizedArchitectures(args.architectures);
+  return {
+    ...options,
+    installerUrl: validatedPublicHttpsUrl(
+      args.installerUrl,
+      "Installer URL",
+      { requiredSuffix: ".dmg" },
+    ),
+    installerVersion: args.installerVersion,
+    installerSha256: args.installerSha256 ?? null,
+    minimumMacos: args.minimumMacos,
+    architectures,
+    architecturesText: architectures.join(","),
   };
 }
 
@@ -330,12 +564,6 @@ async function regularFile(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) 
     throw new TypeError(`${label} must be a non-empty regular file within its size bound`);
   }
   return stats;
-}
-
-async function sha256File(path) {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return hash.digest("hex");
 }
 
 function inspectPng(bytes) {
@@ -405,30 +633,26 @@ function replaceExactlyOnce(html, token, replacement, label) {
 
 function injectReleaseMetadata(html, values) {
   let output = html;
-  const semanticPlaceholderCount =
-    output.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1;
-  if (semanticPlaceholderCount !== 1) {
-    throw new TypeError(
-      "Source must contain exactly one semantic open target placeholder",
-    );
-  }
-  const semanticMetaToken =
-    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
-    + `content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`;
-  output = replaceExactlyOnce(
-    output,
-    semanticMetaToken,
-    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
-      + `content="${htmlAttribute(PRODUCT_BRAND.appOpenURL)}">`,
-    "semantic open target meta placeholder",
-  );
-  for (const [name, valueKey] of Object.entries(REQUIRED_META)) {
+  for (const [name, valueKey] of Object.entries(SITE_META)) {
     const token = `<meta name="${name}" content="">`;
     output = replaceExactlyOnce(
       output,
       token,
       `<meta name="${name}" content="${htmlAttribute(values[valueKey])}">`,
       `empty ${name} meta tag`,
+    );
+  }
+  for (const [name, valueKey] of Object.entries(INSTALLER_META)) {
+    const token = `<meta name="${name}" content="">`;
+    output = replaceExactlyOnce(
+      output,
+      token,
+      values.installerConfigured
+        ? `<meta name="${name}" content="${htmlAttribute(values[valueKey])}">`
+        : "",
+      values.installerConfigured
+        ? `empty ${name} meta tag`
+        : `empty ${name} no-installer metadata slot`,
     );
   }
   for (const token of REQUIRED_STATIC_SOCIAL_TAGS) {
@@ -489,58 +713,77 @@ async function fileManifest(root, { excludedFiles = new Set() } = {}) {
   return rows;
 }
 
-function verifiedMirrorRecord(record) {
-  if (record === null || typeof record !== "object"
-      || typeof record.sourceText !== "string"
-      || typeof record.sha256 !== "string"
-      || !Number.isSafeInteger(record.byteLength)
-      || record.byteLength < 0) {
-    throw new TypeError("Verified telemetry mirror reader returned an invalid record");
-  }
-  const sha256 = createHash("sha256").update(record.sourceText, "utf8").digest("hex");
-  const byteLength = Buffer.byteLength(record.sourceText, "utf8");
-  if (record.sha256 !== sha256 || record.byteLength !== byteLength) {
-    throw new TypeError("Verified telemetry mirror reader returned inconsistent bytes");
-  }
-  return Object.freeze({ sourceText: record.sourceText, sha256, byteLength });
-}
-
 export async function buildPublicReleaseSite(rawArgs, {
-  readVerifiedMirror = readVerifiedTelemetryBrowserMirror,
+  validateInstallerArtifact = validateMacOSDMG,
+  verifyPublishedInstaller = verifyPublishedInstallerRemote,
 } = {}) {
-  if (typeof readVerifiedMirror !== "function") {
-    throw new TypeError("readVerifiedMirror must be a function");
+  if (typeof validateInstallerArtifact !== "function") {
+    throw new TypeError("validateInstallerArtifact must be a function");
+  }
+  if (typeof verifyPublishedInstaller !== "function") {
+    throw new TypeError("verifyPublishedInstaller must be a function");
   }
   const options = validateInputs(rawArgs);
-  const requiredTelemetryModules = REQUIRED_TELEMETRY_MODULE_BASENAMES.map(
-    (basename) => join(options.source, basename),
-  );
-  for (let index = 0; index < requiredTelemetryModules.length; index += 1) {
-    await regularFile(
-      requiredTelemetryModules[index],
-      `Required public telemetry module ${
-        REQUIRED_TELEMETRY_MODULE_BASENAMES[index]
-      }`,
-    );
-  }
-  const telemetryMirror = verifiedMirrorRecord(await readVerifiedMirror({
-    outputFile: requiredTelemetryModules[0],
-  }));
   const sourceIndex = join(options.source, SITE_INDEX_SOURCE_BASENAME);
   await regularFile(
     sourceIndex,
     `Release-site index source ${SITE_INDEX_SOURCE_BASENAME}`,
   );
   const sourceHtml = await readFile(sourceIndex, "utf8");
-  const installerStats = await regularFile(
-    options.installerPath,
-    "Installer artifact",
-  );
-  const installerSha256 = await sha256File(options.installerPath);
-  if (installerSha256 !== options.installerSha256) {
-    throw new TypeError(
-      "Installer SHA-256 does not match the selected local installer artifact",
-    );
+  const publicSourceFiles = [];
+  for (const basename of PUBLIC_SITE_SOURCE_BASENAMES) {
+    const sourcePath = join(options.source, basename);
+    if (!(await pathExists(sourcePath))) {
+      throw new TypeError(`Public release source ${basename} is required`);
+    }
+    await regularFile(sourcePath, `Public release source ${basename}`);
+    publicSourceFiles.push({ basename, sourcePath });
+  }
+  let installerEvidence = null;
+  if (options.installerConfigured) {
+    installerEvidence = await validateMacOSSignedReleaseArtifact({
+      releaseManifestPath: options.installerReleaseManifest,
+      artifactPath: options.installerPath,
+      validateArtifact: validateInstallerArtifact,
+    });
+    const releaseVersion = installerEvidence.manifest.application.shortVersion;
+    if (releaseVersion !== options.installerVersion) {
+      throw new TypeError(
+        "Installer version does not match the signed macOS release manifest",
+      );
+    }
+    if (!/(?:^|[-_.])arm64(?:[-_.]|$)/u.test(
+      installerEvidence.manifest.artifact.fileName,
+    )) {
+      throw new TypeError(
+        "Signed macOS release artifact must be the supported arm64 DMG",
+      );
+    }
+    const installerURL = new URL(options.installerUrl);
+    let installerURLFileName;
+    try {
+      installerURLFileName = decodeURIComponent(
+        installerURL.pathname.split("/").at(-1) ?? "",
+      );
+    } catch {
+      throw new TypeError("Installer URL contains an invalid encoded artifact name");
+    }
+    if (installerURLFileName !== installerEvidence.manifest.artifact.fileName) {
+      throw new TypeError(
+        "Installer URL artifact name does not match the signed macOS release manifest",
+      );
+    }
+    if (options.installerSha256 !== null
+        && options.installerSha256 !== installerEvidence.artifact.sha256) {
+      throw new TypeError(
+        "Installer SHA-256 does not match the signed macOS release manifest",
+      );
+    }
+    await verifyPublishedInstaller({
+      expectedBytes: installerEvidence.artifact.bytes,
+      expectedSha256: installerEvidence.artifact.sha256,
+      installerUrl: options.installerUrl,
+    });
   }
   const socialStats = await regularFile(
     options.socialImage,
@@ -552,20 +795,10 @@ export async function buildPublicReleaseSite(rawArgs, {
   const socialSha256 = createHash("sha256").update(socialBytes).digest("hex");
   const releaseValues = {
     ...options,
-    installerBytes: installerStats.size,
+    installerBytes: installerEvidence?.artifact.bytes ?? null,
+    installerSha256: installerEvidence?.artifact.sha256 ?? null,
   };
   const releaseHtml = injectReleaseMetadata(sourceHtml, releaseValues);
-  // The community entry becomes the site index, so its own file is not copied
-  // a second time under its source name.
-  const unpublishedSourceFiles = new Set([
-    requiredTelemetryModules[0],
-    resolve(sourceIndex),
-    ...APP_ONLY_SOURCE_BASENAMES.map((basename) =>
-      resolve(join(options.source, basename))),
-  ]);
-  await fileManifest(options.source, {
-    excludedFiles: new Set([requiredTelemetryModules[0]]),
-  });
 
   if (await pathExists(options.output)) {
     if (!options.replace) {
@@ -574,20 +807,10 @@ export async function buildPublicReleaseSite(rawArgs, {
     await rm(options.output, { recursive: true });
   }
   await mkdir(dirname(options.output), { recursive: true });
-  await cp(options.source, options.output, {
-    recursive: true,
-    errorOnExist: true,
-    force: false,
-    verbatimSymlinks: true,
-    filter(source) {
-      return !unpublishedSourceFiles.has(resolve(source));
-    },
-  });
-  await writeFile(
-    join(options.output, TELEMETRY_BROWSER_MIRROR_BASENAME),
-    telemetryMirror.sourceText,
-    { encoding: "utf8", mode: 0o644, flag: "wx" },
-  );
+  await mkdir(options.output, { recursive: true, mode: 0o755 });
+  for (const { basename, sourcePath } of publicSourceFiles) {
+    await copyFile(sourcePath, join(options.output, basename));
+  }
   await writeFile(join(options.output, "index.html"), releaseHtml, {
     encoding: "utf8",
     mode: 0o644,
@@ -605,26 +828,41 @@ export async function buildPublicReleaseSite(rawArgs, {
   );
   const files = await fileManifest(options.output);
   const publishedNames = new Set(files.map(({ path }) => path));
-  // `index.html` is the rendered community entry, so it is checked by content
-  // below rather than by name; every other dashboard-only file must be absent.
-  for (
-    const withheld of [
-      ...APP_ONLY_SOURCE_BASENAMES.filter((name) => name !== "index.html"),
-      SITE_INDEX_SOURCE_BASENAME,
-    ]
-  ) {
+  // `index.html` is the rendered community entry. No source entry point,
+  // admin file, or local-only asset may survive the generated allow-list.
+  for (const withheld of [
+    ...WITHHELD_SOURCE_BASENAMES.filter((name) => name !== "index.html"),
+    SITE_INDEX_SOURCE_BASENAME,
+  ]) {
     if (publishedNames.has(withheld)) {
       throw new Error(
         `Release output published the in-app dashboard surface: ${withheld}`,
       );
     }
   }
-  const stagedMirror = files.find(({ path }) =>
-    path === TELEMETRY_BROWSER_MIRROR_BASENAME);
-  if (stagedMirror === undefined
-      || stagedMirror.sha256 !== telemetryMirror.sha256
-      || stagedMirror.bytes !== telemetryMirror.byteLength) {
-    throw new Error("Release output did not stage the verified telemetry mirror bytes");
+  const generatedNames = new Set([
+    ...PUBLIC_SITE_SOURCE_BASENAMES,
+    "index.html",
+    ROBOTS_FILENAME,
+    SOCIAL_PREVIEW_FILENAME,
+  ]);
+  for (const publishedName of publishedNames) {
+    if (!generatedNames.has(publishedName)) {
+      throw new Error(
+        `Release output published an unreviewed public asset: ${publishedName}`,
+      );
+    }
+  }
+  for (const { path } of files.filter(({ path }) =>
+    /\.(?:css|html|js|json|txt)$/u.test(path))) {
+    const contents = await readFile(join(options.output, path), "utf8");
+    for (const marker of PUBLIC_ROUTE_MARKERS) {
+      if (contents.includes(marker)) {
+        throw new Error(
+          `Release output asset referenced a local-only route or control: ${path} (${marker})`,
+        );
+      }
+    }
   }
   const manifest = {
     schemaVersion: "usage-monitor-release-site-manifest-v0.2",
@@ -648,15 +886,23 @@ export async function buildPublicReleaseSite(rawArgs, {
         policy: "allow_all",
       },
     },
-    installer: {
-      url: options.installerUrl,
-      version: options.installerVersion,
-      sha256: options.installerSha256,
-      bytes: installerStats.size,
-      minimumMacos: options.minimumMacos,
-      architectures: options.architectures,
-      verifiedFromLocalArtifact: true,
-    },
+    ...(installerEvidence
+      ? {
+        installer: {
+          url: options.installerUrl,
+          version: options.installerVersion,
+          sha256: installerEvidence.artifact.sha256,
+          bytes: installerEvidence.artifact.bytes,
+          minimumMacos: options.minimumMacos,
+          architectures: options.architectures,
+          verifiedSignedReleaseEvidence: true,
+          releaseEvidence: {
+            schemaVersion: installerEvidence.manifest.schemaVersion,
+            verification: "signed-release-manifest-and-platform-validation",
+          },
+        },
+      }
+      : {}),
     files,
   };
   await writeFile(
@@ -669,26 +915,27 @@ export async function buildPublicReleaseSite(rawArgs, {
   if (verifiedHtml !== releaseHtml) {
     throw new Error("Release output index did not keep the rendered community entry");
   }
-  for (const name of APP_ONLY_SOURCE_BASENAMES) {
-    if (verifiedHtml.includes(`./${name}`)) {
+  for (const marker of PUBLIC_ROUTE_MARKERS) {
+    if (verifiedHtml.includes(marker)) {
       throw new Error(
-        `Release output index referenced the in-app dashboard surface: ${name}`,
+        `Release output index referenced a local-only route or control: ${marker}`,
       );
     }
   }
-  for (const name of Object.keys(REQUIRED_META)) {
+  for (const name of Object.keys(SITE_META)) {
     if (verifiedHtml.includes(`<meta name="${name}" content="">`)) {
       throw new Error(`Release output retained empty ${name} metadata`);
     }
   }
-  const semanticTargetMeta =
-    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
-    + `content="${htmlAttribute(PRODUCT_BRAND.appOpenURL)}">`;
-  if (verifiedHtml.includes(SEMANTIC_OPEN_TARGET_PLACEHOLDER)
-      || verifiedHtml.split(semanticTargetMeta).length - 1 !== 1) {
-    throw new Error(
-      "Release output did not contain exactly one configured semantic open target",
-    );
+  if (installerEvidence) {
+    for (const name of Object.keys(INSTALLER_META)) {
+      if (verifiedHtml.includes(`<meta name="${name}" content="">`)) {
+        throw new Error(`Release output retained empty ${name} metadata`);
+      }
+    }
+  } else if (Object.keys(INSTALLER_META).some((name) =>
+    verifiedHtml.includes(`<meta name="${name}"`))) {
+    throw new Error("No-installer release output retained installer metadata");
   }
   for (const token of [
     '<link rel="canonical" href="">',
@@ -706,7 +953,7 @@ export async function buildPublicReleaseSite(rawArgs, {
   return {
     output: options.output,
     site: manifest.site,
-    installer: manifest.installer,
+    installer: manifest.installer ?? null,
     fileCount: manifest.files.length + 1,
   };
 }

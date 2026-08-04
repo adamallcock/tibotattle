@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assessStagingConfiguration,
+  GENERATED_WORKER_ASSET_DIRECTORY,
   probeStagingLive,
 } from "./staging-readiness-lib.mjs";
 import {
@@ -23,6 +24,46 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
     "STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED",
   ]);
   assert.equal(JSON.stringify(result).includes("app-usagemonitor-staging"), false);
+});
+
+test("every deployable Worker asset environment uses the generated community tree", () => {
+  for (const environment of [
+    checkedInConfig,
+    checkedInConfig.env.staging,
+    checkedInConfig.env.production,
+  ]) {
+    assert.equal(environment.assets.directory, GENERATED_WORKER_ASSET_DIRECTORY);
+    assert.equal(environment.assets.not_found_handling, "single-page-application");
+  }
+  assert.equal(
+    assessStagingConfiguration(checkedInConfig).checks.deployableAssetsClosed,
+    true,
+  );
+});
+
+test("staging readiness rejects dashboard source and local control asset routes", () => {
+  for (const directory of [
+    "../web/public",
+    "../../.release-build/public-release-site",
+  ]) {
+    const config = structuredClone(checkedInConfig);
+    config.env.staging.assets.directory = directory;
+    const result = assessStagingConfiguration(config);
+    assert.equal(result.checks.assetsClosed, false, directory);
+    assert.equal(result.checks.deployableAssetsClosed, false, directory);
+  }
+  for (const route of [
+    "/admin/*",
+    "/sign-in/*",
+    "/contribution/*",
+    "/app-open/*",
+  ]) {
+    const config = structuredClone(checkedInConfig);
+    config.env.staging.assets.run_worker_first = ["/api/*", route];
+    const result = assessStagingConfiguration(config);
+    assert.equal(result.checks.assetsClosed, false, route);
+    assert.equal(result.checks.deployableAssetsClosed, false, route);
+  }
 });
 
 test("unsafe staging admission configuration fails closed", () => {

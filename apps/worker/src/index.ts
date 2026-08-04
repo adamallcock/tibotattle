@@ -606,6 +606,43 @@ async function deleteExpiredGoogleHandoffs(
   return result.meta.changes;
 }
 
+/**
+ * A provider can return a valid state with an explicit cancellation (or an
+ * exchange can fail after that state has been claimed). That handoff cannot
+ * subsequently succeed: authorization codes are one-time and the person has
+ * already chosen a different outcome. Delete only an empty, live row so a
+ * late cancellation can never undo a completed or delivered sign-in.
+ */
+async function discardPendingAppleHandoff(
+  db: D1Database,
+  state: string,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    `DELETE FROM apple_signin_handoffs
+      WHERE state = ?
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).run();
+}
+
+async function discardPendingGoogleHandoff(
+  db: D1Database,
+  state: string,
+  nowIso: string,
+): Promise<void> {
+  await db.prepare(
+    `DELETE FROM google_signin_handoffs
+      WHERE state = ?
+        AND identity_link_key IS NULL
+        AND proof IS NULL
+        AND delivered_at IS NULL
+        AND expires_at > ?`,
+  ).bind(state, nowIso).run();
+}
+
 async function hasExpiredAppleHandoffs(db: D1Database, nowIso: string): Promise<boolean> {
   return Boolean(await db.prepare(
     "SELECT 1 AS found FROM apple_signin_handoffs WHERE expires_at <= ? LIMIT 1",
@@ -775,13 +812,15 @@ async function handleIdentityAppleCallback(
   const code = form.get("code");
   const failure = signInCallbackPage(SIGNIN_NOT_COMPLETED_MESSAGE);
   if (typeof state !== "string"
-      || !APPLE_SIGNIN_STATE_PATTERN.test(state)
-      || form.get("error") !== null
-      || typeof code !== "string"
-      || code.length === 0) {
+      || !APPLE_SIGNIN_STATE_PATTERN.test(state)) {
     return failure;
   }
   const nowIso = new Date().toISOString();
+  if (form.get("error") !== null) {
+    await discardPendingAppleHandoff(env.USAGE_MONITOR_DB, state, nowIso);
+    return failure;
+  }
+  if (typeof code !== "string" || code.length === 0) return failure;
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state FROM apple_signin_handoffs
       WHERE state = ?
@@ -796,6 +835,13 @@ async function handleIdentityAppleCallback(
     const idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
     verified = await verifiedHostedCallbackIdentity(env, "apple", idToken);
   } catch {
+    // A provider code can be spent only once. Leaving this handoff pending
+    // would make the desktop app poll a state that cannot ever complete.
+    await discardPendingAppleHandoff(
+      env.USAGE_MONITOR_DB,
+      state,
+      new Date().toISOString(),
+    );
     return failure;
   }
   // Re-checked against the time the exchange finished, not the time it
@@ -951,13 +997,15 @@ async function handleIdentityGoogleCallback(
   const state = parameters.get("state");
   const code = parameters.get("code");
   if (typeof state !== "string"
-      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)
-      || parameters.get("error") !== null
-      || typeof code !== "string"
-      || code.length === 0) {
+      || !GOOGLE_SIGNIN_STATE_PATTERN.test(state)) {
     return failure;
   }
   const nowIso = new Date().toISOString();
+  if (parameters.get("error") !== null) {
+    await discardPendingGoogleHandoff(env.USAGE_MONITOR_DB, state, nowIso);
+    return failure;
+  }
+  if (typeof code !== "string" || code.length === 0) return failure;
   const pending = await env.USAGE_MONITOR_DB.prepare(
     `SELECT code_verifier AS codeVerifier FROM google_signin_handoffs
       WHERE state = ?
@@ -977,6 +1025,13 @@ async function handleIdentityGoogleCallback(
     );
     verified = await verifiedHostedCallbackIdentity(env, "google", idToken);
   } catch {
+    // A provider code can be spent only once. Leaving this handoff pending
+    // would make the desktop app poll a state that cannot ever complete.
+    await discardPendingGoogleHandoff(
+      env.USAGE_MONITOR_DB,
+      state,
+      new Date().toISOString(),
+    );
     return failure;
   }
   // Re-checked against the time the exchange finished, not the time it

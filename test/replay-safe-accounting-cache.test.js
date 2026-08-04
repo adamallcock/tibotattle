@@ -246,12 +246,12 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
   assert.equal(latest.components.output_combined_tokens, 0);
   assert.equal(latest.componentCosts.input_uncached_tokens.pricedTokens, 2_000_000);
   assert.equal(latest.componentCosts.input_uncached_tokens.unpricedTokens, 100);
-  assert.equal(latest.componentCosts.input_uncached_tokens.costUsd, 7);
+  assert.equal(latest.componentCosts.input_uncached_tokens.costUsd, 7.5);
   assert.equal(latest.componentCosts.input_cache_read_tokens.costUsd, 0.5);
-  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 4.8);
-  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 37.2);
+  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 6);
+  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 39);
   assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 0);
-  assert.equal(latest.apiPriceEquivalentUsd, 49.5);
+  assert.equal(latest.apiPriceEquivalentUsd, 53);
   assert.equal(
     Object.values(latest.componentCosts)
       .reduce((sum, row) => sum + row.costUsd, 0),
@@ -291,10 +291,10 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
       ],
     ],
   );
-  assert.equal(cache.timeline[2].apiPriceEquivalentUsd, 49.5);
+  assert.equal(cache.timeline[2].apiPriceEquivalentUsd, 53);
   assert.deepEqual(cache.weeklyCalibrationInput, {
     status: "complete",
-    encoding: "accounting_compact_v1",
+    encoding: "accounting_compact_v2",
     retainedUsageEvents: 4,
     retainedWeeklySnapshots: 0,
     estimatedRetainedBytes: 1_024,
@@ -304,6 +304,84 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
       combinedInputs: 1_500_000,
       retainedBytes: 320 * 1024 * 1024,
     },
+  });
+});
+
+test("replay-safe fast pricing plans keep pre-change events on their historical card", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-29T23:59:59.999Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+      usageEvent({
+        timestamp: "2026-07-30T00:00:00.000Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+  const all = period(cache, "all");
+  assert.deepEqual(all.priceCardIds, [
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+  ]);
+  assert.deepEqual(all.priceCardBreakdown.map(({ priceCardId, events, costUsd }) => ({
+    priceCardId,
+    events,
+    costUsd,
+  })), [
+    {
+      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      events: 1,
+      costUsd: "2",
+    },
+    {
+      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      events: 1,
+      costUsd: "2.5",
+    },
+  ]);
+  assert.equal(all.apiPriceEquivalentUsd, 4.5);
+});
+
+test("replay-safe cache rejects price-card event and exact-cost reconciliation drift", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-provenance-cache-"));
+  const cacheFile = join(directory, "accounting.json");
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-30T00:00:00.000Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+  const all = period(cache, "all");
+  assert.equal(all.apiPriceEquivalentUsdExact, "2");
+
+  const badEvents = structuredClone(cache);
+  const badEventsPeriod = period(badEvents, "all");
+  badEventsPeriod.priceCardBreakdown[0].events += 1;
+  await writeFile(cacheFile, JSON.stringify(badEvents));
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
+
+  const badCost = structuredClone(cache);
+  const badCostPeriod = period(badCost, "all");
+  badCostPeriod.priceCardBreakdown[0].costUsd = "3";
+  await writeFile(cacheFile, JSON.stringify(badCost));
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
   });
 });
 
@@ -329,17 +407,17 @@ test("separated output takes precedence over a duplicate combined alias", async 
   assert.equal(latest.components.output_text_tokens, 400_000);
   assert.equal(latest.components.output_reasoning_tokens, 600_000);
   assert.equal(latest.components.output_combined_tokens, 0);
-  assert.equal(latest.apiPriceEquivalentUsd, 14);
+  assert.equal(latest.apiPriceEquivalentUsd, 17.5);
   assert.equal(latest.pricingCoverage.fullyPricedEvents, 1);
-  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 4.8);
-  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 7.2);
+  assert.equal(latest.componentCosts.output_text_tokens.costUsd, 6);
+  assert.equal(latest.componentCosts.output_reasoning_tokens.costUsd, 9);
   assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 0);
   assert.equal(cache.timeline[0].totalTokens, 2_000_000);
-  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 14);
+  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 17.5);
   assert.equal(
     Object.values(latest.componentCosts)
       .reduce((sum, row) => sum + row.costUsd, 0),
-    14,
+    17.5,
   );
 });
 
@@ -363,13 +441,13 @@ test("combined-only output is retained once and priced as ordinary output", asyn
   assert.equal(latest.components.output_text_tokens, 0);
   assert.equal(latest.components.output_reasoning_tokens, 0);
   assert.equal(latest.components.output_combined_tokens, 1_000_000);
-  assert.equal(latest.apiPriceEquivalentUsd, 14);
+  assert.equal(latest.apiPriceEquivalentUsd, 17.5);
   assert.equal(latest.pricingCoverage.fullyPricedEvents, 1);
   assert.equal(latest.componentCosts.output_combined_tokens.pricedTokens, 1_000_000);
   assert.equal(latest.componentCosts.output_combined_tokens.unpricedTokens, 0);
-  assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 12);
+  assert.equal(latest.componentCosts.output_combined_tokens.costUsd, 15);
   assert.equal(cache.timeline[0].totalTokens, 2_000_000);
-  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 14);
+  assert.equal(cache.timeline[0].apiPriceEquivalentUsd, 17.5);
 });
 
 test("refresh and read round-trip a valid owner-only cache", async () => {
@@ -428,12 +506,12 @@ test("cache freshness uses the covered end and rejects a future projection", asy
 
 test("the same lineage-aware scan produces a bounded weekly calibration summary", async () => {
   const resetStarts = [
-    Date.parse("2026-07-01T00:00:00.000Z"),
-    Date.parse("2026-07-08T00:00:00.000Z"),
-    Date.parse("2026-07-15T00:00:00.000Z"),
+    Date.parse("2026-07-30T00:00:00.000Z"),
+    Date.parse("2026-08-06T00:00:00.000Z"),
+    Date.parse("2026-08-13T00:00:00.000Z"),
   ];
   const cache = await buildReplaySafeAccountingCache({
-    now: () => NOW,
+    now: () => Date.parse("2026-08-20T12:00:00.000Z"),
     windowDays: 31,
     scan: async ({ onUsage, onRateLimitSnapshot }) => {
       for (const [resetIndex, resetStart] of resetStarts.entries()) {
@@ -671,6 +749,27 @@ test("a replay cache from an older official price registry is withheld", async (
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
     errorCode: "cache_price_registry_outdated",
+    cache: null,
+  });
+});
+
+test("a cache from the former current-price basis is withheld for deterministic rebuild", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-semantics-cache-"));
+  const cacheFile = join(directory, "accounting.json");
+  const cache = await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([]),
+  });
+  await writeFile(cacheFile, JSON.stringify({
+    ...cache,
+    schemaVersion: "local-replay-safe-accounting-v0.1",
+    priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+  }));
+
+  assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
+    status: "unavailable",
+    errorCode: "cache_accounting_semantics_outdated",
     cache: null,
   });
 });

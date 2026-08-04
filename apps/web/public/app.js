@@ -239,14 +239,66 @@ function formatPercent(value, digits = 0) {
   return `${Number.isInteger(number) ? number.toFixed(0) : number.toFixed(digits)}%`;
 }
 
+let activeInformationPopover = null;
+let nextInformationPopoverId = 1;
+
+function positionInformationPopover(popover, button) {
+  const anchor = button.getBoundingClientRect();
+  const viewportPadding = 16;
+  const preferredTop = anchor.bottom + 8;
+  const width = popover.offsetWidth;
+  const height = popover.offsetHeight;
+  const left = Math.min(
+    Math.max(viewportPadding, anchor.left),
+    Math.max(viewportPadding, window.innerWidth - width - viewportPadding),
+  );
+  const top = preferredTop + height <= window.innerHeight - viewportPadding
+    ? preferredTop
+    : Math.max(viewportPadding, anchor.top - height - 8);
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(top)}px`;
+}
+
+function closeInformationPopover({ restoreFocus = false } = {}) {
+  const current = activeInformationPopover;
+  if (!current) return;
+  current.popover.remove();
+  current.button.setAttribute("aria-expanded", "false");
+  current.button.removeAttribute("aria-describedby");
+  activeInformationPopover = null;
+  if (restoreFocus && current.button.isConnected) current.button.focus();
+}
+
+function openInformationPopover(button) {
+  if (activeInformationPopover?.button === button) {
+    closeInformationPopover({ restoreFocus: false });
+    return;
+  }
+  closeInformationPopover();
+  const popover = node("span", "info-popover");
+  const id = `information-popover-${nextInformationPopoverId++}`;
+  popover.id = id;
+  popover.setAttribute("role", "tooltip");
+  popover.textContent = button.dataset.informationExplanation ?? "";
+  document.body.append(popover);
+  button.setAttribute("aria-expanded", "true");
+  button.setAttribute("aria-describedby", id);
+  activeInformationPopover = { button, popover };
+  positionInformationPopover(popover, button);
+}
+
 function informationLabel(label, explanation) {
   const fragment = document.createDocumentFragment();
   fragment.append(document.createTextNode(label));
   const button = node("button", "info-button", "i");
   button.type = "button";
-  button.tabIndex = 0;
-  button.title = explanation;
-  button.setAttribute("aria-label", `${label}: ${explanation}`);
+  button.dataset.informationExplanation = explanation;
+  button.setAttribute("aria-label", `More information about ${label}`);
+  button.setAttribute("aria-expanded", "false");
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openInformationPopover(button);
+  });
   fragment.append(button);
   return fragment;
 }
@@ -722,20 +774,24 @@ const SHARE_CARD_HEIGHT = 800;
 // Drawn at twice the posted size so the text stays clean after a feed
 // resamples it, and legible once a timeline scales it down.
 const SHARE_CARD_PIXEL_SCALE = 2;
-const SHARE_CARD_MAX_CAVEATS = 5;
-const SHARE_CARD_MAX_CAVEAT_LINES = 7;
+// A shared image is read at a glance. Keep only the two qualifications that
+// materially change how a reader should compare its headline figures.
+const SHARE_CARD_MAX_CAVEATS = 2;
+const SHARE_CARD_MAX_CAVEAT_LINES = 2;
 // One type size for all three figures, reduced until the longest of them fits
 // its column. A figure is never cut off: "Not estimable" and a seven-figure
 // total both overrun the column at the full size, and an ellipsis in the
 // largest type on the card is unreadable and easy to misread.
 const SHARE_CARD_VALUE_SIZE = 54;
 const SHARE_CARD_VALUE_MIN_SIZE = 34;
-// The plotted history. Fewer than three fits is a scatter, not a history, and
-// beyond two dozen the points crowd at the width a feed shows.
-const SHARE_CARD_TREND_MIN_POINTS = 3;
-const SHARE_CARD_TREND_MAX_POINTS = 26;
-const SHARE_CARD_TREND_MIN_HEIGHT = 88;
-const SHARE_CARD_TREND_MAX_HEIGHT = 210;
+// The plot has 94 px of fixed axis padding, so anything shorter cannot carry
+// an honest chart. This lower bound prevents a caveat from collapsing the
+// evidence region into a zero-height plot.
+const SHARE_CARD_TREND_MIN_HEIGHT = 142;
+// The chart is the evidence on the image, not decorative garnish. Reserve a
+// meaningful vertical lane for it instead of compressing it below three cards
+// and a verbose footer.
+const SHARE_CARD_TREND_MAX_HEIGHT = 290;
 // Identifier-shaped only, exactly as a diagnostic code is: no space, no
 // slash, no separator that could carry a path or a folder name.
 const SHARE_CARD_REGISTRY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u;
@@ -860,49 +916,54 @@ function shareCardDateLabel(timestamp) {
 }
 
 /**
- * The history the card plots: one point per qualifying reset-series fit, each
- * with the within-reset sensitivity bar the weekly panel draws.
- *
- * Only fits observed across at least the fixed primary-evidence span are
- * plotted. The horizontal
- * axis carries date-only labels for the derived estimate availability, never a
+ * The history the card plots: the exact allowance-history series the weekly
+ * panel uses, including shorter diagnostic observations. The horizontal axis
+ * carries date-only labels for the derived estimate availability, never a
  * raw-log timestamp or a time of day.
  */
-function shareCardTrend(rows) {
-  const points = (Array.isArray(rows) ? rows : [])
-    .map((row) => ({
-      at: Date.parse(row?.last_observed_at ?? row?.first_observed_at ?? ""),
-      value: finite(row?.value_usd ?? row?.value),
-      low: finite(row?.pairwise_p10_usd),
-      high: finite(row?.pairwise_p90_usd),
-      spanPp: finite(row?.displayed_span_pp),
-    }))
-    .filter((point) =>
-      Number.isFinite(point.at)
-      && point.value !== null
-      && point.value > 0
-      && point.spanPp !== null
-      && point.spanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP)
-    .sort((left, right) => left.at - right.at)
-    .slice(-SHARE_CARD_TREND_MAX_POINTS)
-    .map((point) => Object.freeze({
-      at: point.at,
-      dateLabel: shareCardDateLabel(point.at),
-      value: point.value,
-      // A sensitivity bound that is missing or the wrong side of the fit
-      // collapses onto the fit rather than drawing a bar it cannot support.
-      low: point.low !== null && point.low > 0 && point.low < point.value
-        ? point.low
-        : point.value,
-      high: point.high !== null && point.high > point.value
-        ? point.high
-        : point.value,
-    }));
-  if (points.length < SHARE_CARD_TREND_MIN_POINTS) return null;
+function shareCardTrend(history) {
+  // The card is a compact rendering of the exact series on Allowance estimate
+  // history. It must not silently remove shorter fits, change the active
+  // period, or rescale the chart just because it is being shared.
+  const points = (Array.isArray(history?.points) ? history.points : [])
+    .map((point) => {
+      const value = finite(point?.value);
+      if (!Number.isFinite(point?.at) || value === null || value <= 0) return null;
+      const low = finite(point?.low);
+      const high = finite(point?.high);
+      return Object.freeze({
+        at: point.at,
+        dateLabel: point.dateLabel,
+        value,
+        low,
+        high,
+        historicalMedian: finite(point?.historicalMedian),
+        acrossResetLow: finite(point?.acrossResetLow),
+        acrossResetHigh: finite(point?.acrossResetHigh),
+        wellObserved: point.wellObserved === true,
+      });
+    })
+    .filter((point) => point !== null);
+  const axisLow = finite(history?.axis?.low);
+  const axisHigh = finite(history?.axis?.high);
+  if (!points.length || axisLow === null || axisHigh === null || axisHigh <= axisLow) {
+    return null;
+  }
+  const observedBounds = points.flatMap((point) => [
+    point.value,
+    point.low,
+    point.high,
+  ]).filter((value) => value !== null);
   return Object.freeze({
     points: Object.freeze(points),
-    low: Math.min(...points.map((point) => point.low)),
-    high: Math.max(...points.map((point) => point.high)),
+    low: Math.min(...observedBounds),
+    high: Math.max(...observedBounds),
+    axis: Object.freeze({
+      low: axisLow,
+      high: axisHigh,
+      ticks: Object.freeze([...(history?.axis?.ticks ?? [])]),
+    }),
+    xTicks: Object.freeze([...(history?.xTicks ?? [])]),
     count: points.length,
     firstDateLabel: points[0].dateLabel,
     lastDateLabel: points[points.length - 1].dateLabel,
@@ -923,6 +984,7 @@ function buildShareCard(data, {
   registryVersion = "",
   home = "",
   contractVersion = "",
+  history = allowanceHistoryChartModel(data),
 } = {}) {
   if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) {
     throw new TypeError("A results card requires a minted reference.");
@@ -930,7 +992,10 @@ function buildShareCard(data, {
   const isDemo = data?.mode === "demo";
   const pricing = data?.pricing ?? {};
   const fastMode = pricing.fastMode ?? {};
-  const summary = data?.gradient?.summary ?? {};
+  // The share card's third figure is specifically the weekly reset fit. Do
+  // not substitute the older general-gradient summary here: both are API-price
+  // equivalents, but their evidence source and denominator are different.
+  const summary = data?.weekly?.summary ?? {};
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
   const remaining = finite(allowanceWindow?.remainingPercent);
@@ -944,9 +1009,15 @@ function buildShareCard(data, {
   const excluded = finite(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
   const period = shareCardPeriodLabel(pricing.periodLabel);
 
-  const capacity = finite(summary.capacity_usd ?? summary.capacityUsd);
-  const lower = finite(summary.lower_80_usd ?? summary.lower80Usd);
-  const upper = finite(summary.upper_80_usd ?? summary.upper80Usd);
+  const capacity = finite(
+    summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd,
+  );
+  const lower = finite(
+    summary.lower_80_across_resets_usd ?? summary.lower80Usd,
+  );
+  const upper = finite(
+    summary.upper_80_across_resets_usd ?? summary.upper80Usd,
+  );
   const hasCapacity = capacity !== null && capacity > 0;
   const hasRange = hasCapacity
     && lower !== null && lower > 0
@@ -961,29 +1032,34 @@ function buildShareCard(data, {
         : `of the ${windowLabel}`,
     },
     {
-      // The same two names the accounting panel uses, so a reader comparing a
-      // posted card against the dashboard sees one metric, not two.
-      label: useWeighted
-        ? "Quota-weighted API-price equivalent"
-        : "Standard-rate API-price equivalent",
-      value: spend === null ? "Not available" : formatMoney(spend, 2),
+      // This is the complete rolling ledger selection, not a single weekly
+      // allowance. The label must make the different denominator clear on the
+      // image itself: an activity total can legitimately exceed one estimated
+      // allowance without being a billing error or an allowance overrun.
+      label: "Recorded activity",
+      value: spend === null ? "Not available" : formatMoney(spend, 0),
       detail: spend === null
         ? "no priced usage was recorded"
-        : `over ${period}`,
+        : `${period} · event-time API equivalent`,
     },
     {
-      label: "A full allowance measures",
+      label: "Estimated 7-day allowance",
       value: hasCapacity ? formatMoney(capacity, 0) : "Not estimable",
       detail: hasRange
-        ? `80% range ${formatMoney(lower, 0)}–${formatMoney(upper, 0)}`
+        ? `Observed reset range ${formatMoney(lower, 0)}–${formatMoney(upper, 0)}`
         : hasCapacity
           ? "no across-reset range yet"
           : "not enough matched windows yet",
     },
   ];
 
+  const relationshipNote = spend !== null && hasCapacity
+    ? `Activity sums all events in ${period}; the estimate is one seven-day allowance.`
+    : "";
+
   // Assembled from the same state the panels report, strongest qualification
-  // first, so a shortened card never drops the caveat that matters most.
+  // first. The distinct activity-versus-allowance explanation lives directly
+  // under the figures above, so it is never displaced by a shorter caveat.
   const caveats = [];
   if (isDemo) {
     caveats.push(
@@ -1010,16 +1086,9 @@ function buildShareCard(data, {
       `${formatPercent(coverage, 1)} of recorded usage could be priced; the rest is left unpriced rather than estimated.`,
     );
   }
-  caveats.push(
-    hasRange
-      ? "The range is variation across qualifying reset periods, not an 80% probability. API prices are a measuring stick for quota consumption, not a subscription charge or a published dollar cap."
-      : "API prices are a measuring stick for quota consumption, not a subscription charge or a published dollar cap.",
-  );
-
   const identifiers = [
-    reference,
-    appVersion === "" ? "unversioned build" : `TiboTattle ${appVersion}`,
-    registryVersion === "" ? "" : `prices ${registryVersion}`,
+    `Debug: ${reference}`,
+    appVersion === "" ? "unversioned" : `v${appVersion}`,
   ].filter((part) => part !== "");
 
   return Object.freeze({
@@ -1035,11 +1104,12 @@ function buildShareCard(data, {
       : "Measured on my own Mac. Nothing left it.",
     badge: isDemo ? "DEMO DATA" : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
-    trend: shareCardTrend(data?.weekly?.weeklyValues),
-    trendLabel: "Seven-day fits, each with its own sensitivity bar",
-    trendEmpty: "Not enough qualifying resets yet to plot a history.",
+    relationshipNote,
+    trend: shareCardTrend(history),
+    trendLabel: "7-day allowance estimates",
+    trendEmpty: "Not enough observed reset history yet.",
     trendEmptyDetail:
-      "Each reset observed across most of the allowance adds one fit, with the sensitivity bar that fit carries.",
+      "A completed reset becomes a point once enough of its allowance was observed.",
     caveats: Object.freeze(caveats),
     identifierLine: identifiers.join(" · "),
     contractVersion,
@@ -1074,7 +1144,7 @@ function shareCardText(card) {
 function shareCardTrendText(card) {
   return card.trend === null
     ? `${card.trendLabel}: ${card.trendEmpty} ${card.trendEmptyDetail}`
-    : `${card.trendLabel}: ${card.trend.count} fits observed from ${card.trend.firstDateLabel} to ${card.trend.lastDateLabel}. The vertical axis is API-price equivalent USD, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every sensitivity bar.`;
+    : `${card.trendLabel}: ${card.trend.count} fits observed from ${card.trend.firstDateLabel} to ${card.trend.lastDateLabel}. The vertical axis is API equivalent in dollars, spanning ${formatMoney(card.trend.low, 0)} to ${formatMoney(card.trend.high, 0)} including every measured range.`;
 }
 
 function shareCardFont(weight, size, family = "sans") {
@@ -1172,39 +1242,6 @@ function drawShareCardBadge(context, badge, x, y) {
   return width;
 }
 
-/**
- * Plot the reset-series fits and their sensitivity bars.
- *
- * Independent estimates, so they are drawn as points and never joined into a
- * line the model does not claim. Only numbers reach the canvas here: each
- * point's position comes from a parsed timestamp and a dollar figure, and the
- * axis is labelled with formatted money and date-only observation labels.
- */
-function shareCardTrendAxis(low, high) {
-  const observedRange = Math.max(
-    high - low,
-    Math.max(Math.abs(low), Math.abs(high), 1) * .1,
-  );
-  const paddedLow = Math.max(0, low - observedRange * .08);
-  const paddedHigh = high + observedRange * .08;
-  const desiredStep = Math.max((paddedHigh - paddedLow) / 4, Number.MIN_VALUE);
-  const magnitude = 10 ** Math.floor(Math.log10(desiredStep));
-  const normalized = desiredStep / magnitude;
-  const multiple = [1, 2, 2.5, 5, 10].find((candidate) => candidate >= normalized) ?? 10;
-  const step = multiple * magnitude;
-  const axisLow = Math.max(0, Math.floor(paddedLow / step) * step);
-  const axisHigh = Math.ceil(paddedHigh / step) * step;
-  const ticks = [];
-  for (let value = axisHigh; value >= axisLow - step / 1_000; value -= step) {
-    ticks.push(Number(value.toFixed(8)));
-  }
-  return Object.freeze({
-    low: axisLow,
-    high: axisHigh,
-    ticks: Object.freeze(ticks),
-  });
-}
-
 function drawShareCardTrend(context, card, x, y, width, height) {
   drawShareCardPanel(context, x, y, width, height);
   context.save();
@@ -1221,11 +1258,10 @@ function drawShareCardTrend(context, card, x, y, width, height) {
     context.restore();
     return;
   }
-  const { points, low, high } = card.trend;
-  const axis = shareCardTrendAxis(low, high);
-  const xAxisLabel = "Reset estimate availability (local date)";
-  const yAxisLabel = "API-price equivalent (USD)";
-  const padTop = 20;
+  const { points, axis, xTicks } = card.trend;
+  const xAxisLabel = "Reset estimate date";
+  const yAxisLabel = "7-day allowance ($)";
+  const padTop = 40;
   const padBottom = 54;
   const padLeft = 92;
   const padRight = 20;
@@ -1235,11 +1271,13 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   const plotRight = x + width - padRight;
   const plotTop = y + padTop;
   const plotBottom = y + height - padBottom;
-  const span = points[points.length - 1].at - points[0].at;
+  const domainStart = points[0].at;
+  const domainEnd = points.at(-1).at;
+  const span = domainEnd - domainStart;
   const range = axis.high - axis.low;
   const positionX = (point) => points.length === 1 || span <= 0
     ? (plotLeft + plotRight) / 2
-    : plotLeft + (point.at - points[0].at) / span * (plotRight - plotLeft);
+    : plotLeft + (point.at - domainStart) / span * (plotRight - plotLeft);
   const positionY = (value) => range <= 0
     ? (plotTop + plotBottom) / 2
     : plotBottom - (value - axis.low) / range * (plotBottom - plotTop);
@@ -1262,26 +1300,59 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   context.lineTo(plotRight, plotBottom);
   context.stroke();
 
+  const bandLow = finite(points[0]?.acrossResetLow);
+  const bandHigh = finite(points[0]?.acrossResetHigh);
+  if (bandLow !== null && bandHigh !== null && bandHigh > bandLow) {
+    context.fillStyle = "rgba(49, 95, 132, .14)";
+    context.fillRect(
+      plotLeft,
+      positionY(bandHigh),
+      plotRight - plotLeft,
+      positionY(bandLow) - positionY(bandHigh),
+    );
+  }
+
   for (const point of points) {
     const pointX = Math.round(positionX(point)) + .5;
-    context.strokeStyle = "rgba(23, 79, 69, .38)";
-    context.lineWidth = 2;
-    context.beginPath();
-    context.moveTo(pointX, positionY(point.high));
-    context.lineTo(pointX, positionY(point.low));
-    context.stroke();
-    context.lineWidth = 1.5;
-    for (const bound of [point.high, point.low]) {
-      const capY = Math.round(positionY(bound)) + .5;
+    if (point.low !== null && point.high !== null) {
+      context.strokeStyle = "rgba(49, 95, 132, .78)";
+      context.lineWidth = 1.8;
       context.beginPath();
-      context.moveTo(pointX - 4, capY);
-      context.lineTo(pointX + 4, capY);
+      context.moveTo(pointX, positionY(point.high));
+      context.lineTo(pointX, positionY(point.low));
       context.stroke();
+      for (const bound of [point.high, point.low]) {
+        const capY = Math.round(positionY(bound)) + .5;
+        context.beginPath();
+        context.moveTo(pointX - 5, capY);
+        context.lineTo(pointX + 5, capY);
+        context.stroke();
+      }
     }
-    context.fillStyle = "#174f45";
+  }
+
+  const median = finite(points[0]?.historicalMedian);
+  if (median !== null) {
+    const medianY = Math.round(positionY(median)) + .5;
+    context.strokeStyle = "#174f45";
+    context.lineWidth = 3;
+    context.beginPath();
+    context.moveTo(plotLeft, medianY);
+    context.lineTo(plotRight, medianY);
+    context.stroke();
+  }
+
+  for (const point of points) {
+    const pointX = Math.round(positionX(point)) + .5;
+    context.fillStyle = point.wellObserved ? "#315f84" : "#fffef9";
     context.beginPath();
     context.arc(pointX, positionY(point.value), 4.5, 0, Math.PI * 2);
     context.fill();
+    if (!point.wellObserved) {
+      context.strokeStyle = "#a9492f";
+      context.lineWidth = 2.4;
+      context.stroke();
+    }
   }
 
   context.fillStyle = "#65706b";
@@ -1294,21 +1365,16 @@ function drawShareCardTrend(context, card, x, y, width, height) {
       positionY(value) + 5,
     );
   }
-  context.save();
-  context.translate(x + 20, (plotTop + plotBottom) / 2);
-  context.rotate(-Math.PI / 2);
-  context.textAlign = "center";
-  context.fillText(yAxisLabel, 0, 0);
-  context.restore();
+  context.textAlign = "left";
+  context.font = shareCardFont(700, 13);
+  context.fillText(yAxisLabel, plotLeft, y + 22);
 
-  const dateIndexes = points.length < 3
-    ? [0, points.length - 1]
-    : [0, Math.floor((points.length - 1) / 2), points.length - 1];
-  for (const index of [...new Set(dateIndexes)]) {
-    const point = points[index];
-    const alignment = index === 0 ? "left" : index === points.length - 1 ? "right" : "center";
-    context.textAlign = alignment;
-    context.fillText(point.dateLabel, positionX(point), plotBottom + 21);
+  for (const tick of xTicks) {
+    context.textAlign = tick.alignment;
+    const tickX = points.length === 1 || span <= 0
+      ? (plotLeft + plotRight) / 2
+      : plotLeft + (tick.at - domainStart) / span * (plotRight - plotLeft);
+    context.fillText(tick.label, tickX, plotBottom + 21);
   }
   context.font = shareCardFont(600, 13);
   context.textAlign = "center";
@@ -1369,8 +1435,8 @@ function drawShareCard(canvas, card) {
 
   const gap = 22;
   const columnWidth = (inner - gap * 2) / 3;
-  const statTop = 222;
-  const statHeight = 178;
+  const statTop = 207;
+  const statHeight = 165;
   const padding = 20;
   const textWidth = columnWidth - padding * 2;
   const valueSize = shareCardValueSize(
@@ -1394,29 +1460,48 @@ function drawShareCard(canvas, card) {
     context.fillText(
       shareCardFit(context, stat.value, textWidth),
       x + padding,
-      statTop + 110,
+      statTop + 104,
     );
     context.fillStyle = "#65706b";
     context.font = shareCardFont(600, 17);
     shareCardWrap(context, stat.detail, textWidth, 2).forEach((line, lineIndex) => {
-      context.fillText(line, x + padding, statTop + 140 + lineIndex * 21);
+      context.fillText(line, x + padding, statTop + 132 + lineIndex * 20);
     });
   });
 
-  // The qualifications are laid out from the bottom up, so a card with one
-  // caveat and a card with several both sit against the same rule instead of
-  // leaving the strongest qualification stranded in white space. The history
-  // above them then takes exactly the space they leave, so the card is never
-  // hollow in the middle and never crowds a qualification out.
+  // A short comparison note sits directly beneath the figures because the
+  // rolling activity total and the single-allowance estimate are intentionally
+  // not comparable measurements. It is visual context, not a fine-print
+  // caveat, so it stays readable when a card is seen outside the dashboard.
+  const relationshipTop = statTop + statHeight + 21;
+  if (card.relationshipNote !== "") {
+    context.fillStyle = "rgba(23, 79, 69, .3)";
+    context.fillRect(margin, relationshipTop - 14, 3, 22);
+    context.fillStyle = "#65706b";
+    context.font = shareCardFont(600, 15);
+    context.fillText(
+      shareCardFit(context, card.relationshipNote, inner - 20),
+      margin + 18,
+      relationshipTop,
+    );
+  }
+
+  // Qualifications are reserved only for incomplete data. A complete card
+  // gives the plot its natural visual weight instead of spending the lower
+  // third on generic methodology copy.
   context.font = shareCardFont(500, 17);
   const caveatLines = card.caveats
     .slice(0, SHARE_CARD_MAX_CAVEATS)
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  const ruleY = SHARE_CARD_HEIGHT - 82.5;
-  const caveatTop = ruleY - 22 - (caveatLines.length - 1) * caveatStep;
-  const trendTop = statTop + statHeight + 44;
+  const ruleY = SHARE_CARD_HEIGHT - 58.5;
+  const caveatTop = caveatLines.length === 0
+    ? ruleY - 8
+    : ruleY - 22 - (caveatLines.length - 1) * caveatStep;
+  const trendTop = card.relationshipNote === ""
+    ? statTop + statHeight + 36
+    : statTop + statHeight + 48;
   const trendHeight = Math.min(
     SHARE_CARD_TREND_MAX_HEIGHT,
     Math.max(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop),
@@ -1427,7 +1512,7 @@ function drawShareCard(canvas, card) {
   if (card.trend !== null) {
     context.textAlign = "right";
     context.fillText(
-      `${card.trend.count} qualifying resets`,
+      `${card.trend.count} reset fits`,
       SHARE_CARD_WIDTH - margin,
       trendTop - 14,
     );
@@ -1435,19 +1520,21 @@ function drawShareCard(canvas, card) {
   }
   drawShareCardTrend(context, card, margin, trendTop, inner, trendHeight);
 
-  context.font = shareCardFont(500, 17);
-  let caveatY = caveatTop;
-  context.fillStyle = "rgba(23, 79, 69, .3)";
-  context.fillRect(
-    margin,
-    caveatY - 16,
-    3,
-    (caveatLines.length - 1) * caveatStep + 22,
-  );
-  context.fillStyle = "#65706b";
-  for (const line of caveatLines) {
-    context.fillText(line, margin + 20, caveatY);
-    caveatY += caveatStep;
+  if (caveatLines.length > 0) {
+    context.font = shareCardFont(500, 17);
+    let caveatY = caveatTop;
+    context.fillStyle = "rgba(23, 79, 69, .3)";
+    context.fillRect(
+      margin,
+      caveatY - 16,
+      3,
+      (caveatLines.length - 1) * caveatStep + 22,
+    );
+    context.fillStyle = "#65706b";
+    for (const line of caveatLines) {
+      context.fillText(line, margin + 20, caveatY);
+      caveatY += caveatStep;
+    }
   }
 
   context.strokeStyle = "rgba(23, 33, 30, .16)";
@@ -1457,23 +1544,23 @@ function drawShareCard(canvas, card) {
   context.lineTo(SHARE_CARD_WIDTH - margin, ruleY);
   context.stroke();
 
-  context.fillStyle = "#17211e";
-  context.font = shareCardFont(700, 18);
+  context.fillStyle = "#65706b";
+  context.font = shareCardFont(500, 12);
   context.fillText(
     shareCardFit(context, card.identifierLine, inner),
     margin,
-    ruleY + 28.5,
+    ruleY + 24,
   );
   context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 16);
+  context.font = shareCardFont(500, 13);
   context.fillText(
     shareCardFit(
       context,
-      "Local-first measurement. No prompts, files, folder names, or account details leave the Mac.",
+      "Local measurement · API equivalent, not a bill.",
       inner,
     ),
     margin,
-    ruleY + 52.5,
+    ruleY + 48,
   );
   return true;
 }
@@ -1510,6 +1597,8 @@ function updateShareCardActions() {
 function renderShareCard(data) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
+  const history = allowanceHistoryChartModel(data);
+  const trend = shareCardTrend(history);
   const signature = JSON.stringify([
     data?.mode,
     shareCardWindowKind(allowanceWindow),
@@ -1519,10 +1608,11 @@ function renderShareCard(data) {
     finite(data?.pricing?.coveragePercent),
     data?.pricing?.fastMode?.weightingStatus ?? "",
     finite(data?.pricing?.fastMode?.unweightedUnknownApiPriceEquivalentUsd, 0),
-    finite(data?.gradient?.summary?.capacity_usd
-      ?? data?.gradient?.summary?.capacityUsd),
-    // The plotted history is on the image too, so a new fit is a new card.
-    shareCardTrend(data?.weekly?.weeklyValues)?.points ?? null,
+    finite(data?.weekly?.summary?.median_weekly_value_usd
+      ?? data?.weekly?.summary?.medianWeeklyValueUsd),
+    // The plotted history is on the image too, so any change to the canonical
+    // dashboard model becomes a new card.
+    trend,
   ]);
   if (signature !== shareCardSignature || shareCardReference === "") {
     shareCardSignature = signature;
@@ -1534,6 +1624,7 @@ function renderShareCard(data) {
     registryVersion: shareCardRegistryVersion(data?.pricing?.registryVersion),
     contractVersion: shareCardRegistryVersion(data?.schemaVersion),
     home: shareCardHome(),
+    history,
   });
   $("#share-card-reference").textContent = shareCard.reference;
   canvas.setAttribute("aria-label", shareCardText(shareCard));
@@ -2025,7 +2116,7 @@ function renderUsageTimeline(data) {
     }));
   }
   $("#usage-timeline-copy").textContent =
-    `Replay-safe local increments · ${USER_TIME_ZONE} · current Standard API prices`;
+    `Replay-safe local increments · ${USER_TIME_ZONE} · event-time historical API cards`;
   const summary = $("#usage-timeline-summary");
   clear(summary);
   const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
@@ -2371,6 +2462,9 @@ function lineChart({
   confidence = null,
   errorBars = null,
   xDomain = null,
+  xTicks = null,
+  yDomain = null,
+  yTickFormat = null,
   statusIntervals = [],
   secondarySeries = [],
   secondaryYLabel = null,
@@ -2379,17 +2473,21 @@ function lineChart({
   const height = 330;
   const hasSecondary = secondarySeries.length > 0;
   const margin = { top: 24, right: hasSecondary ? 64 : 22, bottom: 50, left: 58 };
-  const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
-  if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
-  if (errorBars) values.push(...points.flatMap((point) => [finite(point[errorBars.low]), finite(point[errorBars.high])].filter((value) => value !== null)));
-  if (includeZero) values.push(0);
-  let min = Math.min(...values);
-  let max = Math.max(...values);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
-  if (min === max) { min -= 1; max += 1; }
-  const pad = (max - min) * .1;
-  min = includeZero && min >= 0 ? 0 : min - pad;
-  max += pad;
+  let min = finite(yDomain?.low);
+  let max = finite(yDomain?.high);
+  if (min === null || max === null || max <= min) {
+    const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
+    if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
+    if (errorBars) values.push(...points.flatMap((point) => [finite(point[errorBars.low]), finite(point[errorBars.high])].filter((value) => value !== null)));
+    if (includeZero) values.push(0);
+    min = Math.min(...values);
+    max = Math.max(...values);
+    if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
+    if (min === max) { min -= 1; max += 1; }
+    const pad = (max - min) * .1;
+    min = includeZero && min >= 0 ? 0 : min - pad;
+    max += pad;
+  }
   const timestamps = points.map((point) => Date.parse(point.timestamp ?? point.date));
   const timed = timestamps.every(Number.isFinite);
   const dataStartMs = timed ? Math.min(...timestamps) : 0;
@@ -2428,7 +2526,10 @@ function lineChart({
     const value = max - index / 4 * (max - min);
     const yPosition = y(value);
     svg.append(svgLine(margin.left, yPosition, width - margin.right, yPosition, "chart-grid"));
-    svg.append(svgText(margin.left - 8, yPosition + 3, value.toFixed(Math.abs(max - min) < 10 ? 1 : 0), "chart-axis-label", "end"));
+    const label = yTickFormat === null
+      ? value.toFixed(Math.abs(max - min) < 10 ? 1 : 0)
+      : yTickFormat(value, Math.abs(max - min) < 10 ? 1 : 0);
+    svg.append(svgText(margin.left - 8, yPosition + 3, label, "chart-axis-label", "end"));
     if (hasSecondary) {
       svg.append(svgText(
         width - margin.right + 8,
@@ -2445,16 +2546,32 @@ function lineChart({
   }
 
   if (timed) {
-    for (let index = 0; index < 4; index += 1) {
-      const timestamp = new Date(
-        domainStartMs + (safeDomainEndMs - domainStartMs) * index / 3,
-      ).toISOString();
+    const ticks = Array.isArray(xTicks) && xTicks.length > 0
+      ? xTicks
+      : Array.from({ length: 4 }, (_, index) => {
+        const at = domainStartMs + (safeDomainEndMs - domainStartMs) * index / 3;
+        return {
+          at,
+          label: formatLocal(
+            new Date(at).toISOString(),
+            { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 },
+          ),
+          alignment: index === 0 ? "start" : index === 3 ? "end" : "middle",
+        };
+      });
+    for (const tick of ticks) {
+      const at = finite(tick?.at);
+      if (at === null) continue;
+      const position = margin.left + (at - domainStartMs)
+        / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
       svg.append(svgText(
-        margin.left + (width - margin.left - margin.right) * index / 3,
+        position,
         height - 22,
-        formatLocal(timestamp, { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 }),
+        typeof tick.label === "string"
+          ? tick.label
+          : formatLocal(new Date(at).toISOString(), { dateOnly: true }),
         "chart-axis-label",
-        index === 0 ? "start" : index === 3 ? "end" : "middle",
+        tick.alignment ?? "middle",
       ));
     }
     svg.append(svgText(width / 2, height - 6, USER_TIME_ZONE, "chart-axis-label", "middle"));
@@ -2672,22 +2789,202 @@ function renderWeeklyPricingReceipt(data) {
   const rebuiltAt = data.artifactStatus?.weekly?.generatedAt
     ? ` The fits were last rebuilt ${formatLocal(data.artifactStatus.weekly.generatedAt)}.`
     : "";
-  const currentPriceSensitivity = pricing.priceEpochBasis
-    === "current_price_sensitivity_at_registry_observation";
+  const eventTimeHistoricalPricing = pricing.priceEpochBasis
+    === "event_time_when_registry_has_effective_evidence";
   const title = $("#weekly-pricing-receipt-title");
   const copy = $("#weekly-pricing-receipt-copy");
 
-  if (!currentPriceSensitivity) {
+  if (!eventTimeHistoricalPricing) {
     title.textContent = "Price epoch was not verified";
-    copy.textContent = `This build returned ${registryVersion}, ${reviewedAt}, but not the price epoch used for the fits. The app will not claim that a recent price change was applied until that evidence is present.${rebuiltAt}`;
+    copy.textContent = `This build returned ${registryVersion}, ${reviewedAt}, but not event-time historical card selection for the fits.${rebuiltAt}`;
     return;
   }
 
-  title.textContent = "Current official prices are applied to every fit";
-  const julyThirtyRepricing = pricing.registryVersion === "app-official-api-prices-v0.2"
-    ? " It includes the lower GPT-5.6 Terra and Luna prices effective July 30."
+  title.textContent = pricing.mixedPriceCardWindows
+    ? "Historical event-time prices span card windows"
+    : "Historical event-time prices used for each fit";
+  const priceCardIds = Array.isArray(pricing.priceCardIds)
+    ? pricing.priceCardIds
+    : [];
+  const hasPostJulyThirtyTerraOrLunaCard = priceCardIds.some((id) => (
+    (id.includes(":gpt-5.6-terra:") || id.includes(":gpt-5.6-luna:"))
+    && id.includes("-from-2026-07-30:")
+  ));
+  const julyThirtyPricing = priceCardIds.length === 0
+    ? " No per-card provenance was returned, so this build does not claim whether the July 30 GPT-5.6 Terra/Luna change affects these fits."
+    : hasPostJulyThirtyTerraOrLunaCard
+      ? " The lower official GPT-5.6 Terra/Luna cards effective July 30 are being used for retained events on or after that date; earlier events keep their earlier cards."
+      : " No retained event in these fits uses the GPT-5.6 Terra/Luna post-July 30 card, so that lower-price change does not affect this view.";
+  const mixedWindows = pricing.mixedPriceCardWindows
+    ? " At least one fit uses mixed official card windows."
     : "";
-  copy.textContent = `Every visible fit, including the newest, uses ${registryVersion}, ${reviewedAt}; this is not a stale pre-change calculation.${julyThirtyRepricing}${rebuiltAt}`;
+  const historicalTotal = pricing.eventTimeHistoricalTotalUsdExact
+    ? ` The retained event-time historical total is ${pricing.eventTimeHistoricalTotalUsdExact} USD; no current-card sensitivity total is claimed for this view.`
+    : " No separate event-time historical total was returned for this view.";
+  copy.textContent = `Each fit selects the official card effective at each usage event timestamp from ${registryVersion}, ${reviewedAt}.${julyThirtyPricing}${mixedWindows}${historicalTotal}${rebuiltAt}`;
+}
+
+/**
+ * The one presentation model for the allowance history in the dashboard and
+ * on the share card. It deliberately contains only derived numerical evidence
+ * and date-only labels, so both surfaces inherit the same inclusion, range,
+ * point-classification, and axis decisions without exposing source rows.
+ */
+function allowanceHistoryChartModel(data, {
+  rangeDays = activeWeeklyRangeDays,
+} = {}) {
+  const summary = data?.weekly?.summary ?? {};
+  const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
+  const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
+  const upper = finite(summary.upper_80_across_resets_usd ?? summary.upper80Usd);
+  const allPoints = (Array.isArray(data?.weekly?.weeklyValues) ? data.weekly.weeklyValues : [])
+    .map((row, index) => {
+      const at = Date.parse(row?.last_observed_at ?? row?.first_observed_at ?? "");
+      const value = finite(row?.value_usd ?? row?.value);
+      const observedSpanPp = finite(row?.displayed_span_pp);
+      if (!Number.isFinite(at) || value === null) return null;
+      return Object.freeze({
+        timestamp: row?.last_observed_at ?? row?.first_observed_at,
+        at,
+        dateLabel: shareCardDateLabel(at),
+        resetDueAt: row?.reset_due_at ?? row?.resetAt ?? null,
+        value,
+        low: finite(row?.pairwise_p10_usd ?? row?.lower),
+        high: finite(row?.pairwise_p90_usd ?? row?.upper),
+        observedSpanPp,
+        wellObserved: isWellObservedWeeklyFit(observedSpanPp),
+        historicalMedian: estimate,
+        acrossResetLow: lower,
+        acrossResetHigh: upper,
+        index,
+      });
+    })
+    .filter((point) => point !== null)
+    .sort((left, right) => left.at - right.at);
+  const latestObservedAt = allPoints.at(-1)?.at ?? null;
+  const validRangeDays = Number.isFinite(rangeDays) && rangeDays > 0 ? rangeDays : null;
+  const cutoffAt = latestObservedAt === null || validRangeDays === null
+    ? Number.NEGATIVE_INFINITY
+    : latestObservedAt - validRangeDays * 24 * 60 * 60 * 1_000;
+  const points = allPoints.filter((point) => point.at >= cutoffAt);
+  const axis = allowanceHistoryAxis(points);
+  return Object.freeze({
+    allPoints: Object.freeze(allPoints),
+    points: Object.freeze(points),
+    axis,
+    xTicks: allowanceHistoryDateTicks(points),
+  });
+}
+
+/**
+ * Keep both renderers on the same vertical scale. This is the dashboard's
+ * former chart-domain calculation expressed once: fitted values, across-reset
+ * range, and each measured sensitivity range all count toward the domain.
+ */
+function allowanceHistoryAxis(points) {
+  const values = (Array.isArray(points) ? points : [])
+    .flatMap((point) => [
+      finite(point?.value),
+      finite(point?.historicalMedian),
+      finite(point?.acrossResetLow),
+      finite(point?.acrossResetHigh),
+      finite(point?.low),
+      finite(point?.high),
+    ])
+    .filter((value) => value !== null);
+  let low = Math.min(...values);
+  let high = Math.max(...values);
+  if (!Number.isFinite(low) || !Number.isFinite(high)) {
+    low = 0;
+    high = 1;
+  }
+  if (low === high) {
+    low -= 1;
+    high += 1;
+  }
+  const padding = (high - low) * .1;
+  low -= padding;
+  high += padding;
+  return Object.freeze({
+    low,
+    high,
+    ticks: Object.freeze(
+      Array.from({ length: 5 }, (_, index) => high - index / 4 * (high - low)),
+    ),
+  });
+}
+
+/**
+ * Four evenly spaced date labels are legible in both the interactive view and
+ * a posted image. They are based on the selected history domain rather than
+ * on the density of reset fits.
+ */
+function allowanceHistoryDateTicks(points, maximum = 4) {
+  const first = points?.[0]?.at;
+  const last = points?.at(-1)?.at;
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return Object.freeze([]);
+  if (last <= first) {
+    return Object.freeze([
+      Object.freeze({ at: first, label: shareCardDateLabel(first), alignment: "middle" }),
+    ]);
+  }
+  return Object.freeze(Array.from({ length: maximum }, (_, index) => {
+    const at = first + (last - first) * index / (maximum - 1);
+    return Object.freeze({
+      at,
+      label: shareCardDateLabel(at),
+      alignment: index === 0 ? "start" : index === maximum - 1 ? "end" : "middle",
+    });
+  }));
+}
+
+function renderAllowanceHistoryChart(history) {
+  return lineChart({
+    points: history.points,
+    series: [
+      {
+        key: "historicalMedian",
+        className: "chart-line-weekly-center",
+        label: "Historical median",
+      },
+      {
+        key: "value",
+        className: "chart-point-weekly-mature",
+        label: `Observed across ${WEEKLY_WELL_OBSERVED_SPAN_PP}+ points`,
+        connect: false,
+        markers: true,
+        tooltip: false,
+        markerRadius: (point) => point.wellObserved ? 4 : 0,
+      },
+      {
+        key: "value",
+        className: "chart-point-weekly-partial",
+        label: "Short observation",
+        connect: false,
+        markers: true,
+        tooltip: false,
+        markerRadius: (point) => point.wellObserved ? 0 : 4,
+      },
+    ],
+    confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
+    errorBars: {
+      low: "low",
+      high: "high",
+      className: "chart-error-bar-weekly",
+      label: "Measured range",
+      tooltip: false,
+    },
+    xDomain: {
+      startMs: history.points[0]?.at,
+      endMs: history.points.at(-1)?.at,
+    },
+    xTicks: history.xTicks,
+    yDomain: history.axis,
+    yTickFormat: (value, digits) => formatMoney(value, digits),
+    yLabel: "7-day allowance ($)",
+    title: "Seven-day allowance estimate history",
+    description: `One dot per distinct seven-day reset estimate, plotted when observed in ${USER_TIME_ZONE}. Filled dots use at least ${WEEKLY_WELL_OBSERVED_SPAN_PP} displayed percentage points; outlined dots are shorter observations. Each vertical bar is that reset's measured range.`,
+  });
 }
 
 function renderWeekly(data) {
@@ -2710,36 +3007,10 @@ function renderWeekly(data) {
     ? `${evidenceExplanation} Account attribution is unavailable for these historical fits.`
     : evidenceExplanation;
 
-  const values = data.weekly.weeklyValues.map((row, index) => {
-    const value = finite(row.value_usd ?? row.value);
-    const observedSpanPp = finite(row.displayed_span_pp);
-    return {
-    ...row,
-    timestamp: row.last_observed_at ?? row.first_observed_at,
-    resetDueAt: row.reset_due_at ?? row.resetAt ?? null,
-    value,
-    low: finite(row.pairwise_p10_usd ?? row.lower),
-    high: finite(row.pairwise_p90_usd ?? row.upper),
-    observedSpanPp,
-    historicalMedian: estimate,
-    acrossResetLow: lower,
-    acrossResetHigh: upper,
-    matureValue: isWellObservedWeeklyFit(observedSpanPp) ? value : null,
-    provisionalValue: isWellObservedWeeklyFit(observedSpanPp) ? null : value,
-    index
-    };
-  }).filter((row) => row.timestamp && row.value !== null)
-    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
-  const latestObservedMs = values.reduce(
-    (latest, row) => Math.max(latest, Date.parse(row.timestamp)),
-    Number.NEGATIVE_INFINITY,
-  );
-  const cutoffMs = Number.isFinite(latestObservedMs)
-    ? latestObservedMs - activeWeeklyRangeDays * 24 * 60 * 60 * 1_000
-    : Number.NEGATIVE_INFINITY;
-  const rangedValues = values.filter((row) => Date.parse(row.timestamp) >= cutoffMs);
-  const chartValues = rangedValues;
-  $("#weekly-partial-legend").hidden = !chartValues.some((row) => row.provisionalValue !== null);
+  const history = allowanceHistoryChartModel(data);
+  const values = history.allPoints;
+  const chartValues = history.points;
+  $("#weekly-partial-legend").hidden = !chartValues.some((row) => !row.wellObserved);
   const empty = $("#weekly-empty");
   const shell = $("#weekly-chart");
   if (!chartValues.length) {
@@ -2749,43 +3020,7 @@ function renderWeekly(data) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(lineChart({
-      points: chartValues,
-      series: [
-        {
-          key: "historicalMedian",
-          className: "chart-line-weekly-center",
-          label: "Historical median",
-        },
-        {
-          key: "matureValue",
-          className: "chart-point-weekly-mature",
-          label: `Observed across ${WEEKLY_WELL_OBSERVED_SPAN_PP}+ points`,
-          connect: false,
-          markers: true,
-          tooltip: false,
-        },
-        {
-          key: "provisionalValue",
-          className: "chart-point-weekly-partial",
-          label: "Short observation",
-          connect: false,
-          markers: true,
-          tooltip: false,
-        },
-      ],
-      confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
-      errorBars: {
-        low: "low",
-        high: "high",
-        className: "chart-error-bar-weekly",
-        label: "Measured range",
-        tooltip: false,
-      },
-      yLabel: "API-equivalent USD",
-      title: "Seven-day allowance estimate history",
-      description: `One dot per distinct seven-day reset estimate, plotted when observed in ${USER_TIME_ZONE}. Filled dots use at least ${WEEKLY_WELL_OBSERVED_SPAN_PP} displayed percentage points; outlined dots are shorter observations. Each vertical bar is that reset's measured range.`
-    }));
+    shell.replaceChildren(renderAllowanceHistoryChart(history));
   }
   renderWeeklyTable(values);
 }
@@ -2886,6 +3121,34 @@ function renderAccountingDimension(containerSelector, dimension, {
   }
 }
 
+function renderAccountingComponentBars(containerSelector, rows, {
+  emptyMessage,
+  valueFor,
+  displayValue,
+  titleFor = () => ""
+}) {
+  const container = $(containerSelector);
+  clear(container);
+  if (!rows.length) {
+    container.append(node("p", "empty-inline", emptyMessage));
+    return;
+  }
+  const maximum = Math.max(1, ...rows.map(valueFor));
+  for (const rowData of rows) {
+    const value = valueFor(rowData);
+    const row = node("div", "component-row");
+    const label = node("span", "", componentLabel(rowData.key));
+    const title = titleFor(rowData);
+    if (title) label.title = title;
+    const track = node("div", "component-track");
+    const fill = node("i");
+    fill.style.width = `${Math.max(value > 0 ? 1 : 0, value / maximum * 100)}%`;
+    track.append(fill);
+    row.append(label, track, node("strong", "", displayValue(rowData)));
+    container.append(row);
+  }
+}
+
 function renderAccounting(data) {
   const accounting = accountingPeriod(data);
   const summary = $("#accounting-summary");
@@ -2943,22 +3206,37 @@ function renderAccounting(data) {
     summary.append(card);
   }
 
-  const components = $("#accounting-components");
-  clear(components);
-  const componentRows = Object.entries(accounting.components ?? {})
-    .filter(([, value]) => value > 0)
-    .sort((left, right) => right[1] - left[1]);
-  const maximum = Math.max(1, ...componentRows.map(([, value]) => value));
-  for (const [key, value] of componentRows) {
-    const row = node("div", "component-row");
-    row.append(node("span", "", componentLabel(key)));
-    const track = node("div", "component-track");
-    const fill = node("i");
-    fill.style.width = `${Math.max(value > 0 ? 1 : 0, value / maximum * 100)}%`;
-    track.append(fill);
-    row.append(track, node("strong", "", compact(value)));
-    components.append(row);
-  }
+  const componentCountRows = Object.entries(accounting.components ?? {})
+    .filter(([, tokens]) => tokens > 0)
+    .map(([key, tokens]) => ({ key, tokens }))
+    .sort((left, right) => right.tokens - left.tokens);
+  renderAccountingComponentBars("#accounting-component-counts", componentCountRows, {
+    emptyMessage: "No token-component accounting in this period.",
+    valueFor: (row) => row.tokens,
+    displayValue: (row) => compact(row.tokens)
+  });
+
+  const componentCostRows = Object.entries(accounting.componentCosts ?? {})
+    .map(([key, value]) => ({
+      key,
+      tokens: finite(value?.tokens, 0),
+      unpricedTokens: finite(value?.unpricedTokens, 0),
+      costUsd: finite(value?.costUsd, 0)
+    }))
+    .filter((row) => row.tokens > 0 || row.costUsd > 0)
+    .sort((left, right) => right.costUsd - left.costUsd || right.tokens - left.tokens);
+  renderAccountingComponentBars("#accounting-component-costs", componentCostRows, {
+    emptyMessage: "No component costs were priced in this period.",
+    valueFor: (row) => row.costUsd,
+    displayValue: (row) => row.costUsd > 0
+      ? `${formatApiMoney(row.costUsd)}${row.unpricedTokens > 0 ? " + unpriced" : ""}`
+      : "Unpriced",
+    titleFor: (row) => {
+      const parts = [`${compact(row.tokens)} tokens`];
+      if (row.unpricedTokens > 0) parts.push(`${compact(row.unpricedTokens)} unpriced`);
+      return parts.join(" · ");
+    }
+  });
 
   const models = $("#accounting-models");
   clear(models);
@@ -4075,7 +4353,7 @@ const HOSTED_IDENTITY_ERROR_COPY = {
   IDENTITY_REQUIRED:
     "Hosted participation requires sign-in. Sign in with Google or Apple above, then try again. Nothing was uploaded.",
   IDENTITY_TOKEN_INVALID:
-    "The sign-in could not be verified by the contribution service. Sign in again, then retry. Nothing was uploaded.",
+    "The sign-in was cancelled or could not be completed. Nothing was uploaded. You can try again.",
   IDENTITY_CONFIGURATION_INVALID:
     "Hosted sign-in is not configured on the contribution service, so hosted actions are unavailable. Local reporting continues unchanged.",
   IDENTITY_PROVIDER_UNAVAILABLE:
@@ -4467,7 +4745,7 @@ const HOSTED_SIGNIN_FLOWS = {
     start: () => communityClient.identityGoogleStart(),
     result: (state) => communityClient.identityGoogleResult(state),
     waiting:
-      "Finish signing in with Google in your browser. TiboTattle collects the result itself and returns to the front when it is ready; you can close the callback tab. Only a stable account identifier is requested; no email or name is asked for. If no browser tab opened, try again.",
+      "Finish signing in with Google in your browser. TiboTattle returns to the front when it is ready. You can cancel this sign-in here at any time; nothing is uploaded until you review it.",
     signedIn:
       "Signed in with Google. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
@@ -4483,7 +4761,7 @@ const HOSTED_SIGNIN_FLOWS = {
     start: () => communityClient.identityAppleStart(),
     result: (state) => communityClient.identityAppleResult(state),
     waiting:
-      "Finish signing in with Apple in your browser. TiboTattle collects the result itself and returns to the front when it is ready; you can close the callback tab. No name or email is requested. If no browser tab opened, try again.",
+      "Finish signing in with Apple in your browser. TiboTattle returns to the front when it is ready. You can cancel this sign-in here at any time; nothing is uploaded until you review it.",
     signedIn:
       "Signed in with Apple. This page holds only a short-lived opaque proof; the service keeps only an irreversible identity hash, never your email or name.",
     timedOut:
@@ -4526,6 +4804,17 @@ async function beginHostedSignIn(providerId) {
         identity = await flow.result(request.state);
       } catch (error) {
         if (error?.code !== "IDENTITY_RESULT_PENDING") throw error;
+        // The fixed callback page wakes the native dashboard only after the
+        // provider has returned. A current service turns a cancelled callback
+        // into IDENTITY_TOKEN_INVALID; this branch preserves the same safe UI
+        // outcome while a previously deployed service still reports pending.
+        if (attempt.returnedToApp) {
+          status.hidden = false;
+          status.className = "participant-action-status";
+          status.textContent =
+            `${flow.label} sign-in did not complete. Nothing was uploaded. You can try again.`;
+          return;
+        }
       }
       if (identity !== null) {
         if (attempt.cancelled || activeHostedSignIn !== attempt) return;
@@ -4557,10 +4846,10 @@ async function beginHostedSignIn(providerId) {
       error,
       messages: unconfigured
         ? { IDENTITY_CONFIGURATION_INVALID: flow.unconfigured }
-        : error?.code === "IDENTITY_TOKEN_INVALID" && attempt.returnedToApp
+        : error?.code === "IDENTITY_TOKEN_INVALID"
           ? {
             IDENTITY_TOKEN_INVALID:
-              `${flow.label} did not confirm the sign-in. Nothing was uploaded; try again.`,
+              `${flow.label} sign-in was cancelled or did not complete. Nothing was uploaded. You can try again.`,
           }
           : {},
       fallback: hostedIdentityErrorCopy(error)
@@ -5244,7 +5533,7 @@ function renderPersonalStats(container, payload) {
   verification.append(
     node("strong", "", "Server-repriced API equivalent. "),
     document.createTextNode(
-      "This is a current public API price-card comparison calculated by the server, not a subscription charge or OpenAI’s internal quota unit."
+      "This is an event-time public API price-card comparison calculated by the server, not a subscription charge or OpenAI’s internal quota unit."
     )
   );
   container.append(verification);
@@ -5754,9 +6043,12 @@ function renderContributionHistory(container, payload) {
     const recordSummary = item.recordCounts === null
       ? "Fixture contract"
       : `${compact(item.recordCounts.accepted)} accepted · ${compact(item.recordCounts.deduplicated)} duplicate`;
+    const pricingBasis = item.serverAccounting.priceBasis
+      ? ` · ${item.serverAccounting.priceBasis}`
+      : "";
     const pricingSummary = item.serverAccounting.verification === "server_repriced"
-      ? `${formatApiMoney(item.serverAccounting.apiPriceEquivalentUsd)} API-price equivalent`
-      : "Server repricing unavailable";
+      ? `${formatApiMoney(item.serverAccounting.apiPriceEquivalentUsd)} API-price equivalent${pricingBasis}`
+      : `Server repricing unavailable${pricingBasis}`;
     const quarantineSummary = item.quarantine.state === "deleted"
       ? `Encrypted object deleted ${formatLocal(item.quarantine.deletedAt)}`
       : `Encrypted object scheduled for deletion after ${formatLocal(item.quarantine.scheduledDeletionAt)}`;
@@ -6304,6 +6596,25 @@ $("#contribution-history").addEventListener("click", (event) => {
     deleteSingleContribution(button.dataset.contributionId);
   }
 });
+document.addEventListener("click", (event) => {
+  const current = activeInformationPopover;
+  if (!current) return;
+  if (current.button.contains(event.target) || current.popover.contains(event.target)) return;
+  closeInformationPopover();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !activeInformationPopover) return;
+  event.preventDefault();
+  closeInformationPopover({ restoreFocus: true });
+});
+window.addEventListener("resize", () => {
+  const current = activeInformationPopover;
+  if (current) positionInformationPopover(current.popover, current.button);
+});
+document.addEventListener("scroll", () => {
+  const current = activeInformationPopover;
+  if (current) positionInformationPopover(current.popover, current.button);
+}, true);
 
 mountDashboardNavigation({
   documentRef: document,

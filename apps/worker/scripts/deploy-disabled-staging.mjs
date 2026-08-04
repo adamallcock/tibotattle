@@ -11,6 +11,7 @@ import {
 import {
   checkLocalWorkspacePackages,
 } from "./check-local-workspace-packages.mjs";
+import { stageProductionAssets } from "./stage-production-assets.mjs";
 
 export const DEPLOY_CONFIRMATION = "DEPLOY_DISABLED_STAGING";
 
@@ -116,6 +117,7 @@ export async function runDisabledStagingDeployment({
   spawn = spawnSync,
   fetchImpl = fetch,
   checkWorkspacePackages = checkLocalWorkspacePackages,
+  stageAssets = stageProductionAssets,
 }) {
   if (confirmation !== DEPLOY_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
@@ -143,6 +145,11 @@ export async function runDisabledStagingDeployment({
       ? error.code
       : "WORKSPACE_PACKAGES_CHECK_FAILED";
     return { ok: false, code };
+  }
+  try {
+    await stageAssets();
+  } catch {
+    return { ok: false, code: "STAGING_PUBLIC_ASSETS_INVALID" };
   }
 
   const readiness = probeStagingLive({

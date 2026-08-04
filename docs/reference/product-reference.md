@@ -116,8 +116,9 @@ artifact. There is no first-party `LICENSE` or `COPYING` file yet, so a public
 repository switch remains blocked on an explicit license decision.
 
 The macOS release foundation pins Sparkle 2.9.3 for external-distribution
-builds. Automatic update download and install-on-quit are off until the user
-opts in. Development/ad-hoc builds reject updater inputs, omit
+builds. Signed production releases enable automatic update download by default;
+the user can turn it off with the single native **Automatic updates** switch in
+**Settings → General** and can always check manually. Development/ad-hoc builds reject updater inputs, omit
 `Sparkle.framework`, and perform no updater networking. Production still
 requires a human-approved HTTPS appcast and download origin, an offline
 Ed25519 update-signing key, Developer ID signing, Apple notarization, and a
@@ -129,19 +130,27 @@ Apple-silicon macOS is the primary pilot target. Intel macOS, Windows, and
 Linux installers remain secondary until the signed, hosted Apple-silicon
 journey is proven with real users.
 
-An approved public release site is built from the same dashboard with explicit,
-fail-closed release inputs. The builder reads the selected notarized DMG,
-records its byte size, streams its SHA-256, and refuses to build unless that
-digest matches the human-supplied release digest. It also requires explicit
-macOS and CPU compatibility, release notes, privacy, security, and support
-links, plus a real 1200x630 PNG. Every public URL must be stable HTTPS on a
-non-placeholder host.
+An approved public release site is built from the dedicated community landing
+entry, not from the loopback dashboard. It shows the delayed seven-day
+community snapshot and a fail-closed Mac download CTA; personal dashboard,
+admin, contribution, and local-app routing surfaces are not part of the
+generated output. A site may intentionally have no installer: the builder then
+removes installer metadata, omits the installer claim from its manifest, and
+leaves the download CTA disabled. When an installer is configured, the builder
+requires the exact `usage-monitor-macos-release-v0.2` manifest emitted beside
+the DMG, verifies its sibling path, byte size, and SHA-256, and reruns the
+existing Developer ID, notarization, stapling, Gatekeeper, clean-profile, and
+signed-updater validation. A caller hash is only an optional cross-check; it is
+never release evidence. The builder also requires explicit macOS and CPU
+compatibility, release notes, privacy, security, and support links, plus a real
+1200x630 PNG. Every public URL must be stable HTTPS on a non-placeholder host.
 
 ```bash
 npm run product:release-site -- \
-  --output /absolute/path/to/release-site \
+  --output "$PWD/.release-build/public-release-site" \
   --site-url "$APPROVED_PUBLIC_SITE_URL" \
   --installer-path "$NOTARIZED_DMG_PATH" \
+  --installer-release-manifest "$NOTARIZED_DMG_PATH.release.json" \
   --installer-url "$APPROVED_PUBLIC_DMG_URL" \
   --installer-version 1.2.3 \
   --installer-sha256 "$VERIFIED_DMG_SHA256" \
@@ -156,13 +165,18 @@ npm run product:release-site -- \
 ```
 
 `APPROVED_PUBLIC_SITE_URL` must end in `/`; this pilot release builder accepts
-only `arm64` and rejects `x86_64` or universal claims. The output shows the
-verified download size, compatibility, digest, and support links. It also
-includes canonical/Open Graph/Twitter metadata, the supplied image as
+only `arm64` and rejects `x86_64` or universal claims. With an installer, the
+output shows its verified download size, compatibility, digest, and support
+links; without one those claims and metadata are omitted. Every build includes
+canonical/Open Graph/Twitter metadata, the supplied image as
 `social-preview.png`, an allow-list `robots.txt`, and a deterministic
-`release-site-manifest.json`. Building does not publish the site or authorize
-a release. DNS, HTTPS hosting, notarization, signing, and the final release
-decision remain human-controlled.
+`release-site-manifest.json`. Building does not publish the site or authorize a
+release. Before a production Worker deploy, the staging script consumes only
+that generated directory, verifies its manifest and file hashes, and atomically
+materializes `.release-build/worker-assets`; root, direct index, and SPA
+fallback requests then resolve to the generated community `index.html`. It
+rejects raw dashboard/admin assets and unexpected files. DNS, HTTPS hosting,
+notarization, signing, and the final release decision remain human-controlled.
 
 ## Current multi-surface and account-aware outcome
 

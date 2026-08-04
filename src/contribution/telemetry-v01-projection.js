@@ -106,7 +106,7 @@ function priceUsage(record, components) {
           || record.apiServiceTier === "batch"
           ? record.apiServiceTier
           : "standard",
-        priceEpochBasis: "current_price_sensitivity",
+        priceEpochBasis: "event_time",
       });
     }
     if (record.provider === "anthropic_claude_code") {
@@ -115,7 +115,7 @@ function priceUsage(record, components) {
         components,
       }, {
         apiServiceTier: "standard",
-        priceEpochBasis: "current_price_sensitivity",
+        priceEpochBasis: "event_time",
       });
     }
   } catch {
@@ -173,7 +173,7 @@ function transportUsage(record) {
         : sixDecimalUsd(priced.totalUsd),
       pricingCoveragePercent: coveragePercent(priced),
       unknownBillableUnits: unknownBillableUnits(priced),
-      priceBasis: "current_api_prices",
+      priceBasis: fullyUnpriced ? "unpriced" : "historical_api_prices",
     },
   };
 }
@@ -231,6 +231,14 @@ function batchAccounting(usageEvents) {
     (sum, row) => sum + row.accounting.pricingCoveragePercent,
     0,
   ) / usageEvents.length;
+  const priceBases = new Set(
+    usageEvents.map((row) => row.accounting.priceBasis),
+  );
+  const priceBasis = priceBases.size === 0
+    ? "unpriced"
+    : priceBases.size === 1
+      ? [...priceBases][0]
+      : "mixed_api_prices";
   return {
     estimatedApiCostUsd: sixDecimalUsd(cost),
     pricedEventCoveragePercent: Number(coverage.toFixed(6)),
@@ -240,7 +248,7 @@ function batchAccounting(usageEvents) {
       (sum, row) => sum + row.accounting.unknownBillableUnits,
       0,
     ),
-    priceBasis: "current_api_prices",
+    priceBasis,
   };
 }
 

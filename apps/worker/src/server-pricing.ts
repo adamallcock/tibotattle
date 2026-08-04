@@ -1,14 +1,16 @@
 import {
   APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
-  APP_PRICE_REGISTRY_OBSERVED_AT,
   priceUsageEvent,
 } from "@app-usagemonitor/accounting";
 import type { TelemetryUsageEvent } from "./telemetry-validation";
 
-export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.1";
+export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.2";
 
 type PricingStatus = "fully_priced" | "partially_priced" | "unpriced";
+export type ServerPriceBasis = "historical_api_prices" | "unpriced";
+export type ServerContributionPriceBasis = ServerPriceBasis | "mixed_api_prices";
+export type ServerPriceEpochBasis = "event_time_when_registry_has_effective_evidence";
 
 export interface ServerPricingResult {
   exactCostUsd: string;
@@ -22,7 +24,9 @@ export interface ServerPricingResult {
   registryVersion: string;
   registrySha256: string;
   registryObservedAt: string;
-  priceEpochBasis: "current_price_sensitivity_at_registry_observation";
+  priceBasis: ServerPriceBasis;
+  priceEventTime: string | null;
+  priceEpochBasis: ServerPriceEpochBasis;
   apiServiceTier: "standard" | "priority" | "flex" | "batch" | "unknown";
   tierBasis: "subscription_standard_counterfactual" | "observed_api_service_tier"
     | "api_service_tier_unavailable";
@@ -79,6 +83,13 @@ function boundedNumber(value: bigint): number {
   return value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value);
 }
 
+function usableEventTime(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= 32
+    && Number.isFinite(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
 function tierForEvent(row: TelemetryUsageEvent): {
   apiServiceTier: ServerPricingResult["apiServiceTier"];
   tierBasis: ServerPricingResult["tierBasis"];
@@ -124,8 +135,10 @@ function failClosed(
     methodVersion: SERVER_PRICING_METHOD_VERSION,
     registryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
     registrySha256: APP_PRICE_REGISTRY_MANIFEST.sha256,
-    registryObservedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
-    priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+    registryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+    priceBasis: "unpriced",
+    priceEventTime: usableEventTime(row.eventTime) ? row.eventTime : null,
+    priceEpochBasis: "event_time_when_registry_has_effective_evidence",
     apiServiceTier: tier.apiServiceTier,
     tierBasis: tier.tierBasis,
     subscriptionSpeedMode: row.speedMode,
@@ -140,6 +153,9 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
   if (tier.apiServiceTier === "unknown") {
     return failClosed(row, "api_service_tier_unavailable", tier);
   }
+  if (!usableEventTime(row.eventTime)) {
+    return failClosed(row, "historical_price_timestamp_missing", tier);
+  }
   if (row.provider === "openai_codex"
       && CONTEXT_SENSITIVE_OPENAI_MODELS.has(row.modelId)
       && row.totalInputContextTokens === null) {
@@ -153,13 +169,13 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
     model: row.modelId,
     surface,
     apiTier: tier.apiServiceTier,
-    pricedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    pricedAt: row.eventTime,
     totalInputContextTokens: row.totalInputContextTokens,
     components: row.components,
   }, {
     priceCards: APP_OFFICIAL_PRICE_CARDS,
     pricingContext: {
-      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
     },
   });
 
@@ -186,6 +202,13 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
     }
   }
   for (const warning of priced.warnings.coverage) reasonCodes.add(warning.code);
+  if (priced.coverageStatus === "unpriced"
+      && reasonCodes.has("historical_price_missing")) {
+    // The component-level fallback warning is an implementation detail of
+    // the empty historical card lookup. Retain the evidence boundary as the
+    // single audit reason rather than presenting a second, misleading cause.
+    reasonCodes.delete("component_price_missing");
+  }
 
   const costNanousd = toNanousd(priced.totalUsd);
   if (costNanousd > MAX_SAFE_EVENT_NANOUSD) {
@@ -203,8 +226,12 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
     methodVersion: SERVER_PRICING_METHOD_VERSION,
     registryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
     registrySha256: APP_PRICE_REGISTRY_MANIFEST.sha256,
-    registryObservedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
-    priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+    registryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+    priceBasis: priced.coverageStatus === "unpriced"
+      ? "unpriced"
+      : "historical_api_prices",
+    priceEventTime: row.eventTime,
+    priceEpochBasis: "event_time_when_registry_has_effective_evidence",
     apiServiceTier: tier.apiServiceTier,
     tierBasis: tier.tierBasis,
     subscriptionSpeedMode: row.speedMode,

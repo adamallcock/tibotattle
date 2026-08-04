@@ -139,10 +139,17 @@ The checked-in `staging` environment is intentionally safe but incomplete:
 - two D1 bindings, one private R2 binding, two independent rate limiters,
   static assets, hourly lifecycle work, and Worker observability are explicit
   environment configuration; and
+- root, staging, and production `ASSETS` bindings all consume the
+  manifest-verified `.release-build/worker-assets` tree. The staging step
+  allows only the generated community landing assets and rejects dashboard,
+  admin, sign-in, contribution, and app-open routes; the native app's
+  loopback server continues to use `apps/web/public` separately; and
 - D1 resource IDs are schema-valid sentinels that the strict readiness command
   rejects.
 
-Run the non-mutating configuration and dry-deployment gate:
+Run the non-mutating configuration and dry-deployment gate. It first verifies
+and atomically stages the generated public release tree, so a missing,
+tampered, or unsafe release output blocks before Wrangler is invoked:
 
 ```sh
 npm run staging:check

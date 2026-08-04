@@ -105,6 +105,38 @@ function resetTransitions({
   });
 }
 
+test("weekly reset provenance preserves mixed historical card windows", () => {
+  const reset = Math.floor(Date.parse("2026-08-03T00:00:00.000Z") / 1_000);
+  const preChangeId = "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01";
+  const postChangeId = "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01";
+  const transitions = resetTransitions({ reset }).map((row, index) => {
+    const eventTime = new Date(
+      Date.parse("2026-07-29T14:00:00.000Z") + index * 60 * 60 * 1_000,
+    ).toISOString();
+    const priceCardId = index < 10 ? preChangeId : postChangeId;
+    return {
+      ...row,
+      eventTime,
+      lastPriorObservedAt: eventTime,
+      firstNextObservedAt: eventTime,
+      priceCardIds: [priceCardId],
+      priceCardBreakdown: [{
+        priceCardId,
+        events: 1,
+        costUsd: index < 10 ? "2.5" : "2",
+      }],
+    };
+  });
+  const report = analyzeWeeklyCalibration(dataset(transitions));
+
+  assert.equal(report.resetValues.length, 1);
+  assert.deepEqual(report.resetValues[0].priceCardIds, [postChangeId, preChangeId].sort());
+  assert.deepEqual(report.resetValues[0].priceCardBreakdown, [
+    { priceCardId: postChangeId, events: 10, costUsd: "20" },
+    { priceCardId: preChangeId, events: 10, costUsd: "25" },
+  ]);
+});
+
 test("weekly calibration merges a sequential primary-to-secondary slot move into one reset", () => {
   const reset = 1_785_000_000;
   const transitions = resetTransitions({ reset, slot: "primary" }).map((row, index) => ({

@@ -32,6 +32,22 @@ private enum BundledProduct {
         return value
     }
 
+    private static func requiredHTTPSOrigin(_ key: String) -> String {
+        let value = requiredString(key)
+        guard let components = URLComponents(string: value),
+              components.scheme?.lowercased() == "https",
+              components.host != nil,
+              components.user == nil,
+              components.password == nil,
+              components.percentEncodedPath.isEmpty,
+              components.query == nil,
+              components.fragment == nil
+        else {
+            fatalError("Invalid bundled product HTTPS origin: \(key)")
+        }
+        return value
+    }
+
     static let displayName = requiredString("CFBundleDisplayName")
     static let bundleName = requiredString("UsageMonitorBundleName")
     static let appOpenScheme =
@@ -51,6 +67,8 @@ private enum BundledProduct {
         requiredString("UsageMonitorMonitoredAppDisplayName")
     static let monitoredAppBundleIdentifier =
         requiredString("UsageMonitorMonitoredAppBundleIdentifier")
+    static let publicWebsiteOrigin =
+        requiredHTTPSOrigin("UsageMonitorPublicWebsiteOrigin")
 }
 
 private let loopbackHost = "127.0.0.1"
@@ -70,13 +88,43 @@ private final class AppUpdater {
         ) as? Bool == true
     }
 
+    /// The installed preview is deliberately a real client of the deployed
+    /// service, but it is not itself a notarized release. Until the first
+    /// signed appcast is published, a manual Sparkle check would otherwise
+    /// show the opaque generic network error for the expected 404 response.
+    static var isPreviewDistribution: Bool {
+        Bundle.main.object(
+            forInfoDictionaryKey: "UsageMonitorPreviewDistribution"
+        ) as? Bool == true
+        || Bundle.main.object(
+            forInfoDictionaryKey: "UsageMonitorBuildChannel"
+        ) as? String == "preview_distribution"
+    }
+
+    private static var appcastURL: URL? {
+        guard let value = Bundle.main.object(
+            forInfoDictionaryKey: "SUFeedURL"
+        ) as? String,
+              let url = URL(string: value),
+              url.scheme?.lowercased() == "https",
+              url.host != nil
+        else {
+            return nil
+        }
+        return url
+    }
+
 #if canImport(Sparkle)
     private let controller: SPUStandardUpdaterController?
+    private var hasStarted = false
+    private var previewFeedPreflightInFlight = false
 
     init() {
         controller = Self.bundledUpdaterEnabled
             ? SPUStandardUpdaterController(
-                startingUpdater: true,
+                // Do not let Sparkle begin update networking before the
+                // first-run disclosure explains the default behavior.
+                startingUpdater: false,
                 updaterDelegate: nil,
                 userDriverDelegate: nil
             )
@@ -95,8 +143,55 @@ private final class AppUpdater {
         controller?.updater.automaticallyDownloadsUpdates == true
     }
 
+    func startAfterFirstRunDisclosure() {
+        guard let controller, !hasStarted else { return }
+        controller.startUpdater()
+        hasStarted = true
+    }
+
     func checkForUpdates(_ sender: Any?) {
-        controller?.checkForUpdates(sender)
+        guard hasStarted, let controller else { return }
+        guard Self.isPreviewDistribution,
+              let appcastURL = Self.appcastURL
+        else {
+            controller.checkForUpdates(sender)
+            return
+        }
+        guard !previewFeedPreflightInFlight else { return }
+
+        // A 404 at the canonical feed is an expected pre-release condition,
+        // not an actionable fault in the person's Mac. Let Sparkle handle all
+        // other responses (including malformed or unsigned feeds), where its
+        // built-in validation and remediation remain the source of truth.
+        previewFeedPreflightInFlight = true
+        var request = URLRequest(url: appcastURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 5
+        request.httpMethod = "HEAD"
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.previewFeedPreflightInFlight = false
+                if (response as? HTTPURLResponse)?.statusCode == 404 {
+                    self.showPreviewFeedNotPublished()
+                    return
+                }
+                controller.checkForUpdates(sender)
+            }
+        }.resume()
+    }
+
+    private func showPreviewFeedNotPublished() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = TiboTattleLocalization.string(
+            .settingsPreviewUpdatesPendingTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .settingsPreviewUpdatesPendingMessage
+        )
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     func setAutomaticUpdatesEnabled(_ enabled: Bool) {
@@ -127,6 +222,8 @@ private final class AppUpdater {
     var automaticUpdatesEnabled: Bool {
         false
     }
+
+    func startAfterFirstRunDisclosure() {}
 
     func checkForUpdates(_ sender: Any?) {}
 
@@ -1020,6 +1117,8 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
     private var allowedPort: Int?
+    private var pendingDashboardURL: URL?
+    private var viewportPreparationAttempts = 0
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
     private var hasDashboardTarget = false
@@ -1042,15 +1141,35 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         // token is already memory-only by design; a non-persistent store keeps
         // loopback cookies and local storage off disk as well.
         configuration.websiteDataStore = .nonPersistent()
+        // Give the embedded dashboard the same versioned localization
+        // contract as native AppKit. The dashboard can opt into this handoff
+        // when its resolver is ready; keeping the current page unchanged
+        // means the English-only foundation remains safe to ship today.
+        let localizationHandoff = Self.localizationHandoffScript()
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: localizationHandoff,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
         // The AppKit frame owns navigation and refresh in the installed app.
         // Install this fixed marker before any dashboard script runs so the
         // public-web header cannot flash, or remain visible if WebKit delays a
         // didFinish callback behind local dashboard work.
         let nativeShellMarker = """
-        document.documentElement.classList.add('native-dashboard');
-        document.addEventListener('DOMContentLoaded', function () {
-          if (document.body) document.body.classList.add('native-dashboard');
-        }, { once: true });
+        (function () {
+          function markNativeDashboard() {
+            if (document.documentElement) {
+              document.documentElement.classList.add('native-dashboard');
+            }
+            if (document.body) {
+              document.body.classList.add('native-dashboard');
+            }
+          }
+          markNativeDashboard();
+          document.addEventListener('DOMContentLoaded', markNativeDashboard, { once: true });
+        })();
         """
         configuration.userContentController.addUserScript(
             WKUserScript(
@@ -1068,6 +1187,22 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         webView.translatesAutoresizingMaskIntoConstraints = false
     }
 
+    private static func localizationHandoffScript() -> String {
+        let payload: [String: Any] = [
+            "schemaVersion": "tibotattle-localization-v1",
+            "table": TiboTattleLocalization.tableName,
+            "fallbackLocale": TiboTattleLocalization.fallbackLocalization,
+            "preferredLanguages": Locale.preferredLanguages,
+            "resourceRoot": "./localization"
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "window.__TIBOTATTLE_LOCALIZATION__ = null;"
+        }
+        return "window.__TIBOTATTLE_LOCALIZATION__ = \(json);"
+    }
+
     func load(_ url: URL) {
         guard url.scheme?.lowercased() == "http",
               url.host == loopbackHost,
@@ -1078,6 +1213,35 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         }
         allowedPort = port
         hasDashboardTarget = true
+        pendingDashboardURL = url
+        viewportPreparationAttempts = 0
+        loadWhenViewportIsReady()
+    }
+
+    /// WKWebView can commit a document before AppKit has given its split pane a
+    /// usable size. On a cold launch that produces a loaded, but white,
+    /// dashboard until the user manually resizes the window. Defer the first
+    /// request for a few main-loop passes until the embedded viewport exists.
+    private func loadWhenViewportIsReady() {
+        guard hasDashboardTarget, let url = pendingDashboardURL else { return }
+        webView.superview?.layoutSubtreeIfNeeded()
+        webView.layoutSubtreeIfNeeded()
+        let viewport = webView.bounds.integral
+        guard viewport.width >= 120, viewport.height >= 120 else {
+            guard viewportPreparationAttempts < 20 else {
+                pendingDashboardURL = nil
+                hasDashboardTarget = false
+                onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                return
+            }
+            viewportPreparationAttempts += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+                [weak self] in
+                self?.loadWhenViewportIsReady()
+            }
+            return
+        }
+        pendingDashboardURL = nil
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         webView.load(request)
@@ -1086,6 +1250,8 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     func stop() {
         allowedPort = nil
         hasDashboardTarget = false
+        pendingDashboardURL = nil
+        viewportPreparationAttempts = 0
         webView.stopLoading()
         webView.loadHTMLString("", baseURL: nil)
     }
@@ -1152,8 +1318,19 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         // The local page keeps its public-web navigation when opened in a
         // browser. In the app, AppKit owns navigation and status so the
         // document can concentrate on the current page.
-        webView.evaluateJavaScript("document.body.classList.add('native-dashboard')")
-        onLoaded()
+        webView.evaluateJavaScript("""
+        document.body && document.body.classList.add('native-dashboard');
+        (document.querySelector('#main')?.innerText || '').trim().length;
+        """) { [weak self] value, error in
+            guard let self, self.hasDashboardTarget else { return }
+            let textLength = (value as? NSNumber)?.intValue ?? 0
+            guard error == nil, textLength >= 32 else {
+                self.hasDashboardTarget = false
+                self.onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                return
+            }
+            self.onLoaded()
+        }
     }
 
     func webView(
@@ -1360,6 +1537,54 @@ private enum NativeDashboardDestination: String, CaseIterable {
     }
 }
 
+/// `NSSplitView` owns the frame of each arranged pane.  A WKWebView is not a
+/// reliable arranged child itself: on a live first launch, Auto Layout can
+/// retain the zero frame it had before the split view received a window.  This
+/// pane makes the ownership explicit and gives WebKit its final frame during
+/// every AppKit layout pass.
+@MainActor
+private final class NativeDashboardReportPane: NSView {
+    private let webView: WKWebView
+
+    init(webView: WKWebView) {
+        self.webView = webView
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = true
+        webView.translatesAutoresizingMaskIntoConstraints = true
+        webView.autoresizingMask = [.width, .height]
+        fitWebViewToBounds()
+        addSubview(webView)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        fitWebViewToBounds()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        fitWebViewToBounds()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        fitWebViewToBounds()
+    }
+
+    @discardableResult
+    func fitWebViewToBounds() -> Bool {
+        let frame = bounds.integral
+        guard frame.width > 0, frame.height > 0 else { return false }
+        webView.frame = frame
+        webView.setNeedsDisplay(frame)
+        return true
+    }
+}
+
 /// The native frame for the loopback dashboard.  WebKit remains responsible
 /// for the rich charts and accessible, selectable report content; AppKit owns
 /// the navigation, lifecycle status, and refresh control that should feel like
@@ -1376,12 +1601,14 @@ private final class NativeDashboardChrome: NSView {
         target: nil,
         action: nil
     )
+    private let reportPane: NativeDashboardReportPane
     private var pageButtons: [NativeDashboardDestination: NSButton] = [:]
 
     var onNavigate: ((NativeDashboardDestination) -> Void)?
     var onRefresh: (() -> Void)?
 
     init(webView: WKWebView) {
+        reportPane = NativeDashboardReportPane(webView: webView)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
@@ -1458,12 +1685,16 @@ private final class NativeDashboardChrome: NSView {
         }
         sidebar.addSubview(pageStack)
 
+        // Keep WebKit inside a pane that follows NSSplitView's frame directly.
+        // This is intentionally not an Auto Layout relationship: AppKit
+        // resizes split panes by changing their frames, and this pane mirrors
+        // that frame to WebKit synchronously in `layout()`.
         let split = NSSplitView()
         split.isVertical = true
         split.dividerStyle = .thin
         split.translatesAutoresizingMaskIntoConstraints = false
         split.addArrangedSubview(sidebar)
-        split.addArrangedSubview(webView)
+        split.addArrangedSubview(reportPane)
         split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
         split.setPosition(216, ofDividerAt: 0)
 
@@ -1528,6 +1759,14 @@ private final class NativeDashboardChrome: NSView {
         refreshButton.isEnabled = refreshEnabled && !isRefreshing
     }
 
+    @discardableResult
+    func prepareReportViewport() -> Bool {
+        window?.contentView?.layoutSubtreeIfNeeded()
+        layoutSubtreeIfNeeded()
+        reportPane.layoutSubtreeIfNeeded()
+        return reportPane.fitWebViewToBounds()
+    }
+
     private func configureBadge(_ button: NSButton, symbol: String) {
         button.isBordered = false
         button.bezelStyle = .recessed
@@ -1580,6 +1819,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var settingsWindow: NSWindow?
     private var settingsTabs: NSTabViewController?
     private weak var settingsCodexHomeLabel: NSTextField?
+    private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
+    private weak var settingsAutomaticUpdatesDetailLabel: NSTextField?
+    private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var nativeDashboardChrome: NativeDashboardChrome?
     private var nativeRefreshPoll: DispatchWorkItem?
@@ -1619,11 +1861,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         title: "Codex Folder…",
         target: self,
         action: #selector(showCodexHomeOptions)
-    )
-    private lazy var lifecycleHelpButton = NSButton(
-        title: "Version & Updates…",
-        target: self,
-        action: #selector(showLifecycleHelp)
     )
     private lazy var openInBrowserButton = NSButton(
         title: "Open in Browser",
@@ -1676,6 +1913,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 try markFirstRunCompleted(stateRoot: stateRoot)
             }
             firstRunAcknowledged = true
+            // Sparkle is intentionally started only after the first-run
+            // disclosure has been accepted, including for releases that
+            // default to automatic download/install-on-quit.
+            updater.startAfterFirstRunDisclosure()
         } catch {
             let launcherError = error as? LauncherError
             retryAllowed = ![
@@ -1700,6 +1941,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         Stores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only \(BundledProduct.displayName) app-data folder.
 
         Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
+
+        Signed app updates are checked automatically. By default, a verified
+        update downloads in the background and installs when you quit; you can
+        turn that off in Settings → General.
 
         Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
 
@@ -1808,7 +2053,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             settingsButton,
             diagnosticsButton,
             codexHomeButton,
-            lifecycleHelpButton,
             quitButton,
         ] {
             button.bezelStyle = NSButton.BezelStyle.rounded
@@ -1969,6 +2213,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         dashboardContainer.isHidden = false
         statusStack.isHidden = true
         actionRow.isHidden = true
+        // Force the split pane through an AppKit layout pass before the first
+        // local request. Without this, WebKit can load at a zero-sized viewport
+        // and remain blank until the user resizes the window.
+        window?.contentView?.layoutSubtreeIfNeeded()
+        dashboardContainer.layoutSubtreeIfNeeded()
+        _ = nativeDashboardChrome?.prepareReportViewport()
         host.load(url)
     }
 
@@ -2135,14 +2385,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: BundledProduct.displayName)
         let about = NSMenuItem(
-            title: "About \(BundledProduct.displayName)",
+            title: TiboTattleLocalization.format(
+                .menuAboutProduct,
+                BundledProduct.displayName
+            ),
             action: #selector(showAbout),
             keyEquivalent: ""
         )
         about.target = self
         appMenu.addItem(about)
         let settings = NSMenuItem(
-            title: "Settings…",
+            title: TiboTattleLocalization.string(.menuSettings),
             action: #selector(showSettingsWindow),
             keyEquivalent: ","
         )
@@ -2150,7 +2403,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         appMenu.addItem(settings)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
-            title: "Quit \(BundledProduct.displayName)",
+            title: TiboTattleLocalization.format(
+                .menuQuitProduct,
+                BundledProduct.displayName
+            ),
             action: #selector(quitApplication),
             keyEquivalent: "q"
         )
@@ -2160,15 +2416,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         mainMenu.addItem(appItem)
 
         let editItem = NSMenuItem()
-        let editMenu = NSMenu(title: "Edit")
+        let editMenu = NSMenu(title: TiboTattleLocalization.string(.menuEdit))
         let selectAll = NSMenuItem(
-            title: "Select All",
+            title: TiboTattleLocalization.string(.menuSelectAll),
             action: Selector(("selectAll:")),
             keyEquivalent: "a"
         )
         selectAll.target = nil
         let copy = NSMenuItem(
-            title: "Copy",
+            title: TiboTattleLocalization.string(.menuCopy),
             action: Selector(("copy:")),
             keyEquivalent: "c"
         )
@@ -2498,6 +2754,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         settingsCodexHomeLabel?.stringValue = codexHomeSettingsSummary()
     }
 
+    private func automaticUpdatesSettingsSummary() -> String {
+        guard updater.isAvailable else {
+            return TiboTattleLocalization.string(
+                .settingsAutomaticUpdatesUnavailable
+            )
+        }
+        if AppUpdater.isPreviewDistribution {
+            return TiboTattleLocalization.string(
+                .settingsPreviewUpdatesPending
+            )
+        }
+        return updater.automaticUpdatesEnabled
+            ? TiboTattleLocalization.string(.settingsAutomaticUpdatesOn)
+            : TiboTattleLocalization.string(.settingsAutomaticUpdatesOff)
+    }
+
+    private func updateAutomaticUpdatesSettingsControl() {
+        settingsAutomaticUpdatesSwitch?.isEnabled = updater.allowsAutomaticUpdateOptIn
+        settingsAutomaticUpdatesSwitch?.state = updater.automaticUpdatesEnabled
+            ? .on
+            : .off
+        settingsAutomaticUpdatesDetailLabel?.stringValue =
+            automaticUpdatesSettingsSummary()
+        settingsAboutAutomaticUpdatesDetailLabel?.stringValue =
+            automaticUpdatesSettingsSummary()
+    }
+
     @objc private func showSettingsWindow() {
         showSettings(selecting: 0)
     }
@@ -2510,6 +2793,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if let settingsWindow, let settingsTabs {
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
+            updateAutomaticUpdatesSettingsControl()
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -2522,27 +2806,52 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         )
         settingsCodexHomeLabel = sourceStatus
         let chooseSource = NSButton(
-            title: "Choose Codex Folder…",
+            title: TiboTattleLocalization.string(.settingsChooseCodexFolder),
             target: self,
             action: #selector(showCodexHomeOptions)
         )
         let useDefaultSource = NSButton(
-            title: "Use Default",
+            title: TiboTattleLocalization.string(.settingsUseDefault),
             target: self,
             action: #selector(useDefaultCodexHome)
         )
         let sourceActions = NSStackView(views: [chooseSource, useDefaultSource])
         sourceActions.orientation = .horizontal
         sourceActions.spacing = 8
+        let languageLabel = settingsLabel(
+            TiboTattleLocalization.string(.settingsLanguage),
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor
+        )
+        let languageValue = settingsLabel(
+            TiboTattleLocalization.string(.settingsLanguageSystem),
+            font: .systemFont(ofSize: 13, weight: .medium),
+            color: .secondaryLabelColor
+        )
+        let languageRow = NSStackView(views: [languageLabel, languageValue])
+        languageRow.orientation = .horizontal
+        languageRow.alignment = .firstBaseline
+        languageRow.spacing = 12
+        let languageSection = NSStackView(views: [
+            languageRow,
+            settingsLabel(
+                TiboTattleLocalization.string(.settingsLanguageSummary),
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            ),
+        ])
+        languageSection.orientation = .vertical
+        languageSection.alignment = .leading
+        languageSection.spacing = 6
         let sourceSection = NSStackView(views: [
             settingsLabel(
-                "Codex folder",
+                TiboTattleLocalization.string(.settingsCodexFolder),
                 font: .systemFont(ofSize: 14, weight: .semibold),
                 color: .labelColor
             ),
             sourceStatus,
             settingsLabel(
-                "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else.",
+                TiboTattleLocalization.string(.settingsCodexFolderSummary),
                 font: .systemFont(ofSize: 12),
                 color: .secondaryLabelColor
             ),
@@ -2552,14 +2861,53 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         sourceSection.alignment = .leading
         sourceSection.spacing = 7
         let openDashboardFromSettings = NSButton(
-            title: "Open Dashboard",
+            title: TiboTattleLocalization.string(.settingsOpenDashboard),
             target: self,
             action: #selector(openDashboard)
         )
+        let automaticUpdatesSwitch = NSSwitch()
+        automaticUpdatesSwitch.state = updater.automaticUpdatesEnabled
+            ? .on
+            : .off
+        automaticUpdatesSwitch.isEnabled = updater.allowsAutomaticUpdateOptIn
+        automaticUpdatesSwitch.target = self
+        automaticUpdatesSwitch.action = #selector(toggleAutomaticUpdates(_:))
+        automaticUpdatesSwitch.toolTip =
+            TiboTattleLocalization.string(.settingsAutomaticUpdatesTooltip)
+        settingsAutomaticUpdatesSwitch = automaticUpdatesSwitch
+        let automaticUpdatesDetail = settingsLabel(
+            automaticUpdatesSettingsSummary(),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        settingsAutomaticUpdatesDetailLabel = automaticUpdatesDetail
+        let automaticUpdatesHeading = settingsLabel(
+            TiboTattleLocalization.string(.settingsAutomaticUpdates),
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor
+        )
+        let automaticUpdatesHeader = NSStackView(
+            views: [automaticUpdatesHeading, automaticUpdatesSwitch]
+        )
+        automaticUpdatesHeader.orientation = .horizontal
+        automaticUpdatesHeader.alignment = .centerY
+        automaticUpdatesHeader.spacing = 12
+        let automaticUpdatesSection = NSStackView(views: [
+            automaticUpdatesHeader,
+            automaticUpdatesDetail,
+        ])
+        automaticUpdatesSection.orientation = .vertical
+        automaticUpdatesSection.alignment = .leading
+        automaticUpdatesSection.spacing = 6
         let general = settingsPage(
-            title: "General",
-            summary: "TiboTattle refreshes local usage while it is open. It does not install a login item, LaunchAgent, or daemon; raw logs never leave this Mac.",
-            views: [sourceSection, openDashboardFromSettings]
+            title: TiboTattleLocalization.string(.settingsGeneral),
+            summary: TiboTattleLocalization.string(.settingsGeneralSummary),
+            views: [
+                languageSection,
+                sourceSection,
+                automaticUpdatesSection,
+                openDashboardFromSettings,
+            ]
         )
 
         let version = Bundle.main.object(
@@ -2568,47 +2916,84 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let build = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleVersion"
         ) as? String ?? "unknown"
-        let updateMessage = updater.isAvailable
-            ? "Signed updates are available for this release."
-            : "This development copy does not check for updates. A signed release installs in Applications."
+        let appIcon = NSImageView(image: NSApp.applicationIconImage)
+        appIcon.imageScaling = .scaleProportionallyUpOrDown
+        appIcon.setContentHuggingPriority(.required, for: .horizontal)
+        appIcon.setContentHuggingPriority(.required, for: .vertical)
+        NSLayoutConstraint.activate([
+            appIcon.widthAnchor.constraint(equalToConstant: 64),
+            appIcon.heightAnchor.constraint(equalToConstant: 64),
+        ])
+        let aboutBrandCopy = NSStackView(views: [
+            settingsLabel(
+                BundledProduct.displayName,
+                font: .systemFont(ofSize: 18, weight: .semibold),
+                color: .labelColor
+            ),
+            settingsLabel(
+                TiboTattleLocalization.format(.settingsVersion, version, build),
+                font: .systemFont(ofSize: 13),
+                color: .secondaryLabelColor
+            ),
+        ])
+        aboutBrandCopy.orientation = .vertical
+        aboutBrandCopy.alignment = .leading
+        aboutBrandCopy.spacing = 4
+        let aboutBranding = NSStackView(views: [appIcon, aboutBrandCopy])
+        aboutBranding.orientation = .horizontal
+        aboutBranding.alignment = .centerY
+        aboutBranding.spacing = 12
         let projectLinks = NSStackView(views: [
             externalLinkButton(
-                title: "TiboTattle website",
-                address: "https://tibotattle.com"
+                title: TiboTattleLocalization.string(.settingsWebsite),
+                address: BundledProduct.publicWebsiteOrigin
             ),
             externalLinkButton(
-                title: "GitHub",
+                title: TiboTattleLocalization.string(.settingsGitHub),
                 address: "https://github.com/adamallcock"
             ),
             externalLinkButton(
-                title: "X / Twitter",
+                title: TiboTattleLocalization.string(.settingsX),
                 address: "https://x.com/adamallcock"
             ),
         ])
         projectLinks.orientation = .horizontal
         projectLinks.spacing = 8
+        let checkForUpdates = NSButton(
+            title: TiboTattleLocalization.string(.settingsCheckForUpdates),
+            target: self,
+            action: #selector(checkForUpdates)
+        )
+        checkForUpdates.isEnabled = updater.isAvailable
+        let aboutAutomaticUpdatesDetail = settingsLabel(
+            automaticUpdatesSettingsSummary(),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        settingsAboutAutomaticUpdatesDetailLabel = aboutAutomaticUpdatesDetail
         let about = settingsPage(
-            title: "About TiboTattle",
-            summary: "TiboTattle \(version) (\(build))\n\n\(updateMessage)",
+            title: TiboTattleLocalization.format(
+                .settingsAboutProduct,
+                BundledProduct.displayName
+            ),
+            summary: TiboTattleLocalization.string(.settingsAboutSummary),
             views: [
+                aboutBranding,
+                aboutAutomaticUpdatesDetail,
+                checkForUpdates,
                 projectLinks,
-                NSButton(
-                    title: "Version & Updates…",
-                    target: self,
-                    action: #selector(showLifecycleHelp)
-                ),
             ]
         )
 
         for controller in [general, about] {
-            controller.title = "TiboTattle Settings"
+            controller.title = TiboTattleLocalization.string(.settingsWindowTitle)
         }
 
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
         for (label, symbol, controller) in [
-            ("General", "gearshape", general),
-            ("About", "info.circle", about),
+            (TiboTattleLocalization.string(.settingsGeneral), "gearshape", general),
+            (TiboTattleLocalization.string(.settingsAboutTab), "info.circle", about),
         ] {
             let item = NSTabViewItem(identifier: label)
             item.label = label
@@ -2621,7 +3006,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         tabs.selectedTabViewItemIndex = index
         let newWindow = NSWindow(contentViewController: tabs)
-        newWindow.title = "TiboTattle Settings"
+        newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
         newWindow.setContentSize(NSSize(width: 620, height: 390))
         newWindow.contentMinSize = NSSize(width: 560, height: 350)
@@ -2689,106 +3074,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
     }
 
-    @objc private func showLifecycleHelp() {
-        let version =
-            Bundle.main.object(
-                forInfoDictionaryKey: "CFBundleShortVersionString"
-            ) as? String
-            ?? "unknown"
-        let build =
-            Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
-                as? String
-            ?? "unknown"
-        let updateSummary: String
-        if updater.isAvailable {
-            let automaticStatus = updater.automaticUpdatesEnabled
-                ? "Automatic signed update download and install-on-quit are enabled because you opted in."
-                : "Automatic download and install-on-quit are off. You can opt in from Automatic Updates."
-            updateSummary =
-                "Signed automatic checks are enabled. \(automaticStatus) Check for Updates is always available here."
-        } else {
-            updateSummary =
-                "This development build contains no updater framework and performs no update networking."
-        }
-        let instructions = """
-        \(BundledProduct.displayName) \(version) (\(build))
-
-        Release notes: local personal analysis with optional pseudonymous community contribution.
-
-        Update: \(updateSummary)
-
-        Uninstall:
-        Quit \(BundledProduct.displayName) and move \(BundledProduct.bundleName) to Trash. Local app-data cleanup remains available under Data & Diagnostics for troubleshooting.
-
-        \(BundledProduct.monitoredAppDisplayName) logs are never removed by these steps.
-        """
-        let alert = NSAlert()
-        alert.messageText = "Version, updates, and uninstall"
-        alert.informativeText = instructions
-        var actions = ["done"]
-        alert.addButton(withTitle: "Done")
-        if updater.isAvailable {
-            alert.addButton(withTitle: "Check for Updates")
-            actions.append("check")
-            if updater.allowsAutomaticUpdateOptIn {
-                alert.addButton(withTitle: "Automatic Updates…")
-                actions.append("automatic")
-            }
-        }
-        alert.addButton(withTitle: "Copy Details")
-        actions.append("copy")
-        let response = alert.runModal()
-        let actionIndex =
-            response.rawValue
-            - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-        guard actions.indices.contains(actionIndex) else {
-            return
-        }
-        switch actions[actionIndex] {
-        case "check":
-            updater.checkForUpdates(lifecycleHelpButton)
-        case "automatic":
-            showAutomaticUpdateOptions()
-        case "copy":
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(instructions, forType: .string)
-            statusLabel.stringValue = "Version details copied"
-            detailLabel.stringValue =
-                "The copy contains product lifecycle details only—no local paths, identifiers, or Codex content."
-        default:
-            break
-        }
+    @objc private func checkForUpdates(_ sender: Any?) {
+        updater.checkForUpdates(sender)
     }
 
-    private func showAutomaticUpdateOptions() {
+    @objc private func toggleAutomaticUpdates(_ sender: NSSwitch) {
         guard updater.isAvailable,
               updater.allowsAutomaticUpdateOptIn
         else {
+            updateAutomaticUpdatesSettingsControl()
             return
         }
-        let currentlyEnabled = updater.automaticUpdatesEnabled
-        let alert = NSAlert()
-        alert.messageText = "Automatic updates"
-        alert.informativeText = currentlyEnabled
-            ? "Automatic signed update download and install-on-quit are on. Turn them off to return to visible update prompts and Check for Updates."
-            : "Automatic updates are off. If you turn them on, Sparkle may download signed updates in the background and install them when you quit the app. You can turn this off here later."
-        alert.addButton(
-            withTitle: currentlyEnabled
-                ? "Turn Off Automatic Updates"
-                : "Turn On Automatic Updates"
-        )
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            return
-        }
-        updater.setAutomaticUpdatesEnabled(!currentlyEnabled)
-        let enabled = updater.automaticUpdatesEnabled
-        statusLabel.stringValue =
-            enabled ? "Automatic updates enabled" : "Automatic updates disabled"
-        detailLabel.stringValue = enabled
-            ? "Sparkle may now download signed updates in the background and install them when you quit."
-            : "Updates remain available through visible prompts and Check for Updates."
+        updater.setAutomaticUpdatesEnabled(sender.state == .on)
+        updateAutomaticUpdatesSettingsControl()
     }
 
     private func showDataManagement() {
@@ -3676,6 +3974,98 @@ private enum LifecycleContractSmokeTest {
     }
 }
 
+/// Exercises the real AppKit status item without starting the local companion
+/// or reading any local evidence. This catches the class of regression where a
+/// custom menu view has no measured frame and leaves an apparently empty menu
+/// header in an installed build.
+@MainActor
+private enum MenuBarContractSmokeTest {
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let controller = MenuBarStatusController(
+            productName: BundledProduct.displayName,
+            actions: MenuBarStatusController.Actions(
+                openTiboTattle: {},
+                showSettings: {},
+                showAbout: {},
+                quit: {}
+            )
+        )
+        let starting = controller.nativePresentationContract()
+        controller.companionUnavailable(
+            summary: "The local companion is unavailable for this smoke test."
+        )
+        let unavailable = controller.nativePresentationContract()
+        controller.shutDown()
+        guard starting.informationRowsAreNative,
+              starting.informationRowsHaveTitles,
+              unavailable.informationRowsAreNative,
+              unavailable.unavailableRowHasTitle,
+              starting.analyzeShortcut == "r",
+              starting.settingsShortcut == ",",
+              starting.quitShortcut == "q",
+              starting.usesNativeStatusItemMenu,
+              starting.escapeDismissalMonitorInstalled,
+              starting.sameAppClickAwayMonitorInstalled,
+              starting.appDeactivationDismissalObserverInstalled
+        else {
+            FileHandle.standardError.write(
+                Data("macOS menu bar contract smoke failed\\n".utf8)
+            )
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT "
+                + "native_rows=true titles=true states=starting,unavailable "
+                + "shortcuts=cmd-r,cmd-comma,cmd-q "
+                + "dismissal=native,escape,same-app,deactivation"
+        )
+        return 0
+    }
+}
+
+/// Lays out the installed AppKit dashboard frame without starting a companion
+/// or loading a page. This catches a native split-view regression where the
+/// loopback server is healthy but WebKit receives no usable display frame.
+@MainActor
+private enum NativeDashboardLayoutSmokeTest {
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let host = DashboardWebHost(
+            onLoaded: {},
+            onFailure: { _ in },
+            onDownloadFailure: {},
+            openExternally: { _ in },
+            onNavigation: { _ in }
+        )
+        let chrome = NativeDashboardChrome(webView: host.webView)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1_180, height: 860),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = chrome
+        window.displayIfNeeded()
+        chrome.layoutSubtreeIfNeeded()
+        let webFrame = host.webView.frame
+        guard webFrame.width >= 600, webFrame.height >= 600 else {
+            FileHandle.standardError.write(
+                Data("macOS native dashboard layout smoke failed\\n".utf8)
+            )
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT "
+                + "web_width=\(Int(webFrame.width)) "
+                + "web_height=\(Int(webFrame.height))"
+        )
+        return 0
+    }
+}
+
 @main
 private struct UsageMonitorMain {
     static func main() {
@@ -3730,6 +4120,16 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--first-run-contract-smoke-test") {
             exit(LifecycleContractSmokeTest.firstRunContract())
+        }
+        if arguments.contains("--menu-bar-contract-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.run()
+            })
+        }
+        if arguments.contains("--native-dashboard-layout-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                NativeDashboardLayoutSmokeTest.run()
+            })
         }
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)

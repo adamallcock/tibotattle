@@ -390,7 +390,7 @@ export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   sha256: APP_PRICE_REGISTRY_SHA256,
   observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
   priceBasis: "official_api_price_not_subscription_allowance",
-  historicalDefault: "current_price_sensitivity_unless_vendor_effective_window_is_proven",
+  historicalDefault: "event_time_when_official_effective_window_matches",
   sources: Object.values(SOURCE_DEFINITIONS).map((definition) => ({
     provider: definition.provider,
     url: definition.url,

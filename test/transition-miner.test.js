@@ -181,6 +181,8 @@ test("transition miner collapses repeated snapshots and retains skipped and regr
     assert.equal(dataset.transitions[0].lastPriorObservedAt, "2026-07-23T00:00:02.000Z");
     assert.equal(dataset.transitions[0].marginalApiPricedUsd, 10);
     assert.equal(dataset.transitions[0].marginalComponents.input_uncached_tokens, 10);
+    assert.match(dataset.pricing.eventTimeHistoricalTotalUsdExact, /^\d+(?:\.\d+)?$/u);
+    assert.equal(dataset.pricing.currentPriceSensitivityTotalUsdExact, null);
     assert.equal(dataset.pricing.serviceTier.observed, null);
     assert.equal(dataset.pricing.serviceTier.apiPriceAssumption, "standard");
     assert.equal(dataset.pricing.longContext.observedFrom, "per_event_total_input_tokens");

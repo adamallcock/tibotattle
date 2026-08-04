@@ -226,9 +226,33 @@ body.native-dashboard #cancel-refresh { display: none; }
   font-size: .68rem;
   font-weight: 800;
   line-height: 1;
-  cursor: help;
+  cursor: pointer;
 }
-.info-button:hover, .info-button:focus-visible { color: var(--blue); }
+.info-button:hover, .info-button:focus-visible, .info-button[aria-expanded="true"] {
+  color: var(--blue);
+}
+.info-button:focus-visible {
+  outline: 3px solid rgba(49, 95, 132, .35);
+  outline-offset: 3px;
+}
+.info-popover {
+  position: fixed;
+  z-index: 40;
+  width: min(19rem, calc(100vw - 2rem));
+  padding: .7rem .8rem;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  background: var(--white);
+  box-shadow: 0 14px 30px rgba(31, 45, 39, .18);
+  font-family: var(--sans);
+  font-size: .76rem;
+  font-weight: 600;
+  letter-spacing: normal;
+  line-height: 1.45;
+  text-align: left;
+  text-transform: none;
+}
 
 main, footer { width: min(1240px, calc(100% - 48px)); margin-inline: auto; }
 .page-heading {
@@ -1017,6 +1041,16 @@ tbody tr:last-child td { border-bottom: 0; }
 .accounting-summary { grid-template-columns: repeat(4, 1fr); }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }
+.accounting-component-grid { margin-bottom: 18px; }
+.accounting-models-panel table { table-layout: fixed; }
+.accounting-models-panel th:first-child,
+.accounting-models-panel td:first-child {
+  width: 36%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.accounting-models-panel th:not(:first-child),
+.accounting-models-panel td:not(:first-child) { text-align: right; }
 .accounting-bars { display: grid; gap: 10px; }
 .accounting-dimensions {
   display: grid;
@@ -1461,6 +1495,56 @@ h2 { font-size: clamp(2rem, 3.8vw, 3.25rem); }
   font-size: .7rem;
 }
 
+/* Public landing hierarchy. Keep the community surface intentionally small;
+   the broader rules above remain shared with the loopback dashboard. */
+.community-site .community-hero {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  padding-bottom: 28px;
+}
+.community-site .topbar { column-gap: 12px; }
+.community-site .community-hero .lede { max-width: 760px; }
+.community-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 24px;
+}
+.community-site .community-section {
+  padding-top: 20px;
+  border-top: 0;
+}
+.community-site .community-section > .lede {
+  max-width: 850px;
+  margin-bottom: 24px;
+}
+.community-site .community-result-panel { background: rgba(255, 254, 249, .86); }
+.community-site .community-download { margin-top: 18px; }
+.community-site .community-trust-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.community-site .community-trust-grid .panel { height: 100%; }
+.community-site .community-trust-grid .panel h3 { margin-bottom: 10px; }
+.community-site .community-trust-grid .panel p:last-child {
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: .8rem;
+}
+.community-faq-list { display: grid; gap: 12px; }
+.community-faq-item { margin-top: 0; }
+.community-faq-item > summary { padding: 17px 20px; }
+.community-faq-item > summary strong {
+  margin-top: 0;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: .82rem;
+  font-weight: 750;
+}
+.community-faq-answer { padding: 0 20px 17px; }
+.community-faq-answer p { margin: 0; color: var(--muted); font-size: .78rem; }
+
 footer {
   display: flex;
   justify-content: space-between;
@@ -1518,6 +1602,8 @@ footer {
   }
   #cancel-refresh.button.compact { display: inline-flex; }
   .page-heading { padding-top: 38px; }
+  .community-site .community-trust-grid { grid-template-columns: 1fr; }
+  .community-hero-actions .button { flex: 1 1 12rem; }
   .freshness-card { min-width: 0; }
   .dashboard-section { padding: 44px 0; }
   .metric-grid, .two-column, .privacy-lists, .result-metrics, .coverage-counts, .pricing-basis-grid, .backend-facts, .history-facts, .snapshot-quality-grid { grid-template-columns: 1fr; }

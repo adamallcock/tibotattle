@@ -372,7 +372,7 @@
 
         <aside class="weekly-pricing-receipt" id="weekly-pricing-receipt" aria-live="polite">
           <div>
-            <p class="panel-kicker">Price basis used for every fit</p>
+            <p class="panel-kicker">Price basis for the visible fits</p>
             <h3 id="weekly-pricing-receipt-title">Price table not yet loaded</h3>
           </div>
           <p id="weekly-pricing-receipt-copy">
@@ -440,7 +440,7 @@
           <div class="chart-heading">
             <div>
               <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
-              <p id="usage-timeline-copy">Replay-safe local increments · browser-local time · current API prices</p>
+              <p id="usage-timeline-copy">Replay-safe local increments · browser-local time · event-time historical API cards</p>
             </div>
             <div class="chart-control-stack">
               <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping">
@@ -585,27 +585,42 @@
           </div>
         </div>
         <div class="metric-grid accounting-summary" id="accounting-summary"></div>
-        <div class="two-column">
+        <div class="two-column accounting-component-grid">
           <article class="panel">
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Token components</p>
-                <h3>Non-overlapping token components</h3>
+                <h3>Token count</h3>
               </div>
             </div>
             <p class="annotation">
-              Output text excludes reasoning tokens. Combined output is used only
-              when a source does not provide that split, and is never added again.
+              Every measured token belongs to one non-overlapping component.
+              Output text excludes reasoning tokens; combined output is only used
+              when a source does not provide that split.
             </p>
-            <div class="accounting-bars" id="accounting-components"></div>
+            <div class="accounting-bars" id="accounting-component-counts"></div>
           </article>
           <article class="panel">
             <div class="panel-heading">
               <div>
-                <p class="panel-kicker">Models</p>
-                <h3>Recognized and unknown model usage</h3>
+                <p class="panel-kicker">Cost contribution</p>
+                <h3>API-equivalent cost</h3>
               </div>
             </div>
+            <p class="annotation">
+              Standard-rate API equivalent by component. Tokens with no mapped
+              price remain visible in the count, but do not add a guessed cost.
+            </p>
+            <div class="accounting-bars" id="accounting-component-costs"></div>
+          </article>
+        </div>
+        <article class="panel accounting-models-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Models</p>
+              <h3>Recognized and unknown model usage</h3>
+            </div>
+          </div>
             <div class="table-wrap">
               <table>
                 <caption class="sr-only">Replay-safe usage grouped by recognized model</caption>
@@ -617,8 +632,7 @@
               Any unrecognized model is kept as an explicit overflow row. Its
               tokens remain visible, but no price is invented.
             </p>
-          </article>
-        </div>
+        </article>
       </section>
 
       <section class="dashboard-section" id="coverage" aria-labelledby="coverage-title" data-dashboard-page="method" data-requires-evidence>
@@ -745,7 +759,7 @@
                 Check sign-in
               </button>
               <button class="button button-quiet" id="identity-signin-cancel" type="button">
-                Cancel
+                Cancel sign-in
               </button>
             </div>
             <p class="annotation" id="identity-google-unavailable" hidden>

@@ -745,16 +745,38 @@ test("local dashboard retains the pricing epoch required to explain allowance fi
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
     pricing: {
-      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+      eventTimeHistoricalTotalUsdExact: "12.345678",
+      currentPriceSensitivityTotalUsdExact: null,
       registryVersion: "app-official-api-prices-v0.2",
       registryObservedAt: "2026-08-01T13:47:00Z",
+      priceCardIds: ["pre-change", "post-change"],
+      priceCardBreakdown: [{ priceCardId: "pre-change", events: 1, costUsd: "2.5" }],
+      mixedPriceCardWindows: true,
     },
   });
   assert.equal(
     result.pricing.priceEpochBasis,
-    "current_price_sensitivity_at_registry_observation",
+    "event_time_when_registry_has_effective_evidence",
   );
+  assert.equal(result.pricing.eventTimeHistoricalTotalUsdExact, "12.345678");
+  assert.equal(result.pricing.currentPriceSensitivityTotalUsdExact, null);
   assert.equal(result.pricing.registryVersion, "app-official-api-prices-v0.2");
+  assert.deepEqual(result.pricing.priceCardIds, ["pre-change", "post-change"]);
+  assert.deepEqual(result.pricing.priceCardBreakdown, [
+    { priceCardId: "pre-change", events: 1, costUsd: "2.5" },
+  ]);
+  assert.equal(result.pricing.mixedPriceCardWindows, true);
+
+  const forgedCurrentTotal = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    pricing: {
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+      eventTimeHistoricalTotalUsdExact: "12.345678",
+      currentPriceSensitivityTotalUsdExact: "12.345678",
+    },
+  });
+  assert.equal(forgedCurrentTotal.pricing.currentPriceSensitivityTotalUsdExact, null);
 });
 
 test("missing numeric evidence stays missing instead of becoming zero", () => {
@@ -2479,6 +2501,11 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource.match(/async function beginHostedSignIn\([\s\S]*?\n\}/u)?.[0] ?? "";
   assert.match(pollBody, /HOSTED_SIGNIN_POLL_ATTEMPTS/u);
   assert.match(pollBody, /error\?\.code !== "IDENTITY_RESULT_PENDING"/u);
+  assert.match(pollBody, /if \(attempt\.returnedToApp\)/u);
+  assert.match(
+    pollBody,
+    /sign-in did not complete\. Nothing was uploaded\. You can try again\./u,
+  );
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
   assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
   assert.match(pollBody, /foregroundNativeDashboardAfterSignIn\(\)/u);
@@ -2508,6 +2535,7 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   // the server-side expiry.
   assert.match(appSource, /function checkHostedSignInNow\(\)/u);
   assert.match(appSource, /function cancelHostedSignIn\(\)/u);
+  assert.match(html, />\s*Cancel sign-in\s*</u);
   assert.match(appSource, /Nothing was uploaded\./u);
   assert.match(
     appSource,
@@ -2520,6 +2548,16 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(
     appSource,
     /\$\("#identity-signin-cancel"\)\.addEventListener\("click", cancelHostedSignIn\);/u,
+  );
+  const cancelBody =
+    appSource.match(/function cancelHostedSignIn\(\)\s*\{[\s\S]*?\n\}/u)?.[0] ?? "";
+  assert.match(cancelBody, /attempt\.cancelled = true;/u);
+  assert.match(cancelBody, /activeHostedSignIn = null;/u);
+  assert.match(cancelBody, /hostedIdentityBusy = false;/u);
+  assert.match(cancelBody, /renderHostedIdentity\(\);/u);
+  assert.match(
+    pollBody,
+    /IDENTITY_TOKEN_INVALID:\s*`\$\{flow\.label\} sign-in was cancelled or did not complete/u,
   );
 
   // Signing out is page-local: it forgets the memory-only identity and the
@@ -3022,6 +3060,12 @@ test("participant history keeps lifecycle and provenance bounded and private", a
       recordCounts: { declared: 3, accepted: 2, deduplicated: 1 },
       serverAccounting: {
         apiPriceEquivalentUsd: "0.0032",
+        priceBasis: "historical_api_prices",
+        priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+        eventTimeRange: {
+          startAt: "2026-07-25T12:05:00.000Z",
+          endAt: "2026-07-25T12:05:00.000Z"
+        },
         verification: "server_repriced",
         registrySha256: "private-projected-away"
       },
@@ -3041,6 +3085,15 @@ test("participant history keeps lifecycle and provenance bounded and private", a
   assert.equal(normalized.items[0].contributionId, contributionId);
   assert.equal(normalized.items[0].recordCounts.deduplicated, 1);
   assert.equal(normalized.items[0].serverAccounting.apiPriceEquivalentUsd, 0.0032);
+  assert.equal(normalized.items[0].serverAccounting.priceBasis, "historical_api_prices");
+  assert.equal(
+    normalized.items[0].serverAccounting.priceEpochBasis,
+    "event_time_when_registry_has_effective_evidence",
+  );
+  assert.deepEqual(normalized.items[0].serverAccounting.eventTimeRange, {
+    startAt: "2026-07-25T12:05:00.000Z",
+    endAt: "2026-07-25T12:05:00.000Z",
+  });
   assert.equal(normalized.items[0].quarantine.state, "retained");
   assert.deepEqual(normalized.contributionAdmission, {
     state: "available",
@@ -3173,7 +3226,12 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="timeline-chart"/);
   assert.match(html, /id="weekly-chart"/);
   assert.match(html, /id="accounting"/);
+  assert.match(html, /id="accounting-component-counts"/);
+  assert.match(html, /id="accounting-component-costs"/);
+  assert.match(html, /Cost contribution/);
   assert.match(html, /id="accounting-models"/);
+  assert.match(html, /class="panel accounting-models-panel"/);
+  assert.match(appSource, /function renderAccountingComponentBars/);
   assert.match(html, /Usage increments/);
   assert.match(html, /API pricing is a measuring stick, not your bill/);
   // The dashboard does not ask the user to supply a speed assumption; only
@@ -3443,7 +3501,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     html.indexOf('id="window-controls"') > html.indexOf("advanced-calibration"),
     "rolling window controls stay inside advanced calibration",
   );
-  assert.match(appSource, /row\.last_observed_at \?\? row\.first_observed_at/);
+  assert.match(appSource, /row\?\.last_observed_at \?\? row\?\.first_observed_at/);
   assert.match(appSource, /label: "Short observation"/);
   assert.match(appSource, /lookbackHours: activeContributionLookbackHours/);
   assert.match(styles, /interactive-chart/);
@@ -3493,12 +3551,14 @@ test("weekly view states the exact price epoch and whether the July repricing is
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
   assert.match(html, /id="weekly-pricing-receipt"/u);
-  assert.match(html, /Price basis used for every fit/u);
+  assert.match(html, /Price basis for the visible fits/u);
   assert.match(appSource, /function renderWeeklyPricingReceipt/u);
-  assert.match(appSource, /current_price_sensitivity_at_registry_observation/u);
-  assert.match(appSource, /Current official prices are applied to every fit/u);
-  assert.match(appSource, /lower GPT-5\.6 Terra and Luna prices effective July 30/u);
-  assert.match(appSource, /this is not a stale pre-change calculation/u);
+  assert.match(appSource, /event_time_when_registry_has_effective_evidence/u);
+  assert.match(appSource, /Historical event-time prices used for each fit/u);
+  assert.match(appSource, /mixed official card windows/u);
+  assert.match(appSource, /lower official GPT-5\.6 Terra\/Luna cards effective July 30 are being used/u);
+  assert.match(appSource, /earlier events keep their earlier cards/u);
+  assert.doesNotMatch(appSource, /Current official prices are applied to every fit/u);
   assert.match(appSource, /renderWeeklyPricingReceipt\(data\);/u);
   assert.match(styles, /\.weekly-pricing-receipt/u);
 });
@@ -3507,17 +3567,19 @@ test("weekly keeps every fit visible and marks short observations separately", a
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.doesNotMatch(html, /id="weekly-evidence-controls"/u);
+  assert.match(appSource, /const history = allowanceHistoryChartModel\(data\);/u);
+  assert.match(appSource, /const chartValues = history\.points;/u);
   assert.match(
     appSource,
-    /const chartValues = rangedValues;/u,
+    /wellObserved: isWellObservedWeeklyFit\(observedSpanPp\),/u,
   );
   assert.match(
     appSource,
-    /matureValue: isWellObservedWeeklyFit\(observedSpanPp\) \? value : null/u,
+    /markerRadius: \(point\) => point\.wellObserved \? 4 : 0,/u,
   );
   assert.match(
     appSource,
-    /provisionalValue: isWellObservedWeeklyFit\(observedSpanPp\) \? null : value/u,
+    /markerRadius: \(point\) => point\.wellObserved \? 0 : 4,/u,
   );
   assert.match(appSource, /weekly-partial-legend"\)\.hidden = !chartValues\.some/u);
   assert.doesNotMatch(appSource, /showWeeklyPartialDiagnostics/u);
@@ -3556,14 +3618,33 @@ test("weekly points carry measured ranges without mouse-only detail popovers", a
     appSource,
     /if \(errorBars\) values\.push\([\s\S]*?errorBars\.low[\s\S]*?errorBars\.high/u,
   );
-  const weeklyMatch = appSource.match(/function renderWeekly\(data\) \{([\s\S]*?)\n\}/u)?.[1] ?? "";
-  assert.match(weeklyMatch, /tooltip: false,/u);
-  assert.doesNotMatch(weeklyMatch, /focusable: true|weeklyPointDetail|markerOpacity|markerRadius/u);
+  const weeklyChart = appSource.match(
+    /function renderAllowanceHistoryChart\(history\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(weeklyChart, /tooltip: false,/u);
+  assert.doesNotMatch(weeklyChart, /focusable: true|weeklyPointDetail|markerOpacity/u);
   assert.match(appSource, /if \(item\.tooltip !== false \|\| item\.focusable === true\)/u);
   assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
   assert.match(html, /vertical bar shows the range supported/u);
   assert.doesNotMatch(html, /Per-week within-reset sensitivity|Scroll horizontally on a narrow screen/u);
+});
+
+test("metric information controls open an accessible popover instead of relying on title hover", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+  assert.match(appSource, /function openInformationPopover\(button\)/u);
+  assert.match(appSource, /popover\.setAttribute\("role", "tooltip"\)/u);
+  assert.match(appSource, /button\.setAttribute\("aria-expanded", "true"\)/u);
+  assert.match(appSource, /button\.setAttribute\("aria-describedby", id\)/u);
+  assert.match(appSource, /button\.addEventListener\("click", \(event\) => \{/u);
+  assert.match(appSource, /document\.addEventListener\("keydown", \(event\) => \{/u);
+  assert.match(appSource, /event\.key !== "Escape"/u);
+  assert.match(appSource, /document\.addEventListener\("click", \(event\) => \{/u);
+  assert.doesNotMatch(appSource, /button\.title = explanation/u);
+  assert.match(styles, /\.info-popover \{/u);
+  assert.match(styles, /\.info-button\[aria-expanded="true"\]/u);
 });
 
 test("calibration zoom moves in bounded granular steps on every input device", async () => {
@@ -4771,7 +4852,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [...new Set(firstArguments(section, "context.fillText("))].sort(),
     [
       "\"TiboTattle\"",
-      "`${card.trend.count} qualifying resets`",
+      "`${card.trend.count} reset fits`",
       "badge",
       "card.home",
       "card.trendEmpty",
@@ -4779,12 +4860,13 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "card.trendLabel.toUpperCase()",
       "formatMoney(value, axisDigits)",
       "line",
-      "point.dateLabel",
-      "shareCardFit( context, \"Local-first measurement. No prompts, files, folder names, or account details leave the Mac.\", inner, )",
+      "shareCardFit( context, \"Local measurement · API equivalent, not a bill.\", inner, )",
       "shareCardFit(context, card.identifierLine, inner)",
+      "shareCardFit(context, card.relationshipNote, inner - 20)",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
+      "tick.label",
       "xAxisLabel",
       "yAxisLabel",
     ],
@@ -4798,9 +4880,6 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       [...section.matchAll(/data\??\.[A-Za-z]+(?:\?\.[A-Za-z]+)*/gu)].map((match) => match[0]),
     )].sort(),
     [
-      "data?.gradient?.summary",
-      "data?.gradient?.summary?.capacity",
-      "data?.gradient?.summary?.capacityUsd",
       "data?.mode",
       "data?.pricing",
       "data?.pricing?.coveragePercent",
@@ -4811,31 +4890,37 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "data?.pricing?.totalCostUsd",
       "data?.quotaWindows",
       "data?.schemaVersion",
-      "data?.weekly?.weeklyValues",
+      "data?.weekly?.summary",
+      "data?.weekly?.summary?.median",
+      "data?.weekly?.summary?.medianWeeklyValueUsd",
     ],
   );
 
-  // The plotted history reads five numeric fields per fit and nothing else.
-  // A timestamp is parsed to a number before a date-only local label is made;
-  // neither a raw timestamp nor a time of day can reach the image.
+  // The card receives the same derived history model as the Allowance page.
+  // It cannot independently read raw local records, change the active range,
+  // hide shorter fits, or select a different vertical scale.
   const trend = section.match(
-    /function shareCardTrend\(rows\) \{[\s\S]*?\n\}/u,
+    /function shareCardTrend\(history\) \{[\s\S]*?\n\}/u,
   )?.[0];
   assert.ok(trend, "the plotted history builder is available");
   assert.deepEqual(
-    [...new Set([...trend.matchAll(/row\?\.[A-Za-z0-9_]+/gu)].map((match) => match[0]))].sort(),
+    [...new Set([...trend.matchAll(/point\?\.[A-Za-z0-9_]+/gu)].map((match) => match[0]))].sort(),
     [
-      "row?.displayed_span_pp",
-      "row?.first_observed_at",
-      "row?.last_observed_at",
-      "row?.pairwise_p10_usd",
-      "row?.pairwise_p90_usd",
-      "row?.value",
-      "row?.value_usd",
+      "point?.acrossResetHigh",
+      "point?.acrossResetLow",
+      "point?.at",
+      "point?.high",
+      "point?.historicalMedian",
+      "point?.low",
+      "point?.value",
     ],
   );
-  assert.match(trend, /at: Date\.parse\(row\?\.last_observed_at \?\? row\?\.first_observed_at \?\? ""\)/u);
-  assert.match(trend, /dateLabel: shareCardDateLabel\(point\.at\),/u);
+  assert.match(trend, /Array\.isArray\(history\?\.points\)/u);
+  assert.match(trend, /dateLabel: point\.dateLabel,/u);
+  assert.match(trend, /wellObserved: point\.wellObserved === true,/u);
+  assert.match(trend, /const axisLow = finite\(history\?\.axis\?\.low\);/u);
+  assert.match(trend, /axis: Object\.freeze\(\{[\s\S]*?low: axisLow,/u);
+  assert.match(trend, /xTicks: Object\.freeze\(\[\.\.\.\(history\?\.xTicks \?\? \[\]\)\]\),/u);
   assert.match(trend, /firstDateLabel: points\[0\]\.dateLabel,/u);
   assert.match(trend, /lastDateLabel: points\[points\.length - 1\]\.dateLabel,/u);
   assert.doesNotMatch(
@@ -4852,14 +4937,19 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     section,
     /function shareCardDateLabel\(timestamp\) \{\s*\n\s*return Number\.isFinite\(timestamp\) \? SHARE_CARD_DATE_FORMAT\.format\(timestamp\) : "";/u,
   );
-  assert.match(section, /const yAxisLabel = "API-price equivalent \(USD\)";/u);
-  assert.match(section, /const xAxisLabel = "Reset estimate availability \(local date\)";/u);
-  assert.match(section, /function shareCardTrendAxis\(low, high\) \{/u);
+  assert.match(section, /const yAxisLabel = "7-day allowance \(\$\)";/u);
+  assert.match(section, /const xAxisLabel = "Reset estimate date";/u);
   assert.match(section, /for \(const value of axis\.ticks\) \{[\s\S]*?formatMoney\(value, axisDigits\)/u);
-  assert.match(section, /context\.fillText\(point\.dateLabel, positionX\(point\), plotBottom \+ 21\);/u);
-  // Which fits qualify is fixed in the build, not read from the on-screen
-  // control, so two readers of the same evidence post the same picture.
-  assert.match(trend, /point\.spanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP/u);
+  assert.match(section, /for \(const tick of xTicks\) \{[\s\S]*?context\.fillText\(tick\.label, tickX, plotBottom \+ 21\);/u);
+  assert.match(section, /const bandLow = finite\(points\[0\]\?\.acrossResetLow\);/u);
+  assert.match(section, /const median = finite\(points\[0\]\?\.historicalMedian\);/u);
+  assert.doesNotMatch(
+    section,
+    /SHARE_CARD_TREND_MAX_POINTS|function shareCardTrendAxis|function shareCardTrendDateTicks/u,
+  );
+  // The classification is fixed in the shared model, not read from the
+  // on-screen control, so two readers of the same evidence post the same
+  // picture.
   assert.doesNotMatch(section, /weeklySpanThresholdPp|showWeeklyPartialDiagnostics/u);
 
   // The three free-form strings that do arrive are each replaced before use.
@@ -4953,6 +5043,36 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   );
 });
 
+test("the posted allowance graph uses the exact history model from the dashboard", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const section = shareCardSource(appSource);
+
+  // A single presentation model owns range selection, point inclusion,
+  // classification, vertical bounds, and date landmarks. Both surfaces take
+  // their chart state from that model, so a post cannot tell a different story
+  // from the Allowance estimate history beside it.
+  assert.match(appSource, /function allowanceHistoryChartModel\(data,/u);
+  assert.match(appSource, /function allowanceHistoryAxis\(points\)/u);
+  assert.match(appSource, /function allowanceHistoryDateTicks\(points, maximum = 4\)/u);
+  assert.match(
+    appSource,
+    /function renderWeekly\(data\) \{[\s\S]*?const history = allowanceHistoryChartModel\(data\);/u,
+  );
+  assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history\)\);/u);
+  assert.match(
+    section,
+    /const history = allowanceHistoryChartModel\(data\);\s*\n\s*const trend = shareCardTrend\(history\);/u,
+  );
+  assert.match(
+    section,
+    /history = allowanceHistoryChartModel\(data\),/u,
+  );
+  assert.doesNotMatch(
+    section,
+    /SHARE_CARD_TREND_MAX_POINTS|shareCardTrendAxis|shareCardTrendDateTicks/u,
+  );
+});
+
 test("a posted results card always carries a diagnostic-format reference", async () => {
   // The reference is minted by the same helper the diagnostic surfaces use, so
   // a card someone posts can be matched against the local log.
@@ -4988,10 +5108,15 @@ test("a posted results card always carries a diagnostic-format reference", async
     "finite(data?.pricing?.quotaWeightedTotalCostUsd)",
     "finite(data?.pricing?.totalCostUsd)",
     "finite(data?.pricing?.coveragePercent)",
-    "shareCardTrend(data?.weekly?.weeklyValues)?.points",
+    "finite(data?.weekly?.summary?.median_weekly_value_usd",
+    "trend,",
   ]) {
     assert.ok(signature.includes(figure), `${figure} re-mints the reference`);
   }
+  assert.match(
+    section,
+    /const history = allowanceHistoryChartModel\(data\);\s*\n\s*const trend = shareCardTrend\(history\);/u,
+  );
   assert.match(
     section,
     /if \(signature !== shareCardSignature \|\| shareCardReference === ""\) \{/u,
@@ -4999,9 +5124,9 @@ test("a posted results card always carries a diagnostic-format reference", async
 
   // It is printed on the image itself, first in the identifier line, and it
   // names the saved file so a downloaded card stays matched to it.
-  assert.match(section, /const identifiers = \[\s*\n\s*reference,/u);
-  assert.match(section, /`TiboTattle \$\{appVersion\}`/u);
-  assert.match(section, /`prices \$\{registryVersion\}`/u);
+  assert.match(section, /const identifiers = \[\s*\n\s*`Debug: \$\{reference\}`,/u);
+  assert.match(section, /`v\$\{appVersion\}`/u);
+  assert.doesNotMatch(section, /price table \$\{registryVersion\}/u);
   assert.match(
     section,
     /return `tibotattle-results-\$\{card\.reference\}\.png`;/u,
@@ -5065,19 +5190,42 @@ test("a posted results card states a figure in full and marks a fixture as one",
     /if \(isDemo\) \{\s*\n\s*caveats\.push\(\s*\n\s*"Labeled demo data: an illustrative fixture, not measured usage\.",/u,
   );
 
-  // The history takes exactly the room the qualifications leave, so the card
-  // is neither hollow in the middle nor crowded when every caveat applies.
+  // The history takes exactly the room the qualifications leave, but a card
+  // without material qualifications is allowed to use that visual height.
   assert.match(
     section,
-    /const caveatTop = ruleY - 22 - \(caveatLines\.length - 1\) \* caveatStep;/u,
+    /const caveatTop = caveatLines\.length === 0\s*\n\s*\? ruleY - 8\s*\n\s*: ruleY - 22 - \(caveatLines\.length - 1\) \* caveatStep;/u,
   );
   assert.match(
     section,
     /const trendHeight = Math\.min\(\s*\n\s*SHARE_CARD_TREND_MAX_HEIGHT,\s*\n\s*Math\.max\(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop\),\s*\n\s*\);/u,
   );
-  // Every qualification still fits: the caveat cap is unchanged.
-  assert.match(appSource, /const SHARE_CARD_MAX_CAVEATS = 5;/u);
-  assert.match(appSource, /const SHARE_CARD_MAX_CAVEAT_LINES = 7;/u);
+  assert.match(
+    section,
+    /const trendTop = card\.relationshipNote === ""\s*\n\s*\? statTop \+ statHeight \+ 36\s*\n\s*: statTop \+ statHeight \+ 48;/u,
+  );
+  assert.match(section, /relationshipNote,/u);
+  // The image makes the incomparable denominators explicit rather than
+  // suggesting that seven days of recorded events is a single allowance.
+  assert.match(section, /label: "Recorded activity"/u);
+  assert.match(section, /label: "Estimated 7-day allowance"/u);
+  assert.match(
+    section,
+    /Activity sums all events in \$\{period\}; the estimate is one seven-day allowance\./u,
+  );
+  // The social image reuses the date landmarks and vertical domain from the
+  // Allowance estimate history, instead of inventing a compact-card axis.
+  assert.match(appSource, /function allowanceHistoryDateTicks\(points, maximum = 4\)/u);
+  assert.match(appSource, /xTicks: history\.xTicks,/u);
+  assert.match(appSource, /yDomain: history\.axis,/u);
+  assert.match(section, /for \(const tick of xTicks\)/u);
+  assert.doesNotMatch(section, /shareCardTrendDateTicks|shareCardTrendAxis/u);
+  assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 290;/u);
+  assert.match(section, /const SHARE_CARD_TREND_MIN_HEIGHT = 142;/u);
+  // Only the qualifications that can change interpretation survive on a
+  // social image; the full evidence remains in the local app.
+  assert.match(appSource, /const SHARE_CARD_MAX_CAVEATS = 2;/u);
+  assert.match(appSource, /const SHARE_CARD_MAX_CAVEAT_LINES = 2;/u);
 
   // The posted image and the preview element describe the same picture.
   assert.match(appSource, /const SHARE_CARD_WIDTH = 1200;/u);

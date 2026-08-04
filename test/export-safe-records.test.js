@@ -158,7 +158,7 @@ function claudeStatus(overrides = {}) {
   };
 }
 
-test("safe-record adapter emits validated metadata-only envelopes matching the legacy bundle bytes", async () => {
+test("safe-record adapter preserves scanner-release order while its canonical bundle matches legacy bytes", async () => {
   const home = await safeRecordFixture();
   try {
     const envelopes = [];
@@ -187,7 +187,10 @@ test("safe-record adapter emits validated metadata-only envelopes matching the l
     });
 
     assert.deepEqual(envelopes.map(({ recordType }) => recordType), [
-      "quotaSnapshot", "quotaSnapshot", "usageEvent", "activityMarker",
+      // Leading quota snapshots are deliberately held until the parser has
+      // accepted a real usage record; this is the scanner's streaming order,
+      // while the bundle comparison below remains canonicalized.
+      "usageEvent", "quotaSnapshot", "quotaSnapshot", "activityMarker",
     ]);
     assert.equal(guard.snapshot().counters.outputRecords, envelopes.length);
     assert.equal(

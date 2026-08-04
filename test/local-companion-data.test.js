@@ -277,8 +277,13 @@ test("local companion builds a closed real-data projection without identifiers o
     );
     assert.equal(
       snapshot.overview.pricing.priceEpochBasis,
-      "current_price_sensitivity_at_registry_observation",
+      "event_time_when_registry_has_effective_evidence",
     );
+    assert.equal(
+      snapshot.overview.pricing.eventTimeHistoricalTotalUsdExact,
+      snapshot.overview.accounting.apiPriceEquivalentUsdExact ?? null,
+    );
+    assert.equal(snapshot.overview.pricing.currentPriceSensitivityTotalUsdExact, null);
     assert.equal(fastMode.inference.appliedToWeighting, false);
     assert.equal(fastMode.inference.status, "insufficient_signal");
     assert.equal(snapshot.gradient.datasets.summary[0].private_field, undefined);
@@ -326,15 +331,15 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
       join(root, ".usage-monitor", "collector-events.jsonl"),
       [
         // Observed Standard on a family with a published Fast rate.
-        usage("2026-07-25T11:00:00.000Z", "gpt-5.4", "standard"),
+        usage("2026-07-26T11:00:00.000Z", "gpt-5.4", "standard"),
         // No recorded mode: only the stated preference can attribute this.
-        usage("2026-07-25T11:10:00.000Z", "gpt-5.4", "unknown"),
+        usage("2026-07-26T11:10:00.000Z", "gpt-5.4", "unknown"),
       ].map((line) => `${line}\n`).join(""),
     );
     const build = (fastModePreference) => buildLocalCompanionSnapshot({
       root,
       fastModePreference,
-      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
 
     // Each event prices to $5 of Standard-rate API equivalent. Stating
@@ -402,6 +407,71 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
   }
 });
 
+test("collector fallback keeps mixed event-time price provenance while an old replay cache is withheld", async () => {
+  const root = await fixtureRoot();
+  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  const olderTerraCard =
+    "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-01";
+  const lowerTerraCard =
+    "openai:gpt-5.6-terra:standard:long-from-2026-07-30:official-observed-2026-08-01";
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-terra",
+      components: { input_uncached_tokens: 1_000_000 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        usage("2026-07-29T23:59:59.000Z"),
+        usage("2026-07-30T00:00:00.000Z"),
+      ].map((line) => `${line}\n`).join(""),
+    );
+    // This is deliberately a former cache shape: it must be withheld rather
+    // than supplying legacy price provenance during the rebuild interval.
+    await writeFile(cacheFile, JSON.stringify({
+      schemaVersion: "local-replay-safe-accounting-v0.1",
+      priceEpochBasis: "current_price_sensitivity_at_registry_observation",
+    }));
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingCacheFile: cacheFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-07-30T01:00:00.000Z"),
+    });
+
+    assert.equal(
+      snapshot.overview.pricing.accountingCacheStatus,
+      "unavailable",
+    );
+    assert.equal(
+      snapshot.overview.pricing.accountingSource,
+      "legacy_collector_unverified",
+    );
+    assert.equal(snapshot.overview.pricing.totalCostUsd, 9);
+    assert.equal(snapshot.overview.pricing.eventTimeHistoricalTotalUsdExact, "9");
+    assert.deepEqual(snapshot.overview.pricing.priceCardIds, [
+      lowerTerraCard,
+      olderTerraCard,
+    ]);
+    assert.deepEqual(snapshot.overview.pricing.priceCardBreakdown, [
+      { priceCardId: lowerTerraCard, events: 1, costUsd: "4" },
+      { priceCardId: olderTerraCard, events: 1, costUsd: "5" },
+    ]);
+    assert.equal(snapshot.overview.pricing.mixedPriceCardWindows, true);
+    assert.deepEqual(
+      snapshot.overview.accounting.periods.find((period) => period.periodId === "7d")
+        ?.priceCardBreakdown,
+      snapshot.overview.pricing.priceCardBreakdown,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a declared Codex baseline fills only the turns it actually covers", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-companion-declared-"));
   try {
@@ -425,15 +495,15 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       [
         // Before the configuration was ever read: the declaration must not
         // reach back to it, however close.
-        usage("2026-07-25T09:00:00.000Z", "unknown"),
+        usage("2026-07-26T09:00:00.000Z", "unknown"),
         // Inside the covered interval, but observed Standard in the log, so
         // the declaration must not touch it either.
-        usage("2026-07-25T10:30:00.000Z", "standard"),
+        usage("2026-07-26T10:30:00.000Z", "standard"),
         // Inside the covered interval and unobserved: the only turn the
         // declaration is allowed to attribute.
-        usage("2026-07-25T10:45:00.000Z", "unknown"),
+        usage("2026-07-26T10:45:00.000Z", "unknown"),
         // After the newest reading: uncovered again until the next reading.
-        usage("2026-07-25T11:30:00.000Z", "unknown"),
+        usage("2026-07-26T11:30:00.000Z", "unknown"),
       ].map((line) => `${line}\n`).join(""),
     );
 
@@ -444,10 +514,10 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       fastModePreference: "mixed_unknown",
       codexSpeedBaselines: [{
         mode: "fast",
-        firstSeenAt: "2026-07-25T10:00:00.000Z",
-        lastSeenAt: "2026-07-25T11:00:00.000Z",
+        firstSeenAt: "2026-07-26T10:00:00.000Z",
+        lastSeenAt: "2026-07-26T11:00:00.000Z",
       }],
-      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
 
     const fastMode = snapshot.overview.accounting.fastMode;
@@ -476,7 +546,7 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
     const undeclared = await buildLocalCompanionSnapshot({
       root,
       fastModePreference: "mixed_unknown",
-      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
     assert.equal(
       undeclared.overview.accounting.fastMode.coverage.declaredFromConfigEvents,
