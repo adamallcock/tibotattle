@@ -34,6 +34,11 @@ import { fileURLToPath } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
+  assertReleaseChannelConfiguration,
+  resolveReleaseChannel,
+  STABLE_RELEASE_CHANNEL,
+} from "../config/release-channels.js";
+import {
   SPARKLE_FRAMEWORK_LINKS,
   SPARKLE_FRAMEWORK_SHA256,
   SPARKLE_MACH_O_PATHS,
@@ -147,12 +152,12 @@ export const MACOS_BUILD_PROFILES = Object.freeze({
   test: MACOS_BUILD_PROFILE_TEST,
 });
 
-// Preview clients are meant to exercise the same publicly deployed service
-// boundary as the installed app. These are public identifiers only: the
+// Preview clients are intentionally separate from named external release
+// channels. These compatibility defaults are public identifiers only: the
 // central origin, signed-feed URL, and Ed25519 *public* key contain no release
-// credential and cannot publish, sign, or install a production update. Keeping
-// them in the reviewed build path stops ordinary client QA from silently
-// falling back to a no-service development bundle.
+// credential and cannot publish, sign, or install a production update. The
+// defaults remain for the reviewed preview path, but are never consulted for
+// an external channel (including internal-dogfood).
 export const MACOS_PREVIEW_PUBLIC_CONFIGURATION = Object.freeze({
   centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
   sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -406,6 +411,30 @@ export function normalizeMacOSCentralOrigin(
   fail("Central origin must be an HTTPS DNS origin and non-loopback");
 }
 
+function resolveOperationalReleaseChannel(channel = STABLE_RELEASE_CHANNEL) {
+  if (typeof channel !== "string") {
+    fail(
+      "External distribution must select a named release channel",
+      "MACOS_RELEASE_CHANNEL_NAME_REQUIRED",
+    );
+  }
+  return resolveReleaseChannel(channel);
+}
+
+function normalizeMacOSReleaseChannelOrigin(channel) {
+  const normalized = normalizeMacOSCentralOrigin(channel.serviceOrigin);
+  if (normalized.mode !== CENTRAL_ORIGIN_MODE_HTTPS) {
+    fail(
+      `Release channel ${channel.name} must use a non-loopback HTTPS service origin`,
+      "MACOS_RELEASE_CHANNEL_MISMATCH",
+    );
+  }
+  return Object.freeze({
+    ...normalized,
+    mode: channel.serviceOriginMode,
+  });
+}
+
 export function normalizeMacOSBundleVersion(value = BUNDLE_VERSION) {
   if (typeof value !== "string"
       || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u
@@ -421,6 +450,7 @@ export function validateMacOSDistributionConfiguration({
   centralService,
   externalDistribution = false,
   previewDistribution = false,
+  releaseChannel = STABLE_RELEASE_CHANNEL,
 }) {
   if (typeof externalDistribution !== "boolean") {
     fail("externalDistribution must be a boolean");
@@ -434,8 +464,29 @@ export function validateMacOSDistributionConfiguration({
       "MACOS_DISTRIBUTION_CHANNEL_CONFLICT",
     );
   }
+  if (!externalDistribution
+      && (typeof releaseChannel !== "string"
+        || releaseChannel !== STABLE_RELEASE_CHANNEL)) {
+    fail(
+      "A named external release channel requires --external-distribution",
+      "MACOS_RELEASE_CHANNEL_EXTERNAL_REQUIRED",
+    );
+  }
+  const selectedReleaseChannel = externalDistribution
+    ? typeof releaseChannel === "string"
+      ? resolveOperationalReleaseChannel(releaseChannel)
+      : assertReleaseChannelConfiguration(releaseChannel)
+    : null;
+  if (selectedReleaseChannel && !selectedReleaseChannel.configured) {
+    fail(
+      `Release channel ${selectedReleaseChannel.name} has no reviewed dedicated endpoints yet`,
+      "RELEASE_CHANNEL_NOT_CONFIGURED",
+    );
+  }
+  const requiredHTTPSMode = selectedReleaseChannel?.serviceOriginMode
+    ?? CENTRAL_ORIGIN_MODE_HTTPS;
   const httpsOriginConfigured = centralService?.configured
-    && centralService.mode === CENTRAL_ORIGIN_MODE_HTTPS
+    && centralService.mode === requiredHTTPSMode
     && typeof centralService.origin === "string"
     && centralService.origin.length > 0;
   if ((externalDistribution || previewDistribution) && !httpsOriginConfigured) {
@@ -449,10 +500,18 @@ export function validateMacOSDistributionConfiguration({
       code,
     );
   }
+  if (selectedReleaseChannel
+      && (centralService.origin !== selectedReleaseChannel.serviceOrigin
+        || centralService.mode !== selectedReleaseChannel.serviceOriginMode)) {
+    fail(
+      `External distribution must use the reviewed ${selectedReleaseChannel.name} service origin and mode`,
+      "MACOS_DISTRIBUTION_ENDPOINTS_MISMATCH",
+    );
+  }
   const channel = previewDistribution
     ? DISTRIBUTION_CHANNEL_PREVIEW
     : externalDistribution
-      ? DISTRIBUTION_CHANNEL_PRODUCTION
+      ? selectedReleaseChannel.buildManifestChannel
       : DISTRIBUTION_CHANNEL_DEVELOPMENT;
   return Object.freeze({
     channel,
@@ -1523,10 +1582,12 @@ function infoPlist(centralService, {
   bundleVersion,
   distribution,
   iconIncluded,
+  publicWebsiteOrigin = DEPLOYMENT_ENDPOINTS.public.origin,
+  releaseChannelName,
   updater,
 }) {
   const publicWebsiteConfiguration = `  <key>UsageMonitorPublicWebsiteOrigin</key>
-  <string>${xmlString(DEPLOYMENT_ENDPOINTS.public.origin)}</string>
+  <string>${xmlString(publicWebsiteOrigin)}</string>
 `;
   const centralServiceConfiguration = centralService.configured
     ? `  <key>UsageMonitorCentralOrigin</key>
@@ -1565,6 +1626,8 @@ function infoPlist(centralService, {
 `;
   const distributionConfiguration = `  <key>UsageMonitorBuildChannel</key>
   <string>${xmlString(distribution.channel)}</string>
+  <key>UsageMonitorReleaseChannel</key>
+  <string>${xmlString(releaseChannelName)}</string>
   <key>UsageMonitorPreviewDistribution</key>
   <${distribution.previewDistribution ? "true" : "false"}/>
 `;
@@ -2556,6 +2619,7 @@ export async function validateMacOSPreviewApp(appPath) {
   }
   const release = manifest.release;
   if (release?.channel !== DISTRIBUTION_CHANNEL_PREVIEW
+      || release.channelName !== DISTRIBUTION_CHANNEL_PREVIEW
       || release.previewDistributionRequested !== true
       || release.externalDistributionRequested !== false
       || release.previewOriginValidated !== true
@@ -2579,6 +2643,7 @@ export async function validateMacOSPreviewApp(appPath) {
       || plist.UsageMonitorPublicWebsiteOrigin
         !== DEPLOYMENT_ENDPOINTS.public.origin
       || plist.UsageMonitorBuildChannel !== DISTRIBUTION_CHANNEL_PREVIEW
+      || plist.UsageMonitorReleaseChannel !== DISTRIBUTION_CHANNEL_PREVIEW
       || plist.UsageMonitorPreviewDistribution !== true
       || plist.UsageMonitorCentralOriginMode !== CENTRAL_ORIGIN_MODE_HTTPS
       || plist.UsageMonitorUpdaterEnabled !== true
@@ -2818,6 +2883,8 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   let allowLoopbackCentralOrigin = false;
   let externalDistribution = false;
   let previewDistribution = false;
+  let releaseChannel = STABLE_RELEASE_CHANNEL;
+  let releaseChannelSeen = false;
   let replacePreviewOutput = false;
   let bundleVersion = BUNDLE_VERSION;
   let bundleVersionSeen = false;
@@ -2855,6 +2922,12 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         fail("--preview-distribution must be provided at most once");
       }
       previewDistribution = true;
+    } else if (argument === "--release-channel") {
+      if (releaseChannelSeen || index + 1 >= argv.length) {
+        fail("--release-channel must be provided at most once with a value");
+      }
+      releaseChannelSeen = true;
+      releaseChannel = argv[++index];
     } else if (argument === "--replace-preview-output") {
       if (replacePreviewOutput) {
         fail("--replace-preview-output must be provided at most once");
@@ -2907,6 +2980,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         || allowLoopbackCentralOrigin
         || externalDistribution
         || previewDistribution
+        || releaseChannelSeen
         || replacePreviewOutput
         || testBuild
         || bundleVersionSeen
@@ -2931,6 +3005,15 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
       "--test-build cannot create a distributable app",
       "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN",
     );
+  }
+  if (!externalDistribution && releaseChannel !== STABLE_RELEASE_CHANNEL) {
+    fail(
+      "A named external release channel requires --external-distribution",
+      "MACOS_RELEASE_CHANNEL_EXTERNAL_REQUIRED",
+    );
+  }
+  if (externalDistribution) {
+    resolveOperationalReleaseChannel(releaseChannel);
   }
   if (previewDistribution) {
     const environmentOutput = environment.USAGE_MONITOR_PREVIEW_OUTPUT;
@@ -2962,6 +3045,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
     allowLoopbackCentralOrigin,
     externalDistribution,
     previewDistribution,
+    releaseChannel,
     replacePreviewOutput,
     bundleVersion,
     sparkleFramework,
@@ -2978,6 +3062,8 @@ async function buildApplication(stageApp, centralService, {
   buildProfile,
   distribution,
   iconAssets,
+  publicWebsiteOrigin,
+  releaseChannelName,
   updater,
 }) {
   const contents = join(stageApp, "Contents");
@@ -3010,6 +3096,8 @@ async function buildApplication(stageApp, centralService, {
       bundleVersion,
       distribution,
       iconIncluded: iconAssets !== null,
+      publicWebsiteOrigin,
+      releaseChannelName,
       updater,
     }),
   );
@@ -3075,6 +3163,7 @@ async function buildApplication(stageApp, centralService, {
       appOpenScheme: PRODUCT_BRAND.appOpenScheme,
       appOpenURL: PRODUCT_BRAND.appOpenURL,
       channel: distribution.channel,
+      channelName: releaseChannelName,
       externalDistributionRequested: distribution.externalDistribution,
       iconIncluded: iconAssets !== null,
       iconSha256: iconAssets ? sha256(iconAssets.icon.bytes) : null,
@@ -3155,7 +3244,11 @@ async function buildApplication(stageApp, centralService, {
   // subdomain does). Scan everything else strictly: build paths, home
   // directories, and any other appearance of the owner identifier still fail.
   let scanned = serialized;
-  for (const reviewedPublicUrl of [centralService.origin, updater?.appcastURL]) {
+  for (const reviewedPublicUrl of [
+    centralService.origin,
+    publicWebsiteOrigin,
+    updater?.appcastURL,
+  ]) {
     if (typeof reviewedPublicUrl === "string" && reviewedPublicUrl.length > 0) {
       scanned = scanned.replaceAll(reviewedPublicUrl, "");
     }
@@ -3176,6 +3269,7 @@ export async function buildMacOSApp({
   allowLoopbackCentralOrigin = false,
   externalDistribution = false,
   previewDistribution = false,
+  releaseChannel = STABLE_RELEASE_CHANNEL,
   replacePreviewOutput = false,
   previewStagingRoot = DEFAULT_PREVIEW_STAGING_ROOT,
   bundleVersion = BUNDLE_VERSION,
@@ -3185,15 +3279,59 @@ export async function buildMacOSApp({
   sparklePublicEdKey = null,
 }) {
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
-  const centralService = normalizeMacOSCentralOrigin(centralOrigin, {
-    allowLoopbackCentralOrigin,
-  });
+  if (externalDistribution && previewDistribution) {
+    fail(
+      "Production and preview distribution channels are mutually exclusive",
+      "MACOS_DISTRIBUTION_CHANNEL_CONFLICT",
+    );
+  }
+  if (!externalDistribution
+      && (typeof releaseChannel !== "string"
+        || releaseChannel !== STABLE_RELEASE_CHANNEL)) {
+    fail(
+      "A named external release channel requires --external-distribution",
+      "MACOS_RELEASE_CHANNEL_EXTERNAL_REQUIRED",
+    );
+  }
+  const selectedReleaseChannel = externalDistribution
+    ? resolveOperationalReleaseChannel(releaseChannel)
+    : null;
+  if (externalDistribution && centralOrigin !== null) {
+    const configuredCentralService = normalizeMacOSCentralOrigin(
+      centralOrigin,
+      { allowLoopbackCentralOrigin },
+    );
+    if (configuredCentralService.origin
+        !== selectedReleaseChannel.serviceOrigin) {
+      fail(
+        `External distribution must use the reviewed ${selectedReleaseChannel.name} service origin`,
+        "MACOS_DISTRIBUTION_ENDPOINTS_MISMATCH",
+      );
+    }
+  }
+  if (externalDistribution
+      && sparkleAppcastURL !== null
+      && sparkleAppcastURL
+        !== selectedReleaseChannel.sparkle.appcastURL) {
+    fail(
+      `External distribution must use the reviewed ${selectedReleaseChannel.name} appcast URL`,
+      "MACOS_DISTRIBUTION_ENDPOINTS_MISMATCH",
+    );
+  }
+  const centralService = selectedReleaseChannel
+    ? normalizeMacOSReleaseChannelOrigin(selectedReleaseChannel)
+    : normalizeMacOSCentralOrigin(centralOrigin, {
+      allowLoopbackCentralOrigin,
+    });
   const selectedBundleVersion = normalizeMacOSBundleVersion(bundleVersion);
   const distribution = validateMacOSDistributionConfiguration({
     centralService,
     externalDistribution,
     previewDistribution,
+    releaseChannel: selectedReleaseChannel ?? releaseChannel,
   });
+  const releaseChannelName = selectedReleaseChannel?.name
+    ?? distribution.channel;
   if (selectedBuildProfile === MACOS_BUILD_PROFILE_TEST
       && (distribution.externalDistribution || distribution.previewDistribution)) {
     fail(
@@ -3202,18 +3340,21 @@ export async function buildMacOSApp({
     );
   }
   const updater = await normalizeMacOSUpdaterConfiguration({
-    appcastURL: sparkleAppcastURL,
+    appcastURL: selectedReleaseChannel?.sparkle.appcastURL
+      ?? sparkleAppcastURL,
     externalDistribution: distribution.externalDistribution,
     previewDistribution: distribution.previewDistribution,
     frameworkPath: sparkleFramework,
     publicEdKey: sparklePublicEdKey,
   });
-  if (distribution.externalDistribution
-      && (centralService.origin !== DEPLOYMENT_ENDPOINTS.public.origin
-        || updater.appcastURL !== DEPLOYMENT_ENDPOINTS.sparkle.appcastURL)) {
+  const selectedPublicEdKeySha256 =
+    selectedReleaseChannel?.sparkle.publicEdKeySha256 ?? null;
+  if (selectedPublicEdKeySha256 !== null
+      && selectedPublicEdKeySha256
+        !== sha256(Buffer.from(updater.publicEdKey, "base64"))) {
     fail(
-      "External distribution endpoints must match config/deployment-endpoints.js",
-      "MACOS_DISTRIBUTION_ENDPOINTS_MISMATCH",
+      `Sparkle public key does not match the reviewed ${selectedReleaseChannel.name} channel key`,
+      "MACOS_RELEASE_CHANNEL_MISMATCH",
     );
   }
   const selectedOutput = distribution.previewDistribution
@@ -3239,6 +3380,9 @@ export async function buildMacOSApp({
       buildProfile: selectedBuildProfile,
       distribution,
       iconAssets,
+      publicWebsiteOrigin: selectedReleaseChannel?.publicWebsiteOrigin
+        ?? DEPLOYMENT_ENDPOINTS.public.origin,
+      releaseChannelName,
       updater,
     });
     signApplicationBundle(stagedApp);
@@ -3280,6 +3424,7 @@ async function main(argv) {
     allowLoopbackCentralOrigin,
     externalDistribution,
     previewDistribution,
+    releaseChannel,
     replacePreviewOutput,
     bundleVersion,
     buildProfile,
@@ -3303,6 +3448,7 @@ async function main(argv) {
     allowLoopbackCentralOrigin,
     externalDistribution,
     previewDistribution,
+    releaseChannel,
     replacePreviewOutput,
     bundleVersion,
     buildProfile,

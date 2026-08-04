@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "jsonc-parser";
+import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 
 export const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 export const checkedInConfig = parse(
@@ -54,8 +55,15 @@ export function successSpawn(config, calls) {
         stderr: "",
       };
     }
-    if (joined.startsWith("d1 migrations list ")) {
-      return { status: 0, stdout: "No migrations to apply!", stderr: "" };
+    if (joined.includes("FROM d1_migrations")) {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{
+          results: EXPECTED_STAGING_MIGRATIONS[args[2]]
+            .map((name) => ({ name })),
+        }]),
+        stderr: "",
+      };
     }
     if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
         && joined.includes("sqlite_master")) {

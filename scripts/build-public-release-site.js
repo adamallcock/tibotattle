@@ -39,6 +39,8 @@ const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
 const SOCIAL_PREVIEW_FILENAME = "social-preview.png";
 const ROBOTS_FILENAME = "robots.txt";
+const PUBLIC_COMMUNITY_ROUTE_FILENAME = "community.html";
+const PUBLIC_FALLBACK_ROUTE_FILENAME = "404.html";
 const SITE_ENTRY_MODULE_BASENAME = "community.js";
 /**
  * The public site is built from the community entry, not from the dashboard
@@ -127,6 +129,12 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   '"admin.html"',
   "'admin.html'",
   'id="refresh-button"',
+  'id="connection-notice"',
+  'id="companion-setup"',
+  'id="setup-card"',
+  'id="quota-cards"',
+  'id="weekly-chart"',
+  'id="timeline-chart"',
   'id="connect-community"',
   'id="contribution-form"',
   'id="identity-signin"',
@@ -147,6 +155,12 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   'href="#signin',
   'href="#admin',
   'href="#app-open',
+  'class="dashboard-shell"',
+  'class="dashboard-sidebar"',
+  "data-dashboard-page=",
+  "data-requires-evidence",
+  "/api/local/",
+  "LocalCompanionClient",
   "/sign-in",
   "/signin",
   "/contribution",
@@ -763,6 +777,37 @@ function localPublicReferences(
   return references;
 }
 
+function relativePublicSourceName(sourceRoot, sourcePath) {
+  return relative(sourceRoot, sourcePath).split(sep).join("/");
+}
+
+/**
+ * The mixed web source intentionally contains the loopback dashboard beside
+ * the public entry. Only the selected public closure may be copied. Check the
+ * closure before creating the output directory so a failed build cannot leave
+ * a deployable partial site containing a local client module.
+ */
+function assertPublicClosureHasNoDashboardSource(sourceRoot, sourceFiles) {
+  for (const sourceFile of sourceFiles) {
+    const relativeName = relativePublicSourceName(sourceRoot, sourceFile);
+    if (APP_ONLY_SOURCE_BASENAMES.includes(parse(relativeName).base)) {
+      throw new TypeError(
+        `Public release closure contains dashboard-only source: ${relativeName}`,
+      );
+    }
+  }
+}
+
+function assertNoForbiddenPublicReferences(contents, label, errorType = Error) {
+  for (const marker of PUBLIC_ROUTE_MARKERS) {
+    if (contents.includes(marker)) {
+      throw new errorType(
+        `${label} referenced a local-only route or control: ${marker}`,
+      );
+    }
+  }
+}
+
 /**
  * Select the exact public closure, rather than copying the mixed web source
  * directory. HTML and CSS references are constrained locally; JavaScript is
@@ -851,6 +896,27 @@ export async function buildPublicReleaseSite(rawArgs, {
     source: options.source,
     sourceHtml,
   });
+  assertPublicClosureHasNoDashboardSource(options.source, publicSourceFiles);
+  for (const sourceFile of publicSourceFiles) {
+    const extension = extname(sourceFile).toLowerCase();
+    if (extension === ".css"
+        || ![".html", ".js", ".json", ".txt"].includes(extension)) {
+      continue;
+    }
+    assertNoForbiddenPublicReferences(
+      await readFile(sourceFile, "utf8"),
+      `Public release source ${relativePublicSourceName(options.source, sourceFile)}`,
+      TypeError,
+    );
+  }
+  // Check the selected source before any release metadata or output writes.
+  // This catches a dashboard shell/control accidentally added to the public
+  // entry even when it does not have a recognizable app-only filename.
+  assertNoForbiddenPublicReferences(
+    sourceHtml,
+    `Public release source ${SITE_INDEX_SOURCE_BASENAME}`,
+    TypeError,
+  );
   let installerEvidence = null;
   if (options.installerConfigured) {
     installerEvidence = await validateMacOSSignedReleaseArtifact({
@@ -942,6 +1008,18 @@ export async function buildPublicReleaseSite(rawArgs, {
     encoding: "utf8",
     mode: 0o644,
   });
+  // Keep explicit aliases for hosts that map extensionless `/community` and
+  // unknown routes to static HTML files. Both aliases are the public entry;
+  // neither may ever fall through to the loopback dashboard source.
+  for (const routeFilename of [
+    PUBLIC_COMMUNITY_ROUTE_FILENAME,
+    PUBLIC_FALLBACK_ROUTE_FILENAME,
+  ]) {
+    await writeFile(join(options.output, routeFilename), releaseHtml, {
+      encoding: "utf8",
+      mode: 0o644,
+    });
+  }
   await writeFile(
     join(options.output, SOCIAL_PREVIEW_FILENAME),
     socialBytes,
@@ -955,12 +1033,11 @@ export async function buildPublicReleaseSite(rawArgs, {
   );
   const files = await fileManifest(options.output);
   const publishedNames = new Set(files.map(({ path }) => path));
-  // `index.html` is the rendered community entry. Every other app-only file
-  // must remain absent even if a future selection rule accidentally finds it.
-  for (const withheld of [
-    ...APP_ONLY_SOURCE_BASENAMES.filter((name) => name !== "index.html"),
-    SITE_INDEX_SOURCE_BASENAME,
-  ]) {
+  // `index.html` is the rendered community entry. Every app-only file must
+  // remain absent even if a future selection rule accidentally finds it.
+  for (const withheld of APP_ONLY_SOURCE_BASENAMES.filter(
+    (name) => name !== "index.html",
+  )) {
     if (publishedNames.has(withheld)) {
       throw new Error(
         `Release output published the in-app dashboard surface: ${withheld}`,
@@ -971,6 +1048,8 @@ export async function buildPublicReleaseSite(rawArgs, {
     ...publicSourceFiles.map((sourceFile) =>
       relative(options.source, sourceFile).split(sep).join("/")),
     "index.html",
+    PUBLIC_COMMUNITY_ROUTE_FILENAME,
+    PUBLIC_FALLBACK_ROUTE_FILENAME,
     ROBOTS_FILENAME,
     SOCIAL_PREVIEW_FILENAME,
   ]);
@@ -984,12 +1063,12 @@ export async function buildPublicReleaseSite(rawArgs, {
   for (const { path } of files.filter(({ path }) =>
     /\.(?:css|html|js|json|txt)$/u.test(path))) {
     const contents = await readFile(join(options.output, path), "utf8");
-    for (const marker of PUBLIC_ROUTE_MARKERS) {
-      if (contents.includes(marker)) {
-        throw new Error(
-          `Release output asset referenced a local-only route or control: ${path} (${marker})`,
-        );
-      }
+    // The shared stylesheet deliberately retains selectors used only by the
+    // loopback dashboard; selectors are not served/imported dashboard source
+    // and must not make the public community CSS fail closed. Markup and
+    // executable/data assets are checked for the actual boundary markers.
+    if (!path.endsWith(".css")) {
+      assertNoForbiddenPublicReferences(contents, `Release output asset ${path}`);
     }
   }
   const manifest = {
@@ -1043,10 +1122,13 @@ export async function buildPublicReleaseSite(rawArgs, {
   if (verifiedHtml !== releaseHtml) {
     throw new Error("Release output index did not keep the rendered community entry");
   }
-  for (const marker of PUBLIC_ROUTE_MARKERS) {
-    if (verifiedHtml.includes(marker)) {
+  for (const routeFilename of [
+    PUBLIC_COMMUNITY_ROUTE_FILENAME,
+    PUBLIC_FALLBACK_ROUTE_FILENAME,
+  ]) {
+    if (await readFile(join(options.output, routeFilename), "utf8") !== releaseHtml) {
       throw new Error(
-        `Release output index referenced a local-only route or control: ${marker}`,
+        `Release output ${routeFilename} did not keep the rendered community entry`,
       );
     }
   }

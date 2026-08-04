@@ -7,18 +7,23 @@ import { parse } from "jsonc-parser";
 import {
   probeStagingLive,
   REQUIRED_D1_BINDINGS,
+  STAGING_PROOF_TYPES,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
 
 function run(spawn, wrangler, workerDirectory, args) {
-  const result = spawn(wrangler, args, {
-    cwd: workerDirectory,
-    encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
-  });
-  return !result.error && result.status === 0;
+  try {
+    const result = spawn(wrangler, args, {
+      cwd: workerDirectory,
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return !result.error && result.status === 0;
+  } catch {
+    return false;
+  }
 }
 
 export function prepareDisabledStaging({
@@ -31,25 +36,37 @@ export function prepareDisabledStaging({
   if (confirmation !== PREPARE_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
   }
-  const before = probeStagingLive({
-    config,
-    wrangler,
-    workerDirectory,
-    spawn,
-  });
+  let before;
+  try {
+    before = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "STAGING_READINESS_FAILED" };
+  }
   const infrastructureReady = before.checks.authenticated
     && before.checks.resourceIdentifiersConfigured
     && before.checks.d1ServiceReachable
     && before.checks.r2ServiceReachable
     && before.checks.d1ResourcesExist
     && before.checks.r2ResourceExists;
-  if (before.state === "unsafe_configuration" || !infrastructureReady) {
+  const migrationPreflightBlockers = before.blockers.filter((code) =>
+    ![
+      "REMOTE_MIGRATIONS_PENDING",
+      "REMOTE_MIGRATION_STATE_UNINITIALIZED",
+      "REMOTE_COLLECTION_NOT_CONTAINED",
+      "REQUIRED_STAGING_SECRETS_MISSING",
+    ].includes(code));
+  if (before.state === "unsafe_configuration"
+      || !infrastructureReady
+      || migrationPreflightBlockers.length > 0) {
     return {
       ok: false,
       code: "STAGING_INFRASTRUCTURE_BLOCKED",
-      blockers: before.blockers.filter((code) =>
-        !["REMOTE_MIGRATIONS_PENDING", "REMOTE_COLLECTION_NOT_CONTAINED"]
-          .includes(code)),
+      blockers: migrationPreflightBlockers,
     };
   }
 
@@ -65,6 +82,35 @@ export function prepareDisabledStaging({
     )) {
       return { ok: false, code: "STAGING_MIGRATION_FAILED" };
     }
+  }
+
+  let afterMigrations;
+  try {
+    afterMigrations = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "STAGING_MIGRATIONS_UNVERIFIED" };
+  }
+  const migrationVerificationBlockers = afterMigrations.blockers.filter(
+    (code) => ![
+      "REMOTE_COLLECTION_NOT_CONTAINED",
+      "REQUIRED_STAGING_SECRETS_MISSING",
+    ].includes(code),
+  );
+  if (!afterMigrations.checks.migrationsCurrent
+      || !afterMigrations.checks.pilotSchemaCurrent
+      || migrationVerificationBlockers.length > 0) {
+    return {
+      ok: false,
+      code: "STAGING_MIGRATIONS_UNVERIFIED",
+      blockers: migrationVerificationBlockers.length > 0
+        ? migrationVerificationBlockers
+        : ["REMOTE_MIGRATIONS_PENDING"],
+    };
   }
 
   const containmentSql = `
@@ -92,12 +138,17 @@ UPDATE collection_controls
     return { ok: false, code: "STAGING_CONTAINMENT_FAILED" };
   }
 
-  const after = probeStagingLive({
-    config,
-    wrangler,
-    workerDirectory,
-    spawn,
-  });
+  let after;
+  try {
+    after = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "STAGING_PREPARATION_UNVERIFIED" };
+  }
   const remainingBlockers = after.blockers.filter(
     (code) => code !== "REQUIRED_STAGING_SECRETS_MISSING",
   );
@@ -118,6 +169,10 @@ UPDATE collection_controls
     receipt: stagingOperationReceipt("disabled_staging_prepared", {
       resourcesVerified: after.checks.d1ResourcesExist
         && after.checks.r2ResourceExists,
+      staticConfigurationChecked: after.evidenceType
+        === STAGING_PROOF_TYPES.LIVE_REMOTE,
+      remoteReadOnlyProof: true,
+      migrationInventoryCurrent: after.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: after.checks.migrationsCurrent,
       pilotSchemaCurrent: after.checks.pilotSchemaCurrent,
       collectionContained: after.checks.collectionContained,
@@ -134,21 +189,26 @@ async function main() {
     process.exit(2);
   }
   const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
-  const config = parse(
-    await readFile(join(workerDirectory, "wrangler.jsonc"), "utf8"),
-  );
-  const wrangler = join(
-    workerDirectory,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "wrangler.cmd" : "wrangler",
-  );
-  const result = prepareDisabledStaging({
-    config,
-    confirmation: process.argv[3],
-    wrangler,
-    workerDirectory,
-  });
+  let result;
+  try {
+    const config = parse(
+      await readFile(join(workerDirectory, "wrangler.jsonc"), "utf8"),
+    );
+    const wrangler = join(
+      workerDirectory,
+      "node_modules",
+      ".bin",
+      process.platform === "win32" ? "wrangler.cmd" : "wrangler",
+    );
+    result = prepareDisabledStaging({
+      config,
+      confirmation: process.argv[3],
+      wrangler,
+      workerDirectory,
+    });
+  } catch {
+    result = { ok: false, code: "STAGING_PREPARATION_FAILED" };
+  }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok ? 0 : 1);
 }

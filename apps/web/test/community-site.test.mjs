@@ -7,14 +7,10 @@ import {
 } from "../../../config/product-brand.js";
 import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
-  normalizeCommunitySnapshot,
   PublicCommunityClient,
 } from "../public/community-data.js";
 import {
   COMMUNITY_METRIC_LABELS,
-  COMMUNITY_ESTIMATE_STATE_COPY,
-  COMMUNITY_SNAPSHOT_STATE_COPY,
-  renderCommunityEstimate,
   renderCommunitySnapshot,
 } from "../public/community-view.js";
 import {
@@ -166,7 +162,8 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="community-result"/u);
   assert.match(html, /id="community-snapshot-service-detail"/u);
   assert.match(html, /id="community-service-state"/u);
-  assert.match(html, /id="community-estimate-result"/u);
+  assert.match(html, /id="community-snapshot-status"/u);
+  assert.match(html, /id="community-snapshot-panel-state"/u);
 
   // Every control that cannot work without the local companion is absent from
   // the website. These are the dead controls the split exists to remove.
@@ -304,15 +301,16 @@ test("the public community client exposes one read-only aggregate request", asyn
   );
 });
 
-test("the first visit leads with the product, combined Mac action, and named estimate gate", async () => {
+test("the first visit leads with the product, combined Mac action, and snapshot-only community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
   assert.match(html, /local-first Mac app for understanding personal Codex\s+usage/u);
-  assert.match(html, /estimates your seven-day allowance in API-equivalent terms/u);
+  assert.match(html, /estimates your personal seven-day allowance in\s+API-equivalent terms/u);
   assert.match(html, /Download for macOS/u);
   assert.match(html, /Already installed\?/u);
   assert.match(html, /Open TiboTattle/u);
-  assert.match(html, /Community seven-day estimate/u);
+  assert.match(html, /Delayed community activity/u);
+  assert.match(html, /Community activity snapshot/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/tibotattle-weekly-preview\.jpg"/u);
@@ -344,7 +342,7 @@ test("the first visit leads with the product, combined Mac action, and named est
   );
   assert.doesNotMatch(
     html,
-    /Activity totals[^<]+are an allowance estimate/u,
+    /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks/u,
   );
 });
 
@@ -380,15 +378,23 @@ test("the public header and footer stay compact on narrow screens", async () => 
   );
 });
 
-test("unavailable community evidence uses the compact public state", async () => {
+test("unavailable community activity uses the compact public state", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(html, /data-community-state="checking"/u);
-  assert.match(html, /<h2 id="community-title">Community seven-day estimate<\/h2>/u);
+  assert.match(html, /<h2 id="community-title">Community activity snapshot<\/h2>/u);
   assert.match(
     html,
-    /Published only when delayed, aggregate evidence passes privacy and quality checks\./u,
+    /Published as delayed, aggregate activity for a defined reporting period\./u,
+  );
+  assert.doesNotMatch(
+    html,
+    /privacy[- ]reviewed|privacy and quality checks|community seven-day estimate|community allowance|community estimate|community capacity|best guess/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /renderCommunityEstimate|estimateContainer|estimateHero|estimateStates|id="community-estimate/u,
   );
   assert.match(source, /\.dataset\.communityState = state;/u);
   assert.match(styles, /\[data-community-state="service_unavailable"\]/u);
@@ -471,11 +477,7 @@ test("the community view degrades honestly without a service or a published week
       payload,
     });
     assert.equal(state, expectedState);
-    assert.equal(
-      container.text.includes(COMMUNITY_SNAPSHOT_STATE_COPY[expectedState]),
-      true,
-      expectedState,
-    );
+    assert.match(container.text, /[A-Za-z]{3}/u, expectedState);
     // No empty panel and no invented figure in any degraded state.
     assert.equal(container.children.length > 0, true, expectedState);
     assert.equal(
@@ -486,38 +488,16 @@ test("the community view degrades honestly without a service or a published week
   }
 });
 
-test("the named estimate gate never derives an allowance from the activity-only contract", () => {
-  for (const [payload, expectedEstimateState] of [
-    [null, "service_unavailable"],
-    [publishedSnapshot({ releaseStatus: "not_yet_published" }), "not_yet_published"],
-    [publishedSnapshot({ releaseStatus: "suppressed" }), "suppressed"],
-    [publishedSnapshot(), "activity_only"],
-  ]) {
-    const documentRef = fakeDocument();
-    const estimate = documentRef.createElement("div");
-    const hero = documentRef.createElement("p");
-    const stateNode = documentRef.createElement("span");
-    const estimateState = renderCommunityEstimate({
-      documentRef,
-      container: estimate,
-      hero,
-      stateNode,
-      snapshot: normalizeCommunitySnapshot(payload),
-    });
-    assert.equal(estimateState, expectedEstimateState);
-    assert.equal(
-      estimate.text,
-      COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState].body,
-    );
-    assert.match(estimate.text, /estimate/iu);
-    assert.doesNotMatch(estimate.text, /100,000|100000|\$/u);
-    assert.equal(
-      hero.textContent,
-      COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState].hero,
-    );
-    assert.equal(stateNode.className, "evidence-chip neutral");
-    assert.ok(COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState]);
-  }
+test("the public source contains no community allowance, estimate, capacity, or privacy-review claim", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const source = await readFile(SITE_SOURCE, "utf8");
+  const publicCopy = `${html}\n${source}`;
+  assert.match(publicCopy, /delayed, aggregate/u);
+  assert.doesNotMatch(
+    publicCopy,
+    /Community seven-day estimate|community allowance|community estimate|community capacity|best guess|privacy[- ]reviewed|privacy and quality checks/u,
+  );
+  assert.doesNotMatch(publicCopy, /id="community-estimate|renderCommunityEstimate/u);
 });
 
 test("the generated community state follows the active UI language", () => {
@@ -550,7 +530,10 @@ test("a published community week renders its support gate, provenance, and cells
     container.text,
     /at least 20 distinct eligible social-provider accounts/u,
   );
-  assert.match(container.text, /not an average, and not a cost/u);
+  assert.match(
+    container.text,
+    /not everyone's usage, an average, a cost, or a personal reading/u,
+  );
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a released week renders its cell table");
   const headerLabels = table

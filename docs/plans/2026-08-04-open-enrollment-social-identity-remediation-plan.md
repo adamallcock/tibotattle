@@ -63,12 +63,14 @@ against real infrastructure:
 
 1. Run the local disposable D1 preflight, then deploy the reviewed Worker
    revision **while enrollment remains disabled**, drain all old Worker
-   identity traffic, and only then apply migrations `0023`–`0028` in a
-   disabled staging environment. The reverse schema-before-code ordering is
-   unsafe: an old deletion worker can remove an identity link without writing
-   the new primary cooldown marker. Verify rollback/withdrawal behaviour with
-   representative state. The local preflight is evidence only; it does not
-   contact Cloudflare or prove the deployed migration state or rollout order.
+   identity traffic, and only then apply the complete migration set
+   `0023`–`0028` in a disabled staging environment. A `0023`–`0026` rehearsal
+   alone does not exercise the selected re-entry and identity-key continuity
+   controls. The reverse schema-before-code ordering is unsafe: an old
+   deletion worker can remove an identity link without writing the new primary
+   cooldown marker. Verify rollback/withdrawal behaviour with representative
+   state. The local preflight is evidence only; it does not contact Cloudflare
+   or prove the deployed migration state or rollout order.
 2. Provision and independently verify Google/Apple portal settings, exact HTTPS
    callback origin, secrets, callback URL redaction, and the signed native
    browser journeys. Do not infer them from source configuration.
@@ -423,6 +425,9 @@ development test hooks fail closed in hosted environments.
    closed rather than splitting the same provider account into a new identity
    namespace. Rotation remains intentionally unsupported until a dual-key
    migration is designed and tested.
+
+The selected local policy is the bounded cooldown path, not clean re-entry as a
+new account generation. No permanent hidden social identifier is retained.
 
 **Exit gate:** A user can clearly stop uploads, recover same account on a
 replacement Mac, intentionally switch accounts, and delete data without UI

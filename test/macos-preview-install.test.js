@@ -21,6 +21,7 @@ import {
   installMacOSPreviewApp,
   macOSUserApplicationsTarget,
   parseMacOSPreviewInstallArguments,
+  requiresMacOSSystemInstallConfirmation,
 } from "../scripts/install-macos-preview-app.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 
@@ -126,6 +127,49 @@ test("preview CLI requires the explicit replacement opt-in", () => {
     {
       code: MACOS_PREVIEW_INSTALL_CODES.REPLACE_REQUIRED,
       message: /--replace/u,
+    },
+  );
+});
+
+test("preview CLI requires an unmistakable confirmation before targeting system Applications", () => {
+  assert.throws(
+    () => parseMacOSPreviewInstallArguments([
+      "--app",
+      "/tmp/TiboTattle.app",
+      "--target",
+      "/Applications/TiboTattle.app",
+      "--replace",
+    ]),
+    {
+      code: MACOS_PREVIEW_INSTALL_CODES.SYSTEM_INSTALL_CONFIRMATION_REQUIRED,
+      message: /--confirm-system-install/u,
+    },
+  );
+  const parsed = parseMacOSPreviewInstallArguments([
+    "--app",
+    "/tmp/TiboTattle.app",
+    "--target",
+    "/Applications/TiboTattle.app",
+    "--replace",
+    "--confirm-system-install",
+  ]);
+  assert.equal(parsed.confirmSystemInstall, true);
+  assert.equal(parsed.targetPath, "/Applications/TiboTattle.app");
+  assert.equal(requiresMacOSSystemInstallConfirmation(parsed.targetPath), true);
+});
+
+test("programmatic system installation refuses before it inspects a source", async () => {
+  await assert.rejects(
+    () => installMacOSPreviewApp({
+      allowedTargetPaths: ["/Applications/TiboTattle.app"],
+      replace: true,
+      sourcePath: "/tmp/TiboTattle.app",
+      targetPath: "/Applications/TiboTattle.app",
+      validator: fixtureValidator(),
+    }),
+    {
+      code: MACOS_PREVIEW_INSTALL_CODES.SYSTEM_INSTALL_CONFIRMATION_REQUIRED,
+      message: /--confirm-system-install/u,
     },
   );
 });

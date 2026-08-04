@@ -7,8 +7,10 @@ import {
 import {
   checkedInConfig,
   provisionedConfig,
+  successSpawn,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
+import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 
 test("preparation requires exact confirmation before inspection or mutation", () => {
   const calls = [];
@@ -96,12 +98,20 @@ test("preparation applies both migrations, contains collection, and rechecks", (
         stderr: "",
       };
     }
-    if (joined.startsWith("d1 migrations list ")) {
+    if (joined.includes("FROM d1_migrations")) {
+      if (!migrationsApplied) {
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "Error: no such table: d1_migrations",
+        };
+      }
       return {
         status: 0,
-        stdout: migrationsApplied
-          ? "No migrations to apply!"
-          : "Migrations to be applied",
+        stdout: JSON.stringify([{
+          results: EXPECTED_STAGING_MIGRATIONS[args[2]]
+            .map((name) => ({ name })),
+        }]),
         stderr: "",
       };
     }
@@ -169,6 +179,9 @@ test("preparation applies both migrations, contains collection, and rechecks", (
   assert.equal(result.receipt.collectionAuthorized, false);
   assert.deepEqual(result.receipt.evidence, {
     resourcesVerified: true,
+    staticConfigurationChecked: true,
+    remoteReadOnlyProof: true,
+    migrationInventoryCurrent: true,
     migrationsCurrent: true,
     pilotSchemaCurrent: true,
     collectionContained: true,
@@ -177,4 +190,43 @@ test("preparation applies both migrations, contains collection, and rechecks", (
   assert.equal(Number.isFinite(Date.parse(result.receipt.generatedAt)), true);
   assert.equal(applyCount, 2);
   assert.equal(containmentApplied, true);
+});
+
+test("preparation does not contain until applied migrations are proven exact", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  let applyCount = 0;
+  const baseSpawn = successSpawn(config, calls);
+  const spawn = (command, args, options) => {
+    const joined = args.join(" ");
+    if (joined.includes("FROM d1_migrations")) {
+      calls.push(args);
+      return {
+        status: 0,
+        stdout: JSON.stringify([{ results: [] }]),
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("d1 migrations apply ")) {
+      calls.push(args);
+      applyCount += 1;
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    return baseSpawn(command, args, options);
+  };
+  const result = prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn,
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_MIGRATIONS_UNVERIFIED",
+    blockers: ["REMOTE_MIGRATIONS_PENDING"],
+  });
+  assert.equal(applyCount, 2);
+  assert.equal(calls.some((args) => args.some((value) =>
+    typeof value === "string" && value.includes("UPDATE collection_controls"))), false);
 });
