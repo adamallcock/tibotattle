@@ -143,6 +143,11 @@ test("preparation applies both migrations, contains collection, and rechecks", (
             primary_cooldown_retention_index: 1,
             primary_cooldown_retention_index_shape: 1,
             primary_cooldown_guard_trigger: 1,
+            primary_identity_link_secret_configuration_table: 1,
+            primary_identity_link_secret_configuration_singleton: 1,
+            primary_identity_link_secret_configuration_key_version: 1,
+            primary_identity_link_secret_configuration_secret_fingerprint: 1,
+            primary_identity_link_secret_configuration_recorded_at: 1,
           }],
         }]),
         stderr: "",
@@ -234,13 +239,20 @@ test("preparation applies both migrations, contains collection, and rechecks", (
       primary: {
         status: "verified",
         verified: true,
-        tables: { identityReenrollmentCooldowns: true },
+        tables: {
+          identityReenrollmentCooldowns: true,
+          identityLinkSecretConfiguration: true,
+        },
         columns: {
           participantCooldownDigest: true,
           cooldownDigest: true,
           schemaVersion: true,
           deletedAt: true,
           retainUntil: true,
+          identityLinkSecretConfigurationSingleton: true,
+          identityLinkSecretConfigurationKeyVersion: true,
+          identityLinkSecretConfigurationSecretFingerprint: true,
+          identityLinkSecretConfigurationRecordedAt: true,
         },
         indexes: { retention: true, retentionShape: true },
         triggers: { reenrollmentCooldownGuard: true },
@@ -276,6 +288,109 @@ test("preparation applies both migrations, contains collection, and rechecks", (
   assert.equal(Number.isFinite(Date.parse(result.receipt.generatedAt)), true);
   assert.equal(applyCount, 2);
   assert.equal(containmentApplied, true);
+  const containmentIndex = calls.findIndex((args) =>
+    args[0] === "d1"
+    && args[1] === "execute"
+    && args.some((value) =>
+      typeof value === "string" && value.includes("UPDATE collection_controls")));
+  const firstMigrationIndex = calls.findIndex((args) =>
+    args[0] === "d1" && args[1] === "migrations" && args[2] === "apply");
+  assert.equal(containmentIndex >= 0, true);
+  assert.equal(firstMigrationIndex >= 0, true);
+  assert.equal(containmentIndex < firstMigrationIndex, true);
+});
+
+test("preparation contains an existing active target before any migration", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const result = prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: successSpawn(config, calls, {
+      initialCollectionState: "operational",
+    }),
+  });
+  assert.equal(result.ok, true);
+  const containmentIndices = calls.flatMap((args, index) =>
+    args.some((value) =>
+      typeof value === "string" && value.includes("UPDATE collection_controls"))
+      ? [index]
+      : []);
+  const migrationIndices = calls.flatMap((args, index) =>
+    args[0] === "d1" && args[1] === "migrations" && args[2] === "apply"
+      ? [index]
+      : []);
+  assert.deepEqual(containmentIndices.length, 1);
+  assert.equal(containmentIndices[0] < migrationIndices[0], true);
+});
+
+test("preparation stops at containment failure or crash before migration", () => {
+  for (const scenario of [
+    { name: "failed containment", options: { containmentFailure: true } },
+    { name: "crashed containment", options: { containmentCrash: true } },
+    {
+      name: "unverified containment",
+      options: { containmentProofFailure: true },
+    },
+  ]) {
+    const config = provisionedConfig();
+    const calls = [];
+    const result = prepareDisabledStaging({
+      config,
+      confirmation: PREPARE_CONFIRMATION,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn: successSpawn(config, calls, {
+        ...scenario.options,
+        initialCollectionState: "operational",
+      }),
+    });
+    assert.equal(result.ok, false, scenario.name);
+    assert.equal(
+      result.code,
+      scenario.name === "unverified containment"
+        ? "STAGING_CONTAINMENT_UNVERIFIED"
+        : "STAGING_CONTAINMENT_FAILED",
+      scenario.name,
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "d1" && args[1] === "migrations"),
+      false,
+      scenario.name,
+    );
+  }
+});
+
+test("fresh bootstrap contains after the primary migration before the next mutation", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const result = prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: successSpawn(config, calls, {
+      freshTarget: true,
+      containmentFailure: true,
+    }),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_CONTAINMENT_FAILED",
+  });
+  assert.deepEqual(
+    calls.filter((args) => args[0] === "d1" && args[1] === "migrations")
+      .map((args) => args[3]),
+    ["USAGE_MONITOR_DB"],
+  );
+  const containmentIndex = calls.findIndex((args) =>
+    args.some((value) =>
+      typeof value === "string" && value.includes("UPDATE collection_controls")));
+  const firstMigrationIndex = calls.findIndex((args) =>
+    args[0] === "d1" && args[1] === "migrations");
+  assert.equal(firstMigrationIndex < containmentIndex, true);
 });
 
 test("preparation does not contain until applied migrations are proven exact", () => {

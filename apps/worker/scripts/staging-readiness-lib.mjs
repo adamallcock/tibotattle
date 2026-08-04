@@ -109,6 +109,16 @@ const PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
   cooldownRetentionIndex: "primary_cooldown_retention_index",
   cooldownRetentionIndexShape: "primary_cooldown_retention_index_shape",
   cooldownGuardTrigger: "primary_cooldown_guard_trigger",
+  identityLinkSecretConfigurationTable:
+    "primary_identity_link_secret_configuration_table",
+  identityLinkSecretConfigurationSingleton:
+    "primary_identity_link_secret_configuration_singleton",
+  identityLinkSecretConfigurationKeyVersion:
+    "primary_identity_link_secret_configuration_key_version",
+  identityLinkSecretConfigurationSecretFingerprint:
+    "primary_identity_link_secret_configuration_secret_fingerprint",
+  identityLinkSecretConfigurationRecordedAt:
+    "primary_identity_link_secret_configuration_recorded_at",
 });
 
 const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
@@ -173,7 +183,37 @@ SELECT
     SELECT 1 FROM sqlite_master
      WHERE type = 'trigger'
        AND name = 'participants_identity_reenrollment_cooldown_guard'
-  ) AS primary_cooldown_guard_trigger;
+  ) AS primary_cooldown_guard_trigger,
+  EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_link_secret_configuration'
+  ) AS primary_identity_link_secret_configuration_table,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
+     WHERE name = 'singleton'
+       AND type = 'INTEGER'
+       AND notnull = 1
+       AND pk = 1
+  ) AS primary_identity_link_secret_configuration_singleton,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
+     WHERE name = 'key_version'
+       AND type = 'TEXT'
+       AND notnull = 1
+  ) AS primary_identity_link_secret_configuration_key_version,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
+     WHERE name = 'secret_fingerprint'
+       AND type = 'TEXT'
+       AND notnull = 1
+  ) AS primary_identity_link_secret_configuration_secret_fingerprint,
+  EXISTS(
+    SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
+     WHERE name = 'recorded_at'
+       AND type = 'TEXT'
+       AND notnull = 1
+  ) AS primary_identity_link_secret_configuration_recorded_at;
 `;
 
 const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_SQL = `
@@ -638,11 +678,50 @@ function classifyMigrationProbe(result, expectedNames) {
 const READ_ONLY_MIGRATION_PROBE_SQL =
   "SELECT name FROM d1_migrations ORDER BY id;";
 
+const COLLECTION_CONTROL_PROBE_SQL = `
+SELECT schema_version,
+       control_state,
+       enrollment_enabled,
+       upload_registration_enabled,
+       processing_enabled,
+       publication_enabled
+  FROM collection_controls
+ WHERE singleton = 1;
+`;
+
 function collectionControlRow(value) {
   const statements = Array.isArray(value) ? value : [];
   return statements.findLast(
     (entry) => Array.isArray(entry?.results) && entry.results.length === 1,
   )?.results?.[0] ?? null;
+}
+
+function collectionControlProbeState(result) {
+  if (!result.ok) {
+    const output = `${result.stdout}${result.stderr}`;
+    return /no such table[\s:]+.*collection_controls|collection_controls.*no such table/iu
+      .test(output)
+      ? "missing"
+      : "unknown";
+  }
+  const row = collectionControlRow(parseJson(result.stdout));
+  if (row === null
+      || row.schema_version !== "collection-controls-v0.1"
+      || !["operational", "degraded", "contained"].includes(
+        row.control_state,
+      )
+      || !["enrollment_enabled", "upload_registration_enabled",
+        "processing_enabled", "publication_enabled"]
+        .every((field) => row[field] === 0 || row[field] === 1)) {
+    return "invalid";
+  }
+  return row.control_state === "contained"
+      && row.enrollment_enabled === 0
+      && row.upload_registration_enabled === 0
+      && row.processing_enabled === 0
+      && row.publication_enabled === 0
+    ? "contained"
+    : "uncontained";
 }
 
 function schemaProbeValues(result, fields) {
@@ -681,6 +760,8 @@ function primaryIdentityProtectionSchemaEvidence(result) {
     verified: status === "verified",
     tables: {
       identityReenrollmentCooldowns: values.cooldownTable,
+      identityLinkSecretConfiguration:
+        values.identityLinkSecretConfigurationTable,
     },
     columns: {
       participantCooldownDigest: values.participantCooldownDigestColumn,
@@ -688,6 +769,14 @@ function primaryIdentityProtectionSchemaEvidence(result) {
       schemaVersion: values.cooldownSchemaVersionColumn,
       deletedAt: values.cooldownDeletedAtColumn,
       retainUntil: values.cooldownRetainUntilColumn,
+      identityLinkSecretConfigurationSingleton:
+        values.identityLinkSecretConfigurationSingleton,
+      identityLinkSecretConfigurationKeyVersion:
+        values.identityLinkSecretConfigurationKeyVersion,
+      identityLinkSecretConfigurationSecretFingerprint:
+        values.identityLinkSecretConfigurationSecretFingerprint,
+      identityLinkSecretConfigurationRecordedAt:
+        values.identityLinkSecretConfigurationRecordedAt,
     },
     indexes: {
       retention: values.cooldownRetentionIndex,
@@ -802,13 +891,20 @@ function safeSchemaEvidence(value) {
     return safeSide;
   };
   const primary = side(value.primary, {
-    tables: ["identityReenrollmentCooldowns"],
+    tables: [
+      "identityReenrollmentCooldowns",
+      "identityLinkSecretConfiguration",
+    ],
     columns: [
       "participantCooldownDigest",
       "cooldownDigest",
       "schemaVersion",
       "deletedAt",
       "retainUntil",
+      "identityLinkSecretConfigurationSingleton",
+      "identityLinkSecretConfigurationKeyVersion",
+      "identityLinkSecretConfigurationSecretFingerprint",
+      "identityLinkSecretConfigurationRecordedAt",
     ],
     indexes: ["retention", "retentionShape"],
     triggers: ["reenrollmentCooldownGuard"],
@@ -916,6 +1012,7 @@ export function probeStagingLive({
     collectionContained: false,
   };
   let migrationProof = [];
+  let collectionControlState = "unknown";
   let identitySchemaEvidence = identityProtectionSchemaEvidence();
   const blockers = [...configuration.blockers];
 
@@ -928,6 +1025,7 @@ export function probeStagingLive({
       state: "unsafe_configuration",
       collectionAuthorized: false,
       migrationInventory: configuration.migrationInventory,
+      collectionControlState,
       evidence: {
         identityProtectionSchema: identitySchemaEvidence,
       },
@@ -1047,6 +1145,36 @@ export function probeStagingLive({
         .filter((code) => code !== null),
     );
 
+    const probeCollectionControls = () => {
+      const control = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "USAGE_MONITOR_DB",
+          "--remote", "--env", "staging",
+          "--command", COLLECTION_CONTROL_PROBE_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      collectionControlState = collectionControlProbeState(control);
+      if (collectionControlState === "missing"
+          && migrationStates.every((state) => state.status === "uninitialized")) {
+        collectionControlState = "fresh";
+      } else if (collectionControlState === "uncontained") {
+        blockers.push("REMOTE_COLLECTION_NOT_CONTAINED");
+      } else if (collectionControlState === "invalid") {
+        blockers.push("REMOTE_COLLECTION_CONTROLS_INVALID");
+      } else if (collectionControlState === "unknown") {
+        blockers.push("REMOTE_COLLECTION_CONTROLS_UNKNOWN");
+      } else if (collectionControlState === "missing") {
+        blockers.push("REMOTE_COLLECTION_CONTROLS_UNAVAILABLE");
+      }
+      checks.collectionContained = collectionControlState === "contained";
+    };
+
+    if (!checks.migrationsCurrent) probeCollectionControls();
+
     if (checks.migrationsCurrent) {
       const schemaProbe = runWrangler(
         wrangler,
@@ -1138,37 +1266,8 @@ export function probeStagingLive({
         blockers.push(deletionLedgerSchemaBlocker);
       }
 
-      const control = runWrangler(
-        wrangler,
-        workerDirectory,
-        [
-          "d1", "execute", "USAGE_MONITOR_DB",
-          "--remote", "--env", "staging",
-          "--command",
-          `SELECT schema_version,
-                  control_state,
-                  enrollment_enabled,
-                  upload_registration_enabled,
-                  processing_enabled,
-                  publication_enabled
-             FROM collection_controls
-            WHERE singleton = 1;`,
-          "--json",
-        ],
-        spawn,
-      );
-      const row = collectionControlRow(parseJson(control.stdout));
-      checks.collectionContained = control.ok
-        && row?.schema_version === "collection-controls-v0.1"
-        && row?.control_state === "contained"
-        && row?.enrollment_enabled === 0
-        && row?.upload_registration_enabled === 0
-        && row?.processing_enabled === 0
-        && row?.publication_enabled === 0;
-      if (!checks.collectionContained) {
-        blockers.push("REMOTE_COLLECTION_NOT_CONTAINED");
-      }
     }
+    if (checks.migrationsCurrent) probeCollectionControls();
   }
 
   const uniqueBlockers = [...new Set(blockers)];
@@ -1185,6 +1284,7 @@ export function probeStagingLive({
     collectionAuthorized: false,
     migrationInventory: configuration.migrationInventory,
     migrationProof,
+    collectionControlState,
     checks: {
       ...configuration.checks,
       ...checks,

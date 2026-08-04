@@ -26,8 +26,19 @@ export function successSpawn(
     missingDeletionLedgerSchema = false,
     primarySchemaError = false,
     deletionLedgerSchemaError = false,
+    missingIdentityLinkSecretConfiguration = false,
+    malformedIdentityLinkSecretConfigurationField = null,
+    initialCollectionState = "contained",
+    containmentFailure = false,
+    containmentCrash = false,
+    containmentProofFailure = false,
+    migrationFailureAt = null,
+    freshTarget = false,
   } = {},
 ) {
+  let applyCount = 0;
+  const appliedBindings = new Set();
+  let collectionState = freshTarget ? "missing" : initialCollectionState;
   return (_command, args) => {
     calls.push(args);
     const joined = args.join(" ");
@@ -65,6 +76,13 @@ export function successSpawn(
       };
     }
     if (joined.includes("FROM d1_migrations")) {
+      if (freshTarget && !appliedBindings.has(args[2])) {
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "Error: no such table: d1_migrations",
+        };
+      }
       return {
         status: 0,
         stdout: JSON.stringify([{
@@ -101,6 +119,28 @@ export function successSpawn(
             primary_cooldown_retention_index: missingPrimarySchema ? 0 : 1,
             primary_cooldown_retention_index_shape: missingPrimarySchema ? 0 : 1,
             primary_cooldown_guard_trigger: missingPrimarySchema ? 0 : 1,
+            primary_identity_link_secret_configuration_table:
+              missingIdentityLinkSecretConfiguration ? 0 : 1,
+            primary_identity_link_secret_configuration_singleton:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_singleton"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_key_version:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_key_version"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_secret_fingerprint:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_secret_fingerprint"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_recorded_at:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_recorded_at"
+                ? 0 : 1,
           }],
         }]),
         stderr: "",
@@ -148,21 +188,48 @@ export function successSpawn(
         stderr: "",
       };
     }
-    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")) {
+    if (joined.startsWith("d1 migrations apply ")) {
+      applyCount += 1;
+      if (migrationFailureAt === applyCount) {
+        return { status: 1, stdout: "", stderr: "migration failed" };
+      }
+      appliedBindings.add(args[3]);
+      if (freshTarget && args[3] === "USAGE_MONITOR_DB") {
+        collectionState = "operational";
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")
+        && args.includes("--json")) {
+      if (collectionState === "missing") {
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "Error: no such table: collection_controls",
+        };
+      }
       return {
         status: 0,
         stdout: JSON.stringify([{
           results: [{
             schema_version: "collection-controls-v0.1",
-            control_state: "contained",
-            enrollment_enabled: 0,
-            upload_registration_enabled: 0,
-            processing_enabled: 0,
-            publication_enabled: 0,
+            control_state: collectionState,
+            enrollment_enabled: collectionState === "contained" ? 0 : 1,
+            upload_registration_enabled: collectionState === "contained" ? 0 : 1,
+            processing_enabled: collectionState === "contained" ? 0 : 1,
+            publication_enabled: collectionState === "contained" ? 0 : 1,
           }],
         }]),
         stderr: "",
       };
+    }
+    if (joined.startsWith("d1 execute USAGE_MONITOR_DB ")) {
+      if (containmentCrash) throw new Error("containment crashed");
+      if (containmentFailure) {
+        return { status: 1, stdout: "", stderr: "containment failed" };
+      }
+      if (!containmentProofFailure) collectionState = "contained";
+      return { status: 0, stdout: "", stderr: "" };
     }
     throw new Error(`Unexpected fake Wrangler call: ${joined}`);
   };

@@ -286,6 +286,27 @@ test("live readiness blocks missing identity protection schema in either databas
       blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
       side: "deletionLedger",
     },
+    {
+      name: "primary identity-link secret configuration table",
+      options: { missingIdentityLinkSecretConfiguration: true },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "tables",
+      evidenceKey: "identityLinkSecretConfiguration",
+    },
+    {
+      name: "primary identity-link secret configuration column",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_key_version",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "columns",
+      evidenceKey: "identityLinkSecretConfigurationKeyVersion",
+    },
   ]) {
     const config = provisionedConfig();
     const result = probeStagingLive({
@@ -307,6 +328,14 @@ test("live readiness blocks missing identity protection schema in either databas
       "incomplete",
       scenario.name,
     );
+    if (scenario.evidenceGroup) {
+      assert.equal(
+        result.evidence.identityProtectionSchema[scenario.side]
+          [scenario.evidenceGroup][scenario.evidenceKey],
+        false,
+        scenario.name,
+      );
+    }
     assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
   }
 });

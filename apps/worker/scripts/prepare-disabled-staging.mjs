@@ -14,6 +14,19 @@ import {
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
 
+const CONTAINMENT_SQL = `
+UPDATE collection_controls
+   SET enrollment_enabled = 0,
+       upload_registration_enabled = 0,
+       processing_enabled = 0,
+       publication_enabled = 0,
+       control_state = 'contained',
+       revision = revision + 1,
+       reason_code = 'maintenance',
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+ WHERE singleton = 1;
+`;
+
 function run(spawn, wrangler, workerDirectory, args) {
   try {
     const result = spawn(wrangler, args, {
@@ -25,6 +38,84 @@ function run(spawn, wrangler, workerDirectory, args) {
   } catch {
     return false;
   }
+}
+
+function isFreshBootstrapTarget(readiness) {
+  const migrationProof = readiness?.migrationProof;
+  return readiness?.collectionControlState === "fresh"
+    && Array.isArray(migrationProof)
+    && migrationProof.length === REQUIRED_D1_BINDINGS.length
+    && migrationProof.every((state, index) =>
+      state?.binding === REQUIRED_D1_BINDINGS[index].binding
+      && state.status === "uninitialized");
+}
+
+function readinessBlockers(readiness, fallback) {
+  return Array.isArray(readiness?.blockers)
+    && readiness.blockers.length > 0
+    ? readiness.blockers
+    : [fallback];
+}
+
+function containAndVerify({
+  readiness,
+  spawn,
+  wrangler,
+  workerDirectory,
+  config,
+}) {
+  if (readiness?.checks?.collectionContained === true) {
+    return { ok: true, readiness };
+  }
+  if (readiness?.collectionControlState !== "uncontained") {
+    return {
+      ok: false,
+      code: "STAGING_CONTAINMENT_UNVERIFIED",
+      blockers: readinessBlockers(
+        readiness,
+        "REMOTE_COLLECTION_NOT_CONTAINED",
+      ),
+    };
+  }
+  if (!run(
+    spawn,
+    wrangler,
+    workerDirectory,
+    [
+      "d1", "execute", "USAGE_MONITOR_DB",
+      "--remote", "--env", "staging",
+      "--command", CONTAINMENT_SQL,
+    ],
+  )) {
+    return { ok: false, code: "STAGING_CONTAINMENT_FAILED" };
+  }
+
+  let afterContainment;
+  try {
+    afterContainment = probeStagingLive({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return {
+      ok: false,
+      code: "STAGING_CONTAINMENT_UNVERIFIED",
+      blockers: ["REMOTE_COLLECTION_NOT_CONTAINED"],
+    };
+  }
+  if (!afterContainment.checks.collectionContained) {
+    return {
+      ok: false,
+      code: "STAGING_CONTAINMENT_UNVERIFIED",
+      blockers: readinessBlockers(
+        afterContainment,
+        "REMOTE_COLLECTION_NOT_CONTAINED",
+      ),
+    };
+  }
+  return { ok: true, readiness: afterContainment };
 }
 
 export function prepareDisabledStaging({
@@ -86,7 +177,22 @@ export function prepareDisabledStaging({
     };
   }
 
-  for (const { binding } of REQUIRED_D1_BINDINGS) {
+  let readiness = before;
+  const freshBootstrap = isFreshBootstrapTarget(before);
+  for (let index = 0; index < REQUIRED_D1_BINDINGS.length; index += 1) {
+    const initialBootstrap = freshBootstrap && index === 0;
+    if (!readiness.checks.collectionContained && !initialBootstrap) {
+      const containment = containAndVerify({
+        readiness,
+        spawn,
+        wrangler,
+        workerDirectory,
+        config,
+      });
+      if (!containment.ok) return containment;
+      readiness = containment.readiness;
+    }
+    const { binding } = REQUIRED_D1_BINDINGS[index];
     if (!run(
       spawn,
       wrangler,
@@ -97,6 +203,29 @@ export function prepareDisabledStaging({
       ],
     )) {
       return { ok: false, code: "STAGING_MIGRATION_FAILED" };
+    }
+    if (index === REQUIRED_D1_BINDINGS.length - 1) continue;
+
+    try {
+      readiness = probeStagingLive({
+        config,
+        wrangler,
+        workerDirectory,
+        spawn,
+      });
+    } catch {
+      return { ok: false, code: "STAGING_MIGRATIONS_UNVERIFIED" };
+    }
+    if (!readiness.checks.collectionContained) {
+      const containment = containAndVerify({
+        readiness,
+        spawn,
+        wrangler,
+        workerDirectory,
+        config,
+      });
+      if (!containment.ok) return containment;
+      readiness = containment.readiness;
     }
   }
 
@@ -112,13 +241,11 @@ export function prepareDisabledStaging({
     return { ok: false, code: "STAGING_MIGRATIONS_UNVERIFIED" };
   }
   const migrationVerificationBlockers = afterMigrations.blockers.filter(
-    (code) => ![
-      "REMOTE_COLLECTION_NOT_CONTAINED",
-      "REQUIRED_STAGING_SECRETS_MISSING",
-    ].includes(code),
+    (code) => code !== "REQUIRED_STAGING_SECRETS_MISSING",
   );
   if (!afterMigrations.checks.migrationsCurrent
       || !afterMigrations.checks.pilotSchemaCurrent
+      || !afterMigrations.checks.collectionContained
       || !identityProtectionSchemaVerified(afterMigrations)
       || migrationVerificationBlockers.length > 0) {
     return {
@@ -129,79 +256,30 @@ export function prepareDisabledStaging({
         : ["REMOTE_MIGRATIONS_PENDING"],
     };
   }
-
-  const containmentSql = `
-UPDATE collection_controls
-   SET enrollment_enabled = 0,
-       upload_registration_enabled = 0,
-       processing_enabled = 0,
-       publication_enabled = 0,
-       control_state = 'contained',
-       revision = revision + 1,
-       reason_code = 'maintenance',
-       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
- WHERE singleton = 1;
-`;
-  if (!run(
-    spawn,
-    wrangler,
-    workerDirectory,
-    [
-      "d1", "execute", "USAGE_MONITOR_DB",
-      "--remote", "--env", "staging",
-      "--command", containmentSql,
-    ],
-  )) {
-    return { ok: false, code: "STAGING_CONTAINMENT_FAILED" };
-  }
-
-  let after;
-  try {
-    after = probeStagingLive({
-      config,
-      wrangler,
-      workerDirectory,
-      spawn,
-    });
-  } catch {
-    return { ok: false, code: "STAGING_PREPARATION_UNVERIFIED" };
-  }
-  const remainingBlockers = after.blockers.filter(
-    (code) => code !== "REQUIRED_STAGING_SECRETS_MISSING",
-  );
-  if (remainingBlockers.length > 0
-      || !after.checks.migrationsCurrent
-      || !after.checks.collectionContained
-      || !identityProtectionSchemaVerified(after)) {
-    return {
-      ok: false,
-      code: "STAGING_PREPARATION_UNVERIFIED",
-      blockers: remainingBlockers,
-    };
-  }
   return {
     ok: true,
     code: "DISABLED_STAGING_PREPARED",
     collectionAuthorized: false,
-    secretsInstalled: after.checks.requiredSecretsInstalled,
+    secretsInstalled: afterMigrations.checks.requiredSecretsInstalled,
     receipt: stagingOperationReceipt("disabled_staging_prepared", {
-      resourcesVerified: after.checks.d1ResourcesExist
-        && after.checks.r2ResourceExists,
-      staticConfigurationChecked: after.evidenceType
+      resourcesVerified: afterMigrations.checks.d1ResourcesExist
+        && afterMigrations.checks.r2ResourceExists,
+      staticConfigurationChecked: afterMigrations.evidenceType
         === STAGING_PROOF_TYPES.LIVE_REMOTE,
       remoteReadOnlyProof: true,
-      migrationInventoryCurrent: after.checks.remoteMigrationInventoryCurrent,
-      migrationsCurrent: after.checks.migrationsCurrent,
-      pilotSchemaCurrent: after.checks.pilotSchemaCurrent,
+      migrationInventoryCurrent:
+        afterMigrations.checks.remoteMigrationInventoryCurrent,
+      migrationsCurrent: afterMigrations.checks.migrationsCurrent,
+      pilotSchemaCurrent: afterMigrations.checks.pilotSchemaCurrent,
       primaryReenrollmentSchemaCurrent:
-        after.checks.primaryReenrollmentSchemaCurrent,
+        afterMigrations.checks.primaryReenrollmentSchemaCurrent,
       deletionLedgerSchemaCurrent:
-        after.checks.deletionLedgerSchemaCurrent,
+        afterMigrations.checks.deletionLedgerSchemaCurrent,
       identityProtectionSchemaCurrent:
-        after.checks.identityProtectionSchemaCurrent,
-      identityProtectionSchema: after.evidence.identityProtectionSchema,
-      collectionContained: after.checks.collectionContained,
-      secretsInstalled: after.checks.requiredSecretsInstalled,
+        afterMigrations.checks.identityProtectionSchemaCurrent,
+      identityProtectionSchema: afterMigrations.evidence.identityProtectionSchema,
+      collectionContained: afterMigrations.checks.collectionContained,
+      secretsInstalled: afterMigrations.checks.requiredSecretsInstalled,
     }),
   };
 }
