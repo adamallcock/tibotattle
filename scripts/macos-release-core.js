@@ -1157,6 +1157,26 @@ export function createMacOSSignedReplacementContract() {
   });
 }
 
+function validateSignedReleaseChannel(manifest, label) {
+  const channel = manifest?.channel;
+  if (channel === null || typeof channel !== "object"
+      || Array.isArray(channel)
+      || typeof channel.name !== "string") {
+    fail(
+      `${label} is missing required named channel provenance`,
+      "MACOS_RELEASE_CHANNEL_PROVENANCE_REQUIRED",
+    );
+  }
+  try {
+    return assertReleaseChannelPublication(channel.name, channel).name;
+  } catch {
+    fail(
+      `${label} has channel provenance that does not match its named policy`,
+      "MACOS_RELEASE_CHANNEL_MISMATCH",
+    );
+  }
+}
+
 function validateSignedReleaseManifest(manifest, label) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
       || manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
@@ -1201,14 +1221,7 @@ function validateSignedReleaseManifest(manifest, label) {
     );
   }
   if (manifest.channel !== undefined) {
-    try {
-      assertReleaseChannelPublication(manifest.channel.name, manifest.channel);
-    } catch {
-      fail(
-        `${label} has channel provenance that does not match its named policy`,
-        "MACOS_RELEASE_CHANNEL_MISMATCH",
-      );
-    }
+    validateSignedReleaseChannel(manifest, label);
   }
   macOSBundleVersionParts(manifest.application.bundleVersion);
   return manifest;
@@ -1226,6 +1239,20 @@ export function validateMacOSSignedReplacementPair({
     candidateManifest,
     "Candidate release",
   );
+  const previousChannelName = validateSignedReleaseChannel(
+    previous,
+    "Previous release",
+  );
+  const candidateChannelName = validateSignedReleaseChannel(
+    candidate,
+    "Candidate release",
+  );
+  if (candidateChannelName !== previousChannelName) {
+    fail(
+      "Replacement and rollback manifests must use the same named release channel",
+      "MACOS_RELEASE_CHANNEL_MISMATCH",
+    );
+  }
   if (candidate.application.bundleIdentifier
         !== previous.application.bundleIdentifier) {
     fail(

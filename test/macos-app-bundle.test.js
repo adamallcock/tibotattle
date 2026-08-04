@@ -38,6 +38,7 @@ import {
   RELEASE_CHANNELS_SCHEMA_VERSION,
   STABLE_RELEASE_CHANNEL,
   assertReleaseChannelConfiguration,
+  createReleaseChannelProvenance,
 } from "../config/release-channels.js";
 import {
   MACOS_RUNTIME_STATIC_ASSETS,
@@ -1608,6 +1609,15 @@ test("native central service accepts development, stable, and dogfood HTTPS mode
   );
 });
 
+test("development and preview builds treat the release-channel policy as optional", async () => {
+  const source = await readFile(BUILD_SCRIPT, "utf8");
+  assert.match(
+    source,
+    /const selectedPublicEdKeySha256 =\s+selectedReleaseChannel\?\.sparkle\.publicEdKeySha256 \?\? null/u,
+  );
+  assert.match(source, /if \(selectedPublicEdKeySha256 !== null/u);
+});
+
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), "1");
   for (const value of ["1", "1.2", "1.2.3", "0.0.0", "123456789"]) {
@@ -2216,6 +2226,11 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       fileName,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     },
+    channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+      publicEdKeySha256: createHash("sha256")
+        .update(Buffer.alloc(32, 1))
+        .digest("hex"),
+    }),
     source: {
       commit: "a".repeat(40),
       tag: RELEASE_MANIFEST.tag,
@@ -2354,6 +2369,40 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         },
       }),
       { code: "MACOS_REPLACEMENT_MANIFEST_INVALID" },
+    );
+    for (const [label, previous, candidate] of [
+      [
+        "previous",
+        { ...previousManifest, channel: undefined },
+        candidateManifest,
+      ],
+      [
+        "candidate",
+        previousManifest,
+        { ...candidateManifest, channel: undefined },
+      ],
+    ]) {
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: previous,
+          candidateManifest: candidate,
+        }),
+        { code: "MACOS_RELEASE_CHANNEL_PROVENANCE_REQUIRED" },
+        `${label} release channel provenance must be required`,
+      );
+    }
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest,
+        candidateManifest: {
+          ...candidateManifest,
+          channel: {
+            ...candidateManifest.channel,
+            name: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+          },
+        },
+      }),
+      { code: "MACOS_RELEASE_CHANNEL_MISMATCH" },
     );
     assert.throws(
       () => validateMacOSSignedReplacementPair({

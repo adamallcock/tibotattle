@@ -3347,8 +3347,10 @@ export async function buildMacOSApp({
     frameworkPath: sparkleFramework,
     publicEdKey: sparklePublicEdKey,
   });
-  if (selectedReleaseChannel?.sparkle.publicEdKeySha256 !== null
-      && selectedReleaseChannel?.sparkle.publicEdKeySha256
+  const selectedPublicEdKeySha256 =
+    selectedReleaseChannel?.sparkle.publicEdKeySha256 ?? null;
+  if (selectedPublicEdKeySha256 !== null
+      && selectedPublicEdKeySha256
         !== sha256(Buffer.from(updater.publicEdKey, "base64"))) {
     fail(
       `Sparkle public key does not match the reviewed ${selectedReleaseChannel.name} channel key`,

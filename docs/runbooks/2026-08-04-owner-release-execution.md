@@ -247,6 +247,13 @@ node scripts/validate-macos-replacement.js \
   --candidate "/path/to/candidate.dmg.release.json"
 ```
 
+Before comparing versions, the replacement gate requires valid named-channel
+provenance on both manifests and requires the previous `N` and candidate `N+1`
+names to match exactly. A stable manifest cannot replace an internal-dogfood
+manifest, and neither may omit channel provenance. The provenance must also
+match the selected policy's service mode, endpoints, updater feed, bucket,
+object prefix, and reviewed public-key input; otherwise stop the release.
+
 The owner signs the exact stable DMG and validates the appcast locally with
 the complete existing publisher command, including `--channel stable`, using
 only the reviewed stable bucket, release manifest, appcast, DMG, and public
