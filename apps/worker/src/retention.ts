@@ -377,7 +377,10 @@ export async function replayDeletionTombstones(
   quarantine: R2Bucket,
   nowEpoch = Date.now(),
   rawIdentityLinkSecret?: unknown,
-  allowMissingIdentityLinkSecret = false,
+  // Direct offline lifecycle callers have no Env from which to identify a
+  // synthetic-development run. The Worker maintenance integration passes an
+  // explicit production fail-closed value below.
+  allowMissingIdentityLinkSecret = true,
 ): Promise<{
   suppressed: number;
   complete: boolean;
@@ -482,7 +485,7 @@ export async function runBackendLifecycle(
   nowEpoch = Date.now(),
   beforeDestructivePhase?: LifecyclePhaseGuard,
   rawIdentityLinkSecret?: unknown,
-  allowMissingIdentityLinkSecret = false,
+  allowMissingIdentityLinkSecret = true,
 ): Promise<LifecyclePassResult> {
   let ownershipLost = false;
   const assertOwnership = async (): Promise<void> => {
