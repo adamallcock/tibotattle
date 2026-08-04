@@ -41,30 +41,20 @@ stable and `internal-dogfood` for dogfood). External inspection requires both
 named-identity fields to match the selected policy; it does not infer `stable`
 from the legacy `production` value.
 
-## Follow-up boundary
+## Implemented verification boundary
 
-The release-readiness/preview verifiers still need to consume the selected
-policy where they inspect remote artifacts.
-The `58739e3` release-readiness observer should consume the same
-`getReleaseChannel`/`resolveReleaseChannel` contract when it is refactored;
-it must not keep treating `config/deployment-endpoints.js` as the universal
-channel source.
+The release-readiness observer and remote macOS preview verifier now resolve
+the selected named channel policy before they inspect a remote endpoint. They
+derive the service origin, appcast URL, and object prefix from that policy,
+enforce the sealed channel identity, and reject command-line endpoint
+overrides. An unconfigured `internal-dogfood` channel fails before any network
+request and never falls back to the stable channel.
 
-Preview remains a distinct `preview_distribution` path and rejects a named
-non-stable channel, so it cannot silently become dogfood. For backwards
-compatibility, `MACOS_PREVIEW_PUBLIC_CONFIGURATION` still supplies the
-reviewed stable central/appcast defaults when preview is invoked without
-overrides. That is the remaining risk: a preview build can still be an
-explicitly requested production-service test client until a separately
-reviewed preview policy (or an explicit-only preview configuration) replaces
-those defaults. This lane does not edit the worker, package scripts, or public
-preview verifier.
-
-In particular, `scripts/verify-macos-preview-remote.js` currently requires
-`UsageMonitorCentralOriginMode === production_https` near lines 321 and 459;
-it must instead resolve the named channel policy, require the channel’s exact
-service origin and expected mode, and reject unconfigured dogfood without
-falling back to stable. The build must emit the same channel/mode metadata.
+Preview remains a distinct `preview_distribution` path rather than a release
+channel. It cannot silently become dogfood: a channel-bound external bundle
+must carry matching named-identity fields and match the selected channel's
+policy. These checks establish a local fail-closed boundary only; they do not
+prove that a signed artifact, update feed, or hosted service exists.
 
 The external prerequisite is owner provisioning of dedicated staging service,
 update-feed, DNS/R2 bucket, and the corresponding credentials/public key. This

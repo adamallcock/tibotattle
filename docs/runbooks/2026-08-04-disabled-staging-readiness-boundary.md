@@ -23,18 +23,21 @@ npm --prefix apps/worker run staging:check
 The staging gate requires the exact staging Worker/database/bucket names,
 `workers_dev: true`, no staging routes or `PUBLIC_ORIGIN`, disabled enrollment
 and ingestion variables, contained collection controls, and the exact local
-migration inventory. The primary D1 inventory is 0001–0026, including the
-reviewed tail:
+migration inventory. The primary D1 inventory is 0001–0028, including the
+reviewed identity-protection tail:
 
 - `0023_community_aggregate_safety.sql`
 - `0024_apple_signin_nonce_binding.sql`
 - `0025_device_lifecycle.sql`
 - `0026_signin_start_admission.sql`
+- `0027_identity_reenrollment_cooldown_guard.sql`
+- `0028_identity_link_secret_configuration.sql`
 
-The deletion ledger inventory is `0001_deletion_tombstones.sql`. Any missing,
-extra, malformed, production-named, or otherwise unreviewed target fails
-closed with a fixed blocker. Static output has `liveProof: false` and must not
-be described as a remote readiness or migration result.
+The deletion ledger inventory is `0001_deletion_tombstones.sql` and
+`0002_identity_reenrollment_cooldown.sql`. Any missing, extra, malformed,
+production-named, or otherwise unreviewed target fails closed with a fixed
+blocker. Static output has `liveProof: false` and must not be described as a
+remote readiness or migration result.
 
 ## Live read-only proof
 
@@ -51,9 +54,10 @@ credential values, plus the read-only SQL query
 table. A newly created D1 without that table is reported as uninitialized, not
 as current. A
 current result requires the remote applied-name sequence to match the
-checked-in inventory for both D1 bindings, followed by the existing schema and
-containment checks. Live output has `liveProof: true`, but it remains a
-readiness observation rather than authorization to collect data.
+checked-in inventory for both D1 bindings, including the identity-link secret
+configuration and re-enrollment-cooldown protections, followed by the existing
+schema and containment checks. Live output has `liveProof: true`, but it
+remains a readiness observation rather than authorization to collect data.
 
 ## Explicit mutation gate
 
