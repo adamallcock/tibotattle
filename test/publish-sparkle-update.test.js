@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -26,6 +26,7 @@ function sha256(value) {
 
 async function createReleaseFixture({
   appcastURL = CANONICAL_APPCAST_URL,
+  bundleVersion = "1",
   dmgbBytes = Buffer.from("signed-notarized-dmg-fixture"),
   mutateAppcast = (value) => value,
   mutateManifest = (value) => value,
@@ -40,12 +41,12 @@ async function createReleaseFixture({
   const digest = sha256(dmgbBytes);
   const signature = sign(null, dmgbBytes, TEST_KEY_PAIR.privateKey)
     .toString("base64");
-  const artifactURL = `${CANONICAL_UPDATE_ORIGIN}/releases/1/${digest}/${fileName}`;
+  const artifactURL = `${CANONICAL_UPDATE_ORIGIN}/releases/${bundleVersion}/${digest}/${fileName}`;
   const manifest = mutateManifest({
     schemaVersion: "usage-monitor-macos-release-v0.2",
     application: {
       bundleIdentifier: "com.usagemonitor.local",
-      bundleVersion: "1",
+      bundleVersion,
       shortVersion: "0.1.0",
     },
     artifact: { bytes: dmgbBytes.length, fileName, sha256: digest },
@@ -70,7 +71,7 @@ async function createReleaseFixture({
   });
   const appcast = mutateAppcast(`<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
-<enclosure url="${artifactURL}" length="${dmgbBytes.length}" sparkle:version="1" sparkle:edSignature="${signature}" />
+<enclosure url="${artifactURL}" length="${dmgbBytes.length}" sparkle:version="${bundleVersion}" sparkle:edSignature="${signature}" />
 </item></channel></rss>
 `);
   await Promise.all([
@@ -87,17 +88,33 @@ async function createReleaseFixture({
 }
 
 function missingRemoteObjectRunner() {
+  return remoteObjectRunner();
+}
+
+function remoteObjectRunner(objects = new Map()) {
   const calls = [];
-  return {
-    calls,
-    run: async (arguments_) => {
-      calls.push(arguments_);
-      if (arguments_.at(2) === "get") {
+  const run = async (arguments_) => {
+    calls.push(arguments_);
+    if (arguments_.at(2) === "get") {
+      const object = objects.get(arguments_[3]);
+      if (object === undefined) {
         return { status: 1, stderr: "Object not found" };
       }
-      return { status: 0 };
-    },
+      const destination = arguments_[arguments_.indexOf("--file") + 1];
+      await writeFile(destination, object);
+    }
+    return { status: 0 };
   };
+  return { calls, run };
+}
+
+function appcastEnclosure({ bytes, deltaFrom, signature, url, version }) {
+  const delta = deltaFrom === undefined
+    ? ""
+    : ` sparkle:deltaFrom="${deltaFrom}"`;
+  const enclosureSignature = signature
+    ?? sign(null, bytes, TEST_KEY_PAIR.privateKey).toString("base64");
+  return `<item><enclosure url="${url}" length="${bytes.length}" sparkle:version="${version}"${delta} sparkle:edSignature="${enclosureSignature}" /></item>`;
 }
 
 test("validates an explicitly supplied canonical signed update without invoking Wrangler by default", async () => {
@@ -127,7 +144,12 @@ test("validates an explicitly supplied canonical signed update without invoking 
     assert.equal(publication.artifact.cacheControl, IMMUTABLE_CACHE_CONTROL);
     assert.equal(publication.manifest.cacheControl, IMMUTABLE_CACHE_CONTROL);
     assert.equal(publication.appcast.cacheControl, APPCAST_CACHE_CONTROL);
-    assert.deepEqual(verified, [[fixture.dmgPath, { production: true }]]);
+    assert.deepEqual(verified, [[fixture.dmgPath, {
+      expectedBundleIdentifier: "com.usagemonitor.local",
+      expectedBundleVersion: "1",
+      expectedShortVersion: "0.1.0",
+      production: true,
+    }]]);
   } finally {
     await fixture.cleanup();
   }
@@ -221,6 +243,207 @@ test("requires an explicit appcast replacement after immutable preflight passes"
     assert.equal(calls.length, 3);
   } finally {
     await fixture.cleanup();
+  }
+});
+
+test("rejects a preserved enclosure whose R2 object is unavailable before writing", async () => {
+  const olderBytes = Buffer.from("older-release");
+  const olderDigest = sha256(olderBytes);
+  const olderFileName = "TiboTattle-0.1.0-macOS-arm64.dmg";
+  const olderURL = `${CANONICAL_UPDATE_ORIGIN}/releases/0/${olderDigest}/${olderFileName}`;
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      "</channel>",
+      `${appcastEnclosure({
+        bytes: olderBytes,
+        url: olderURL,
+        version: "0",
+      })}</channel>`,
+    ),
+  });
+  const runner = missingRemoteObjectRunner();
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_APPCAST_OBJECT_MISSING" },
+    );
+    assert.equal(
+      runner.calls.some((call) => call[3] === `${APPROVED_R2_BUCKET}/releases/0/${olderDigest}/${olderFileName}`),
+      true,
+    );
+    assert.equal(
+      runner.calls.some((call) => call[2] === "put"),
+      false,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("verifies preserved delta bytes and checksum before publication", async () => {
+  const deltaBytes = Buffer.from("delta-release");
+  const deltaDigest = sha256(deltaBytes);
+  const deltaFileName = "TiboTattle-0.1.0-macOS-arm64.delta";
+  const deltaKey = `releases/1/${deltaDigest}/${deltaFileName}`;
+  const deltaURL = `${CANONICAL_UPDATE_ORIGIN}/${deltaKey}`;
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      "</channel>",
+      `${appcastEnclosure({
+        bytes: deltaBytes,
+        deltaFrom: "0",
+        url: deltaURL,
+        version: "1",
+      })}</channel>`,
+    ),
+  });
+  const runner = remoteObjectRunner(new Map([
+    [`${APPROVED_R2_BUCKET}/${deltaKey}`, deltaBytes],
+  ]));
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.equal(
+      runner.calls.some((call) => call[3] === `${APPROVED_R2_BUCKET}/${deltaKey}`),
+      true,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("rejects a preserved enclosure whose R2 bytes do not match its URL digest", async () => {
+  const deltaBytes = Buffer.from("delta-release");
+  const deltaDigest = sha256(deltaBytes);
+  const deltaFileName = "TiboTattle-0.1.0-macOS-arm64.delta";
+  const deltaKey = `releases/1/${deltaDigest}/${deltaFileName}`;
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      "</channel>",
+      `${appcastEnclosure({
+        bytes: deltaBytes,
+        deltaFrom: "0",
+        url: `${CANONICAL_UPDATE_ORIGIN}/${deltaKey}`,
+        version: "1",
+      })}</channel>`,
+    ),
+  });
+  const runner = remoteObjectRunner(new Map([
+    [`${APPROVED_R2_BUCKET}/${deltaKey}`, Buffer.alloc(deltaBytes.length)],
+  ]));
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_APPCAST_OBJECT_CHECKSUM_MISMATCH" },
+    );
+    assert.equal(
+      runner.calls.some((call) => call[2] === "put"),
+      false,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("rejects a preserved enclosure whose signature does not match its R2 bytes", async () => {
+  const deltaBytes = Buffer.from("delta-release");
+  const deltaDigest = sha256(deltaBytes);
+  const deltaFileName = "TiboTattle-0.1.0-macOS-arm64.delta";
+  const deltaKey = `releases/1/${deltaDigest}/${deltaFileName}`;
+  const unrelatedKeyPair = generateKeyPairSync("ed25519");
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      "</channel>",
+      `${appcastEnclosure({
+        bytes: deltaBytes,
+        deltaFrom: "0",
+        signature: sign(null, deltaBytes, unrelatedKeyPair.privateKey)
+          .toString("base64"),
+        url: `${CANONICAL_UPDATE_ORIGIN}/${deltaKey}`,
+        version: "1",
+      })}</channel>`,
+    ),
+  });
+  const runner = remoteObjectRunner(new Map([
+    [`${APPROVED_R2_BUCKET}/${deltaKey}`, deltaBytes],
+  ]));
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_SIGNATURE_INVALID" },
+    );
+    assert.equal(
+      runner.calls.some((call) => call[2] === "put"),
+      false,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("rejects a candidate that is not newer than the live appcast", async () => {
+  const previous = await createReleaseFixture({ bundleVersion: "2" });
+  const candidate = await createReleaseFixture({ bundleVersion: "2" });
+  const currentAppcast = await readFile(previous.appcastPath);
+  const runner = remoteObjectRunner(new Map([
+    [`${APPROVED_R2_BUCKET}/appcast.xml`, currentAppcast],
+  ]));
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: candidate.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: candidate.dmgPath,
+        publish: true,
+        releaseManifestPath: candidate.releaseManifestPath,
+        replaceAppcast: true,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_VERSION_NOT_NEWER" },
+    );
+    assert.equal(
+      runner.calls.some((call) => call[2] === "put"), false);
+  } finally {
+    await previous.cleanup();
+    await candidate.cleanup();
   }
 });
 

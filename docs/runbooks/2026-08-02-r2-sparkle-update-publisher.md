@@ -61,13 +61,19 @@ the release-manifest SHA-256 and production assurances, requires the manifest's
 canonical feed URL, and verifies every appcast enclosure stays on the approved
 origin. It only accepts the current enclosure when it points to the
 content-addressed object path above and has the exact manifest byte length and
-bundle version.
+bundle version. Validation-only mode remains local and does not contact R2.
+When `--publish` is supplied, the publisher performs an additional read-only
+R2 preflight before any upload: every preserved DMG or delta enclosure must
+exist at its content-addressed key with the advertised byte length and SHA-256,
+and any existing appcast must contain a lower highest bundle version than the
+candidate.
 
 After reviewing the printed plan, append `--publish` to run Wrangler. Artifact
 and manifest keys are content-addressed under
 `releases/<bundle-version>/<dmg-sha256>/` and are never overwritten. The mutable
 `appcast.xml` is checked first and needs the additional explicit
-`--replace-appcast` flag after the initial publication:
+`--replace-appcast` flag after the initial publication; that flag does not allow
+an equal or lower bundle version to replace the live appcast:
 
 ```bash
 npm run product:macos:publish-update -- \

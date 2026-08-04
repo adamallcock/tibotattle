@@ -3875,6 +3875,13 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
         shortVersion: "0.1.0",
       },
     );
+    await assert.rejects(
+      validateMacOSDMG(dmg, {
+        expectedBundleVersion: "999",
+        production: false,
+      }),
+      { code: "MACOS_RELEASE_ARTIFACT_METADATA_MISMATCH" },
+    );
 
     const watchdogHome = join(temporaryRoot, "watchdog-home");
     await mkdir(watchdogHome, { recursive: true, mode: 0o700 });
