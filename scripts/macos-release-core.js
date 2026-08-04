@@ -2310,7 +2310,7 @@ export async function releaseMacOSApp({
     `${PRODUCT_BRAND.executableName}.dmg`,
   );
   try {
-    runMacOSReleaseCommand(process.execPath, [
+    const buildArguments = [
       BUILD_SCRIPT,
       "--output",
       stagedApp,
@@ -2327,8 +2327,17 @@ export async function releaseMacOSApp({
       updaterConfiguration.appcastURL,
       "--sparkle-public-ed-key",
       updaterConfiguration.publicEdKey,
-    ], {
-      env: releaseEnvironment(),
+    ];
+    runMacOSReleaseCommand(process.execPath, buildArguments, {
+      env: releaseChannel.name === STABLE_RELEASE_CHANNEL
+        ? {
+          ...releaseEnvironment(),
+          // This is an accident-prevention marker, not a hostile-user
+          // security boundary. It is set only after the release-core
+          // continuity/bootstrap decision above has passed.
+          USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
+        }
+        : releaseEnvironment(),
       failureMessage: "Fresh release build from checked-out source failed",
       timeout: 300_000,
     });

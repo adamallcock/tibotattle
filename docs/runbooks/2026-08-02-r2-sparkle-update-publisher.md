@@ -35,6 +35,16 @@ accepted only while the live stable appcast is empty. Bootstrap is not a
 fallback for missing prior state, and an existing appcast cannot be bootstrapped
 over.
 
+The macOS bundle builder has a separate accident-prevention boundary: direct
+`build-macos-app.js --external-distribution --release-channel stable`
+invocation fails before it creates an output bundle. `release-macos-app.js`
+performs the shared continuity/bootstrap validation first, then sets a
+narrowly scoped `USAGE_MONITOR_MACOS_RELEASE_GATE=release-macos-app` marker for
+its fresh builder subprocess. The marker is an internal handoff, not a
+hostile-user security boundary; it prevents an ordinary direct build from
+being mistaken for a fully gated release. Development and preview builds do
+not require or use it.
+
 The installed Wrangler R2 CLI exposes only an ordinary `PUT`; it has no
 conditional-write flag. Therefore `--publish` fails closed unless the caller
 supplies either the preserved test seam or an explicit owner-provisioned guard

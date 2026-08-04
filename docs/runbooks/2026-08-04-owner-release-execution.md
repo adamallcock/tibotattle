@@ -234,9 +234,18 @@ stable channel explicitly:
 
 ```sh
 npm run product:macos:updater:prepare
-npm run product:macos:release -- --channel stable
+npm run product:macos:release -- \
+  --channel stable \
+  --previous-stable-manifest "/path/to/previous-stable-release.json"
 npm run product:macos:validate:release
 ```
+
+For the first stable publication only, replace the previous-manifest option
+with the explicit `--stable-bootstrap` decision. The direct bundle builder
+refuses stable external output; only this release path sets its internal
+post-continuity handoff marker. Neither local release output nor this command
+claims that a signed production update has been published; the owner-only
+publisher and live appcast checks remain separate gates.
 
 Retain the previous signed/notarized DMG and manifest, and run the existing
 replacement validator before replacing a shipped candidate:
