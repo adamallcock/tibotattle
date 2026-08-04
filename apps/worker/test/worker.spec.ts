@@ -5155,6 +5155,9 @@ describe("synthetic usage monitor service", () => {
       ).bind(firstBody.participantId).run();
       const duringDeletion = await identityEnroll(linkKey);
       expect(duringDeletion.status).toBe(409);
+      await expect(duringDeletion.json()).resolves.toMatchObject({
+        error: { code: "PARTICIPANT_DELETING" },
+      });
 
       const { finishParticipantDeletion } = await import("../src/repository");
       await finishParticipantDeletion(

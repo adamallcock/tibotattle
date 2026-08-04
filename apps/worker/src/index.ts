@@ -652,6 +652,15 @@ async function assertIdentityReenrollmentAllowed(
     identityLinkKey,
   );
   if (state?.state === "active") return;
+  // Do not fall through to a fresh enrollment when the deletion still owns
+  // the link.  Its cooldown is written to the independent ledger immediately
+  // before the primary row is removed; allowing this request to continue
+  // would leave a cross-database race where the first check sees `deleting`,
+  // the deletion commits, and reattach then sees no row.  The caller must
+  // start a new verified handoff after deletion reaches a stable outcome.
+  if (state?.state === "deleting") {
+    throw new ApiError(409, "PARTICIPANT_DELETING");
+  }
   const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
   if (!identityRequired(env)
       && (typeof rawIdentityLinkSecret !== "string"
