@@ -13,6 +13,7 @@ const EXACT_ROUTES = [
   ["/api/health", "health"],
   ["/api/ready", "ready"],
   ["/api/v1/enroll", "enroll"],
+  ["/api/v1/internal/release/appcast", "sparkle_appcast_guard"],
   ["/api/v1/identity/google/start", "identity_google_start"],
   ["/api/v1/identity/google/callback", "identity_google_callback"],
   ["/api/v1/identity/google/result", "identity_google_result"],
@@ -46,7 +47,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(33);
+    expect(EXACT_ROUTES).toHaveLength(34);
     expect(WORKER_ROUTE_POLICY).toEqual(
       EXACT_ROUTES.map(([pathname, id]) => ({ pathname, id })),
     );

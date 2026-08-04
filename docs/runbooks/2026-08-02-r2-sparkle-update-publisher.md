@@ -36,21 +36,59 @@ fallback for missing prior state, and an existing appcast cannot be bootstrapped
 over.
 
 The installed Wrangler R2 CLI exposes only an ordinary `PUT`; it has no
-conditional-write flag. Therefore `--publish` intentionally fails closed
-unless the caller supplies the owner-provisioned `atomicAppcastGuard` seam. The
-guard must perform the final appcast mutation as one atomic compare-and-swap:
-compare the expected current appcast bytes/hash (or the empty state) and write
-the candidate bytes in the same remote conditional operation. A read followed
-by an ordinary Wrangler `PUT` is not an implementation of this contract.
+conditional-write flag. Therefore `--publish` fails closed unless the caller
+supplies either the preserved test seam or an explicit owner-provisioned guard
+endpoint and token. The production guard contract is the exact Worker route
+`/api/v1/internal/release/appcast`; it is not a broad R2 proxy and is absent
+(`404`) while disabled.
 
-The owner must provide a Worker or Durable Object endpoint using a real R2
-conditional primitive, such as Workers R2 `put(..., { onlyIf: { etagMatches } })`
-or an R2 S3 `If-Match`/`If-None-Match` request. See the [Workers R2 API
+The guard authenticates a bounded canonical request with an HMAC-SHA-256 over
+the schema, `POST`, exact route, timestamp, nonce, and body SHA-256. The token
+is read from the allowlisted environment variable name, never printed or
+placed in a receipt or request body. The Worker rejects stale timestamps and
+consumes each nonce once in the existing
+D1 database with a short TTL before it reads or writes R2. A duplicate nonce,
+bad signature, or failed storage operation fails closed. The request names the
+reviewed `stable` channel, exact `tibotattle-updates` bucket and `appcast.xml`
+key, exact XML content type/cache-control, bounded candidate bytes, candidate
+SHA-256, and expected current state/hash (and optional current HTTP etag).
+
+The owner-only Worker reads the current appcast, verifies that state, and calls
+R2 `put(..., { onlyIf: { etagMatches } })` (or the empty-object equivalent) with
+the candidate and HTTP metadata. Cloudflare documents that a failed R2
+conditional put returns `null`, which the guard reports as a distinct conflict;
+it performs no fallback ordinary put. See the [Workers R2 API
 reference](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/)
 and [R2 S3 API compatibility
-reference](https://developers.cloudflare.com/r2/api/s3/api/). Until that
-owner-only guard is provisioned and reviewed, no live appcast publication is
-permitted.
+reference](https://developers.cloudflare.com/r2/api/s3/api/). The appcast is
+the only mutable release object; artifacts and manifests remain immutable and
+are handled by the existing publisher first.
+
+The checked-in Worker configuration intentionally does not declare the release
+R2 binding, enable the route, or provide its secret. Before any owner
+activation, the owner must separately review and provision all of the
+following for the exact selected channel:
+
+1. Apply the checked-in D1 migration for the nonce ledger.
+2. Bind R2 as `SPARKLE_RELEASES` to the exact reviewed update bucket
+   `tibotattle-updates`; do not point it at `QUARANTINE` or another bucket.
+3. Set `SPARKLE_APPCAST_GUARD_MODE=enabled` plus exact reviewed values for
+   `SPARKLE_APPCAST_GUARD_CHANNEL=stable`,
+   `SPARKLE_APPCAST_GUARD_BUCKET=tibotattle-updates`,
+   `SPARKLE_APPCAST_GUARD_APPCAST_KEY=appcast.xml`,
+   `SPARKLE_APPCAST_GUARD_ENDPOINT_PATH=/api/v1/internal/release/appcast`,
+   `SPARKLE_APPCAST_GUARD_CONTENT_TYPE=application/xml; charset=utf-8`,
+   `SPARKLE_APPCAST_GUARD_CACHE_CONTROL=public, max-age=300, must-revalidate`,
+   and `SPARKLE_APPCAST_GUARD_MAX_XML_BYTES=1048576`.
+4. Store a fresh owner-only value of at least 32 characters as the
+   `SPARKLE_APPCAST_GUARD_TOKEN` Worker secret. Never put its value in source,
+   shell history, receipts, logs, or the appcast.
+5. Verify the explicit CLI endpoint is HTTPS, has no credentials/query/hash,
+   and is exactly the selected channel service origin plus the fixed route.
+
+This is an owner provisioning checklist, not evidence that the binding,
+secret, route, endpoint, or D1 migration is deployed. Until all five items are
+reviewed and receipted, no live appcast publication is permitted.
 
 ## Required manual signing gate
 
@@ -135,13 +173,20 @@ npm run product:macos:publish-update -- \
   --appcast "/absolute/path/to/appcast.xml" \
   --sparkle-public-ed-key "$USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY" \
   --previous-stable-manifest "/absolute/path/to/previous-stable-release.json" \
+  --atomic-appcast-guard-endpoint "https://EXACT-REVIEWED-SERVICE-ORIGIN/api/v1/internal/release/appcast" \
+  --atomic-appcast-guard-token-env SPARKLE_APPCAST_GUARD_TOKEN \
   --replace-appcast \
   --publish
 ```
 
-The command-line publisher currently stops with
-`SPARKLE_UPDATE_ATOMIC_GUARD_REQUIRED` because it cannot inject the owner guard.
-Once the owner-only guard is provisioned, the publisher uploads the DMG and
+The token option is an allowlisted environment-variable name, not a literal
+secret argument. The publisher reads `SPARKLE_APPCAST_GUARD_TOKEN` only when
+`--publish` is active and removes it from its environment before invoking
+Wrangler, so child processes do not inherit the value. A literal
+`--atomic-appcast-guard-token` option is rejected. Without both explicit guard
+options, the command-line publisher stops with
+`SPARKLE_UPDATE_ATOMIC_GUARD_REQUIRED` (or an options error) before any remote
+read or mutation. Once the owner-only guard is provisioned, the publisher uploads the DMG and
 manifest first with one-year immutable caching
 (`application/x-apple-diskimage` and `application/json; charset=utf-8`), then
 calls the guard for the appcast-last atomic mutation with

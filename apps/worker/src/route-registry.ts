@@ -14,6 +14,10 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   { pathname: "/api/health", id: "health" },
   { pathname: "/api/ready", id: "ready" },
   { pathname: "/api/v1/enroll", id: "enroll" },
+  {
+    pathname: "/api/v1/internal/release/appcast",
+    id: "sparkle_appcast_guard",
+  },
   // Both hosted providers use the same three-route handoff: the dashboard
   // starts a sign-in, the provider redirects to this service's own callback,
   // and the dashboard reads the one-time result back keyed by an unguessable

@@ -151,6 +151,7 @@ import {
   matchWorkerRoute,
   type ApiWorkerRouteId,
 } from "./route-registry";
+import { handleSparkleAppcastGuard } from "./sparkle-appcast-guard";
 import {
   assertCsrf,
   assertSameOrigin,
@@ -2655,6 +2656,8 @@ async function routeApi(
       return handleRetiredAppleDomainAssociation();
     case "enroll":
       return handleEnroll(request, env);
+    case "sparkle_appcast_guard":
+      return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":
       return handleIdentityGoogleStart(request, env);
     case "identity_google_callback":

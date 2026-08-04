@@ -267,6 +267,27 @@ replacement requires that flag and a strictly higher bundle version. Add
 redirect, signature/digest/length mismatch, or public read-back failure as not
 published.
 
+Before the first owner publication, complete the guard provisioning checklist
+in [`the R2 Sparkle publisher runbook`](./2026-08-02-r2-sparkle-update-publisher.md)
+and retain a content-free receipt for the exact stable channel, binding, route,
+configuration checks, nonce-ledger migration, and post-provisioning conflict
+probe. The CLI must receive both explicit
+`--atomic-appcast-guard-endpoint` and
+`--atomic-appcast-guard-token-env SPARKLE_APPCAST_GUARD_TOKEN` options; the
+token is supplied through that allowlisted environment variable name, never as
+a literal CLI argument. The publisher scrubs the variable before spawning
+Wrangler. There is no stable endpoint default. Validation-only runs remain
+usable without either option and must not contact the guard or R2.
+
+Before opening any broader intake, rehearse signed `N` followed by signed `N+1`
+in a disposable environment with the exact previous-manifest continuity input.
+The rehearsal must include one successful guarded appcast CAS, a deliberate
+stale-current conflict with no second appcast mutation, a retry with a fresh
+nonce, and the normal Sparkle cancel/retry/install-on-quit/relaunch flow.
+Preserve only content-free statuses, byte counts, and SHA-256 values; do not
+retain tokens, raw signed XML, or raw logs. A passing local test or remote
+appcast read-back does not prove this owner-only rehearsal occurred.
+
 After the publisher succeeds, independently retain its content-free
 publication receipt and complete the same disposable `N → N+1` rehearsal
 against the stable feed. The feed and artifact read-back still do not replace

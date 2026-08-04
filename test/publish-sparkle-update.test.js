@@ -14,6 +14,8 @@ import { getReleaseChannel } from "../config/release-channels.js";
 import {
   APPROVED_R2_BUCKET,
   APPCAST_ATOMIC_GUARD_SCHEMA,
+  APPCAST_ATOMIC_GUARD_ROUTE,
+  APPCAST_ATOMIC_GUARD_TOKEN_ENV,
   APPCAST_CACHE_CONTROL,
   CANONICAL_APPCAST_URL,
   CANONICAL_UPDATE_ORIGIN,
@@ -394,6 +396,116 @@ test("fails closed before any remote mutation without the owner atomic appcast g
     );
     assert.equal(runner.calls.length, 0);
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("requires both explicit guard endpoint and token before any remote mutation", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        atomicAppcastGuardEndpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED" },
+    );
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed when the explicit guard token environment variable is unset", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  const previousToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        atomicAppcastGuardEndpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+        atomicAppcastGuardTokenEnv: APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED" },
+    );
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    if (previousToken === undefined) {
+      delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    } else {
+      process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
+    }
+    await fixture.cleanup();
+  }
+});
+
+test("publishes through the explicit owner guard endpoint without exposing its token", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  const publicReadback = publicReadbackFixture(fixture);
+  const guardCalls = [];
+  const token = "owner-release-guard-token-012345678901";
+  const previousToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = token;
+  try {
+    const publication = await publishSparkleUpdateRaw({
+      appcastPath: fixture.appcastPath,
+      atomicAppcastGuardEndpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+      atomicAppcastGuardTokenEnv: APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      stableBootstrap: true,
+      runWrangler: runner.run,
+      fetchGuard: async (url, options) => {
+        guardCalls.push({ url, options });
+        return Response.json({
+          schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+          status: "committed",
+        });
+      },
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.status, "published");
+    assert.equal(guardCalls.length, 1);
+    assert.equal(guardCalls[0].url, `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`);
+    assert.equal(guardCalls[0].options.method, "POST");
+    assert.equal(guardCalls[0].options.headers["x-usage-monitor-release-signature"].length, 43);
+    assert.equal(guardCalls[0].options.body.includes(token), false);
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+    assert.equal(runner.calls.some((call) => call[2] === "put"
+      && call[3] === `${APPROVED_R2_BUCKET}/appcast.xml`), false);
+  } finally {
+    if (previousToken === undefined) {
+      delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    } else {
+      process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
+    }
     await fixture.cleanup();
   }
 });
@@ -1261,6 +1373,31 @@ test("requires the approved explicit bucket and does not accept signing-key argu
     "--sparkle-public-ed-key", TEST_PUBLIC_ED_KEY,
   ]);
   assert.equal(parsed.sparklePublicEdKey, TEST_PUBLIC_ED_KEY);
+  const guarded = parseSparkleUpdatePublisherArguments([
+    "--atomic-appcast-guard-endpoint",
+    `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+    "--atomic-appcast-guard-token-env",
+    APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+    "--bucket", APPROVED_R2_BUCKET,
+    "--channel", "stable",
+    "--dmg", "release.dmg",
+    "--appcast", "appcast.xml",
+    "--release-manifest", "release.json",
+    "--sparkle-public-ed-key", TEST_PUBLIC_ED_KEY,
+  ]);
+  assert.equal(guarded.atomicAppcastGuardTokenEnv, APPCAST_ATOMIC_GUARD_TOKEN_ENV);
+  assert.throws(
+    () => parseSparkleUpdatePublisherArguments([
+      "--bucket", APPROVED_R2_BUCKET,
+      "--channel", "stable",
+      "--dmg", "release.dmg",
+      "--appcast", "appcast.xml",
+      "--release-manifest", "release.json",
+      "--sparkle-public-ed-key", TEST_PUBLIC_ED_KEY,
+      "--atomic-appcast-guard-token", "literal-secret-must-not-be-accepted",
+    ]),
+    /Unknown or repeated argument/u,
+  );
   assert.throws(
     () => parseSparkleUpdatePublisherArguments([
       "--bucket", "other-bucket",

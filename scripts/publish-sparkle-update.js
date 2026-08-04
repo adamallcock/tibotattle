@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash, createPublicKey, verify } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  createPublicKey,
+  randomBytes,
+  verify,
+} from "node:crypto";
 import {
   lstat,
   mkdtemp,
@@ -42,6 +48,10 @@ export const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 export const APPCAST_CACHE_CONTROL = "public, max-age=300, must-revalidate";
 export const APPCAST_ATOMIC_GUARD_SCHEMA =
   "usage-monitor-sparkle-appcast-atomic-guard-v1";
+export const APPCAST_ATOMIC_GUARD_ROUTE =
+  "/api/v1/internal/release/appcast";
+export const APPCAST_ATOMIC_GUARD_TOKEN_ENV =
+  "SPARKLE_APPCAST_GUARD_TOKEN";
 const PUBLICATION_STATUS_VALIDATED = "validated";
 const PUBLICATION_STATUS_PUBLISHED = "published";
 const PUBLICATION_STATUS_RESUMED_VERIFIED = "resumed_verified";
@@ -95,6 +105,70 @@ function requiredOption(value, label) {
     fail(`${label} is required`);
   }
   return value;
+}
+
+function normalizeAppcastAtomicGuardEndpoint(value, channel) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || value.includes("\0")) {
+    fail(
+      "--atomic-appcast-guard-endpoint must be supplied as a canonical HTTPS URL",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
+    );
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    fail(
+      "--atomic-appcast-guard-endpoint must be supplied as a canonical HTTPS URL",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
+    );
+  }
+  if (parsed.protocol !== "https:"
+      || parsed.origin !== channel.serviceOrigin
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== APPCAST_ATOMIC_GUARD_ROUTE
+      || parsed.search
+      || parsed.hash
+      || parsed.href !== value) {
+    fail(
+      `--atomic-appcast-guard-endpoint must be the exact ${channel.name} guard route on ${channel.serviceOrigin}`,
+      "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
+    );
+  }
+  return parsed.href;
+}
+
+function normalizeAppcastAtomicGuardTokenEnv(value) {
+  if (value === null || value === undefined) return null;
+  if (value !== APPCAST_ATOMIC_GUARD_TOKEN_ENV) {
+    fail(
+      `--atomic-appcast-guard-token-env must name ${APPCAST_ATOMIC_GUARD_TOKEN_ENV}`,
+      "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_ENV_INVALID",
+    );
+  }
+  return value;
+}
+
+function normalizeAppcastAtomicGuardToken(value) {
+  if (typeof value !== "string"
+      || !/^[^\u0000-\u001f\u007f]{32,256}$/u.test(value)) {
+    fail(
+      `The ${APPCAST_ATOMIC_GUARD_TOKEN_ENV} environment variable must contain a non-logged owner secret`,
+      "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED",
+    );
+  }
+  return value;
+}
+
+function readAppcastAtomicGuardToken(envName) {
+  const value = process.env[envName];
+  // Do not let Wrangler children inherit the owner secret. The environment
+  // variable name is allowlisted above; the value is never included in an
+  // option object, receipt, request body, or diagnostic.
+  delete process.env[envName];
+  return normalizeAppcastAtomicGuardToken(value);
 }
 
 async function readRegularInput(path, { label, maximumBytes }) {
@@ -1056,11 +1130,11 @@ async function putObject({ bucket, key, path, contentType, cacheControl, runWran
 
 /**
  * The installed Wrangler R2 CLI only exposes an unconditional PUT. The
- * publisher therefore accepts a guard only through this owner-only seam; the
- * owner implementation must perform the final mutation with a real remote
- * conditional primitive (for example Workers R2 `onlyIf` or R2 S3
- * `If-Match`/`If-None-Match`). A read followed by an ordinary PUT does not
- * satisfy this contract.
+ * publisher therefore accepts a guard only through this owner-only seam or
+ * the explicit owner-provisioned HTTPS endpoint below; the owner
+ * implementation must perform the final mutation with a real remote
+ * conditional primitive. A read followed by an ordinary PUT does not satisfy
+ * this contract.
  */
 function normalizeAppcastAtomicGuard(value) {
   if (value === null || value === undefined) return null;
@@ -1082,6 +1156,117 @@ function appcastAtomicExpectation(currentAppcast) {
     bytes: currentAppcast.bytes,
     content: Buffer.from(currentAppcast.content),
     sha256: currentAppcast.sha256,
+  };
+}
+
+function remoteAppcastAtomicExpectation(currentAppcast) {
+  if (currentAppcast === null) {
+    return { state: "empty", bytes: 0, sha256: null, etag: null };
+  }
+  return {
+    state: "present",
+    bytes: currentAppcast.bytes,
+    sha256: currentAppcast.sha256,
+    // Wrangler's object-get command intentionally exposes bytes only. The
+    // guard re-reads this state and obtains the R2 etag immediately before its
+    // conditional put; a non-null value is supported when an owner seam has
+    // one, but the R2 CAS remains the authoritative race check.
+    etag: currentAppcast.etag ?? null,
+  };
+}
+
+function canonicalRemoteGuardRequest(timestamp, nonce, bodySha256) {
+  return `${APPCAST_ATOMIC_GUARD_SCHEMA}\0POST\0${APPCAST_ATOMIC_GUARD_ROUTE}`
+    + `\0${timestamp}\0${nonce}\0${bodySha256}`;
+}
+
+async function readAtomicGuardResponse(response) {
+  let body;
+  try {
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > 16 * 1024) {
+      fail(
+        "The appcast atomic guard returned an oversized response",
+        "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+      );
+    }
+    body = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED") throw error;
+    fail(
+      "The appcast atomic guard returned an invalid response",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+    );
+  }
+  if (body?.status === "conflict") return { status: "conflict" };
+  if (body?.status === "committed") return { status: "committed" };
+  fail(
+    "The appcast atomic guard did not return a commit result",
+    "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+  );
+}
+
+function createRemoteAppcastAtomicGuard({ channel, endpoint, token, fetchGuard }) {
+  return {
+    schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+    ownerOnly: true,
+    compareAndSwap: async ({
+      bucket,
+      cacheControl,
+      content,
+      contentType,
+      expectedCurrent,
+      key,
+    }) => {
+      const candidateBytes = Buffer.from(content);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const nonce = randomBytes(24).toString("base64url");
+      const body = JSON.stringify({
+        schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+        channel: channel.name,
+        bucket,
+        key,
+        contentType,
+        cacheControl,
+        expectedCurrent: remoteAppcastAtomicExpectation(expectedCurrent),
+        candidate: {
+          bytes: candidateBytes.length,
+          sha256: createHash("sha256").update(candidateBytes).digest("hex"),
+          base64: candidateBytes.toString("base64url"),
+        },
+      });
+      const bodySha256 = createHash("sha256").update(body).digest("hex");
+      const signature = createHmac("sha256", token)
+        .update(canonicalRemoteGuardRequest(timestamp, nonce, bodySha256))
+        .digest("base64url");
+      let response;
+      try {
+        response = await fetchGuard(endpoint, {
+          method: "POST",
+          redirect: "error",
+          headers: {
+            "content-type": "application/json",
+            "x-usage-monitor-release-timestamp": timestamp,
+            "x-usage-monitor-release-nonce": nonce,
+            "x-usage-monitor-release-signature": signature,
+          },
+          body,
+        });
+      } catch {
+        fail(
+          "The appcast atomic guard request failed",
+          "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+        );
+      }
+      if (response.status === 409) return readAtomicGuardResponse(response);
+      if (!response.ok) {
+        fail(
+          "The appcast atomic guard rejected the publication request",
+          "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED",
+        );
+      }
+      return readAtomicGuardResponse(response);
+    },
   };
 }
 
@@ -1108,7 +1293,10 @@ async function putAppcastWithAtomicGuard({
       schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
     });
   } catch (error) {
-    if (error?.code === "SPARKLE_UPDATE_WRANGLER_FAILED") throw error;
+    if (error?.code === "SPARKLE_UPDATE_WRANGLER_FAILED"
+        || error?.code === "SPARKLE_UPDATE_ATOMIC_GUARD_REMOTE_FAILED") {
+      throw error;
+    }
     fail(
       "The owner-provisioned appcast atomic guard failed",
       "SPARKLE_UPDATE_ATOMIC_GUARD_FAILED",
@@ -1137,6 +1325,8 @@ async function putAppcastWithAtomicGuard({
  */
 export async function publishSparkleUpdate({
   atomicAppcastGuard = null,
+  atomicAppcastGuardEndpoint = null,
+  atomicAppcastGuardTokenEnv = null,
   appcastPath,
   bucket,
   channel,
@@ -1149,6 +1339,7 @@ export async function publishSparkleUpdate({
   stableBootstrap = false,
   runWrangler = defaultRunWrangler,
   fetchPublic = defaultPublicFetch,
+  fetchGuard = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
 } = {}) {
   if (typeof publish !== "boolean" || typeof replaceAppcast !== "boolean"
@@ -1157,14 +1348,31 @@ export async function publishSparkleUpdate({
         && typeof previousStableManifestPath !== "string")
       || typeof runWrangler !== "function"
       || typeof fetchPublic !== "function"
+      || typeof fetchGuard !== "function"
       || typeof validateDMG !== "function") {
     fail("Publisher options are invalid");
   }
   const releaseChannel = resolveReleaseChannel(channel);
   normalizeBucket(bucket, releaseChannel);
-  const normalizedAppcastAtomicGuard = normalizeAppcastAtomicGuard(
+  const normalizedAppcastAtomicGuardEndpoint =
+    normalizeAppcastAtomicGuardEndpoint(
+      atomicAppcastGuardEndpoint,
+      releaseChannel,
+    );
+  const normalizedAppcastAtomicGuardTokenEnv =
+    normalizeAppcastAtomicGuardTokenEnv(
+      atomicAppcastGuardTokenEnv,
+  );
+  const injectedAppcastAtomicGuard = normalizeAppcastAtomicGuard(
     atomicAppcastGuard,
   );
+  if ((normalizedAppcastAtomicGuardEndpoint === null)
+      !== (normalizedAppcastAtomicGuardTokenEnv === null)) {
+    fail(
+      "--atomic-appcast-guard-endpoint and --atomic-appcast-guard-token-env are required together",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED",
+    );
+  }
   const normalizedSparklePublicKey = normalizeSparklePublicKey(
     sparklePublicEdKey,
   );
@@ -1268,6 +1476,20 @@ export async function publishSparkleUpdate({
     verified: false,
   });
   if (!publish) return publication;
+  const normalizedAppcastAtomicGuardToken =
+    injectedAppcastAtomicGuard === null
+      && normalizedAppcastAtomicGuardEndpoint !== null
+      ? readAppcastAtomicGuardToken(normalizedAppcastAtomicGuardTokenEnv)
+      : null;
+  const normalizedAppcastAtomicGuard = injectedAppcastAtomicGuard
+    ?? (normalizedAppcastAtomicGuardEndpoint === null
+      ? null
+      : createRemoteAppcastAtomicGuard({
+        channel: releaseChannel,
+        endpoint: normalizedAppcastAtomicGuardEndpoint,
+        fetchGuard,
+        token: normalizedAppcastAtomicGuardToken,
+      }));
   if (normalizedAppcastAtomicGuard === null) {
     fail(
       "Publishing requires an owner-provisioned atomic appcast guard; Wrangler's ordinary R2 PUT is not concurrency safe",
@@ -1441,6 +1663,8 @@ export async function publishSparkleUpdate({
 export function parseSparkleUpdatePublisherArguments(argv) {
   const options = {
     appcastPath: null,
+    atomicAppcastGuardEndpoint: null,
+    atomicAppcastGuardTokenEnv: null,
     bucket: null,
     channel: null,
     dmgPath: null,
@@ -1453,6 +1677,8 @@ export function parseSparkleUpdatePublisherArguments(argv) {
   };
   const flags = new Map([
     ["--appcast", "appcastPath"],
+    ["--atomic-appcast-guard-endpoint", "atomicAppcastGuardEndpoint"],
+    ["--atomic-appcast-guard-token-env", "atomicAppcastGuardTokenEnv"],
     ["--bucket", "bucket"],
     ["--channel", "channel"],
     ["--dmg", "dmgPath"],
@@ -1486,7 +1712,19 @@ export function parseSparkleUpdatePublisherArguments(argv) {
     ["--release-manifest", "releaseManifestPath"],
     ["--sparkle-public-ed-key", "sparklePublicEdKey"],
   ]) requiredOption(options[key], flag);
-  resolveReleaseChannel(options.channel);
+  const releaseChannel = resolveReleaseChannel(options.channel);
+  normalizeAppcastAtomicGuardEndpoint(
+    options.atomicAppcastGuardEndpoint,
+    releaseChannel,
+  );
+  normalizeAppcastAtomicGuardTokenEnv(options.atomicAppcastGuardTokenEnv);
+  if ((options.atomicAppcastGuardEndpoint === null)
+      !== (options.atomicAppcastGuardTokenEnv === null)) {
+    fail(
+      "--atomic-appcast-guard-endpoint and --atomic-appcast-guard-token-env are required together",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED",
+    );
+  }
   if (options.channel !== "stable"
       && (options.previousStableManifestPath !== null
         || options.stableBootstrap)) {

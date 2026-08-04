@@ -23,6 +23,7 @@ export const REQUIRED_PRIMARY_MIGRATIONS = Object.freeze([
   "0026_signin_start_admission.sql",
   "0027_identity_reenrollment_cooldown_guard.sql",
   "0028_identity_link_secret_configuration.sql",
+  "0029_sparkle_appcast_guard_nonces.sql",
 ]);
 
 const DATABASES = Object.freeze([
@@ -46,6 +47,7 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["table", "sign_in_start_admission_windows"],
   ["table", "identity_reenrollment_cooldowns"],
   ["table", "identity_link_secret_configuration"],
+  ["table", "sparkle_appcast_guard_nonces"],
   ["index", "community_aggregate_exclusions_participant"],
   ["index", "apple_signin_handoffs_expires_at"],
   ["index", "device_credentials_social_recheck"],
@@ -53,6 +55,7 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["index", "device_pairing_events_velocity"],
   ["index", "sign_in_start_admission_windows_retention"],
   ["index", "identity_reenrollment_cooldowns_retention"],
+  ["index", "idx_sparkle_appcast_guard_nonces_expires_at"],
   ["trigger", "community_snapshot_policy_changed"],
   ["trigger", "community_snapshot_policy_no_delete"],
   ["trigger", "community_aggregate_exclusion_inserted"],
@@ -358,7 +361,7 @@ function baseReceipt(configChecks) {
     },
     blockers: [...configChecks.blockers],
     evidence: {
-      migrationWindow: "0023-0028",
+      migrationWindow: "0023-0029",
       database: "USAGE_MONITOR_DB",
       rollbackRestoreEquivalent: "isolated_cleanup",
     },
