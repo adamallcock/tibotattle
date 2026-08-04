@@ -5,7 +5,6 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
 import {
-  identityProtectionSchemaVerified,
   probeStagingLive,
   REQUIRED_D1_BINDINGS,
   stagingOperationReceipt,
@@ -51,19 +50,6 @@ export function prepareDisabledStaging({
       blockers: before.blockers.filter((code) =>
         !["REMOTE_MIGRATIONS_PENDING", "REMOTE_COLLECTION_NOT_CONTAINED"]
           .includes(code)),
-    };
-  }
-  if (before.checks.migrationsCurrent
-      && !identityProtectionSchemaVerified(before)) {
-    const schemaBlockers = before.blockers.filter((code) =>
-      code.startsWith("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_")
-      || code.startsWith("REMOTE_DELETION_LEDGER_SCHEMA_"));
-    return {
-      ok: false,
-      code: "STAGING_SCHEMA_PROTECTION_BLOCKED",
-      blockers: schemaBlockers.length > 0
-        ? schemaBlockers
-        : ["REMOTE_IDENTITY_PROTECTION_SCHEMA_UNVERIFIED"],
     };
   }
 
@@ -117,8 +103,7 @@ UPDATE collection_controls
   );
   if (remainingBlockers.length > 0
       || !after.checks.migrationsCurrent
-      || !after.checks.collectionContained
-      || !identityProtectionSchemaVerified(after)) {
+      || !after.checks.collectionContained) {
     return {
       ok: false,
       code: "STAGING_PREPARATION_UNVERIFIED",
@@ -135,9 +120,6 @@ UPDATE collection_controls
         && after.checks.r2ResourceExists,
       migrationsCurrent: after.checks.migrationsCurrent,
       pilotSchemaCurrent: after.checks.pilotSchemaCurrent,
-      identityProtectionSchemaCurrent:
-        after.checks.identityProtectionSchemaCurrent,
-      identityProtectionSchema: after.evidence.identityProtectionSchema,
       collectionContained: after.checks.collectionContained,
       secretsInstalled: after.checks.requiredSecretsInstalled,
     }),

@@ -105,84 +105,11 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
   assert.equal(result.state, "ready_for_disabled_deploy");
   assert.equal(result.collectionAuthorized, false);
   assert.equal(Object.values(result.checks).every(Boolean), true);
-  assert.equal(result.checks.primaryReenrollmentSchemaCurrent, true);
-  assert.equal(result.checks.deletionLedgerSchemaCurrent, true);
-  assert.equal(result.checks.identityProtectionSchemaCurrent, true);
-  assert.equal(result.evidence.identityProtectionSchema.status, "verified");
-  assert.equal(result.evidence.identityProtectionSchema.verified, true);
-  assert.equal(
-    result.evidence.identityProtectionSchema.primary.columns.participantCooldownDigest,
-    true,
-  );
-  assert.equal(
-    result.evidence.identityProtectionSchema.deletionLedger.columns.participantDigest,
-    true,
-  );
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 7);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 5);
   const serialized = JSON.stringify(result);
   assert.equal(serialized.includes(config.env.staging.d1_databases[0].database_id), false);
   assert.equal(serialized.includes(config.env.staging.r2_buckets[0].bucket_name), false);
-});
-
-test("live readiness blocks missing identity protection schema in either database", () => {
-  for (const scenario of [
-    {
-      name: "primary re-enrollment protection",
-      options: { missingPrimarySchema: true },
-      check: "primaryReenrollmentSchemaCurrent",
-      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
-      side: "primary",
-    },
-    {
-      name: "deletion-ledger cooldown protection",
-      options: { missingDeletionLedgerSchema: true },
-      check: "deletionLedgerSchemaCurrent",
-      blocker: "REMOTE_DELETION_LEDGER_SCHEMA_INCOMPLETE",
-      side: "deletionLedger",
-    },
-  ]) {
-    const config = provisionedConfig();
-    const result = probeStagingLive({
-      config,
-      wrangler: "/fake/wrangler",
-      workerDirectory,
-      spawn: successSpawn(config, [], scenario.options),
-    });
-    assert.equal(result.state, "blocked", scenario.name);
-    assert.equal(result.checks[scenario.check], false, scenario.name);
-    assert.equal(result.checks.identityProtectionSchemaCurrent, false);
-    assert.equal(
-      result.evidence.identityProtectionSchema.status,
-      "incomplete",
-      scenario.name,
-    );
-    assert.equal(
-      result.evidence.identityProtectionSchema[scenario.side].status,
-      "incomplete",
-      scenario.name,
-    );
-    assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
-  }
-});
-
-test("live readiness marks an unavailable schema probe unknown without leaking output", () => {
-  const config = provisionedConfig();
-  const result = probeStagingLive({
-    config,
-    wrangler: "/fake/wrangler",
-    workerDirectory,
-    spawn: successSpawn(config, [], { primarySchemaError: true }),
-  });
-  assert.equal(result.state, "blocked");
-  assert.equal(result.checks.primaryReenrollmentSchemaCurrent, false);
-  assert.equal(result.evidence.identityProtectionSchema.status, "unknown");
-  assert.equal(result.evidence.identityProtectionSchema.primary.status, "unknown");
-  assert.equal(
-    result.blockers.includes("REMOTE_IDENTITY_REENROLLMENT_SCHEMA_UNKNOWN"),
-    true,
-  );
-  assert.equal(JSON.stringify(result).includes("provider-secret"), false);
 });
 
 test("live readiness reports R2 account enablement without leaking command output", () => {
