@@ -364,6 +364,49 @@ export async function reattachParticipantByLinkKey(
   };
 }
 
+/**
+ * Reads only the lifecycle state for a pairwise link key. Callers use this to
+ * distinguish an active account (which may reattach) from a deleted account
+ * (which is subject to the short anti-reissue cooldown). No provider subject
+ * or raw identity material is returned.
+ */
+export async function participantIdentityLinkState(
+  db: D1Database,
+  identityLinkKey: string,
+): Promise<{ id: string; state: "active" | "deleting" } | null> {
+  const row = await db.prepare(
+    `SELECT id, state
+       FROM participants
+      WHERE identity_link_key = ?`,
+  ).bind(identityLinkKey).first<{ id: string; state: string }>();
+  if (!row) return null;
+  if (row.state !== "active" && row.state !== "deleting") {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+  return { id: row.id, state: row.state };
+}
+
+/**
+ * Returns the pairwise link key only while the authenticated deletion session
+ * owns the deleting participant. The key is consumed immediately by the
+ * purpose-separated cooldown HMAC and is never persisted by this helper.
+ */
+export async function participantIdentityLinkKeyForDeletion(
+  db: D1Database,
+  participantId: string,
+  sessionId: string,
+): Promise<string | null> {
+  const row = await db.prepare(
+    `SELECT identity_link_key
+       FROM participants
+      WHERE id = ? AND state = 'deleting' AND deletion_session_id = ?`,
+  ).bind(participantId, sessionId).first<{
+    identity_link_key: string | null;
+  }>();
+  if (row === null) throw new ApiError(409, "PARTICIPANT_DELETING");
+  return row.identity_link_key;
+}
+
 interface RecoveryResult {
   participantId: string;
   recoveryCode: string;

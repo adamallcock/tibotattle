@@ -19,7 +19,11 @@ import {
   rebuildPendingCommunityWeeklySnapshots,
 } from "../src/community-snapshots";
 import {
+  hasDeletionTombstone,
+  hasIdentityReenrollmentCooldown,
   participantDeletionDigest,
+  purgeExpiredDeletionTombstones,
+  purgeExpiredIdentityReenrollmentCooldowns,
   recordDeletionTombstone,
   runBackendLifecycle,
 } from "../src/retention";
@@ -4866,6 +4870,43 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
 
+  it("does not let expired tombstones block auth and purges them one bounded page at a time", async () => {
+    const nowEpoch = Date.parse("2026-08-04T00:00:00.000Z");
+    const participantIds = Array.from(
+      { length: 101 },
+      () => `participant:${crypto.randomUUID()}`,
+    );
+    const ledger = testBindings().DELETION_LEDGER;
+    for (let offset = 0; offset < participantIds.length; offset += 50) {
+      const rows = participantIds.slice(offset, offset + 50);
+      await ledger.batch(await Promise.all(
+        rows.map(async (participantId) => ledger.prepare(
+          `INSERT INTO deletion_tombstones (
+            participant_digest, schema_version, deleted_at, retain_until
+          ) VALUES (?, 'participant-deletion-tombstone-v0.1', ?, ?)`,
+        ).bind(
+          await participantDeletionDigest(participantId),
+          "2026-01-01T00:00:00.000Z",
+          "2026-07-01T00:00:00.000Z",
+        )),
+      ));
+    }
+
+    await expect(hasDeletionTombstone(
+      ledger,
+      participantIds[0]!,
+      nowEpoch,
+    )).resolves.toBe(false);
+    const first = await purgeExpiredDeletionTombstones(ledger, nowEpoch);
+    expect(first).toEqual({ purged: 100, complete: false });
+    const second = await purgeExpiredDeletionTombstones(ledger, nowEpoch);
+    expect(second).toEqual({ purged: 1, complete: true });
+    const remaining = await ledger.prepare(
+      "SELECT COUNT(*) AS total FROM deletion_tombstones",
+    ).first<{ total: number }>();
+    expect(remaining?.total).toBe(0);
+  });
+
   it("suppresses a pre-deletion primary restore using only the independent digest", async () => {
     const participant = await enrollTelemetry();
     await uploadEnvelope(
@@ -5124,6 +5165,81 @@ describe("synthetic usage monitor service", () => {
       expect(afterDeletion.status).toBe(201);
       const freshBody = await afterDeletion.json<{ participantId: string }>();
       expect(freshBody.participantId).not.toBe(firstBody.participantId);
+    });
+
+    it("suppresses immediate hosted re-enrollment and permits it after cooldown expiry", async () => {
+      const env = identityBindings();
+      const linkKey = await sha256Hex("test-hosted-identity\0cooldown-subject");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+
+      const deleted = await api("/api/v1/me", {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      }, env);
+      expect(deleted.status).toBe(200);
+
+      const cooldown = await env.DELETION_LEDGER.prepare(
+        `SELECT identity_cooldown_digest, deleted_at, retain_until
+           FROM identity_reenrollment_cooldowns`,
+      ).first<{
+        identity_cooldown_digest: string;
+        deleted_at: string;
+        retain_until: string;
+      }>();
+      expect(cooldown?.identity_cooldown_digest).toMatch(/^[0-9a-f]{64}$/u);
+      expect(cooldown?.deleted_at).toMatch(/Z$/u);
+      expect(cooldown?.retain_until).toMatch(/Z$/u);
+      expect(JSON.stringify(cooldown)).not.toContain(linkKey);
+      await expect(hasIdentityReenrollmentCooldown(
+        env.DELETION_LEDGER,
+        linkKey,
+        env.IDENTITY_LINK_SECRET,
+      )).resolves.toBe(true);
+
+      const immediate = await identityEnroll(linkKey, "google", env);
+      expect(immediate.status).toBe(409);
+      await expect(immediate.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_REENROLLMENT_COOLDOWN" },
+      });
+
+      await env.DELETION_LEDGER.prepare(
+        `UPDATE identity_reenrollment_cooldowns
+            SET deleted_at = ?, retain_until = ?`,
+      ).bind(
+        "2026-01-01T00:00:00.000Z",
+        "2026-07-01T00:00:00.000Z",
+      ).run();
+      await expect(hasIdentityReenrollmentCooldown(
+        env.DELETION_LEDGER,
+        linkKey,
+        env.IDENTITY_LINK_SECRET,
+        Date.parse("2026-08-04T00:00:00.000Z"),
+      )).resolves.toBe(false);
+      await expect(purgeExpiredIdentityReenrollmentCooldowns(
+        env.DELETION_LEDGER,
+        Date.parse("2026-08-04T00:00:00.000Z"),
+      )).resolves.toEqual({ purged: 1, complete: true });
+      const afterExpiry = await identityEnroll(linkKey, "google", env);
+      expect(afterExpiry.status).toBe(201);
+      const fresh = await afterExpiry.json<{ participantId: string }>();
+      expect(fresh.participantId).not.toBe(participant.participantId);
+    });
+
+    it("keeps the synthetic development identity path usable without the hosted secret", async () => {
+      const env = identityBindings({ IDENTITY_LINK_SECRET: undefined });
+      const linkKey = await sha256Hex("test-development-identity-without-secret");
+      const first = await identityEnroll(linkKey, "google", env);
+      expect(first.status).toBe(201);
+      const participant = await enrollmentFrom(first);
+      const deleted = await api("/api/v1/me", {
+        method: "DELETE",
+        headers: personalHeaders(participant, { csrf: true }),
+      }, env);
+      expect(deleted.status).toBe(200);
+      const second = await identityEnroll(linkKey, "google", env);
+      expect(second.status).toBe(201);
     });
   });
 });

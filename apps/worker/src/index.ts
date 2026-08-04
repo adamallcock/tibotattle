@@ -92,6 +92,8 @@ import {
   insertContribution,
   listContributions,
   markParticipantDeleting,
+  participantIdentityLinkKeyForDeletion,
+  participantIdentityLinkState,
   reattachParticipantByLinkKey,
   recoverAccess,
   revokeSession,
@@ -128,7 +130,11 @@ import {
   reconcilePendingQuarantineObjects,
 } from "./quarantine-reconciliation";
 import {
+  hasIdentityReenrollmentCooldown,
   hasDeletionTombstone,
+  purgeExpiredDeletionTombstones,
+  purgeExpiredIdentityReenrollmentCooldowns,
+  recordIdentityReenrollmentCooldown,
   recordDeletionTombstone,
   runBackendLifecycle,
 } from "./retention";
@@ -455,6 +461,12 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   const verifiedIdentity = identityProvided
     ? await consumeHostedIdentityProof(env.USAGE_MONITOR_DB, identityValue)
     : null;
+  if (verifiedIdentity !== null) {
+    await assertIdentityReenrollmentAllowed(
+      env,
+      verifiedIdentity.linkKeyHex,
+    );
+  }
   if (deviceBootstrapRequested) {
     await assertCollectionControl(
       env.USAGE_MONITOR_DB,
@@ -622,6 +634,36 @@ async function consumeHostedIdentityProof(
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
   return { provider, linkKeyHex: claimed.linkKeyHex };
+}
+
+/**
+ * A proof is consumed before this check, so a caller cannot replay one hosted
+ * handoff while probing the cooldown. Existing active participants are
+ * deliberately exempt: sign-in remains a reattachment operation, not a new
+ * account generation. Deleted or deleting links are compared only through
+ * the short-lived, purpose-separated ledger digest.
+ */
+async function assertIdentityReenrollmentAllowed(
+  env: Env,
+  identityLinkKey: string,
+): Promise<void> {
+  const state = await participantIdentityLinkState(
+    env.USAGE_MONITOR_DB,
+    identityLinkKey,
+  );
+  if (state?.state === "active") return;
+  const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
+  if (!identityRequired(env)
+      && (typeof rawIdentityLinkSecret !== "string"
+        || rawIdentityLinkSecret.length < 32)) {
+    return;
+  }
+  const coolingDown = await hasIdentityReenrollmentCooldown(
+    env.DELETION_LEDGER,
+    identityLinkKey,
+    rawIdentityLinkSecret,
+  );
+  if (coolingDown) throw new ApiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
 }
 
 /**
@@ -2077,6 +2119,23 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     env.DELETION_LEDGER,
     session.participantId,
   );
+  const identityLinkKey = await participantIdentityLinkKeyForDeletion(
+    env.USAGE_MONITOR_DB,
+    session.participantId,
+    session.sessionId,
+  );
+  if (identityLinkKey !== null) {
+    const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
+    if (identityRequired(env)
+        || (typeof rawIdentityLinkSecret === "string"
+          && rawIdentityLinkSecret.length >= 32)) {
+      await recordIdentityReenrollmentCooldown(
+        env.DELETION_LEDGER,
+        identityLinkKey,
+        rawIdentityLinkSecret,
+      );
+    }
+  }
   const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
   if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
     throw new ApiError(500, "INTERNAL_ERROR");
@@ -2222,6 +2281,12 @@ async function handleAdminAction(request: Request, env: Env): Promise<Response> 
           quarantineReconciliationComplete: result.quarantineReconciliationComplete,
           expiredIdentityHandoffsPurged: result.expiredIdentityHandoffsPurged,
           expiredIdentityHandoffPurgeComplete: result.expiredIdentityHandoffPurgeComplete,
+          expiredDeletionTombstonesPurged: result.expiredDeletionTombstonesPurged,
+          deletionTombstonePurgeComplete: result.deletionTombstonePurgeComplete,
+          expiredIdentityReenrollmentCooldownsPurged:
+            result.expiredIdentityReenrollmentCooldownsPurged,
+          identityReenrollmentCooldownPurgeComplete:
+            result.identityReenrollmentCooldownPurgeComplete,
           aggregateRebuildComplete: result.aggregateRebuildComplete,
           publicationEnabled: result.publicationEnabled,
         },
@@ -2701,6 +2766,10 @@ interface ScheduledMaintenanceLog {
   quarantineReconciliationComplete: boolean;
   expiredIdentityHandoffsPurged: number;
   expiredIdentityHandoffPurgeComplete: boolean;
+  expiredDeletionTombstonesPurged: number;
+  deletionTombstonePurgeComplete: boolean;
+  expiredIdentityReenrollmentCooldownsPurged: number;
+  identityReenrollmentCooldownPurgeComplete: boolean;
   expiredSignInAdmissionsPurged: number;
   signInAdmissionPurgeComplete: boolean;
   staleDevicePairingsRevoked: number;
@@ -2778,6 +2847,10 @@ export async function runScheduledMaintenance(
   let quarantineReconciliationComplete = false;
   let expiredIdentityHandoffsPurged = 0;
   let expiredIdentityHandoffPurgeComplete = false;
+  let expiredDeletionTombstonesPurged = 0;
+  let deletionTombstonePurgeComplete = false;
+  let expiredIdentityReenrollmentCooldownsPurged = 0;
+  let identityReenrollmentCooldownPurgeComplete = false;
   let expiredSignInAdmissionsPurged = 0;
   let signInAdmissionPurgeComplete = false;
   let staleDevicePairingsRevoked = 0;
@@ -2802,6 +2875,10 @@ export async function runScheduledMaintenance(
         quarantineReconciliationComplete,
         expiredIdentityHandoffsPurged,
         expiredIdentityHandoffPurgeComplete,
+        expiredDeletionTombstonesPurged,
+        deletionTombstonePurgeComplete,
+        expiredIdentityReenrollmentCooldownsPurged,
+        identityReenrollmentCooldownPurgeComplete,
         expiredSignInAdmissionsPurged,
         signInAdmissionPurgeComplete,
         staleDevicePairingsRevoked,
@@ -2829,6 +2906,19 @@ export async function runScheduledMaintenance(
     );
     expiredIdentityHandoffsPurged = handoffPurge.purged;
     expiredIdentityHandoffPurgeComplete = handoffPurge.complete;
+    const deletionTombstonePurge = await purgeExpiredDeletionTombstones(
+      env.DELETION_LEDGER,
+    );
+    expiredDeletionTombstonesPurged = deletionTombstonePurge.purged;
+    deletionTombstonePurgeComplete = deletionTombstonePurge.complete;
+    const identityReenrollmentCooldownPurge =
+      await purgeExpiredIdentityReenrollmentCooldowns(
+        env.DELETION_LEDGER,
+      );
+    expiredIdentityReenrollmentCooldownsPurged =
+      identityReenrollmentCooldownPurge.purged;
+    identityReenrollmentCooldownPurgeComplete =
+      identityReenrollmentCooldownPurge.complete;
     const signInAdmissionPurge = await purgeExpiredSignInStartAdmissions(
       env.USAGE_MONITOR_DB,
     );
@@ -2852,6 +2942,8 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         ownedMaintenanceLease,
       ),
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      !identityRequired(env),
     );
     quarantineRetentionComplete =
       lifecycle.quarantineRetentionComplete;
@@ -2893,6 +2985,8 @@ export async function runScheduledMaintenance(
     const complete = lifecycleComplete
       && quarantineReconciliationComplete
       && expiredIdentityHandoffPurgeComplete
+      && deletionTombstonePurgeComplete
+      && identityReenrollmentCooldownPurgeComplete
       && signInAdmissionPurgeComplete
       && rebuildComplete;
     const log: ScheduledMaintenanceLog = {
@@ -2906,6 +3000,10 @@ export async function runScheduledMaintenance(
       quarantineReconciliationComplete,
       expiredIdentityHandoffsPurged,
       expiredIdentityHandoffPurgeComplete,
+      expiredDeletionTombstonesPurged,
+      deletionTombstonePurgeComplete,
+      expiredIdentityReenrollmentCooldownsPurged,
+      identityReenrollmentCooldownPurgeComplete,
       expiredSignInAdmissionsPurged,
       signInAdmissionPurgeComplete,
       staleDevicePairingsRevoked,
@@ -2930,6 +3028,10 @@ export async function runScheduledMaintenance(
       quarantineReconciliationComplete,
       expiredIdentityHandoffsPurged,
       expiredIdentityHandoffPurgeComplete,
+      expiredDeletionTombstonesPurged,
+      deletionTombstonePurgeComplete,
+      expiredIdentityReenrollmentCooldownsPurged,
+      identityReenrollmentCooldownPurgeComplete,
       expiredSignInAdmissionsPurged,
       signInAdmissionPurgeComplete,
       staleDevicePairingsRevoked,
