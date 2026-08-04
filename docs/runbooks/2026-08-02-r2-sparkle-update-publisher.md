@@ -191,8 +191,9 @@ npm run product:macos:publish-update -- \
 
 The token option is an allowlisted environment-variable name, not a literal
 secret argument. The publisher reads `SPARKLE_APPCAST_GUARD_TOKEN` only when
-`--publish` is active and removes it from its environment before invoking
-Wrangler, so child processes do not inherit the value. A literal
+`--publish` is active and removes it from its environment before local input
+and DMG validation, so child processes do not inherit the value even when
+validation fails. A literal
 `--atomic-appcast-guard-token` option is rejected. Without both explicit guard
 options, the command-line publisher stops with
 `SPARKLE_UPDATE_ATOMIC_GUARD_REQUIRED` (or an options error) before any remote

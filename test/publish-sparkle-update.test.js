@@ -354,6 +354,37 @@ test("validates an explicitly supplied canonical signed update without invoking 
   }
 });
 
+test("does not consume a remote guard token during validation-only runs", async () => {
+  const fixture = await createReleaseFixture();
+  const token = "validation-only-guard-token-012345678901";
+  const previousToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = token;
+  try {
+    await publishSparkleUpdateRaw({
+      appcastPath: fixture.appcastPath,
+      atomicAppcastGuardEndpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+      atomicAppcastGuardTokenEnv: APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      stableBootstrap: true,
+      validateDMG: async () => {
+        assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], token);
+      },
+    });
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], token);
+  } finally {
+    if (previousToken === undefined) {
+      delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    } else {
+      process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
+    }
+    await fixture.cleanup();
+  }
+});
+
 test("requires explicit stable continuity state even for validation-only publisher runs", async () => {
   const fixture = await createReleaseFixture();
   try {
@@ -426,6 +457,37 @@ test("requires both explicit guard endpoint and token before any remote mutation
   }
 });
 
+test("rejects injected atomic guards combined with either remote guard option", async () => {
+  const injectedGuard = {
+    schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA,
+    ownerOnly: true,
+    compareAndSwap: async () => ({ status: "committed" }),
+  };
+  for (const remoteOptions of [
+    {
+      atomicAppcastGuardEndpoint:
+        `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+    },
+    { atomicAppcastGuardTokenEnv: APPCAST_ATOMIC_GUARD_TOKEN_ENV },
+  ]) {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        ...remoteOptions,
+        appcastPath: "not-read-appcast.xml",
+        atomicAppcastGuard: injectedGuard,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: "not-read.dmg",
+        publish: true,
+        releaseManifestPath: "not-read-release.json",
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+      }),
+      { code: "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_CONFLICT" },
+    );
+  }
+});
+
 test("fails closed when the explicit guard token environment variable is unset", async () => {
   const fixture = await createReleaseFixture();
   const runner = missingRemoteObjectRunner();
@@ -489,7 +551,9 @@ test("publishes through the explicit owner guard endpoint without exposing its t
         });
       },
       fetchPublic: publicReadback.fetch,
-      validateDMG: async () => {},
+      validateDMG: async () => {
+        assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+      },
     });
     assert.equal(publication.status, "published");
     assert.equal(guardCalls.length, 1);
@@ -500,6 +564,42 @@ test("publishes through the explicit owner guard endpoint without exposing its t
     assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
     assert.equal(runner.calls.some((call) => call[2] === "put"
       && call[3] === `${APPROVED_R2_BUCKET}/appcast.xml`), false);
+  } finally {
+    if (previousToken === undefined) {
+      delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    } else {
+      process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
+    }
+    await fixture.cleanup();
+  }
+});
+
+test("removes a remote guard token before a failing DMG validation", async () => {
+  const fixture = await createReleaseFixture();
+  const token = "failing-validation-guard-token-012345678901";
+  const previousToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = token;
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        atomicAppcastGuardEndpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+        atomicAppcastGuardTokenEnv: APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+        validateDMG: async () => {
+          assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+          throw new Error("synthetic DMG validation failure");
+        },
+      }),
+      { message: "synthetic DMG validation failure" },
+    );
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
   } finally {
     if (previousToken === undefined) {
       delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];

@@ -1366,6 +1366,14 @@ export async function publishSparkleUpdate({
   const injectedAppcastAtomicGuard = normalizeAppcastAtomicGuard(
     atomicAppcastGuard,
   );
+  if (injectedAppcastAtomicGuard !== null
+      && (normalizedAppcastAtomicGuardEndpoint !== null
+        || normalizedAppcastAtomicGuardTokenEnv !== null)) {
+    fail(
+      "An injected appcast atomic guard cannot be combined with remote guard options",
+      "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_CONFLICT",
+    );
+  }
   if ((normalizedAppcastAtomicGuardEndpoint === null)
       !== (normalizedAppcastAtomicGuardTokenEnv === null)) {
     fail(
@@ -1373,6 +1381,11 @@ export async function publishSparkleUpdate({
       "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED",
     );
   }
+  const normalizedAppcastAtomicGuardToken = publish
+    && injectedAppcastAtomicGuard === null
+    && normalizedAppcastAtomicGuardEndpoint !== null
+    ? readAppcastAtomicGuardToken(normalizedAppcastAtomicGuardTokenEnv)
+    : null;
   const normalizedSparklePublicKey = normalizeSparklePublicKey(
     sparklePublicEdKey,
   );
@@ -1476,11 +1489,6 @@ export async function publishSparkleUpdate({
     verified: false,
   });
   if (!publish) return publication;
-  const normalizedAppcastAtomicGuardToken =
-    injectedAppcastAtomicGuard === null
-      && normalizedAppcastAtomicGuardEndpoint !== null
-      ? readAppcastAtomicGuardToken(normalizedAppcastAtomicGuardTokenEnv)
-      : null;
   const normalizedAppcastAtomicGuard = injectedAppcastAtomicGuard
     ?? (normalizedAppcastAtomicGuardEndpoint === null
       ? null
