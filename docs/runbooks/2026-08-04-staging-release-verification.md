@@ -1,34 +1,35 @@
 ---
-title: TiboTattle staging release verification
+title: TiboTattle canonical production containment observer
 date: 2026-08-04
 type: runbook
-status: blocked-pending-owner-staging-and-production-reconciliation
+status: production-containment-observer
 ---
 
-# TiboTattle staging release verification
+# TiboTattle canonical production containment observer
 
-This runbook covers the read-only release-gate helper added in this worktree.
-It validates the reviewed endpoint manifest, checks endpoint consumers for
-source drift, and emits a content-free JSON receipt. It never deploys, invokes
-Wrangler, writes R2/D1/Durable Objects, reads credentials, or changes an
-installed app.
+This runbook covers the read-only canonical production containment observer
+added in this worktree. It validates the reviewed production endpoint manifest,
+checks endpoint consumers for source drift, and emits a content-free JSON
+receipt. It never deploys, invokes Wrangler, writes R2/D1/Durable Objects,
+reads credentials, or changes an installed app.
 
 ## Current boundary
 
-The canonical manifest identifies `https://tibotattle.com` as the public
+The canonical production manifest identifies `https://tibotattle.com` as the
 service and `https://updates.tibotattle.com/appcast.xml` as the Sparkle feed.
-The release program expects a disabled, contained service. Fresh owner-provided
-live evidence currently reports production `enrollmentMode=open`; therefore
-production is uncontained and is not a staging or dogfood test target. The
-helper must report that as deployment drift; it must not infer that production
-is safe from the checked-in staging configuration.
+The observer expects production to be disabled and contained. Fresh
+owner-provided live evidence currently reports production
+`enrollmentMode=open`; therefore production is uncontained. The helper must
+report that as deployment drift and must not identify itself as an internal
+dogfood channel or infer safety from staging configuration.
 
-The checked-in staging environment is separate and uses its own HTTPS
-`workers.dev` origin. This helper intentionally does not accept an arbitrary
-origin, so it cannot accidentally treat production as staging or probe an
+The checked-in staging configuration describes a separate deployment shape,
+but this observer has no live staging-origin input and makes no claim that a
+real `workers.dev` staging deployment exists. It intentionally does not accept
+an arbitrary origin, so it cannot treat production as staging or probe an
 unreviewed host.
 
-## Read-only verification
+## Read-only production observation
 
 Run the local check without network access:
 
@@ -36,25 +37,27 @@ Run the local check without network access:
 node apps/worker/scripts/release-readiness.mjs
 ```
 
-This validates the canonical manifest and all checked-in endpoint consumers.
-Its receipt has `status: "public_unchecked"`; that is not live release proof.
+This validates the canonical production manifest and all checked-in endpoint
+consumers. Its receipt identifies the channel as
+`production_containment_observer` and has `status: "public_unchecked"`; that
+is not live production evidence.
 
-Only an explicitly requested public check performs bounded, credential-free
-GET requests to the canonical health, ready, and appcast URLs:
+Only an explicitly requested production observation performs bounded,
+credential-free GET requests to the canonical health, ready, and appcast URLs:
 
 ```sh
 node apps/worker/scripts/release-readiness.mjs --probe-public --timeout-ms 5000
 ```
 
-The live check expects `/api/health` to report `enrollmentMode: "disabled"`,
-all four collection controls contained, and no external participant
-authorization. An observed open/invite-enabled/otherwise inconsistent response
-is recorded as fixed-code deployment drift. A structurally valid `503
-not_ready` from `/api/ready` is retained as evidence but fails the live gate.
-An explicit `404` (or `410`) from the appcast is recorded as
-`APPCAST_NOT_PUBLISHED` and is always not-ready. Appcast XML is bounded and
-only its byte count, digest, and structural counts enter the receipt; response
-bodies and fetch errors never do.
+The production observation expects `/api/health` to report
+`enrollmentMode: "disabled"`, all four collection controls contained, and no
+external participant authorization. An observed open/invite-enabled/otherwise
+inconsistent response is recorded as fixed-code deployment drift. A
+structurally valid `503 not_ready` from `/api/ready` is retained as evidence
+but fails the observation. An explicit `404` (or `410`) from the appcast is
+recorded as `APPCAST_NOT_PUBLISHED` and is always not-ready. Appcast XML is
+bounded and only its byte count, digest, and structural counts enter the
+receipt; response bodies and fetch errors never do.
 
 The receipt is content-free and includes only fixed statuses/codes, public
 manifest identifiers, hashes, bounded byte/count metadata, and
@@ -71,10 +74,11 @@ node --test apps/worker/scripts/release-readiness.check.mjs
 
 ## Owner-only staging follow-up
 
-The following commands are documented for the release owner only. They were
-not invoked by this verification lane. Review the exact origin and current
-Cloudflare account state before running them; never substitute production for
-the staging host.
+The following commands are a separate owner-only staging lane, not part of the
+production containment observer. They were not invoked by this verification
+lane. No staging origin is asserted here; the owner must review the exact host
+and current Cloudflare account state before running them, and must never
+substitute production for staging.
 
 1. Check the checked-in staging configuration and dry deployment:
 
@@ -92,11 +96,11 @@ the staging host.
    ```
 
 3. Re-read staging readiness, then deploy only to the exact owner-confirmed
-   staging origin:
+   staging origin supplied by the owner:
 
    ```sh
    npm --prefix apps/worker run staging:deploy -- \
-     --origin https://EXACT-STAGING-HOST \
+     --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
      --confirm DEPLOY_DISABLED_STAGING
    ```
 
@@ -108,4 +112,4 @@ the staging host.
 
 These commands can inspect credentials or mutate remote state and remain
 outside this lane's authorization. Their receipts must be reviewed separately;
-the public production probe above cannot substitute for them.
+the canonical production containment observation cannot substitute for them.

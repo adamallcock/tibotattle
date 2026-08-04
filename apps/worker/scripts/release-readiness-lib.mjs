@@ -14,7 +14,7 @@ import {
 
 export const RELEASE_READINESS_SCHEMA_VERSION =
   "tibotattle-release-readiness-v0.1";
-export const RELEASE_CHANNEL = "internal_dogfood";
+export const OBSERVATION_CHANNEL = "production_containment_observer";
 export const EXPECTED_ENROLLMENT_MODE = "disabled";
 export const DEFAULT_RELEASE_PROBE_TIMEOUT_MS = 5_000;
 export const MAX_RELEASE_PROBE_TIMEOUT_MS = 30_000;
@@ -539,8 +539,8 @@ export async function verifyReleaseReadiness({
         : "not_ready";
   return Object.freeze({
     schemaVersion: RELEASE_READINESS_SCHEMA_VERSION,
-    operation: "release_readiness_verification",
-    channel: RELEASE_CHANNEL,
+    operation: "production_containment_observation",
+    channel: OBSERVATION_CHANNEL,
     generatedAt: timestamp(clock),
     endpointManifest: manifestReceipt(manifest),
     deploymentDrift: deployment,

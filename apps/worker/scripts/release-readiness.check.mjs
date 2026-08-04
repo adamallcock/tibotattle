@@ -4,6 +4,7 @@ import {
   DEPLOYMENT_ENDPOINTS,
 } from "../../../config/deployment-endpoints.js";
 import {
+  OBSERVATION_CHANNEL,
   RELEASE_READINESS_SCHEMA_VERSION,
   verifyReleaseReadiness,
 } from "./release-readiness-lib.mjs";
@@ -115,6 +116,9 @@ test("manifest-only verification is read-only and does not call fetch", async ()
   });
   assert.equal(fetchCalls, 0);
   assert.equal(result.schemaVersion, RELEASE_READINESS_SCHEMA_VERSION);
+  assert.equal(result.operation, "production_containment_observation");
+  assert.equal(result.channel, OBSERVATION_CHANNEL);
+  assert.equal(result.channel, "production_containment_observer");
   assert.equal(result.status, "public_unchecked");
   assert.equal(result.ready, false);
   assert.equal(result.public.requested, false);
@@ -288,6 +292,13 @@ test("CLI is offline by default and only fails the gate after an explicit live p
   });
   assert.throws(
     () => parseReleaseReadinessArguments(["--timeout-ms", "30001"]),
+    { code: "RELEASE_READINESS_ARGUMENTS_INVALID" },
+  );
+  assert.throws(
+    () => parseReleaseReadinessArguments([
+      "--origin",
+      "https://staging.example.test",
+    ]),
     { code: "RELEASE_READINESS_ARGUMENTS_INVALID" },
   );
   const output = [];
