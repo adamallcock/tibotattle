@@ -14,7 +14,7 @@ const PUBLIC_REFRESH_ERROR_CODES = new Set([
   "temporary_disconnect",
 ]);
 const RECENT_INDEX_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
-const EARLY_HEADLINE_RECENT_RUN_BYTES = 64 * 1024 * 1024;
+const EARLY_HEADLINE_RECENT_RUN_BYTES = 128 * 1024 * 1024;
 // The first pass exists to make the dashboard useful quickly on machines with
 // a large Codex history. Keep one individual rollout bounded as well as the
 // whole pass: otherwise a single multi-gigabyte rollout can consume the entire
@@ -42,6 +42,18 @@ const INDEXING_PHASES = new Set([
   "prospective",
 ]);
 const ACCOUNTING_REFRESH_STATUSES = new Set(["reused", "rebuilt"]);
+const ARCHIVE_INDEX_STATUSES = new Set(["complete", "partial"]);
+const ARCHIVE_INDEX_PHASES = new Set(["complete", "awaiting_resume"]);
+const ARCHIVE_INDEX_ERROR_CODES = new Set([
+  "archive_directory_entries",
+  "archive_rollout_files",
+  "archive_timeout",
+  "archive_interrupted",
+  "archive_disk_space",
+  "archive_storage_unavailable",
+  "archive_index_unavailable",
+]);
+const ARCHIVE_INDEX_PROGRESS_KIND = "archive_index";
 const HEADLINE_READY_INDEXING_STATUSES = new Set([
   "recent_7d_complete",
   "recent_7d_partial",
@@ -63,6 +75,8 @@ function isResourceLimitedRefreshError(error) {
       || code.startsWith("accounting_transition_")
       || code.startsWith("export_resource_")
       || code.startsWith("collector_resource_")
+      || code.startsWith("codex_log_discovery_")
+      || code === "local_archive_index_timeout"
     );
 }
 
@@ -217,6 +231,65 @@ function publicIndexingResult(value) {
   };
 }
 
+function publicArchiveIndexResult(value) {
+  if (!value || !ARCHIVE_INDEX_STATUSES.has(value.status)
+      || !ARCHIVE_INDEX_PHASES.has(value.phase)
+      || safeCanonicalInstant(value.generatedAt) === null
+      || safeCanonicalInstant(value.coveredAt?.startAt) === null
+      || safeCanonicalInstant(value.coveredAt?.endAt) === null
+      || !Number.isSafeInteger(value.sourceCount)
+      || value.sourceCount < 0
+      || !Number.isSafeInteger(value.indexedSourceCount)
+      || value.indexedSourceCount < 0
+      || !Number.isSafeInteger(value.pendingSourceCount)
+      || value.pendingSourceCount < 0
+      || value.indexedSourceCount + value.pendingSourceCount
+        !== value.sourceCount
+      || !Number.isSafeInteger(value.sourceBytes)
+      || value.sourceBytes < 0
+      || !Number.isSafeInteger(value.indexedBytes)
+      || value.indexedBytes < 0
+      || value.indexedBytes > value.sourceBytes
+      || !Number.isSafeInteger(value.readBudgetBytes)
+      || value.readBudgetBytes < 1
+      || !Number.isSafeInteger(value.scanBytes)
+      || value.scanBytes < 0) return null;
+  return {
+    status: value.status,
+    phase: value.phase,
+    generatedAt: value.generatedAt,
+    coveredAt: {
+      startAt: value.coveredAt.startAt,
+      endAt: value.coveredAt.endAt,
+    },
+    sourceCount: value.sourceCount,
+    indexedSourceCount: value.indexedSourceCount,
+    pendingSourceCount: value.pendingSourceCount,
+    sourceBytes: value.sourceBytes,
+    indexedBytes: value.indexedBytes,
+    readBudgetBytes: value.readBudgetBytes,
+    scanBytes: value.scanBytes,
+    ...(ARCHIVE_INDEX_ERROR_CODES.has(value.errorCode)
+      ? { errorCode: value.errorCode }
+      : {}),
+  };
+}
+
+function publicArchiveIndexProgress(value) {
+  return value?.kind === ARCHIVE_INDEX_PROGRESS_KIND
+      && value.status === "scanning"
+    ? { kind: ARCHIVE_INDEX_PROGRESS_KIND, status: "scanning" }
+    : null;
+}
+
+function publicRefreshProgress(value) {
+  return publicIndexingResult(value) ?? publicArchiveIndexProgress(value);
+}
+
+function terminalRefreshProgress(value) {
+  return value?.kind === ARCHIVE_INDEX_PROGRESS_KIND ? null : value;
+}
+
 function mergeCollectorPasses(early, continued, now = Date.now()) {
   const earlyRefresh = early?.refresh ?? {};
   const continuedRefresh = continued?.refresh ?? {};
@@ -256,16 +329,15 @@ function mergeCollectorPasses(early, continued, now = Date.now()) {
 
 export function createLocalCollectorRefreshRunner({
   codexHome = join(homedir(), ".codex"),
-  dataFile = null,
-  checkpointFile = null,
-  lockFile = null,
-  journalFile = null,
+  stateFile = null,
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
   refreshAccounting = null,
-  accountingCacheFile = null,
+  refreshArchiveIndex = null,
+  archiveIndexFile = null,
+  archiveIndexSecretFile = null,
   // Collection-time capture of the Codex speed-mode baseline. Codex writes the
   // mode to the rollout log only when it is applied or changed, so a session's
   // baseline exists nowhere but the configuration's `service_tier` key - and
@@ -286,17 +358,18 @@ export function createLocalCollectorRefreshRunner({
   if (refreshAccounting !== null && typeof refreshAccounting !== "function") {
     throw new TypeError("refreshAccounting must be a function or null");
   }
+  if (refreshArchiveIndex !== null && typeof refreshArchiveIndex !== "function") {
+    throw new TypeError("refreshArchiveIndex must be a function or null");
+  }
   if (recordCodexSpeedBaseline !== null
       && typeof recordCodexSpeedBaseline !== "function") {
     throw new TypeError("recordCodexSpeedBaseline must be a function or null");
   }
   for (const [name, value] of Object.entries({
-    dataFile,
-    checkpointFile,
-    lockFile,
-    journalFile,
+    stateFile,
     accountObservationOperationLockFile,
-    accountingCacheFile,
+    archiveIndexFile,
+    archiveIndexSecretFile,
   })) {
     if (value !== null && (typeof value !== "string" || value.length < 1)) {
       throw new TypeError(`${name} must be a non-empty string or null`);
@@ -343,10 +416,7 @@ export function createLocalCollectorRefreshRunner({
     }
     const collectorOptions = {
       codexHome,
-      ...(dataFile === null ? {} : { dataFile }),
-      ...(checkpointFile === null ? {} : { checkpointFile }),
-      ...(lockFile === null ? {} : { lockFile }),
-      ...(journalFile === null ? {} : { journalFile }),
+      ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
       backfill: true,
@@ -361,9 +431,10 @@ export function createLocalCollectorRefreshRunner({
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
     };
-    // The headline pass uses the collector's ordinary atomic ledger/checkpoint
-    // path with a much smaller read budget. It therefore publishes only after
-    // a durable bounded pass, while leaving the same checkpoint resumable.
+    // The headline pass uses the collector's ordinary atomic SQLite state
+    // transaction with a much smaller read budget. It therefore publishes
+    // only after a durable bounded pass, while leaving the same checkpoint
+    // resumable.
     let result = await runCollector({
       ...collectorOptions,
       maximumRecentRunBytes: EARLY_HEADLINE_RECENT_RUN_BYTES,
@@ -410,16 +481,14 @@ export function createLocalCollectorRefreshRunner({
     if (refreshAccounting !== null && accountingMayRun) {
       // A provider quota observation does not alter replay-safe token
       // accounting. Reuse a current cache when no rollout usage record was
-      // added, while the collector ledger continues to supply the fresh quota
+      // added, while the collector state continues to supply the fresh quota
       // card independently.
       const collectorWroteNoRolloutUsage =
         result?.rolloutRecordsWritten === 0;
       if (collectorWroteNoRolloutUsage && signal?.aborted !== true) {
         try {
           const existing = await readAccountingCache({
-            ...(accountingCacheFile === null
-              ? {}
-              : { cacheFile: accountingCacheFile }),
+            ...(stateFile === null ? {} : { stateFile }),
             now: clock,
             maximumAgeMs: MAX_REUSABLE_ACCOUNTING_CACHE_AGE_MS,
           });
@@ -437,7 +506,7 @@ export function createLocalCollectorRefreshRunner({
       if (accounting === null) {
         accounting = await refreshAccounting({
           codexHome,
-          ...(accountingCacheFile === null ? {} : { cacheFile: accountingCacheFile }),
+          ...(stateFile === null ? {} : { stateFile }),
           now: clock,
           windowDays: 31,
           declaredSpeedBaselines,
@@ -450,6 +519,24 @@ export function createLocalCollectorRefreshRunner({
       result?.refresh?.notificationEvidence,
       clock(),
     );
+    let archiveIndex = null;
+    if (refreshArchiveIndex !== null
+        && accountingMayRun
+        && signal?.aborted !== true) {
+      await onProgress?.({
+        kind: ARCHIVE_INDEX_PROGRESS_KIND,
+        status: "scanning",
+      });
+      archiveIndex = await refreshArchiveIndex({
+        codexHome,
+        ...(archiveIndexFile === null ? {} : { indexFile: archiveIndexFile }),
+        ...(archiveIndexSecretFile === null
+          ? {}
+          : { secretFile: archiveIndexSecretFile }),
+        now: clock,
+        signal,
+      });
+    }
     return {
       rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
         ? result.rolloutRecordsWritten
@@ -476,6 +563,9 @@ export function createLocalCollectorRefreshRunner({
               accounting.diagnostics?.forkReplayEventsExcluded ?? 0,
           },
         }),
+      ...(publicArchiveIndexResult(archiveIndex) === null
+        ? {}
+        : { archiveIndex: publicArchiveIndexResult(archiveIndex) }),
       ...(publicIndexingResult(result?.indexing) === null
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
@@ -519,6 +609,8 @@ function publicRefreshResult(result, now = Date.now()) {
         safeCount(result.accounting.forkReplayEventsExcluded),
     };
   }
+  const archiveIndex = publicArchiveIndexResult(result?.archiveIndex);
+  if (archiveIndex !== null) projected.archiveIndex = archiveIndex;
   return projected;
 }
 
@@ -536,7 +628,7 @@ export class LocalCompanionRefreshController {
   constructor({
     runner,
     dataStore,
-    timeoutMs = 60_000,
+    timeoutMs = 5 * 60_000,
     clock = () => Date.now(),
     createRefreshId = randomUUID,
   }) {
@@ -618,10 +710,11 @@ export class LocalCompanionRefreshController {
         onProgress: async (progress) => {
           if (timedOut
               || !["running", "cancelling"].includes(this.#state.status)) return;
-          const projected = publicIndexingResult(progress);
+          const projected = publicRefreshProgress(progress);
           if (projected === null) return;
           let quickResultAt = this.#state.quickResultAt;
-          if (projected.phase === "quick_result"
+          if (projected.kind !== ARCHIVE_INDEX_PROGRESS_KIND
+              && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
               await this.#dataStore.reload();
@@ -653,7 +746,9 @@ export class LocalCompanionRefreshController {
             finishedAt: new Date(this.#clock()).toISOString(),
             result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
-              ?? this.#state.progress,
+              ?? (this.#state.progress?.kind === ARCHIVE_INDEX_PROGRESS_KIND
+                ? null
+                : this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_cancelled",
           };
@@ -674,7 +769,9 @@ export class LocalCompanionRefreshController {
               ?? new Date(this.#clock()).toISOString(),
             result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
-              ?? this.#state.progress,
+              ?? (this.#state.progress?.kind === ARCHIVE_INDEX_PROGRESS_KIND
+                ? null
+                : this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_timed_out",
           };
@@ -704,7 +801,7 @@ export class LocalCompanionRefreshController {
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
             result: null,
-            progress: this.#state.progress,
+            progress: terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_cancelled",
           };
@@ -717,7 +814,7 @@ export class LocalCompanionRefreshController {
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
           result: null,
-          progress: this.#state.progress,
+          progress: terminalRefreshProgress(this.#state.progress),
           quickResultAt: this.#state.quickResultAt,
           errorCode: isResourceLimitedRefreshError(error)
             ? "refresh_resource_limited"
@@ -739,7 +836,7 @@ export class LocalCompanionRefreshController {
         startedAt: this.#state.startedAt,
         finishedAt: new Date(this.#clock()).toISOString(),
         result: null,
-        progress: this.#state.progress,
+        progress: terminalRefreshProgress(this.#state.progress),
         quickResultAt: this.#state.quickResultAt,
         errorCode: "refresh_timed_out",
       };

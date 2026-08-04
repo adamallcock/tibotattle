@@ -32,7 +32,7 @@ the normal app remains open. The Login Item only launches that normal app; it
 does not add a separate scanner or upload path. Mutable state stays in the
 owner-only `~/Library/Application Support/Usage Monitor` directory. Large
 histories are indexed in bounded, automatically continued slices under one
-user action. A separate 64 MiB checkpointed pass publishes a useful current
+user action. A separate 128 MiB checkpointed pass publishes a useful current
 headline first; the user can keep reading, cancel safely, and resume later. One
 click permits the initial pass plus exactly two automatic bounded
 continuations. Each accepted pass has a six-minute browser polling window
@@ -76,11 +76,40 @@ confirms the post-register/unregister result, exposes a pending-request removal
 route, and includes only fixed path-free Login Item status/action values in
 Data & Diagnostics.
 
-Passive discovery is abort-aware and bounded: one pass admits at most 20,000
-directory entries and 5,000 rollout files, applies its byte ceiling to new
+The all-history archive-accounting index is separate from that foreground
+collector. Its first scheduled source parse is 128 MiB; each later resumable
+pass may schedule 1.5 GiB, inspect 500,000 directory entries and 125,000
+rollout files, and run for five minutes. It atomically publishes privacy-scoped SQLite progress in
+128 MiB-or-smaller commit slices. The local cost surface labels archive
+coverage as scanning, partial, or complete, while current cost controls retain
+their explicit cached 31-day label. The index is a coverage gate before any
+future all-history aggregate; a partial archive is never shown as an all-time
+total.
+
+Before staging a new archive SQLite generation, the companion reserves local
+free space for the current index, the selected parse budget, and 128 MiB of
+headroom. If that conservative check cannot pass, it reports a fixed
+`archive_disk_space` partial state rather than beginning a stage that could run
+the disk out of space. A partial state remains a coverage warning, never an
+all-history total.
+
+The scheduled-parse budget excludes small source-identity and lineage
+preflight reads. Finalized JSONL sources use a one-byte terminal-newline check
+before their previously indexed prefix is reused; the source caps and
+five-minute deadline remain the outer whole-operation safeguards.
+
+Passive discovery is abort-aware and bounded: one pass admits at most 500,000
+directory entries and 125,000 rollout files, applies its byte ceiling to new
 files, appends, truncations, and reseeding, and preserves durable cursors with
 fixed content-free pause evidence when a resource bound is reached. Foreground
-collection inherits the same limits.
+collection inherits these discovery limits so it cannot stop a qualifying
+archive scan at the former artificial threshold; it retains its separate
+recent-window byte and record-batch bounds inside one owner-only SQLite state
+database. Legacy app-managed JSON/JSONL collector state is parity-migrated and
+removed on first normal access; raw Codex rollout JSONL remains input only.
+Migration has an owner-only startup lease, rejects malformed or oversized
+legacy JSONL instead of retiring it, and reports `complete` only once every
+managed legacy artifact is absent.
 
 The ordinary contribution journey deliberately omits account recovery,
 security reset, personal server export, and multi-device management. A quiet
@@ -278,7 +307,7 @@ node ./src/cli.js uninstall-claude-callback
 # Permanent removal is a separate two-step action valid only after uninstall.
 node ./src/cli.js remove-claude-callback-identity
 node ./src/cli.js remove-claude-callback-identity --confirm-removal TOKEN_FROM_PREFLIGHT
-# Profile monitorability from a full-grain transition dataset and the passive ledger.
+# Profile monitorability from a full-grain transition dataset and the passive collector state.
 pnpm quality -- --input .usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json
 # Reuse the cached replay-safe history for a fast provider/account crosscheck.
 # On supported macOS arm64 systems, account scoping uses its dedicated Keychain item automatically.
@@ -307,10 +336,11 @@ node ./src/cli.js verify-bundle --input exports/local-review.umx.json
 # Create a resumable disk-backed export set, then verify the complete set.
 node ./src/cli.js export-set --since 2026-07-24T18:00:00.000Z --until 2026-07-24T20:00:00.000Z --workspace .usage-monitor/export-workspace --directory exports/local-set
 node ./src/cli.js verify-export-set --directory exports/local-set
-# Explicitly include the local Codex collector ledger and Claude's default status state.
-node ./src/cli.js export-set --since 2026-07-24T18:00:00.000Z --until 2026-07-24T20:00:00.000Z --workspace .usage-monitor/export-workspace-with-quota --directory exports/local-set-with-quota --collector-file .usage-monitor/collector-events.jsonl --claude-status
+# The managed local collector is SQLite and is never exported as a raw ledger.
+# --collector-file remains available only for an explicitly supplied external JSONL supplement.
+node ./src/cli.js export-set --since 2026-07-24T18:00:00.000Z --until 2026-07-24T20:00:00.000Z --workspace .usage-monitor/export-workspace-with-quota --directory exports/local-set-with-quota --claude-status
 # Resume must repeat the same supplemental source selection; an explicit Claude directory overrides the default.
-node ./src/cli.js export-set --resume --workspace .usage-monitor/export-workspace-with-quota --directory exports/local-set-with-quota --collector-file .usage-monitor/collector-events.jsonl --claude-status
+node ./src/cli.js export-set --resume --workspace .usage-monitor/export-workspace-with-quota --directory exports/local-set-with-quota --claude-status
 # Include privacy-minimized Claude Code transcript usage from the default local projects directory.
 node ./src/cli.js export-set --since 2026-07-01T00:00:00.000Z --until 2026-07-25T23:59:59.999Z --workspace .usage-monitor/export-workspace-with-claude --directory exports/local-set-with-claude --claude-usage
 # An explicit projects directory both selects Claude usage and overrides the default location.
@@ -371,7 +401,7 @@ Local rollout logs normally retain the last provider-reported `used_percent`, wi
 - `usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]`: construct and privacy-check one resource-bounded metadata-only single bundle, then print only coverage, counts, resource-policy version, check results, and size. It never writes a bundle or contacts a server. Histories that exceed a single-bundle ceiling fail explicitly; use `export-set` for deterministic bounded chunking and restart-safe replay.
 - `usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]`: write the same validated bundle and its SHA-256 privacy receipt as a recoverable no-clobber owner-only transaction in one destination directory. A durable manifest and exact staged digests are synced before the receipt is published; the bundle is published last as the commit point. If the process stops after that durable boundary, the transaction remains explicitly recoverable rather than being guessed or silently discarded. The v0.1 bundle is forced to `transportReady: false`; no upload command, endpoint, or network transport is implemented.
 - `usage-monitor verify-bundle --input PATH [--receipt PATH]`: verify canonical bytes, owner-only regular-file and directory controls, schema validity, the live export compatibility tuple plus checked-in manifest freshness, record counts, provider declarations, ordering, unique occurrence IDs, coverage bounds, privacy checks, and receipt hash/size equality. Output is a bounded content-free summary and never includes paths or pseudonyms. The packaged `usage-monitor-local verify-bundle` command enters through the same application verification boundary; the offline artifact smoke exercises that exact launcher command.
-- `usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--claude-usage | --claude-projects-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]`: freeze complete Codex rollout prefixes and, only when explicitly selected, the Codex collector ledger, Claude status snapshot inventory, and/or Claude Code transcript usage; stream validated safe records through an owner-only SQLite workspace; resume without duplicate logical records; materialize deterministic bounded gzip bundle/receipt chunks; and publish the complete manifest last. `--claude-status` selects the default local status state directory, while `--claude-state-dir PATH` explicitly includes and overrides it. `--claude-usage` selects the default local Claude projects directory, while `--claude-projects-dir PATH` explicitly includes and overrides it. Creation requires `--since` and `--until`; `--resume` rejects new bounds and requires the same supplemental-source selections so the controller can rebind and revalidate the descriptor-bound sources. No option installs a callback, contacts a network service, uploads data, or exposes private source plans in CLI output.
+- `usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--claude-usage | --claude-projects-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]`: freeze complete Codex rollout prefixes and, only when explicitly selected, an external supplemental collector JSONL source, Claude status snapshot inventory, and/or Claude Code transcript usage; stream validated safe records through an owner-only SQLite workspace; resume without duplicate logical records; materialize deterministic bounded gzip bundle/receipt chunks; and publish the complete manifest last. `--claude-status` selects the default local status state directory, while `--claude-state-dir PATH` explicitly includes and overrides it. `--claude-usage` selects the default local Claude projects directory, while `--claude-projects-dir PATH` explicitly includes and overrides it. Creation requires `--since` and `--until`; `--resume` rejects new bounds and requires the same supplemental-source selections so the controller can rebind and revalidate the descriptor-bound sources. No option installs a callback, contacts a network service, uploads data, or exposes private source plans in CLI output.
 - `usage-monitor inspect-export-workspace --workspace PATH`: print only bounded workspace status (`scan_complete`, resumable `incomplete`, or discard-only `poisoned_source_integrity`), coverage, source counts/bytes, safe-record counts, and disk bytes. It never prints source paths, record values, or pseudonyms.
 - `usage-monitor verify-export-set --directory PATH`: independently verify the canonical manifest and its receipt, every inferred fixed-name compressed chunk pair, encoded hashes and byte limits before bounded decompression, decoded canonical hashes/bytes/counts/shared contract, cross-chunk ordering and occurrence-ID uniqueness using a temporary disk-backed index, greedy packing boundaries, and the chunk-independent logical-record digest. Output is content-free.
 - `usage-monitor delete-local-export --workspace PATH --directory PATH [--confirm-deletion TOKEN]`: without a token, independently verify and bind one complete export set to its workspace, then print only bounded file/byte counts and a short target-specific confirmation token without changing files. With that exact token, acquire the workspace and destination leases, durably commit a content-free exact-inventory journal, and move each candidate through same-directory quarantine, re-verification, and durable unlink. Source logs, identity state, unrelated destination siblings, and both directories are retained. No participant secret or network access is used, and secure SSD erasure is not claimed. The OS user account is the local trust boundary; this is not a sandbox against malicious code already running as that same user.
@@ -381,8 +411,10 @@ Local rollout logs normally retain the last provider-reported `used_percent`, wi
 - `usage-monitor crosscheck --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--input LOCAL_HISTORY_PATH] [--allow-stale-cache] [--plan-timeline PATH] [--provider-ui PATH] [--output PATH] [--report-file PATH]`: compare the fixed 69-day replay-safe interval to the current account's official daily token buckets, account-level quota, optional visible-UI observation, and prospective same-scope collector records. Historical local rows stay account-unattributed. Cached input is accepted only for unchanged sources or when every appended complete record is proven later than the fixed end; stale override is explicit and retained in output.
 - `usage-monitor quality [--input TRANSITIONS_PATH] [--collector-file PATH] [--output PATH] [--report-file PATH]`: profile monitorability before interpreting a gradient. It selects the dominant exact reset series, evaluates independent interval coverage dimensions, measures integer-display lag, distinguishes fixed-reset timestamp jitter from moving/high-churn limit families, checks collector freshness, and prioritizes remediation.
 - `usage-monitor register-account --alias LOCAL_ALIAS --default-plan PLAN_VARIANT [--plan-timeline PATH]`: register the currently signed-in account under a low-cardinality local alias and a plan assumption effective from the registration time. It never saves the email or rewrites an existing account's earlier plan history.
-- `usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill]`: tail complete new rollout lines from atomic byte checkpoints, optionally refresh a stale rate-limit snapshot through the read-only app-server account endpoint, flush owner-only records/checkpoint, and exit.
-- `usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N]`: hold one app-server connection, consume rate-limit notifications, watch active/archive rollout directories, reconcile periodically, reconnect with bounded backoff, and exit cleanly on `SIGINT`/`SIGTERM`.
+- `usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--state-file PATH]`: tail complete new rollout lines from SQLite cursors, optionally refresh a stale rate-limit snapshot through the read-only app-server account endpoint, atomically commit owner-only records and checkpoint state, and exit.
+- `usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--state-file PATH]`: hold one app-server connection, consume rate-limit notifications, watch active/archive rollout directories, atomically commit SQLite collector state, reconcile periodically, reconnect with bounded backoff, and exit cleanly on `SIGINT`/`SIGTERM`.
+- `usage-monitor collector-state-status [--state-file PATH] [--json]`: report only collector-state size, bounded counts, observed time range, cache bytes, migration status, and whether a manual maintenance review threshold is reached. It does not migrate, compact, archive, or delete data.
+- `usage-monitor plan-collector-retention --before ISO_TIMESTAMP [--state-file PATH] [--json]`: emit a content-free, read-only candidate record/byte/range/digest plan for a future retention action. It changes nothing; archival and removal require a later receipt-backed explicit workflow.
 - `usage-monitor experiment --manifest PATH [--execute-live] [--offline]`: validate and API-price a content-free experiment manifest. Live execution requires the explicit flag and is refused before spawning Codex when price warnings, projected cost, quota availability, or minimum headroom fail.
 - `usage-monitor contamination [--transitions PATH] [--inference PATH] [--experiments PATH] [--observations PATH]`: preserve every adjacent snapshot interval, classify contamination/control state, calculate sensitivity residuals, and report change-point and lagging daily-bucket signals without forcing local cost to match quota.
 - `usage-monitor tools --since ISO_TIMESTAMP --until ISO_TIMESTAMP`: classify privacy-safe client tool observations separately from typed Responses/provider units and apply standard API tool prices only to an exact provider unit.
@@ -393,7 +425,7 @@ Use `--offline` on `capture` to keep ccusage and RunCost on their local price ca
 ## Functional local product
 
 The loopback companion is now the default product preview. It reads the
-privacy-minimized collector ledger and verified report artifacts locally, then
+privacy-minimized collector SQLite state and verified report artifacts locally, then
 serves only a closed dashboard projection:
 
 ```bash
@@ -1007,7 +1039,7 @@ explicit isolated replay test; historical research should normally use
 token/model cursor state, filesystem inode/birth-time cursor keys, and hashes
 of privacy-sanitized events—not rollout paths or session IDs.
 
-Raw privacy-minimized collector records are deliberately append-only during this proof of concept. No automatic retention or deletion is enabled because losing reset/account evidence would be harder to repair than excess local disk use. File size should be monitored and old closed periods should eventually be archived into owner-only monthly partitions with a manifest and digest before any source records are removed.
+Raw privacy-minimized collector records are deliberately append-only during this proof of concept. No automatic retention or deletion is enabled because losing reset/account evidence would be harder to repair than excess local disk use. `collector-state-status` and `plan-collector-retention --before` expose a read-only maintenance signal and candidate receipt digest without altering data. Old closed periods should eventually be archived into owner-only monthly partitions with a manifest and digest before any source records are removed.
 
 `quality` treats collector state as operational evidence. Fresh means the newest collector or app-server record is no more than five minutes old, delayed means five to thirty minutes, and stale means more than thirty minutes. A one-time refresh does not establish continuous coverage: long gaps and the absence of live app-server notifications remain P0 findings even when the newest poll is fresh.
 

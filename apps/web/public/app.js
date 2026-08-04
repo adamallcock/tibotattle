@@ -114,6 +114,11 @@ let activeContributionLookbackHours = 24;
 let localActionBusy = false;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
+// Archive indexing progress is intentionally transient: the durable dashboard
+// continues to show only the last verified complete/partial coverage receipt.
+// While a refresh owns a new pass, make that distinction visible beside cost
+// rather than letting a previous complete receipt look current.
+let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
 let globalState = null;
@@ -803,6 +808,35 @@ function renderQuotaCards(data) {
   }
 }
 
+function historyCoverageLabel(history) {
+  if (archiveHistoryScanActive) {
+    return t(history?.status === "complete"
+      ? "dashboard.pricing.historyScanningComplete"
+      : "dashboard.pricing.historyScanningPartial");
+  }
+  if (history?.status === "complete") {
+    return t("dashboard.pricing.historyComplete");
+  }
+  if (history?.errorCode === "archive_disk_space") {
+    return t("dashboard.pricing.historyDiskSpace");
+  }
+  if (history?.errorCode === "archive_storage_unavailable") {
+    return t("dashboard.pricing.historyStorageUnavailable");
+  }
+  if (history?.phase === "not_started") {
+    return t("dashboard.pricing.historyNotStarted");
+  }
+  const indexed = finite(history?.indexedSourceCount, 0);
+  const total = finite(history?.sourceCount, 0);
+  if (total > 0) {
+    return t("dashboard.pricing.historyProgress", {
+      indexed: compact(indexed),
+      total: compact(total),
+    });
+  }
+  return t("dashboard.pricing.historyResume");
+}
+
 function renderPricing(data) {
   const pricing = data.pricing;
   const fastMode = pricing.fastMode;
@@ -843,12 +877,14 @@ function renderPricing(data) {
       { count: compact(replay) },
     )
     : t("dashboard.pricing.legacyProjection");
+  const history = historyCoverageLabel(pricing.historyCoverage);
   $("#cost-coverage").textContent = pricing.coveragePercent === null
-    ? t("dashboard.pricing.noCoverage")
-    : t("dashboard.pricing.coverage", {
+    ? t("dashboard.pricing.noCoverageWithHistory", { history })
+    : t("dashboard.pricing.coverageWithHistory", {
       method: accountingMethod,
       percent: formatPercent(pricing.coveragePercent, 1),
       provenance,
+      history,
     });
   const list = $("#cost-components");
   clear(list);
@@ -1051,6 +1087,8 @@ const SHARE_CARD_HOME_PATTERN =
 // renamed or injected label can never reach a shared card.
 const SHARE_CARD_PERIOD_KEYS = new Map([
   ["All retained evidence", "share.period.allRetained"],
+  ["Cached 31-day window", "share.period.cachedThirtyOneDay"],
+  ["Cached 31-day collector window", "share.period.cachedThirtyOneDayCollector"],
   ["Last 24 hours", "share.period.lastDay"],
   ["Last 30 days", "share.period.lastThirtyDays"],
   ["Last 7 days", "share.period.lastSevenDays"],
@@ -4745,6 +4783,7 @@ async function requestRefresh() {
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
+  archiveHistoryScanActive = false;
   button.textContent = "Starting local analysis…";
   updateLocalActionButtons();
   setGlobalState("updating");
@@ -4783,7 +4822,14 @@ async function requestRefresh() {
       outcome = refresh.status ?? "failed";
       finalErrorCode = refresh.errorCode ?? null;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
-      if (progress) renderIndexProgress(progress, { status: outcome });
+      const archiveScanning = progress?.kind === "archive_index";
+      if (archiveScanning && !archiveHistoryScanActive) {
+        archiveHistoryScanActive = true;
+        if (dashboard) renderPricing(dashboard);
+      }
+      if (progress && !archiveScanning) {
+        renderIndexProgress(progress, { status: outcome });
+      }
       if (progress?.phase === "quick_result" && !quickResultLoaded) {
         try {
           await loadQuickResultDashboard();
@@ -4806,6 +4852,8 @@ async function requestRefresh() {
         ? progress.filesSelected : null;
       button.textContent = outcome === "cancelling"
         ? "Stopping safely…"
+        : archiveScanning
+          ? `Indexing archive history… ${elapsedLabel}`
         : progress?.phase === "quick_result"
           ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
         : processed !== null && selected !== null
@@ -4873,6 +4921,7 @@ async function requestRefresh() {
       return;
     }
     if (outcome !== "succeeded") throw new Error("The local refresh did not complete successfully.");
+    archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
   } catch {
@@ -4896,6 +4945,9 @@ async function requestRefresh() {
       showDemo: !dashboard
     });
   } finally {
+    const wasArchiveScanning = archiveHistoryScanActive;
+    archiveHistoryScanActive = false;
+    if (wasArchiveScanning && dashboard) renderPricing(dashboard);
     localActionBusy = false;
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;

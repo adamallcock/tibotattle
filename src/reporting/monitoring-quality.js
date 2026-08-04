@@ -177,47 +177,142 @@ function summarizeFlatRuns(intervals) {
   };
 }
 
-function summarizeCollector(records, nowMs, { freshMs = DEFAULT_FRESH_MS, staleMs = DEFAULT_STALE_MS } = {}) {
-  const ordered = [...records]
-    .filter((row) => Number.isFinite(Date.parse(row.observedAt)))
-    .sort((left, right) => left.observedAt.localeCompare(right.observedAt));
-  const usage = ordered.filter((row) => row.kind === "codex_rollout_usage_snapshot");
-  const quota = ordered.filter((row) => row.kind === "codex_quota_snapshot");
-  const appServer = quota.filter((row) => row.source === "app_server_read" || row.source === "app_server_notification");
-  const latest = ordered.at(-1) ?? null;
-  const latestAppServer = appServer.at(-1) ?? null;
-  const ageMs = latest ? Math.max(0, nowMs - Date.parse(latest.observedAt)) : null;
-  const appServerAgeMs = latestAppServer ? Math.max(0, nowMs - Date.parse(latestAppServer.observedAt)) : null;
-  const statusFor = (value) => value === null ? "missing" : value <= freshMs ? "fresh" : value <= staleMs ? "delayed" : "stale";
-  const scopedUsage = usage.filter((row) => row.accountScope?.status === "available" && row.accountScope?.scopeId).length;
-  const knownSpeedUsage = usage.filter((row) => ["standard", "fast"].includes(row.tierSemantics?.codexSpeedMode)).length;
-  const staleness = usage.map((row) => row.stalenessMs).filter(Number.isFinite);
-  const gaps = ordered.slice(1).map((row, index) => Date.parse(row.observedAt) - Date.parse(ordered[index].observedAt));
-  const appServerGaps = appServer.slice(1).map((row, index) => Date.parse(row.observedAt) - Date.parse(appServer[index].observedAt));
+export function createCollectorQualityAccumulator({
+  nowMs,
+  freshMs = DEFAULT_FRESH_MS,
+  staleMs = DEFAULT_STALE_MS,
+  trackStaleness = false,
+} = {}) {
+  if (!Number.isFinite(nowMs)
+      || !Number.isFinite(freshMs) || freshMs < 0
+      || !Number.isFinite(staleMs) || staleMs < freshMs
+      || typeof trackStaleness !== "boolean") {
+    throw new TypeError("Collector quality accumulator options are invalid");
+  }
+  let records = 0;
+  let firstObservedAt = null;
+  let lastObservedAt = null;
+  let lastSource = null;
+  let priorObservedMs = null;
+  let maxRecordGapMs = null;
+  let quotaSnapshotRecords = 0;
+  let appServerSnapshotRecords = 0;
+  let appServerNotificationRecords = 0;
+  let lastAppServerObservedAt = null;
+  let lastAppServerObservedMs = null;
+  let priorAppServerObservedMs = null;
+  let latestAppServerGapMs = null;
+  let maxAppServerGapMs = null;
+  let usageRecords = 0;
+  let accountScopedUsageRecords = 0;
+  let knownSpeedUsageRecords = 0;
+  const staleness = [];
+
   return {
-    records: ordered.length,
-    firstObservedAt: ordered[0]?.observedAt ?? null,
-    lastObservedAt: latest?.observedAt ?? null,
-    lastSource: latest?.source ?? null,
-    ageMs,
-    status: statusFor(ageMs),
-    quotaSnapshotRecords: quota.length,
-    appServerSnapshotRecords: appServer.length,
-    appServerNotificationRecords: appServer.filter((row) => row.source === "app_server_notification").length,
-    lastAppServerObservedAt: latestAppServer?.observedAt ?? null,
-    appServerAgeMs,
-    appServerStatus: statusFor(appServerAgeMs),
-    latestAppServerGapMs: appServerGaps.at(-1) ?? null,
-    maxAppServerGapMs: appServerGaps.length > 0 ? Math.max(...appServerGaps) : null,
-    maxRecordGapMs: gaps.length > 0 ? Math.max(...gaps) : null,
-    usageRecords: usage.length,
-    accountScopedUsageRecords: scopedUsage,
-    accountScopedUsageFraction: ratio(scopedUsage, usage.length),
-    knownSpeedUsageRecords: knownSpeedUsage,
-    knownSpeedUsageFraction: ratio(knownSpeedUsage, usage.length),
-    rolloutReceiptStalenessMsP50: round(quantile(staleness, 0.5), 3),
-    rolloutReceiptStalenessMsP90: round(quantile(staleness, 0.9), 3),
+    add(record) {
+      const observedAt = record?.observedAt;
+      const observedAtMs = Date.parse(observedAt);
+      if (typeof observedAt !== "string" || !Number.isFinite(observedAtMs)) return;
+      records += 1;
+      if (firstObservedAt === null) firstObservedAt = observedAt;
+      if (priorObservedMs !== null) {
+        const gap = observedAtMs - priorObservedMs;
+        maxRecordGapMs = maxRecordGapMs === null ? gap : Math.max(maxRecordGapMs, gap);
+      }
+      priorObservedMs = observedAtMs;
+      lastObservedAt = observedAt;
+      lastSource = record?.source ?? null;
+      if (record?.kind === "codex_rollout_usage_snapshot") {
+        usageRecords += 1;
+        if (record.accountScope?.status === "available" && record.accountScope?.scopeId) {
+          accountScopedUsageRecords += 1;
+        }
+        if (["standard", "fast"].includes(record.tierSemantics?.codexSpeedMode)) {
+          knownSpeedUsageRecords += 1;
+        }
+        if (trackStaleness && Number.isFinite(record.stalenessMs)) {
+          staleness.push(record.stalenessMs);
+        }
+      }
+      if (record?.kind === "codex_quota_snapshot") {
+        quotaSnapshotRecords += 1;
+        if (record.source === "app_server_read" || record.source === "app_server_notification") {
+          appServerSnapshotRecords += 1;
+          if (record.source === "app_server_notification") {
+            appServerNotificationRecords += 1;
+          }
+          if (priorAppServerObservedMs !== null) {
+            const gap = observedAtMs - priorAppServerObservedMs;
+            latestAppServerGapMs = gap;
+            maxAppServerGapMs = maxAppServerGapMs === null
+              ? gap
+              : Math.max(maxAppServerGapMs, gap);
+          }
+          priorAppServerObservedMs = observedAtMs;
+          lastAppServerObservedAt = observedAt;
+          lastAppServerObservedMs = observedAtMs;
+        }
+      }
+    },
+    finalize({
+      rolloutReceiptStalenessMsP50 = null,
+      rolloutReceiptStalenessMsP90 = null,
+    } = {}) {
+      const ageMs = lastObservedAt === null
+        ? null
+        : Math.max(0, nowMs - Date.parse(lastObservedAt));
+      const appServerAgeMs = lastAppServerObservedMs === null
+        ? null
+        : Math.max(0, nowMs - lastAppServerObservedMs);
+      const statusFor = (value) => value === null
+        ? "missing"
+        : value <= freshMs ? "fresh" : value <= staleMs ? "delayed" : "stale";
+      const p50 = Number.isFinite(rolloutReceiptStalenessMsP50)
+        ? rolloutReceiptStalenessMsP50
+        : (trackStaleness ? quantile(staleness, 0.5) : null);
+      const p90 = Number.isFinite(rolloutReceiptStalenessMsP90)
+        ? rolloutReceiptStalenessMsP90
+        : (trackStaleness ? quantile(staleness, 0.9) : null);
+      return {
+        records,
+        firstObservedAt,
+        lastObservedAt,
+        lastSource,
+        ageMs,
+        status: statusFor(ageMs),
+        quotaSnapshotRecords,
+        appServerSnapshotRecords,
+        appServerNotificationRecords,
+        lastAppServerObservedAt,
+        appServerAgeMs,
+        appServerStatus: statusFor(appServerAgeMs),
+        latestAppServerGapMs,
+        maxAppServerGapMs,
+        maxRecordGapMs,
+        usageRecords,
+        accountScopedUsageRecords,
+        accountScopedUsageFraction: ratio(accountScopedUsageRecords, usageRecords),
+        knownSpeedUsageRecords,
+        knownSpeedUsageFraction: ratio(knownSpeedUsageRecords, usageRecords),
+        rolloutReceiptStalenessMsP50: round(p50, 3),
+        rolloutReceiptStalenessMsP90: round(p90, 3),
+      };
+    },
   };
+}
+
+function summarizeCollector(records, nowMs, options = {}) {
+  const accumulator = createCollectorQualityAccumulator({
+    nowMs,
+    ...options,
+    trackStaleness: true,
+  });
+  for (const record of [...records]
+    .filter((row) => typeof row?.observedAt === "string" && Number.isFinite(Date.parse(row.observedAt)))
+    .sort((left, right) => left.observedAt.localeCompare(right.observedAt))) {
+    accumulator.add(record);
+  }
+  return accumulator.finalize();
 }
 
 function opportunity(priority, id, title, evidence, action) {
@@ -227,6 +322,7 @@ function opportunity(priority, id, title, evidence, action) {
 export function analyzeMonitoringQuality({
   transitions,
   collectorRecords = [],
+  collectorSummary = null,
   now = new Date().toISOString(),
 }) {
   if (!transitions || !Array.isArray(transitions.windowGroups)) throw new Error("Monitoring quality requires a transition dataset with windowGroups");
@@ -251,7 +347,9 @@ export function analyzeMonitoringQuality({
   const unknownSpeedEvents = sum(intervals, (row) => row.tierUsageEventCounts?.unknown);
   const knownSpeedEvents = sum(intervals, (row) => (row.tierUsageEventCounts?.standard ?? 0) + (row.tierUsageEventCounts?.fast ?? 0));
   const cadence = intervals.map((row) => row.elapsedMs).filter(Number.isFinite);
-  const collector = summarizeCollector(collectorRecords, nowMs);
+  const collector = collectorSummary && typeof collectorSummary === "object"
+    ? collectorSummary
+    : summarizeCollector(collectorRecords, nowMs);
   const dominantFamily = resetFamilies.find((row) => row.limitId === dominantGroup?.limitId
     && row.slot === dominantGroup?.slot
     && row.windowDurationMins === dominantGroup?.windowDurationMins

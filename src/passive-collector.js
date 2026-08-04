@@ -23,15 +23,16 @@ import {
   unknownCodexTier,
 } from "./providers/codex/logs.js";
 import {
-  appendJsonLinesOwnerOnly,
-  appendOwnerOnlyText,
-  readJsonIfExists,
-  serializeJsonLines,
   stableJson,
-  truncateDurably,
-  unlinkDurably,
-  writeJsonOwnerOnlyAtomic,
 } from "./storage.js";
+import {
+  acquireLocalCollectorStateLock,
+  commitLocalCollectorState,
+  defaultLocalCollectorStatePath,
+  prepareLocalCollectorState,
+  readLocalCollectorCheckpoint,
+  saveLocalCollectorCheckpoint,
+} from "./local-collector-state.js";
 
 const CHECKPOINT_SCHEMA_VERSION = "0.3";
 const RECORD_SCHEMA_VERSION = "0.3";
@@ -44,8 +45,12 @@ const MAX_RECENT_PRELUDE_BYTES = 32 * 1024 * 1024;
 const MAX_RECENT_RUN_BYTES = 1536 * 1024 * 1024;
 const MAX_LINEAGE_PREFIX_BYTES = 1024 * 1024;
 const MAX_CURSOR_SEED_BYTES = 8 * 1024 * 1024;
-const MAX_DISCOVERY_DIRECTORY_ENTRIES = 20_000;
-const MAX_DISCOVERY_ROLLOUT_FILES = 5_000;
+// Both the responsive collector and the resumable archive index must be able
+// to discover the same substantial Codex history. These remain hard limits:
+// they are deliberately generous enough for established local histories, not
+// permission for unbounded recursive traversal.
+export const MAX_DISCOVERY_DIRECTORY_ENTRIES = 500_000;
+export const MAX_DISCOVERY_ROLLOUT_FILES = 125_000;
 const INDEXING_BOUNDARY = "modified_at_and_collection_start";
 const INDEXING_PHASES = new Set([
   "discovering",
@@ -110,20 +115,8 @@ const COLLECTOR_DISCOVERY_STOP_CODES = new Set([
   COLLECTOR_RESOURCE_LIMIT_CODES.rollout_files,
 ]);
 
-export function defaultCollectorDataFile() {
-  return resolve(process.cwd(), ".usage-monitor", "collector-events.jsonl");
-}
-
-export function defaultCollectorCheckpointFile() {
-  return resolve(process.cwd(), ".usage-monitor", "collector-checkpoint-v0.3.json");
-}
-
-export function defaultCollectorLockFile() {
-  return resolve(process.cwd(), ".usage-monitor", "collector.lock");
-}
-
-export function defaultCollectorBatchJournalFile(checkpointFile = defaultCollectorCheckpointFile()) {
-  return `${checkpointFile}.batch-journal`;
+export function defaultCollectorStateFile() {
+  return defaultLocalCollectorStatePath(process.cwd());
 }
 
 function indexingDescriptor({
@@ -330,115 +323,6 @@ function trimRecentKeys(checkpoint, recentSet, maximumRecentEventKeys) {
   if (excess <= 0) return;
   const removed = checkpoint.recentEventKeys.splice(0, excess);
   for (const item of removed) recentSet.delete(item);
-}
-
-function jsonDigest(value) {
-  return createHash("sha256").update(stableJson(value)).digest("hex");
-}
-
-async function fileSize(path) {
-  try {
-    return (await stat(path)).size;
-  } catch (error) {
-    if (error.code === "ENOENT") return 0;
-    throw error;
-  }
-}
-
-async function digestFileSlice(path, start, length) {
-  const handle = await open(path, "r");
-  try {
-    const hash = createHash("sha256");
-    const buffer = Buffer.alloc(Math.min(256 * 1024, Math.max(1, length)));
-    let position = start;
-    let remaining = length;
-    while (remaining > 0) {
-      const requested = Math.min(buffer.length, remaining);
-      const { bytesRead } = await handle.read(buffer, 0, requested, position);
-      if (bytesRead === 0) throw new Error("Collector batch journal points beyond the event ledger");
-      hash.update(buffer.subarray(0, bytesRead));
-      position += bytesRead;
-      remaining -= bytesRead;
-    }
-    return hash.digest("hex");
-  } finally {
-    await handle.close();
-  }
-}
-
-export async function commitCollectorRecordBatch({
-  records,
-  checkpoint,
-  dataFile,
-  checkpointFile,
-  journalFile = defaultCollectorBatchJournalFile(checkpointFile),
-  clock = () => Date.now(),
-  writeJournal = writeJsonOwnerOnlyAtomic,
-  writeCheckpoint = writeJsonOwnerOnlyAtomic,
-  removeJournal = unlinkDurably,
-}) {
-  const payload = serializeJsonLines(records);
-  if (payload.length === 0) return;
-  checkpoint.savedAt = new Date(clock()).toISOString();
-  const dataStartOffset = await fileSize(dataFile);
-  const payloadBytes = Buffer.byteLength(payload);
-  const journal = {
-    schemaVersion: "0.1",
-    state: "prepared",
-    dataStartOffset,
-    payloadBytes,
-    payloadDigest: createHash("sha256").update(payload).digest("hex"),
-    checkpointAfterDigest: jsonDigest(checkpoint),
-  };
-  await writeJournal(journalFile, journal);
-  await appendOwnerOnlyText(dataFile, payload, { sync: true });
-  await writeCheckpoint(checkpointFile, checkpoint);
-  await removeJournal(journalFile);
-}
-
-export async function recoverCollectorBatchJournal({
-  dataFile,
-  checkpointFile,
-  journalFile = defaultCollectorBatchJournalFile(checkpointFile),
-  truncateLedger = truncateDurably,
-  removeJournal = unlinkDurably,
-}) {
-  const journal = await readJsonIfExists(journalFile, null);
-  if (journal === null) return { status: "none" };
-  const valid = journal.schemaVersion === "0.1"
-    && journal.state === "prepared"
-    && Number.isSafeInteger(journal.dataStartOffset)
-    && journal.dataStartOffset >= 0
-    && Number.isSafeInteger(journal.payloadBytes)
-    && journal.payloadBytes > 0
-    && typeof journal.payloadDigest === "string"
-    && /^[a-f0-9]{64}$/.test(journal.payloadDigest)
-    && typeof journal.checkpointAfterDigest === "string"
-    && /^[a-f0-9]{64}$/.test(journal.checkpointAfterDigest);
-  if (!valid) throw new Error("Collector batch journal is malformed; refusing automatic recovery");
-
-  const durableCheckpoint = await readJsonIfExists(checkpointFile, null);
-  const checkpointCommitted = durableCheckpoint !== null && jsonDigest(durableCheckpoint) === journal.checkpointAfterDigest;
-  const size = await fileSize(dataFile);
-  const expectedEnd = journal.dataStartOffset + journal.payloadBytes;
-  if (size < journal.dataStartOffset || size > expectedEnd) {
-    throw new Error("Collector event ledger changed outside the prepared batch; refusing automatic recovery");
-  }
-  if (checkpointCommitted) {
-    if (size !== expectedEnd) throw new Error("Collector checkpoint committed but its event batch is incomplete");
-    const digest = await digestFileSlice(dataFile, journal.dataStartOffset, journal.payloadBytes);
-    if (digest !== journal.payloadDigest) throw new Error("Collector committed event batch failed digest verification");
-    await removeJournal(journalFile);
-    return { status: "committed_batch_retained" };
-  }
-
-  if (size === expectedEnd) {
-    const digest = await digestFileSlice(dataFile, journal.dataStartOffset, journal.payloadBytes);
-    if (digest !== journal.payloadDigest) throw new Error("Collector uncommitted event batch failed digest verification");
-  }
-  if (size !== journal.dataStartOffset) await truncateLedger(dataFile, journal.dataStartOffset);
-  await removeJournal(journalFile);
-  return { status: size === journal.dataStartOffset ? "prepared_batch_absent" : "uncommitted_batch_rolled_back" };
 }
 
 function tierUpdateFromRecord(record, diagnostics) {
@@ -916,7 +800,6 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
 export async function ingestRolloutUpdates({
   codexHome,
   checkpoint,
-  dataFile,
   clock = () => Date.now(),
   initializeAtEnd = false,
   maximumBufferedLineBytes = MAX_BUFFERED_ROLLOUT_LINE_BYTES,
@@ -929,7 +812,7 @@ export async function ingestRolloutUpdates({
   maximumLineagePrefixBytes = MAX_LINEAGE_PREFIX_BYTES,
   maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
   maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
-  commitRecordBatch = null,
+  commitRecordBatch,
   rollouts = null,
   signal = null,
   onProgress = null,
@@ -959,6 +842,9 @@ export async function ingestRolloutUpdates({
   if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
   if (onProgress !== null && typeof onProgress !== "function") {
     throw new TypeError("onProgress must be a function");
+  }
+  if (typeof commitRecordBatch !== "function") {
+    throw new TypeError("commitRecordBatch must be a function");
   }
   positiveSafeInteger(maximumDiscoveryDirectoryEntries, "maximumDiscoveryDirectoryEntries");
   positiveSafeInteger(maximumDiscoveryRolloutFiles, "maximumDiscoveryRolloutFiles");
@@ -1011,12 +897,11 @@ export async function ingestRolloutUpdates({
     const batchSize = recordBatch.length;
     checkpoint.diagnostics.rolloutRecordsWritten += batchSize;
     checkpoint.diagnostics.rolloutRecordBatchesWritten = (checkpoint.diagnostics.rolloutRecordBatchesWritten ?? 0) + 1;
-    if (commitRecordBatch) await commitRecordBatch(recordBatch);
-    else await appendJsonLinesOwnerOnly(dataFile, recordBatch);
+    await commitRecordBatch(recordBatch);
     recordsWritten += batchSize;
     recordBatchesWritten += 1;
     recordBatch = [];
-    if (commitRecordBatch) committedVersion = changeVersion;
+    committedVersion = changeVersion;
     await onProgress?.({
       recordsWritten,
       recordBatchesWritten,
@@ -1439,7 +1324,10 @@ async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObs
   );
 }
 
-async function appendAppRecord({ payload, source, checkpoint, dataFile, clock, commitRecord = null }) {
+async function appendAppRecord({ payload, source, checkpoint, clock, commitRecord }) {
+  if (typeof commitRecord !== "function") {
+    throw new TypeError("commitRecord must be a function");
+  }
   const receivedAt = new Date(clock()).toISOString();
   const record = appServerSnapshotRecord(payload, { source, receivedAt });
   const recentSet = new Set(checkpoint.recentEventKeys);
@@ -1468,43 +1356,15 @@ async function appendAppRecord({ payload, source, checkpoint, dataFile, clock, c
   }
   checkpoint.lastQuotaObservedAt = record.observedAt;
   checkpoint.diagnostics.appServerRecordsWritten += 1;
-  if (commitRecord) await commitRecord([record]);
-  else await appendJsonLinesOwnerOnly(dataFile, [record]);
+  await commitRecord([record]);
   return record;
 }
 
-export async function acquireCollectorLock(lockFile, { clock = () => Date.now(), processExists = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-} } = {}) {
-  await mkdir(dirname(lockFile), { recursive: true });
-  async function acquire(allowStaleRecovery) {
-    try {
-      const handle = await open(lockFile, "wx", 0o600);
-      await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date(clock()).toISOString() }));
-      await handle.close();
-      return async () => {
-        try {
-          await unlink(lockFile);
-        } catch (error) {
-          if (error.code !== "ENOENT") throw error;
-        }
-      };
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      const existing = await readJsonIfExists(lockFile, {});
-      if (allowStaleRecovery && Number.isInteger(existing?.pid) && !processExists(existing.pid)) {
-        await unlink(lockFile);
-        return acquire(false);
-      }
-      throw new Error(`Collector lock is already held at ${lockFile}`);
-    }
-  }
-  return acquire(true);
+function resultStateProperties(result, { stateFile }) {
+  Object.defineProperties(result, {
+    stateFile: { value: stateFile, enumerable: false },
+  });
+  return result;
 }
 
 function safeErrorCode(error) {
@@ -1522,10 +1382,7 @@ function recordAppServerError(checkpoint, error) {
 
 export async function runCollectorOnce({
   codexHome,
-  dataFile = defaultCollectorDataFile(),
-  checkpointFile = defaultCollectorCheckpointFile(),
-  lockFile = defaultCollectorLockFile(),
-  journalFile = defaultCollectorBatchJournalFile(checkpointFile),
+  stateFile = defaultCollectorStateFile(),
   staleAfterMs = 60_000,
   refreshStale = true,
   backfill = false,
@@ -1544,7 +1401,8 @@ export async function runCollectorOnce({
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
-  commitBatch = commitCollectorRecordBatch,
+  commitState = commitLocalCollectorState,
+  saveState = saveLocalCollectorCheckpoint,
 } = {}) {
   if (!validSignal(signal)) throw new TypeError("signal must be an AbortSignal");
   if (onProgress !== null && typeof onProgress !== "function") {
@@ -1554,13 +1412,25 @@ export async function runCollectorOnce({
     canonicalInstant(backfillSinceAt, "backfillSinceAt");
     if (!backfill) throw new TypeError("backfillSinceAt requires backfill");
   }
-  const release = await acquireCollectorLock(lockFile, { clock });
+  if (typeof stateFile !== "string" || stateFile.length < 1) {
+    throw new TypeError("stateFile must be a non-empty string");
+  }
+  // The migration lease serializes one-time JSON retirement before the normal
+  // collector instance lock. Reversing that order can make a second startup
+  // wait on SQLite while the first startup is still importing into it.
+  await prepareLocalCollectorState({ stateFile, clock });
+  const release = await acquireLocalCollectorStateLock(stateFile, { clock });
   let client = null;
   let abortClient = null;
   try {
-    await recoverCollectorBatchJournal({ dataFile, checkpointFile, journalFile });
     const nowIso = new Date(clock()).toISOString();
-    const existing = await readJsonIfExists(checkpointFile, null);
+    const existing = await readLocalCollectorCheckpoint({ stateFile });
+    const saveCheckpoint = async () => {
+      await saveState({ stateFile, checkpoint, clock });
+    };
+    const commitRecords = async (records) => {
+      await commitState({ stateFile, records, checkpoint, clock });
+    };
     const requestedBackfillStart = backfill
       ? (backfillSinceAt ?? "1970-01-01T00:00:00.000Z")
       : null;
@@ -1607,7 +1477,7 @@ export async function runCollectorOnce({
       checkpoint.indexing = cloneIndexing(indexing);
       recordCollectorResourceLimit(checkpoint, error.resourceLimit);
       checkpoint.savedAt = new Date(clock()).toISOString();
-      await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+      await saveCheckpoint();
       await emitIndexingProgress(onProgress, checkpoint.indexing);
       const paused = {
         mode: "run_once",
@@ -1624,11 +1494,7 @@ export async function runCollectorOnce({
         indexing: cloneIndexing(checkpoint.indexing),
         diagnostics: publicDiagnostics(checkpoint.diagnostics),
       };
-      Object.defineProperties(paused, {
-        checkpointFile: { value: checkpointFile, enumerable: false },
-        dataFile: { value: dataFile, enumerable: false },
-      });
-      return paused;
+      return resultStateProperties(paused, { stateFile });
     }
     const collectionStartMs = Date.parse(checkpoint.collectionStartedAt);
     const selected = discovered.filter((file) => rolloutMayOverlap(file, collectionStartMs));
@@ -1643,7 +1509,7 @@ export async function runCollectorOnce({
       indexing.status = "bounded_pause";
       indexing.phase = "paused";
       checkpoint.savedAt = new Date(clock()).toISOString();
-      await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+      await saveCheckpoint();
       await emitIndexingProgress(onProgress, indexing);
       const paused = {
         mode: "run_once",
@@ -1660,17 +1526,12 @@ export async function runCollectorOnce({
         indexing: cloneIndexing(indexing),
         diagnostics: publicDiagnostics(checkpoint.diagnostics),
       };
-      Object.defineProperties(paused, {
-        checkpointFile: { value: checkpointFile, enumerable: false },
-        dataFile: { value: dataFile, enumerable: false },
-      });
-      return paused;
+      return resultStateProperties(paused, { stateFile });
     }
     if (indexingRun) indexing.phase = "rollout_index";
     const ingestion = await ingestRolloutUpdates({
       codexHome,
       checkpoint,
-      dataFile,
       clock,
       initializeAtEnd: existing === null && !backfill,
       maximumBufferedLineBytes,
@@ -1695,14 +1556,7 @@ export async function runCollectorOnce({
         }
         await emitIndexingProgress(onProgress, indexing);
       },
-      commitRecordBatch: (records) => commitBatch({
-        records,
-        checkpoint,
-        dataFile,
-        checkpointFile,
-        journalFile,
-        clock,
-      }),
+      commitRecordBatch: commitRecords,
     });
     recordCollectorResourceLimit(checkpoint, ingestion.resourceLimit);
     if (indexingRun) {
@@ -1729,7 +1583,7 @@ export async function runCollectorOnce({
     }
     if (ingestion.changed && ingestion.lastChangeCommitted !== true) {
       checkpoint.savedAt = new Date(clock()).toISOString();
-      await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+      await saveCheckpoint();
     }
     const lastObservedMs = checkpoint.lastQuotaObservedAt ? Date.parse(checkpoint.lastQuotaObservedAt) : Number.NEGATIVE_INFINITY;
     const shouldRefresh = !signal?.aborted
@@ -1755,16 +1609,8 @@ export async function runCollectorOnce({
           payload,
           source: "app_server_read",
           checkpoint,
-          dataFile,
           clock,
-          commitRecord: (records) => commitBatch({
-            records,
-            checkpoint,
-            dataFile,
-            checkpointFile,
-            journalFile,
-            clock,
-          }),
+          commitRecord: commitRecords,
         });
         refresh.recordWritten = record !== null;
         if (record !== null) {
@@ -1774,11 +1620,7 @@ export async function runCollectorOnce({
           }
         }
       } catch (error) {
-        if (await readJsonIfExists(journalFile, null)) {
-          const recovery = await recoverCollectorBatchJournal({ dataFile, checkpointFile, journalFile });
-          if (recovery.status === "committed_batch_retained") refresh.recordWritten = true;
-        }
-        const restored = await readJsonIfExists(checkpointFile, null);
+        const restored = await readLocalCollectorCheckpoint({ stateFile });
         if (!restored) throw new Error("Collector app-record recovery completed without a durable checkpoint");
         for (const key of Object.keys(checkpoint)) delete checkpoint[key];
         Object.assign(checkpoint, restored);
@@ -1794,7 +1636,7 @@ export async function runCollectorOnce({
       checkpoint.indexing = cloneIndexing(indexing);
     }
     checkpoint.savedAt = new Date(clock()).toISOString();
-    await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+    await saveCheckpoint();
     await emitIndexingProgress(onProgress, checkpoint.indexing);
     const result = {
       mode: "run_once",
@@ -1816,11 +1658,7 @@ export async function runCollectorOnce({
       indexing: cloneIndexing(checkpoint.indexing),
       diagnostics: publicDiagnostics(checkpoint.diagnostics),
     };
-    Object.defineProperties(result, {
-      checkpointFile: { value: checkpointFile, enumerable: false },
-      dataFile: { value: dataFile, enumerable: false },
-    });
-    return result;
+    return resultStateProperties(result, { stateFile });
   } finally {
     signal?.removeEventListener("abort", abortClient);
     client?.close();
@@ -1848,10 +1686,7 @@ function waitForAbort(signal, timeoutMs) {
 
 export async function runCollectorForeground({
   codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex"),
-  dataFile = defaultCollectorDataFile(),
-  checkpointFile = defaultCollectorCheckpointFile(),
-  lockFile = defaultCollectorLockFile(),
-  journalFile = defaultCollectorBatchJournalFile(checkpointFile),
+  stateFile = defaultCollectorStateFile(),
   staleAfterMs = 60_000,
   reconciliationMs = 60_000,
   reconnectBaseMs = 1_000,
@@ -1866,17 +1701,16 @@ export async function runCollectorForeground({
   maximumRecentRunBytes = MAX_RECENT_RUN_BYTES,
   maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
   maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
+  commitState = commitLocalCollectorState,
+  saveState = saveLocalCollectorCheckpoint,
 } = {}) {
   if (typeof watchRoot !== "function") throw new TypeError("watchRoot must be a function");
-  const release = await acquireCollectorLock(lockFile, { clock });
-  let existing;
-  try {
-    await recoverCollectorBatchJournal({ dataFile, checkpointFile, journalFile });
-    existing = await readJsonIfExists(checkpointFile, null);
-  } catch (error) {
-    await release();
-    throw error;
+  if (typeof stateFile !== "string" || stateFile.length < 1) {
+    throw new TypeError("stateFile must be a non-empty string");
   }
+  await prepareLocalCollectorState({ stateFile, clock });
+  const release = await acquireLocalCollectorStateLock(stateFile, { clock });
+  const existing = await readLocalCollectorCheckpoint({ stateFile });
   const checkpoint = existing ?? emptyCheckpoint(new Date(clock()).toISOString(), false);
   let client = null;
   let reconnectAttempts = 0;
@@ -1911,14 +1745,13 @@ export async function runCollectorForeground({
 
   async function save() {
     checkpoint.savedAt = new Date(clock()).toISOString();
-    await writeJsonOwnerOnlyAtomic(checkpointFile, checkpoint);
+    await saveState({ stateFile, checkpoint, clock });
     checkpointWrites += 1;
     hasDurableCheckpoint = true;
   }
 
   async function restoreCheckpoint() {
-    await recoverCollectorBatchJournal({ dataFile, checkpointFile, journalFile });
-    const durable = await readJsonIfExists(checkpointFile, null);
+    const durable = await readLocalCollectorCheckpoint({ stateFile });
     const restored = durable ?? emptyCheckpoint(checkpoint.collectionStartedAt, false);
     hasDurableCheckpoint = durable !== null;
     for (const key of Object.keys(checkpoint)) delete checkpoint[key];
@@ -1933,10 +1766,9 @@ export async function runCollectorForeground({
         payload,
         source,
         checkpoint,
-        dataFile,
         clock,
         commitRecord: async (records) => {
-          await commitCollectorRecordBatch({ records, checkpoint, dataFile, checkpointFile, journalFile, clock });
+          await commitState({ stateFile, records, checkpoint, clock });
           checkpointWrites += 1;
           hasDurableCheckpoint = true;
         },
@@ -2022,7 +1854,6 @@ export async function runCollectorForeground({
             result = await ingestUpdates({
               codexHome,
               checkpoint,
-              dataFile,
               clock,
               initializeAtEnd: !hasDurableCheckpoint && checkpoint.diagnostics.filesDiscovered === 0,
               maximumRecordBatchSize,
@@ -2032,7 +1863,7 @@ export async function runCollectorForeground({
               maximumDiscoveryRolloutFiles,
               signal,
               commitRecordBatch: async (records) => {
-                await commitCollectorRecordBatch({ records, checkpoint, dataFile, checkpointFile, journalFile, clock });
+                await commitState({ stateFile, records, checkpoint, clock });
                 checkpointWrites += 1;
                 hasDurableCheckpoint = true;
               },

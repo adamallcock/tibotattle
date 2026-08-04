@@ -20,10 +20,15 @@ import { analyzeToolMechanisms, renderToolMechanismReport, REQUIRED_TOOL_CLASSES
 import { planBaselineCorrectionMigration } from "./correction-migration.js";
 import { analyzeWeeklyLimitHistory, renderWeeklyLimitHistoryReport } from "./weekly-limit-history.js";
 import { renderCorrectionReport, resolveCorrections } from "./corrections.js";
-import { analyzeProviderCrosscheck, renderProviderCrosscheckReport } from "./provider-crosscheck.js";
+import {
+  analyzeProviderCrosscheck,
+  createProspectiveAccountScopedAccumulator,
+  renderProviderCrosscheckReport,
+} from "./provider-crosscheck.js";
 import {
   analyzeMonitoringQuality,
   analyzeWeeklyCalibration,
+  createCollectorQualityAccumulator,
   renderMonitoringQualityReport,
   renderWeeklyCalibrationReport,
 } from "./reporting/index.js";
@@ -98,12 +103,17 @@ import {
   setContributionSyncPaused,
 } from "./contribution-sync-queue.js";
 import {
-  defaultCollectorCheckpointFile,
-  defaultCollectorDataFile,
-  defaultCollectorLockFile,
+  defaultCollectorStateFile,
   runCollectorForeground,
   runCollectorOnce,
 } from "./passive-collector.js";
+import {
+  forEachLocalCollectorRecord,
+  inspectLocalCollectorStateStorage,
+  planLocalCollectorStateRetention,
+  prepareLocalCollectorState,
+  readLocalCollectorRolloutStalenessSummary,
+} from "./local-collector-state.js";
 import {
   appendObservation,
   appendJsonLinesOwnerOnly,
@@ -209,8 +219,10 @@ function usage() {
   usage-monitor sync-contributions-status [--queue-file PATH]
   usage-monitor sync-contributions-pause [--queue-file PATH]
   usage-monitor sync-contributions-resume [--queue-file PATH]
-  usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--data-file PATH] [--checkpoint-file PATH]
-  usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--data-file PATH] [--checkpoint-file PATH]
+  usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--state-file PATH]
+  usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--state-file PATH]
+  usage-monitor collector-state-status [--state-file PATH] [--json]
+  usage-monitor plan-collector-retention --before ISO_TIMESTAMP [--state-file PATH] [--json]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
   usage-monitor contamination [--transitions PATH] [--inference PATH] [--experiments PATH] [--observations PATH] [--output PATH] [--report-file PATH]
   usage-monitor tools --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--output PATH] [--report-file PATH]
@@ -238,14 +250,14 @@ export function parseArgs(argv) {
     offline: false,
     json: false,
     dataFile: null,
+    stateFile: null,
     startAt: null,
     endAt: null,
+    beforeAt: null,
     outputFile: null,
     auditFile: null,
     inputFile: null,
     reportFile: null,
-    checkpointFile: null,
-    lockFile: null,
     staleAfterMs: 60_000,
     reconciliationMs: 60_000,
     durationMs: null,
@@ -314,14 +326,17 @@ export function parseArgs(argv) {
     else if (arg === "--claude-usage") result.claudeUsage = true;
     else if (arg === "--label") result.label = readOptionValue(argv, index++, arg);
     else if (arg === "--data-file") result.dataFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--state-file") result.stateFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--since") result.startAt = readOptionValue(argv, index++, arg);
     else if (arg === "--until") result.endAt = readOptionValue(argv, index++, arg);
+    else if (arg === "--before") result.beforeAt = readOptionValue(argv, index++, arg);
     else if (arg === "--output") result.outputFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--audit-file") result.auditFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--input") result.inputFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--report-file") result.reportFile = resolve(readOptionValue(argv, index++, arg));
-    else if (arg === "--checkpoint-file") result.checkpointFile = resolve(readOptionValue(argv, index++, arg));
-    else if (arg === "--lock-file") result.lockFile = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--checkpoint-file" || arg === "--lock-file") {
+      throw new Error(`${arg} was retired; use the single SQLite --state-file instead`);
+    }
     else if (arg === "--stale-after-ms") result.staleAfterMs = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--reconciliation-ms") result.reconciliationMs = readNonNegativeNumber(argv, index++, arg);
     else if (arg === "--duration-ms") result.durationMs = readNonNegativeNumber(argv, index++, arg);
@@ -420,6 +435,26 @@ export function parseArgs(argv) {
         || result.maximumUploadBytesPerPass
           > CONTRIBUTION_SYNC_QUEUE_LIMITS.maximumReservedUploadBytesPerPass)) {
     throw new Error("--max-upload-bytes-per-pass requires an integer from 16384 to 268435456");
+  }
+  if (result.dataFile !== null && ["collect-once", "collect-foreground"].includes(result.command)) {
+    throw new Error("--data-file is not collector state; use --state-file instead");
+  }
+  if (result.stateFile !== null && ![
+    "collect-once",
+    "collect-foreground",
+    "collector-state-status",
+    "plan-collector-retention",
+  ].includes(result.command)) {
+    throw new Error("--state-file is available only for collector and collector-state maintenance commands");
+  }
+  if (result.beforeAt !== null && result.command !== "plan-collector-retention") {
+    throw new Error("--before is available only for plan-collector-retention");
+  }
+  if (result.command === "plan-collector-retention"
+      && (!result.beforeAt
+        || !Number.isFinite(Date.parse(result.beforeAt))
+        || new Date(Date.parse(result.beforeAt)).toISOString() !== result.beforeAt)) {
+    throw new Error("plan-collector-retention requires --before as a valid ISO timestamp");
   }
   result.dataFile ??= defaultDataFile();
   return result;
@@ -1242,6 +1277,11 @@ export async function run(
       throw new Error("--since and --until must be valid ISO timestamps");
     }
     const capturedAt = new Date().toISOString();
+    const collectorStateFile = defaultCollectorStateFile();
+    // Crosscheck is a normal managed-state reader. Migrate before querying so
+    // an older JSON-only installation is never silently treated as having no
+    // prospective evidence.
+    await prepareLocalCollectorState({ stateFile: collectorStateFile });
     const cacheSidecarFile = defaultLocalHistoryCacheValidationFile();
     const usesDefaultHistoryCache = args.inputFile === defaultLocalHistoryFile();
     const localScanPromise = args.inputFile
@@ -1271,24 +1311,37 @@ export async function run(
         })
       : scanAndPriceCodexLogs({ startAt: args.startAt, endAt: args.endAt, offline: args.offline })
           .then((localScan) => ({ localScan, cacheValidation: { status: "fresh_scan" } }));
-    const [localScanResult, accountSnapshot, planTimeline, providerUiObservations, prospectiveCollectorRecords] = await Promise.all([
+    const [localScanResult, accountSnapshot, planTimeline, providerUiObservations] = await Promise.all([
       localScanPromise,
       readSanitizedAccountSnapshot(capturedAt),
       readJsonIfExists(args.planTimelineFile ?? defaultPlanTimelineFile(), null),
       readObservations(args.providerUiFile ?? defaultProviderUiObservationFile()),
-      readObservations(defaultCollectorDataFile()),
     ]);
     const { localScan, cacheValidation } = localScanResult;
     if (localScan.startAt !== args.startAt || localScan.endAt !== args.endAt) {
       throw new Error("Crosscheck local-history bounds do not match --since/--until");
     }
+    const prospectiveCollectorAccumulator = createProspectiveAccountScopedAccumulator({
+      accountScope: accountSnapshot?.accountScope,
+      planTimeline,
+      providerPlanType: accountSnapshot?.canonical?.planType
+        ?? accountSnapshot?.accountScope?.planType
+        ?? "unknown",
+      startAt: localScan.startAt,
+      endAt: localScan.endAt,
+    });
+    await forEachLocalCollectorRecord({
+      stateFile: collectorStateFile,
+      orderBy: "observed_at",
+      onRecord: (record) => prospectiveCollectorAccumulator.add(record),
+    });
     if (!args.inputFile) await writeJsonOwnerOnlyAtomic(defaultLocalHistoryFile(), localScan);
     const report = analyzeProviderCrosscheck({
       localScan,
       accountSnapshot,
       planTimeline,
       providerUiObservations,
-      prospectiveCollectorRecords,
+      prospectiveCollectorAccumulator,
       cacheValidation,
     });
     args.outputFile ??= defaultProviderCrosscheckFile();
@@ -1303,14 +1356,40 @@ export async function run(
   }
   if (args.command === "quality") {
     args.inputFile ??= defaultTransitionFile();
-    args.collectorFile ??= defaultCollectorDataFile();
     args.outputFile ??= defaultMonitoringQualityFile();
     const transitionDataset = JSON.parse(await readFile(args.inputFile, "utf8"));
-    const collectorRecords = await readObservations(args.collectorFile);
+    const collectorStateFile = defaultCollectorStateFile();
+    const analyzedAt = new Date().toISOString();
+    let collectorRecords = [];
+    let collectorSummary = null;
+    if (args.collectorFile === null) {
+      await prepareLocalCollectorState({ stateFile: collectorStateFile });
+      const accumulator = createCollectorQualityAccumulator({
+        nowMs: Date.parse(analyzedAt),
+      });
+      await forEachLocalCollectorRecord({
+        stateFile: collectorStateFile,
+        orderBy: "observed_at",
+        onRecord: (record) => accumulator.add(record),
+      });
+      const staleness = await readLocalCollectorRolloutStalenessSummary({
+        stateFile: collectorStateFile,
+      });
+      collectorSummary = accumulator.finalize({
+        rolloutReceiptStalenessMsP50: staleness.p50,
+        rolloutReceiptStalenessMsP90: staleness.p90,
+      });
+    } else {
+      // An explicit external --collector-file is retained for offline
+      // analysis compatibility. Managed collector state always uses the
+      // streaming path above.
+      collectorRecords = await readObservations(args.collectorFile);
+    }
     const report = analyzeMonitoringQuality({
       transitions: transitionDataset,
       collectorRecords,
-      now: new Date().toISOString(),
+      collectorSummary,
+      now: analyzedAt,
     });
     args.reportFile ??= defaultMonitoringQualityReportFile(report.analyzedAt);
     await writeJsonOwnerOnlyAtomic(args.outputFile, report);
@@ -1319,6 +1398,37 @@ export async function run(
     console.log(`Dominant series: ${report.dominantSeries.snapshotIntervals} interval(s); flat quota displays ${(100 * (report.quantization.flatIntervalFraction ?? 0)).toFixed(1)}%; account-known ${(100 * (report.metadata.accountKnownIntervalFraction ?? 0)).toFixed(1)}%.`);
     console.log(`Report data: ${args.outputFile}`);
     console.log(`Human report: ${args.reportFile}`);
+    return;
+  }
+  if (args.command === "collector-state-status") {
+    const status = await inspectLocalCollectorStateStorage({
+      stateFile: args.stateFile ?? defaultCollectorStateFile(),
+    });
+    if (args.json) {
+      console.log(JSON.stringify(status, null, 2));
+      return;
+    }
+    if (status.status === "missing") {
+      console.log("Collector state: missing.");
+      return;
+    }
+    console.log(`Collector state: ${status.recordCount} record(s), ${status.fileBytes} bytes on disk.`);
+    console.log(`Observed range: ${status.firstObservedAt ?? "unavailable"} to ${status.lastObservedAt ?? "unavailable"}.`);
+    console.log(`Maintenance review: ${status.needsReview ? "recommended" : "not currently needed"}.`);
+    console.log("This status command does not compact or delete collector state.");
+    return;
+  }
+  if (args.command === "plan-collector-retention") {
+    const plan = await planLocalCollectorStateRetention({
+      stateFile: args.stateFile ?? defaultCollectorStateFile(),
+      before: args.beforeAt,
+    });
+    if (args.json) {
+      console.log(JSON.stringify(plan, null, 2));
+      return;
+    }
+    console.log(`Retention plan through ${plan.before}: ${plan.eligible.recordCount} eligible record(s), ${plan.eligible.recordJsonBytes} JSON byte(s).`);
+    console.log(plan.guidance);
     return;
   }
   if (args.command === "calibrate-weekly") {
@@ -1337,17 +1447,14 @@ export async function run(
   if (args.command === "collect-once") {
     const selection = selectedAccountObservation();
     const result = await runCollectorOnceCommand({
-      dataFile: args.dataFile === defaultDataFile() ? defaultCollectorDataFile() : args.dataFile,
-      checkpointFile: args.checkpointFile ?? defaultCollectorCheckpointFile(),
-      lockFile: args.lockFile ?? defaultCollectorLockFile(),
+      stateFile: args.stateFile ?? defaultCollectorStateFile(),
       staleAfterMs: args.staleAfterMs,
       refreshStale: args.refreshStale,
       backfill: args.backfill,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
     });
     console.log(`Collector run-once: ${result.rolloutRecordsWritten} rollout record(s); refresh ${result.refresh.attempted ? (result.refresh.errorCode ?? (result.refresh.recordWritten ? "recorded" : "deduplicated")) : "not needed"}.`);
-    console.log(`Data: ${result.dataFile}`);
-    console.log(`Checkpoint: ${result.checkpointFile}`);
+    console.log(`State: ${result.stateFile}`);
     return;
   }
   if (args.command === "collect-foreground") {
@@ -1359,9 +1466,7 @@ export async function run(
     try {
       const selection = selectedAccountObservation();
       const result = await runCollectorForegroundCommand({
-        dataFile: args.dataFile === defaultDataFile() ? defaultCollectorDataFile() : args.dataFile,
-        checkpointFile: args.checkpointFile ?? defaultCollectorCheckpointFile(),
-        lockFile: args.lockFile ?? defaultCollectorLockFile(),
+        stateFile: args.stateFile ?? defaultCollectorStateFile(),
         staleAfterMs: args.staleAfterMs,
         reconciliationMs: args.reconciliationMs,
         signal: controller.signal,

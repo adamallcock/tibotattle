@@ -4,19 +4,26 @@ import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { commitLocalCollectorState } from "../src/local-collector-state.js";
 
 const SCRIPT = resolve("scripts/build-prospective-collector-transitions.js");
 
-function run(input, output) {
+function runArguments(arguments_) {
   return spawnSync(process.execPath, [
     SCRIPT,
-    "--input", input,
-    "--output", output,
+    ...arguments_,
   ], {
     cwd: process.cwd(),
     encoding: "utf8",
     env: { PATH: process.env.PATH ?? "" },
   });
+}
+
+function run(input, output) {
+  return runArguments([
+    "--input", input,
+    "--output", output,
+  ]);
 }
 
 test("prospective CLI writes an owner-only deterministic empty evidence artifact", async () => {
@@ -59,6 +66,36 @@ test("prospective CLI refuses symlinked and non-owner-only sources without echoi
     assert.equal(loose.status, 1);
     assert.equal(loose.stderr, "prospective source must be owner-only\n");
     assert.equal(loose.stderr.includes(input), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("prospective CLI uses the SQLite collector state unless an external input is explicit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "app-usagemonitor-prospective-state-"));
+  try {
+    const stateFile = join(directory, "local-collector-state-v1.sqlite");
+    const output = join(directory, "output.json");
+    await commitLocalCollectorState({
+      stateFile,
+      checkpoint: {},
+      records: [],
+    });
+    const result = runArguments([
+      "--state-file", stateFile,
+      "--output", output,
+    ]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^Built 0 account-partitioned prospective transitions/u);
+    await readFile(output, "utf8");
+
+    const ambiguous = runArguments([
+      "--state-file", stateFile,
+      "--input", join(directory, "external.jsonl"),
+      "--output", output,
+    ]);
+    assert.equal(ambiguous.status, 1);
+    assert.equal(ambiguous.stderr, "prospective source selection is ambiguous\n");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

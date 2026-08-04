@@ -1,6 +1,4 @@
-import { createReadStream } from "node:fs";
-import { lstat, readFile, stat } from "node:fs/promises";
-import { createInterface } from "node:readline";
+import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   addUsdStrings,
@@ -22,13 +20,21 @@ import {
 } from "@app-usagemonitor/accounting";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
-  defaultReplaySafeAccountingCachePath,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
 import {
+  defaultLocalArchiveAccountingIndexPath,
+  inspectLocalArchiveAccountingIndex,
+} from "./local-archive-accounting-index.js";
+import {
+  defaultLocalCollectorStatePath,
+  forEachLocalCollectorRecord,
+  prepareLocalCollectorState,
+  readLocalCollectorState,
+} from "./local-collector-state.js";
+import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
 } from "./reporting/index.js";
-import { writeJsonOwnerOnlyAtomic } from "./storage.js";
 import {
   projectWeeklyPaceForecast,
   weeklyPaceSnapshotsFromCollectorRecord,
@@ -36,11 +42,8 @@ import {
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
-const MAX_LEDGER_BYTES = 2 * 1024 * 1024 * 1024;
-const MAX_LEDGER_LINE_BYTES = 1024 * 1024;
 const MAX_LEDGER_RECORDS = 5_000_000;
 const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024;
-const MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024;
 const MAX_DATASET_ROWS = 2_500;
 const MAX_SAFE_TEXT_LENGTH = 2_000;
 
@@ -84,23 +87,13 @@ const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox"]);
 const KNOWN_PLANS = new Set(["free", "plus", "pro", "team", "business", "enterprise", "unknown"]);
 const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 const RECENT_TIMELINE_DAYS = 31;
+const RECENT_COLLECTOR_PERIOD_LABEL =
+  `Cached ${RECENT_TIMELINE_DAYS}-day collector window`;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
-const COLLECTOR_PROJECTION_SCHEMA_VERSION =
-  "collector-dashboard-projection-v2";
-const MAX_COLLECTOR_PROJECTION_BYTES = 16 * 1024 * 1024;
 const MAX_WEEKLY_PACE_OBSERVATIONS = 8_192;
-const WEEKLY_PACE_FORECAST_SCHEMA_VERSION =
-  "local-weekly-pace-forecast-v0.1";
-const WEEKLY_PACE_FORECAST_STATUSES = new Set([
-  "unavailable",
-  "insufficient_observations",
-  "available",
-  "will_reach_reset_first",
-]);
-const WEEKLY_PACE_FORECAST_METHOD = "median_adjacent_quota_slope";
 
 const REPORTS = Object.freeze([
   {
@@ -1058,361 +1051,45 @@ function finalizeQuotaTimeline(rows) {
   return deterministicSample(changes, MAX_QUOTA_TIMELINE_POINTS);
 }
 
-function safeCachedCount(value, maximum = MAX_LEDGER_RECORDS) {
-  return Number.isSafeInteger(value)
-      && value >= 0
-      && value <= maximum
-    ? value
-    : null;
-}
-
-function safeCachedEpoch(value) {
-  return value === null
-    ? null
-    : Number.isSafeInteger(value) && value >= 0
-      ? value
-      : undefined;
-}
-
-function cachedQuotaRow(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const observedAt = canonicalIndexInstant(value.observedAt);
-  const resetAt = value.resetAt === null
-    ? null
-    : canonicalIndexInstant(value.resetAt);
-  if (observedAt === null
-      || (value.resetAt !== null && resetAt === null)
-      || !KNOWN_LIMITS.has(value.limitId)
-      || !KNOWN_SLOTS.has(value.slot)
-      || !KNOWN_PLANS.has(value.planType)
-      || (value.accountAttribution !== "unattributed"
-        && value.accountAttribution !== "attributed_pseudonymous")
-      || (value.usedPercent !== null
-        && (typeof value.usedPercent !== "number"
-          || !Number.isFinite(value.usedPercent)
-          || value.usedPercent < 0
-          || value.usedPercent > 100))
-      || (value.remainingPercent !== null
-        && (typeof value.remainingPercent !== "number"
-          || !Number.isFinite(value.remainingPercent)
-          || value.remainingPercent < 0
-          || value.remainingPercent > 100))
-      || (value.durationMinutes !== null
-        && (!Number.isSafeInteger(value.durationMinutes)
-          || value.durationMinutes < 1))) {
-    return null;
-  }
-  return {
-    observedAt,
-    limitId: value.limitId,
-    slot: value.slot,
-    planType: value.planType,
-    usedPercent: value.usedPercent,
-    remainingPercent: value.remainingPercent,
-    durationMinutes: value.durationMinutes,
-    resetAt,
-    accountAttribution: value.accountAttribution,
-  };
-}
-
-function cachedPaceNumber(value, {
-  minimum = Number.NEGATIVE_INFINITY,
-  maximum = Number.POSITIVE_INFINITY,
-} = {}) {
-  if (value === null) return null;
-  return typeof value === "number"
-      && Number.isFinite(value)
-      && value >= minimum
-      && value <= maximum
-    ? value
-    : undefined;
-}
-
-function cachedWeeklyPaceForecast(value) {
-  const expectedKeys = [
-    "schemaVersion",
-    "status",
-    "currentUsedPercent",
-    "remainingPercent",
-    "resetsAt",
-    "pace",
-    "observationCount",
-    "etaAt",
-    "hoursToExhaustion",
-    "hoursToReset",
-  ];
-  if (!value || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).sort().join("\0")
-        !== [...expectedKeys].sort().join("\0")
-      || value.schemaVersion !== WEEKLY_PACE_FORECAST_SCHEMA_VERSION
-      || !WEEKLY_PACE_FORECAST_STATUSES.has(value.status)
-      || !value.pace || typeof value.pace !== "object"
-      || Array.isArray(value.pace)
-      || Object.keys(value.pace).sort().join("\0")
-        !== [
-          "method",
-          "sampleCount",
-          "elapsedHours",
-          "movementPp",
-          "percentagePointsPerHour",
-        ].sort().join("\0")) {
-    return null;
-  }
-  const currentUsedPercent = cachedPaceNumber(value.currentUsedPercent, {
-    minimum: 0,
-    maximum: 100,
-  });
-  const remainingPercent = cachedPaceNumber(value.remainingPercent, {
-    minimum: 0,
-    maximum: 100,
-  });
-  const elapsedHours = cachedPaceNumber(value.pace.elapsedHours, { minimum: 0 });
-  const movementPp = cachedPaceNumber(value.pace.movementPp, { minimum: 0 });
-  const percentagePointsPerHour = cachedPaceNumber(
-    value.pace.percentagePointsPerHour,
-    { minimum: 0, maximum: 100 },
-  );
-  const hoursToExhaustion = cachedPaceNumber(value.hoursToExhaustion, {
-    minimum: 0,
-  });
-  const hoursToReset = cachedPaceNumber(value.hoursToReset, { minimum: 0 });
-  const resetsAt = value.resetsAt === null
-    ? null
-    : canonicalIndexInstant(value.resetsAt);
-  const etaAt = value.etaAt === null
-    ? null
-    : canonicalIndexInstant(value.etaAt);
-  if (currentUsedPercent === undefined
-      || remainingPercent === undefined
-      || elapsedHours === undefined
-      || movementPp === undefined
-      || percentagePointsPerHour === undefined
-      || hoursToExhaustion === undefined
-      || hoursToReset === undefined
-      || (value.resetsAt !== null && resetsAt === null)
-      || (value.etaAt !== null && etaAt === null)
-      || value.pace.method !== null
-        && value.pace.method !== WEEKLY_PACE_FORECAST_METHOD
-      || !Number.isSafeInteger(value.pace.sampleCount)
-      || value.pace.sampleCount < 0
-      || value.pace.sampleCount >= MAX_WEEKLY_PACE_OBSERVATIONS
-      || !Number.isSafeInteger(value.observationCount)
-      || value.observationCount < 0
-      || value.observationCount > MAX_WEEKLY_PACE_OBSERVATIONS) {
-    return null;
-  }
-  if (value.status === "available") {
-    if (currentUsedPercent === null
-        || remainingPercent === null
-        || resetsAt === null
-        || etaAt === null
-        || hoursToExhaustion === null
-        || percentagePointsPerHour === null
-        || !(Date.parse(etaAt) < Date.parse(resetsAt))) return null;
-  } else if (etaAt !== null || hoursToExhaustion !== null) {
-    return null;
-  }
-  return {
-    schemaVersion: WEEKLY_PACE_FORECAST_SCHEMA_VERSION,
-    status: value.status,
-    currentUsedPercent,
-    remainingPercent,
-    resetsAt,
-    pace: {
-      method: value.pace.method,
-      sampleCount: value.pace.sampleCount,
-      elapsedHours,
-      movementPp,
-      percentagePointsPerHour,
-    },
-    observationCount: value.observationCount,
-    etaAt,
-    hoursToExhaustion,
-    hoursToReset,
-  };
-}
-
-function cachedCollectorProjection(value, nowMs) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-      || value.status !== "available") return null;
-  const countNames = [
-    "recordCount",
-    "malformedLines",
-  ];
-  const counts = Object.fromEntries(countNames.map((name) => [
-    name,
-    safeCachedCount(value[name]),
-  ]));
-  if (Object.values(counts).some((count) => count === null)) return null;
-  const epochNames = [
-    "firstRecordAt",
-    "latestRecordAt",
-    "firstExportableRecordAt",
-    "latestExportableRecordAt",
-  ];
-  const epochs = Object.fromEntries(epochNames.map((name) => [
-    name,
-    safeCachedEpoch(value[name]),
-  ]));
-  if (Object.values(epochs).some((epoch) => epoch === undefined)) {
-    return null;
-  }
-  const recordCounts = {};
-  for (const name of ["usage", "quota", "tools", "other"]) {
-    const count = safeCachedCount(value.recordCounts?.[name]);
-    if (count === null) return null;
-    recordCounts[name] = count;
-  }
-  if (Object.values(recordCounts).reduce(
-    (sum, count) => sum + count,
-    0,
-  ) !== counts.recordCount) return null;
-  const toolCounts = {};
-  for (const name of KNOWN_TOOL_CLASSES) {
-    const count = safeCachedCount(value.tools?.counts?.[name]);
-    if (count === null) return null;
-    toolCounts[name] = count;
-  }
-  const toolTotal = Object.values(toolCounts).reduce(
-    (sum, count) => sum + count,
-    0,
-  );
-  if (toolTotal !== safeCachedCount(value.tools?.total)) return null;
-  const quotaRows = Array.isArray(value.timeline?.quota)
-      && value.timeline.quota.length <= MAX_QUOTA_TIMELINE_POINTS
-    ? value.timeline.quota.map(cachedQuotaRow)
-    : null;
-  if (quotaRows === null || quotaRows.includes(null)) return null;
-  const recentStartMs = nowMs
-    - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
-  const quotaWindows = Array.isArray(value.quota?.windows)
-      && value.quota.windows.length <= 16
-    ? value.quota.windows.map((window) => cachedQuotaRow({
-      ...window,
-      observedAt: value.quota.observedAt,
-      accountAttribution: value.quota.accountAttribution,
-    }))
-    : null;
-  if (quotaWindows === null || quotaWindows.includes(null)) return null;
-  const paceForecast = cachedWeeklyPaceForecast(value.paceForecast);
-  if (paceForecast === null) return null;
-  return {
-    status: "available",
-    ...counts,
-    ...epochs,
-    usage: summarizeUsage([], nowMs),
-    quota: {
-      status: value.quota.status === "available"
-        ? "available"
-        : "unavailable",
-      observedAt: canonicalIndexInstant(value.quota.observedAt),
-      accountAttribution:
-        value.quota.accountAttribution === "attributed_pseudonymous"
-          ? "attributed_pseudonymous"
-          : "unattributed",
-      windows: quotaWindows.map((row) => ({
-        limitId: row.limitId,
-        slot: row.slot,
-        planType: row.planType,
-        usedPercent: row.usedPercent,
-        remainingPercent: row.remainingPercent,
-        durationMinutes: row.durationMinutes,
-        resetAt: row.resetAt,
-      })),
-    },
-    tools: { total: toolTotal, counts: toolCounts },
-    timeline: {
-      bucketMinutes: TIMELINE_BUCKET_MS / 60_000,
-      coveredAt: {
-        startAt: canonicalIndexInstant(
-          value.timeline?.coveredAt?.startAt,
-          { nullable: true },
-        ),
-        endAt: canonicalIndexInstant(
-          value.timeline?.coveredAt?.endAt,
-          { nullable: true },
-        ),
-      },
-      usage: [],
-      quota: quotaRows.filter((row) => {
-        const observedMs = Date.parse(row.observedAt);
-        return observedMs >= recentStartMs
-          && observedMs <= nowMs + 5 * 60_000;
-      }),
-    },
-    recordCounts,
-    paceForecast,
-  };
-}
-
 async function readCollectorProjection(
-  path,
+  stateFile,
   nowMs,
   { summarizeUsageEvents = true, declaredSpeedBaselines = [] } = {},
 ) {
-  let metadata;
+  let state;
   try {
-    metadata = await stat(path);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return {
-        status: "missing",
-        recordCount: 0,
-        malformedLines: 0,
-        firstRecordAt: null,
-        latestRecordAt: null,
-        firstExportableRecordAt: null,
-        latestExportableRecordAt: null,
-        usage: summarizeUsage([], nowMs),
-        quota: latestQuotaProjection([]),
-        tools: summarizeToolClasses([]),
-        timeline: { bucketMinutes: 15, usage: [], quota: [] },
-        recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
-        paceForecast: projectWeeklyPaceForecast({ nowMs }),
-      };
-    }
+    state = await readLocalCollectorState({ stateFile, includeRecords: false });
+  } catch {
     throw fixedError("collector_unavailable");
   }
-  if (!metadata.isFile() || metadata.size > MAX_LEDGER_BYTES) throw fixedError("collector_invalid_size");
-  const projectionFile = `${path}.projection-v2.json`;
-  if (!summarizeUsageEvents) {
-    try {
-      const cachedMetadata = await lstat(projectionFile);
-      if (cachedMetadata.isFile()
-          && !cachedMetadata.isSymbolicLink()
-          && cachedMetadata.nlink === 1
-          && (typeof process.getuid !== "function"
-            || cachedMetadata.uid === process.getuid())
-          && (cachedMetadata.mode & 0o077) === 0
-          && cachedMetadata.size <= MAX_COLLECTOR_PROJECTION_BYTES) {
-        const cached = JSON.parse(await readFile(projectionFile, "utf8"));
-        const projection = cachedCollectorProjection(
-          cached?.projection,
-          nowMs,
-        );
-        if (cached?.schemaVersion
-              === COLLECTOR_PROJECTION_SCHEMA_VERSION
-            && cached.source?.device === metadata.dev
-            && cached.source?.inode === metadata.ino
-            && cached.source?.birthtimeMs
-              === Math.trunc(metadata.birthtimeMs)
-            && cached.source?.size === metadata.size
-            && cached.source?.mtimeMs === Math.trunc(metadata.mtimeMs)
-            && projection !== null) {
-          return projection;
-        }
-      }
-    } catch {
-      // Any cache ambiguity falls back to the authoritative owner-only ledger.
-    }
+  if (state.status === "missing") {
+    return {
+      status: "missing",
+      recordCount: 0,
+      malformedLines: 0,
+      firstRecordAt: null,
+      latestRecordAt: null,
+      firstExportableRecordAt: null,
+      latestExportableRecordAt: null,
+      usage: summarizeUsage([], nowMs),
+      quota: latestQuotaProjection([]),
+      tools: summarizeToolClasses([]),
+      timeline: { bucketMinutes: 15, usage: [], quota: [] },
+      recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
+      paceForecast: projectWeeklyPaceForecast({ nowMs }),
+    };
   }
   const periods = [
     { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
     { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
     { summary: newUsagePeriod("30d", "Last 30 days"), start: nowMs - 30 * 24 * 60 * 60 * 1_000 },
-    { summary: newUsagePeriod("all", "All retained evidence"), start: Number.NEGATIVE_INFINITY },
+    // The collector is a bounded recent state store, not an all-history source.
+    // Keep its broadest selectable period explicit even if the state happens
+    // to contain older rows from an earlier run.
+    {
+      summary: newUsagePeriod("all", RECENT_COLLECTOR_PERIOD_LABEL),
+      start: nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000,
+    },
   ];
   const toolCounts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
   const recordCounts = { usage: 0, quota: 0, tools: 0, other: 0 };
@@ -1422,32 +1099,15 @@ async function readCollectorProjection(
   const weeklyPaceSnapshots = [];
   let toolTotal = 0;
   let recordCount = 0;
-  let malformedLines = 0;
+  const malformedLines = Number.isSafeInteger(state.migration?.source?.malformedLines)
+    ? state.migration.source.malformedLines
+    : 0;
   let firstRecordAt = null;
   let latestRecordAt = null;
   let firstExportableRecordAt = null;
   let latestExportableRecordAt = null;
   let latestQuotaRecord = null;
-  const lines = createInterface({
-    input: createReadStream(path, { encoding: "utf8", highWaterMark: 64 * 1024 }),
-    crlfDelay: Infinity,
-  });
-  for await (const line of lines) {
-    if (Buffer.byteLength(line) > MAX_LEDGER_LINE_BYTES) {
-      malformedLines += 1;
-      continue;
-    }
-    let value;
-    try {
-      value = JSON.parse(line);
-    } catch {
-      malformedLines += 1;
-      continue;
-    }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      malformedLines += 1;
-      continue;
-    }
+  await forEachLocalCollectorRecord({ stateFile, onRecord: async (value) => {
     recordCount += 1;
     if (recordCount > MAX_LEDGER_RECORDS) throw fixedError("collector_invalid_size");
     const observedMs = validObservedAt(value);
@@ -1545,7 +1205,7 @@ async function readCollectorProjection(
       toolCounts[toolClass] += 1;
       toolTotal += 1;
     }
-  }
+  } });
   if (weeklyPaceSnapshots.length > MAX_WEEKLY_PACE_OBSERVATIONS) {
     weeklyPaceSnapshots.sort((left, right) => (
       left.observedAt.localeCompare(right.observedAt)
@@ -1590,22 +1250,6 @@ async function readCollectorProjection(
     recordCounts,
     paceForecast,
   };
-  if (!summarizeUsageEvents) {
-    await writeJsonOwnerOnlyAtomic(projectionFile, {
-      schemaVersion: COLLECTOR_PROJECTION_SCHEMA_VERSION,
-      generatedAt: new Date(nowMs).toISOString(),
-      source: {
-        device: metadata.dev,
-        inode: metadata.ino,
-        birthtimeMs: Math.trunc(metadata.birthtimeMs),
-        size: metadata.size,
-        mtimeMs: Math.trunc(metadata.mtimeMs),
-      },
-      projection,
-    }).catch(() => {
-      // Dashboard availability must not depend on an optimization write.
-    });
-  }
   return projection;
 }
 
@@ -1683,12 +1327,14 @@ function validCollectorIndexDescriptor(value) {
     && endAt === null;
 }
 
-async function readCollectorIndexProjection(path, collector) {
-  let metadata;
+async function readCollectorIndexProjection(stateFile, collector) {
+  let state;
   try {
-    metadata = await lstat(path);
-  } catch (error) {
-    if (error.code === "ENOENT") {
+    state = await readLocalCollectorState({ stateFile, includeRecords: false });
+  } catch {
+    throw fixedError("collector_unavailable");
+  }
+  if (state.status === "missing" || state.checkpoint === null) {
       return {
         status: "not_started",
         phase: "starting",
@@ -1700,19 +1346,8 @@ async function readCollectorIndexProjection(path, collector) {
         coveredAt: { startAt: null, endAt: null },
         boundedBy: "modified_at_and_collection_start",
       };
-    }
-    throw fixedError("collector_unavailable");
   }
-  if (!metadata.isFile() || metadata.isSymbolicLink()
-      || metadata.size > MAX_CHECKPOINT_BYTES) {
-    throw fixedError("collector_unavailable");
-  }
-  let checkpoint;
-  try {
-    checkpoint = JSON.parse(await readFile(path, "utf8"));
-  } catch {
-    throw fixedError("collector_unavailable");
-  }
+  const checkpoint = state.checkpoint;
   const diagnostics = checkpoint?.diagnostics ?? {};
   const retainedFiles = checkpoint?.files
     && typeof checkpoint.files === "object"
@@ -1804,7 +1439,10 @@ function summarizeUsage(records, nowMs) {
     { summary: newUsagePeriod("24h", "Last 24 hours"), start: nowMs - 24 * 60 * 60 * 1_000 },
     { summary: newUsagePeriod("7d", "Last 7 days"), start: nowMs - 7 * 24 * 60 * 60 * 1_000 },
     { summary: newUsagePeriod("30d", "Last 30 days"), start: nowMs - 30 * 24 * 60 * 60 * 1_000 },
-    { summary: newUsagePeriod("all", "All retained evidence"), start: Number.NEGATIVE_INFINITY },
+    {
+      summary: newUsagePeriod("all", RECENT_COLLECTOR_PERIOD_LABEL),
+      start: nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000,
+    },
   ];
   for (const record of records) {
     if (record.kind !== "codex_rollout_usage_snapshot") continue;
@@ -1935,9 +1573,8 @@ function fastModeGapStatus(coverage) {
 
 export async function buildLocalCompanionSnapshot({
   root = process.cwd(),
-  collectorFile = resolve(root, ".usage-monitor", "collector-events.jsonl"),
-  checkpointFile = resolve(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
-  accountingCacheFile = defaultReplaySafeAccountingCachePath(root),
+  collectorStateFile = defaultLocalCollectorStatePath(root),
+  archiveIndexFile = defaultLocalArchiveAccountingIndexPath(root),
   allowDevelopmentArtifactFallback = false,
   // Owner-stated Codex speed mode. The composition root reads it from
   // owner-only local state; an unrecognised value never becomes a silent Fast.
@@ -1951,11 +1588,18 @@ export async function buildLocalCompanionSnapshot({
 } = {}) {
   const nowMs = now();
   if (!Number.isFinite(nowMs)) throw new TypeError("now must return a finite epoch timestamp");
-  const replaySafeAccounting = await readReplaySafeAccountingCache({
-    cacheFile: accountingCacheFile,
-    now: () => nowMs,
-    maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
-  });
+  // Make a legacy installation converge before any snapshot readers race to
+  // inspect it. Once complete this is a cheap receipt check; it never revives
+  // JSON as an active state backend.
+  await prepareLocalCollectorState({ stateFile: collectorStateFile, clock: () => nowMs });
+  const [replaySafeAccounting, archiveCoverage] = await Promise.all([
+    readReplaySafeAccountingCache({
+      stateFile: collectorStateFile,
+      now: () => nowMs,
+      maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
+    }),
+    inspectLocalArchiveAccountingIndex({ indexFile: archiveIndexFile }),
+  ]);
   const replaySafeCache = ["available", "stale"].includes(
     replaySafeAccounting.status,
   )
@@ -1977,7 +1621,7 @@ export async function buildLocalCompanionSnapshot({
         datasets: {},
       }),
     projectArtifact(root, "quality"),
-    readCollectorProjection(collectorFile, nowMs, {
+    readCollectorProjection(collectorStateFile, nowMs, {
       summarizeUsageEvents: replaySafeCache === null,
       declaredSpeedBaselines: Array.isArray(codexSpeedBaselines)
         ? codexSpeedBaselines
@@ -2005,7 +1649,7 @@ export async function buildLocalCompanionSnapshot({
     paceForecast: collector.paceForecast,
   };
   const latestRecordAt = collector.latestRecordAt;
-  const indexing = await readCollectorIndexProjection(checkpointFile, collector);
+  const indexing = await readCollectorIndexProjection(collectorStateFile, collector);
   const latestEvidenceAt = latestRecordAt === null ? null : new Date(latestRecordAt).toISOString();
   const evidenceAgeSeconds = latestRecordAt === null ? null : Math.max(0, Math.round((nowMs - latestRecordAt) / 1_000));
   const collectorFreshnessStatus = evidenceAgeSeconds === null
@@ -2067,14 +1711,19 @@ export async function buildLocalCompanionSnapshot({
   }
   if (replaySafeCache === null && (displayUsage?.events ?? 0) > 0) {
     warnings.push(
-      "Recent cost accounting is using the legacy collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
+      "Recent cost accounting is using the live collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
     );
   }
   if (indexing.status === "prospective_only") {
-    warnings.push("The retained ledger began prospectively and does not prove recent-history coverage.");
+    warnings.push("The retained collector state began prospectively and does not prove recent-history coverage.");
   }
   if ((displayUsage?.pricingCoverage.unpricedEvents ?? 0) > 0) {
     warnings.push("Some usage events have an unknown model and are excluded from API-price-equivalent cost.");
+  }
+  if (archiveCoverage.status !== "complete") {
+    warnings.push(
+      "Historical archive coverage is partial. Cost totals remain limited to their explicitly labelled recent cached period.",
+    );
   }
   // Headline provenance must describe the same period as the numeric headline,
   // not a separately selected set of weekly calibration fits. This is also the
@@ -2112,7 +1761,7 @@ export async function buildLocalCompanionSnapshot({
         lastScanAt: latestEvidenceAt,
         safeRecordCount: collector.recordCount,
         identityMode: "prospective_pseudonymous_not_exposed",
-        sourceMode: "content_free_collector_ledger",
+        sourceMode: "content_free_collector_state",
         indexingState: indexing.status,
         indexing,
         coveredAt: {
@@ -2150,7 +1799,7 @@ export async function buildLocalCompanionSnapshot({
       },
       accounting: {
         periodId: displayUsage?.id ?? "all",
-        periodLabel: displayUsage?.label ?? "All retained evidence",
+        periodLabel: displayUsage?.label ?? RECENT_COLLECTOR_PERIOD_LABEL,
         events: displayUsage?.events ?? 0,
         totalTokens: displayUsage?.totalTokens ?? 0,
         apiPriceEquivalentUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
@@ -2178,10 +1827,11 @@ export async function buildLocalCompanionSnapshot({
         subscriptionSpeedIsSeparate: true,
         reasoningEffortAvailable: false,
         accountingSource: replaySafeCache === null
-          ? "legacy_collector_unverified"
+          ? "collector_projection_unverified"
           : replaySafeCache.accountingMethod,
         accountingCacheStatus: replaySafeAccounting.status,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
+        historyCoverage: archiveCoverage,
         generatedAt: replaySafeCache?.generatedAt ?? null,
         coveredAt: replaySafeCache?.coveredAt ?? null,
         unknownModelEvents: displayUsage?.byModel
@@ -2229,7 +1879,7 @@ export async function buildLocalCompanionSnapshot({
         quotaWeightedMetricLabel: displayFastMode.metricLabel,
         quotaWeightedMetricExplainer: displayFastMode.metricExplainer,
         fastMode: displayFastMode,
-        periodLabel: displayUsage?.label ?? "All retained evidence",
+        periodLabel: displayUsage?.label ?? RECENT_COLLECTOR_PERIOD_LABEL,
         coveragePercent: pricingCoveragePercent,
         eventCount: displayUsage?.events ?? 0,
         apiTier: "standard",
@@ -2264,13 +1914,15 @@ export async function buildLocalCompanionSnapshot({
         // historical card windows.
         priceEpochBasis: "event_time_when_registry_has_effective_evidence",
         accountingSource: replaySafeCache === null
-          ? "legacy_collector_unverified"
+          ? "collector_projection_unverified"
           : replaySafeCache.accountingMethod,
         accountingCacheStatus: replaySafeAccounting.status,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
+        historyCoverage: archiveCoverage,
       },
       coverage: {
         overallPercent: pricingCoveragePercent,
+        history: archiveCoverage,
       },
       warnings,
       monitoringGaps: [

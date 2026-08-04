@@ -1,14 +1,54 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   buildReplaySafeAccountingCache,
-  readReplaySafeAccountingCache,
-  refreshReplaySafeAccountingCache,
+  readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
+  refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  readLocalCollectorAccountingCache,
+  writeLocalCollectorAccountingCache,
+} from "../src/local-collector-state.js";
+
+// The previous JSON paths are test-fixture names only. The wrappers prove the
+// same cache contracts against SQLite without allowing production callers to
+// use the retired cacheFile option.
+function refreshReplaySafeAccountingCache({ cacheFile, ...options } = {}) {
+  return refreshReplaySafeAccountingCacheImpl({
+    ...options,
+    ...(cacheFile === undefined ? {} : { stateFile: cacheFile }),
+  });
+}
+
+function readReplaySafeAccountingCache({ cacheFile, ...options } = {}) {
+  return readReplaySafeAccountingCacheImpl({
+    ...options,
+    ...(cacheFile === undefined ? {} : { stateFile: cacheFile }),
+  });
+}
+
+async function writeTestCache(stateFile, cache) {
+  await writeLocalCollectorAccountingCache({ stateFile, cache });
+}
+
+async function readTestCache(stateFile) {
+  return (await readLocalCollectorAccountingCache({ stateFile })).cache;
+}
+
+test("production replay-cache APIs reject the retired JSON cacheFile option", async () => {
+  await assert.rejects(
+    refreshReplaySafeAccountingCacheImpl({ cacheFile: "/private/retired.json" }),
+    /cacheFile was retired; use stateFile/u,
+  );
+  await assert.rejects(
+    readReplaySafeAccountingCacheImpl({ cacheFile: "/private/retired.json" }),
+    /cacheFile was retired; use stateFile/u,
+  );
+});
 
 const NOW = Date.parse("2026-07-27T12:00:00.000Z");
 const COMPONENT_KEYS = [
@@ -367,7 +407,7 @@ test("replay-safe cache rejects price-card event and exact-cost reconciliation d
   const badEvents = structuredClone(cache);
   const badEventsPeriod = period(badEvents, "all");
   badEventsPeriod.priceCardBreakdown[0].events += 1;
-  await writeFile(cacheFile, JSON.stringify(badEvents));
+  await writeTestCache(cacheFile, badEvents);
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
     errorCode: "cache_invalid",
@@ -377,7 +417,7 @@ test("replay-safe cache rejects price-card event and exact-cost reconciliation d
   const badCost = structuredClone(cache);
   const badCostPeriod = period(badCost, "all");
   badCostPeriod.priceCardBreakdown[0].costUsd = "3";
-  await writeFile(cacheFile, JSON.stringify(badCost));
+  await writeTestCache(cacheFile, badCost);
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
     errorCode: "cache_invalid",
@@ -704,7 +744,7 @@ test("cache validation requires the bounded quota timeline so older cache shapes
     scan: scanner([]),
   });
   delete cache.quotaTimeline;
-  await writeFile(cacheFile, JSON.stringify(cache));
+  await writeTestCache(cacheFile, cache);
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
     errorCode: "cache_invalid",
@@ -726,7 +766,7 @@ test("cache validation requires the bounded quota timeline so older cache shapes
     { length: 10_001 },
     () => ({ ...rebuilt.quotaTimeline[0] }),
   );
-  await writeFile(cacheFile, JSON.stringify(rebuilt));
+  await writeTestCache(cacheFile, rebuilt);
   assert.equal(
     (await readReplaySafeAccountingCache({ cacheFile })).errorCode,
     "cache_invalid",
@@ -741,10 +781,10 @@ test("a replay cache from an older official price registry is withheld", async (
     now: () => NOW,
     scan: scanner([]),
   });
-  await writeFile(cacheFile, JSON.stringify({
+  await writeTestCache(cacheFile, {
     ...cache,
     priceRegistryVersion: "superseded-price-registry",
-  }));
+  });
 
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
@@ -761,11 +801,11 @@ test("a cache from the former current-price basis is withheld for deterministic 
     now: () => NOW,
     scan: scanner([]),
   });
-  await writeFile(cacheFile, JSON.stringify({
+  await writeTestCache(cacheFile, {
     ...cache,
     schemaVersion: "local-replay-safe-accounting-v0.1",
     priceEpochBasis: "current_price_sensitivity_at_registry_observation",
-  }));
+  });
 
   assert.deepEqual(await readReplaySafeAccountingCache({ cacheFile }), {
     status: "unavailable",
@@ -802,7 +842,9 @@ test("refresh forwards AbortSignal and never writes an aborted projection", asyn
     ),
   );
   assert.equal(observedSignal, controller.signal);
-  await assert.rejects(stat(cacheFile), { code: "ENOENT" });
+  // State preparation is allowed to create the SQLite container before the
+  // scan starts, but an aborted refresh must not store an accounting value.
+  assert.equal(await readTestCache(cacheFile), null);
 });
 
 test("compact transition input ceilings fail closed without truncating or replacing the last good cache", async () => {
@@ -818,7 +860,7 @@ test("compact transition input ceilings fail closed without truncating or replac
       }),
     ]),
   });
-  const before = await readFile(cacheFile, "utf8");
+  const before = await readTestCache(cacheFile);
   const denseUsageScan = async ({ onUsage }) => {
     for (let index = 0; index < 4; index += 1) {
       onUsage(usageEvent({
@@ -838,7 +880,7 @@ test("compact transition input ceilings fail closed without truncating or replac
     }),
     (error) => error?.code === "accounting_transition_usage_limit_exceeded",
   );
-  assert.equal(await readFile(cacheFile, "utf8"), before);
+  assert.deepEqual(await readTestCache(cacheFile), before);
 
   const denseSnapshotScan = async ({ onRateLimitSnapshot }) => {
     for (let index = 0; index < 4; index += 1) {
@@ -870,7 +912,7 @@ test("compact transition input ceilings fail closed without truncating or replac
       error?.code === "accounting_transition_snapshot_limit_exceeded"
     ),
   );
-  assert.equal(await readFile(cacheFile, "utf8"), before);
+  assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });
 
@@ -882,7 +924,7 @@ test("measured RSS ceiling fails closed during accounting and preserves the last
     now: () => NOW,
     scan: scanner([]),
   });
-  const before = await readFile(cacheFile, "utf8");
+  const before = await readTestCache(cacheFile);
   const samples = [50, 101];
 
   await assert.rejects(
@@ -901,7 +943,7 @@ test("measured RSS ceiling fails closed during accounting and preserves the last
     (error) => error?.code === "accounting_transition_rss_limit_exceeded",
   );
 
-  assert.equal(await readFile(cacheFile, "utf8"), before);
+  assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });
 
@@ -913,7 +955,7 @@ test("deep log scanning receives hard resource bounds and preserves the last cac
     now: () => NOW,
     scan: scanner([]),
   });
-  const before = await readFile(cacheFile, "utf8");
+  const before = await readTestCache(cacheFile);
   let observedGuard = null;
 
   await assert.rejects(
@@ -935,7 +977,7 @@ test("deep log scanning receives hard resource bounds and preserves the last cac
   );
 
   assert.equal(typeof observedGuard?.checkRuntime, "function");
-  assert.equal(await readFile(cacheFile, "utf8"), before);
+  assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });
 
@@ -947,7 +989,7 @@ test("an AbortSignal can interrupt cooperative derivation after a dense scan and
     now: () => NOW,
     scan: scanner([]),
   });
-  const before = await readFile(cacheFile, "utf8");
+  const before = await readTestCache(cacheFile);
   const controller = new AbortController();
   let scanCompleted = false;
   const scan = async ({ onUsage }) => {
@@ -975,7 +1017,7 @@ test("an AbortSignal can interrupt cooperative derivation after a dense scan and
     ),
   );
   assert.equal(scanCompleted, true);
-  assert.equal(await readFile(cacheFile, "utf8"), before);
+  assert.deepEqual(await readTestCache(cacheFile), before);
 });
 
 test("a failed refresh leaves the last good owner-only cache intact", async () => {
@@ -991,7 +1033,7 @@ test("a failed refresh leaves the last good owner-only cache intact", async () =
       }),
     ]),
   });
-  const before = await readFile(cacheFile, "utf8");
+  const before = await readTestCache(cacheFile);
 
   await assert.rejects(
     refreshReplaySafeAccountingCache({
@@ -1004,6 +1046,6 @@ test("a failed refresh leaves the last good owner-only cache intact", async () =
     /controlled_scan_failure/,
   );
 
-  assert.equal(await readFile(cacheFile, "utf8"), before);
+  assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
 });

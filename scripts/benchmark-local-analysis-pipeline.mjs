@@ -44,9 +44,9 @@ if ((await readdir(selected.stateDirectory)).length !== 0) {
   throw new Error("Benchmark state directory must be empty");
 }
 
-const cacheFile = join(
+const stateFile = join(
   selected.stateDirectory,
-  "local-replay-safe-accounting-v0.1.json",
+  "local-collector-state-v1.sqlite",
 );
 const indexFile = join(
   selected.stateDirectory,
@@ -59,7 +59,7 @@ const secretFile = join(
 const fixedEndMs = Date.parse(selected.endAt);
 const startedAt = performance.now();
 const cache = await refreshReplaySafeAccountingCache({
-  cacheFile,
+  stateFile,
   indexFile,
   indexSecretFile: secretFile,
   codexHome: selected.codexHome,

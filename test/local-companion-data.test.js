@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import {
   mkdir,
   mkdtemp,
-  readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,6 +17,10 @@ import {
 import {
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  readLocalCollectorAccountingCache,
+  writeLocalCollectorAccountingCache,
+} from "../src/local-collector-state.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -138,7 +142,8 @@ test("local companion builds a closed real-data projection without identifiers o
     ];
     await writeFile(
       join(root, ".usage-monitor", "collector-events.jsonl"),
-      `${ledger.map((row) => JSON.stringify(row)).join("\n")}\nmalformed\n`,
+      `${ledger.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      { mode: 0o600 },
     );
     await writeFile(
       join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
@@ -183,7 +188,7 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.deepEqual(snapshot.overview.usage[0].byModel.map((row) => row.model), ["gpt-5.6-sol", "unknown"]);
     assert.equal(snapshot.overview.tools.counts.subagent, 1);
     assert.equal(snapshot.overview.tools.counts.other, 1);
-    assert.equal(snapshot.overview.collector.malformedLines, 1);
+    assert.equal(snapshot.overview.collector.malformedLines, 0);
     assert.deepEqual(snapshot.overview.collector.coveredAt, {
       startAt: "2026-07-25T11:00:00.000Z",
       endAt: "2026-07-25T11:47:00.000Z",
@@ -224,6 +229,18 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(snapshot.overview.accounting.byLineage.forked.events, 1);
     assert.equal(snapshot.overview.accounting.reasoningEffortAvailable, false);
     assert.equal(snapshot.overview.accounting.apiPriceCounterfactualTier, "standard");
+    assert.deepEqual(snapshot.overview.pricing.historyCoverage, {
+      status: "partial",
+      phase: "not_started",
+      errorCode: "archive_index_unavailable",
+      generatedAt: null,
+      coveredAt: { startAt: null, endAt: null },
+      sourceCount: 0,
+      indexedSourceCount: 0,
+      pendingSourceCount: 0,
+      sourceBytes: 0,
+      indexedBytes: 0,
+    });
     assert.equal(
       snapshot.overview.monitoringGaps.find((row) => row.id === "ordinary_chat")?.status,
       "excluded",
@@ -335,6 +352,7 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
         // No recorded mode: only the stated preference can attribute this.
         usage("2026-07-26T11:10:00.000Z", "gpt-5.4", "unknown"),
       ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
     );
     const build = (fastModePreference) => buildLocalCompanionSnapshot({
       root,
@@ -409,7 +427,7 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
 
 test("collector fallback keeps mixed event-time price provenance while an old replay cache is withheld", async () => {
   const root = await fixtureRoot();
-  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   const olderTerraCard =
     "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-01";
   const lowerTerraCard =
@@ -428,17 +446,18 @@ test("collector fallback keeps mixed event-time price provenance while an old re
         usage("2026-07-29T23:59:59.000Z"),
         usage("2026-07-30T00:00:00.000Z"),
       ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
     );
     // This is deliberately a former cache shape: it must be withheld rather
     // than supplying legacy price provenance during the rebuild interval.
-    await writeFile(cacheFile, JSON.stringify({
+    await writeLocalCollectorAccountingCache({ stateFile, cache: {
       schemaVersion: "local-replay-safe-accounting-v0.1",
       priceEpochBasis: "current_price_sensitivity_at_registry_observation",
-    }));
+    } });
 
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       allowDevelopmentArtifactFallback: true,
       now: () => Date.parse("2026-07-30T01:00:00.000Z"),
     });
@@ -449,7 +468,7 @@ test("collector fallback keeps mixed event-time price provenance while an old re
     );
     assert.equal(
       snapshot.overview.pricing.accountingSource,
-      "legacy_collector_unverified",
+      "collector_projection_unverified",
     );
     assert.equal(snapshot.overview.pricing.totalCostUsd, 9);
     assert.equal(snapshot.overview.pricing.eventTimeHistoricalTotalUsdExact, "9");
@@ -467,6 +486,39 @@ test("collector fallback keeps mixed event-time price provenance while an old re
         ?.priceCardBreakdown,
       snapshot.overview.pricing.priceCardBreakdown,
     );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("collector fallback never presents its retained ledger as all local history", async () => {
+  const root = await fixtureRoot();
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      [
+        usage("2026-06-01T12:00:00.000Z"),
+        usage("2026-07-25T11:00:00.000Z"),
+      ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const broadest = snapshot.overview.accounting.periods
+      .find((period) => period.periodId === "all");
+    assert.equal(broadest?.periodLabel, "Cached 31-day collector window");
+    assert.equal(broadest?.events, 1);
+    assert.equal(snapshot.overview.pricing.historyCoverage.status, "partial");
   } finally {
     await rm(root, { recursive: true });
   }
@@ -505,6 +557,7 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
         // After the newest reading: uncovered again until the next reading.
         usage("2026-07-26T11:30:00.000Z", "unknown"),
       ].map((line) => `${line}\n`).join(""),
+      { mode: 0o600 },
     );
 
     const snapshot = await buildLocalCompanionSnapshot({
@@ -581,6 +634,7 @@ test("a completed bounded tail is projected as useful partial recent coverage", 
           total_tokens: 11,
         },
       })}\n`,
+      { mode: 0o600 },
     );
     await writeFile(
       join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
@@ -624,7 +678,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
   const root = await mkdtemp(join(tmpdir(), "local-companion-missing-"));
   try {
     await mkdir(join(root, ".usage-monitor"));
-    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "", { mode: 0o600 });
     await writeFile(
       join(root, ".usage-monitor", "collector-checkpoint-v0.3.json"),
       JSON.stringify({
@@ -644,6 +698,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
           },
         },
       }),
+      { mode: 0o600 },
     );
     await writeFile(join(root, ARTIFACT_FILES.gradient), "{malformed");
     const snapshot = await buildLocalCompanionSnapshot({
@@ -663,7 +718,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
 
 test("live weekly cache replaces the repo artifact and labels historical account ambiguity", async () => {
   const root = await fixtureRoot();
-  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   try {
     const collectorFile = join(
       root,
@@ -675,9 +730,9 @@ test("live weekly cache replaces the repo artifact and labels historical account
       observedAt: "2026-07-25T11:30:00.000Z",
       toolClass: "subagent",
       eventKey: "PRIVATE_COLLECTOR_EVENT_KEY",
-    })}\n`);
+    })}\n`, { mode: 0o600 });
     await refreshReplaySafeAccountingCache({
-      cacheFile,
+      stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
       windowDays: 31,
       scan: async ({ onUsage, onRateLimitSnapshot }) => {
@@ -709,7 +764,7 @@ test("live weekly cache replaces the repo artifact and labels historical account
     });
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       allowDevelopmentArtifactFallback: true,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
@@ -747,18 +802,17 @@ test("live weekly cache replaces the repo artifact and labels historical account
       ],
     );
     assert.equal(snapshot.overview.tools.total, 1);
-    const projectionBytes = await readFile(
-      `${collectorFile}.projection-v2.json`,
+    await assert.rejects(
+      stat(`${collectorFile}.projection-v1.json`),
+      { code: "ENOENT" },
     );
-    assert.equal(
-      projectionBytes.includes(
-        Buffer.from("PRIVATE_COLLECTOR_EVENT_KEY"),
-      ),
-      false,
+    await assert.rejects(
+      stat(`${collectorFile}.projection-v2.json`),
+      { code: "ENOENT" },
     );
     const cachedSnapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       allowDevelopmentArtifactFallback: true,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
@@ -771,22 +825,26 @@ test("live weekly cache replaces the repo artifact and labels historical account
 
 test("malformed live weekly reset rows fail closed without crashing the dashboard", async () => {
   const root = await fixtureRoot();
-  const cacheFile = join(root, ".usage-monitor", "accounting.json");
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   try {
-    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), "");
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      "",
+      { mode: 0o600 },
+    );
     await refreshReplaySafeAccountingCache({
-      cacheFile,
+      stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
       windowDays: 31,
       scan: async () => ({ diagnostics: {} }),
     });
-    const cache = JSON.parse(await readFile(cacheFile, "utf8"));
+    const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
     cache.weeklyCalibration.recentResets = [null];
-    await writeFile(cacheFile, JSON.stringify(cache));
+    await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      accountingCacheFile: cacheFile,
+      collectorStateFile: stateFile,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(snapshot.weekly.status, "unavailable");

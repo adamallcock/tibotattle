@@ -287,7 +287,7 @@ const LOCAL_REVIEW_LEGACY_MIGRATION_TARGETS = Object.freeze([]);
 export const LEGACY_STORAGE_DIRECT_IMPORTERS = Object.freeze([
   "src/build-weekly-calibration-audit.js",
   "src/cli.js",
-  "src/local-companion-data.js",
+  "src/local-collector-state.js",
   "src/passive-collector.js",
   "src/r7-materialized-boundary-benchmark.js",
   "src/r7-real-history-benchmark.js",

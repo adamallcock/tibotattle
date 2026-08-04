@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { appendFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile as readFileNative,
+  rename,
+  rm,
+  stat as statNative,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,16 +19,50 @@ import {
   deriveOpenAIAccountScope,
 } from "../src/providers/codex/account.js";
 import {
-  acquireCollectorLock,
   appServerSnapshotRecord,
-  commitCollectorRecordBatch,
   discoverCollectorRollouts,
   ingestRolloutUpdates,
   notificationEvidenceFromAppServerRecord,
-  recoverCollectorBatchJournal,
+  MAX_DISCOVERY_DIRECTORY_ENTRIES,
+  MAX_DISCOVERY_ROLLOUT_FILES,
   runCollectorForeground,
   runCollectorOnce,
 } from "../src/passive-collector.js";
+import {
+  acquireLocalCollectorStateLock,
+  commitLocalCollectorState,
+  readLocalCollectorRecords,
+  readLocalCollectorState,
+} from "../src/local-collector-state.js";
+
+const virtualCollectorStatePaths = new Map();
+
+function virtualCollectorState(path) {
+  return virtualCollectorStatePaths.get(path) ?? null;
+}
+
+async function readFile(path, options) {
+  const virtual = virtualCollectorState(path);
+  if (virtual === null) return readFileNative(path, options);
+  const state = await readLocalCollectorState({ stateFile: virtual.stateFile });
+  const contents = virtual.kind === "checkpoint"
+    ? JSON.stringify(state.checkpoint)
+    : (state.records ?? []).map((record) => JSON.stringify(record)).join("\n")
+      + ((state.records ?? []).length > 0 ? "\n" : "");
+  return options === "utf8" || options?.encoding === "utf8"
+    ? contents
+    : Buffer.from(contents);
+}
+
+async function stat(path) {
+  const virtual = virtualCollectorState(path);
+  return statNative(virtual?.stateFile ?? path);
+}
+
+test("collector discovery defaults leave room for the resumable archive index", () => {
+  assert.equal(MAX_DISCOVERY_DIRECTORY_ENTRIES, 500_000);
+  assert.equal(MAX_DISCOVERY_ROLLOUT_FILES, 125_000);
+});
 
 function usage(input) {
   return {
@@ -89,19 +133,29 @@ async function collectorFixture(lines = []) {
   await mkdir(archive, { recursive: true });
   const rollout = join(sessions, "rollout-2026-07-23T00-00-00-fixture.jsonl");
   await writeFile(rollout, lines.length ? `${lines.join("\n")}\n` : "");
+  const stateFile = join(root, "state", "local-collector-state-v1.sqlite");
+  const dataFile = join(root, "state", "events.virtual");
+  const checkpointFile = join(root, "state", "checkpoint.virtual");
+  virtualCollectorStatePaths.set(dataFile, { stateFile, kind: "records" });
+  virtualCollectorStatePaths.set(checkpointFile, { stateFile, kind: "checkpoint" });
   return {
     root,
     codexHome,
     sessions,
     archive,
     rollout,
-    dataFile: join(root, "state", "events.jsonl"),
-    checkpointFile: join(root, "state", "checkpoint.json"),
+    stateFile,
+    dataFile,
+    checkpointFile,
     lockFile: join(root, "state", "collector.lock"),
   };
 }
 
 async function readLines(path) {
+  const virtual = virtualCollectorState(path);
+  if (virtual !== null) {
+    return (await readLocalCollectorRecords({ stateFile: virtual.stateFile })).records;
+  }
   try {
     return (await readFile(path, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
   } catch (error) {
@@ -312,8 +366,8 @@ test("fresh recent backfill selects only overlapping archives and reports conten
         && !serialized.includes("recent.jsonl");
     }));
     assert.equal(JSON.stringify(result).includes(fixture.root), false);
-    assert.equal(Object.keys(result).includes("dataFile"), false);
-    assert.equal(result.dataFile, fixture.dataFile, "legacy direct property access remains compatible");
+    assert.equal(Object.keys(result).includes("stateFile"), false);
+    assert.equal(result.stateFile, fixture.stateFile);
     assert.equal((await readLines(fixture.dataFile)).length, 2);
     const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
     assert.deepEqual(checkpoint.indexing, result.indexing);
@@ -998,39 +1052,19 @@ test("collector compacts recent event keys once per batch", async () => {
   }
 });
 
-test("append success followed by checkpoint failure replays exactly once", async () => {
+test("a failed SQLite transaction leaves no partial collector batch and retries exactly once", async () => {
   const fixture = await collectorFixture();
   try {
     const options = { ...fixture, refreshStale: false, clock: () => Date.parse("2026-07-23T00:01:00.000Z") };
     await runCollectorOnce(options);
     await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 1)}\n`);
-    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
-    await assert.rejects(() => ingestRolloutUpdates({
-      codexHome: fixture.codexHome,
-      checkpoint,
-      dataFile: fixture.dataFile,
-      clock: options.clock,
-      commitRecordBatch: (records) => commitCollectorRecordBatch({
-        records,
-        checkpoint,
-        dataFile: fixture.dataFile,
-        checkpointFile: fixture.checkpointFile,
-        clock: options.clock,
-        writeCheckpoint: async () => { throw new Error("injected checkpoint failure"); },
-      }),
-    }), /injected checkpoint failure/);
-    assert.equal((await readLines(fixture.dataFile)).length, 1);
-    const recoveryOrder = [];
-    await assert.rejects(() => recoverCollectorBatchJournal({
-      dataFile: fixture.dataFile,
-      checkpointFile: fixture.checkpointFile,
-      truncateLedger: async () => {
-        recoveryOrder.push("truncate");
-        throw new Error("injected rollback sync failure");
+    await assert.rejects(() => runCollectorOnce({
+      ...options,
+      commitState: async () => {
+        throw new Error("injected sqlite transaction failure");
       },
-      removeJournal: async () => recoveryOrder.push("remove"),
-    }), /injected rollback sync failure/);
-    assert.deepEqual(recoveryOrder, ["truncate"]);
+    }), /injected sqlite transaction failure/);
+    assert.equal((await readLines(fixture.dataFile)).length, 0);
     const retried = await runCollectorOnce(options);
     assert.equal(retried.rolloutRecordsWritten, 1);
     assert.equal((await readLines(fixture.dataFile)).length, 1);
@@ -1039,27 +1073,19 @@ test("append success followed by checkpoint failure replays exactly once", async
   }
 });
 
-test("a committed batch is retained when journal cleanup fails", async () => {
+test("a committed SQLite batch is retained when its caller loses the acknowledgment", async () => {
   const fixture = await collectorFixture();
   try {
     const options = { ...fixture, refreshStale: false, clock: () => Date.parse("2026-07-23T00:01:00.000Z") };
     await runCollectorOnce(options);
     await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 1)}\n`);
-    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
-    await assert.rejects(() => ingestRolloutUpdates({
-      codexHome: fixture.codexHome,
-      checkpoint,
-      dataFile: fixture.dataFile,
-      clock: options.clock,
-      commitRecordBatch: (records) => commitCollectorRecordBatch({
-        records,
-        checkpoint,
-        dataFile: fixture.dataFile,
-        checkpointFile: fixture.checkpointFile,
-        clock: options.clock,
-        removeJournal: async () => { throw new Error("injected journal cleanup failure"); },
-      }),
-    }), /injected journal cleanup failure/);
+    await assert.rejects(() => runCollectorOnce({
+      ...options,
+      commitState: async (commit) => {
+        await commitLocalCollectorState(commit);
+        throw new Error("injected post-commit acknowledgment failure");
+      },
+    }), /injected post-commit acknowledgment failure/);
     assert.equal((await readLines(fixture.dataFile)).length, 1);
     const retried = await runCollectorOnce(options);
     assert.equal(retried.rolloutRecordsWritten, 0);
@@ -1352,10 +1378,9 @@ test("run-once rolls back an app snapshot after checkpoint failure and retries i
       staleAfterMs: 0,
       appServerFactory: () => new SnapshotClient(),
       clock,
-      commitBatch: (options) => commitCollectorRecordBatch({
-        ...options,
-        writeCheckpoint: async () => { throw new Error("injected app checkpoint failure"); },
-      }),
+      commitState: async () => {
+        throw new Error("injected app transaction failure");
+      },
     });
     assert.equal(failed.refresh.recordWritten, false);
     assert.equal(failed.refresh.errorCode, "temporary_disconnect");
@@ -1374,7 +1399,7 @@ test("run-once rolls back an app snapshot after checkpoint failure and retries i
   }
 });
 
-test("run-once restores app state after journal preparation fails", async () => {
+test("run-once restores app state after a SQLite transaction preparation failure", async () => {
   const fixture = await collectorFixture();
   class SnapshotClient {
     async start() {}
@@ -1391,10 +1416,9 @@ test("run-once restores app state after journal preparation fails", async () => 
       staleAfterMs: 0,
       appServerFactory: () => new SnapshotClient(),
       clock,
-      commitBatch: (options) => commitCollectorRecordBatch({
-        ...options,
-        writeJournal: async () => { throw new Error("injected journal preparation failure"); },
-      }),
+      commitState: async () => {
+        throw new Error("injected transaction preparation failure");
+      },
     });
     assert.equal(failed.refresh.recordWritten, false);
     assert.equal((await readLines(fixture.dataFile)).length, 0);
@@ -1416,14 +1440,19 @@ test("run-once restores app state after journal preparation fails", async () => 
   }
 });
 
-test("collector lock rejects contention and recovers a stale lock", async () => {
+test("SQLite collector lock rejects contention and recovers a stale lock", async () => {
   const fixture = await collectorFixture();
   try {
-    const release = await acquireCollectorLock(fixture.lockFile, { processExists: () => true });
-    await assert.rejects(() => acquireCollectorLock(fixture.lockFile, { processExists: () => true }), /already held/);
+    const release = await acquireLocalCollectorStateLock(fixture.stateFile, { processExists: () => true });
+    await assert.rejects(
+      () => acquireLocalCollectorStateLock(fixture.stateFile, { processExists: () => true }),
+      /local_collector_state_lock_held/,
+    );
     await release();
-    await writeFile(fixture.lockFile, JSON.stringify({ pid: 999999, startedAt: "2026-07-22T00:00:00.000Z" }));
-    const releaseRecovered = await acquireCollectorLock(fixture.lockFile, { processExists: () => false });
+    const releaseRecovered = await acquireLocalCollectorStateLock(
+      fixture.stateFile,
+      { processExists: () => false },
+    );
     await releaseRecovered();
   } finally {
     await rm(fixture.root, { recursive: true });
@@ -1794,7 +1823,10 @@ test("foreground ingestion queue recovers after one transient failure", async ()
     close() {}
   }
   try {
-    setTimeout(() => controller.abort(), 100);
+    // SQLite initialization and its first durable transaction can take longer
+    // than the old JSON checkpoint write on a cold filesystem. Leave enough
+    // time for the scheduled reconciliation to demonstrate recovery.
+    setTimeout(() => controller.abort(), 300);
     const result = await runCollectorForeground({
       ...fixture,
       signal: controller.signal,

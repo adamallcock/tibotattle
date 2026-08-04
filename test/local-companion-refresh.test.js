@@ -207,6 +207,23 @@ test("refresh controller binds every terminal receipt to one opaque refresh run"
   assert.equal(controller.getStatus().status, "succeeded");
 });
 
+const PARTIAL_ARCHIVE_INDEX = Object.freeze({
+  status: "partial",
+  phase: "awaiting_resume",
+  generatedAt: "2026-07-23T12:00:00.000Z",
+  coveredAt: Object.freeze({
+    startAt: "1970-01-01T00:00:00.000Z",
+    endAt: "2026-07-23T12:00:00.000Z",
+  }),
+  sourceCount: 10,
+  indexedSourceCount: 3,
+  pendingSourceCount: 7,
+  sourceBytes: 1000,
+  indexedBytes: 300,
+  readBudgetBytes: 128 * 1024 * 1024,
+  scanBytes: 128 * 1024 * 1024,
+});
+
 test("local refresh requests a bounded recent index and returns only safe progress", async () => {
   let options;
   const controller = new AbortController();
@@ -244,7 +261,7 @@ test("local refresh requests a bounded recent index and returns only safe progre
   assert.equal(options.backfill, true);
   assert.equal(options.backfillSinceAt, "2026-07-16T12:00:00.000Z");
   assert.equal(options.signal, controller.signal);
-  assert.equal(options.maximumRecentRunBytes, 64 * 1024 * 1024);
+  assert.equal(options.maximumRecentRunBytes, 128 * 1024 * 1024);
   assert.equal(options.maximumRecentTailBytes, 4 * 1024 * 1024);
   assert.equal(options.maximumRecentPreludeBytes, 512 * 1024);
   assert.equal(options.maximumBufferedLineBytes, 1024 * 1024);
@@ -267,28 +284,15 @@ test("local refresh routes collector, credential lock, and accounting writes ben
   try {
     const runner = createLocalCollectorRefreshRunner({
       codexHome: join(stateRoot, "read-only-codex-source"),
-      dataFile: paths.collectorFile,
-      checkpointFile: paths.checkpointFile,
-      lockFile: paths.collectorLockFile,
-      journalFile: paths.collectorJournalFile,
+      stateFile: paths.collectorStateFile,
       accountObservationOperationLockFile:
         paths.accountObservationLockFile,
-      accountingCacheFile: paths.accountingCacheFile,
       selectAccountObservationSecret: (options) => {
         selectionOptions = options;
         return { loadAccountObservationSecret: null };
       },
       runCollector: async (options) => {
         collectorOptions = options;
-        for (const path of [
-          options.dataFile,
-          options.checkpointFile,
-          options.lockFile,
-          options.journalFile,
-        ]) {
-          await mkdir(dirname(path), { recursive: true });
-          await writeFile(path, "state\n", { mode: 0o600 });
-        }
         return {
           rolloutRecordsWritten: 0,
           filesDiscovered: 0,
@@ -299,8 +303,8 @@ test("local refresh routes collector, credential lock, and accounting writes ben
           },
         };
       },
-      refreshAccounting: async ({ cacheFile }) => {
-        await writeFile(cacheFile, "accounting\n", { mode: 0o600 });
+      refreshAccounting: async ({ stateFile }) => {
+        assert.equal(stateFile, paths.collectorStateFile);
         return {
           generatedAt: "2026-07-23T12:00:00.000Z",
           periods: [],
@@ -317,18 +321,10 @@ test("local refresh routes collector, credential lock, and accounting writes ben
     );
     assert.deepEqual(
       [
-        collectorOptions.dataFile,
-        collectorOptions.checkpointFile,
-        collectorOptions.lockFile,
-        collectorOptions.journalFile,
-        paths.accountingCacheFile,
+        collectorOptions.stateFile,
       ],
       [
-        paths.collectorFile,
-        paths.checkpointFile,
-        paths.collectorLockFile,
-        paths.collectorJournalFile,
-        paths.accountingCacheFile,
+        paths.collectorStateFile,
       ],
     );
     for (const path of Object.values(paths)) {
@@ -339,6 +335,57 @@ test("local refresh routes collector, credential lock, and accounting writes ben
   }
 });
 
+test("local refresh starts a bounded archive index only after the foreground result is safe", async () => {
+  const controller = new AbortController();
+  const clock = () => Date.parse("2026-07-23T12:00:00.000Z");
+  let archiveOptions;
+  const progress = [];
+  const runner = createLocalCollectorRefreshRunner({
+    codexHome: "/private/codex-home",
+    archiveIndexFile: "/private/archive-index.sqlite",
+    archiveIndexSecretFile: "/private/archive-index-secret",
+    clock,
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 3,
+      refresh: {
+        attempted: true,
+        recordWritten: false,
+        errorCode: null,
+      },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshArchiveIndex: async (options) => {
+      archiveOptions = options;
+      return {
+        ...PARTIAL_ARCHIVE_INDEX,
+        privatePath: "/private/must-not-escape",
+      };
+    },
+  });
+
+  const result = await runner({
+    signal: controller.signal,
+    onProgress: (value) => progress.push(value),
+  });
+  assert.deepEqual(archiveOptions, {
+    codexHome: "/private/codex-home",
+    indexFile: "/private/archive-index.sqlite",
+    secretFile: "/private/archive-index-secret",
+    now: clock,
+    signal: controller.signal,
+  });
+  assert.deepEqual(result.archiveIndex, PARTIAL_ARCHIVE_INDEX);
+  assert.deepEqual(progress.at(-1), {
+    kind: "archive_index",
+    status: "scanning",
+  });
+  assert.equal(JSON.stringify(result).includes("/private/"), false);
+});
+
 test("zero-write local refresh reuses a current valid accounting cache without altering it", async () => {
   const controller = new AbortController();
   const clock = () => Date.parse("2026-07-23T12:00:00.000Z");
@@ -346,7 +393,7 @@ test("zero-write local refresh reuses a current valid accounting cache without a
   let readOptions;
   let rebuilds = 0;
   const runner = createLocalCollectorRefreshRunner({
-    accountingCacheFile: "/private/accounting-cache.json",
+    stateFile: "/private/local-collector-state.sqlite",
     clock,
     selectAccountObservationSecret: () => ({
       loadAccountObservationSecret: null,
@@ -377,7 +424,7 @@ test("zero-write local refresh reuses a current valid accounting cache without a
   const result = await runner({ signal: controller.signal });
 
   assert.deepEqual(readOptions, {
-    cacheFile: "/private/accounting-cache.json",
+    stateFile: "/private/local-collector-state.sqlite",
     now: clock,
     maximumAgeMs: 30 * 60 * 1_000,
   });
@@ -574,7 +621,7 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
   let accountingOptions;
   const runner = createLocalCollectorRefreshRunner({
     codexHome: "/private/codex-home",
-    accountingCacheFile: "/private/accounting-cache.json",
+    stateFile: "/private/local-collector-state.sqlite",
     clock,
     selectAccountObservationSecret: () => ({
       loadAccountObservationSecret: async () => Buffer.alloc(32, 8),
@@ -602,7 +649,7 @@ test("local refresh forwards its AbortSignal into replay-safe accounting", async
   const result = await runner({ signal: controller.signal });
 
   assert.equal(accountingOptions.codexHome, "/private/codex-home");
-  assert.equal(accountingOptions.cacheFile, "/private/accounting-cache.json");
+  assert.equal(accountingOptions.stateFile, "/private/local-collector-state.sqlite");
   assert.equal(accountingOptions.now, clock);
   assert.equal(accountingOptions.windowDays, 31);
   assert.equal(accountingOptions.signal, controller.signal);
@@ -777,8 +824,8 @@ test("an early bounded pass publishes a useful headline before the normal contin
           resourceLimit: {
             code: "collector_resource_source_bytes_limit_exceeded",
             dimension: "source_bytes",
-            limit: 64 * 1024 * 1024,
-            observed: 64 * 1024 * 1024 + 1,
+            limit: 128 * 1024 * 1024,
+            observed: 128 * 1024 * 1024 + 1,
           },
           refresh: {
             attempted: true,
@@ -822,7 +869,7 @@ test("an early bounded pass publishes a useful headline before the normal contin
   assert.equal(collectorOptions.length, 2);
   assert.equal(
     collectorOptions[0].maximumRecentRunBytes,
-    64 * 1024 * 1024,
+    128 * 1024 * 1024,
   );
   assert.equal(
     collectorOptions[0].maximumRecentTailBytes,
@@ -930,7 +977,7 @@ test("the reviewed normal-pass byte ceiling stops after one early headline conti
     runCollector: async () => {
       collectorCalls += 1;
       const limit = collectorCalls === 1
-        ? 64 * 1024 * 1024
+        ? 128 * 1024 * 1024
         : 1_500 * 1024 * 1024;
       return {
         rolloutRecordsWritten: 0,
@@ -1021,7 +1068,7 @@ test("a bounded continuation keeps the early headline and skips deep accounting"
   assert.equal(collectorOptions.length, 2);
   assert.equal(
     collectorOptions[0].maximumRecentRunBytes,
-    64 * 1024 * 1024,
+    128 * 1024 * 1024,
   );
   assert.equal(
     collectorOptions[0].maximumRecentTailBytes,

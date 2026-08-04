@@ -1,4 +1,3 @@
-import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { scanCodexLogEvents } from "./codex-log-scan.js";
@@ -6,8 +5,6 @@ import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   createIndexedCodexLogScan,
   defaultLocalAnalysisIndexSecretPath,
-  readLocalAnalysisIndexProjection,
-  writeLocalAnalysisIndexProjection,
 } from "./local-analysis-index.js";
 import {
   CODEX_TRANSITION_DERIVATION_CEILINGS,
@@ -30,7 +27,13 @@ import {
   analyzeQuotaPace,
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
-import { writeJsonOwnerOnlyAtomic } from "./storage.js";
+import {
+  defaultLocalCollectorStatePath,
+  prepareLocalCollectorState,
+  readLocalCollectorAccountingCache,
+  writeLocalCollectorAccountingCache,
+} from "./local-collector-state.js";
+import { stableJson } from "./storage.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
@@ -1069,11 +1072,7 @@ function publicDiagnostics(value) {
 export function defaultReplaySafeAccountingCachePath(
   root = process.cwd(),
 ) {
-  return resolve(
-    root,
-    ".usage-monitor",
-    "local-replay-safe-accounting-v0.2.json",
-  );
+  return defaultLocalCollectorStatePath(root);
 }
 
 export async function buildReplaySafeAccountingCache({
@@ -1311,23 +1310,38 @@ export async function buildReplaySafeAccountingCache({
 }
 
 export async function refreshReplaySafeAccountingCache({
-  cacheFile = defaultReplaySafeAccountingCachePath(),
-  indexFile = resolve(
-    dirname(cacheFile),
-    "local-analysis-index-v2.sqlite",
-  ),
-  indexSecretFile = defaultLocalAnalysisIndexSecretPath(indexFile),
+  stateFile = null,
+  // A JSON cache is no longer a supported durable target. Keeping this
+  // explicit catch prevents a stale caller from silently writing SQLite bytes
+  // to a misleading .json path.
+  cacheFile = undefined,
+  indexFile = null,
+  indexSecretFile = null,
   scan = null,
   indexWorkerCount,
   indexChunkBytes,
   ...options
 } = {}) {
+  if (cacheFile !== undefined) {
+    throw new TypeError("cacheFile was retired; use stateFile");
+  }
+  const selectedStateFile = stateFile ?? defaultReplaySafeAccountingCachePath();
+  const selectedIndexFile = indexFile ?? resolve(
+    dirname(selectedStateFile),
+    "local-analysis-index-v2.sqlite",
+  );
+  const selectedIndexSecretFile = indexSecretFile
+    ?? defaultLocalAnalysisIndexSecretPath(selectedIndexFile);
+  if (typeof selectedStateFile !== "string" || selectedStateFile.length < 1
+      || typeof selectedIndexFile !== "string" || selectedIndexFile.length < 1) {
+    throw new TypeError("Replay-safe SQLite state paths are invalid");
+  }
   if (scan !== null && typeof scan !== "function") {
     throw new TypeError("scan must be a function or null");
   }
   const effectiveScan = scan ?? createIndexedCodexLogScan({
-    indexFile,
-    secretFile: indexSecretFile,
+    indexFile: selectedIndexFile,
+    secretFile: selectedIndexSecretFile,
     ...(indexWorkerCount === undefined
       ? {}
       : { workerCount: indexWorkerCount }),
@@ -1335,19 +1349,18 @@ export async function refreshReplaySafeAccountingCache({
       ? {}
       : { chunkBytes: indexChunkBytes }),
   });
+  // Converge legacy state before spending a potentially substantial raw-log
+  // scan. A live old JSON collector or an unverified parity mismatch must
+  // fail before we derive a cache that cannot be committed safely.
+  await prepareLocalCollectorState({ stateFile: selectedStateFile });
   const cache = await buildReplaySafeAccountingCache({
     ...options,
     scan: effectiveScan,
   });
-  await writeJsonOwnerOnlyAtomic(cacheFile, cache);
-  if (scan === null) {
-    await writeLocalAnalysisIndexProjection({
-      indexFile,
-      schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
-      generatedAt: cache.generatedAt,
-      value: cache,
-    });
+  if (Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
+    throw fixedError("cache_invalid_size");
   }
+  await writeLocalCollectorAccountingCache({ stateFile: selectedStateFile, cache });
   return cache;
 }
 
@@ -1613,14 +1626,18 @@ function validCache(value) {
 }
 
 export async function readReplaySafeAccountingCache({
-  cacheFile = defaultReplaySafeAccountingCachePath(),
-  indexFile = resolve(
-    dirname(cacheFile),
-    "local-analysis-index-v2.sqlite",
-  ),
+  stateFile = null,
+  cacheFile = undefined,
   now = null,
   maximumAgeMs = null,
 } = {}) {
+  if (cacheFile !== undefined) {
+    throw new TypeError("cacheFile was retired; use stateFile");
+  }
+  const selectedStateFile = stateFile ?? defaultReplaySafeAccountingCachePath();
+  if (typeof selectedStateFile !== "string" || selectedStateFile.length < 1) {
+    throw new TypeError("Replay-safe SQLite state path is invalid");
+  }
   if (now !== null && typeof now !== "function") {
     throw new TypeError("now must be a function or null");
   }
@@ -1630,26 +1647,18 @@ export async function readReplaySafeAccountingCache({
   }
   let unavailableErrorCode = null;
   let parsed = null;
-  let metadata;
   try {
-    metadata = await stat(cacheFile);
-  } catch (error) {
-    if (error.code === "ENOENT") {
+    await prepareLocalCollectorState({ stateFile: selectedStateFile });
+    const stored = await readLocalCollectorAccountingCache({ stateFile: selectedStateFile });
+    if (stored.status === "missing" || stored.cache === null) {
       unavailableErrorCode = "cache_missing";
     } else {
-      unavailableErrorCode = "cache_unavailable";
+      parsed = stored.cache;
     }
-  }
-  if (metadata !== undefined) {
-    if (!metadata.isFile() || metadata.size > MAX_CACHE_BYTES) {
-      unavailableErrorCode = "cache_invalid_size";
-    } else {
-      try {
-        parsed = JSON.parse(await readFile(cacheFile, "utf8"));
-      } catch {
-        unavailableErrorCode = "cache_malformed";
-      }
-    }
+  } catch (error) {
+    unavailableErrorCode = error?.code === "local_collector_state_missing"
+      ? "cache_missing"
+      : "cache_unavailable";
   }
   if (parsed !== null && !validCache(parsed)) {
     const registryOutdated = (
@@ -1667,16 +1676,6 @@ export async function readReplaySafeAccountingCache({
         ? "cache_accounting_semantics_outdated"
         : "cache_invalid";
     parsed = null;
-  }
-  if (parsed === null) {
-    const projection = await readLocalAnalysisIndexProjection({
-      indexFile,
-      schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
-    });
-    if (projection.status === "available"
-        && validCache(projection.value)) {
-      parsed = projection.value;
-    }
   }
   if (parsed === null) {
     return {

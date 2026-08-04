@@ -789,6 +789,85 @@ test("local dashboard normalizer accepts artifact rows and keeps stale state exp
   assert.equal(result.gradient.rollingHistory.length, 1);
 });
 
+test("history coverage only becomes complete from coherent archive evidence", () => {
+  const complete = {
+    status: "complete",
+    phase: "idle",
+    generatedAt: "2026-08-03T12:00:00.000Z",
+    coveredAt: {
+      startAt: "1970-01-01T00:00:00.000Z",
+      endAt: "2026-08-03T12:00:00.000Z",
+    },
+    sourceCount: 3,
+    indexedSourceCount: 3,
+    pendingSourceCount: 0,
+    sourceBytes: 100,
+    indexedBytes: 100,
+  };
+  assert.equal(
+    normalizeDashboardPayload({ pricing: { historyCoverage: complete } })
+      .pricing.historyCoverage.status,
+    "complete",
+  );
+  assert.equal(
+    normalizeDashboardPayload({
+      pricing: {
+        historyCoverage: { ...complete, indexedSourceCount: 2 },
+      },
+    }).pricing.historyCoverage.status,
+    "partial",
+  );
+  assert.equal(
+    normalizeDashboardPayload({
+      pricing: {
+        historyCoverage: { ...complete, status: "scanning", phase: "scanning" },
+      },
+    }).pricing.historyCoverage.status,
+    "partial",
+  );
+  assert.equal(
+    normalizeDashboardPayload({
+      pricing: {
+        historyCoverage: { ...complete, status: "partial", phase: "awaiting_resume", errorCode: "archive_disk_space" },
+      },
+    }).pricing.historyCoverage.errorCode,
+    "archive_disk_space",
+  );
+});
+
+test("cost coverage visibly distinguishes a transient archive scan from a verified receipt", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const localizationSource = await readFile(
+    new URL("../public/localization.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(appSource, /let archiveHistoryScanActive = false;/u);
+  assert.match(appSource, /dashboard\.pricing\.historyScanningComplete/u);
+  assert.match(appSource, /dashboard\.pricing\.historyScanningPartial/u);
+  assert.match(appSource, /dashboard\.pricing\.historyDiskSpace/u);
+  assert.match(appSource, /dashboard\.pricing\.historyStorageUnavailable/u);
+  assert.match(
+    localizationSource,
+    /"dashboard\.pricing\.historyScanningComplete": \["History index scanning; last verified coverage complete"/u,
+  );
+  assert.match(
+    localizationSource,
+    /"dashboard\.pricing\.historyScanningPartial": \["History index scanning; last verified coverage partial"/u,
+  );
+  assert.match(
+    localizationSource,
+    /"dashboard\.pricing\.historyDiskSpace": \["History index partial; insufficient local disk space to stage the next safe archive pass"/u,
+  );
+  assert.match(
+    localizationSource,
+    /"dashboard\.pricing\.historyStorageUnavailable": \["History index partial; local disk headroom could not be verified for the next safe archive pass"/u,
+  );
+  assert.match(
+    appSource,
+    /if \(archiveScanning && !archiveHistoryScanActive\) \{\s*archiveHistoryScanActive = true;\s*if \(dashboard\) renderPricing\(dashboard\);/u,
+  );
+});
+
 test("local dashboard retains the pricing epoch required to explain allowance fits", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
@@ -5096,6 +5175,8 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [...phrases.matchAll(/\["([^"]+)", "([^"]+)"\]/gu)].map((match) => match[1]),
     [
       "All retained evidence",
+      "Cached 31-day window",
+      "Cached 31-day collector window",
       "Last 24 hours",
       "Last 30 days",
       "Last 7 days",

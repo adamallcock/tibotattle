@@ -7,6 +7,57 @@ import { classifySessionSurface } from "./surface-classification.js";
 
 const MAXIMUM_ACTIVE_APPEND_PROOF_BYTES = 8 * 1024 * 1024;
 
+function discoveryLimitError(dimension, limit, observed, progress) {
+  const error = new Error("Codex log discovery stopped at a resource limit");
+  error.name = "CodexLogDiscoveryLimitError";
+  error.code = `codex_log_discovery_${dimension}`;
+  error.resourceLimit = Object.freeze({ dimension, limit, observed });
+  error.discoveryProgress = Object.freeze({ ...progress });
+  return error;
+}
+
+function createDiscoveryLimiter(limits) {
+  if (limits === null || limits === undefined) return null;
+  if (!limits || typeof limits !== "object" || Array.isArray(limits)
+      || Object.keys(limits).length !== 2
+      || !Object.hasOwn(limits, "maximumDirectoryEntries")
+      || !Object.hasOwn(limits, "maximumRolloutFiles")
+      || !Number.isSafeInteger(limits.maximumDirectoryEntries)
+      || limits.maximumDirectoryEntries < 1
+      || !Number.isSafeInteger(limits.maximumRolloutFiles)
+      || limits.maximumRolloutFiles < 1) {
+    throw new TypeError("Codex log discovery limits are invalid");
+  }
+  const progress = {
+    directoryEntries: 0,
+    rolloutFiles: 0,
+  };
+  return {
+    observeDirectoryEntry() {
+      progress.directoryEntries += 1;
+      if (progress.directoryEntries > limits.maximumDirectoryEntries) {
+        throw discoveryLimitError(
+          "directory_entries",
+          limits.maximumDirectoryEntries,
+          progress.directoryEntries,
+          progress,
+        );
+      }
+    },
+    observeRolloutFile() {
+      progress.rolloutFiles += 1;
+      if (progress.rolloutFiles > limits.maximumRolloutFiles) {
+        throw discoveryLimitError(
+          "rollout_files",
+          limits.maximumRolloutFiles,
+          progress.rolloutFiles,
+          progress,
+        );
+      }
+    },
+  };
+}
+
 export class CodexLogSourceChangedError extends Error {
   constructor() {
     super("Codex log source changed during scan; retry");
@@ -200,7 +251,12 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     sourceChanged();
   }
 
-  async function collectJsonlFileInfos(root, resourceGuard = null, signal = null) {
+  async function collectJsonlFileInfos(
+    root,
+    resourceGuard = null,
+    signal = null,
+    discoveryLimiter = null,
+  ) {
     const files = [];
     async function walk(directory) {
       throwIfAborted(signal);
@@ -212,12 +268,14 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       }
       for await (const entry of entries) {
         throwIfAborted(signal);
+        discoveryLimiter?.observeDirectoryEntry();
         resourceGuard?.observeDirectoryEntry();
         const path = filesystem.joinPath(directory, entry.name);
         if (entry.isDirectory()) {
           await walk(path);
         } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
           throwIfAborted(signal);
+          discoveryLimiter?.observeRolloutFile();
           const metadata = await filesystem.statPath(path);
           // Discovery walks bounded history to resolve ancestry, but charges
           // selected sources once before parsing.
@@ -305,14 +363,26 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     endAt = null,
     resourceGuard = null,
     signal = null,
+    discoveryLimits = null,
   }) {
     if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
     throwIfAborted(signal);
+    const discoveryLimiter = createDiscoveryLimiter(discoveryLimits);
     const cutoffMs = new Date(startAt).getTime();
     const endMs = endAt === null ? Number.POSITIVE_INFINITY : new Date(endAt).getTime();
     const [active, archived] = await Promise.all([
-      collectJsonlFileInfos(filesystem.joinPath(codexHome, "sessions"), resourceGuard, signal),
-      collectJsonlFileInfos(filesystem.joinPath(codexHome, "archived_sessions"), resourceGuard, signal),
+      collectJsonlFileInfos(
+        filesystem.joinPath(codexHome, "sessions"),
+        resourceGuard,
+        signal,
+        discoveryLimiter,
+      ),
+      collectJsonlFileInfos(
+        filesystem.joinPath(codexHome, "archived_sessions"),
+        resourceGuard,
+        signal,
+        discoveryLimiter,
+      ),
     ]);
     throwIfAborted(signal);
     const byName = new Map();

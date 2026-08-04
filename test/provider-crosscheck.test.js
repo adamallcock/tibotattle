@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { analyzeProviderCrosscheck } from "../src/provider-crosscheck.js";
+import {
+  analyzeProviderCrosscheck,
+  createProspectiveAccountScopedAccumulator,
+} from "../src/provider-crosscheck.js";
 import { createInitialPlanTimeline } from "../src/plan-timeline.js";
 
 const SCOPE = "openai-account:v1:0123456789abcdef0123456789abcdef0123456789a";
@@ -185,6 +188,48 @@ test("prospective collector comparison filters by account and dates plan variant
   assert.equal(scoped.byPlanVariant["pro-20x"].eventCount, 1);
   assert.equal(scoped.daily[0].officialAccountTokens, 300);
   assert.equal(scoped.daily[0].partialLocalToOfficialRatio, 0.1);
+});
+
+test("streaming prospective aggregation is parity-equivalent to the array compatibility path", () => {
+  const timeline = createInitialPlanTimeline({ scopeId: SCOPE, effectiveAt: "2026-07-23T00:00:00Z" });
+  const records = [
+    {
+      kind: "codex_rollout_usage_snapshot",
+      observedAt: "2026-07-23T12:00:00.000Z",
+      accountScope: accountSnapshot().accountScope,
+      components: { input_uncached_tokens: 25, output_text_tokens: 5 },
+    },
+    {
+      kind: "codex_rollout_usage_snapshot",
+      observedAt: "2026-07-23T12:01:00.000Z",
+      accountScope: { ...accountSnapshot().accountScope, scopeId: `openai-account:v1:${"z".repeat(43)}` },
+      components: { input_uncached_tokens: 999 },
+    },
+  ];
+  const accumulator = createProspectiveAccountScopedAccumulator({
+    accountScope: accountSnapshot().accountScope,
+    planTimeline: timeline,
+    providerPlanType: "pro",
+    startAt: localScan().startAt,
+    endAt: localScan().endAt,
+  });
+  for (const record of records) accumulator.add(record);
+  const arrayReport = analyzeProviderCrosscheck({
+    localScan: localScan(),
+    accountSnapshot: accountSnapshot(),
+    planTimeline: timeline,
+    prospectiveCollectorRecords: records,
+  });
+  const streamingReport = analyzeProviderCrosscheck({
+    localScan: localScan(),
+    accountSnapshot: accountSnapshot(),
+    planTimeline: timeline,
+    prospectiveCollectorAccumulator: accumulator,
+  });
+  assert.deepEqual(
+    streamingReport.comparisons.prospectiveAccountScoped,
+    arrayReport.comparisons.prospectiveAccountScoped,
+  );
 });
 
 test("prospective comparison never assigns one provider day across mixed plan variants", () => {

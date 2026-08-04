@@ -17,12 +17,16 @@ import { scanCodexLogEvents } from "../src/codex-log-scan.js";
 import {
   createIndexedCodexLogScan,
   inspectLocalAnalysisIndex,
+  markLocalAnalysisIndexCoveragePartial,
   refreshLocalAnalysisIndex,
 } from "../src/local-analysis-index.js";
 import {
   readReplaySafeAccountingCache,
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  writeLocalCollectorAccountingCache,
+} from "../src/local-collector-state.js";
 
 const START_AT = "2026-07-24T11:55:00.000Z";
 const END_AT = "2026-07-24T12:10:00.000Z";
@@ -391,6 +395,122 @@ test("persistent local index preserves replay-safe accounting and appends only n
   );
 });
 
+test("partial index batches retain durable cursors and resume to the exact receipt", async () => {
+  const { root, codexHome, parentPath, childPath } = await chunkedFixture({
+    includeSecondSource: true,
+  });
+  const indexFile = join(root, "local-analysis-index-v4.sqlite");
+  const secretFile = join(root, "local-analysis-index-secret-v4");
+  const legacy = await receipt(scanCodexLogEvents, codexHome);
+
+  let refreshed = null;
+  let partialPasses = 0;
+  for (let pass = 0; pass < 8; pass += 1) {
+    refreshed = await refreshLocalAnalysisIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      workerCount: 2,
+      chunkBytes: CHUNK_BYTES,
+      maximumSourcesPerRefresh: 1,
+      maximumScanBytesPerRefresh: CHUNK_BYTES,
+    });
+    const inspection = await inspectLocalAnalysisIndex({ indexFile });
+    assert.deepEqual(inspection.coverage, refreshed.coverage);
+    assert.equal(inspection.coverage.sourceCount, 2);
+    assert.equal(
+      inspection.coverage.indexedSourceCount
+        + inspection.coverage.pendingSourceCount,
+      2,
+    );
+    assert.equal(refreshed.scanBytes <= CHUNK_BYTES, true);
+    if (refreshed.coverage.status === "complete") break;
+    partialPasses += 1;
+    assert.equal(inspection.coverage.status, "partial");
+    assert.equal(inspection.coverage.pendingSourceCount > 0, true);
+    assert.equal(
+      inspection.coverage.indexedBytes < inspection.coverage.sourceBytes,
+      true,
+    );
+  }
+
+  assert.ok(refreshed);
+  assert.equal(partialPasses >= 2, true);
+  assert.deepEqual(refreshed.coverage, {
+    status: "complete",
+    sourceCount: 2,
+    indexedSourceCount: 2,
+    pendingSourceCount: 0,
+    sourceBytes: refreshed.sourceBytes,
+    indexedBytes: refreshed.sourceBytes,
+  });
+  assert.deepEqual(
+    await receipt(createIndexedCodexLogScan({
+      indexFile,
+      secretFile,
+      workerCount: 2,
+      chunkBytes: CHUNK_BYTES,
+    }), codexHome),
+    legacy,
+  );
+
+  const bytes = await readFile(indexFile);
+  for (const canary of ["PRIVATE_PARENT", "PRIVATE_CHILD", parentPath, childPath]) {
+    assert.equal(bytes.includes(Buffer.from(canary)), false);
+  }
+});
+
+test("coverage marker withholds a nominally complete archive until a fresh check clears it", async () => {
+  const { root, codexHome } = await fixture();
+  const indexFile = join(root, "local-analysis-index-coverage.sqlite");
+  const secretFile = join(root, "local-analysis-index-coverage-secret");
+  await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+
+  await markLocalAnalysisIndexCoveragePartial({
+    indexFile,
+    reason: "timeout",
+    observedAt: END_AT,
+  });
+  const blocked = (await inspectLocalAnalysisIndex({ indexFile })).coverage;
+  assert.deepEqual(blocked, {
+    status: "partial",
+    sourceCount: 2,
+    indexedSourceCount: 2,
+    pendingSourceCount: 0,
+    sourceBytes: blocked.sourceBytes,
+    indexedBytes: blocked.indexedBytes,
+    blockReason: "timeout",
+  });
+
+  const refreshed = await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  assert.equal(refreshed.coverage.status, "complete");
+  assert.equal(
+    Object.hasOwn(
+      (await inspectLocalAnalysisIndex({ indexFile })).coverage,
+      "blockReason",
+    ),
+    false,
+  );
+});
+
 test("same-size prefix rewrites invalidate a cached index even when millisecond metadata collides", async () => {
   const { root, codexHome, parentPath } = await fixture();
   // Keep the terminal 4 KiB unchanged: a tail-only boundary HMAC cannot see
@@ -453,9 +573,9 @@ test("same-size prefix rewrites invalidate a cached index even when millisecond 
   assert.notDeepEqual(refreshed, initial);
 });
 
-test("committed index projection recovers a malformed compatibility cache", async () => {
+test("the canonical SQLite accounting state never falls back to an index projection", async () => {
   const { root, codexHome } = await fixture();
-  const cacheFile = join(root, "accounting.json");
+  const stateFile = join(root, "local-collector-state-v1.sqlite");
   const indexFile = join(root, "local-analysis-index-v2.sqlite");
   const indexSecretFile = join(
     root,
@@ -463,7 +583,7 @@ test("committed index projection recovers a malformed compatibility cache", asyn
   );
   const nowMs = Date.parse(END_AT);
   const written = await refreshReplaySafeAccountingCache({
-    cacheFile,
+    stateFile,
     indexFile,
     indexSecretFile,
     codexHome,
@@ -472,12 +592,16 @@ test("committed index projection recovers a malformed compatibility cache", asyn
     indexWorkerCount: 2,
     indexChunkBytes: 4 * 1024 * 1024,
   });
-  await writeFile(cacheFile, "{malformed compatibility cache");
+  const invalid = structuredClone(written);
+  delete invalid.quotaTimeline;
+  await writeLocalCollectorAccountingCache({ stateFile, cache: invalid });
   const recovered = await readReplaySafeAccountingCache({
-    cacheFile,
-    indexFile,
+    stateFile,
     now: () => nowMs,
   });
-  assert.equal(recovered.status, "available");
-  assert.deepEqual(recovered.cache, written);
+  assert.deepEqual(recovered, {
+    status: "unavailable",
+    errorCode: "cache_invalid",
+    cache: null,
+  });
 });

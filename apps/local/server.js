@@ -15,6 +15,9 @@ import {
   refreshReplaySafeAccountingCache,
 } from "../../src/replay-safe-accounting-cache.js";
 import {
+  refreshLocalArchiveAccountingIndex,
+} from "../../src/local-archive-accounting-index.js";
+import {
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   acquireAutomaticContributionInstanceLock,
   createAutomaticContributionController,
@@ -1765,9 +1768,8 @@ function createPreparedLocalCompanionServer({
   dataStore = new LocalCompanionDataStore({
     builder: async () => buildLocalCompanionSnapshot({
       root: resourceRoot,
-      collectorFile: statePaths.collectorFile,
-      checkpointFile: statePaths.checkpointFile,
-      accountingCacheFile: statePaths.accountingCacheFile,
+      collectorStateFile: statePaths.collectorStateFile,
+      archiveIndexFile: statePaths.archiveAccountingIndexFile,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       // The owner's stated Codex speed mode. It attributes only the turns that
@@ -1783,14 +1785,13 @@ function createPreparedLocalCompanionServer({
   }),
   refreshRunner = createLocalCollectorRefreshRunner({
     codexHome,
-    dataFile: statePaths.collectorFile,
-    checkpointFile: statePaths.checkpointFile,
-    lockFile: statePaths.collectorLockFile,
-    journalFile: statePaths.collectorJournalFile,
+    stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
     refreshAccounting: refreshReplaySafeAccountingCache,
-    accountingCacheFile: statePaths.accountingCacheFile,
+    refreshArchiveIndex: refreshLocalArchiveAccountingIndex,
+    archiveIndexFile: statePaths.archiveAccountingIndexFile,
+    archiveIndexSecretFile: statePaths.archiveAccountingIndexSecretFile,
     recordCodexSpeedBaseline: async () => (
       (await codexSpeedBaseline.record()).windows
     ),

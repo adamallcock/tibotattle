@@ -233,7 +233,7 @@ const artifact = {
       {
         id: "opportunity_table",
         title: "Prioritized monitoring improvements",
-        subtitle: "Evidence and smallest useful implementation action from the retained local logs and collector ledger.",
+        subtitle: "Evidence and smallest useful implementation action from retained local logs and the SQLite collector state.",
         dataset: "opportunities",
         sourceId: "monitoring_quality",
         density: "spacious",
@@ -249,7 +249,7 @@ const artifact = {
     sources: [
       { id: "monitoring_quality", label: "Local monitoring-quality diagnostic", path: ".usage-monitor/monitoring-quality-v0.1.json" },
       { id: "local_transitions", label: "Recent local transition ledger", path: ".usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json" },
-      { id: "collector_ledger", label: "Privacy-minimized passive collector ledger", path: ".usage-monitor/collector-events.jsonl" },
+      { id: "collector_state", label: "Privacy-minimized passive collector state", path: ".usage-monitor/local-collector-state-v1.sqlite" },
       { id: "coverage_register", label: "Usage-monitor coverage gaps register", path: "docs/governance/2026-07-24-coverage-gaps-register.md" },
       { id: "agentic_pool_policy", label: "OpenAI Codex pricing and usage-limit policy", href: "https://learn.chatgpt.com/docs/pricing" },
     ],
@@ -282,7 +282,7 @@ const artifact = {
         tables_used: [
           ".usage-monitor/monitoring-quality-v0.1.json",
           ".usage-monitor/transitions-simple-current-2026-07-24-v0.3.2.json",
-          ".usage-monitor/collector-events.jsonl",
+          ".usage-monitor/local-collector-state-v1.sqlite",
         ],
         filters: [
           `dominantReset=${quality.scope.dominantSeries.resetIdentity}`,
@@ -316,15 +316,15 @@ const artifact = {
       },
     },
     {
-      id: "collector_ledger",
+      id: "collector_state",
       query: {
         engine: "node",
         language: "javascript",
-        id: "privacy-minimized-collector-v0.3",
+        id: "privacy-minimized-collector-sqlite-v1",
         sql: "SELECT kind, source, observed_at, received_at, staleness_ms, account_scope_status, speed_mode FROM local_collector_events ORDER BY observed_at",
-        description: "Append-only privacy-minimized collector records used to assess freshness and prospective metadata coverage.",
+        description: "Atomically committed privacy-minimized collector records used to assess freshness and prospective metadata coverage.",
         executed_at: quality.analyzedAt,
-        tables_used: [".usage-monitor/collector-events.jsonl"],
+        tables_used: [".usage-monitor/local-collector-state-v1.sqlite"],
       },
     },
     {

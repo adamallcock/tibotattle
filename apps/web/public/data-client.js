@@ -2105,6 +2105,78 @@ function normalizeQuota(window, index) {
   };
 }
 
+function normalizeHistoryCoverage(value = {}) {
+  const phase = [
+    "complete",
+    "idle",
+    "awaiting_resume",
+    "not_started",
+    "invalid",
+  ].includes(value?.phase)
+    ? value.phase
+    : "not_started";
+  const sourceCount = count(value?.sourceCount, null);
+  const indexedSourceCount = count(value?.indexedSourceCount, null);
+  const pendingSourceCount = count(value?.pendingSourceCount, null);
+  const sourceBytes = count(value?.sourceBytes, null);
+  const indexedBytes = count(value?.indexedBytes, null);
+  const generatedAt = canonicalInstant(value?.generatedAt);
+  const coveredStartAt = canonicalInstant(value?.coveredAt?.startAt);
+  const coveredEndAt = canonicalInstant(value?.coveredAt?.endAt);
+  const errorCode = [
+    "archive_directory_entries",
+    "archive_rollout_files",
+    "archive_timeout",
+    "archive_interrupted",
+    "archive_disk_space",
+    "archive_storage_unavailable",
+    "archive_index_unavailable",
+  ].includes(value?.errorCode)
+    ? value.errorCode
+    : null;
+  const coherent = sourceCount !== null
+    && indexedSourceCount !== null
+    && pendingSourceCount !== null
+    && indexedSourceCount + pendingSourceCount === sourceCount
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && indexedBytes <= sourceBytes;
+  // “Complete” is a claim about the whole archive, so a malformed or
+  // internally inconsistent browser payload must fail closed to partial.
+  const complete = value?.status === "complete"
+    && ["complete", "idle"].includes(phase)
+    && errorCode === null
+    && coherent
+    && indexedSourceCount === sourceCount
+    && pendingSourceCount === 0
+    && indexedBytes === sourceBytes
+    && generatedAt !== null
+    && coveredStartAt !== null
+    && coveredEndAt !== null
+    && Date.parse(coveredEndAt) >= Date.parse(coveredStartAt);
+  return {
+    status: complete ? "complete" : "partial",
+    phase,
+    sourceCount: sourceCount ?? 0,
+    indexedSourceCount: sourceCount === null || indexedSourceCount === null
+      ? 0
+      : Math.min(indexedSourceCount, sourceCount),
+    pendingSourceCount: sourceCount === null || pendingSourceCount === null
+      ? 0
+      : Math.min(pendingSourceCount, sourceCount),
+    sourceBytes: sourceBytes ?? 0,
+    indexedBytes: sourceBytes === null || indexedBytes === null
+      ? 0
+      : Math.min(indexedBytes, sourceBytes),
+    generatedAt: generatedAt ?? "",
+    errorCode,
+    coveredAt: {
+      startAt: coveredStartAt ?? "",
+      endAt: coveredEndAt ?? "",
+    },
+  };
+}
+
 function normalizePricing(pricing = {}) {
   const source = pricing?.components ?? pricing?.componentTotals ?? {};
   const priceEpochBasis = text(pricing?.priceEpochBasis, "");
@@ -2163,6 +2235,7 @@ function normalizePricing(pricing = {}) {
     })),
     accountingSource: text(pricing?.accountingSource, "unknown"),
     accountingCacheStatus: text(pricing?.accountingCacheStatus, "unknown"),
+    historyCoverage: normalizeHistoryCoverage(pricing?.historyCoverage),
     replayExclusionDiagnostics: {
       filesScanned: count(pricing?.replayExclusionDiagnostics?.filesScanned, 0),
       forkReplayEventsExcluded: count(
@@ -3450,7 +3523,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       demoAccountingPeriod("24h", "Last 24 hours", .131),
       demoAccountingPeriod("7d", "Last 7 days", 1),
       demoAccountingPeriod("30d", "Last 30 days", 2.15),
-      demoAccountingPeriod("all", "All retained evidence", 2.62)
+      demoAccountingPeriod("all", "Cached 31-day window", 2.62)
     ]
   };
   return normalizeDashboardPayload({

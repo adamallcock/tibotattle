@@ -5,6 +5,11 @@ import { lstat, open } from "node:fs/promises";
 import { resolve } from "node:path";
 import { priceCodexUsageEvent } from "@app-usagemonitor/accounting";
 import { readBoundedUtf8LineEntries } from "../../src/bounded-jsonl.js";
+import {
+  defaultLocalCollectorStatePath,
+  forEachLocalCollectorRecord,
+  prepareLocalCollectorState,
+} from "../../src/local-collector-state.js";
 import { buildProspectiveCollectorTransitions } from "../../src/prospective-collector-transitions.js";
 import { writeJsonOwnerOnlyAtomic } from "../../src/storage.js";
 
@@ -18,6 +23,10 @@ function option(name, fallback) {
   const value = process.argv[index + 1];
   if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
   return value;
+}
+
+function hasOption(name) {
+  return process.argv.includes(name);
 }
 
 function fixedFailure(error) {
@@ -99,6 +108,21 @@ async function readCollectorRecords(path) {
   return records;
 }
 
+async function readCollectorStateRecords(stateFile) {
+  await prepareLocalCollectorState({ stateFile });
+  const records = [];
+  await forEachLocalCollectorRecord({
+    stateFile,
+    onRecord: async (record) => {
+      if (records.length >= MAXIMUM_SOURCE_LINES) {
+        throw new Error("prospective state exceeds the bounded record policy");
+      }
+      records.push(record);
+    },
+  });
+  return records;
+}
+
 function standardApiPriceEquivalent(record) {
   const priced = priceCodexUsageEvent({
     ...record,
@@ -112,15 +136,26 @@ function standardApiPriceEquivalent(record) {
 }
 
 async function main() {
-  const inputFile = resolve(option(
-    "--input",
-    ".usage-monitor/collector-events.jsonl",
-  ));
+  const inputSelected = hasOption("--input");
+  const stateSelected = hasOption("--state-file");
+  if (inputSelected && stateSelected) {
+    throw new Error("prospective source selection is ambiguous");
+  }
+  const inputFile = inputSelected
+    ? resolve(option("--input", null))
+    : null;
+  const stateFile = stateSelected
+    ? resolve(option("--state-file", null))
+    : defaultLocalCollectorStatePath();
   const outputFile = resolve(option(
     "--output",
     ".usage-monitor/prospective-account-transitions-v0.1.json",
   ));
-  const records = await readCollectorRecords(inputFile);
+  // SQLite is the normal collector source. `--input` remains an explicit
+  // external JSONL import for historical research, never a managed fallback.
+  const records = inputFile === null
+    ? await readCollectorStateRecords(stateFile)
+    : await readCollectorRecords(inputFile);
   const result = buildProspectiveCollectorTransitions(records, {
     priceUsage: standardApiPriceEquivalent,
   });

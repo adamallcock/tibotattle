@@ -266,6 +266,61 @@ test("discovery preserves unbounded lineage reads while scan passes use the disc
   }
 });
 
+test("discovery limits fail closed with content-free progress", async () => {
+  const archivedRoot = `${VIRTUAL_CODEX_HOME}/archived_sessions`;
+  const privateSecondName = "rollout-2026-07-24T12-00-01-private-limit-canary.jsonl";
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => asyncEntries(path === archivedRoot
+        ? [{
+          name: ROLLOUT_NAME,
+          isDirectory: () => false,
+          isFile: () => true,
+        }, {
+          name: privateSecondName,
+          isDirectory: () => false,
+          isFile: () => true,
+        }]
+        : []),
+      statPath: async () => ({
+        dev: 12,
+        ino: 34,
+        size: 6789,
+        mtimeMs: Date.parse("2026-07-24T12:30:00.000Z"),
+        ctimeMs: Date.parse("2026-07-24T12:30:00.000Z"),
+        birthtimeMs: Date.parse("2026-07-24T12:00:00.000Z"),
+      }),
+    }),
+    lineReader: completeLineReader(),
+  });
+
+  await assert.rejects(
+    scanner.discoverCodexRolloutInfos({
+      startAt: START_AT,
+      endAt: END_AT,
+      discoveryLimits: {
+        maximumDirectoryEntries: 10,
+        maximumRolloutFiles: 1,
+      },
+    }),
+    (error) => {
+      assert.equal(error?.name, "CodexLogDiscoveryLimitError");
+      assert.equal(error?.code, "codex_log_discovery_rollout_files");
+      assert.deepEqual(error?.resourceLimit, {
+        dimension: "rollout_files",
+        limit: 1,
+        observed: 2,
+      });
+      assert.deepEqual(error?.discoveryProgress, {
+        directoryEntries: 2,
+        rolloutFiles: 2,
+      });
+      assert.equal(error?.message.includes(privateSecondName), false);
+      return true;
+    },
+  );
+});
+
 function activeSourceFixture({ appendError = null } = {}) {
   const prefix = Buffer.from(`${scanLines().join("\n")}\n`, "utf8");
   const appended = Buffer.from(`${JSON.stringify({
