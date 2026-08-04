@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#082f2a">
+    <meta
+      name="description"
+      content="A plain-language overview of TiboTattle's local dashboard, optional contribution, and delayed community aggregates."
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="TiboTattle Privacy Overview">
+    <meta
+      property="og:description"
+      content="How TiboTattle keeps personal Codex usage local and publishes only reviewed aggregate community evidence."
+    >
+    <title>TiboTattle Privacy Overview</title>
+    <link rel="icon" type="image/png" href="./tibotattle-icon.png">
+    <link rel="apple-touch-icon" href="./tibotattle-icon.png">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body class="community-site resource-site">
+    <a class="skip-link" href="#main">Skip to privacy overview</a>
+
+    <header class="topbar">
+      <a class="brand" href="./community.html" aria-label="TiboTattle home">
+        <img class="brand-icon" src="./tibotattle-icon.png" alt="" width="42" height="42">
+        <span>TiboTattle</span>
+      </a>
+      <nav class="primary-nav" aria-label="Public resources">
+        <a href="./community.html">Home</a>
+        <a href="./docs.html">Docs</a>
+        <a href="./privacy.html" aria-current="page">Privacy</a>
+      </nav>
+      <a class="header-download" href="./community.html#download">
+        <img src="./apple.svg" alt="" width="14" height="14">
+        <span>Download</span>
+      </a>
+    </header>
+
+    <main class="resource-main" id="main" tabindex="-1">
+      <header class="resource-heading">
+        <p class="eyebrow">Privacy overview</p>
+        <h1>Your dashboard belongs on your Mac.</h1>
+        <p class="resource-lede">
+          TiboTattle separates personal analysis from public community evidence.
+          Local usage remains useful without an account or contribution.
+        </p>
+      </header>
+
+      <div class="resource-grid">
+        <article class="resource-card" id="website">
+          <h2>Public website</h2>
+          <p>
+            This website cannot read local Codex files. It serves product
+            information, the signed-download state, and a reviewed aggregate
+            community snapshot when one is available.
+          </p>
+        </article>
+        <article class="resource-card" id="app">
+          <h2>Mac app</h2>
+          <p>
+            TiboTattle reads content-free usage and quota metadata locally.
+            Personal scans, API-equivalent pricing, and dashboard history stay
+            on the Mac that calculated them.
+          </p>
+        </article>
+        <article class="resource-card" id="contribution">
+          <h2>Optional contribution</h2>
+          <p>
+            Nothing is contributed unless you review and opt in. A contribution
+            contains bounded, content-free observations rather than prompts,
+            responses, file contents, or personal dashboard history.
+          </p>
+        </article>
+        <article class="resource-card" id="publication">
+          <h2>Community publication</h2>
+          <p>
+            Public figures are delayed, capped per contributor, rounded, and
+            withheld unless enough independent support passes privacy and
+            quality review. Failed or weak evidence stays unavailable.
+          </p>
+        </article>
+      </div>
+
+      <nav class="resource-actions" aria-label="Privacy actions">
+        <a class="button button-primary" href="./community.html#download">Get TiboTattle</a>
+        <a class="button button-secondary" href="./docs.html">Read the docs</a>
+      </nav>
+    </main>
+
+    <footer>
+      <div class="footer-copy">
+        <span class="footer-brand">
+          <img src="./tibotattle-icon.png" alt="" width="28" height="28">
+          <strong>TiboTattle</strong>
+        </span>
+        <p>Local-first and independent. Not affiliated with OpenAI.</p>
+      </div>
+      <nav class="footer-links" aria-label="Find TiboTattle online">
+        <a class="footer-resource" href="./docs.html">Docs</a>
+        <a class="footer-resource" href="./privacy.html" aria-current="page">Privacy</a>
+        <a
+          class="footer-social"
+          href="https://github.com/adamallcock"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="GitHub (opens in a new tab)"
+        >
+          <img src="./github.svg" alt="" width="16" height="16">
+          <span class="footer-social-label">GitHub</span>
+        </a>
+        <a
+          class="footer-social"
+          href="https://x.com/adamallcock"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="X (opens in a new tab)"
+        >
+          <img src="./x.svg" alt="" width="15" height="15">
+          <span class="footer-social-label">X</span>
+        </a>
+      </nav>
+    </footer>
+  </body>
+</html>

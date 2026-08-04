@@ -84,6 +84,7 @@ async function loadCommunitySnapshot() {
     estimateStates: [$("#community-estimate-panel-state")],
     payload,
   });
+  $("#community").dataset.communityState = state;
   if (failure === null) {
     setServiceState(
       state === "not_yet_published"

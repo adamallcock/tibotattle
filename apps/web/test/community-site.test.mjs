@@ -26,6 +26,8 @@ import {
 
 const SITE_HTML = new URL("../public/community.html", import.meta.url);
 const SITE_SOURCE = new URL("../public/community.js", import.meta.url);
+const DOCS_HTML = new URL("../public/docs.html", import.meta.url);
+const PRIVACY_HTML = new URL("../public/privacy.html", import.meta.url);
 const APP_HTML = new URL("../public/index.html", import.meta.url);
 const APP_SOURCE = new URL("../public/app.js", import.meta.url);
 
@@ -292,7 +294,8 @@ test("the public community client exposes one read-only aggregate request", asyn
 test("the first visit leads with the product, combined Mac action, and named estimate gate", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
-  assert.match(html, /TiboTattle is a local-first Mac app that turns Codex usage metadata/u);
+  assert.match(html, /local-first Mac app for understanding personal Codex\s+usage/u);
+  assert.match(html, /estimates your seven-day allowance in API-equivalent terms/u);
   assert.match(html, /Download for macOS/u);
   assert.match(html, /Already installed\?/u);
   assert.match(html, /Open TiboTattle/u);
@@ -306,7 +309,9 @@ test("the first visit leads with the product, combined Mac action, and named est
   assert.match(html, /Your dashboard is calculated privately on your Mac\./u);
   assert.match(html, /href="https:\/\/github\.com\/adamallcock"/u);
   assert.match(html, /href="https:\/\/x\.com\/adamallcock"/u);
-  assert.match(html, />\s*X\s*<\/a>/u);
+  assert.match(html, /footer-social-label">X<\/span>/u);
+  assert.match(html, /href="\.\/docs\.html">Docs<\/a>/u);
+  assert.match(html, /href="\.\/privacy\.html">Privacy<\/a>/u);
   assert.doesNotMatch(
     html,
     /github\.com\/adamallcock\/(?:app-usagemonitor|tibotattle-client)/u,
@@ -360,6 +365,48 @@ test("the public header and footer stay compact on narrow screens", async () => 
     styles,
     /@media \(max-width: 420px\) \{[\s\S]*?\.community-site footer \{[\s\S]*?flex-direction: column;/u,
   );
+});
+
+test("unavailable community evidence uses the compact public state", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const source = await readFile(SITE_SOURCE, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  assert.match(html, /data-community-state="checking"/u);
+  assert.match(html, /<h2 id="community-title">Community seven-day estimate<\/h2>/u);
+  assert.match(
+    html,
+    /Published only when delayed, aggregate evidence passes privacy and quality checks\./u,
+  );
+  assert.match(source, /\.dataset\.communityState = state;/u);
+  assert.match(styles, /\[data-community-state="service_unavailable"\]/u);
+  assert.match(styles, /\[data-community-state="not_yet_published"\]/u);
+  assert.match(
+    styles,
+    /@media \(max-width: 1120px\) \{[\s\S]*?\.community-site \.community-proof\[data-community-state\] \.community-proof-heading \{\s*grid-template-columns: 1fr;/u,
+  );
+});
+
+test("the public guidance pages are useful stubs without app-only controls", async () => {
+  const docs = await readFile(DOCS_HTML, "utf8");
+  const privacy = await readFile(PRIVACY_HTML, "utf8");
+  assert.match(docs, /<title>TiboTattle Docs<\/title>/u);
+  assert.match(
+    docs,
+    /Estimated API-equivalent value of the observed seven-day allowance\./u,
+  );
+  assert.match(docs, /Activity totals alone are never presented as an allowance\./u);
+  assert.match(privacy, /<title>TiboTattle Privacy Overview<\/title>/u);
+  assert.match(privacy, /This website cannot read local Codex files\./u);
+  assert.match(privacy, /Nothing is contributed unless you review and opt in\./u);
+  for (const page of [docs, privacy]) {
+    assert.match(page, /href="\.\/community\.html#download"/u);
+    assert.match(page, /href="\.\/docs\.html"/u);
+    assert.match(page, /href="\.\/privacy\.html"/u);
+    assert.doesNotMatch(
+      page,
+      /<script|id="contribution-form"|id="identity-signin"|id="quota-cards"|\/api\/local/u,
+    );
+  }
 });
 
 test("both browser entry points share one community renderer and one install card", async () => {

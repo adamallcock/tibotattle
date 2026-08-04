@@ -47,6 +47,10 @@ const SITE_ENTRY_MODULE_BASENAME = "community.js";
  * that can never make them work.
  */
 const SITE_INDEX_SOURCE_BASENAME = "community.html";
+const PUBLIC_AUXILIARY_PAGE_BASENAMES = Object.freeze([
+  "docs.html",
+  "privacy.html",
+]);
 /**
  * Defense-in-depth absence ledger for the in-app dashboard surface. The
  * release is selected from the public module and asset closures below; these
@@ -718,23 +722,41 @@ async function fileManifest(root, { excludedFiles = new Set() } = {}) {
   return rows;
 }
 
-function localPublicReferences(source, { css = false } = {}) {
-  const pattern = css
-    ? /url\(\s*["']?\.\/([^"'()?#]+)(?:[?#][^"'()]*)?["']?\s*\)/gu
-    : /\b(?:href|src)="\.\/([^"?#]+)(?:[?#][^"]*)?"/gu;
+function localPublicReferences(
+  source,
+  { allowEntryModule = false, css = false } = {},
+) {
+  const candidates = css
+    ? [...source.matchAll(
+      /url\(\s*["']?\.\/([^"'()?#]+)(?:[?#][^"'()]*)?["']?\s*\)/gu,
+    )].map((match) => match[1])
+    : [...source.matchAll(
+      /\b(?:href|src)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gu,
+    )]
+      .map((match) => match[1] ?? match[2] ?? match[3])
+      .filter((value) => value.startsWith("./"))
+      .map((value) => value.slice(2).split(/[?#]/u, 1)[0]);
   const references = new Set();
-  for (const match of source.matchAll(pattern)) {
-    const name = match[1];
+  for (const name of candidates) {
     if (!name
         || name.includes("/")
         || name.includes("\\")
-        || ![".css", ".ico", ".jpeg", ".jpg", ".js", ".png", ".svg", ".webp"]
+        || ![".css", ".html", ".ico", ".jpeg", ".jpg", ".js", ".png", ".svg", ".webp"]
           .includes(extname(name).toLowerCase())) {
       throw new TypeError(`Public source contains an unreviewed local reference: ${name}`);
     }
-    if (extname(name).toLowerCase() === ".js"
-        && name !== SITE_ENTRY_MODULE_BASENAME) {
+    const extension = extname(name).toLowerCase();
+    if (extension === ".js"
+        && (!allowEntryModule || name !== SITE_ENTRY_MODULE_BASENAME)) {
       throw new TypeError(`Public HTML may load only ${SITE_ENTRY_MODULE_BASENAME}`);
+    }
+    if (extension === ".html"
+        && name !== SITE_INDEX_SOURCE_BASENAME
+        && !PUBLIC_AUXILIARY_PAGE_BASENAMES.includes(name)) {
+      throw new TypeError(`Public source contains an unreviewed HTML page: ${name}`);
+    }
+    if (APP_ONLY_SOURCE_BASENAMES.includes(name)) {
+      throw new TypeError(`Public source references an app-only asset: ${name}`);
     }
     references.add(name);
   }
@@ -748,6 +770,26 @@ function localPublicReferences(source, { css = false } = {}) {
  * macOS client. This makes both accidental app-client imports and symlink
  * escapes release-time failures.
  */
+function renderAuxiliaryPublicHtml(sourceHtml) {
+  return sourceHtml.replace(
+    /\bhref\s*=\s*(?:"(\.\/community\.html(?:[?#][^"]*)?)"|'(\.\/community\.html(?:[?#][^']*)?)'|(\.\/community\.html(?:[?#][^\s"'=<>`]*)?))/gu,
+    (_attribute, doubleQuoted, singleQuoted, unquoted) => {
+      const value = doubleQuoted ?? singleQuoted ?? unquoted;
+      const rendered = value.replace("./community.html", "./index.html");
+      if (doubleQuoted !== undefined) return `href="${rendered}"`;
+      if (singleQuoted !== undefined) return `href='${rendered}'`;
+      return `href=${rendered}`;
+    },
+  );
+}
+
+function assertStaticAuxiliaryPublicHtml(sourceHtml, basename) {
+  if (/<script\b/iu.test(sourceHtml)) {
+    throw new TypeError(
+      `Public auxiliary page must be static and script-free: ${basename}`,
+      );
+  }
+}
 async function collectPublicSourceFiles({ source, sourceHtml }) {
   const sourceParent = dirname(source);
   const entrypoint = `${relative(sourceParent, source).split(sep).join("/")}/${SITE_ENTRY_MODULE_BASENAME}`;
@@ -757,12 +799,15 @@ async function collectPublicSourceFiles({ source, sourceHtml }) {
     repositoryRoot: sourceParent,
   });
   const files = new Set(moduleGraph.files.map((file) => resolve(file)));
-  const pending = [...localPublicReferences(sourceHtml)];
+  const pending = [
+    ...localPublicReferences(sourceHtml, { allowEntryModule: true }),
+  ];
   const inspected = new Set();
   while (pending.length > 0) {
     const name = pending.pop();
     if (inspected.has(name)) continue;
     inspected.add(name);
+    if (name === SITE_INDEX_SOURCE_BASENAME) continue;
     const path = resolve(join(source, name));
     await regularFile(path, `Referenced public source ${name}`);
     files.add(path);
@@ -772,6 +817,10 @@ async function collectPublicSourceFiles({ source, sourceHtml }) {
         throw new TypeError("Public CSS imports must be bundled before release");
       }
       pending.push(...localPublicReferences(css, { css: true }));
+    } else if (extname(name).toLowerCase() === ".html") {
+      const html = await readFile(path, "utf8");
+      assertStaticAuxiliaryPublicHtml(html, name);
+      pending.push(...localPublicReferences(html));
     }
   }
   return [...files].sort((left, right) =>
@@ -877,7 +926,17 @@ export async function buildPublicReleaseSite(rawArgs, {
       relative(options.source, sourceFile),
     );
     await mkdir(dirname(outputFile), { recursive: true });
-    await copyFile(sourceFile, outputFile);
+    if (extname(sourceFile).toLowerCase() === ".html") {
+      const auxiliaryHtml = renderAuxiliaryPublicHtml(
+        await readFile(sourceFile, "utf8"),
+      );
+      await writeFile(outputFile, auxiliaryHtml, {
+        encoding: "utf8",
+        mode: 0o644,
+      });
+    } else {
+      await copyFile(sourceFile, outputFile);
+    }
   }
   await writeFile(join(options.output, "index.html"), releaseHtml, {
     encoding: "utf8",

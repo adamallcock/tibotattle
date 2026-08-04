@@ -211,3 +211,34 @@ The corrected release policy is an allowlist derived from the public entry:
 The app keeps `CommunityClient`, `LocalCompanionClient`, sign-in, contribution,
 and deletion behavior unchanged through `data-client.js`; it re-exports the
 shared snapshot normalizer so existing app imports remain compatible.
+
+## Public guidance and compact-state revision
+
+Final first-visit review accepted three bounded follow-ups. The product copy
+will name the personal result as an estimated **API-equivalent value** rather
+than an unspecified seven-day estimate. Community states with no released
+activity will use a shorter heading, tighter spacing, and the existing closed
+method disclosure; released community activity keeps the fuller evidence
+surface.
+
+The user also authorized useful public Docs and Privacy stubs. These are static,
+account-free pages that explain startup, the local dashboard boundary, optional
+contribution, and delayed aggregate publication without importing any app,
+identity, contribution, or local-companion JavaScript. The landing footer links
+to both pages while GitHub continues to point to the public profile until a
+specific product repository is approved for public access.
+
+The release builder treats `docs.html` and `privacy.html` as the only approved
+auxiliary HTML pages. It recursively closes over their referenced public assets,
+rejects any other HTML page or script entry, rewrites source-preview home links
+from `community.html` to the released `index.html`; release tests scan every
+published page for dashboard-only controls and capabilities.
+
+Final rendered verification used 1443×962 and 391×752 CSS viewports. The wide
+hero retained equal columns; the phone layout had no horizontal overflow, a
+single-column 398px unavailable-community block, and a 94px footer. The full
+phone landing measured 2,014px after the responsive fix, down from the broken
+2,135px render. Docs and Privacy both rendered as single-column static pages,
+and the Docs → Privacy → Download path returned to the landing-page install
+anchor. Architecture, web, release, browser-serving, exporter, and macOS bundle
+checks all passed; no release or deployment operation was run.
