@@ -321,6 +321,11 @@ function fakeRemote({
           primary_cooldown_retention_index: 1,
           primary_cooldown_retention_index_shape: 1,
           primary_cooldown_guard_trigger: 1,
+          primary_identity_link_secret_configuration_table: 1,
+          primary_identity_link_secret_configuration_singleton: 1,
+          primary_identity_link_secret_configuration_key_version: 1,
+          primary_identity_link_secret_configuration_secret_fingerprint: 1,
+          primary_identity_link_secret_configuration_recorded_at: 1,
         });
       }
       if (command.includes("FROM collection_controls")) {
