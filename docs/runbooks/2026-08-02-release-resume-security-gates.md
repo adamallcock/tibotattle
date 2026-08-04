@@ -98,10 +98,21 @@ placeholders, and do not put the values in the repository.
 2. From that clean tag, run the normal local verification and
    `npm --prefix apps/worker run production:deploy:dry`. Deploy the Worker
    separately only when a new reviewed service change requires it.
-3. Verify live `/api/health`, `/api/ready`, the exact custom-domain callback
+3. Run the localization gate: native and browser catalog parity, placeholder
+   integrity, locale fallback/override tests, bundle resource inclusion, and
+   a rendered English/`zh-Hans`/Spanish check of the language picker. Confirm
+   that no language-selection path reloads the existing local dashboard or
+   changes privacy, refresh, event-time, accounting, or provider-data
+   behavior. Run the raw-data boundary, plural, RTL-fixture, and
+   pseudo-localized expansion checks. Record the clean-profile packaged-AppKit
+   system-language, text-expansion, and VoiceOver check separately if it is
+   not performed by this release run, and do not claim human translation
+   quality until native speakers review the privacy, deletion, security, and
+   background-process copy.
+4. Verify live `/api/health`, `/api/ready`, the exact custom-domain callback
    boundary, and a full Google/Apple sign-in completion without inspecting or
    logging provider tokens.
-4. Build, Developer-ID sign, notarize, staple, and validate the macOS DMG from
+5. Build, Developer-ID sign, notarize, staple, and validate the macOS DMG from
    the tagged source. The release manifest must contain the matching commit
    and tag.
 5. Complete the signed, `/Applications` Login Item lifecycle rehearsal below

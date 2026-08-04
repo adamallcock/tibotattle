@@ -185,29 +185,43 @@ level, file ordering inputs, and timestamps. A Developer ID timestamp and
 Apple's disk-image tooling make byte-for-byte identity across release machines
 an invalid promise; the command records the resulting SHA-256 instead.
 
-## Localization and regionalization foundation
+## Localization and regionalization
 
-Native strings live in `Resources/en.lproj/Localizable.strings` under stable
-`menu.*`, `settings.*`, and `notification.*` keys. `Sources/Localization.swift` follows the
-macOS preferred-language list, falls back to the English catalog when a locale
-or key is unavailable, and uses `Locale.current` for dates and numbers. Add a
-complete sibling locale such as `fr.lproj` only when its catalog and dashboard
-copy are ready together.
+TiboTattle ships English (`en-US`), Simplified Chinese (`zh-Hans`), and
+Spanish (`es`) for product-owned native and browser copy. General settings has
+a persisted **Language** picker; it defaults to the Mac's preferred language
+and falls back safely to English. `zh-TW`, `zh-Hant`, and an ambiguous `zh`
+request do not select the Simplified Chinese catalog.
 
-The build records these resources in the source digest and copies them both to
-the app bundle root and to `Contents/Resources/app/localization/`, where the
-embedded loopback dashboard can consume the same catalog later. At document
-start, the WebKit host also exposes the versioned
-`window.__TIBOTATTLE_LOCALIZATION__` handoff with the preferred-language list
-and resource root; the current dashboard leaves it unused until its resolver
-is ready. The current release intentionally has no language picker: English is
-the only shipped translation, so the effective preference remains **System
-default** with a safe English fallback. The implementation/next-locale gate
-is recorded in
-[`docs/decisions/2026-08-03-macos-localization-foundation.md`](../../docs/decisions/2026-08-03-macos-localization-foundation.md).
-General settings exposes this current behavior as a read-only **Language —
-System** row; it has no picker or override while English is the only shipped
-translation.
+Native strings live under stable `menu.*`, `settings.*`, and `notification.*`
+keys. Add another locale only when its native catalog and dashboard copy are
+complete together.
+
+Native resources live in `Resources/{en,zh-Hans,es}.lproj/Localizable.strings`.
+The build records them in the source digest and copies them both to the app
+bundle root and to `Contents/Resources/app/localization/`. The WebKit host
+injects the versioned `window.__TIBOTATTLE_LOCALIZATION__` handoff and accepts
+only a closed language-preference message; a selection updates the loaded
+dashboard without resetting its local/hosted sign-in state.
+
+Before each later loopback-document load, the host refreshes its document-start
+handoff so the newly loaded dashboard receives the current native choice. The
+browser surface confines legacy exact-text translation to explicit product
+roots and marks provider, report, identity, JSON, file, SVG, and diagnostic
+values as raw. A language choice never reinterprets those values as UI copy.
+The picker announces changes to assistive technology; pseudo-localization is a
+test-only expansion fixture, not a shipped language.
+
+Launcher recovery, first-run updater disclosures, Codex-source summaries,
+menu-bar unavailable states, and the native status-icon accessibility label
+use the same closed catalog. A missing companion therefore has the same
+selected-language behavior as the ordinary dashboard and settings controls.
+
+Language choice never changes event time zones, pricing/accounting values, or
+provider data: native formatting follows `Locale.current`, and web formatting
+uses `Intl` with the regional locale. Translation provenance, contributor
+workflow, test requirements, and the future-locale checklist are in
+[`docs/decisions/2026-08-03-localization-system.md`](../../docs/decisions/2026-08-03-localization-system.md).
 
 ## Preview distribution build
 

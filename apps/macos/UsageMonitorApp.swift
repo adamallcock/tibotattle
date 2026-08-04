@@ -190,7 +190,7 @@ private final class AppUpdater {
         alert.informativeText = TiboTattleLocalization.string(
             .settingsPreviewUpdatesPendingMessage
         )
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
         alert.runModal()
     }
 
@@ -238,15 +238,23 @@ private final class AppUpdater {
 
     var firstRunUpdatesDisclosure: String {
         guard isAvailable else {
-            return "This development build does not include update checks. Signed releases installed in Applications can check for updates from About."
+            return TiboTattleLocalization.string(
+                .settingsUpdateDisclosureDevelopment
+            )
         }
         if Self.isPreviewDistribution {
-            return "This preview uses manual signed-update checks. It does not check, download, or install updates automatically."
+            return TiboTattleLocalization.string(
+                .settingsUpdateDisclosurePreview
+            )
         }
         if allowsAutomaticUpdateOptIn && automaticUpdatesEnabled {
-            return "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → General."
+            return TiboTattleLocalization.string(
+                .settingsUpdateDisclosureAutomaticOn
+            )
         }
-        return "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
+        return TiboTattleLocalization.string(
+            .settingsUpdateDisclosureAutomaticOff
+        )
     }
 }
 
@@ -331,47 +339,68 @@ private enum LauncherError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidCentralService:
-            return "The bundled community-service connection is invalid."
+            return TiboTattleLocalization.string(.launcherErrorInvalidCentralService)
         case .invalidCodexHome:
-            return "The selected Codex folder is unavailable or unsafe."
+            return TiboTattleLocalization.string(.launcherErrorInvalidCodexHome)
         case .invalidCodexHomeSettings:
-            return "The saved Codex folder setting is unavailable or unsafe."
+            return TiboTattleLocalization.string(
+                .launcherErrorInvalidCodexHomeSettings
+            )
         case .invalidFirstRunState:
-            return "The saved first-run acknowledgement is unavailable or unsafe."
+            return TiboTattleLocalization.string(
+                .launcherErrorInvalidFirstRunState
+            )
         case .invalidHome:
-            return "The current home directory is unavailable."
+            return TiboTattleLocalization.string(.launcherErrorInvalidHome)
         case .invalidResource:
-            return "The bundled local companion is incomplete."
+            return TiboTattleLocalization.string(.launcherErrorInvalidResource)
         case .invalidStateDirectory:
-            return "The private \(BundledProduct.displayName) data directory is unavailable."
+            return TiboTattleLocalization.format(
+                .launcherErrorInvalidStateDirectory,
+                BundledProduct.displayName
+            )
         case .companionAlreadyRunning:
-            return "Another \(BundledProduct.displayName) window is already using this Mac's local data."
+            return TiboTattleLocalization.format(
+                .launcherErrorCompanionAlreadyRunning,
+                BundledProduct.displayName
+            )
         case .companionExited:
-            return "The local companion stopped before it became ready."
+            return TiboTattleLocalization.string(.launcherErrorCompanionExited)
         case .companionLaunch:
-            return "The local companion could not be started."
+            return TiboTattleLocalization.string(.launcherErrorCompanionLaunch)
         case .companionTimeout:
-            return "The local companion did not become ready in time."
+            return TiboTattleLocalization.string(.launcherErrorCompanionTimeout)
         case .codexHomeSettingsWrite:
-            return "The selected Codex folder could not be saved privately."
+            return TiboTattleLocalization.string(
+                .launcherErrorCodexHomeSettingsWrite
+            )
         case .dashboardDownloadFailed:
-            return "The dashboard could not save that file to your Downloads folder."
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardDownloadFailed
+            )
         case .dashboardWebViewUnavailable:
-            return "The in-app dashboard view could not be displayed."
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardWebViewUnavailable
+            )
         case .dataErase:
-            return "The local \(BundledProduct.displayName) data could not be moved to Trash."
+            return TiboTattleLocalization.format(
+                .launcherErrorDataErase,
+                BundledProduct.displayName
+            )
         case .firstRunStateWrite:
-            return "The first-run acknowledgement could not be saved privately."
+            return TiboTattleLocalization.string(
+                .launcherErrorFirstRunStateWrite
+            )
         case .healthCheck:
-            return "The local companion health check failed."
+            return TiboTattleLocalization.string(.launcherErrorHealthCheck)
         case .keychainDenied:
-            return "macOS did not allow the requested Keychain reset."
+            return TiboTattleLocalization.string(.launcherErrorKeychainDenied)
         case .keychainLocked:
-            return "The login Keychain is locked."
+            return TiboTattleLocalization.string(.launcherErrorKeychainLocked)
         case .keychainReset:
-            return "The local identity and device reset did not finish."
+            return TiboTattleLocalization.string(.launcherErrorKeychainReset)
         case .keychainResetPartial:
-            return "The local identity and device reset finished only partially."
+            return TiboTattleLocalization.string(.launcherErrorKeychainResetPartial)
         }
     }
 
@@ -425,31 +454,55 @@ private enum LauncherError: LocalizedError {
     var recoverySuggestion: String {
         switch self {
         case .invalidCentralService, .invalidResource:
-            return "Reinstall this signed \(BundledProduct.displayName) build."
+            return TiboTattleLocalization.format(
+                .launcherRecoveryReinstall,
+                BundledProduct.displayName
+            )
         case .invalidCodexHome, .invalidCodexHomeSettings:
-            return "Choose Codex Source and select a readable Codex home, or restore the default."
+            return TiboTattleLocalization.string(
+                .launcherRecoveryChooseCodexHome
+            )
         case .invalidFirstRunState:
-            return "Move the \(BundledProduct.displayName) app-state folder to Trash, then reopen the app."
+            return TiboTattleLocalization.format(
+                .launcherRecoveryMoveAppState,
+                BundledProduct.displayName
+            )
         case .invalidHome, .invalidStateDirectory, .codexHomeSettingsWrite,
              .firstRunStateWrite:
-            return "Check access to your home and Application Support folders, then retry."
+            return TiboTattleLocalization.string(.launcherRecoveryCheckAccess)
         case .dashboardDownloadFailed:
-            return "Check access to your Downloads folder, then save the file again."
+            return TiboTattleLocalization.string(
+                .launcherRecoveryDashboardDownload
+            )
         case .dashboardWebViewUnavailable:
-            return "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
+            return TiboTattleLocalization.string(
+                .launcherRecoveryDashboardWebView
+            )
         case .companionAlreadyRunning:
-            return "Open the existing TiboTattle window, or quit it before starting another copy."
+            return TiboTattleLocalization.format(
+                .launcherRecoveryExistingWindow,
+                BundledProduct.displayName
+            )
         case .companionExited, .companionLaunch, .companionTimeout,
              .healthCheck:
-            return "Choose Retry. If it repeats, copy Data & Diagnostics for support."
+            return TiboTattleLocalization.string(
+                .launcherRecoveryRetryDiagnostics
+            )
         case .dataErase:
-            return "Quit other processes using \(BundledProduct.displayName) data, then try the erase again."
+            return TiboTattleLocalization.format(
+                .launcherRecoveryDataErase,
+                BundledProduct.displayName
+            )
         case .keychainDenied:
-            return "Retry the reset and approve the macOS Keychain prompt."
+            return TiboTattleLocalization.string(
+                .launcherRecoveryKeychainDenied
+            )
         case .keychainLocked:
-            return "Unlock the login Keychain in Keychain Access, then retry."
+            return TiboTattleLocalization.string(
+                .launcherRecoveryKeychainLocked
+            )
         case .keychainReset, .keychainResetPartial:
-            return "Copy Data & Diagnostics, then retry the same local reset."
+            return TiboTattleLocalization.string(.launcherRecoveryReset)
         }
     }
 }
@@ -1128,12 +1181,14 @@ private struct LocalKeychainResetResult: Decodable {
 /// can fetch a remote origin.
 @MainActor
 private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelegate,
-    WKDownloadDelegate {
+    WKDownloadDelegate, WKScriptMessageHandler {
     private let onLoaded: () -> Void
     private let onFailure: (String) -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
+    private let onLanguagePreferenceChange:
+        (TiboTattleLocalization.LanguagePreference) -> Void
     private var allowedPort: Int?
     private var pendingDashboardURL: URL?
     private var viewportPreparationAttempts = 0
@@ -1147,35 +1202,73 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         onFailure: @escaping (String) -> Void,
         onDownloadFailure: @escaping () -> Void,
         openExternally: @escaping (URL) -> Void,
-        onNavigation: @escaping (String) -> Void
+        onNavigation: @escaping (String) -> Void,
+        onLanguagePreferenceChange: @escaping (
+            TiboTattleLocalization.LanguagePreference
+        ) -> Void
     ) {
         self.onLoaded = onLoaded
         self.onFailure = onFailure
         self.onDownloadFailure = onDownloadFailure
         self.openExternally = openExternally
         self.onNavigation = onNavigation
+        self.onLanguagePreferenceChange = onLanguagePreferenceChange
         let configuration = WKWebViewConfiguration()
         // Nothing this surface stores survives the app. The hosted sign-in
         // token is already memory-only by design; a non-persistent store keeps
         // loopback cookies and local storage off disk as well.
         configuration.websiteDataStore = .nonPersistent()
-        // Give the embedded dashboard the same versioned localization
-        // contract as native AppKit. The dashboard can opt into this handoff
-        // when its resolver is ready; keeping the current page unchanged
-        // means the English-only foundation remains safe to ship today.
-        let localizationHandoff = Self.localizationHandoffScript()
-        configuration.userContentController.addUserScript(
-            WKUserScript(
-                source: localizationHandoff,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: true
-            )
+        // The language preference can change while this host remains alive.
+        // Install the first document-start scripts now, then refresh them
+        // before every later local navigation. That gives a reloaded document
+        // the current native preference without reloading the live document
+        // merely because a person changed its language.
+        Self.addDocumentStartScripts(
+            to: configuration.userContentController
         )
-        // The AppKit frame owns navigation and refresh in the installed app.
-        // Install this fixed marker before any dashboard script runs so the
-        // public-web header cannot flash, or remain visible if WebKit delays a
-        // didFinish callback behind local dashboard work.
-        let nativeShellMarker = """
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        configuration.userContentController.add(
+            self,
+            name: "tibotattleLocalization"
+        )
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = false
+        webView.setAccessibilityLabel(
+            TiboTattleLocalization.string(.accessibilityLocalDashboard)
+        )
+        webView.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    private static func localizationHandoffScript() -> String {
+        let payload: [String: Any] = [
+            "schemaVersion": TiboTattleLocalization.schemaVersion,
+            "host": "native",
+            "table": TiboTattleLocalization.tableName,
+            "fallbackLocale": TiboTattleLocalization.fallbackLocale,
+            "supportedLocales": TiboTattleLocalization.supportedWebLocales,
+            "languagePreference": TiboTattleLocalization.languagePreference
+                .rawValue,
+            "resolvedLocale": TiboTattleLocalization.selectedWebLocale,
+            "preferredLanguages": Locale.preferredLanguages,
+            "formatLocale": Locale.current.identifier,
+            "resourceRoot": "./localization"
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "window.__TIBOTATTLE_LOCALIZATION__ = null;"
+        }
+        return "window.__TIBOTATTLE_LOCALIZATION__ = \(json);"
+    }
+
+    /// The AppKit frame owns navigation and refresh in the installed app.
+    /// Install this fixed marker before any dashboard script runs so the
+    /// public-web header cannot flash, or remain visible if WebKit delays a
+    /// didFinish callback behind local dashboard work.
+    private static func nativeShellMarkerScript() -> String {
+        """
         (function () {
           function markNativeDashboard() {
             if (document.documentElement) {
@@ -1189,36 +1282,36 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
           document.addEventListener('DOMContentLoaded', markNativeDashboard, { once: true });
         })();
         """
-        configuration.userContentController.addUserScript(
+    }
+
+    private static func addDocumentStartScripts(
+        to controller: WKUserContentController
+    ) {
+        controller.addUserScript(
             WKUserScript(
-                source: nativeShellMarker,
+                source: localizationHandoffScript(),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: true
             )
         )
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = false
-        webView.setAccessibilityLabel("Local dashboard")
-        webView.translatesAutoresizingMaskIntoConstraints = false
+        controller.addUserScript(
+            WKUserScript(
+                source: nativeShellMarkerScript(),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
     }
 
-    private static func localizationHandoffScript() -> String {
-        let payload: [String: Any] = [
-            "schemaVersion": "tibotattle-localization-v1",
-            "table": TiboTattleLocalization.tableName,
-            "fallbackLocale": TiboTattleLocalization.fallbackLocalization,
-            "preferredLanguages": Locale.preferredLanguages,
-            "resourceRoot": "./localization"
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: data, encoding: .utf8)
-        else {
-            return "window.__TIBOTATTLE_LOCALIZATION__ = null;"
-        }
-        return "window.__TIBOTATTLE_LOCALIZATION__ = \(json);"
+    /// User scripts are copied into each document when it starts loading.
+    /// Rebuilding this very small, app-owned script set immediately before a
+    /// subsequent load prevents a stale `languagePreference` from winning
+    /// after Settings changed it in an already-open dashboard. Script message
+    /// handlers are independent from user scripts and remain registered.
+    private func refreshDocumentStartScripts() {
+        let controller = webView.configuration.userContentController
+        controller.removeAllUserScripts()
+        Self.addDocumentStartScripts(to: controller)
     }
 
     func load(_ url: URL) {
@@ -1262,6 +1355,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         pendingDashboardURL = nil
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        refreshDocumentStartScripts()
         webView.load(request)
     }
 
@@ -1283,6 +1377,42 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         webView.evaluateJavaScript(
             "window.dispatchEvent(new Event('tibotattle:hosted-sign-in-return'));"
         )
+    }
+
+    /// Change the copy in the existing loopback document without reloading it.
+    /// In particular, this must not disturb the in-memory hosted-sign-in
+    /// handoff that is signalled separately above.
+    func notifyLanguagePreferenceChange(
+        _ preference: TiboTattleLocalization.LanguagePreference
+    ) {
+        guard hasDashboardTarget else { return }
+        let payload: [String: String] = ["preference": preference.rawValue]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webView.evaluateJavaScript("""
+        window.dispatchEvent(new CustomEvent('tibotattle:locale-override', {
+          detail: \(json)
+        }));
+        """)
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "tibotattleLocalization",
+              message.frameInfo.isMainFrame,
+              let payload = message.body as? [String: Any],
+              payload["type"] as? String == "set-language-preference",
+              let rawPreference = payload["preference"] as? String,
+              let preference = TiboTattleLocalization.LanguagePreference(
+                  rawValue: rawPreference
+              )
+        else {
+            return
+        }
+        onLanguagePreferenceChange(preference)
     }
 
     private func isCompanionURL(_ url: URL) -> Bool {
@@ -1412,7 +1542,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         let alert = NSAlert()
         alert.messageText = BundledProduct.displayName
         alert.informativeText = message
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
         alert.runModal()
         completionHandler()
     }
@@ -1429,8 +1559,8 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         let alert = NSAlert()
         alert.messageText = BundledProduct.displayName
         alert.informativeText = message
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonContinue))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
         completionHandler(alert.runModal() == .alertFirstButtonReturn)
     }
 
@@ -1534,12 +1664,18 @@ private enum NativeDashboardDestination: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .overview: return "Overview"
-        case .weekly: return "Allowance"
-        case .trends: return "Trends"
-        case .method: return "How it works"
-        case .community: return "Community"
-        case .data: return "Data & Privacy"
+        case .overview:
+            return TiboTattleLocalization.string(.nativeDashboardOverview)
+        case .weekly:
+            return TiboTattleLocalization.string(.nativeDashboardAllowance)
+        case .trends:
+            return TiboTattleLocalization.string(.nativeDashboardTrends)
+        case .method:
+            return TiboTattleLocalization.string(.nativeDashboardHowItWorks)
+        case .community:
+            return TiboTattleLocalization.string(.nativeDashboardCommunity)
+        case .data:
+            return TiboTattleLocalization.string(.nativeDashboardDataPrivacy)
         }
     }
 
@@ -1703,6 +1839,15 @@ private final class NativeDashboardChrome: NSView {
         }
     }
 
+    func refreshLocalization() {
+        for (destination, button) in pageButtons {
+            button.title = destination.title
+            button.image = NSImage(
+                systemSymbolName: destination.symbolName,
+                accessibilityDescription: destination.title
+            )
+        }
+    }
     @discardableResult
     func prepareReportViewport() -> Bool {
         window?.contentView?.layoutSubtreeIfNeeded()
@@ -1784,47 +1929,55 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-settings"
     )
-    private let statusLabel = NSTextField(labelWithString: "Starting locally…")
+    private let statusLabel = NSTextField(labelWithString:
+        TiboTattleLocalization.string(.launcherStartingLocally))
     private let detailLabel = NSTextField(
         wrappingLabelWithString:
-            "Preparing the private local dashboard and its bounded foreground update."
+            TiboTattleLocalization.string(
+                .launcherDetailPreparingLocalDashboard
+            )
     )
     private let privacyLabel = NSTextField(
         labelWithString:
-            "Foreground only • local metadata • contribution is opt-in"
+            TiboTattleLocalization.string(
+                .launcherPrivacyForegroundOnly
+            )
     )
     private lazy var openButton = NSButton(
-        title: "Open Dashboard",
+        title: TiboTattleLocalization.string(.settingsOpenDashboard),
         target: self,
         action: #selector(openDashboard)
     )
     private lazy var retryButton = NSButton(
-        title: "Retry",
+        title: TiboTattleLocalization.string(.launcherRetry),
         target: self,
         action: #selector(retryCompanion)
     )
     private lazy var settingsButton = NSButton(
-        title: "Settings…",
+        title: TiboTattleLocalization.string(.menuSettings),
         target: self,
         action: #selector(showSettingsWindow)
     )
     private lazy var diagnosticsButton = NSButton(
-        title: "Data & Diagnostics…",
+        title: TiboTattleLocalization.string(.launcherDataDiagnostics),
         target: self,
         action: #selector(showDiagnostics)
     )
     private lazy var codexHomeButton = NSButton(
-        title: "Codex Folder…",
+        title: TiboTattleLocalization.string(.settingsChooseCodexFolder),
         target: self,
         action: #selector(showCodexHomeOptions)
     )
     private lazy var openInBrowserButton = NSButton(
-        title: "Open in Browser",
+        title: TiboTattleLocalization.string(.launcherOpenInBrowser),
         target: self,
         action: #selector(openDashboardInBrowser)
     )
     private lazy var quitButton = NSButton(
-        title: "Quit",
+        title: TiboTattleLocalization.format(
+            .menuQuitProduct,
+            BundledProduct.displayName
+        ),
         target: self,
         action: #selector(quitApplication)
     )
@@ -1917,7 +2070,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func showFirstRunDisclosure() -> Bool {
         let alert = NSAlert()
-        alert.messageText = "Welcome to \(BundledProduct.displayName)"
+        alert.messageText = TiboTattleLocalization.format(
+            .launcherWelcome,
+            BundledProduct.displayName
+        )
         alert.informativeText = """
         \(BundledProduct.displayName) updates local \(BundledProduct.monitoredAppDisplayName) metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.
 
@@ -1953,8 +2109,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             TiboTattleLocalization.string(.settingsStartAtLogin)
         )
         alert.accessoryView = startAtLogin
-        alert.addButton(withTitle: "Get Started")
-        alert.addButton(withTitle: "Quit")
+        alert.addButton(
+            withTitle: TiboTattleLocalization.string(.launcherGetStarted)
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.format(
+            .menuQuitProduct,
+            BundledProduct.displayName
+        ))
         guard alert.runModal() == .alertFirstButtonReturn else {
             return false
         }
@@ -2019,9 +2180,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         lastLifecycleStatus = "Starting"
         lastFailureCode = nil
         lastRecoverySuggestion = nil
-        statusLabel.stringValue = "Starting locally…"
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherStartingLocally
+        )
         detailLabel.stringValue =
-            "Preparing the private local dashboard and its bounded foreground update."
+            TiboTattleLocalization.string(
+                .launcherDetailPreparingLocalDashboard
+            )
         openButton.isEnabled = false
         openInBrowserButton.isEnabled = false
         retryButton.isEnabled = false
@@ -2100,7 +2265,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         openInBrowserButton.bezelStyle = .rounded
         openInBrowserButton.isEnabled = false
         openInBrowserButton.toolTip =
-            "Open the same local dashboard in your default browser."
+            TiboTattleLocalization.string(.launcherOpenBrowserTooltip)
 
         for button in [
             settingsButton,
@@ -2248,12 +2413,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         switch itemIdentifier {
         case Self.toolbarStatusIdentifier:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Local status"
-            let label = NSTextField(labelWithString: "Starting locally…")
+            item.label = TiboTattleLocalization.string(.nativeDashboardStatus)
+            item.toolTip = TiboTattleLocalization.string(
+                .nativeDashboardCurrentEvidenceTooltip
+            )
+            let label = NSTextField(labelWithString: TiboTattleLocalization.string(
+                .launcherStartingLocally
+            ))
             label.font = .systemFont(ofSize: 12, weight: .medium)
             label.textColor = .secondaryLabelColor
             label.lineBreakMode = .byTruncatingTail
             label.maximumNumberOfLines = 1
+            label.toolTip = TiboTattleLocalization.string(
+                .nativeDashboardCurrentEvidenceTooltip
+            )
+            label.setAccessibilityLabel(TiboTattleLocalization.string(
+                .nativeDashboardCurrentEvidenceTooltip
+            ))
             label.setContentCompressionResistancePriority(
                 .defaultLow,
                 for: .horizontal
@@ -2270,11 +2446,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return item
         case Self.toolbarRefreshIdentifier:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Refresh usage"
-            item.toolTip = "Refresh local Codex usage"
+            item.label = TiboTattleLocalization.string(
+                .nativeDashboardRefreshUsage
+            )
+            item.toolTip = TiboTattleLocalization.string(
+                .nativeDashboardRefreshUsageTooltip
+            )
             item.image = NSImage(
                 systemSymbolName: "arrow.clockwise",
-                accessibilityDescription: "Refresh usage"
+                accessibilityDescription: TiboTattleLocalization.string(
+                    .nativeDashboardRefreshUsage
+                )
             )
             item.target = self
             item.action = #selector(refreshDashboardFromToolbar)
@@ -2283,11 +2465,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return item
         case Self.toolbarShareIdentifier:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Share"
-            item.toolTip = "Open the local share card"
+            item.label = TiboTattleLocalization.string(.nativeDashboardShare)
+            item.toolTip = TiboTattleLocalization.string(
+                .nativeDashboardShareTooltip
+            )
             item.image = NSImage(
                 systemSymbolName: "square.and.arrow.up",
-                accessibilityDescription: "Open local share card"
+                accessibilityDescription: TiboTattleLocalization.string(
+                    .nativeDashboardShareTooltip
+                )
             )
             item.target = self
             item.action = #selector(showShareCardFromToolbar)
@@ -2296,10 +2482,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return item
         case Self.toolbarSettingsIdentifier:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "Settings"
+            item.label = TiboTattleLocalization.string(.menuSettings)
             item.image = NSImage(
                 systemSymbolName: "gearshape",
-                accessibilityDescription: "Settings"
+                accessibilityDescription: TiboTattleLocalization.string(
+                    .menuSettings
+                )
             )
             item.target = self
             item.action = #selector(showSettingsWindow)
@@ -2316,21 +2504,60 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     ) {
         nativeToolbarStatusLabel?.stringValue = title
         nativeRefreshToolbarItem?.label = isRefreshing
-            ? "Updating…"
-            : "Refresh usage"
+            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            : TiboTattleLocalization.string(.nativeDashboardRefreshUsage)
         nativeRefreshToolbarItem?.toolTip = isRefreshing
-            ? "Local usage is updating"
-            : "Refresh local Codex usage"
+            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            : TiboTattleLocalization.string(
+                .nativeDashboardRefreshUsageTooltip
+            )
         nativeRefreshToolbarItem?.image = NSImage(
             systemSymbolName: isRefreshing
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: isRefreshing
-                ? "Updating local usage"
-                : "Refresh usage"
+                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                : TiboTattleLocalization.string(
+                    .nativeDashboardRefreshUsage
+                )
         )
         nativeRefreshToolbarItem?.isEnabled = refreshEnabled && !isRefreshing
         nativeShareToolbarItem?.isEnabled = dashboardWebViewShowing
+    }
+
+    private func refreshNativeToolbarLocalization() {
+        nativeToolbarStatusLabel?.toolTip = TiboTattleLocalization.string(
+            .nativeDashboardCurrentEvidenceTooltip
+        )
+        nativeToolbarStatusLabel?.setAccessibilityLabel(
+            TiboTattleLocalization.string(
+                .nativeDashboardCurrentEvidenceTooltip
+            )
+        )
+        nativeRefreshToolbarItem?.label = nativeRefreshInFlight
+            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            : TiboTattleLocalization.string(.nativeDashboardRefreshUsage)
+        nativeRefreshToolbarItem?.toolTip = nativeRefreshInFlight
+            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            : TiboTattleLocalization.string(
+                .nativeDashboardRefreshUsageTooltip
+            )
+        nativeRefreshToolbarItem?.image = NSImage(
+            systemSymbolName: nativeRefreshInFlight
+                ? "arrow.triangle.2.circlepath.circle.fill"
+                : "arrow.clockwise",
+            accessibilityDescription: nativeRefreshInFlight
+                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                : TiboTattleLocalization.string(
+                    .nativeDashboardRefreshUsage
+                )
+        )
+        nativeShareToolbarItem?.label = TiboTattleLocalization.string(
+            .nativeDashboardShare
+        )
+        nativeShareToolbarItem?.toolTip = TiboTattleLocalization.string(
+            .nativeDashboardShareTooltip
+        )
     }
 
     @objc private func refreshDashboardFromToolbar() {
@@ -2382,6 +2609,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 },
                 onNavigation: { [weak self] rawDestination in
                     self?.selectNativeDashboardDestination(rawDestination)
+                },
+                onLanguagePreferenceChange: { [weak self] preference in
+                    self?.changeLanguagePreference(preference)
                 }
             )
             let chrome = NativeDashboardChrome(webView: created.webView)
@@ -2410,13 +2640,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             nativeDashboardChrome = chrome
             return created
         }()
-        statusLabel.stringValue = "Opening the dashboard…"
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherOpeningDashboard
+        )
         detailLabel.stringValue =
-            "Loading the private local dashboard from this Mac only."
+            TiboTattleLocalization.string(.launcherLoadingPrivateDashboard)
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? "Updating local usage…"
-                : "Opening local report…",
+                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                : TiboTattleLocalization.string(.nativeDashboardStarting),
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
         )
@@ -2497,7 +2729,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         cancelNativeRefreshSchedule()
         nativeRefreshInFlight = true
         updateNativeToolbar(
-            title: automatic ? "Updating automatically…" : "Updating…",
+            title: automatic
+                ? TiboTattleLocalization.string(.launcherUpdatingAutomatically)
+                : TiboTattleLocalization.string(.nativeDashboardUpdating),
             isRefreshing: true,
             refreshEnabled: false
         )
@@ -2512,7 +2746,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     .refreshFailed
                 )
                 self.finishNativeRefresh(
-                    title: "Update unavailable",
+                    title: TiboTattleLocalization.string(
+                        .launcherUpdateUnavailable
+                    ),
                     refreshEnabled: true
                 )
             case .unreachable:
@@ -2520,7 +2756,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     .providerUnavailable
                 )
                 self.finishNativeRefresh(
-                    title: "Local companion unavailable",
+                    title: TiboTattleLocalization.string(
+                        .launcherCompanionUnavailable
+                    ),
                     refreshEnabled: false
                 )
             }
@@ -2560,11 +2798,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                        LocalCompanionOverviewProjection.evidence(
                         for: overview
                        ) == .live {
-                        title = "Up to date"
+                        title = TiboTattleLocalization.string(.launcherUpToDate)
                     } else if overview?.lanes.isEmpty == false {
-                        title = "Needs attention"
+                        title = TiboTattleLocalization.string(
+                            .launcherNeedsAttention
+                        )
                     } else {
-                        title = "No allowance observed yet"
+                        title = TiboTattleLocalization.string(
+                            .launcherNoAllowanceObserved
+                        )
                     }
                     let expectedRefreshID = terminalRefreshID == self.nativeRefreshID
                         ? self.nativeRefreshID
@@ -2713,10 +2955,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         lastFailureCode = failure.failureCode
         lastRecoverySuggestion = failure.recoverySuggestion
         let alert = NSAlert()
-        alert.messageText = "Nothing was saved"
-        alert.informativeText =
-            "\(failure.errorDescription ?? "") Code: \(failure.failureCode). \(failure.recoverySuggestion)"
-        alert.addButton(withTitle: "OK")
+        alert.messageText = TiboTattleLocalization.string(.launcherNothingSaved)
+        alert.informativeText = TiboTattleLocalization.format(
+            .launcherFailureDetails,
+            failure.errorDescription ?? "",
+            failure.failureCode,
+            failure.recoverySuggestion
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
         alert.runModal()
     }
 
@@ -2730,9 +2976,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         lastLifecycleStatus = "Dashboard unavailable"
         lastFailureCode = failure.failureCode
         lastRecoverySuggestion = failure.recoverySuggestion
-        statusLabel.stringValue = "Dashboard didn’t open"
-        detailLabel.stringValue =
-            "\(failure.errorDescription ?? "") Code: \(failure.failureCode). \(failure.recoverySuggestion)"
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherDashboardDidNotOpen
+        )
+        detailLabel.stringValue = TiboTattleLocalization.format(
+            .launcherFailureDetails,
+            failure.errorDescription ?? "",
+            failure.failureCode,
+            failure.recoverySuggestion
+        )
         openButton.isEnabled = dashboardURL != nil
         openInBrowserButton.isEnabled = dashboardURL != nil
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
@@ -2846,13 +3098,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         lastLifecycleStatus = "Ready"
         lastFailureCode = nil
         lastRecoverySuggestion = nil
-        statusLabel.stringValue = "Preparing your local view…"
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherPreparingLocalView
+        )
         if centralServiceMode == nil {
-            detailLabel.stringValue =
-                "Updating local usage while the app is open. Large histories may need several passes. Nothing leaves this Mac."
+            detailLabel.stringValue = TiboTattleLocalization.string(
+                .launcherUpdatingLocalUsage
+            )
         } else {
-            detailLabel.stringValue =
-                "Updating local usage while the app is open. A reviewed contribution remains an explicit manual choice."
+            detailLabel.stringValue = TiboTattleLocalization.string(
+                .launcherUpdatingLocalUsageContribution
+            )
         }
         openButton.isEnabled = true
         openInBrowserButton.isEnabled = true
@@ -2898,9 +3154,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ?? LauncherError.companionLaunch("unexpected")
         lastFailureCode = launcherError.failureCode
         lastRecoverySuggestion = launcherError.recoverySuggestion
-        statusLabel.stringValue = "Couldn’t start"
-        detailLabel.stringValue =
-            "\(launcherError.errorDescription ?? "The local dashboard could not be started.") Code: \(launcherError.failureCode). \(launcherError.recoverySuggestion)"
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherCouldNotStart
+        )
+        detailLabel.stringValue = TiboTattleLocalization.format(
+            .launcherFailureDetails,
+            launcherError.errorDescription
+                ?? TiboTattleLocalization.string(.launcherLocalDashboardCouldNotStart),
+            launcherError.failureCode,
+            launcherError.recoverySuggestion
+        )
         openButton.isEnabled = false
         openInBrowserButton.isEnabled = false
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
@@ -2910,8 +3173,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             refreshEnabled: false
         )
         menuBarStatus?.companionUnavailable(
-            summary:
-                "Not running: \(launcherError.failureCode). Open the window for the recovery step."
+            summary: TiboTattleLocalization.format(
+                .menuBarFailureRecovery,
+                launcherError.failureCode
+            )
         )
     }
 
@@ -3037,8 +3302,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func codexHomeSettingsSummary() -> String {
         codexHomeConfiguration?.mode == .custom
-            ? "Custom folder selected"
-            : "Default location (~/.codex)"
+            ? TiboTattleLocalization.string(.settingsCodexFolderCustomSelected)
+            : TiboTattleLocalization.string(.settingsCodexFolderDefaultLocation)
     }
 
     private func updateSettingsCodexHomeSummary() {
@@ -3487,6 +3752,77 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         showSettings(selecting: 1)
     }
 
+    @objc private func selectLanguagePreference(_ sender: NSPopUpButton) {
+        guard let rawPreference = sender.selectedItem?.representedObject
+            as? String,
+              let preference = TiboTattleLocalization.LanguagePreference(
+                  rawValue: rawPreference
+              )
+        else {
+            return
+        }
+        changeLanguagePreference(preference)
+    }
+
+    /// Product language controls TiboTattle-owned copy only. Formatting keeps
+    /// using `Locale.current`, and this bridge never changes provider data,
+    /// accounting, timestamps, refresh ownership, or notification policy.
+    private func changeLanguagePreference(
+        _ preference: TiboTattleLocalization.LanguagePreference
+    ) {
+        guard preference != TiboTattleLocalization.languagePreference else {
+            return
+        }
+        let selectedSettingsTab = settingsTabs?.selectedTabViewItemIndex ?? 0
+        let shouldRestoreSettings = settingsWindow?.isVisible == true
+        TiboTattleLocalization.setLanguagePreference(preference)
+        installApplicationMenu()
+        refreshLauncherStaticLocalization()
+        menuBarStatus?.refreshLocalization()
+        nativeDashboardChrome?.refreshLocalization()
+        refreshNativeToolbarLocalization()
+        dashboardWebHost?.notifyLanguagePreferenceChange(preference)
+
+        // Settings is built from native controls rather than a constrained
+        // fixed-width form. Recreate it to let translated labels naturally
+        // remeasure and to update every accessibility label in one place.
+        settingsWindow?.close()
+        settingsWindow = nil
+        settingsTabs = nil
+        settingsCodexHomeLabel = nil
+        settingsAutomaticUpdatesSwitch = nil
+        settingsAutomaticUpdatesDetailLabel = nil
+        settingsAboutAutomaticUpdatesDetailLabel = nil
+        if shouldRestoreSettings {
+            showSettings(selecting: selectedSettingsTab)
+        }
+    }
+
+    private func refreshLauncherStaticLocalization() {
+        openButton.title = TiboTattleLocalization.string(.settingsOpenDashboard)
+        retryButton.title = TiboTattleLocalization.string(.launcherRetry)
+        settingsButton.title = TiboTattleLocalization.string(.menuSettings)
+        diagnosticsButton.title = TiboTattleLocalization.string(
+            .launcherDataDiagnostics
+        )
+        codexHomeButton.title = TiboTattleLocalization.string(
+            .settingsChooseCodexFolder
+        )
+        openInBrowserButton.title = TiboTattleLocalization.string(
+            .launcherOpenInBrowser
+        )
+        openInBrowserButton.toolTip = TiboTattleLocalization.string(
+            .launcherOpenBrowserTooltip
+        )
+        quitButton.title = TiboTattleLocalization.format(
+            .menuQuitProduct,
+            BundledProduct.displayName
+        )
+        privacyLabel.stringValue = TiboTattleLocalization.string(
+            .launcherPrivacyForegroundOnly
+        )
+    }
+
     private func showSettings(selecting index: Int) {
         if let settingsWindow, let settingsTabs {
             settingsTabs.selectedTabViewItemIndex = index
@@ -3524,17 +3860,47 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             font: .systemFont(ofSize: 14, weight: .semibold),
             color: .labelColor
         )
-        let languageValue = settingsLabel(
-            TiboTattleLocalization.string(.settingsLanguageSystem),
-            font: .systemFont(ofSize: 13, weight: .medium),
-            color: .secondaryLabelColor
+        let languagePicker = NSPopUpButton(
+            frame: .zero,
+            pullsDown: false
         )
-        let languageRow = NSStackView(views: [languageLabel, languageValue])
+        let languageChoices: [(
+            TiboTattleLocalization.LanguagePreference,
+            String
+        )] = [
+            (.system, TiboTattleLocalization.string(.settingsLanguageSystem)),
+            (.english, TiboTattleLocalization.string(.settingsLanguageEnglish)),
+            (.simplifiedChinese, "简体中文"),
+            (.spanish, "Español"),
+        ]
+        for (preference, title) in languageChoices {
+            languagePicker.addItem(withTitle: title)
+            languagePicker.lastItem?.representedObject = preference.rawValue
+        }
+        if let selectedIndex = languageChoices.firstIndex(where: {
+            $0.0 == TiboTattleLocalization.languagePreference
+        }) {
+            languagePicker.selectItem(at: selectedIndex)
+        }
+        languagePicker.target = self
+        languagePicker.action = #selector(selectLanguagePreference(_:))
+        languagePicker.toolTip = TiboTattleLocalization.string(
+            .settingsLanguagePickerHint
+        )
+        languagePicker.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsLanguage)
+        )
+        let languageRow = NSStackView(views: [languageLabel, languagePicker])
         languageRow.orientation = .horizontal
-        languageRow.alignment = .firstBaseline
+        languageRow.alignment = .centerY
         languageRow.spacing = 12
         let languageSection = NSStackView(views: [
             languageRow,
+            settingsLabel(
+                TiboTattleLocalization.string(.settingsLanguagePickerHint),
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            ),
             settingsLabel(
                 TiboTattleLocalization.string(.settingsLanguageSummary),
                 font: .systemFont(ofSize: 12),
@@ -3936,20 +4302,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func showDiagnostics() {
         let diagnostics = diagnosticText()
         let alert = NSAlert()
-        alert.messageText =
-            "\(BundledProduct.displayName) data and diagnostics"
+        alert.messageText = TiboTattleLocalization.format(
+            .dialogDataAndDiagnostics,
+            BundledProduct.displayName
+        )
         alert.informativeText = diagnostics
-        alert.addButton(withTitle: "Done")
-        alert.addButton(withTitle: "Copy Diagnostics")
-        alert.addButton(withTitle: "Manage Data…")
+        alert.addButton(withTitle: TiboTattleLocalization.string(.dialogDone))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.dialogCopyDiagnostics))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.dialogManageData))
         switch alert.runModal() {
         case .alertSecondButtonReturn:
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(diagnostics, forType: .string)
-            statusLabel.stringValue = "Diagnostics copied"
-            detailLabel.stringValue =
-                "Copied fixed lifecycle fields only—no paths, identifiers, or Codex content."
+            statusLabel.stringValue = TiboTattleLocalization.string(
+                .dialogDiagnosticsCopied
+            )
+            detailLabel.stringValue = TiboTattleLocalization.string(
+                .dialogDiagnosticsCopiedDetail
+            )
         case .alertThirdButtonReturn:
             showDataManagement()
         default:
@@ -3974,14 +4345,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func showDataManagement() {
         let alert = NSAlert()
-        alert.messageText =
-            "Manage local \(BundledProduct.displayName) data"
-        alert.informativeText = """
-        Local app state, local Keychain capabilities, and hosted data are separate. Choose the exact layer you intend to manage.
-        """
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Local App Data…")
-        alert.addButton(withTitle: "Identity & Device Reset…")
+        alert.messageText = TiboTattleLocalization.format(
+            .dialogManageLocalData,
+            BundledProduct.displayName
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogManageLocalDataDescription
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.dialogLocalAppData))
+        alert.addButton(
+            withTitle: TiboTattleLocalization.string(.dialogIdentityDeviceReset)
+        )
         switch alert.runModal() {
         case .alertSecondButtonReturn:
             showLocalAppDataManagement()
@@ -3994,13 +4369,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func showLocalAppDataManagement() {
         let alert = NSAlert()
-        alert.messageText = "Local app data"
-        alert.informativeText = """
-        This owner-only Application Support folder contains settings, indexes, cached analysis, prepared contributions, and local device-binding state. It is separate from Codex logs, Keychain, and hosted data.
-        """
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Show Local Data")
-        alert.addButton(withTitle: "Erase Local Data…")
+        alert.messageText = TiboTattleLocalization.string(.dialogLocalAppData)
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogLocalAppDataDescription
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.dialogShowLocalData))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.dialogEraseLocalData))
         switch alert.runModal() {
         case .alertSecondButtonReturn:
             do {
@@ -4020,18 +4395,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func showCodexHomeOptions() {
         let current =
             codexHomeConfiguration?.mode == .custom
-            ? "Custom Codex folder"
-            : "Default Codex folder (~/.codex)"
+            ? TiboTattleLocalization.string(.dialogCustomCodexFolder)
+            : TiboTattleLocalization.string(.dialogDefaultCodexFolder)
         let alert = NSAlert()
-        alert.messageText = "Codex folder"
-        alert.informativeText = """
-        Current: \(current)
-
-        \(BundledProduct.displayName) stores a custom folder only in owner-only app settings. Diagnostics never copy its path. The local companion reads only the sessions and archived_sessions folders beneath the selected Codex home.
-        """
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Choose Folder…")
-        alert.addButton(withTitle: "Use Default")
+        alert.messageText = TiboTattleLocalization.string(.settingsCodexFolder)
+        alert.informativeText = TiboTattleLocalization.format(
+            .dialogCodexFolderDescription,
+            current,
+            BundledProduct.displayName
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        alert.addButton(
+            withTitle: TiboTattleLocalization.string(.settingsChooseCodexFolder)
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.settingsUseDefault))
         switch alert.runModal() {
         case .alertSecondButtonReturn:
             chooseCustomCodexHome()
@@ -4044,10 +4421,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func chooseCustomCodexHome() {
         let panel = NSOpenPanel()
-        panel.title = "Choose your Codex home folder"
-        panel.message =
-            "Choose the folder that contains Codex sessions or archived_sessions."
-        panel.prompt = "Use This Folder"
+        panel.title = TiboTattleLocalization.string(.dialogChooseCodexHomeFolder)
+        panel.message = TiboTattleLocalization.string(
+            .dialogChooseCodexHomeFolderMessage
+        )
+        panel.prompt = TiboTattleLocalization.string(.dialogUseThisFolder)
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = false
@@ -4086,9 +4464,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func restartCompanionAfterCodexHomeChange() {
-        statusLabel.stringValue = "Codex folder updated"
-        detailLabel.stringValue =
-            "Restarting the foreground-only local companion with the validated source."
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherCodexFolderUpdated
+        )
+        detailLabel.stringValue = TiboTattleLocalization.string(
+            .launcherRestartingLocalCompanion
+        )
         openButton.isEnabled = false
         retryButton.isEnabled = false
         // This status has to be readable, so the embedded dashboard yields.
@@ -4111,17 +4492,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func confirmEraseLocalData() {
         let confirmation = NSAlert()
         confirmation.alertStyle = .critical
-        confirmation.messageText =
-            "Move all local \(BundledProduct.displayName) data to Trash?"
-        confirmation.informativeText = """
-        App state: local indexes, cached analysis, prepared contributions, custom Codex settings, and local device-binding state move to Trash.
-
-        Keychain: pseudonymous identity and device credentials remain.
-
-        Hosted service: sent community data and registered devices remain. Codex logs are never changed.
-        """
-        confirmation.addButton(withTitle: "Cancel")
-        confirmation.addButton(withTitle: "Move Data to Trash")
+        confirmation.messageText = TiboTattleLocalization.format(
+            .dialogMoveLocalDataToTrash,
+            BundledProduct.displayName
+        )
+        confirmation.informativeText = TiboTattleLocalization.string(
+            .dialogMoveLocalDataToTrashDescription
+        )
+        confirmation.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        confirmation.addButton(
+            withTitle: TiboTattleLocalization.string(.dialogMoveDataToTrash)
+        )
         guard confirmation.runModal() == .alertSecondButtonReturn else {
             return
         }
@@ -4131,18 +4512,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func confirmLocalKeychainResetStepOne() {
         let confirmation = NSAlert()
         confirmation.alertStyle = .warning
-        confirmation.messageText = "Reset local identity and device?"
-        confirmation.informativeText = """
-        This is a targeted local security-recovery action, not uninstall or hosted deletion.
-
-        App state: indexes, cached analysis, prepared contributions, settings, and Codex logs remain. Only the local device-binding marker and any retired file identity residue are removed.
-
-        Keychain: the \(BundledProduct.displayName) export identity and paired-device credential are removed. Account-observation and Claude-session pseudonym keys are not targeted.
-
-        Hosted service: no registered device is revoked and no hosted contribution or result is deleted. Use the hosted privacy workflow separately. Secure erasure is not claimed.
-        """
-        confirmation.addButton(withTitle: "Cancel")
-        confirmation.addButton(withTitle: "Continue…")
+        confirmation.messageText = TiboTattleLocalization.string(
+            .dialogResetIdentityDevice
+        )
+        confirmation.informativeText = TiboTattleLocalization.format(
+            .dialogIdentityDeviceResetDescription,
+            BundledProduct.displayName
+        )
+        confirmation.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        confirmation.addButton(withTitle: TiboTattleLocalization.string(.commonContinue) + "…")
         guard confirmation.runModal() == .alertSecondButtonReturn else {
             return
         }
@@ -4152,15 +4530,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func confirmLocalKeychainResetStepTwo() {
         let confirmation = NSAlert()
         confirmation.alertStyle = .critical
-        confirmation.messageText =
-            "Reset exactly two local Keychain capabilities now?"
-        confirmation.informativeText = """
-        \(BundledProduct.displayName) will stop its foreground companion, remove its export identity and paired-device credential from Keychain, remove only their two local residue files, and then restart.
-
-        Existing prepared or hosted data will not be rewritten or deleted. Future contribution activity will use a new identity and require device pairing again.
-        """
-        confirmation.addButton(withTitle: "Cancel")
-        confirmation.addButton(withTitle: "Reset Local Identity")
+        confirmation.messageText = TiboTattleLocalization.string(
+            .dialogResetCapabilities
+        )
+        confirmation.informativeText = TiboTattleLocalization.format(
+            .dialogResetCapabilitiesDescription,
+            BundledProduct.displayName
+        )
+        confirmation.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        confirmation.addButton(
+            withTitle: TiboTattleLocalization.string(.dialogResetLocalIdentity)
+        )
         guard confirmation.runModal() == .alertSecondButtonReturn else {
             return
         }
@@ -4170,9 +4550,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func performLocalKeychainReset() {
         guard keychainResetProcess == nil else { return }
         lastLifecycleStatus = "Resetting local identity"
-        statusLabel.stringValue = "Resetting local identity…"
-        detailLabel.stringValue =
-            "Stopping the foreground companion before the exact local Keychain transaction."
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherResettingLocalIdentity
+        )
+        detailLabel.stringValue = TiboTattleLocalization.string(
+            .launcherResettingLocalIdentityDetail
+        )
         openButton.isEnabled = false
         retryButton.isEnabled = false
         // This status has to be readable, so the embedded dashboard yields.
@@ -4256,15 +4639,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         if status == 0, let decoded, decoded.isCompleteReset {
             let result = NSAlert()
-            result.messageText = "Local identity and device reset"
-            result.informativeText = """
-            App state: retained, except the targeted local device-binding marker and retired identity residue.
-
-            Keychain: the \(BundledProduct.displayName) export identity and paired-device credential are now absent. Secure erasure is not claimed.
-
-            Hosted service: no device was revoked and no data was deleted. Pair this app again before a future contribution and use the hosted privacy workflow separately for hosted deletion.
-            """
-            result.addButton(withTitle: "Done")
+            result.messageText = TiboTattleLocalization.string(
+                .dialogIdentityDeviceResetComplete
+            )
+            result.informativeText = TiboTattleLocalization.format(
+                .dialogIdentityDeviceResetCompleteDescription,
+                BundledProduct.displayName
+            )
+            result.addButton(withTitle: TiboTattleLocalization.string(.dialogDone))
             result.runModal()
             retryAllowed = true
             startCompanion()
@@ -4292,9 +4674,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func eraseLocalData() {
         lastLifecycleStatus = "Erasing local data"
-        statusLabel.stringValue = "Moving local data to Trash…"
-        detailLabel.stringValue =
-            "The local companion is stopping before its exact owner-only state directory is moved."
+        statusLabel.stringValue = TiboTattleLocalization.string(
+            .launcherMovingLocalDataToTrash
+        )
+        detailLabel.stringValue = TiboTattleLocalization.string(
+            .launcherMovingLocalDataToTrashDetail
+        )
         openButton.isEnabled = false
         retryButton.isEnabled = false
         // This status has to be readable, so the embedded dashboard yields.
@@ -4324,9 +4709,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                         }
                         self.lastLifecycleStatus = "Local data erased"
                         self.statusLabel.stringValue =
-                            "Local data moved to Trash"
+                            TiboTattleLocalization.string(
+                                .launcherLocalDataMovedToTrash
+                            )
                         self.detailLabel.stringValue =
-                            "A fresh owner-only local store will be created now. Codex logs were not changed."
+                            TiboTattleLocalization.string(
+                                .launcherLocalDataMovedToTrashDetail
+                            )
                         self.startCompanion()
                     }
                 } catch {
@@ -4408,10 +4797,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         startupTimeout = nil
         if keychainResetProcess?.isRunning == true {
             let alert = NSAlert()
-            alert.messageText = "Local identity reset is finishing"
-            alert.informativeText =
-                "Wait for this short Keychain transaction to finish, then quit."
-            alert.addButton(withTitle: "OK")
+            alert.messageText = TiboTattleLocalization.string(.dialogResetFinishing)
+            alert.informativeText = TiboTattleLocalization.string(
+                .dialogResetFinishingDescription
+            )
+            alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
             alert.runModal()
             return .terminateCancel
         }
@@ -5175,7 +5565,8 @@ private enum NativeDashboardLayoutSmokeTest {
             onFailure: { _ in },
             onDownloadFailure: {},
             openExternally: { _ in },
-            onNavigation: { _ in }
+            onNavigation: { _ in },
+            onLanguagePreferenceChange: { _ in }
         )
         let chrome = NativeDashboardChrome(webView: host.webView)
         let window = NSWindow(

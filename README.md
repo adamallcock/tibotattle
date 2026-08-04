@@ -65,6 +65,16 @@ then open <http://localhost:8787>. A useful headline usually appears within
 seconds; the first deep pass over a large history is bounded, cancellable, and
 resumable.
 
+## Languages
+
+TiboTattle ships English, Simplified Chinese, and Spanish for its native shell,
+local dashboard, and public community/install surface. New users follow a safe
+system-language match with English fallback; General settings and the web
+header both provide a persisted override. Language choice does not change
+regional number/date formatting, event times, or quota/pricing semantics. See
+[the localization decision record](docs/decisions/2026-08-03-localization-system.md)
+for the provenance and future-locale policy.
+
 ## Privacy model
 
 - Local analysis works fully offline. On a new macOS install, the first-run

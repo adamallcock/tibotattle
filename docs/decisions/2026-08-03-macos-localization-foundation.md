@@ -2,10 +2,14 @@
 title: TiboTattle macOS localization foundation
 date: 2026-08-03
 type: decision-record
-status: implemented-foundation
+status: superseded
 ---
 
 # TiboTattle macOS localization foundation
+
+> Superseded on 2026-08-03 by
+> [TiboTattle cross-surface localization system](2026-08-03-localization-system.md).
+> This record preserves the original English-only foundation decision.
 
 ## Audit conclusion
 

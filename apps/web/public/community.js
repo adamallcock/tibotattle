@@ -17,12 +17,36 @@ import {
   configuredSemanticOpenTarget,
   renderInstallerJourney,
 } from "./install-cta.js";
+import { createBrowserLocalization, translate } from "./localization.js";
+import {
+  getFormattingLocale,
+  setFormattingLocale,
+  setMessageLocale,
+} from "./ui-format.js";
+
+const localization = createBrowserLocalization();
+setFormattingLocale(localization.formatLocale());
+setMessageLocale(localization.locale());
+// Resolve generated copy from the document language at render time. The
+// browser localizer updates that attribute before emitting its locale-change
+// event, which keeps a rerender from observing a stale closure during a live
+// picker change.
+const t = (key, values = {}) => translate(
+  key,
+  values,
+  typeof document === "undefined"
+    ? localization.locale()
+    : document.documentElement?.lang ?? localization.locale(),
+);
 
 const $ = (selector) => document.querySelector(selector);
 const publicErrorCodePattern =
   /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
 const publicRequestIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+let lastCommunitySnapshotPayload = null;
+let lastCommunitySnapshotFailure = null;
+let communitySnapshotSettled = false;
 const communityClient = new PublicCommunityClient();
 
 function publicErrorCode(candidate) {
@@ -52,29 +76,57 @@ function bindInstalledAppLink() {
     if (!target) return;
     const status = $("#open-installed-app-status");
     status.hidden = false;
-    status.textContent =
-      "Opening TiboTattle… If no app appears, install the signed Mac download above, then try again.";
+    localization.setLegacyText(
+      status,
+      "Opening TiboTattle… If no app appears, install the signed Mac download above, then try again.",
+    );
   });
 }
 
-function setServiceState(text, { reachable }) {
-  const state = $("#community-service-state");
-  state.textContent = text;
-  state.className = reachable ? "evidence-chip" : "evidence-chip neutral";
+/**
+ * The badge describes the reader-facing snapshot state, not transport health.
+ * The renderer below retains the precise safe state copy in the panel body.
+ */
+export function setPublicSnapshotPresentation(documentRef, state, {
+  failed = false,
+} = {}) {
+  const chip = documentRef.querySelector("#community-service-state");
+  const title = documentRef.querySelector("#community-snapshot-title");
+  title.textContent = t("community.snapshotTitle");
+  if (failed || state === "service_unavailable") {
+    chip.textContent = t("community.snapshotUnavailable");
+    chip.className = "evidence-chip neutral";
+    return;
+  }
+  const presentation = {
+    published: [t("community.snapshotAvailable"), true],
+    published_partial: [t("community.snapshotPartlyAvailable"), true],
+    not_yet_published: [t("community.noSnapshotPublished"), false],
+    withdrawn: [t("community.snapshotWithdrawn"), false],
+    suppressed: [t("community.noSnapshotReleased"), false],
+    unsupported_schema: [t("community.snapshotUnavailableShort"), false],
+    development_unsafe: [t("community.snapshotUnavailableShort"), false],
+  }[state] ?? [t("community.snapshotUnavailableShort"), false];
+  chip.textContent = presentation[0];
+  chip.className = presentation[1] ? "evidence-chip" : "evidence-chip neutral";
 }
 
-async function loadCommunitySnapshot() {
+function renderPublicInstallerJourney() {
+  const release = renderInstallerJourney(document, {
+    showUnavailableAction: true,
+    formatLocale: getFormattingLocale(),
+    translateMessage: t,
+  });
+  localization.setLegacyText(
+    $("#header-download-label"),
+    release ? "Download" : "Release status",
+  );
+  return release;
+}
+
+function renderCommunityResult({ payload, failure = null }) {
   const container = $("#community-result");
   const detail = $("#community-snapshot-service-detail");
-  let payload = null;
-  let failure = null;
-  try {
-    payload = await communityClient.communityStats();
-  } catch (error) {
-    failure = error;
-  }
-  // A null payload renders the fixed "service unavailable" state, which is
-  // separate from a service that answered and has published nothing yet.
   const state = renderCommunitySnapshot({
     documentRef: document,
     container,
@@ -86,36 +138,58 @@ async function loadCommunitySnapshot() {
   });
   $("#community").dataset.communityState = state;
   if (failure === null) {
-    setServiceState(
-      state === "not_yet_published"
-        ? "Community service reachable; nothing published yet"
-        : "Community service reachable",
-      { reachable: true },
-    );
-    return;
+    setPublicSnapshotPresentation(document, state);
+    return state;
   }
-  setServiceState("Community service unavailable", { reachable: false });
+  setPublicSnapshotPresentation(document, state, { failed: true });
   // Only the fixed, content-free identifiers the service itself returned are
   // repeated back. This page files no diagnostic note: there is no local
   // companion here to file one with.
   const code = publicErrorCode(failure?.code);
   const requestId = publicRequestId(failure?.requestId);
   const sentences = [
-    "The published snapshot could not be loaded. Nothing is inferred from a failed request.",
+    t("community.failedLoad"),
   ];
-  if (code !== "") sentences.push(`Reported cause: ${code.replace(/_/gu, " ")}.`);
-  if (requestId !== "") sentences.push(`Service reference ${requestId}.`);
+  if (code !== "") sentences.push(t("community.reportedCause", { code: code.replace(/_/gu, " ") }));
+  if (requestId !== "") sentences.push(t("community.serviceReference", { reference: requestId }));
   const note = document.createElement("p");
   note.className = "annotation";
   note.textContent = sentences.join(" ");
   container.append(note);
+  return state;
 }
 
-bindInstalledAppLink();
-const installerRelease = renderInstallerJourney(document, {
-  showUnavailableAction: true,
-});
-$("#header-download-label").textContent = installerRelease
-  ? "Download"
-  : "Release status";
-void loadCommunitySnapshot();
+async function loadCommunitySnapshot() {
+  let payload = null;
+  let failure = null;
+  try {
+    payload = await communityClient.communityStats();
+  } catch (error) {
+    failure = error;
+  }
+  // A null payload renders the fixed "service unavailable" state, which is
+  // separate from a service that answered and has published nothing yet. Keep
+  // the settled failure too so a language switch rerenders its safe copy.
+  lastCommunitySnapshotPayload = payload;
+  lastCommunitySnapshotFailure = failure;
+  communitySnapshotSettled = true;
+  renderCommunityResult({ payload, failure });
+}
+
+if (typeof document !== "undefined") {
+  bindInstalledAppLink();
+  renderPublicInstallerJourney();
+  void loadCommunitySnapshot();
+  window.addEventListener("tibotattle:locale-change", (event) => {
+    setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
+    setMessageLocale(event.detail?.locale ?? localization.locale());
+    renderPublicInstallerJourney();
+    if (communitySnapshotSettled) {
+      renderCommunityResult({
+        payload: lastCommunitySnapshotPayload,
+        failure: lastCommunitySnapshotFailure,
+      });
+    }
+    localization.localizeTree();
+  });
+}

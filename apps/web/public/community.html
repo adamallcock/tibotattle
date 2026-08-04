@@ -57,26 +57,46 @@
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./community.js"></script>
   </head>
-  <body class="community-site">
+  <body class="community-site" data-i18n-root data-i18n-legacy-root>
     <a class="skip-link" href="#main">Skip to TiboTattle</a>
 
-    <header class="topbar">
-      <a class="brand" href="#install" aria-label="TiboTattle home">
+    <header class="topbar" data-i18n-legacy-root>
+      <a
+        class="brand"
+        href="#install"
+        aria-label="TiboTattle home"
+        data-i18n-aria-label="aria.tibotattleHome"
+      >
         <img class="brand-icon" src="./tibotattle-icon.png" alt="" width="42" height="42">
         <span>TiboTattle</span>
       </a>
-      <nav class="primary-nav" aria-label="Site sections">
+      <nav
+        class="primary-nav"
+        aria-label="Site sections"
+        data-i18n-aria-label="aria.siteSections"
+      >
         <a href="#how-it-works">How it works</a>
         <a href="#community">Community</a>
         <a href="./docs.html">Docs</a>
       </nav>
+      <label class="language-picker">
+        <span class="sr-only" data-i18n="language.label">Language</span>
+        <select data-language-picker aria-label="Language"></select>
+      </label>
+      <p
+        class="sr-only"
+        data-language-announcement
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></p>
       <a class="header-download" href="#download">
         <img src="./apple.svg" alt="" width="14" height="14">
         <span id="header-download-label">Release status</span>
       </a>
     </header>
 
-    <main id="main" tabindex="-1">
+    <main id="main" tabindex="-1" data-i18n-legacy-root>
       <section class="product-hero" id="install" aria-labelledby="install-title">
         <div class="hero-copy">
           <h1 id="install-title">Understand your Codex week.</h1>
@@ -86,7 +106,12 @@
             with a clear history kept on your Mac.
           </p>
 
-          <div class="install-cluster" id="download" aria-label="Get TiboTattle for Mac">
+          <div
+            class="install-cluster"
+            id="download"
+            aria-label="Get TiboTattle for Mac"
+            data-i18n-aria-label="aria.getTiboTattleForMac"
+          >
             <div class="install-actions">
               <a
                 class="button mac-download-button"
@@ -120,7 +145,7 @@
               <span id="installer-size"></span>
               <span id="installer-sha256"></span>
             </div>
-            <nav class="installer-links" id="installer-links" aria-label="Release information" hidden>
+            <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
               <a id="release-notes-link" href="" hidden>Release notes</a>
               <a id="privacy-link" href="" hidden>Privacy</a>
               <a id="security-link" href="" hidden>Security</a>
@@ -167,13 +192,19 @@
               width="914"
               height="430"
               alt="Sample seven-day allowance history with reset-level uncertainty ranges"
+              data-i18n-alt="alt.previewWeeklyHistory"
             >
           </div>
           <figcaption>Your dashboard is calculated privately on your Mac.</figcaption>
         </figure>
       </section>
 
-      <section class="feature-strip" id="how-it-works" aria-label="What TiboTattle provides">
+      <section
+        class="feature-strip"
+        id="how-it-works"
+        aria-label="What TiboTattle provides"
+        data-i18n-aria-label="aria.tibotattleFeatures"
+      >
         <article>
           <h2>Seven-day view</h2>
           <p>See the estimate and its history across observed resets.</p>
@@ -239,7 +270,7 @@
       </section>
     </main>
 
-    <footer>
+    <footer data-i18n-legacy-root>
       <div class="footer-copy">
         <span class="footer-brand">
           <img src="./tibotattle-icon.png" alt="" width="28" height="28">
@@ -247,7 +278,11 @@
         </span>
         <p>Local-first and independent. Not affiliated with OpenAI.</p>
       </div>
-      <nav class="footer-links" aria-label="Find TiboTattle online">
+      <nav
+        class="footer-links"
+        aria-label="Find TiboTattle online"
+        data-i18n-aria-label="aria.findTiboTattleOnline"
+      >
         <a class="footer-resource" href="./docs.html">Docs</a>
         <a class="footer-resource" href="./privacy.html">Privacy</a>
         <a
@@ -256,6 +291,7 @@
           target="_blank"
           rel="noreferrer"
           aria-label="GitHub (opens in a new tab)"
+          data-i18n-aria-label="aria.githubExternal"
         >
           <img src="./github.svg" alt="" width="16" height="16">
           <span class="footer-social-label">GitHub</span>
@@ -266,6 +302,7 @@
           target="_blank"
           rel="noreferrer"
           aria-label="X (opens in a new tab)"
+          data-i18n-aria-label="aria.xExternal"
         >
           <img src="./x.svg" alt="" width="15" height="15">
           <span class="footer-social-label">X</span>

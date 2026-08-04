@@ -2,16 +2,199 @@ import Foundation
 
 /// The native localization boundary for TiboTattle.
 ///
-/// The app intentionally has no language override yet. `Bundle` follows the
-/// macOS preferred-language list, while `Locale.current` keeps dates and
-/// numbers in the user's regional format even when the selected translation
-/// falls back to English. The same key namespace and `.lproj` resources are
-/// staged under the embedded dashboard's web root by the macOS build.
+/// Translation choice and regional formatting are deliberately separate:
+/// changing the app language never changes a displayed event's time zone,
+/// decimal separator policy, currency, accounting arithmetic, or source
+/// provenance. `Locale.current` remains the formatting authority while the
+/// selected `.lproj` controls only product copy.
 enum TiboTattleLocalization {
+    static let schemaVersion = "tibotattle-localization-v2"
+    static let fallbackLocalization = "en"
+    static let fallbackLocale = "en-US"
+    static let tableName = "Localizable"
+    static let supportedWebLocales = ["en-US", "zh-Hans", "es"]
+    static let languagePreferenceDefaultsKey =
+        "tibotattle.language-preference.v1"
+
+    enum LanguagePreference: String, CaseIterable {
+        case system
+        case english = "en-US"
+        case simplifiedChinese = "zh-Hans"
+        case spanish = "es"
+
+        var nativeLocalization: String? {
+            switch self {
+            case .system:
+                nil
+            case .english:
+                "en"
+            case .simplifiedChinese:
+                "zh-Hans"
+            case .spanish:
+                "es"
+            }
+        }
+    }
+
     enum Key: String, CaseIterable {
+        case accessibilityLocalDashboard = "accessibility.localDashboard"
+        case accessibilityMenuBarStatus = "accessibility.menuBarStatus"
+        case commonCancel = "common.cancel"
+        case commonContinue = "common.continue"
+        case commonOK = "common.ok"
+        case dialogChooseCodexHomeFolder = "dialog.chooseCodexHomeFolder"
+        case dialogChooseCodexHomeFolderMessage = "dialog.chooseCodexHomeFolderMessage"
+        case dialogCodexFolderDescription = "dialog.codexFolderDescription"
+        case dialogCopyDiagnostics = "dialog.copyDiagnostics"
+        case dialogCustomCodexFolder = "dialog.customCodexFolder"
+        case dialogDataAndDiagnostics = "dialog.dataAndDiagnostics"
+        case dialogDefaultCodexFolder = "dialog.defaultCodexFolder"
+        case dialogDiagnosticsCopied = "dialog.diagnosticsCopied"
+        case dialogDiagnosticsCopiedDetail = "dialog.diagnosticsCopiedDetail"
+        case dialogDone = "dialog.done"
+        case dialogEraseLocalData = "dialog.eraseLocalData"
+        case dialogIdentityDeviceReset = "dialog.identityDeviceReset"
+        case dialogIdentityDeviceResetComplete = "dialog.identityDeviceResetComplete"
+        case dialogIdentityDeviceResetCompleteDescription = "dialog.identityDeviceResetCompleteDescription"
+        case dialogIdentityDeviceResetDescription = "dialog.identityDeviceResetDescription"
+        case dialogLocalAppData = "dialog.localAppData"
+        case dialogLocalAppDataDescription = "dialog.localAppDataDescription"
+        case dialogManageData = "dialog.manageData"
+        case dialogManageLocalData = "dialog.manageLocalData"
+        case dialogManageLocalDataDescription = "dialog.manageLocalDataDescription"
+        case dialogMoveDataToTrash = "dialog.moveDataToTrash"
+        case dialogMoveLocalDataToTrash = "dialog.moveLocalDataToTrash"
+        case dialogMoveLocalDataToTrashDescription = "dialog.moveLocalDataToTrashDescription"
+        case dialogResetCapabilities = "dialog.resetCapabilities"
+        case dialogResetCapabilitiesDescription = "dialog.resetCapabilitiesDescription"
+        case dialogResetFinishing = "dialog.resetFinishing"
+        case dialogResetFinishingDescription = "dialog.resetFinishingDescription"
+        case dialogResetIdentityDevice = "dialog.resetIdentityDevice"
+        case dialogResetLocalIdentity = "dialog.resetLocalIdentity"
+        case dialogShowLocalData = "dialog.showLocalData"
+        case dialogUseThisFolder = "dialog.useThisFolder"
+        case launcherCompanionUnavailable = "launcher.companionUnavailable"
+        case launcherCouldNotStart = "launcher.couldNotStart"
+        case launcherCodexFolderUpdated = "launcher.codexFolderUpdated"
+        case launcherDataDiagnostics = "launcher.dataDiagnostics"
+        case launcherDashboardDidNotOpen = "launcher.dashboardDidNotOpen"
+        case launcherDetailPreparingLocalDashboard = "launcher.detailPreparingLocalDashboard"
+        case launcherErrorCompanionAlreadyRunning = "launcher.errorCompanionAlreadyRunning"
+        case launcherErrorCompanionExited = "launcher.errorCompanionExited"
+        case launcherErrorCompanionLaunch = "launcher.errorCompanionLaunch"
+        case launcherErrorCompanionTimeout = "launcher.errorCompanionTimeout"
+        case launcherErrorCodexHomeSettingsWrite = "launcher.errorCodexHomeSettingsWrite"
+        case launcherErrorDashboardDownloadFailed = "launcher.errorDashboardDownloadFailed"
+        case launcherErrorDashboardWebViewUnavailable = "launcher.errorDashboardWebViewUnavailable"
+        case launcherErrorDataErase = "launcher.errorDataErase"
+        case launcherErrorFirstRunStateWrite = "launcher.errorFirstRunStateWrite"
+        case launcherErrorHealthCheck = "launcher.errorHealthCheck"
+        case launcherErrorInvalidCentralService = "launcher.errorInvalidCentralService"
+        case launcherErrorInvalidCodexHome = "launcher.errorInvalidCodexHome"
+        case launcherErrorInvalidCodexHomeSettings = "launcher.errorInvalidCodexHomeSettings"
+        case launcherErrorInvalidFirstRunState = "launcher.errorInvalidFirstRunState"
+        case launcherErrorInvalidHome = "launcher.errorInvalidHome"
+        case launcherErrorInvalidResource = "launcher.errorInvalidResource"
+        case launcherErrorInvalidStateDirectory = "launcher.errorInvalidStateDirectory"
+        case launcherErrorKeychainDenied = "launcher.errorKeychainDenied"
+        case launcherErrorKeychainLocked = "launcher.errorKeychainLocked"
+        case launcherErrorKeychainReset = "launcher.errorKeychainReset"
+        case launcherErrorKeychainResetPartial = "launcher.errorKeychainResetPartial"
+        case launcherFailureDetails = "launcher.failureDetails"
+        case launcherFirstRunDisclosure = "launcher.firstRunDisclosure"
+        case launcherGetStarted = "launcher.getStarted"
+        case launcherLoadingPrivateDashboard = "launcher.loadingPrivateDashboard"
+        case launcherLocalDashboardCouldNotStart = "launcher.localDashboardCouldNotStart"
+        case launcherLocalDataMovedToTrash = "launcher.localDataMovedToTrash"
+        case launcherLocalDataMovedToTrashDetail = "launcher.localDataMovedToTrashDetail"
+        case launcherMovingLocalDataToTrash = "launcher.movingLocalDataToTrash"
+        case launcherMovingLocalDataToTrashDetail = "launcher.movingLocalDataToTrashDetail"
+        case launcherNeedsAttention = "launcher.needsAttention"
+        case launcherNoAllowanceObserved = "launcher.noAllowanceObserved"
+        case launcherNothingSaved = "launcher.nothingSaved"
+        case launcherOpenBrowserTooltip = "launcher.openBrowserTooltip"
+        case launcherOpenInBrowser = "launcher.openInBrowser"
+        case launcherOpeningDashboard = "launcher.openingDashboard"
+        case launcherPreparingLocalView = "launcher.preparingLocalView"
+        case launcherPrivacyForegroundOnly = "launcher.privacyForegroundOnly"
+        case launcherRetry = "launcher.retry"
+        case launcherRecoveryCheckAccess = "launcher.recoveryCheckAccess"
+        case launcherRecoveryChooseCodexHome = "launcher.recoveryChooseCodexHome"
+        case launcherRecoveryDashboardDownload = "launcher.recoveryDashboardDownload"
+        case launcherRecoveryDashboardWebView = "launcher.recoveryDashboardWebView"
+        case launcherRecoveryDataErase = "launcher.recoveryDataErase"
+        case launcherRecoveryExistingWindow = "launcher.recoveryExistingWindow"
+        case launcherRecoveryKeychainDenied = "launcher.recoveryKeychainDenied"
+        case launcherRecoveryKeychainLocked = "launcher.recoveryKeychainLocked"
+        case launcherRecoveryMoveAppState = "launcher.recoveryMoveAppState"
+        case launcherRecoveryReinstall = "launcher.recoveryReinstall"
+        case launcherRecoveryReset = "launcher.recoveryReset"
+        case launcherRecoveryRetryDiagnostics = "launcher.recoveryRetryDiagnostics"
+        case launcherRestartingLocalCompanion = "launcher.restartingLocalCompanion"
+        case launcherResettingLocalIdentity = "launcher.resettingLocalIdentity"
+        case launcherResettingLocalIdentityDetail = "launcher.resettingLocalIdentityDetail"
+        case launcherStartingLocally = "launcher.startingLocally"
+        case launcherUpdateUnavailable = "launcher.updateUnavailable"
+        case launcherUpdatingAutomatically = "launcher.updatingAutomatically"
+        case launcherUpdatingLocalUsage = "launcher.updatingLocalUsage"
+        case launcherUpdatingLocalUsageContribution = "launcher.updatingLocalUsageContribution"
+        case launcherUpToDate = "launcher.upToDate"
+        case launcherWelcome = "launcher.welcome"
+        case nativeDashboardAllowance = "nativeDashboard.allowance"
+        case nativeDashboardCommunity = "nativeDashboard.community"
+        case nativeDashboardCurrentEvidenceTooltip = "nativeDashboard.currentEvidenceTooltip"
+        case nativeDashboardDataPrivacy = "nativeDashboard.dataPrivacy"
+        case nativeDashboardHowItWorks = "nativeDashboard.howItWorks"
+        case nativeDashboardLocalOnly = "nativeDashboard.localOnly"
+        case nativeDashboardLocalOnlyTooltip = "nativeDashboard.localOnlyTooltip"
+        case nativeDashboardOverview = "nativeDashboard.overview"
+        case nativeDashboardRefreshUsage = "nativeDashboard.refreshUsage"
+        case nativeDashboardRefreshUsageTooltip = "nativeDashboard.refreshUsageTooltip"
+        case nativeDashboardShare = "nativeDashboard.share"
+        case nativeDashboardShareTooltip = "nativeDashboard.shareTooltip"
+        case nativeDashboardStarting = "nativeDashboard.starting"
+        case nativeDashboardStatus = "nativeDashboard.status"
+        case nativeDashboardTrends = "nativeDashboard.trends"
+        case nativeDashboardUpdating = "nativeDashboard.updating"
         case menuAboutProduct = "menu.aboutProduct"
         case menuCopy = "menu.copy"
         case menuEdit = "menu.edit"
+        case menuBarAnalyzeLocalUsage = "menuBar.analyzeLocalUsage"
+        case menuBarAnalysisRequestRejected = "menuBar.analysisRequestRejected"
+        case menuBarAnalyzingLocalUsage = "menuBar.analyzingLocalUsage"
+        case menuBarAllowanceTitle = "menuBar.allowanceTitle"
+        case menuBarCompanionNotRunning = "menuBar.companionNotRunning"
+        case menuBarCompanionStarting = "menuBar.companionStarting"
+        case menuBarCurrentEvidence = "menuBar.currentEvidence"
+        case menuBarCurrentEvidenceWithAge = "menuBar.currentEvidenceWithAge"
+        case menuBarDaysAgo = "menuBar.daysAgo"
+        case menuBarFiveHourAllowance = "menuBar.fiveHourAllowance"
+        case menuBarFailureRecovery = "menuBar.failureRecovery"
+        case menuBarHoursAgo = "menuBar.hoursAgo"
+        case menuBarJustNow = "menuBar.justNow"
+        case menuBarLastObservationNotCurrent = "menuBar.lastObservationNotCurrent"
+        case menuBarLocalEvidenceStale = "menuBar.localEvidenceStale"
+        case menuBarLocalEvidenceStaleWithAge = "menuBar.localEvidenceStaleWithAge"
+        case menuBarMinutesAgo = "menuBar.minutesAgo"
+        case menuBarNoVerifiedAllowance = "menuBar.noVerifiedAllowance"
+        case menuBarNoVerifiedQuota = "menuBar.noVerifiedQuota"
+        case menuBarOpenProduct = "menuBar.openProduct"
+        case menuBarQuotaEvidenceUnavailable = "menuBar.quotaEvidenceUnavailable"
+        case menuBarQuotaLastObserved = "menuBar.quotaLastObserved"
+        case menuBarQuotaRemaining = "menuBar.quotaRemaining"
+        case menuBarQuotaResetUnavailable = "menuBar.quotaResetUnavailable"
+        case menuBarQuotaResets = "menuBar.quotaResets"
+        case menuBarQuotaValuesUnavailable = "menuBar.quotaValuesUnavailable"
+        case menuBarResetDaysHours = "menuBar.resetDaysHours"
+        case menuBarResetHoursMinutes = "menuBar.resetHoursMinutes"
+        case menuBarResetMinutes = "menuBar.resetMinutes"
+        case menuBarRetryLocalAnalysis = "menuBar.retryLocalAnalysis"
+        case menuBarSevenDayAllowance = "menuBar.sevenDayAllowance"
+        case menuBarStaleEvidenceHidden = "menuBar.staleEvidenceHidden"
+        case menuBarUpdateLocalUsage = "menuBar.updateLocalUsage"
+        case menuBarVerifiedAllowanceMany = "menuBar.verifiedAllowanceMany"
+        case menuBarVerifiedAllowanceOne = "menuBar.verifiedAllowanceOne"
+        case menuBarWaitingToAnalyze = "menuBar.waitingToAnalyze"
         case menuQuitProduct = "menu.quitProduct"
         case menuSelectAll = "menu.selectAll"
         case menuSettings = "menu.settings"
@@ -30,11 +213,17 @@ enum TiboTattleLocalization {
         case settingsCheckForUpdates = "settings.checkForUpdates"
         case settingsChooseCodexFolder = "settings.chooseCodexFolder"
         case settingsCodexFolder = "settings.codexFolder"
+        case settingsCodexFolderCustomSelected = "settings.codexFolderCustomSelected"
+        case settingsCodexFolderDefaultLocation = "settings.codexFolderDefaultLocation"
         case settingsCodexFolderSummary = "settings.codexFolderSummary"
         case settingsGeneral = "settings.general"
         case settingsGeneralSummary = "settings.generalSummary"
         case settingsGitHub = "settings.github"
         case settingsLanguage = "settings.language"
+        case settingsLanguageEnglish = "settings.languageEnglish"
+        case settingsLanguagePickerHint = "settings.languagePickerHint"
+        case settingsLanguageSimplifiedChinese = "settings.languageSimplifiedChinese"
+        case settingsLanguageSpanish = "settings.languageSpanish"
         case settingsLanguageSummary = "settings.languageSummary"
         case settingsLanguageSystem = "settings.languageSystem"
         case settingsNotifications = "settings.notifications"
@@ -97,21 +286,335 @@ enum TiboTattleLocalization {
         case settingsStartAtLoginUnregistrationNotConfirmedMessage = "settings.startAtLoginUnregistrationNotConfirmedMessage"
         case settingsStartAtLoginUnregistrationNotConfirmedTitle = "settings.startAtLoginUnregistrationNotConfirmedTitle"
         case settingsUseDefault = "settings.useDefault"
+        case settingsUpdateDisclosureAutomaticOff = "settings.updateDisclosureAutomaticOff"
+        case settingsUpdateDisclosureAutomaticOn = "settings.updateDisclosureAutomaticOn"
+        case settingsUpdateDisclosureDevelopment = "settings.updateDisclosureDevelopment"
+        case settingsUpdateDisclosurePreview = "settings.updateDisclosurePreview"
         case settingsVersion = "settings.version"
         case settingsWebsite = "settings.website"
         case settingsWindowTitle = "settings.windowTitle"
         case settingsX = "settings.x"
 
         /// English remains a process-local fallback if a bundle is unpacked
-        /// without its resources or a future translation misses one key.
+        /// without resources or a future translation misses one key.
         var fallbackValue: String {
             switch self {
+            case .accessibilityLocalDashboard:
+                "Local dashboard"
+            case .accessibilityMenuBarStatus:
+                "TiboTattle status"
+            case .commonCancel:
+                "Cancel"
+            case .commonContinue:
+                "Continue"
+            case .commonOK:
+                "OK"
+            case .dialogChooseCodexHomeFolder:
+                "Choose your Codex home folder"
+            case .dialogChooseCodexHomeFolderMessage:
+                "Choose the folder that contains Codex sessions or archived_sessions."
+            case .dialogCodexFolderDescription:
+                "Current: %@\n\n%@ stores a custom folder only in owner-only app settings. Diagnostics never copy its path. The local companion reads only the sessions and archived_sessions folders beneath the selected Codex home."
+            case .dialogCopyDiagnostics:
+                "Copy Diagnostics"
+            case .dialogCustomCodexFolder:
+                "Custom Codex folder"
+            case .dialogDataAndDiagnostics:
+                "%@ data and diagnostics"
+            case .dialogDefaultCodexFolder:
+                "Default Codex folder (~/.codex)"
+            case .dialogDiagnosticsCopied:
+                "Diagnostics copied"
+            case .dialogDiagnosticsCopiedDetail:
+                "Copied fixed lifecycle fields only—no paths, identifiers, or Codex content."
+            case .dialogDone:
+                "Done"
+            case .dialogEraseLocalData:
+                "Erase Local Data…"
+            case .dialogIdentityDeviceReset:
+                "Identity & Device Reset…"
+            case .dialogIdentityDeviceResetComplete:
+                "Local identity and device reset"
+            case .dialogIdentityDeviceResetCompleteDescription:
+                "App state: retained, except the targeted local device-binding marker and retired identity residue.\n\nKeychain: the %@ export identity and paired-device credential are now absent. Secure erasure is not claimed.\n\nHosted service: no device was revoked and no data was deleted. Pair this app again before a future contribution and use the hosted privacy workflow separately for hosted deletion."
+            case .dialogIdentityDeviceResetDescription:
+                "This is a targeted local security-recovery action, not uninstall or hosted deletion.\n\nApp state: indexes, cached analysis, prepared contributions, settings, and Codex logs remain. Only the local device-binding marker and any retired file identity residue are removed.\n\nKeychain: the %@ export identity and paired-device credential are removed. Account-observation and Claude-session pseudonym keys are not targeted.\n\nHosted service: no registered device is revoked and no hosted contribution or result is deleted. Use the hosted privacy workflow separately. Secure erasure is not claimed."
+            case .dialogLocalAppData:
+                "Local app data"
+            case .dialogLocalAppDataDescription:
+                "This owner-only Application Support folder contains settings, indexes, cached analysis, prepared contributions, and local device-binding state. It is separate from Codex logs, Keychain, and hosted data."
+            case .dialogManageData:
+                "Manage Data…"
+            case .dialogManageLocalData:
+                "Manage local %@ data"
+            case .dialogManageLocalDataDescription:
+                "Local app state, local Keychain capabilities, and hosted data are separate. Choose the exact layer you intend to manage."
+            case .dialogMoveDataToTrash:
+                "Move Data to Trash"
+            case .dialogMoveLocalDataToTrash:
+                "Move all local %@ data to Trash?"
+            case .dialogMoveLocalDataToTrashDescription:
+                "App state: local indexes, cached analysis, prepared contributions, custom Codex settings, and local device-binding state move to Trash.\n\nKeychain: pseudonymous identity and device credentials remain.\n\nHosted service: sent community data and registered devices remain. Codex logs are never changed."
+            case .dialogResetCapabilities:
+                "Reset exactly two local Keychain capabilities now?"
+            case .dialogResetCapabilitiesDescription:
+                "%@ will stop its foreground companion, remove its export identity and paired-device credential from Keychain, remove only their two local residue files, and then restart.\n\nExisting prepared or hosted data will not be rewritten or deleted. Future contribution activity will use a new identity and require device pairing again."
+            case .dialogResetFinishing:
+                "Local identity reset is finishing"
+            case .dialogResetFinishingDescription:
+                "Wait for this short Keychain transaction to finish, then quit."
+            case .dialogResetIdentityDevice:
+                "Reset local identity and device?"
+            case .dialogResetLocalIdentity:
+                "Reset Local Identity"
+            case .dialogShowLocalData:
+                "Show Local Data"
+            case .dialogUseThisFolder:
+                "Use This Folder"
+            case .launcherCompanionUnavailable:
+                "Local companion unavailable"
+            case .launcherCouldNotStart:
+                "Couldn’t start"
+            case .launcherCodexFolderUpdated:
+                "Codex folder updated"
+            case .launcherDataDiagnostics:
+                "Data & Diagnostics…"
+            case .launcherDashboardDidNotOpen:
+                "Dashboard didn’t open"
+            case .launcherDetailPreparingLocalDashboard:
+                "Preparing the private local dashboard and its bounded foreground update."
+            case .launcherErrorCompanionAlreadyRunning:
+                "Another %@ window is already using this Mac's local data."
+            case .launcherErrorCompanionExited:
+                "The local companion stopped before it became ready."
+            case .launcherErrorCompanionLaunch:
+                "The local companion could not be started."
+            case .launcherErrorCompanionTimeout:
+                "The local companion did not become ready in time."
+            case .launcherErrorCodexHomeSettingsWrite:
+                "The selected Codex folder could not be saved privately."
+            case .launcherErrorDashboardDownloadFailed:
+                "The dashboard could not save that file to your Downloads folder."
+            case .launcherErrorDashboardWebViewUnavailable:
+                "The in-app dashboard view could not be displayed."
+            case .launcherErrorDataErase:
+                "The local %@ data could not be moved to Trash."
+            case .launcherErrorFirstRunStateWrite:
+                "The first-run acknowledgement could not be saved privately."
+            case .launcherErrorHealthCheck:
+                "The local companion health check failed."
+            case .launcherErrorInvalidCentralService:
+                "The bundled community-service connection is invalid."
+            case .launcherErrorInvalidCodexHome:
+                "The selected Codex folder is unavailable or unsafe."
+            case .launcherErrorInvalidCodexHomeSettings:
+                "The saved Codex folder setting is unavailable or unsafe."
+            case .launcherErrorInvalidFirstRunState:
+                "The saved first-run acknowledgement is unavailable or unsafe."
+            case .launcherErrorInvalidHome:
+                "The current home directory is unavailable."
+            case .launcherErrorInvalidResource:
+                "The bundled local companion is incomplete."
+            case .launcherErrorInvalidStateDirectory:
+                "The private %@ data directory is unavailable."
+            case .launcherErrorKeychainDenied:
+                "macOS did not allow the requested Keychain reset."
+            case .launcherErrorKeychainLocked:
+                "The login Keychain is locked."
+            case .launcherErrorKeychainReset:
+                "The local identity and device reset did not finish."
+            case .launcherErrorKeychainResetPartial:
+                "The local identity and device reset finished only partially."
+            case .launcherFailureDetails:
+                "%@ Code: %@. %@"
+            case .launcherFirstRunDisclosure:
+                "%@ updates local %@ metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.\n\nReads: timestamps, model and speed labels, token counters, tool categories, and quota snapshots from the selected %@ sessions folders.\n\nStores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only %@ app-data folder.\n\nCommunity contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.\n\n%@\n\nNever contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.\n\nKeep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints. You can choose whether the app opens at login. TiboTattle installs no LaunchAgent or daemon."
+            case .launcherGetStarted:
+                "Get Started"
+            case .launcherLoadingPrivateDashboard:
+                "Loading the private local dashboard from this Mac only."
+            case .launcherLocalDashboardCouldNotStart:
+                "The local dashboard could not be started."
+            case .launcherLocalDataMovedToTrash:
+                "Local data moved to Trash"
+            case .launcherLocalDataMovedToTrashDetail:
+                "A fresh owner-only local store will be created now. Codex logs were not changed."
+            case .launcherMovingLocalDataToTrash:
+                "Moving local data to Trash…"
+            case .launcherMovingLocalDataToTrashDetail:
+                "The local companion is stopping before its exact owner-only state directory is moved."
+            case .launcherNeedsAttention:
+                "Needs attention"
+            case .launcherNoAllowanceObserved:
+                "No allowance observed yet"
+            case .launcherNothingSaved:
+                "Nothing was saved"
+            case .launcherOpenBrowserTooltip:
+                "Open the same local dashboard in your default browser."
+            case .launcherOpenInBrowser:
+                "Open in Browser"
+            case .launcherOpeningDashboard:
+                "Opening the dashboard…"
+            case .launcherPreparingLocalView:
+                "Preparing your local view…"
+            case .launcherPrivacyForegroundOnly:
+                "Foreground only • local metadata • contribution is opt-in"
+            case .launcherRetry:
+                "Retry"
+            case .launcherRecoveryCheckAccess:
+                "Check access to your home and Application Support folders, then retry."
+            case .launcherRecoveryChooseCodexHome:
+                "Choose Codex Source and select a readable Codex home, or restore the default."
+            case .launcherRecoveryDashboardDownload:
+                "Check access to your Downloads folder, then save the file again."
+            case .launcherRecoveryDashboardWebView:
+                "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
+            case .launcherRecoveryDataErase:
+                "Quit other processes using %@ data, then try the erase again."
+            case .launcherRecoveryExistingWindow:
+                "Open the existing %@ window, or quit it before starting another copy."
+            case .launcherRecoveryKeychainDenied:
+                "Retry the reset and approve the macOS Keychain prompt."
+            case .launcherRecoveryKeychainLocked:
+                "Unlock the login Keychain in Keychain Access, then retry."
+            case .launcherRecoveryMoveAppState:
+                "Move the %@ app-state folder to Trash, then reopen the app."
+            case .launcherRecoveryReinstall:
+                "Reinstall this signed %@ build."
+            case .launcherRecoveryReset:
+                "Copy Data & Diagnostics, then retry the same local reset."
+            case .launcherRecoveryRetryDiagnostics:
+                "Choose Retry. If it repeats, copy Data & Diagnostics for support."
+            case .launcherRestartingLocalCompanion:
+                "Restarting the foreground-only local companion with the validated source."
+            case .launcherResettingLocalIdentity:
+                "Resetting local identity…"
+            case .launcherResettingLocalIdentityDetail:
+                "Stopping the foreground companion before the exact local Keychain transaction."
+            case .launcherStartingLocally:
+                "Starting locally…"
+            case .launcherUpdateUnavailable:
+                "Update unavailable"
+            case .launcherUpdatingAutomatically:
+                "Updating automatically…"
+            case .launcherUpdatingLocalUsage:
+                "Updating local usage while the app is open. Large histories may need several passes. Nothing leaves this Mac."
+            case .launcherUpdatingLocalUsageContribution:
+                "Updating local usage while the app is open. A reviewed contribution remains an explicit manual choice."
+            case .launcherUpToDate:
+                "Up to date"
+            case .launcherWelcome:
+                "Welcome to %@"
+            case .nativeDashboardAllowance:
+                "Allowance"
+            case .nativeDashboardCommunity:
+                "Community"
+            case .nativeDashboardCurrentEvidenceTooltip:
+                "The current local evidence state."
+            case .nativeDashboardDataPrivacy:
+                "Data & Privacy"
+            case .nativeDashboardHowItWorks:
+                "How it works"
+            case .nativeDashboardLocalOnly:
+                "Local only"
+            case .nativeDashboardLocalOnlyTooltip:
+                "Analysis and cached results stay on this Mac. Community contribution is optional."
+            case .nativeDashboardOverview:
+                "Overview"
+            case .nativeDashboardRefreshUsage:
+                "Refresh usage"
+            case .nativeDashboardRefreshUsageTooltip:
+                "Update local usage now. This reads only the selected Codex folders on this Mac."
+            case .nativeDashboardShare:
+                "Share"
+            case .nativeDashboardShareTooltip:
+                "Open the local share card."
+            case .nativeDashboardStarting:
+                "Starting…"
+            case .nativeDashboardStatus:
+                "Local status"
+            case .nativeDashboardTrends:
+                "Trends"
+            case .nativeDashboardUpdating:
+                "Updating…"
             case .menuAboutProduct:
                 "About %@"
             case .menuCopy:
                 "Copy"
             case .menuEdit:
                 "Edit"
+            case .menuBarAnalyzeLocalUsage:
+                "Analyze Local Usage"
+            case .menuBarAnalysisRequestRejected:
+                "The local companion could not accept an analysis request."
+            case .menuBarAnalyzingLocalUsage:
+                "Analyzing Local Usage…"
+            case .menuBarAllowanceTitle:
+                "%@ · %@ allowance"
+            case .menuBarCompanionNotRunning:
+                "The local companion is not running."
+            case .menuBarCompanionStarting:
+                "Starting the local companion…"
+            case .menuBarCurrentEvidence:
+                "Observed locally · verified current evidence"
+            case .menuBarCurrentEvidenceWithAge:
+                "Observed %@ · verified current evidence"
+            case .menuBarDaysAgo:
+                "%d days ago"
+            case .menuBarFiveHourAllowance:
+                "Five-hour allowance"
+            case .menuBarFailureRecovery:
+                "Not running: %@. Open the window for the recovery step."
+            case .menuBarHoursAgo:
+                "%d hours ago"
+            case .menuBarJustNow:
+                "just now"
+            case .menuBarLastObservationNotCurrent:
+                "Quota lanes were last observed, but are not current"
+            case .menuBarLocalEvidenceStale:
+                "Local evidence is stale. Allowance values and reset countdowns are hidden."
+            case .menuBarLocalEvidenceStaleWithAge:
+                "Last observed %@ · stale. Allowance values and reset countdowns are hidden."
+            case .menuBarMinutesAgo:
+                "%d minutes ago"
+            case .menuBarNoVerifiedAllowance:
+                "No verified Codex allowance observed yet"
+            case .menuBarNoVerifiedQuota:
+                "No verified quota observation yet · choose Analyze Local Usage."
+            case .menuBarOpenProduct:
+                "Open %@"
+            case .menuBarQuotaEvidenceUnavailable:
+                "Quota evidence is unavailable right now. Retry Local Analysis."
+            case .menuBarQuotaLastObserved:
+                "%@: last observation is not current"
+            case .menuBarQuotaRemaining:
+                "%@: %@ remaining"
+            case .menuBarQuotaResetUnavailable:
+                "%@: %@ · reset time unavailable"
+            case .menuBarQuotaResets:
+                "%@: %@ · resets %@"
+            case .menuBarQuotaValuesUnavailable:
+                "Quota values are unavailable until a fresh local observation."
+            case .menuBarResetDaysHours:
+                "in %dd %dh"
+            case .menuBarResetHoursMinutes:
+                "in %dh %dm"
+            case .menuBarResetMinutes:
+                "in %dm"
+            case .menuBarRetryLocalAnalysis:
+                "Retry Local Analysis"
+            case .menuBarSevenDayAllowance:
+                "Seven-day allowance"
+            case .menuBarStaleEvidenceHidden:
+                "Allowance values and reset countdowns are hidden."
+            case .menuBarUpdateLocalUsage:
+                "Update Local Usage"
+            case .menuBarVerifiedAllowanceMany:
+                "%d verified Codex allowances"
+            case .menuBarVerifiedAllowanceOne:
+                "1 verified Codex allowance"
+            case .menuBarWaitingToAnalyze:
+                "Waiting to Analyze Local Usage"
             case .menuQuitProduct:
                 "Quit %@"
             case .menuSelectAll:
@@ -148,6 +651,10 @@ enum TiboTattleLocalization {
                 "Choose Codex Folder…"
             case .settingsCodexFolder:
                 "Codex folder"
+            case .settingsCodexFolderCustomSelected:
+                "Custom folder selected"
+            case .settingsCodexFolderDefaultLocation:
+                "Default location (~/.codex)"
             case .settingsCodexFolderSummary:
                 "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else."
             case .settingsGeneral:
@@ -158,8 +665,16 @@ enum TiboTattleLocalization {
                 "GitHub"
             case .settingsLanguage:
                 "Language"
+            case .settingsLanguageEnglish:
+                "English"
+            case .settingsLanguagePickerHint:
+                "Choose the language used for TiboTattle controls and explanations."
+            case .settingsLanguageSimplifiedChinese:
+                "Simplified Chinese"
+            case .settingsLanguageSpanish:
+                "Spanish"
             case .settingsLanguageSummary:
-                "Uses the Mac language when available; regional formats follow this Mac."
+                "Uses your Mac language by default. Dates, numbers, and currency keep this Mac's regional format."
             case .settingsLanguageSystem:
                 "System"
             case .settingsNotifications:
@@ -282,6 +797,14 @@ enum TiboTattleLocalization {
                 "Removal from login was not confirmed"
             case .settingsUseDefault:
                 "Use Default"
+            case .settingsUpdateDisclosureAutomaticOff:
+                "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
+            case .settingsUpdateDisclosureAutomaticOn:
+                "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → General."
+            case .settingsUpdateDisclosureDevelopment:
+                "This development build does not include update checks. Signed releases installed in Applications can check for updates from About."
+            case .settingsUpdateDisclosurePreview:
+                "This preview uses manual signed-update checks. It does not check, download, or install updates automatically."
             case .settingsVersion:
                 "Version %@ (%@)"
             case .settingsWebsite:
@@ -294,14 +817,65 @@ enum TiboTattleLocalization {
         }
     }
 
-    static let fallbackLocalization = "en"
-    static let tableName = "Localizable"
-
     /// Formatting is deliberately independent from translation fallback. A
-    /// French system with only English resources still receives French date,
-    /// number, decimal, and grouping conventions.
+    /// French system with English UI text still receives French date, number,
+    /// decimal, grouping, and currency conventions.
     static var locale: Locale {
         .current
+    }
+
+    static var languagePreference: LanguagePreference {
+        guard let raw = UserDefaults.standard.string(
+            forKey: languagePreferenceDefaultsKey
+        ), let value = LanguagePreference(rawValue: raw) else {
+            return .system
+        }
+        return value
+    }
+
+    static func setLanguagePreference(_ value: LanguagePreference) {
+        UserDefaults.standard.set(
+            value.rawValue,
+            forKey: languagePreferenceDefaultsKey
+        )
+    }
+
+    static var selectedWebLocale: String {
+        switch selectedNativeLocalization {
+        case "zh-Hans":
+            "zh-Hans"
+        case "es":
+            "es"
+        default:
+            fallbackLocale
+        }
+    }
+
+    static var selectedNativeLocalization: String {
+        if let selected = languagePreference.nativeLocalization {
+            return selected
+        }
+        for preferred in Locale.preferredLanguages {
+            if let localization = nativeLocalization(for: preferred) {
+                return localization
+            }
+        }
+        return fallbackLocalization
+    }
+
+    static func languagePreferenceDisplayName() -> String {
+        switch languagePreference {
+        case .system:
+            string(.settingsLanguageSystem)
+        case .english:
+            string(.settingsLanguageEnglish)
+        case .simplifiedChinese:
+            // Keep a self-identifying script name in every UI language so a
+            // person can recover the picker even if they selected it by error.
+            "简体中文"
+        case .spanish:
+            "Español"
+        }
     }
 
     static func string(_ key: Key) -> String {
@@ -342,6 +916,16 @@ enum TiboTattleLocalization {
         return formatter
     }
 
+    static func percentString(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .percent
+        formatter.maximumFractionDigits = 0
+        return formatter.string(
+            from: NSNumber(value: Double(value) / 100)
+        ) ?? "\(value)%"
+    }
+
     static func dateFormatter(
         dateStyle: DateFormatter.Style = .medium,
         timeStyle: DateFormatter.Style = .short
@@ -353,13 +937,36 @@ enum TiboTattleLocalization {
         return formatter
     }
 
+    private static func nativeLocalization(for preferredLanguage: String)
+        -> String? {
+        let normalized = preferredLanguage
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
+        if normalized == "zh-hans"
+            || normalized.hasPrefix("zh-hans-")
+            || normalized == "zh-cn"
+            || normalized.hasPrefix("zh-cn-")
+            || normalized == "zh-sg"
+            || normalized.hasPrefix("zh-sg-") {
+            return "zh-Hans"
+        }
+        // Chinese without a script is ambiguous, and Traditional Chinese is
+        // not a Simplified Chinese fallback. Both therefore use English until
+        // a corresponding catalog is shipped.
+        if normalized == "zh" || normalized.hasPrefix("zh-") {
+            return nil
+        }
+        if normalized == "es" || normalized.hasPrefix("es-") {
+            return "es"
+        }
+        if normalized == "en" || normalized.hasPrefix("en-") {
+            return "en"
+        }
+        return nil
+    }
+
     private static func localizedBundle() -> Bundle {
-        let available = Bundle.main.localizations.filter { $0 != "Base" }
-        let preferred = Bundle.preferredLocalizations(
-            from: available,
-            forPreferences: Locale.preferredLanguages
-        ).first ?? fallbackLocalization
-        return bundle(for: preferred) ?? englishBundle() ?? Bundle.main
+        bundle(for: selectedNativeLocalization) ?? englishBundle() ?? Bundle.main
     }
 
     private static func englishBundle() -> Bundle? {

@@ -69,15 +69,20 @@
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
   </head>
-  <body class="first-run">
-    <a class="skip-link" href="#main">Skip to monitoring dashboard</a>
+  <body class="first-run" data-i18n-root>
+    <a class="skip-link" href="#main" data-i18n-legacy-root>Skip to monitoring dashboard</a>
 
-    <header class="topbar">
-      <a class="brand" href="#overview" aria-label="TiboTattle dashboard">
+    <header class="topbar" data-i18n-legacy-root>
+      <a class="brand" href="#overview" aria-label="TiboTattle dashboard" data-i18n-aria-label="aria.tibotattleDashboard">
         <img class="brand-icon" src="./tibotattle-icon.png" alt="">
         <span>TiboTattle</span>
       </a>
       <div class="top-actions">
+        <label class="language-picker">
+          <span class="sr-only" data-i18n="language.label">Language</span>
+          <select data-language-picker aria-label="Language"></select>
+        </label>
+        <p class="sr-only" data-language-announcement role="status" aria-live="polite" aria-atomic="true"></p>
         <span class="state-pill state-connecting" id="central-state" data-requires-evidence hidden>
           <span class="state-dot" aria-hidden="true"></span>
           Community checking
@@ -95,9 +100,9 @@
       </div>
     </header>
 
-    <div class="dashboard-shell">
-      <aside class="dashboard-sidebar" aria-label="Dashboard navigation">
-        <nav class="primary-nav" aria-label="Dashboard sections">
+    <div class="dashboard-shell" data-i18n-legacy-root>
+      <aside class="dashboard-sidebar" aria-label="Dashboard navigation" data-i18n-aria-label="aria.dashboardNavigation">
+        <nav class="primary-nav" aria-label="Dashboard sections" data-i18n-aria-label="aria.dashboardSections">
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
@@ -160,7 +165,7 @@
               <span id="installer-size"></span>
               <span id="installer-sha256"></span>
             </div>
-            <nav class="installer-links" id="installer-links" aria-label="Release information" hidden>
+            <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
               <a id="release-notes-link" href="" hidden>Release notes</a>
               <a id="privacy-link" href="" hidden>Privacy</a>
               <a id="security-link" href="" hidden>Security</a>
@@ -339,6 +344,7 @@
               width="1200"
               height="800"
               aria-label="A results card is generated once local evidence is available."
+              data-i18n-aria-label="aria.shareCard"
             ></canvas>
           </div>
           <div class="share-actions">
@@ -388,14 +394,14 @@
               <h3>Allowance estimate history</h3>
             </div>
             <div class="weekly-chart-controls">
-              <div class="segmented-control" id="weekly-range-controls" aria-label="Weekly history date range">
+              <div class="segmented-control" id="weekly-range-controls" aria-label="Weekly history date range" data-i18n-aria-label="aria.weeklyHistoryRange">
                 <button type="button" data-days="7">7d</button>
                 <button type="button" data-days="31" class="active" aria-pressed="true">31d</button>
                 <button type="button" data-days="36500">All</button>
               </div>
             </div>
           </div>
-          <div class="legend weekly-legend" aria-label="Weekly estimate chart legend">
+          <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>Typical estimate</span>
             <span><i class="legend-dot weekly-mature"></i>Observed across 50+ points</span>
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
@@ -444,17 +450,17 @@
               <p id="usage-timeline-copy">Replay-safe local increments · browser-local time · event-time historical API cards</p>
             </div>
             <div class="chart-control-stack">
-              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping">
+              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
                 <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
                 <button type="button" data-group="day">Day</button>
                 <button type="button" data-group="week">Week</button>
               </div>
-              <div class="segmented-control" id="range-controls" aria-label="Usage chart date range">
+              <div class="segmented-control" id="range-controls" aria-label="Usage chart date range" data-i18n-aria-label="aria.usageDateRange">
                 <button type="button" data-days="1">24h</button>
                 <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
                 <button type="button" data-days="31">31d</button>
               </div>
-              <div class="legend compact-legend" aria-label="Usage chart legend">
+              <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
                 <span><i class="legend-dot cost"></i>API-cost estimate</span>
                 <span><i class="legend-dot allowance"></i>7-day allowance remaining</span>
               </div>
@@ -478,25 +484,25 @@
             </div>
             <div class="calibration-controls">
               <span class="control-label">Calibration window</span>
-              <div class="segmented-control" id="window-controls" aria-label="Calibration rolling comparison window">
+              <div class="segmented-control" id="window-controls" aria-label="Calibration rolling comparison window" data-i18n-aria-label="aria.calibrationWindow">
                 <button type="button" data-hours="0.25">15 min</button>
                 <button type="button" data-hours="1" class="active" aria-pressed="true">1 hour</button>
                 <button type="button" data-hours="3">3 hours</button>
               </div>
-              <div class="segmented-control" id="calibration-range-controls" aria-label="Calibration date range">
+              <div class="segmented-control" id="calibration-range-controls" aria-label="Calibration date range" data-i18n-aria-label="aria.calibrationDateRange">
                 <button type="button" data-days="1">24h</button>
                 <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
                 <button type="button" data-days="31">31d</button>
               </div>
-              <div class="chart-navigation" aria-label="Calibration zoom and pan">
-                <button class="button button-quiet compact" id="timeline-pan-back" type="button" title="Pan calibration earlier">← Earlier</button>
-                <button class="button button-quiet compact" id="timeline-zoom-out" type="button" title="Zoom out">−</button>
-                <button class="button button-quiet compact" id="timeline-zoom-in" type="button" title="Zoom in">+</button>
+              <div class="chart-navigation" aria-label="Calibration zoom and pan" data-i18n-aria-label="aria.calibrationZoomPan">
+                <button class="button button-quiet compact" id="timeline-pan-back" type="button" title="Pan calibration earlier" data-i18n-title="title.panCalibrationEarlier">← Earlier</button>
+                <button class="button button-quiet compact" id="timeline-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
+                <button class="button button-quiet compact" id="timeline-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
                 <button class="button button-quiet compact" id="timeline-reset-zoom" type="button">Reset view</button>
-                <button class="button button-quiet compact" id="timeline-pan-forward" type="button" title="Pan calibration later">Later →</button>
+                <button class="button button-quiet compact" id="timeline-pan-forward" type="button" title="Pan calibration later" data-i18n-title="title.panCalibrationLater">Later →</button>
                 <span class="sr-only" id="timeline-zoom-status" aria-live="polite"></span>
               </div>
-              <div class="legend" aria-label="Calibration chart legend">
+              <div class="legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
                 <span><i class="legend-dot observed"></i>Observed quota</span>
                 <span><i class="legend-dot expected"></i>Expected from API cost</span>
                 <span><i class="legend-dot chart-status-missing"></i>Missing quota bracket</span>
@@ -567,7 +573,7 @@
             <p class="eyebrow">04 · Cost accounting</p>
             <h2 id="accounting-title">How the estimate was calculated</h2>
           </div>
-          <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period">
+          <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period" data-i18n-aria-label="aria.accountingPeriod">
             <button type="button" data-period="24h">24h</button>
             <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
             <button type="button" data-period="30d">30d</button>
@@ -833,7 +839,7 @@
           </p>
         </div>
 
-        <div class="boundary-diagram" role="img" aria-label="Raw logs remain local. The local companion extracts content-free metadata for the dashboard. Only a reviewed safe export can be sent to the contribution service.">
+        <div class="boundary-diagram" role="img" aria-label="Raw logs remain local. The local companion extracts content-free metadata for the dashboard. Only a reviewed safe export can be sent to the contribution service." data-i18n-aria-label="aria.rawLogsLocal">
           <div class="boundary-node private">
             <span>On your computer</span>
             <strong>Raw Codex logs</strong>
@@ -970,7 +976,7 @@
               </div>
               <div class="preparation-window">
                 <span class="control-label">Evidence to prepare</span>
-                <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback">
+                <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback" data-i18n-aria-label="aria.contributionLookback">
                   <button type="button" data-lookback-hours="1">1 hour</button>
                   <button type="button" data-lookback-hours="24" class="active" aria-pressed="true">24 hours</button>
                   <button type="button" data-lookback-hours="168">7 days</button>
@@ -1026,7 +1032,7 @@
                 </dl>
                 <details class="exact-json-inspection">
                   <summary>Review every validated field and value</summary>
-                  <pre id="selected-contribution-json"></pre>
+                  <pre id="selected-contribution-json" data-i18n-skip></pre>
                 </details>
                 <p class="backend-contract-note">
                   This is the complete plaintext contribution. These exact values
@@ -1086,7 +1092,7 @@
               <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
               <div><dt>Upload reservation</dt><dd id="sync-next-bytes">—</dd></div>
             </dl>
-            <div class="sync-actions" aria-label="Foreground contribution controls">
+            <div class="sync-actions" aria-label="Foreground contribution controls" data-i18n-aria-label="aria.foregroundContributionControls">
               <button class="button button-secondary" id="sync-inspect" type="button">
                 Inspect next
               </button>
@@ -1114,7 +1120,7 @@
                 This verified JSON is read from the owner-only prepared set over
                 loopback. It has not been sent to the contribution service.
               </p>
-              <pre id="sync-exact-review-json" tabindex="0"></pre>
+              <pre id="sync-exact-review-json" tabindex="0" data-i18n-skip></pre>
             </details>
             <p class="backend-contract-note">
               Inspection uses loopback only: it performs no service request,
@@ -1171,7 +1177,7 @@
             <div><dt>Participant rights</dt><dd id="backend-participant-rights">Checking</dd></div>
             <div><dt>Accepted upload contract</dt><dd id="backend-contract">Checking</dd></div>
           </dl>
-          <ol class="backend-flow" aria-label="Contribution backend lifecycle">
+          <ol class="backend-flow" aria-label="Contribution backend lifecycle" data-i18n-aria-label="aria.contributionBackendLifecycle">
             <li><strong>1</strong><span>Browser validation</span><small>Reject raw or oversized files before upload</small></li>
             <li><strong>2</strong><span>Encrypted transport</span><small>One-use upload authorization and envelope encryption</small></li>
             <li><strong>3</strong><span>Server validation</span><small>Closed schema, content-field rejection, and canonical repricing</small></li>
@@ -1212,6 +1218,7 @@
                 class="participant-detail contribution-history"
                 id="contribution-history"
                 aria-label="Private contribution history"
+                data-i18n-aria-label="aria.privateContributionHistory"
                 hidden
               ></section>
             </details>
@@ -1260,7 +1267,7 @@
       </section>
     </main>
 
-    <footer>
+    <footer data-i18n-legacy-root>
       <p>TiboTattle · evidence, uncertainty, and privacy boundaries kept visible.</p>
       <p class="footer-disclaimer">
         Named with affection for the Codex community. Not affiliated with or

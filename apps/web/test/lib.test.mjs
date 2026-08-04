@@ -2593,7 +2593,7 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(pollBody, /if \(attempt\.returnedToApp\)/u);
   assert.match(
     pollBody,
-    /sign-in did not complete\. Nothing was uploaded\. You can try again\./u,
+    /t\("contribution\.signInIncomplete", \{/u,
   );
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
   assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
@@ -3374,7 +3374,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="contribution-history"/);
   assert.match(html, /privacy-safe TiboTattle export/);
   assert.match(appSource, /demo-button.*addEventListener/s);
-  assert.match(appSource, /companionReachable \? "Ready to analyze"/);
+  assert.match(appSource, /status\.readyToAnalyze/);
   assert.match(appSource, /Continue your local analysis/);
   assert.match(appSource, /ready: "Retention and restore replay current"/);
   assert.match(appSource, /contributionSyncExactReview/);
@@ -3387,11 +3387,10 @@ test("public interface is dashboard-first and never substitutes demo data automa
     appSource,
     /Your hosted content-free pseudonymous metadata was deleted/,
   );
-  assert.match(appSource, /This address is the backend-only service/);
-  assert.match(
-    appSource,
-    /Open TiboTattle from Applications and use its in-app window/,
-  );
+  assert.match(appSource, /function renderDashboardUnavailableState/);
+  assert.match(appSource, /dashboard\.unavailable\.backendOnlyTitle/);
+  assert.match(appSource, /dashboard\.unavailable\.companionCopy/);
+  assert.match(appSource, /dashboard\.unavailable\.noRealUsage/);
   assert.match(html, /your dashboard in its own TiboTattle in-app window/u);
   assert.match(html, /Use the TiboTattle in-app window/u);
   assert.doesNotMatch(appSource, /dashboard tab|local tab|separate local dashboard/u);
@@ -3405,7 +3404,7 @@ test("first run is a truthful install and local preflight journey", async () => 
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
-  assert.match(html, /<body class="first-run">/u);
+  assert.match(html, /<body class="first-run" data-i18n-root>/u);
   assert.match(
     html,
     /<meta name="usage-monitor-installer-url" content="">/u,
@@ -3486,8 +3485,8 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget\(document\);/u);
   assert.match(appSource, /installedAppLink\.href = SEMANTIC_OPEN_TARGET/u);
   assert.doesNotMatch(appSource, /usagemonitor:\/\/open/u);
-  assert.match(installSource, /SHA-256 \$\{release\.sha256\}/u);
-  assert.match(installSource, /Requires macOS \$\{release\.minimumMacos\} or later/u);
+  assert.match(installSource, /translateMessage\(\s*"installer\.sha256",\s*\{ value: release\.sha256 \}/u);
+  assert.match(installSource, /translateMessage\("installer\.requiresMacOS", \{/u);
   assert.match(installSource, /selected\.protocol === "https:"/u);
   assert.doesNotMatch(appSource, /loopbackHttp/u);
   assert.match(appSource, /function openInstalledApp\(\)/u);
@@ -3507,7 +3506,7 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /rolloutFilesObservedCapped/u);
   assert.match(appSource, /setup-check-again.*checkLocalSetup/su);
   assert.match(appSource, /setJourneyState\(ready \? "local-ready" : "needs-local-setup"\)/u);
-  assert.match(appSource, /setup: "Set up this Mac"/u);
+  assert.match(appSource, /setup: "status\.setUpMac"/u);
   assert.match(appSource, /if \(!ready\) setGlobalState\("setup"/u);
   assert.doesNotMatch(appSource, /product laboratory/u);
   assert.match(styles, /body\.first-run \[data-requires-evidence\]/u);
@@ -3568,7 +3567,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /renderResiduals\(data, visiblePoints, viewport\)/);
   assert.match(appSource, /safeDomainEndMs - domainStartMs/);
   assert.match(appSource, /REPORTING_TIME_ZONE/);
-  assert.match(appSource, /REPORTING_CALENDAR_PARTS/);
+  assert.match(appSource, /localCalendarParts\(\)\.formatToParts\(timestamp\)/);
   assert.match(appSource, /formatReportingTime\(item\.timestamp\)/);
   assert.match(appSource, /Window ending \(\$\{REPORTING_TIME_ZONE\}\)/);
   assert.doesNotMatch(appSource, /function formatUtc/);
@@ -3626,9 +3625,9 @@ test("default calibration view explains the fitted rate and uncertainty plainly"
     assert.match(html, new RegExp(`id="${id}"`));
   }
   assert.match(appSource, /function renderCalibrationRate/);
-  assert.match(appSource, /API equivalent per 1 percentage point/);
-  assert.match(appSource, /not an 80% probability/);
-  assert.match(appSource, /not a provider-published dollar cap/);
+  assert.match(appSource, /t\("dashboard\.calibration\.perPoint"/u);
+  assert.match(appSource, /t\("dashboard\.calibration\.withRange"/u);
+  assert.match(appSource, /t\("dashboard\.calibration\.withoutRange"/u);
 });
 
 test("weekly view keeps the default surface to the estimate and its reset history", async () => {
@@ -3650,10 +3649,9 @@ test("weekly view states the exact price epoch and whether the July repricing is
   assert.match(html, /Price basis for the visible fits/u);
   assert.match(appSource, /function renderWeeklyPricingReceipt/u);
   assert.match(appSource, /event_time_when_registry_has_effective_evidence/u);
-  assert.match(appSource, /Historical event-time prices used for each fit/u);
-  assert.match(appSource, /mixed official card windows/u);
-  assert.match(appSource, /lower official GPT-5\.6 Terra\/Luna cards effective July 30 are being used/u);
-  assert.match(appSource, /earlier events keep their earlier cards/u);
+  assert.match(appSource, /t\("dashboard\.priceEpoch\.singleTitle"/u);
+  assert.match(appSource, /t\("dashboard\.priceEpoch\.mixedWindows"/u);
+  assert.match(appSource, /t\("dashboard\.priceEpoch\.postJulyCard"/u);
   assert.doesNotMatch(appSource, /Current official prices are applied to every fit/u);
   assert.match(appSource, /renderWeeklyPricingReceipt\(data\);/u);
   assert.match(styles, /\.weekly-pricing-receipt/u);
@@ -3783,7 +3781,7 @@ test("calibration zoom moves in bounded granular steps on every input device", a
   // The zoom level itself has to be readable without seeing the chart.
   assert.match(
     appSource,
-    /a span of \$\{formatSpanLength\(viewport\.endMs - viewport\.startMs\)\}/u,
+    /t\("dashboard\.timeline\.status", \{/u,
   );
 });
 
@@ -3809,7 +3807,7 @@ test("residuals span the calibration range and show uncomputable windows as gaps
     /const computed = residuals\.filter\(\(row\) => row\.residual !== null\);/u,
   );
   assert.match(appSource, /function residualGapReasons/u);
-  assert.match(appSource, /never as zero/u);
+  assert.match(appSource, /t\("dashboard\.residual\.partial", \{/u);
   assert.match(html, /id="residual-coverage"/u);
   assert.match(html, /windows that cannot be differenced are shaded gaps, never zeros/u);
 });
@@ -4757,20 +4755,20 @@ test("result panels show the number and its caveat, not the service plumbing", a
   assert.match(appSource, /from "\.\/community-view\.js"/u);
   assert.match(
     detailBody,
-    /container\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*`Activity totals for the week above/u,
+    /t\("community\.weeklyActivity", \{/u,
   );
   assert.match(
     detailBody,
-    /container\.append\(node\(\s*"p",\s*"snapshot-partial",\s*"Some metrics were not released/u,
+    /t\("community\.partialMetrics"\)/u,
   );
   // Data-format version, ingestion cutoff, release timing, clipping mechanics
   // and the estimate-evidence boundary all moved into the disclosure.
   for (const relocated of [
     /detail\.append\(quality\);/u,
-    /\["Data format", snapshot\.schemaVersion\]/u,
-    /\["Ingestion cutoff", formatLocal\(snapshot\.ingestionCutoffAt\)\]/u,
-    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*`Each value is clipped per participant/u,
-    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*"This snapshot reports privacy-safe activity totals only/u,
+    /\[t\("community\.contract"\), snapshot\.schemaVersion\]/u,
+    /\[t\("community\.ingestionCutoff"\), formatLocal\(snapshot\.ingestionCutoffAt\)\]/u,
+    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*t\("community\.releaseMechanics", \{/u,
+    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*t\("community\.currentReleaseScope"\)/u,
   ]) {
     assert.match(detailBody, relocated);
   }
@@ -4870,7 +4868,7 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   );
   assert.match(
     connect,
-    /For safety, this page discarded the one-time sign-in; sign in again before retrying\./u,
+    /t\("contribution\.signInDiscarded", \{/u,
   );
   assert.match(
     connect,
@@ -4960,20 +4958,20 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     [...new Set(firstArguments(section, "context.fillText("))].sort(),
     [
       "\"TiboTattle\"",
-      "`${card.trend.count} reset fits`",
       "badge",
       "card.home",
       "card.trendEmpty",
       "card.trendEmptyDetail",
-      "card.trendLabel.toUpperCase()",
+      "card.trendLabel.toLocaleUpperCase(localization.locale())",
       "formatMoney(value, axisDigits)",
       "line",
-      "shareCardFit( context, \"Local measurement · API equivalent, not a bill.\", inner, )",
+      "shareCardFit( context, t(\"share.footer\"), inner, )",
       "shareCardFit(context, card.identifierLine, inner)",
       "shareCardFit(context, card.relationshipNote, inner - 20)",
       "shareCardFit(context, card.subtitle, inner)",
       "shareCardFit(context, card.title, inner)",
       "shareCardFit(context, stat.value, textWidth)",
+      "tPlural(\"share.resetFit\", card.trend.count)",
       "tick.label",
       "xAxisLabel",
       "yAxisLabel",
@@ -5035,15 +5033,18 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     section,
     /toLocaleString|toLocaleDateString|toLocaleTimeString|toISOString/u,
   );
-  // The card delegates to the same explicit reporting-zone formatter as the
-  // dashboard, and it receives a parsed number rather than a source string.
+  // The date formatter follows the independently selected regional format in
+  // the viewer's time zone. It accepts the parsed number, not a source string.
   assert.match(
     section,
-    /function shareCardDateLabel\(timestamp\) \{[\s\S]*?formatReportingTime\(timestamp, \{ dateOnly: true \}\)/u,
+    /function shareCardDateLabel\(timestamp\) \{[\s\S]*?new Intl\.DateTimeFormat\(getFormattingLocale\(\), \{[\s\S]*?month: "short",[\s\S]*?day: "numeric",[\s\S]*?year: "numeric",/u,
   );
-  assert.doesNotMatch(section, /SHARE_CARD_DATE_FORMAT/u);
-  assert.match(section, /const yAxisLabel = "7-day allowance \(\$\)";/u);
-  assert.match(section, /const xAxisLabel = "Reset estimate date";/u);
+  assert.match(
+    section,
+    /if \(!Number\.isFinite\(timestamp\)\) return "";/u,
+  );
+  assert.match(section, /const yAxisLabel = t\("share\.axis\.allowance"\);/u);
+  assert.match(section, /const xAxisLabel = t\("share\.axis\.resetEstimateDate"\);/u);
   assert.match(section, /for \(const value of axis\.ticks\) \{[\s\S]*?formatMoney\(value, axisDigits\)/u);
   assert.match(section, /for \(const tick of xTicks\) \{[\s\S]*?context\.fillText\(tick\.label, tickX, plotBottom \+ 21\);/u);
   assert.match(section, /const bandLow = finite\(points\[0\]\?\.acrossResetLow\);/u);
@@ -5070,7 +5071,9 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   );
   assert.deepEqual(
     [...new Set(
-      [...section.matchAll(/\b(?:window|allowanceWindow)\??\.[A-Za-z]+/gu)].map((match) => match[0]),
+      [...section.matchAll(/\b(?:window|allowanceWindow)\??\.[A-Za-z]+/gu)]
+        .map((match) => match[0])
+        .filter((value) => !value.startsWith("window.")),
     )].sort(),
     [
       "allowanceWindow?.remainingPercent",
@@ -5078,15 +5081,15 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "window?.remainingPercent",
     ],
   );
-  // A period name is looked up in the product's own vocabulary and the phrase
-  // written here is printed. The arriving string is matched, never rendered,
-  // so even a recognized label reaches the image only as fixed copy.
+  // A period name is looked up in the product's own vocabulary and then
+  // translated from a stable key. The arriving string is matched, never
+  // rendered, so even a recognized label reaches the image only as fixed copy.
   assert.match(
     section,
-    /function shareCardPeriodLabel\(candidate\) \{\s*\n\s*return SHARE_CARD_PERIOD_PHRASES\.get\(candidate\) \?\? SHARE_CARD_UNKNOWN_PERIOD;/u,
+    /function shareCardPeriodLabel\(candidate\) \{\s*\n\s*return t\(SHARE_CARD_PERIOD_KEYS\.get\(candidate\) \?\? "share\.period\.recorded"\);/u,
   );
   const phrases = section.match(
-    /const SHARE_CARD_PERIOD_PHRASES = new Map\(\[([\s\S]*?)\]\);/u,
+    /const SHARE_CARD_PERIOD_KEYS = new Map\(\[([\s\S]*?)\]\);/u,
   )?.[1];
   assert.ok(phrases, "the period vocabulary is available");
   assert.deepEqual(
@@ -5233,8 +5236,8 @@ test("a posted results card always carries a diagnostic-format reference", async
 
   // It is printed on the image itself, first in the identifier line, and it
   // names the saved file so a downloaded card stays matched to it.
-  assert.match(section, /const identifiers = \[\s*\n\s*`Debug: \$\{reference\}`,/u);
-  assert.match(section, /`v\$\{appVersion\}`/u);
+  assert.match(section, /const identifiers = \[\s*\n\s*t\("share\.identifier\.debug", \{ reference \}\),/u);
+  assert.match(section, /t\("share\.identifier\.version", \{/u);
   assert.doesNotMatch(section, /price table \$\{registryVersion\}/u);
   assert.match(
     section,
@@ -5272,10 +5275,14 @@ test("a posted results card states a figure in full and marks a fixture as one",
   );
   assert.match(section, /context\.font = shareCardFont\(500, valueSize, "serif"\);/u);
   assert.doesNotMatch(section, /shareCardFont\(500, 54, "serif"\)/u);
-  // Every value the card can print for missing evidence is spelled out, so the
-  // size that fits them is the size the row is drawn at.
-  for (const empty of ["Not observed", "Not available", "Not estimable"]) {
-    assert.ok(section.includes(`"${empty}"`), `${empty} is one of the fixed figures`);
+  // Every value the card can print for missing evidence comes from a stable
+  // semantic key, so the size that fits it is the size the row is drawn at.
+  for (const key of [
+    "share.value.notObserved",
+    "share.value.notAvailable",
+    "share.value.notEstimable",
+  ]) {
+    assert.ok(section.includes(`t("${key}")`), `${key} is one of the fixed figures`);
   }
 
   // A fixture is marked where a reader scrolling a timeline will see it: in
@@ -5283,9 +5290,9 @@ test("a posted results card states a figure in full and marks a fixture as one",
   // the smallest copy on the image.
   assert.match(
     section,
-    /subtitle: isDemo\s*\n\s*\? "Illustrative demo data\. Not a measurement\."\s*\n\s*: "Measured on my own Mac\. Nothing left it\.",/u,
+    /subtitle: isDemo\s*\n\s*\? t\("share\.subtitle\.demo"\)\s*\n\s*: t\("share\.subtitle\.local"\),/u,
   );
-  assert.match(section, /badge: isDemo \? "DEMO DATA" : "",/u);
+  assert.match(section, /badge: isDemo \? t\("share\.badge\.demo"\) : "",/u);
   assert.match(section, /if \(card\.badge !== ""\) \{\s*\n\s*drawShareCardBadge\(/u);
   // The mark is drawn in the header, above the figures it qualifies.
   assert.ok(
@@ -5296,7 +5303,7 @@ test("a posted results card states a figure in full and marks a fixture as one",
   // And the caveat that says the same thing stays, first in the list.
   assert.match(
     section,
-    /if \(isDemo\) \{\s*\n\s*caveats\.push\(\s*\n\s*"Labeled demo data: an illustrative fixture, not measured usage\.",/u,
+    /if \(isDemo\) \{\s*\n\s*caveats\.push\(t\("share\.caveat\.demo"\)\);/u,
   );
 
   // The history takes exactly the room the qualifications leave, but a card
@@ -5316,11 +5323,11 @@ test("a posted results card states a figure in full and marks a fixture as one",
   assert.match(section, /relationshipNote,/u);
   // The image makes the incomparable denominators explicit rather than
   // suggesting that seven days of recorded events is a single allowance.
-  assert.match(section, /label: "Recorded activity"/u);
-  assert.match(section, /label: "Estimated 7-day allowance"/u);
+  assert.match(section, /label: t\("share\.stat\.recordedActivity"\),/u);
+  assert.match(section, /label: t\("share\.stat\.estimatedAllowance"\),/u);
   assert.match(
     section,
-    /Activity sums all events in \$\{period\}; the estimate is one seven-day allowance\./u,
+    /t\("share\.relationship", \{ period \}\)/u,
   );
   // The social image reuses the date landmarks and vertical domain from the
   // Allowance estimate history, instead of inventing a compact-card axis.

@@ -115,7 +115,7 @@ async function fixture() {
   await writeFile(join(source, "community.html"), sourceHtml());
   await writeFile(
     join(source, "community.js"),
-    'import "./community-view.js";\nconsole.log("safe");\n',
+    'import "./community-view.js";\nimport "./localization.js";\nconsole.log("safe");\n',
   );
   await writeFile(
     join(source, "community-view.js"),
@@ -125,6 +125,7 @@ async function fixture() {
     join(source, "ui-format.js"),
     "export const safeFormat = true;\n",
   );
+  await writeFile(join(source, "localization.js"), "export const safeLocale = true;\n");
   await writeFile(join(source, "styles.css"), "body { color: green; }\n");
   await writeFile(join(source, "tibotattle-icon.png"), "reviewed public asset\n");
   await writeFile(
@@ -263,7 +264,7 @@ test("release-site build verifies artifacts and materializes complete public met
     },
   });
 
-  assert.equal(result.fileCount, 9);
+  assert.equal(result.fileCount, 10);
   assert.deepEqual(validatedArtifacts, [[
     value.installerPath,
     { production: true },
@@ -351,6 +352,7 @@ test("release-site build verifies artifacts and materializes complete public met
       "community-view.js",
       "community.js",
       "index.html",
+      "localization.js",
       "robots.txt",
       "social-preview.png",
       "styles.css",
@@ -514,9 +516,9 @@ test("checked-in public source satisfies the complete release contract", async (
       "community.js",
       "docs.html",
       "github.svg",
-      "i18n.generated.js",
       "index.html",
       "install-cta.js",
+      "localization.js",
       "privacy.html",
       "robots.txt",
       "social-preview.png",

@@ -164,6 +164,10 @@ async function fixture() {
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
   await writeFile(
+    join(staticRoot, "localization.js"),
+    "export const localization = true;",
+  );
+  await writeFile(
     join(staticRoot, "telemetry-shared.generated.js"),
     "export const telemetry = true;",
   );
@@ -350,6 +354,7 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     );
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
+    assert.equal((await fetch(`${base}/localization.js`)).status, 200);
     assert.equal(
       (await fetch(`${base}/telemetry-shared.generated.js`)).status,
       200,
