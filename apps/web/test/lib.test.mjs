@@ -2746,7 +2746,7 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(signOutBody, /hostedIdentity = null;/u);
   assert.match(signOutBody, /setCommunitySession\(null\);/u);
   assert.match(signOutBody, /renderHostedIdentity\(\);/u);
-  assert.match(signOutBody, /still signed in\. Nothing was changed/u);
+  assert.match(signOutBody, /fallback: t\("contribution\.signOutFailed"\)/u);
   assert.doesNotMatch(
     signOutBody,
     /localClient\.|deleteParticipant|deleteContribution|revokeDevice/u,

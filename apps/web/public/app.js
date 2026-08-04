@@ -4665,9 +4665,6 @@ async function inspectNextContribution() {
   }
 }
 
-const DEVICE_DISCONNECT_CONFIRMATION =
-  "Disconnect this Mac from contribution?\n\nThis stops future uploads from this Mac, pauses local delivery, and removes this Mac's upload credential. Metadata already contributed is not deleted. You can reconnect later by reviewing a new contribution.";
-
 /**
  * Stop only this installation's background upload capability. The hosted
  * contribution account/session remains intact: sign-out and metadata deletion
@@ -4675,12 +4672,10 @@ const DEVICE_DISCONNECT_CONFIRMATION =
  */
 async function disconnectThisMacContributionDevice() {
   if (contributionSyncBusy || communityConnectBusy) return;
-  if (!window.confirm(DEVICE_DISCONNECT_CONFIRMATION)) return;
+  if (!window.confirm(t("contribution.disconnectConfirmation"))) return;
   contributionSyncBusy = true;
   updateContributionSyncButtons();
-  showContributionSyncAction(
-    "Stopping future uploads from this Mac and removing its local upload credential…"
-  );
+  showContributionSyncAction(t("contribution.disconnectStopping"));
   try {
     const result = await localClient.disconnectContributionDevice();
     if (result.status !== "disconnected"
@@ -4691,15 +4686,12 @@ async function disconnectThisMacContributionDevice() {
     }
     clearContributionSyncExactReview();
     await refreshContributionSyncControls();
-    showContributionSyncAction(
-      "This Mac is disconnected: future uploads are stopped, local delivery is paused, and its upload credential was removed. Metadata already contributed was not deleted. You can reconnect later by reviewing a new contribution."
-    );
+    showContributionSyncAction(t("contribution.disconnectCompleted"));
   } catch (error) {
     showContributionSyncAction(describeFailure({
       surface: "contribution_send",
       error,
-      fallback:
-        "This Mac could not be disconnected, so its local credential was not changed. Retry when the contribution service is reachable."
+      fallback: t("contribution.disconnectFailed")
     }).text, true);
   } finally {
     contributionSyncBusy = false;
@@ -5374,7 +5366,7 @@ function renderHostedIdentity() {
     || googleUnavailableNow;
   googleUnavailable.hidden = !googleUnavailableNow || signedIn;
   googleUnavailable.textContent = enrollmentPaused
-    ? "New contribution enrollment is currently paused. Local reporting is unaffected."
+    ? t("contribution.enrollmentPaused")
     : serviceConfigured
       ? "Hosted sign-in is not configured for this build."
       : "This build has no contribution service, so hosted sign-in is unavailable.";
@@ -5399,10 +5391,7 @@ function renderHostedIdentity() {
   checkButton.disabled = !hostedIdentityBusy || signedIn;
   cancelButton.disabled = !hostedIdentityBusy || signedIn;
   $("#identity-account-badge").hidden = provider === null;
-  setRawText(
-    $("#identity-account-provider"),
-    provider?.label ?? "Signed in for hosted contribution",
-  );
+  setRawText($("#identity-account-provider"), provider?.label ?? t("contribution.identityGenericSession"));
   if (provider !== null) {
     $("#identity-account-mark").setAttribute("href", provider.mark);
   }
@@ -5437,22 +5426,21 @@ async function signOutHostedIdentity() {
   status.hidden = false;
   status.className = "participant-action-status";
   status.textContent = hadServerSession
-    ? "Signing out securely…"
-    : "Forgetting this unfinished sign-in…";
+    ? t("contribution.signOutStarting")
+    : t("contribution.signOutForgetting");
   try {
     if (hadServerSession) await communityClient.logout();
     hostedIdentity = null;
     setCommunitySession(null);
     $("#participant-controls").hidden = true;
     status.textContent = hadServerSession
-      ? "Signed out. Your server session was revoked and this page forgot the sign-in. Metadata already contributed is unchanged; Hosted privacy controls still let you export or delete it. Sign in again with Google or Apple when you want to contribute."
-      : "This unfinished sign-in was forgotten. No server session or metadata was created. Sign in again with Google or Apple when you want to contribute.";
+      ? t("contribution.signOutCompleted")
+      : t("contribution.signOutUnfinished");
   } catch (error) {
     showFailure(status, {
       surface: "hosted_identity",
       error,
-      fallback:
-        "The service could not confirm sign-out, so you are still signed in. Nothing was changed; check your connection and try again."
+      fallback: t("contribution.signOutFailed")
     });
   } finally {
     hostedIdentityBusy = false;
@@ -5701,7 +5689,7 @@ function updateCommunityConnectButton() {
     || !consent.checked;
   if (!communityConnectBusy) {
     button.textContent = enrollmentPaused
-      ? "New enrollment paused"
+      ? t("contribution.enrollmentPausedButton")
       : hostedSignInRequired()
         ? "Sign in above to contribute"
         : "Review contribution";
@@ -5867,8 +5855,7 @@ async function connectCommunityContribution() {
   if (hostedEnrollmentIsPaused()) {
     status.hidden = false;
     status.className = "participant-action-status error";
-    status.textContent =
-      "New contribution enrollment is currently paused. Local reporting is unaffected, and nothing was uploaded.";
+    status.textContent = t("contribution.enrollmentPausedNoUpload");
     return;
   }
   if (hostedSignInRequired()) {
