@@ -23,20 +23,22 @@ On macOS, build and open the self-contained local app:
 
 ```bash
 npm run product:macos:build
-open ".release-build/macos/Usage Monitor.app"
+open ".release-build/macos/TiboTattle.app"
 ```
 
 The app includes its own pinned Node runtime, starts one loopback-only
-companion on an ephemeral port, reads local Codex metadata only after an
-explicit dashboard action, and keeps mutable state in the owner-only
-`~/Library/Application Support/Usage Monitor` directory. Large histories are
-indexed in bounded, automatically continued slices under one user action. A
-separate 64 MiB checkpointed pass publishes a useful current headline first;
-the user can keep reading, cancel safely, and resume later. One click permits
-the initial pass plus exactly two automatic bounded continuations. Each
-accepted pass has a six-minute browser polling window around a five-minute
-server pass, giving roughly an 18-minute finite UI budget before the app pauses
-deep analysis, retains verified state, and offers an explicit later resume.
+companion on an ephemeral port, and performs its bounded local refresh while
+the normal app remains open. The Login Item only launches that normal app; it
+does not add a separate scanner or upload path. Mutable state stays in the
+owner-only `~/Library/Application Support/Usage Monitor` directory. Large
+histories are indexed in bounded, automatically continued slices under one
+user action. A separate 64 MiB checkpointed pass publishes a useful current
+headline first; the user can keep reading, cancel safely, and resume later. One
+click permits the initial pass plus exactly two automatic bounded
+continuations. Each accepted pass has a six-minute browser polling window
+around a five-minute server pass, giving roughly an 18-minute finite UI budget
+before the app pauses deep analysis, retains verified state, and offers an
+explicit later resume.
 
 The app owns local collection and lifecycle. It opens a private loopback
 dashboard for personal results and can also display delayed community
@@ -63,9 +65,16 @@ unprotected fully accepted sets become eligible when older than seven days or
 beyond the eight most-recent accepted sets, with at most sixteen sets retired
 per pass. The reviewed first-send evidence, active write-ahead claim, and
 pending set are protected from automatic retirement, and work that is
-retryable, in flight, or rejected is never retired. The app installs no daemon,
-Login Item, LaunchAgent, or background service, and the schedule can be paused
-from the dashboard.
+retryable, in flight, or rejected is never retired. On macOS 13 or later, the
+normal app may be registered as a user-controlled Login Item only after an
+affirmative first-run or Settings action; that item merely launches the app at
+login. It is not a daemon, LaunchAgent, privileged helper, autonomous
+background service, scan, or upload mechanism, and the schedule can be paused
+from the dashboard. The native Settings state is a fresh ServiceManagement
+read, not a stored preference: it reconciles on return from System Settings,
+confirms the post-register/unregister result, exposes a pending-request removal
+route, and includes only fixed path-free Login Item status/action values in
+Data & Diagnostics.
 
 Passive discovery is abort-aware and bounded: one pass admits at most 20,000
 directory entries and 5,000 rollout files, applies its byte ceiling to new
@@ -648,9 +657,11 @@ The device credential can only mint an exact five-minute, one-use authorization
 for one encrypted envelope matching the device's consent version. It cannot use browser sessions, read private
 statistics, export or delete data, recover access, rotate consent, pair another
 device, or change its consent version. Account-scoped v0.2 devices can be paired
-only through the explicitly enabled loopback preview. This slice is foreground-only;
-login-item, LaunchAgent, daemon, signed-app, and silent background installation
-remain separately gated.
+only through the explicitly enabled loopback preview. This slice is
+foreground-only: a user-controlled native Login Item may launch the ordinary
+app at login, but it does not make contribution autonomous or permit a silent
+scan/upload. LaunchAgents, daemons, privileged helpers, and silent background
+installation remain separately gated.
 
 `npm run product:check` runs the functional UI, loopback server, transport
 builder, Cloudflare-runtime ingestion/lifecycle tests, generated types, and a

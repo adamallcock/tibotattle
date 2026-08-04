@@ -1694,6 +1694,10 @@ async function compileLauncher(destination, updater, swiftSources) {
     "AppKit",
     "-framework",
     "Foundation",
+    // Login-at-login registration uses Apple's macOS 13+ ServiceManagement
+    // API directly.  The framework is provided by the OS and is not bundled.
+    "-framework",
+    "ServiceManagement",
     // The dashboard is hosted in-app. WebKit is a system framework, so this
     // adds no bundled binary and no new outbound reach: the embedded view is
     // pinned to the loopback companion origin by its navigation delegate.

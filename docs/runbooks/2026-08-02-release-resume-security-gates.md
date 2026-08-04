@@ -104,9 +104,68 @@ placeholders, and do not put the values in the repository.
 4. Build, Developer-ID sign, notarize, staple, and validate the macOS DMG from
    the tagged source. The release manifest must contain the matching commit
    and tag.
-5. Publish the signed DMG and signed Sparkle appcast to the approved update
+5. Complete the signed, `/Applications` Login Item lifecycle rehearsal below
+   in a disposable profile and validate its receipt with
+   `npm run product:macos:validate:login-item-release -- --app
+   "/Applications/TiboTattle.app" --rehearsal RECEIPT.json`. This command runs
+   only the packaged fake-manager smoke plus production artifact checks; it
+   must not change the operator's real Login Items.
+6. Publish the signed DMG and signed Sparkle appcast to the approved update
    destination, then independently verify the public HTTPS feed, artifact
    checksum, signature, and a clean-Mac update/install flow.
+
+### Native Login Item rehearsal
+
+Run this only in a disposable clean macOS user profile or release VM, never as
+part of a source test on an operator's everyday account. On a first launch,
+confirm that **Start TiboTattle at login** is visibly preselected yet no Login
+Item exists before the person chooses **Get Started**. After that affirmative
+action, inspect the Settings status, disable/unregister it, re-enable it, and
+exercise the requires-approval/System Settings route if macOS presents one;
+return to TiboTattle and confirm the Settings status reconciles. If approval
+is pending, use **Remove Pending Login Item** and confirm the request is
+withdrawn.
+
+Sign out/in once to confirm automatic launch. Then test signed upgrade,
+moving/reinstalling the app, uninstall/reinstall, and a second launch attempt;
+each must leave one normal-app Login Item at most and explain an existing
+companion rather than starting an overlap. Confirm that the only persistent
+launch mechanism is TiboTattle's native `SMAppService.mainApp` registration:
+there must be no LaunchAgent, LaunchDaemon, privileged helper, independent
+process, raw-log scan, or background contribution/upload mechanism outside the
+normal app lifecycle. Finally, close the main window and reopen it from the
+menu bar, then use explicit Quit and confirm the companion stops.
+
+Record the completed checks in a privacy-safe JSON receipt with this shape
+(do not add user names, paths, account details, or raw logs):
+
+```json
+{
+  "schemaVersion": "usage-monitor-macos-login-item-release-rehearsal-v1",
+  "recordedOn": "YYYY-MM-DD",
+  "environment": {
+    "cleanDisposableProfile": true,
+    "installedInApplications": true
+  },
+  "application": {
+    "bundleIdentifier": "com.usagemonitor.local",
+    "bundleVersion": "RELEASE_BUILD",
+    "shortVersion": "RELEASE_VERSION"
+  },
+  "checks": {
+    "firstRunConsentIsVisibleAndAffirmative": true,
+    "settingsReconcileAfterSystemSettingsChange": true,
+    "enableDisableAndPendingRemoval": true,
+    "automaticLoginLaunch": true,
+    "upgradeRetainsSingleMainAppLoginItem": true,
+    "moveAndReinstallLeavesNoStaleDuplicate": true,
+    "uninstallAndReinstallLeavesNoStaleDuplicate": true,
+    "duplicateLaunchExplainsExistingApp": true,
+    "windowCloseKeepsMenuBarAndQuitStopsApp": true,
+    "noAgentDaemonOrBackgroundUpload": true
+  }
+}
+```
 
 ## Explicitly not complete
 

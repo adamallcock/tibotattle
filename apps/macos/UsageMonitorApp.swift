@@ -484,7 +484,9 @@ private struct LifecycleDiagnostics {
         centralConfigured: Bool,
         codexHomeMode: CodexHomeMode,
         codexHomeValidated: Bool,
-        appStateAvailable: Bool
+        appStateAvailable: Bool,
+        loginItemStatus: LoginItemStatus,
+        loginItemLastOperation: LoginItemDiagnosticAction
     ) -> String {
         [
             "\(BundledProduct.displayName) diagnostics",
@@ -498,6 +500,9 @@ private struct LifecycleDiagnostics {
             "codex_source: \(codexHomeMode.rawValue)",
             "codex_source_validated: \(codexHomeValidated)",
             "app_state: \(appStateAvailable ? "owner_only_available" : "unavailable")",
+            "login_item_status: \(loginItemStatus.diagnosticValue)",
+            "login_item_last_operation: \(loginItemLastOperation.rawValue)",
+            "login_item_service: main_app_only",
             "process_lifecycle: foreground_only",
             "automatic_upload: off",
             "paths_included: false",
@@ -1835,6 +1840,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
     private weak var settingsAutomaticUpdatesDetailLabel: NSTextField?
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
+    private weak var settingsStartAtLoginSwitch: NSSwitch?
+    private weak var settingsStartAtLoginDetailLabel: NSTextField?
+    private weak var settingsStartAtLoginPendingRemovalButton: NSButton?
+    private weak var settingsStartAtLoginRefreshButton: NSButton?
+    private var lastLoginItemDiagnosticAction: LoginItemDiagnosticAction = .none
+    private var loginItemOperationInFlight = false
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var nativeDashboardChrome: NativeDashboardChrome?
     private var nativeRefreshPoll: DispatchWorkItem?
@@ -1891,8 +1902,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var dashboardWebHost: DashboardWebHost?
     private var dashboardWebViewShowing = false
 
-    init(semanticOpenTarget: SemanticOpenTarget) {
+    private let loginItemManager: LoginItemManaging
+
+    init(
+        semanticOpenTarget: SemanticOpenTarget,
+        loginItemManager: LoginItemManaging = SystemLoginItemManager()
+    ) {
         self.semanticOpenTarget = semanticOpenTarget
+        self.loginItemManager = loginItemManager
         super.init()
     }
 
@@ -1943,6 +1960,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         startCompanion()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // System Settings is the recovery surface for approval and external
+        // changes. Refresh when the person returns so the Settings switch is
+        // not a stale cached preference.
+        updateStartAtLoginSettingsControl()
+    }
+
     private func showFirstRunDisclosure() -> Bool {
         let alert = NSAlert()
         alert.messageText = "Welcome to \(BundledProduct.displayName)"
@@ -1959,11 +1983,79 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
 
-        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints. TiboTattle installs no login item, LaunchAgent, or daemon.
+        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.
+
+        \(TiboTattleLocalization.string(.firstRunLoginItemDisclosure))
         """
+        let startAtLogin = NSButton(
+            checkboxWithTitle: TiboTattleLocalization.string(
+                .settingsStartAtLogin
+            ),
+            target: nil,
+            action: nil
+        )
+        startAtLogin.state = .on
+        startAtLogin.frame = NSRect(x: 0, y: 0, width: 400, height: 24)
+        startAtLogin.toolTip = TiboTattleLocalization.string(
+            .settingsStartAtLoginSummary
+        )
+        startAtLogin.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsStartAtLogin)
+        )
+        alert.accessoryView = startAtLogin
         alert.addButton(withTitle: "Get Started")
         alert.addButton(withTitle: "Quit")
-        return alert.runModal() == .alertFirstButtonReturn
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return false
+        }
+
+        // Registration is deliberately downstream of the affirmative Get
+        // Started action.  Existing first-run receipts take the path above
+        // only to acknowledge state and never register silently on upgrade.
+        if startAtLogin.state == .on {
+            do {
+                try registerLoginItemForFirstRun(
+                    startAtLogin: true,
+                    manager: loginItemManager
+                )
+                let result = loginItemOperationResult(
+                    operation: .register,
+                    status: observeLoginItemStatus()
+                )
+                lastLoginItemDiagnosticAction = LoginItemDiagnosticAction.make(
+                    operation: .register,
+                    result: result
+                )
+                showLoginItemOperationResult(
+                    result,
+                    operation: .register,
+                    allowContinue: true
+                )
+            } catch {
+                if let reconciled = reconciledLoginItemOperationResultAfterError(
+                    operation: .register,
+                    status: observeLoginItemStatus()
+                ) {
+                    lastLoginItemDiagnosticAction =
+                        LoginItemDiagnosticAction.make(
+                            operation: .register,
+                            result: reconciled
+                        )
+                    showLoginItemOperationResult(
+                        reconciled,
+                        operation: .register,
+                        allowContinue: true
+                    )
+                    return true
+                }
+                lastLoginItemDiagnosticAction = .registerFailed
+                showLoginItemOperationFailure(
+                    operation: .register,
+                    allowContinue: true
+                )
+            }
+        }
+        return true
     }
 
     private func startCompanion() {
@@ -2273,10 +2365,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         nativeDashboardChrome?.select(destination)
     }
 
-    /// Updates are automatic while the app is open, never through a login
-    /// item, daemon, or background URL session.  The same bounded loopback
-    /// refresh route remains the only reader, so a manual click and the
-    /// foreground cadence cannot start two scans at once.
+    /// Updates are automatic only while the ordinary app is open. A login
+    /// item (if enabled) launches that same foreground app; it never starts a
+    /// separate worker, daemon, or background URL session. The same bounded
+    /// loopback refresh route remains the only reader, so a manual click and
+    /// the foreground cadence cannot start two scans at once.
     private func refreshLocalUsage(automatic: Bool) {
         guard !quitting,
               !nativeRefreshInFlight,
@@ -2367,9 +2460,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         nativeRefreshPoll = nil
     }
 
-    /// The foreground app keeps its own local evidence current without a
-    /// login item or worker. A five-minute cadence is intentionally modest:
-    /// it observes new Codex rollouts while avoiding a permanent parser loop.
+    /// The foreground app keeps its own local evidence current while a
+    /// login-item launch (if enabled) remains only an explicit app start. A
+    /// five-minute cadence is intentionally modest: it observes new Codex
+    /// rollouts while avoiding a permanent parser loop or hidden worker.
     private func scheduleNativeRefresh() {
         cancelNativeRefreshSchedule()
         guard !quitting, dashboardURL != nil else { return }
@@ -2792,6 +2886,270 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             automaticUpdatesSettingsSummary()
     }
 
+    @discardableResult
+    private func observeLoginItemStatus() -> LoginItemStatus {
+        loginItemManager.status
+    }
+
+    private func startAtLoginSettingsSummary(
+        for status: LoginItemStatus
+    ) -> String {
+        switch status {
+        case .enabled:
+            return TiboTattleLocalization.string(
+                .settingsStartAtLoginEnabled
+            )
+        case .notRegistered:
+            return TiboTattleLocalization.string(
+                .settingsStartAtLoginDisabled
+            )
+        case .requiresApproval:
+            return TiboTattleLocalization.string(
+                .settingsStartAtLoginNeedsApproval
+            )
+        case .unknown:
+            return TiboTattleLocalization.string(
+                .settingsStartAtLoginUnavailable
+            )
+        }
+    }
+
+    private func updateStartAtLoginSettingsControl() {
+        let status = observeLoginItemStatus()
+        let presentation = loginItemSettingsPresentation(for: status)
+        settingsStartAtLoginSwitch?.state = presentation.isOn ? .on : .off
+        settingsStartAtLoginSwitch?.isEnabled = presentation.isEnabled
+            && !loginItemOperationInFlight
+        settingsStartAtLoginDetailLabel?.stringValue =
+            startAtLoginSettingsSummary(for: status)
+        settingsStartAtLoginPendingRemovalButton?.isHidden =
+            !presentation.showsPendingRemoval
+        settingsStartAtLoginPendingRemovalButton?.isEnabled =
+            presentation.showsPendingRemoval && !loginItemOperationInFlight
+        settingsStartAtLoginRefreshButton?.isEnabled =
+            !loginItemOperationInFlight
+    }
+
+    @objc private func toggleStartAtLogin(_ sender: NSSwitch) {
+        performLoginItemOperation(
+            sender.state == .on ? .register : .unregister,
+            allowContinue: false
+        )
+    }
+
+    @objc private func removePendingLoginItem() {
+        performLoginItemOperation(.unregister, allowContinue: false)
+    }
+
+    @objc private func refreshLoginItemStatus() {
+        updateStartAtLoginSettingsControl()
+    }
+
+    private func performLoginItemOperation(
+        _ operation: LoginItemOperation,
+        allowContinue: Bool
+    ) {
+        // The ServiceManagement calls are synchronous, but the guard prevents
+        // repeated accessibility/keyboard activations from queuing conflicting
+        // register and unregister requests while a confirmation alert is up.
+        guard !loginItemOperationInFlight else { return }
+        loginItemOperationInFlight = true
+        updateStartAtLoginSettingsControl()
+        defer {
+            loginItemOperationInFlight = false
+            updateStartAtLoginSettingsControl()
+        }
+        do {
+            switch operation {
+            case .register:
+                try loginItemManager.register()
+            case .unregister:
+                try loginItemManager.unregister()
+            }
+            let result = loginItemOperationResult(
+                operation: operation,
+                status: observeLoginItemStatus()
+            )
+            lastLoginItemDiagnosticAction = LoginItemDiagnosticAction.make(
+                operation: operation,
+                result: result
+            )
+            showLoginItemOperationResult(
+                result,
+                operation: operation,
+                allowContinue: allowContinue
+            )
+        } catch {
+            if let reconciled = reconciledLoginItemOperationResultAfterError(
+                operation: operation,
+                status: observeLoginItemStatus()
+            ) {
+                lastLoginItemDiagnosticAction =
+                    LoginItemDiagnosticAction.make(
+                        operation: operation,
+                        result: reconciled
+                    )
+                showLoginItemOperationResult(
+                    reconciled,
+                    operation: operation,
+                    allowContinue: allowContinue
+                )
+                return
+            }
+            lastLoginItemDiagnosticAction = LoginItemDiagnosticAction.make(
+                operation: operation,
+                result: .failed
+            )
+            showLoginItemOperationFailure(
+                operation: operation,
+                allowContinue: allowContinue
+            )
+        }
+    }
+
+    @objc private func openLoginItemsSettings() {
+        loginItemManager.openSystemSettings()
+    }
+
+    private func showLoginItemOperationResult(
+        _ result: LoginItemOperationResult,
+        operation: LoginItemOperation,
+        allowContinue: Bool
+    ) {
+        switch result {
+        case .confirmed:
+            return
+        case .requiresApproval:
+            showLoginItemApprovalNotice(allowContinue: allowContinue)
+        case .notConfirmed:
+            showLoginItemUnconfirmed(
+                operation: operation,
+                allowContinue: allowContinue
+            )
+        case .unavailable:
+            showLoginItemStatusUnavailable(allowContinue: allowContinue)
+        case .failed:
+            showLoginItemOperationFailure(
+                operation: operation,
+                allowContinue: allowContinue
+            )
+        }
+    }
+
+    private func showLoginItemUnconfirmed(
+        operation: LoginItemOperation,
+        allowContinue: Bool
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        switch operation {
+        case .register:
+            alert.messageText = TiboTattleLocalization.string(
+                .settingsStartAtLoginRegistrationNotConfirmedTitle
+            )
+            alert.informativeText = TiboTattleLocalization.string(
+                .settingsStartAtLoginRegistrationNotConfirmedMessage
+            )
+        case .unregister:
+            alert.messageText = TiboTattleLocalization.string(
+                .settingsStartAtLoginUnregistrationNotConfirmedTitle
+            )
+            alert.informativeText = TiboTattleLocalization.string(
+                .settingsStartAtLoginUnregistrationNotConfirmedMessage
+            )
+        }
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            .settingsOpenLoginItems
+        ))
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            allowContinue
+                ? .settingsContinueWithoutLogin
+                : .settingsDismiss
+        ))
+        if alert.runModal() == .alertFirstButtonReturn {
+            loginItemManager.openSystemSettings()
+        }
+    }
+
+    private func showLoginItemStatusUnavailable(allowContinue: Bool) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = TiboTattleLocalization.string(
+            .settingsStartAtLoginUnavailableTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .settingsStartAtLoginUnavailableMessage
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            .settingsOpenLoginItems
+        ))
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            allowContinue
+                ? .settingsContinueWithoutLogin
+                : .settingsDismiss
+        ))
+        if alert.runModal() == .alertFirstButtonReturn {
+            loginItemManager.openSystemSettings()
+        }
+    }
+
+    private func showLoginItemOperationFailure(
+        operation: LoginItemOperation,
+        allowContinue: Bool
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        switch operation {
+        case .register:
+            alert.messageText = TiboTattleLocalization.string(
+                .settingsStartAtLoginRegistrationErrorTitle
+            )
+            alert.informativeText = TiboTattleLocalization.string(
+                .settingsStartAtLoginRegistrationErrorMessage
+            )
+        case .unregister:
+            alert.messageText = TiboTattleLocalization.string(
+                .settingsStartAtLoginUnregistrationErrorTitle
+            )
+            alert.informativeText = TiboTattleLocalization.string(
+                .settingsStartAtLoginUnregistrationErrorMessage
+            )
+        }
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            .settingsOpenLoginItems
+        ))
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            allowContinue
+                ? .settingsContinueWithoutLogin
+                : .settingsDismiss
+        ))
+        if alert.runModal() == .alertFirstButtonReturn {
+            loginItemManager.openSystemSettings()
+        }
+    }
+
+    private func showLoginItemApprovalNotice(allowContinue: Bool) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = TiboTattleLocalization.string(
+            .settingsStartAtLoginApprovalTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .settingsStartAtLoginApprovalMessage
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            .settingsOpenLoginItems
+        ))
+        alert.addButton(withTitle: TiboTattleLocalization.string(
+            allowContinue
+                ? .settingsContinue
+                : .settingsDismiss
+        ))
+        if alert.runModal() == .alertFirstButtonReturn {
+            loginItemManager.openSystemSettings()
+        }
+    }
+
     @objc private func showSettingsWindow() {
         showSettings(selecting: 0)
     }
@@ -2805,6 +3163,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
+            updateStartAtLoginSettingsControl()
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -2910,6 +3269,83 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         automaticUpdatesSection.orientation = .vertical
         automaticUpdatesSection.alignment = .leading
         automaticUpdatesSection.spacing = 6
+        let startAtLoginStatus = observeLoginItemStatus()
+        let startAtLoginPresentation = loginItemSettingsPresentation(
+            for: startAtLoginStatus
+        )
+        let startAtLoginSwitch = NSSwitch()
+        startAtLoginSwitch.state = startAtLoginPresentation.isOn
+            ? .on
+            : .off
+        startAtLoginSwitch.isEnabled = startAtLoginPresentation.isEnabled
+        startAtLoginSwitch.target = self
+        startAtLoginSwitch.action = #selector(toggleStartAtLogin(_:))
+        startAtLoginSwitch.toolTip = TiboTattleLocalization.string(
+            .settingsStartAtLoginSummary
+        )
+        startAtLoginSwitch.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsStartAtLogin)
+        )
+        settingsStartAtLoginSwitch = startAtLoginSwitch
+        let startAtLoginDetail = settingsLabel(
+            startAtLoginSettingsSummary(for: startAtLoginStatus),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        settingsStartAtLoginDetailLabel = startAtLoginDetail
+        let startAtLoginHeading = settingsLabel(
+            TiboTattleLocalization.string(.settingsStartAtLogin),
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor
+        )
+        let startAtLoginHeader = NSStackView(
+            views: [startAtLoginHeading, startAtLoginSwitch]
+        )
+        startAtLoginHeader.orientation = .horizontal
+        startAtLoginHeader.alignment = .centerY
+        startAtLoginHeader.spacing = 12
+        let openLoginItems = NSButton(
+            title: TiboTattleLocalization.string(.settingsOpenLoginItems),
+            target: self,
+            action: #selector(openLoginItemsSettings)
+        )
+        openLoginItems.bezelStyle = .rounded
+        let refreshLoginItemStatus = NSButton(
+            title: TiboTattleLocalization.string(
+                .settingsRefreshLoginItemStatus
+            ),
+            target: self,
+            action: #selector(refreshLoginItemStatus)
+        )
+        refreshLoginItemStatus.bezelStyle = .rounded
+        refreshLoginItemStatus.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsRefreshLoginItemStatus)
+        )
+        settingsStartAtLoginRefreshButton = refreshLoginItemStatus
+        let removePendingLoginItem = NSButton(
+            title: TiboTattleLocalization.string(
+                .settingsRemovePendingLoginItem
+            ),
+            target: self,
+            action: #selector(removePendingLoginItem)
+        )
+        removePendingLoginItem.bezelStyle = .rounded
+        removePendingLoginItem.isHidden =
+            !startAtLoginPresentation.showsPendingRemoval
+        removePendingLoginItem.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsRemovePendingLoginItem)
+        )
+        settingsStartAtLoginPendingRemovalButton = removePendingLoginItem
+        let startAtLoginSection = NSStackView(views: [
+            startAtLoginHeader,
+            startAtLoginDetail,
+            openLoginItems,
+            refreshLoginItemStatus,
+            removePendingLoginItem,
+        ])
+        startAtLoginSection.orientation = .vertical
+        startAtLoginSection.alignment = .leading
+        startAtLoginSection.spacing = 6
         let general = settingsPage(
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
@@ -2917,6 +3353,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 languageSection,
                 sourceSection,
                 automaticUpdatesSection,
+                startAtLoginSection,
                 openDashboardFromSettings,
             ]
         )
@@ -3019,14 +3456,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let newWindow = NSWindow(contentViewController: tabs)
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
-        newWindow.setContentSize(NSSize(width: 620, height: 390))
-        newWindow.contentMinSize = NSSize(width: 560, height: 350)
+        newWindow.setContentSize(NSSize(width: 620, height: 500))
+        newWindow.contentMinSize = NSSize(width: 560, height: 440)
         newWindow.isReleasedWhenClosed = false
         newWindow.center()
         settingsWindow = newWindow
         settingsTabs = tabs
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        updateStartAtLoginSettingsControl()
     }
 
     private func diagnosticText() -> String {
@@ -3057,7 +3495,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             centralConfigured: centralServiceMode != nil,
             codexHomeMode: mode,
             codexHomeValidated: codexValidated,
-            appStateAvailable: appStateAvailable
+            appStateAvailable: appStateAvailable,
+            loginItemStatus: observeLoginItemStatus(),
+            loginItemLastOperation: lastLoginItemDiagnosticAction
         )
     }
 
@@ -3520,8 +3960,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return true
     }
 
-    func windowWillClose(_ notification: Notification) {
-        NSApp.terminate(nil)
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === window, !quitting else { return true }
+        // The native window is a surface, not the application lifecycle. Keep
+        // the companion and menu-bar item alive when the user closes it; the
+        // explicit Quit action remains the only normal termination path.
+        sender.orderOut(nil)
+        return false
     }
 
     func applicationShouldTerminate(
@@ -3539,6 +3984,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             return .terminateCancel
         }
         guard !quitting, companion?.isRunning == true else {
+            // When the companion is already stopped there is no asynchronous
+            // cleanup to wait for. Mark termination as intentional so the
+            // window-close delegate cannot turn an explicit Quit into a
+            // hide-only action.
+            quitting = true
             return .terminateNow
         }
         quitting = true
@@ -3849,7 +4299,9 @@ private enum LifecycleContractSmokeTest {
             centralConfigured: false,
             codexHomeMode: .custom,
             codexHomeValidated: true,
-            appStateAvailable: true
+            appStateAvailable: true,
+            loginItemStatus: .requiresApproval,
+            loginItemLastOperation: .registerRequiresApproval
         )
         print(rendered)
         return rendered.contains("/") ? 1 : 0
@@ -3985,6 +4437,246 @@ private enum LifecycleContractSmokeTest {
     }
 }
 
+/// Exercises the login-item seam with a fake manager.  This mode deliberately
+/// never constructs the production login-item adapter or opens System Settings;
+/// it proves the registration boundary in an isolated
+/// launcher process instead of mutating the developer's Login Items state.
+private enum LoginItemContractSmokeTest {
+    private final class FakeManager: LoginItemManaging {
+        var status: LoginItemStatus = .notRegistered
+        var registerCalls = 0
+        var unregisterCalls = 0
+        var settingsCalls = 0
+        var registerError: Error?
+        var unregisterError: Error?
+        var registerStatusAfterCall: LoginItemStatus?
+        var unregisterStatusAfterCall: LoginItemStatus?
+
+        func register() throws {
+            registerCalls += 1
+            if let registerError {
+                throw registerError
+            }
+            status = registerStatusAfterCall ?? .enabled
+        }
+
+        func unregister() throws {
+            unregisterCalls += 1
+            if let unregisterError {
+                throw unregisterError
+            }
+            status = unregisterStatusAfterCall ?? .notRegistered
+        }
+
+        func openSystemSettings() {
+            settingsCalls += 1
+        }
+    }
+
+    private struct FakeError: Error {}
+
+    static func run() -> Int32 {
+        let manager = FakeManager()
+        do {
+            // An unchecked first-run option must not register or even need a
+            // status mutation.  This is the upgrade/no-silent-registration
+            // boundary for existing first-run receipts.
+            guard try !registerLoginItemForFirstRun(
+                startAtLogin: false,
+                manager: manager
+            ), manager.registerCalls == 0,
+                  manager.status == .notRegistered
+            else {
+                return 1
+            }
+
+            // All four status states have an explicit settings presentation.
+            // Pending approval never masquerades as a usable off switch; it
+            // exposes an explicit removal route instead.
+            guard loginItemSettingsPresentation(for: .enabled)
+                    == LoginItemSettingsPresentation(
+                        isEnabled: true,
+                        isOn: true,
+                        showsPendingRemoval: false
+                    ),
+                  loginItemSettingsPresentation(for: .notRegistered)
+                    == LoginItemSettingsPresentation(
+                        isEnabled: true,
+                        isOn: false,
+                        showsPendingRemoval: false
+                    ),
+                  loginItemSettingsPresentation(for: .requiresApproval)
+                    == LoginItemSettingsPresentation(
+                        isEnabled: false,
+                        isOn: false,
+                        showsPendingRemoval: true
+                    ),
+                  loginItemSettingsPresentation(for: .unknown)
+                    == LoginItemSettingsPresentation(
+                        isEnabled: false,
+                        isOn: false,
+                        showsPendingRemoval: false
+                    )
+            else {
+                return 1
+            }
+
+            // A concurrent System Settings change may make a request
+            // idempotently true while its original call reports an error. Only
+            // independently confirmed, approval-required, or unavailable
+            // states are reconciled; a plain unconfirmed request stays an
+            // error.
+            guard reconciledLoginItemOperationResultAfterError(
+                operation: .register,
+                status: .enabled
+            ) == .confirmed,
+                  reconciledLoginItemOperationResultAfterError(
+                    operation: .register,
+                    status: .requiresApproval
+                  ) == .requiresApproval,
+                  reconciledLoginItemOperationResultAfterError(
+                    operation: .unregister,
+                    status: .unknown
+                  ) == .unavailable,
+                  reconciledLoginItemOperationResultAfterError(
+                    operation: .register,
+                    status: .notRegistered
+                  ) == nil
+            else {
+                return 1
+            }
+
+            guard try registerLoginItemForFirstRun(
+                startAtLogin: true,
+                manager: manager
+            ), manager.registerCalls == 1,
+                  manager.status == .enabled,
+                  loginItemOperationResult(
+                    operation: .register,
+                    status: manager.status
+                  ) == .confirmed
+            else {
+                return 1
+            }
+
+            try manager.unregister()
+            guard manager.unregisterCalls == 1,
+                  manager.status == .notRegistered,
+                  loginItemOperationResult(
+                    operation: .unregister,
+                    status: manager.status
+                  ) == .confirmed
+            else {
+                return 1
+            }
+
+            manager.registerStatusAfterCall = .requiresApproval
+            try manager.register()
+            guard manager.registerCalls == 2,
+                  manager.status == .requiresApproval,
+                  loginItemOperationResult(
+                    operation: .register,
+                    status: manager.status
+                  ) == .requiresApproval
+            else {
+                return 1
+            }
+
+            // Removal stays available if an approval-pending request needs to
+            // be withdrawn. A non-throwing unregister is still checked before
+            // the UI claims it worked.
+            manager.unregisterStatusAfterCall = .enabled
+            try manager.unregister()
+            guard manager.unregisterCalls == 2,
+                  loginItemOperationResult(
+                    operation: .unregister,
+                    status: manager.status
+                  ) == .notConfirmed
+            else {
+                return 1
+            }
+
+            manager.registerStatusAfterCall = .notRegistered
+            try manager.register()
+            guard manager.registerCalls == 3,
+                  loginItemOperationResult(
+                    operation: .register,
+                    status: manager.status
+                  ) == .notConfirmed
+            else {
+                return 1
+            }
+
+            manager.registerStatusAfterCall = .unknown
+            try manager.register()
+            guard manager.registerCalls == 4,
+                  loginItemOperationResult(
+                    operation: .register,
+                    status: manager.status
+                  ) == .unavailable
+            else {
+                return 1
+            }
+
+            manager.unregisterStatusAfterCall = .unknown
+            try manager.unregister()
+            guard manager.unregisterCalls == 3,
+                  loginItemOperationResult(
+                    operation: .unregister,
+                    status: manager.status
+                  ) == .unavailable
+            else {
+                return 1
+            }
+
+            manager.registerError = FakeError()
+            do {
+                try manager.register()
+                return 1
+            } catch {
+                // Denied/error paths remain injectable and do not fall back to
+                // a hidden process or an unreviewed legacy API.
+            }
+            guard manager.registerCalls == 5,
+                  LoginItemDiagnosticAction.make(
+                    operation: .register,
+                    result: .failed
+                  ) == .registerFailed
+            else {
+                return 1
+            }
+
+            manager.unregisterError = FakeError()
+            do {
+                try manager.unregister()
+                return 1
+            } catch {
+                // Expected error path.
+            }
+            guard manager.unregisterCalls == 4,
+                  LoginItemDiagnosticAction.make(
+                    operation: .unregister,
+                    result: .failed
+                  ) == .unregisterFailed,
+                  manager.settingsCalls == 0
+            else {
+                return 1
+            }
+        } catch {
+            return 1
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_LOGIN_ITEM_CONTRACT "
+                + "fake=true register=affirmative-only unregister=explicit "
+                + "status=enabled,not-registered,requires-approval,unavailable "
+                + "outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed "
+                + "pending_removal=true real_service_calls=0 daemon=false"
+        )
+        return 0
+    }
+}
+
 /// Exercises the real AppKit status item without starting the local companion
 /// or reading any local evidence. This catches the class of regression where a
 /// custom menu view has no measured frame and leaves an apparently empty menu
@@ -4081,6 +4773,12 @@ private enum NativeDashboardLayoutSmokeTest {
 private struct UsageMonitorMain {
     static func main() {
         let arguments = Array(CommandLine.arguments.dropFirst())
+        // This isolated seam smoke intentionally runs before bundle branding
+        // is resolved, so it can execute as a plain launcher binary without
+        // constructing the production login-item adapter.
+        if arguments.contains("--login-item-contract-smoke-test") {
+            exit(LoginItemContractSmokeTest.run())
+        }
         let semanticOpenTarget = SemanticOpenTarget(
             scheme: BundledProduct.appOpenScheme,
             host: BundledProduct.appOpenHost,
