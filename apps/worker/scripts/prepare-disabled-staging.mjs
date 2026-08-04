@@ -177,11 +177,17 @@ export function prepareDisabledStaging({
     };
   }
 
+  if (isFreshBootstrapTarget(before)) {
+    return {
+      ok: false,
+      code: "STAGING_FRESH_BOOTSTRAP_REQUIRES_OWNER_CONTAINMENT",
+      blockers: ["OWNER_CONTAINMENT_REQUIRED_BEFORE_MIGRATIONS"],
+    };
+  }
+
   let readiness = before;
-  const freshBootstrap = isFreshBootstrapTarget(before);
   for (let index = 0; index < REQUIRED_D1_BINDINGS.length; index += 1) {
-    const initialBootstrap = freshBootstrap && index === 0;
-    if (!readiness.checks.collectionContained && !initialBootstrap) {
+    if (!readiness.checks.collectionContained) {
       const containment = containAndVerify({
         readiness,
         spawn,

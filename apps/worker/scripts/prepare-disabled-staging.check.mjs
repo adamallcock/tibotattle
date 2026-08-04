@@ -148,6 +148,13 @@ test("preparation applies both migrations, contains collection, and rechecks", (
             primary_identity_link_secret_configuration_key_version: 1,
             primary_identity_link_secret_configuration_secret_fingerprint: 1,
             primary_identity_link_secret_configuration_recorded_at: 1,
+            primary_identity_link_secret_configuration_columns_exact: 1,
+            primary_identity_link_secret_configuration_singleton_check: 1,
+            primary_identity_link_secret_configuration_key_version_check: 1,
+            primary_identity_link_secret_configuration_fingerprint_check: 1,
+            primary_identity_link_secret_configuration_check_count: 1,
+            primary_identity_link_secret_configuration_strict: 1,
+            primary_identity_link_secret_configuration_no_extra_objects: 1,
           }],
         }]),
         stderr: "",
@@ -253,6 +260,15 @@ test("preparation applies both migrations, contains collection, and rechecks", (
           identityLinkSecretConfigurationKeyVersion: true,
           identityLinkSecretConfigurationSecretFingerprint: true,
           identityLinkSecretConfigurationRecordedAt: true,
+        },
+        constraints: {
+          identityLinkSecretConfigurationColumnsExact: true,
+          identityLinkSecretConfigurationSingletonCheck: true,
+          identityLinkSecretConfigurationKeyVersionCheck: true,
+          identityLinkSecretConfigurationFingerprintCheck: true,
+          identityLinkSecretConfigurationCheckCount: true,
+          identityLinkSecretConfigurationStrict: true,
+          identityLinkSecretConfigurationNoExtraObjects: true,
         },
         indexes: { retention: true, retentionShape: true },
         triggers: { reenrollmentCooldownGuard: true },
@@ -363,7 +379,7 @@ test("preparation stops at containment failure or crash before migration", () =>
   }
 });
 
-test("fresh bootstrap contains after the primary migration before the next mutation", () => {
+test("fresh bootstrap stops before any migration without an operational claim", () => {
   const config = provisionedConfig();
   const calls = [];
   const result = prepareDisabledStaging({
@@ -371,26 +387,20 @@ test("fresh bootstrap contains after the primary migration before the next mutat
     confirmation: PREPARE_CONFIRMATION,
     wrangler: "/fake/wrangler",
     workerDirectory,
-    spawn: successSpawn(config, calls, {
-      freshTarget: true,
-      containmentFailure: true,
-    }),
+    spawn: successSpawn(config, calls, { freshTarget: true }),
   });
   assert.deepEqual(result, {
     ok: false,
-    code: "STAGING_CONTAINMENT_FAILED",
+    code: "STAGING_FRESH_BOOTSTRAP_REQUIRES_OWNER_CONTAINMENT",
+    blockers: ["OWNER_CONTAINMENT_REQUIRED_BEFORE_MIGRATIONS"],
   });
   assert.deepEqual(
     calls.filter((args) => args[0] === "d1" && args[1] === "migrations")
       .map((args) => args[3]),
-    ["USAGE_MONITOR_DB"],
+    [],
   );
-  const containmentIndex = calls.findIndex((args) =>
-    args.some((value) =>
-      typeof value === "string" && value.includes("UPDATE collection_controls")));
-  const firstMigrationIndex = calls.findIndex((args) =>
-    args[0] === "d1" && args[1] === "migrations");
-  assert.equal(firstMigrationIndex < containmentIndex, true);
+  assert.equal(result.receipt, undefined);
+  assert.equal(result.collectionAuthorized, undefined);
 });
 
 test("preparation does not contain until applied migrations are proven exact", () => {

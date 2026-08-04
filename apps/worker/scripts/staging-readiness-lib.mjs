@@ -112,6 +112,8 @@ const PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
   cooldownGuardTrigger: "primary_cooldown_guard_trigger",
   identityLinkSecretConfigurationTable:
     "primary_identity_link_secret_configuration_table",
+  identityLinkSecretConfigurationColumnsExact:
+    "primary_identity_link_secret_configuration_columns_exact",
   identityLinkSecretConfigurationSingleton:
     "primary_identity_link_secret_configuration_singleton",
   identityLinkSecretConfigurationKeyVersion:
@@ -120,6 +122,18 @@ const PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
     "primary_identity_link_secret_configuration_secret_fingerprint",
   identityLinkSecretConfigurationRecordedAt:
     "primary_identity_link_secret_configuration_recorded_at",
+  identityLinkSecretConfigurationSingletonCheck:
+    "primary_identity_link_secret_configuration_singleton_check",
+  identityLinkSecretConfigurationKeyVersionCheck:
+    "primary_identity_link_secret_configuration_key_version_check",
+  identityLinkSecretConfigurationFingerprintCheck:
+    "primary_identity_link_secret_configuration_fingerprint_check",
+  identityLinkSecretConfigurationCheckCount:
+    "primary_identity_link_secret_configuration_check_count",
+  identityLinkSecretConfigurationStrict:
+    "primary_identity_link_secret_configuration_strict",
+  identityLinkSecretConfigurationNoExtraObjects:
+    "primary_identity_link_secret_configuration_no_extra_objects",
 });
 
 const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
@@ -138,6 +152,19 @@ const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
   cooldownRetentionIndex: "deletion_cooldown_retention_index",
   cooldownRetentionIndexShape: "deletion_cooldown_retention_index_shape",
 });
+
+function sqlStringLiteral(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+const IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL =
+  "replace(replace(replace(replace(sql, char(10), ''), char(13), ''), char(9), ''), ' ', '')";
+const IDENTITY_LINK_SECRET_CONFIGURATION_KEY_VERSION_GLOB = sqlStringLiteral(
+  "'*[^A-Za-z0-9._-]*'",
+);
+const IDENTITY_LINK_SECRET_CONFIGURATION_FINGERPRINT_GLOB = sqlStringLiteral(
+  "'*[^0-9a-f]*'",
+);
 
 const PRIMARY_IDENTITY_PROTECTION_SCHEMA_SQL = `
 SELECT
@@ -193,28 +220,136 @@ SELECT
   EXISTS(
     SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
      WHERE name = 'singleton'
-       AND type = 'INTEGER'
-       AND notnull = 1
+       AND upper(type) = 'INTEGER'
+       AND "notnull" = 1
        AND pk = 1
+       AND dflt_value IS NULL
   ) AS primary_identity_link_secret_configuration_singleton,
   EXISTS(
     SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
      WHERE name = 'key_version'
-       AND type = 'TEXT'
-       AND notnull = 1
+       AND upper(type) = 'TEXT'
+       AND "notnull" = 1
+       AND pk = 0
+       AND dflt_value IS NULL
   ) AS primary_identity_link_secret_configuration_key_version,
   EXISTS(
     SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
      WHERE name = 'secret_fingerprint'
-       AND type = 'TEXT'
-       AND notnull = 1
+       AND upper(type) = 'TEXT'
+       AND "notnull" = 1
+       AND pk = 0
+       AND dflt_value IS NULL
   ) AS primary_identity_link_secret_configuration_secret_fingerprint,
   EXISTS(
     SELECT 1 FROM pragma_table_info('identity_link_secret_configuration')
      WHERE name = 'recorded_at'
-       AND type = 'TEXT'
-       AND notnull = 1
-  ) AS primary_identity_link_secret_configuration_recorded_at;
+       AND upper(type) = 'TEXT'
+       AND "notnull" = 1
+       AND pk = 0
+       AND dflt_value IS NULL
+  ) AS primary_identity_link_secret_configuration_recorded_at,
+  (
+    SELECT count(*) FROM pragma_table_xinfo(
+      'identity_link_secret_configuration'
+    )
+  ) = 4
+  AND NOT EXISTS(
+    SELECT 1 FROM pragma_table_xinfo('identity_link_secret_configuration')
+     WHERE name NOT IN ('singleton', 'key_version',
+                        'secret_fingerprint', 'recorded_at')
+        OR hidden <> 0
+  ) AS primary_identity_link_secret_configuration_columns_exact,
+  EXISTS(
+    SELECT 1
+      FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_link_secret_configuration'
+       AND instr(
+         lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+         'check(singleton=1)'
+       ) > 0
+  ) AS primary_identity_link_secret_configuration_singleton_check,
+  EXISTS(
+    SELECT 1
+      FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_link_secret_configuration'
+       AND instr(
+         lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+         'length(key_version)between1and64'
+       ) > 0
+       AND instr(
+         lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+         'key_versionnotglob'
+       ) > 0
+       AND instr(
+         substr(
+           ${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL},
+           instr(
+             lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+             'key_versionnotglob'
+           )
+         ),
+         ${IDENTITY_LINK_SECRET_CONFIGURATION_KEY_VERSION_GLOB}
+       ) > 0
+  ) AS primary_identity_link_secret_configuration_key_version_check,
+  EXISTS(
+    SELECT 1
+      FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_link_secret_configuration'
+       AND instr(
+         lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+         'length(secret_fingerprint)=64'
+       ) > 0
+       AND instr(
+         lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+         'secret_fingerprintnotglob'
+       ) > 0
+       AND instr(
+         substr(
+           ${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL},
+           instr(
+             lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+             'secret_fingerprintnotglob'
+           )
+         ),
+         ${IDENTITY_LINK_SECRET_CONFIGURATION_FINGERPRINT_GLOB}
+       ) > 0
+  ) AS primary_identity_link_secret_configuration_fingerprint_check,
+  EXISTS(
+    SELECT 1
+      FROM sqlite_master
+     WHERE type = 'table'
+       AND name = 'identity_link_secret_configuration'
+       AND (
+         length(lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}))
+         - length(replace(
+             lower(${IDENTITY_LINK_SECRET_CONFIGURATION_COMPACT_SQL}),
+             'check(',
+             ''
+           ))
+       ) / length('check(') = 3
+  ) AS primary_identity_link_secret_configuration_check_count,
+  EXISTS(
+    SELECT 1 FROM pragma_table_list
+     WHERE schema = 'main'
+       AND type = 'table'
+       AND name = 'identity_link_secret_configuration'
+       AND strict = 1
+       AND wr = 0
+  ) AS primary_identity_link_secret_configuration_strict,
+  NOT EXISTS(
+    SELECT 1 FROM sqlite_master
+     WHERE type IN ('index', 'trigger')
+       AND tbl_name = 'identity_link_secret_configuration'
+  )
+  AND NOT EXISTS(
+    SELECT 1 FROM pragma_foreign_key_list(
+      'identity_link_secret_configuration'
+    )
+  ) AS primary_identity_link_secret_configuration_no_extra_objects;
 `;
 
 const DELETION_LEDGER_IDENTITY_PROTECTION_SCHEMA_SQL = `
@@ -779,6 +914,22 @@ function primaryIdentityProtectionSchemaEvidence(result) {
       identityLinkSecretConfigurationRecordedAt:
         values.identityLinkSecretConfigurationRecordedAt,
     },
+    constraints: {
+      identityLinkSecretConfigurationColumnsExact:
+        values.identityLinkSecretConfigurationColumnsExact,
+      identityLinkSecretConfigurationSingletonCheck:
+        values.identityLinkSecretConfigurationSingletonCheck,
+      identityLinkSecretConfigurationKeyVersionCheck:
+        values.identityLinkSecretConfigurationKeyVersionCheck,
+      identityLinkSecretConfigurationFingerprintCheck:
+        values.identityLinkSecretConfigurationFingerprintCheck,
+      identityLinkSecretConfigurationCheckCount:
+        values.identityLinkSecretConfigurationCheckCount,
+      identityLinkSecretConfigurationStrict:
+        values.identityLinkSecretConfigurationStrict,
+      identityLinkSecretConfigurationNoExtraObjects:
+        values.identityLinkSecretConfigurationNoExtraObjects,
+    },
     indexes: {
       retention: values.cooldownRetentionIndex,
       retentionShape: values.cooldownRetentionIndexShape,
@@ -864,7 +1015,10 @@ function safeSchemaEvidence(value) {
     candidate === true || candidate === false || candidate === null
       ? candidate
       : null;
-  const side = (candidate, { tables, columns, indexes, triggers = null }) => {
+  const side = (
+    candidate,
+    { tables, columns, constraints = null, indexes, triggers = null },
+  ) => {
     const sideStatus = ["verified", "incomplete", "unknown"].includes(
       candidate?.status,
     )
@@ -880,10 +1034,18 @@ function safeSchemaEvidence(value) {
       columns: Object.fromEntries(
         columns.map((key) => [key, booleanOrNull(candidate?.columns?.[key])]),
       ),
-      indexes: Object.fromEntries(
-        indexes.map((key) => [key, booleanOrNull(candidate?.indexes?.[key])]),
-      ),
     };
+    if (constraints !== null) {
+      safeSide.constraints = Object.fromEntries(
+        constraints.map((key) => [
+          key,
+          booleanOrNull(candidate?.constraints?.[key]),
+        ]),
+      );
+    }
+    safeSide.indexes = Object.fromEntries(
+      indexes.map((key) => [key, booleanOrNull(candidate?.indexes?.[key])]),
+    );
     if (triggers !== null) {
       safeSide.triggers = Object.fromEntries(
         triggers.map((key) => [key, booleanOrNull(candidate?.triggers?.[key])]),
@@ -906,6 +1068,15 @@ function safeSchemaEvidence(value) {
       "identityLinkSecretConfigurationKeyVersion",
       "identityLinkSecretConfigurationSecretFingerprint",
       "identityLinkSecretConfigurationRecordedAt",
+    ],
+    constraints: [
+      "identityLinkSecretConfigurationColumnsExact",
+      "identityLinkSecretConfigurationSingletonCheck",
+      "identityLinkSecretConfigurationKeyVersionCheck",
+      "identityLinkSecretConfigurationFingerprintCheck",
+      "identityLinkSecretConfigurationCheckCount",
+      "identityLinkSecretConfigurationStrict",
+      "identityLinkSecretConfigurationNoExtraObjects",
     ],
     indexes: ["retention", "retentionShape"],
     triggers: ["reenrollmentCooldownGuard"],

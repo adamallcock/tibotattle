@@ -71,11 +71,38 @@ npm --prefix apps/worker run staging:prepare -- \
 
 Preparation refuses unsafe configuration, missing resources, remote migration
 inventory drift, and unverified migration application. On a fresh D1, the
-explicitly confirmed migration apply may create the migration ledger; the
-preparation then proves the exact remote inventory again before issuing the
-containment update and rechecks containment. Its receipt is fixed-shape,
-content-free, and always records `collectionAuthorized: false` and
-`activationState: not_authorized`.
+preparation refuses to run any migration command when both D1 migration ledgers
+are uninitialized and `collection_controls` is absent. Wrangler applies the
+whole pending migration chain, and migration `0009_collection_controls.sql`
+creates an operational row, so containment cannot safely be established after
+that command. The failure is
+`STAGING_FRESH_BOOTSTRAP_REQUIRES_OWNER_CONTAINMENT`, with no operation receipt
+or operational claim.
+
+Fresh bootstrap therefore has an owner-only external prerequisite: the owner
+must use a separately reviewed Cloudflare D1 bootstrap protocol that establishes
+the exact staging migration state and a verified `collection_controls` row in
+the `contained` state before any arbitrary pending migration chain is run. That
+protocol is intentionally not invented in this worktree because it would need
+to coordinate D1 migration bookkeeping with the pre-control schema safely. The
+owner must re-run `npm --prefix apps/worker run staging:ready` and confirm live
+`collectionControlState: "contained"` before retrying preparation. If that
+protocol is unavailable, staging remains blocked.
+
+For an already-initialized but uncontained target, preparation still issues the
+containment update and verifies live containment before applying either
+migration stream. Once all migrations and schema protections are verified, its
+receipt is fixed-shape, content-free, and always records
+`collectionAuthorized: false` and `activationState: not_authorized`.
+
+The identity-link secret configuration proof uses semantic PRAGMA and
+`sqlite_master` evidence rather than comparing the serialized full DDL. It
+requires the exact four-column shape, singleton primary key, required
+non-null/type invariants, SQLite `STRICT`, exactly the three expected CHECK
+clauses (including the singleton, key-version, and lowercase fingerprint
+constraints), and no table-bound extra indexes, triggers, or foreign keys. This
+tolerates harmless SQLite layout serialization differences while blocking
+altered or extra schema evidence. Any mismatch blocks readiness.
 
 No production custom domain, production resource identifier, arbitrary origin,
 or unreviewed Workers host is a staging proof. Deployment/rehearsal may only

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
 import {
   assessStagingConfiguration,
   EXPECTED_STAGING_MIGRATIONS,
@@ -270,7 +273,7 @@ test("operation receipts keep evidence fixed and non-secret", () => {
   assert.equal(JSON.stringify(receipt).includes("private command output"), false);
 });
 
-test("live readiness blocks missing identity protection schema in either database", () => {
+test("live readiness blocks missing or altered identity protection schema", () => {
   for (const scenario of [
     {
       name: "primary re-enrollment protection",
@@ -307,6 +310,90 @@ test("live readiness blocks missing identity protection schema in either databas
       evidenceGroup: "columns",
       evidenceKey: "identityLinkSecretConfigurationKeyVersion",
     },
+    {
+      name: "primary identity-link secret configuration extra column",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_columns_exact",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationColumnsExact",
+    },
+    {
+      name: "primary identity-link secret configuration singleton check",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_singleton_check",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationSingletonCheck",
+    },
+    {
+      name: "primary identity-link secret configuration key-version check",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_key_version_check",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationKeyVersionCheck",
+    },
+    {
+      name: "primary identity-link secret configuration fingerprint check",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_fingerprint_check",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationFingerprintCheck",
+    },
+    {
+      name: "primary identity-link secret configuration check count",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_check_count",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationCheckCount",
+    },
+    {
+      name: "primary identity-link secret configuration strict flag",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_strict",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationStrict",
+    },
+    {
+      name: "primary identity-link secret configuration extra object",
+      options: {
+        malformedIdentityLinkSecretConfigurationField:
+          "primary_identity_link_secret_configuration_no_extra_objects",
+      },
+      check: "primaryReenrollmentSchemaCurrent",
+      blocker: "REMOTE_IDENTITY_REENROLLMENT_SCHEMA_INCOMPLETE",
+      side: "primary",
+      evidenceGroup: "constraints",
+      evidenceKey: "identityLinkSecretConfigurationNoExtraObjects",
+    },
   ]) {
     const config = provisionedConfig();
     const result = probeStagingLive({
@@ -337,6 +424,69 @@ test("live readiness blocks missing identity protection schema in either databas
       );
     }
     assert.equal(result.blockers.includes(scenario.blocker), true, scenario.name);
+  }
+});
+
+test("semantic identity-link proof matches the checked-in migrated table", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(readFileSync(join(
+      workerDirectory,
+      "migrations",
+      "0028_identity_link_secret_configuration.sql",
+    ), "utf8"));
+    const config = provisionedConfig();
+    const calls = [];
+    const baseSpawn = successSpawn(config, calls);
+    let identityProbeRow;
+    const spawn = (command, args, options) => {
+      const commandIndex = args.indexOf("--command");
+      const commandText = commandIndex >= 0
+        ? String(args[commandIndex + 1])
+        : "";
+      if (args[0] === "d1"
+          && args[1] === "execute"
+          && args[2] === "USAGE_MONITOR_DB"
+          && commandText.includes(
+            "primary_identity_link_secret_configuration_check_count",
+          )) {
+        identityProbeRow = database.prepare(commandText).get();
+        return {
+          status: 0,
+          stdout: JSON.stringify([{ results: [identityProbeRow] }]),
+          stderr: "",
+        };
+      }
+      return baseSpawn(command, args, options);
+    };
+    probeStagingLive({
+      config,
+      wrangler: "/fake/wrangler",
+      workerDirectory,
+      spawn,
+    });
+    assert.deepEqual(
+      Object.fromEntries([
+        "primary_identity_link_secret_configuration_columns_exact",
+        "primary_identity_link_secret_configuration_singleton_check",
+        "primary_identity_link_secret_configuration_key_version_check",
+        "primary_identity_link_secret_configuration_fingerprint_check",
+        "primary_identity_link_secret_configuration_check_count",
+        "primary_identity_link_secret_configuration_strict",
+        "primary_identity_link_secret_configuration_no_extra_objects",
+      ].map((key) => [key, identityProbeRow?.[key]])),
+      {
+        primary_identity_link_secret_configuration_columns_exact: 1,
+        primary_identity_link_secret_configuration_singleton_check: 1,
+        primary_identity_link_secret_configuration_key_version_check: 1,
+        primary_identity_link_secret_configuration_fingerprint_check: 1,
+        primary_identity_link_secret_configuration_check_count: 1,
+        primary_identity_link_secret_configuration_strict: 1,
+        primary_identity_link_secret_configuration_no_extra_objects: 1,
+      },
+    );
+  } finally {
+    database.close();
   }
 });
 

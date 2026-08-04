@@ -141,6 +141,41 @@ export function successSpawn(
               || malformedIdentityLinkSecretConfigurationField
                 === "primary_identity_link_secret_configuration_recorded_at"
                 ? 0 : 1,
+            primary_identity_link_secret_configuration_columns_exact:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_columns_exact"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_singleton_check:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_singleton_check"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_key_version_check:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_key_version_check"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_fingerprint_check:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_fingerprint_check"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_check_count:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_check_count"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_strict:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_strict"
+                ? 0 : 1,
+            primary_identity_link_secret_configuration_no_extra_objects:
+              missingIdentityLinkSecretConfiguration
+              || malformedIdentityLinkSecretConfigurationField
+                === "primary_identity_link_secret_configuration_no_extra_objects"
+                ? 0 : 1,
           }],
         }]),
         stderr: "",
