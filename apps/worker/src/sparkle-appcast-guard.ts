@@ -855,6 +855,7 @@ export async function handleSparkleAppcastGuard(
   }
   if (!current.matches) return conflictResponse("current_state_conflict");
 
+  const publicKey = await configuredSparklePublicKey(configuration);
   if (current.bytes !== null) {
     let currentText: string;
     try {
@@ -863,6 +864,12 @@ export async function handleSparkleAppcastGuard(
       invalidCandidate();
     }
     const currentAppcast = parseSparkleAppcast(currentText);
+    // A non-empty appcast is a trusted monotonic baseline only after its
+    // canonical active artifact has independently passed the same R2 and
+    // Sparkle signature checks as the candidate.
+    for (const enclosure of currentAppcast.enclosures) {
+      await verifyCandidateArtifact(configuration.bucket, enclosure, publicKey);
+    }
     if (compareBundleVersions(
       candidateAppcast.latest.version,
       currentAppcast.latest.version,
@@ -870,7 +877,6 @@ export async function handleSparkleAppcastGuard(
       invalidCandidate();
     }
   }
-  const publicKey = await configuredSparklePublicKey(configuration);
   for (const enclosure of candidateAppcast.enclosures) {
     await verifyCandidateArtifact(configuration.bucket, enclosure, publicKey);
   }

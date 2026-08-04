@@ -88,8 +88,12 @@ artifact's canonical content-addressed URL, immutable R2 metadata, exact
 bytes/length/hash, and Sparkle Ed25519 signature. It reads the stable public key only from the named
 owner-provisioned public configuration and checks its SHA-256 fingerprint; the
 private key never enters the Worker. It then reads the current appcast,
-verifies that state, and calls R2 `put(..., { onlyIf: { etagMatches } })` (or the
-empty-object equivalent) with the candidate and HTTP metadata. Cloudflare
+verifies that state and, when non-empty, independently verifies the current
+full enclosure's R2 metadata/bytes and Sparkle signature before using its
+version as the monotonic baseline. A malformed active feed or missing/bad
+artifact fails closed with no write; owner remediation or a controlled
+migration must establish a valid baseline before replacement. It then calls R2
+`put(..., { onlyIf: { etagMatches } })` (or the empty-object equivalent) with the candidate and HTTP metadata. Cloudflare
 documents that a failed R2 conditional put returns `null`, which the guard
 reports as a distinct conflict; it performs no fallback ordinary put. See the [Workers R2 API
 reference](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/)

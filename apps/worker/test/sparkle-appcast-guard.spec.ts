@@ -613,6 +613,7 @@ describe("Sparkle appcast atomic guard", () => {
     for (const [version, nonce] of [["2", "equal-version-nonce-01"], ["1", "lower-version-nonce-01"]] as const) {
       const bucket = new FakeR2Bucket();
       const current = await seedAppcast(bucket, "2");
+      await installArtifact(bucket, "2");
       await installArtifact(bucket, version);
       const response = await invoke(
         await signedRequest(
@@ -667,6 +668,7 @@ describe("Sparkle appcast atomic guard", () => {
   it("commits a valid higher candidate after independently verifying its artifact", async () => {
     const bucket = new FakeR2Bucket();
     const current = await seedAppcast(bucket, "1");
+    await installArtifact(bucket, "1");
     await installArtifact(bucket, "2");
     const candidate = await appcastBytes("2");
     const response = await invoke(
@@ -685,6 +687,58 @@ describe("Sparkle appcast atomic guard", () => {
     expect(response.status).toBe(200);
     expect(bucket.putCalls).toBe(1);
     expect(bucket.object?.bytes).toEqual(candidate);
+  });
+
+  it("rejects a missing or bad-signature active artifact before any appcast put", async () => {
+    const missing = new FakeR2Bucket();
+    const missingCurrent = await seedAppcast(missing, "1");
+    await installArtifact(missing, "2");
+    const missingResponse = await invoke(
+      await signedRequest(await payload({
+        candidate: await appcastBytes("2"),
+        expectedCurrent: {
+          state: "present",
+          bytes: missingCurrent.byteLength,
+          sha256: await sha256Hex(missingCurrent),
+          etag: null,
+        },
+      })),
+      bindings(missing),
+      NOW,
+    );
+
+    const badSignature = new FakeR2Bucket();
+    const validCurrent = await appcastBytes("1");
+    const badCurrent = encoder.encode(
+      new TextDecoder().decode(validCurrent)
+        .replace(/sparkle:edSignature="[^"]+"/u, `sparkle:edSignature="${"A".repeat(86)}=="`),
+    );
+    badSignature.object = {
+      bytes: badCurrent,
+      etag: "bad-current-etag",
+      contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
+      cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
+    };
+    await installArtifact(badSignature, "1");
+    await installArtifact(badSignature, "2");
+    const badSignatureResponse = await invoke(
+      await signedRequest(await payload({
+        candidate: await appcastBytes("2"),
+        expectedCurrent: {
+          state: "present",
+          bytes: badCurrent.byteLength,
+          sha256: await sha256Hex(badCurrent),
+          etag: null,
+        },
+      }), TOKEN, Math.floor(NOW / 1000), "bad-current-signature-nonce-01"),
+      bindings(badSignature),
+      NOW,
+    );
+
+    expect(missingResponse.status).toBe(422);
+    expect(badSignatureResponse.status).toBe(422);
+    expect(missing.putCalls).toBe(0);
+    expect(badSignature.putCalls).toBe(0);
   });
 
   it("rejects the wrong channel/key before any R2 mutation", async () => {
@@ -743,6 +797,7 @@ describe("Sparkle appcast atomic guard", () => {
   it("returns a distinct R2 conditional-write conflict", async () => {
     const bucket = new FakeR2Bucket();
     const current = await appcastBytes("1");
+    await installArtifact(bucket, "1");
     await installArtifact(bucket, "2");
     bucket.object = {
       bytes: current,

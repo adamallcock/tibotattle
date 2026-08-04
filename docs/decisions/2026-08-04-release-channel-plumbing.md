@@ -78,12 +78,15 @@ update rehearsal gates have passed.
 
 The disabled appcast guard now has a local server-side verification boundary:
 when owner-provisioned, it independently checks exactly one full stable `.dmg`
-enclosure/item, rejects all delta/history entries, enforces monotonic version,
-and verifies the referenced R2 artifact metadata/bytes and Sparkle Ed25519
-signature before the existing nonce/CAS write. The checked-in Worker remains
-disabled and unprovisioned; code validation is not channel readiness, and real
-readiness still requires owner review of the stable public-key fingerprint,
-R2/D1 bindings, token, signed/notarized artifacts, deployed feed, and guarded
-CAS rehearsal. Passing local code validation is not a live release or evidence
-that the owner-only signing, notarization, Worker guard, R2 mutation, public
-read-back, or clean-profile update rehearsal gates have passed.
+enclosure/item, rejects all delta/history entries, verifies both the active
+baseline and candidate R2 artifact metadata/bytes and Sparkle Ed25519
+signatures, and enforces monotonic version before the existing nonce/CAS write.
+A malformed or unverifiable non-empty baseline fails closed; owner remediation
+or a controlled migration must establish a valid baseline rather than silently
+overwriting it. The checked-in Worker remains disabled and unprovisioned; code
+validation is not channel readiness, and real readiness still requires owner
+review of the stable public-key fingerprint, R2/D1 bindings, token,
+signed/notarized artifacts, deployed feed, and guarded CAS rehearsal.
+Passing local code validation is not a live release or evidence that the
+owner-only signing, notarization, Worker guard, R2 mutation, public read-back,
+or clean-profile update rehearsal gates have passed.
