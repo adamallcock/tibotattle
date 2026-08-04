@@ -43,7 +43,7 @@ deletion flows.  An authentication package cannot safely infer those product
 consent and device-ownership rules.
 
 This plan complements and finishes the security direction in the existing
-[G3 session/capability plan](2026-07-25-g3-session-capability-separation-plan.md)
+[G3 session/capability plan](./2026-07-25-g3-session-capability-separation-plan.md)
 and the native-flow direction in the
 [macOS migration plan](2026-08-03-native-first-macos-client-migration-plan.md).
 It supersedes any remaining runtime behaviour that forwards a hosted personal
@@ -287,7 +287,7 @@ framework migration.
   restore behaviour.
 - Decide and record the production backup-retention horizon before making a
   deletion guarantee. The existing
-  [retention and restore plan](2026-07-26-backend-retention-and-restore-safety-plan.md)
+  [retention and restore plan](./2026-07-26-backend-retention-and-restore-safety-plan.md)
   is the starting point, not a production policy.
 - Create a feature flag with only safe states: `disabled`, `native_ticket`,
   and (after the spike) `better_auth`. Do not retain an `unsafe_loopback_cookie`
