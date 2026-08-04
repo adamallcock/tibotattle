@@ -3,6 +3,9 @@ import { test } from "node:test";
 import { readFile } from "node:fs/promises";
 
 import {
+  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+} from "../../../config/product-brand.js";
+import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   normalizeCommunitySnapshot,
 } from "../public/data-client.js";
@@ -13,10 +16,6 @@ import {
   renderCommunityEstimate,
   renderCommunitySnapshot,
 } from "../public/community-view.js";
-import {
-  renderPublicInstallerJourney,
-  setPublicSnapshotPresentation,
-} from "../public/community.js";
 import {
   configuredInstallerRelease,
   configuredSemanticOpenTarget,
@@ -143,35 +142,20 @@ function publishedSnapshot(overrides = {}) {
   };
 }
 
-test("the public site leads with a fail-closed Mac app download and distinct community evidence", async () => {
+test("the public site presents only the install call to action and the community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
 
   assert.match(html, /<script type="module" src="\.\/community\.js">/u);
-  assert.match(html, /id="hero-title"/u);
-  assert.match(html, /id="community"/u);
-  assert.match(html, /id="download"/u);
-  assert.match(html, /Signed Mac installer/u);
-  assert.match(html, /privacy-reviewed community evidence/u);
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="installer-details"/u);
   assert.match(html, /id="installer-unavailable"/u);
-  assert.match(html, /id="installer-steps" hidden/u);
+  assert.match(html, /id="open-installed-app"/u);
   assert.match(html, /id="community-result"/u);
   assert.match(html, /id="community-snapshot-service-detail"/u);
   assert.match(html, /id="community-service-state"/u);
-  assert.match(html, /id="community-snapshot-title">Seven-day community snapshot/u);
   assert.match(html, /id="community-estimate-result"/u);
   assert.match(html, /id="community-estimate-state"/u);
-  assert.match(html, /id="community-estimate-panel-state"/u);
-  assert.ok(
-    html.indexOf('id="installer-link"') < html.indexOf('id="community"'),
-    "the signed-download action appears before the public community snapshot",
-  );
-  assert.doesNotMatch(
-    html,
-    /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\/open/u,
-  );
 
   // Every control that cannot work without the local companion is absent from
   // the website. These are the dead controls the split exists to remove.
@@ -203,29 +187,23 @@ test("the public site leads with a fail-closed Mac app download and distinct com
     const companionOnlyModule of [
       "./app.js",
       "./navigation.js",
-      "./admin.js",
-      "./admin-client.js",
-      "./data-client.js",
-      "./install-cta.js",
       "LocalCompanionClient",
       "createTelemetryEnvelope",
       "createGoogleSignInRequest",
       "registerUpload",
       "contributeSerialized",
-      "./lib.js",
     ]
   ) {
     assert.equal(source.includes(companionOnlyModule), false, companionOnlyModule);
   }
-  assert.match(html, /<img[^>]+src="\.\/tibotattle-icon\.png"/u);
 
-  // Accessibility: the site keeps a skip link, named landmarks, keyboard
-  // focus rings, and native details/summary FAQ disclosures.
+  // Accessibility: the site keeps the same skip link and named landmarks the
+  // dashboard uses, and the focus ring is global rather than per page.
   assert.match(html, /<a class="skip-link" href="#main">/u);
   assert.match(html, /<main id="main">/u);
   assert.match(html, /<nav class="primary-nav" aria-label="Site sections">/u);
+  assert.match(html, /aria-labelledby="install-title"/u);
   assert.match(html, /aria-labelledby="community-title"/u);
-  assert.match(html, /aria-labelledby="download-title"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
     /button:focus-visible, input:focus-visible, a:focus-visible/u,
@@ -253,43 +231,48 @@ test("the public site leads with a fail-closed Mac app download and distinct com
       name,
     );
   }
-  assert.doesNotMatch(html, /semantic-open-target|open-installed-app/u);
+  assert.equal(
+    html.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1,
+    1,
+  );
 });
 
-test("the first visit leads with the product purpose, signed download, and named estimate gate", async () => {
+test("the first visit leads with the product, combined Mac action, and named estimate gate", async () => {
   const html = await readFile(SITE_HTML, "utf8");
-  const purpose = "TiboTattle is a local-first Mac app for understanding personal Codex";
-  assert.match(html, new RegExp(purpose, "u"));
-  assert.match(html, /Signed Mac installer/u);
-  assert.match(html, /Download signed Mac installer/u);
-  assert.match(html, /Community seven-day allowance estimate/u);
-  assert.match(html, /<section class="community-hero"[^>]*id="download"/u);
+  assert.match(html, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
+  assert.match(html, /TiboTattle is a local-first Mac app that turns content-free usage/u);
+  assert.match(html, /Download for macOS/u);
+  assert.match(html, /Already installed\?/u);
+  assert.match(html, /Open TiboTattle/u);
+  assert.match(html, /Community seven-day estimate/u);
+  assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
+  assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
+  assert.match(html, /src="\.\/tibotattle-weekly-preview\.jpg"/u);
+  assert.match(html, /Illustrative fixture — not your usage\./u);
   assert.match(html, /id="installer-link"/u);
   assert.ok(
     html.indexOf('id="installer-link"') < html.indexOf('id="community"'),
     "the primary installer action appears before the community activity section",
   );
-  assert.match(
-    html,
-    /Your personal dashboard, local scans, sign-in, and optional\s+contribution/u,
+  assert.ok(
+    html.indexOf('class="product-window"') < html.indexOf('id="how-it-works"'),
+    "the app preview appears before the supporting feature strip",
   );
+  assert.doesNotMatch(html, /After download|companion-steps|install-explainer/u);
   assert.doesNotMatch(
     html,
     /Activity totals[^<]+are an allowance estimate/u,
   );
-  assert.doesNotMatch(html, /open-installed-app|usagemonitor:\/\/open/u);
 });
 
-test("browser entry points share the renderer without shipping local app controls", async () => {
+test("both browser entry points share one community renderer and one install card", async () => {
   const siteSource = await readFile(SITE_SOURCE, "utf8");
   const appSource = await readFile(APP_SOURCE, "utf8");
-  assert.match(siteSource, /from "\.\/community-view\.js"/u);
-  assert.match(appSource, /from "\.\/community-view\.js"/u);
-  assert.doesNotMatch(siteSource, /from "\.\/install-cta\.js"/u);
-  assert.match(appSource, /from "\.\/install-cta\.js"/u);
-  // No forked copy: the dashboard entry no longer defines the community
-  // renderer, while the public entry keeps its own companion-free install
-  // card instead of shipping the app-open helper.
+  for (const shared of ["./community-view.js", "./install-cta.js"]) {
+    assert.match(siteSource, new RegExp(`from "${shared.replace(".", "\\.")}"`, "u"));
+    assert.match(appSource, new RegExp(`from "${shared.replace(".", "\\.")}"`, "u"));
+  }
+  // No forked copy: the dashboard entry no longer defines either renderer.
   assert.doesNotMatch(appSource, /const COMMUNITY_METRIC_LABELS = Object\.freeze/u);
   assert.doesNotMatch(appSource, /function configuredInstallerRelease\(/u);
   assert.doesNotMatch(appSource, /function formatInstallerSize\(/u);
@@ -365,9 +348,12 @@ test("the named estimate gate never derives an allowance from the activity-only 
       snapshot: normalizeCommunitySnapshot(payload),
     });
     assert.equal(estimateState, expectedEstimateState);
-    assert.match(estimate.text, /no released allowance estimate/u);
+    assert.match(estimate.text, /no released allowance estimate/iu);
     assert.doesNotMatch(estimate.text, /100,000|100000|\$/u);
-    assert.match(hero.textContent, /estimate|evidence/u);
+    assert.equal(
+      hero.textContent,
+      COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState].hero,
+    );
     assert.equal(stateNode.className, "evidence-chip neutral");
     assert.ok(COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState]);
   }
@@ -389,11 +375,6 @@ test("a published community week renders its support gate, provenance, and cells
   assert.match(container.text, /not an average, and not a cost/u);
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a released week renders its cell table");
-  const breakdown = container.descendants().find(({ tag, className }) => (
-    tag === "details" && className.includes("snapshot-breakdown")
-  ));
-  assert.ok(breakdown, "the detailed cell table is opt-in disclosure content");
-  assert.equal(breakdown.descendants().includes(table), true);
   const headerLabels = table
     .descendants()
     .filter(({ tag }) => tag === "th")
@@ -414,58 +395,6 @@ test("a published community week renders its support gate, provenance, and cells
   assert.equal(
     bare.descendants().some(({ tag }) => tag === "table"),
     true,
-  );
-  assert.equal(
-    bare.descendants().some(({ tag, className }) => (
-      tag === "details" && className.includes("snapshot-breakdown")
-    )),
-    true,
-  );
-});
-
-test("the public page names only a verified installer as a download", () => {
-  const complete = {
-    "usage-monitor-installer-url": "https://downloads.example.org/TiboTattle.dmg",
-    "usage-monitor-installer-version": "1.2.3",
-    "usage-monitor-installer-sha256": "a".repeat(64),
-    "usage-monitor-installer-bytes": "12582912",
-    "usage-monitor-minimum-macos": "13.0",
-    "usage-monitor-architectures": "arm64",
-    "usage-monitor-release-notes-url": "https://example.org/releases/1.2.3",
-    "usage-monitor-privacy-url": "https://example.org/privacy",
-    "usage-monitor-security-url": "https://example.org/security",
-    "usage-monitor-support-url": "https://example.org/support",
-  };
-  const unavailable = fakeDocument();
-  assert.equal(renderPublicInstallerJourney(unavailable), null);
-  assert.equal(unavailable.byId.get("installer-steps").hidden, true);
-  assert.equal(unavailable.byId.get("installer-link").hidden, true);
-  assert.equal(unavailable.byId.get("installer-unavailable").hidden, false);
-
-  const ready = fakeDocument(complete);
-  assert.equal(renderPublicInstallerJourney(ready)?.version, "1.2.3");
-  assert.equal(ready.byId.get("installer-steps").hidden, false);
-  assert.equal(ready.byId.get("installer-link").hidden, false);
-  assert.equal(ready.byId.get("installer-unavailable").hidden, true);
-});
-
-test("the public snapshot badge reports reader-facing snapshot state", () => {
-  const unavailable = fakeDocument();
-  setPublicSnapshotPresentation(unavailable, "service_unavailable", { failed: true });
-  assert.equal(
-    unavailable.byId.get("community-service-state").textContent,
-    "Snapshot temporarily unavailable",
-  );
-  assert.equal(
-    unavailable.byId.get("community-snapshot-title").textContent,
-    "Seven-day community snapshot",
-  );
-
-  const published = fakeDocument();
-  setPublicSnapshotPresentation(published, "published");
-  assert.equal(
-    published.byId.get("community-service-state").textContent,
-    "Snapshot available",
   );
 });
 

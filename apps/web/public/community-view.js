@@ -196,38 +196,38 @@ const PENDING_CONTRACT_ROWS = Object.freeze([
 export const COMMUNITY_ESTIMATE_STATE_COPY = Object.freeze({
   service_unavailable: Object.freeze({
     label: "Unavailable",
-    hero: "The community service is unavailable, so no estimate is shown.",
-    body: "No allowance estimate is inferred from an unavailable response.",
+    hero: "Unavailable right now",
+    body: "No released allowance estimate is available while the community service is offline.",
   }),
   development_unsafe: Object.freeze({
     label: "Unavailable",
-    hero: "No public estimate is shown from a development-only response.",
-    body: "The service returned a development diagnostic rather than a released public aggregate.",
+    hero: "No public estimate",
+    body: "No released allowance estimate is shown from a development-only response.",
   }),
   unsupported_schema: Object.freeze({
     label: "Unavailable",
-    hero: "The released evidence contract is not supported by this page yet.",
-    body: "No allowance estimate is shown until the public contract can be checked end to end.",
+    hero: "Estimate update required",
+    body: "No released allowance estimate is shown until this evidence contract can be checked end to end.",
   }),
   not_yet_published: Object.freeze({
     label: "Collecting evidence",
-    hero: "No allowance number is published yet; matched quota evidence is still being collected.",
-    body: "A privacy-reviewed seven-day allowance estimate will appear only when a released aggregate includes matched quota coverage and uncertainty. Until then, no number is inferred.",
+    hero: "Collecting matched evidence",
+    body: "No released allowance estimate yet. Matched quota coverage and uncertainty are still being collected.",
   }),
   withdrawn: Object.freeze({
     label: "Not published",
-    hero: "This week's estimate is unavailable because the released revision was withdrawn.",
-    body: "The weekly revision was withdrawn for privacy or quality reasons. A replacement must be released before an allowance estimate can appear.",
+    hero: "This week was withdrawn",
+    body: "No released allowance estimate is available because this revision was withdrawn for privacy or quality reasons.",
   }),
   suppressed: Object.freeze({
     label: "Not published",
-    hero: "This week's evidence did not qualify for a public estimate.",
-    body: "The weekly aggregate did not pass its fixed privacy release policy. No allowance number is inferred, and the policy does not disclose how close it was.",
+    hero: "Not published this week",
+    body: "No released allowance estimate: this week did not pass the fixed privacy release policy.",
   }),
   activity_only: Object.freeze({
     label: "Activity only",
-    hero: "This release contains activity totals, not an allowance estimate.",
-    body: "The released aggregate contains delayed activity totals only. Activity is not an allowance, so no seven-day estimate is calculated from it.",
+    hero: "Activity released; estimate pending",
+    body: "No released allowance estimate. This aggregate contains delayed activity totals only.",
   }),
 });
 
@@ -256,12 +256,6 @@ export function renderCommunityEstimate({
   if (container) {
     clear(container);
     container.append(node("p", "estimate-status-copy", copy.body));
-    const note = node(
-      "p",
-      "estimate-status-note",
-      "Current public data availability: no released allowance estimate.",
-    );
-    container.append(note);
   }
   if (hero) hero.textContent = copy.hero;
   for (const item of [stateNode, ...stateNodes]) {

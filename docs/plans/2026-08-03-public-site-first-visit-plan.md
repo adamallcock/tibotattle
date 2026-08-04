@@ -94,3 +94,33 @@ their existing delay, per-cell support gate, clipping, and rounding language.
   prerequisite is to build the public release site with a verified signed
   installer/social image and separately reconcile the live deployment before
   publishing it.
+
+## Visual simplification revision
+
+User review of the first implementation found the install and open steps too
+separate, the page too text-heavy, and the CSS-drawn brand mark incorrect. A
+current comparison with [CodexBar](https://codexbar.app/?lang=en) on 2026-08-03
+showed the useful pattern: one promise, one download action, and the product
+itself in the first viewport. TiboTattle will adopt that hierarchy without
+copying CodexBar's identity or broad multi-provider claims.
+
+The revised first visit uses:
+
+- the approved `tibotattle-icon.png` bird artwork for the brand and favicon;
+- a deep-green hero with the exact headline `Understand your Codex week.`;
+- one install cluster containing `Download for macOS` and the subordinate
+  `Already installed? Open TiboTattle` action;
+- a product preview derived from the repository's labeled demo: `$1,879 API
+  equivalent`, `61% remaining`, and the real seven-day history chart, visibly
+  marked as illustrative rather than personal or public community data;
+- one compact community-estimate status line in the hero, three short product
+  benefits, and one collapsed evidence-method section below it; and
+- no public Docs or GitHub link until a public destination exists. The current
+  GitHub remote returns 404 to an unauthenticated public request, and repository
+  Markdown is not a published documentation surface.
+
+The visual targets are the generated desktop and mobile concepts under
+`/Users/adamallcock/.codex/generated_images/019fca39-224d-7f91-ab58-c0c20aa1247f/`.
+They are design references only; the production page keeps text, actions,
+status, and app-preview framing in HTML and uses a privacy-safe screenshot of
+the labeled demo chart as its only new product image.
