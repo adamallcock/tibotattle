@@ -688,6 +688,32 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /SPUStandardUpdaterController/u);
   assert.match(source, /startingUpdater:\s*false/u);
   assert.doesNotMatch(source, /startingUpdater:\s*true/u);
+  assert.match(source, /private enum AppUpdaterState: Equatable/u);
+  assert.match(
+    source,
+    /case unavailable[\s\S]*case unverified[\s\S]*case ready[\s\S]*case checking[\s\S]*case updateAvailable[\s\S]*case verifiedNoUpdate[\s\S]*case failed/u,
+  );
+  assert.match(source, /feedIsReachable = false/u);
+  assert.match(source, /hasError: error != nil/u);
+  assert.match(source, /hasBody: data\?\.isEmpty == false/u);
+  assert.match(source, /request\.httpMethod = "GET"/u);
+  assert.doesNotMatch(source, /request\.httpMethod = "HEAD"/u);
+  assert.match(
+    source,
+    /static func feedResponseIsReachable\([\s\S]*200..<300/u,
+  );
+  assert.match(
+    source,
+    /guard Self\.feedResponseIsReachable\([\s\S]*showFeedFailureAlert/u,
+  );
+  assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.launcherRetry\)\)/u);
+  assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.commonCancel\)\)/u);
+  assert.match(source, /alert\.runModal\(\) == \.alertFirstButtonReturn[\s\S]*checkForUpdates\(nil\)/u);
+  assert.match(source, /didFindValidUpdate[\s\S]*\.updateAvailable/u);
+  assert.match(source, /updaterDidNotFindUpdate[\s\S]*\.verifiedNoUpdate/u);
+  assert.match(source, /didAbortWithError[\s\S]*\.failed/u);
+  assert.match(source, /controller\.checkForUpdates\(sender\)/u);
+  assert.match(source, /runtimeStateDescription/u);
   assert.match(
     source,
     /firstRunAcknowledged = true[\s\S]*updater\.startAfterFirstRunDisclosure\(\)/u,
@@ -3744,7 +3770,21 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       updaterSmoke.stdout,
-      /runtime=development_disabled/u,
+      /runtime=development_disabled state=unavailable_in_build/u,
+    );
+    const failedFeedSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-feed-contract-smoke-test", "404"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      failedFeedSmoke.status,
+      0,
+      failedFeedSmoke.stderr || failedFeedSmoke.stdout,
+    );
+    assert.match(
+      failedFeedSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT status=404 result=failed sparkle_check=false$/mu,
     );
     const loginItemSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -4549,6 +4589,48 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
     assert.equal(plist.SUEnableAutomaticChecks, false);
     assert.equal(plist.SUAllowsAutomaticUpdates, false);
     assert.equal(plist.SUAutomaticallyUpdate, false);
+    const updaterSmoke = spawnSync(
+      join(output, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-contract-smoke-test"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      updaterSmoke.status,
+      0,
+      updaterSmoke.stderr || updaterSmoke.stdout,
+    );
+    assert.match(
+      updaterSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_CONTRACT runtime=sparkle_2_9_3_enabled state=feed_unverified$/mu,
+    );
+    const failedFeedSmoke = spawnSync(
+      join(output, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-feed-contract-smoke-test", "404"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      failedFeedSmoke.status,
+      0,
+      failedFeedSmoke.stderr || failedFeedSmoke.stdout,
+    );
+    assert.match(
+      failedFeedSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT status=404 result=failed sparkle_check=false$/mu,
+    );
+    const reachableFeedSmoke = spawnSync(
+      join(output, "Contents", "MacOS", "TiboTattle"),
+      ["--updater-feed-contract-smoke-test", "200"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      reachableFeedSmoke.status,
+      0,
+      reachableFeedSmoke.stderr || reachableFeedSmoke.stdout,
+    );
+    assert.match(
+      reachableFeedSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT status=200 result=reachable sparkle_check=true$/mu,
+    );
     await assert.rejects(
       buildMacOSApp({
         bundleVersion: "42",

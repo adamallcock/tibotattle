@@ -81,17 +81,37 @@ private let firstRunReceiptFileName = "first-run-v1.json"
 private let keychainResetHelperName = "reset-local-keychain.js"
 private let companionStartupTimeoutSeconds = 20
 
-private final class AppUpdater {
+private enum AppUpdaterState: Equatable {
+    case unavailable
+    case unverified
+    case ready
+    case checking
+    case updateAvailable
+    case verifiedNoUpdate
+    case failed
+}
+
+@MainActor
+private final class AppUpdater: NSObject {
     private static var bundledUpdaterEnabled: Bool {
         Bundle.main.object(
             forInfoDictionaryKey: "UsageMonitorUpdaterEnabled"
         ) as? Bool == true
     }
 
-    /// The installed preview is deliberately a real client of the deployed
-    /// service, but it is not itself a notarized release. Until the first
-    /// signed appcast is published, a manual Sparkle check would otherwise
-    /// show the opaque generic network error for the expected 404 response.
+    private(set) var state: AppUpdaterState
+    var onStateChange: (() -> Void)?
+
+    /// This is intentionally not an optimistic "up to date" default. A
+    /// configured feed is only usable after this process has independently
+    /// observed a non-empty feed response. Sparkle remains the authority for
+    /// appcast parsing, signatures, and the verified update result.
+    private(set) var feedIsReachable = false
+    private var feedPreflightInFlight = false
+
+    /// Channel metadata controls disclosure copy only. Updater availability
+    /// still requires this bundle's enabled flag and fresh feed evidence; no
+    /// channel name is treated as proof that an endpoint is safe to use.
     static var isPreviewDistribution: Bool {
         Bundle.main.object(
             forInfoDictionaryKey: "UsageMonitorPreviewDistribution"
@@ -115,20 +135,20 @@ private final class AppUpdater {
     }
 
 #if canImport(Sparkle)
-    private let controller: SPUStandardUpdaterController?
+    private var controller: SPUStandardUpdaterController?
     private var hasStarted = false
-    private var previewFeedPreflightInFlight = false
 
-    init() {
-        controller = Self.bundledUpdaterEnabled
-            ? SPUStandardUpdaterController(
-                // Do not let Sparkle begin update networking before the
-                // first-run disclosure explains the default behavior.
-                startingUpdater: false,
-                updaterDelegate: nil,
-                userDriverDelegate: nil
-            )
-            : nil
+    override init() {
+        state = Self.bundledUpdaterEnabled ? .unverified : .unavailable
+        super.init()
+        guard Self.bundledUpdaterEnabled else { return }
+        controller = SPUStandardUpdaterController(
+            // Do not let Sparkle begin update networking before the
+            // first-run disclosure explains the default behavior.
+            startingUpdater: false,
+            updaterDelegate: self,
+            userDriverDelegate: nil
+        )
     }
 
     var isAvailable: Bool {
@@ -143,60 +163,169 @@ private final class AppUpdater {
         controller?.updater.automaticallyDownloadsUpdates == true
     }
 
+    /// Automatic-update controls remain disabled until the endpoint and the
+    /// latest check both have a truthful state. This prevents a configured
+    /// but unavailable feed from looking ready merely because Sparkle exists.
+    var canConfigureAutomaticUpdates: Bool {
+        guard isAvailable, feedIsReachable else { return false }
+        return ![.checking, .failed].contains(state)
+    }
+
+    var canCheckForUpdates: Bool {
+        isAvailable && !feedPreflightInFlight && state != .checking
+    }
+
+    var menuItemTitle: String {
+        state == .failed
+            ? TiboTattleLocalization.string(.launcherRetry)
+            : TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+    }
+
+    var settingsSummary: String {
+        switch state {
+        case .unavailable:
+            return TiboTattleLocalization.string(
+                .settingsAutomaticUpdatesUnavailable
+            )
+        case .unverified:
+            return TiboTattleLocalization.string(
+                .settingsAutomaticUpdatesUnavailable
+            )
+        case .ready:
+            if Self.isPreviewDistribution {
+                return TiboTattleLocalization.string(
+                    .settingsUpdateDisclosurePreview
+                )
+            }
+            return automaticUpdatesEnabled
+                ? TiboTattleLocalization.string(.settingsAutomaticUpdatesOn)
+                : TiboTattleLocalization.string(.settingsAutomaticUpdatesOff)
+        case .checking:
+            return TiboTattleLocalization.string(.settingsCheckForUpdates)
+                + "…"
+        case .updateAvailable:
+            // The native Sparkle sheet presents the version and install
+            // choices. Keep this native summary truthful without inventing a
+            // second version display in the settings window.
+            return automaticUpdatesEnabled
+                ? TiboTattleLocalization.string(.settingsAutomaticUpdatesOn)
+                : TiboTattleLocalization.string(.settingsAutomaticUpdatesOff)
+        case .verifiedNoUpdate:
+            return TiboTattleLocalization.string(.launcherUpToDate)
+        case .failed:
+            return TiboTattleLocalization.string(
+                .launcherUpdateUnavailable
+            )
+        }
+    }
+
+    private func setState(_ next: AppUpdaterState) {
+        guard state != next else { return }
+        state = next
+        onStateChange?()
+    }
+
     func startAfterFirstRunDisclosure() {
-        guard let controller, !hasStarted else { return }
-        controller.startUpdater()
-        hasStarted = true
+        guard isAvailable, !hasStarted, !Self.isPreviewDistribution else {
+            return
+        }
+        preflightFeed(userInitiated: false) { [weak self] in
+            guard let self else { return }
+            self.startUpdaterIfNeeded()
+            if self.state == .checking {
+                self.setState(.ready)
+            }
+        }
     }
 
     func checkForUpdates(_ sender: Any?) {
-        guard hasStarted, let controller else { return }
-        guard Self.isPreviewDistribution,
-              let appcastURL = Self.appcastURL
-        else {
-            controller.checkForUpdates(sender)
+        guard isAvailable, !feedPreflightInFlight else { return }
+        preflightFeed(userInitiated: true) { [weak self] in
+            guard let self, let controller = self.controller else { return }
+            self.startUpdaterIfNeeded()
+            self.setState(.checking)
+            // Sparkle requires the updater to be started before a manual
+            // check. Dispatching one main-queue turn keeps that contract
+            // intact when the manual check also starts the updater.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.hasStarted else { return }
+                controller.checkForUpdates(sender)
+            }
+        }
+    }
+
+    private func startUpdaterIfNeeded() {
+        guard let controller, !hasStarted else { return }
+        hasStarted = true
+        controller.startUpdater()
+        if state != .checking {
+            setState(.ready)
+        }
+    }
+
+    private func preflightFeed(
+        userInitiated: Bool,
+        onReachable: @escaping () -> Void
+    ) {
+        guard !feedPreflightInFlight else { return }
+        guard let appcastURL = Self.appcastURL else {
+            feedIsReachable = false
+            setState(.failed)
+            if userInitiated {
+                showFeedFailureAlert()
+            }
             return
         }
-        guard !previewFeedPreflightInFlight else { return }
 
-        // A 404 at the canonical feed is an expected pre-release condition,
-        // not an actionable fault in the person's Mac. Let Sparkle handle all
-        // other responses (including malformed or unsigned feeds), where its
-        // built-in validation and remediation remain the source of truth.
-        previewFeedPreflightInFlight = true
+        feedPreflightInFlight = true
+        feedIsReachable = false
+        setState(.checking)
         var request = URLRequest(url: appcastURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = 5
-        request.httpMethod = "HEAD"
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.previewFeedPreflightInFlight = false
-                if (response as? HTTPURLResponse)?.statusCode == 404 {
-                    self.showPreviewFeedNotPublished()
+                self.feedPreflightInFlight = false
+                guard Self.feedResponseIsReachable(
+                    statusCode: (response as? HTTPURLResponse)?.statusCode,
+                    hasError: error != nil,
+                    hasBody: data?.isEmpty == false
+                ) else {
+                    self.feedIsReachable = false
+                    self.setState(.failed)
+                    if userInitiated {
+                        self.showFeedFailureAlert()
+                    }
                     return
                 }
-                controller.checkForUpdates(sender)
+                self.feedIsReachable = true
+                onReachable()
             }
         }.resume()
     }
 
-    private func showPreviewFeedNotPublished() {
+    private func showFeedFailureAlert() {
         let alert = NSAlert()
-        alert.alertStyle = .informational
+        alert.alertStyle = .warning
         alert.messageText = TiboTattleLocalization.string(
-            .settingsPreviewUpdatesPendingTitle
+            .launcherUpdateUnavailable
         )
         alert.informativeText = TiboTattleLocalization.string(
-            .settingsPreviewUpdatesPendingMessage
+            .settingsAutomaticUpdatesUnavailable
         )
-        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
-        alert.runModal()
+        alert.addButton(withTitle: TiboTattleLocalization.string(.launcherRetry))
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        if alert.runModal() == .alertFirstButtonReturn {
+            checkForUpdates(nil)
+        }
     }
 
     func setAutomaticUpdatesEnabled(_ enabled: Bool) {
         guard let updater = controller?.updater,
-              updater.allowsAutomaticUpdates
+              updater.allowsAutomaticUpdates,
+              feedIsReachable
         else {
             return
         }
@@ -209,7 +338,10 @@ private final class AppUpdater {
             : "sparkle_not_configured"
     }
 #else
-    init() {}
+    override init() {
+        state = .unavailable
+        super.init()
+    }
 
     var isAvailable: Bool {
         false
@@ -223,6 +355,22 @@ private final class AppUpdater {
         false
     }
 
+    var canConfigureAutomaticUpdates: Bool {
+        false
+    }
+
+    var canCheckForUpdates: Bool {
+        false
+    }
+
+    var menuItemTitle: String {
+        TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+    }
+
+    var settingsSummary: String {
+        TiboTattleLocalization.string(.settingsAutomaticUpdatesUnavailable)
+    }
+
     func startAfterFirstRunDisclosure() {}
 
     func checkForUpdates(_ sender: Any?) {}
@@ -233,6 +381,47 @@ private final class AppUpdater {
         bundledUpdaterEnabled
             ? "invalid_framework_missing"
             : "development_disabled"
+    }
+#endif
+
+    /// Keep this classification limited to reachability evidence. A successful
+    /// response does not claim that the appcast is valid or signed.
+    static func feedResponseIsReachable(
+        statusCode: Int?,
+        hasError: Bool,
+        hasBody: Bool
+    ) -> Bool {
+        guard !hasError, hasBody, let statusCode else { return false }
+        return (200..<300).contains(statusCode)
+    }
+
+    static var runtimeStateDescription: String {
+#if canImport(Sparkle)
+        bundledUpdaterEnabled ? "feed_unverified" : "unavailable_in_build"
+#else
+        "unavailable_in_build"
+#endif
+    }
+
+#if canImport(Sparkle)
+    // Sparkle's standard user driver remains the native presentation for a
+    // verified update or a verified no-update result. These delegate hooks
+    // keep the app's own status surface aligned with that result and make a
+    // failed check retryable from About or the menu bar.
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        setState(.updateAvailable)
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
+        setState(.verifiedNoUpdate)
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        setState(.verifiedNoUpdate)
+    }
+
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        setState(.failed)
     }
 #endif
 
@@ -257,6 +446,10 @@ private final class AppUpdater {
         )
     }
 }
+
+#if canImport(Sparkle)
+extension AppUpdater: SPUUpdaterDelegate {}
+#endif
 
 private enum CentralServiceMode: String {
     case developmentLoopback = "development_loopback"
@@ -1894,6 +2087,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
     private weak var settingsAutomaticUpdatesDetailLabel: NSTextField?
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
+    private weak var settingsCheckForUpdatesButton: NSButton?
     private weak var settingsStartAtLoginSwitch: NSSwitch?
     private weak var settingsStartAtLoginDetailLabel: NSTextField?
     private weak var settingsStartAtLoginPendingRemovalButton: NSButton?
@@ -1996,6 +2190,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         self.semanticOpenTarget = semanticOpenTarget
         self.loginItemManager = loginItemManager
         super.init()
+        updater.onStateChange = { [weak self] in
+            self?.updateUpdaterPresentation()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -3065,6 +3262,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
             )
         )
+        updateUpdaterPresentation()
     }
 
     @objc private func showMainWindow() {
@@ -3311,23 +3509,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func automaticUpdatesSettingsSummary() -> String {
-        guard updater.isAvailable else {
-            return TiboTattleLocalization.string(
-                .settingsAutomaticUpdatesUnavailable
-            )
-        }
-        if AppUpdater.isPreviewDistribution {
-            return TiboTattleLocalization.string(
-                .settingsPreviewUpdatesPending
-            )
-        }
-        return updater.automaticUpdatesEnabled
-            ? TiboTattleLocalization.string(.settingsAutomaticUpdatesOn)
-            : TiboTattleLocalization.string(.settingsAutomaticUpdatesOff)
+        updater.settingsSummary
     }
 
     private func updateAutomaticUpdatesSettingsControl() {
-        settingsAutomaticUpdatesSwitch?.isEnabled = updater.allowsAutomaticUpdateOptIn
+        settingsAutomaticUpdatesSwitch?.isEnabled =
+            updater.canConfigureAutomaticUpdates
         settingsAutomaticUpdatesSwitch?.state = updater.automaticUpdatesEnabled
             ? .on
             : .off
@@ -3335,6 +3522,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             automaticUpdatesSettingsSummary()
         settingsAboutAutomaticUpdatesDetailLabel?.stringValue =
             automaticUpdatesSettingsSummary()
+    }
+
+    private func updateUpdaterPresentation() {
+        updateAutomaticUpdatesSettingsControl()
+        settingsCheckForUpdatesButton?.title = updater.menuItemTitle
+        settingsCheckForUpdatesButton?.isEnabled = updater.canCheckForUpdates
+        menuBarStatus?.updateUpdaterPresentation(
+            title: updater.menuItemTitle,
+            isEnabled: updater.canCheckForUpdates
+        )
     }
 
     @discardableResult
@@ -3779,6 +3976,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         installApplicationMenu()
         refreshLauncherStaticLocalization()
         menuBarStatus?.refreshLocalization()
+        updateUpdaterPresentation()
         nativeDashboardChrome?.refreshLocalization()
         refreshNativeToolbarLocalization()
         dashboardWebHost?.notifyLanguagePreferenceChange(preference)
@@ -3793,6 +3991,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsAutomaticUpdatesSwitch = nil
         settingsAutomaticUpdatesDetailLabel = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
+        settingsCheckForUpdatesButton = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
         }
@@ -3936,7 +4135,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         automaticUpdatesSwitch.state = updater.automaticUpdatesEnabled
             ? .on
             : .off
-        automaticUpdatesSwitch.isEnabled = updater.allowsAutomaticUpdateOptIn
+        automaticUpdatesSwitch.isEnabled = updater.canConfigureAutomaticUpdates
         automaticUpdatesSwitch.target = self
         automaticUpdatesSwitch.action = #selector(toggleAutomaticUpdates(_:))
         automaticUpdatesSwitch.toolTip =
@@ -4205,11 +4404,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         projectLinks.orientation = .horizontal
         projectLinks.spacing = 8
         let checkForUpdates = NSButton(
-            title: TiboTattleLocalization.string(.settingsCheckForUpdates),
+            title: updater.menuItemTitle,
             target: self,
             action: #selector(checkForUpdates)
         )
-        checkForUpdates.isEnabled = updater.isAvailable
+        checkForUpdates.isEnabled = updater.canCheckForUpdates
+        settingsCheckForUpdatesButton = checkForUpdates
         let aboutAutomaticUpdatesDetail = settingsLabel(
             automaticUpdatesSettingsSummary(),
             font: .systemFont(ofSize: 12),
@@ -4333,8 +4533,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func toggleAutomaticUpdates(_ sender: NSSwitch) {
-        guard updater.isAvailable,
-              updater.allowsAutomaticUpdateOptIn
+        guard updater.canConfigureAutomaticUpdates
         else {
             updateAutomaticUpdatesSettingsControl()
             return
@@ -5628,8 +5827,31 @@ private struct UsageMonitorMain {
             print(
                 "USAGE_MONITOR_MACOS_UPDATER_CONTRACT "
                     + "runtime=\(description)"
+                    + " state=\(AppUpdater.runtimeStateDescription)"
             )
             exit(description == "invalid_framework_missing" ? 1 : 0)
+        }
+        if let feedIndex = arguments.firstIndex(
+            of: "--updater-feed-contract-smoke-test"
+        ) {
+            guard feedIndex + 1 < arguments.count,
+                  let statusCode = Int(arguments[feedIndex + 1])
+            else {
+                exit(2)
+            }
+            let hasBody = (200..<300).contains(statusCode)
+            let reachable = AppUpdater.feedResponseIsReachable(
+                statusCode: statusCode,
+                hasError: false,
+                hasBody: hasBody
+            )
+            print(
+                "USAGE_MONITOR_MACOS_UPDATER_FEED_CONTRACT "
+                    + "status=\(statusCode) "
+                    + "result=\(reachable ? "reachable" : "failed") "
+                    + "sparkle_check=\(reachable)"
+            )
+            exit(0)
         }
         if arguments.contains("--watchdog-smoke-test") {
             exit(WatchdogSmokeTest.run())

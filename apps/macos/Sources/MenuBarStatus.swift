@@ -649,6 +649,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let aboutItem = NSMenuItem()
     private let checkForUpdatesItem = NSMenuItem()
     private let quitItem = NSMenuItem()
+    private var updaterMenuTitle: String?
+    private var updaterMenuEnabled = true
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
     private var companionGeneration: UInt64 = 0
@@ -720,7 +722,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 TiboTattleLocalization.string(.settingsCheckForUpdates) + "…",
                 #selector(checkForUpdates)
             )
-            checkForUpdatesItem.isEnabled = true
+            checkForUpdatesItem.isEnabled = updaterMenuEnabled
             menu.addItem(checkForUpdatesItem)
         }
         configure(
@@ -846,8 +848,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             productName
         )
         if actions.checkForUpdates != nil {
-            checkForUpdatesItem.title =
-                TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+            checkForUpdatesItem.title = updaterMenuTitle
+                ?? TiboTattleLocalization.string(.settingsCheckForUpdates) + "…"
+            checkForUpdatesItem.isEnabled = updaterMenuEnabled
         }
         settingsItem.title = TiboTattleLocalization.string(.menuSettings)
         aboutItem.title = TiboTattleLocalization.format(
@@ -859,6 +862,17 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             productName
         )
         render()
+    }
+
+    /// The updater state is owned by the launcher, but the menu keeps the
+    /// always-visible retry/check affordance honest without starting any
+    /// updater work itself.
+    func updateUpdaterPresentation(title: String, isEnabled: Bool) {
+        guard !stopped, actions.checkForUpdates != nil else { return }
+        updaterMenuTitle = title
+        updaterMenuEnabled = isEnabled
+        checkForUpdatesItem.title = title
+        checkForUpdatesItem.isEnabled = isEnabled
     }
 
     /// Used only by the packaged AppKit smoke mode. The test instantiates the
