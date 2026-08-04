@@ -63,6 +63,24 @@ exits the app and stops the current pass; completed checkpoints remain
 available on the next launch. **Open in Browser** is a separate optional
 control in the app, not the primary dashboard destination.
 
+## Report and native-toolbar boundary
+
+The primary in-app experience remains the rich local WebKit report: its charts,
+tables, text, and existing share card are not replaced with a sparse native
+dashboard. The regular AppKit window keeps the usual close, minimise, and
+resize controls. Its unified toolbar adds only the native affordances that are
+better outside the report: local status, **Refresh usage**, **Share**, and
+**Settings**. **Share** opens the report's existing local share card; it does
+not create a second report or sharing service.
+
+The toolbar has no independent data authority. **Refresh usage** reuses the
+already-running loopback Node companion and its existing local refresh route.
+There is still one companion child while the app is open; the in-app refresh
+timer is only foreground scheduling, not a daemon, login item, LaunchAgent, or
+background URL session. The separate Keychain-reset helper remains available
+only after its explicit diagnostic confirmation and is unrelated to the
+toolbar or usage accounting.
+
 The troubleshooting-only local erase action moves only
 `~/Library/Application Support/Usage Monitor` to Trash after the companion has
 stopped. It does not modify Codex logs, revoke already-sent community data, or
