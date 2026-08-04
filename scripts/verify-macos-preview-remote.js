@@ -24,7 +24,10 @@ const DEFAULT_PREVIEW_APP_PATH = join(
 const PLIST_MAX_BYTES = 1024 * 1024;
 const MAX_APPCAST_BYTES = 1024 * 1024;
 const MAX_HEALTH_RESPONSE_BYTES = 64 * 1024;
-const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024 * 1024;
+// A TiboTattle DMG is a product-sized installer, not an arbitrary remote
+// object. Keep the readback cap finite enough that a bad endpoint cannot turn
+// this observer into a multi-GB downloader.
+const MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const SPARKLE_NAMESPACE =
@@ -39,11 +42,16 @@ export const MACOS_PREVIEW_REMOTE_HEALTH_PATHS = Object.freeze([
 
 export const MACOS_PREVIEW_REMOTE_CODES = Object.freeze({
   APPCAST_BODY_TOO_LARGE: "MACOS_PREVIEW_REMOTE_APPCAST_BODY_TOO_LARGE",
+  APPCAST_CANDIDATE_INVALID: "MACOS_PREVIEW_REMOTE_APPCAST_CANDIDATE_INVALID",
   APPCAST_INVALID: "MACOS_PREVIEW_REMOTE_APPCAST_INVALID",
   APPCAST_NOT_PUBLISHED: "MACOS_PREVIEW_REMOTE_APPCAST_NOT_PUBLISHED",
   APPCAST_URL_MISMATCH: "MACOS_PREVIEW_REMOTE_APPCAST_URL_MISMATCH",
   ARGUMENTS_INVALID: "MACOS_PREVIEW_REMOTE_ARGUMENTS_INVALID",
   ARTIFACT_BODY_TOO_LARGE: "MACOS_PREVIEW_REMOTE_ARTIFACT_BODY_TOO_LARGE",
+  ARTIFACT_CONTENT_LENGTH_MISMATCH:
+    "MACOS_PREVIEW_REMOTE_ARTIFACT_CONTENT_LENGTH_MISMATCH",
+  ARTIFACT_CONTENT_LENGTH_MISSING:
+    "MACOS_PREVIEW_REMOTE_ARTIFACT_CONTENT_LENGTH_MISSING",
   ARTIFACT_INVALID: "MACOS_PREVIEW_REMOTE_ARTIFACT_INVALID",
   FETCH_FAILED: "MACOS_PREVIEW_REMOTE_FETCH_FAILED",
   FETCH_REDIRECT: "MACOS_PREVIEW_REMOTE_FETCH_REDIRECT",
@@ -56,7 +64,7 @@ export const MACOS_PREVIEW_REMOTE_CODES = Object.freeze({
 });
 
 export const MACOS_PREVIEW_REMOTE_RECEIPT_SCHEMA =
-  "usage-monitor-macos-internal-update-rehearsal-v1";
+  "usage-monitor-macos-remote-feed-preflight-v2";
 
 const DEFAULT_CLOCK = Object.freeze({
   now: () => Date.now(),
@@ -352,6 +360,11 @@ function publicPreviewMetadata(plist) {
   return Object.freeze({
     appcastURL: updater.appcastURL,
     centralOrigin: centralService.origin,
+    // This is a public-key fingerprint only. The remote observer never reads,
+    // derives, or accepts a Sparkle private key.
+    publicEdKeySha256: createHash("sha256")
+      .update(Buffer.from(updater.publicEdKey, "base64"))
+      .digest("hex"),
   });
 }
 
@@ -713,7 +726,18 @@ function declaredResponseBytes(response) {
   return selected;
 }
 
-async function readBoundedResponseDigest(response, maximumBytes) {
+async function readBoundedResponseDigest(
+  response,
+  maximumBytes,
+  expectedBytes,
+  { onReader = null } = {},
+) {
+  if (!response?.body || typeof response.body.getReader !== "function") {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RESPONSE_INVALID,
+      "Remote artifact response must expose a streaming body",
+    );
+  }
   const hash = createHash("sha256");
   let bytes = 0;
   const consume = (chunk) => {
@@ -727,27 +751,30 @@ async function readBoundedResponseDigest(response, maximumBytes) {
     }
     hash.update(value);
   };
-  if (response?.body && typeof response.body.getReader === "function") {
-    const reader = response.body.getReader();
-    try {
-      for (;;) {
-        const next = await reader.read();
-        if (next.done) break;
-        consume(next.value);
-      }
-    } catch (error) {
-      await cancelReader(reader);
-      throw error;
+  const reader = response.body.getReader();
+  onReader?.(reader);
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      consume(next.value);
     }
-  } else if (typeof response?.arrayBuffer === "function") {
-    consume(await response.arrayBuffer());
-  } else if (typeof response?.text === "function") {
-    consume(await response.text());
-  } else {
-    throw remoteError(
-      MACOS_PREVIEW_REMOTE_CODES.RESPONSE_INVALID,
-      "Remote artifact response has no readable body",
-    );
+    if (bytes !== expectedBytes) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_CONTENT_LENGTH_MISMATCH,
+        "Remote artifact stream length did not match its Content-Length",
+      );
+    }
+  } catch (error) {
+    await cancelReader(reader);
+    throw error;
+  } finally {
+    onReader?.(null);
+    try {
+      reader.releaseLock?.();
+    } catch {
+      // The bounded read has already failed closed.
+    }
   }
   return Object.freeze({
     bytes,
@@ -765,6 +792,7 @@ export async function fetchBoundedMacOSPreviewArtifact(
     clock = DEFAULT_CLOCK,
     fetchImpl = globalThis.fetch,
     maximumBytes = MAX_ARTIFACT_BYTES,
+    expectedBytes = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   } = {},
 ) {
@@ -785,11 +813,34 @@ export async function fetchBoundedMacOSPreviewArtifact(
       "Remote artifact body limit is outside the bounded range",
     );
   }
+  if (!Number.isSafeInteger(expectedBytes)
+      || expectedBytes < 1
+      || expectedBytes > MAX_ARTIFACT_BYTES) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.ARGUMENTS_INVALID,
+      "A bounded expected artifact byte length is required",
+    );
+  }
+  if (expectedBytes > maximumBytes) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_BODY_TOO_LARGE,
+      "Expected artifact byte length exceeds the bounded body limit",
+    );
+  }
   const controller = new AbortController();
   const start = selectedClock.now();
   let timedOut = false;
   let timerScheduled = false;
   let timer;
+  let activeReader = null;
+  const abortOperation = () => {
+    try {
+      controller.abort();
+    } catch {
+      // AbortController is best effort; reader cancellation still applies.
+    }
+    if (activeReader !== null) void cancelReader(activeReader);
+  };
   const operation = (async () => {
     let response;
     try {
@@ -831,7 +882,24 @@ export async function fetchBoundedMacOSPreviewArtifact(
         status,
       });
     }
-    const digest = await readBoundedResponseDigest(response, maximumBytes);
+    if (contentLength === null) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_CONTENT_LENGTH_MISSING,
+        "Remote artifact Content-Length is required before streaming",
+      );
+    }
+    if (contentLength !== expectedBytes) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_CONTENT_LENGTH_MISMATCH,
+        "Remote artifact Content-Length did not match the appcast length",
+      );
+    }
+    const digest = await readBoundedResponseDigest(
+      response,
+      Math.min(maximumBytes, expectedBytes),
+      expectedBytes,
+      { onReader: (reader) => { activeReader = reader; } },
+    );
     return Object.freeze({
       ...digest,
       contentLength,
@@ -842,11 +910,7 @@ export async function fetchBoundedMacOSPreviewArtifact(
   const timeout = new Promise((_, reject) => {
     timer = selectedClock.setTimeout(() => {
       timedOut = true;
-      try {
-        controller.abort();
-      } catch {
-        // AbortController is best effort; the race still enforces the bound.
-      }
+      abortOperation();
       reject(requestFailure(MACOS_PREVIEW_REMOTE_CODES.TIMEOUT));
     }, boundedTimeout);
     timerScheduled = true;
@@ -861,6 +925,10 @@ export async function fetchBoundedMacOSPreviewArtifact(
     throw requestFailure(MACOS_PREVIEW_REMOTE_CODES.FETCH_FAILED);
   } finally {
     if (timerScheduled) selectedClock.clearTimeout(timer);
+    if (timedOut) abortOperation();
+    // Keep a timed-out fetch/stream from becoming an unhandled rejection while
+    // the caller receives the bounded timeout result.
+    void operation.catch(() => {});
   }
 }
 
@@ -889,6 +957,10 @@ function requestFailureResult(error) {
   } else if (code === MACOS_PREVIEW_REMOTE_CODES.RESPONSE_INVALID
       || code === MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_INVALID) {
     outcome = "invalid_response";
+  } else if (code === MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_CONTENT_LENGTH_MISSING) {
+    outcome = "content_length_missing";
+  } else if (code === MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_CONTENT_LENGTH_MISMATCH) {
+    outcome = "content_length_mismatch";
   } else if (code === MACOS_PREVIEW_REMOTE_CODES.APPCAST_BODY_TOO_LARGE
       || code === MACOS_PREVIEW_REMOTE_CODES.ARTIFACT_BODY_TOO_LARGE) {
     outcome = "body_too_large";
@@ -1195,13 +1267,14 @@ function contentAddressedArtifact(value) {
     return null;
   }
   return Object.freeze({
+    artifactType: segments[3].endsWith(".dmg") ? "full_dmg" : "delta",
     bundleVersion: segments[1],
     fileName: segments[3],
     sha256: segments[2],
   });
 }
 
-function validSparkleSignature(value) {
+function validSparkleSignatureShape(value) {
   return typeof value === "string"
     && /^[A-Za-z0-9+/]{86}==$/u.test(value)
     && Buffer.from(value, "base64").length === 64
@@ -1213,6 +1286,7 @@ function validateAppcastStructure(value, {
   expectedArtifactURL = null,
   expectedBundleVersion = null,
   requireContentAddressed = false,
+  requireSingleFullDmg = false,
 } = {}) {
   const root = parseXMLDocument(value);
   if (root.name !== "rss"
@@ -1261,7 +1335,7 @@ function validateAppcastStructure(value, {
           || lengthNumber > MAX_ARTIFACT_BYTES
           || typeof version !== "string"
           || version.length === 0
-          || !validSparkleSignature(attributes.get("sparkle:edSignature"))
+          || !validSparkleSignatureShape(attributes.get("sparkle:edSignature"))
           || enclosure.children.length > 0
           || enclosure.text.trim() !== ""
           || (expectedArtifactOrigin !== null
@@ -1277,13 +1351,23 @@ function validateAppcastStructure(value, {
       enclosureCount += 1;
       enclosures.push(Object.freeze({
         artifactSha256: contentAddress?.sha256 ?? null,
+        artifactType: contentAddress?.artifactType ?? null,
         artifactVersion: contentAddress?.bundleVersion ?? null,
         length: lengthNumber,
-        signaturePresent: true,
+        // Base64/64-byte shape only; this is never cryptographic proof.
+        signatureStructurallyValid: true,
         url: artifactURL,
         version,
       }));
     }
+  }
+  if (requireSingleFullDmg
+      && (enclosures.length !== 1
+        || enclosures[0]?.artifactType !== "full_dmg")) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.APPCAST_CANDIDATE_INVALID,
+      "The update gate requires exactly one full-DMG enclosure and rejects deltas or ambiguity",
+    );
   }
   if (expectedArtifactURL !== null) {
     const matches = enclosures.filter(
@@ -1322,6 +1406,8 @@ export function validateSparkleAppcastXML(value, options = {}) {
     return Object.freeze({
       reason: error?.code === MACOS_PREVIEW_REMOTE_CODES.APPCAST_BODY_TOO_LARGE
         ? "body_too_large"
+        : error?.code === MACOS_PREVIEW_REMOTE_CODES.APPCAST_CANDIDATE_INVALID
+          ? "single_full_dmg_required"
         : error?.code === MACOS_PREVIEW_REMOTE_CODES.APPCAST_URL_MISMATCH
           ? "mismatched_url"
           : "invalid_xml_or_sparkle_structure",
@@ -1447,11 +1533,52 @@ async function checkArtifact({
     });
   }
   let response;
+  const expectedDigest = artifact.artifactSha256;
+  const expectedBytes = artifact.length;
+  if (endpointConfig?.artifactSha256 !== undefined
+      && endpointConfig.artifactSha256 !== expectedDigest) {
+    return Object.freeze({
+      checked: false,
+      bytes: null,
+      httpStatus: null,
+      reason: "configured_artifact_digest_mismatch",
+      sha256: null,
+      status: "invalid",
+      valid: false,
+    });
+  }
+  if (endpointConfig?.artifactBytes !== undefined
+      && endpointConfig.artifactBytes !== expectedBytes) {
+    return Object.freeze({
+      checked: false,
+      bytes: null,
+      httpStatus: null,
+      reason: "configured_artifact_bytes_mismatch",
+      sha256: null,
+      status: "invalid",
+      valid: false,
+    });
+  }
+  if (typeof expectedDigest !== "string"
+      || !Number.isSafeInteger(expectedBytes)
+      || expectedBytes < 1
+      || expectedBytes > MAX_ARTIFACT_BYTES) {
+    return Object.freeze({
+      checked: false,
+      bytes: null,
+      httpStatus: null,
+      reason: "digest_missing",
+      sha256: null,
+      status: "invalid",
+      valid: false,
+    });
+  }
   try {
     response = await fetchBoundedMacOSPreviewArtifact(artifact.url, {
       clock,
       fetchImpl,
-      maximumBytes: Math.min(MAX_ARTIFACT_BYTES, Math.max(artifact.length, 1)),
+      expectedBytes,
+      maximumBytes: MAX_ARTIFACT_BYTES,
       timeoutMs,
     });
   } catch (error) {
@@ -1479,9 +1606,6 @@ async function checkArtifact({
       valid: false,
     });
   }
-  const expectedDigest = endpointConfig?.artifactSha256
-    ?? artifact.artifactSha256;
-  const expectedBytes = endpointConfig?.artifactBytes ?? artifact.length;
   if (response.bytes !== expectedBytes) {
     return Object.freeze({
       checked: true,
@@ -1535,6 +1659,45 @@ function claimResult(requested, passed = false, reason = "not_requested") {
   });
 }
 
+function sparkleAcceptanceResult() {
+  // This verifier deliberately does not claim to be Sparkle. It neither
+  // verifies an Ed25519 signature nor observes an installed client's update
+  // flow; both require the real signed N to N+1 rehearsal.
+  return Object.freeze({
+    cryptographicSignatureVerified: false,
+    nativeClientRehearsalVerified: false,
+    reason: "installed_client_rehearsal_required",
+    status: "not_verified",
+  });
+}
+
+function remotePublicationReadbackResult(
+  central,
+  appcast,
+  artifact,
+  { checked, productionClaim },
+) {
+  const passed = checked
+    && central.passed
+    && appcast.valid
+    && (!productionClaim || artifact.valid);
+  const reason = !checked
+    ? "remote_preflight_not_requested"
+    : !central.passed
+      ? "central_endpoint_not_healthy"
+      : !appcast.valid
+        ? `appcast_${appcast.reason}`
+        : productionClaim && !artifact.valid
+          ? `artifact_${artifact.reason}`
+          : "remote_publication_readback_verified";
+  return Object.freeze({
+    checked,
+    passed,
+    reason,
+    status: !checked ? "not_checked" : passed ? "passed" : "blocked",
+  });
+}
+
 function endpointConfigurationResult(metadata, endpointConfig, healthPaths) {
   const mismatchFields = [];
   if (endpointConfig?.centralOrigin !== undefined
@@ -1547,6 +1710,9 @@ function endpointConfigurationResult(metadata, endpointConfig, healthPaths) {
   }
   return Object.freeze({
     appcastURL: endpointConfig?.appcastURL ?? metadata.appcastURL,
+    artifactBytes: endpointConfig?.artifactBytes ?? null,
+    artifactSha256: endpointConfig?.artifactSha256 ?? null,
+    artifactURL: endpointConfig?.artifactURL ?? null,
     centralOrigin: endpointConfig?.centralOrigin ?? metadata.centralOrigin,
     configured: endpointConfig !== null,
     healthPaths: Object.freeze(
@@ -1592,8 +1758,15 @@ function localOnlyRemoteResult(
     local,
     metadata,
     overall: productionClaim
-      ? "not_ready"
+      ? "remote_feed_preflight_unchecked"
       : "local_valid_remote_unchecked",
+    remotePublicationReadback: remotePublicationReadbackResult(
+      { passed: false },
+      { valid: false, reason: "remote_preflight_not_requested" },
+      artifactNotChecked(),
+      { checked: false, productionClaim },
+    ),
+    sparkleAcceptance: sparkleAcceptanceResult(),
   });
 }
 
@@ -1692,6 +1865,7 @@ export async function verifyMacOSPreviewRemote({
         ?? null,
       expectedBundleVersion: productionClaim ? local.bundleVersion : null,
       requireContentAddressed: productionClaim,
+      requireSingleFullDmg: productionClaim,
     },
   );
   let artifact = artifactNotChecked();
@@ -1712,32 +1886,35 @@ export async function verifyMacOSPreviewRemote({
   } else if (productionClaim) {
     artifact = artifactNotChecked("appcast_proof_missing");
   }
-  const claimPassed = productionClaim
-    && central.passed
-    && appcast.valid
-    && artifact.valid;
+  const remotePublicationReadback = remotePublicationReadbackResult(
+    central,
+    appcast,
+    artifact,
+    { checked: true, productionClaim },
+  );
+  const claim = claimResult(
+    productionClaim,
+    false,
+    productionClaim
+      ? (remotePublicationReadback.passed
+        ? "installed_client_rehearsal_required"
+        : remotePublicationReadback.reason)
+      : "not_requested",
+  );
   return Object.freeze({
     appcast,
     artifact,
-    claim: claimResult(
-      productionClaim,
-      claimPassed,
-      claimPassed
-        ? "feed_and_artifact_verified"
-        : !central.passed
-          ? "central_endpoint_not_healthy"
-          : !appcast.valid
-            ? `appcast_${appcast.reason}`
-            : `artifact_${artifact.reason}`,
-    ),
+    claim,
     central,
     endpointConfiguration,
     live: true,
     local,
     metadata,
-    overall: productionClaim
-      ? (claimPassed ? "ready" : "not_ready")
-      : (central.passed && appcast.valid ? "ready" : "not_ready"),
+    overall: remotePublicationReadback.passed
+      ? "remote_feed_preflight_passed"
+      : "remote_feed_preflight_blocked",
+    remotePublicationReadback,
+    sparkleAcceptance: sparkleAcceptanceResult(),
   });
 }
 
@@ -1750,6 +1927,96 @@ function receiptDate(value) {
     );
   }
   return value;
+}
+
+function receiptRequiredString(value, label) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      `${label} is required for a bound receipt`,
+    );
+  }
+  return value;
+}
+
+function receiptBinding(result) {
+  const metadata = result.metadata ?? {};
+  const local = result.local ?? {};
+  const endpointConfiguration = result.endpointConfiguration ?? {};
+  const enclosures = Array.isArray(result.appcast?.enclosures)
+    ? result.appcast.enclosures
+    : [];
+  if (enclosures.length > 1) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "A receipt cannot bind an ambiguous appcast candidate",
+    );
+  }
+  const enclosure = enclosures[0] ?? null;
+  const bundleVersion = receiptRequiredString(
+    local.bundleVersion,
+    "Receipt bundle version",
+  );
+  if (enclosure !== null
+      && (enclosure.artifactType !== "full_dmg"
+        || enclosure.version !== bundleVersion)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "Receipt enclosure is not the exact full-DMG candidate version",
+    );
+  }
+  const artifactURL = enclosure?.url ?? endpointConfiguration.artifactURL;
+  if (!publicArtifactURL(artifactURL)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "A receipt requires one exact public artifact URL",
+    );
+  }
+  const artifactSha256 = enclosure?.artifactSha256 ?? null;
+  if (artifactSha256 !== null && !/^[a-f0-9]{64}$/u.test(artifactSha256)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "Receipt artifact SHA-256 is invalid",
+    );
+  }
+  const artifactBytes = enclosure?.length ?? null;
+  if (artifactBytes !== null
+      && (!Number.isSafeInteger(artifactBytes)
+        || artifactBytes < 1
+        || artifactBytes > MAX_ARTIFACT_BYTES)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "Receipt artifact byte length is invalid",
+    );
+  }
+  if (enclosure !== null && (artifactSha256 === null || artifactBytes === null)) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "A receipt candidate must include its feed digest and length",
+    );
+  }
+  if (!/^[a-f0-9]{64}$/u.test(metadata.publicEdKeySha256 ?? "")) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "Receipt public-key fingerprint is invalid",
+    );
+  }
+  return Object.freeze({
+    appcastURL: receiptRequiredString(metadata.appcastURL, "Receipt appcast URL"),
+    artifactBytes,
+    artifactSha256,
+    artifactURL,
+    bundleIdentifier: receiptRequiredString(
+      local.bundleIdentifier,
+      "Receipt bundle identifier",
+    ),
+    bundleVersion,
+    channel: receiptRequiredString(local.channel, "Receipt channel"),
+    publicEdKeySha256: receiptRequiredString(
+      metadata.publicEdKeySha256,
+      "Receipt public-key fingerprint",
+    ),
+  });
 }
 
 /**
@@ -1769,6 +2036,19 @@ export function createMacOSPreviewRemoteReceipt(result, { recordedOn } = {}) {
   const artifact = result.artifact ?? artifactNotChecked();
   const central = result.central ?? {};
   const claim = result.claim ?? claimResult(false);
+  if (claim.passed === true) {
+    throw remoteError(
+      MACOS_PREVIEW_REMOTE_CODES.RECEIPT_INVALID,
+      "The remote observer cannot record a passed update-acceptance claim",
+    );
+  }
+  const binding = receiptBinding(result);
+  const remotePublicationReadback = result.remotePublicationReadback ?? {
+    checked: result.live === true,
+    passed: false,
+    reason: "remote_preflight_not_requested",
+    status: "not_checked",
+  };
   return Object.freeze({
     appcast: Object.freeze({
       checked: appcast.checked === true,
@@ -1811,10 +2091,10 @@ export function createMacOSPreviewRemoteReceipt(result, { recordedOn } = {}) {
         : "not_checked",
     }),
     claim: Object.freeze({
-      passed: claim.passed === true,
+      passed: false,
       reason: typeof claim.reason === "string" ? claim.reason : null,
       requested: claim.requested === true,
-      status: typeof claim.status === "string" ? claim.status : "blocked",
+      status: "blocked",
     }),
     contentFree: true,
     endpoint: Object.freeze({
@@ -1843,6 +2123,8 @@ export function createMacOSPreviewRemoteReceipt(result, { recordedOn } = {}) {
         ? endpointConfiguration.status
         : "unknown",
     }),
+    binding,
+    cryptographicSignatureVerified: false,
     local: Object.freeze({
       bundleIdentifier: result.local?.bundleIdentifier ?? null,
       bundleVersion: result.local?.bundleVersion ?? null,
@@ -1851,10 +2133,27 @@ export function createMacOSPreviewRemoteReceipt(result, { recordedOn } = {}) {
       updaterEnabled: result.local?.updaterEnabled === true,
     }),
     networkChecked: result.live === true,
-    outcome: typeof result.overall === "string" ? result.overall : "not_ready",
+    outcome: typeof result.overall === "string"
+      ? result.overall
+      : "remote_feed_preflight_unchecked",
     payloadsRecorded: false,
     recordedOn: receiptDate(recordedOn),
+    remotePublicationReadback: Object.freeze({
+      checked: remotePublicationReadback.checked === true,
+      passed: remotePublicationReadback.passed === true,
+      reason: typeof remotePublicationReadback.reason === "string"
+        ? remotePublicationReadback.reason
+        : null,
+      status: typeof remotePublicationReadback.status === "string"
+        ? remotePublicationReadback.status
+        : "not_checked",
+    }),
     schemaVersion: MACOS_PREVIEW_REMOTE_RECEIPT_SCHEMA,
+    sparkleAcceptance: Object.freeze({
+      nativeClientRehearsalVerified: false,
+      reason: "installed_client_rehearsal_required",
+      status: "not_verified",
+    }),
   });
 }
 
@@ -1882,10 +2181,19 @@ export async function writeMacOSPreviewRemoteReceipt(path, receipt) {
 const APPCAST_DIAGNOSTICS = Object.freeze({
   bytes_mismatch: "the remote artifact byte count did not match the feed",
   body_too_large: "the response exceeded the bounded body limit",
+  configured_artifact_bytes_mismatch:
+    "the configured artifact byte override did not match the selected feed enclosure",
+  configured_artifact_digest_mismatch:
+    "the configured artifact digest override did not match the selected feed enclosure",
+  content_length_mismatch:
+    "the artifact Content-Length did not match the selected feed enclosure",
+  content_length_missing:
+    "the artifact did not provide Content-Length before streaming",
   digest_missing: "the feed did not provide a content-addressed artifact proof",
   endpoint_urls_mismatch:
     "the explicit endpoints did not match the candidate bundle metadata",
-  feed_and_artifact_verified: "the public feed and artifact bytes were verified",
+  installed_client_rehearsal_required:
+    "a real signed N to N+1 installed-client rehearsal is still required",
   http_error: "the configured appcast endpoint returned an unexpected HTTP status",
   invalid_response: "the remote response metadata was invalid",
   invalid_xml_or_sparkle_structure:
@@ -1898,6 +2206,8 @@ const APPCAST_DIAGNOSTICS = Object.freeze({
     "no signed release appcast is published at the configured URL yet",
   redirect_refused: "a redirect was returned and was not followed",
   sha256_mismatch: "the remote artifact hash did not match the feed proof",
+  single_full_dmg_required:
+    "the update gate requires exactly one full-DMG enclosure and rejects deltas",
   timeout: "the bounded HTTPS request timed out",
 });
 
@@ -1932,7 +2242,11 @@ function renderResult(result, stdout) {
       stdout,
       "Remote checks: not run (pass --live for bounded read-only HTTPS checks)",
     );
-    writeLine(stdout, "Preview remote readiness: not checked");
+    writeLine(stdout, "Remote feed preflight: not checked");
+    writeLine(
+      stdout,
+      "Sparkle update acceptance: not verified (requires a real signed N to N+1 installed-client rehearsal)",
+    );
     return;
   }
   for (const endpoint of result.central.endpoints) {
@@ -1966,12 +2280,16 @@ function renderResult(result, stdout) {
   }
   writeLine(
     stdout,
-    `Preview remote readiness: ${result.overall === "ready" ? "ready" : "not ready"}`,
+    `Remote feed preflight: ${result.remotePublicationReadback?.passed ? "passed" : "blocked"}`,
+  );
+  writeLine(
+    stdout,
+    "Sparkle update acceptance: not verified (requires a real signed N to N+1 installed-client rehearsal)",
   );
   if (result.claim?.requested) {
     writeLine(
       stdout,
-      `Production claim: ${result.claim.passed ? "passed" : "blocked"}`,
+      "Production claim: blocked (remote feed readback is not update acceptance)",
     );
   }
 }
@@ -1990,14 +2308,14 @@ export async function runMacOSPreviewRemoteCLI(
     if (options.help) {
       writeLine(stdout, "Usage: node scripts/verify-macos-preview-remote.js [options]");
       writeLine(stdout, "  --app PATH          Preview TiboTattle.app to validate");
-      writeLine(stdout, "  --live              Perform bounded read-only HTTPS checks");
+      writeLine(stdout, "  --live              Perform bounded remote feed preflight checks");
       writeLine(stdout, "  --central-origin URL  Explicit public central-service origin");
       writeLine(stdout, "  --appcast-url URL   Explicit public Sparkle appcast URL");
       writeLine(stdout, "  --artifact-url URL  Expected public enclosure URL");
       writeLine(stdout, "  --artifact-sha256 HEX64  Expected public artifact SHA-256");
       writeLine(stdout, "  --artifact-bytes N  Expected public artifact byte length");
       writeLine(stdout, "  --health-path PATH  Central health/ready path (repeatable)");
-      writeLine(stdout, "  --production-claim  Require a valid feed and artifact proof");
+      writeLine(stdout, "  --production-claim  Require feed/artifact preflight; acceptance remains blocked");
       writeLine(stdout, "  --receipt FILE      Write a content-free JSON receipt");
       writeLine(stdout, "  --timeout-ms N      Per-request timeout, 1..30000 (default 5000)");
       return Object.freeze({ exitCode: 0, result: null });
@@ -2010,7 +2328,7 @@ export async function runMacOSPreviewRemoteCLI(
     renderResult(result, stdout);
     const exitCode = options.productionClaim
       ? (result.claim?.passed === true ? 0 : 1)
-      : (options.live && result.overall !== "ready" ? 1 : 0);
+      : (options.live && result.remotePublicationReadback?.passed !== true ? 1 : 0);
     return Object.freeze({ exitCode, result });
   } catch (error) {
     const code = error?.code ?? "MACOS_PREVIEW_REMOTE_FAILED";

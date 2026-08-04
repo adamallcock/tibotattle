@@ -9,9 +9,11 @@ status: owner-run-internal-only
 
 This is an owner-run rehearsal for a disposable macOS profile. It is not a
 signing, notarization, Sparkle-feed publication, R2 write, deployment, or
-release-approval procedure. The verifier only reads the candidate bundle's
-public metadata and, when `--live` is explicitly supplied, performs bounded
-credential-free HTTPS reads of the configured public endpoints.
+release-approval procedure. The verifier performs a **remote feed preflight**:
+it reads the candidate bundle's public metadata and, when `--live` is
+explicitly supplied, performs bounded credential-free HTTPS readback of the
+configured public endpoints. It does not verify the Sparkle signature and it
+does not prove that an installed client accepts the update.
 
 `N` means the currently installed signed build in the disposable profile;
 `N+1` means the candidate build being rehearsed. Keep the signed `N` DMG (or
@@ -21,64 +23,83 @@ ordinary development or ad-hoc build for the N to N+1 claim.
 ## Gate meaning
 
 Run the verifier against the exact candidate app bundle. Endpoint values are
-explicit arguments so a copied or stale bundle cannot silently redirect the
-rehearsal to a different service. The explicit central origin and appcast URL
-must match the candidate's embedded public metadata before any request is
-made.
+explicit arguments from the reviewed release-channel metadata/config contract
+so a copied or stale bundle cannot silently redirect the rehearsal to a
+different service. The explicit central origin and appcast URL must match the
+candidate's embedded public metadata before any request is made.
+The only full update-acceptance proof is an owner-observed signed N to N+1
+rehearsal in this disposable profile; no verifier result or receipt can replace
+that observation.
 
 Offline inspection is useful for the local boundary, but it is not a usable
-updater proof:
+remote feed preflight or updater proof:
 
 ```bash
 node scripts/verify-macos-preview-remote.js \
   --app "/absolute/path/to/N+1/TiboTattle.app" \
-  --central-origin "https://tibotattle.com" \
-  --appcast-url "https://updates.tibotattle.com/appcast.xml" \
-  --artifact-url "https://updates.tibotattle.com/releases/<N+1>/<sha256>/TiboTattle.dmg" \
+  --central-origin "<reviewed channel central origin>" \
+  --appcast-url "<reviewed channel appcast URL>" \
+  --artifact-url "<reviewed channel artifact URL>" \
   --production-claim \
   --receipt "/absolute/path/to/rehearsal/N+1-offline.json"
 ```
 
 Because `--live` is absent, this command must exit non-zero with a blocked
-production claim. The receipt is still useful: it records that the network was
-not checked and contains no appcast or artifact payload.
+production claim. The content-free receipt records that the remote feed
+preflight was not checked and contains no appcast or artifact payload.
 
 After the owner has confirmed that the public feed and artifact are intended
-to be exercised, run the bounded live proof:
+to be exercised, run the bounded live remote feed preflight:
 
 ```bash
 node scripts/verify-macos-preview-remote.js \
   --app "/absolute/path/to/N+1/TiboTattle.app" \
-  --central-origin "https://tibotattle.com" \
-  --appcast-url "https://updates.tibotattle.com/appcast.xml" \
-  --artifact-url "https://updates.tibotattle.com/releases/<N+1>/<sha256>/TiboTattle.dmg" \
+  --central-origin "<reviewed channel central origin>" \
+  --appcast-url "<reviewed channel appcast URL>" \
+  --artifact-url "<reviewed channel artifact URL>" \
   --live \
   --production-claim \
   --receipt "/absolute/path/to/rehearsal/N+1-live.json"
 ```
 
-The live command exits zero only when all of the following are true:
+The live command intentionally exits non-zero when `--production-claim` is
+present: this verifier never turns remote readback into a passed production
+claim. A receipt may report `remotePublicationReadback.status` as `passed`
+only when all of the following are true:
 
 - the candidate bundle is locally valid and remains in the preview boundary;
 - the explicit endpoints match the embedded public metadata;
 - every configured central health/ready endpoint is healthy;
 - the appcast is a valid bounded Sparkle RSS/XML document, is not a 404/410,
-  and contains exactly the configured content-addressed N+1 enclosure; and
-- the remote enclosure bytes have the advertised length and SHA-256.
+  and contains exactly one content-addressed full `.dmg` N+1 enclosure; and
+- the remote response supplies `Content-Length` matching that enclosure before
+  the bounded stream is consumed, and the streamed bytes have its SHA-256.
+
+The selected enclosure is the sole source of artifact identity. Optional
+artifact digest/length configuration is an exact cross-check only; it cannot
+select or replace the feed candidate. Delta enclosures, multiple full-DMG
+enclosures, missing `Content-Length`, mismatches, and ambiguous candidates are
+blocked.
 
 An unavailable request, malformed XML, invalid enclosure metadata, mismatched
-URL, missing artifact, byte mismatch, or hash mismatch is a blocked result.
-The verifier never turns a healthy central endpoint into updater readiness when
-the feed is absent. In particular, the read-only evidence recorded at
+URL, missing artifact, byte mismatch, missing/mismatched `Content-Length`, or
+hash mismatch is a blocked preflight. The verifier never turns a healthy
+central endpoint into update acceptance when the feed is absent. In particular,
+the read-only evidence recorded at
 `2026-08-04T18:56Z`—`https://updates.tibotattle.com/appcast.xml` returning
 HTTP 404 while `/api/health` reported `enrollmentMode=open`—is a blocking
 `not_published` appcast state, not a usable production updater.
 
-The JSON receipt is content-free. It records bounded states, HTTP statuses,
-public endpoint metadata, artifact byte count/hash, and the claim outcome. It
-does not record appcast XML, artifact bytes, Sparkle signatures, public keys,
-credentials, account data, raw logs, or filesystem paths. Preserve one fresh
-receipt per attempt; the verifier refuses to overwrite an existing receipt.
+The JSON receipt is content-free and schema-versioned. It binds the attempt to
+the exact channel, feed URL, selected artifact URL/hash/length when observed,
+candidate version, and public Ed25519 key fingerprint. It records
+`cryptographicSignatureVerified: false` because this verifier performs no
+public-key verification, and `sparkleAcceptance.status: "not_verified"` until
+the owner observes a real signed N to N+1 installed-client rehearsal. It does
+not record appcast XML, artifact bytes, Sparkle signatures, public keys,
+credentials, account data, raw logs, or filesystem paths. A receipt cannot
+record a passed update-acceptance claim and the verifier refuses to overwrite
+an existing receipt.
 
 ## Owner-only prerequisites
 
@@ -100,7 +121,8 @@ outside this lane:
 
 If any prerequisite is missing, stop at the offline inspection and report the
 specific blocked state. Do not substitute an ad-hoc signature, a local file,
-an empty feed, or a central-health response for the missing updater proof.
+an empty feed, a central-health response, a content hash, or this verifier's
+receipt for the missing updater proof.
 
 ## Exact N to N+1 profile rehearsal
 
@@ -113,9 +135,10 @@ receipt and a pass/fail note for each step.
    example, a visible setting) so retention can be checked without recording
    account or activity data.
 2. **Preflight N+1.** Run the live verifier command above against the exact
-   `N+1` bundle. A non-zero exit, `not_published`, `unavailable`, `invalid`, or
-   `mismatched_url` result ends the attempt; do not open an updater flow and do
-   not make a production claim.
+   `N+1` bundle. A blocked `remotePublicationReadback`, `not_published`,
+   `unavailable`, `invalid`, or `mismatched_url` result ends the attempt; do
+   not open an updater flow and do not make a production claim. Even a passed
+   remote preflight leaves `sparkleAcceptance` unverified.
 3. **Cancellation path.** From N, start the manual update check and begin the
    N+1 download/install flow. Cancel while the operation is cancellable. Confirm
    that the app remains on N, the update is not reported as installed, and the
@@ -134,17 +157,20 @@ receipt and a pass/fail note for each step.
    fallback as evidence that N+1 passed.
 6. **Closeout.** Only when cancellation, retry, and fallback handling are
    understood and the successful retry is observed may the owner mark the
-   internal N to N+1 rehearsal complete. Keep the verifier receipt and the
-   human pass/fail note together. This is still preview/dogfood evidence; it
-   does not authorize production publication.
+   internal N to N+1 rehearsal complete. Keep the verifier preflight receipt
+   with the owner-only operational record; that record is not an input to this
+   verifier and cannot make an unverified update pass. This is still
+   preview/dogfood evidence; it does not authorize production publication.
 
 ## Stop conditions and recovery
 
 Stop immediately for a feed HTTP 404/410, any redirect, malformed XML,
-invalid enclosure URL/length/version/signature metadata, a candidate/endpoint
-URL mismatch, an artifact status other than 2xx, a byte-count/hash mismatch,
-an unexpected installed app identity, or a state change outside the rehearsal.
+invalid enclosure URL/length/version/signature metadata, a delta or ambiguous
+candidate, a candidate/endpoint URL mismatch, missing/mismatched
+`Content-Length`, an artifact status other than 2xx, a byte-count/hash
+mismatch, an unexpected installed app identity, or a state change outside the
+rehearsal.
 Retry only with a fresh receipt filename after the owner has diagnosed the
 bounded failure. If the second attempt fails, use the retained N fallback and
 leave production claims blocked until the owner supplies fresh feed/artifact
-evidence.
+evidence and completes the real signed N to N+1 installed-client rehearsal.

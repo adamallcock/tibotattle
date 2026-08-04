@@ -8,6 +8,7 @@ import {
   createMacOSPreviewRemoteReceipt,
   MACOS_PREVIEW_REMOTE_RECEIPT_SCHEMA,
   parseMacOSPreviewRemoteArguments,
+  runMacOSPreviewRemoteCLI,
   verifyMacOSPreviewRemote,
   writeMacOSPreviewRemoteReceipt,
 } from "../scripts/verify-macos-preview-remote.js";
@@ -23,6 +24,9 @@ const ARTIFACT_SHA256 = createHash("sha256")
 const ARTIFACT_URL =
   `https://updates.example.test/releases/${BUNDLE_VERSION}/${ARTIFACT_SHA256}/TiboTattle.dmg`;
 const PUBLIC_ED_KEY = Buffer.alloc(32, 4).toString("base64");
+const PUBLIC_ED_KEY_SHA256 = createHash("sha256")
+  .update(Buffer.alloc(32, 4))
+  .digest("hex");
 const SPARKLE_SIGNATURE = Buffer.alloc(64, 7).toString("base64");
 const VALID_APPCAST = `<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
@@ -68,13 +72,34 @@ function response(status, body = "", url = "", contentType = "application/xml") 
   };
 }
 
-function artifactResponse(url = ARTIFACT_URL, bytes = ARTIFACT_BYTES) {
+function streamingBody(bytes) {
+  let emitted = false;
   return {
-    body: null,
+    getReader: () => ({
+      cancel: async () => {},
+      read: async () => {
+        if (emitted) return { done: true, value: undefined };
+        emitted = true;
+        return { done: false, value: Uint8Array.from(bytes) };
+      },
+      releaseLock: () => {},
+    }),
+  };
+}
+
+function artifactResponse(
+  url = ARTIFACT_URL,
+  bytes = ARTIFACT_BYTES,
+  contentLength = bytes.length,
+) {
+  return {
+    body: streamingBody(bytes),
     headers: {
-      get: (name) => name === "content-length" ? String(bytes.length) : null,
+      get: (name) => name === "content-length"
+        ? (contentLength === null ? null : String(contentLength))
+        : null,
     },
-    arrayBuffer: async () => Uint8Array.from(bytes).buffer,
+    arrayBuffer: async () => assert.fail("artifact fallback materialization must not be used"),
     status: 200,
     url,
   };
@@ -145,7 +170,7 @@ test("no-network production claim is blocked and receipt contains no payload con
     } }),
   });
   assert.equal(fetchCalls, 0);
-  assert.equal(result.overall, "not_ready");
+  assert.equal(result.overall, "remote_feed_preflight_unchecked");
   assert.equal(result.claim.status, "blocked");
   assert.equal(result.claim.reason, "network_not_enabled");
   const receipt = createMacOSPreviewRemoteReceipt(result, {
@@ -173,7 +198,7 @@ test("HTTP 404 appcast is not published and blocks the production claim", async 
   assert.equal(result.appcast.httpStatus, 404);
   assert.equal(result.artifact.checked, false);
   assert.equal(result.claim.passed, false);
-  assert.equal(result.overall, "not_ready");
+  assert.equal(result.overall, "remote_feed_preflight_blocked");
   assert.deepEqual(calls.map(({ url }) => url), [
     `${CENTRAL_ORIGIN}/api/health`,
     `${CENTRAL_ORIGIN}/api/ready`,
@@ -233,7 +258,98 @@ test("mismatched explicit artifact URL is a blocking feed proof failure", async 
   assert.equal(result.claim.passed, false);
 });
 
-test("valid mocked feed and content-addressed artifact produce a passing claim", async () => {
+test("artifact digest and length overrides cannot replace the selected feed enclosure", async () => {
+  let artifactReads = 0;
+  const result = await verifyMacOSPreviewRemote(strictOptions({
+    endpointConfig: {
+      ...ENDPOINT_CONFIG,
+      artifactBytes: ARTIFACT_BYTES.length + 1,
+      artifactSha256: "0".repeat(64),
+    },
+    fetchImpl: async (url) => {
+      if (url === ARTIFACT_URL) artifactReads += 1;
+      return healthyOrFeedResponse(url);
+    },
+  }));
+  assert.equal(artifactReads, 0);
+  assert.equal(result.artifact.checked, false);
+  assert.equal(result.artifact.reason, "configured_artifact_digest_mismatch");
+  assert.equal(result.remotePublicationReadback.passed, false);
+  assert.equal(result.claim.passed, false);
+});
+
+test("the update gate rejects deltas and ambiguous full-DMG candidates", async () => {
+  const deltaURL =
+    `https://updates.example.test/releases/${BUNDLE_VERSION}/${ARTIFACT_SHA256}/TiboTattle.delta`;
+  const ambiguousAppcast = VALID_APPCAST.replace(
+    "    </item>",
+    `      <enclosure url="${deltaURL}" length="${ARTIFACT_BYTES.length}"
+        sparkle:version="${BUNDLE_VERSION}" sparkle:edSignature="${SPARKLE_SIGNATURE}" />
+    </item>`,
+  );
+  let artifactReads = 0;
+  const result = await verifyMacOSPreviewRemote(strictOptions({
+    fetchImpl: async (url) => {
+      if (url === ARTIFACT_URL || url === deltaURL) artifactReads += 1;
+      return healthyOrFeedResponse(url, ambiguousAppcast);
+    },
+  }));
+  assert.equal(artifactReads, 0);
+  assert.equal(result.appcast.valid, false);
+  assert.equal(result.appcast.reason, "single_full_dmg_required");
+  assert.equal(result.artifact.checked, false);
+  assert.equal(result.claim.passed, false);
+});
+
+test("artifact Content-Length must match the appcast before the stream is read", async () => {
+  let streamed = false;
+  const result = await verifyMacOSPreviewRemote(strictOptions({
+    fetchImpl: async (url) => {
+      if (url !== ARTIFACT_URL) return healthyOrFeedResponse(url);
+      return {
+        ...artifactResponse(url, ARTIFACT_BYTES, ARTIFACT_BYTES.length + 1),
+        body: {
+          getReader: () => ({
+            cancel: async () => {},
+            read: async () => {
+              streamed = true;
+              return { done: true, value: undefined };
+            },
+            releaseLock: () => {},
+          }),
+        },
+      };
+    },
+  }));
+  assert.equal(streamed, false);
+  assert.equal(result.artifact.status, "unavailable");
+  assert.equal(result.artifact.reason, "content_length_mismatch");
+  assert.equal(result.claim.passed, false);
+});
+
+test("artifact readback fails closed when Content-Length is absent", async () => {
+  let streamed = false;
+  const result = await verifyMacOSPreviewRemote(strictOptions({
+    fetchImpl: async (url) => {
+      if (url !== ARTIFACT_URL) return healthyOrFeedResponse(url);
+      return {
+        ...artifactResponse(url, ARTIFACT_BYTES, null),
+        body: {
+          getReader: () => {
+            streamed = true;
+            return streamingBody(ARTIFACT_BYTES).getReader();
+          },
+        },
+      };
+    },
+  }));
+  assert.equal(streamed, false);
+  assert.equal(result.artifact.status, "unavailable");
+  assert.equal(result.artifact.reason, "content_length_missing");
+  assert.equal(result.claim.passed, false);
+});
+
+test("structurally valid arbitrary signature bytes only pass remote readback, never update acceptance", async () => {
   const calls = [];
   const result = await verifyMacOSPreviewRemote(strictOptions({
     fetchImpl: async (url, options) => {
@@ -246,9 +362,14 @@ test("valid mocked feed and content-addressed artifact produce a passing claim",
   assert.equal(result.artifact.status, "valid");
   assert.equal(result.artifact.bytes, ARTIFACT_BYTES.length);
   assert.equal(result.artifact.sha256, ARTIFACT_SHA256);
-  assert.equal(result.claim.passed, true);
-  assert.equal(result.claim.reason, "feed_and_artifact_verified");
-  assert.equal(result.overall, "ready");
+  assert.equal(result.remotePublicationReadback.passed, true);
+  assert.equal(result.remotePublicationReadback.reason, "remote_publication_readback_verified");
+  assert.equal(result.sparkleAcceptance.cryptographicSignatureVerified, false);
+  assert.equal(result.sparkleAcceptance.nativeClientRehearsalVerified, false);
+  assert.equal(result.sparkleAcceptance.status, "not_verified");
+  assert.equal(result.claim.passed, false);
+  assert.equal(result.claim.reason, "installed_client_rehearsal_required");
+  assert.equal(result.overall, "remote_feed_preflight_passed");
   assert.deepEqual(calls.map(({ url }) => url), [
     `${CENTRAL_ORIGIN}/api/health`,
     `${CENTRAL_ORIGIN}/api/ready`,
@@ -259,11 +380,38 @@ test("valid mocked feed and content-addressed artifact produce a passing claim",
     recordedOn: "2026-08-04",
   });
   const serialized = JSON.stringify(receipt);
-  assert.equal(receipt.claim.status, "passed");
+  assert.equal(receipt.claim.status, "blocked");
+  assert.equal(receipt.remotePublicationReadback.status, "passed");
+  assert.equal(receipt.cryptographicSignatureVerified, false);
+  assert.equal(receipt.binding.channel, "preview_distribution");
+  assert.equal(receipt.binding.appcastURL, APPCAST_URL);
+  assert.equal(receipt.binding.artifactURL, ARTIFACT_URL);
+  assert.equal(receipt.binding.artifactSha256, ARTIFACT_SHA256);
+  assert.equal(receipt.binding.artifactBytes, ARTIFACT_BYTES.length);
+  assert.equal(receipt.binding.bundleVersion, BUNDLE_VERSION);
+  assert.equal(receipt.binding.publicEdKeySha256, PUBLIC_ED_KEY_SHA256);
   assert.equal(receipt.contentFree, true);
   assert.equal(serialized.includes(VALID_APPCAST), false);
   assert.equal(serialized.includes(SPARKLE_SIGNATURE), false);
   assert.equal(serialized.includes(ARTIFACT_BYTES.toString("utf8")), false);
+  assert.throws(
+    () => createMacOSPreviewRemoteReceipt({ ...result, claim: { passed: true } }),
+    { code: "MACOS_PREVIEW_REMOTE_RECEIPT_INVALID" },
+  );
+
+  const output = [];
+  const cli = await runMacOSPreviewRemoteCLI(
+    ["--app", APP_PATH, "--live", "--production-claim"],
+    {
+      stdout: (line) => output.push(line),
+      stderr: (line) => output.push(`stderr:${line}`),
+      verifyRemote: async () => result,
+    },
+  );
+  assert.equal(cli.exitCode, 1);
+  assert.equal(output.includes("Remote feed preflight: passed"), true);
+  assert.equal(output.some((line) => line.includes("Sparkle update acceptance: not verified")), true);
+  assert.equal(output.some((line) => line.includes("Production claim: passed")), false);
 });
 
 test("receipt writer is content-free and refuses to overwrite an attempt", async () => {
