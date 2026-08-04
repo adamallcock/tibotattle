@@ -115,9 +115,9 @@ The revised first visit uses:
   marked as illustrative rather than personal or public community data;
 - one compact community-estimate status line in the hero, three short product
   benefits, and one collapsed evidence-method section below it; and
-- no public Docs or GitHub link until a public destination exists. The current
-  GitHub remote returns 404 to an unauthenticated public request, and repository
-  Markdown is not a published documentation surface.
+- no public Docs or project-repository link until those destinations exist.
+  The current project remote returns 404 to an unauthenticated public request,
+  and repository Markdown is not a published documentation surface.
 
 The visual targets are the generated desktop and mobile concepts under
 `/Users/adamallcock/.codex/generated_images/019fca39-224d-7f91-ab58-c0c20aa1247f/`.
