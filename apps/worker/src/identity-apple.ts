@@ -38,6 +38,11 @@ const MAXIMUM_SERVICES_ID_LENGTH = 256;
 const MAXIMUM_AUTHORIZATION_CODE_LENGTH = 2048;
 const MAXIMUM_TOKEN_RESPONSE_BYTES = 64 * 1024;
 const MAXIMUM_ID_TOKEN_LENGTH = 16 * 1024;
+// A browser handoff is short-lived and the callback must resolve to either a
+// completed or failed state.  Do not let a provider connection hold that
+// state in limbo until the five-minute handoff expires.
+export const APPLE_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 10_000;
+const MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
 
 export const APPLE_SIGNIN_STATE_PATTERN = /^[A-Za-z0-9_-]{43,128}$/u;
 // Apple receives this value in the authorization request and echoes it in the
@@ -51,6 +56,11 @@ export interface AppleSignInConfiguration {
   readonly teamId: string;
   readonly keyId: string;
   readonly privateKeyDer: Uint8Array;
+}
+
+export interface AppleAuthorizationCodeExchangeOptions {
+  /** Internal test seam; production callers use the bounded default. */
+  readonly timeoutMilliseconds?: number;
 }
 
 /**
@@ -212,37 +222,46 @@ export async function exchangeAppleAuthorizationCode(
   code: string,
   redirectUri: string,
   nowMs: number = Date.now(),
+  options: AppleAuthorizationCodeExchangeOptions = {},
 ): Promise<string> {
   if (typeof code !== "string"
       || code.length === 0
       || code.length > MAXIMUM_AUTHORIZATION_CODE_LENGTH) {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
+  const timeoutMilliseconds = options.timeoutMilliseconds
+    ?? APPLE_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS;
+  if (!Number.isSafeInteger(timeoutMilliseconds)
+      || timeoutMilliseconds < 1
+      || timeoutMilliseconds > MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
   const configuration = appleSignInConfiguration(env);
   const clientSecret = await appleClientSecret(env, nowMs);
-  let response: Response;
-  try {
-    response = await fetch(APPLE_TOKEN_URL, {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: configuration.servicesId,
-        client_secret: clientSecret,
-        code,
-        redirect_uri: redirectUri,
-      }),
-    });
-  } catch {
-    throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
-  }
-  if (!response.ok) throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   let text: string;
   try {
-    text = await response.text();
+    text = await withAppleProviderTimeout(
+      async (signal) => {
+        const response = await fetch(APPLE_TOKEN_URL, {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/x-www-form-urlencoded",
+          },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: configuration.servicesId,
+            client_secret: clientSecret,
+            code,
+            redirect_uri: redirectUri,
+          }),
+          signal,
+        });
+        if (!response.ok) throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
+        return response.text();
+      },
+      timeoutMilliseconds,
+    );
   } catch {
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
@@ -265,4 +284,29 @@ export async function exchangeAppleAuthorizationCode(
     throw new ApiError(401, "IDENTITY_TOKEN_INVALID");
   }
   return idToken;
+}
+
+/**
+ * Bounds the complete provider response, not just connection establishment.
+ * The abort signal lets a real fetch release its socket/body, while the race
+ * also protects the callback when a test or unusual runtime returns a promise
+ * that ignores abort.  Neither timeout path includes provider material.
+ */
+async function withAppleProviderTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMilliseconds: number,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Apple identity provider request timed out"));
+    }, timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

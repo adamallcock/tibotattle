@@ -30,6 +30,10 @@ const MAXIMUM_JWKS_BYTES = 64 * 1024;
 const CLOCK_SKEW_SECONDS = 300;
 const MAXIMUM_NONCE_LENGTH = 256;
 const NONCE_HASH_PATTERN = /^[0-9a-f]{64}$/u;
+// A provider key fetch is part of the browser callback's critical path. Keep
+// an unavailable provider from leaving the short-lived handoff in limbo.
+export const OIDC_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 10_000;
+const MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
 
 export interface VerifiedIdentity {
   provider: "google" | "apple";
@@ -119,44 +123,51 @@ function environmentJwksFetcher(env: Env): JwksFetcher | undefined {
 async function providerJwksFetcher(
   url: string,
   request: oauth.CustomFetchOptions<"GET">,
+  timeoutMilliseconds: number,
 ): Promise<Response> {
-  let response: Response;
   try {
-    response = await fetch(url, {
-      method: request.method,
-      headers: request.headers,
-      redirect: request.redirect,
-      signal: request.signal,
-    });
+    return await withOidcProviderTimeout(async (signal) => {
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: request.method,
+          headers: request.headers,
+          redirect: request.redirect,
+          signal,
+        });
+      } catch {
+        throw new ProviderUnavailableError();
+      }
+      if (!response.ok) throw new ProviderUnavailableError();
+
+      let text: string;
+      try {
+        text = await response.text();
+      } catch {
+        throw new ProviderUnavailableError();
+      }
+      if (text.length > MAXIMUM_JWKS_BYTES) throw new ProviderUnavailableError();
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new ProviderUnavailableError();
+      }
+      if (!isJsonWebKeySet(parsed)) throw new ProviderUnavailableError();
+
+      // oauth4webapi owns every security-sensitive JWKS operation after this
+      // bounded transport read: key filtering, key import, algorithm binding,
+      // cache lifetime, and JWS verification.
+      return new Response(text, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }, timeoutMilliseconds, request.signal);
   } catch {
     throw new ProviderUnavailableError();
   }
-  if (!response.ok) throw new ProviderUnavailableError();
-
-  let text: string;
-  try {
-    text = await response.text();
-  } catch {
-    throw new ProviderUnavailableError();
-  }
-  if (text.length > MAXIMUM_JWKS_BYTES) throw new ProviderUnavailableError();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new ProviderUnavailableError();
-  }
-  if (!isJsonWebKeySet(parsed)) throw new ProviderUnavailableError();
-
-  // oauth4webapi owns every security-sensitive JWKS operation after this
-  // bounded transport read: key filtering, key import, algorithm binding,
-  // cache lifetime, and JWS verification.
-  return new Response(text, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
 }
 
 function oidcClient(expectedAudience: string, nowMs: number): oauth.Client {
@@ -189,6 +200,7 @@ async function validateWithOauth4WebApi(
   nowMs: number,
   jwksFetcher: JwksFetcher | undefined,
   expectedNonce: string | undefined,
+  timeoutMilliseconds: number,
 ): Promise<Record<string, unknown>> {
   const response = idTokenResponse(idToken);
   const tokenResponse = await oauth.processAuthorizationCodeResponse(
@@ -208,9 +220,12 @@ async function validateWithOauth4WebApi(
     [oauth.customFetch]: async (url, request) => {
       if (url !== server.jwksUrl) throw new ProviderUnavailableError();
       if (jwksFetcher !== undefined) {
-        return Response.json(await jwksFetcher(url));
+        return Response.json(await withOidcProviderTimeout(
+          () => jwksFetcher(url),
+          timeoutMilliseconds,
+        ));
       }
-      return providerJwksFetcher(url, request);
+      return providerJwksFetcher(url, request, timeoutMilliseconds);
     },
   };
   await oauth.validateApplicationLevelSignature(
@@ -274,6 +289,8 @@ export async function verifyHostedIdentity(
      * raw nonce is intentionally not persisted by the handoff repository.
      */
     expectedNonceHash?: string;
+    /** Internal test seam; production callers use the bounded default. */
+    timeoutMilliseconds?: number;
   } = {},
 ): Promise<VerifiedIdentity> {
   if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
@@ -327,6 +344,13 @@ export async function verifyHostedIdentity(
 
   const testJwksFetcher = environmentJwksFetcher(env);
   const jwksFetcher = testJwksFetcher ?? options.jwksFetcher;
+  const timeoutMilliseconds = options.timeoutMilliseconds
+    ?? OIDC_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS;
+  if (!Number.isSafeInteger(timeoutMilliseconds)
+      || timeoutMilliseconds < 1
+      || timeoutMilliseconds > MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS) {
+    throw new ApiError(500, "INTERNAL_ERROR");
+  }
   const nowMs = options.nowMs ?? Date.now();
   const servers = provider === "google" ? oidcServers.google : oidcServers.apple;
   let claims: Record<string, unknown> | undefined;
@@ -340,6 +364,7 @@ export async function verifyHostedIdentity(
           nowMs,
           jwksFetcher,
           expectedNonce,
+          timeoutMilliseconds,
         );
         break;
       } catch (error) {
@@ -405,4 +430,36 @@ export async function verifyHostedIdentity(
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
   return { provider, linkKeyHex };
+}
+
+/**
+ * Bounds both the real fetch and injected test fetchers. The parent signal is
+ * retained so oauth4webapi can cancel its own request, while the local timer
+ * guarantees a provider outage becomes a finite, opaque failure.
+ */
+async function withOidcProviderTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMilliseconds: number,
+  parentSignal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (parentSignal?.aborted) {
+    controller.abort();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new ProviderUnavailableError());
+    }, timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", abortFromParent);
+  }
 }

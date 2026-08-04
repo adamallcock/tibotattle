@@ -974,6 +974,30 @@ describe("default JWKS fetcher", () => {
     }
   });
 
+  it("fails closed and aborts when the JWKS provider does not answer", async () => {
+    let aborted = false;
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+      }, { once: true });
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+
+    const token = await rs256Token(header(), googlePayload(), primary.privateKey);
+    await expect(verifyHostedIdentity(
+      bindings(),
+      { provider: "google", idToken: token },
+      { nowMs: NOW_MS, timeoutMilliseconds: 1 },
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "IDENTITY_PROVIDER_UNAVAILABLE",
+    });
+    expect(aborted).toBe(true);
+  });
+
   it("verifies a real token through the default fetcher against the documented JWKS URLs", async () => {
     const seenUrls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {

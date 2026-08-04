@@ -6,6 +6,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   APPLE_SIGNIN_NONCE_PATTERN,
   appleClientSecret,
+  exchangeAppleAuthorizationCode,
   hashAppleSignInNonce,
 } from "../src/identity-apple";
 import {
@@ -252,6 +253,31 @@ describe("web Sign in with Apple", () => {
     expect(secret.includes(privateKeyBase64)).toBe(false);
     expect(secret.includes(privateKeyBase64.slice(0, 32))).toBe(false);
     expect(secret.includes("PRIVATE KEY")).toBe(false);
+  });
+
+  it("fails closed and aborts a token exchange that outlives the callback budget", async () => {
+    let aborted = false;
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+      }, { once: true });
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+
+    await expect(exchangeAppleAuthorizationCode(
+      bindings(),
+      "apple-hung-provider-code",
+      CALLBACK_URL,
+      Date.now(),
+      { timeoutMilliseconds: 1 },
+    )).rejects.toMatchObject({
+      status: 401,
+      code: "IDENTITY_TOKEN_INVALID",
+    });
+    expect(aborted).toBe(true);
   });
 
   it("carries a start, an Apple callback, and a single-use result end to end", async () => {
@@ -544,6 +570,19 @@ describe("web Sign in with Apple", () => {
       "SELECT state FROM apple_signin_handoffs WHERE state = ?",
     ).bind(cancelled.state).first<{ state: string }>();
     expect(cancelledRow).toBeNull();
+
+    // Cancellation is terminal only for that state. A fresh start must be
+    // usable immediately rather than inheriting a stale "signing in" marker.
+    const reentered = await startSignIn();
+    expect(reentered.state).not.toBe(cancelled.state);
+    const reenteredResult = await json("/api/v1/identity/apple/result", {
+      state: reentered.state,
+    });
+    expect(reenteredResult.status).toBe(404);
+    expect(await reenteredResult.json()).toMatchObject({
+      error: { code: "IDENTITY_RESULT_PENDING" },
+    });
+
     const pendingResult = await json("/api/v1/identity/apple/result", {
       state: stillPending.state,
     });
