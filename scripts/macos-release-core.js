@@ -27,8 +27,12 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  assertReleaseChannelPublication,
+  createReleaseChannelProvenance,
+  resolveReleaseChannel,
+} from "../config/release-channels.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
   SPARKLE_FRAMEWORK_SHA256,
@@ -691,12 +695,19 @@ function parsePlist(path) {
   }
 }
 
-function validateProductionOrigin(plist) {
-  if (plist.UsageMonitorCentralOriginMode !== "production_https"
+function validateProductionOrigin(plist, {
+  expectedMode = "production_https",
+  channel = "stable",
+} = {}) {
+  if (plist.UsageMonitorCentralOriginMode !== expectedMode
       || typeof plist.UsageMonitorCentralOrigin !== "string") {
     fail(
-      "Release app is not sealed to a production HTTPS service",
-      "MACOS_PRODUCTION_ORIGIN_REQUIRED",
+      channel === "stable"
+        ? "Release app is not sealed to a production HTTPS service"
+        : `Release app is not sealed to the reviewed ${channel} HTTPS service`,
+      channel === "stable"
+        ? "MACOS_PRODUCTION_ORIGIN_REQUIRED"
+        : "MACOS_RELEASE_CHANNEL_MISMATCH",
     );
   }
   let origin;
@@ -833,6 +844,7 @@ async function validateUpdaterBoundary(appPath, plist, manifest, {
 }
 
 export async function inspectMacOSApp(appPath, {
+  channel = "stable",
   requireExternalDistribution = false,
 } = {}) {
   const selected = resolve(appPath);
@@ -876,14 +888,26 @@ export async function inspectMacOSApp(appPath, {
     await regularPath(join(selected, ...relativePath.split("/")));
   }
   if (requireExternalDistribution) {
-    const centralOrigin = validateProductionOrigin(plist);
-    if (centralOrigin !== DEPLOYMENT_ENDPOINTS.public.origin
+    const releaseChannel = resolveReleaseChannel(channel);
+    const centralOrigin = validateProductionOrigin(plist, {
+      channel: releaseChannel.name,
+      expectedMode: releaseChannel.serviceOriginMode,
+    });
+    if (centralOrigin !== releaseChannel.serviceOrigin
         || plist.UsageMonitorPublicWebsiteOrigin
-          !== DEPLOYMENT_ENDPOINTS.public.origin
-        || plist.SUFeedURL !== DEPLOYMENT_ENDPOINTS.sparkle.appcastURL) {
+          !== releaseChannel.publicWebsiteOrigin
+        || plist.SUFeedURL !== releaseChannel.sparkle.appcastURL) {
       fail(
-        "Release app is not sealed to the reviewed deployment endpoints",
+        `Release app is not sealed to the reviewed ${releaseChannel.name} deployment endpoints`,
         "MACOS_RELEASE_ENDPOINTS_MISMATCH",
+      );
+    }
+    if (manifest.release?.channel !== undefined
+        && manifest.release.channel
+          !== releaseChannel.buildManifestChannel) {
+      fail(
+        `Release app build manifest is not marked for channel ${releaseChannel.name}`,
+        "MACOS_RELEASE_CHANNEL_MISMATCH",
       );
     }
     if (manifest.release?.externalDistributionRequested !== true
@@ -957,7 +981,12 @@ export function readMacOSReleaseCredentials(environment = process.env) {
 
 export function readMacOSReleaseBuildConfiguration(
   environment = process.env,
+  channel = "stable",
 ) {
+  const releaseChannel = resolveReleaseChannel(channel);
+  const endpointSourceLabel = releaseChannel.name === "stable"
+    ? "config/deployment-endpoints.js"
+    : `the reviewed ${releaseChannel.name} channel`;
   const configuredProductionOrigin =
     environment.USAGE_MONITOR_PRODUCTION_ORIGIN;
   const bundleVersion = environment.USAGE_MONITOR_BUNDLE_VERSION;
@@ -967,8 +996,8 @@ export function readMacOSReleaseBuildConfiguration(
     environment.USAGE_MONITOR_SPARKLE_APPCAST_URL;
   const sparklePublicEdKey =
     environment.USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY;
-  const productionOrigin = DEPLOYMENT_ENDPOINTS.public.origin;
-  const sparkleAppcastURL = DEPLOYMENT_ENDPOINTS.sparkle.appcastURL;
+  const productionOrigin = releaseChannel.serviceOrigin;
+  const sparkleAppcastURL = releaseChannel.sparkle.appcastURL;
   if (configuredProductionOrigin !== undefined) {
     if (typeof configuredProductionOrigin !== "string") {
       fail(
@@ -978,23 +1007,29 @@ export function readMacOSReleaseBuildConfiguration(
     }
     const normalizedConfiguredOrigin = validateProductionOrigin({
       UsageMonitorCentralOrigin: configuredProductionOrigin,
-      UsageMonitorCentralOriginMode: "production_https",
+      UsageMonitorCentralOriginMode: releaseChannel.serviceOriginMode,
+    }, {
+      channel: releaseChannel.name,
+      expectedMode: releaseChannel.serviceOriginMode,
     });
     if (normalizedConfiguredOrigin !== productionOrigin) {
       fail(
-        "USAGE_MONITOR_PRODUCTION_ORIGIN must match config/deployment-endpoints.js",
+        `USAGE_MONITOR_PRODUCTION_ORIGIN must match ${endpointSourceLabel}`,
         "MACOS_RELEASE_ENDPOINTS_MISMATCH",
       );
     }
   }
   const normalizedOrigin = validateProductionOrigin({
     UsageMonitorCentralOrigin: productionOrigin,
-    UsageMonitorCentralOriginMode: "production_https",
+    UsageMonitorCentralOriginMode: releaseChannel.serviceOriginMode,
+  }, {
+    channel: releaseChannel.name,
+    expectedMode: releaseChannel.serviceOriginMode,
   });
   if (configuredSparkleAppcastURL !== undefined
       && configuredSparkleAppcastURL !== sparkleAppcastURL) {
     fail(
-      "USAGE_MONITOR_SPARKLE_APPCAST_URL must match config/deployment-endpoints.js",
+      `USAGE_MONITOR_SPARKLE_APPCAST_URL must match ${endpointSourceLabel}`,
       "MACOS_RELEASE_ENDPOINTS_MISMATCH",
     );
   }
@@ -1024,6 +1059,17 @@ export function readMacOSReleaseBuildConfiguration(
     fail(
       "Release updater framework and public Ed25519 key are required",
       "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
+    );
+  }
+  const publicKeyBytes = Buffer.from(sparklePublicEdKey, "base64");
+  const publicKeySha256 = createHash("sha256")
+    .update(publicKeyBytes)
+    .digest("hex");
+  if (releaseChannel.sparkle.publicEdKeySha256 !== null
+      && releaseChannel.sparkle.publicEdKeySha256 !== publicKeySha256) {
+    fail(
+      `USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY does not match the reviewed ${releaseChannel.name} channel key`,
+      "MACOS_RELEASE_CHANNEL_MISMATCH",
     );
   }
   return Object.freeze({
@@ -1136,6 +1182,16 @@ function validateSignedReleaseManifest(manifest, label) {
       `${label} is not a complete signed replacement release manifest`,
       "MACOS_REPLACEMENT_MANIFEST_INVALID",
     );
+  }
+  if (manifest.channel !== undefined) {
+    try {
+      assertReleaseChannelPublication(manifest.channel.name, manifest.channel);
+    } catch {
+      fail(
+        `${label} has channel provenance that does not match its named policy`,
+        "MACOS_RELEASE_CHANNEL_MISMATCH",
+      );
+    }
   }
   macOSBundleVersionParts(manifest.application.bundleVersion);
   return manifest;
@@ -1713,12 +1769,14 @@ export function validateMacOSLoginItemReleaseRehearsal(receipt, {
 }
 
 export async function validateInstalledMacOSApp(appPath, {
+  channel = "stable",
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
   expectedShortVersion = null,
   production = true,
 } = {}) {
   const inspected = await inspectMacOSApp(appPath, {
+    channel,
     requireExternalDistribution: production,
   });
   if ((expectedBundleIdentifier !== null
@@ -1821,6 +1879,7 @@ export async function validateInstalledMacOSApp(appPath, {
 }
 
 export async function validateMacOSDMG(path, {
+  channel = "stable",
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
   expectedShortVersion = null,
@@ -1879,6 +1938,7 @@ export async function validateMacOSDMG(path, {
       failureMessage: "Mounted application copy failed",
     });
     return await validateInstalledMacOSApp(installedApp, {
+      channel,
       expectedBundleIdentifier,
       expectedBundleVersion,
       expectedShortVersion,
@@ -1926,14 +1986,16 @@ async function assertReplaceableReleaseTarget(path, {
 
 export async function releaseMacOSApp({
   appPath,
+  channel,
   output,
   environment = process.env,
   replace = false,
 }) {
+  const releaseChannel = resolveReleaseChannel(channel);
   const sourceProvenance = readMacOSReleaseSourceProvenance();
   const credentials = readMacOSReleaseCredentials(environment);
   const buildConfiguration =
-    readMacOSReleaseBuildConfiguration(environment);
+    readMacOSReleaseBuildConfiguration(environment, releaseChannel.name);
   const updaterConfiguration = await normalizeMacOSUpdaterConfiguration({
     appcastURL: buildConfiguration.sparkleAppcastURL,
     externalDistribution: true,
@@ -1941,6 +2003,7 @@ export async function releaseMacOSApp({
     publicEdKey: buildConfiguration.sparklePublicEdKey,
   });
   const inspectedCandidate = await inspectMacOSApp(appPath, {
+    channel: releaseChannel.name,
     requireExternalDistribution: true,
   });
   if (inspectedCandidate.plist.UsageMonitorCentralOrigin
@@ -1952,7 +2015,7 @@ export async function releaseMacOSApp({
       || inspectedCandidate.plist.SUPublicEDKey
         !== updaterConfiguration.publicEdKey) {
     fail(
-      "Release candidate does not match the explicitly approved origin and bundle version",
+      `Release candidate does not match the explicitly approved ${releaseChannel.name} origin and bundle version`,
       "MACOS_RELEASE_CONFIGURATION_MISMATCH",
     );
   }
@@ -2009,6 +2072,7 @@ export async function releaseMacOSApp({
       timeout: 300_000,
     });
     const inspected = await inspectMacOSApp(stagedApp, {
+      channel: releaseChannel.name,
       requireExternalDistribution: true,
     });
     if (inspected.buildManifest.inputs?.sourceSha256
@@ -2049,7 +2113,10 @@ export async function releaseMacOSApp({
       notaryProfile: credentials.notaryProfile,
     });
     stapleAndValidate(stagedApp);
-    await validateInstalledMacOSApp(stagedApp, { production: true });
+    await validateInstalledMacOSApp(stagedApp, {
+      channel: releaseChannel.name,
+      production: true,
+    });
     await packageMacOSDMG({
       appPath: stagedApp,
       output: stagedDMG,
@@ -2060,7 +2127,10 @@ export async function releaseMacOSApp({
       notaryProfile: credentials.notaryProfile,
     });
     stapleAndValidate(stagedDMG);
-    await validateMacOSDMG(stagedDMG, { production: true });
+    await validateMacOSDMG(stagedDMG, {
+      channel: releaseChannel.name,
+      production: true,
+    });
 
     const outputExists = await assertReplaceableReleaseTarget(
       selectedOutput,
@@ -2102,6 +2172,10 @@ export async function releaseMacOSApp({
         sourceSha256:
           inspected.buildManifest.inputs.sourceSha256,
       },
+      channel: createReleaseChannelProvenance(releaseChannel.name, {
+        publicEdKeySha256:
+          inspected.buildManifest.release.updater.publicEdKeySha256,
+      }),
       source: sourceProvenance,
       privacy: {
         credentialsRecorded: false,
@@ -2119,6 +2193,7 @@ export async function releaseMacOSApp({
       { replace },
     );
     return Object.freeze({
+      channel: releaseChannel.name,
       output: selectedOutput,
       releaseManifest: releaseManifestPath,
       sha256: releaseManifest.artifact.sha256,

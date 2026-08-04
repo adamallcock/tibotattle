@@ -2,18 +2,24 @@
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RELEASE_MANIFEST } from "../config/release-manifest.js";
+import { resolveReleaseChannel } from "../config/release-channels.js";
 import { releaseMacOSApp } from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
-function parseArguments(argv) {
+export function parseArguments(argv) {
   let appPath = null;
+  let channel = null;
   let output = null;
   let replace = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--app" && appPath === null && index + 1 < argv.length) {
       appPath = resolve(argv[++index]);
+    } else if (argument === "--channel"
+        && channel === null
+        && index + 1 < argv.length) {
+      channel = argv[++index];
     } else if (argument === "--output"
         && output === null
         && index + 1 < argv.length) {
@@ -27,15 +33,26 @@ function parseArguments(argv) {
   if (!appPath) {
     throw new Error("--app is required");
   }
+  if (!channel) {
+    throw new Error("--channel is required; choose a named release channel explicitly");
+  }
+  resolveReleaseChannel(channel);
+  const defaultOutput = channel === "stable"
+    ? join(
+      ".release-build",
+      "macos-release",
+      RELEASE_MANIFEST.macOS.arm64DmgFileName,
+    )
+    : join(
+      ".release-build",
+      "macos-release",
+      channel,
+      RELEASE_MANIFEST.macOS.arm64DmgFileName,
+    );
   return {
     appPath,
-    output: output ?? resolve(
-      join(
-        ".release-build",
-        "macos-release",
-        RELEASE_MANIFEST.macOS.arm64DmgFileName,
-      ),
-    ),
+    channel,
+    output: output ?? resolve(defaultOutput),
     replace,
   };
 }
@@ -43,6 +60,7 @@ function parseArguments(argv) {
 export async function main(argv) {
   const result = await releaseMacOSApp(parseArguments(argv));
   console.log("TiboTattle macOS release: complete");
+  console.log(`Channel: ${result.channel}`);
   console.log(`DMG: ${result.output}`);
   console.log(`Release manifest: ${result.releaseManifest}`);
   console.log(`SHA-256: ${result.sha256}`);

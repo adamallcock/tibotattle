@@ -8,6 +8,7 @@ import {
   RELEASE_MANIFEST,
   RELEASE_VERSION,
 } from "../config/release-manifest.js";
+import { getReleaseChannel } from "../config/release-channels.js";
 import {
   APPROVED_R2_BUCKET,
   APPCAST_CACHE_CONTROL,
@@ -23,6 +24,10 @@ const TEST_PUBLIC_ED_KEY = TEST_KEY_PAIR.publicKey
   .export({ format: "der", type: "spki" })
   .subarray(-32)
   .toString("base64");
+const STABLE_CHANNEL = getReleaseChannel("stable");
+const TEST_PUBLIC_ED_KEY_SHA256 = sha256(
+  Buffer.from(TEST_PUBLIC_ED_KEY, "base64"),
+);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -45,7 +50,7 @@ async function createReleaseFixture({
   const digest = sha256(dmgbBytes);
   const signature = sign(null, dmgbBytes, TEST_KEY_PAIR.privateKey)
     .toString("base64");
-  const artifactURL = `${CANONICAL_UPDATE_ORIGIN}/releases/${bundleVersion}/${digest}/${fileName}`;
+  const artifactURL = `${STABLE_CHANNEL.sparkle.origin}/${STABLE_CHANNEL.sparkle.objectPrefix}/${bundleVersion}/${digest}/${fileName}`;
   const manifest = mutateManifest({
     schemaVersion: "usage-monitor-macos-release-v0.2",
     application: {
@@ -54,6 +59,20 @@ async function createReleaseFixture({
       shortVersion: RELEASE_VERSION,
     },
     artifact: { bytes: dmgbBytes.length, fileName, sha256: digest },
+    channel: {
+      name: STABLE_CHANNEL.name,
+      serviceOriginMode: STABLE_CHANNEL.serviceOriginMode,
+      serviceOrigin: STABLE_CHANNEL.serviceOrigin,
+      publicWebsiteOrigin: STABLE_CHANNEL.publicWebsiteOrigin,
+      sparkle: {
+        origin: STABLE_CHANNEL.sparkle.origin,
+        appcastURL: STABLE_CHANNEL.sparkle.appcastURL,
+        appcastObjectKey: STABLE_CHANNEL.sparkle.appcastObjectKey,
+        r2Bucket: STABLE_CHANNEL.sparkle.r2Bucket,
+        objectPrefix: STABLE_CHANNEL.sparkle.objectPrefix,
+        publicEdKeySha256: TEST_PUBLIC_ED_KEY_SHA256,
+      },
+    },
     assurances: {
       appNotarizationAccepted: true,
       appTicketStapled: true,
@@ -176,6 +195,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
     const publication = await publishSparkleUpdate({
       appcastPath: fixture.appcastPath,
       bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
       dmgPath: fixture.dmgPath,
       releaseManifestPath: fixture.releaseManifestPath,
       sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
@@ -197,6 +217,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
     assert.equal(publication.manifest.cacheControl, IMMUTABLE_CACHE_CONTROL);
     assert.equal(publication.appcast.cacheControl, APPCAST_CACHE_CONTROL);
     assert.deepEqual(verified, [[fixture.dmgPath, {
+      channel: "stable",
       expectedBundleIdentifier: "com.usagemonitor.local",
       expectedBundleVersion: "1",
       expectedShortVersion: "0.1.0",
@@ -215,6 +236,7 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
     const publication = await publishSparkleUpdate({
       appcastPath: fixture.appcastPath,
       bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
       dmgPath: fixture.dmgPath,
       publish: true,
       releaseManifestPath: fixture.releaseManifestPath,
@@ -259,6 +281,7 @@ test("does not report publication success when the public appcast is unavailable
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -286,6 +309,7 @@ test("does not report publication success when the public DMG bytes differ", asy
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -329,6 +353,7 @@ test("does not report publication success when a retained enclosure is missing f
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -356,6 +381,7 @@ test("refuses an existing immutable object before it can be overwritten", async 
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -383,6 +409,7 @@ test("requires an explicit appcast replacement after immutable preflight passes"
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -422,6 +449,7 @@ test("rejects a preserved enclosure whose R2 object is unavailable before writin
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -471,6 +499,7 @@ test("verifies preserved delta bytes and checksum before publication", async () 
     const publication = await publishSparkleUpdate({
       appcastPath: fixture.appcastPath,
       bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
       dmgPath: fixture.dmgPath,
       publish: true,
       releaseManifestPath: fixture.releaseManifestPath,
@@ -513,6 +542,7 @@ test("rejects a preserved enclosure whose R2 bytes do not match its URL digest",
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -558,6 +588,7 @@ test("rejects a preserved enclosure whose signature does not match its R2 bytes"
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
@@ -588,6 +619,7 @@ test("rejects a candidate that is not newer than the live appcast", async () => 
       publishSparkleUpdate({
         appcastPath: candidate.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: candidate.dmgPath,
         publish: true,
         releaseManifestPath: candidate.releaseManifestPath,
@@ -640,6 +672,7 @@ test("fails closed when the appcast signature, URL, or manifest checksum is inva
         publishSparkleUpdate({
           appcastPath: fixture.appcastPath,
           bucket: APPROVED_R2_BUCKET,
+          channel: "stable",
           dmgPath: fixture.dmgPath,
           releaseManifestPath: fixture.releaseManifestPath,
           sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
@@ -666,6 +699,7 @@ test("requires the supplied public key to match the release manifest fingerprint
       publishSparkleUpdate({
         appcastPath: fixture.appcastPath,
         bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
         dmgPath: fixture.dmgPath,
         releaseManifestPath: fixture.releaseManifestPath,
         sparklePublicEdKey: Buffer.alloc(32, 9).toString("base64"),
@@ -682,6 +716,7 @@ test("requires the supplied public key to match the release manifest fingerprint
 test("requires the approved explicit bucket and does not accept signing-key arguments", async () => {
   const parsed = parseSparkleUpdatePublisherArguments([
     "--bucket", APPROVED_R2_BUCKET,
+    "--channel", "stable",
     "--dmg", "release.dmg",
     "--appcast", "appcast.xml",
     "--release-manifest", "release.json",
@@ -701,6 +736,7 @@ test("requires the approved explicit bucket and does not accept signing-key argu
   assert.throws(
     () => parseSparkleUpdatePublisherArguments([
       "--bucket", APPROVED_R2_BUCKET,
+      "--channel", "stable",
       "--dmg", "release.dmg",
       "--appcast", "appcast.xml",
       "--release-manifest", "release.json",
@@ -709,10 +745,21 @@ test("requires the approved explicit bucket and does not accept signing-key argu
     ]),
     /requires --publish/u,
   );
+  assert.throws(
+    () => parseSparkleUpdatePublisherArguments([
+      "--bucket", APPROVED_R2_BUCKET,
+      "--dmg", "release.dmg",
+      "--appcast", "appcast.xml",
+      "--release-manifest", "release.json",
+      "--sparkle-public-ed-key", TEST_PUBLIC_ED_KEY,
+    ]),
+    /--channel is required/u,
+  );
   await assert.rejects(
     publishSparkleUpdate({
       appcastPath: "appcast.xml",
       bucket: "another-bucket",
+      channel: "stable",
       dmgPath: "release.dmg",
       releaseManifestPath: "release.json",
       sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
