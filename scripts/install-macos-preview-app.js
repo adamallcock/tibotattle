@@ -41,6 +41,7 @@ export const MACOS_PREVIEW_INSTALL_CODES = Object.freeze({
   PARENT_INVALID: "MACOS_PREVIEW_INSTALL_PARENT_INVALID",
   PARENT_MISSING: "MACOS_PREVIEW_INSTALL_PARENT_MISSING",
   REPLACE_REQUIRED: "MACOS_PREVIEW_INSTALL_REPLACE_REQUIRED",
+  SYSTEM_INSTALL_CONFIRMATION_REQUIRED: "MACOS_PREVIEW_INSTALL_SYSTEM_CONFIRMATION_REQUIRED",
   ROLLBACK_FAILED: "MACOS_PREVIEW_INSTALL_ROLLBACK_FAILED",
   SOURCE_INVALID: "MACOS_PREVIEW_INSTALL_SOURCE_INVALID",
   SOURCE_MISSING: "MACOS_PREVIEW_INSTALL_SOURCE_MISSING",
@@ -119,6 +120,20 @@ export function getMacOSPreviewInstallTargetPaths(homeDirectory = homedir()) {
 
 export function macOSUserApplicationsTarget(homeDirectory = homedir()) {
   return getMacOSPreviewInstallTargetPaths(homeDirectory)[1];
+}
+
+export function requiresMacOSSystemInstallConfirmation(targetPath) {
+  return targetPath === SYSTEM_APPLICATIONS_TARGET;
+}
+
+function assertMacOSSystemInstallConfirmation(targetPath, confirmed) {
+  if (!requiresMacOSSystemInstallConfirmation(targetPath) || confirmed === true) {
+    return;
+  }
+  throw fail(
+    MACOS_PREVIEW_INSTALL_CODES.SYSTEM_INSTALL_CONFIRMATION_REQUIRED,
+    `Installing to ${SYSTEM_APPLICATIONS_TARGET} requires --confirm-system-install in addition to --replace`,
+  );
 }
 
 function normalizeAllowedTargetPaths(allowedTargetPaths, homeDirectory) {
@@ -419,6 +434,7 @@ export async function installMacOSPreviewApp({
   sourcePath,
   targetPath,
   replace = false,
+  confirmSystemInstall = false,
   backupPath = null,
   validator = validateMacOSPreviewApp,
   fileSystem = DEFAULT_FILE_SYSTEM,
@@ -443,6 +459,7 @@ export async function installMacOSPreviewApp({
     allowedTargetPaths,
     homeDirectory,
   });
+  assertMacOSSystemInstallConfirmation(target, confirmSystemInstall);
   if (source === target) {
     throw fail(
       MACOS_PREVIEW_INSTALL_CODES.SOURCE_TARGET_CONFLICT,
@@ -643,12 +660,13 @@ export function usage() {
   return [
     "Usage:",
     `  node scripts/install-macos-preview-app.js --app <${PRODUCT_BRAND.bundleName} path> \\`,
-    `    --target ${SYSTEM_APPLICATIONS_TARGET} --replace`,
+    `    --target ${SYSTEM_APPLICATIONS_TARGET} --replace --confirm-system-install`,
     `  node scripts/install-macos-preview-app.js --app <${PRODUCT_BRAND.bundleName} path> \\`,
     "    --user-applications --replace",
     "",
     "The target is restricted to /Applications or the current user's ~/Applications.",
     "--replace is mandatory because this command moves an existing app to a backup.",
+    "--confirm-system-install is additionally mandatory for /Applications.",
   ].join("\n");
 }
 
@@ -670,6 +688,7 @@ export function parseMacOSPreviewInstallArguments(
   let sourcePath = null;
   let targetPath = null;
   let replace = false;
+  let confirmSystemInstall = false;
   let userApplications = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -710,6 +729,14 @@ export function parseMacOSPreviewInstallArguments(
         );
       }
       replace = true;
+    } else if (argument === "--confirm-system-install") {
+      if (confirmSystemInstall) {
+        throw fail(
+          MACOS_PREVIEW_INSTALL_CODES.ARGUMENTS_INVALID,
+          "--confirm-system-install may be provided only once",
+        );
+      }
+      confirmSystemInstall = true;
     } else if (argument === "--help" || argument === "-h") {
       if (argv.length !== 1) {
         throw fail(
@@ -745,7 +772,15 @@ export function parseMacOSPreviewInstallArguments(
   }
   const selectedTarget = targetPath
     ?? macOSUserApplicationsTarget(homeDirectory);
+  if (confirmSystemInstall && !requiresMacOSSystemInstallConfirmation(selectedTarget)) {
+    throw fail(
+      MACOS_PREVIEW_INSTALL_CODES.ARGUMENTS_INVALID,
+      "--confirm-system-install is valid only with --target /Applications/TiboTattle.app",
+    );
+  }
+  assertMacOSSystemInstallConfirmation(selectedTarget, confirmSystemInstall);
   return Object.freeze({
+    confirmSystemInstall,
     replace: true,
     sourcePath,
     targetPath: selectedTarget,
