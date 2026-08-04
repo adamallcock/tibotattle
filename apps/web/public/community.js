@@ -146,8 +146,6 @@ export function renderPublicInstallerJourney(documentRef) {
   const releaseLinks = select("#installer-links");
   const unavailable = select("#installer-unavailable");
   const steps = select("#installer-steps");
-  const navigationLink = select("#download-nav-link");
-  const heroLink = select("#download-hero-link");
   if (release) {
     const architectureLabel = release.architectures.length === 2
       ? "Apple silicon and Intel"
@@ -177,8 +175,6 @@ export function renderPublicInstallerJourney(documentRef) {
     releaseLinks.hidden = false;
     unavailable.hidden = true;
     steps.hidden = false;
-    navigationLink.textContent = "Download";
-    heroLink.textContent = "Download for Mac";
     return release;
   }
   link.removeAttribute("href");
@@ -209,8 +205,6 @@ export function renderPublicInstallerJourney(documentRef) {
   releaseLinks.hidden = true;
   unavailable.hidden = false;
   steps.hidden = true;
-  navigationLink.textContent = "Mac app";
-  heroLink.textContent = "Mac app availability";
   return null;
 }
 
@@ -298,6 +292,10 @@ async function loadCommunitySnapshot() {
     documentRef: document,
     container,
     detail,
+    estimateContainer: $("#community-estimate-result"),
+    estimateHero: $("#community-estimate-hero"),
+    estimateState: $("#community-estimate-state"),
+    estimateStates: [$("#community-estimate-panel-state")],
     payload,
   });
   if (failure === null) {

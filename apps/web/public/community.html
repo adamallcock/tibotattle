@@ -6,15 +6,15 @@
     <meta name="color-scheme" content="light">
     <meta name="theme-color" content="#f5f1e8">
     <!--
-      This is the public website surface. It shows the delayed community
-      snapshot and leads visitors to the Mac app. The personal dashboard,
+      This is the public website surface. It explains the Mac app, offers a
+      signed installer only after its release metadata verifies, and shows the
+      delayed community snapshot. Personal dashboards, local scans,
       contribution preparation, hosted sign-in, and every local-only control
-      stay inside the loopback app window.
+      remain inside the app.
 
-      Release packaging replaces every empty release slot below only after it
-      verifies the selected installer and social-preview artifacts. Keeping
-      any slot empty makes the page say that no download is published instead
-      of inventing one.
+      Release packaging replaces each empty release slot only after verifying
+      the selected installer and social-preview artifacts. Empty slots make
+      the page say that no download is published rather than inventing one.
     -->
     <meta name="usage-monitor-installer-url" content="">
     <meta name="usage-monitor-installer-version" content="">
@@ -31,7 +31,7 @@
     <meta property="og:title" content="TiboTattle · Private usage visibility for Mac">
     <meta
       property="og:description"
-      content="See the privacy-safe seven-day community snapshot, then download TiboTattle for Mac."
+      content="TiboTattle is a local-first Mac app for understanding personal Codex usage, with privacy-reviewed community evidence when it is ready."
     >
     <meta property="og:url" content="">
     <meta property="og:image" content="">
@@ -42,19 +42,19 @@
     <meta name="twitter:title" content="TiboTattle · Private usage visibility for Mac">
     <meta
       name="twitter:description"
-      content="See the privacy-safe seven-day community snapshot, then download TiboTattle for Mac."
+      content="TiboTattle is a local-first Mac app for understanding personal Codex usage, with privacy-reviewed community evidence when it is ready."
     >
     <meta name="twitter:image" content="">
     <meta
       name="description"
-      content="TiboTattle is a local-first Mac app for understanding Codex usage. Read the privacy-safe seven-day community snapshot, then download the app."
+      content="TiboTattle is a local-first Mac app for understanding personal Codex usage. Download the signed Mac app, or read the privacy-reviewed community seven-day evidence."
     >
     <title>TiboTattle · Private usage visibility for Mac</title>
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./community.js"></script>
   </head>
   <body class="community-site">
-    <a class="skip-link" href="#main">Skip to the community snapshot</a>
+    <a class="skip-link" href="#main">Skip to the Mac app and community snapshot</a>
 
     <header class="topbar">
       <a class="brand" href="#main" aria-label="TiboTattle home">
@@ -62,97 +62,30 @@
         <span>TiboTattle</span>
       </a>
       <nav class="primary-nav" aria-label="Site sections">
-        <a href="#community">Snapshot</a>
-        <a href="#download" id="download-nav-link">Mac app</a>
-        <a href="#faq">FAQ</a>
+        <a href="#download">Mac app</a>
+        <a href="#community">Community snapshot</a>
       </nav>
     </header>
 
     <main id="main">
-      <section class="page-heading community-hero" aria-labelledby="hero-title">
-        <div>
-          <p class="eyebrow">Private usage visibility for Mac</p>
-          <h1 id="hero-title">Know what your Codex week is doing.</h1>
+      <section class="community-hero" id="download" aria-labelledby="hero-title">
+        <div class="community-hero-copy">
+          <p class="eyebrow">Local-first Mac app</p>
+          <h1 id="hero-title">Understand your personal Codex usage on your own Mac.</h1>
           <p class="lede">
-            TiboTattle is a local-first Mac app that reads content-free usage
-            and quota metadata on your Mac. Your personal dashboard stays in
-            the app; this site only publishes the delayed, privacy-safe view
-            that contributors chose to share.
+            TiboTattle reads content-free usage and quota metadata on your Mac,
+            then keeps the full personal dashboard in the app where that
+            evidence can be handled honestly.
           </p>
-          <div class="community-hero-actions">
-            <a class="button button-primary" href="#download" id="download-hero-link">Mac app availability</a>
-            <a class="button button-secondary" href="#community">See the snapshot</a>
-          </div>
-        </div>
-      </section>
-
-      <section class="dashboard-section community-section" id="community" aria-labelledby="community-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Privacy-safe community snapshot</p>
-            <h2 id="community-title">A seven-day view, shared carefully.</h2>
-          </div>
-        </div>
-        <p class="lede">
-          This page shows delayed, privacy-safe weekly activity from opt-in
-          contributors — not your personal usage, quota, or cost.
-        </p>
-        <p class="annotation community-estimate-gate">
-          A community seven-day allowance estimate will appear only after
-          enough matched quota evidence exists; it is not published today.
-        </p>
-        <article class="panel community-result-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Delayed community evidence</p>
-              <h3 id="community-snapshot-title">Seven-day community snapshot</h3>
-            </div>
-            <span class="evidence-chip neutral" id="community-service-state" role="status">
-              Checking snapshot
-            </span>
-          </div>
-          <div class="result-summary" id="community-result">
-            <p>Checking for the latest delayed weekly snapshot…</p>
-          </div>
-          <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
-            <summary>
-              <span><strong>How this snapshot is produced</strong></span>
-            </summary>
-            <div class="service-detail-body">
-              <div id="community-snapshot-service-detail"></div>
-              <p class="annotation">
-                Community values use a fixed delay, independent per-cell
-                support, participant-level clipping, and coarse rounding. A
-                sealed revision is never rewritten; privacy-affecting deletion
-                withdraws it and schedules a replacement revision without the
-                deleted source.
-              </p>
-            </div>
-          </details>
-        </article>
-      </section>
-
-      <section class="companion-setup community-download" id="download" aria-labelledby="download-title">
-        <div class="companion-setup-copy">
-          <p class="eyebrow">Download for Mac</p>
-          <h2 id="download-title">Keep your personal view on your Mac.</h2>
-          <p>
-            The app reads your local Codex metadata and shows the personal
-            dashboard in its own window. The website never asks for access to
-            those files, and nothing is uploaded unless you explicitly choose
-            to contribute from the app.
-          </p>
-        </div>
-        <div class="installer-unavailable" id="installer-unavailable" role="status">
-          The signed Mac app is not available to download yet. We will only
-          offer it here after its installer and release metadata verify.
-        </div>
-        <ol class="companion-steps" id="installer-steps" hidden>
-          <li>
-            <strong>Signed Mac installer</strong>
+          <div class="hero-download" aria-labelledby="download-title">
+            <p class="action-label" id="download-title">Signed Mac installer</p>
             <a class="button button-primary" id="installer-link" href="" hidden>
-              Download TiboTattle for Mac
+              Download signed Mac installer
             </a>
+            <span class="installer-unavailable" id="installer-unavailable" role="status">
+              A signed Mac installer is not available yet. We will offer it
+              here only after the installer and its release metadata verify.
+            </span>
             <div class="installer-details" id="installer-details" hidden>
               <span id="installer-version"></span>
               <span id="installer-compatibility"></span>
@@ -165,80 +98,125 @@
               <a id="security-link" href="" hidden>Security</a>
               <a id="support-link" href="" hidden>Support</a>
             </nav>
-          </li>
+          </div>
+          <p class="hero-boundary">
+            Your personal dashboard, local scans, sign-in, and optional
+            contribution controls stay inside the Mac app. This site never
+            reads your Codex files.
+          </p>
+        </div>
+
+        <aside class="estimate-callout" aria-labelledby="hero-estimate-title">
+          <div class="estimate-callout-heading">
+            <p class="eyebrow">Privacy-reviewed community evidence</p>
+            <span class="evidence-chip neutral" id="community-estimate-state" role="status">
+              Checking evidence
+            </span>
+          </div>
+          <h2 id="hero-estimate-title">Community seven-day allowance estimate</h2>
+          <p id="community-estimate-hero">
+            Checking whether a matched, privacy-reviewed estimate is published.
+          </p>
+          <dl class="estimate-facts">
+            <div>
+              <dt>Window</dt>
+              <dd>7 days</dd>
+            </div>
+            <div>
+              <dt>Public rule</dt>
+              <dd>Delayed and support-gated</dd>
+            </div>
+          </dl>
+          <a class="text-link" href="#community">See the evidence policy</a>
+        </aside>
+      </section>
+
+      <section class="install-explainer" aria-labelledby="install-title">
+        <div class="install-explainer-copy">
+          <p class="eyebrow">After download</p>
+          <h2 id="install-title">Start locally. Decide what to share.</h2>
+          <p>
+            The Mac app runs a private loopback companion, reads metadata
+            locally, and shows the personal dashboard in its own window.
+            Nothing is uploaded unless you explicitly review and opt in.
+          </p>
+        </div>
+        <ol class="companion-steps" id="installer-steps" hidden>
           <li>
             <strong>Open TiboTattle from Applications</strong>
-            <span>
-              The personal dashboard opens inside the Mac app and uses its
-              private loopback companion.
-            </span>
+            <span>Your personal dashboard opens in the Mac app.</span>
           </li>
           <li>
-            <strong>Choose what to share</strong>
-            <span>
-              Any community contribution is optional, delayed, clipped, and
-              rounded before a public snapshot can be released.
-            </span>
+            <strong>Understand your local usage</strong>
+            <span>Your Codex evidence and personal dashboard stay on your Mac.</span>
+          </li>
+          <li>
+            <strong>Contribute only if you choose</strong>
+            <span>Any public community evidence is delayed, clipped, and rounded.</span>
           </li>
         </ol>
       </section>
 
-      <section class="dashboard-section community-trust" id="privacy" aria-labelledby="trust-title">
-        <div class="section-heading">
+      <section class="community-section" id="community" aria-labelledby="community-title">
+        <div class="section-heading community-section-heading">
           <div>
-            <p class="eyebrow">Local-first by design</p>
-            <h2 id="trust-title">A clear boundary for personal data.</h2>
+            <p class="eyebrow">Public evidence</p>
+            <h2 id="community-title">A seven-day estimate when the evidence is ready.</h2>
           </div>
+          <p>
+            This page publishes only a released, delayed aggregate. Activity
+            totals and an allowance estimate are different claims.
+          </p>
         </div>
-        <div class="community-trust-grid">
-          <article class="panel">
-            <p class="panel-kicker">On your Mac</p>
-            <h3>Personal evidence stays local.</h3>
-            <p>
-              TiboTattle reads content-free metadata locally for the personal
-              dashboard. Raw prompts, responses, transcripts, and file paths
-              are not part of this public page.
-            </p>
-          </article>
-          <article class="panel">
-            <p class="panel-kicker">In the snapshot</p>
-            <h3>Only reviewed aggregates appear.</h3>
-            <p>
-              The public view is delayed and support-gated. Released metrics
-              are clipped per participant, rounded down, and may show a status
-              instead of a value when support is insufficient.
-            </p>
-          </article>
-        </div>
-      </section>
 
-      <section class="dashboard-section community-faq" id="faq" aria-labelledby="faq-title">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">A few useful boundaries</p>
-            <h2 id="faq-title">FAQ</h2>
+        <article class="panel estimate-panel" aria-labelledby="community-estimate-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Estimate gate</p>
+              <h3 id="community-estimate-title">Community seven-day allowance estimate</h3>
+            </div>
+            <span class="evidence-chip neutral" id="community-estimate-panel-state" role="status">
+              Checking evidence
+            </span>
           </div>
-        </div>
-        <div class="community-faq-list">
-          <details class="journey-disclosure community-faq-item">
-            <summary><span><strong>Can this website show my personal usage?</strong></span></summary>
-            <div class="community-faq-answer">
-              <p>No. Your personal dashboard is a Mac-app surface backed by the local loopback companion. This page only requests the public community snapshot endpoint.</p>
+          <div class="estimate-result" id="community-estimate-result">
+            <p>Checking whether matched quota evidence is sufficient to publish an estimate…</p>
+          </div>
+        </article>
+
+        <article class="panel activity-panel" aria-labelledby="community-snapshot-title">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Delayed community evidence</p>
+              <h3 id="community-snapshot-title">Seven-day community snapshot</h3>
+            </div>
+            <span class="evidence-chip neutral" id="community-service-state" role="status">
+              Checking snapshot
+            </span>
+          </div>
+          <p class="activity-intro">
+            If released, these are privacy-safe activity totals from people who
+            chose to contribute from the app. They are not an average, cost, or
+            allowance estimate.
+          </p>
+          <div class="result-summary" id="community-result">
+            <p>Checking for the latest delayed weekly snapshot…</p>
+          </div>
+          <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
+            <summary>
+              <span><strong>How this snapshot is produced</strong></span>
+            </summary>
+            <div class="service-detail-body">
+              <div id="community-snapshot-service-detail"></div>
+              <p class="annotation">
+                Community values use a fixed delay, independent per-cell support,
+                participant-level clipping, and coarse rounding. A sealed
+                revision is never rewritten; privacy-affecting deletion
+                withdraws it and schedules a replacement without that source.
+              </p>
             </div>
           </details>
-          <details class="journey-disclosure community-faq-item">
-            <summary><span><strong>What do the published numbers mean?</strong></span></summary>
-            <div class="community-faq-answer">
-              <p>They are delayed activity totals from contributors, clipped per participant and rounded down. A cell can instead show a release status. They are not a community allowance or best estimate.</p>
-            </div>
-          </details>
-          <details class="journey-disclosure community-faq-item">
-            <summary><span><strong>Why might Download for Mac be unavailable?</strong></span></summary>
-            <div class="community-faq-answer">
-              <p>The download remains hidden until a signed public installer and its release metadata pass the fixed checks. No placeholder or unverified artifact is offered.</p>
-            </div>
-          </details>
-        </div>
+        </article>
       </section>
     </main>
 
@@ -247,15 +225,15 @@
       <p class="footer-disclaimer">
         Named with affection for the Codex community. Not affiliated with or
         endorsed by OpenAI or Thibault Sottiaux — and we will happily rename if
-        asked.
+        asked. Your tokens tattle only to you.
       </p>
     </footer>
 
     <noscript>
       <div class="noscript">
-        JavaScript is required to show the published community snapshot and
-        available download details. The page does not contain a local dashboard
-        or a personal-data control.
+        JavaScript is required to show verified download details and the
+        published community snapshot. This page contains no local dashboard or
+        personal-data control.
       </div>
     </noscript>
   </body>

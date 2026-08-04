@@ -189,6 +189,90 @@ const PENDING_CONTRACT_ROWS = Object.freeze([
 ]);
 
 /**
+ * The current weekly contract publishes activity cells, not allowance
+ * evidence. Keep that distinction as a separate rendered state so a future
+ * contract cannot accidentally turn a token total into a quota claim.
+ */
+export const COMMUNITY_ESTIMATE_STATE_COPY = Object.freeze({
+  service_unavailable: Object.freeze({
+    label: "Unavailable",
+    hero: "The community service is unavailable, so no estimate is shown.",
+    body: "No allowance estimate is inferred from an unavailable response.",
+  }),
+  development_unsafe: Object.freeze({
+    label: "Unavailable",
+    hero: "No public estimate is shown from a development-only response.",
+    body: "The service returned a development diagnostic rather than a released public aggregate.",
+  }),
+  unsupported_schema: Object.freeze({
+    label: "Unavailable",
+    hero: "The released evidence contract is not supported by this page yet.",
+    body: "No allowance estimate is shown until the public contract can be checked end to end.",
+  }),
+  not_yet_published: Object.freeze({
+    label: "Collecting evidence",
+    hero: "No allowance number is published yet; matched quota evidence is still being collected.",
+    body: "A privacy-reviewed seven-day allowance estimate will appear only when a released aggregate includes matched quota coverage and uncertainty. Until then, no number is inferred.",
+  }),
+  withdrawn: Object.freeze({
+    label: "Not published",
+    hero: "This week's estimate is unavailable because the released revision was withdrawn.",
+    body: "The weekly revision was withdrawn for privacy or quality reasons. A replacement must be released before an allowance estimate can appear.",
+  }),
+  suppressed: Object.freeze({
+    label: "Not published",
+    hero: "This week's evidence did not qualify for a public estimate.",
+    body: "The weekly aggregate did not pass its fixed privacy release policy. No allowance number is inferred, and the policy does not disclose how close it was.",
+  }),
+  activity_only: Object.freeze({
+    label: "Activity only",
+    hero: "This release contains activity totals, not an allowance estimate.",
+    body: "The released aggregate contains delayed activity totals only. Activity is not an allowance, so no seven-day estimate is calculated from it.",
+  }),
+});
+
+function estimateState(snapshot) {
+  return Object.hasOwn(COMMUNITY_ESTIMATE_STATE_COPY, snapshot.state)
+    ? snapshot.state
+    : "activity_only";
+}
+
+/**
+ * Render the named public estimate gate without deriving a number from the
+ * current activity-only contract. The optional nodes are public-site-only;
+ * the in-app dashboard keeps its existing activity snapshot surface.
+ */
+export function renderCommunityEstimate({
+  documentRef,
+  container = null,
+  hero = null,
+  stateNode = null,
+  stateNodes = [],
+  snapshot,
+}) {
+  const { clear, node } = createDomHelpers(documentRef);
+  const state = estimateState(snapshot);
+  const copy = COMMUNITY_ESTIMATE_STATE_COPY[state];
+  if (container) {
+    clear(container);
+    container.append(node("p", "estimate-status-copy", copy.body));
+    const note = node(
+      "p",
+      "estimate-status-note",
+      "Current public data availability: no released allowance estimate.",
+    );
+    container.append(note);
+  }
+  if (hero) hero.textContent = copy.hero;
+  for (const item of [stateNode, ...stateNodes]) {
+    if (!item) continue;
+    item.textContent = copy.label;
+    item.className = "evidence-chip neutral";
+  }
+  return state;
+}
+
+/**
  * Renders one community snapshot payload.
  *
  * `detail` is optional: the public site shows the same provenance disclosure
@@ -199,6 +283,10 @@ export function renderCommunitySnapshot({
   documentRef,
   container,
   detail = null,
+  estimateContainer = null,
+  estimateHero = null,
+  estimateState = null,
+  estimateStates = [],
   payload,
   now = Date.now(),
 }) {
@@ -206,6 +294,14 @@ export function renderCommunitySnapshot({
   clear(container);
   if (detail) clear(detail);
   const snapshot = normalizeCommunitySnapshot(payload);
+  renderCommunityEstimate({
+    documentRef,
+    container: estimateContainer,
+    hero: estimateHero,
+    stateNode: estimateState,
+    stateNodes: estimateStates,
+    snapshot,
+  });
 
   if (snapshot.state === "service_unavailable") {
     container.append(
