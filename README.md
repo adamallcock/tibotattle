@@ -8,7 +8,8 @@ work would have cost at API prices, and how well token cost explains your quota
 consumption.
 
 Everything runs locally. Raw logs never leave your machine, and no prompt,
-response, file path, or account identifier ever enters any derived artifact.
+response, file path, or raw account identifier ever enters any derived
+artifact.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
@@ -73,6 +74,15 @@ resumable.
   from System Settings, and can remove an approval-pending request as well as
   an enabled item. This starts the normal app at login; it does not install a
   daemon, LaunchAgent, privileged helper, or separate background worker.
+- Optional macOS allowance notifications are **off by default** and local-only.
+  If enabled in **Settings → General**, they are evaluated only after the
+  existing foreground refresh receives fresh direct provider quota evidence.
+  Stale, inferred, mixed-source, unknown, unobserved, forecast, and
+  log-derived state never notifies; turning the same switch off immediately
+  stops future alerts and clears only their local pending/dedupe state.
+  The current provider receipt supplies a reset schedule but no reset identity,
+  so reset alerts are visibly unavailable rather than inferred from time or a
+  percentage change.
 - The dashboard binds to loopback only. The packaged app's network behavior is
   audited at build time (zero JavaScript and zero native network attempts in
   offline mode).

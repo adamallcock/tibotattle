@@ -1732,6 +1732,11 @@ async function compileLauncher(destination, updater, swiftSources) {
     // API directly.  The framework is provided by the OS and is not bundled.
     "-framework",
     "ServiceManagement",
+    // Native, opt-in local alerts use the macOS notification center only.
+    // This is a system framework; it adds no helper, service, or bundled
+    // network-capable dependency.
+    "-framework",
+    "UserNotifications",
     // The dashboard is hosted in-app. WebKit is a system framework, so this
     // adds no bundled binary and no new outbound reach: the embedded view is
     // pinned to the loopback companion origin by its navigation delegate.

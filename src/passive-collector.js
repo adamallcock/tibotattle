@@ -62,6 +62,16 @@ const INDEXING_STATUSES = new Set([
   "prospective_only",
   "bounded_pause",
 ]);
+// This deliberately narrow projection is the only quota evidence that the
+// native notification feature may consume.  It is built from the direct
+// `account/rateLimits/read` pass after that pass has committed a local record;
+// log-derived snapshots and app-server push notifications are not eligible.
+const QUOTA_NOTIFICATION_EVIDENCE_SCHEMA =
+  "tibotattle-notification-evidence-v2";
+const QUOTA_NOTIFICATION_WINDOW_MINUTES = new Set([300, 10_080]);
+const QUOTA_NOTIFICATION_SCOPE_DOMAIN =
+  "app-usagemonitor/quota-notification-continuity/v1\u0000";
+const OPENAI_SCOPE_ID_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;
 const ROLLOUT_FILENAME_TIME =
   /rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})/u;
 const DIAGNOSTIC_COUNT_FIELDS = Object.freeze([
@@ -1337,6 +1347,85 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
   return safe;
 }
 
+/**
+ * Return the closed, local-only notification projection for one freshly
+ * committed direct provider observation.  This is intentionally not a
+ * generic quota serializer: a missing continuity marker, unexpected schema,
+ * stale timestamp, or unfamiliar quota window suppresses notifications.
+ *
+ * The continuity key is a second one-way digest of the existing local
+ * account-scope HMAC.  It permits a local baseline to be partitioned without
+ * exposing a provider account subject to the loopback client or notification
+ * text.
+ */
+export function notificationEvidenceFromAppServerRecord(record) {
+  if (!record || typeof record !== "object"
+      || record.kind !== "codex_quota_snapshot"
+      || record.provider !== "openai_codex"
+      || record.source !== "app_server_read"
+      || record.stalenessMs !== 0
+      || record.observedAt !== record.receivedAt) return null;
+  const observedAt = record.observedAt;
+  const observedAtMs = typeof observedAt === "string" ? Date.parse(observedAt) : NaN;
+  if (!Number.isFinite(observedAtMs)
+      || new Date(observedAtMs).toISOString() !== observedAt) return null;
+
+  const accountScope = record.accountScope;
+  if (accountScope?.status !== "available"
+      || accountScope.version !== "openai-account-v1"
+      || !OPENAI_SCOPE_ID_PATTERN.test(accountScope.scopeId ?? "")) return null;
+  const continuityKey = createHash("sha256")
+    .update(QUOTA_NOTIFICATION_SCOPE_DOMAIN, "utf8")
+    .update(accountScope.scopeId, "utf8")
+    .digest("base64url");
+
+  if (!Array.isArray(record.windows) || record.windows.length === 0) return null;
+  const windows = [];
+  for (const window of record.windows) {
+    if (!window || typeof window !== "object"
+        || window.provider !== "openai_codex"
+        || window.limitId !== "codex"
+        || !["primary", "secondary"].includes(window.slot)
+        || typeof window.planType !== "string"
+        || window.planType.length === 0
+        || window.planType === "unknown"
+        || !Number.isFinite(window.usedPercent)
+        || window.usedPercent < 0
+        || window.usedPercent > 100
+        || !Number.isSafeInteger(window.windowDurationMins)
+        || !QUOTA_NOTIFICATION_WINDOW_MINUTES.has(window.windowDurationMins)
+        || !Number.isSafeInteger(window.resetsAt)
+        || window.resetsAt <= 0) return null;
+    const resetAtMs = window.resetsAt * 1_000;
+    if (!Number.isSafeInteger(resetAtMs)
+        || !Number.isFinite(new Date(resetAtMs).getTime())
+        || resetAtMs <= observedAtMs) return null;
+    windows.push({
+      lane: window.slot,
+      usedPercent: window.usedPercent,
+      durationMinutes: window.windowDurationMins,
+      resetAt: new Date(resetAtMs).toISOString(),
+      // `resetsAt` tells us which allowance window the provider currently
+      // reports. It is a schedule, not an observed reset event or stable
+      // provider reset identity. Keep that distinction explicit so native
+      // notification code can partition threshold dedupe without pretending
+      // that a later schedule has proved a reset occurred.
+      resetProofKind: "provider_reported_schedule_only",
+    });
+  }
+  windows.sort((left, right) => left.lane.localeCompare(right.lane));
+  return {
+    schemaVersion: QUOTA_NOTIFICATION_EVIDENCE_SCHEMA,
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt,
+    continuityKey,
+    windows,
+  };
+}
+
 async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret) {
   const rateLimits = await client.readRateLimits();
   const [account, accountUsage] = await Promise.all([
@@ -1678,6 +1767,12 @@ export async function runCollectorOnce({
           }),
         });
         refresh.recordWritten = record !== null;
+        if (record !== null) {
+          const notificationEvidence = notificationEvidenceFromAppServerRecord(record);
+          if (notificationEvidence !== null) {
+            refresh.notificationEvidence = notificationEvidence;
+          }
+        }
       } catch (error) {
         if (await readJsonIfExists(journalFile, null)) {
           const recovery = await recoverCollectorBatchJournal({ dataFile, checkpointFile, journalFile });

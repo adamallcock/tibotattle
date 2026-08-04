@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
@@ -47,6 +48,12 @@ const HEADLINE_READY_INDEXING_STATUSES = new Set([
   "prospective_only",
   "bounded_pause",
 ]);
+const QUOTA_NOTIFICATION_EVIDENCE_SCHEMA =
+  "tibotattle-notification-evidence-v2";
+const QUOTA_NOTIFICATION_DURATION_MINUTES = new Set([300, 10_080]);
+const QUOTA_NOTIFICATION_LANES = new Set(["primary", "secondary"]);
+const QUOTA_NOTIFICATION_CONTINUITY_KEY = /^[A-Za-z0-9_-]{43}$/u;
+const MAX_NOTIFICATION_EVIDENCE_AGE_MS = 5 * 60 * 1_000;
 
 function isResourceLimitedRefreshError(error) {
   const code = error?.code;
@@ -103,6 +110,87 @@ function safeCanonicalInstant(value) {
     : null;
 }
 
+function hasExactKeys(value, keys) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\u0000") === [...keys].sort().join("\u0000");
+}
+
+/**
+ * The loopback response deliberately exposes a closed, minimal notification
+ * contract instead of a dashboard/ledger projection.  Anything that is not
+ * a just-collected direct provider observation is omitted rather than being
+ * relabelled as fresh evidence for the native shell.
+ */
+function publicNotificationEvidence(value, now = Date.now()) {
+  const evidenceKeys = [
+    "continuityKey",
+    "freshness",
+    "observedAt",
+    "provider",
+    "schemaVersion",
+    "source",
+    "status",
+    "windows",
+  ];
+  if (!hasExactKeys(value, evidenceKeys)
+      || value.schemaVersion !== QUOTA_NOTIFICATION_EVIDENCE_SCHEMA
+      || value.status !== "fresh_provider_observation"
+      || value.provider !== "openai_codex"
+      || value.source !== "app_server_read"
+      || value.freshness !== "fresh"
+      || safeCanonicalInstant(value.observedAt) === null
+      || !QUOTA_NOTIFICATION_CONTINUITY_KEY.test(value.continuityKey)
+      || !Array.isArray(value.windows)
+      || value.windows.length < 1
+      || value.windows.length > QUOTA_NOTIFICATION_LANES.size) return null;
+  const ageMs = now - Date.parse(value.observedAt);
+  if (!Number.isFinite(now)
+      || !Number.isFinite(ageMs)
+      || ageMs < 0
+      || ageMs > MAX_NOTIFICATION_EVIDENCE_AGE_MS) return null;
+  const seenLanes = new Set();
+  const windows = [];
+  for (const window of value.windows) {
+    if (!hasExactKeys(window, [
+      "durationMinutes",
+      "lane",
+      "resetAt",
+      "resetProofKind",
+      "usedPercent",
+    ])
+        || !QUOTA_NOTIFICATION_LANES.has(window.lane)
+        || seenLanes.has(window.lane)
+        || !Number.isFinite(window.usedPercent)
+        || window.usedPercent < 0
+        || window.usedPercent > 100
+        || !Number.isSafeInteger(window.durationMinutes)
+        || !QUOTA_NOTIFICATION_DURATION_MINUTES.has(window.durationMinutes)
+        || safeCanonicalInstant(window.resetAt) === null
+        || Date.parse(window.resetAt) <= Date.parse(value.observedAt)
+        || window.resetProofKind !== "provider_reported_schedule_only") return null;
+    seenLanes.add(window.lane);
+    windows.push({
+      lane: window.lane,
+      usedPercent: window.usedPercent,
+      durationMinutes: window.durationMinutes,
+      resetAt: window.resetAt,
+      resetProofKind: "provider_reported_schedule_only",
+    });
+  }
+  return {
+    schemaVersion: QUOTA_NOTIFICATION_EVIDENCE_SCHEMA,
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: value.observedAt,
+    continuityKey: value.continuityKey,
+    windows: windows.sort((left, right) => left.lane.localeCompare(right.lane)),
+  };
+}
+
 function publicIndexingResult(value) {
   if (!value || !INDEXING_MODES.has(value.mode)
       || !INDEXING_STATUSES.has(value.status)
@@ -129,12 +217,16 @@ function publicIndexingResult(value) {
   };
 }
 
-function mergeCollectorPasses(early, continued) {
+function mergeCollectorPasses(early, continued, now = Date.now()) {
   const earlyRefresh = early?.refresh ?? {};
   const continuedRefresh = continued?.refresh ?? {};
   const latestAttempt = continuedRefresh.attempted === true
     ? continuedRefresh
     : earlyRefresh;
+  const notificationEvidence = publicNotificationEvidence(
+    latestAttempt?.notificationEvidence,
+    now,
+  );
   return {
     ...continued,
     rolloutRecordsWritten: addReportedCounts(
@@ -155,6 +247,9 @@ function mergeCollectorPasses(early, continued) {
         continuedRefresh.recordWritten,
       ),
       errorCode: latestAttempt?.errorCode ?? null,
+      ...(notificationEvidence === null
+        ? {}
+        : { notificationEvidence }),
     },
   };
 }
@@ -300,7 +395,7 @@ export function createLocalCollectorRefreshRunner({
       // Resume without the headline override so the collector's reviewed
       // normal-pass budget and source-consistency checks remain authoritative.
       const continued = await runCollector(collectorOptions);
-      result = mergeCollectorPasses(result, continued);
+      result = mergeCollectorPasses(result, continued, clock());
       if (collectorResourceLimit(continued) !== null) {
         throwCollectorResourceLimit();
       }
@@ -351,6 +446,10 @@ export function createLocalCollectorRefreshRunner({
         accountingRefreshStatus = "rebuilt";
       }
     }
+    const notificationEvidence = publicNotificationEvidence(
+      result?.refresh?.notificationEvidence,
+      clock(),
+    );
     return {
       rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
         ? result.rolloutRecordsWritten
@@ -363,6 +462,7 @@ export function createLocalCollectorRefreshRunner({
           ? safeCollectorErrorCode(result.refresh.errorCode)
           : null,
       },
+      ...(notificationEvidence === null ? {} : { notificationEvidence }),
       ...(accounting === null
         ? {}
         : {
@@ -383,7 +483,7 @@ export function createLocalCollectorRefreshRunner({
   };
 }
 
-function publicRefreshResult(result) {
+function publicRefreshResult(result, now = Date.now()) {
   const projected = {
     rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
       ? result.rolloutRecordsWritten
@@ -397,6 +497,13 @@ function publicRefreshResult(result) {
         : null,
     },
   };
+  const notificationEvidence = publicNotificationEvidence(
+    result?.notificationEvidence,
+    now,
+  );
+  if (notificationEvidence !== null) {
+    projected.notificationEvidence = notificationEvidence;
+  }
   const indexing = publicIndexingResult(result?.indexing);
   if (indexing !== null) projected.indexing = indexing;
   if (result?.accounting?.status === "replay_safe"
@@ -419,6 +526,7 @@ export class LocalCompanionRefreshController {
   #abortController = null;
   #cancelRequested = false;
   #clock;
+  #createRefreshId;
   #dataStore;
   #inFlight = null;
   #runner;
@@ -430,6 +538,7 @@ export class LocalCompanionRefreshController {
     dataStore,
     timeoutMs = 60_000,
     clock = () => Date.now(),
+    createRefreshId = randomUUID,
   }) {
     if (typeof runner !== "function") throw new TypeError("runner must be a function");
     if (!dataStore || typeof dataStore.reload !== "function") {
@@ -438,12 +547,17 @@ export class LocalCompanionRefreshController {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 5 * 60_000) {
       throw new TypeError("timeoutMs must be between 1,000 and 300,000");
     }
+    if (typeof createRefreshId !== "function") {
+      throw new TypeError("createRefreshId must be a function");
+    }
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
     this.#clock = clock;
+    this.#createRefreshId = createRefreshId;
     this.#state = {
       status: "idle",
+      refreshId: null,
       startedAt: null,
       finishedAt: null,
       result: null,
@@ -478,9 +592,15 @@ export class LocalCompanionRefreshController {
   start() {
     if (this.#inFlight !== null) return false;
     const startedAt = this.#clock();
+    const refreshId = this.#createRefreshId();
+    if (typeof refreshId !== "string"
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(refreshId)) {
+      throw new TypeError("createRefreshId must return a UUID");
+    }
     this.#cancelRequested = false;
     this.#state = {
       status: "running",
+      refreshId,
       startedAt: new Date(startedAt).toISOString(),
       finishedAt: null,
       result: null,
@@ -528,9 +648,10 @@ export class LocalCompanionRefreshController {
           }
           this.#state = {
             status: "cancelled",
+            refreshId: this.#state.refreshId,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
-            result: publicRefreshResult(result),
+            result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
               ?? this.#state.progress,
             quickResultAt: this.#state.quickResultAt,
@@ -547,10 +668,11 @@ export class LocalCompanionRefreshController {
           }
           this.#state = {
             status: "failed",
+            refreshId: this.#state.refreshId,
             startedAt: this.#state.startedAt,
             finishedAt: this.#state.finishedAt
               ?? new Date(this.#clock()).toISOString(),
-            result: publicRefreshResult(result),
+            result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
               ?? this.#state.progress,
             quickResultAt: this.#state.quickResultAt,
@@ -562,9 +684,10 @@ export class LocalCompanionRefreshController {
         const finalProgress = publicIndexingResult(result?.indexing);
         this.#state = {
           status: "succeeded",
+          refreshId: this.#state.refreshId,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
-          result: publicRefreshResult(result),
+          result: publicRefreshResult(result, this.#clock()),
           progress: finalProgress?.status === "bounded_pause"
               && this.#state.quickResultAt !== null
             ? { ...finalProgress, phase: "quick_result" }
@@ -577,6 +700,7 @@ export class LocalCompanionRefreshController {
         if (this.#cancelRequested) {
           this.#state = {
             status: "cancelled",
+            refreshId: this.#state.refreshId,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
             result: null,
@@ -589,6 +713,7 @@ export class LocalCompanionRefreshController {
         if (timedOut) return;
         this.#state = {
           status: "failed",
+          refreshId: this.#state.refreshId,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
           result: null,
@@ -610,6 +735,7 @@ export class LocalCompanionRefreshController {
       controller.abort();
       this.#state = {
         status: "failed",
+        refreshId: this.#state.refreshId,
         startedAt: this.#state.startedAt,
         finishedAt: new Date(this.#clock()).toISOString(),
         result: null,

@@ -319,6 +319,15 @@ There is no:
 - complete uninstall guide; or
 - clean removal of `~/Library/Application Support/Usage Monitor`.
 
+Historical-scope note (updated 2026-08-03): this audit correctly describes the
+then-current build. TiboTattle now has a narrower native macOS capability:
+opt-in, local-only allowance threshold notifications sourced only from a fresh
+direct provider quota observation. Reset alerts remain suppressed because the
+current receipt offers a schedule rather than an explicit reset identity. It
+does **not** notify when longer
+work completes, run while closed, add a login item/daemon, collect an email or
+push identity, or turn stale/inferred/mixed/unobserved state into an alert.
+
 Dragging the application to Trash leaves its local state and Keychain
 capabilities behind.
 

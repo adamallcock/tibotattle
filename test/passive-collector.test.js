@@ -14,6 +14,7 @@ import {
   commitCollectorRecordBatch,
   discoverCollectorRollouts,
   ingestRolloutUpdates,
+  notificationEvidenceFromAppServerRecord,
   recoverCollectorBatchJournal,
   runCollectorForeground,
   runCollectorOnce,
@@ -1135,6 +1136,71 @@ test("notification event identity deduplicates repeated snapshots without retain
   assert.equal(JSON.stringify(first).includes("fixture"), false);
 });
 
+test("fresh direct app-server records expose a closed local notification projection", () => {
+  assert.equal(notificationEvidenceFromAppServerRecord(null), null);
+  const rateLimit = appPayload(84).rateLimits;
+  const record = appServerSnapshotRecord({
+    accountScope: {
+      status: "available",
+      reason: null,
+      version: "openai-account-v1",
+      scopeId: `openai-account:v1:${"A".repeat(43)}`,
+      planType: "pro",
+    },
+    canonical: rateLimit,
+    byLimitId: { codex: rateLimit },
+  }, {
+    source: "app_server_read",
+    receivedAt: "2026-07-23T00:00:00.000Z",
+  });
+  const evidence = notificationEvidenceFromAppServerRecord(record);
+  assert.deepEqual(evidence, {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: "2026-07-23T00:00:00.000Z",
+    continuityKey: evidence.continuityKey,
+    windows: [{
+      lane: "primary",
+      usedPercent: 84,
+      durationMinutes: 10080,
+      resetAt: new Date(1784854800 * 1_000).toISOString(),
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  });
+  assert.match(evidence.continuityKey, /^[A-Za-z0-9_-]{43}$/u);
+  const serialized = JSON.stringify(evidence);
+  assert.equal(serialized.includes(record.accountScope.scopeId), false);
+  assert.equal(serialized.includes("planType"), false);
+  assert.equal(
+    notificationEvidenceFromAppServerRecord({
+      ...record,
+      source: "app_server_notification",
+    }),
+    null,
+  );
+  assert.equal(
+    notificationEvidenceFromAppServerRecord({ ...record, stalenessMs: 1 }),
+    null,
+  );
+  assert.equal(
+    notificationEvidenceFromAppServerRecord({
+      ...record,
+      accountScope: { ...record.accountScope, scopeId: null },
+    }),
+    null,
+  );
+  assert.equal(
+    notificationEvidenceFromAppServerRecord({
+      ...record,
+      windows: [{ ...record.windows[0], windowDurationMins: 60 }],
+    }),
+    null,
+  );
+});
+
 test("a fresh app-server account marker provisionally scopes only new nearby rollout events", async () => {
   const fixture = await collectorFixture();
   const accountSecret = Buffer.alloc(32, 81);
@@ -1146,13 +1212,26 @@ test("a fresh app-server account marker provisionally scopes only new nearby rol
     close() {}
   }
   try {
-    await runCollectorOnce({
+    const firstRefresh = await runCollectorOnce({
       ...fixture,
       staleAfterMs: 0,
       appServerFactory: () => new ScopedClient(),
       loadAccountObservationSecret: async () => Buffer.from(accountSecret),
       clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
     });
+    assert.equal(
+      firstRefresh.refresh.notificationEvidence?.source,
+      "app_server_read",
+    );
+    assert.match(
+      firstRefresh.refresh.notificationEvidence?.continuityKey ?? "",
+      /^[A-Za-z0-9_-]{43}$/u,
+    );
+    assert.equal(
+      JSON.stringify(firstRefresh.refresh.notificationEvidence)
+        .includes("private.owner"),
+      false,
+    );
     await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 2)}\n`);
     await runCollectorOnce({
       ...fixture,
