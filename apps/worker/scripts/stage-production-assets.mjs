@@ -34,18 +34,26 @@ export const PRODUCTION_ASSET_DIRECTORY = join(
 
 const RELEASE_MANIFEST_BASENAME = "release-site-manifest.json";
 const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
+  "404.html",
+  "apple.svg",
+  "community-data.js",
   "community-view.js",
   "community.js",
+  "community.html",
+  "docs.html",
+  "github.svg",
   "i18n.generated.js",
   "index.html",
   "localization.js",
+  "install-cta.js",
+  "privacy.html",
   "robots.txt",
   "social-preview.png",
   "styles.css",
-  // The reviewed app mark is a public brand asset of the landing page, not a
-  // loopback/dashboard surface. It must travel with the generated page.
   "tibotattle-icon.png",
+  "tibotattle-weekly-preview.jpg",
   "ui-format.js",
+  "x.svg",
 ]);
 const PUBLIC_RELEASE_ASSET_SET = new Set(PUBLIC_RELEASE_ASSET_BASENAMES);
 const LOCAL_ONLY_BASENAMES = Object.freeze([
@@ -258,6 +266,7 @@ async function verifiedGeneratedFiles(sourceDirectory) {
   }
   const textAssetNames = actualFiles
     .map(({ path }) => path)
+    .filter((path) => path !== RELEASE_MANIFEST_BASENAME)
     .filter((path) => /\.(?:css|html|js|json|txt)$/u.test(path));
   for (const name of textAssetNames) {
     const contents = await readFile(join(sourceDirectory, name), "utf8");

@@ -16,10 +16,6 @@ import { deflateSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 import {
-  PRODUCT_BRAND,
-  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-} from "../config/product-brand.js";
-import {
   buildPublicReleaseSite,
   verifyPublishedInstallerRemote,
 } from "../scripts/build-public-release-site.js";
@@ -89,7 +85,6 @@ function sourceHtml() {
     '<meta name="usage-monitor-privacy-url" content="">',
     '<meta name="usage-monitor-security-url" content="">',
     '<meta name="usage-monitor-support-url" content="">',
-    `<meta name="usage-monitor-semantic-open-target" content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
     '<link rel="canonical" href="">',
     '<meta property="og:type" content="website">',
     '<meta property="og:url" content="">',
@@ -372,13 +367,6 @@ test("release-site build verifies artifacts and materializes complete public met
     html,
     /usage-monitor-architectures" content="arm64"/u,
   );
-  assert.equal(
-    html.includes(
-      `<meta name="usage-monitor-semantic-open-target" content="${PRODUCT_BRAND.appOpenURL}">`,
-    ),
-    true,
-  );
-  assert.equal(html.includes(SEMANTIC_OPEN_TARGET_PLACEHOLDER), false);
   assert.match(
     html,
     /<link rel="canonical" href="https:\/\/usagemonitor\.app\/">/u,
@@ -478,7 +466,7 @@ test("no-installer release-site build succeeds without installer claims and disa
   );
 });
 
-test("public static routes keep root, community, privacy, and fallback out of the loopback dashboard", async (t) => {
+test("public static routes keep root, community, docs, privacy, and fallback out of the loopback dashboard", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
   const noInstallerArgs = {
@@ -505,6 +493,7 @@ test("public static routes keep root, community, privacy, and fallback out of th
     ["/", 200],
     ["/community", 200],
     ["/privacy", 200],
+    ["/docs", 200],
     ["/unknown/fallback", 404],
   ]) {
     const response = await fetch(`${routeServer.baseUrl}${route}`);
@@ -515,6 +504,7 @@ test("public static routes keep root, community, privacy, and fallback out of th
   const root = responses.get("/");
   const community = responses.get("/community");
   const privacy = responses.get("/privacy");
+  const docs = responses.get("/docs");
   const fallback = responses.get("/unknown/fallback");
   for (const [route, html] of [
     ["/", root],
@@ -530,6 +520,7 @@ test("public static routes keep root, community, privacy, and fallback out of th
       'src="./data-client.js"',
       'src="./navigation.js"',
       'id="refresh-button"',
+      'id="open-installed-app"',
       'id="contribution-form"',
       'id="identity-signin"',
       'class="dashboard-shell"',
@@ -547,6 +538,8 @@ test("public static routes keep root, community, privacy, and fallback out of th
   assert.match(privacy, /<h1>Your dashboard belongs on your Mac\.<\/h1>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.doesNotMatch(privacy, /<script\b/iu);
+  assert.match(docs, /<h1>TiboTattle, from download to dashboard\.<\/h1>/u);
+  assert.doesNotMatch(docs, /<script\b/iu);
   assert.equal(fallback, root, "the fallback must return the public entry, not the dashboard");
 
   for (const forbiddenAsset of [
@@ -752,6 +745,7 @@ test("checked-in public source satisfies the complete release contract", async (
       'id="quota-cards"',
       'id="weekly-chart"',
       'id="refresh-button"',
+      'id="open-installed-app"',
     ]
   ) {
     assert.equal(publishedHtml.includes(dashboardOnly), false, dashboardOnly);
@@ -1044,28 +1038,15 @@ test("release-site source must expose each empty metadata slot exactly once", as
   );
 });
 
-test("release-site source must expose the semantic open target placeholder exactly once", async (t) => {
+test("release-site source rejects local app-open controls", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
-  const semanticMeta =
-    `<meta name="usage-monitor-semantic-open-target" `
-    + `content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`;
-
   await writeFile(
     join(value.source, "community.html"),
-    sourceHtml().replace(semanticMeta, ""),
+    `${sourceHtml()}<a id="open-installed-app">Open</a>\n`,
   );
   await assert.rejects(
     buildFixtureSite(releaseArgs(value)),
-    /exactly one semantic open target placeholder/u,
-  );
-
-  await writeFile(
-    join(value.source, "community.html"),
-    sourceHtml().replace(semanticMeta, `${semanticMeta}\n${semanticMeta}`),
-  );
-  await assert.rejects(
-    buildFixtureSite(releaseArgs(value)),
-    /exactly one semantic open target placeholder/u,
+    /local-only route or control: id="open-installed-app"/u,
   );
 });

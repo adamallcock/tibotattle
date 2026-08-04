@@ -34,7 +34,6 @@ import {
   renderCommunitySnapshot as renderSharedCommunitySnapshot,
 } from "./community-view.js";
 import {
-  configuredSemanticOpenTarget,
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
 import {
@@ -156,6 +155,16 @@ function rawNode(tag, className, value) {
   const element = node(tag, className, value == null ? "" : String(value));
   element.setAttribute("data-i18n-skip", "");
   return element;
+}
+
+function configuredSemanticOpenTarget(documentRef) {
+  const target = documentRef
+    .querySelector('meta[name="usage-monitor-semantic-open-target"]')
+    ?.getAttribute("content")
+    ?.trim();
+  return target && /^[a-z][a-z0-9+.-]*:\/\/open$/iu.test(target)
+    ? target
+    : null;
 }
 
 const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget(document);

@@ -3,9 +3,6 @@ import { test } from "node:test";
 import { readFile } from "node:fs/promises";
 
 import {
-  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-} from "../../../config/product-brand.js";
-import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   PublicCommunityClient,
 } from "../public/community-data.js";
@@ -15,7 +12,6 @@ import {
 } from "../public/community-view.js";
 import {
   configuredInstallerRelease,
-  configuredSemanticOpenTarget,
   formatInstallerSize,
   renderInstallerJourney,
 } from "../public/install-cta.js";
@@ -158,7 +154,7 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="installer-unavailable-action"/u);
   assert.match(html, /id="installer-details"/u);
   assert.match(html, /id="installer-unavailable"/u);
-  assert.match(html, /id="open-installed-app"/u);
+  assert.doesNotMatch(html, /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\//u);
   assert.match(html, /id="community-result"/u);
   assert.match(html, /id="community-snapshot-service-detail"/u);
   assert.match(html, /id="community-service-state"/u);
@@ -246,10 +242,6 @@ test("the public site presents only the install call to action and the community
       name,
     );
   }
-  assert.equal(
-    html.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1,
-    1,
-  );
 });
 
 test("the public community client exposes one read-only aggregate request", async () => {
@@ -301,14 +293,12 @@ test("the public community client exposes one read-only aggregate request", asyn
   );
 });
 
-test("the first visit leads with the product, combined Mac action, and snapshot-only community view", async () => {
+test("the first visit leads with the product, Mac download action, and snapshot-only community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
   assert.match(html, /local-first Mac app for understanding personal Codex\s+usage/u);
   assert.match(html, /estimates your personal seven-day allowance in\s+API-equivalent terms/u);
   assert.match(html, /Download for macOS/u);
-  assert.match(html, /Already installed\?/u);
-  assert.match(html, /Open TiboTattle/u);
   assert.match(html, /Delayed community activity/u);
   assert.match(html, /Community activity snapshot/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
@@ -572,12 +562,10 @@ test("the install card refuses a partially injected release", () => {
     "usage-monitor-privacy-url": "https://example.org/privacy",
     "usage-monitor-security-url": "https://example.org/security",
     "usage-monitor-support-url": "https://example.org/support",
-    "usage-monitor-semantic-open-target": "usagemonitor://open",
   };
   const ready = fakeDocument(complete);
   const release = configuredInstallerRelease(ready);
   assert.equal(release.version, "1.2.3");
-  assert.equal(configuredSemanticOpenTarget(ready), "usagemonitor://open");
   assert.equal(formatInstallerSize(12_582_912), "12 MiB download");
   assert.equal(renderInstallerJourney(ready)?.version, "1.2.3");
   assert.equal(ready.byId.get("installer-link").hidden, false);
@@ -628,10 +616,4 @@ test("the install card refuses a partially injected release", () => {
       false,
     );
   }
-  assert.equal(
-    configuredSemanticOpenTarget(fakeDocument({
-      "usage-monitor-semantic-open-target": "https://example.org/open",
-    })),
-    null,
-  );
 });

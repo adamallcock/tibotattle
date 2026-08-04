@@ -14,7 +14,6 @@
 import { PublicCommunityClient } from "./community-data.js";
 import { renderCommunitySnapshot } from "./community-view.js";
 import {
-  configuredSemanticOpenTarget,
   renderInstallerJourney,
 } from "./install-cta.js";
 import { createBrowserLocalization, translate } from "./localization.js";
@@ -59,28 +58,6 @@ function publicRequestId(candidate) {
   return typeof candidate === "string" && publicRequestIdPattern.test(candidate)
     ? candidate
     : "";
-}
-
-function bindInstalledAppLink() {
-  const link = $("#open-installed-app");
-  const copy = $(".open-installed-copy");
-  const target = configuredSemanticOpenTarget(document);
-  if (target) {
-    link.href = target;
-    copy.hidden = false;
-  } else {
-    link.removeAttribute("href");
-    copy.hidden = true;
-  }
-  link.addEventListener("click", () => {
-    if (!target) return;
-    const status = $("#open-installed-app-status");
-    status.hidden = false;
-    localization.setLegacyText(
-      status,
-      "Opening TiboTattle… If no app appears, install the signed Mac download above, then try again.",
-    );
-  });
 }
 
 /**
@@ -183,7 +160,6 @@ async function loadCommunitySnapshot() {
 }
 
 if (typeof document !== "undefined") {
-  bindInstalledAppLink();
   renderPublicInstallerJourney();
   void loadCommunitySnapshot();
   window.addEventListener("tibotattle:locale-change", (event) => {

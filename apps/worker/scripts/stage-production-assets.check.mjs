@@ -25,10 +25,26 @@ async function fixture() {
   await mkdir(source, { recursive: true });
   await writeFile(join(root, ".gitignore"), ".release-build/\n");
   const generatedFiles = {
+    "404.html": "<!doctype html><title>public fallback</title>\n",
+    "apple.svg": "<svg></svg>\n",
+    "community-data.js": "export const communityData = true;\n",
+    "community-view.js": "export const communityView = true;\n",
+    "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "community.js": "console.log('community');\n",
+    "docs.html": "<!doctype html><title>public docs</title>\n",
+    "github.svg": "<svg></svg>\n",
+    "i18n.generated.js": "export const messages = {};\n",
     "index.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
+    "install-cta.js": "export const installCta = true;\n",
+    "localization.js": "export const localization = true;\n",
+    "privacy.html": "<!doctype html><title>public privacy</title>\n",
+    "robots.txt": "User-agent: *\nAllow: /\n",
+    "social-preview.png": "reviewed social preview\n",
     "styles.css": "body { color: green; }\n",
     "tibotattle-icon.png": Buffer.from("reviewed public brand asset\n"),
+    "tibotattle-weekly-preview.jpg": "reviewed weekly preview\n",
+    "ui-format.js": "export const uiFormat = true;\n",
+    "x.svg": "<svg></svg>\n",
   };
   const manifest = {
     schemaVersion: "usage-monitor-release-site-manifest-v0.2",
@@ -136,7 +152,7 @@ test("stages only verified generated public assets and maps the community entry 
     sourceDirectory: value.source,
     destinationDirectory: value.destination,
   });
-  assert.equal(result.files, 5);
+  assert.equal(result.files, Object.keys(value.generatedFiles).length + 1);
   assert.equal(
     await readFile(join(value.destination, "index.html"), "utf8"),
     value.generatedFiles["index.html"],
@@ -149,12 +165,23 @@ test("stages only verified generated public assets and maps the community entry 
     await readFile(join(value.destination, "tibotattle-icon.png")),
     value.generatedFiles["tibotattle-icon.png"],
   );
+  for (const publicRoute of [
+    "404.html",
+    "community.html",
+    "docs.html",
+    "index.html",
+    "privacy.html",
+  ]) {
+    assert.equal(
+      await readFile(join(value.destination, publicRoute), "utf8"),
+      value.generatedFiles[publicRoute],
+      publicRoute,
+    );
+  }
   for (const withheld of [
     "admin.js",
     "app.js",
-    "community.html",
     "data-client.js",
-    "install-cta.js",
     "navigation.js",
   ]) {
     await assert.rejects(

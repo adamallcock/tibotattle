@@ -3566,11 +3566,9 @@ test("first run is a truthful install and local preflight journey", async () => 
     installSource,
     /export function configuredInstallerRelease\(documentRef\)/u,
   );
-  assert.match(
-    installSource,
-    /export function configuredSemanticOpenTarget\(documentRef\)/u,
-  );
+  assert.doesNotMatch(installSource, /configuredSemanticOpenTarget|usage-monitor-semantic-open-target/u);
   assert.match(appSource, /from "\.\/install-cta\.js"/u);
+  assert.match(appSource, /function configuredSemanticOpenTarget\(documentRef\)/u);
   assert.match(appSource, /const SEMANTIC_OPEN_TARGET = configuredSemanticOpenTarget\(document\);/u);
   assert.match(appSource, /installedAppLink\.href = SEMANTIC_OPEN_TARGET/u);
   assert.doesNotMatch(appSource, /usagemonitor:\/\/open/u);

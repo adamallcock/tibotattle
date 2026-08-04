@@ -24,10 +24,6 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  PRODUCT_BRAND,
-  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-} from "../config/product-brand.js";
-import {
   collectMacOSWebModuleGraph,
 } from "./build-macos-app.js";
 import {
@@ -75,7 +71,6 @@ const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
 const MAXIMUM_SOCIAL_PREVIEW_BYTES = 10 * 1024 * 1024;
 const INSTALLER_FETCH_TIMEOUT_MS = 120_000;
 const MAXIMUM_INSTALLER_REDIRECTS = 5;
-const SEMANTIC_OPEN_TARGET_META_NAME = "usage-monitor-semantic-open-target";
 const INSTALLER_META = Object.freeze({
   "usage-monitor-installer-url": "installerUrl",
   "usage-monitor-installer-version": "installerVersion",
@@ -144,6 +139,7 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   'id="signin"',
   'id="admin"',
   'id="app-open"',
+  'id="open-installed-app"',
   'id="contribution-',
   'id="identity-',
   'id="sign-in-',
@@ -165,6 +161,8 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "/signin",
   "/contribution",
   "/admin",
+  "usage-monitor-semantic-open-target",
+  "usagemonitor://",
 ]);
 const REQUIRED_STATIC_SOCIAL_TAGS = Object.freeze([
   '<meta property="og:type" content="website">',
@@ -639,23 +637,6 @@ function replaceExactlyOnce(html, token, replacement, label) {
 
 function injectReleaseMetadata(html, values) {
   let output = html;
-  const semanticPlaceholderCount =
-    output.split(SEMANTIC_OPEN_TARGET_PLACEHOLDER).length - 1;
-  if (semanticPlaceholderCount !== 1) {
-    throw new TypeError(
-      "Source must contain exactly one semantic open target placeholder",
-    );
-  }
-  const semanticMetaToken =
-    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
-    + `content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`;
-  output = replaceExactlyOnce(
-    output,
-    semanticMetaToken,
-    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
-      + `content="${htmlAttribute(PRODUCT_BRAND.appOpenURL)}">`,
-    "semantic open target meta placeholder",
-  );
   for (const [name, valueKey] of Object.entries(SITE_META)) {
     const token = `<meta name="${name}" content="">`;
     output = replaceExactlyOnce(
@@ -1146,15 +1127,6 @@ export async function buildPublicReleaseSite(rawArgs, {
   } else if (Object.keys(INSTALLER_META).some((name) =>
     verifiedHtml.includes(`<meta name="${name}"`))) {
     throw new Error("No-installer release output retained installer metadata");
-  }
-  const semanticTargetMeta =
-    `<meta name="${SEMANTIC_OPEN_TARGET_META_NAME}" `
-    + `content="${htmlAttribute(PRODUCT_BRAND.appOpenURL)}">`;
-  if (verifiedHtml.includes(SEMANTIC_OPEN_TARGET_PLACEHOLDER)
-      || verifiedHtml.split(semanticTargetMeta).length - 1 !== 1) {
-    throw new Error(
-      "Release output did not contain exactly one configured semantic open target",
-    );
   }
   for (const token of [
     '<link rel="canonical" href="">',

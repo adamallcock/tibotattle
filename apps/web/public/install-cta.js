@@ -15,16 +15,6 @@ function defaultMessage(key, values = {}) {
   return translate(key, values, DEFAULT_LOCALE);
 }
 
-export function configuredSemanticOpenTarget(documentRef) {
-  const target = documentRef
-    .querySelector('meta[name="usage-monitor-semantic-open-target"]')
-    ?.getAttribute("content")
-    ?.trim();
-  return target && /^[a-z][a-z0-9+.-]*:\/\/open$/iu.test(target)
-    ? target
-    : null;
-}
-
 function configuredInstallerUrl(documentRef) {
   const raw = documentRef
     .querySelector('meta[name="usage-monitor-installer-url"]')
