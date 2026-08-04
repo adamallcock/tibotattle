@@ -22,6 +22,7 @@ export const REQUIRED_PRIMARY_MIGRATIONS = Object.freeze([
   "0025_device_lifecycle.sql",
   "0026_signin_start_admission.sql",
   "0027_identity_reenrollment_cooldown_guard.sql",
+  "0028_identity_link_secret_configuration.sql",
 ]);
 
 const DATABASES = Object.freeze([
@@ -31,6 +32,8 @@ const DATABASES = Object.freeze([
     migrationsDir: "deletion-ledger-migrations",
   }),
 ]);
+
+const IDENTITY_LINK_SECRET_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 
 export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["table", "collection_controls"],
@@ -42,6 +45,7 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["table", "device_pairing_events"],
   ["table", "sign_in_start_admission_windows"],
   ["table", "identity_reenrollment_cooldowns"],
+  ["table", "identity_link_secret_configuration"],
   ["index", "community_aggregate_exclusions_participant"],
   ["index", "apple_signin_handoffs_expires_at"],
   ["index", "device_credentials_social_recheck"],
@@ -134,6 +138,12 @@ export const REQUIRED_COLUMNS = Object.freeze({
     "deleted_at",
     "retain_until",
   ]),
+  identity_link_secret_configuration: Object.freeze([
+    "singleton",
+    "key_version",
+    "secret_fingerprint",
+    "recorded_at",
+  ]),
 });
 
 export const REQUIRED_DELETION_LEDGER_COLUMNS = Object.freeze({
@@ -166,6 +176,11 @@ function disabledEnvironment(environment, expectedName) {
     && vars.UPLOAD_INGRESS_QUEUE_MODE === "disabled");
 }
 
+function configuredIdentityLinkSecretVersion(environment) {
+  const value = objectRecord(environment?.vars)?.IDENTITY_LINK_SECRET_VERSION;
+  return typeof value === "string" && IDENTITY_LINK_SECRET_VERSION_PATTERN.test(value);
+}
+
 export function assessDisabledEnrollmentConfiguration(config) {
   const checks = {
     stagingEnrollmentDisabled: disabledEnvironment(
@@ -176,6 +191,10 @@ export function assessDisabledEnrollmentConfiguration(config) {
       config?.env?.production,
       "production",
     ),
+    stagingIdentityLinkSecretVersionConfigured:
+      configuredIdentityLinkSecretVersion(config?.env?.staging),
+    productionIdentityLinkSecretVersionConfigured:
+      configuredIdentityLinkSecretVersion(config?.env?.production),
   };
   const blockers = Object.entries(checks)
     .filter(([, ok]) => !ok)
@@ -339,7 +358,7 @@ function baseReceipt(configChecks) {
     },
     blockers: [...configChecks.blockers],
     evidence: {
-      migrationWindow: "0023-0027",
+      migrationWindow: "0023-0028",
       database: "USAGE_MONITOR_DB",
       rollbackRestoreEquivalent: "isolated_cleanup",
     },

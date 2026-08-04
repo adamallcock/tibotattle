@@ -31,6 +31,7 @@ function safeConfig() {
           ENROLLMENT_MODE: "disabled",
           ACCOUNT_SCOPED_INGEST_MODE: "disabled",
           UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+          IDENTITY_LINK_SECRET_VERSION: "staging-v1",
         },
       },
       production: {
@@ -39,6 +40,7 @@ function safeConfig() {
           ENROLLMENT_MODE: "disabled",
           ACCOUNT_SCOPED_INGEST_MODE: "disabled",
           UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+          IDENTITY_LINK_SECRET_VERSION: "production-v1",
         },
       },
     },
@@ -82,6 +84,8 @@ test("disabled enrollment config is required and reports booleans only", () => {
     checks: {
       stagingEnrollmentDisabled: true,
       productionEnrollmentDisabled: true,
+      stagingIdentityLinkSecretVersionConfigured: true,
+      productionIdentityLinkSecretVersionConfigured: true,
     },
     blockers: [],
   });
@@ -90,6 +94,13 @@ test("disabled enrollment config is required and reports booleans only", () => {
   assert.equal(blocked.ok, false);
   assert.deepEqual(blocked.blockers, ["CONFIG_STAGING_ENROLLMENT_DISABLED"]);
   assert.equal(typeof blocked.checks.stagingEnrollmentDisabled, "boolean");
+  delete config.env.production.vars.IDENTITY_LINK_SECRET_VERSION;
+  const missingVersion = assessDisabledEnrollmentConfiguration(config);
+  assert.equal(missingVersion.ok, false);
+  assert.deepEqual(missingVersion.blockers, [
+    "CONFIG_STAGING_ENROLLMENT_DISABLED",
+    "CONFIG_PRODUCTION_IDENTITY_LINK_SECRET_VERSION_CONFIGURED",
+  ]);
 });
 
 test("release preflight applies both local migration streams, checks schema, and cleans state", async () => {
@@ -169,6 +180,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.requiredSchemaPresent, true);
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
+  assert.equal(result.evidence.migrationWindow, "0023-0028");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 2);

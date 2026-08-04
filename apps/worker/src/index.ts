@@ -114,6 +114,7 @@ import {
   googleCodeChallenge,
   googleSignInConfiguration,
 } from "./identity-google";
+import { assertPinnedIdentityLinkSecretConfiguration } from "./identity-link-configuration";
 import { identityRequired, verifyHostedIdentity } from "./identity-oidc";
 import {
   completeAppleSignInHandoff,
@@ -461,6 +462,13 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   if (identityRequired(env) && !identityProvided) {
     throw new ApiError(401, "IDENTITY_REQUIRED");
   }
+  if (identityRequired(env)) {
+    await assertPinnedIdentityLinkSecretConfiguration(
+      env.USAGE_MONITOR_DB,
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+    );
+  }
   const verifiedIdentity = identityProvided
     ? await consumeHostedIdentityProof(env.USAGE_MONITOR_DB, identityValue)
     : null;
@@ -578,6 +586,13 @@ async function assertHostedSignInStartAllowed(env: Env): Promise<void> {
   // before an edge budget, coordinated admission slot, or provider redirect so
   // a temporarily paused service cannot create stranded OAuth handoffs.
   await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+  if (identityRequired(env)) {
+    await assertPinnedIdentityLinkSecretConfiguration(
+      env.USAGE_MONITOR_DB,
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+    );
+  }
 }
 
 /**
@@ -985,6 +1000,13 @@ async function handleIdentityAppleCallback(
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
+    if (identityRequired(env)) {
+      await assertPinnedIdentityLinkSecretConfiguration(
+        env.USAGE_MONITOR_DB,
+        Reflect.get(env, "IDENTITY_LINK_SECRET"),
+        Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+      );
+    }
     const idToken = await exchangeAppleAuthorizationCode(env, code, redirectUri);
     verified = await verifiedHostedCallbackIdentity(env, "apple", idToken, {
       // The offline harness intentionally has no signed Apple token. Hosted
@@ -1166,6 +1188,13 @@ async function handleIdentityGoogleCallback(
   if (!pending) return failure;
   let verified: { provider: "apple" | "google"; linkKeyHex: string };
   try {
+    if (identityRequired(env)) {
+      await assertPinnedIdentityLinkSecretConfiguration(
+        env.USAGE_MONITOR_DB,
+        Reflect.get(env, "IDENTITY_LINK_SECRET"),
+        Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+      );
+    }
     const idToken = await exchangeGoogleAuthorizationCode(
       env,
       code,
@@ -2148,6 +2177,13 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
   if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
   const session = await personalSession(request, env, true, true);
   assertCsrf(request, session);
+  if (identityRequired(env)) {
+    await assertPinnedIdentityLinkSecretConfiguration(
+      env.USAGE_MONITOR_DB,
+      Reflect.get(env, "IDENTITY_LINK_SECRET"),
+      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
+    );
+  }
   if (session.participantState === "active") {
     await markParticipantDeleting(
       env.USAGE_MONITOR_DB,

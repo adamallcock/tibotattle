@@ -156,7 +156,8 @@
         "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
         "UPLOAD_INGRESS_BURST": "16",
         "UPLOAD_INGRESS_LEASE_SECONDS": "90",
-        "SIGN_IN_START_MAX_PER_MINUTE": "5"
+        "SIGN_IN_START_MAX_PER_MINUTE": "5",
+        "IDENTITY_LINK_SECRET_VERSION": "staging-v1"
       },
       "secrets": {
         "required": [
@@ -279,6 +280,10 @@
         "UPLOAD_INGRESS_BURST": "16",
         "UPLOAD_INGRESS_LEASE_SECONDS": "90",
         "SIGN_IN_START_MAX_PER_MINUTE": "20",
+        // A non-secret immutable label paired with the keyed fingerprint in
+        // D1. Changing either it or IDENTITY_LINK_SECRET fails closed until a
+        // separately reviewed dual-key identity migration exists.
+        "IDENTITY_LINK_SECRET_VERSION": "production-v1",
         "GOOGLE_OIDC_CLIENT_ID": "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com",
         // Web Sign in with Apple. APPLE_SERVICES_ID is the Apple Services ID:
         // it is the OAuth client_id, the subject of the ES256 client secret,

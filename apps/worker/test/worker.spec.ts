@@ -1429,6 +1429,7 @@ describe("synthetic usage monitor service", () => {
       GOOGLE_OIDC_CLIENT_ID: GOOGLE_CLIENT,
       APPLE_SERVICES_ID: APPLE_CLIENT,
       IDENTITY_LINK_SECRET: "identity-link-secret-for-tests-0123456789abcdef",
+      IDENTITY_LINK_SECRET_VERSION: "test-v1",
       ...overrides,
     } as unknown as Partial<Env>);
   }
@@ -5098,6 +5099,68 @@ describe("synthetic usage monitor service", () => {
       expect(await recovery.json()).toMatchObject({
         error: { code: "IDENTITY_REQUIRED" },
       });
+    });
+
+    it("pins the hosted identity key configuration and rejects an in-place rotation", async () => {
+      const production = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+      });
+      const first = await identityEnroll(
+        await sha256Hex("test-hosted-identity\\0configuration-pin-first"),
+        "google",
+        production,
+      );
+      expect(first.status).toBe(201);
+      const pinned = await production.USAGE_MONITOR_DB.prepare(
+        `SELECT key_version, secret_fingerprint
+           FROM identity_link_secret_configuration
+          WHERE singleton = 1`,
+      ).first<{ key_version: string; secret_fingerprint: string }>();
+      expect(pinned?.key_version).toBe("test-v1");
+      expect(pinned?.secret_fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+      expect(JSON.stringify(pinned)).not.toContain(
+        configuredIdentityLinkSecret(production),
+      );
+
+      const changedSecret = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+        IDENTITY_LINK_SECRET: "rotated-identity-link-secret-for-tests-0123456789",
+      });
+      const secretRejected = await identityEnroll(
+        await sha256Hex("test-hosted-identity\\0configuration-pin-secret"),
+        "google",
+        changedSecret,
+      );
+      expect(secretRejected.status).toBe(503);
+      await expect(secretRejected.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_CONFIGURATION_INVALID" },
+      });
+
+      const changedVersion = identityBindings({
+        ENVIRONMENT: "production" as Env["ENVIRONMENT"],
+        ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
+        PUBLIC_ORIGIN: "https://tibotattle.com",
+        IDENTITY_LINK_SECRET_VERSION:
+          "test-v2" as unknown as Env["IDENTITY_LINK_SECRET_VERSION"],
+      } as unknown as Partial<Env>);
+      const versionRejected = await identityEnroll(
+        await sha256Hex("test-hosted-identity\\0configuration-pin-version"),
+        "google",
+        changedVersion,
+      );
+      expect(versionRejected.status).toBe(503);
+      await expect(versionRejected.json()).resolves.toMatchObject({
+        error: { code: "IDENTITY_CONFIGURATION_INVALID" },
+      });
+
+      const participants = await production.USAGE_MONITOR_DB.prepare(
+        "SELECT COUNT(*) AS total FROM participants",
+      ).first<{ total: number }>();
+      expect(participants?.total).toBe(1);
     });
 
     it("enrolls, stores only the pairwise hash, and reattaches the same participant", async () => {
