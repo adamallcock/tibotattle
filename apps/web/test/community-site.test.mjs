@@ -342,6 +342,26 @@ test("the public hero keeps equal columns and a bounded stacked preview", async 
   assert.doesNotMatch(styles, /font-size: clamp\(3\.15rem, 16vw, 5\.2rem\);/u);
 });
 
+test("the public header and footer stay compact on narrow screens", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  assert.match(
+    styles,
+    /\.community-site \.topbar \{[\s\S]*?min-height: 64px;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site \.topbar \{\s*min-height: 56px;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 700px\) \{[\s\S]*?\.community-site footer \{\s*display: grid;\s*grid-template-columns: minmax\(0, 1fr\) auto;/u,
+  );
+  assert.doesNotMatch(
+    styles,
+    /@media \(max-width: 420px\) \{[\s\S]*?\.community-site footer \{[\s\S]*?flex-direction: column;/u,
+  );
+});
+
 test("both browser entry points share one community renderer and one install card", async () => {
   const siteSource = await readFile(SITE_SOURCE, "utf8");
   const appSource = await readFile(APP_SOURCE, "utf8");

@@ -1790,7 +1790,7 @@ footer {
 }
 .community-site .topbar {
   grid-template-columns: auto minmax(0, 1fr) auto;
-  min-height: 74px;
+  min-height: 64px;
   padding-inline: max(24px, calc((100vw - 1180px) / 2));
   border-color: rgba(255, 253, 247, .14);
   background: rgba(8, 47, 42, .92);
@@ -1803,9 +1803,9 @@ footer {
   letter-spacing: -.02em;
 }
 .community-site .brand-icon {
-  width: 42px;
-  height: 42px;
-  border-radius: 12px;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
   box-shadow: 0 8px 22px rgba(0, 0, 0, .2);
 }
 .community-site .primary-nav {
@@ -1816,7 +1816,7 @@ footer {
   margin-right: 12px;
 }
 .community-site .primary-nav a {
-  padding: .55rem .72rem;
+  padding: .45rem .68rem;
   color: rgba(255, 253, 247, .7);
   font-size: .72rem;
   letter-spacing: .01em;
@@ -1831,8 +1831,8 @@ footer {
   align-items: center;
   gap: .42rem;
   justify-self: end;
-  min-height: 38px;
-  padding: .55rem .9rem;
+  min-height: 34px;
+  padding: .45rem .82rem;
   border-radius: .42rem;
   color: var(--site-green-deep);
   background: var(--site-paper);
@@ -2277,7 +2277,7 @@ footer {
   gap: 28px;
   width: min(1180px, calc(100% - 48px));
   margin: 0 auto;
-  padding: 28px 0 38px;
+  padding: 18px 0 22px;
 }
 .community-site .footer-copy {
   display: flex;
@@ -2292,6 +2292,8 @@ footer {
   color: var(--ink);
 }
 .community-site .footer-brand img {
+  width: 24px;
+  height: 24px;
   border-radius: 8px;
 }
 .community-site footer p {
@@ -2308,8 +2310,8 @@ footer {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  min-height: 36px;
-  padding: .45rem .65rem;
+  min-height: 32px;
+  padding: .35rem .58rem;
   border: 1px solid var(--line);
   border-radius: .42rem;
   color: var(--ink);
@@ -2353,23 +2355,23 @@ footer {
 
 @media (max-width: 700px) {
   .community-site .topbar {
-    min-height: 66px;
+    min-height: 56px;
     padding-inline: 14px;
   }
   .community-site .brand {
     font-size: .82rem;
   }
   .community-site .brand-icon {
-    width: 38px;
-    height: 38px;
-    border-radius: 10px;
+    width: 32px;
+    height: 32px;
+    border-radius: 9px;
   }
   .community-site .primary-nav {
     display: none;
   }
   .community-site .header-download {
-    min-height: 36px;
-    padding-inline: .72rem;
+    min-height: 32px;
+    padding-inline: .65rem;
   }
   .community-site .product-hero {
     gap: 32px;
@@ -2437,7 +2439,27 @@ footer {
     display: grid;
   }
   .community-site footer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px 14px;
     width: min(100% - 36px, 1180px);
+    padding: 16px 0 18px;
+  }
+  .community-site .footer-copy {
+    display: contents;
+  }
+  .community-site .footer-brand {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .community-site .footer-links {
+    grid-column: 2;
+    grid-row: 1;
+    gap: 6px;
+  }
+  .community-site footer p {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 }
 
@@ -2466,10 +2488,5 @@ footer {
   }
   .community-site .snapshot-quality-grid {
     grid-template-columns: 1fr;
-  }
-  .community-site footer {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 18px;
   }
 }
