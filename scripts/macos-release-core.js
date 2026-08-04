@@ -1606,11 +1606,25 @@ export async function validateMacOSApplicationsLink(path) {
 }
 
 export async function validateInstalledMacOSApp(appPath, {
+  expectedBundleIdentifier = null,
+  expectedBundleVersion = null,
+  expectedShortVersion = null,
   production = true,
 } = {}) {
   const inspected = await inspectMacOSApp(appPath, {
     requireExternalDistribution: production,
   });
+  if ((expectedBundleIdentifier !== null
+      && inspected.bundleIdentifier !== expectedBundleIdentifier)
+      || (expectedBundleVersion !== null
+        && inspected.bundleVersion !== expectedBundleVersion)
+      || (expectedShortVersion !== null
+        && inspected.shortVersion !== expectedShortVersion)) {
+    fail(
+      "Installed application metadata does not match its release manifest",
+      "MACOS_RELEASE_ARTIFACT_METADATA_MISMATCH",
+    );
+  }
   runMacOSReleaseCommand("/usr/bin/codesign", [
     "--verify",
     "--deep",
@@ -1696,6 +1710,9 @@ export async function validateInstalledMacOSApp(appPath, {
 }
 
 export async function validateMacOSDMG(path, {
+  expectedBundleIdentifier = null,
+  expectedBundleVersion = null,
+  expectedShortVersion = null,
   production = true,
 } = {}) {
   const selected = resolve(path);
@@ -1750,7 +1767,12 @@ export async function validateMacOSDMG(path, {
     ], {
       failureMessage: "Mounted application copy failed",
     });
-    return await validateInstalledMacOSApp(installedApp, { production });
+    return await validateInstalledMacOSApp(installedApp, {
+      expectedBundleIdentifier,
+      expectedBundleVersion,
+      expectedShortVersion,
+      production,
+    });
   } finally {
     await rm(isolatedRoot, { recursive: true, force: true });
     detachDMG(attached);

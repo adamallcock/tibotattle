@@ -46,6 +46,7 @@ const REQUIRED_RELEASE_ASSURANCES = Object.freeze([
 const MAX_APPCAST_BYTES = 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_DMG_BYTES = 10 * 1024 * 1024 * 1024;
+const PUBLIC_READBACK_TIMEOUT_MS = 30_000;
 const BUNDLE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -57,11 +58,23 @@ const ED25519_SPKI_PREFIX = Buffer.from(
   "302a300506032b6570032100",
   "hex",
 );
+const SAFE_RELEASE_OBJECT_FILE_NAME_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:dmg|delta)$/u;
 
 function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   const error = new Error(message);
   error.code = code;
   throw error;
+}
+
+function defaultPublicFetch(...arguments_) {
+  if (typeof globalThis.fetch !== "function") {
+    fail(
+      "Public update read-back requires the Node fetch implementation",
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return globalThis.fetch(...arguments_);
 }
 
 function requiredOption(value, label) {
@@ -148,6 +161,8 @@ function validateReleaseManifest(manifest, dmg, sparklePublicKey) {
       || manifest.application?.bundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
       || typeof manifest.application?.bundleVersion !== "string"
       || !BUNDLE_VERSION_PATTERN.test(manifest.application.bundleVersion)
+      || typeof manifest.application?.shortVersion !== "string"
+      || manifest.application.shortVersion.length === 0
       || typeof manifest.artifact?.fileName !== "string"
       || !SAFE_DMG_FILE_NAME_PATTERN.test(manifest.artifact.fileName)
       || manifest.artifact.fileName.includes("..")
@@ -211,6 +226,26 @@ function validateAppcastSignature(value) {
   }
 }
 
+function verifyEnclosureSignature({ bytes, enclosure, sparklePublicKey }) {
+  let signatureVerified = false;
+  try {
+    signatureVerified = verify(
+      null,
+      bytes,
+      sparklePublicKey.key,
+      Buffer.from(enclosure.signature, "base64"),
+    );
+  } catch {
+    signatureVerified = false;
+  }
+  if (!signatureVerified) {
+    fail(
+      "Appcast enclosure signature does not verify against its artifact and the supplied public key",
+      "SPARKLE_UPDATE_SIGNATURE_INVALID",
+    );
+  }
+}
+
 function validatePublishedDownloadURL(value) {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
     fail("Appcast enclosure URL is invalid");
@@ -232,6 +267,42 @@ function validatePublishedDownloadURL(value) {
   return selected.href;
 }
 
+function parsePublishedObjectKey(value) {
+  let selected;
+  try {
+    selected = new URL(value);
+  } catch {
+    fail("Appcast enclosure URL is invalid");
+  }
+  const segments = selected.pathname.slice(1).split("/");
+  if (segments.length !== 4
+      || segments[0] !== "releases"
+      || !BUNDLE_VERSION_PATTERN.test(segments[1] ?? "")
+      || !SHA256_PATTERN.test(segments[2] ?? "")
+      || !SAFE_RELEASE_OBJECT_FILE_NAME_PATTERN.test(segments[3] ?? "")) {
+    fail(
+      "Appcast enclosure URL must name a content-addressed DMG or delta object",
+      "SPARKLE_UPDATE_APPCAST_OBJECT_PATH_INVALID",
+    );
+  }
+  return Object.freeze({
+    bundleVersion: segments[1],
+    fileName: segments[3],
+    key: segments.slice(0, 4).join("/"),
+    sha256: segments[2],
+  });
+}
+
+function compareBundleVersions(left, right) {
+  const leftParts = left.split(".").map(Number).concat([0, 0]).slice(0, 3);
+  const rightParts = right.split(".").map(Number).concat([0, 0]).slice(0, 3);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] < rightParts[index]) return -1;
+    if (leftParts[index] > rightParts[index]) return 1;
+  }
+  return 0;
+}
+
 function appcastEnclosures(text) {
   if (text.includes("<!DOCTYPE") || text.includes("<!ENTITY")) {
     fail("Appcast must not contain a document type or entity declaration");
@@ -241,16 +312,42 @@ function appcastEnclosures(text) {
   return matches.map((match) => {
     const attributes = parseEnclosureAttributes(match[1]);
     const url = validatePublishedDownloadURL(attributes.get("url"));
+    const object = parsePublishedObjectKey(url);
     const length = attributes.get("length");
-    if (!/^(?:0|[1-9][0-9]*)$/u.test(length ?? "")) {
+    const lengthNumber = Number(length);
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(length ?? "")
+        || !Number.isSafeInteger(lengthNumber)
+        || lengthNumber < 1
+        || lengthNumber > MAX_DMG_BYTES) {
       fail("Appcast enclosure length is invalid");
     }
     validateAppcastSignature(attributes.get("sparkle:edSignature"));
+    const version = attributes.get("sparkle:version");
+    if (typeof version !== "string"
+        || !BUNDLE_VERSION_PATTERN.test(version)
+        || object.bundleVersion !== version) {
+      fail(
+        "Appcast enclosure version must match its immutable object path",
+        "SPARKLE_UPDATE_APPCAST_VERSION_MISMATCH",
+      );
+    }
+    const deltaFrom = attributes.get("sparkle:deltaFrom");
+    if (deltaFrom !== undefined
+        && (!BUNDLE_VERSION_PATTERN.test(deltaFrom)
+          || compareBundleVersions(deltaFrom, version) >= 0)) {
+      fail(
+        "Appcast delta source must be an older bundle version",
+        "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+      );
+    }
     return Object.freeze({
-      length: Number(length),
+      deltaFrom,
+      length: lengthNumber,
+      objectKey: object.key,
+      objectSha256: object.sha256,
       signature: attributes.get("sparkle:edSignature"),
       url,
-      version: attributes.get("sparkle:version"),
+      version,
     });
   });
 }
@@ -271,12 +368,6 @@ function validateAppcast(text, {
   sparklePublicKey,
 }) {
   const enclosures = appcastEnclosures(text);
-  if (enclosures.length !== 1) {
-    fail(
-      "Appcast must contain exactly one enclosure so every published signature is locally verified",
-      "SPARKLE_UPDATE_UNVERIFIED_ENCLOSURES",
-    );
-  }
   const artifactURL = new URL(
     objectKeys.artifact,
     `${CANONICAL_UPDATE_ORIGIN}/`,
@@ -289,24 +380,328 @@ function validateAppcast(text, {
       || matching[0].version !== manifest.bundleVersion) {
     fail("Appcast must contain exactly one signed enclosure for this manifest and DMG");
   }
-  let signatureVerified = false;
-  try {
-    signatureVerified = verify(
-      null,
-      dmgBytes,
-      sparklePublicKey.key,
-      Buffer.from(matching[0].signature, "base64"),
-    );
-  } catch {
-    signatureVerified = false;
+  verifyEnclosureSignature({
+    bytes: dmgBytes,
+    enclosure: matching[0],
+    sparklePublicKey,
+  });
+  return Object.freeze({
+    artifactURL,
+    enclosure: matching[0],
+    enclosures: Object.freeze(enclosures),
+  });
+}
+
+function responseHeader(response, name) {
+  const value = response?.headers?.get?.(name);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function declaredResponseLength(response, label, { required = false } = {}) {
+  const value = responseHeader(response, "content-length");
+  if (value === "") {
+    if (required) {
+      fail(
+        `${label} response is missing Content-Length`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    return null;
   }
-  if (!signatureVerified) {
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) {
     fail(
-      "Appcast enclosure signature does not verify against the supplied DMG and public key",
-      "SPARKLE_UPDATE_SIGNATURE_INVALID",
+      `${label} response has an invalid Content-Length: ${value}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
     );
   }
-  return Object.freeze({ artifactURL, enclosure: matching[0] });
+  const selected = Number(value);
+  if (!Number.isSafeInteger(selected) || selected > MAX_DMG_BYTES) {
+    fail(
+      `${label} response has an unsafe Content-Length: ${value}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return selected;
+}
+
+function validatePublicResponse(response, {
+  cacheControl = null,
+  contentType = null,
+  label,
+} = {}) {
+  const status = response?.status;
+  if (status !== 200) {
+    fail(
+      `${label} returned HTTP ${String(status)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (contentType !== null) {
+    const observed = responseHeader(response, "content-type")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (observed !== contentType) {
+      fail(
+        `${label} returned Content-Type ${observed || "<missing>"}; expected ${contentType}`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+  }
+  if (cacheControl !== null
+      && responseHeader(response, "cache-control") !== cacheControl) {
+    fail(
+      `${label} returned Cache-Control ${responseHeader(response, "cache-control") || "<missing>"}; expected ${cacheControl}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+}
+
+async function fetchPublicResponse(fetchPublic, url, {
+  label,
+  method = "GET",
+} = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    PUBLIC_READBACK_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetchPublic(url, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+      },
+      method,
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response?.url && response.url !== url) {
+      fail(
+        `${label} redirected away from the canonical URL`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    return response;
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED") throw error;
+    if (error?.name === "AbortError") {
+      fail(
+        `${label} timed out after ${PUBLIC_READBACK_TIMEOUT_MS} ms`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    fail(
+      `${label} request failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readResponseBytes(response, {
+  expectedBytes = null,
+  label,
+  maximumBytes,
+} = {}) {
+  const declared = declaredResponseLength(response, label, {
+    required: expectedBytes !== null,
+  });
+  if (declared !== null && declared > maximumBytes) {
+    fail(
+      `${label} response exceeds the safe size limit`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  let bytes;
+  try {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    fail(
+      `${label} body read failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (bytes.length < 1 || bytes.length > maximumBytes) {
+    fail(
+      `${label} response has an unsafe body size: ${bytes.length}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (declared !== null && declared !== bytes.length) {
+    fail(
+      `${label} Content-Length ${declared} does not match body bytes ${bytes.length}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (expectedBytes !== null && expectedBytes !== bytes.length) {
+    fail(
+      `${label} body bytes ${bytes.length} do not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return bytes;
+}
+
+async function readResponseDigest(response, {
+  expectedBytes,
+  expectedSha256,
+  label,
+} = {}) {
+  const declared = declaredResponseLength(response, label, { required: true });
+  if (declared !== expectedBytes) {
+    fail(
+      `${label} Content-Length ${declared} does not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const hash = createHash("sha256");
+  let bytes = 0;
+  try {
+    if (response.body?.getReader) {
+      const reader = response.body.getReader();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        const value = Buffer.from(chunk.value);
+        bytes += value.length;
+        if (bytes > MAX_DMG_BYTES) {
+          fail(
+            `${label} response exceeds the safe size limit`,
+            "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+          );
+        }
+        hash.update(value);
+      }
+    } else {
+      const value = Buffer.from(await response.arrayBuffer());
+      bytes = value.length;
+      if (bytes > MAX_DMG_BYTES) {
+        fail(
+          `${label} response exceeds the safe size limit`,
+          "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+        );
+      }
+      hash.update(value);
+    }
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED") throw error;
+    fail(
+      `${label} body read failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (bytes !== expectedBytes) {
+    fail(
+      `${label} body bytes ${bytes} do not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const observedSha256 = hash.digest("hex");
+  if (observedSha256 !== expectedSha256) {
+    fail(
+      `${label} SHA-256 ${observedSha256} does not match expected ${expectedSha256}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return observedSha256;
+}
+
+async function verifyPublicPublication({
+  appcastBytes,
+  appcastUpdate,
+  dmg,
+  dmgBytes,
+  fetchPublic,
+  manifest,
+  objectKeys,
+  publication,
+  sparklePublicKey,
+}) {
+  const publicAppcastResponse = await fetchPublicResponse(
+    fetchPublic,
+    publication.appcast.url,
+    { label: "Public Sparkle appcast" },
+  );
+  validatePublicResponse(publicAppcastResponse, {
+    cacheControl: APPCAST_CACHE_CONTROL,
+    contentType: "application/xml",
+    label: "Public Sparkle appcast",
+  });
+  const publicAppcastBytes = await readResponseBytes(publicAppcastResponse, {
+    expectedBytes: appcastBytes.length,
+    label: "Public Sparkle appcast",
+    maximumBytes: MAX_APPCAST_BYTES,
+  });
+  const localAppcastSha256 = createHash("sha256")
+    .update(appcastBytes)
+    .digest("hex");
+  const publicAppcastSha256 = createHash("sha256")
+    .update(publicAppcastBytes)
+    .digest("hex");
+  if (publicAppcastSha256 !== localAppcastSha256) {
+    fail(
+      `Public Sparkle appcast SHA-256 ${publicAppcastSha256} does not match the uploaded ${localAppcastSha256}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const publicAppcastText = publicAppcastBytes.toString("utf8");
+  const publicUpdate = validateAppcast(publicAppcastText, {
+    dmg,
+    dmgBytes,
+    manifest,
+    objectKeys,
+    sparklePublicKey,
+  });
+  if (publicUpdate.artifactURL !== appcastUpdate.artifactURL
+      || publicUpdate.enclosure.length !== appcastUpdate.enclosure.length
+      || publicUpdate.enclosure.version !== appcastUpdate.enclosure.version
+      || publicUpdate.enclosure.signature !== appcastUpdate.enclosure.signature) {
+    fail(
+      "Public Sparkle appcast does not retain the validated update enclosure",
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+
+  const enclosures = appcastEnclosures(publicAppcastText);
+  for (const enclosure of enclosures) {
+    if (enclosure.url === publication.artifact.url) continue;
+    const response = await fetchPublicResponse(fetchPublic, enclosure.url, {
+      label: `Public Sparkle enclosure ${enclosure.url}`,
+      method: "HEAD",
+    });
+    validatePublicResponse(response, {
+      cacheControl: IMMUTABLE_CACHE_CONTROL,
+      label: `Public Sparkle enclosure ${enclosure.url}`,
+    });
+    const declared = declaredResponseLength(response, "Public Sparkle enclosure", {
+      required: true,
+    });
+    if (declared !== enclosure.length) {
+      fail(
+        `Public Sparkle enclosure ${enclosure.url} Content-Length ${declared} does not match appcast ${enclosure.length}`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+  }
+
+  const publicArtifactResponse = await fetchPublicResponse(
+    fetchPublic,
+    publication.artifact.url,
+    { label: "Public Sparkle DMG" },
+  );
+  validatePublicResponse(publicArtifactResponse, {
+    cacheControl: IMMUTABLE_CACHE_CONTROL,
+    contentType: "application/x-apple-diskimage",
+    label: "Public Sparkle DMG",
+  });
+  await readResponseDigest(publicArtifactResponse, {
+    expectedBytes: dmg.size,
+    expectedSha256: publication.artifact.sha256,
+    label: "Public Sparkle DMG",
+  });
 }
 
 function normalizeBucket(bucket) {
@@ -362,6 +757,131 @@ async function remoteObjectExists({ bucket, key, runWrangler, temporaryRoot }) {
   fail("Unable to establish the current R2 object state", "SPARKLE_UPDATE_WRANGLER_FAILED");
 }
 
+async function readRemoteObject({
+  bucket,
+  key,
+  maximumBytes = MAX_DMG_BYTES,
+  runWrangler,
+  temporaryRoot,
+}) {
+  const destination = join(
+    temporaryRoot,
+    createHash("sha256").update(`read:${key}`).digest("hex"),
+  );
+  const result = await runWrangler([
+    "r2",
+    "object",
+    "get",
+    wranglerObjectPath(bucket, key),
+    "--file",
+    destination,
+    "--remote",
+  ]);
+  if (result?.status !== 0) {
+    if (resultWasNotFound(result ?? {})) return null;
+    fail(
+      `Unable to read R2 object ${key}`,
+      "SPARKLE_UPDATE_WRANGLER_FAILED",
+    );
+  }
+  let metadata;
+  try {
+    metadata = await lstat(destination);
+  } catch (error) {
+    fail(
+      `R2 object ${key} could not be read: ${error.message}`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()
+      || metadata.size < 1 || metadata.size > maximumBytes) {
+    fail(
+      `R2 object ${key} was not returned as a safe regular file`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  const contents = await readFileWithSha256(destination);
+  if (contents.bytes.length !== metadata.size) {
+    fail(
+      `R2 object ${key} changed while it was being read`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  return Object.freeze({
+    bytes: metadata.size,
+    path: destination,
+    sha256: contents.sha256,
+  });
+}
+
+function highestAppcastVersion(text) {
+  const enclosures = appcastEnclosures(text);
+  return enclosures.reduce(
+    (highest, enclosure) => highest === null
+      || compareBundleVersions(enclosure.version, highest) > 0
+      ? enclosure.version
+      : highest,
+    null,
+  );
+}
+
+async function validatePublishedEnclosureObjects({
+  appcastUpdate,
+  bucket,
+  dmg,
+  runWrangler,
+  sparklePublicKey,
+  temporaryRoot,
+}) {
+  const remoteObjects = new Map();
+  for (const enclosure of appcastUpdate.enclosures) {
+    if (enclosure.url === appcastUpdate.artifactURL) {
+      continue;
+    }
+    if (!remoteObjects.has(enclosure.objectKey)) {
+      remoteObjects.set(
+        enclosure.objectKey,
+        await readRemoteObject({
+          bucket,
+          key: enclosure.objectKey,
+          runWrangler,
+          temporaryRoot,
+        }),
+      );
+    }
+    const remote = remoteObjects.get(enclosure.objectKey);
+    if (!remote) {
+      fail(
+        `Appcast enclosure object is unavailable: ${enclosure.url}`,
+        "SPARKLE_UPDATE_APPCAST_OBJECT_MISSING",
+      );
+    }
+    if (remote.bytes !== enclosure.length) {
+      fail(
+        `Appcast enclosure byte length does not match R2 object: ${enclosure.url} (advertised ${enclosure.length}, received ${remote.bytes})`,
+        "SPARKLE_UPDATE_APPCAST_OBJECT_LENGTH_MISMATCH",
+      );
+    }
+    if (remote.sha256 !== enclosure.objectSha256) {
+      fail(
+        `Appcast enclosure SHA-256 does not match R2 object: ${enclosure.url} (expected ${enclosure.objectSha256}, received ${remote.sha256})`,
+        "SPARKLE_UPDATE_APPCAST_OBJECT_CHECKSUM_MISMATCH",
+      );
+    }
+    verifyEnclosureSignature({
+      bytes: await readFile(remote.path),
+      enclosure,
+      sparklePublicKey,
+    });
+  }
+  if (appcastUpdate.enclosure.length !== dmg.size) {
+    fail(
+      "Current appcast enclosure length does not match the candidate DMG",
+      "SPARKLE_UPDATE_APPCAST_LENGTH_MISMATCH",
+    );
+  }
+}
+
 async function putObject({ bucket, key, path, contentType, cacheControl, runWrangler }) {
   const result = await runWrangler([
     "r2",
@@ -397,10 +917,13 @@ export async function publishSparkleUpdate({
   replaceAppcast = false,
   sparklePublicEdKey,
   runWrangler = defaultRunWrangler,
+  fetchPublic = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
 } = {}) {
   if (typeof publish !== "boolean" || typeof replaceAppcast !== "boolean"
-      || typeof runWrangler !== "function" || typeof validateDMG !== "function") {
+      || typeof runWrangler !== "function"
+      || typeof fetchPublic !== "function"
+      || typeof validateDMG !== "function") {
     fail("Publisher options are invalid");
   }
   normalizeBucket(bucket);
@@ -421,7 +944,12 @@ export async function publishSparkleUpdate({
     dmg,
     normalizedSparklePublicKey,
   );
-  await validateDMG(dmg.path, { production: true });
+  await validateDMG(dmg.path, {
+    expectedBundleIdentifier: manifest.manifest.application.bundleIdentifier,
+    expectedBundleVersion: manifest.bundleVersion,
+    expectedShortVersion: manifest.manifest.application.shortVersion,
+    production: true,
+  });
   const dmgWithSha256 = await readFileWithSha256(dmg.path);
   if (dmgWithSha256.bytes.length !== dmg.size) {
     fail("DMG changed while it was being validated");
@@ -435,8 +963,9 @@ export async function publishSparkleUpdate({
     fileName: basename(dmg.path),
     sha256: observedDMGSha256,
   });
+  const appcastBytes = await readFile(appcast.path);
   const appcastUpdate = validateAppcast(
-    await readFile(appcast.path, "utf8"),
+    appcastBytes.toString("utf8"),
     {
       dmg,
       dmgBytes: dmgWithSha256.bytes,
@@ -495,6 +1024,39 @@ export async function publishSparkleUpdate({
     if (appcastExists && !replaceAppcast) {
       fail("Refusing to replace appcast.xml without --replace-appcast", "SPARKLE_UPDATE_APPCAST_REPLACE_REQUIRED");
     }
+    if (appcastExists) {
+      const currentAppcast = await readRemoteObject({
+        bucket,
+        key: publication.appcast.key,
+        maximumBytes: MAX_APPCAST_BYTES,
+        runWrangler,
+        temporaryRoot,
+      });
+      if (!currentAppcast) {
+        fail(
+          "R2 appcast disappeared during publication preflight",
+          "SPARKLE_UPDATE_APPCAST_STATE_CHANGED",
+        );
+      }
+      const currentVersion = highestAppcastVersion(
+        await readFile(currentAppcast.path, "utf8"),
+      );
+      if (currentVersion === null
+          || compareBundleVersions(manifest.bundleVersion, currentVersion) <= 0) {
+        fail(
+          `Candidate bundle version ${manifest.bundleVersion} is not newer than the live appcast version ${currentVersion ?? "unknown"}`,
+          "SPARKLE_UPDATE_VERSION_NOT_NEWER",
+        );
+      }
+    }
+    await validatePublishedEnclosureObjects({
+      appcastUpdate,
+      bucket,
+      dmg,
+      runWrangler,
+      sparklePublicKey: normalizedSparklePublicKey,
+      temporaryRoot,
+    });
     for (const object of [publication.artifact, publication.manifest, publication.appcast]) {
       await putObject({
         bucket,
@@ -508,6 +1070,17 @@ export async function publishSparkleUpdate({
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+  await verifyPublicPublication({
+    appcastBytes,
+    appcastUpdate,
+    dmg,
+    dmgBytes: dmgWithSha256.bytes,
+    fetchPublic,
+    manifest,
+    objectKeys,
+    publication,
+    sparklePublicKey: normalizedSparklePublicKey,
+  });
   return publication;
 }
 
@@ -561,6 +1134,8 @@ export async function main(argv) {
   console.log(`R2 appcast: ${publication.appcast.url}`);
   if (!publication.published) {
     console.log("Validation only; re-run with --publish to invoke Wrangler.");
+  } else {
+    console.log("Public read-back: canonical appcast and DMG verified.");
   }
 }
 

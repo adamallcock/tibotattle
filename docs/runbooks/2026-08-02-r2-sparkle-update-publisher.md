@@ -37,9 +37,11 @@ passed to or stored by this publisher. The appcast and its referenced DMG are
 validated before any Wrangler command can run. Supply the matching public key
 through `--sparkle-public-ed-key`; it is compared with the release manifest's
 public-key SHA-256 fingerprint and used for local Ed25519 verification.
-The current publisher intentionally accepts exactly one enclosure so it never
-publishes an unverified historical or delta URL; rollback uses the separately
-retained signed DMG and release manifest.
+The candidate release must have exactly one matching enclosure. The appcast may
+also retain older signed full or delta enclosures; before publication, each is
+read and cryptographically verified from R2. This publisher does not upload a
+new delta artifact, so a release containing one is accepted only when its
+immutable object was already safely published and verified.
 
 ## Publish procedure
 
@@ -61,13 +63,19 @@ the release-manifest SHA-256 and production assurances, requires the manifest's
 canonical feed URL, and verifies every appcast enclosure stays on the approved
 origin. It only accepts the current enclosure when it points to the
 content-addressed object path above and has the exact manifest byte length and
-bundle version.
+bundle version. Validation-only mode remains local and does not contact R2.
+When `--publish` is supplied, the publisher performs an additional read-only
+R2 preflight before any upload: every preserved DMG or delta enclosure must
+exist at its content-addressed key with the advertised byte length and SHA-256,
+and any existing appcast must contain a lower highest bundle version than the
+candidate.
 
 After reviewing the printed plan, append `--publish` to run Wrangler. Artifact
 and manifest keys are content-addressed under
 `releases/<bundle-version>/<dmg-sha256>/` and are never overwritten. The mutable
 `appcast.xml` is checked first and needs the additional explicit
-`--replace-appcast` flag after the initial publication:
+`--replace-appcast` flag after the initial publication; that flag does not allow
+an equal or lower bundle version to replace the live appcast:
 
 ```bash
 npm run product:macos:publish-update -- \
@@ -83,8 +91,14 @@ npm run product:macos:publish-update -- \
 Wrangler uploads the DMG and manifest first with one-year immutable caching
 (`application/x-apple-diskimage` and `application/json; charset=utf-8`), then
 the appcast with `application/xml; charset=utf-8` and
-`public, max-age=300, must-revalidate`. A failed later upload leaves no changed
-feed pointer; do not delete immutable release objects as recovery.
+`public, max-age=300, must-revalidate`. After the three uploads, the publisher
+fetches the canonical public appcast with cache bypass, requires the exact
+uploaded bytes and cache metadata, revalidates the current enclosure, streams
+the public DMG to verify its byte length and SHA-256, and checks the public
+length of any preserved enclosure entries. It does not report publication
+success when that public read-back fails. A failed later upload or read-back can
+leave immutable objects behind; the feed pointer is not automatically rolled
+back, so do not delete immutable release objects as recovery.
 
 ## Post-publication check
 
