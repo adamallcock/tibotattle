@@ -402,7 +402,14 @@ function validateAppcast(text, {
   );
   if (matching.length !== 1
       || matching[0].length !== dmg.size
-      || matching[0].version !== manifest.bundleVersion) {
+      || matching[0].version !== manifest.bundleVersion
+      || matching[0].deltaFrom !== undefined) {
+    if (matching.length === 1 && matching[0].deltaFrom !== undefined) {
+      fail(
+        "The publisher only accepts a full candidate DMG; new Sparkle delta publication is unsupported",
+        "SPARKLE_UPDATE_DELTA_UNSUPPORTED",
+      );
+    }
     fail("Appcast must contain exactly one signed enclosure for this manifest and DMG");
   }
   verifyEnclosureSignature({
@@ -768,25 +775,6 @@ function defaultRunWrangler(arguments_) {
   });
 }
 
-async function remoteObjectExists({ bucket, key, runWrangler, temporaryRoot }) {
-  const destination = join(
-    temporaryRoot,
-    createHash("sha256").update(key).digest("hex"),
-  );
-  const result = await runWrangler([
-    "r2",
-    "object",
-    "get",
-    wranglerObjectPath(bucket, key),
-    "--file",
-    destination,
-    "--remote",
-  ]);
-  if (result?.status === 0) return true;
-  if (resultWasNotFound(result ?? {})) return false;
-  fail("Unable to establish the current R2 object state", "SPARKLE_UPDATE_WRANGLER_FAILED");
-}
-
 async function readRemoteObject({
   bucket,
   key,
@@ -798,6 +786,7 @@ async function readRemoteObject({
     temporaryRoot,
     createHash("sha256").update(`read:${key}`).digest("hex"),
   );
+  await rm(destination, { force: true });
   const result = await runWrangler([
     "r2",
     "object",
@@ -830,7 +819,30 @@ async function readRemoteObject({
       "SPARKLE_UPDATE_R2_OBJECT_INVALID",
     );
   }
-  const contents = await readFileWithSha256(destination);
+  let resolvedDestination;
+  try {
+    resolvedDestination = await realpath(destination);
+  } catch (error) {
+    fail(
+      `R2 object ${key} could not be resolved: ${error.message}`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  if (resolvedDestination !== destination) {
+    fail(
+      `R2 object ${key} was returned outside the probe directory`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
+  let contents;
+  try {
+    contents = await readFileWithSha256(destination);
+  } catch (error) {
+    fail(
+      `R2 object ${key} could not be read: ${error.message}`,
+      "SPARKLE_UPDATE_R2_OBJECT_INVALID",
+    );
+  }
   if (contents.bytes.length !== metadata.size) {
     fail(
       `R2 object ${key} changed while it was being read`,
@@ -839,9 +851,41 @@ async function readRemoteObject({
   }
   return Object.freeze({
     bytes: metadata.size,
+    content: contents.bytes,
     path: destination,
     sha256: contents.sha256,
   });
+}
+
+function verifyRetainedImmutableObject({
+  candidate,
+  object,
+  remote,
+}) {
+  if (remote.bytes !== candidate.bytes.length
+      || remote.sha256 !== candidate.sha256
+      || !remote.content.equals(candidate.bytes)) {
+    fail(
+      `Existing immutable R2 object ${object.key} does not match the validated candidate bytes, SHA-256, and size`,
+      "SPARKLE_UPDATE_IMMUTABLE_OBJECT_MISMATCH",
+    );
+  }
+  return remote;
+}
+
+function assertAppcastStateUnchanged(expected, observed, key) {
+  const unchanged = expected === null
+    ? observed === null
+    : observed !== null
+      && observed.bytes === expected.bytes
+      && observed.sha256 === expected.sha256
+      && observed.content.equals(expected.content);
+  if (!unchanged) {
+    fail(
+      `R2 appcast ${key} changed during publication preflight`,
+      "SPARKLE_UPDATE_APPCAST_STATE_CHANGED",
+    );
+  }
 }
 
 function highestAppcastVersion(text, channel) {
@@ -899,7 +943,7 @@ async function validatePublishedEnclosureObjects({
       );
     }
     verifyEnclosureSignature({
-      bytes: await readFile(remote.path),
+      bytes: remote.content,
       enclosure,
       sparklePublicKey,
     });
@@ -971,8 +1015,12 @@ export async function publishSparkleUpdate({
       maximumBytes: MAX_MANIFEST_BYTES,
     }),
   ]);
+  const releaseManifestWithSha256 = await readFileWithSha256(releaseManifest.path);
+  if (releaseManifestWithSha256.bytes.length !== releaseManifest.size) {
+    fail("Release manifest changed while it was being read");
+  }
   const manifest = validateReleaseManifest(
-    readManifest(await readFile(releaseManifest.path, "utf8")),
+    readManifest(releaseManifestWithSha256.bytes.toString("utf8")),
     dmg,
     normalizedSparklePublicKey,
     releaseChannel,
@@ -999,6 +1047,9 @@ export async function publishSparkleUpdate({
     sha256: observedDMGSha256,
   });
   const appcastBytes = await readFile(appcast.path);
+  if (appcastBytes.length !== appcast.size) {
+    fail("Appcast changed while it was being read");
+  }
   const appcastUpdate = validateAppcast(
     appcastBytes.toString("utf8"),
     {
@@ -1020,6 +1071,7 @@ export async function publishSparkleUpdate({
     }),
     channel: releaseChannel.name,
     artifact: Object.freeze({
+      bytes: dmg.size,
       cacheControl: IMMUTABLE_CACHE_CONTROL,
       contentType: "application/x-apple-diskimage",
       key: objectKeys.artifact,
@@ -1029,10 +1081,12 @@ export async function publishSparkleUpdate({
     }),
     bucket,
     manifest: Object.freeze({
+      bytes: releaseManifestWithSha256.bytes.length,
       cacheControl: IMMUTABLE_CACHE_CONTROL,
       contentType: "application/json; charset=utf-8",
       key: objectKeys.manifest,
       path: releaseManifest.path,
+      sha256: releaseManifestWithSha256.sha256,
     }),
     published: publish,
   });
@@ -1042,41 +1096,48 @@ export async function publishSparkleUpdate({
     join(await realpath(tmpdir()), "tibotattle-r2-update-probe-"),
   );
   try {
-    for (const object of [publication.artifact, publication.manifest]) {
-      if (await remoteObjectExists({
+    const immutableObjects = [
+      {
+        candidate: dmgWithSha256,
+        maximumBytes: MAX_DMG_BYTES,
+        object: publication.artifact,
+      },
+      {
+        candidate: releaseManifestWithSha256,
+        maximumBytes: MAX_MANIFEST_BYTES,
+        object: publication.manifest,
+      },
+    ];
+    for (const immutableObject of immutableObjects) {
+      const remote = await readRemoteObject({
         bucket,
-        key: object.key,
-        runWrangler,
-        temporaryRoot,
-      })) {
-        fail("Refusing to overwrite an immutable R2 update object", "SPARKLE_UPDATE_OBJECT_EXISTS");
-      }
-    }
-    const appcastExists = await remoteObjectExists({
-      bucket,
-      key: publication.appcast.key,
-      runWrangler,
-      temporaryRoot,
-    });
-    if (appcastExists && !replaceAppcast) {
-      fail("Refusing to replace appcast.xml without --replace-appcast", "SPARKLE_UPDATE_APPCAST_REPLACE_REQUIRED");
-    }
-    if (appcastExists) {
-      const currentAppcast = await readRemoteObject({
-        bucket,
-        key: publication.appcast.key,
-        maximumBytes: MAX_APPCAST_BYTES,
+        key: immutableObject.object.key,
+        maximumBytes: immutableObject.maximumBytes,
         runWrangler,
         temporaryRoot,
       });
-      if (!currentAppcast) {
-        fail(
-          "R2 appcast disappeared during publication preflight",
-          "SPARKLE_UPDATE_APPCAST_STATE_CHANGED",
-        );
+      if (remote !== null) {
+        verifyRetainedImmutableObject({
+          candidate: immutableObject.candidate,
+          object: immutableObject.object,
+          remote,
+        });
       }
+      immutableObject.remote = remote;
+    }
+    const currentAppcast = await readRemoteObject({
+      bucket,
+      key: publication.appcast.key,
+      maximumBytes: MAX_APPCAST_BYTES,
+      runWrangler,
+      temporaryRoot,
+    });
+    if (currentAppcast !== null && !replaceAppcast) {
+      fail("Refusing to replace appcast.xml without --replace-appcast", "SPARKLE_UPDATE_APPCAST_REPLACE_REQUIRED");
+    }
+    if (currentAppcast !== null) {
       const currentVersion = highestAppcastVersion(
-        await readFile(currentAppcast.path, "utf8"),
+        currentAppcast.content.toString("utf8"),
         releaseChannel,
       );
       if (currentVersion === null
@@ -1095,16 +1156,37 @@ export async function publishSparkleUpdate({
       sparklePublicKey: normalizedSparklePublicKey,
       temporaryRoot,
     });
-    for (const object of [publication.artifact, publication.manifest, publication.appcast]) {
+    for (const immutableObject of immutableObjects) {
+      if (immutableObject.remote !== null) continue;
       await putObject({
         bucket,
-        key: object.key,
-        path: object.path,
-        contentType: object.contentType,
-        cacheControl: object.cacheControl,
+        key: immutableObject.object.key,
+        path: immutableObject.object.path,
+        contentType: immutableObject.object.contentType,
+        cacheControl: immutableObject.object.cacheControl,
         runWrangler,
       });
     }
+    const appcastBeforeWrite = await readRemoteObject({
+      bucket,
+      key: publication.appcast.key,
+      maximumBytes: MAX_APPCAST_BYTES,
+      runWrangler,
+      temporaryRoot,
+    });
+    assertAppcastStateUnchanged(
+      currentAppcast,
+      appcastBeforeWrite,
+      publication.appcast.key,
+    );
+    await putObject({
+      bucket,
+      key: publication.appcast.key,
+      path: publication.appcast.path,
+      contentType: publication.appcast.contentType,
+      cacheControl: publication.appcast.cacheControl,
+      runWrangler,
+    });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

@@ -179,6 +179,40 @@ function remoteObjectRunner(objects = new Map()) {
   return { calls, run };
 }
 
+function statefulRemoteObjectRunner({
+  failures = new Map(),
+  objects = new Map(),
+} = {}) {
+  const calls = [];
+  const remoteObjects = new Map(objects);
+  const remainingFailures = new Map(failures);
+  const run = async (arguments_) => {
+    calls.push(arguments_);
+    const operation = arguments_.at(2);
+    const objectPath = arguments_.at(3);
+    if (operation === "get") {
+      if (!remoteObjects.has(objectPath)) {
+        return { status: 1, stderr: "Object not found" };
+      }
+      const destination = arguments_[arguments_.indexOf("--file") + 1];
+      await writeFile(destination, remoteObjects.get(objectPath));
+      return { status: 0 };
+    }
+    if (operation === "put") {
+      const remaining = remainingFailures.get(objectPath) ?? 0;
+      if (remaining > 0) {
+        remainingFailures.set(objectPath, remaining - 1);
+        return { status: 1, stderr: "simulated publication failure" };
+      }
+      const source = arguments_[arguments_.indexOf("--file") + 1];
+      remoteObjects.set(objectPath, await readFile(source));
+      return { status: 0 };
+    }
+    return { status: 1, stderr: `unsupported mocked operation: ${operation}` };
+  };
+  return { calls, objects: remoteObjects, run };
+}
+
 function appcastEnclosure({ bytes, deltaFrom, signature, url, version }) {
   const delta = deltaFrom === undefined
     ? ""
@@ -246,28 +280,119 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
       validateDMG: async () => {},
     });
     assert.equal(publication.published, true);
-    assert.equal(runner.calls.length, 6);
+    assert.equal(runner.calls.length, 7);
     assert.deepEqual(runner.calls.slice(0, 3).map((call) => call.slice(0, 4)), [
       ["r2", "object", "get", `${APPROVED_R2_BUCKET}/${publication.artifact.key}`],
       ["r2", "object", "get", `${APPROVED_R2_BUCKET}/${publication.manifest.key}`],
       ["r2", "object", "get", `${APPROVED_R2_BUCKET}/appcast.xml`],
     ]);
-    assert.deepEqual(runner.calls.slice(3).map((call) => call.slice(0, 4)), [
+    assert.deepEqual(runner.calls.slice(3, 5).map((call) => call.slice(0, 4)), [
       ["r2", "object", "put", `${APPROVED_R2_BUCKET}/${publication.artifact.key}`],
       ["r2", "object", "put", `${APPROVED_R2_BUCKET}/${publication.manifest.key}`],
-      ["r2", "object", "put", `${APPROVED_R2_BUCKET}/appcast.xml`],
+    ]);
+    assert.deepEqual(runner.calls[5].slice(0, 4), [
+      "r2", "object", "get", `${APPROVED_R2_BUCKET}/appcast.xml`,
+    ]);
+    assert.deepEqual(runner.calls[6].slice(0, 4), [
+      "r2", "object", "put", `${APPROVED_R2_BUCKET}/appcast.xml`,
     ]);
     assert.equal(runner.calls[3].includes("application/x-apple-diskimage"), true);
     assert.equal(runner.calls[3].includes(IMMUTABLE_CACHE_CONTROL), true);
     assert.equal(runner.calls[4].includes("application/json; charset=utf-8"), true);
     assert.equal(runner.calls[4].includes(IMMUTABLE_CACHE_CONTROL), true);
-    assert.equal(runner.calls[5].includes("application/xml; charset=utf-8"), true);
-    assert.equal(runner.calls[5].includes(APPCAST_CACHE_CONTROL), true);
+    assert.equal(runner.calls[6].includes("application/xml; charset=utf-8"), true);
+    assert.equal(runner.calls[6].includes(APPCAST_CACHE_CONTROL), true);
     assert.equal(runner.calls.flat().includes("--force"), false);
     assert.deepEqual(publicReadback.calls, [
       { method: "GET", url: CANONICAL_APPCAST_URL },
       { method: "GET", url: fixture.artifactURL },
     ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("retries after an artifact-only partial publication and resumes missing work", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
+  const appcastObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
+  const runner = statefulRemoteObjectRunner({
+    failures: new Map([[manifestObjectPath, 1]]),
+  });
+  const publicReadback = publicReadbackFixture(fixture);
+  const options = {
+    appcastPath: fixture.appcastPath,
+    bucket: APPROVED_R2_BUCKET,
+    channel: "stable",
+    dmgPath: fixture.dmgPath,
+    publish: true,
+    releaseManifestPath: fixture.releaseManifestPath,
+    sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    runWrangler: runner.run,
+    fetchPublic: publicReadback.fetch,
+    validateDMG: async () => {},
+  };
+  try {
+    await assert.rejects(publishSparkleUpdate(options), {
+      code: "SPARKLE_UPDATE_WRANGLER_FAILED",
+    });
+    assert.deepEqual(runner.objects.get(artifactObjectPath), fixture.dmgBytes);
+    assert.equal(runner.objects.has(manifestObjectPath), false);
+    assert.equal(runner.objects.has(appcastObjectPath), false);
+
+    const publication = await publishSparkleUpdate(options);
+    assert.equal(publication.published, true);
+    assert.deepEqual(
+      runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
+      [artifactObjectPath, manifestObjectPath, manifestObjectPath, appcastObjectPath],
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("retries after artifact and manifest publication and writes the appcast last", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
+  const appcastObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
+  const runner = statefulRemoteObjectRunner({
+    failures: new Map([[appcastObjectPath, 1]]),
+  });
+  const publicReadback = publicReadbackFixture(fixture);
+  const options = {
+    appcastPath: fixture.appcastPath,
+    bucket: APPROVED_R2_BUCKET,
+    channel: "stable",
+    dmgPath: fixture.dmgPath,
+    publish: true,
+    releaseManifestPath: fixture.releaseManifestPath,
+    sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    runWrangler: runner.run,
+    fetchPublic: publicReadback.fetch,
+    validateDMG: async () => {},
+  };
+  try {
+    await assert.rejects(publishSparkleUpdate(options), {
+      code: "SPARKLE_UPDATE_WRANGLER_FAILED",
+    });
+    assert.deepEqual(runner.objects.get(artifactObjectPath), fixture.dmgBytes);
+    assert.deepEqual(
+      runner.objects.get(manifestObjectPath),
+      await readFile(fixture.releaseManifestPath),
+    );
+    assert.equal(runner.objects.has(appcastObjectPath), false);
+
+    const publication = await publishSparkleUpdate(options);
+    assert.equal(publication.published, true);
+    assert.deepEqual(
+      runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
+      [artifactObjectPath, manifestObjectPath, appcastObjectPath, appcastObjectPath],
+    );
+    assert.deepEqual(runner.objects.get(appcastObjectPath), await readFile(fixture.appcastPath));
   } finally {
     await fixture.cleanup();
   }
@@ -292,7 +417,7 @@ test("does not report publication success when the public appcast is unavailable
       }),
       { code: "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED" },
     );
-    assert.equal(runner.calls.length, 6);
+    assert.equal(runner.calls.length, 7);
   } finally {
     await fixture.cleanup();
   }
@@ -373,7 +498,80 @@ test("does not report publication success when a retained enclosure is missing f
   }
 });
 
-test("refuses an existing immutable object before it can be overwritten", async () => {
+test("retains matching immutable objects without overwriting them", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const runner = statefulRemoteObjectRunner({
+    objects: new Map([
+      [`${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`, fixture.dmgBytes],
+      [`${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`, await readFile(fixture.releaseManifestPath)],
+    ]),
+  });
+  const publicReadback = publicReadbackFixture(fixture);
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.deepEqual(
+      runner.calls.filter((call) => call[2] === "put").map((call) => call[3]),
+      [`${APPROVED_R2_BUCKET}/appcast.xml`],
+    );
+    assert.deepEqual(
+      runner.objects.get(`${APPROVED_R2_BUCKET}/${publication.artifact.key}`),
+      fixture.dmgBytes,
+    );
+    assert.deepEqual(
+      runner.objects.get(`${APPROVED_R2_BUCKET}/${publication.manifest.key}`),
+      await readFile(fixture.releaseManifestPath),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("aborts on mismatched existing immutable bytes before appcast mutation", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const artifactKey = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const runner = statefulRemoteObjectRunner({
+    objects: new Map([[artifactKey, Buffer.alloc(fixture.dmgBytes.length, 42)]]),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_IMMUTABLE_OBJECT_MISMATCH" },
+    );
+    assert.equal(runner.calls.some((call) => call[2] === "put"), false);
+    assert.equal(
+      runner.calls.some((call) => call[3] === `${APPROVED_R2_BUCKET}/appcast.xml`),
+      false,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed on a successful remote read with no materialized object", async () => {
   const fixture = await createReleaseFixture();
   const calls = [];
   try {
@@ -392,18 +590,20 @@ test("refuses an existing immutable object before it can be overwritten", async 
         },
         validateDMG: async () => {},
       }),
-      { code: "SPARKLE_UPDATE_OBJECT_EXISTS" },
+      { code: "SPARKLE_UPDATE_R2_OBJECT_INVALID" },
     );
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0][2], "get");
+    assert.equal(calls.some((call) => call[2] === "put"), false);
   } finally {
     await fixture.cleanup();
   }
 });
 
 test("requires an explicit appcast replacement after immutable preflight passes", async () => {
+  const current = await createReleaseFixture({ bundleVersion: "0" });
   const fixture = await createReleaseFixture();
-  const calls = [];
+  const runner = statefulRemoteObjectRunner({
+    objects: new Map([[`${APPROVED_R2_BUCKET}/appcast.xml`, await readFile(current.appcastPath)]]),
+  });
   try {
     await assert.rejects(
       publishSparkleUpdate({
@@ -414,16 +614,14 @@ test("requires an explicit appcast replacement after immutable preflight passes"
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
-        runWrangler: async (arguments_) => {
-          calls.push(arguments_);
-          return { status: arguments_[2] === "get" && calls.length === 3 ? 0 : 1, stderr: "Object not found" };
-        },
+        runWrangler: runner.run,
         validateDMG: async () => {},
       }),
       { code: "SPARKLE_UPDATE_APPCAST_REPLACE_REQUIRED" },
     );
-    assert.equal(calls.length, 3);
+    assert.equal(runner.calls.some((call) => call[2] === "put"), false);
   } finally {
+    await current.cleanup();
     await fixture.cleanup();
   }
 });
@@ -638,6 +836,38 @@ test("rejects a candidate that is not newer than the live appcast", async () => 
   }
 });
 
+test("does not overwrite or report success for a no-op retry", async () => {
+  const fixture = await createReleaseFixture();
+  const digest = sha256(fixture.dmgBytes);
+  const runner = statefulRemoteObjectRunner({
+    objects: new Map([
+      [`${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`, fixture.dmgBytes],
+      [`${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`, await readFile(fixture.releaseManifestPath)],
+      [`${APPROVED_R2_BUCKET}/appcast.xml`, await readFile(fixture.appcastPath)],
+    ]),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        replaceAppcast: true,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_VERSION_NOT_NEWER" },
+    );
+    assert.equal(runner.calls.some((call) => call[2] === "put"), false);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("fails closed when the appcast signature, URL, or manifest checksum is invalid", async () => {
   const unsigned = await createReleaseFixture({
     mutateAppcast: (value) => value.replace(/ sparkle:edSignature="[^"]+"/u, ""),
@@ -689,6 +919,32 @@ test("fails closed when the appcast signature, URL, or manifest checksum is inva
       wrongChecksum.cleanup(),
       nonCanonicalFeed.cleanup(),
     ]);
+  }
+});
+
+test("does not introduce a new Sparkle delta enclosure", async () => {
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      'sparkle:version="1"',
+      'sparkle:version="1" sparkle:deltaFrom="0"',
+    ),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("unsupported delta must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_DELTA_UNSUPPORTED" },
+    );
+  } finally {
+    await fixture.cleanup();
   }
 });
 
