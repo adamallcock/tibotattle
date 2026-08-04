@@ -248,7 +248,16 @@ test("the first visit leads with the product, combined Mac action, and named est
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/tibotattle-weekly-preview\.jpg"/u);
-  assert.match(html, /Illustrative fixture — not your usage\./u);
+  assert.match(html, /src="\.\/apple\.svg"/u);
+  assert.match(html, /Sample data/u);
+  assert.match(html, /From TiboTattle’s built-in demo\./u);
+  assert.match(html, /Your dashboard is calculated privately on your Mac\./u);
+  assert.match(html, /href="https:\/\/github\.com\/adamallcock"/u);
+  assert.match(html, /href="https:\/\/x\.com\/adamallcock"/u);
+  assert.doesNotMatch(
+    html,
+    /github\.com\/adamallcock\/(?:app-usagemonitor|tibotattle-client)/u,
+  );
   assert.match(html, /id="installer-link"/u);
   assert.ok(
     html.indexOf('id="installer-link"') < html.indexOf('id="community"'),
@@ -258,7 +267,10 @@ test("the first visit leads with the product, combined Mac action, and named est
     html.indexOf('class="product-window"') < html.indexOf('id="how-it-works"'),
     "the app preview appears before the supporting feature strip",
   );
-  assert.doesNotMatch(html, /After download|companion-steps|install-explainer/u);
+  assert.doesNotMatch(
+    html,
+    /After download|companion-steps|install-explainer|Illustrative demo|Illustrative fixture|Example local dashboard/u,
+  );
   assert.doesNotMatch(
     html,
     /Activity totals[^<]+are an allowance estimate/u,
@@ -348,7 +360,11 @@ test("the named estimate gate never derives an allowance from the activity-only 
       snapshot: normalizeCommunitySnapshot(payload),
     });
     assert.equal(estimateState, expectedEstimateState);
-    assert.match(estimate.text, /no released allowance estimate/iu);
+    assert.equal(
+      estimate.text,
+      COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState].body,
+    );
+    assert.match(estimate.text, /estimate/iu);
     assert.doesNotMatch(estimate.text, /100,000|100000|\$/u);
     assert.equal(
       hero.textContent,
@@ -420,6 +436,10 @@ test("the install card refuses a partially injected release", () => {
   assert.equal(formatInstallerSize(12_582_912), "12 MiB download");
   assert.equal(renderInstallerJourney(ready)?.version, "1.2.3");
   assert.equal(ready.byId.get("installer-link").hidden, false);
+  assert.equal(
+    ready.byId.get("installer-link").attributes.has("aria-disabled"),
+    false,
+  );
   assert.equal(ready.byId.get("installer-unavailable").hidden, true);
   assert.match(
     ready.byId.get("installer-compatibility").textContent,
@@ -443,6 +463,21 @@ test("the install card refuses a partially injected release", () => {
     assert.equal(documentRef.byId.get("installer-unavailable").hidden, false);
     assert.equal(
       Object.hasOwn(documentRef.byId.get("installer-link"), "href"),
+      false,
+    );
+
+    const publicDocument = fakeDocument({ ...complete, [name]: hostile });
+    assert.equal(
+      renderInstallerJourney(publicDocument, { showUnavailableAction: true }),
+      null,
+    );
+    assert.equal(publicDocument.byId.get("installer-link").hidden, false);
+    assert.equal(
+      publicDocument.byId.get("installer-link").attributes.get("aria-disabled"),
+      "true",
+    );
+    assert.equal(
+      Object.hasOwn(publicDocument.byId.get("installer-link"), "href"),
       false,
     );
   }

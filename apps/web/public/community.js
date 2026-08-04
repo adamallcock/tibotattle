@@ -95,5 +95,5 @@ async function loadCommunitySnapshot() {
 }
 
 bindInstalledAppLink();
-renderInstallerJourney(document);
+renderInstallerJourney(document, { showUnavailableAction: true });
 void loadCommunitySnapshot();

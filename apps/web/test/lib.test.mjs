@@ -4763,14 +4763,14 @@ test("result panels show the number and its caveat, not the service plumbing", a
     detailBody,
     /container\.append\(node\(\s*"p",\s*"snapshot-partial",\s*"Some metrics were not released/u,
   );
-  // Contract version, ingestion cutoff, release timing, clipping mechanics and
-  // the next-contract statement all moved into the disclosure.
+  // Data-format version, ingestion cutoff, release timing, clipping mechanics
+  // and the estimate-evidence boundary all moved into the disclosure.
   for (const relocated of [
     /detail\.append\(quality\);/u,
-    /\["Contract", snapshot\.schemaVersion\]/u,
+    /\["Data format", snapshot\.schemaVersion\]/u,
     /\["Ingestion cutoff", formatLocal\(snapshot\.ingestionCutoffAt\)\]/u,
     /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*`Each value is clipped per participant/u,
-    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*"This release currently reports privacy-safe activity totals/u,
+    /detail\.append\(node\(\s*"p",\s*"snapshot-disclosure",\s*"This snapshot reports privacy-safe activity totals only/u,
   ]) {
     assert.match(detailBody, relocated);
   }

@@ -169,23 +169,23 @@ export const COMMUNITY_METRIC_LABELS = Object.freeze({
  */
 export const COMMUNITY_SNAPSHOT_STATE_COPY = Object.freeze({
   service_unavailable:
-    "The central service is unavailable. This is separate from whether a weekly snapshot exists.",
+    "Community activity is temporarily unavailable. This does not tell us whether a weekly snapshot exists.",
   development_unsafe:
-    "Live cumulative community totals are development-only and are not displayed.",
+    "Live cumulative totals have not passed privacy review, so they are not displayed.",
   unsupported_schema:
-    "The service returned an unsupported community-snapshot contract. No values were displayed.",
+    "This community snapshot cannot be displayed safely with this version of TiboTattle.",
   not_yet_published: "No stable weekly snapshot is available yet.",
   withdrawn:
     "This weekly revision was withdrawn for privacy or quality reasons. A replacement revision may be pending.",
   suppressed:
-    "This week did not pass the fixed privacy release policy. We do not disclose why or how close the cohort was.",
+    "This week did not pass the privacy checks required for publication. We do not disclose why or how close the cohort was.",
 });
 
 const PENDING_CONTRACT_ROWS = Object.freeze([
-  Object.freeze(["Released snapshot", "Not loaded"]),
-  Object.freeze(["Cohort limit estimate", "Not in current contract"]),
-  Object.freeze(["Matched quota coverage", "Not in current contract"]),
-  Object.freeze(["Change confidence", "Not in current contract"]),
+  Object.freeze(["Weekly snapshot", "Waiting for service"]),
+  Object.freeze(["Seven-day estimate", "Not available"]),
+  Object.freeze(["Matched quota coverage", "Not available"]),
+  Object.freeze(["Confidence range", "Not available"]),
 ]);
 
 /**
@@ -197,37 +197,37 @@ export const COMMUNITY_ESTIMATE_STATE_COPY = Object.freeze({
   service_unavailable: Object.freeze({
     label: "Unavailable",
     hero: "Unavailable right now",
-    body: "No released allowance estimate is available while the community service is offline.",
+    body: "The community service is temporarily unavailable, so there’s no estimate to show.",
   }),
   development_unsafe: Object.freeze({
     label: "Unavailable",
     hero: "No public estimate",
-    body: "No released allowance estimate is shown from a development-only response.",
+    body: "There’s no privacy-reviewed community estimate to show right now.",
   }),
   unsupported_schema: Object.freeze({
     label: "Unavailable",
     hero: "Estimate update required",
-    body: "No released allowance estimate is shown until this evidence contract can be checked end to end.",
+    body: "This estimate needs an update before it can be shown safely.",
   }),
   not_yet_published: Object.freeze({
     label: "Collecting evidence",
     hero: "Collecting matched evidence",
-    body: "No released allowance estimate yet. Matched quota coverage and uncertainty are still being collected.",
+    body: "The community estimate isn’t ready yet. Matched quota coverage and uncertainty are still being collected.",
   }),
   withdrawn: Object.freeze({
     label: "Not published",
     hero: "This week was withdrawn",
-    body: "No released allowance estimate is available because this revision was withdrawn for privacy or quality reasons.",
+    body: "This week’s estimate was withdrawn after privacy or quality review.",
   }),
   suppressed: Object.freeze({
     label: "Not published",
     hero: "Not published this week",
-    body: "No released allowance estimate: this week did not pass the fixed privacy release policy.",
+    body: "This week’s estimate is not published because the evidence did not pass the required privacy checks.",
   }),
   activity_only: Object.freeze({
     label: "Activity only",
     hero: "Activity released; estimate pending",
-    body: "No released allowance estimate. This aggregate contains delayed activity totals only.",
+    body: "This week’s community activity is available, but it does not support an allowance estimate yet.",
   }),
 });
 
@@ -312,7 +312,7 @@ export function renderCommunitySnapshot({
     detail.append(node(
       "p",
       "snapshot-disclosure",
-      "No community capacity or change claim is inferred from aggregate activity alone. The next contract must publish replay exclusions, matched quota coverage, uncertainty, and cohort support together.",
+      "A community estimate needs matched quota coverage, replay checks, uncertainty, and enough independent contributors. Activity totals alone are never used as an estimate.",
     ));
     return snapshot.state;
   }
@@ -354,7 +354,7 @@ export function renderCommunitySnapshot({
     const quality = node("dl", "snapshot-quality-grid");
     for (
       const [term, value] of [
-        ["Contract", snapshot.schemaVersion],
+        ["Data format", snapshot.schemaVersion],
         ["Released model cells", compact(snapshot.cells.length)],
         [
           "Minimum support",
@@ -389,7 +389,7 @@ export function renderCommunitySnapshot({
     detail.append(node(
       "p",
       "snapshot-disclosure",
-      "This release currently reports privacy-safe activity totals. Cohort weekly-limit estimates, matched quota coverage, replay exclusions, and change confidence require the next community contract before they can be shown honestly.",
+      "This snapshot reports privacy-safe activity totals only. A community estimate also needs matched quota coverage, replay checks, uncertainty, and confidence.",
     ));
   }
 

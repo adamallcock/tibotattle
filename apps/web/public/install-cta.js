@@ -141,7 +141,10 @@ export function formatInstallerSize(bytes) {
   })} MiB download`;
 }
 
-export function renderInstallerJourney(documentRef) {
+export function renderInstallerJourney(
+  documentRef,
+  { showUnavailableAction = false } = {},
+) {
   const select = (selector) => documentRef.querySelector(selector);
   const release = configuredInstallerRelease(documentRef);
   const link = select("#installer-link");
@@ -156,6 +159,7 @@ export function renderInstallerJourney(documentRef) {
         : "Intel";
     link.href = release.installerUrl;
     link.hidden = false;
+    link.removeAttribute("aria-disabled");
     select("#installer-version").textContent = `Version ${release.version}`;
     select("#installer-compatibility").textContent =
       `Requires macOS ${release.minimumMacos} or later · ${architectureLabel}`;
@@ -179,7 +183,12 @@ export function renderInstallerJourney(documentRef) {
     return release;
   }
   link.removeAttribute("href");
-  link.hidden = true;
+  link.hidden = !showUnavailableAction;
+  if (showUnavailableAction) {
+    link.setAttribute("aria-disabled", "true");
+  } else {
+    link.removeAttribute("aria-disabled");
+  }
   details.hidden = true;
   for (
     const id of [

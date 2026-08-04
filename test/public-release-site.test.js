@@ -15,17 +15,16 @@ import { deflateSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 import {
-  buildPublicReleaseSite,
-  verifyPublishedInstallerRemote,
-} from "../scripts/build-public-release-site.js";
-import {
-  verifyGeneratedCommunityAssetTree,
-} from "../apps/worker/scripts/stage-production-assets.mjs";
+  PRODUCT_BRAND,
+  SEMANTIC_OPEN_TARGET_PLACEHOLDER,
+} from "../config/product-brand.js";
+import { buildPublicReleaseSite } from "../scripts/build-public-release-site.js";
 import {
   collectMacOSWebModuleGraph,
 } from "../scripts/build-macos-app.js";
-import { createMacOSSignedReplacementContract } from "../scripts/macos-release-core.js";
-import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
+import {
+  readVerifiedTelemetryBrowserMirror,
+} from "../scripts/generate-telemetry-browser-mirror.js";
 
 const PNG_SIGNATURE = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -85,6 +84,7 @@ function sourceHtml() {
     '<meta name="usage-monitor-privacy-url" content="">',
     '<meta name="usage-monitor-security-url" content="">',
     '<meta name="usage-monitor-support-url" content="">',
+    `<meta name="usage-monitor-semantic-open-target" content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
     '<link rel="canonical" href="">',
     '<meta property="og:type" content="website">',
     '<meta property="og:url" content="">',
@@ -93,8 +93,6 @@ function sourceHtml() {
     '<meta property="og:image:height" content="630">',
     '<meta name="twitter:card" content="summary_large_image">',
     '<meta name="twitter:image" content="">',
-    '<link rel="stylesheet" href="./styles.css">',
-    '<script type="module" src="./community.js"></script>',
     "<title>Usage Monitor</title>",
     "",
   ].join("\n");
@@ -109,11 +107,6 @@ async function fixture() {
   // ignore a file that never existed.
   await writeFile(join(source, "community.html"), sourceHtml());
   await writeFile(join(source, "community.js"), "console.log('safe');\n");
-  await writeFile(join(source, "community-view.js"), "export const safeView = true;\n");
-  await writeFile(join(source, "i18n.generated.js"), "export const safeI18n = true;\n");
-  await writeFile(join(source, "styles.css"), "body { color: green; }\n");
-  await writeFile(join(source, "tibotattle-icon.png"), "reviewed public brand asset\n");
-  await writeFile(join(source, "ui-format.js"), "export const safeFormat = true;\n");
   await writeFile(
     join(source, "index.html"),
     "<!doctype html><title>dashboard</title>\n",
@@ -121,60 +114,17 @@ async function fixture() {
   await writeFile(join(source, "app.js"), "console.log('dashboard');\n");
   await writeFile(join(source, "navigation.js"), "export const nav = 1;\n");
   for (const basename of [
-    "admin-client.js",
-    "admin.css",
-    "admin.html",
-    "admin.js",
+    "telemetry-envelope.js",
+    "telemetry-shared.generated.js",
   ]) {
-    await writeFile(join(source, basename), "must stay private\n");
+    await writeFile(
+      join(source, basename),
+      await readFile(join(PUBLIC_SOURCE, basename)),
+    );
   }
-  const installerPath = join(root, "TiboTattle-1.2.3-macOS-arm64.dmg");
-  const installerBytes = Buffer.from("deterministic signed release evidence fixture");
+  const installerPath = join(root, "UsageMonitor-1.2.3.dmg");
+  const installerBytes = Buffer.from("deterministic notarized installer fixture");
   await writeFile(installerPath, installerBytes);
-  const releaseManifestPath = `${installerPath}.release.json`;
-  const releaseManifest = {
-    schemaVersion: "usage-monitor-macos-release-v0.2",
-    application: {
-      bundleIdentifier: "com.usagemonitor.local",
-      bundleVersion: "1",
-      shortVersion: "1.2.3",
-    },
-    artifact: {
-      bytes: installerBytes.length,
-      fileName: "TiboTattle-1.2.3-macOS-arm64.dmg",
-      sha256: createHash("sha256").update(installerBytes).digest("hex"),
-    },
-    source: {
-      commit: "a".repeat(40),
-      tag: "v1.2.3",
-    },
-    assurances: {
-      appNotarizationAccepted: true,
-      appTicketStapled: true,
-      candidateReproducedFromCheckedOutSource: true,
-      cleanProfileSmokePassed: true,
-      developerIDHardenedRuntime: true,
-      dmgGatekeeperAssessmentPassed: true,
-      dmgNotarizationAccepted: true,
-      dmgTicketStapled: true,
-    },
-    updater: {
-      appcastURL: "https://updates.tibotattle.com/appcast.xml",
-      automaticChecks: true,
-      automaticUpdateOptInAvailable: true,
-      automaticUpdatesEnabledByDefault: true,
-      afterUserOptIn: {
-        automaticDownload: true,
-        installOnQuit: true,
-      },
-      enabled: true,
-      frameworkVersion: SPARKLE_VERSION,
-      publicEdKeySha256: "b".repeat(64),
-      requiresSignedFeed: true,
-    },
-    replacement: createMacOSSignedReplacementContract(),
-  };
-  await writeFile(releaseManifestPath, `${JSON.stringify(releaseManifest)}\n`);
   const socialImage = join(root, "release-preview.png");
   await writeFile(socialImage, SOCIAL_IMAGE);
   return {
@@ -184,8 +134,6 @@ async function fixture() {
     installerPath,
     installerBytes,
     installerSha256: createHash("sha256").update(installerBytes).digest("hex"),
-    installerReleaseManifest: releaseManifestPath,
-    releaseManifest,
     socialImage,
   };
 }
@@ -196,9 +144,8 @@ function releaseArgs(value, overrides = {}) {
     output: value.output,
     siteUrl: "https://usagemonitor.app/",
     installerPath: value.installerPath,
-    installerReleaseManifest: value.installerReleaseManifest,
     installerUrl:
-      "https://downloads.usagemonitor.app/releases/TiboTattle-1.2.3-macOS-arm64.dmg",
+      "https://downloads.usagemonitor.app/releases/UsageMonitor-1.2.3.dmg",
     installerVersion: "1.2.3",
     installerSha256: value.installerSha256,
     minimumMacos: "13.0",
@@ -213,53 +160,14 @@ function releaseArgs(value, overrides = {}) {
   };
 }
 
-function buildFixtureSite(args, overrides = {}) {
-  return buildPublicReleaseSite(args, {
-    validateInstallerArtifact: async () => {},
-    verifyPublishedInstaller: async ({
-      installerUrl,
-      expectedBytes,
-      expectedSha256,
-    }) => ({
-      bytes: expectedBytes,
-      finalUrl: installerUrl,
-      sha256: expectedSha256,
-    }),
-    ...overrides,
-  });
-}
-
 test("release-site build verifies artifacts and materializes complete public metadata", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
-  const validatedArtifacts = [];
-  const verifiedPublishedInstallers = [];
-  const result = await buildPublicReleaseSite(releaseArgs(value), {
-    validateInstallerArtifact: async (...args) => validatedArtifacts.push(args),
-    verifyPublishedInstaller: async (evidence) => {
-      verifiedPublishedInstallers.push(evidence);
-      return {
-        bytes: evidence.expectedBytes,
-        finalUrl: evidence.installerUrl,
-        sha256: evidence.expectedSha256,
-      };
-    },
-  });
+  const result = await buildPublicReleaseSite(releaseArgs(value));
 
-  assert.equal(result.fileCount, 10);
-  assert.deepEqual(validatedArtifacts, [[
-    value.installerPath,
-    { production: true },
-  ]]);
-  assert.deepEqual(verifiedPublishedInstallers, [{
-    expectedBytes: value.installerBytes.length,
-    expectedSha256: value.installerSha256,
-    installerUrl:
-      "https://downloads.usagemonitor.app/releases/TiboTattle-1.2.3-macOS-arm64.dmg",
-  }]);
+  assert.equal(result.fileCount, 7);
   assert.equal(result.installer.bytes, value.installerBytes.length);
-  assert.equal(result.installer.verifiedSignedReleaseEvidence, true);
-  assert.equal(Object.hasOwn(result.installer, "verifiedFromLocalArtifact"), false);
+  assert.equal(result.installer.verifiedFromLocalArtifact, true);
   assert.deepEqual(result.installer.architectures, ["arm64"]);
   assert.equal(result.site.socialPreview.width, 1200);
   assert.equal(result.site.socialPreview.height, 630);
@@ -267,7 +175,7 @@ test("release-site build verifies artifacts and materializes complete public met
   const html = await readFile(join(value.output, "index.html"), "utf8");
   assert.match(
     html,
-    /content="https:\/\/downloads\.usagemonitor\.app\/releases\/TiboTattle-1\.2\.3-macOS-arm64\.dmg"/u,
+    /content="https:\/\/downloads\.usagemonitor\.app\/releases\/UsageMonitor-1\.2\.3\.dmg"/u,
   );
   assert.match(html, /usage-monitor-installer-version" content="1\.2\.3"/u);
   assert.match(
@@ -289,7 +197,13 @@ test("release-site build verifies artifacts and materializes complete public met
     html,
     /usage-monitor-architectures" content="arm64"/u,
   );
-  assert.doesNotMatch(html, /usage-monitor-semantic-open-target|usagemonitor:\/\/open/u);
+  assert.equal(
+    html.includes(
+      `<meta name="usage-monitor-semantic-open-target" content="${PRODUCT_BRAND.appOpenURL}">`,
+    ),
+    true,
+  );
+  assert.equal(html.includes(SEMANTIC_OPEN_TARGET_PLACEHOLDER), false);
   assert.match(
     html,
     /<link rel="canonical" href="https:\/\/usagemonitor\.app\/">/u,
@@ -325,184 +239,80 @@ test("release-site build verifies artifacts and materializes complete public met
   assert.deepEqual(
     manifest.files.map(({ path }) => path),
     [
-      "community-view.js",
       "community.js",
-      "i18n.generated.js",
       "index.html",
       "robots.txt",
       "social-preview.png",
-      "styles.css",
-      "tibotattle-icon.png",
-      "ui-format.js",
+      "telemetry-envelope.js",
+      "telemetry-shared.generated.js",
     ],
   );
   assert.equal(Object.hasOwn(manifest.installer, "path"), false);
-  assert.equal(manifest.installer.releaseEvidence.schemaVersion, "usage-monitor-macos-release-v0.2");
   assert.doesNotMatch(manifestText, /release-preview\.png/u);
-  assert.deepEqual(
-    (await verifyGeneratedCommunityAssetTree(value.output))
-      .map(({ path }) => path)
-      .sort(),
-    [
-      "community-view.js",
-      "community.js",
-      "i18n.generated.js",
-      "index.html",
-      "release-site-manifest.json",
-      "robots.txt",
-      "social-preview.png",
-      "styles.css",
-      "tibotattle-icon.png",
-      "ui-format.js",
-    ],
-  );
 });
 
-test("no-installer release-site build succeeds without installer claims and disables the CTA", async (t) => {
+test("release-site stages the verified telemetry snapshot if the source changes after capture", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
-  const {
-    installerPath,
-    installerReleaseManifest,
-    installerUrl,
-    installerVersion,
-    installerSha256,
-    minimumMacos,
-    architectures,
-    ...noInstallerArgs
-  } = releaseArgs(value);
-  noInstallerArgs.source = PUBLIC_SOURCE;
-  void installerPath;
-  void installerReleaseManifest;
-  void installerUrl;
-  void installerVersion;
-  void installerSha256;
-  void minimumMacos;
-  void architectures;
-
-  const result = await buildFixtureSite(noInstallerArgs);
-  assert.equal(result.installer, null);
-  const html = await readFile(join(value.output, "index.html"), "utf8");
-  assert.match(html, /Signed Mac installer/u);
-  assert.doesNotMatch(html, /Download the verified Mac app/u);
-  assert.match(html, /id="installer-link"[^>]*hidden/u);
-  assert.match(html, /id="installer-unavailable"/u);
-  assert.doesNotMatch(html, /usage-monitor-installer-/u);
+  const mirror = join(value.source, "telemetry-shared.generated.js");
+  let verified;
+  await buildPublicReleaseSite(releaseArgs(value), {
+    readVerifiedMirror: async (options) => {
+      verified = await readVerifiedTelemetryBrowserMirror(options);
+      await writeFile(mirror, "// changed after verification\n");
+      return verified;
+    },
+  });
+  assert.equal(await readFile(mirror, "utf8"), "// changed after verification\n");
+  assert.equal(
+    await readFile(join(value.output, "telemetry-shared.generated.js"), "utf8"),
+    verified.sourceText,
+  );
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
-  assert.equal(Object.hasOwn(manifest, "installer"), false);
-  assert.doesNotMatch(
-    JSON.stringify(manifest),
-    /verified(?:FromLocalArtifact|SignedReleaseEvidence)/u,
-  );
-});
-
-test("arbitrary text fixture with a matching caller hash cannot enable installer metadata", async (t) => {
-  const value = await fixture();
-  t.after(() => rm(value.root, { recursive: true, force: true }));
-  const plainPath = join(value.root, "not-an-installer.txt");
-  const plainBytes = Buffer.from("plain text is not signed release evidence\n");
-  await writeFile(plainPath, plainBytes);
-  await assert.rejects(
-    buildFixtureSite({
-      ...releaseArgs(value),
-      installerPath: plainPath,
-      installerReleaseManifest: plainPath,
-      installerSha256: createHash("sha256").update(plainBytes).digest("hex"),
-    }),
-    /release manifest|JSON|signed macOS/u,
-  );
-  assert.equal(await readFile(join(value.root, "not-an-installer.txt"), "utf8"), plainBytes.toString());
-  await assert.rejects(readFile(join(value.output, "release-site-manifest.json")));
-});
-
-test("release-site build withholds installer claims when the public artifact cannot be reverified", async (t) => {
-  const value = await fixture();
-  t.after(() => rm(value.root, { recursive: true, force: true }));
-  await assert.rejects(
-    buildFixtureSite(releaseArgs(value), {
-      verifyPublishedInstaller: async () => {
-        throw new Error("Published installer digest does not match signed evidence");
-      },
-    }),
-    /Published installer digest does not match signed evidence/u,
-  );
-  await assert.rejects(readFile(join(value.output, "release-site-manifest.json")));
-});
-
-test("published installer verification follows only public HTTPS redirects and rehashes bytes", async () => {
-  const installerBytes = Buffer.from("signed installer bytes");
-  const installerSha256 = createHash("sha256")
-    .update(installerBytes)
-    .digest("hex");
-  const requests = [];
-  const result = await verifyPublishedInstallerRemote({
-    installerUrl: "https://downloads.usagemonitor.app/TiboTattle.dmg",
-    expectedBytes: installerBytes.length,
-    expectedSha256: installerSha256,
-    fetchImpl: async (url, options) => {
-      requests.push({ url: String(url), options });
-      if (requests.length === 1) {
-        return new Response(null, {
-          headers: {
-            location: "https://objects.usagemonitor.app/signed/TiboTattle.dmg?token=reviewed",
-          },
-          status: 302,
-        });
-      }
-      return new Response(installerBytes, {
-        headers: { "content-length": String(installerBytes.length) },
-        status: 200,
-      });
+  assert.deepEqual(
+    manifest.files.find(({ path }) => path === "telemetry-shared.generated.js"),
+    {
+      path: "telemetry-shared.generated.js",
+      bytes: verified.byteLength,
+      sha256: verified.sha256,
     },
-  });
-  assert.equal(requests.length, 2);
-  assert.equal(requests[0].options.redirect, "manual");
-  assert.equal(requests[1].url, "https://objects.usagemonitor.app/signed/TiboTattle.dmg?token=reviewed");
-  assert.deepEqual(result, {
-    bytes: installerBytes.length,
-    finalUrl: "https://objects.usagemonitor.app/signed/TiboTattle.dmg?token=reviewed",
-    sha256: installerSha256,
-  });
-  await assert.rejects(
-    verifyPublishedInstallerRemote({
-      installerUrl: "https://downloads.usagemonitor.app/TiboTattle.dmg",
-      expectedBytes: installerBytes.length,
-      expectedSha256: installerSha256,
-      fetchImpl: async () => new Response(Buffer.from("wrong bytes"), {
-        headers: { "content-length": "11" },
-        status: 200,
-      }),
-    }),
-    /byte length|digest/u,
   );
 });
 
 test("checked-in public source satisfies the complete release contract", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
-  const result = await buildFixtureSite(
+  const result = await buildPublicReleaseSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 10);
+  assert.equal(result.fileCount, 18);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
-  // The exact published surface: the community entry, its pure renderer and
-  // formatting helper, and nothing that needs the local companion.
+  // The exact published surface: the community entry and the modules it
+  // shares with the app, and nothing that needs the local companion.
   assert.deepEqual(
     manifest.files.map(({ path }) => path),
     [
+      "apple.svg",
       "community-view.js",
       "community.js",
-      "i18n.generated.js",
+      "data-client.js",
+      "github.svg",
       "index.html",
+      "install-cta.js",
+      "lib.js",
       "robots.txt",
       "social-preview.png",
       "styles.css",
+      "telemetry-envelope.js",
+      "telemetry-shared.generated.js",
       "tibotattle-icon.png",
+      "tibotattle-weekly-preview.jpg",
       "ui-format.js",
+      "x.svg",
     ],
   );
   // The list above is a reviewed ledger of names, so it cannot notice a module
@@ -511,6 +321,15 @@ test("checked-in public source satisfies the complete release contract", async (
   // the community entry's real import closure instead, so extracting a shared
   // module can never publish an index whose imports 404.
   const publishedNames = new Set(manifest.files.map(({ path }) => path));
+  for (const publicAsset of [
+    "apple.svg",
+    "github.svg",
+    "tibotattle-icon.png",
+    "tibotattle-weekly-preview.jpg",
+    "x.svg",
+  ]) {
+    assert.ok(publishedNames.has(publicAsset), `Missing public asset ${publicAsset}`);
+  }
   const communityClosure = await collectMacOSWebModuleGraph({
     entrypoints: ["apps/web/public/community.js"],
   });
@@ -525,11 +344,10 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.match(html, /id="installer-compatibility"/u);
   assert.match(html, /id="release-notes-link"/u);
   // The install call to action and the community view are present; the
-  // companion-only dashboard surfaces and shared local client are not.
+  // companion-only dashboard surfaces are not.
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="community-result"/u);
   assert.match(html, /src="\.\/community\.js"/u);
-  assert.match(html, /<img[^>]+src="\.\/tibotattle-icon\.png"/u);
   for (
     const dashboardOnly of [
       "./app.js",
@@ -548,13 +366,55 @@ test("checked-in public source satisfies the complete release contract", async (
   ) {
     assert.equal(html.includes(dashboardOnly), false, dashboardOnly);
   }
-  assert.equal(
-    manifest.files.some(({ path }) => ["data-client.js", "install-cta.js"].includes(path)),
-    false,
+  assert.match(
+    await readFile(
+      join(value.output, "telemetry-shared.generated.js"),
+      "utf8",
+    ),
+    /^\/\/ @generated by scripts\/generate-telemetry-browser-mirror\.js\n/u,
+  );
+  assert.match(
+    await readFile(join(value.output, "telemetry-envelope.js"), "utf8"),
+    /from "\.\/telemetry-shared\.generated\.js";/u,
   );
   assert.doesNotMatch(
     html,
     /<meta name="usage-monitor-installer-bytes" content="">/u,
+  );
+});
+
+test("release-site build requires both browser telemetry modules", async (t) => {
+  for (const basename of [
+    "telemetry-envelope.js",
+    "telemetry-shared.generated.js",
+  ]) {
+    const value = await fixture();
+    t.after(() => rm(value.root, { recursive: true, force: true }));
+    await rm(join(value.source, basename));
+
+    await assert.rejects(
+      buildPublicReleaseSite(releaseArgs(value)),
+      new RegExp(
+        `Required public telemetry module ${
+          basename.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
+        }`,
+        "u",
+      ),
+    );
+  }
+});
+
+test("release-site build refuses a stale browser telemetry mirror", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  await writeFile(
+    join(value.source, "telemetry-shared.generated.js"),
+    "// @generated by scripts/generate-telemetry-browser-mirror.js\nstale\n",
+  );
+
+  await assert.rejects(
+    buildPublicReleaseSite(releaseArgs(value)),
+    /is stale; regenerate it without --check/u,
   );
 });
 
@@ -564,49 +424,49 @@ test("release-site build fails closed for unsafe or incomplete release metadata"
   const base = releaseArgs(value);
 
   await assert.rejects(
-    buildFixtureSite({
+    buildPublicReleaseSite({
       ...base,
       installerUrl: "http://downloads.usagemonitor.app/app.dmg",
     }),
     /public HTTPS/u,
   );
   await assert.rejects(
-    buildFixtureSite({
+    buildPublicReleaseSite({
       ...base,
       installerUrl: "https://example.com/app.dmg",
     }),
     /public HTTPS/u,
   );
   await assert.rejects(
-    buildFixtureSite({ ...base, siteUrl: "https://usagemonitor.app" }),
+    buildPublicReleaseSite({ ...base, siteUrl: "https://usagemonitor.app" }),
     /must end with \//u,
   );
   await assert.rejects(
-    buildFixtureSite({
+    buildPublicReleaseSite({
       ...base,
       supportUrl: "https://usagemonitor.app/support?source=release",
     }),
     /no port, query, or fragment/u,
   );
   await assert.rejects(
-    buildFixtureSite({ ...base, installerVersion: "v1.2.3" }),
+    buildPublicReleaseSite({ ...base, installerVersion: "v1.2.3" }),
     /numeric three- or four-part/u,
   );
   await assert.rejects(
-    buildFixtureSite({ ...base, installerSha256: "A".repeat(64) }),
+    buildPublicReleaseSite({ ...base, installerSha256: "A".repeat(64) }),
     /lowercase hexadecimal/u,
   );
   await assert.rejects(
-    buildFixtureSite({ ...base, minimumMacos: "latest" }),
+    buildPublicReleaseSite({ ...base, minimumMacos: "latest" }),
     /canonical version/u,
   );
   await assert.rejects(
-    buildFixtureSite({ ...base, architectures: "arm64,amd64" }),
+    buildPublicReleaseSite({ ...base, architectures: "arm64,amd64" }),
     /Architectures must be exactly arm64/u,
   );
   await assert.rejects(
-    buildFixtureSite({ ...base, privacyUrl: "" }),
-    /Site metadata and artifact paths are incomplete/u,
+    buildPublicReleaseSite({ ...base, privacyUrl: "" }),
+    /All release metadata/u,
   );
 });
 
@@ -622,7 +482,7 @@ test("release-site build rejects Intel and universal compatibility declarations"
     "arm64,universal",
   ]) {
     await assert.rejects(
-      buildFixtureSite({ ...base, architectures }),
+      buildPublicReleaseSite({ ...base, architectures }),
       {
         name: "TypeError",
         message:
@@ -638,17 +498,17 @@ test("release-site build compares digest, dimensions, and regular artifact paths
   t.after(() => rm(value.root, { recursive: true, force: true }));
 
   await assert.rejects(
-    buildFixtureSite({
+    buildPublicReleaseSite({
       ...releaseArgs(value),
       installerSha256: "0".repeat(64),
     }),
-    /does not match the signed macOS release manifest/u,
+    /does not match the selected local installer/u,
   );
 
   const wrongSize = join(value.root, "wrong-size.png");
   await writeFile(wrongSize, grayscalePng(1199, 630));
   await assert.rejects(
-    buildFixtureSite({
+    buildPublicReleaseSite({
       ...releaseArgs(value),
       socialImage: wrongSize,
     }),
@@ -658,11 +518,11 @@ test("release-site build compares digest, dimensions, and regular artifact paths
   const linkedInstaller = join(value.root, "linked.dmg");
   await symlink(value.installerPath, linkedInstaller);
   await assert.rejects(
-    buildFixtureSite({
+    buildPublicReleaseSite({
       ...releaseArgs(value),
       installerPath: linkedInstaller,
     }),
-    /does not match the release manifest artifact/u,
+    /regular file/u,
   );
 });
 
@@ -670,9 +530,9 @@ test("release-site build never replaces an existing output without explicit scop
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
   const base = releaseArgs(value);
-  await buildFixtureSite(base);
-  await assert.rejects(buildFixtureSite(base), /Output already exists/u);
-  await buildFixtureSite({ ...base, replace: true });
+  await buildPublicReleaseSite(base);
+  await assert.rejects(buildPublicReleaseSite(base), /Output already exists/u);
+  await buildPublicReleaseSite({ ...base, replace: true });
   assert.equal(
     JSON.parse(
       await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
@@ -692,20 +552,33 @@ test("release-site source must expose each empty metadata slot exactly once", as
     ),
   );
   await assert.rejects(
-    buildFixtureSite(releaseArgs(value)),
+    buildPublicReleaseSite(releaseArgs(value)),
     /exactly one empty usage-monitor-installer-url/u,
   );
 });
 
-test("release-site output never exposes a local app-open route", async (t) => {
+test("release-site source must expose the semantic open target placeholder exactly once", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
-  const html = await readFile(
-    join((await buildFixtureSite(releaseArgs(value))).output, "index.html"),
-    "utf8",
+  const semanticMeta =
+    `<meta name="usage-monitor-semantic-open-target" `
+    + `content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`;
+
+  await writeFile(
+    join(value.source, "community.html"),
+    sourceHtml().replace(semanticMeta, ""),
   );
-  assert.doesNotMatch(
-    html,
-    /usage-monitor-semantic-open-target|usagemonitor:\/\/open|open-installed-app/u,
+  await assert.rejects(
+    buildPublicReleaseSite(releaseArgs(value)),
+    /exactly one semantic open target placeholder/u,
+  );
+
+  await writeFile(
+    join(value.source, "community.html"),
+    sourceHtml().replace(semanticMeta, `${semanticMeta}\n${semanticMeta}`),
+  );
+  await assert.rejects(
+    buildPublicReleaseSite(releaseArgs(value)),
+    /exactly one semantic open target placeholder/u,
   );
 });

@@ -124,3 +124,35 @@ The visual targets are the generated desktop and mobile concepts under
 They are design references only; the production page keeps text, actions,
 status, and app-preview framing in HTML and uses a privacy-safe screenshot of
 the labeled demo chart as its only new product image.
+
+## Public polish revision
+
+Follow-up review found that the visual hierarchy was working, but phrases such
+as `Illustrative fixture`, `current contract`, and `release state` exposed
+implementation and QA language to first-time visitors. Public copy will use
+product language instead: `Sample data`, `built-in demo`, and short, state-
+specific explanations of why a community estimate is or is not available.
+The detailed privacy disclosure may describe caps, delays, rounding, support,
+and uncertainty, but it must not read like an internal schema audit.
+
+The unavailable installer state will retain the same large `Download for
+macOS` control as a configured release, marked disabled and paired with the
+quiet line `Signed release coming soon.` This keeps the intended action clear
+without linking to or implying an installer that has not passed the release
+builder. The installed-app action remains beside it; the app-only dashboard
+keeps its existing shared-renderer fallback through an explicit public-site
+option.
+
+The native app already links to `https://github.com/adamallcock` and
+`https://x.com/adamallcock`. A read-only check on 2026-08-03 confirmed the
+GitHub profile is public and the X profile URL resolves. The public website may
+therefore use those profile links in its footer. It must not link to either
+`app-usagemonitor` or `tibotattle-client` until an owner-approved public source
+repository exists. There is still no public Docs destination, so no Docs link
+will be invented.
+
+The Apple, GitHub, and X marks are vendored from Simple Icons 16.21.0, whose
+official repository distributes its SVG library under CC0-1.0. Bundling the
+files keeps the release site self-contained; the page does not contact an icon
+CDN at runtime. The approved `tibotattle-icon.png` remains the product icon,
+favicon, and app-preview identity.
