@@ -66,8 +66,13 @@ resumable.
 
 ## Privacy model
 
-- Local analysis works fully offline; the app installs no daemon, Login Item,
-  or background service.
+- Local analysis works fully offline. On a new macOS install, the first-run
+  disclosure visibly preselects **Start TiboTattle at login**, but TiboTattle
+  registers the native Login Item only after the person confirms **Get
+  Started**. Settings re-reads the real macOS state after a request or return
+  from System Settings, and can remove an approval-pending request as well as
+  an enabled item. This starts the normal app at login; it does not install a
+  daemon, LaunchAgent, privileged helper, or separate background worker.
 - The dashboard binds to loopback only. The packaged app's network behavior is
   audited at build time (zero JavaScript and zero native network attempts in
   offline mode).

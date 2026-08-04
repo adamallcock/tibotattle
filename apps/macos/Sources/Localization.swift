@@ -37,6 +37,31 @@ enum TiboTattleLocalization {
         case settingsPreviewUpdatesPending = "settings.previewUpdatesPending"
         case settingsPreviewUpdatesPendingMessage = "settings.previewUpdatesPendingMessage"
         case settingsPreviewUpdatesPendingTitle = "settings.previewUpdatesPendingTitle"
+        case firstRunLoginItemDisclosure = "firstRun.loginItemDisclosure"
+        case settingsContinue = "settings.continue"
+        case settingsContinueWithoutLogin = "settings.continueWithoutLogin"
+        case settingsDismiss = "settings.dismiss"
+        case settingsOpenLoginItems = "settings.openLoginItems"
+        case settingsRefreshLoginItemStatus = "settings.refreshLoginItemStatus"
+        case settingsRemovePendingLoginItem = "settings.removePendingLoginItem"
+        case settingsStartAtLogin = "settings.startAtLogin"
+        case settingsStartAtLoginApprovalMessage = "settings.startAtLoginApprovalMessage"
+        case settingsStartAtLoginApprovalTitle = "settings.startAtLoginApprovalTitle"
+        case settingsStartAtLoginDisabled = "settings.startAtLoginDisabled"
+        case settingsStartAtLoginEnabled = "settings.startAtLoginEnabled"
+        case settingsStartAtLoginNeedsApproval = "settings.startAtLoginNeedsApproval"
+        case settingsStartAtLoginRegistrationErrorMessage = "settings.startAtLoginRegistrationErrorMessage"
+        case settingsStartAtLoginRegistrationErrorTitle = "settings.startAtLoginRegistrationErrorTitle"
+        case settingsStartAtLoginRegistrationNotConfirmedMessage = "settings.startAtLoginRegistrationNotConfirmedMessage"
+        case settingsStartAtLoginRegistrationNotConfirmedTitle = "settings.startAtLoginRegistrationNotConfirmedTitle"
+        case settingsStartAtLoginSummary = "settings.startAtLoginSummary"
+        case settingsStartAtLoginUnavailable = "settings.startAtLoginUnavailable"
+        case settingsStartAtLoginUnavailableMessage = "settings.startAtLoginUnavailableMessage"
+        case settingsStartAtLoginUnavailableTitle = "settings.startAtLoginUnavailableTitle"
+        case settingsStartAtLoginUnregistrationErrorMessage = "settings.startAtLoginUnregistrationErrorMessage"
+        case settingsStartAtLoginUnregistrationErrorTitle = "settings.startAtLoginUnregistrationErrorTitle"
+        case settingsStartAtLoginUnregistrationNotConfirmedMessage = "settings.startAtLoginUnregistrationNotConfirmedMessage"
+        case settingsStartAtLoginUnregistrationNotConfirmedTitle = "settings.startAtLoginUnregistrationNotConfirmedTitle"
         case settingsUseDefault = "settings.useDefault"
         case settingsVersion = "settings.version"
         case settingsWebsite = "settings.website"
@@ -86,7 +111,7 @@ enum TiboTattleLocalization {
             case .settingsGeneral:
                 "General"
             case .settingsGeneralSummary:
-                "TiboTattle refreshes local usage while it is open. It does not install a login item, LaunchAgent, or daemon; raw logs never leave this Mac."
+                "TiboTattle refreshes local usage while it is open. Start at login is an explicit macOS login-item choice; no LaunchAgent, daemon, privileged helper, or hidden persistent process is used. Raw logs never leave this Mac."
             case .settingsGitHub:
                 "GitHub"
             case .settingsLanguage:
@@ -103,6 +128,56 @@ enum TiboTattleLocalization {
                 "This preview is connected to the live TiboTattle service, but the signed update feed has not been published yet. Local analysis is unaffected. Check again after a signed release is available."
             case .settingsPreviewUpdatesPendingTitle:
                 "Updates aren't published yet"
+            case .firstRunLoginItemDisclosure:
+                "By default, first-run setup preselects Start TiboTattle at login. TiboTattle adds a macOS login item only after you click Get Started; it uses no LaunchAgent, daemon, privileged helper, or hidden persistent process."
+            case .settingsContinue:
+                "Continue"
+            case .settingsContinueWithoutLogin:
+                "Continue Without Login"
+            case .settingsDismiss:
+                "OK"
+            case .settingsOpenLoginItems:
+                "Open Login Items Settings"
+            case .settingsRefreshLoginItemStatus:
+                "Refresh Login Item Status"
+            case .settingsRemovePendingLoginItem:
+                "Remove Pending Login Item"
+            case .settingsStartAtLogin:
+                "Start TiboTattle at login"
+            case .settingsStartAtLoginApprovalMessage:
+                "macOS has registered TiboTattle, but it still needs your approval. Open System Settings → Login Items and allow TiboTattle."
+            case .settingsStartAtLoginApprovalTitle:
+                "Approve start at login"
+            case .settingsStartAtLoginDisabled:
+                "TiboTattle will not start automatically."
+            case .settingsStartAtLoginEnabled:
+                "TiboTattle starts when you sign in."
+            case .settingsStartAtLoginNeedsApproval:
+                "macOS needs your approval in System Settings → Login Items."
+            case .settingsStartAtLoginRegistrationErrorMessage:
+                "macOS did not allow TiboTattle to enable its login item. Open System Settings → Login Items to review the permission."
+            case .settingsStartAtLoginRegistrationErrorTitle:
+                "Couldn't enable start at login"
+            case .settingsStartAtLoginRegistrationNotConfirmedMessage:
+                "macOS did not confirm that TiboTattle will start at login. Review System Settings → Login Items before relying on it."
+            case .settingsStartAtLoginRegistrationNotConfirmedTitle:
+                "Start at login was not confirmed"
+            case .settingsStartAtLoginSummary:
+                "Start TiboTattle automatically when you sign in. You can change this later in Settings → General."
+            case .settingsStartAtLoginUnavailable:
+                "Login item status is unavailable. Open System Settings → Login Items."
+            case .settingsStartAtLoginUnavailableMessage:
+                "macOS did not provide the current Login Item status. Open System Settings → Login Items to review it."
+            case .settingsStartAtLoginUnavailableTitle:
+                "Login Item status is unavailable"
+            case .settingsStartAtLoginUnregistrationErrorMessage:
+                "macOS did not allow TiboTattle to disable its login item. Open System Settings → Login Items to review the permission."
+            case .settingsStartAtLoginUnregistrationErrorTitle:
+                "Couldn't disable start at login"
+            case .settingsStartAtLoginUnregistrationNotConfirmedMessage:
+                "macOS did not confirm that TiboTattle was removed from Login Items. Review System Settings → Login Items before relying on it."
+            case .settingsStartAtLoginUnregistrationNotConfirmedTitle:
+                "Removal from login was not confirmed"
             case .settingsUseDefault:
                 "Use Default"
             case .settingsVersion:

@@ -77,6 +77,7 @@ import {
   validateMacOSSignedReplacementPair,
   validateMacOSApplicationsLink,
   validateMacOSDMG,
+  validateMacOSLoginItemReleaseRehearsal,
 } from "../scripts/macos-release-core.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
@@ -445,10 +446,11 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
 }
 
 test("native launcher keeps the requested foreground-only lifecycle", async () => {
-  const [source, semanticOpenTargetSource, menuBarStatusSource] = await Promise.all([
+  const [source, semanticOpenTargetSource, menuBarStatusSource, loginItemSource] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(SEMANTIC_OPEN_TARGET_SOURCE, "utf8"),
     readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps", "macos", "Sources", "LoginItemManager.swift"), "utf8"),
   ]);
   const firstRunDisclosureSource = source.slice(
     source.indexOf("private func showFirstRunDisclosure"),
@@ -533,7 +535,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /init\(semanticOpenTarget: SemanticOpenTarget\)[\s\S]*self\.semanticOpenTarget = semanticOpenTarget/u,
+    /init\([\s\S]*semanticOpenTarget: SemanticOpenTarget[\s\S]*self\.semanticOpenTarget = semanticOpenTarget/u,
   );
   assert.match(
     source,
@@ -570,6 +572,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /Welcome to \\\(BundledProduct\.displayName\)/u,
   );
   assert.match(source, /addButton\(withTitle: "Get Started"\)/u);
+  assert.match(
+    firstRunDisclosureSource,
+    /checkboxWithTitle:[\s\S]*\.settingsStartAtLogin/u,
+  );
+  assert.match(firstRunDisclosureSource, /startAtLogin\.state = \.on/u);
+  assert.match(
+    firstRunDisclosureSource,
+    /guard alert\.runModal\(\) == \.alertFirstButtonReturn[\s\S]*?registerLoginItemForFirstRun/u,
+  );
   assert.match(source, /first-run-v1\.json/u);
   assert.match(source, /usage-monitor-first-run-v1/u);
   assert.match(source, /Community contribution is optional/iu);
@@ -665,7 +676,36 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /nativeRefreshIntervalSeconds = 300/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
   assert.match(source, /LocalCompanionEvidenceReader/u);
-  assert.match(source, /LaunchAgent, or daemon/iu);
+  assert.match(source, /firstRunLoginItemDisclosure/u);
+  assert.match(source, /registerLoginItemForFirstRun/u);
+  assert.match(source, /func applicationDidBecomeActive[\s\S]*?updateStartAtLoginSettingsControl\(\)/u);
+  assert.match(source, /title: TiboTattleLocalization\.string\([\s\S]*?\.settingsRefreshLoginItemStatus/u);
+  assert.match(source, /title: TiboTattleLocalization\.string\([\s\S]*?\.settingsRemovePendingLoginItem/u);
+  assert.match(source, /@objc private func removePendingLoginItem\(\)[\s\S]*?\.unregister/u);
+  assert.match(source, /loginItemOperationResult\([\s\S]*?showLoginItemOperationResult/u);
+  assert.match(source, /windowShouldClose\(_ sender: NSWindow\)/u);
+  assert.match(source, /sender\.orderOut\(nil\)[\s\S]*return false/u);
+  assert.match(
+    source,
+    /private func quitApplication\(\) \{\s*NSApp\.terminate\(nil\)/u,
+  );
+  assert.match(loginItemSource, /import ServiceManagement/u);
+  assert.match(loginItemSource, /SMAppService\.mainApp/u);
+  assert.match(loginItemSource, /SMAppService\.openSystemSettingsLoginItems\(\)/u);
+  assert.match(loginItemSource, /case \.notFound:/u);
+  assert.match(loginItemSource, /struct LoginItemSettingsPresentation/u);
+  assert.match(loginItemSource, /case \.requiresApproval:[\s\S]*?showsPendingRemoval: true/u);
+  assert.match(loginItemSource, /case notConfirmed/u);
+  assert.match(loginItemSource, /func reconciledLoginItemOperationResultAfterError/u);
+  for (const forbidden of [
+    "daemonService",
+    "agentService",
+    "SMLoginItemSetEnabled",
+    "LaunchAgents",
+    "LaunchDaemons",
+  ]) {
+    assert.equal(loginItemSource.includes(forbidden), false, forbidden);
+  }
   assert.match(source, /title: "Quit"/u);
   assert.match(source, /title: "Settings…"[\s\S]*keyEquivalent: ","/u);
   // The menu-bar item is additive: the Dock icon and the regular activation
@@ -732,8 +772,6 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   for (const forbidden of [
     "LaunchAgents",
     "LaunchDaemons",
-    "ServiceManagement",
-    "SMAppService",
     "SMLoginItemSetEnabled",
     "URLSessionConfiguration.background",
   ]) {
@@ -750,6 +788,10 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   // WebKit is a system framework: the bundle gains no new binary and the
   // packaged app declares no new transport exception for it.
   assert.match(buildSource, /"-framework",\s*\n\s*"WebKit",/u);
+  assert.match(
+    buildSource,
+    /"-framework",\s*\n\s*"ServiceManagement",/u,
+  );
   assert.equal(buildSource.includes("NSAllowsArbitraryLoads"), false);
   assert.equal(buildSource.includes("NSExceptionDomains"), false);
   assert.match(
@@ -1612,6 +1654,124 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   );
 });
 
+test("Login Item release rehearsal requires the installed signed-app lifecycle evidence", () => {
+  const checks = {
+    firstRunConsentIsVisibleAndAffirmative: true,
+    settingsReconcileAfterSystemSettingsChange: true,
+    enableDisableAndPendingRemoval: true,
+    automaticLoginLaunch: true,
+    upgradeRetainsSingleMainAppLoginItem: true,
+    moveAndReinstallLeavesNoStaleDuplicate: true,
+    uninstallAndReinstallLeavesNoStaleDuplicate: true,
+    duplicateLaunchExplainsExistingApp: true,
+    windowCloseKeepsMenuBarAndQuitStopsApp: true,
+    noAgentDaemonOrBackgroundUpload: true,
+  };
+  const rehearsal = {
+    schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v1",
+    recordedOn: "2026-08-04",
+    environment: {
+      cleanDisposableProfile: true,
+      installedInApplications: true,
+    },
+    application: {
+      bundleIdentifier: "com.usagemonitor.local",
+      bundleVersion: "17",
+      shortVersion: "0.1.0",
+    },
+    checks,
+  };
+  const validated = validateMacOSLoginItemReleaseRehearsal(rehearsal, {
+    bundleVersion: "17",
+    shortVersion: "0.1.0",
+  });
+  assert.equal(validated.bundleIdentifier, "com.usagemonitor.local");
+  assert.equal(validated.bundleVersion, "17");
+  assert.equal(validated.requiredChecks.length, 10);
+  assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal({
+      ...rehearsal,
+      checks: {
+        ...checks,
+        automaticLoginLaunch: false,
+      },
+    }, {
+      bundleVersion: "17",
+      shortVersion: "0.1.0",
+    }),
+    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
+  );
+  assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal(rehearsal, {
+      bundleVersion: "18",
+      shortVersion: "0.1.0",
+    }),
+    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
+  );
+  assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal({
+      ...rehearsal,
+      recordedOn: "2026-02-30",
+    }, {
+      bundleVersion: "17",
+      shortVersion: "0.1.0",
+    }),
+    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
+  );
+});
+
+test("Login Item release tooling validates only the fake seam and an Applications receipt", async () => {
+  const [releaseSource, gateSource] = await Promise.all([
+    readFile(RELEASE_CORE, "utf8"),
+    readFile(
+      join(
+        REPOSITORY_ROOT,
+        "scripts",
+        "validate-macos-login-item-release.js",
+      ),
+      "utf8",
+    ),
+  ]);
+  assert.match(
+    releaseSource,
+    /validateMacOSLoginItemContract\(inspected\.executablePath\)/u,
+  );
+  assert.match(
+    releaseSource,
+    /--login-item-contract-smoke-test/u,
+  );
+  assert.match(releaseSource, /real Login Items; the executable/u);
+  assert.match(releaseSource, /fake ServiceManagement seam/u);
+  assert.match(
+    gateSource,
+    /const REQUIRED_APPLICATION_PATH\s*=\s*`\/Applications\/\$\{PRODUCT_BRAND\.bundleName\}`/u,
+  );
+  assert.match(gateSource, /validateInstalledMacOSApp\(appPath, \{ production: true \}\)/u);
+  assert.match(gateSource, /validateMacOSLoginItemReleaseRehearsal/u);
+  assert.equal(gateSource.includes("register()"), false);
+  assert.equal(gateSource.includes("unregister()"), false);
+  const refusedDevelopmentPath = spawnSync(process.execPath, [
+    join(
+      REPOSITORY_ROOT,
+      "scripts",
+      "validate-macos-login-item-release.js",
+    ),
+    "--app",
+    ".release-build/macos/TiboTattle.app",
+    "--rehearsal",
+    "/tmp/unused-login-item-rehearsal.json",
+  ], {
+    cwd: REPOSITORY_ROOT,
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  assert.equal(refusedDevelopmentPath.status, 1);
+  assert.match(
+    refusedDevelopmentPath.stderr,
+    /must use \/Applications\/TiboTattle\.app/u,
+  );
+});
+
 test("signed updater replacement contract validates upgrade and rollback artifacts", async () => {
   assert.equal(compareMacOSBundleVersions("1", "1.0.0"), 0);
   assert.equal(compareMacOSBundleVersions("1.2", "1.1.99"), 1);
@@ -2322,6 +2482,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   );
   assert.deepEqual(swiftSources.relativeFiles, [
     "apps/macos/Sources/Localization.swift",
+    "apps/macos/Sources/LoginItemManager.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
     "apps/macos/UsageMonitorApp.swift",
@@ -3377,6 +3538,20 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
       updaterSmoke.stdout,
       /runtime=development_disabled/u,
     );
+    const loginItemSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--login-item-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      loginItemSmoke.status,
+      0,
+      loginItemSmoke.stderr || loginItemSmoke.stdout,
+    );
+    assert.match(
+      loginItemSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_LOGIN_ITEM_CONTRACT fake=true register=affirmative-only unregister=explicit status=enabled,not-registered,requires-approval,unavailable outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed pending_removal=true real_service_calls=0 daemon=false$/mu,
+    );
     const menuBarSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
       ["--menu-bar-contract-smoke-test"],
@@ -3722,6 +3897,18 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
     assert.match(
       diagnostics.stdout,
       /^failure_code: UM_MACOS_COMPANION_START_TIMEOUT$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^login_item_status: requires_approval$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^login_item_last_operation: register_requires_approval$/mu,
+    );
+    assert.match(
+      diagnostics.stdout,
+      /^login_item_service: main_app_only$/mu,
     );
     assert.match(diagnostics.stdout, /^paths_included: false$/mu);
     assert.match(diagnostics.stdout, /^identifiers_included: false$/mu);

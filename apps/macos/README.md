@@ -1,11 +1,11 @@
 ---
-title: Usage Monitor macOS Release Runbook
+title: TiboTattle macOS Release Runbook
 date: 2026-07-29
 type: runbook
 status: implemented-foundation
 ---
 
-# Usage Monitor macOS release runbook
+# TiboTattle macOS release runbook
 
 This directory contains the native foreground launcher and the release
 contracts for a self-contained Usage Monitor app. The ordinary developer build
@@ -16,15 +16,21 @@ a clean-profile smoke all succeed.
 
 ## Consumer lifecycle in the app
 
-1. Launch **Usage Monitor.app**.
+1. Launch **TiboTattle.app**.
 2. On the first launch, review the one-time **Get Started** disclosure. It
    explains exactly which Codex metadata can be read after an explicit Analyze
    action, what owner-only local state is retained, which content is excluded,
    how optional contribution stays off, and what happens when the browser or
-   app closes. The acknowledgement is an owner-only local receipt; moving local
-   app data to Trash makes the disclosure appear again.
+   app closes. The accessible native **Start TiboTattle at login** control is
+   visibly preselected. Choosing **Get Started** is the affirmative action
+   that may register the native Login Item; clearing it continues without a
+   Login Item. The acknowledgement is an owner-only local receipt; moving
+   local app data to Trash makes the disclosure appear again.
 3. The native window starts one private loopback companion on an ephemeral
-   port. Nothing is scanned or uploaded merely because the app launched.
+   port and performs its existing bounded local refresh while the normal app
+   remains open. The Login Item adds no separate scanner; raw logs and prompts
+   are never uploaded by the launch itself, and optional contribution keeps its
+   separate review and consent controls.
 4. A menu-bar status item appears alongside the window and the Dock icon. It is
    an additional affordance, not a replacement: the app stays a regular
    foreground application and installs no `LSUIElement` agent. The compact
@@ -55,14 +61,48 @@ a clean-profile smoke all succeed.
 10. A trusted website or browser bookmark may use `usagemonitor://open` to
    activate the app and open its loopback dashboard. All other hosts, paths,
    credentials, queries, and fragments in that custom scheme are rejected.
-11. Closing or quitting the native app stops the companion. No daemon or login
-   item is installed. After an explicit reviewed first contribution, the user
-   may enable six-hour contribution while the app remains open.
+11. Closing the primary window leaves the regular menu-bar app available;
+   **Quit TiboTattle** stops the companion. If the person accepted the
+   first-run default or later enables it in Settings, the app uses one native
+   Login Item to launch this normal app at login. It never installs a daemon,
+   LaunchAgent, privileged helper, or separately persistent worker. After an
+   explicit reviewed first contribution, the user may enable six-hour
+   contribution while the app remains open.
 
 Keep the app open while local analysis runs. Closing the TiboTattle window
-exits the app and stops the current pass; completed checkpoints remain
-available on the next launch. **Open in Browser** is a separate optional
-control in the app, not the primary dashboard destination.
+hides that window; the menu-bar item can reopen it. Explicit Quit stops the
+current pass; completed checkpoints remain available on the next launch.
+**Open in Browser** is a separate optional control in the app, not the primary
+dashboard destination.
+
+### Launch-at-login lifecycle
+
+TiboTattle supports macOS 13 or later and uses Apple's
+`ServiceManagement` `SMAppService.mainApp` API directly. A fresh install does
+not register during launch or status refresh: the first-run checkbox is only a
+preselected choice. On first run, its **Get Started** action is the sole point
+that may request registration. Existing installs that completed the earlier
+first-run receipt are never registered by an update; they can opt in from
+**Settings…** → **General**.
+
+The Settings control reads the service's reported state rather than treating a
+stored preference as proof. It refreshes when Settings opens, when the app
+becomes active again after System Settings, after an explicit **Refresh Login
+Item Status** action, and after every requested change. A non-throwing request
+is not treated as proof: TiboTattle reads the status again and says whether
+enable/disable was confirmed, needs approval, was not confirmed, or is
+unavailable. If approval is pending, the toggle is disabled rather than shown
+as a misleading off state; **Remove Pending Login Item** can explicitly
+withdraw it. The setting affects app launch at login only: it does not add a
+separate scan, keep a companion process alive after Quit, send a contribution,
+or permit a silent background upload. The existing bounded refresh remains a
+normal-app, while-running behavior.
+
+The ordinary regular window remains visible when the app launches. The product
+does not use an undocumented heuristic to guess whether a particular startup
+came from login versus a person opening the app, because that could hide a
+manual launch. Closing the window is the explicit way to leave the regular
+menu-bar companion running; **Quit TiboTattle** still stops it.
 
 ## Report and native-toolbar boundary
 
@@ -103,7 +143,7 @@ After the reset, future contribution activity uses a new identity and requires
 pairing again.
 
 The ordinary uninstall journey is simply: quit Usage Monitor and move
-**Usage Monitor.app** to Trash. Advanced local cleanup is kept under
+**TiboTattle.app** to Trash. Advanced local cleanup is kept under
 **Data & Diagnostics…** rather than presented as part of normal onboarding.
 
 ## Developer build
@@ -113,7 +153,7 @@ The current bundle is pinned to Node 26.2.0 and Apple silicon:
 ```bash
 npm run product:macos:build
 npm run product:macos:validate:development
-open ".release-build/macos/Usage Monitor.app"
+open ".release-build/macos/TiboTattle.app"
 ```
 
 Create a deterministic-layout developer DMG:
@@ -254,7 +294,7 @@ private update-signing key must not enter the repository or release host:
 
 ```bash
 node ./scripts/build-macos-app.js \
-  --output ".release-build/macos-production/Usage Monitor.app" \
+  --output ".release-build/macos-production/TiboTattle.app" \
   --central-origin "https://REPLACE-WITH-APPROVED-HOST" \
   --external-distribution \
   --bundle-version 1 \
@@ -388,8 +428,9 @@ npm run product:macos:validate:release
 ```
 
 The automated validator proves the bundle and Gatekeeper contract on the build
-Mac with an empty temporary home. It is not a substitute for a truly clean
-machine.
+Mac with an empty temporary home. It also runs the packaged Login Item contract
+smoke against an injected fake manager; that check makes zero real
+ServiceManagement calls. It is not a substitute for a truly clean machine.
 
 Before sending the DMG to any external user, perform a human clean-Mac or
 disposable-VM rehearsal:
@@ -401,14 +442,31 @@ disposable-VM rehearsal:
 4. launch it without Terminal, Control-click bypasses, or privacy-setting
    exceptions;
 5. verify the calm Ready state, Retry path, diagnostics copy and failure code,
-   default/custom Codex source selection, exact
-   configured app-open link, first scan, first reviewed contribution,
-   opt-in six-hour contribution schedule, **Check for Updates**, quit,
-   relaunch, and uninstall journey;
-6. verify no Login Item, LaunchAgent, daemon, unexpected network connection, or
-   orphan companion remains; and
+   default/custom Codex source selection, exact configured app-open link,
+   first scan, first reviewed contribution, opt-in six-hour contribution
+   schedule, **Check for Updates**, close/reopen from the menu bar, explicit
+   quit, relaunch, and uninstall journey;
+6. on a disposable clean macOS user profile, verify that first-run visibly
+   preselects **Start TiboTattle at login** but does not create a Login Item
+   until **Get Started** is chosen; then verify the Settings status, explicit
+   status refresh after returning from System Settings, disable/re-enable, and
+   the approval/System Settings/**Remove Pending Login Item** recovery paths.
+   Sign out/in once to prove automatic launch; then rehearse signed upgrade,
+   move/reinstall, uninstall/reinstall, and an attempted second launch to
+   confirm one normal-app Login Item and no stale duplicate. Confirm that the
+   only possible Login Item is TiboTattle's native app registration, and that
+   there is no LaunchAgent, LaunchDaemon, daemon, privileged helper,
+   unexpected network connection, autonomous raw-log scan, background upload,
+   or orphan companion; and
 7. retain the macOS version, hardware architecture, artifact SHA-256, elapsed
-   onboarding times, and observed failures in the release receipt.
+   onboarding times, and observed failures in the release receipt; then run
+   the receipt gate without changing Login Items:
+
+   ```bash
+   npm run product:macos:validate:login-item-release -- \
+     --app "/Applications/TiboTattle.app" \
+     --rehearsal "docs/receipts/YYYY-MM-DD-macos-login-item-release-rehearsal.json"
+   ```
 
 ## Human-only gates
 

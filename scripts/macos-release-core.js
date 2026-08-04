@@ -107,6 +107,26 @@ const REQUIRED_NODE_RUNTIME_ENTITLEMENTS = Object.freeze([
   "com.apple.security.cs.allow-jit",
   "com.apple.security.cs.allow-unsigned-executable-memory",
 ]);
+const LOGIN_ITEM_RELEASE_REHEARSAL_SCHEMA =
+  "usage-monitor-macos-login-item-release-rehearsal-v1";
+const REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS = Object.freeze([
+  "firstRunConsentIsVisibleAndAffirmative",
+  "settingsReconcileAfterSystemSettingsChange",
+  "enableDisableAndPendingRemoval",
+  "automaticLoginLaunch",
+  "upgradeRetainsSingleMainAppLoginItem",
+  "moveAndReinstallLeavesNoStaleDuplicate",
+  "uninstallAndReinstallLeavesNoStaleDuplicate",
+  "duplicateLaunchExplainsExistingApp",
+  "windowCloseKeepsMenuBarAndQuitStopsApp",
+  "noAgentDaemonOrBackgroundUpload",
+]);
+const LOGIN_ITEM_CONTRACT_OUTPUT =
+  "USAGE_MONITOR_MACOS_LOGIN_ITEM_CONTRACT "
+  + "fake=true register=affirmative-only unregister=explicit "
+  + "status=enabled,not-registered,requires-approval,unavailable "
+  + "outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed "
+  + "pending_removal=true real_service_calls=0 daemon=false";
 
 function fail(message, code = "MACOS_RELEASE_FAILED") {
   const error = new Error(message);
@@ -1605,6 +1625,93 @@ export async function validateMacOSApplicationsLink(path) {
   }
 }
 
+/**
+ * Exercise only the compiled fake ServiceManagement seam. This never creates,
+ * changes, or queries the caller's real Login Items; the executable recognizes
+ * the contract argument before it constructs the production adapter.
+ */
+export function validateMacOSLoginItemContract(executablePath, {
+  environment = releaseEnvironment(),
+} = {}) {
+  const smoke = runMacOSReleaseCommand(executablePath, [
+    "--login-item-contract-smoke-test",
+  ], {
+    env: environment,
+    failureMessage: "Packaged Login Item contract smoke failed",
+    timeout: 5_000,
+  });
+  if (smoke.stdout.trim() !== LOGIN_ITEM_CONTRACT_OUTPUT) {
+    fail(
+      "Packaged Login Item contract smoke reported an unexpected result",
+      "MACOS_LOGIN_ITEM_CONTRACT_INVALID",
+    );
+  }
+  return Object.freeze({
+    fakeServiceManagement: true,
+    realServiceCalls: 0,
+    daemon: false,
+  });
+}
+
+function isValidRehearsalDate(value) {
+  if (typeof value !== "string"
+      || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) {
+    return false;
+  }
+  const [year, month, day] = value.split("-").map(Number);
+  const candidate = new Date(Date.UTC(year, month - 1, day));
+  return candidate.getUTCFullYear() === year
+    && candidate.getUTCMonth() === month - 1
+    && candidate.getUTCDate() === day;
+}
+
+function isSafeRehearsalString(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 128
+    && !value.includes("\0");
+}
+
+/**
+ * Validate a privacy-safe human rehearsal receipt. The receipt makes the
+ * non-automatable lifecycle checks (real sign-in, replacement, move, and
+ * uninstall) explicit without allowing release tooling to mutate a person's
+ * Login Items database itself.
+ */
+export function validateMacOSLoginItemReleaseRehearsal(receipt, {
+  bundleIdentifier = BUNDLE_IDENTIFIER,
+  bundleVersion,
+  shortVersion,
+} = {}) {
+  const recordedOn = receipt?.recordedOn;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+      || receipt.schemaVersion !== LOGIN_ITEM_RELEASE_REHEARSAL_SCHEMA
+      || !isValidRehearsalDate(recordedOn)
+      || receipt.environment?.cleanDisposableProfile !== true
+      || receipt.environment?.installedInApplications !== true
+      || receipt.application?.bundleIdentifier !== bundleIdentifier
+      || !isSafeRehearsalString(receipt.application?.bundleVersion)
+      || !isSafeRehearsalString(receipt.application?.shortVersion)
+      || (bundleVersion !== undefined
+        && receipt.application.bundleVersion !== bundleVersion)
+      || (shortVersion !== undefined
+        && receipt.application.shortVersion !== shortVersion)
+      || REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS.some(
+        (key) => receipt.checks?.[key] !== true,
+      )) {
+    fail(
+      "Login Item release rehearsal receipt is incomplete or does not match the installed app",
+      "MACOS_LOGIN_ITEM_REHEARSAL_INVALID",
+    );
+  }
+  return Object.freeze({
+    bundleIdentifier: receipt.application.bundleIdentifier,
+    bundleVersion: receipt.application.bundleVersion,
+    recordedOn,
+    requiredChecks: [...REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS],
+  });
+}
+
 export async function validateInstalledMacOSApp(appPath, {
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
@@ -1665,6 +1772,10 @@ export async function validateInstalledMacOSApp(appPath, {
       failureMessage: "Gatekeeper rejected the installed application",
     });
   }
+  // This uses a fake manager by contract. The production ServiceManagement
+  // adapter is not constructed and the operator's real Login Item remains
+  // untouched during every build, signing, DMG, and validation run.
+  validateMacOSLoginItemContract(inspected.executablePath);
   const isolatedRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-clean-install-"),
   );
