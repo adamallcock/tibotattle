@@ -4,8 +4,13 @@ import { readFile } from "node:fs/promises";
 
 import {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
+  normalizeCommunitySnapshot,
+} from "../public/data-client.js";
+import {
   COMMUNITY_METRIC_LABELS,
+  COMMUNITY_ESTIMATE_STATE_COPY,
   COMMUNITY_SNAPSHOT_STATE_COPY,
+  renderCommunityEstimate,
   renderCommunitySnapshot,
 } from "../public/community-view.js";
 import {
@@ -138,7 +143,7 @@ function publishedSnapshot(overrides = {}) {
   };
 }
 
-test("the public site presents the community snapshot first and a fail-closed download CTA", async () => {
+test("the public site leads with a fail-closed Mac app download and distinct community evidence", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
 
@@ -146,24 +151,22 @@ test("the public site presents the community snapshot first and a fail-closed do
   assert.match(html, /id="hero-title"/u);
   assert.match(html, /id="community"/u);
   assert.match(html, /id="download"/u);
-  assert.match(html, /id="faq"/u);
-  assert.match(html, /Download for Mac/u);
-  assert.match(html, /privacy-safe seven-day community snapshot/u);
-  assert.match(html, /community seven-day allowance estimate will appear only after/u);
+  assert.match(html, /Signed Mac installer/u);
+  assert.match(html, /privacy-reviewed community evidence/u);
   assert.match(html, /id="installer-link"/u);
   assert.match(html, /id="installer-details"/u);
   assert.match(html, /id="installer-unavailable"/u);
   assert.match(html, /id="installer-steps" hidden/u);
-  assert.match(html, /id="download-nav-link"/u);
-  assert.match(html, /id="download-hero-link"/u);
   assert.match(html, /id="community-result"/u);
   assert.match(html, /id="community-snapshot-service-detail"/u);
   assert.match(html, /id="community-service-state"/u);
   assert.match(html, /id="community-snapshot-title">Seven-day community snapshot/u);
-  assert.doesNotMatch(html, /Published seven-day snapshot/u);
+  assert.match(html, /id="community-estimate-result"/u);
+  assert.match(html, /id="community-estimate-state"/u);
+  assert.match(html, /id="community-estimate-panel-state"/u);
   assert.ok(
-    html.indexOf('id="community"') < html.indexOf('id="download"'),
-    "the community snapshot precedes the download section",
+    html.indexOf('id="installer-link"') < html.indexOf('id="community"'),
+    "the signed-download action appears before the public community snapshot",
   );
   assert.doesNotMatch(
     html,
@@ -223,7 +226,6 @@ test("the public site presents the community snapshot first and a fail-closed do
   assert.match(html, /<nav class="primary-nav" aria-label="Site sections">/u);
   assert.match(html, /aria-labelledby="community-title"/u);
   assert.match(html, /aria-labelledby="download-title"/u);
-  assert.match(html, /aria-labelledby="faq-title"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
     /button:focus-visible, input:focus-visible, a:focus-visible/u,
@@ -252,6 +254,30 @@ test("the public site presents the community snapshot first and a fail-closed do
     );
   }
   assert.doesNotMatch(html, /semantic-open-target|open-installed-app/u);
+});
+
+test("the first visit leads with the product purpose, signed download, and named estimate gate", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const purpose = "TiboTattle is a local-first Mac app for understanding personal Codex";
+  assert.match(html, new RegExp(purpose, "u"));
+  assert.match(html, /Signed Mac installer/u);
+  assert.match(html, /Download signed Mac installer/u);
+  assert.match(html, /Community seven-day allowance estimate/u);
+  assert.match(html, /<section class="community-hero"[^>]*id="download"/u);
+  assert.match(html, /id="installer-link"/u);
+  assert.ok(
+    html.indexOf('id="installer-link"') < html.indexOf('id="community"'),
+    "the primary installer action appears before the community activity section",
+  );
+  assert.match(
+    html,
+    /Your personal dashboard, local scans, sign-in, and optional\s+contribution/u,
+  );
+  assert.doesNotMatch(
+    html,
+    /Activity totals[^<]+are an allowance estimate/u,
+  );
+  assert.doesNotMatch(html, /open-installed-app|usagemonitor:\/\/open/u);
 });
 
 test("browser entry points share the renderer without shipping local app controls", async () => {
@@ -317,6 +343,33 @@ test("the community view degrades honestly without a service or a published week
       false,
       expectedState,
     );
+  }
+});
+
+test("the named estimate gate never derives an allowance from the activity-only contract", () => {
+  for (const [payload, expectedEstimateState] of [
+    [null, "service_unavailable"],
+    [publishedSnapshot({ releaseStatus: "not_yet_published" }), "not_yet_published"],
+    [publishedSnapshot({ releaseStatus: "suppressed" }), "suppressed"],
+    [publishedSnapshot(), "activity_only"],
+  ]) {
+    const documentRef = fakeDocument();
+    const estimate = documentRef.createElement("div");
+    const hero = documentRef.createElement("p");
+    const stateNode = documentRef.createElement("span");
+    const estimateState = renderCommunityEstimate({
+      documentRef,
+      container: estimate,
+      hero,
+      stateNode,
+      snapshot: normalizeCommunitySnapshot(payload),
+    });
+    assert.equal(estimateState, expectedEstimateState);
+    assert.match(estimate.text, /no released allowance estimate/u);
+    assert.doesNotMatch(estimate.text, /100,000|100000|\$/u);
+    assert.match(hero.textContent, /estimate|evidence/u);
+    assert.equal(stateNode.className, "evidence-chip neutral");
+    assert.ok(COMMUNITY_ESTIMATE_STATE_COPY[expectedEstimateState]);
   }
 });
 
@@ -386,17 +439,14 @@ test("the public page names only a verified installer as a download", () => {
   const unavailable = fakeDocument();
   assert.equal(renderPublicInstallerJourney(unavailable), null);
   assert.equal(unavailable.byId.get("installer-steps").hidden, true);
-  assert.equal(unavailable.byId.get("download-nav-link").textContent, "Mac app");
-  assert.equal(
-    unavailable.byId.get("download-hero-link").textContent,
-    "Mac app availability",
-  );
+  assert.equal(unavailable.byId.get("installer-link").hidden, true);
+  assert.equal(unavailable.byId.get("installer-unavailable").hidden, false);
 
   const ready = fakeDocument(complete);
   assert.equal(renderPublicInstallerJourney(ready)?.version, "1.2.3");
   assert.equal(ready.byId.get("installer-steps").hidden, false);
-  assert.equal(ready.byId.get("download-nav-link").textContent, "Download");
-  assert.equal(ready.byId.get("download-hero-link").textContent, "Download for Mac");
+  assert.equal(ready.byId.get("installer-link").hidden, false);
+  assert.equal(ready.byId.get("installer-unavailable").hidden, true);
 });
 
 test("the public snapshot badge reports reader-facing snapshot state", () => {

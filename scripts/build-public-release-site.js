@@ -71,6 +71,14 @@ const WITHHELD_SOURCE_BASENAMES = Object.freeze([
   "index.html",
   "install-cta.js",
   "navigation.js",
+  // The operator page and its client are private service controls, not a
+  // public website surface. The reviewed TiboTattle icon is deliberately in
+  // the public allow-list above so the installer page visibly matches the
+  // downloaded app.
+  "admin-client.js",
+  "admin.css",
+  "admin.html",
+  "admin.js",
 ]);
 const MAXIMUM_SOCIAL_PREVIEW_BYTES = 10 * 1024 * 1024;
 const INSTALLER_FETCH_TIMEOUT_MS = 120_000;
