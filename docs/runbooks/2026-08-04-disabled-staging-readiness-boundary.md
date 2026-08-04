@@ -97,6 +97,16 @@ that command. The failure is
 `STAGING_FRESH_BOOTSTRAP_REQUIRES_OWNER_CONTAINMENT`, with no operation receipt
 or operational claim.
 
+Before preparation makes any remote inspection, containment, or migration
+call, it also runs the local release preflight against a disposable database.
+That preflight requires the exact reviewed migration inventory and format,
+safe transaction structure, two successful local applications, and the
+community/device/identity schema invariants. It deliberately fails closed when
+the local migration chain seeds an operational `collection_controls` row: that
+is not a remote observation and does not make it safe to apply the same chain
+to a hosted database. A blocked local preflight returns
+`LOCAL_STAGING_PREFLIGHT_BLOCKED` and reaches no remote command.
+
 Fresh bootstrap therefore has an owner-only external prerequisite: the owner
 must use a separately reviewed Cloudflare D1 bootstrap protocol that establishes
 the exact staging migration state and a verified `collection_controls` row in

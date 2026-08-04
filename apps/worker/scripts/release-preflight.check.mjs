@@ -17,8 +17,11 @@ import {
   REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS,
   REQUIRED_PRIMARY_MIGRATIONS,
   REQUIRED_SCHEMA_OBJECTS,
+  validateMigrationInventory,
+  validateMigrationSource,
   runReleasePreflight,
 } from "./release-preflight.mjs";
+import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -90,7 +93,10 @@ function containedCollectionControlRow() {
   };
 }
 
-async function standardFixture({ collectionControlRows = [containedCollectionControlRow()] } = {}) {
+async function standardFixture({
+  collectionControlRows = [containedCollectionControlRow()],
+  schemaMismatch = null,
+} = {}) {
   const calls = [];
   const primaryMigrations = await migrationNames("migrations");
   const deletionLedgerMigrations = await migrationNames("deletion-ledger-migrations");
@@ -104,6 +110,10 @@ async function standardFixture({ collectionControlRows = [containedCollectionCon
       columns.map((name) => ({ name })),
     ]),
   );
+  if (schemaMismatch !== null) {
+    const [table, column] = schemaMismatch;
+    columnRows[table] = columnRows[table].filter((row) => row.name !== column);
+  }
   const deletionLedgerColumnRows = Object.fromEntries(
     Object.entries(REQUIRED_DELETION_LEDGER_COLUMNS).map(([table, columns]) => [
       table,
@@ -199,6 +209,10 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.deepEqual(result.blockers, []);
   assert.equal(result.checks.primaryMigrationsAppliedInOrder, true);
   assert.equal(result.checks.deletionLedgerMigrationsAppliedInOrder, true);
+  assert.equal(result.checks.localMigrationInventorySafe, true);
+  assert.equal(result.checks.localMigrationSourcesSafe, true);
+  assert.equal(result.checks.primaryMigrationRerunStable, true);
+  assert.equal(result.checks.deletionLedgerMigrationRerunStable, true);
   assert.equal(result.checks.requiredSchemaPresent, true);
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsContained, true);
@@ -206,12 +220,89 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.evidence.migrationWindow, "0023-0029");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
-  assert.equal(calls.filter((args) => args.includes("migrations")).length, 2);
+  assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
   assert.equal(
     REQUIRED_PRIMARY_MIGRATIONS.every((name) => primaryMigrations.includes(name)),
     true,
   );
 });
+
+test("migration source preflight rejects missing, malformed, and transaction-owning inputs", () => {
+  const inventory = {
+    USAGE_MONITOR_DB: [...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB],
+    DELETION_LEDGER: [...EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER],
+  };
+  assert.deepEqual(validateMigrationInventory(inventory), { ok: true, code: null });
+
+  const missing = structuredClone(inventory);
+  missing.USAGE_MONITOR_DB.splice(1, 1);
+  assert.deepEqual(validateMigrationInventory(missing), {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+  });
+
+  const malformedName = structuredClone(inventory);
+  const nonceIndex = malformedName.USAGE_MONITOR_DB.findIndex((name) =>
+    name.startsWith("0024_"));
+  malformedName.USAGE_MONITOR_DB[nonceIndex] = "0024-apple-signin.sql";
+  assert.deepEqual(validateMigrationInventory(malformedName), {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+  });
+
+  assert.deepEqual(validateMigrationSource(
+    "0024_apple_signin_nonce_binding.sql",
+    "CREATE TABLE example (id INTEGER);\n",
+  ), { ok: true, code: null });
+  assert.deepEqual(validateMigrationSource(
+    "0024_apple_signin_nonce_binding.sql",
+    "CREATE TABLE example (id INTEGER);",
+  ), { ok: false, code: "LOCAL_MIGRATION_SOURCE_FORMAT_INVALID" });
+  assert.deepEqual(validateMigrationSource(
+    "0024_apple_signin_nonce_binding.sql",
+    "BEGIN;\nCREATE TABLE example (id INTEGER);\nCOMMIT;\n",
+  ), {
+    ok: false,
+    code: "LOCAL_MIGRATION_TRANSACTION_CONTROL_UNSUPPORTED",
+  });
+});
+
+for (const [label, bundle] of [
+  ["missing migration", {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+    names: [],
+  }],
+  ["malformed migration source", {
+    ok: false,
+    code: "LOCAL_MIGRATION_SOURCE_FORMAT_INVALID",
+    names: [...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB],
+  }],
+]) {
+  test(`invalid ${label} stops before any local migration command`, async () => {
+    let called = false;
+    const result = await runReleasePreflight({
+      config: safeConfig(),
+      workerDirectory,
+      wrangler: "fake-wrangler",
+      spawn: () => {
+        called = true;
+        return { status: 0, stdout: "must-not-run", stderr: "" };
+      },
+      readMigrations: async () => ({
+        USAGE_MONITOR_DB: bundle,
+        DELETION_LEDGER: {
+          ok: true,
+          code: null,
+          names: [...EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER],
+        },
+      }),
+    });
+    assert.equal(result.state, "blocked");
+    assert.equal(result.blockers.includes(bundle.code), true);
+    assert.equal(called, false);
+  });
+}
 
 for (const [label, collectionControlRows, blocker] of [
   ["operational", [{
@@ -246,6 +337,24 @@ for (const [label, collectionControlRows, blocker] of [
     assert.equal(JSON.stringify(result).includes("release-ready"), false);
   });
 }
+
+test("release preflight blocks a missing community schema invariant", async () => {
+  const { spawn } = await standardFixture({
+    schemaMismatch: ["community_snapshot_policy", "account_tool_units_cap"],
+  });
+  const result = await runReleasePreflight({
+    config: safeConfig(),
+    workerDirectory,
+    wrangler: "fake-wrangler",
+    spawn,
+    createState: disposableState,
+    cleanupState: removeState,
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.requiredSchemaPresent, false);
+  assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
+  assert.equal(result.collectionAuthorized, false);
+});
 
 test("migration failure is content-free, local-only, and still cleans isolated state", async () => {
   let cleanupCalled = false;

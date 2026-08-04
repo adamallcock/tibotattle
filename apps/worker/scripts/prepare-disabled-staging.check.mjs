@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   PREPARE_CONFIRMATION,
-  prepareDisabledStaging,
+  prepareDisabledStaging as rawPrepareDisabledStaging,
 } from "./prepare-disabled-staging.mjs";
+import {
+  createStagingDeploymentIdentity,
+  DEPLOYMENT_PROOF_SCHEMA_VERSION,
+  STAGING_DISABLED_WORKER_PROOF_OPERATION,
+} from "./deployment-proof.mjs";
 import {
   checkedInConfig,
   provisionedConfig,
@@ -11,14 +16,14 @@ import {
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
 import {
-  createStagingDeploymentIdentity,
-  DEPLOYMENT_PROOF_SCHEMA_VERSION,
-  STAGING_DISABLED_WORKER_PROOF_OPERATION,
-} from "./deployment-proof.mjs";
-import {
   EXPECTED_STAGING_MIGRATIONS,
   STAGING_PROOF_TYPES,
 } from "./staging-readiness-lib.mjs";
+
+const passingLocalPreflight = async () => ({
+  state: "ready",
+  blockers: [],
+});
 
 const STAGING_ORIGIN = "https://app-usagemonitor-staging.workers.dev";
 const SOURCE_COMMIT = "c26823c";
@@ -57,19 +62,22 @@ const VALID_DEPLOYMENT_PROOF_CHECK = Object.freeze({
   },
 });
 
-function prepare(options = {}) {
-  return prepareDisabledStaging({
+function prepareDisabledStaging(options = {}) {
+  return rawPrepareDisabledStaging({
+    stagingOrigin: STAGING_ORIGIN,
     deploymentIdentity: DEPLOYMENT_IDENTITY,
+    expectedSourceCommit: SOURCE_COMMIT,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
+    localPreflight: passingLocalPreflight,
     ...options,
   });
 }
 
-test("preparation requires exact confirmation before inspection or mutation", () => {
+test("preparation requires exact confirmation before inspection or mutation", async () => {
   const calls = [];
-  const result = prepare({
+  const result = await prepareDisabledStaging({
     config: provisionedConfig(),
     confirmation: "yes",
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn: (_command, args) => {
@@ -81,29 +89,12 @@ test("preparation requires exact confirmation before inspection or mutation", ()
   assert.deepEqual(calls, []);
 });
 
-test("preparation requires the generated deployment identity and rejects another intent", () => {
-  const noIdentity = prepareDisabledStaging({
-    config: provisionedConfig(),
-    confirmation: PREPARE_CONFIRMATION,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
-    wrangler: "/fake/wrangler",
-    workerDirectory,
-  });
-  assert.deepEqual(noIdentity, {
-    ok: false,
-    code: "STAGING_DEPLOYMENT_IDENTITY_REQUIRED",
-  });
-
+test("preparation requires one exact compatible-worker identity and proof before local or remote work", async () => {
   const calls = [];
-  const otherIdentity = createStagingDeploymentIdentity({
-    origin: "https://other-staging.workers.dev",
-    sourceCommit: SOURCE_COMMIT,
-  });
-  const mismatch = prepare({
+  const noIdentity = await prepareDisabledStaging({
     config: provisionedConfig(),
     confirmation: PREPARE_CONFIRMATION,
-    deploymentIdentity: otherIdentity,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
+    deploymentIdentity: null,
     wrangler: "/fake/wrangler",
     workerDirectory,
     spawn: (_command, args) => {
@@ -111,14 +102,57 @@ test("preparation requires the generated deployment identity and rejects another
       return { status: 0, stdout: "", stderr: "" };
     },
   });
-  assert.deepEqual(mismatch, {
+  assert.deepEqual(noIdentity, {
     ok: false,
-    code: "STAGING_DEPLOYMENT_IDENTITY_MISMATCH",
+    code: "STAGING_DEPLOYMENT_IDENTITY_REQUIRED",
+  });
+
+  const badProof = await prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: {
+      ok: false,
+      code: "STAGING_DISABLED_WORKER_PROOF_MISMATCH",
+    },
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: (_command, args) => {
+      calls.push(args);
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(badProof, {
+    ok: false,
+    code: "STAGING_DISABLED_WORKER_PROOF_MISMATCH",
   });
   assert.deepEqual(calls, []);
 });
 
-test("preparation will not mutate unprovisioned infrastructure", () => {
+test("failed local preflight cannot reach remote staging inspection or mutation", async () => {
+  const calls = [];
+  const result = await prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    localPreflight: async () => ({
+      state: "blocked",
+      blockers: ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
+    }),
+    spawn: (_command, args) => {
+      calls.push(args);
+      return { status: 0, stdout: "must-not-run", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "LOCAL_STAGING_PREFLIGHT_BLOCKED",
+    blockers: ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("preparation will not mutate unprovisioned infrastructure", async () => {
   const calls = [];
   const spawn = (_command, args) => {
     calls.push(args);
@@ -132,12 +166,12 @@ test("preparation will not mutate unprovisioned infrastructure", () => {
     }
     throw new Error(`Unexpected command: ${joined}`);
   };
-  const result = prepare({
+  const result = await prepareDisabledStaging({
     config: checkedInConfig,
     confirmation: PREPARE_CONFIRMATION,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
+    localPreflight: passingLocalPreflight,
     spawn,
   });
   assert.equal(result.ok, false);
@@ -147,7 +181,7 @@ test("preparation will not mutate unprovisioned infrastructure", () => {
   assert.equal(calls.some((args) => args.includes("execute")), false);
 });
 
-test("preparation applies both migrations, contains collection, and rechecks", () => {
+test("preparation applies both migrations, contains collection, and rechecks", async () => {
   const config = provisionedConfig();
   const calls = [];
   let migrationsApplied = false;
@@ -296,12 +330,12 @@ test("preparation applies both migrations, contains collection, and rechecks", (
     }
     throw new Error(`Unexpected command: ${joined}`);
   };
-  const result = prepare({
+  const result = await prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
+    localPreflight: passingLocalPreflight,
     spawn,
   });
   assert.equal(result.ok, true);
@@ -405,15 +439,15 @@ test("preparation applies both migrations, contains collection, and rechecks", (
   assert.equal(containmentIndex < firstMigrationIndex, true);
 });
 
-test("preparation contains an existing active target before any migration", () => {
+test("preparation contains an existing active target before any migration", async () => {
   const config = provisionedConfig();
   const calls = [];
-  const result = prepare({
+  const result = await prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
+    localPreflight: passingLocalPreflight,
     spawn: successSpawn(config, calls, {
       initialCollectionState: "operational",
     }),
@@ -432,7 +466,7 @@ test("preparation contains an existing active target before any migration", () =
   assert.equal(containmentIndices[0] < migrationIndices[0], true);
 });
 
-test("preparation stops at containment failure or crash before migration", () => {
+test("preparation stops at containment failure or crash before migration", async () => {
   for (const scenario of [
     { name: "failed containment", options: { containmentFailure: true } },
     { name: "crashed containment", options: { containmentCrash: true } },
@@ -443,12 +477,12 @@ test("preparation stops at containment failure or crash before migration", () =>
   ]) {
     const config = provisionedConfig();
     const calls = [];
-    const result = prepare({
+    const result = await prepareDisabledStaging({
       config,
       confirmation: PREPARE_CONFIRMATION,
-      deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
       wrangler: "/fake/wrangler",
       workerDirectory,
+      localPreflight: passingLocalPreflight,
       spawn: successSpawn(config, calls, {
         ...scenario.options,
         initialCollectionState: "operational",
@@ -470,15 +504,15 @@ test("preparation stops at containment failure or crash before migration", () =>
   }
 });
 
-test("fresh bootstrap stops before any migration without an operational claim", () => {
+test("fresh bootstrap stops before any migration without an operational claim", async () => {
   const config = provisionedConfig();
   const calls = [];
-  const result = prepare({
+  const result = await prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
+    localPreflight: passingLocalPreflight,
     spawn: successSpawn(config, calls, { freshTarget: true }),
   });
   assert.deepEqual(result, {
@@ -495,7 +529,7 @@ test("fresh bootstrap stops before any migration without an operational claim", 
   assert.equal(result.collectionAuthorized, undefined);
 });
 
-test("preparation does not contain until applied migrations are proven exact", () => {
+test("preparation does not contain until applied migrations are proven exact", async () => {
   const config = provisionedConfig();
   const calls = [];
   let applyCount = 0;
@@ -517,12 +551,12 @@ test("preparation does not contain until applied migrations are proven exact", (
     }
     return baseSpawn(command, args, options);
   };
-  const result = prepare({
+  const result = await prepareDisabledStaging({
     config,
     confirmation: PREPARE_CONFIRMATION,
-    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     wrangler: "/fake/wrangler",
     workerDirectory,
+    localPreflight: passingLocalPreflight,
     spawn,
   });
   assert.deepEqual(result, {
@@ -535,31 +569,7 @@ test("preparation does not contain until applied migrations are proven exact", (
     typeof value === "string" && value.includes("UPDATE collection_controls"))), false);
 });
 
-test("preparation refuses absent or invalid compatible-worker proof before migration", () => {
-  for (const deploymentProofCheck of [
-    { ok: false, code: "DEPLOYMENT_PROOF_REQUIRED" },
-    { ok: false, code: "STAGING_DISABLED_WORKER_PROOF_MISMATCH" },
-    { ok: false, code: "DEPLOYMENT_PROOF_MALFORMED" },
-  ]) {
-    const calls = [];
-    const result = prepare({
-      config: provisionedConfig(),
-      confirmation: PREPARE_CONFIRMATION,
-      deploymentProofCheck,
-      wrangler: "/fake/wrangler",
-      workerDirectory,
-      spawn: (_command, args) => {
-        calls.push(args);
-        return { status: 0, stdout: "", stderr: "" };
-      },
-    });
-    assert.deepEqual(result, deploymentProofCheck);
-    assert.equal(calls.some((args) => args.includes("apply")), false);
-    assert.equal(calls.some((args) => args.includes("execute")), false);
-  }
-});
-
-test("preparation refuses missing identity protection before any mutation", () => {
+test("preparation refuses missing identity protection before any mutation", async () => {
   for (const scenario of [
     {
       name: "primary re-enrollment protection",
@@ -574,12 +584,12 @@ test("preparation refuses missing identity protection before any mutation", () =
   ]) {
     const config = provisionedConfig();
     const calls = [];
-    const result = prepare({
+    const result = await prepareDisabledStaging({
       config,
       confirmation: PREPARE_CONFIRMATION,
-      deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
       wrangler: "/fake/wrangler",
       workerDirectory,
+      localPreflight: passingLocalPreflight,
       spawn: successSpawn(config, calls, scenario.options),
     });
     assert.equal(result.ok, false, scenario.name);

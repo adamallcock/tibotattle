@@ -16,6 +16,7 @@ import {
   readDeploymentProof,
   validateDeploymentProof,
 } from "./deployment-proof.mjs";
+import { runReleasePreflight } from "./release-preflight.mjs";
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
 
@@ -123,7 +124,7 @@ function containAndVerify({
   return { ok: true, readiness: afterContainment };
 }
 
-export function prepareDisabledStaging({
+export async function prepareDisabledStaging({
   config,
   confirmation,
   stagingOrigin,
@@ -134,6 +135,7 @@ export function prepareDisabledStaging({
   wrangler,
   workerDirectory,
   spawn = spawnSync,
+  localPreflight = runReleasePreflight,
 }) {
   if (confirmation !== PREPARE_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
@@ -157,6 +159,27 @@ export function prepareDisabledStaging({
       expectedDeploymentIdentity: deploymentIdentity,
     });
   if (!proofCheck.ok) return proofCheck;
+  let localReadiness;
+  try {
+    localReadiness = await localPreflight({
+      config,
+      wrangler,
+      workerDirectory,
+      spawn,
+    });
+  } catch {
+    return { ok: false, code: "LOCAL_STAGING_PREFLIGHT_FAILED" };
+  }
+  if (localReadiness?.state !== "ready") {
+    return {
+      ok: false,
+      code: "LOCAL_STAGING_PREFLIGHT_BLOCKED",
+      blockers: readinessBlockers(
+        localReadiness,
+        "LOCAL_STAGING_PREFLIGHT_BLOCKED",
+      ),
+    };
+  }
   let before;
   try {
     before = probeStagingLive({
@@ -368,7 +391,7 @@ async function main() {
         expectedSourceCommit,
         expectedDeploymentIdentity: deploymentIdentityCheck.identity,
       });
-      result = prepareDisabledStaging({
+      result = await prepareDisabledStaging({
         config,
         confirmation: process.argv[9],
         stagingOrigin: process.argv[3],

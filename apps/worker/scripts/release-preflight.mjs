@@ -13,6 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse, printParseErrorCode } from "jsonc-parser";
+import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 
 export const RELEASE_PREFLIGHT_SCHEMA_VERSION =
   "usage-monitor-worker-release-preflight-v0.1";
@@ -42,11 +43,17 @@ const COLLECTION_CONTROL_FLAGS = Object.freeze([
   "processing_enabled",
   "publication_enabled",
 ]);
+const MIGRATION_FILENAME_PATTERN = /^\d{4}_[a-z0-9][a-z0-9_]*\.sql$/u;
+const MIGRATION_TRANSACTION_CONTROL_PATTERN =
+  /\bBEGIN\s*(?:;|(?:DEFERRED|IMMEDIATE|EXCLUSIVE|TRANSACTION)\b)|\b(?:COMMIT|ROLLBACK|SAVEPOINT|RELEASE\s+SAVEPOINT)\b/iu;
 
 export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["table", "collection_controls"],
+  ["table", "participants"],
   ["table", "apple_signin_handoffs"],
   ["table", "device_credentials"],
+  ["table", "community_weekly_snapshots"],
+  ["table", "community_snapshot_mutation_control"],
   ["table", "community_snapshot_policy"],
   ["table", "community_aggregate_exclusions"],
   ["table", "device_credential_rotations"],
@@ -80,7 +87,17 @@ export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
 
 export const REQUIRED_COLUMNS = Object.freeze({
   participants: Object.freeze([
+    "identity_link_key",
     "identity_cooldown_digest",
+  ]),
+  community_weekly_snapshots: Object.freeze([
+    "release_state",
+    "withdrawn_at",
+    "withdrawal_epoch",
+  ]),
+  community_snapshot_mutation_control: Object.freeze([
+    "singleton_id",
+    "mutation_epoch",
   ]),
   apple_signin_handoffs: Object.freeze([
     "state",
@@ -252,18 +269,117 @@ function parseRows(stdout) {
   }
 }
 
-function migrationFiles(files) {
-  return files
-    .filter((name) => /^\d+_.+\.sql$/u.test(name))
-    .sort((left, right) => left.localeCompare(right, "en"));
+function sameStringArray(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
 }
 
-async function readMigrationNames(workerDirectory, migrationsDir) {
-  const directory = join(workerDirectory, migrationsDir);
-  const files = await readdir(directory, { withFileTypes: true });
-  return migrationFiles(
-    files.filter((entry) => entry.isFile()).map((entry) => entry.name),
-  );
+export function validateMigrationInventory(
+  inventory,
+  expected = EXPECTED_STAGING_MIGRATIONS,
+) {
+  if (inventory === null || typeof inventory !== "object"
+      || Array.isArray(inventory)) {
+    return { ok: false, code: "LOCAL_MIGRATION_INVENTORY_DRIFT" };
+  }
+  for (const database of DATABASES) {
+    const names = inventory[database.binding];
+    const expectedNames = expected?.[database.binding];
+    if (!Array.isArray(names) || !Array.isArray(expectedNames)
+        || !sameStringArray(names, [...names].sort((left, right) =>
+          left.localeCompare(right, "en")))
+        || !sameStringArray(names, expectedNames)
+        || !names.every((name) => MIGRATION_FILENAME_PATTERN.test(name))) {
+      return { ok: false, code: "LOCAL_MIGRATION_INVENTORY_DRIFT" };
+    }
+  }
+  return { ok: true, code: null };
+}
+
+function migrationSourceWithoutComments(source) {
+  return source
+    .replace(/--[^\r\n]*(?:\r?\n|$)/gu, "\n")
+    .replace(/\/\*[\s\S]*?\*\//gu, " ");
+}
+
+export function validateMigrationSource(name, source) {
+  if (!MIGRATION_FILENAME_PATTERN.test(name)
+      || typeof source !== "string"
+      || source.length === 0
+      || source.charCodeAt(0) === 0xfeff
+      || source.includes("\r")
+      || !source.endsWith("\n")
+      || source.trim().length === 0) {
+    return { ok: false, code: "LOCAL_MIGRATION_SOURCE_FORMAT_INVALID" };
+  }
+  if (MIGRATION_TRANSACTION_CONTROL_PATTERN.test(
+    migrationSourceWithoutComments(source),
+  )) {
+    return {
+      ok: false,
+      code: "LOCAL_MIGRATION_TRANSACTION_CONTROL_UNSUPPORTED",
+    };
+  }
+  return { ok: true, code: null };
+}
+
+async function readMigrationBundles(workerDirectory) {
+  const bundles = {};
+  for (const database of DATABASES) {
+    const directory = join(workerDirectory, database.migrationsDir);
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      bundles[database.binding] = {
+        ok: false,
+        code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+        names: [],
+      };
+      continue;
+    }
+    const names = entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right, "en"));
+    const inventoryValidation = validateMigrationInventory({
+      [database.binding]: names,
+      ...(database.binding === "USAGE_MONITOR_DB"
+        ? { DELETION_LEDGER: EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER }
+        : { USAGE_MONITOR_DB: EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB }),
+    });
+    if (!inventoryValidation.ok) {
+      bundles[database.binding] = {
+        ok: false,
+        code: inventoryValidation.code,
+        names,
+      };
+      continue;
+    }
+    let sourceCode = null;
+    for (const name of names) {
+      let source;
+      try {
+        source = await readFile(join(directory, name), "utf8");
+      } catch {
+        sourceCode = "LOCAL_MIGRATION_SOURCE_UNAVAILABLE";
+        break;
+      }
+      const validation = validateMigrationSource(name, source);
+      if (!validation.ok) {
+        sourceCode = validation.code;
+        break;
+      }
+    }
+    bundles[database.binding] = {
+      ok: sourceCode === null,
+      code: sourceCode,
+      names,
+    };
+  }
+  return bundles;
 }
 
 function migrationRowsMatch(rows, expected) {
@@ -397,8 +513,12 @@ function baseReceipt(configChecks) {
     collectionAuthorized: false,
     checks: {
       disabledEnrollmentConfiguration: configChecks.ok,
+      localMigrationInventorySafe: false,
+      localMigrationSourcesSafe: false,
       primaryMigrationsAppliedInOrder: false,
       deletionLedgerMigrationsAppliedInOrder: false,
+      primaryMigrationRerunStable: false,
+      deletionLedgerMigrationRerunStable: false,
       requiredSchemaPresent: false,
       deletionLedgerSchemaPresent: false,
       collectionControlsContained: false,
@@ -410,6 +530,7 @@ function baseReceipt(configChecks) {
       migrationWindow: "0023-0029",
       database: "USAGE_MONITOR_DB",
       rollbackRestoreEquivalent: "isolated_cleanup",
+      transactionAssumption: "migration-runner-owns-transaction-boundary",
     },
   };
 }
@@ -427,6 +548,7 @@ export async function runReleasePreflight({
   spawn = spawnSync,
   createState = createOwnerOnlyState,
   cleanupState = cleanupOwnerOnlyState,
+  readMigrations = readMigrationBundles,
 } = {}) {
   const configuration = assessDisabledEnrollmentConfiguration(config);
   const receipt = baseReceipt(configuration);
@@ -435,68 +557,120 @@ export async function runReleasePreflight({
   let stateDirectory = null;
   let cleanupOk = false;
   try {
-    const migrationNames = await Promise.all(
-      DATABASES.map(({ migrationsDir }) =>
-        readMigrationNames(workerDirectory, migrationsDir)),
+    const migrationBundles = await readMigrations(workerDirectory);
+    const migrationInventory = Object.fromEntries(
+      DATABASES.map(({ binding }) => [
+        binding,
+        migrationBundles?.[binding]?.names ?? [],
+      ]),
     );
-    stateDirectory = await createState();
-    const metadata = await lstat(stateDirectory);
-    if (!validOwnerOnlyDirectory(metadata)) {
-      receipt.blockers.push("LOCAL_STATE_DIRECTORY_UNSAFE");
-    } else {
-      const applied = [];
-      let migrationFailed = false;
-      for (const [index, database] of DATABASES.entries()) {
-        const migration = runWrangler({
-          wrangler,
-          workerDirectory,
-          configPath,
-          spawn,
-          args: [
-            "d1",
-            "migrations",
-            "apply",
-            database.binding,
-            "--local",
-            "--env",
-            "staging",
-            "--persist-to",
+    const inventoryValidation = validateMigrationInventory(migrationInventory);
+    receipt.checks.localMigrationInventorySafe = inventoryValidation.ok;
+    receipt.checks.localMigrationSourcesSafe = DATABASES.every((database) =>
+      migrationBundles?.[database.binding]?.ok === true);
+    if (!receipt.checks.localMigrationInventorySafe) {
+      receipt.blockers.push(inventoryValidation.code);
+    }
+    for (const database of DATABASES) {
+      const code = migrationBundles?.[database.binding]?.code;
+      if (code !== null && code !== undefined) receipt.blockers.push(code);
+    }
+    if (receipt.checks.localMigrationInventorySafe
+        && receipt.checks.localMigrationSourcesSafe) {
+      stateDirectory = await createState();
+      const metadata = await lstat(stateDirectory);
+      if (!validOwnerOnlyDirectory(metadata)) {
+        receipt.blockers.push("LOCAL_STATE_DIRECTORY_UNSAFE");
+      } else {
+        const applied = [];
+        let migrationFailed = false;
+        for (const [index, database] of DATABASES.entries()) {
+          const names = migrationBundles[database.binding].names;
+          const applyMigration = () => runWrangler({
+            wrangler,
+            workerDirectory,
+            configPath,
+            spawn,
+            args: [
+              "d1",
+              "migrations",
+              "apply",
+              database.binding,
+              "--local",
+              "--env",
+              "staging",
+              "--persist-to",
+              stateDirectory,
+            ],
+          });
+          const firstMigration = applyMigration();
+          if (!firstMigration.ok) {
+            receipt.blockers.push(
+              index === 0
+                ? "LOCAL_PRIMARY_MIGRATION_FAILED"
+                : "LOCAL_DELETION_LEDGER_MIGRATION_FAILED",
+            );
+            migrationFailed = true;
+            break;
+          }
+          const firstRows = runQuery({
+            wrangler,
+            workerDirectory,
+            configPath,
             stateDirectory,
-          ],
-        });
-        if (!migration.ok) {
-          receipt.blockers.push(
-            index === 0
-              ? "LOCAL_PRIMARY_MIGRATION_FAILED"
-              : "LOCAL_DELETION_LEDGER_MIGRATION_FAILED",
-          );
-          migrationFailed = true;
-          break;
+            binding: database.binding,
+            spawn,
+            sql: "SELECT id, name FROM d1_migrations ORDER BY id",
+          });
+          const firstApplied = migrationRowsMatch(firstRows, names);
+
+          const secondMigration = applyMigration();
+          if (!secondMigration.ok) {
+            receipt.blockers.push(
+              index === 0
+                ? "LOCAL_PRIMARY_MIGRATION_RERUN_FAILED"
+                : "LOCAL_DELETION_LEDGER_MIGRATION_RERUN_FAILED",
+            );
+            migrationFailed = true;
+            break;
+          }
+          const secondRows = runQuery({
+            wrangler,
+            workerDirectory,
+            configPath,
+            stateDirectory,
+            binding: database.binding,
+            spawn,
+            sql: "SELECT id, name FROM d1_migrations ORDER BY id",
+          });
+          const secondApplied = migrationRowsMatch(secondRows, names);
+          applied.push({
+            firstApplied,
+            rerunStable: secondApplied
+              && JSON.stringify(firstRows) === JSON.stringify(secondRows),
+          });
         }
-        const rows = runQuery({
-          wrangler,
-          workerDirectory,
-          configPath,
-          stateDirectory,
-          binding: database.binding,
-          spawn,
-          sql: "SELECT id, name FROM d1_migrations ORDER BY id",
-        });
-        applied.push(migrationRowsMatch(rows, migrationNames[index]));
-      }
-      if (!migrationFailed) {
-        receipt.checks.primaryMigrationsAppliedInOrder = applied[0] === true
-          && migrationNames[0].some((name) =>
-            REQUIRED_PRIMARY_MIGRATIONS.includes(name))
-          && REQUIRED_PRIMARY_MIGRATIONS.every((name) =>
-            migrationNames[0].includes(name));
-        receipt.checks.deletionLedgerMigrationsAppliedInOrder = applied[1] === true
-          && migrationNames[1].length > 0;
-        if (!receipt.checks.primaryMigrationsAppliedInOrder) {
-          receipt.blockers.push("LOCAL_PRIMARY_MIGRATION_ORDER_INVALID");
-        }
-        if (!receipt.checks.deletionLedgerMigrationsAppliedInOrder) {
-          receipt.blockers.push("LOCAL_DELETION_LEDGER_MIGRATION_ORDER_INVALID");
+        if (!migrationFailed) {
+          receipt.checks.primaryMigrationsAppliedInOrder =
+            applied[0]?.firstApplied === true;
+          receipt.checks.deletionLedgerMigrationsAppliedInOrder =
+            applied[1]?.firstApplied === true;
+          receipt.checks.primaryMigrationRerunStable =
+            applied[0]?.rerunStable === true;
+          receipt.checks.deletionLedgerMigrationRerunStable =
+            applied[1]?.rerunStable === true;
+          if (!receipt.checks.primaryMigrationsAppliedInOrder) {
+            receipt.blockers.push("LOCAL_PRIMARY_MIGRATION_ORDER_INVALID");
+          }
+          if (!receipt.checks.deletionLedgerMigrationsAppliedInOrder) {
+            receipt.blockers.push("LOCAL_DELETION_LEDGER_MIGRATION_ORDER_INVALID");
+          }
+          if (!receipt.checks.primaryMigrationRerunStable) {
+            receipt.blockers.push("LOCAL_PRIMARY_MIGRATION_RERUN_UNSTABLE");
+          }
+          if (!receipt.checks.deletionLedgerMigrationRerunStable) {
+            receipt.blockers.push("LOCAL_DELETION_LEDGER_MIGRATION_RERUN_UNSTABLE");
+          }
         }
       }
     }

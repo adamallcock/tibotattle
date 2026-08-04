@@ -224,12 +224,6 @@ export async function runDisabledStagingDeployment({
     return { ok: false, code: "STAGING_ORIGIN_INVALID" };
   }
   if (compatiblePhase) {
-    if (!identityReceiptFile) {
-      return {
-        ok: false,
-        code: "STAGING_DEPLOYMENT_IDENTITY_RECEIPT_REQUIRED",
-      };
-    }
     const runtimeConfiguration = compatibleRuntimeConfiguration(
       config,
       workerDirectory,
@@ -239,6 +233,12 @@ export async function runDisabledStagingDeployment({
         ok: false,
         code: "STAGING_COMPATIBLE_RUNTIME_CONFIGURATION_BLOCKED",
         blockers: runtimeConfiguration.blockers,
+      };
+    }
+    if (!identityReceiptFile) {
+      return {
+        ok: false,
+        code: "STAGING_DEPLOYMENT_IDENTITY_RECEIPT_REQUIRED",
       };
     }
     const sourceCommit = expectedSourceCommit
