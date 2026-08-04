@@ -445,6 +445,10 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     readFile(SEMANTIC_OPEN_TARGET_SOURCE, "utf8"),
     readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
   ]);
+  const firstRunDisclosureSource = source.slice(
+    source.indexOf("private func showFirstRunDisclosure"),
+    source.indexOf("private func startCompanion"),
+  );
   assert.match(source, /import AppKit/u);
   assert.match(source, /"USAGE_MONITOR_PORT": "0"/u);
   assert.match(source, /"USAGE_MONITOR_RESOURCE_ROOT"/u);
@@ -587,7 +591,23 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /Signed app updates are checked automatically[\s\S]*Settings → General/u,
+    /var firstRunUpdatesDisclosure: String[\s\S]*guard isAvailable else[\s\S]*development build does not include update checks/u,
+  );
+  assert.match(
+    source,
+    /if Self\.isPreviewDistribution[\s\S]*manual signed-update checks[\s\S]*does not check, download, or install updates automatically/u,
+  );
+  assert.match(
+    source,
+    /allowsAutomaticUpdateOptIn && automaticUpdatesEnabled[\s\S]*Signed app updates are checked automatically[\s\S]*Settings → General/u,
+  );
+  assert.equal(
+    firstRunDisclosureSource.includes("\\(updater.firstRunUpdatesDisclosure)"),
+    true,
+  );
+  assert.doesNotMatch(
+    firstRunDisclosureSource,
+    /Signed app updates are checked automatically/u,
   );
   assert.match(source, /updater\.automaticallyDownloadsUpdates = enabled/u);
   assert.match(source, /NSSwitch\(\)/u);

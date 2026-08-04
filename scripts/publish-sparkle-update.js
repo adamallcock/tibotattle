@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify } from "node:crypto";
 import {
   lstat,
   mkdtemp,
@@ -49,9 +49,14 @@ const MAX_DMG_BYTES = 10 * 1024 * 1024 * 1024;
 const BUNDLE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const ED25519_PUBLIC_KEY_PATTERN = /^[A-Za-z0-9+/]{43}=$/u;
 const ED25519_SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/u;
 const SAFE_DMG_FILE_NAME_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.dmg$/u;
+const ED25519_SPKI_PREFIX = Buffer.from(
+  "302a300506032b6570032100",
+  "hex",
+);
 
 function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   const error = new Error(message);
@@ -82,8 +87,47 @@ async function readRegularInput(path, { label, maximumBytes }) {
   return Object.freeze({ path: selected, size: metadata.size });
 }
 
-async function sha256File(path) {
-  return createHash("sha256").update(await readFile(path)).digest("hex");
+async function readFileWithSha256(path) {
+  const bytes = await readFile(path);
+  return Object.freeze({
+    bytes,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+function normalizeSparklePublicKey(value) {
+  if (typeof value !== "string"
+      || !ED25519_PUBLIC_KEY_PATTERN.test(value)) {
+    fail(
+      "--sparkle-public-ed-key must be canonical base64 for 32 public-key bytes",
+      "SPARKLE_UPDATE_PUBLIC_KEY_INVALID",
+    );
+  }
+  const raw = Buffer.from(value, "base64");
+  if (raw.length !== 32 || raw.toString("base64") !== value) {
+    fail(
+      "--sparkle-public-ed-key must be canonical base64 for 32 public-key bytes",
+      "SPARKLE_UPDATE_PUBLIC_KEY_INVALID",
+    );
+  }
+  let key;
+  try {
+    key = createPublicKey({
+      key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
+      format: "der",
+      type: "spki",
+    });
+  } catch {
+    fail(
+      "--sparkle-public-ed-key could not be imported as an Ed25519 public key",
+      "SPARKLE_UPDATE_PUBLIC_KEY_INVALID",
+    );
+  }
+  return Object.freeze({
+    encoded: value,
+    key,
+    sha256: createHash("sha256").update(raw).digest("hex"),
+  });
 }
 
 function readManifest(text) {
@@ -99,7 +143,7 @@ function readManifest(text) {
   }
 }
 
-function validateReleaseManifest(manifest, dmg) {
+function validateReleaseManifest(manifest, dmg, sparklePublicKey) {
   if (manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
       || manifest.application?.bundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
       || typeof manifest.application?.bundleVersion !== "string"
@@ -120,6 +164,18 @@ function validateReleaseManifest(manifest, dmg) {
         (key) => manifest.assurances?.[key] !== true,
       )) {
     fail("Release manifest is not a complete canonical signed-DMG release");
+  }
+  if (!SHA256_PATTERN.test(manifest.updater?.publicEdKeySha256 ?? "")) {
+    fail(
+      "Release manifest is missing the public Ed25519 key fingerprint",
+      "SPARKLE_UPDATE_PUBLIC_KEY_MISMATCH",
+    );
+  }
+  if (manifest.updater.publicEdKeySha256 !== sparklePublicKey.sha256) {
+    fail(
+      "Release manifest public Ed25519 key fingerprint does not match the supplied public key",
+      "SPARKLE_UPDATE_PUBLIC_KEY_MISMATCH",
+    );
   }
   return Object.freeze({
     artifactSha256: manifest.artifact.sha256,
@@ -207,18 +263,48 @@ function immutableObjectKeys({ bundleVersion, fileName, sha256 }) {
   });
 }
 
-function validateAppcast(text, { manifest, dmg, objectKeys }) {
+function validateAppcast(text, {
+  dmg,
+  dmgBytes,
+  manifest,
+  objectKeys,
+  sparklePublicKey,
+}) {
+  const enclosures = appcastEnclosures(text);
+  if (enclosures.length !== 1) {
+    fail(
+      "Appcast must contain exactly one enclosure so every published signature is locally verified",
+      "SPARKLE_UPDATE_UNVERIFIED_ENCLOSURES",
+    );
+  }
   const artifactURL = new URL(
     objectKeys.artifact,
     `${CANONICAL_UPDATE_ORIGIN}/`,
   ).href;
-  const matching = appcastEnclosures(text).filter(
+  const matching = enclosures.filter(
     (enclosure) => enclosure.url === artifactURL,
   );
   if (matching.length !== 1
       || matching[0].length !== dmg.size
       || matching[0].version !== manifest.bundleVersion) {
     fail("Appcast must contain exactly one signed enclosure for this manifest and DMG");
+  }
+  let signatureVerified = false;
+  try {
+    signatureVerified = verify(
+      null,
+      dmgBytes,
+      sparklePublicKey.key,
+      Buffer.from(matching[0].signature, "base64"),
+    );
+  } catch {
+    signatureVerified = false;
+  }
+  if (!signatureVerified) {
+    fail(
+      "Appcast enclosure signature does not verify against the supplied DMG and public key",
+      "SPARKLE_UPDATE_SIGNATURE_INVALID",
+    );
   }
   return Object.freeze({ artifactURL, enclosure: matching[0] });
 }
@@ -297,9 +383,10 @@ async function putObject({ bucket, key, path, contentType, cacheControl, runWran
 
 /**
  * Validate and, only when publish is explicitly true, publish one complete
- * Sparkle update. The publisher deliberately accepts neither Sparkle signing
- * keys nor Cloudflare credentials; the operator performs signing separately
- * and Wrangler uses its own existing local authentication.
+ * Sparkle update. The publisher deliberately accepts no Sparkle private signing
+ * key nor Cloudflare credentials; the operator performs signing separately and
+ * supplies only the public verification key. Wrangler uses its own existing
+ * local authentication.
  */
 export async function publishSparkleUpdate({
   appcastPath,
@@ -308,6 +395,7 @@ export async function publishSparkleUpdate({
   publish = false,
   releaseManifestPath,
   replaceAppcast = false,
+  sparklePublicEdKey,
   runWrangler = defaultRunWrangler,
   validateDMG = validateMacOSDMG,
 } = {}) {
@@ -316,6 +404,7 @@ export async function publishSparkleUpdate({
     fail("Publisher options are invalid");
   }
   normalizeBucket(bucket);
+  const normalizedSparklePublicKey = normalizeSparklePublicKey(sparklePublicEdKey);
   const [dmg, appcast, releaseManifest] = await Promise.all([
     readRegularInput(dmgPath, { label: "--dmg", maximumBytes: MAX_DMG_BYTES }),
     readRegularInput(appcastPath, {
@@ -330,9 +419,14 @@ export async function publishSparkleUpdate({
   const manifest = validateReleaseManifest(
     readManifest(await readFile(releaseManifest.path, "utf8")),
     dmg,
+    normalizedSparklePublicKey,
   );
   await validateDMG(dmg.path, { production: true });
-  const observedDMGSha256 = await sha256File(dmg.path);
+  const dmgWithSha256 = await readFileWithSha256(dmg.path);
+  if (dmgWithSha256.bytes.length !== dmg.size) {
+    fail("DMG changed while it was being validated");
+  }
+  const observedDMGSha256 = dmgWithSha256.sha256;
   if (observedDMGSha256 !== manifest.artifactSha256) {
     fail("DMG does not match the release manifest SHA-256");
   }
@@ -343,7 +437,13 @@ export async function publishSparkleUpdate({
   });
   const appcastUpdate = validateAppcast(
     await readFile(appcast.path, "utf8"),
-    { dmg, manifest, objectKeys },
+    {
+      dmg,
+      dmgBytes: dmgWithSha256.bytes,
+      manifest,
+      objectKeys,
+      sparklePublicKey: normalizedSparklePublicKey,
+    },
   );
   const publication = Object.freeze({
     appcast: Object.freeze({
@@ -419,12 +519,14 @@ export function parseSparkleUpdatePublisherArguments(argv) {
     publish: false,
     releaseManifestPath: null,
     replaceAppcast: false,
+    sparklePublicEdKey: null,
   };
   const flags = new Map([
     ["--appcast", "appcastPath"],
     ["--bucket", "bucket"],
     ["--dmg", "dmgPath"],
     ["--release-manifest", "releaseManifestPath"],
+    ["--sparkle-public-ed-key", "sparklePublicEdKey"],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];

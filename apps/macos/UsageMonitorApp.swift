@@ -235,6 +235,19 @@ private final class AppUpdater {
             : "development_disabled"
     }
 #endif
+
+    var firstRunUpdatesDisclosure: String {
+        guard isAvailable else {
+            return "This development build does not include update checks. Signed releases installed in Applications can check for updates from About."
+        }
+        if Self.isPreviewDistribution {
+            return "This preview uses manual signed-update checks. It does not check, download, or install updates automatically."
+        }
+        if allowsAutomaticUpdateOptIn && automaticUpdatesEnabled {
+            return "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → General."
+        }
+        return "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
+    }
 }
 
 private enum CentralServiceMode: String {
@@ -1942,9 +1955,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
 
-        Signed app updates are checked automatically. By default, a verified
-        update downloads in the background and installs when you quit; you can
-        turn that off in Settings → General.
+        \(updater.firstRunUpdatesDisclosure)
 
         Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
 

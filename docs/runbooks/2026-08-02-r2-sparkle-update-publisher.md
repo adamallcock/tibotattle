@@ -15,7 +15,9 @@ manifest that records any other feed.
 The publisher writes only to the explicitly supplied approved R2 bucket,
 `tibotattle-updates`, using the pinned local Wrangler CLI. It does not deploy a
 Worker, create a bucket, configure DNS, read Cloudflare credentials, accept a
-Sparkle private key, or invoke a signing utility. Wrangler uses its existing
+Sparkle private key, or invoke a signing utility. It accepts the public
+Ed25519 verification key only to match the release-manifest fingerprint and
+verify the exact appcast enclosure signature. Wrangler uses its existing
 operator authentication only when an explicit publish is requested.
 
 ## Required manual signing gate
@@ -32,7 +34,12 @@ https://updates.tibotattle.com/releases/<bundle-version>/<dmg-sha256>/<dmg-file-
 
 The Sparkle private key stays with the manual signing process; it must never be
 passed to or stored by this publisher. The appcast and its referenced DMG are
-validated before any Wrangler command can run.
+validated before any Wrangler command can run. Supply the matching public key
+through `--sparkle-public-ed-key`; it is compared with the release manifest's
+public-key SHA-256 fingerprint and used for local Ed25519 verification.
+The current publisher intentionally accepts exactly one enclosure so it never
+publishes an unverified historical or delta URL; rollback uses the separately
+retained signed DMG and release manifest.
 
 ## Publish procedure
 
@@ -45,7 +52,8 @@ npm run product:macos:publish-update -- \
   --bucket tibotattle-updates \
   --dmg ".release-build/macos-release/TiboTattle-0.1.0-macOS-arm64.dmg" \
   --release-manifest ".release-build/macos-release/TiboTattle-0.1.0-macOS-arm64.dmg.release.json" \
-  --appcast "/absolute/path/to/appcast.xml"
+  --appcast "/absolute/path/to/appcast.xml" \
+  --sparkle-public-ed-key "$USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY"
 ```
 
 The default production verifier re-runs the signed/notarized DMG gate, checks
@@ -67,6 +75,7 @@ npm run product:macos:publish-update -- \
   --dmg "/absolute/path/to/TiboTattle-0.1.0-macOS-arm64.dmg" \
   --release-manifest "/absolute/path/to/TiboTattle-0.1.0-macOS-arm64.dmg.release.json" \
   --appcast "/absolute/path/to/appcast.xml" \
+  --sparkle-public-ed-key "$USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY" \
   --replace-appcast \
   --publish
 ```

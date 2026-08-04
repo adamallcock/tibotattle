@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,11 @@ import {
   publishSparkleUpdate,
 } from "../scripts/publish-sparkle-update.js";
 
-const SIGNATURE = Buffer.alloc(64, 11).toString("base64");
+const TEST_KEY_PAIR = generateKeyPairSync("ed25519");
+const TEST_PUBLIC_ED_KEY = TEST_KEY_PAIR.publicKey
+  .export({ format: "der", type: "spki" })
+  .subarray(-32)
+  .toString("base64");
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -34,6 +38,8 @@ async function createReleaseFixture({
   const appcastPath = join(root, "appcast.xml");
   const releaseManifestPath = join(root, `${fileName}.release.json`);
   const digest = sha256(dmgbBytes);
+  const signature = sign(null, dmgbBytes, TEST_KEY_PAIR.privateKey)
+    .toString("base64");
   const artifactURL = `${CANONICAL_UPDATE_ORIGIN}/releases/1/${digest}/${fileName}`;
   const manifest = mutateManifest({
     schemaVersion: "usage-monitor-macos-release-v0.2",
@@ -56,12 +62,15 @@ async function createReleaseFixture({
     updater: {
       appcastURL,
       enabled: true,
+      publicEdKeySha256: sha256(
+        Buffer.from(TEST_PUBLIC_ED_KEY, "base64"),
+      ),
       requiresSignedFeed: true,
     },
   });
   const appcast = mutateAppcast(`<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
-<enclosure url="${artifactURL}" length="${dmgbBytes.length}" sparkle:version="1" sparkle:edSignature="${SIGNATURE}" />
+<enclosure url="${artifactURL}" length="${dmgbBytes.length}" sparkle:version="1" sparkle:edSignature="${signature}" />
 </item></channel></rss>
 `);
   await Promise.all([
@@ -100,6 +109,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
       bucket: APPROVED_R2_BUCKET,
       dmgPath: fixture.dmgPath,
       releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
       runWrangler: async () => assert.fail("dry run must not call Wrangler"),
       validateDMG: async (...arguments_) => verified.push(arguments_),
     });
@@ -133,6 +143,7 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
       dmgPath: fixture.dmgPath,
       publish: true,
       releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
       runWrangler: runner.run,
       validateDMG: async () => {},
     });
@@ -171,6 +182,7 @@ test("refuses an existing immutable object before it can be overwritten", async 
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
         runWrangler: async (arguments_) => {
           calls.push(arguments_);
           return { status: 0 };
@@ -197,6 +209,7 @@ test("requires an explicit appcast replacement after immutable preflight passes"
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
         runWrangler: async (arguments_) => {
           calls.push(arguments_);
           return { status: arguments_[2] === "get" && calls.length === 3 ? 0 : 1, stderr: "Object not found" };
@@ -213,7 +226,13 @@ test("requires an explicit appcast replacement after immutable preflight passes"
 
 test("fails closed when the appcast signature, URL, or manifest checksum is invalid", async () => {
   const unsigned = await createReleaseFixture({
-    mutateAppcast: (value) => value.replace(`sparkle:edSignature="${SIGNATURE}"`, ""),
+    mutateAppcast: (value) => value.replace(/ sparkle:edSignature="[^"]+"/u, ""),
+  });
+  const badSignature = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      /sparkle:edSignature="[^"]+"/u,
+      `sparkle:edSignature="${Buffer.alloc(64, 11).toString("base64")}"`,
+    ),
   });
   const wrongOrigin = await createReleaseFixture({
     mutateAppcast: (value) => value.replace(CANONICAL_UPDATE_ORIGIN, "https://updates.example.test"),
@@ -228,13 +247,20 @@ test("fails closed when the appcast signature, URL, or manifest checksum is inva
     }),
   });
   try {
-    for (const fixture of [unsigned, wrongOrigin, wrongChecksum, nonCanonicalFeed]) {
+    for (const fixture of [
+      unsigned,
+      badSignature,
+      wrongOrigin,
+      wrongChecksum,
+      nonCanonicalFeed,
+    ]) {
       await assert.rejects(
         publishSparkleUpdate({
           appcastPath: fixture.appcastPath,
           bucket: APPROVED_R2_BUCKET,
           dmgPath: fixture.dmgPath,
           releaseManifestPath: fixture.releaseManifestPath,
+          sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
           runWrangler: async () => assert.fail("invalid input must not call Wrangler"),
           validateDMG: async () => {},
         }),
@@ -243,6 +269,7 @@ test("fails closed when the appcast signature, URL, or manifest checksum is inva
   } finally {
     await Promise.all([
       unsigned.cleanup(),
+      badSignature.cleanup(),
       wrongOrigin.cleanup(),
       wrongChecksum.cleanup(),
       nonCanonicalFeed.cleanup(),
@@ -250,7 +277,35 @@ test("fails closed when the appcast signature, URL, or manifest checksum is inva
   }
 });
 
+test("requires the supplied public key to match the release manifest fingerprint", async () => {
+  const fixture = await createReleaseFixture();
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: Buffer.alloc(32, 9).toString("base64"),
+        runWrangler: async () => assert.fail("key mismatch must not call Wrangler"),
+        validateDMG: async () => assert.fail("key mismatch must not validate the DMG"),
+      }),
+      { code: "SPARKLE_UPDATE_PUBLIC_KEY_MISMATCH" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("requires the approved explicit bucket and does not accept signing-key arguments", async () => {
+  const parsed = parseSparkleUpdatePublisherArguments([
+    "--bucket", APPROVED_R2_BUCKET,
+    "--dmg", "release.dmg",
+    "--appcast", "appcast.xml",
+    "--release-manifest", "release.json",
+    "--sparkle-public-ed-key", TEST_PUBLIC_ED_KEY,
+  ]);
+  assert.equal(parsed.sparklePublicEdKey, TEST_PUBLIC_ED_KEY);
   assert.throws(
     () => parseSparkleUpdatePublisherArguments([
       "--bucket", "other-bucket",
@@ -267,6 +322,7 @@ test("requires the approved explicit bucket and does not accept signing-key argu
       "--dmg", "release.dmg",
       "--appcast", "appcast.xml",
       "--release-manifest", "release.json",
+      "--sparkle-public-ed-key", TEST_PUBLIC_ED_KEY,
       "--replace-appcast",
     ]),
     /requires --publish/u,
@@ -277,6 +333,7 @@ test("requires the approved explicit bucket and does not accept signing-key argu
       bucket: "another-bucket",
       dmgPath: "release.dmg",
       releaseManifestPath: "release.json",
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
       runWrangler: async () => assert.fail("an unapproved bucket must not run Wrangler"),
       validateDMG: async () => assert.fail("an unapproved bucket must not validate inputs"),
     }),
