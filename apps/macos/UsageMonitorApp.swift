@@ -1598,74 +1598,28 @@ private final class NativeDashboardReportPane: NSView {
     }
 }
 
-/// The native frame for the loopback dashboard.  WebKit remains responsible
-/// for the rich charts and accessible, selectable report content; AppKit owns
-/// the navigation, lifecycle status, and refresh control that should feel like
-/// part of a Mac app rather than a webpage inside one.
+/// The native frame for the loopback dashboard. WebKit remains responsible for
+/// the rich charts and accessible, selectable report content. AppKit owns the
+/// sidebar here, while the window's unified toolbar owns status, refresh,
+/// sharing, and settings. Keeping that chrome outside WebKit preserves normal
+/// Mac behavior without replacing the report itself.
 @MainActor
 private final class NativeDashboardChrome: NSView {
-    private let header = NSVisualEffectView()
     private let sidebar = NSVisualEffectView()
-    private let titleLabel = NSTextField(labelWithString: BundledProduct.displayName)
-    private let modeButton = NSButton(title: "Local only", target: nil, action: nil)
-    private let freshnessButton = NSButton(title: "Starting…", target: nil, action: nil)
-    private let refreshButton = NSButton(
-        title: "Refresh usage",
-        target: nil,
-        action: nil
-    )
     private let reportPane: NativeDashboardReportPane
     private var pageButtons: [NativeDashboardDestination: NSButton] = [:]
 
     var onNavigate: ((NativeDashboardDestination) -> Void)?
-    var onRefresh: (() -> Void)?
 
     init(webView: WKWebView) {
         reportPane = NativeDashboardReportPane(webView: webView)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
-        header.material = .headerView
-        header.blendingMode = .withinWindow
-        header.state = .active
-        header.translatesAutoresizingMaskIntoConstraints = false
-
         sidebar.material = .sidebar
         sidebar.blendingMode = .withinWindow
         sidebar.state = .active
         sidebar.translatesAutoresizingMaskIntoConstraints = false
-
-        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        titleLabel.textColor = .labelColor
-
-        configureBadge(modeButton, symbol: "lock.fill")
-        modeButton.toolTip = "Analysis and cached results stay on this Mac. Community contribution is optional."
-        configureBadge(freshnessButton, symbol: "checkmark.circle.fill")
-        freshnessButton.toolTip = "The current local evidence state."
-
-        refreshButton.bezelStyle = .rounded
-        refreshButton.image = NSImage(
-            systemSymbolName: "arrow.clockwise",
-            accessibilityDescription: "Refresh local usage"
-        )
-        refreshButton.imagePosition = .imageLeading
-        refreshButton.target = self
-        refreshButton.action = #selector(requestRefresh)
-        refreshButton.toolTip = "Update local usage now. This reads only the selected Codex folders on this Mac."
-
-        let headerContent = NSStackView(views: [
-            titleLabel,
-            NSView(),
-            modeButton,
-            freshnessButton,
-            refreshButton,
-        ])
-        headerContent.orientation = .horizontal
-        headerContent.alignment = .centerY
-        headerContent.spacing = 10
-        headerContent.translatesAutoresizingMaskIntoConstraints = false
-        headerContent.setCustomSpacing(18, after: titleLabel)
-        header.addSubview(headerContent)
 
         let pageStack = NSStackView()
         pageStack.orientation = .vertical
@@ -1711,23 +1665,14 @@ private final class NativeDashboardChrome: NSView {
         split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
         split.setPosition(216, ofDividerAt: 0)
 
-        addSubview(header)
         addSubview(split)
         NSLayoutConstraint.activate([
-            header.leadingAnchor.constraint(equalTo: leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: trailingAnchor),
-            header.topAnchor.constraint(equalTo: topAnchor),
-            header.heightAnchor.constraint(equalToConstant: 58),
-            headerContent.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
-            headerContent.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
-            headerContent.topAnchor.constraint(equalTo: header.topAnchor),
-            headerContent.bottomAnchor.constraint(equalTo: header.bottomAnchor),
             pageStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             pageStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             pageStack.topAnchor.constraint(equalTo: sidebar.topAnchor),
             split.leadingAnchor.constraint(equalTo: leadingAnchor),
             split.trailingAnchor.constraint(equalTo: trailingAnchor),
-            split.topAnchor.constraint(equalTo: header.bottomAnchor),
+            split.topAnchor.constraint(equalTo: topAnchor),
             split.bottomAnchor.constraint(equalTo: bottomAnchor),
             sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 190),
             sidebar.widthAnchor.constraint(lessThanOrEqualToConstant: 250),
@@ -1753,25 +1698,6 @@ private final class NativeDashboardChrome: NSView {
         }
     }
 
-    func updateSyncStatus(
-        title: String,
-        isRefreshing: Bool,
-        refreshEnabled: Bool
-    ) {
-        freshnessButton.title = title
-        freshnessButton.image = NSImage(
-            systemSymbolName: isRefreshing
-                ? "arrow.triangle.2.circlepath.circle.fill"
-                : "checkmark.circle.fill",
-            accessibilityDescription: title
-        )
-        freshnessButton.contentTintColor = isRefreshing
-            ? .controlAccentColor
-            : .systemGreen
-        refreshButton.title = isRefreshing ? "Updating…" : "Refresh usage"
-        refreshButton.isEnabled = refreshEnabled && !isRefreshing
-    }
-
     @discardableResult
     func prepareReportViewport() -> Bool {
         window?.contentView?.layoutSubtreeIfNeeded()
@@ -1779,24 +1705,6 @@ private final class NativeDashboardChrome: NSView {
         reportPane.layoutSubtreeIfNeeded()
         return reportPane.fitWebViewToBounds()
     }
-
-    private func configureBadge(_ button: NSButton, symbol: String) {
-        button.isBordered = false
-        button.bezelStyle = .recessed
-        button.font = .systemFont(ofSize: 12, weight: .semibold)
-        button.image = NSImage(
-            systemSymbolName: symbol,
-            accessibilityDescription: button.title
-        )
-        button.imagePosition = .imageLeading
-        button.contentTintColor = .secondaryLabelColor
-        button.isEnabled = true
-    }
-
-    @objc private func requestRefresh() {
-        onRefresh?()
-    }
-
     @objc private func selectDestination(_ sender: NSButton) {
         guard let rawValue = sender.identifier?.rawValue,
               let destination = NativeDashboardDestination(rawValue: rawValue)
@@ -1809,7 +1717,8 @@ private final class NativeDashboardChrome: NSView {
 }
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate,
+    NSWindowDelegate, NSToolbarDelegate {
     private let semanticOpenTarget: SemanticOpenTarget
     private let updater = AppUpdater()
     private var centralService: CentralServiceConfiguration?
@@ -1837,10 +1746,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var nativeDashboardChrome: NativeDashboardChrome?
+    private weak var nativeToolbarStatusLabel: NSTextField?
+    private weak var nativeRefreshToolbarItem: NSToolbarItem?
+    private weak var nativeShareToolbarItem: NSToolbarItem?
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
     private static let nativeRefreshIntervalSeconds = 300
+    private static let toolbarStatusIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.dashboard-status"
+    )
+    private static let toolbarRefreshIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.dashboard-refresh"
+    )
+    private static let toolbarShareIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.dashboard-share"
+    )
+    private static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.dashboard-settings"
+    )
     private let statusLabel = NSTextField(labelWithString: "Starting locally…")
     private let detailLabel = NSTextField(
         wrappingLabelWithString:
@@ -2151,6 +2075,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             defer: false
         )
         newWindow.title = BundledProduct.displayName
+        newWindow.toolbar = makeDashboardToolbar()
+        newWindow.toolbarStyle = .unified
         newWindow.contentView = content
         newWindow.contentMinSize = NSSize(width: 900, height: 420)
         newWindow.isReleasedWhenClosed = false
@@ -2159,6 +2085,165 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         newWindow.makeKeyAndOrderFront(nil)
         window = newWindow
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func makeDashboardToolbar() -> NSToolbar {
+        let toolbar = NSToolbar(
+            identifier: "com.usagemonitor.local.dashboard-toolbar"
+        )
+        toolbar.delegate = self
+        toolbar.displayMode = .iconAndLabel
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        return toolbar
+    }
+
+    func toolbarAllowedItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        [
+            .flexibleSpace,
+            Self.toolbarStatusIdentifier,
+            Self.toolbarRefreshIdentifier,
+            Self.toolbarShareIdentifier,
+            Self.toolbarSettingsIdentifier,
+        ]
+    }
+
+    func toolbarDefaultItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        [
+            Self.toolbarStatusIdentifier,
+            .flexibleSpace,
+            Self.toolbarRefreshIdentifier,
+            Self.toolbarShareIdentifier,
+            Self.toolbarSettingsIdentifier,
+        ]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        switch itemIdentifier {
+        case Self.toolbarStatusIdentifier:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Local status"
+            let label = NSTextField(labelWithString: "Starting locally…")
+            label.font = .systemFont(ofSize: 12, weight: .medium)
+            label.textColor = .secondaryLabelColor
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+            label.setContentCompressionResistancePriority(
+                .defaultLow,
+                for: .horizontal
+            )
+            label.widthAnchor.constraint(
+                greaterThanOrEqualToConstant: 160
+            ).isActive = true
+            label.widthAnchor.constraint(
+                lessThanOrEqualToConstant: 280
+            ).isActive = true
+            label.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            item.view = label
+            nativeToolbarStatusLabel = label
+            return item
+        case Self.toolbarRefreshIdentifier:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Refresh usage"
+            item.toolTip = "Refresh local Codex usage"
+            item.image = NSImage(
+                systemSymbolName: "arrow.clockwise",
+                accessibilityDescription: "Refresh usage"
+            )
+            item.target = self
+            item.action = #selector(refreshDashboardFromToolbar)
+            item.isEnabled = false
+            nativeRefreshToolbarItem = item
+            return item
+        case Self.toolbarShareIdentifier:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Share"
+            item.toolTip = "Open the local share card"
+            item.image = NSImage(
+                systemSymbolName: "square.and.arrow.up",
+                accessibilityDescription: "Open local share card"
+            )
+            item.target = self
+            item.action = #selector(showShareCardFromToolbar)
+            item.isEnabled = false
+            nativeShareToolbarItem = item
+            return item
+        case Self.toolbarSettingsIdentifier:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Settings"
+            item.image = NSImage(
+                systemSymbolName: "gearshape",
+                accessibilityDescription: "Settings"
+            )
+            item.target = self
+            item.action = #selector(showSettingsWindow)
+            return item
+        default:
+            return nil
+        }
+    }
+
+    private func updateNativeToolbar(
+        title: String,
+        isRefreshing: Bool,
+        refreshEnabled: Bool
+    ) {
+        nativeToolbarStatusLabel?.stringValue = title
+        nativeRefreshToolbarItem?.label = isRefreshing
+            ? "Updating…"
+            : "Refresh usage"
+        nativeRefreshToolbarItem?.toolTip = isRefreshing
+            ? "Local usage is updating"
+            : "Refresh local Codex usage"
+        nativeRefreshToolbarItem?.image = NSImage(
+            systemSymbolName: isRefreshing
+                ? "arrow.triangle.2.circlepath.circle.fill"
+                : "arrow.clockwise",
+            accessibilityDescription: isRefreshing
+                ? "Updating local usage"
+                : "Refresh usage"
+        )
+        nativeRefreshToolbarItem?.isEnabled = refreshEnabled && !isRefreshing
+        nativeShareToolbarItem?.isEnabled = dashboardWebViewShowing
+    }
+
+    @objc private func refreshDashboardFromToolbar() {
+        // This reuses the existing foreground-only Node companion path. The
+        // toolbar never starts a helper, daemon, or separate background task.
+        refreshLocalUsage(automatic: false)
+    }
+
+    @objc private func showShareCardFromToolbar() {
+        guard dashboardWebViewShowing,
+              let webView = dashboardWebHost?.webView
+        else {
+            return
+        }
+        nativeDashboardChrome?.select(.overview)
+        // This is a closed local navigation: it exposes the report's already
+        // rendered, privacy-reviewed share card and does not generate a new
+        // process, read path, or native-to-JavaScript capability.
+        webView.evaluateJavaScript("""
+        if (window.location.hash !== '#overview') {
+          window.location.hash = '#overview';
+        } else {
+          window.dispatchEvent(new HashChangeEvent('hashchange'));
+        }
+        window.setTimeout(function () {
+          document.getElementById('share-panel')?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start'
+          });
+        }, 0);
+        """)
     }
 
     /// The dashboard runs inside a native AppKit shell.  The HTML stays a
@@ -2185,9 +2270,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             chrome.onNavigate = { [weak self] destination in
                 self?.navigateNativeDashboard(to: destination)
             }
-            chrome.onRefresh = { [weak self] in
-                self?.refreshLocalUsage(automatic: false)
-            }
             dashboardContainer.addSubview(chrome)
             NSLayoutConstraint.activate([
                 chrome.leadingAnchor.constraint(
@@ -2213,10 +2295,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         statusLabel.stringValue = "Opening the dashboard…"
         detailLabel.stringValue =
             "Loading the private local dashboard from this Mac only."
-        nativeDashboardChrome?.updateSyncStatus(
-            title: nativeRefreshInFlight ? "Updating…" : "Starting…",
+        updateNativeToolbar(
+            title: nativeRefreshInFlight
+                ? "Updating local usage…"
+                : "Opening local report…",
             isRefreshing: nativeRefreshInFlight,
-            refreshEnabled: true
+            refreshEnabled: dashboardURL != nil
         )
         // Show the native frame before WebKit completes the report document.
         // If the loopback page fails, dashboardWebViewFailed restores the
@@ -2240,6 +2324,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         actionRow.isHidden = true
         lastLifecycleStatus = "Dashboard open"
         openInBrowserButton.isEnabled = true
+        updateNativeToolbar(
+            title: nativeRefreshInFlight
+                ? "Updating local usage…"
+                : "Local report ready",
+            isRefreshing: nativeRefreshInFlight,
+            refreshEnabled: dashboardURL != nil
+        )
         // WKWebView follows the normal responder chain only once it owns focus.
         // This makes Cmd-C / Cmd-A act on selected dashboard text, just as they
         // do in a browser, instead of silently targeting the launcher window.
@@ -2286,7 +2377,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         cancelNativeRefreshSchedule()
         nativeRefreshInFlight = true
-        nativeDashboardChrome?.updateSyncStatus(
+        updateNativeToolbar(
             title: automatic ? "Updating automatically…" : "Updating…",
             isRefreshing: true,
             refreshEnabled: false
@@ -2354,7 +2445,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
         nativeRefreshInFlight = false
         cancelNativeRefreshPoll()
-        nativeDashboardChrome?.updateSyncStatus(
+        updateNativeToolbar(
             title: title,
             isRefreshing: false,
             refreshEnabled: refreshEnabled
@@ -2477,6 +2568,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         openButton.isEnabled = dashboardURL != nil
         openInBrowserButton.isEnabled = dashboardURL != nil
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
+        updateNativeToolbar(
+            title: "Dashboard unavailable",
+            isRefreshing: false,
+            refreshEnabled: dashboardURL != nil
+        )
     }
 
     private func hideDashboardWebView() {
@@ -2489,6 +2585,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         cancelNativeRefreshPoll()
         nativeRefreshInFlight = false
         dashboardWebHost?.stop()
+        updateNativeToolbar(
+            title: "Starting locally…",
+            isRefreshing: false,
+            refreshEnabled: false
+        )
     }
 
     /// A link the embedded dashboard cannot load itself. Only credential-free
@@ -2629,6 +2730,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         openButton.isEnabled = false
         openInBrowserButton.isEnabled = false
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
+        updateNativeToolbar(
+            title: "Local companion unavailable",
+            isRefreshing: false,
+            refreshEnabled: false
+        )
         menuBarStatus?.companionUnavailable(
             summary:
                 "Not running: \(launcherError.failureCode). Open the window for the recovery step."

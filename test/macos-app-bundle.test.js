@@ -659,7 +659,8 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /document\.querySelector\('#main'\)\?\.innerText/u);
   assert.match(source, /split\.addArrangedSubview\(reportPane\)/u);
   assert.doesNotMatch(source, /split\.addArrangedSubview\(webView\)/u);
-  assert.match(source, /configureBadge\(modeButton, symbol: "lock\.fill"\)/u);
+  assert.match(source, /newWindow\.toolbar = makeDashboardToolbar\(\)/u);
+  assert.match(source, /newWindow\.toolbarStyle = \.unified/u);
   assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
   assert.match(source, /nativeRefreshIntervalSeconds = 300/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
@@ -852,6 +853,54 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
+});
+
+test("unified toolbar preserves the rich loopback report and single authority", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  assert.match(
+    source,
+    /private final class AppDelegate: NSObject, NSApplicationDelegate,\s*NSWindowDelegate, NSToolbarDelegate/u,
+  );
+  // The standard AppKit window (and its traffic lights) remains; the toolbar
+  // is a presentation layer on top of the existing embedded WebKit report.
+  assert.match(
+    source,
+    /styleMask: \[\.titled, \.closable, \.miniaturizable, \.resizable\]/u,
+  );
+  assert.match(
+    source,
+    /newWindow\.toolbar = makeDashboardToolbar\(\)\s*\n\s*newWindow\.toolbarStyle = \.unified/u,
+  );
+
+  const chrome = source.match(
+    /private final class NativeDashboardChrome: NSView \{([\s\S]*?)\n\}\n\n@MainActor\nprivate final class AppDelegate/u,
+  )?.[1];
+  assert.ok(chrome, "native dashboard chrome should be present");
+  // Removing the old in-content header prevents a second refresh/status row;
+  // the existing sidebar and report stay in place beneath the toolbar.
+  assert.match(chrome, /split\.topAnchor\.constraint\(equalTo: topAnchor\)/u);
+  assert.doesNotMatch(chrome, /\bheader\b/u);
+  assert.doesNotMatch(chrome, /onRefresh/u);
+
+  const toolbar = source.match(
+    /private func makeDashboardToolbar\(\) -> NSToolbar \{([\s\S]*?)\n    \/\/\/ The dashboard runs inside a native AppKit shell/u,
+  )?.[1];
+  assert.ok(toolbar, "dashboard toolbar implementation should be present");
+  assert.match(toolbar, /toolbarStatusIdentifier/u);
+  assert.match(toolbar, /toolbarRefreshIdentifier/u);
+  assert.match(toolbar, /toolbarShareIdentifier/u);
+  assert.match(toolbar, /toolbarSettingsIdentifier/u);
+  assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
+  assert.match(
+    toolbar,
+    /@objc private func showShareCardFromToolbar\(\) \{[\s\S]*?document\.getElementById\('share-panel'\)\?\.scrollIntoView/u,
+  );
+  // Toolbar actions must reuse the report and the already-running companion;
+  // they may not become another parser, service, or native share process.
+  assert.doesNotMatch(
+    toolbar,
+    /\b(?:CompanionProcess|Process|URLSession|NSSharingService)\b/u,
+  );
 });
 
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
