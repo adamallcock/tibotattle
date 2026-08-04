@@ -53,6 +53,13 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["trigger", "community_aggregate_exclusion_no_delete"],
 ]);
 
+export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
+  ["table", "deletion_tombstones"],
+  ["table", "identity_reenrollment_cooldowns"],
+  ["index", "deletion_tombstones_retention"],
+  ["index", "identity_reenrollment_cooldowns_retention"],
+]);
+
 export const REQUIRED_COLUMNS = Object.freeze({
   apple_signin_handoffs: Object.freeze([
     "state",
@@ -113,6 +120,21 @@ export const REQUIRED_COLUMNS = Object.freeze({
     "window_started_at",
     "accepted_count",
     "last_accepted_at",
+  ]),
+});
+
+export const REQUIRED_DELETION_LEDGER_COLUMNS = Object.freeze({
+  deletion_tombstones: Object.freeze([
+    "participant_digest",
+    "schema_version",
+    "deleted_at",
+    "retain_until",
+  ]),
+  identity_reenrollment_cooldowns: Object.freeze([
+    "identity_cooldown_digest",
+    "schema_version",
+    "deleted_at",
+    "retain_until",
   ]),
 });
 
@@ -298,6 +320,7 @@ function baseReceipt(configChecks) {
       primaryMigrationsAppliedInOrder: false,
       deletionLedgerMigrationsAppliedInOrder: false,
       requiredSchemaPresent: false,
+      deletionLedgerSchemaPresent: false,
       localOnly: true,
       isolatedStateCleaned: false,
     },
@@ -386,7 +409,8 @@ export async function runReleasePreflight({
             REQUIRED_PRIMARY_MIGRATIONS.includes(name))
           && REQUIRED_PRIMARY_MIGRATIONS.every((name) =>
             migrationNames[0].includes(name));
-        receipt.checks.deletionLedgerMigrationsAppliedInOrder = applied[1] === true;
+        receipt.checks.deletionLedgerMigrationsAppliedInOrder = applied[1] === true
+          && migrationNames[1].length > 0;
         if (!receipt.checks.primaryMigrationsAppliedInOrder) {
           receipt.blockers.push("LOCAL_PRIMARY_MIGRATION_ORDER_INVALID");
         }
@@ -426,6 +450,39 @@ export async function runReleasePreflight({
         && columnsPresent.every(Boolean);
       if (!receipt.checks.requiredSchemaPresent) {
         receipt.blockers.push("LOCAL_SCHEMA_INCOMPLETE");
+      }
+
+      const deletionLedgerObjects = runQuery({
+        wrangler,
+        workerDirectory,
+        configPath,
+        stateDirectory,
+        binding: "DELETION_LEDGER",
+        spawn,
+        sql: "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name",
+      });
+      const deletionLedgerObjectNames = schemaObjectNames(deletionLedgerObjects);
+      const deletionLedgerObjectsPresent =
+        REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS.every(([type, name]) =>
+          deletionLedgerObjectNames.has(`${type}:${name}`));
+      const deletionLedgerColumnsPresent = await Promise.all(
+        Object.entries(REQUIRED_DELETION_LEDGER_COLUMNS).map(async ([table, columns]) => {
+          const rows = runQuery({
+            wrangler,
+            workerDirectory,
+            configPath,
+            stateDirectory,
+            binding: "DELETION_LEDGER",
+            spawn,
+            sql: `PRAGMA table_info('${table}')`,
+          });
+          return hasColumns(rows, columns);
+        }),
+      );
+      receipt.checks.deletionLedgerSchemaPresent = deletionLedgerObjectsPresent
+        && deletionLedgerColumnsPresent.every(Boolean);
+      if (!receipt.checks.deletionLedgerSchemaPresent) {
+        receipt.blockers.push("LOCAL_DELETION_LEDGER_SCHEMA_INCOMPLETE");
       }
     }
   } catch {
