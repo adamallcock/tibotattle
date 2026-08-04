@@ -35,6 +35,7 @@ import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import {
   MACOS_RUNTIME_STATIC_ASSETS,
   MACOS_ACCOUNTING_RUNTIME_FILES,
+  MACOS_BUILD_PROFILES,
   MACOS_IDENTITY_CORE_RUNTIME_FILES,
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
   MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
@@ -51,6 +52,7 @@ import {
   assertMacOSWebModuleInventory,
   assertMacOSWorkspaceRuntimePackageInventory,
   normalizeMacOSBundleVersion,
+  normalizeMacOSBuildProfile,
   normalizeMacOSCentralOrigin,
   parseMacOSBuildArguments,
   stageMacOSWebModules,
@@ -128,6 +130,25 @@ const BUILD_SUPPORTED =
   process.platform === "darwin"
   && process.arch === "arm64"
   && process.version === "v26.2.0";
+const MACOS_TEST_LANES_ACTIVE = process.env.USAGE_MONITOR_TEST_LANES === "1";
+const MACOS_TEST_SCOPE = MACOS_TEST_LANES_ACTIVE
+  ? process.env.USAGE_MONITOR_MACOS_TEST_SCOPE ?? "all"
+  : "all";
+if (MACOS_TEST_LANES_ACTIVE
+    && !new Set(["all", "source", "artifact"]).has(MACOS_TEST_SCOPE)) {
+  throw new Error(
+    "USAGE_MONITOR_MACOS_TEST_SCOPE must be one of all, source, or artifact",
+  );
+}
+
+function macOSArtifactTest(name, options, body) {
+  return test(name, {
+    ...options,
+    skip: MACOS_TEST_SCOPE === "source"
+      ? "excluded by the macOS source-only lane"
+      : options.skip,
+  }, body);
+}
 
 test("reviewed product brand owns the native bundle and semantic-open identity", () => {
   assert.equal(Object.isFrozen(PRODUCT_BRAND), true);
@@ -424,9 +445,10 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     const timeout = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGKILL");
-      rejectRun(new Error(`child timed out: ${stderr || stdout}`));
     }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       stdout = `${stdout}${chunk}`.slice(-16_384);
@@ -438,10 +460,41 @@ function runCaptured(command, arguments_, options = {}, timeoutMs = 30_000) {
       clearTimeout(timeout);
       rejectRun(error);
     });
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       clearTimeout(timeout);
+      if (timedOut) {
+        rejectRun(new Error(`child timed out: ${stderr || stdout}`));
+        return;
+      }
       resolveRun({ code, signal, stdout, stderr });
     });
+  });
+}
+
+function buildOutputValue(output, label) {
+  const line = output.split("\n").find((candidate) =>
+    candidate.startsWith(`${label}: `));
+  assert.notEqual(line, undefined, `missing ${label} from macOS build output`);
+  return line.slice(`${label}: `.length);
+}
+
+async function buildMacOSAppInIndependentProcess(output) {
+  const result = await runCaptured(
+    process.execPath,
+    [BUILD_SCRIPT, "--output", output],
+    { cwd: REPOSITORY_ROOT },
+    120_000,
+  );
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  assert.equal(result.signal, null, result.stderr || result.stdout);
+  const totalBytes = Number(buildOutputValue(result.stdout, "Payload bytes"));
+  assert.equal(Number.isSafeInteger(totalBytes), true);
+  return Object.freeze({
+    buildProfile: buildOutputValue(result.stdout, "Compiler profile"),
+    output: buildOutputValue(result.stdout, "Output"),
+    payloadSha256: buildOutputValue(result.stdout, "Payload SHA-256"),
+    sourceSha256: buildOutputValue(result.stdout, "Source SHA-256"),
+    totalBytes,
   });
 }
 
@@ -1640,7 +1693,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
 });
 
-test("preview CLI inputs are opt-in and development parsing ignores preview environment", () => {
+test("preview CLI inputs are opt-in and development parsing ignores preview environment", async () => {
   const environment = {
     USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
     USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
@@ -1657,6 +1710,20 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   assert.equal(development.sparkleFramework, null);
   assert.equal(development.sparkleAppcastURL, null);
   assert.equal(development.sparklePublicEdKey, null);
+  assert.equal(development.buildProfile, MACOS_BUILD_PROFILES.release);
+
+  const testBuild = parseMacOSBuildArguments([
+    "--output",
+    ".release-build/macos-test/TiboTattle.app",
+    "--test-build",
+  ], environment);
+  assert.equal(testBuild.buildProfile, MACOS_BUILD_PROFILES.test);
+  assert.equal(normalizeMacOSBuildProfile("release"), "release");
+  assert.equal(normalizeMacOSBuildProfile("test"), "test");
+  assert.throws(
+    () => normalizeMacOSBuildProfile("profiling"),
+    { code: "MACOS_BUILD_PROFILE_INVALID" },
+  );
 
   const preview = parseMacOSBuildArguments([
     "--preview-distribution",
@@ -1729,6 +1796,40 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
       ".release-build/macos/TiboTattle.app",
     ], environment),
     { code: "MACOS_APP_BUILD_FAILED" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--output",
+      ".release-build/macos-production/TiboTattle.app",
+      "--external-distribution",
+      "--test-build",
+    ], environment),
+    { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+      "--test-build",
+    ], environment),
+    { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" },
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--validate-preview",
+      "--app",
+      ".release-build/macos-preview/current/TiboTattle.app",
+      "--test-build",
+    ], environment),
+    { code: "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID" },
+  );
+  await assert.rejects(
+    buildMacOSApp({
+      output: join(tmpdir(), "usage-monitor-test-profile-preview.app"),
+      centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      previewDistribution: true,
+      buildProfile: MACOS_BUILD_PROFILES.test,
+    }),
+    { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" },
   );
 });
 
@@ -2493,7 +2594,10 @@ test("macOS central origin policy is fixed, HTTPS-first, and explicit for loopba
 });
 
 test("macOS runtime graph is closed over exact source and dependency allowlists", async () => {
-  const [graph, webModules, swiftSources] = await Promise.all([
+  const [graph, concurrentGraph, webModules, swiftSources] = await Promise.all([
+    collectMacOSRuntimeGraph(),
+    // The reproducibility artifact test can build two independent bundles at
+    // once, so the graph scanner must not share mutable RegExp cursor state.
     collectMacOSRuntimeGraph(),
     collectMacOSWebModuleGraph(),
     collectMacOSSwiftSources(),
@@ -2512,6 +2616,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "ajv",
     "runcost/browser",
   ]);
+  assert.deepEqual(concurrentGraph, graph);
   assert.equal(graph.builtins.includes("node:http"), true);
   assert.equal(graph.builtins.includes("node:sqlite"), true);
   assert.equal(graph.relativeFiles.includes("src/local-installation-diagnostics.js"), true);
@@ -3285,7 +3390,7 @@ test("macOS Swift discovery rejects candidates in unknown top-level directories"
   }
 });
 
-test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdog smokes", {
+macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdog smokes", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
   // This creates and deeply verifies two complete signed app bundles. On a
   // loaded developer Mac, codesign and the framework inventory alone can take
@@ -3300,8 +3405,26 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
   const outputB = join(temporaryRoot, "b", "TiboTattle.app");
   const smokeHome = join(temporaryRoot, "smoke-home");
   try {
-    const first = await buildMacOSApp({ output: outputA });
-    const second = await buildMacOSApp({ output: outputB });
+    // Each child has its own Node event loop, output parent, and compiler
+    // scratch tree. This makes Swift compilation and codesigning genuinely
+    // concurrent rather than serialising them behind this process's spawnSync
+    // calls. allSettled ensures cleanup waits for both children on failure.
+    const attempts = await Promise.allSettled([
+      buildMacOSAppInIndependentProcess(outputA),
+      buildMacOSAppInIndependentProcess(outputB),
+    ]);
+    const failures = attempts.filter((attempt) => attempt.status === "rejected");
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures.map(({ reason }) => reason),
+        "independent reproducibility builds failed",
+      );
+    }
+    const [first, second] = attempts.map(({ value }) => value);
+    assert.equal(first.buildProfile, MACOS_BUILD_PROFILES.release);
+    assert.equal(second.buildProfile, MACOS_BUILD_PROFILES.release);
+    assert.equal(first.output, outputA);
+    assert.equal(second.output, outputB);
     assert.equal(first.payloadSha256, second.payloadSha256);
     assert.equal(first.sourceSha256, second.sourceSha256);
     assert.equal(first.totalBytes, second.totalBytes);
@@ -4335,7 +4458,7 @@ test("reproducible ad-hoc-signed app passes orderly and launcher-SIGKILL watchdo
   }
 });
 
-test("preview distribution builds retain the normal identity and reject production validation", {
+macOSArtifactTest("preview distribution builds retain the normal identity and reject production validation", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
   timeout: 120_000,
 }, async (context) => {
@@ -4455,7 +4578,7 @@ test("preview distribution builds retain the normal identity and reject producti
   }
 });
 
-test("signed app relays central readiness to an explicitly connected loopback lab", {
+macOSArtifactTest("signed app relays central readiness to an explicitly connected loopback lab", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
   timeout: 60_000,
 }, async () => {
@@ -4637,6 +4760,10 @@ test("build script itself does not admit private output trees", async () => {
   assert.match(source, /MACOS_PREVIEW_OUTPUT_FORBIDDEN/u);
   assert.match(source, /--preview-distribution/u);
   assert.match(source, /--validate-preview/u);
+  assert.match(source, /COPYFILE_FICLONE/u);
+  assert.match(source, /MACOS_BUILD_PROFILE_TEST/u);
+  assert.match(source, /\["-Onone"\]/u);
+  assert.match(source, /\["-O", "-whole-module-optimization"\]/u);
   assert.match(source, /MACOS_ICON_ASSET_REQUIRED/u);
   assert.match(source, /CFBundleURLSchemes/u);
   assert.match(source, /PRODUCT_BRAND\.appOpenScheme/u);

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants as fileSystemConstants } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -88,10 +89,16 @@ const CENTRAL_ORIGIN_MODE_LOOPBACK = "development_loopback";
 const DISTRIBUTION_CHANNEL_DEVELOPMENT = "development";
 const DISTRIBUTION_CHANNEL_PREVIEW = "preview_distribution";
 const DISTRIBUTION_CHANNEL_PRODUCTION = "production";
+const MACOS_BUILD_PROFILE_RELEASE = "release";
+const MACOS_BUILD_PROFILE_TEST = "test";
 const FIXED_EPOCH_SECONDS = 946_684_800;
 const MAXIMUM_BUNDLE_BYTES = 512 * 1024 * 1024;
 const MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
 const CODESIGN_PATH = "/usr/bin/codesign";
+// On APFS, this lets the large immutable runtime inputs share blocks until a
+// later build step actually changes them. Node falls back to a regular copy on
+// filesystems without clone support, so release output remains portable.
+const COPY_FILE_MODE = fileSystemConstants.COPYFILE_FICLONE ?? 0;
 const SPARKLE_FRAMEWORK_PREFIX =
   "Contents/Frameworks/Sparkle.framework";
 const SIGNED_EXECUTABLE_PATH =
@@ -134,6 +141,11 @@ const DEFAULT_PREVIEW_FRAMEWORK = join(
   ".release-deps",
   "Sparkle.framework",
 );
+
+export const MACOS_BUILD_PROFILES = Object.freeze({
+  release: MACOS_BUILD_PROFILE_RELEASE,
+  test: MACOS_BUILD_PROFILE_TEST,
+});
 
 // Preview clients are meant to exercise the same publicly deployed service
 // boundary as the installed app. These are public identifiers only: the
@@ -582,8 +594,12 @@ export async function collectMacOSRuntimeGraph(entrypoint = ENTRYPOINT) {
     const source = await readFile(file, "utf8");
     const dynamicExternal = DYNAMIC_EXTERNAL_BY_FILE[repositoryRelative(file)];
     if (dynamicExternal) external.add(dynamicExternal);
-    for (const pattern of SOURCE_PATTERNS) {
-      pattern.lastIndex = 0;
+    for (const sourcePattern of SOURCE_PATTERNS) {
+      // A build can run alongside another isolated build in the artifact
+      // reproducibility check. RegExp instances with the global flag carry
+      // mutable lastIndex state, so use a fresh scanner for each source rather
+      // than sharing a module-level scanner across async graph walks.
+      const pattern = new RegExp(sourcePattern.source, sourcePattern.flags);
       for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
         const specifier = match[1];
         if (specifier.startsWith(".")) {
@@ -1029,7 +1045,7 @@ async function copyRegularFile(source, destination, mode = 0o444) {
     fail(`Build input is not a regular file: ${basename(source)}`);
   }
   await mkdir(dirname(destination), { recursive: true, mode: 0o755 });
-  await copyFile(source, destination, 0);
+  await copyFile(source, destination, COPY_FILE_MODE);
   await chmod(destination, mode);
   await utimes(destination, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
 }
@@ -1659,6 +1675,47 @@ function assertBuildPlatform() {
   }
 }
 
+export function normalizeMacOSBuildProfile(value = MACOS_BUILD_PROFILE_RELEASE) {
+  if (value === MACOS_BUILD_PROFILE_RELEASE
+      || value === MACOS_BUILD_PROFILE_TEST) {
+    return value;
+  }
+  fail(
+    `Unsupported macOS build profile: ${value}`,
+    "MACOS_BUILD_PROFILE_INVALID",
+  );
+}
+
+function testCompilerModuleCachePath(sdk, toolchainVersion) {
+  const cacheKey = createHash("sha256")
+    .update([
+      process.version,
+      process.arch,
+      sdk,
+      toolchainVersion,
+      MINIMUM_MACOS_VERSION,
+      MACOS_BUILD_PROFILE_TEST,
+    ].join("\0"))
+    .digest("hex")
+    .slice(0, 24);
+  return join(
+    tmpdir(),
+    "app-usagemonitor-macos-test-swift-module-cache",
+    cacheKey,
+  );
+}
+
+async function prepareTestCompilerModuleCache(sdk, toolchainVersion) {
+  const moduleCache = testCompilerModuleCachePath(sdk, toolchainVersion);
+  await mkdir(moduleCache, { recursive: true, mode: 0o700 });
+  const metadata = await lstat(moduleCache);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    fail("Test compiler module cache is not a private regular directory");
+  }
+  await chmod(moduleCache, 0o700);
+  return moduleCache;
+}
+
 function signApplicationBundle(appBundle) {
   run(CODESIGN_PATH, [
     "--force",
@@ -1686,7 +1743,10 @@ function preSignLauncherForInventory(appBundle) {
   ]);
 }
 
-async function compileLauncher(destination, updater, swiftSources) {
+async function compileLauncher(destination, updater, swiftSources, {
+  buildProfile = MACOS_BUILD_PROFILE_RELEASE,
+} = {}) {
+  const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   const sdk = run("/usr/bin/xcrun", [
     "--sdk",
     "macosx",
@@ -1698,12 +1758,20 @@ async function compileLauncher(destination, updater, swiftSources) {
     dirname(destination),
     ".usage-monitor-swift-build-",
   ));
+  const moduleCache = selectedBuildProfile === MACOS_BUILD_PROFILE_TEST
+    ? await prepareTestCompilerModuleCache(
+      sdk,
+      run("/usr/bin/xcrun", ["--sdk", "macosx", "swiftc", "--version"], {
+        env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+      }),
+    )
+    : compilerScratch;
   const compileEnvironment = {
-    CLANG_MODULE_CACHE_PATH: compilerScratch,
+    CLANG_MODULE_CACHE_PATH: moduleCache,
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
     SDKROOT: sdk,
     SOURCE_DATE_EPOCH: String(FIXED_EPOCH_SECONDS),
-    SWIFT_MODULE_CACHE_PATH: compilerScratch,
+    SWIFT_MODULE_CACHE_PATH: moduleCache,
     TMPDIR: compilerScratch,
     ZERO_AR_DATE: "1",
   };
@@ -1714,8 +1782,9 @@ async function compileLauncher(destination, updater, swiftSources) {
     "-swift-version",
     "5",
     "-parse-as-library",
-    "-O",
-    "-whole-module-optimization",
+    ...(selectedBuildProfile === MACOS_BUILD_PROFILE_TEST
+      ? ["-Onone"]
+      : ["-O", "-whole-module-optimization"]),
     "-target",
     `arm64-apple-macos${MINIMUM_MACOS_VERSION}`,
     "-sdk",
@@ -1723,7 +1792,7 @@ async function compileLauncher(destination, updater, swiftSources) {
     "-module-name",
     `${PRODUCT_BRAND.executableName}Launcher`,
     "-module-cache-path",
-    compilerScratch,
+    moduleCache,
     "-framework",
     "AppKit",
     "-framework",
@@ -2757,6 +2826,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   let sparklePublicEdKey = null;
   let validatePreview = false;
   let appPath = null;
+  let testBuild = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--output") {
@@ -2795,6 +2865,11 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         fail("--validate-preview must be provided at most once");
       }
       validatePreview = true;
+    } else if (argument === "--test-build") {
+      if (testBuild) {
+        fail("--test-build must be provided at most once");
+      }
+      testBuild = true;
     } else if (argument === "--app") {
       if (appPath !== null || index + 1 >= argv.length) {
         fail("--app must be provided at most once with a value");
@@ -2833,6 +2908,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         || externalDistribution
         || previewDistribution
         || replacePreviewOutput
+        || testBuild
         || bundleVersionSeen
         || sparkleFramework !== null
         || sparkleAppcastURL !== null
@@ -2849,6 +2925,12 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   }
   if (replacePreviewOutput && !previewDistribution) {
     fail("--replace-preview-output requires --preview-distribution");
+  }
+  if (testBuild && (externalDistribution || previewDistribution)) {
+    fail(
+      "--test-build cannot create a distributable app",
+      "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN",
+    );
   }
   if (previewDistribution) {
     const environmentOutput = environment.USAGE_MONITOR_PREVIEW_OUTPUT;
@@ -2885,11 +2967,15 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
     sparkleFramework,
     sparkleAppcastURL,
     sparklePublicEdKey,
+    buildProfile: testBuild
+      ? MACOS_BUILD_PROFILE_TEST
+      : MACOS_BUILD_PROFILE_RELEASE,
   };
 }
 
 async function buildApplication(stageApp, centralService, {
   bundleVersion,
+  buildProfile,
   distribution,
   iconAssets,
   updater,
@@ -2932,6 +3018,7 @@ async function buildApplication(stageApp, centralService, {
     join(executables, PRODUCT_BRAND.executableName),
     updater,
     swiftSources,
+    { buildProfile },
   );
   await copyPinnedSparkleFramework(contents, updater);
   const node = await copyPinnedNode(resources);
@@ -3092,10 +3179,12 @@ export async function buildMacOSApp({
   replacePreviewOutput = false,
   previewStagingRoot = DEFAULT_PREVIEW_STAGING_ROOT,
   bundleVersion = BUNDLE_VERSION,
+  buildProfile = MACOS_BUILD_PROFILE_RELEASE,
   sparkleFramework = null,
   sparkleAppcastURL = null,
   sparklePublicEdKey = null,
 }) {
+  const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   const centralService = normalizeMacOSCentralOrigin(centralOrigin, {
     allowLoopbackCentralOrigin,
   });
@@ -3105,6 +3194,13 @@ export async function buildMacOSApp({
     externalDistribution,
     previewDistribution,
   });
+  if (selectedBuildProfile === MACOS_BUILD_PROFILE_TEST
+      && (distribution.externalDistribution || distribution.previewDistribution)) {
+    fail(
+      "Test compiler profile cannot create a distributable app",
+      "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN",
+    );
+  }
   const updater = await normalizeMacOSUpdaterConfiguration({
     appcastURL: sparkleAppcastURL,
     externalDistribution: distribution.externalDistribution,
@@ -3140,6 +3236,7 @@ export async function buildMacOSApp({
   try {
     const manifest = await buildApplication(stagedApp, centralService, {
       bundleVersion: selectedBundleVersion,
+      buildProfile: selectedBuildProfile,
       distribution,
       iconAssets,
       updater,
@@ -3168,6 +3265,7 @@ export async function buildMacOSApp({
       externalDistributionRequested:
         manifest.release.externalDistributionRequested,
       updaterEnabled: manifest.release.updater.enabled,
+      buildProfile: selectedBuildProfile,
     });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -3184,6 +3282,7 @@ async function main(argv) {
     previewDistribution,
     replacePreviewOutput,
     bundleVersion,
+    buildProfile,
     sparkleFramework,
     sparkleAppcastURL,
     sparklePublicEdKey,
@@ -3206,6 +3305,7 @@ async function main(argv) {
     previewDistribution,
     replacePreviewOutput,
     bundleVersion,
+    buildProfile,
     sparkleFramework,
     sparkleAppcastURL,
     sparklePublicEdKey,
@@ -3215,6 +3315,7 @@ async function main(argv) {
   console.log(`Payload SHA-256: ${result.payloadSha256}`);
   console.log(`Source SHA-256: ${result.sourceSha256}`);
   console.log(`Payload bytes: ${result.totalBytes}`);
+  console.log(`Compiler profile: ${result.buildProfile}`);
   console.log(`Channel: ${result.channel}`);
   console.log(`Central service: ${result.centralServiceMode}`);
   console.log(

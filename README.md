@@ -126,6 +126,36 @@ npm test
 npm run product:check
 ```
 
+For native iteration, start with a deterministic preflight and the source-only
+macOS lane:
+
+```bash
+npm run test:fast
+npm run test:macos:smoke
+```
+
+`test:macos:smoke` builds one development-only app with the test compiler
+profile; that profile cannot create preview or external-distribution output.
+Use `npm run test:changed -- --base <revision>` to select known changed paths,
+which includes `<revision>...HEAD` plus staged, unstaged, and untracked local
+paths. It narrows only reviewed native app/build and i18n paths: native source
+changes include the test-profile smoke, and `--full` adds the expensive
+bundle-artifact lane. Web, local-server, shared configuration, runner, and
+unfamiliar paths conservatively run the complete `npm run check` gate. The
+smoke lane requires macOS arm64 with the pinned Node v26.2.0 builder; it fails
+rather than falsely reporting a smoke result on another platform. The retained
+release-quality macOS gate is always:
+
+```bash
+npm run product:macos:test
+```
+
+`npm test` and lane execution remain serial by design. The artifact lane itself
+uses two isolated OS-level builder processes for its reproducibility check;
+each build has a separate output and compiler scratch directory. Measure the
+local lanes with `npm run test:benchmark` (or `test:benchmark:release` to
+include the retained release gate).
+
 `npm run architecture:check` enforces the ownership boundaries. The complete
 command catalog, privacy boundary documentation, and operational detail live in
 the [full product reference](docs/reference/product-reference.md).
