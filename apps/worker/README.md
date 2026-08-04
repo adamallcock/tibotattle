@@ -199,18 +199,22 @@ deploy the compatible disabled Worker before any migration:
 npm run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST \
   --phase pre_migration_compatibility \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
 ```
 
-The deploy step does not create live-proof evidence. The owner must observe the
-active opaque revision and disabled/contained health, then retain the local
-non-secret proof outside Git. Only after that proof is reviewed may preparation
-reach remote D1 mutation:
+The deploy step emits a local non-secret identity receipt but does not create
+live-proof evidence; its revision field explicitly remains owner-observation
+required. The owner must observe the active opaque revision and
+disabled/contained health, then retain a proof referencing that identity
+receipt outside Git. Only after that proof is reviewed may preparation reach
+remote D1 mutation:
 
 ```sh
 npm run staging:prepare -- \
   --origin https://EXACT-STAGING-HOST \
   --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm PREPARE_DISABLED_STAGING
 ```
 

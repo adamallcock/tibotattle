@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import {
   CANONICAL_PRODUCTION_DEPLOYMENT_PROOF,
   DEPLOYMENT_PROOF_SCHEMA_VERSION,
@@ -13,9 +14,48 @@ import {
 import {
   PRODUCTION_DEPLOY_CONFIRMATION,
   runProductionDeployment,
+  recheckProductionContainment,
 } from "./production-deploy.mjs";
 
 const NOW = Date.parse("2026-08-04T20:00:00.000Z");
+const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
+
+function containedHealth() {
+  return {
+    status: "ok",
+    enrollmentMode: "disabled",
+    collectionControls: {
+      state: "contained",
+      enrollment: false,
+      uploadRegistration: false,
+      processing: false,
+      publication: false,
+    },
+    contracts: {
+      accountScopedContribution: {
+        externalParticipantsAuthorized: false,
+      },
+    },
+  };
+}
+
+function jsonHealthResponse(value = containedHealth(), status = 200) {
+  return {
+    url: HEALTH_URL,
+    status,
+    headers: {
+      get(name) {
+        return {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+          "x-content-type-options": "nosniff",
+        }[name];
+      },
+    },
+    text: async () => JSON.stringify(value),
+  };
+}
 
 function proofCheck(overrides = {}) {
   const proof = {
@@ -57,6 +97,16 @@ function options(overrides = {}) {
     now: NOW,
     wrangler: "/fake/wrangler",
     workerDirectory: "/worker",
+    expectedSourceCommit: "c26823c",
+    sourceCommitCheck: () => "c26823c",
+    releasePreflight: async () => ({
+      state: "ready",
+      blockers: [],
+    }),
+    fetchImpl: async (url) => {
+      assert.equal(String(url), HEALTH_URL);
+      return jsonHealthResponse();
+    },
     ...overrides,
   };
 }
@@ -145,11 +195,20 @@ test("production deployment refuses invalid or stale proof before Wrangler", asy
 
 test("valid production proof routes through local checks and then the exact production Wrangler deploy", async () => {
   const calls = [];
+  const healthCalls = [];
   const result = await runProductionDeployment(options({
     proofCheck: proofCheck(),
+    releasePreflight: async () => {
+      calls.push("preflight");
+      return { state: "ready", blockers: [] };
+    },
     checkWorkspacePackages: async () => calls.push("workspace"),
     checkEndpoints: async () => calls.push("endpoints"),
     stageAssets: async () => calls.push("assets"),
+    fetchImpl: async (url, request) => {
+      healthCalls.push({ url: String(url), request });
+      return jsonHealthResponse();
+    },
     spawn: (_command, args) => {
       calls.push(args);
       return { status: 0, stdout: "deployed", stderr: "" };
@@ -157,11 +216,133 @@ test("valid production proof routes through local checks and then the exact prod
   }));
   assert.equal(result.ok, true);
   assert.deepEqual(calls, [
+    "preflight",
     "workspace",
     "endpoints",
     "assets",
     ["deploy", "--env", "production", "--strict"],
   ]);
+  assert.equal(healthCalls.length, 1);
+  assert.equal(healthCalls[0].url, HEALTH_URL);
+  assert.equal(healthCalls[0].request.method, "GET");
+  assert.equal(healthCalls[0].request.credentials, "omit");
+  assert.equal(healthCalls[0].request.redirect, "error");
   assert.equal(result.collectionAuthorized, false);
+  assert.equal(result.immediateHealthRecheck, "contained");
   assert.equal(result.containmentProof.workerRevision, "production-revision-0001");
+});
+
+test("production deployment treats release preflight as a hard gate", async () => {
+  const calls = [];
+  const result = await runProductionDeployment(options({
+    proofCheck: proofCheck(),
+    releasePreflight: async () => ({
+      state: "blocked",
+      blockers: ["LOCAL_SCHEMA_INCOMPLETE"],
+    }),
+    checkWorkspacePackages: async () => calls.push("workspace"),
+    checkEndpoints: async () => calls.push("endpoints"),
+    stageAssets: async () => calls.push("assets"),
+    spawn: () => calls.push("deploy"),
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "RELEASE_PREFLIGHT_BLOCKED",
+    blockers: ["LOCAL_SCHEMA_INCOMPLETE"],
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("production deployment does not spawn Wrangler when immediate health recheck fails", async () => {
+  for (const fetchImpl of [
+    async () => {
+      throw new Error("network");
+    },
+    async () => jsonHealthResponse({
+      ...containedHealth(),
+      enrollmentMode: "open",
+    }),
+    async () => ({
+      ...jsonHealthResponse(),
+      url: "https://redirected.example.test/api/health",
+    }),
+    async () => ({
+      ...jsonHealthResponse(),
+      headers: {
+        get(name) {
+          return name === "cache-control" ? "public" : "nosniff";
+        },
+      },
+    }),
+  ]) {
+    let spawned = false;
+    const result = await runProductionDeployment(options({
+      proofCheck: proofCheck(),
+      fetchImpl,
+      checkWorkspacePackages: async () => {},
+      checkEndpoints: async () => {},
+      stageAssets: async () => {},
+      spawn: () => {
+        spawned = true;
+        return { status: 0 };
+      },
+    }));
+    assert.equal(spawned, false);
+    assert.equal(result.ok, false);
+    assert.match(result.code, /^PRODUCTION_HEALTH_RECHECK_/u);
+  }
+});
+
+test("production deployment stops before Wrangler on a proof source revision mismatch", async () => {
+  let spawned = false;
+  const result = await runProductionDeployment(options({
+    proofCheck: proofCheck({
+      worker: { ...proofCheck().proof.worker, sourceCommit: "deadbee" },
+    }),
+    checkWorkspacePackages: async () => {
+      throw new Error("must not run");
+    },
+    spawn: () => {
+      spawned = true;
+      return { status: 0 };
+    },
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_CONTAINMENT_PROOF_MISMATCH",
+  });
+  assert.equal(spawned, false);
+});
+
+test("production deployment stops if the checked-out source revision changes before Wrangler", async () => {
+  let spawned = false;
+  const result = await runProductionDeployment(options({
+    proofCheck: proofCheck(),
+    sourceCommitCheck: () => "deadbee",
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    stageAssets: async () => {},
+    spawn: () => {
+      spawned = true;
+      return { status: 0 };
+    },
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_SOURCE_REVISION_CHANGED",
+  });
+  assert.equal(spawned, false);
+});
+
+test("production health recheck requires the canonical URL and security headers", async () => {
+  const calls = [];
+  const result = await recheckProductionContainment({
+    fetchImpl: async (url, request) => {
+      calls.push({ url, request });
+      return jsonHealthResponse();
+    },
+  });
+  assert.deepEqual(result, { ok: true, code: null });
+  assert.deepEqual(calls.map((call) => call.url), [HEALTH_URL]);
+  assert.equal(calls[0].request.headers.accept, "application/json");
 });

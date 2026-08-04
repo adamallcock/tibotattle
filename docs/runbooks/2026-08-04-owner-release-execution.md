@@ -44,7 +44,10 @@ statuses, artifact byte count/digest, and pass/fail. Never record private keys,
 Keychain exports, provider tokens, OAuth codes/verifiers, account identifiers,
 raw appcast/artifact bytes, or raw logs.
 
-Worker deployment proof is a separate local JSON receipt, not a Wrangler log.
+Worker deployment proof is a separate local JSON receipt, not a Wrangler log;
+the proof and staging deployment-identity files must be regular owner-owned
+files with mode `0600` (no group/world access), and are read through the
+owner-only local-file gate.
 For production, first run the read-only owner observation and retain its
 output; then record the observed opaque Worker revision in a receipt with
 schema `tibotattle-worker-deployment-proof-v0.1`, operation
@@ -55,8 +58,16 @@ canonical production origin, the observer's matched endpoint-manifest fields,
 `enrollmentMode: "disabled"`, `collectionControls: "contained"`, and the four
 owner-observation evidence flags. The deploy wrapper validates the receipt's
 age, revision, containment, endpoint manifest, and channel before any local
-asset step or Wrangler call. It never treats checked-in configuration or
-staging evidence as production containment.
+asset step or Wrangler call, then performs an immediate credential-free
+canonical `/api/health` recheck with redirect, JSON, security-header,
+disabled/contained, and no-external-authorization checks immediately before
+spawning Wrangler. Both the bounded owner proof and that live health recheck
+are required. The health recheck does not prove the Worker revision; that role
+remains with the owner-observed revision in the proof. The wrapper never treats
+checked-in configuration or staging evidence as production containment. It also
+runs the existing local-only `release:preflight` and refuses the production
+deploy unless that disposable migration/schema rehearsal returns a ready
+receipt.
 
 ## Strict sequence
 
@@ -107,11 +118,14 @@ non-production staging origin and resources may the owner run the mutating lane:
 npm --prefix apps/worker run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
   --phase pre_migration_compatibility \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
-# Observe the deployed disabled revision and create the local proof receipt.
+# Observe the deployed disabled revision and create a proof referencing the
+# generated local deployment-identity receipt.
 npm --prefix apps/worker run staging:prepare -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
   --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm PREPARE_DISABLED_STAGING
 npm --prefix apps/worker run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
@@ -119,11 +133,21 @@ npm --prefix apps/worker run staging:deploy -- \
 npm --prefix apps/worker run staging:ready
 ```
 
-The final receipt must show the exact staging resources, current checked-in
-migration sequence, lifecycle readiness, `ENROLLMENT_MODE=disabled`, all
-collection controls contained, and `collectionAuthorized: false`. A
+The compatible phase first validates the staged runtime configuration itself:
+the staging environment, origin boundary, enrollment, account-scoped ingest,
+upload-ingress queue, asset routes, and related disabled-mode bindings must be
+closed before package or asset checks. It does not manufacture live proof. The
+owner must then observe the deployed revision and health before `staging:prepare`
+can reach remote migration commands. The final receipt must show the exact
+staging resources, current checked-in migration sequence, lifecycle readiness,
+`ENROLLMENT_MODE=disabled`, all collection controls contained, and
+`collectionAuthorized: false`. A
 `workers.dev` hostname appearing in output is not by itself proof that it is
-the reviewed staging target. Never substitute the production custom domain.
+the reviewed staging target. The identity receipt binds the output origin,
+checked-out source commit, endpoint manifest, and explicit
+owner-observation-required revision state; preparation derives its proof
+expectations from that receipt and rejects another origin or deployment
+intent. Never substitute the production custom domain.
 
 **Gate / rollback.** Any missing resource, migration drift, origin mismatch,
 redirect, readiness failure, open/invite-enabled health, or non-contained

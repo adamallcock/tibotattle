@@ -11,18 +11,62 @@ import {
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
 import {
+  createStagingDeploymentIdentity,
+  DEPLOYMENT_PROOF_SCHEMA_VERSION,
+  STAGING_DISABLED_WORKER_PROOF_OPERATION,
+} from "./deployment-proof.mjs";
+import {
   EXPECTED_STAGING_MIGRATIONS,
   STAGING_PROOF_TYPES,
 } from "./staging-readiness-lib.mjs";
 
+const STAGING_ORIGIN = "https://app-usagemonitor-staging.workers.dev";
+const SOURCE_COMMIT = "c26823c";
+const DEPLOYMENT_IDENTITY = createStagingDeploymentIdentity({
+  origin: STAGING_ORIGIN,
+  sourceCommit: SOURCE_COMMIT,
+});
 const VALID_DEPLOYMENT_PROOF_CHECK = Object.freeze({
   ok: true,
   code: null,
+  proof: {
+    schemaVersion: DEPLOYMENT_PROOF_SCHEMA_VERSION,
+    operation: STAGING_DISABLED_WORKER_PROOF_OPERATION,
+    environment: "staging",
+    channel: "staging",
+    phase: "pre_migration_compatibility",
+    observedAt: new Date().toISOString(),
+    target: { origin: STAGING_ORIGIN },
+    worker: {
+      revision: "staging-revision-0001",
+      sourceCommit: SOURCE_COMMIT,
+      enrollmentMode: "disabled",
+      collectionControls: "contained",
+    },
+    evidence: {
+      ownerObservedRemoteRevision: true,
+      ownerObservedDisabledMode: true,
+      ownerObservedContainment: true,
+      ownerObservedCanonicalTarget: true,
+    },
+    deploymentIdentity: {
+      schemaVersion: DEPLOYMENT_IDENTITY.schemaVersion,
+      intentId: DEPLOYMENT_IDENTITY.intentId,
+      sha256: DEPLOYMENT_IDENTITY.sha256,
+    },
+  },
 });
+
+function prepare(options = {}) {
+  return prepareDisabledStaging({
+    deploymentIdentity: DEPLOYMENT_IDENTITY,
+    ...options,
+  });
+}
 
 test("preparation requires exact confirmation before inspection or mutation", () => {
   const calls = [];
-  const result = prepareDisabledStaging({
+  const result = prepare({
     config: provisionedConfig(),
     confirmation: "yes",
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -34,6 +78,43 @@ test("preparation requires exact confirmation before inspection or mutation", ()
     },
   });
   assert.deepEqual(result, { ok: false, code: "CONFIRMATION_REQUIRED" });
+  assert.deepEqual(calls, []);
+});
+
+test("preparation requires the generated deployment identity and rejects another intent", () => {
+  const noIdentity = prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+  });
+  assert.deepEqual(noIdentity, {
+    ok: false,
+    code: "STAGING_DEPLOYMENT_IDENTITY_REQUIRED",
+  });
+
+  const calls = [];
+  const otherIdentity = createStagingDeploymentIdentity({
+    origin: "https://other-staging.workers.dev",
+    sourceCommit: SOURCE_COMMIT,
+  });
+  const mismatch = prepare({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    deploymentIdentity: otherIdentity,
+    deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: (_command, args) => {
+      calls.push(args);
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(mismatch, {
+    ok: false,
+    code: "STAGING_DEPLOYMENT_IDENTITY_MISMATCH",
+  });
   assert.deepEqual(calls, []);
 });
 
@@ -51,7 +132,7 @@ test("preparation will not mutate unprovisioned infrastructure", () => {
     }
     throw new Error(`Unexpected command: ${joined}`);
   };
-  const result = prepareDisabledStaging({
+  const result = prepare({
     config: checkedInConfig,
     confirmation: PREPARE_CONFIRMATION,
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -215,7 +296,7 @@ test("preparation applies both migrations, contains collection, and rechecks", (
     }
     throw new Error(`Unexpected command: ${joined}`);
   };
-  const result = prepareDisabledStaging({
+  const result = prepare({
     config,
     confirmation: PREPARE_CONFIRMATION,
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -327,7 +408,7 @@ test("preparation applies both migrations, contains collection, and rechecks", (
 test("preparation contains an existing active target before any migration", () => {
   const config = provisionedConfig();
   const calls = [];
-  const result = prepareDisabledStaging({
+  const result = prepare({
     config,
     confirmation: PREPARE_CONFIRMATION,
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -362,7 +443,7 @@ test("preparation stops at containment failure or crash before migration", () =>
   ]) {
     const config = provisionedConfig();
     const calls = [];
-    const result = prepareDisabledStaging({
+    const result = prepare({
       config,
       confirmation: PREPARE_CONFIRMATION,
       deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -392,7 +473,7 @@ test("preparation stops at containment failure or crash before migration", () =>
 test("fresh bootstrap stops before any migration without an operational claim", () => {
   const config = provisionedConfig();
   const calls = [];
-  const result = prepareDisabledStaging({
+  const result = prepare({
     config,
     confirmation: PREPARE_CONFIRMATION,
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -436,7 +517,7 @@ test("preparation does not contain until applied migrations are proven exact", (
     }
     return baseSpawn(command, args, options);
   };
-  const result = prepareDisabledStaging({
+  const result = prepare({
     config,
     confirmation: PREPARE_CONFIRMATION,
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
@@ -461,7 +542,7 @@ test("preparation refuses absent or invalid compatible-worker proof before migra
     { ok: false, code: "DEPLOYMENT_PROOF_MALFORMED" },
   ]) {
     const calls = [];
-    const result = prepareDisabledStaging({
+    const result = prepare({
       config: provisionedConfig(),
       confirmation: PREPARE_CONFIRMATION,
       deploymentProofCheck,
@@ -493,7 +574,7 @@ test("preparation refuses missing identity protection before any mutation", () =
   ]) {
     const config = provisionedConfig();
     const calls = [];
-    const result = prepareDisabledStaging({
+    const result = prepare({
       config,
       confirmation: PREPARE_CONFIRMATION,
       deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,

@@ -12,6 +12,7 @@ import {
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
 import {
+  readStagingDeploymentIdentity,
   readDeploymentProof,
   validateDeploymentProof,
 } from "./deployment-proof.mjs";
@@ -126,6 +127,7 @@ export function prepareDisabledStaging({
   config,
   confirmation,
   stagingOrigin,
+  deploymentIdentity = null,
   deploymentProof,
   expectedSourceCommit = null,
   deploymentProofCheck = null,
@@ -136,12 +138,24 @@ export function prepareDisabledStaging({
   if (confirmation !== PREPARE_CONFIRMATION) {
     return { ok: false, code: "CONFIRMATION_REQUIRED" };
   }
-  const proofCheck = deploymentProofCheck ?? validateDeploymentProof({
-    proof: deploymentProof,
-    kind: "staging",
-    expectedOrigin: stagingOrigin,
-    expectedSourceCommit,
-  });
+  if (!deploymentIdentity) {
+    return { ok: false, code: "STAGING_DEPLOYMENT_IDENTITY_REQUIRED" };
+  }
+  if (stagingOrigin !== deploymentIdentity.deployment?.origin) {
+    return {
+      ok: false,
+      code: "STAGING_DEPLOYMENT_IDENTITY_MISMATCH",
+    };
+  }
+  const proofCheck = deploymentProofCheck?.ok === false
+    ? deploymentProofCheck
+    : validateDeploymentProof({
+      proof: deploymentProofCheck?.proof ?? deploymentProof,
+      kind: "staging",
+      expectedOrigin: deploymentIdentity.deployment?.origin,
+      expectedSourceCommit,
+      expectedDeploymentIdentity: deploymentIdentity,
+    });
   if (!proofCheck.ok) return proofCheck;
   let before;
   try {
@@ -306,13 +320,16 @@ export function prepareDisabledStaging({
 }
 
 async function main() {
-  if (process.argv.length !== 8
+  if (process.argv.length !== 10
       || process.argv[2] !== "--origin"
       || process.argv[4] !== "--receipt-file"
-      || process.argv[6] !== "--confirm") {
+      || process.argv[6] !== "--identity-receipt-file"
+      || process.argv[8] !== "--confirm") {
     process.stderr.write(
       "Usage: prepare-disabled-staging.mjs --origin https://HOST "
-        + `--receipt-file /owner-only/path --confirm ${PREPARE_CONFIRMATION}\n`,
+        + "--receipt-file /owner-only/proof.json "
+        + "--identity-receipt-file /owner-only/identity.json "
+        + `--confirm ${PREPARE_CONFIRMATION}\n`,
     );
     process.exit(2);
   }
@@ -336,21 +353,32 @@ async function main() {
     const expectedSourceCommit = sourceCommitResult.status === 0
       ? sourceCommitResult.stdout.trim()
       : "source-revision-unavailable";
-    const deploymentProofCheck = await readDeploymentProof({
-      filename: process.argv[5],
-      kind: "staging",
+    const deploymentIdentityCheck = await readStagingDeploymentIdentity({
+      filename: process.argv[7],
       expectedOrigin: process.argv[3],
       expectedSourceCommit,
     });
-    result = prepareDisabledStaging({
-      config,
-      confirmation: process.argv[7],
-      stagingOrigin: process.argv[3],
-      expectedSourceCommit,
-      deploymentProofCheck,
-      wrangler,
-      workerDirectory,
-    });
+    if (!deploymentIdentityCheck.ok) {
+      result = deploymentIdentityCheck;
+    } else {
+      const deploymentProofCheck = await readDeploymentProof({
+        filename: process.argv[5],
+        kind: "staging",
+        expectedOrigin: deploymentIdentityCheck.identity.deployment.origin,
+        expectedSourceCommit,
+        expectedDeploymentIdentity: deploymentIdentityCheck.identity,
+      });
+      result = prepareDisabledStaging({
+        config,
+        confirmation: process.argv[9],
+        stagingOrigin: process.argv[3],
+        deploymentIdentity: deploymentIdentityCheck.identity,
+        expectedSourceCommit,
+        deploymentProofCheck,
+        wrangler,
+        workerDirectory,
+      });
+    }
   } catch {
     result = { ok: false, code: "STAGING_PREPARATION_FAILED" };
   }

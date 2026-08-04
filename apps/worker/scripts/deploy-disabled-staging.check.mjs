@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -112,8 +112,11 @@ test("deployment requires an exact confirmation before any command", async () =>
   assert.deepEqual(calls, []);
 });
 
-test("pre-migration compatibility phase deploys the disabled Worker without claiming live proof", async () => {
+test("pre-migration compatibility phase deploys the disabled Worker without claiming live proof", async (t) => {
   const config = provisionedConfig();
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-staging-identity-"));
+  const identityReceiptFile = join(root, "deployment-identity.json");
+  t.after(() => rm(root, { recursive: true, force: true }));
   const calls = [];
   let liveProbeCalled = false;
   const result = await runDeployment({
@@ -121,6 +124,8 @@ test("pre-migration compatibility phase deploys the disabled Worker without clai
     origin: stagingOrigin,
     phase: "pre_migration_compatibility",
     confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+    identityReceiptFile,
+    expectedSourceCommit: "c26823c",
     spawn: (_command, args) => {
       calls.push(args);
       if (args[0] === "deploy") {
@@ -134,15 +139,94 @@ test("pre-migration compatibility phase deploys the disabled Worker without clai
       return containedFetch();
     },
   });
-  assert.deepEqual(result, {
+  const { deploymentIdentity, ...resultSummary } = result;
+  assert.deepEqual(resultSummary, {
     ok: true,
     code: "COMPATIBLE_DISABLED_STAGING_DEPLOYED",
     collectionAuthorized: false,
     receiptRequired: true,
     liveContainmentObserved: false,
+    runtimeConfiguration: "disabled_contained",
   });
+  const identity = JSON.parse(await readFile(identityReceiptFile, "utf8"));
+  assert.equal(identity.deployment.origin, stagingOrigin);
+  assert.equal(identity.deployment.sourceCommit, "c26823c");
+  assert.equal(identity.deployment.revisionObserved, false);
+  assert.deepEqual(deploymentIdentity, identity);
   assert.deepEqual(calls, [["deploy", "--env", "staging", "--strict"]]);
   assert.equal(liveProbeCalled, false);
+});
+
+test("pre-migration compatibility requires a durable identity receipt before checks or Wrangler", async () => {
+  const calls = [];
+  const result = await runDeployment({
+    config: provisionedConfig(),
+    origin: stagingOrigin,
+    phase: "pre_migration_compatibility",
+    confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+    checkWorkspacePackages: async () => calls.push("workspace"),
+    stageAssets: async () => calls.push("assets"),
+    spawn: () => calls.push("deploy"),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_DEPLOYMENT_IDENTITY_RECEIPT_REQUIRED",
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("pre-migration compatibility refuses an open or unexpected staged runtime configuration", async (t) => {
+  for (const scenario of [
+    {
+      name: "enrollment enabled",
+      mutate: (config) => {
+        config.env.staging.vars.ENROLLMENT_MODE = "open";
+      },
+      blocker: "CONFIG_ENROLLMENT_DISABLED",
+    },
+    {
+      name: "account-scoped ingest enabled",
+      mutate: (config) => {
+        config.env.staging.vars.ACCOUNT_SCOPED_INGEST_MODE = "open";
+      },
+      blocker: "CONFIG_ACCOUNT_SCOPED_INGEST_DISABLED",
+    },
+    {
+      name: "upload ingress queue enabled",
+      mutate: (config) => {
+        config.env.staging.vars.UPLOAD_INGRESS_QUEUE_MODE = "enabled";
+      },
+      blocker: "CONFIG_NO_UNEXPECTED_VARIABLES",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      let workspaceChecked = false;
+      let assetsChecked = false;
+      let spawned = false;
+      const result = await runDeployment({
+        config: scenario.mutate(provisionedConfig()),
+        origin: stagingOrigin,
+        phase: "pre_migration_compatibility",
+        confirmation: COMPATIBLE_DEPLOY_CONFIRMATION,
+        checkWorkspacePackages: async () => {
+          workspaceChecked = true;
+        },
+        stageAssets: async () => {
+          assetsChecked = true;
+        },
+        spawn: () => {
+          spawned = true;
+          return { status: 0, stdout: `Deployed ${stagingOrigin}` };
+        },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.code, "STAGING_COMPATIBLE_RUNTIME_CONFIGURATION_BLOCKED");
+      assert.equal(result.blockers.includes(scenario.blocker), true);
+      assert.equal(workspaceChecked, false);
+      assert.equal(assetsChecked, false);
+      assert.equal(spawned, false);
+    });
+  }
 });
 
 test("deployment accepts only a bare HTTPS staging origin", async () => {

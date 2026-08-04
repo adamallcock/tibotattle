@@ -1,14 +1,16 @@
-import { spawnSync } from "node:child_process";
-import { lstat, readFile } from "node:fs/promises";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmod, lstat, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "jsonc-parser";
 import {
+  assessStagingConfiguration,
   identityProtectionSchemaVerified,
   probeStagingLive,
   stagingOperationReceipt,
 } from "./staging-readiness-lib.mjs";
+import { createStagingDeploymentIdentity } from "./deployment-proof.mjs";
 import {
   checkLocalWorkspacePackages,
 } from "./check-local-workspace-packages.mjs";
@@ -17,6 +19,34 @@ import { stageProductionAssets } from "./stage-production-assets.mjs";
 export const DEPLOY_CONFIRMATION = "DEPLOY_DISABLED_STAGING";
 export const COMPATIBLE_DEPLOY_CONFIRMATION =
   "DEPLOY_COMPATIBLE_DISABLED_STAGING";
+
+function checkedOutSourceCommit(workerDirectory) {
+  try {
+    const value = execFileSync(
+      "/usr/bin/git",
+      ["-C", dirname(workerDirectory), "rev-parse", "HEAD"],
+      { encoding: "utf8" },
+    ).trim();
+    return /^[a-f0-9]{7,64}$/u.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeDeploymentIdentity(filename, identity) {
+  if (typeof filename !== "string" || filename.length === 0) return false;
+  try {
+    await writeFile(filename, `${JSON.stringify(identity)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    await chmod(filename, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function validStagingSecretsFile(filename) {
   if (!filename) return false;
@@ -110,6 +140,49 @@ function deployedWorkersDevOrigins(output) {
   });
 }
 
+function compatibleRuntimeConfiguration(config, workerDirectory) {
+  let assessment;
+  try {
+    assessment = assessStagingConfiguration(config, { workerDirectory });
+  } catch {
+    return {
+      ok: false,
+      blockers: ["STAGING_RUNTIME_CONFIGURATION_UNREADABLE"],
+    };
+  }
+  const requiredChecks = [
+    "environmentDeclared",
+    "publicNameSafe",
+    "workersDevHttpsEnabled",
+    "originBoundaryClosed",
+    "previewUrlsDisabled",
+    "enrollmentDisabled",
+    "accountScopedIngestDisabled",
+    "noUnexpectedVariables",
+    "assetsClosed",
+    "deployableAssetsClosed",
+    "ingressBudgetBindingSafe",
+    "ingressBudgetMigrationSafe",
+  ];
+  const failedChecks = requiredChecks
+    .filter((name) => assessment.checks?.[name] !== true)
+    .map((name) => `CONFIG_${name.replaceAll(/([A-Z])/gu, "_$1").toUpperCase()}`);
+  const blockers = [...new Set([
+    ...failedChecks,
+    ...(assessment.state === "unsafe_configuration"
+      ? assessment.blockers.filter(
+        (code) => code !== "STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED",
+      )
+      : []),
+  ])];
+  return {
+    ok: assessment.state !== "unsafe_configuration"
+      && blockers.length === 0
+      && assessment.collectionAuthorized === false,
+    blockers,
+  };
+}
+
 export async function runDisabledStagingDeployment({
   config,
   origin,
@@ -122,6 +195,9 @@ export async function runDisabledStagingDeployment({
   fetchImpl = fetch,
   checkWorkspacePackages = checkLocalWorkspacePackages,
   stageAssets = stageProductionAssets,
+  identityReceiptFile = null,
+  expectedSourceCommit = null,
+  writeIdentityReceipt = writeDeploymentIdentity,
 }) {
   if (![
     "final",
@@ -146,6 +222,33 @@ export async function runDisabledStagingDeployment({
       || parsedOrigin.pathname !== "/" || parsedOrigin.search
       || parsedOrigin.hash) {
     return { ok: false, code: "STAGING_ORIGIN_INVALID" };
+  }
+  if (compatiblePhase) {
+    if (!identityReceiptFile) {
+      return {
+        ok: false,
+        code: "STAGING_DEPLOYMENT_IDENTITY_RECEIPT_REQUIRED",
+      };
+    }
+    const runtimeConfiguration = compatibleRuntimeConfiguration(
+      config,
+      workerDirectory,
+    );
+    if (!runtimeConfiguration.ok) {
+      return {
+        ok: false,
+        code: "STAGING_COMPATIBLE_RUNTIME_CONFIGURATION_BLOCKED",
+        blockers: runtimeConfiguration.blockers,
+      };
+    }
+    const sourceCommit = expectedSourceCommit
+      ?? checkedOutSourceCommit(workerDirectory);
+    if (!sourceCommit || !/^[a-f0-9]{7,64}$/u.test(sourceCommit)) {
+      return {
+        ok: false,
+        code: "STAGING_SOURCE_REVISION_UNAVAILABLE",
+      };
+    }
   }
   try {
     await checkWorkspacePackages();
@@ -178,10 +281,25 @@ export async function runDisabledStagingDeployment({
     if (deployment.error || deployment.status !== 0) {
       return { ok: false, code: "STAGING_COMPATIBLE_DEPLOY_FAILED" };
     }
-    if (!deployedWorkersDevOrigins(
+    const deployedOrigins = [...new Set(deployedWorkersDevOrigins(
       `${deployment.stdout ?? ""}\n${deployment.stderr ?? ""}`,
-    ).includes(parsedOrigin.origin)) {
+    ))];
+    if (deployedOrigins.length !== 1
+        || deployedOrigins[0] !== parsedOrigin.origin) {
       return { ok: false, code: "STAGING_DEPLOY_ORIGIN_MISMATCH" };
+    }
+    const sourceCommit = expectedSourceCommit
+      ?? checkedOutSourceCommit(workerDirectory);
+    const deploymentIdentity = createStagingDeploymentIdentity({
+      origin: deployedOrigins[0],
+      sourceCommit,
+      workerName: config.env.staging.name,
+    });
+    if (!await writeIdentityReceipt(identityReceiptFile, deploymentIdentity)) {
+      return {
+        ok: false,
+        code: "STAGING_DEPLOYMENT_IDENTITY_RECEIPT_WRITE_FAILED",
+      };
     }
     return {
       ok: true,
@@ -189,6 +307,8 @@ export async function runDisabledStagingDeployment({
       collectionAuthorized: false,
       receiptRequired: true,
       liveContainmentObserved: false,
+      runtimeConfiguration: "disabled_contained",
+      deploymentIdentity,
     };
   }
 
@@ -320,15 +440,17 @@ async function main() {
     if (!value || value.startsWith("--")) return null;
     return value;
   }
-  if (![6, 8].includes(process.argv.length)
+  if (![6, 10].includes(process.argv.length)
       || process.argv[2] !== "--origin"
       || (process.argv.length === 6 && process.argv[4] !== "--confirm")
-      || (process.argv.length === 8
+      || (process.argv.length === 10
         && (process.argv[4] !== "--phase"
-          || process.argv[6] !== "--confirm"))) {
+          || process.argv[6] !== "--identity-receipt-file"
+          || process.argv[8] !== "--confirm"))) {
     process.stderr.write(
       "Usage: deploy-disabled-staging.mjs --origin https://HOST "
-        + `[--phase pre_migration_compatibility --confirm ${COMPATIBLE_DEPLOY_CONFIRMATION}`
+        + `[--phase pre_migration_compatibility --identity-receipt-file /owner-only/path`
+        + ` --confirm ${COMPATIBLE_DEPLOY_CONFIRMATION}`
         + `|--confirm ${DEPLOY_CONFIRMATION}]\n`,
     );
     process.exit(2);
@@ -347,6 +469,7 @@ async function main() {
     origin: option("--origin"),
     confirmation: option("--confirm"),
     phase: option("--phase") ?? "final",
+    identityReceiptFile: option("--identity-receipt-file"),
     wrangler,
     workerDirectory,
     secretsFile: join(workerDirectory, ".dev.vars.staging"),

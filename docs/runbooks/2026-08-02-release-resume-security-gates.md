@@ -16,9 +16,9 @@ published. Do not use a generic `wrangler deploy` against production: the
 reviewed route is the receipt-gated
 `npm --prefix apps/worker run production:deploy -- --receipt-file
 /owner-only/production-containment-proof.json --confirm
-DEPLOY_CONTAINED_PRODUCTION`, which refuses a dirty checkout and stages only
-tracked web assets after the current canonical containment/revision proof is
-validated.
+DEPLOY_CONTAINED_PRODUCTION`, which runs the local-only `release:preflight`
+gate, refuses a dirty checkout, and stages only tracked web assets after the
+current canonical containment/revision proof is validated.
 
 The update-feed infrastructure is provisioned, its TLS certificate is active,
 and its bucket remains empty.

@@ -154,12 +154,17 @@ npm run staging:ready
 npm run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
   --phase pre_migration_compatibility \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
-# Owner observes the exact remote revision and disabled/contained health,
-# then writes the bounded proof below outside the repository.
+# The command emits a local identity receipt containing the deployment output
+# origin, checked-out source commit, endpoint binding, and explicit
+# owner-observation-required revision state. The owner observes the exact
+# remote revision and disabled/contained health, then writes a bounded proof
+# that references that receipt.
 npm run staging:prepare -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
   --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm PREPARE_DISABLED_STAGING
 npm run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
@@ -169,10 +174,16 @@ npm run staging:ready
 
 `staging:check` validates the checked-in closed configuration and dry-run
 bundle; `staging:ready` is a read-only live-resource check. The
-`pre_migration_compatibility` phase performs local/package/asset checks and the
-actual disabled Worker deploy, but deliberately does not claim live health or
-write a proof. The owner must observe the remote active revision and verify
-disabled enrollment plus contained controls before supplying the proof file.
+`pre_migration_compatibility` phase first requires the staged runtime
+configuration itself to declare disabled enrollment, disabled account-scoped
+ingest and upload ingress, and closed routes before it performs package/asset
+checks and the actual disabled Worker deploy. It deliberately does not claim
+live health or write a proof. The owner must observe the remote active revision
+and verify disabled enrollment plus contained controls before supplying the
+proof file. `staging:prepare` derives the canonical origin and source revision
+from the identity receipt and rejects a proof for any other origin, environment,
+source commit, or deployment intent; the identity receipt never invents a
+remote revision when one was not observed locally.
 Only then can `staging:prepare` reach remote containment or migration commands.
 If remote storage must be created or updated, use only the reviewed
 contained-staging preparation procedure in the existing [invite pilot
@@ -189,9 +200,11 @@ The proof is a local, non-secret JSON receipt with schema
 `observedAt`, the exact `workers.dev` origin, the observed opaque Worker
 revision, the reviewed source commit, `enrollmentMode: "disabled"`,
 `collectionControls: "contained"`, and all four owner-observation evidence
-flags. The command validates the structure, age, origin, and source commit; it
-does not manufacture this receipt from local deploy output. Missing, stale,
-malformed, open, or mismatched proof stops before migration.
+flags, plus a `deploymentIdentity` reference containing the generated
+identity receipt's schema, intent ID, and SHA-256. The command validates the
+structure, age, identity reference, origin, and source commit; it does not
+manufacture this owner proof from local deploy output. Missing, stale,
+malformed, open, or mismatched proof or identity stops before migration.
 
 Required disabled-mode acceptance evidence:
 

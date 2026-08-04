@@ -172,10 +172,12 @@ remote migration mutation reachable and it requires the exact confirmation:
 npm run staging:deploy -- \
   --origin https://EXACT-STAGING-HOST \
   --phase pre_migration_compatibility \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
 npm run staging:prepare -- \
   --origin https://EXACT-STAGING-HOST \
   --receipt-file /owner-only/staging-disabled-worker-proof.json \
+  --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm PREPARE_DISABLED_STAGING
 ```
 
@@ -483,6 +485,7 @@ When collection integrity, privacy, billing, or lifecycle state is uncertain:
    npm run staging:prepare -- \
      --origin https://EXACT-STAGING-HOST \
      --receipt-file /owner-only/staging-disabled-worker-proof.json \
+     --identity-receipt-file /owner-only/staging-deployment-identity.json \
      --confirm PREPARE_DISABLED_STAGING
    ```
 

@@ -110,6 +110,7 @@ substitute production for staging.
    npm --prefix apps/worker run staging:deploy -- \
      --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
      --phase pre_migration_compatibility \
+     --identity-receipt-file /owner-only/staging-deployment-identity.json \
      --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
    ```
 
@@ -124,6 +125,7 @@ substitute production for staging.
    npm --prefix apps/worker run staging:prepare -- \
      --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
      --receipt-file /owner-only/staging-disabled-worker-proof.json \
+     --identity-receipt-file /owner-only/staging-deployment-identity.json \
      --confirm PREPARE_DISABLED_STAGING
    ```
 
