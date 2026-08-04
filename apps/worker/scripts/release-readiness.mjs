@@ -4,9 +4,12 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_RELEASE_PROBE_TIMEOUT_MS,
+  DEFAULT_RELEASE_CHANNEL,
   MAX_RELEASE_PROBE_TIMEOUT_MS,
+  REMOTE_CONTAINMENT_OBSERVED_STATUS,
   verifyReleaseReadiness,
 } from "./release-readiness-lib.mjs";
+import { getReleaseChannel } from "../../../config/release-channels.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
@@ -34,6 +37,7 @@ function parseTimeout(value) {
 export function parseReleaseReadinessArguments(argv) {
   const options = {
     help: false,
+    channel: DEFAULT_RELEASE_CHANNEL,
     probePublic: false,
     timeoutMs: DEFAULT_RELEASE_PROBE_TIMEOUT_MS,
   };
@@ -41,6 +45,18 @@ export function parseReleaseReadinessArguments(argv) {
     const argument = argv[index];
     if (argument === "--help") {
       options.help = true;
+    } else if (argument === "--channel") {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("--")) {
+        usageError("--channel requires a named release channel");
+      }
+      try {
+        getReleaseChannel(value);
+      } catch {
+        usageError("--channel must name a reviewed release channel");
+      }
+      options.channel = value;
+      index += 1;
     } else if (argument === "--probe-public") {
       options.probePublic = true;
     } else if (argument === "--timeout-ms") {
@@ -60,7 +76,11 @@ export function parseReleaseReadinessArguments(argv) {
 function writeUsage(writer = process.stdout) {
   writer.write(
     "Usage: node apps/worker/scripts/release-readiness.mjs "
-      + "[--probe-public] [--timeout-ms N]\n",
+      + "[--channel NAME] [--probe-public] [--timeout-ms N]\n",
+  );
+  writer.write(
+    "  --channel NAME  select one reviewed named channel (default stable); "
+      + "unconfigured channels fail closed\n",
   );
   writer.write(
     "  --probe-public  explicitly perform bounded GET checks for health, "
@@ -90,8 +110,9 @@ export async function runReleaseReadinessCLI(
     stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return Object.freeze({
       exitCode: options.probePublic
-        ? result.status === "ready" ? 0 : 1
-        : ["public_unchecked", "ready"].includes(result.status) ? 0 : 1,
+        ? result.status === REMOTE_CONTAINMENT_OBSERVED_STATUS ? 0 : 1
+        : ["public_unchecked", REMOTE_CONTAINMENT_OBSERVED_STATUS]
+          .includes(result.status) ? 0 : 1,
       result,
     });
   } catch {

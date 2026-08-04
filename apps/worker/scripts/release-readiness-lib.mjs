@@ -4,6 +4,10 @@ import {
   assertDeploymentEndpoints,
 } from "../../../config/deployment-endpoints.js";
 import {
+  getReleaseChannel,
+  STABLE_RELEASE_CHANNEL,
+} from "../../../config/release-channels.js";
+import {
   checkDeploymentEndpointConsumers,
 } from "./check-deployment-endpoints.mjs";
 import {
@@ -15,6 +19,9 @@ import {
 export const RELEASE_READINESS_SCHEMA_VERSION =
   "tibotattle-release-readiness-v0.1";
 export const OBSERVATION_CHANNEL = "production_containment_observer";
+export const DEFAULT_RELEASE_CHANNEL = STABLE_RELEASE_CHANNEL;
+export const REMOTE_CONTAINMENT_OBSERVED_STATUS =
+  "remote_containment_observed";
 export const EXPECTED_ENROLLMENT_MODE = "disabled";
 export const DEFAULT_RELEASE_PROBE_TIMEOUT_MS = 5_000;
 export const MAX_RELEASE_PROBE_TIMEOUT_MS = 30_000;
@@ -116,6 +123,52 @@ function manifestReceipt(manifest) {
     publicOrigin: manifest.publicOrigin,
     appcastURL: manifest.appcastURL,
     routeHosts: [...manifest.routeHosts],
+  };
+}
+
+function channelPolicyReceipt(channel) {
+  return {
+    schemaVersion: channel.schemaVersion,
+    name: channel.name,
+    configured: channel.configured,
+    buildManifestChannel: channel.buildManifestChannel,
+    serviceOriginMode: channel.serviceOriginMode,
+    serviceOrigin: channel.serviceOrigin,
+    publicWebsiteOrigin: channel.publicWebsiteOrigin,
+    sparkle: {
+      origin: channel.sparkle.origin,
+      appcastURL: channel.sparkle.appcastURL,
+      appcastObjectKey: channel.sparkle.appcastObjectKey,
+      r2Bucket: channel.sparkle.r2Bucket,
+      objectPrefix: channel.sparkle.objectPrefix,
+      publicEdKeySha256: channel.sparkle.publicEdKeySha256,
+    },
+  };
+}
+
+function unconfiguredManifestReceipt() {
+  return {
+    checked: true,
+    status: "not_configured",
+    code: "RELEASE_CHANNEL_NOT_CONFIGURED",
+    schemaVersion: null,
+    sha256: null,
+    publicOrigin: null,
+    appcastURL: null,
+    routeHosts: [],
+  };
+}
+
+function channelPolicyManifestReceipt(channel) {
+  return {
+    checked: true,
+    status: "matched",
+    code: null,
+    schemaVersion: channel.schemaVersion,
+    sha256: null,
+    publicOrigin: channel.serviceOrigin,
+    appcastURL: channel.sparkle.appcastURL,
+    routeHosts: [],
   };
 }
 
@@ -458,7 +511,24 @@ function unique(values) {
   return [...new Set(values)];
 }
 
+function observationEvidence({ status, configured, probePublic }) {
+  const remoteContainment = !configured
+    ? "not_configured"
+    : !probePublic
+      ? "not_checked"
+      : status === REMOTE_CONTAINMENT_OBSERVED_STATUS
+        ? "observed"
+        : "not_observed";
+  return {
+    scope: "remote_containment",
+    remoteContainment,
+    signedUpdate: "not_proven",
+    nativeClientRehearsal: "not_run",
+  };
+}
+
 export async function verifyReleaseReadiness({
+  channel = DEFAULT_RELEASE_CHANNEL,
   endpoints = DEPLOYMENT_ENDPOINTS,
   probePublic = false,
   endpointConsumerCheck = checkDeploymentEndpointConsumers,
@@ -470,8 +540,8 @@ export async function verifyReleaseReadiness({
     throw new TypeError("probePublic must be a boolean");
   }
   const boundedTimeout = normalizeTimeout(timeoutMs);
-  const manifest = validateCanonicalEndpointManifest(endpoints);
-  const blockers = manifest.ok ? [] : [manifest.code];
+  const selectedChannel = getReleaseChannel(channel);
+  const blockers = [];
   const deployment = deploymentDriftReceipt({
     checked: false,
     status: "not_checked",
@@ -482,13 +552,43 @@ export async function verifyReleaseReadiness({
     ready: notCheckedEndpoint(),
     appcast: notCheckedEndpoint(),
   };
+  let endpointManifest;
+  let manifestIsUsable = false;
+  let publicOrigin = null;
+  let appcastURL = null;
 
-  if (manifest.ok) {
+  if (!selectedChannel.configured) {
+    endpointManifest = unconfiguredManifestReceipt();
+    deployment.code = "RELEASE_CHANNEL_NOT_CONFIGURED";
+    blockers.push("RELEASE_CHANNEL_NOT_CONFIGURED");
+  } else if (selectedChannel.name === STABLE_RELEASE_CHANNEL) {
+    // The stable observer is bound to the reviewed production manifest. An
+    // injected object is accepted only as a drift-test input and is never
+    // used for consumer checks or network requests.
+    const suppliedManifest = validateCanonicalEndpointManifest(endpoints);
+    endpointManifest = manifestReceipt(suppliedManifest);
+    manifestIsUsable = suppliedManifest.ok;
+    publicOrigin = DEPLOYMENT_ENDPOINTS.public.origin;
+    appcastURL = DEPLOYMENT_ENDPOINTS.sparkle.appcastURL;
+    if (!suppliedManifest.ok) blockers.push(suppliedManifest.code);
+  } else {
+    endpointManifest = channelPolicyManifestReceipt(selectedChannel);
+    manifestIsUsable = true;
+    publicOrigin = selectedChannel.serviceOrigin;
+    appcastURL = selectedChannel.sparkle.appcastURL;
+    if (endpoints !== DEPLOYMENT_ENDPOINTS) {
+      blockers.push("RELEASE_CHANNEL_ENDPOINT_OVERRIDE_REJECTED");
+    }
+    deployment.status = "not_applicable";
+    deployment.code = "CHANNEL_LOCAL_DEPLOYMENT_MANIFEST_NOT_CHECKED";
+  }
+
+  if (manifestIsUsable && selectedChannel.name === STABLE_RELEASE_CHANNEL) {
     try {
       if (typeof endpointConsumerCheck !== "function") {
         throw new TypeError("endpoint consumer checker unavailable");
       }
-      await endpointConsumerCheck({ endpoints });
+      await endpointConsumerCheck({ endpoints: DEPLOYMENT_ENDPOINTS });
       deployment.checked = true;
       deployment.status = "no_drift";
       deployment.code = null;
@@ -502,7 +602,7 @@ export async function verifyReleaseReadiness({
 
   if (!probePublic) {
     blockers.push("PUBLIC_PROBE_NOT_REQUESTED");
-  } else if (manifest.ok) {
+  } else if (manifestIsUsable && blockers.length === 0) {
     const requestOptions = {
       clock,
       fetchImpl,
@@ -510,15 +610,15 @@ export async function verifyReleaseReadiness({
     };
     publicChecks = {
       health: await checkHealth({
-        publicOrigin: manifest.publicOrigin,
+        publicOrigin,
         ...requestOptions,
       }),
       ready: await checkReady({
-        publicOrigin: manifest.publicOrigin,
+        publicOrigin,
         ...requestOptions,
       }),
       appcast: await checkAppcast({
-        appcastURL: manifest.appcastURL,
+        appcastURL,
         ...requestOptions,
       }),
     };
@@ -530,19 +630,23 @@ export async function verifyReleaseReadiness({
   }
 
   const uniqueBlockers = unique(blockers.filter(Boolean));
-  const status = !manifest.ok || deployment.status === "drift"
+  const status = !selectedChannel.configured
+    || !manifestIsUsable
+    || deployment.status === "drift"
     ? "blocked"
     : !probePublic
       ? "public_unchecked"
       : uniqueBlockers.length === 0
-        ? "ready"
+        ? REMOTE_CONTAINMENT_OBSERVED_STATUS
         : "not_ready";
   return Object.freeze({
     schemaVersion: RELEASE_READINESS_SCHEMA_VERSION,
     operation: "production_containment_observation",
-    channel: OBSERVATION_CHANNEL,
+    channel: selectedChannel.name,
+    observationChannel: OBSERVATION_CHANNEL,
+    channelPolicy: channelPolicyReceipt(selectedChannel),
     generatedAt: timestamp(clock),
-    endpointManifest: manifestReceipt(manifest),
+    endpointManifest,
     deploymentDrift: deployment,
     expected: {
       enrollmentMode: EXPECTED_ENROLLMENT_MODE,
@@ -551,7 +655,15 @@ export async function verifyReleaseReadiness({
     },
     public: publicReceipt(publicChecks, probePublic),
     status,
-    ready: status === "ready",
+    // This observer never proves a release is ready. The nested public.ready
+    // receipt is only the remote endpoint's own readiness response.
+    ready: false,
+    releaseReady: false,
+    evidence: observationEvidence({
+      status,
+      configured: selectedChannel.configured,
+      probePublic,
+    }),
     collectionAuthorized: false,
     blockers: Object.freeze(uniqueBlockers),
   });

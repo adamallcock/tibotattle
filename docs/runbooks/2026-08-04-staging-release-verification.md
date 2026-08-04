@@ -25,9 +25,12 @@ dogfood channel or infer safety from staging configuration.
 
 The checked-in staging configuration describes a separate deployment shape,
 but this observer has no live staging-origin input and makes no claim that a
-real `workers.dev` staging deployment exists. It intentionally does not accept
-an arbitrary origin, so it cannot treat production as staging or probe an
-unreviewed host.
+real `workers.dev` staging deployment exists. It intentionally accepts only a
+named channel from `config/release-channels.js`, so it cannot treat production
+as dogfood or probe an unreviewed host. `stable` is the default and is bound to
+the reviewed production deployment manifest. `internal-dogfood` is currently
+owner-unconfigured and therefore reports a blocked, null-endpoint receipt
+without falling back to stable.
 
 ## Read-only production observation
 
@@ -38,9 +41,18 @@ node apps/worker/scripts/release-readiness.mjs
 ```
 
 This validates the canonical production manifest and all checked-in endpoint
-consumers. Its receipt identifies the channel as
-`production_containment_observer` and has `status: "public_unchecked"`; that
-is not live production evidence.
+consumers. Its receipt identifies `channel: "stable"`,
+`observationChannel: "production_containment_observer"`, and has
+`status: "public_unchecked"`; that is not live production evidence. Select a
+different reviewed name only when it is present in the channel policy:
+
+```sh
+node apps/worker/scripts/release-readiness.mjs --channel internal-dogfood
+```
+
+An unconfigured channel fails closed and reports its configuration state and
+null endpoints. No `--origin`, endpoint URL, or environment value can replace
+the named policy.
 
 Only an explicitly requested production observation performs bounded,
 credential-free GET requests to the canonical health, ready, and appcast URLs:
@@ -59,10 +71,15 @@ recorded as `APPCAST_NOT_PUBLISHED` and is always not-ready. Appcast XML is
 bounded and only its byte count, digest, and structural counts enter the
 receipt; response bodies and fetch errors never do.
 
-The receipt is content-free and includes only fixed statuses/codes, public
-manifest identifiers, hashes, bounded byte/count metadata, and
-`collectionAuthorized: false`. No request sends an authorization header or
-credential. No command option enables deployment or mutation.
+The receipt is content-free and includes only fixed statuses/codes, the exact
+selected channel policy and public manifest identifiers, hashes, bounded
+byte/count metadata, and `collectionAuthorized: false`. A positive live result
+uses `status: "remote_containment_observed"`; it is an operational observation
+of the remote boundary, not a generic release-ready claim. The receipt records
+`evidence.signedUpdate: "not_proven"` and
+`evidence.nativeClientRehearsal: "not_run"` until a later native client
+rehearsal independently proves those facts. No request sends an authorization
+header or credential. No command option enables deployment or mutation.
 
 Focused local tests:
 
