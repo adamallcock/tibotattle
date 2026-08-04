@@ -80,10 +80,58 @@ async function createReleaseFixture({
     writeFile(releaseManifestPath, `${JSON.stringify(manifest)}\n`),
   ]);
   return {
+    appcast,
     appcastPath,
+    artifactURL,
     cleanup: () => rm(root, { recursive: true, force: true }),
+    dmgBytes: dmgbBytes,
     dmgPath,
     releaseManifestPath,
+  };
+}
+
+function publicReadbackFixture(fixture, {
+  appcastBody = fixture.appcast,
+  artifactBody = fixture.dmgBytes,
+  preservedArtifacts = new Map(),
+} = {}) {
+  const calls = [];
+  return {
+    calls,
+    fetch: async (url, options = {}) => {
+      calls.push({ method: options.method ?? "GET", url });
+      if (url === CANONICAL_APPCAST_URL) {
+        return new Response(appcastBody, {
+          headers: {
+            "Cache-Control": APPCAST_CACHE_CONTROL,
+            "Content-Length": String(Buffer.byteLength(appcastBody)),
+            "Content-Type": "application/xml; charset=utf-8",
+          },
+          status: 200,
+        });
+      }
+      if (url === fixture.artifactURL) {
+        return new Response(artifactBody, {
+          headers: {
+            "Cache-Control": IMMUTABLE_CACHE_CONTROL,
+            "Content-Length": String(artifactBody.length),
+            "Content-Type": "application/x-apple-diskimage",
+          },
+          status: 200,
+        });
+      }
+      if (preservedArtifacts.has(url)) {
+        const body = preservedArtifacts.get(url);
+        return new Response(options.method === "HEAD" ? null : body, {
+          headers: {
+            "Cache-Control": IMMUTABLE_CACHE_CONTROL,
+            "Content-Length": String(body.length),
+          },
+          status: 200,
+        });
+      }
+      return new Response(null, { status: 404 });
+    },
   };
 }
 
@@ -158,6 +206,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
 test("publishes only the three validated objects with cache-safe Wrangler metadata", async () => {
   const fixture = await createReleaseFixture();
   const runner = missingRemoteObjectRunner();
+  const publicReadback = publicReadbackFixture(fixture);
   try {
     const publication = await publishSparkleUpdate({
       appcastPath: fixture.appcastPath,
@@ -167,6 +216,7 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
       releaseManifestPath: fixture.releaseManifestPath,
       sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
       runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
       validateDMG: async () => {},
     });
     assert.equal(publication.published, true);
@@ -188,6 +238,107 @@ test("publishes only the three validated objects with cache-safe Wrangler metada
     assert.equal(runner.calls[5].includes("application/xml; charset=utf-8"), true);
     assert.equal(runner.calls[5].includes(APPCAST_CACHE_CONTROL), true);
     assert.equal(runner.calls.flat().includes("--force"), false);
+    assert.deepEqual(publicReadback.calls, [
+      { method: "GET", url: CANONICAL_APPCAST_URL },
+      { method: "GET", url: fixture.artifactURL },
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("does not report publication success when the public appcast is unavailable", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        fetchPublic: async () => new Response("not found", { status: 404 }),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED" },
+    );
+    assert.equal(runner.calls.length, 6);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("does not report publication success when the public DMG bytes differ", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  const publicReadback = publicReadbackFixture(fixture, {
+    artifactBody: Buffer.alloc(fixture.dmgBytes.length, 42),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        fetchPublic: publicReadback.fetch,
+        validateDMG: async () => {},
+      }),
+      {
+        code: "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+        message: /SHA-256/u,
+      },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("does not report publication success when a retained enclosure is missing from the public origin", async () => {
+  const staleBytes = Buffer.from("previous-signed-release");
+  const staleDigest = sha256(staleBytes);
+  const staleFileName = "TiboTattle-0.1.0-macOS-arm64.dmg";
+  const staleKey = `releases/0/${staleDigest}/${staleFileName}`;
+  const staleURL = `${CANONICAL_UPDATE_ORIGIN}/${staleKey}`;
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      "</channel>",
+      `${appcastEnclosure({
+        bytes: staleBytes,
+        url: staleURL,
+        version: "0",
+      })}</channel>`,
+    ),
+  });
+  const runner = remoteObjectRunner(new Map([
+    [`${APPROVED_R2_BUCKET}/${staleKey}`, staleBytes],
+  ]));
+  const publicReadback = publicReadbackFixture(fixture);
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: runner.run,
+        fetchPublic: publicReadback.fetch,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED" },
+    );
+    assert.deepEqual(publicReadback.calls, [
+      { method: "GET", url: CANONICAL_APPCAST_URL },
+      { method: "HEAD", url: staleURL },
+    ]);
   } finally {
     await fixture.cleanup();
   }
@@ -309,6 +460,9 @@ test("verifies preserved delta bytes and checksum before publication", async () 
   const runner = remoteObjectRunner(new Map([
     [`${APPROVED_R2_BUCKET}/${deltaKey}`, deltaBytes],
   ]));
+  const publicReadback = publicReadbackFixture(fixture, {
+    preservedArtifacts: new Map([[deltaURL, deltaBytes]]),
+  });
   try {
     const publication = await publishSparkleUpdate({
       appcastPath: fixture.appcastPath,
@@ -318,6 +472,7 @@ test("verifies preserved delta bytes and checksum before publication", async () 
       releaseManifestPath: fixture.releaseManifestPath,
       sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
       runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
       validateDMG: async () => {},
     });
     assert.equal(publication.published, true);

@@ -46,6 +46,7 @@ const REQUIRED_RELEASE_ASSURANCES = Object.freeze([
 const MAX_APPCAST_BYTES = 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_DMG_BYTES = 10 * 1024 * 1024 * 1024;
+const PUBLIC_READBACK_TIMEOUT_MS = 30_000;
 const BUNDLE_VERSION_PATTERN =
   /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -64,6 +65,16 @@ function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   const error = new Error(message);
   error.code = code;
   throw error;
+}
+
+function defaultPublicFetch(...arguments_) {
+  if (typeof globalThis.fetch !== "function") {
+    fail(
+      "Public update read-back requires the Node fetch implementation",
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return globalThis.fetch(...arguments_);
 }
 
 function requiredOption(value, label) {
@@ -381,6 +392,318 @@ function validateAppcast(text, {
   });
 }
 
+function responseHeader(response, name) {
+  const value = response?.headers?.get?.(name);
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function declaredResponseLength(response, label, { required = false } = {}) {
+  const value = responseHeader(response, "content-length");
+  if (value === "") {
+    if (required) {
+      fail(
+        `${label} response is missing Content-Length`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    return null;
+  }
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) {
+    fail(
+      `${label} response has an invalid Content-Length: ${value}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const selected = Number(value);
+  if (!Number.isSafeInteger(selected) || selected > MAX_DMG_BYTES) {
+    fail(
+      `${label} response has an unsafe Content-Length: ${value}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return selected;
+}
+
+function validatePublicResponse(response, {
+  cacheControl = null,
+  contentType = null,
+  label,
+} = {}) {
+  const status = response?.status;
+  if (status !== 200) {
+    fail(
+      `${label} returned HTTP ${String(status)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (contentType !== null) {
+    const observed = responseHeader(response, "content-type")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (observed !== contentType) {
+      fail(
+        `${label} returned Content-Type ${observed || "<missing>"}; expected ${contentType}`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+  }
+  if (cacheControl !== null
+      && responseHeader(response, "cache-control") !== cacheControl) {
+    fail(
+      `${label} returned Cache-Control ${responseHeader(response, "cache-control") || "<missing>"}; expected ${cacheControl}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+}
+
+async function fetchPublicResponse(fetchPublic, url, {
+  label,
+  method = "GET",
+} = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    PUBLIC_READBACK_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetchPublic(url, {
+      cache: "no-store",
+      headers: {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+      },
+      method,
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response?.url && response.url !== url) {
+      fail(
+        `${label} redirected away from the canonical URL`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    return response;
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED") throw error;
+    if (error?.name === "AbortError") {
+      fail(
+        `${label} timed out after ${PUBLIC_READBACK_TIMEOUT_MS} ms`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+    fail(
+      `${label} request failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readResponseBytes(response, {
+  expectedBytes = null,
+  label,
+  maximumBytes,
+} = {}) {
+  const declared = declaredResponseLength(response, label, {
+    required: expectedBytes !== null,
+  });
+  if (declared !== null && declared > maximumBytes) {
+    fail(
+      `${label} response exceeds the safe size limit`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  let bytes;
+  try {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    fail(
+      `${label} body read failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (bytes.length < 1 || bytes.length > maximumBytes) {
+    fail(
+      `${label} response has an unsafe body size: ${bytes.length}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (declared !== null && declared !== bytes.length) {
+    fail(
+      `${label} Content-Length ${declared} does not match body bytes ${bytes.length}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (expectedBytes !== null && expectedBytes !== bytes.length) {
+    fail(
+      `${label} body bytes ${bytes.length} do not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return bytes;
+}
+
+async function readResponseDigest(response, {
+  expectedBytes,
+  expectedSha256,
+  label,
+} = {}) {
+  const declared = declaredResponseLength(response, label, { required: true });
+  if (declared !== expectedBytes) {
+    fail(
+      `${label} Content-Length ${declared} does not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const hash = createHash("sha256");
+  let bytes = 0;
+  try {
+    if (response.body?.getReader) {
+      const reader = response.body.getReader();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        const value = Buffer.from(chunk.value);
+        bytes += value.length;
+        if (bytes > MAX_DMG_BYTES) {
+          fail(
+            `${label} response exceeds the safe size limit`,
+            "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+          );
+        }
+        hash.update(value);
+      }
+    } else {
+      const value = Buffer.from(await response.arrayBuffer());
+      bytes = value.length;
+      if (bytes > MAX_DMG_BYTES) {
+        fail(
+          `${label} response exceeds the safe size limit`,
+          "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+        );
+      }
+      hash.update(value);
+    }
+  } catch (error) {
+    if (error?.code === "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED") throw error;
+    fail(
+      `${label} body read failed: ${error?.message || String(error)}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  if (bytes !== expectedBytes) {
+    fail(
+      `${label} body bytes ${bytes} do not match expected ${expectedBytes}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const observedSha256 = hash.digest("hex");
+  if (observedSha256 !== expectedSha256) {
+    fail(
+      `${label} SHA-256 ${observedSha256} does not match expected ${expectedSha256}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  return observedSha256;
+}
+
+async function verifyPublicPublication({
+  appcastBytes,
+  appcastUpdate,
+  dmg,
+  dmgBytes,
+  fetchPublic,
+  manifest,
+  objectKeys,
+  publication,
+  sparklePublicKey,
+}) {
+  const publicAppcastResponse = await fetchPublicResponse(
+    fetchPublic,
+    publication.appcast.url,
+    { label: "Public Sparkle appcast" },
+  );
+  validatePublicResponse(publicAppcastResponse, {
+    cacheControl: APPCAST_CACHE_CONTROL,
+    contentType: "application/xml",
+    label: "Public Sparkle appcast",
+  });
+  const publicAppcastBytes = await readResponseBytes(publicAppcastResponse, {
+    expectedBytes: appcastBytes.length,
+    label: "Public Sparkle appcast",
+    maximumBytes: MAX_APPCAST_BYTES,
+  });
+  const localAppcastSha256 = createHash("sha256")
+    .update(appcastBytes)
+    .digest("hex");
+  const publicAppcastSha256 = createHash("sha256")
+    .update(publicAppcastBytes)
+    .digest("hex");
+  if (publicAppcastSha256 !== localAppcastSha256) {
+    fail(
+      `Public Sparkle appcast SHA-256 ${publicAppcastSha256} does not match the uploaded ${localAppcastSha256}`,
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+  const publicAppcastText = publicAppcastBytes.toString("utf8");
+  const publicUpdate = validateAppcast(publicAppcastText, {
+    dmg,
+    dmgBytes,
+    manifest,
+    objectKeys,
+    sparklePublicKey,
+  });
+  if (publicUpdate.artifactURL !== appcastUpdate.artifactURL
+      || publicUpdate.enclosure.length !== appcastUpdate.enclosure.length
+      || publicUpdate.enclosure.version !== appcastUpdate.enclosure.version
+      || publicUpdate.enclosure.signature !== appcastUpdate.enclosure.signature) {
+    fail(
+      "Public Sparkle appcast does not retain the validated update enclosure",
+      "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+    );
+  }
+
+  const enclosures = appcastEnclosures(publicAppcastText);
+  for (const enclosure of enclosures) {
+    if (enclosure.url === publication.artifact.url) continue;
+    const response = await fetchPublicResponse(fetchPublic, enclosure.url, {
+      label: `Public Sparkle enclosure ${enclosure.url}`,
+      method: "HEAD",
+    });
+    validatePublicResponse(response, {
+      cacheControl: IMMUTABLE_CACHE_CONTROL,
+      label: `Public Sparkle enclosure ${enclosure.url}`,
+    });
+    const declared = declaredResponseLength(response, "Public Sparkle enclosure", {
+      required: true,
+    });
+    if (declared !== enclosure.length) {
+      fail(
+        `Public Sparkle enclosure ${enclosure.url} Content-Length ${declared} does not match appcast ${enclosure.length}`,
+        "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
+      );
+    }
+  }
+
+  const publicArtifactResponse = await fetchPublicResponse(
+    fetchPublic,
+    publication.artifact.url,
+    { label: "Public Sparkle DMG" },
+  );
+  validatePublicResponse(publicArtifactResponse, {
+    cacheControl: IMMUTABLE_CACHE_CONTROL,
+    contentType: "application/x-apple-diskimage",
+    label: "Public Sparkle DMG",
+  });
+  await readResponseDigest(publicArtifactResponse, {
+    expectedBytes: dmg.size,
+    expectedSha256: publication.artifact.sha256,
+    label: "Public Sparkle DMG",
+  });
+}
+
 function normalizeBucket(bucket) {
   if (bucket !== APPROVED_R2_BUCKET) {
     fail(`--bucket must explicitly name the approved bucket ${APPROVED_R2_BUCKET}`);
@@ -594,10 +917,13 @@ export async function publishSparkleUpdate({
   replaceAppcast = false,
   sparklePublicEdKey,
   runWrangler = defaultRunWrangler,
+  fetchPublic = defaultPublicFetch,
   validateDMG = validateMacOSDMG,
 } = {}) {
   if (typeof publish !== "boolean" || typeof replaceAppcast !== "boolean"
-      || typeof runWrangler !== "function" || typeof validateDMG !== "function") {
+      || typeof runWrangler !== "function"
+      || typeof fetchPublic !== "function"
+      || typeof validateDMG !== "function") {
     fail("Publisher options are invalid");
   }
   normalizeBucket(bucket);
@@ -637,8 +963,9 @@ export async function publishSparkleUpdate({
     fileName: basename(dmg.path),
     sha256: observedDMGSha256,
   });
+  const appcastBytes = await readFile(appcast.path);
   const appcastUpdate = validateAppcast(
-    await readFile(appcast.path, "utf8"),
+    appcastBytes.toString("utf8"),
     {
       dmg,
       dmgBytes: dmgWithSha256.bytes,
@@ -743,6 +1070,17 @@ export async function publishSparkleUpdate({
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+  await verifyPublicPublication({
+    appcastBytes,
+    appcastUpdate,
+    dmg,
+    dmgBytes: dmgWithSha256.bytes,
+    fetchPublic,
+    manifest,
+    objectKeys,
+    publication,
+    sparklePublicKey: normalizedSparklePublicKey,
+  });
   return publication;
 }
 
@@ -796,6 +1134,8 @@ export async function main(argv) {
   console.log(`R2 appcast: ${publication.appcast.url}`);
   if (!publication.published) {
     console.log("Validation only; re-run with --publish to invoke Wrangler.");
+  } else {
+    console.log("Public read-back: canonical appcast and DMG verified.");
   }
 }
 

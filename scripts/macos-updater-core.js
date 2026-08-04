@@ -27,6 +27,28 @@ export const SPARKLE_LICENSE_SHA256 =
   "816be66341dd11b22806862dffd8392b240babaced1cdf24da2ff413ef00c3fd";
 export const SPARKLE_UPSTREAM_LICENSE_SHA256 =
   "389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe";
+export const SPARKLE_TOOLS_DIRECTORY_NAME = "SparkleTools";
+
+// These are the public release tools needed to sign an update, generate an
+// appcast, and optionally create a BinaryDelta. `generate_keys` is deliberately
+// not staged: key generation and private-key custody remain outside this tree.
+export const SPARKLE_TOOL_FILES = Object.freeze({
+  BinaryDelta: Object.freeze({
+    archivePath: "./bin/BinaryDelta",
+    mode: "755",
+    sha256: "6f4e7b70aa04d53808c5679b58a839aef2e413b48b06f4427b3fa32898ef9162",
+  }),
+  generate_appcast: Object.freeze({
+    archivePath: "./bin/generate_appcast",
+    mode: "755",
+    sha256: "d70b1872fb6a859695f8abc0a403301d151d1c6c83cf427f4a2716c37a48983d",
+  }),
+  sign_update: Object.freeze({
+    archivePath: "./bin/sign_update",
+    mode: "755",
+    sha256: "bfb52400c3da18bb4c251ac4818c2c2e1e31c2e649a45b31c11109b6e57b34ad",
+  }),
+});
 
 export const SPARKLE_FRAMEWORK_LINKS = Object.freeze({
   Autoupdate: "Versions/Current/Autoupdate",
@@ -162,6 +184,60 @@ export async function inspectPinnedSparkleFramework(path) {
     entries: Object.freeze(entries),
     path: selected,
     sha256: digest,
+    version: SPARKLE_VERSION,
+  });
+}
+
+export async function inspectPinnedSparkleTools(path) {
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    fail("A reviewed Sparkle tools path is required");
+  }
+  const selected = resolve(path);
+  if (basename(selected) !== SPARKLE_TOOLS_DIRECTORY_NAME) {
+    fail(`Updater tools directory must be named ${SPARKLE_TOOLS_DIRECTORY_NAME}`);
+  }
+  const metadata = await lstat(selected).catch(() => {
+    fail("The reviewed Sparkle tools input is unavailable");
+  });
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    fail("The reviewed Sparkle tools input must be a real directory");
+  }
+  if (await realpath(selected) !== selected) {
+    fail("The reviewed Sparkle tools path must not traverse a link");
+  }
+
+  const expectedNames = Object.keys(SPARKLE_TOOL_FILES).sort();
+  const observedEntries = (await readdir(selected, {
+    withFileTypes: true,
+  })).map((entry) => entry.name).sort();
+  if (JSON.stringify(observedEntries) !== JSON.stringify(expectedNames)) {
+    fail("Sparkle tools directory contains an unexpected file set");
+  }
+
+  const tools = [];
+  for (const name of expectedNames) {
+    const toolPath = join(selected, name);
+    const toolMetadata = await lstat(toolPath);
+    if (!toolMetadata.isFile() || toolMetadata.isSymbolicLink()
+        || await realpath(toolPath) !== toolPath) {
+      fail(`Sparkle tool must be a regular non-linked file: ${name}`);
+    }
+    const mode = (toolMetadata.mode & 0o777).toString(8).padStart(3, "0");
+    const expected = SPARKLE_TOOL_FILES[name];
+    if (mode !== expected.mode) {
+      fail(`Sparkle tool has an unexpected mode: ${name}`);
+    }
+    const sha256 = createHash("sha256")
+      .update(await readFile(toolPath))
+      .digest("hex");
+    if (sha256 !== expected.sha256) {
+      fail(`Sparkle tool does not match the pinned release: ${name}`);
+    }
+    tools.push(Object.freeze({ mode, name, path: toolPath, sha256 }));
+  }
+  return Object.freeze({
+    path: selected,
+    tools: Object.freeze(tools),
     version: SPARKLE_VERSION,
   });
 }
