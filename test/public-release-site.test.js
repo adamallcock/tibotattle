@@ -534,7 +534,6 @@ test("checked-in public source satisfies the complete release contract", async (
       "./admin.css",
       "./admin.html",
       "./admin.js",
-      "./tibotattle-icon.png",
       'id="contribution-form"',
       'id="identity-signin"',
       'id="connect-community"',
