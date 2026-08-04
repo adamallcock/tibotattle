@@ -146,7 +146,7 @@ The earlier Standard-only first-three versus last-three decline of 12.04% remain
 
 - 152 Node tests pass, including account/plan inference partitioning, cross-partition headline suppression, raw-identity rejection, task-surface classification, matched-day epoch ratios, prospective same-scope, mixed-plan-day, and one-sided known-boundary handling, fresh-marker scoping, suffix-aware cache freshness and advancement, bounded streamed collector batching, exactly-once rollout and provider-snapshot checkpoint-failure replay, journal-preparation and committed-journal cleanup recovery, bounded dedupe compaction, idle-checkpoint suppression, UI sanitization, and report-width packaging.
 - A privacy scan found neither declared email address nor Gmail address patterns in project source, documentation, the canonical artifact, or new owner-only crosscheck artifacts.
-- The portable report contains 31 rendered blocks, 8 metric cards, 4 charts, and 3 tables. Its embedded artifact equals `artifact.json`; the enhanced reader passes 1440-pixel and 390-pixel viewport checks and keyboard-accessible source-dialog verification with no external requests or browser errors.
+- The portable report contains 31 rendered blocks, 8 metric cards, 4 charts, and 3 tables. Its embedded artifact equals `.usage-monitor/legacy-reports/artifact.json`; the enhanced reader passes 1440-pixel and 390-pixel viewport checks and keyboard-accessible source-dialog verification with no external requests or browser errors.
 
 ## Next evidence to collect
 

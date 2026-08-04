@@ -372,6 +372,20 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     const report = await fetch(`${base}/reports/gradient`);
     assert.equal(report.status, 200);
     assert.match(await report.text(), /Gradient detail/);
+    const privateReportDirectory = join(
+      files.resourceRoot,
+      ".usage-monitor",
+      "legacy-reports",
+    );
+    await mkdir(privateReportDirectory, { recursive: true });
+    await writeFile(
+      join(privateReportDirectory, "2026-07-24-simple-quota-gradient-report.html"),
+      "<!doctype html><title>Canonical gradient detail</title>",
+      { mode: 0o600 },
+    );
+    const canonicalReport = await fetch(`${base}/reports/gradient`);
+    assert.equal(canonicalReport.status, 200);
+    assert.match(await canonicalReport.text(), /Canonical gradient detail/);
 
     assert.equal((await fetch(`${base}/reports/not-allowed`)).status, 404);
     assert.equal((await fetch(`${base}/api/local/not-allowed`)).status, 404);

@@ -798,6 +798,21 @@
       "provenance": null,
       "provenanceReason": "Historical calibration verifier is test-covered but has no single dated provenance artifact.",
       "legacyPaths": []
+    },
+    {
+      "classification": "historical_research_report",
+      "owner": "reporting",
+      "canonicalPath": "scripts/migrate-local-legacy-reports.mjs",
+      "stableAlias": "migrate:legacy-reports",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.migrate:legacy-reports"
+      ],
+      "decision": "retain_as_owner_only_migration",
+      "provenance": null,
+      "provenanceReason": "The migration moves only known ignored historical report outputs into owner-only local state after an explicit SHA-256-reviewed apply step.",
+      "legacyPaths": []
     }
   ]
 }

@@ -3,6 +3,9 @@
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
+import {
+  localLegacyReportPath,
+} from "./local-legacy-report-storage.js";
 
 const STYLE = `<style data-app-usagemonitor-width-fix>
 @media screen{
@@ -24,7 +27,12 @@ export function applyPortableWidthFix(html) {
 }
 
 async function main() {
-  const target = resolve(process.argv[2] ?? "2026-07-24-codex-work-account-usage-report.html");
+  const target = process.argv[2]
+    ? resolve(process.argv[2])
+    : localLegacyReportPath(
+      process.cwd(),
+      "2026-07-24-codex-work-account-usage-report.html",
+    );
   const html = await readFile(target, "utf8");
   await writeFile(target, applyPortableWidthFix(html), "utf8");
   await chmod(target, 0o600);

@@ -16,6 +16,6 @@ Program documentation lives here, grouped by document type. Dated filenames are 
 | [`reports/`](./reports/) | Consolidated readiness and status reports |
 | [`audits/`](./audits/) | Journey audits and gap reviews |
 | [`research/`](./research/) | Source notes and supporting research artifacts |
-| [`qa/`](./qa/) | Browser QA receipts and screenshots |
+| [`qa/`](./qa/) | Browser and native visual QA receipts and screenshots |
 
 The repository root [`README.md`](../README.md) remains the primary product and developer entry point.

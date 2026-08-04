@@ -105,6 +105,15 @@ for the provenance and future-locale policy.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
 
+### Private local report artifacts
+
+Historical technical-report artifacts are kept only in
+`.usage-monitor/legacy-reports/`, which is ignored by Git and never used as a
+public web asset. `npm run migrate:legacy-reports` previews a one-time,
+no-overwrite move from the former repository-root layout; add `-- --apply` only
+after reviewing its SHA-256 manifest. Existing root files remain a read-only
+compatibility fallback until they are explicitly migrated.
+
 ## Repository layout
 
 | Path | Contents |

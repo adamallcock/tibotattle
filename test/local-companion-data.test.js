@@ -30,9 +30,10 @@ const ARTIFACT_FILES = {
 
 async function fixtureRoot() {
   const root = await mkdtemp(join(tmpdir(), "local-companion-data-"));
-  await mkdir(join(root, ".usage-monitor"));
+  const reportDirectory = join(root, ".usage-monitor", "legacy-reports");
+  await mkdir(reportDirectory, { recursive: true });
   for (const [kind, file] of Object.entries(ARTIFACT_FILES)) {
-    await writeFile(join(root, file), JSON.stringify({
+    await writeFile(join(reportDirectory, file), JSON.stringify({
       privateTopLevel: "/Users/private/source",
       snapshot: {
         status: "complete",
@@ -70,7 +71,7 @@ async function fixtureRoot() {
     "2026-07-24-monitoring-quality-report.html",
     "2026-07-24-codex-work-account-usage-report.html",
   ]) {
-    await writeFile(join(root, file), "<!doctype html><title>report</title>");
+    await writeFile(join(reportDirectory, file), "<!doctype html><title>report</title>");
   }
   return root;
 }
@@ -700,7 +701,11 @@ test("missing and malformed artifacts fail closed while collector evidence remai
       }),
       { mode: 0o600 },
     );
-    await writeFile(join(root, ARTIFACT_FILES.gradient), "{malformed");
+    await mkdir(join(root, ".usage-monitor", "legacy-reports"), { recursive: true });
+    await writeFile(
+      join(root, ".usage-monitor", "legacy-reports", ARTIFACT_FILES.gradient),
+      "{malformed",
+    );
     const snapshot = await buildLocalCompanionSnapshot({
       root,
       allowDevelopmentArtifactFallback: true,

@@ -1,5 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
 import {
   addUsdStrings,
   APP_PRICE_REGISTRY_MANIFEST,
@@ -39,6 +38,9 @@ import {
   projectWeeklyPaceForecast,
   weeklyPaceSnapshotsFromCollectorRecord,
 } from "./weekly-pace-projection.js";
+import {
+  resolveLocalLegacyReportReadPath,
+} from "./local-legacy-report-storage.js";
 
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
@@ -341,12 +343,14 @@ function projectDataset(rows, allowedKeys) {
 async function readBoundedJson(path, maximumBytes) {
   let metadata;
   try {
-    metadata = await stat(path);
+    metadata = await lstat(path);
   } catch (error) {
     if (error.code === "ENOENT") throw fixedError("artifact_missing");
     throw fixedError("artifact_unavailable");
   }
-  if (!metadata.isFile() || metadata.size > maximumBytes) throw fixedError("artifact_invalid_size");
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size > maximumBytes) {
+    throw fixedError("artifact_invalid_size");
+  }
   let parsed;
   try {
     parsed = JSON.parse(await readFile(path, "utf8"));
@@ -360,7 +364,8 @@ async function readBoundedJson(path, maximumBytes) {
 async function projectArtifact(root, kind) {
   const specification = ARTIFACTS[kind];
   try {
-    const artifact = await readBoundedJson(resolve(root, specification.file), MAX_ARTIFACT_BYTES);
+    const artifactPath = await resolveLocalLegacyReportReadPath(root, specification.file);
+    const artifact = await readBoundedJson(artifactPath, MAX_ARTIFACT_BYTES);
     const snapshot = artifact.snapshot;
     if (!snapshot || typeof snapshot !== "object" || !snapshot.datasets || typeof snapshot.datasets !== "object") {
       throw fixedError("artifact_malformed");
@@ -1459,8 +1464,9 @@ function summarizeUsage(records, nowMs) {
 async function reportProjection(root) {
   return Promise.all(REPORTS.map(async ({ file, ...report }) => {
     try {
-      const metadata = await stat(resolve(root, file));
-      if (!metadata.isFile()) throw new Error("not_file");
+      const reportPath = await resolveLocalLegacyReportReadPath(root, file);
+      const metadata = await lstat(reportPath);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error("not_file");
       return { ...report, status: "available", updatedAt: metadata.mtime.toISOString() };
     } catch {
       return { ...report, status: "unavailable", updatedAt: null };

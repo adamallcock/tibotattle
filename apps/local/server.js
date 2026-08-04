@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
@@ -11,6 +11,9 @@ import {
   LocalCompanionDataStore,
   buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
+import {
+  resolveLocalLegacyReportReadPath,
+} from "../../src/local-legacy-report-storage.js";
 import {
   refreshReplaySafeAccountingCache,
 } from "../../src/replay-safe-accounting-cache.js";
@@ -1119,16 +1122,23 @@ async function authorizeReviewedContributionMutation(
 }
 
 async function readFixedFile(root, file, maximumBytes) {
-  const path = resolve(root, file);
+  const resolvedRoot = resolve(root);
+  const path = resolve(resolvedRoot, file);
+  const rootPrefix = resolvedRoot.endsWith(sep) ? resolvedRoot : `${resolvedRoot}${sep}`;
+  if (!path.startsWith(rootPrefix)) {
+    const error = new Error("not_found");
+    error.code = "not_found";
+    throw error;
+  }
   let metadata;
   try {
-    metadata = await stat(path);
+    metadata = await lstat(path);
   } catch {
     const error = new Error("not_found");
     error.code = "not_found";
     throw error;
   }
-  if (!metadata.isFile() || metadata.size > maximumBytes) {
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size > maximumBytes) {
     const error = new Error("not_found");
     error.code = "not_found";
     throw error;
@@ -2845,9 +2855,13 @@ function createPreparedLocalCompanionServer({
           return;
         }
         try {
-          const body = await readFixedFile(
+          const reportPath = await resolveLocalLegacyReportReadPath(
             resourceRoot,
             report.file,
+          );
+          const body = await readFixedFile(
+            resourceRoot,
+            reportPath,
             MAX_REPORT_BYTES,
           );
           send(response, 200, body, report.type, { report: true });

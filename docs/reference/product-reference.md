@@ -220,11 +220,11 @@ notarization, signing, and the final release decision remain human-controlled.
 
 The monitor now combines replay-safe local rollout receipts with read-only Codex app-server accounting and privacy-minimized observations from the authenticated **Codex and Work Analytics** page.
 
-The living [coverage gaps register](./docs/governance/2026-07-24-coverage-gaps-register.md) separately tracks unobserved shared-pool surfaces such as ChatGPT Work, Workspace Agents, ChatGPT for Excel, Codex Cloud, other Codex devices, Work Voice task activity, image generation, third-party authenticated apps, and Claude clients. Ordinary Chat conversations and ordinary Chat Voice are explicitly excluded from the Codex/Work shared agentic pool; Spark is tracked as a separate limit.
+The living [coverage gaps register](../governance/2026-07-24-coverage-gaps-register.md) separately tracks unobserved shared-pool surfaces such as ChatGPT Work, Workspace Agents, ChatGPT for Excel, Codex Cloud, other Codex devices, Work Voice task activity, image generation, third-party authenticated apps, and Claude clients. Ordinary Chat conversations and ordinary Chat Voice are explicitly excluded from the Codex/Work shared agentic pool; Spark is tracked as a separate limit.
 
-The log-derived [monitoring quality report](./2026-07-24-monitoring-quality-report.html) and its [source notes](./docs/research/2026-07-24-monitoring-quality-source-notes.md) add an operational observability layer. The new `quality` command measures collector/app-server freshness, fixed-reset jitter versus moving reset families, integer-display censoring, regressions, account/plan/speed/snapshot-age coverage, and parser loss. It emits owner-only JSON plus a dated Markdown diagnostic rather than silently fitting weak intervals.
+The log-derived monitoring quality report (an owner-only artifact at `.usage-monitor/legacy-reports/2026-07-24-monitoring-quality-report.html`) and its [source notes](../research/2026-07-24-monitoring-quality-source-notes.md) add an operational observability layer. The new `quality` command measures collector/app-server freshness, fixed-reset jitter versus moving reset families, integer-display censoring, regressions, account/plan/speed/snapshot-age coverage, and parser loss. It emits owner-only JSON plus a dated Markdown diagnostic rather than silently fitting weak intervals.
 
-The [seven-day calibration report](./2026-07-24-weekly-7-day-calibration-report.html) and [source notes](./docs/research/2026-07-24-weekly-7-day-calibration-source-notes.md) provide the predictive and reset-level view. The `calibrate-weekly` command selects among Standard and speed-aware API-price ledgers using an earlier-70%/later-30% chronological split, then tests lag, forecast, regime, and within-reset update candidates without look-ahead. Fourteen stable windows imply a median $1,878.75 API-price-equivalent seven-day value and a central 80% reset-to-reset range of $1,640.96–$2,280.38. Conservative captured-speed weighting reduces pooled holdout MAE from 2.25 to 2.16 displayed percentage points (4.1%); the no-look-ahead prior-reset error is 3.95 points and 80% of individual errors are bounded explicitly in the report. All 5–60 point online updates and 5–60 second display-lag corrections are currently rejected because they worsen untouched later-period prediction. These are behavioral calibration values, not a provider-published allowance or cash entitlement.
+The seven-day calibration report (an owner-only artifact at `.usage-monitor/legacy-reports/2026-07-24-weekly-7-day-calibration-report.html`) and its [source notes](../research/2026-07-24-weekly-7-day-calibration-source-notes.md) provide the predictive and reset-level view. The `calibrate-weekly` command selects among Standard and speed-aware API-price ledgers using an earlier-70%/later-30% chronological split, then tests lag, forecast, regime, and within-reset update candidates without look-ahead. Fourteen stable windows imply a median $1,878.75 API-price-equivalent seven-day value and a central 80% reset-to-reset range of $1,640.96–$2,280.38. Conservative captured-speed weighting reduces pooled holdout MAE from 2.25 to 2.16 displayed percentage points (4.1%); the no-look-ahead prior-reset error is 3.95 points and 80% of individual errors are bounded explicitly in the report. All 5–60 point online updates and 5–60 second display-lag corrections are currently rejected because they worsen untouched later-period prediction. These are behavioral calibration values, not a provider-published allowance or cash entitlement.
 
 - The retained May 17–July 24 interval contains 2,366 classified rollouts, 295,681 request-like usage events, 55.68B tokens, and $51,671.51 at Standard OpenAI API-price-equivalent rates. Another 585,778 fork-replay events are excluded.
 - Codex task surfaces are explicit: 33 scheduled-task rollouts contribute 673 usage events and 44.58M tokens; 1,821 subagent rollouts contribute 58,948 events and 7.09B tokens. Provider-side Cloud or Work activity without a local rollout remains unallocated.
@@ -1004,17 +1004,17 @@ The owner-only files `.usage-monitor/account-plan-timeline-v0.1.json`, `.usage-m
 
 ## Rebuilding the portable report
 
-`artifact.json` is extended idempotently from the prior weekly-history artifact, so all earlier sections, data, sources, and caveats remain present.
+`.usage-monitor/legacy-reports/artifact.json` is extended idempotently from the prior weekly-history artifact, so all earlier sections, data, sources, and caveats remain present. If upgrading from the former root-level location, first inspect `npm run migrate:legacy-reports` and then run `npm run migrate:legacy-reports -- --apply` after reviewing the manifest.
 
 ```bash
 pnpm build:report-data
 node $HOME/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/build_portable_artifact.mjs \
-  --input artifact.json \
-  --output 2026-07-24-codex-work-account-usage-report.html
-pnpm fix:report-width -- 2026-07-24-codex-work-account-usage-report.html
+  --input .usage-monitor/legacy-reports/artifact.json \
+  --output .usage-monitor/legacy-reports/2026-07-24-codex-work-account-usage-report.html
+pnpm fix:report-width -- .usage-monitor/legacy-reports/2026-07-24-codex-work-account-usage-report.html
 node $HOME/.codex/plugins/cache/openai-curated-remote/data-analytics/0.2.8-13ceeea1f599/skills/build-report/scripts/verify_portable_artifact.mjs \
-  --html 2026-07-24-codex-work-account-usage-report.html \
-  --artifact artifact.json
+  --html .usage-monitor/legacy-reports/2026-07-24-codex-work-account-usage-report.html \
+  --artifact .usage-monitor/legacy-reports/artifact.json
 ```
 
 The width fix is a narrow packaging workaround for the portable reader's `100vw` header when a classic vertical scrollbar is present; it does not modify report content or embedded artifact data.
