@@ -530,6 +530,11 @@ test("checked-in public source satisfies the complete release contract", async (
     const dashboardOnly of [
       "./app.js",
       "./navigation.js",
+      "./admin-client.js",
+      "./admin.css",
+      "./admin.html",
+      "./admin.js",
+      "./tibotattle-icon.png",
       'id="contribution-form"',
       'id="identity-signin"',
       'id="connect-community"',
