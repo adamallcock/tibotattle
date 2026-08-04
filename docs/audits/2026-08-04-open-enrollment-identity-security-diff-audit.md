@@ -2,7 +2,7 @@
 title: Open-Enrollment Identity Security Diff Audit
 date: 2026-08-04
 type: audit
-status: completed_pending_release
+status: implementation-complete-external-release-gated
 ---
 
 # Open-Enrollment Identity Security Diff Audit
@@ -22,17 +22,20 @@ hosted OAuth journey and D1 migration rehearsal.
 
 ## Scope and evidence
 
-The sealed security-diff review was anchored at
-`575450df2d816ede845cd091a90ced558ccc782c`. It covered the 37 initially
-ranked source files and nine supporting add-backs, then a scope reconciliation
-identified and reviewed the eight omitted runtime/configuration files introduced
-by the parallel local-report relocation work. This gives receipts for every
-non-test runtime/configuration path in the current diff (46 paths); tests and
-documentation are explicitly excluded from that execution-surface count.
+The final sealed security-diff review covers
+`4393bcf823435c6082326526f4e28dc56cd01824` through
+`5114acecf6c3719f8dd4c28bfdce4d3dfce0eba5` (snapshot
+`codex-security-snapshot/v1:sha256:63ef50feb951eb3c5fc425d511e0b00ef6664e7c6ee9b383087af1ed477ddc8a`).
+It completed full-file review of 24 selected source/configuration paths across
+the identity, release-preflight, macOS release, and local-report surfaces.
+Coverage is complete and the final report has zero reportable findings; tests
+and documentation are deliberately outside that execution-surface count.
 
-The corresponding machine-generated sealed report and scope-completion
-addendum are retained with the scan bundle outside the repository. This durable
-summary records their conclusion and the release implications without copying
+The earlier sealed review anchored at
+`575450df2d816ede845cd091a90ced558ccc782c` remains the discovery baseline for
+the initial 46-path reconciliation. The final machine-generated scan report is
+retained with the local scan bundle outside the repository. This durable summary
+records its target, conclusion, and release implications without copying
 temporary scanner output into product documentation.
 
 ## Controls verified
@@ -55,27 +58,39 @@ temporary scanner output into product documentation.
   retention window. Production and staging are still configured with enrollment
   disabled.
 
-## Security hardening backlog
+## Post-seal implementation completion
 
-The supplemental review found no cross-user or remote attack path in the
-parallel local-report relocation code. It did identify four useful same-user
-developer-workspace hardening items that should be handled in a separate change
-owned by that workstream:
+The hardening items recorded by the sealed review are now implemented without
+rewriting the parallel archive/local-report work:
 
-1. Refuse final-component and ancestor symlinks for legacy-report reads and
-   report-output writes, instead of allowing Node write calls to follow a
-   pre-created link.
-2. Keep the legacy-report migration read bounded by the descriptor size rather
-   than checking size before a whole-file read that can race with growth.
-3. Preserve the existing owner-only semantics for collector state and
-   accounting caches; treat them as availability/reliability resources, not a
-   claimed defence against a malicious same-UID process.
-4. Re-run the local-report and tool-inventory boundary suites after that
-   workstream resolves its independent architecture and inventory changes.
+1. Legacy report reads and writers reject final and ancestor symlinks. Canonical
+   writers use owner-private, no-follow/no-clobber staging, descriptor sync,
+   identity revalidation, atomic same-directory rename, and exact staging
+   cleanup. The migration read is bounded through one descriptor and rejects
+   growth/replacement.
+2. The Worker has a local-only D1 release preflight that applies and verifies
+   primary migrations `0023`–`0028` and the complete deletion-ledger stream in
+   disposable owner-only state. It cannot deploy, use remote D1, or read a
+   secret.
+3. Deletion tombstones are fixed-duration and boundedly purged. Deletion also
+   writes a purpose-separated 30-day identity re-enrolment cooldown to primary
+   D1 before removing the unique identity link, then mirrors it to the ledger.
+   `0027` rejects a live digest at the participant `INSERT` boundary, so an
+   active-to-deletion timing race cannot mint a replacement account.
+4. `0028` pins the non-secret identity-link version label and a keyed,
+   one-way fingerprint of `IDENTITY_LINK_SECRET` in primary D1. An in-place
+   secret/version change fails closed before a hosted identity operation can
+   split account continuity or bypass a cooldown. A future rotation needs a
+   separate dual-key migration, not a configuration edit.
+5. The controlled-release runbook makes the live OAuth, secret, migration
+   ordering, observability, pilot, approval, and containment evidence explicit.
 
-These are defence-in-depth improvements, not a reason to delay the identity
-remediation integration. They must not be fixed by rewriting or reverting the
-parallel archive/local-report change in this shared checkout.
+Portable Node does not expose `openat`/directory-descriptor rename primitives,
+so it cannot completely eliminate a hostile **same-UID** ancestor-rename race.
+The code rejects static symlinks and revalidates immediately before and after
+publication; the residual is owner-local availability/integrity risk, not a
+remote or cross-participant path. Do not describe owner-only local files as a
+malware boundary.
 
 ## Validation receipt
 
@@ -84,15 +99,22 @@ Focused remediation checks passed:
 ```text
 npm --prefix apps/worker run typecheck
 npm --prefix apps/worker run types:check
-npm --prefix apps/worker test -- --run test/identity-oidc.spec.ts test/device-auth.spec.ts test/worker.spec.ts test/community-snapshots.spec.ts
+npm --prefix apps/worker run types
+npm --prefix apps/worker test -- --run test/worker.spec.ts test/quarantine-reconciliation.spec.ts test/identity-google.spec.ts test/identity-apple.spec.ts test/identity-oidc.spec.ts
+npm --prefix apps/worker run release:preflight
 node --test --test-concurrency=1 apps/local/server.test.mjs
 node --test --test-concurrency=1 apps/web/test/lib.test.mjs apps/web/test/community-site.test.mjs
-node --test test/local-legacy-report-storage.test.js test/local-companion-data.test.js
+node --test --test-concurrency=1 test/local-legacy-report-storage.test.js test/fix-portable-report-width.test.js test/local-companion-data.test.js
 git diff --check
+npm run docs:links:check
 ```
 
-The focused Worker run passed 120 tests, the local server run 35, the browser
-run 114, and the supplemental local-storage run 14.
+The focused Worker identity/lifecycle regression run passes five files and 159
+tests. The release preflight completes four local checks and reports a
+disposable migration rehearsal as ready without contacting remote
+infrastructure. Focused local report storage/width tests and the local
+companion data suite pass; the completed controlled-release steps are in
+[`2026-08-04-open-enrollment-controlled-release.md`](../runbooks/2026-08-04-open-enrollment-controlled-release.md).
 
 The current broad `npm test` sweep is **not green**. Its failures include the
 parallel local-report architecture boundary, generated R7 receipt drift,
@@ -105,9 +127,10 @@ reconcile before a repository-wide green release claim.
 
 ## Preconditions before enabling open enrollment
 
-1. Apply migrations `0023` through `0026` to an isolated D1 staging database
-   and prove upgrade, rollback/restore, retention cleanup, and admission-limit
-   behavior.
+1. Keep enrollment disabled; deploy and drain the reviewed Worker revision
+   before applying migrations `0023` through `0028` to an isolated D1 staging
+   database. Prove upgrade, rollback/restore, retention cleanup, admission-
+   limit behavior, and the no-mixed-version rollout order.
 2. Configure only the approved production Google/Apple client IDs, callback
    URLs, Apple key material, HMAC secrets, and encrypted operational bindings;
    verify no secret appears in logs, errors, analytics, or browser bundles.

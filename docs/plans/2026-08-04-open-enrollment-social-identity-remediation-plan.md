@@ -52,13 +52,23 @@ contributors or to deploy.
 | Honest session and device lifecycle | A restored service session renders as signed in and can be explicitly logged out. Disconnect this Mac first serializes local delivery mutations, revokes the remote device and pending/consuming upload authorizations, then clears only the matching local Keychain binding. |
 | Friction-free bounded upload authority | An active device silently slides its 30-day expiry only while recently used and never beyond a 180-day social-verification horizon. There is no OAuth refresh token and no six-hour prompt. |
 | Account/device limits | Default limits are three active recently used devices, three pairing issues per hour, and six claims per hour. Expired, idle, or invalid device state is revoked by scheduled bounded maintenance. |
+| Deletion and re-entry | A fixed 400-day restore tombstone expires/purges in bounded pages. `0027` writes a 30-day purpose-separated HMAC cooldown to primary D1 before removing the old unique link, mirrors it to the independent ledger, and atomically rejects a fresh participant `INSERT` while it is live. The transient insert guard is cleared in the same enrollment transaction. |
+| Identity-key continuity | `0028` pins a non-secret `IDENTITY_LINK_SECRET_VERSION` and a one-way HMAC fingerprint of the configured link secret in primary D1. A change to either fails closed before a hosted sign-in, enrollment, callback completion, or deletion can silently create a new identity namespace. |
 | Descriptive aggregate contract | `0023` adds account maturity, provider-account eligibility, cross-cell account clipping, auditable exclusions, deterministic withdrawal/rebuild, and `community-weekly-snapshot-v0.3` terminology. Policy storage and browser validation permit only a stricter policy than the published 20-account / 7-day / 2-collection-day / baseline-cap contract. Existing published/suppressed snapshots are withdrawn and rebuilt rather than relabelled. |
+| Local report and migration safety | Legacy report reads/migration and all canonical writers now reject ancestor/final symlinks, use descriptor-bound bounded reads, and publish through a private same-directory staged file with no-follow, fsync, revalidation, and atomic rename. |
+| Release evidence | `npm --prefix apps/worker run release:preflight` is a local-only, disposable D1 migration/schema rehearsal for both primary and deletion-ledger streams. The controlled-release runbook records the remaining account-owner checks and explicit no-enable boundary. |
 
 The remaining release gates are intentional and must stay open until verified
 against real infrastructure:
 
-1. Apply migrations `0023`–`0026` in a disabled staging environment and verify
-   rollback/withdrawal behaviour with representative state.
+1. Run the local disposable D1 preflight, then deploy the reviewed Worker
+   revision **while enrollment remains disabled**, drain all old Worker
+   identity traffic, and only then apply migrations `0023`–`0028` in a
+   disabled staging environment. The reverse schema-before-code ordering is
+   unsafe: an old deletion worker can remove an identity link without writing
+   the new primary cooldown marker. Verify rollback/withdrawal behaviour with
+   representative state. The local preflight is evidence only; it does not
+   contact Cloudflare or prove the deployed migration state or rollout order.
 2. Provision and independently verify Google/Apple portal settings, exact HTTPS
    callback origin, secrets, callback URL redaction, and the signed native
    browser journeys. Do not infer them from source configuration.
@@ -73,8 +83,8 @@ against real infrastructure:
    uploads, aggregate rebuilding, disconnect races, and reconnect at the
    social-recheck boundary. Tune the hard-coded launch candidates from those
    results before enabling enrollment.
-6. Publish a deletion/re-entry policy and obtain explicit release authority to
-   change either staging or production enrollment from `disabled`.
+6. Publish the documented deletion/re-entry policy and obtain explicit release
+   authority to change either staging or production enrollment from `disabled`.
 
 This plan supersedes the account-choice conclusion in the
 [pseudonymous contribution identity plan](2026-08-04-pseudonymous-contribution-identity-remediation-plan.md).
@@ -142,7 +152,12 @@ for the exchange; do not use an embedded web view for OAuth.
 
 The existing HMAC identity link is a good minimisation choice. It is still a
 pseudonymous account-derived datum and must be covered by the privacy notice,
-access controls, deletion policy, and key-rotation procedure.
+access controls, deletion policy, and key-rotation procedure. The link secret
+is continuity-critical: do **not** rotate `IDENTITY_LINK_SECRET` or its
+non-secret version label in place. The implementation pins both a version and
+a keyed fingerprint and fails closed on a mismatch. A future rotation requires
+a separately reviewed dual-key migration/relink plan, with enrollment contained
+throughout; it is not an incident-response shortcut.
 
 ## Red-team assessment and required response
 
@@ -150,7 +165,9 @@ access controls, deletion policy, and key-rotation procedure.
 | --- | --- | --- |
 | Same provider account reinstalls the app | It reattaches to one participant. | Preserve unique link-key semantics and test replay/reinstall after every migration. |
 | Same person uses Google and Apple, or several provider accounts | Each account becomes a separate participant. | Accept as the stated residual risk; cap each account's influence, mature accounts before release, and label the cohort self-selected/provider-account-gated. Never claim human independence. |
-| Delete, then re-enroll with the same account | Deletion clears the identity link and cascades eligibility/counter state, so re-entry can mint a new participant. | Make an explicit policy choice: allow clean re-entry but describe the limit as per active account generation, or retain a short-lived, purpose-separated HMAC cooldown key. Do not retain a permanent hidden social identifier. |
+| Delete, then re-enroll with the same account | A 30-day purpose-separated HMAC cooldown is written to primary D1 before the unique link is removed and mirrored to the deletion ledger. The primary participant `INSERT` checks it atomically. | Publish the fixed 30-day re-entry policy, test expiry/maintenance in staging, and do not retain a permanent hidden social identifier. |
+| Link-secret configuration changes | Changing the HMAC secret would otherwise make every provider account and cooldown look new. | `0028` records a one-way keyed fingerprint plus immutable version label and stops identity-sensitive operations on mismatch. Keep enrollment contained and use a separately reviewed dual-key migration if rotation becomes necessary. |
+| Mixed Worker/schema rollout | A pre-`0027` Worker does not create the primary marker, while a post-`0027` Worker can admit an enrollment. | Keep enrollment disabled, deploy and drain the reviewed Worker revision first, then apply D1 migrations. Do not treat a local migration rehearsal as evidence of this production ordering. |
 | Scripted enrollment from many IPs | Edge limits provide ordinary burst friction; D1 now gives a globally coordinated minute budget before each handoff. | Tune budget/alerts from staging evidence; add risk-triggered Turnstile only with the separately approved server-side verification path. |
 | Account/device farm | Active-device, pairing issue, and pairing claim caps exist; idle/expired state is purged. | Monitor saturation and provide a documented device-replacement support path. Devices do not add aggregate weight. |
 | Account switch on one Mac | Server session logout and Disconnect-this-Mac are explicit transactions; disconnect revokes outstanding upload authority before local Keychain cleanup. | Verify the native signed build and disconnect race in staging before launch. Do not permit ambiguous silent account takeover. |
@@ -395,14 +412,17 @@ development test hooks fail closed in hosted environments.
    an imminent-expiry/reconnect native UI state before public enrollment; do
    not claim automatic secret rotation until the native client safely supports
    it. No refresh-token storage or indefinite self-renewal.
-5. Decide/document re-entry after deletion. If retaining a cooldown, store only
-   a purpose-separated HMAC of identity link, retain it for a short predeclared
-   period, return a neutral cooldown response, and purge it reliably. If not,
-   explicitly treat re-entry as a new account generation and retain no
-   "forever" wording.
-6. Fix deletion-tombstone lifecycle: its documented retention needs a real purge
-   path; no development-only 400-day tombstone becomes an unbounded production
-   record by accident.
+5. **Implemented:** re-entry has a documented 30-day purpose-separated HMAC
+   cooldown. Its primary-D1 copy is enforced at participant `INSERT` and its
+   independent-ledger copy preserves restore safety; both have bounded purge
+   paths and return a neutral cooldown response.
+6. **Implemented:** deletion tombstones have a real bounded purge path; the
+   400-day retention is not an unbounded production record.
+7. **Implemented:** the identity-link HMAC secret has an immutable,
+   database-pinned configuration fingerprint. A configuration mismatch fails
+   closed rather than splitting the same provider account into a new identity
+   namespace. Rotation remains intentionally unsupported until a dual-key
+   migration is designed and tested.
 
 **Exit gate:** A user can clearly stop uploads, recover same account on a
 replacement Mac, intentionally switch accounts, and delete data without UI
@@ -454,6 +474,7 @@ published totals.
 | Active-device renewal | A recently active Keychain-held device bearer slides only to the hard social-verification deadline, without browser interaction. If/when secret rotation is exposed, it must preserve that deadline and old-secret reuse must revoke the device. |
 | Idle or maximum-age recheck | After configured device idleness or maximum social-verification age, the queue pauses and the user gets one clear system-browser reconnect flow; no silent indefinite renewal occurs. |
 | Same account after reinstall | Fresh Mac/app login reattaches existing participant; it does not create a duplicate account unit. |
+| Identity-secret configuration | The configured version and keyed fingerprint match the primary D1 pin; an attempted in-place change fails closed before a new sign-in, enrollment, or deletion. |
 | Different provider/account | App requires explicit Disconnect-this-Mac or authenticated linking; it cannot silently retain old device/session while presenting a new account. |
 | Apple replay/nonce | Missing, mismatched, expired, or consumed nonce/state/proof fails without participant/session/device write. |
 | Callback/browser privacy | OAuth codes, tokens, session cookies, and raw subject never appear in local browser storage, loopback requests, application logs, or URL telemetry. |
