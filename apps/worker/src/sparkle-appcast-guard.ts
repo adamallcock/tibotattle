@@ -79,6 +79,7 @@ export interface SparkleAppcastGuardConfiguration {
   readonly enabled: boolean;
   readonly token: string | null;
   readonly bucket: R2Bucket | null;
+  readonly nonceDatabase: D1Database | null;
   readonly publicEdKey: string | null;
   readonly publicEdKeySha256: string | null;
 }
@@ -96,6 +97,27 @@ function configuredBucket(env: Env): R2Bucket | null {
     return null;
   }
   return value as R2Bucket;
+}
+
+function configuredNonceDatabase(env: Env): D1Database | null {
+  const value = setting(env, "USAGE_MONITOR_DB");
+  if (value === null || typeof value !== "object"
+      || typeof Reflect.get(value, "prepare") !== "function") {
+    return null;
+  }
+  return value as D1Database;
+}
+
+function disabledSparkleAppcastGuardConfiguration():
+SparkleAppcastGuardConfiguration {
+  return Object.freeze({
+    enabled: false,
+    token: null,
+    bucket: null,
+    nonceDatabase: null,
+    publicEdKey: null,
+    publicEdKeySha256: null,
+  });
 }
 
 function canonicalBase64Bytes(value: string): Uint8Array | null {
@@ -126,13 +148,7 @@ export function readSparkleAppcastGuardConfiguration(
 ): SparkleAppcastGuardConfiguration {
   const mode = setting(env, "SPARKLE_APPCAST_GUARD_MODE");
   if (mode === undefined || mode === "disabled") {
-    return Object.freeze({
-      enabled: false,
-      token: null,
-      bucket: null,
-      publicEdKey: null,
-      publicEdKeySha256: null,
-    });
+    return disabledSparkleAppcastGuardConfiguration();
   }
   if (mode !== "enabled") configurationError();
 
@@ -147,6 +163,14 @@ export function readSparkleAppcastGuardConfiguration(
   ];
   for (const [name, expected] of expectedSettings) {
     if (setting(env, name) !== expected) configurationError();
+  }
+  // A partially bound enabled route must remain indistinguishable from an
+  // absent route. The reviewed R2 bucket identity is checked statically by the
+  // deployment gate; Workers cannot introspect an R2 binding's bucket name.
+  const bucket = configuredBucket(env);
+  const nonceDatabase = configuredNonceDatabase(env);
+  if (bucket === null || nonceDatabase === null) {
+    return disabledSparkleAppcastGuardConfiguration();
   }
   const token = setting(env, "SPARKLE_APPCAST_GUARD_TOKEN");
   if (typeof token !== "string" || !TOKEN_PATTERN.test(token)) {
@@ -164,12 +188,11 @@ export function readSparkleAppcastGuardConfiguration(
       || !SHA256_PATTERN.test(publicEdKeySha256)) {
     configurationError();
   }
-  const bucket = configuredBucket(env);
-  if (bucket === null) configurationError();
   return Object.freeze({
     enabled: true,
     token,
     bucket,
+    nonceDatabase,
     publicEdKey,
     publicEdKeySha256,
   });
@@ -370,6 +393,16 @@ function parseXmlAttributes(source: string): Map<string, string> {
   return attributes;
 }
 
+function requireExactXmlAttributes(
+  attributes: Map<string, string>,
+  expected: readonly string[],
+): void {
+  if (attributes.size !== expected.length
+      || expected.some((name) => !attributes.has(name))) {
+    invalidCandidate();
+  }
+}
+
 function findXmlTagEnd(text: string, start: number): number {
   let quote: string | null = null;
   for (let index = start + 1; index < text.length; index += 1) {
@@ -474,9 +507,7 @@ function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
     if (text[index] !== "<") {
       const next = text.indexOf("<", index);
       const content = text.slice(index, next === -1 ? text.length : next);
-      if (/&(?!amp;|lt;|gt;|quot;|apos;|#(?:[0-9]+|x[0-9A-Fa-f]+);)/u.test(content)) {
-        invalidCandidate();
-      }
+      if (!/^\s*$/u.test(content)) invalidCandidate();
       index = next === -1 ? text.length : next;
       continue;
     }
@@ -507,26 +538,39 @@ function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
     if (name === undefined) invalidCandidate();
     const attributes = parseXmlAttributes(attributeSource);
     const parent = stack[stack.length - 1];
+    if (name !== "rss" && name !== "channel"
+        && name !== "item" && name !== "enclosure") {
+      invalidCandidate();
+    }
     if (!rootSeen) {
       if (name !== "rss" || selfClosing
           || attributes.get("version") !== "2.0"
           || attributes.get("xmlns:sparkle") !== SPARKLE_XML_NAMESPACE) {
         invalidCandidate();
       }
+      requireExactXmlAttributes(attributes, ["version", "xmlns:sparkle"]);
       rootSeen = true;
     } else if (stack.length === 0) {
       invalidCandidate();
     }
     if (name === "channel") {
       if (parent !== "rss" || selfClosing || channelSeen) invalidCandidate();
+      requireExactXmlAttributes(attributes, []);
       channelSeen = true;
     }
     if (name === "item") {
       if (parent !== "channel" || selfClosing) invalidCandidate();
+      requireExactXmlAttributes(attributes, []);
       itemCount += 1;
     }
     if (name === "enclosure") {
       if (parent !== "item" || !selfClosing) invalidCandidate();
+      requireExactXmlAttributes(attributes, [
+        "url",
+        "length",
+        "sparkle:version",
+        "sparkle:edSignature",
+      ]);
       enclosures.push(parseSparkleEnclosure(attributes));
     } else if (!selfClosing) {
       stack.push(name);
@@ -761,6 +805,7 @@ export async function handleSparkleAppcastGuard(
   }
   const configuration = readSparkleAppcastGuardConfiguration(env);
   if (!configuration.enabled || configuration.bucket === null
+      || configuration.nonceDatabase === null
       || configuration.token === null) {
     // Keep a disabled route indistinguishable from an unregistered route.
     throw new ApiError(404, "NOT_FOUND");
@@ -777,13 +822,7 @@ export async function handleSparkleAppcastGuard(
     configuration.token,
     nowEpoch,
   );
-  let db: D1Database;
-  const database = Reflect.get(env, "USAGE_MONITOR_DB");
-  if (database === null || typeof database !== "object"
-      || typeof Reflect.get(database, "prepare") !== "function") {
-    throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
-  }
-  db = database as D1Database;
+  const db = configuration.nonceDatabase;
   try {
     await consumeSparkleAppcastGuardNonce(db, authentication.nonce, nowEpoch);
   } catch (error) {

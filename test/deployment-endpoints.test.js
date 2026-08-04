@@ -6,6 +6,7 @@ import {
 } from "../config/deployment-endpoints.js";
 import {
   checkDeploymentEndpointConsumers,
+  validateWorkerSparkleAppcastGuard,
   validateWorkerDeploymentEndpoints,
 } from "../apps/worker/scripts/check-deployment-endpoints.mjs";
 
@@ -59,4 +60,45 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
     "staging:check",
     "staging:deploy",
   ]);
+});
+
+test("enabled Sparkle guard requires reviewed bindings and the nonce schema", () => {
+  const configuration = {
+    vars: { SPARKLE_APPCAST_GUARD_MODE: "enabled" },
+    r2_buckets: [{
+      binding: "SPARKLE_RELEASES",
+      bucket_name: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket,
+    }],
+    d1_databases: [{
+      binding: "USAGE_MONITOR_DB",
+      migrations_dir: "migrations",
+    }],
+  };
+  const migration = `
+    CREATE TABLE IF NOT EXISTS sparkle_appcast_guard_nonces (
+      nonce TEXT PRIMARY KEY NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sparkle_appcast_guard_nonces_expires_at
+      ON sparkle_appcast_guard_nonces(expires_at);
+  `;
+  assert.doesNotThrow(() => validateWorkerSparkleAppcastGuard(
+    configuration,
+    migration,
+  ));
+  configuration.r2_buckets[0].bucket_name = "wrong-reviewed-bucket";
+  assert.throws(
+    () => validateWorkerSparkleAppcastGuard(configuration, migration),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  configuration.r2_buckets[0].bucket_name = DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket;
+  assert.throws(
+    () => validateWorkerSparkleAppcastGuard(configuration, ""),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  delete configuration.r2_buckets;
+  assert.throws(
+    () => validateWorkerSparkleAppcastGuard(configuration, migration),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
 });

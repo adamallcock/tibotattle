@@ -43,6 +43,13 @@ export const WORKER_PACKAGE_PATH = join(
   "worker",
   "package.json",
 );
+export const SPARKLE_GUARD_NONCE_MIGRATION_PATH = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "worker",
+  "migrations",
+  "0029_sparkle_appcast_guard_nonces.sql",
+);
 export const MACOS_BUILD_PATH = join(
   REPOSITORY_ROOT,
   "scripts",
@@ -89,6 +96,70 @@ function rejectEmbeddedEndpoint(source, endpoint, label) {
   if (source.includes(endpoint)) {
     fail(`${label} embeds ${endpoint}; use config/deployment-endpoints.js`);
   }
+}
+
+export const SPARKLE_APPCAST_GUARD_R2_BINDING = "SPARKLE_RELEASES";
+export const SPARKLE_APPCAST_GUARD_D1_BINDING = "USAGE_MONITOR_DB";
+
+function environmentEntries(configuration) {
+  return [
+    ["default", configuration],
+    ["staging", configuration?.env?.staging],
+    ["production", configuration?.env?.production],
+  ];
+}
+
+function bindingEntries(environment, field) {
+  return Array.isArray(environment?.[field]) ? environment[field] : [];
+}
+
+export function validateWorkerSparkleAppcastGuard(
+  configuration,
+  nonceMigration,
+  endpoints = DEPLOYMENT_ENDPOINTS,
+) {
+  assertDeploymentEndpoints(endpoints);
+  if (typeof nonceMigration !== "string") {
+    fail("Sparkle appcast guard nonce migration must be readable");
+  }
+  const normalizedMigration = nonceMigration
+    .replace(/--[^\n]*/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLowerCase();
+  if (!/create table if not exists sparkle_appcast_guard_nonces \( nonce text primary key not null, expires_at integer not null \)/u.test(normalizedMigration)
+      || !/create index if not exists idx_sparkle_appcast_guard_nonces_expires_at on sparkle_appcast_guard_nonces\s*\(expires_at\)/u.test(normalizedMigration)) {
+    fail("Sparkle appcast guard nonce schema is required");
+  }
+
+  const environments = environmentEntries(configuration);
+  for (const [label, environment] of environments) {
+    for (const binding of bindingEntries(environment, "r2_buckets")) {
+      if (binding?.binding === SPARKLE_APPCAST_GUARD_R2_BINDING
+          && binding.bucket_name !== endpoints.sparkle.r2Bucket) {
+        fail(`${label} Sparkle R2 binding must match the reviewed manifest bucket`);
+      }
+    }
+    const mode = environment?.vars?.SPARKLE_APPCAST_GUARD_MODE;
+    if (mode !== "enabled") continue;
+    const hasReviewedR2Binding = bindingEntries(environment, "r2_buckets")
+      .some((binding) => binding?.binding === SPARKLE_APPCAST_GUARD_R2_BINDING
+        && binding.bucket_name === endpoints.sparkle.r2Bucket);
+    if (!hasReviewedR2Binding) {
+      fail(`${label} enabled Sparkle appcast guard requires the reviewed R2 binding`);
+    }
+    const hasNonceDatabase = bindingEntries(environment, "d1_databases")
+      .some((binding) => binding?.binding === SPARKLE_APPCAST_GUARD_D1_BINDING
+        && binding.migrations_dir === "migrations");
+    if (!hasNonceDatabase) {
+      fail(`${label} enabled Sparkle appcast guard requires the nonce D1 binding`);
+    }
+  }
+  return Object.freeze({
+    nonceTable: "sparkle_appcast_guard_nonces",
+    r2Binding: SPARKLE_APPCAST_GUARD_R2_BINDING,
+    r2Bucket: endpoints.sparkle.r2Bucket,
+  });
 }
 
 /**
@@ -227,6 +298,7 @@ export async function checkDeploymentEndpointConsumers({
   wranglerConfigPath = WRANGLER_CONFIG_PATH,
   workerTypesPath = WORKER_TYPES_PATH,
   workerPackagePath = WORKER_PACKAGE_PATH,
+  sparkleGuardNonceMigrationPath = SPARKLE_GUARD_NONCE_MIGRATION_PATH,
   macOSBuildPath = MACOS_BUILD_PATH,
   macOSReleaseCorePath = MACOS_RELEASE_CORE_PATH,
   macOSNativeSourcePath = MACOS_NATIVE_SOURCE_PATH,
@@ -237,6 +309,7 @@ export async function checkDeploymentEndpointConsumers({
     wranglerText,
     workerTypes,
     workerPackageText,
+    sparkleGuardNonceMigration,
     buildSource,
     macOSReleaseSource,
     nativeSource,
@@ -245,13 +318,20 @@ export async function checkDeploymentEndpointConsumers({
     readFile(wranglerConfigPath, "utf8"),
     readFile(workerTypesPath, "utf8"),
     readFile(workerPackagePath, "utf8"),
+    readFile(sparkleGuardNonceMigrationPath, "utf8"),
     readFile(macOSBuildPath, "utf8"),
     readFile(macOSReleaseCorePath, "utf8"),
     readFile(macOSNativeSourcePath, "utf8"),
     readFile(sparklePublisherPath, "utf8"),
   ]);
+  const wranglerConfiguration = parseWranglerConfiguration(wranglerText);
   const worker = validateWorkerDeploymentEndpoints(
-    parseWranglerConfiguration(wranglerText),
+    wranglerConfiguration,
+    endpoints,
+  );
+  const sparkleGuard = validateWorkerSparkleAppcastGuard(
+    wranglerConfiguration,
+    sparkleGuardNonceMigration,
     endpoints,
   );
   const consumers = validateDeploymentEndpointConsumers({
@@ -265,7 +345,7 @@ export async function checkDeploymentEndpointConsumers({
   const gates = validateWorkerDeploymentEndpointGates(
     parseWorkerPackage(workerPackageText),
   );
-  return Object.freeze({ ...consumers, gates, worker });
+  return Object.freeze({ ...consumers, gates, sparkleGuard, worker });
 }
 
 async function main() {

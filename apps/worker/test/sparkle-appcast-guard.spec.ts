@@ -383,6 +383,25 @@ describe("Sparkle appcast atomic guard", () => {
     expect(bucket.putCalls).toBe(0);
   });
 
+  it("keeps enabled mode dark when required R2 or D1 bindings are absent or malformed", async () => {
+    const cases = [
+      { SPARKLE_RELEASES: null },
+      { SPARKLE_RELEASES: { head: () => {}, get: () => {} } },
+      { USAGE_MONITOR_DB: null },
+      { USAGE_MONITOR_DB: { prepare: "not-a-function" } },
+    ];
+    for (const [index, overrides] of cases.entries()) {
+      const response = await invoke(
+        new Request(`https://example.test${SPARKLE_APPCAST_GUARD_ROUTE}`, {
+          method: "GET",
+        }),
+        bindings(new FakeR2Bucket(), overrides),
+        NOW,
+      );
+      expect(response.status, `case ${index}`).toBe(404);
+    }
+  });
+
   it("rejects bad authentication and stale timestamps without touching R2", async () => {
     const bucket = new FakeR2Bucket();
     const body = await payload();
@@ -459,6 +478,38 @@ describe("Sparkle appcast atomic guard", () => {
     );
     expect(response.status).toBe(422);
     expect(bucket.putCalls).toBe(0);
+  });
+
+  it("rejects root-external junk, namespace redeclaration, and Sparkle aliases or duplicates", async () => {
+    const base = new TextDecoder().decode(await appcastBytes("1"));
+    const candidates = [
+      `junk${base}`,
+      `${base}junk`,
+      base.replace("<channel>", '<channel xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'),
+      base.replace(
+        'sparkle:version="1"',
+        'xmlns:s="http://www.andymatuschak.org/xml-namespaces/sparkle" s:version="1"',
+      ),
+      base.replace(
+        'sparkle:version="1"',
+        'sparkle:version="1" sparkle:version="1"',
+      ),
+    ];
+    for (const [index, candidateText] of candidates.entries()) {
+      const bucket = new FakeR2Bucket();
+      const response = await invoke(
+        await signedRequest(
+          await payload({ candidate: encoder.encode(candidateText) }),
+          TOKEN,
+          Math.floor(NOW / 1000),
+          `parser-adversary-nonce-${String(index).padStart(2, "0")}`,
+        ),
+        bindings(bucket),
+        NOW,
+      );
+      expect(response.status, `case ${index}`).toBe(422);
+      expect(bucket.putCalls).toBe(0);
+    }
   });
 
   it("rejects unsigned and bad-signature candidates before any appcast put", async () => {
