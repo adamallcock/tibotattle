@@ -135,7 +135,7 @@ test("offline verification validates locally and never calls fetch", async () =>
   assert.equal(result.appcast.checked, false);
 });
 
-test("live verification checks health then ready, and diagnoses an unpublished appcast", async () => {
+test("live verification checks health and reports an unpublished appcast as blocked preflight", async () => {
   const calls = [];
   const result = await verifyMacOSPreviewRemote({
     appPath: APP_PATH,
@@ -167,7 +167,11 @@ test("live verification checks health then ready, and diagnoses an unpublished a
   assert.equal(result.appcast.status, "not_published");
   assert.equal(result.appcast.reason, "not_published");
   assert.equal(result.appcast.httpStatus, 404);
-  assert.equal(result.overall, "not_ready");
+  assert.equal(result.overall, "remote_feed_preflight_blocked");
+  assert.equal(result.remotePublicationReadback.status, "blocked");
+  assert.equal(result.remotePublicationReadback.reason, "appcast_not_published");
+  assert.equal(result.claim.requested, false);
+  assert.equal(result.sparkleAcceptance.status, "not_verified");
   assert.equal(JSON.stringify(result).includes(PUBLIC_ED_KEY), false);
 });
 
@@ -194,10 +198,13 @@ test("valid Sparkle RSS/XML is distinguished from malformed or empty appcast con
   assert.equal(result.appcast.valid, true);
   assert.equal(result.appcast.itemCount, 1);
   assert.equal(result.appcast.enclosureCount, 1);
-  assert.equal(result.overall, "ready");
+  assert.equal(result.overall, "remote_feed_preflight_passed");
+  assert.equal(result.remotePublicationReadback.passed, true);
+  assert.equal(result.claim.requested, false);
+  assert.equal(result.sparkleAcceptance.status, "not_verified");
 });
 
-test("a bounded timeout becomes a clear endpoint result without leaking response content", async () => {
+test("a bounded timeout blocks remote feed preflight without leaking response content", async () => {
   const timeoutClock = {
     now: () => 2_000,
     setTimeout: (callback) => {
@@ -221,10 +228,13 @@ test("a bounded timeout becomes a clear endpoint result without leaking response
   );
   assert.equal(result.appcast.status, "unavailable");
   assert.equal(result.appcast.reason, "timeout");
-  assert.equal(result.overall, "not_ready");
+  assert.equal(result.overall, "remote_feed_preflight_blocked");
+  assert.equal(result.remotePublicationReadback.status, "blocked");
+  assert.equal(result.claim.requested, false);
+  assert.equal(result.sparkleAcceptance.status, "not_verified");
 });
 
-test("CLI reports the expected missing-appcast truth without printing the signing key", async () => {
+test("CLI reports blocked remote preflight without claiming release acceptance or printing the signing key", async () => {
   const output = [];
   const result = await runMacOSPreviewRemoteCLI(
     ["--app", APP_PATH, "--live"],
@@ -251,7 +261,9 @@ test("CLI reports the expected missing-appcast truth without printing the signin
   assert.equal(output.some((line) => line.includes("not_published")), false);
   assert.equal(output.some((line) => line.includes("no signed release appcast")), true);
   assert.equal(output.some((line) => line.includes(PUBLIC_ED_KEY)), false);
-  assert.equal(output.some((line) => line.includes("Preview remote readiness: not ready")), true);
+  assert.equal(output.some((line) => line.includes("Remote feed preflight: blocked")), true);
+  assert.equal(output.some((line) => line.includes("Sparkle update acceptance: not verified")), true);
+  assert.equal(output.some((line) => line.includes("Production claim:")), false);
 });
 
 assert.deepEqual(MACOS_PREVIEW_REMOTE_HEALTH_PATHS, ["/api/health", "/api/ready"]);
