@@ -8,7 +8,9 @@ import {
   demoDashboard,
   normalizeCommunitySnapshot,
   normalizeParticipantHistory,
-  normalizeParticipantStats
+  normalizeParticipantStats,
+  quotaWindowLabel,
+  selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
   DIAGNOSTIC_REFERENCE_PATTERN,
@@ -745,7 +747,11 @@ function renderDashboard(data) {
 function renderQuotaCards(data) {
   const container = $("#quota-cards");
   clear(container);
-  const windows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
+  const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
+  const primaryWindow = selectPrimaryCodexQuotaWindow(normalWindows);
+  const windows = primaryWindow === null
+    ? normalWindows
+    : [primaryWindow, ...normalWindows.filter((window) => window !== primaryWindow)];
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
     const header = node("div", "metric-card-header");
@@ -767,12 +773,13 @@ function renderQuotaCards(data) {
     const header = node("div", "metric-card-header");
     const name = rawNode("span", "metric-name", window.label);
     const plan = node("span", "evidence-chip");
-    if (window.planType) {
-      setRawText(plan, window.planType);
+    const reportedPlan = providerReportedPlanEvidence(window.planType);
+    if (data.mode === "demo") {
+      plan.textContent = t("dashboard.quota.demo");
+    } else if (reportedPlan) {
+      setRawText(plan, reportedPlan);
     } else {
-      plan.textContent = data.mode === "demo"
-        ? t("dashboard.quota.demo")
-        : t("dashboard.quota.observed");
+      plan.textContent = t("dashboard.quota.observed");
     }
     header.append(
       name,
@@ -820,6 +827,12 @@ function renderQuotaCards(data) {
     }
     container.append(card);
   }
+}
+
+function providerReportedPlanEvidence(value) {
+  const candidate = typeof value === "string" ? value.trim() : "";
+  if (candidate === "" || candidate.toLowerCase() === "unknown") return "";
+  return `Provider reported plan type: ${candidate}`;
 }
 
 function historyCoverageLabel(history) {
@@ -1181,9 +1194,10 @@ function shareCardWindowKind(window) {
 /**
  * Choose the one allowance window the card reports.
  *
- * The seven-day normal Codex window is the headline the rest of the page leads
- * with. A five-hour normal Codex window is used only when that weekly window is
- * absent. Other observed quota products never stand in for either figure.
+ * The share card is a weekly-specific surface. It uses the selected normal
+ * Codex window when that selection is one of the existing named windows;
+ * otherwise it omits the generic window rather than borrowing seven-day
+ * history or an estimate with the wrong denominator.
  */
 function shareCardWindow(windows) {
   const observed = (Array.isArray(windows) ? windows : [])
@@ -1191,6 +1205,10 @@ function shareCardWindow(windows) {
       isPrimaryCodexQuotaWindow(window)
       && finite(window?.remainingPercent) !== null
     ));
+  const selected = selectPrimaryCodexQuotaWindow(observed);
+  if (selected !== null && shareCardWindowKind(selected) !== "other") {
+    return selected;
+  }
   return observed.find((window) => shareCardWindowKind(window) === "seven_day")
     ?? observed.find((window) => shareCardWindowKind(window) === "five_hour")
     ?? null;
@@ -6464,7 +6482,7 @@ function renderPersonalStats(container, payload) {
 
 const ACCOUNT_CALIBRATION_REASONS = Object.freeze({
   account_scoped_dataset_unavailable: "No complete account-scoped dataset has been contributed yet.",
-  supported_quota_track_unavailable: "No five-hour or seven-day quota track is available in the contributed data.",
+  supported_quota_track_unavailable: "No supported provider-reported quota track is available in the contributed data.",
   source_evidence_refused: "The source dataset is partial or otherwise ineligible for calibration.",
   too_few_boundaries: "At least eight useful quota boundaries are required inside a reset window.",
   insufficient_displayed_span: "The visible quota movement covers less than five percentage points.",
@@ -6495,9 +6513,12 @@ function renderAccountScopedQuotaAnalysis(container, analysis) {
   const grid = node("div", "pricing-basis-grid");
   for (const track of analysis.tracks) {
     const card = node("article", "basis-card");
-    const windowLabel = track.windowDurationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES
-      ? "Seven-day allowance"
-      : "Five-hour allowance";
+    const windowLabel = quotaWindowLabel(
+      track.limitId,
+      track.windowDurationMinutes,
+    );
+    const planEvidence = providerReportedPlanEvidence(track.planType)
+      || "Provider reported plan type unavailable";
     const estimate = track.latestCapacityUsd === null
       ? "Collecting evidence"
       : formatApiMoney(track.latestCapacityUsd);
@@ -6505,7 +6526,7 @@ function renderAccountScopedQuotaAnalysis(container, analysis) {
       node(
         "span",
         "basis-label",
-        `${windowLabel} · ${track.planVariant || track.planType}`
+        `${windowLabel} · ${planEvidence}`
       ),
       node("strong", "", estimate)
     );
@@ -6608,8 +6629,10 @@ function renderParticipantQuotaMovement(container, movement) {
     const capacityLabel = movement.apiPriceEquivalentCapacityUsd === null
       ? "Capacity estimate unavailable"
       : `${formatApiMoney(movement.apiPriceEquivalentCapacityUsd)} per 100 percentage points`;
+    const planEvidence = providerReportedPlanEvidence(movement.planType)
+      || "Provider reported plan type unavailable";
     metadata.append(
-      node("span", "", [movement.planType, movement.planVariant, movement.limitId, movement.slot].filter(Boolean).join(" · ") || "Quota track"),
+      node("span", "", [planEvidence, movement.limitId, movement.slot].filter(Boolean).join(" · ") || "Quota track"),
       node("span", "", resetLabel),
       node("span", "", capacityLabel)
     );

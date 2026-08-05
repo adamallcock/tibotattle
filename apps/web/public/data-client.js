@@ -40,10 +40,7 @@ export const CODEX_PRIMARY_LIMIT_ID = "codex";
 export const CODEX_SPARK_LIMIT_ID = "codex_bengalfox";
 export const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
 export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
-const PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES = new Set([
-  CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
-  CODEX_WEEKLY_ALLOWANCE_MINUTES
-]);
+export const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -239,9 +236,7 @@ function normalizeQuotaLimitId(value) {
  */
 export function isPrimaryCodexQuotaWindow(window) {
   return window?.limitId === CODEX_PRIMARY_LIMIT_ID
-    && PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES.has(
-      finite(window?.durationMinutes)
-    );
+    && isValidQuotaWindowDuration(finite(window?.durationMinutes));
 }
 
 export function isPrimaryCodexWeeklyQuotaWindow(window) {
@@ -249,14 +244,53 @@ export function isPrimaryCodexWeeklyQuotaWindow(window) {
     && finite(window?.durationMinutes) === CODEX_WEEKLY_ALLOWANCE_MINUTES;
 }
 
-function quotaWindowLabel(limitId, durationMinutes) {
+export function isValidQuotaWindowDuration(value) {
+  return Number.isSafeInteger(value)
+    && value >= 1
+    && value <= MAX_QUOTA_WINDOW_DURATION_MINUTES;
+}
+
+export function selectPrimaryCodexQuotaWindow(windows) {
+  let selected = null;
+  for (const window of Array.isArray(windows) ? windows : []) {
+    if (!isPrimaryCodexQuotaWindow(window)) continue;
+    if (selected === null) {
+      selected = window;
+      continue;
+    }
+    const durationMinutes = finite(window.durationMinutes);
+    const selectedDurationMinutes = finite(selected.durationMinutes);
+    if (durationMinutes > selectedDurationMinutes
+        || (durationMinutes === selectedDurationMinutes
+          && window.slot === "primary"
+          && selected.slot !== "primary")) {
+      selected = window;
+    }
+  }
+  return selected;
+}
+
+export function formatQuotaWindowDuration(durationMinutes) {
+  const duration = finite(durationMinutes, null);
+  if (!isValidQuotaWindowDuration(duration)) return "";
+  if (duration % (24 * 60) === 0) return `${duration / (24 * 60)}-day`;
+  if (duration % 60 === 0) return `${duration / 60}-hour`;
+  return `${duration}-minute`;
+}
+
+export function quotaWindowLabel(limitId, durationMinutes) {
+  const duration = finite(durationMinutes, null);
   if (limitId === CODEX_PRIMARY_LIMIT_ID
-      && durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
+      && duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
     return "Five-hour allowance";
   }
   if (limitId === CODEX_PRIMARY_LIMIT_ID
-      && durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+      && duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
     return "Seven-day allowance";
+  }
+  if (limitId === CODEX_PRIMARY_LIMIT_ID
+      && isValidQuotaWindowDuration(duration)) {
+    return `Provider-reported ${formatQuotaWindowDuration(duration)} window`;
   }
   return "Other observed allowance";
 }
@@ -1175,7 +1209,7 @@ function normalizeAccountScopedQuotaAnalysis(payload) {
     const windowDurationMinutes = count(continuity.windowDurationMinutes, null);
     if (
       !["openai_codex", "anthropic_claude_code"].includes(continuity.provider)
-      || !PRIMARY_CODEX_ALLOWANCE_WINDOW_MINUTES.has(windowDurationMinutes)
+      || !isValidQuotaWindowDuration(windowDurationMinutes)
     ) {
       return [];
     }
@@ -1923,7 +1957,10 @@ function normalizeLocalTimeline(value = {}) {
     const observedAt = text(row?.observedAt, "");
     const usedPercent = finite(row?.usedPercent, null);
     const remainingPercent = finite(row?.remainingPercent, null);
-    const durationMinutes = count(row?.durationMinutes, null);
+    const durationCandidate = count(row?.durationMinutes, null);
+    const durationMinutes = isValidQuotaWindowDuration(durationCandidate)
+      ? durationCandidate
+      : null;
     const resetAt = row?.resetAt === null ? "" : text(row?.resetAt, "");
     if (!Number.isFinite(Date.parse(observedAt))
         || usedPercent === null || usedPercent < 0 || usedPercent > 100
@@ -2117,7 +2154,10 @@ function safeState(value, fallback = "insufficient") {
 function normalizeQuota(window, index) {
   const used = finite(window?.usedPercent ?? window?.used_percent ?? window?.used, null);
   const remaining = finite(window?.remainingPercent ?? window?.remaining_percent, used === null ? null : 100 - used);
-  const durationMinutes = finite(window?.durationMinutes ?? window?.duration_minutes ?? window?.windowMinutes, null);
+  const durationCandidate = finite(window?.durationMinutes ?? window?.duration_minutes ?? window?.windowMinutes, null);
+  const durationMinutes = isValidQuotaWindowDuration(durationCandidate)
+    ? durationCandidate
+    : null;
   const limitId = normalizeQuotaLimitId(window?.limitId);
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),

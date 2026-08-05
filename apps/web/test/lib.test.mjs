@@ -43,6 +43,8 @@ import {
   CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
   CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION,
   CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
+  formatQuotaWindowDuration,
+  isValidQuotaWindowDuration,
   LOCAL_ONBOARDING_SCHEMA_VERSION,
   CommunityClient,
   demoDashboard,
@@ -68,6 +70,7 @@ import {
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION,
+  selectPrimaryCodexQuotaWindow,
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
   SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
@@ -1138,6 +1141,157 @@ test("normal Codex allowance selection uses stable identifiers, not labels", () 
   );
   assert.doesNotMatch(result.quotaWindows.map((row) => row.label).join(" "), /bengalfox/);
   assert.doesNotMatch(result.quotaWindows.map((row) => row.label).join(" "), /Account/);
+});
+
+test("web quota normalization accepts bounded provider windows without monthly claims", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    quotaWindows: [
+      {
+        id: "generic",
+        limitId: CODEX_PRIMARY_LIMIT_ID,
+        slot: "secondary",
+        durationMinutes: 43_200,
+        usedPercent: 12,
+        remainingPercent: 88,
+        planType: "pro"
+      },
+      {
+        id: "weekly",
+        limitId: CODEX_PRIMARY_LIMIT_ID,
+        slot: "primary",
+        durationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
+        usedPercent: 39,
+        remainingPercent: 61
+      }
+    ]
+  });
+  const generic = result.quotaWindows[0];
+  assert.equal(generic.durationMinutes, 43_200);
+  assert.equal(formatQuotaWindowDuration(generic.durationMinutes), "30-day");
+  assert.equal(generic.label, "Provider-reported 30-day window");
+  assert.doesNotMatch(generic.label, /month/i);
+  assert.equal(isPrimaryCodexQuotaWindow(generic), true);
+  assert.equal(
+    selectPrimaryCodexQuotaWindow(result.quotaWindows),
+    generic
+  );
+  assert.equal(
+    selectPrimaryCodexQuotaWindow([
+      result.quotaWindows[1],
+      { ...generic, slot: "primary", id: "generic-primary" }
+    ]).id,
+    "generic-primary"
+  );
+  const tied = [
+    { ...generic, id: "generic-secondary", slot: "secondary" },
+    { ...generic, id: "generic-primary", slot: "primary" },
+    { ...generic, id: "generic-primary-later", slot: "primary" }
+  ];
+  assert.equal(selectPrimaryCodexQuotaWindow(tied).id, "generic-primary");
+});
+
+test("web quota normalization rejects malformed and out-of-range durations", () => {
+  for (const durationMinutes of [
+    0,
+    -1,
+    1.5,
+    525_601,
+    Number.MAX_SAFE_INTEGER + 1,
+    NaN,
+    "not-a-duration"
+  ]) {
+    const result = normalizeDashboardPayload({
+      mode: "real_local_evidence",
+      status: "live",
+      quotaWindows: [{
+        limitId: CODEX_PRIMARY_LIMIT_ID,
+        durationMinutes,
+        usedPercent: 1,
+        remainingPercent: 99
+      }]
+    });
+    const row = result.quotaWindows[0];
+    assert.equal(row.durationMinutes, null, String(durationMinutes));
+    assert.equal(row.label, "Other observed allowance", String(durationMinutes));
+    assert.equal(isPrimaryCodexQuotaWindow(row), false, String(durationMinutes));
+  }
+  assert.equal(isValidQuotaWindowDuration(1), true);
+  assert.equal(isValidQuotaWindowDuration(525_600), true);
+  assert.equal(isValidQuotaWindowDuration(525_601), false);
+});
+
+test("account-scoped normalization keeps generic and seven-day tracks separate", () => {
+  const result = normalizeParticipantStats({
+    schemaVersion: PARTICIPANT_STATS_SCHEMA_VERSION,
+    accountScopedQuotaAnalysis: {
+      schemaVersion: "account-scoped-quota-analysis-v0.1",
+      status: "ready",
+      tracks: [
+        {
+          continuity: {
+            provider: "openai_codex",
+            planType: "pro",
+            planVariant: "pro-20x",
+            limitId: CODEX_PRIMARY_LIMIT_ID,
+            windowDurationMinutes: 43_200,
+            policyEpoch: "openai_agentic_pool_2026_07_09"
+          },
+          calibration: { tracks: [] },
+          rolling: { status: "not_testable" }
+        },
+        {
+          continuity: {
+            provider: "openai_codex",
+            planType: "pro",
+            planVariant: "pro-20x",
+            limitId: CODEX_PRIMARY_LIMIT_ID,
+            windowDurationMinutes: CODEX_WEEKLY_ALLOWANCE_MINUTES,
+            policyEpoch: "openai_agentic_pool_2026_07_09"
+          },
+          calibration: { tracks: [] },
+          rolling: { status: "not_testable" }
+        },
+        {
+          continuity: {
+            provider: "openai_codex",
+            planType: "pro",
+            planVariant: "pro-20x",
+            limitId: CODEX_PRIMARY_LIMIT_ID,
+            windowDurationMinutes: 0,
+            policyEpoch: "openai_agentic_pool_2026_07_09"
+          },
+          calibration: { tracks: [] },
+          rolling: { status: "not_testable" }
+        }
+      ]
+    }
+  });
+  assert.equal(result.accountScopedQuotaAnalysis.status, "ready");
+  assert.deepEqual(
+    result.accountScopedQuotaAnalysis.tracks.map((track) => track.windowDurationMinutes),
+    [43_200, CODEX_WEEKLY_ALLOWANCE_MINUTES]
+  );
+  assert.equal(result.accountScopedQuotaAnalysis.tracks[0].planType, "pro");
+  assert.doesNotMatch(
+    JSON.stringify(result.accountScopedQuotaAnalysis),
+    /monthly/i
+  );
+});
+
+test("generic quota presentation keeps plan evidence conservative and weekly surfaces exact", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const accountMatch = appSource.match(
+    /function renderAccountScopedQuotaAnalysis\(container, analysis\) \{([\s\S]*?)\n\}\n\nconst QUOTA_MOVEMENT_REASONS/u,
+  );
+  assert.ok(accountMatch, "account-scoped presentation source is available");
+  assert.match(appSource, /Provider reported plan type: \$\{candidate\}/u);
+  assert.match(accountMatch[1], /quotaWindowLabel\(\s*track\.limitId[\s\S]*?track\.windowDurationMinutes/u);
+  assert.match(accountMatch[1], /providerReportedPlanEvidence\(track\.planType\)/u);
+  assert.doesNotMatch(accountMatch[1], /track\.planVariant|monthly|Pro 5x|10x|20x/iu);
+  assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
+  assert.match(appSource, /Seven-day allowance estimate history/u);
 });
 
 test("local split overview contract derives quota and seven-day pricing without exposing identities", () => {
