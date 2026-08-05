@@ -311,9 +311,10 @@ npm run product:macos:validate:release
 
 For the first stable publication only, replace the previous-manifest option
 with the explicit `--stable-bootstrap` decision. The direct bundle builder
-refuses stable external output; only this release path sets its internal
-post-continuity handoff marker. Neither local release output nor this command
-claims that a signed production update has been published; the owner-only
+refuses stable external output; only this release path has the internal
+post-continuity authorization needed by the guarded release builder. Neither
+local release output nor this command claims that a signed production update
+has been published; the owner-only
 publisher and live appcast checks remain separate gates.
 
 Retain the previous signed/notarized DMG and manifest, and run the existing
