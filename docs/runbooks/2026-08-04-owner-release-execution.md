@@ -263,29 +263,27 @@ vars or staging receipts. The observer output alone is not a revision receipt;
 the owner must verify and record the active Worker revision in the bounded local
 proof file.
 
-Only after that fence is recorded may the owner use the separately reviewed
-production activation procedure: deploy the reviewed `invite_only` beta
-configuration through the receipt-gated command (never a generic `wrangler
-deploy`):
+There is **no checked-in beta activation command**. The runtime recognizes
+`invite_only`, but `production:deploy` intentionally rejects any production
+configuration other than the reviewed, fully disabled posture. Do not use that
+command, generic `wrangler deploy`, or a production SQL command to enable a
+beta.
 
-```sh
-npm --prefix apps/worker run production:deploy -- \
-  --receipt-file /owner-only/production-containment-proof.json \
-  --confirm DEPLOY_CONTAINED_PRODUCTION
-```
-
-Then issue only reviewed one-use invitations, and verify
-the exact live beta health/readiness and control receipt. The beta must remain
-non-public, publication-disabled, rate-bounded, and limited to the approved
-cohort. Do not put invitation secrets or OAuth material in receipts.
+Before a beta can proceed, add and independently review a dedicated activation
+procedure that proves the exact endpoint, cohort boundary, invitation policy,
+OAuth callback behavior, rollback path, and post-deploy health receipt. Until
+then, this runbook stops at the recorded containment fence. A future procedure
+must keep the beta non-public, publication-disabled, rate-bounded, and limited
+to the approved cohort; it must never put invitation secrets or OAuth material
+in receipts.
 
 **Gate / rollback.** Any open enrollment, uncontained control, public
 publication, unexpected participant, OAuth state/cancel failure, lifecycle
-failure, or cohort expansion pauses the beta immediately. Use the owner's
-reviewed production containment path, then restore the reviewed disabled
-configuration with the existing `production:deploy` path and re-run the
-containment observer. Do not improvise a production SQL or Wrangler command.
-No public intake gate may inherit a passing staging or dogfood receipt.
+failure, or cohort expansion pauses a future beta immediately. The existing
+`production:deploy` path is only a receipt-gated route back to the reviewed
+disabled configuration; re-run the containment observer after it. Do not
+improvise a production SQL or Wrangler command. No public intake gate may
+inherit a passing staging or dogfood receipt.
 
 ### 5. Public stable: publish, observe, then open intake
 

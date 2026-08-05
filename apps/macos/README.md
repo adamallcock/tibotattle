@@ -329,7 +329,18 @@ must not enter the repository or release host:
 
 ```bash
 npm run product:macos:release -- \
-  --channel stable
+  --channel stable \
+  --stable-bootstrap
+```
+
+`--stable-bootstrap` is an explicit first-stable-release decision. For every
+later stable release, replace it with the manifest from the immediately
+previous stable release so the gate can prove version continuity:
+
+```bash
+npm run product:macos:release -- \
+  --channel stable \
+  --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
 
 The command rejects a missing origin, HTTP, loopback, credentials, paths,
@@ -358,8 +369,12 @@ export USAGE_MONITOR_NOTARY_PROFILE='usage-monitor-notary'
 export USAGE_MONITOR_BUNDLE_VERSION='1'
 export USAGE_MONITOR_SPARKLE_FRAMEWORK="$PWD/.release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY='REPLACE_WITH_32_BYTE_BASE64_PUBLIC_KEY='
-npm run product:macos:release
+npm run product:macos:release -- --channel stable --stable-bootstrap
 ```
+
+For a later stable release, use `--previous-stable-manifest` in place of
+`--stable-bootstrap`, as shown above. The two options are mutually exclusive;
+the release command refuses to guess which continuity policy applies.
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
 and Sparkle appcast. Legacy `USAGE_MONITOR_PRODUCTION_ORIGIN` and
