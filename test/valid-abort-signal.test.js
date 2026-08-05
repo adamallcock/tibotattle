@@ -38,6 +38,19 @@ test("validAbortSignal rejects malformed objects", () => {
   for (const value of malformed) assert.equal(validAbortSignal(value), false);
 });
 
-test("provider normalization preserves the shared validator export", () => {
-  assert.equal(providerNormalization.validAbortSignal, validAbortSignal);
+test("provider normalization preserves validator behavior within its owner", () => {
+  const values = [
+    null,
+    new AbortController().signal,
+    { aborted: false, addEventListener() {} },
+    undefined,
+    {},
+    { aborted: "false", addEventListener() {} },
+  ];
+  for (const value of values) {
+    assert.equal(
+      providerNormalization.validAbortSignal(value),
+      validAbortSignal(value),
+    );
+  }
 });

@@ -2,7 +2,7 @@ import Ajv from "ajv";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { safeValidationErrors } from "../safe-validation-errors.js";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 
 export const EXPORT_WORKSPACE_DISCARD_PLAN_VERSION = "local-export-workspace-discard-plan-v0.1";
 export const EXPORT_WORKSPACE_DISCARD_PREFLIGHT_VERSION = "usage-export-workspace-discard-preflight-v0.1";

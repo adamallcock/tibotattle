@@ -1,5 +1,5 @@
 import Ajv from "ajv";
-import { safeValidationErrors } from "../safe-validation-errors.js";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 
 import activityMarkerSchema from "../../schemas/telemetry-v0.1/activity-marker.schema.json" with { type: "json" };
 import bundleSchema from "../../schemas/telemetry-v0.1/bundle.schema.json" with { type: "json" };

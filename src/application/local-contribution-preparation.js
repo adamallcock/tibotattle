@@ -5,7 +5,6 @@ import {
   preparedContributionSetId,
 } from "../contribution/index.js";
 import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "../export/index.js";
-import { validAbortSignal } from "../valid-abort-signal.js";
 
 export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
@@ -337,6 +336,13 @@ function mappedError(error, stage, signal = null) {
     );
   }
   return new LocalContributionPreparationError("preparation_failed");
+}
+
+function validAbortSignal(signal) {
+  return signal === null
+    || (typeof signal === "object"
+      && typeof signal.aborted === "boolean"
+      && typeof signal.addEventListener === "function");
 }
 
 function throwIfPreparationAborted(signal) {

@@ -2,7 +2,7 @@ import Ajv from "ajv";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { safeValidationErrors } from "../safe-validation-errors.js";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 import { MAXIMUM_EXPORT_SET_CHUNKS } from "./set-schema.js";
 
 export const EXPORT_DELETION_PLAN_VERSION = "local-export-deletion-plan-v0.1";

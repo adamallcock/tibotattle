@@ -1,5 +1,5 @@
 import Ajv from "ajv";
-import { safeValidationErrors } from "../safe-validation-errors.js";
+import { safeValidationErrors } from "./safe-validation-errors.js";
 
 import compatibilitySchema from "../../schemas/telemetry-v0.1/compatibility.schema.json" with { type: "json" };
 import manifestSchemaV0_1 from "../../schemas/export-set-v0.1/manifest.schema.json" with { type: "json" };
