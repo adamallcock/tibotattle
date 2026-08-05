@@ -177,6 +177,23 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/check-root-workspace-hygiene.mjs",
+      "stableAlias": "tools:root-workspace:check",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.tools:root-workspace:check",
+        "package.json#scripts.test:preflight",
+        "test/root-workspace-hygiene.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "The checker is a live repository layout gate that prevents generated reports and unreviewed entries from accumulating at the project root.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "local_review_release",
       "canonicalPath": "scripts/check-local-review-signing-readiness.js",
       "stableAlias": null,
