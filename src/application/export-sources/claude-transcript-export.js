@@ -1,4 +1,5 @@
 import { ExportResourceLimitError, stableJson } from "../../export/index.js";
+import { safeCount, validSha256 } from "./source-validation.js";
 
 export function createClaudeTranscriptExportContext(configuration) {
 const {
@@ -45,14 +46,6 @@ class ClaudeTranscriptExportSourceError extends Error {
 
 function fail(code) {
   throw new ClaudeTranscriptExportSourceError(code);
-}
-
-function safeCount(value) {
-  return Number.isSafeInteger(value) && value >= 0;
-}
-
-function validSha256(value) {
-  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
 function canonicalIso(value) {

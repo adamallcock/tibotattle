@@ -3,6 +3,7 @@ import {
   normalizeSupplementalSourcePlan,
   stableJson,
 } from "../../export/index.js";
+import { safeCount, validSha256 } from "./source-validation.js";
 
 export function createCodexCollectorWorkspaceContext(configuration) {
 const {
@@ -40,7 +41,6 @@ const CODEX_COLLECTOR_DIAGNOSTIC_FIELDS = Object.freeze([
   "malformedAccountScopes", "outOfBoundsRecords", "oversizedIrrelevantLines",
 ]);
 
-const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const MAXIMUM_BATCH_RECORDS = 1_000;
 const SAFE_CODES = new Set(["configuration", "source_integrity"]);
 
@@ -61,14 +61,6 @@ function exactKeys(value, keys) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === keys.length
     && keys.every((key) => Object.hasOwn(value, key));
-}
-
-function validSha256(value) {
-  return typeof value === "string" && SHA256_PATTERN.test(value);
-}
-
-function safeCount(value) {
-  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function codexCollectorWorkspaceSourceKey(sourcePlanSha256) {

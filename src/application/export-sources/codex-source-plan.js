@@ -6,6 +6,7 @@ import {
   stableJson,
   summarizeExportSourcePlan,
 } from "../../export/index.js";
+import { validSha256 } from "./source-validation.js";
 
 export function createCodexSourcePlanContext(configuration) {
 const {
@@ -19,10 +20,6 @@ const {
 const { discoverCodexRolloutInfos } = createLocalCodexLogScanner(codexLogPorts);
 
 function fail(code) { throw new ExportSourcePlanError(code); }
-
-function validSha256(value) {
-  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-}
 
 function sourceKey(rolloutKey) {
   return createHash("sha256")
