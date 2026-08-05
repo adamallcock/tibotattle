@@ -1,9 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildLocalCompanionSnapshot } from "../src/local-companion-data.js";
+import {
+  commitLocalCollectorState,
+  defaultLocalCollectorStatePath,
+  prepareLocalCollectorState,
+} from "../src/local-collector-state.js";
 import {
   projectWeeklyPaceForecast,
   weeklyPaceSnapshotsFromCollectorRecord,
@@ -55,20 +60,31 @@ function quotaRecord({
   };
 }
 
+// These fixtures exercise the current owner-only SQLite state directly.
+// Legacy JSON migration remains covered by local-collector-state.test.js.
+async function writeCollectorState(root, records) {
+  const stateFile = defaultLocalCollectorStatePath(root);
+  await prepareLocalCollectorState({ stateFile, clock: () => NOW });
+  await commitLocalCollectorState({
+    stateFile,
+    checkpoint: {},
+    records,
+    clock: () => NOW,
+  });
+}
+
 test("local companion sends a private account-scoped pace ETA as a safe public projection", async () => {
   const root = await mkdtemp(join(tmpdir(), "weekly-pace-local-companion-"));
+  const stateFile = defaultLocalCollectorStatePath(root);
   const records = [
     quotaRecord({ observedAt: "2026-08-03T12:15:00.000Z", usedPercent: 20 }),
     quotaRecord({ observedAt: "2026-08-03T12:30:00.000Z", usedPercent: 30 }),
   ];
   try {
-    await mkdir(join(root, ".usage-monitor"));
-    await writeFile(
-      join(root, ".usage-monitor", "collector-events.jsonl"),
-      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
-    );
+    await writeCollectorState(root, records);
     const snapshot = await buildLocalCompanionSnapshot({
       root,
+      collectorStateFile: stateFile,
       now: () => NOW,
       allowDevelopmentArtifactFallback: false,
     });
@@ -131,17 +147,15 @@ test("the local pace adapter refuses an unattributed or non-app-server current o
 
 test("local companion retains one safe observation as a non-predictive waiting state", async () => {
   const root = await mkdtemp(join(tmpdir(), "weekly-pace-waiting-state-"));
+  const stateFile = defaultLocalCollectorStatePath(root);
   const records = [
     quotaRecord({ observedAt: "2026-08-03T12:15:00.000Z", usedPercent: 20 }),
   ];
   try {
-    await mkdir(join(root, ".usage-monitor"));
-    await writeFile(
-      join(root, ".usage-monitor", "collector-events.jsonl"),
-      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
-    );
+    await writeCollectorState(root, records);
     const snapshot = await buildLocalCompanionSnapshot({
       root,
+      collectorStateFile: stateFile,
       now: () => NOW,
       allowDevelopmentArtifactFallback: false,
     });

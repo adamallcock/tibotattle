@@ -82,9 +82,9 @@ test("refresh projects a safe account-scoped weekly pace ETA", async () => {
 
 test("owner-only refresh retains the safe pace card through cache validation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-pace-cache-"));
-  const cacheFile = join(directory, "accounting.json");
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
   const written = await refreshReplaySafeAccountingCache({
-    cacheFile,
+    stateFile,
     now: () => NOW,
     scan: async ({ onRateLimitSnapshot }) => {
       onRateLimitSnapshot(snapshot({
@@ -100,7 +100,7 @@ test("owner-only refresh retains the safe pace card through cache validation", a
       return { diagnostics: {} };
     },
   });
-  const read = await readReplaySafeAccountingCache({ cacheFile });
+  const read = await readReplaySafeAccountingCache({ stateFile });
   assert.equal(read.status, "available");
   assert.deepEqual(read.cache.weekly, written.weekly);
 });
