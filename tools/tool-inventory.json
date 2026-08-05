@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-08-03",
+  "reviewedAt": "2026-08-04",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -36,18 +36,49 @@
       "legacyPaths": []
     },
     {
+      "classification": "reusable_benchmark",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/benchmark-test-lanes.mjs",
+      "stableAlias": "test:benchmark",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "test:benchmark:release"
+      ],
+      "callers": [
+        "package.json#scripts.test:benchmark",
+        "package.json#scripts.test:benchmark:release",
+        "test/benchmark-test-lanes.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Benchmark lane orchestration is test infrastructure rather than a standalone dated research artifact.",
+      "legacyPaths": []
+    },
+    {
       "classification": "build_release_operation",
       "owner": "macos_release",
       "canonicalPath": "scripts/build-macos-app.js",
       "stableAlias": "product:macos:build",
       "stableAliasReason": null,
-      "additionalAliases": [],
+      "additionalAliases": [
+        "product:macos:preview:build",
+        "product:macos:preview:validate"
+      ],
       "callers": [
         "package.json#scripts.product:macos:build",
+        "package.json#scripts.product:macos:preview:build",
+        "package.json#scripts.product:macos:preview:validate",
+        "apps/worker/scripts/check-deployment-endpoints.mjs",
         "scripts/macos-release-core.js",
+        "scripts/build-public-release-site.js",
+        "scripts/install-macos-preview-app.js",
+        "scripts/verify-macos-preview-remote.js",
         "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
+        "test/macos-localization.test.js",
+        "test/macos-test-build.test.mjs",
         "test/public-release-site.test.js",
+        "test/weekly-pace-macos-runtime.test.js",
         "apps/local/README.md",
         "apps/macos/README.md"
       ],
@@ -183,7 +214,8 @@
       "stableAliasReason": "Client boundary exporter is invoked directly with an output path and is not a supported npm command.",
       "additionalAliases": [],
       "callers": [
-        "test/export-tibotattle-client.test.js"
+        "test/export-tibotattle-client.test.js",
+        "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_until_client_repository_cutover",
       "provenance": "docs/decisions/2026-08-02-public-client-private-service-provenance-decision.md",
@@ -237,6 +269,26 @@
     {
       "classification": "build_release_operation",
       "owner": "telemetry_contract",
+      "canonicalPath": "scripts/generate-i18n-browser-mirror.js",
+      "stableAlias": "i18n:browser:generate",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "i18n:browser:check"
+      ],
+      "callers": [
+        "package.json#scripts.i18n:browser:generate",
+        "package.json#scripts.i18n:browser:check",
+        "scripts/export-tibotattle-client.mjs",
+        "apps/web/test/i18n-browser-parity.test.mjs"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Generated browser mirror has a canonical package source and parity test, but no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "telemetry_contract",
       "canonicalPath": "scripts/generate-telemetry-contract.js",
       "stableAlias": "telemetry:generate",
       "stableAliasReason": null,
@@ -253,6 +305,23 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/receipts/2026-07-24-g1-exporter-hardening-receipt.md",
       "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/install-macos-preview-app.js",
+      "stableAlias": "product:macos:preview:install",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:preview:install",
+        "test/macos-preview-install.test.js",
+        "docs/plans/2026-08-03-native-first-macos-client-migration-plan.md"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Preview installer is a test-covered macOS release operation with operator guidance but no separate dated provenance artifact.",
       "legacyPaths": []
     },
     {
@@ -345,10 +414,13 @@
         "scripts/package-macos-dmg.js",
         "scripts/release-macos-app.js",
         "scripts/validate-macos-install.js",
+        "scripts/validate-macos-login-item-release.js",
+        "scripts/verify-macos-preview-remote.js",
         "scripts/build-public-release-site.js",
         "scripts/publish-sparkle-update.js",
         "test/macos-app-bundle.test.js",
         "test/public-release-site.test.js",
+        "test/publish-sparkle-update.test.js",
         "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
       ],
       "decision": "retain_as_internal_release_support",
@@ -367,10 +439,12 @@
         "scripts/prepare-sparkle-framework.js",
         "scripts/macos-release-core.js",
         "scripts/build-macos-app.js",
+        "scripts/verify-macos-preview-remote.js",
         "test/macos-app-bundle.test.js",
         "test/public-release-site.test.js",
         "test/macos-updater.test.js",
         "test/macos-updater-release.test.mjs",
+        "test/publish-sparkle-update.test.js",
         "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
       ],
       "decision": "retain_as_internal_release_support",
@@ -421,7 +495,8 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.product:macos:dmg"
+        "package.json#scripts.product:macos:dmg",
+        "test/macos-app-bundle.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -453,7 +528,9 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.product:macos:publish-update",
+        "apps/worker/scripts/check-deployment-endpoints.mjs",
         "test/publish-sparkle-update.test.js",
+        "test/release-channel-policy.test.js",
         "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md"
       ],
       "decision": "retain_and_relocate_after_inventory",
@@ -522,7 +599,8 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.product:macos:release"
+        "package.json#scripts.product:macos:release",
+        "test/release-channel-policy.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -574,6 +652,36 @@
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": null,
       "provenanceReason": "The command creates its own content-free aggregate qualification receipt.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/test-lanes.mjs",
+      "stableAlias": "test:preflight",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "test:fast",
+        "test:changed",
+        "test:changed:full",
+        "test:macos:source",
+        "test:macos:smoke",
+        "test:macos:artifact"
+      ],
+      "callers": [
+        "package.json#scripts.test:preflight",
+        "package.json#scripts.test:fast",
+        "package.json#scripts.test:changed",
+        "package.json#scripts.test:changed:full",
+        "package.json#scripts.test:macos:source",
+        "package.json#scripts.test:macos:smoke",
+        "package.json#scripts.test:macos:artifact",
+        "scripts/benchmark-test-lanes.mjs",
+        "test/test-lanes.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Test lane selection is shared repository test infrastructure rather than a standalone dated research artifact.",
       "legacyPaths": []
     },
     {
@@ -645,6 +753,22 @@
     {
       "classification": "build_release_operation",
       "owner": "macos_release",
+      "canonicalPath": "scripts/validate-macos-login-item-release.js",
+      "stableAlias": "product:macos:validate:login-item-release",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:validate:login-item-release",
+        "test/macos-app-bundle.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Login Item release validation is a test-covered macOS release gate with no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
       "canonicalPath": "scripts/validate-macos-replacement.js",
       "stableAlias": null,
       "stableAliasReason": "Replacement validator is an internal release helper documented for operator use.",
@@ -656,6 +780,27 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "The replacement validator is test-covered, but no dated provenance artifact directly identifies this entry point.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/verify-macos-preview-remote.js",
+      "stableAlias": "product:macos:preview:remote",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.product:macos:preview:remote",
+        "package.json#scripts.product:macos:preview:remote:live",
+        "apps/macos/README.md",
+        "apps/worker/scripts/release-readiness-lib.mjs",
+        "docs/runbooks/2026-08-04-internal-update-rehearsal.md",
+        "test/macos-preview-remote.test.js",
+        "test/verify-macos-preview-remote.test.js"
+      ],
+      "decision": "retain_and_relocate_after_inventory",
+      "provenance": null,
+      "provenanceReason": "Preview remote verification is a test-covered macOS release operation with runbook guidance but no separate dated provenance artifact.",
       "legacyPaths": []
     },
     {
