@@ -327,6 +327,111 @@ test("local companion builds a closed real-data projection without identifiers o
   }
 });
 
+test("local companion relays bounded durations and selects a deterministic primary window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-generic-quota-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-07-25T11:45:00.000Z",
+        windows: [
+          {
+            limitId: "codex",
+            slot: "secondary",
+            planType: "plus",
+            usedPercent: 20,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 30,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "pro",
+            usedPercent: 40,
+            windowDurationMins: 300,
+            resetsAt: 1_784_916_000,
+          },
+          {
+            limitId: "codex",
+            slot: "secondary",
+            planType: "pro",
+            usedPercent: 50,
+            windowDurationMins: 10_080,
+            resetsAt: 1_785_376_800,
+          },
+          {
+            limitId: "codex_bengalfox",
+            slot: "primary",
+            planType: "enterprise",
+            usedPercent: 60,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "pro",
+            usedPercent: 70,
+            windowDurationMins: 0,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            planType: "pro",
+            usedPercent: 80,
+            windowDurationMins: 525_601,
+            resetsAt: 1_784_980_800,
+          },
+        ],
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const windows = snapshot.overview.quota.windows;
+    assert.deepEqual(
+      windows.map((window) => [
+        window.limitId,
+        window.slot,
+        window.durationMinutes,
+        window.planType,
+      ]),
+      [
+        ["codex", "primary", 43_200, "unknown"],
+        ["codex", "secondary", 43_200, "plus"],
+        ["codex", "primary", 300, "pro"],
+        ["codex", "secondary", 10_080, "pro"],
+        ["codex_bengalfox", "primary", 43_200, "enterprise"],
+      ],
+    );
+    assert.equal(snapshot.overview.quotaWindows[0].durationMinutes, 43_200);
+    assert.equal(
+      JSON.stringify(snapshot).includes("monthly"),
+      false,
+    );
+    assert.equal(
+      Object.hasOwn(snapshot.overview.quota.windows[0], "planType"),
+      true,
+    );
+    assert.equal(snapshot.overview.quota.windows[0].planType, "unknown");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("the stated speed mode attributes unrecorded evidence and never overrides an observed mode", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-companion-fast-mode-"));
   try {

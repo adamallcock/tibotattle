@@ -20,6 +20,9 @@ import { dirname, join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import {
+  isValidQuotaWindowDuration,
+} from "@app-usagemonitor/quota-analysis";
+import {
   canonicalComponents,
   createLeadingRateLimitGate,
   deltaComponentPresence,
@@ -30,16 +33,17 @@ import {
 import { stableJson } from "./export/index.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
-  "local-analysis-index-v4";
-// Bumped when extraction changes what the index can hold. v3 gated quota
-// admission; v4 stops the chunk reader from rebuilding a record out of a reused
-// buffer, so every index built before it is missing whichever records happened
-// to straddle a read boundary and must be rebuilt rather than reused.
+  "local-analysis-index-v5";
+// Bumped when extraction or index semantics change. v3 gated quota admission;
+// v4 stops the chunk reader from rebuilding a record out of a reused buffer, so
+// every index built before it is missing whichever records happened to straddle
+// a read boundary; v5 keeps provider-reported quota duration in the leading
+// window identity and refuses out-of-range cached quota facts.
 export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
-  "parallel-jsonl-accounting-v4";
+  "parallel-jsonl-accounting-v5";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
-const INDEX_USER_VERSION = 4;
+const INDEX_USER_VERSION = 5;
 const DEFAULT_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_WORKERS = 10;
 const BOUNDARY_BYTES = 4 * 1024;
@@ -1009,6 +1013,31 @@ function validOptionalPositiveSafeInteger(value) {
     || (Number.isSafeInteger(value) && value >= 1);
 }
 
+// The shared leading-reading gate predates generic provider durations and uses
+// provider/limit/slot as its opaque identity. Keep the duration in the local
+// gate key until every caller has the duration-aware contract; the original
+// entry remains the payload returned to the index projection.
+function quotaGateIdentity(window) {
+  return {
+    ...window,
+    slot: `${window.slot}\u0000${window.windowDurationMins}`,
+  };
+}
+
+function createDurationAwareQuotaGate(settledWindows) {
+  const gate = createLeadingRateLimitGate(
+    settledWindows.map(quotaGateIdentity),
+  );
+  return {
+    offer(window, timestampMs, entry) {
+      return gate.offer(quotaGateIdentity(window), timestampMs, entry);
+    },
+    flush() {
+      return gate.flush();
+    },
+  };
+}
+
 function validOptionalDiscoveryLimits(value) {
   return value === null
     || (value
@@ -1533,8 +1562,11 @@ async function deriveChangedSources({
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const settledQuotaWindows = database.prepare(`
-    SELECT DISTINCT provider, limit_id, slot
-    FROM quota_facts WHERE source_key = ?
+    SELECT DISTINCT provider, limit_id, slot, window_duration_mins
+    FROM quota_facts
+    WHERE source_key = ?
+      AND window_duration_mins BETWEEN 1 AND 525600
+      AND window_duration_mins = CAST(window_duration_mins AS INTEGER)
   `);
   const updateState = database.prepare(`
     UPDATE sources SET current_model=?, current_model_seen=?,
@@ -1628,6 +1660,8 @@ async function deriveChangedSources({
                window_duration_mins, resets_at, source_offset
         FROM ${schema}.quota_records
         WHERE source_key = ?
+          AND window_duration_mins BETWEEN 1 AND 525600
+          AND window_duration_mins = CAST(window_duration_mins AS INTEGER)
         ORDER BY source_offset, slot_order
       `),
     };
@@ -1714,11 +1748,12 @@ async function deriveChangedSources({
     let nextQuota = quotaIterator.next();
     // An appended source already committed its leading reading in an earlier
     // pass, so only a window this source has never recorded is still leading.
-    const leadingQuotaGate = createLeadingRateLimitGate(
+    const leadingQuotaGate = createDurationAwareQuotaGate(
       [...settledQuotaWindows.iterate(source.sourceKey)].map((row) => ({
         provider: row.provider,
         limitId: row.limit_id,
         slot: row.slot,
+        windowDurationMins: Number(row.window_duration_mins),
       })),
     );
     const commitQuota = async (entry) => {
@@ -1840,6 +1875,11 @@ async function deriveChangedSources({
             && Number(nextQuota.value.source_offset)
               === Number(row.source_offset)) {
           const quota = nextQuota.value;
+          const windowDurationMins = Number(quota.window_duration_mins);
+          if (!isValidQuotaWindowDuration(windowDurationMins)) {
+            nextQuota = quotaIterator.next();
+            continue;
+          }
           const entry = {
             sourceOffset: Number(row.source_offset),
             slotOrder: Number(quota.slot_order),
@@ -1850,7 +1890,7 @@ async function deriveChangedSources({
             limitId: quota.limit_id,
             slot: quota.slot,
             usedPercent: Number(quota.used_percent),
-            windowDurationMins: Number(quota.window_duration_mins),
+            windowDurationMins,
             resetsAt: Number(quota.resets_at),
           };
           const gated = leadingQuotaGate.offer(
@@ -2260,11 +2300,15 @@ function readIndexScan(database, {
              window_duration_mins, resets_at
       FROM quota_facts
       WHERE timestamp_ms >= ? AND timestamp_ms <= ?
+        AND window_duration_mins BETWEEN 1 AND 525600
+        AND window_duration_mins = CAST(window_duration_mins AS INTEGER)
       ORDER BY timestamp_ms, source_key, source_offset, slot_order
     `).iterate(startMs, endMs)) {
       throwIfAborted(signal);
       const source = sourceMap.get(row.source_key);
       if (!source) continue;
+      const windowDurationMins = Number(row.window_duration_mins);
+      if (!isValidQuotaWindowDuration(windowDurationMins)) continue;
       const quotaResult = onRateLimitSnapshot?.({
         timestamp: row.observed_at,
         timestampMs: Number(row.timestamp_ms),
@@ -2275,7 +2319,7 @@ function readIndexScan(database, {
           limitId: row.limit_id,
           slot: row.slot,
           usedPercent: Number(row.used_percent),
-          windowDurationMins: Number(row.window_duration_mins),
+          windowDurationMins,
           resetsAt: Number(row.resets_at),
         },
         surfaceClassification: {

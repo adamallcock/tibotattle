@@ -107,6 +107,31 @@ test("local refresh exposes only the closed fresh direct-provider notification r
   assert.equal(JSON.stringify(valid).includes("account"), false);
   assert.equal(JSON.stringify(valid).includes("/private/"), false);
 
+  const genericRunner = createLocalCollectorRefreshRunner({
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 0,
+      refresh: {
+        attempted: true,
+        recordWritten: true,
+        errorCode: null,
+        notificationEvidence: {
+          ...FRESH_NOTIFICATION_EVIDENCE,
+          windows: [{
+            ...FRESH_NOTIFICATION_EVIDENCE.windows[0],
+            durationMinutes: 43_200,
+          }],
+        },
+      },
+    }),
+  });
+  assert.equal(
+    (await genericRunner()).notificationEvidence.windows[0].durationMinutes,
+    43_200,
+  );
+
   const expiredRunner = createLocalCollectorRefreshRunner({
     clock: () => Date.parse("2026-07-23T12:05:00.001Z"),
     selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
@@ -130,11 +155,25 @@ test("local refresh exposes only the closed fresh direct-provider notification r
     ["stale", { ...FRESH_NOTIFICATION_EVIDENCE, freshness: "stale" }],
     ["mixed source", { ...FRESH_NOTIFICATION_EVIDENCE, source: "ledger" }],
     ["inferred", { ...FRESH_NOTIFICATION_EVIDENCE, status: "inferred" }],
-    ["unknown duration", {
+    ["zero duration", {
       ...FRESH_NOTIFICATION_EVIDENCE,
       windows: [{
         ...FRESH_NOTIFICATION_EVIDENCE.windows[0],
-        durationMinutes: 60,
+        durationMinutes: 0,
+      }],
+    }],
+    ["overlong duration", {
+      ...FRESH_NOTIFICATION_EVIDENCE,
+      windows: [{
+        ...FRESH_NOTIFICATION_EVIDENCE.windows[0],
+        durationMinutes: 525_601,
+      }],
+    }],
+    ["fractional duration", {
+      ...FRESH_NOTIFICATION_EVIDENCE,
+      windows: [{
+        ...FRESH_NOTIFICATION_EVIDENCE.windows[0],
+        durationMinutes: 1.5,
       }],
     }],
   ]) {

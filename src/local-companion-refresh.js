@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  isValidQuotaWindowDuration,
+} from "@app-usagemonitor/quota-analysis";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
 import { runCollectorOnce } from "./passive-collector.js";
 import {
@@ -62,7 +65,6 @@ const HEADLINE_READY_INDEXING_STATUSES = new Set([
 ]);
 const QUOTA_NOTIFICATION_EVIDENCE_SCHEMA =
   "tibotattle-notification-evidence-v2";
-const QUOTA_NOTIFICATION_DURATION_MINUTES = new Set([300, 10_080]);
 const QUOTA_NOTIFICATION_LANES = new Set(["primary", "secondary"]);
 const QUOTA_NOTIFICATION_CONTINUITY_KEY = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_NOTIFICATION_EVIDENCE_AGE_MS = 5 * 60 * 1_000;
@@ -180,7 +182,7 @@ function publicNotificationEvidence(value, now = Date.now()) {
         || window.usedPercent < 0
         || window.usedPercent > 100
         || !Number.isSafeInteger(window.durationMinutes)
-        || !QUOTA_NOTIFICATION_DURATION_MINUTES.has(window.durationMinutes)
+        || !isValidQuotaWindowDuration(window.durationMinutes)
         || safeCanonicalInstant(window.resetAt) === null
         || Date.parse(window.resetAt) <= Date.parse(value.observedAt)
         || window.resetProofKind !== "provider_reported_schedule_only") return null;

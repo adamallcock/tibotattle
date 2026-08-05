@@ -17,6 +17,9 @@ import {
   priceCodexUsageEvent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
+import {
+  isValidQuotaWindowDuration,
+} from "@app-usagemonitor/quota-analysis";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   readReplaySafeAccountingCache,
@@ -1005,10 +1008,12 @@ function finalizeTimelineBuckets(buckets) {
 function quotaWindowProjection(window) {
   if (!window || typeof window !== "object") return null;
   const usedPercent = finiteNumber(window.usedPercent);
-  const durationMinutes = Number.isSafeInteger(window.windowDurationMins)
-    && window.windowDurationMins > 0
+  const durationMinutes = isValidQuotaWindowDuration(
+    window.windowDurationMins,
+  )
     ? window.windowDurationMins
     : null;
+  if (durationMinutes === null) return null;
   const resetsAtSeconds = Number.isSafeInteger(window.resetsAt) && window.resetsAt > 0
     ? window.resetsAt
     : null;
@@ -1025,6 +1030,40 @@ function quotaWindowProjection(window) {
       ? null
       : new Date(resetsAtSeconds * 1_000).toISOString(),
   };
+}
+
+function primaryCodexWindowIndex(windows) {
+  let selected = -1;
+  for (let index = 0; index < windows.length; index += 1) {
+    const candidate = windows[index];
+    if (candidate.limitId !== "codex") continue;
+    if (selected === -1) {
+      selected = index;
+      continue;
+    }
+    const prior = windows[selected];
+    if (candidate.durationMinutes > prior.durationMinutes
+        || (candidate.durationMinutes === prior.durationMinutes
+          && candidate.slot === "primary"
+          && prior.slot !== "primary")) {
+      selected = index;
+    }
+  }
+  return selected;
+}
+
+// Keep every observed window, but put the selected normal Codex window first.
+// The scan is stable for equal duration/slot candidates, so provider ordering
+// remains the final deterministic tie-breaker and planType stays attached only
+// to the window where it was observed.
+function orderQuotaWindows(windows) {
+  const selected = primaryCodexWindowIndex(windows);
+  if (selected <= 0) return windows;
+  return [
+    windows[selected],
+    ...windows.slice(0, selected),
+    ...windows.slice(selected + 1),
+  ];
 }
 
 function finalizeQuotaTimeline(rows) {
@@ -1412,10 +1451,10 @@ function latestQuotaProjection(records) {
     .at(-1);
   if (!latest) return { status: "unavailable", observedAt: null, windows: [] };
   const windows = Array.isArray(latest.windows)
-    ? latest.windows.flatMap((window) => {
+    ? orderQuotaWindows(latest.windows.flatMap((window) => {
       const projected = quotaWindowProjection(window);
       return projected === null ? [] : [projected];
-    })
+    }))
     : [];
   return {
     status: windows.length > 0 ? "available" : "unavailable",

@@ -50,7 +50,18 @@ function usage(input, output = 0) {
   };
 }
 
-function token(timestamp, total, last, usedPercent) {
+function token(
+  timestamp,
+  total,
+  last,
+  usedPercent,
+  {
+    primaryDuration = 300,
+    secondaryDuration = 10080,
+    primaryResetAt = 1784912400,
+    secondaryResetAt = 1785430800,
+  } = {},
+) {
   return JSON.stringify({
     timestamp,
     type: "event_msg",
@@ -65,13 +76,13 @@ function token(timestamp, total, last, usedPercent) {
         plan_type: "pro",
         primary: {
           used_percent: usedPercent,
-          window_minutes: 300,
-          resets_at: 1784912400,
+          window_minutes: primaryDuration,
+          resets_at: primaryResetAt,
         },
         secondary: {
           used_percent: usedPercent / 2,
-          window_minutes: 10080,
-          resets_at: 1785430800,
+          window_minutes: secondaryDuration,
+          resets_at: secondaryResetAt,
         },
       },
     },
@@ -392,6 +403,149 @@ test("persistent local index preserves replay-safe accounting and appends only n
   assert.equal(
     updated.lastScan.bytes <= (await stat(childPath)).size - beforeAppendSize,
     true,
+  );
+});
+
+test("local index keeps quota durations distinct and relays a valid generic window", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${[
+    token(
+      "2026-07-24T12:06:00.000Z",
+      usage(240, 50),
+      usage(20, 10),
+      18,
+      {
+        primaryDuration: 43_200,
+        primaryResetAt: 1784912400,
+      },
+    ),
+    token(
+      "2026-07-24T12:07:00.000Z",
+      usage(260, 60),
+      usage(20, 10),
+      30,
+      {
+        primaryDuration: 43_200,
+        primaryResetAt: 1784912400,
+      },
+    ),
+  ].join("\n")}\n`);
+  const indexFile = join(root, "local-analysis-index-generic.sqlite");
+  const secretFile = join(root, "local-analysis-index-generic-secret");
+  const indexedScan = createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 2,
+    chunkBytes: CHUNK_BYTES,
+  });
+
+  const result = await receipt(indexedScan, codexHome);
+  const genericRows = result.quotaRows.filter(
+    (row) => row.window.windowDurationMins === 43_200,
+  );
+  assert.deepEqual(
+    genericRows.map((row) => [row.timestamp, row.window.usedPercent]),
+    [["2026-07-24T12:07:00.000Z", 30]],
+  );
+  assert.equal(
+    result.quotaRows.some(
+      (row) => row.window.windowDurationMins === 300,
+    ),
+    true,
+  );
+  assert.equal(
+    result.quotaRows.some(
+      (row) => row.window.windowDurationMins === 10_080,
+    ),
+    true,
+  );
+  assert.equal(
+    (await inspectLocalAnalysisIndex({ indexFile })).schemaVersion,
+    "local-analysis-index-v5",
+  );
+});
+
+test("local index refuses an out-of-range provider duration without losing source data", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${token(
+    "2026-07-24T12:06:00.000Z",
+    usage(240, 50),
+    usage(20, 10),
+    18,
+    { primaryDuration: 525_601 },
+  )}\n`);
+  const indexFile = join(root, "local-analysis-index-invalid-duration.sqlite");
+  const secretFile = join(root, "local-analysis-index-invalid-duration-secret");
+  const result = await receipt(createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  }), codexHome);
+
+  assert.equal(
+    result.quotaRows.some(
+      (row) => row.window.windowDurationMins === 525_601,
+    ),
+    false,
+  );
+  assert.equal((await stat(parentPath)).size > 0, true);
+  assert.equal(
+    (await inspectLocalAnalysisIndex({ indexFile })).quotaFacts > 0,
+    true,
+  );
+});
+
+test("local index rebuilds a prior semantic generation from source logs", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${token(
+    "2026-07-24T12:06:00.000Z",
+    usage(240, 50),
+    usage(20, 10),
+    18,
+    { primaryDuration: 43_200 },
+  )}\n`);
+  const indexFile = join(root, "local-analysis-index-rebuild.sqlite");
+  const secretFile = join(root, "local-analysis-index-rebuild-secret");
+  await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  const sourceBytesBefore = (await stat(parentPath)).size;
+  const database = new DatabaseSync(indexFile);
+  try {
+    database.exec("PRAGMA user_version=4");
+    database.prepare(
+      "UPDATE meta SET value = ? WHERE key = ?",
+    ).run("local-analysis-index-v4", "schema_version");
+    database.prepare(
+      "UPDATE meta SET value = ? WHERE key = ?",
+    ).run("parallel-jsonl-accounting-v4", "parser_version");
+  } finally {
+    database.close();
+  }
+
+  const rebuilt = await refreshLocalAnalysisIndex({
+    indexFile,
+    secretFile,
+    codexHome,
+    startAt: START_AT,
+    endAt: END_AT,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+  assert.equal(rebuilt.status, "built");
+  assert.equal(rebuilt.scanBytes > 0, true);
+  assert.equal(rebuilt.sourceProjectionReusedCount, 0);
+  assert.equal((await stat(parentPath)).size, sourceBytesBefore);
+  assert.equal(
+    (await inspectLocalAnalysisIndex({ indexFile })).schemaVersion,
+    "local-analysis-index-v5",
   );
 });
 
