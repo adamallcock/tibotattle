@@ -46,6 +46,7 @@ import {
   createOwnerOnlyAutomaticContributionStorageContext,
   readCodexConfigServiceTier,
 } from "./platform/index.js";
+import { hasExactEnumerableKeys } from "./has-exact-enumerable-keys.js";
 
 export const CODEX_SPEED_BASELINE_SCHEMA_VERSION =
   "codex-speed-baseline-v0.1";
@@ -87,13 +88,6 @@ export class CodexSpeedBaselineError extends Error {
   }
 }
 
-function exactKeys(value, expected) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
-}
-
 function canonicalInstant(value) {
   if (typeof value !== "string" || value.length > 32) return null;
   const milliseconds = Date.parse(value);
@@ -103,7 +97,7 @@ function canonicalInstant(value) {
 }
 
 function validWindow(value) {
-  if (!exactKeys(value, WINDOW_KEYS)) return false;
+  if (!hasExactEnumerableKeys(value, WINDOW_KEYS)) return false;
   if (!DECLARABLE_MODES.includes(value.mode)) return false;
   const first = canonicalInstant(value.firstSeenAt);
   const last = canonicalInstant(value.lastSeenAt);
@@ -112,7 +106,7 @@ function validWindow(value) {
 }
 
 function validLedgerDocument(value) {
-  if (!exactKeys(value, LEDGER_KEYS)) return false;
+  if (!hasExactEnumerableKeys(value, LEDGER_KEYS)) return false;
   if (value.schemaVersion !== CODEX_SPEED_BASELINE_SCHEMA_VERSION) return false;
   if (!Array.isArray(value.windows)) return false;
   if (value.windows.length > MAXIMUM_WINDOWS) return false;

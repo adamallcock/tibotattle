@@ -21,6 +21,7 @@ import {
 import {
   createOwnerOnlyAutomaticContributionStorageContext,
 } from "./platform/index.js";
+import { hasExactEnumerableKeys } from "./has-exact-enumerable-keys.js";
 
 export const FAST_MODE_PREFERENCE_SCHEMA_VERSION =
   "fast-mode-preference-v0.1";
@@ -49,13 +50,6 @@ export class FastModePreferenceError extends Error {
   }
 }
 
-function exactKeys(value, expected) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
-}
-
 function canonicalInstant(value) {
   if (typeof value !== "string" || value.length > 32) return null;
   const milliseconds = Date.parse(value);
@@ -65,7 +59,7 @@ function canonicalInstant(value) {
 }
 
 function validSettingsDocument(value) {
-  return exactKeys(value, SETTINGS_KEYS)
+  return hasExactEnumerableKeys(value, SETTINGS_KEYS)
     && value.schemaVersion === FAST_MODE_PREFERENCE_SCHEMA_VERSION
     && isFastModePreference(value.mode)
     && canonicalInstant(value.recordedAt) !== null;
