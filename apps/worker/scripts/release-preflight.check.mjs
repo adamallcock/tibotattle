@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   access,
   chmod,
   mkdtemp,
+  mkdir,
   readdir,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -24,6 +27,12 @@ import {
 import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
+const localWrangler = join(
+  workerDirectory,
+  "node_modules",
+  ".bin",
+  process.platform === "win32" ? "wrangler.cmd" : "wrangler",
+);
 
 function safeConfig() {
   return {
@@ -78,6 +87,73 @@ async function removeState(state) {
   } catch (error) {
     return error?.code === "ENOENT";
   }
+}
+
+async function writeHermeticWranglerConfig(root) {
+  const config = {
+    $schema: join(workerDirectory, "node_modules/wrangler/config-schema.json"),
+    name: "app-usagemonitor-release-preflight-check",
+    main: join(workerDirectory, "src/index.ts"),
+    compatibility_date: "2026-07-26",
+    compatibility_flags: ["nodejs_compat"],
+    env: {
+      staging: {
+        name: "app-usagemonitor-release-preflight-check-staging",
+        workers_dev: true,
+        vars: {
+          ENVIRONMENT: "staging",
+          ENROLLMENT_MODE: "disabled",
+          ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+          UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+          IDENTITY_LINK_SECRET_VERSION: "staging-v1",
+        },
+        d1_databases: [
+          {
+            binding: "USAGE_MONITOR_DB",
+            database_name: "release-preflight-check-primary",
+            database_id: "00000000-0000-4000-8000-000000000010",
+            migrations_dir: join(workerDirectory, "migrations"),
+          },
+          {
+            binding: "DELETION_LEDGER",
+            database_name: "release-preflight-check-deletion-ledger",
+            database_id: "00000000-0000-4000-8000-000000000011",
+            migrations_dir: join(workerDirectory, "deletion-ledger-migrations"),
+          },
+        ],
+      },
+      production: {
+        vars: {
+          ENVIRONMENT: "production",
+          ENROLLMENT_MODE: "disabled",
+          ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+          UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+          IDENTITY_LINK_SECRET_VERSION: "production-v1",
+        },
+      },
+    },
+  };
+  const configPath = join(root, "wrangler.jsonc");
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  return { config, configPath };
+}
+
+function rowsFromWrangler(stdout) {
+  try {
+    const value = JSON.parse(stdout);
+    const entries = Array.isArray(value) ? value : [];
+    return entries.findLast((entry) => Array.isArray(entry?.results))?.results ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function schemaObjectSet(rows) {
+  return new Set(
+    (Array.isArray(rows) ? rows : [])
+      .filter((row) => typeof row?.type === "string" && typeof row?.name === "string")
+      .map((row) => `${row.type}:${row.name}`),
+  );
 }
 
 function containedCollectionControlRow() {
@@ -432,4 +508,145 @@ test("missing deletion-ledger schema blocks the gate with a separate blocker", a
   assert.deepEqual(result.blockers, ["LOCAL_DELETION_LEDGER_SCHEMA_INCOMPLETE"]);
   assert.equal(result.collectionAuthorized, false);
   assert.equal(result.checks.isolatedStateCleaned, true);
+});
+
+test("real Wrangler proves both local D1 streams, schema, and containment query", async () => {
+  const root = await mkdtemp(join(
+    tmpdir(),
+    "usage-monitor-release-preflight-real-wrangler-",
+  ));
+  let statePath = null;
+  const commands = [];
+  const migrationRows = new Map();
+  const schemaRows = new Map();
+  let collectionRows = null;
+  try {
+    const { config, configPath } = await writeHermeticWranglerConfig(root);
+    const hermeticEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) =>
+        !/^(?:CLOUDFLARE_|CF_|WRANGLER_(?!SEND_METRICS$))/u.test(name)),
+    );
+    hermeticEnv.CI = "1";
+    hermeticEnv.WRANGLER_SEND_METRICS = "false";
+    const spawn = (command, args, options) => {
+      assert.equal(command, localWrangler);
+      assert.equal(args.includes("--local"), true);
+      assert.equal(args.includes("--remote"), false);
+      assert.equal(args.includes("deploy"), false);
+      assert.equal(args[args.indexOf("--config") + 1], configPath);
+      assert.equal(args[args.indexOf("--env") + 1], "staging");
+      const persistIndex = args.indexOf("--persist-to");
+      assert.notEqual(persistIndex, -1);
+      assert.equal(args[persistIndex + 1], statePath);
+      const result = spawnSync(command, args, {
+        ...options,
+        env: hermeticEnv,
+      });
+      const commandIndex = args.indexOf("--command");
+      const sql = commandIndex < 0 ? null : args[commandIndex + 1] ?? null;
+      const rows = sql === null ? null : rowsFromWrangler(result.stdout);
+      const binding = args[args.indexOf("execute") + 1] ?? null;
+      if (sql?.includes("d1_migrations") && binding !== null) {
+        const rowsForBinding = migrationRows.get(binding) ?? [];
+        rowsForBinding.push(rows);
+        migrationRows.set(binding, rowsForBinding);
+      }
+      if (sql?.includes("sqlite_master") && binding !== null) {
+        schemaRows.set(binding, rows);
+      }
+      if (sql?.includes("FROM collection_controls")) {
+        collectionRows = rows;
+      }
+      commands.push({ args, binding, result, sql });
+      return result;
+    };
+    const createState = async () => {
+      statePath = join(root, "persist");
+      await mkdir(statePath, { recursive: true });
+      await chmod(statePath, 0o700);
+      return statePath;
+    };
+    const result = await runReleasePreflight({
+      config,
+      configPath,
+      workerDirectory,
+      wrangler: localWrangler,
+      spawn,
+      createState,
+      cleanupState: removeState,
+    });
+
+    assert.equal(result.state, "blocked");
+    assert.equal(result.collectionAuthorized, false);
+    assert.deepEqual(result.blockers, ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"]);
+    assert.equal(result.checks.localOnly, true);
+    assert.equal(result.checks.localMigrationInventorySafe, true);
+    assert.equal(result.checks.localMigrationSourcesSafe, true);
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true);
+    assert.equal(result.checks.deletionLedgerMigrationsAppliedInOrder, true);
+    assert.equal(result.checks.primaryMigrationRerunStable, true);
+    assert.equal(result.checks.deletionLedgerMigrationRerunStable, true);
+    assert.equal(result.checks.requiredSchemaPresent, true);
+    assert.equal(result.checks.deletionLedgerSchemaPresent, true);
+    assert.equal(result.checks.collectionControlsContained, false);
+    assert.equal(result.checks.isolatedStateCleaned, true);
+    assert.ok(statePath);
+    await assert.rejects(access(statePath), (error) => error?.code === "ENOENT");
+
+    const primaryMigrations = await migrationNames("migrations");
+    const deletionLedgerMigrations = await migrationNames("deletion-ledger-migrations");
+    assert.deepEqual(
+      migrationRows.get("USAGE_MONITOR_DB")?.map((rows) =>
+        rows?.map((row) => `${row?.id}:${row?.name}`)),
+      [primaryMigrations, primaryMigrations].map((names) =>
+        names.map((name, index) => `${index + 1}:${name}`)),
+    );
+    assert.deepEqual(
+      migrationRows.get("DELETION_LEDGER")?.map((rows) =>
+        rows?.map((row) => `${row?.id}:${row?.name}`)),
+      [deletionLedgerMigrations, deletionLedgerMigrations].map((names) =>
+        names.map((name, index) => `${index + 1}:${name}`)),
+    );
+
+    const primarySchema = schemaObjectSet(schemaRows.get("USAGE_MONITOR_DB"));
+    for (const [type, name] of REQUIRED_SCHEMA_OBJECTS) {
+      assert.equal(primarySchema.has(`${type}:${name}`), true, `${type}:${name}`);
+    }
+    const deletionLedgerSchema = schemaObjectSet(
+      schemaRows.get("DELETION_LEDGER"),
+    );
+    for (const [type, name] of REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS) {
+      assert.equal(
+        deletionLedgerSchema.has(`${type}:${name}`),
+        true,
+        `DELETION_LEDGER ${type}:${name}`,
+      );
+    }
+
+    assert.equal(collectionRows?.length, 1);
+    assert.equal(collectionRows?.[0]?.control_state, "operational");
+    assert.deepEqual([
+      collectionRows?.[0]?.enrollment_enabled,
+      collectionRows?.[0]?.upload_registration_enabled,
+      collectionRows?.[0]?.processing_enabled,
+      collectionRows?.[0]?.publication_enabled,
+    ], [1, 1, 1, 1]);
+    const collectionQueries = commands.filter(({ sql }) =>
+      sql?.includes("FROM collection_controls"));
+    assert.equal(collectionQueries.length, 1);
+    assert.doesNotMatch(collectionQueries[0].sql, /\b(?:INSERT|UPDATE|DELETE)\b/iu);
+
+    const migrationCommands = commands.filter(({ args }) => args.includes("migrations"));
+    assert.deepEqual(
+      migrationCommands.map(({ args }) => args[args.indexOf("apply") + 1]),
+      [
+        "USAGE_MONITOR_DB",
+        "USAGE_MONITOR_DB",
+        "DELETION_LEDGER",
+        "DELETION_LEDGER",
+      ],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
