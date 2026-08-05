@@ -28,12 +28,13 @@
 "settings.codexFolder" = "Codex folder";
 "settings.codexFolderSummary" = "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else.";
 "settings.general" = "General";
-"settings.generalSummary" = "Refresh runs in this app while it is open. Closing the window does not quit TiboTattle; quitting stops the current refresh. Start at login is optional and managed in System Settings → Login Items. Raw logs stay on this Mac.";
+"settings.generalSummary" = "Local usage refreshes while TiboTattle is open. Raw logs stay on this Mac.";
 "settings.github" = "GitHub";
 "settings.language" = "Language";
-"settings.languageSummary" = "App language only; dates, numbers, and currency use this Mac's format.";
+"settings.languageSummary" = "Uses your Mac language by default.";
 "settings.languageSystem" = "System";
-"settings.notifications" = "Local allowance notifications";
+"settings.notifications" = "Notifications";
+"settings.notificationsAllowanceTitle" = "Allowance alerts";
 "settings.notificationsDetail" = "Optional local alerts use fresh quota observations from the normal refresh. TiboTattle never polls in the background.";
 "settings.notificationsOff" = "Notifications are off. Turn this switch off at any time to stop future local alerts and clear their local pending state.";
 "settings.notificationsPermissionDenied" = "Enabled, but macOS notification permission is denied. No alerts will be sent. Change it in System Settings if you want alerts.";
@@ -267,8 +268,8 @@
 "menuBar.failureRecovery" = "Not running: %@. Open the window for the recovery step.";
 "settings.codexFolderCustomSelected" = "Custom folder selected";
 "settings.codexFolderDefaultLocation" = "Default location (~/.codex)";
-"settings.updateDisclosureAutomaticOff" = "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available.";
-"settings.updateDisclosureAutomaticOn" = "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → General.";
+"settings.updateDisclosureAutomaticOff" = "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → About when available.";
+"settings.updateDisclosureAutomaticOn" = "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → About.";
 "settings.updateDisclosureDevelopment" = "This development build does not include update checks. Signed releases installed in Applications can check for updates from About.";
 "settings.updateDisclosurePreview" = "This preview uses manual signed-update checks. It does not check, download, or install updates automatically.";
 "accessibility.menuBarStatus" = "TiboTattle status";

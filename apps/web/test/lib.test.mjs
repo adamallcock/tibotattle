@@ -77,12 +77,266 @@ import {
   SUPPORTED_PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSIONS
 } from "../public/data-client.js";
 import {
+  adaptiveChartTickCount,
+  classifyTimelineEvidence,
   formatLocal,
   formatReportingTime,
+  formatTimeZoneLabel,
   REPORTING_TIME_ZONE,
   reportingCalendarParts,
+  selectAvailableAccountingPeriod,
   USER_LOCALE,
 } from "../public/ui-format.js";
+
+class FakeSvgElement {
+  constructor(tagName, renderedWidth = 0) {
+    this.tagName = tagName;
+    this.namespaceURI = "http://www.w3.org/2000/svg";
+    this.renderedWidth = renderedWidth;
+    this.attributes = new Map();
+    this.children = [];
+    this.listeners = new Map();
+    this.textContent = "";
+    this.resizeObserver = null;
+  }
+
+  append(...children) {
+    this.children.push(...children.filter(Boolean));
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(name) ?? null;
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatchEvent(event) {
+    const dispatched = event ?? {};
+    dispatched.type ??= "event";
+    dispatched.preventDefault ??= () => { dispatched.defaultPrevented = true; };
+    for (const listener of this.listeners.get(dispatched.type) ?? []) {
+      listener(dispatched);
+    }
+    return true;
+  }
+
+  focus() {
+    this.dispatchEvent({ type: "focus" });
+  }
+
+  blur() {
+    this.dispatchEvent({ type: "blur" });
+  }
+
+  getBoundingClientRect() {
+    return { width: this.renderedWidth };
+  }
+
+  matches(selector) {
+    const tag = selector.match(/^([a-z]+)/iu)?.[1];
+    if (tag && this.tagName !== tag) return false;
+    const className = selector.match(/\.([\w-]+)/u)?.[1];
+    if (className && !this.getAttribute("class")?.split(/\s+/u).includes(className)) {
+      return false;
+    }
+    const attribute = selector.match(/\[([^=\]]+)="([^"]*)"\]/u);
+    if (attribute && this.getAttribute(attribute[1]) !== attribute[2]) return false;
+    return true;
+  }
+
+  querySelectorAll(selector) {
+    const matches = [];
+    const visit = (element) => {
+      for (const child of element.children) {
+        if (child.matches?.(selector)) matches.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return matches;
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+}
+
+class FakeSvgDocument {
+  constructor(renderedWidth = 900) {
+    this.renderedWidth = renderedWidth;
+  }
+
+  createElementNS(_namespace, tagName) {
+    return new FakeSvgElement(
+      tagName,
+      tagName === "svg" ? this.renderedWidth : 0,
+    );
+  }
+}
+
+class FakePeriodControls {
+  constructor(periodIds) {
+    this.buttons = periodIds.map((periodId) => {
+      const button = new FakeSvgElement("button");
+      button.dataset = { period: periodId };
+      button.hidden = false;
+      button.disabled = false;
+      button.classList = {
+        values: new Set(),
+        toggle(name, active) {
+          if (active) this.values.add(name);
+          else this.values.delete(name);
+        },
+      };
+      return button;
+    });
+  }
+
+  querySelectorAll(selector) {
+    return selector === "button" ? this.buttons : [];
+  }
+}
+
+class FakeChartShell {
+  constructor(width = 320) {
+    this.width = width;
+    this.classList = {
+      values: new Set(),
+      add: (...names) => names.forEach((name) => this.classList.values.add(name)),
+      remove: (...names) => names.forEach((name) => this.classList.values.delete(name)),
+    };
+    this.attributes = new Map();
+    this.capturedPointerId = null;
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+
+  setPointerCapture(pointerId) {
+    this.capturedPointerId = pointerId;
+  }
+
+  releasePointerCapture(pointerId) {
+    this.releasedPointerId = pointerId;
+  }
+
+  getBoundingClientRect() {
+    return { width: this.width, left: 0 };
+  }
+}
+
+class FakeResizeObserver {
+  constructor(callback) {
+    this.callback = callback;
+  }
+
+  observe(element) {
+    element.resizeObserver = this;
+  }
+}
+
+async function loadLineChartRenderer(documentRef) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function lineChart(");
+  const end = appSource.indexOf("\nfunction isWellObservedWeeklyFit", start);
+  assert.ok(start >= 0 && end > start, "lineChart DOM renderer is available");
+  const chartSource = appSource.slice(start, end);
+  return Function(
+    "document",
+    "ResizeObserver",
+    "adaptiveChartTickCount",
+    "finite",
+    "formatLocal",
+    "formatMoney",
+    "formatDecimal",
+    "timelineStatusLabel",
+    "setRawText",
+    `${chartSource}\nreturn lineChart;`,
+  )(
+    documentRef,
+    FakeResizeObserver,
+    adaptiveChartTickCount,
+    (value, fallback = null) => typeof value === "number" && Number.isFinite(value) ? value : fallback,
+    (value, { dateOnly = false } = {}) => {
+      const iso = new Date(value).toISOString();
+      return dateOnly ? iso.slice(0, 10) : iso;
+    },
+    (value) => `$${Number(value).toFixed(0)}`,
+    (value) => Number(value).toFixed(1),
+    (status) => String(status),
+    (element, value) => { element.textContent = String(value); },
+  );
+}
+
+async function loadAccountingPeriodSync(periodIds) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function accountingPeriod(data)");
+  const end = appSource.indexOf("\nfunction renderAccountingDimension", start);
+  assert.ok(start >= 0 && end > start, "accounting period guard is available");
+  const controls = new FakePeriodControls(periodIds);
+  const section = appSource.slice(start, end);
+  return Function(
+    "$",
+    "selectAvailableAccountingPeriod",
+    "controls",
+    `let activeAccountingPeriod = "history";\n${section}\nreturn {
+      syncAccountingPeriodControls,
+      getActive: () => activeAccountingPeriod,
+      setActive: (value) => { activeAccountingPeriod = value; },
+      controls,
+    };`,
+  )(
+    () => controls,
+    selectAvailableAccountingPeriod,
+    controls,
+  );
+}
+
+async function loadTimelineInteractions() {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function bindTimelineInteractions(");
+  const end = appSource.indexOf("\nfunction renderTimelineSummary", start);
+  assert.ok(start >= 0 && end > start, "timeline interaction binder is available");
+  const section = appSource.slice(start, end);
+  const calls = {};
+  return Function(
+    "$",
+    "t",
+    "USER_TIME_ZONE",
+    "formatLocal",
+    "formatSpanLength",
+    "wheelZoomFactor",
+    "panTimeline",
+    "zoomTimeline",
+    "resetTimelineViewport",
+    "renderTimeline",
+    "dashboard",
+    "calls",
+    `let timelinePointerStart = null;\n${section}\nreturn { bind: bindTimelineInteractions, calls };`,
+  )(
+    () => ({ textContent: "" }),
+    (_key, values) => JSON.stringify(values ?? {}),
+    "America/New_York",
+    (value) => String(value),
+    (value) => String(value),
+    () => 1,
+    (_points, fraction) => { calls.pan = fraction; },
+    (_points, factor) => { calls.zoom = factor; },
+    () => { calls.reset = true; },
+    () => {},
+    {},
+    calls,
+  );
+}
 
 test("browser reporting timestamps use one explicit system time zone", () => {
   const timestamp = "2026-08-03T16:23:00.000Z";
@@ -117,6 +371,82 @@ test("browser reporting timestamps use one explicit system time zone", () => {
     }).format(date),
   );
   assert.equal(formatReportingTime("not a timestamp"), "Unknown");
+});
+
+test("human time-zone labels are direct localized Intl fixtures", () => {
+  const value = "2026-01-15T12:00:00.000Z";
+  assert.equal(
+    formatTimeZoneLabel({
+      locale: "en-US",
+      timeZone: "America/New_York",
+      value,
+    }),
+    "Eastern Time",
+  );
+  assert.equal(
+    formatTimeZoneLabel({
+      locale: "es",
+      timeZone: "America/New_York",
+      value,
+    }),
+    "hora oriental",
+  );
+  assert.equal(
+    formatTimeZoneLabel({
+      locale: "zh-Hans",
+      timeZone: "Asia/Tokyo",
+      value,
+    }),
+    "日本标准时间",
+  );
+});
+
+test("chart and accounting shared helpers fail closed on unavailable evidence", () => {
+  assert.equal(adaptiveChartTickCount(900), 7);
+  assert.equal(adaptiveChartTickCount(320), 2);
+  assert.ok(adaptiveChartTickCount(320) < adaptiveChartTickCount(900));
+
+  const idle = classifyTimelineEvidence({
+    bracketed: true,
+    sameReset: true,
+    observed: 0,
+    expected: 0,
+    usageEvents: 0,
+    apiCostUsd: 0,
+  });
+  assert.deepEqual(idle, { status: "inactive", residual: 0 });
+
+  const missing = classifyTimelineEvidence({
+    bracketed: false,
+    sameReset: false,
+    observed: null,
+    expected: 0,
+    usageEvents: 0,
+    apiCostUsd: 0,
+  });
+  assert.deepEqual(missing, {
+    status: "missing_quota_bracket",
+    residual: null,
+  });
+
+  const residual = classifyTimelineEvidence({
+    bracketed: true,
+    sameReset: true,
+    observed: 12,
+    expected: 8,
+    usageEvents: 3,
+    apiCostUsd: 4.5,
+  });
+  assert.deepEqual(residual, { status: "matched", residual: 4 });
+
+  const periods = [{ periodId: "7d" }, { periodId: "all" }];
+  assert.equal(selectAvailableAccountingPeriod(periods, "history"), "7d");
+  assert.equal(
+    selectAvailableAccountingPeriod([{ periodId: "history" }, ...periods], "history"),
+    "history",
+  );
+  assert.equal(selectAvailableAccountingPeriod([{ periodId: "all" }], "history"), null);
+  assert.equal(selectAvailableAccountingPeriod([], "history"), null);
 });
 
 test("browser JSON preflight rejects duplicate object keys before parsing", () => {
@@ -859,20 +1189,22 @@ test("cost coverage visibly distinguishes a transient archive scan from a verifi
   assert.match(appSource, /dashboard\.pricing\.historyStorageUnavailable/u);
   assert.match(
     localizationSource,
-    /"dashboard\.pricing\.historyScanningComplete": \["History index scanning; last verified coverage complete"/u,
+    /"dashboard\.pricing\.historyScanningComplete": \["Scanning for older history"/u,
   );
   assert.match(
     localizationSource,
-    /"dashboard\.pricing\.historyScanningPartial": \["History index scanning; last verified coverage partial"/u,
+    /"dashboard\.pricing\.historyScanningPartial": \["Scanning for older history"/u,
   );
   assert.match(
     localizationSource,
-    /"dashboard\.pricing\.historyDiskSpace": \["History index partial; insufficient local disk space to stage the next safe archive pass"/u,
+    /"dashboard\.pricing\.historyDiskSpace": \["History scan paused: free space needed"/u,
   );
   assert.match(
     localizationSource,
-    /"dashboard\.pricing\.historyStorageUnavailable": \["History index partial; local disk headroom could not be verified for the next safe archive pass"/u,
+    /"dashboard\.pricing\.historyStorageUnavailable": \["History scan paused: storage check unavailable"/u,
   );
+  assert.match(appSource, /cost-history-coverage/u);
+  assert.match(appSource, /historyCoverageLabel\(pricing\.historyCoverage\)/u);
   assert.match(
     appSource,
     /if \(archiveScanning && !archiveHistoryScanActive\) \{\s*archiveHistoryScanActive = true;\s*if \(dashboard\) renderPricing\(dashboard\);/u,
@@ -888,6 +1220,7 @@ test("local dashboard retains the pricing epoch required to explain allowance fi
       currentPriceSensitivityTotalUsdExact: null,
       registryVersion: "app-official-api-prices-v0.2",
       registryObservedAt: "2026-08-01T13:47:00Z",
+      evidenceStartDate: "2026-07-26",
       priceCardIds: ["pre-change", "post-change"],
       priceCardBreakdown: [{ priceCardId: "pre-change", events: 1, costUsd: "2.5" }],
       mixedPriceCardWindows: true,
@@ -900,6 +1233,7 @@ test("local dashboard retains the pricing epoch required to explain allowance fi
   assert.equal(result.pricing.eventTimeHistoricalTotalUsdExact, "12.345678");
   assert.equal(result.pricing.currentPriceSensitivityTotalUsdExact, null);
   assert.equal(result.pricing.registryVersion, "app-official-api-prices-v0.2");
+  assert.equal(result.pricing.evidenceStartDate, "2026-07-26");
   assert.deepEqual(result.pricing.priceCardIds, ["pre-change", "post-change"]);
   assert.deepEqual(result.pricing.priceCardBreakdown, [
     { priceCardId: "pre-change", events: 1, costUsd: "2.5" },
@@ -974,6 +1308,7 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
     status: "live",
     accounting: {
       periodId: "7d",
+      evidenceStartDate: "2026-07-26",
       events: 10,
       apiPriceEquivalentUsd: 20,
       quotaWeightedApiPriceEquivalentUsd: 34,
@@ -1013,6 +1348,7 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
   const accounting = result.accounting;
   assert.equal(accounting.quotaWeightedApiPriceEquivalentUsd, 34);
   assert.equal(accounting.apiPriceEquivalentUsd, 20);
+  assert.equal(accounting.evidenceStartDate, "2026-07-26");
   assert.equal(accounting.fastMode.preference, "mixed_unknown");
   assert.equal(accounting.fastMode.weightingStatus, "partial");
   assert.equal(accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd, 8);
@@ -2842,8 +3178,8 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     /@media \(max-width: 760px\)[\s\S]*?\.topbar \.button\.compact \{ display: none; \}/u,
   );
   assert.match(html, />\s*Sign out\s*</u);
-  assert.match(html, /Signing out revokes this browser's service session and forgets/u);
-  assert.match(html, /Hosted privacy controls remain available separately/u);
+  assert.match(html, /Signing out ends this browser's contribution session/u);
+  assert.doesNotMatch(html, /Hosted privacy controls remain available separately/u);
   assert.doesNotMatch(html, /metadata already contributed\s+stays until you delete it/u);
   assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
 
@@ -3635,6 +3971,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /Review every validated field and value/);
   assert.match(html, /id="index-progress"/);
   assert.match(html, /id="setup-card"/);
+  assert.match(html, /id="cost-history-coverage"/);
   assert.match(html, /Check this Mac before analyzing/);
   assert.match(html, /A useful headline often appears in seconds/);
   assert.match(html, /The first deep pass can\s+take a few minutes/);
@@ -3861,11 +4198,8 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /visibleArtifactResiduals\.length[\s\S]*pointResiduals/);
   assert.match(appSource, /renderResiduals\(data, visiblePoints, viewport\)/);
   assert.match(appSource, /safeDomainEndMs - domainStartMs/);
-  assert.match(appSource, /const automaticTickCount = Math\.max\([\s\S]*?Math\.min\(7/u);
+  assert.match(appSource, /adaptiveChartTickCount\(width, \{/u);
   assert.match(appSource, /rotateXTickLabels \? "end"/u);
-  assert.match(appSource, /marker\.addEventListener\("pointerenter"/u);
-  assert.match(appSource, /marker\.addEventListener\("focus"/u);
-  assert.match(appSource, /marker\.setAttribute\("tabindex", "0"\)/u);
   assert.match(appSource, /REPORTING_TIME_ZONE/);
   assert.match(appSource, /localCalendarParts\(\)\.formatToParts\(timestamp\)/);
   assert.match(appSource, /formatReportingTime\(item\.timestamp\)/);
@@ -3877,6 +4211,9 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /point\.periodEndAt \?\? point\.timestamp/);
   assert.match(appSource, /price unavailable/);
   assert.match(appSource, /component\.unpricedTokens/);
+  assert.doesNotMatch(appSource, /tokensWithUnpriced/);
+  assert.match(appSource, /accounting\.pricing\.evidenceStarts/);
+  assert.match(styles, /native-dashboard #setup-card/);
   assert.match(appSource, /timelineStatusLabel/);
   assert.match(appSource, /recent_7d_partial/);
   assert.match(appSource, /cannot prove it reached the entire requested seven-day window/);
@@ -4006,7 +4343,7 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
   );
   assert.match(
     appSource,
-    /confidence: \{ low: "acrossResetLow", high: "acrossResetHigh" \}/u,
+    /confidence: \{[\s\S]*?label: "80% across-reset range",[\s\S]*?format: \(value\) => formatMoney\(value\),[\s\S]*?\},/u,
   );
   assert.match(
     appSource,
@@ -4016,13 +4353,186 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
     /function renderAllowanceHistoryChart\(history\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.match(weeklyChart, /tooltip: false,/u);
-  assert.match(weeklyChart, /tooltip: true,[\s\S]*?focusable: true,/u);
   assert.match(weeklyChart, /detail: \(point\) => `\$\{formatPp\(point\.observedSpanPp\)\} observed/u);
-  assert.match(appSource, /if \(item\.tooltip !== false \|\| item\.focusable === true\)/u);
   assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
   assert.match(html, /vertical bar shows the range supported/u);
   assert.doesNotMatch(html, /Per-week within-reset sensitivity|Scroll horizontally on a narrow screen/u);
+});
+
+test("lineChart DOM interactions cover default points, median, band, and narrow ticks", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const lineChart = await loadLineChartRenderer(documentRef);
+  const points = [0, 1, 2, 3, 4].map((index) => ({
+    timestamp: new Date(Date.UTC(2026, 0, 1 + index)).toISOString(),
+    value: 100 + index * 4,
+    remaining: 70 - index * 3,
+    median: 112,
+    low: 90,
+    high: 140,
+  }));
+  const svg = lineChart({
+    points,
+    series: [{
+      key: "value",
+      className: "chart-line-value",
+      label: "Observed allowance",
+      format: (value) => `$${value}`,
+    }],
+    secondarySeries: [{
+      key: "remaining",
+      className: "chart-line-allowance",
+      label: "Allowance remaining",
+    }],
+    confidence: {
+      low: "low",
+      high: "high",
+      label: "80% across-reset range",
+      format: (value) => `$${value}`,
+    },
+    title: "Allowance history",
+    description: "Allowance history fixture",
+    yLabel: "Allowance",
+  });
+
+  const markers = svg.querySelectorAll('circle.chart-line-value[tabindex="0"]');
+  const secondaryMarkers = svg.querySelectorAll('circle.chart-line-allowance[tabindex="0"]');
+  assert.equal(markers.length, points.length, "primary markers are keyboard reachable without per-series opt-in");
+  assert.equal(secondaryMarkers.length, points.length, "secondary markers share the same interaction defaults");
+  assert.match(markers[0].getAttribute("aria-label"), /Observed allowance/);
+  markers[0].dispatchEvent({ type: "pointerenter" });
+  assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "visible");
+  markers[0].dispatchEvent({ type: "pointerleave" });
+  assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "hidden");
+  markers[0].focus();
+  assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "visible");
+  markers[0].blur();
+
+  const band = svg.querySelector(".chart-area-confidence");
+  assert.equal(band.getAttribute("role"), "img");
+  assert.equal(band.getAttribute("tabindex"), "0");
+  assert.match(band.getAttribute("aria-label"), /80% across-reset range: \$90–\$140/u);
+  band.dispatchEvent({ type: "pointerenter" });
+  assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "visible");
+
+  const medianSvg = lineChart({
+    points,
+    series: [{
+      key: "median",
+      className: "chart-line-weekly-center",
+      label: "Historical median",
+      markers: false,
+      lineFocusable: true,
+      lineDetail: (rows) => `${rows.length} reset estimates`,
+      format: (value) => `$${value}`,
+    }],
+    title: "Allowance history",
+    description: "Allowance history fixture",
+    yLabel: "Allowance",
+  });
+  const medianLine = medianSvg.querySelector(".chart-line-weekly-center");
+  assert.equal(medianLine.getAttribute("role"), "img");
+  assert.equal(medianLine.getAttribute("tabindex"), "0");
+  assert.match(medianLine.getAttribute("aria-label"), /Historical median/);
+  assert.equal(medianSvg.querySelectorAll('circle[tabindex="0"]').length, 0);
+
+  const xLabels = [
+    ...svg.querySelectorAll('text[display="inline"]'),
+    ...svg.querySelectorAll('text[display="none"]'),
+  ];
+  const initialVisible = xLabels.filter((label) => label.getAttribute("display") === "inline");
+  assert.ok(initialVisible.length >= 3, "wide chart keeps a useful tick set");
+  svg.renderedWidth = 320;
+  svg.resizeObserver.callback([{ contentRect: { width: 320 } }]);
+  const narrowVisible = xLabels.filter((label) => label.getAttribute("display") === "inline");
+  assert.ok(narrowVisible.length < initialVisible.length, "narrow chart sheds labels instead of scrolling");
+  assert.equal(narrowVisible.length, 2, "narrow chart retains only endpoint labels");
+});
+
+test("accounting controls hide unavailable history and enable it when indexed evidence exists", async () => {
+  const withoutHistory = await loadAccountingPeriodSync(["24h", "7d", "30d", "all", "history"]);
+  withoutHistory.syncAccountingPeriodControls({
+    accounting: {
+      periods: [{ periodId: "7d" }, { periodId: "all" }],
+    },
+  });
+  assert.equal(withoutHistory.getActive(), "7d");
+  const unavailableHistory = withoutHistory.controls.buttons.find(
+    (button) => button.dataset.period === "history",
+  );
+  assert.equal(unavailableHistory.hidden, true);
+  assert.equal(unavailableHistory.disabled, true);
+  assert.equal(
+    withoutHistory.controls.buttons.find((button) => button.dataset.period === "all").disabled,
+    false,
+  );
+
+  const withHistory = await loadAccountingPeriodSync(["7d", "history", "all"]);
+  withHistory.syncAccountingPeriodControls({
+    accounting: {
+      periods: [{ periodId: "7d" }, { periodId: "history" }, { periodId: "all" }],
+    },
+  });
+  const historyButton = withHistory.controls.buttons.find(
+    (button) => button.dataset.period === "history",
+  );
+  assert.equal(withHistory.getActive(), "history");
+  assert.equal(historyButton.hidden, false);
+  assert.equal(historyButton.disabled, false);
+
+  const cacheOnly = await loadAccountingPeriodSync(["all", "history"]);
+  cacheOnly.syncAccountingPeriodControls({
+    accounting: {
+      periods: [{ periodId: "all" }],
+    },
+  });
+  assert.equal(cacheOnly.getActive(), null, "cache-only payloads do not impersonate indexed history");
+  assert.equal(cacheOnly.controls.buttons.find((button) => button.dataset.period === "all").disabled, false);
+});
+
+test("timeline drag suppresses selection only during the chart gesture", async () => {
+  const { bind, calls } = await loadTimelineInteractions();
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  assert.match(styles, /\.chart-shell \{[\s\S]*?user-select: text;/u);
+  assert.match(styles, /\.chart-shell\.interactive-chart\.is-pointer-active,[\s\S]*?user-select: none;/u);
+  const shell = new FakeChartShell();
+  const points = [
+    { timestamp: "2026-01-01T00:00:00.000Z" },
+    { timestamp: "2026-01-02T00:00:00.000Z" },
+  ];
+  bind(shell, points, {
+    startMs: Date.parse(points[0].timestamp),
+    endMs: Date.parse(points[1].timestamp),
+  });
+
+  const down = { button: 0, clientX: 100, pointerId: 7 };
+  shell.onpointerdown(down);
+  assert.ok(shell.classList.values.has("is-pointer-active"));
+  const selectDuringGesture = {
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  shell.onselectstart(selectDuringGesture);
+  assert.equal(selectDuringGesture.defaultPrevented, true);
+
+  const move = {
+    clientX: 130,
+    pointerId: 7,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  shell.onpointermove(move);
+  assert.equal(move.defaultPrevented, true);
+  assert.ok(shell.classList.values.has("is-panning"));
+  assert.equal(typeof calls.pan, "number");
+
+  const up = {
+    pointerId: 7,
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  shell.onpointerup(up);
+  assert.equal(up.defaultPrevented, true);
+  assert.equal(shell.classList.values.has("is-pointer-active"), false);
+  assert.equal(shell.classList.values.has("is-panning"), false);
+  assert.equal(shell.releasedPointerId, 7);
 });
 
 test("metric information controls open an accessible popover instead of relying on title hover", async () => {
@@ -4347,6 +4857,8 @@ test("post-results contribution CTA is explicit while technical and deletion con
   const ctaPosition = html.indexOf('id="contribution-cta"');
   const dataPosition = html.indexOf('id="data"');
   assert.equal(html.indexOf('id="coverage"'), -1);
+  assert.doesNotMatch(html, /data-nav="data"|>Data &amp; Privacy<|>Data & Privacy</u);
+  assert.doesNotMatch(html, /05 · READING THE ESTIMATE|When to treat this as an estimate/u);
   assert.ok(ctaPosition < dataPosition);
   assert.match(html, /data-dashboard-page="community"[^>]*id="data"|id="data"[^>]*data-dashboard-page="community"/u);
   assert.match(html, /What leaves this Mac — and what never does/u);
@@ -4421,10 +4933,9 @@ test("stale local device conflicts name the leftover credential and offer the re
     )[0],
     /invitation|invite/iu,
   );
-  assert.match(recoverySource, /Metadata you already contributed is untouched/u);
+  assert.match(recoverySource, /Resetting clears only that unusable credential/u);
   assert.match(recoverySource, /await describeFailure\(/u);
-  assert.match(recoverySource, /no hosted device is revoked/u);
-  assert.match(recoverySource, /Data & Diagnostics… menu offers the same repair natively/u);
+  assert.match(recoverySource, /Then connect this Mac again/u);
   assert.match(recoverySource, /Reset this Mac's device credential/u);
   assert.match(recoverySource, /action\.href = SEMANTIC_OPEN_TARGET/u);
   // Both names for the same fault reach the same explanation and repair.
@@ -4454,7 +4965,7 @@ test("stale local device conflicts name the leftover credential and offer the re
   );
   assert.match(
     appSource,
-    /DEVICE_CREDENTIAL_RESET_CONFIRMATION =[\s\S]*?Metadata you already contributed is not deleted, no hosted device is revoked/u,
+    /DEVICE_CREDENTIAL_RESET_CONFIRMATION =[\s\S]*?Local reporting is unchanged/u,
   );
   assert.match(
     resetMatch[1],
@@ -5843,6 +6354,11 @@ test("a posted results card states a figure in full and marks a fixture as one",
   assert.match(appSource, /xTicks: history\.xTicks,/u);
   assert.match(appSource, /yDomain: history\.axis,/u);
   assert.match(section, /for \(const tick of xTicks\)/u);
+  assert.match(
+    section,
+    /context\.textAlign = tick\.alignment === "middle" \? "center" : tick\.alignment;/u,
+    "the shared SVG tick alignment is translated to a valid Canvas alignment",
+  );
   assert.doesNotMatch(section, /shareCardTrendDateTicks|shareCardTrendAxis/u);
   assert.match(section, /const SHARE_CARD_TREND_MAX_HEIGHT = 290;/u);
   assert.match(section, /const SHARE_CARD_TREND_MIN_HEIGHT = 142;/u);

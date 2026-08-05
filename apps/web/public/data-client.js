@@ -2011,7 +2011,7 @@ function normalizeLocalAccounting(value = {}) {
     }];
   });
   const normalized = {
-    periodId: ["24h", "7d", "30d", "all"].includes(value.periodId)
+    periodId: ["24h", "7d", "30d", "all", "history"].includes(value.periodId)
       ? value.periodId
       : "all",
     periodLabel: text(value.periodLabel, "Recorded period"),
@@ -2110,6 +2110,10 @@ function normalizeLocalAccounting(value = {}) {
         0
       )
     },
+    evidenceStartDate: typeof value.evidenceStartDate === "string"
+      && /^\d{4}-\d{2}-\d{2}$/u.test(value.evidenceStartDate)
+      ? value.evidenceStartDate
+      : null,
     generatedAt: text(value.generatedAt, ""),
     coveredAt: {
       startAt: text(value?.coveredAt?.startAt, ""),
@@ -2118,7 +2122,7 @@ function normalizeLocalAccounting(value = {}) {
     unknownModelEvents: count(value.unknownModelEvents, 0),
     periods: []
   };
-  normalized.periods = array(value.periods).slice(0, 4).map((period) => (
+  normalized.periods = array(value.periods).slice(0, 5).map((period) => (
     normalizeLocalAccounting({ ...period, periods: [] })
   ));
   return normalized;
@@ -2279,6 +2283,10 @@ function normalizePricing(pricing = {}) {
     subscriptionSpeedIsSeparate: pricing?.subscriptionSpeedIsSeparate === true,
     registryVersion: text(pricing?.registryVersion, ""),
     registryObservedAt: text(pricing?.registryObservedAt, ""),
+    evidenceStartDate: typeof pricing?.evidenceStartDate === "string"
+      && /^\d{4}-\d{2}-\d{2}$/u.test(pricing.evidenceStartDate)
+      ? pricing.evidenceStartDate
+      : null,
     priceEpochBasis,
     eventTimeHistoricalTotalUsdExact: typeof pricing?.eventTimeHistoricalTotalUsdExact === "string"
       && /^\d+(?:\.\d+)?$/u.test(pricing.eventTimeHistoricalTotalUsdExact)
@@ -2557,8 +2565,8 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       usageEvents: overview?.activity?.usageEvents ?? selectedUsage?.events,
       totalTokens: overview?.activity?.totalTokens ?? selectedUsage?.totalTokens
     },
-    usagePeriods: usagePeriods.slice(0, 4).map((period) => ({
-      id: ["24h", "7d", "30d", "all"].includes(period?.id) ? period.id : "all",
+    usagePeriods: usagePeriods.slice(0, 5).map((period) => ({
+      id: ["24h", "7d", "30d", "all", "history"].includes(period?.id) ? period.id : "all",
       label: text(period?.label, "Recorded period"),
       events: count(period?.events, 0),
       totalTokens: count(period?.totalTokens, 0),

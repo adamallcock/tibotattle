@@ -108,7 +108,7 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.equal(english.get("settings.language"), "Language");
   assert.equal(
     english.get("settings.languageSummary"),
-    "App language only; dates, numbers, and currency use this Mac's format.",
+    "Uses your Mac language by default.",
   );
   assert.match(swiftSource, /LanguagePreference: String, CaseIterable/u);
   assert.match(swiftSource, /UserDefaults\.standard\.set/u);
@@ -152,9 +152,14 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.match(appSource, /com\.apple\.Notifications-Settings\.extension/u);
   assert.doesNotMatch(appSource, /settingsNotificationsReset\)/u);
   assert.doesNotMatch(appSource, /toggleQuotaNotificationReset/u);
-  assert.match(swiftSource, /Refresh runs in this app while it is open/iu);
-  assert.match(swiftSource, /Closing the window does not quit TiboTattle/iu);
-  assert.match(swiftSource, /quitting stops the current refresh/iu);
+  assert.match(
+    swiftSource,
+    /Local usage refreshes while TiboTattle is open\. Raw logs stay on this Mac\./iu,
+  );
+  assert.match(
+    swiftSource,
+    /Start TiboTattle when you sign in\. Manage this in System Settings → Login Items\./iu,
+  );
   assert.match(swiftSource, /System Settings → Login Items/u);
   assert.match(menuBarSource, /menuBarAnalysisRequestRejected/u);
   assert.match(menuBarSource, /accessibilityMenuBarStatus/u);

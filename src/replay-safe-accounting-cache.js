@@ -999,6 +999,95 @@ function finalizePeriod(period) {
   };
 }
 
+// Build one constant-memory accounting total from an already indexed event
+// stream. Unlike the recent replay cache, this deliberately retains no raw
+// transition inputs, quota timeline, or chart buckets: its only contract is a
+// content-free aggregate whose price cards are selected at each event's own
+// timestamp. This is what lets the archive grow beyond the 31-day interactive
+// cache without turning an old Mac's history into an unbounded heap.
+export async function buildReplaySafeAccountingPeriod({
+  id = "history",
+  label = "Indexed history",
+  startAt,
+  endAt,
+  scan,
+  signal = null,
+  declaredSpeedBaselines = [],
+  rss = () => process.memoryUsage().rss,
+  maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
+} = {}) {
+  const canonicalStart = canonicalInstant(startAt);
+  const canonicalEnd = canonicalInstant(endAt);
+  if (typeof id !== "string"
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(id)
+      || typeof label !== "string"
+      || label.length < 1
+      || label.length > 96
+      || canonicalStart === null
+      || canonicalEnd === null
+      || Date.parse(canonicalStart) > Date.parse(canonicalEnd)
+      || typeof scan !== "function"
+      || !validAbortSignal(signal)
+      || typeof rss !== "function"
+      || !Number.isSafeInteger(maximumRssBytes)
+      || maximumRssBytes < 1) {
+    throw new TypeError("Replay-safe accounting period options are invalid");
+  }
+  const baselines = Array.isArray(declaredSpeedBaselines)
+    ? declaredSpeedBaselines
+    : [];
+  const startMs = Date.parse(canonicalStart);
+  const endMs = Date.parse(canonicalEnd);
+  const period = newPeriod(id, label);
+  const price = createAccountingPricer();
+  let acceptedEvents = 0;
+  const checkRuntimeMemory = () => {
+    const currentRss = rss();
+    if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
+      throw fixedError("accounting_archive_rss_measurement_invalid");
+    }
+    if (currentRss > maximumRssBytes) {
+      throw fixedError("accounting_archive_rss_limit_exceeded");
+    }
+  };
+  checkRuntimeMemory();
+  await scan({
+    startAt: canonicalStart,
+    endAt: canonicalEnd,
+    signal,
+    onUsage: (rawEvent) => {
+      throwIfAborted(signal);
+      const observedAt = canonicalInstant(rawEvent?.timestamp);
+      if (observedAt === null) return;
+      const observedMs = Date.parse(observedAt);
+      if (observedMs < startMs || observedMs > endMs) return;
+      const event = eventProjection(rawEvent, price);
+      if (event === null) return;
+      event.declaredSpeed = event.speed === "unknown"
+        ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
+        : "unknown";
+      addEvent(period, event);
+      acceptedEvents += 1;
+      if (acceptedEvents % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+        checkRuntimeMemory();
+      }
+    },
+  });
+  throwIfAborted(signal);
+  checkRuntimeMemory();
+  return {
+    generatedAt: canonicalEnd,
+    coveredAt: {
+      startAt: canonicalStart,
+      endAt: canonicalEnd,
+    },
+    priceEpochBasis: HISTORICAL_PRICE_EPOCH_BASIS,
+    priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
+    priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+    period: finalizePeriod(period),
+  };
+}
+
 function newTimelineBucket(startMs) {
   return {
     startMs,

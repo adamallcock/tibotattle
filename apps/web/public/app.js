@@ -44,6 +44,8 @@ import {
 } from "./localization.js";
 import {
   compact,
+  adaptiveChartTickCount,
+  classifyTimelineEvidence,
   createDomHelpers,
   finite,
   formatAge,
@@ -53,6 +55,7 @@ import {
   formatTimeZoneLabel,
   getFormattingLocale,
   localCalendarParts,
+  selectAvailableAccountingPeriod,
   setFormattingLocale,
   setMessageLocale,
   REPORTING_TIME_ZONE,
@@ -651,7 +654,7 @@ function renderLocalOnboarding(value) {
   const indexing = dashboard?.collector?.indexing ?? null;
   const boundedPause = indexing?.status === "bounded_pause";
   const ready = localAnalysisAllowed(value);
-  card.hidden = false;
+  card.hidden = runsInsideNativeDashboard();
   card.classList.toggle("needs-attention", !ready);
   $("#setup-title").textContent = boundedPause
     ? "Continue your local analysis"
@@ -946,6 +949,10 @@ function renderPricing(data) {
   $("#cost-coverage").title = eventCount > 0
     ? t("dashboard.pricing.coverageDenominator", { count: compact(eventCount) })
     : "";
+  const historyCoverage = historyCoverageLabel(pricing.historyCoverage);
+  const historyCoverageElement = $("#cost-history-coverage");
+  historyCoverageElement.hidden = historyCoverage === "";
+  historyCoverageElement.textContent = historyCoverage;
   const list = $("#cost-components");
   clear(list);
   const components = pricing.components.filter(
@@ -972,12 +979,7 @@ function renderPricing(data) {
       track,
       node("strong", "", costLabel)
     );
-    row.title = hasUnpricedTokens
-      ? t("dashboard.pricing.tokensWithUnpriced", {
-        tokens: compact(component.tokens),
-        unpriced: compact(component.unpricedTokens),
-      })
-      : t("dashboard.pricing.tokens", { count: compact(component.tokens) });
+    row.title = t("dashboard.pricing.tokens", { count: compact(component.tokens) });
     list.append(row);
   }
 }
@@ -1776,7 +1778,8 @@ function drawShareCardTrend(context, card, x, y, width, height) {
   context.fillText(yAxisLabel, plotLeft, y + 22);
 
   for (const tick of xTicks) {
-    context.textAlign = tick.alignment;
+    // SVG uses `middle`; Canvas uses the equivalent `center` value.
+    context.textAlign = tick.alignment === "middle" ? "center" : tick.alignment;
     const tickX = points.length === 1 || span <= 0
       ? (plotLeft + plotRight) / 2
       : plotLeft + (tick.at - domainStart) / span * (plotRight - plotLeft);
@@ -2396,24 +2399,22 @@ function liveTimelinePoints(
     const expected = capacity !== null && capacity > 0
       ? rollingCost / capacity * 100
       : null;
-    const idle = sameReset && observed === 0 && rollingEvents === 0 && rollingCost === 0;
-    const activityWithoutPrice = sameReset && rollingEvents > 0 && rollingCost === 0;
-    const quotaWithoutActivity = sameReset && observed !== null && observed > 0
-      && rollingEvents === 0;
+    const evidence = classifyTimelineEvidence({
+      bracketed,
+      sameReset,
+      observed,
+      expected,
+      usageEvents: rollingEvents,
+      apiCostUsd: rollingCost,
+    });
     points.push({
       timestamp: current.endAt,
       observed,
       expected,
-      residual: observed === null || expected === null ? null : observed - expected,
+      residual: evidence.residual,
       apiCostUsd: Math.max(0, rollingCost),
       usageEvents: Math.max(0, rollingEvents),
-      status: !bracketed ? "missing_quota_bracket"
-        : !sameReset ? "reset_or_track_change"
-          : observed === null ? "backward_or_ambiguous"
-            : idle ? "inactive"
-              : quotaWithoutActivity ? "unexplained_without_local_activity"
-                : activityWithoutPrice ? "unpriced_local_activity"
-                  : "matched"
+      status: evidence.status,
     });
   }
   return points;
@@ -2518,7 +2519,6 @@ function renderUsageTimeline(data) {
         className: "chart-line-value",
         label: "API-price-equivalent usage",
         markers: true,
-        focusable: true,
         markerRadius: 2.6,
         format: (value) => formatApiMoney(value),
       }],
@@ -2528,7 +2528,6 @@ function renderUsageTimeline(data) {
         className: "chart-line-allowance",
         label: "Seven-day allowance remaining",
         markers: true,
-        focusable: true,
       }],
       secondaryYLabel: "Allowance remaining (%)",
       title: "Real local API-price-equivalent usage over time",
@@ -2618,7 +2617,6 @@ function renderTimeline(data) {
           className: "chart-line-observed",
           label: t("dashboard.timeline.observedQuota"),
           markers: true,
-          focusable: true,
           format: formatPp,
         },
         {
@@ -2626,7 +2624,6 @@ function renderTimeline(data) {
           className: "chart-line-expected",
           label: t("dashboard.timeline.expectedCost"),
           markers: true,
-          focusable: true,
           format: formatPp,
         }
       ],
@@ -2713,26 +2710,35 @@ function bindTimelineInteractions(shell, points, viewport) {
     zoomTimeline(points, wheelZoomFactor(event), ratio);
   };
   shell.onpointerdown = (event) => {
-    timelinePointerStart = { x: event.clientX };
+    if (event.button !== undefined && event.button !== 0) return;
+    timelinePointerStart = { x: event.clientX, dragging: false };
     shell.setPointerCapture?.(event.pointerId);
-    shell.classList.add("is-panning");
+    shell.classList.add("is-pointer-active");
   };
   shell.onpointermove = (event) => {
     if (timelinePointerStart === null) return;
     const width = Math.max(1, shell.getBoundingClientRect().width);
     const delta = event.clientX - timelinePointerStart.x;
     if (Math.abs(delta) < 8) return;
+    timelinePointerStart.dragging = true;
     timelinePointerStart.x = event.clientX;
+    shell.classList.add("is-panning");
     event.preventDefault();
     panTimeline(points, -delta / width);
   };
   const stopPanning = (event) => {
+    const wasDragging = timelinePointerStart?.dragging === true;
     timelinePointerStart = null;
     shell.releasePointerCapture?.(event.pointerId);
+    shell.classList.remove("is-pointer-active");
     shell.classList.remove("is-panning");
+    if (wasDragging) event.preventDefault();
   };
   shell.onpointerup = stopPanning;
   shell.onpointercancel = stopPanning;
+  shell.onselectstart = (event) => {
+    if (timelinePointerStart !== null) event.preventDefault();
+  };
   shell.onkeydown = (event) => {
     if (["+", "="].includes(event.key)) {
       event.preventDefault();
@@ -2881,7 +2887,6 @@ function renderResiduals(data, points, viewport = null) {
         className: "chart-line-value",
         label: "Residual",
         markers: true,
-        focusable: true,
         format: formatPp,
       }],
       yLabel: "Percentage points",
@@ -2951,9 +2956,24 @@ function lineChart({
   xLabel = null,
   rotateXTickLabels = false,
 }) {
+  // Data-point details are the safe default for every chart series. A caller
+  // may opt out of the visual markers or the tooltip, but accessibility must
+  // not disappear merely because a new series forgot an opt-in flag.
+  const chartSeries = (Array.isArray(series) ? series : []).map((item) => ({
+    ...item,
+    markers: item.markers !== false,
+    focusable: item.focusable !== false,
+    tooltip: item.tooltip !== false,
+  }));
+  const chartSecondarySeries = (Array.isArray(secondarySeries) ? secondarySeries : []).map((item) => ({
+    ...item,
+    markers: item.markers !== false,
+    focusable: item.focusable !== false,
+    tooltip: item.tooltip !== false,
+  }));
   const width = 900;
   const height = 330;
-  const hasSecondary = secondarySeries.length > 0;
+  const hasSecondary = chartSecondarySeries.length > 0;
   const margin = {
     top: 24,
     right: hasSecondary ? 64 : 22,
@@ -2963,7 +2983,7 @@ function lineChart({
   let min = finite(yDomain?.low);
   let max = finite(yDomain?.high);
   if (min === null || max === null || max <= min) {
-    const values = points.flatMap((point) => series.map((item) => finite(point[item.key])).filter((value) => value !== null));
+    const values = points.flatMap((point) => chartSeries.map((item) => finite(point[item.key])).filter((value) => value !== null));
     if (confidence) values.push(...points.flatMap((point) => [finite(point[confidence.low]), finite(point[confidence.high])].filter((value) => value !== null)));
     if (errorBars) values.push(...points.flatMap((point) => [finite(point[errorBars.low]), finite(point[errorBars.high])].filter((value) => value !== null)));
     if (includeZero) values.push(0);
@@ -3034,8 +3054,86 @@ function lineChart({
     tooltipHeading.textContent = heading.slice(0, 72);
     tooltipDetail.textContent = detail.slice(0, 86);
     tooltip.setAttribute("visibility", "visible");
+    tooltip.setAttribute("aria-hidden", "false");
   };
-  const hideTooltip = () => tooltip.setAttribute("visibility", "hidden");
+  const hideTooltip = () => {
+    tooltip.setAttribute("visibility", "hidden");
+    tooltip.setAttribute("aria-hidden", "true");
+  };
+
+  const bindChartInteraction = ({
+    element,
+    heading,
+    detail = "",
+    xPosition,
+    yPosition,
+    pointer = true,
+    focus = true,
+    label = `${heading}${detail ? ` · ${detail}` : ""}`,
+  }) => {
+    if (focus) {
+      element.setAttribute("tabindex", "0");
+      element.setAttribute("role", "img");
+      element.setAttribute("aria-label", label);
+    }
+    if (typeof element.addEventListener !== "function") return;
+    if (pointer) {
+      element.addEventListener("pointerenter", () => showTooltip(
+        xPosition,
+        yPosition,
+        heading,
+        detail,
+      ));
+      element.addEventListener("pointerleave", hideTooltip);
+    }
+    if (focus) {
+      element.addEventListener("focus", () => showTooltip(
+        xPosition,
+        yPosition,
+        heading,
+        detail,
+      ));
+      element.addEventListener("blur", hideTooltip);
+    }
+  };
+
+  const installTickDensity = (tickLabels) => {
+    if (tickLabels.length === 0) return;
+    const update = (renderedWidth) => {
+      const widthForDensity = Number.isFinite(renderedWidth) && renderedWidth > 0
+        ? renderedWidth
+        : width;
+      const target = Math.min(
+        tickLabels.length,
+        adaptiveChartTickCount(widthForDensity, {
+          left: margin.left,
+          right: margin.right,
+        }),
+      );
+      const visible = new Set();
+      if (target === 1) {
+        visible.add(0);
+      } else {
+        for (let index = 0; index < target; index += 1) {
+          visible.add(Math.round(index * (tickLabels.length - 1) / (target - 1)));
+        }
+      }
+      tickLabels.forEach((label, index) => {
+        label.setAttribute("display", visible.has(index) ? "inline" : "none");
+        label.setAttribute("aria-hidden", visible.has(index) ? "false" : "true");
+      });
+    };
+    const renderedWidth = typeof svg.getBoundingClientRect === "function"
+      ? svg.getBoundingClientRect().width
+      : width;
+    update(renderedWidth);
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver((entries) => {
+        update(entries[0]?.contentRect?.width ?? renderedWidth);
+      });
+      observer.observe(svg);
+    }
+  };
 
   for (let index = 0; index < 5; index += 1) {
     const value = max - index / 4 * (max - min);
@@ -3061,10 +3159,13 @@ function lineChart({
   }
 
   if (timed) {
-    const automaticTickCount = Math.max(
-      3,
-      Math.min(7, Math.floor((width - margin.left - margin.right) / 140) + 1),
-    );
+    // Render the widest useful candidate set once, then hide labels as the
+    // SVG's actual CSS width changes. The plotted geometry stays stable while
+    // narrow cards shed labels instead of acquiring a horizontal scrollbar.
+    const automaticTickCount = adaptiveChartTickCount(width, {
+      left: margin.left,
+      right: margin.right,
+    });
     const ticks = Array.isArray(xTicks) && xTicks.length > 0
       ? xTicks
       : Array.from({ length: automaticTickCount }, (_, index) => {
@@ -3083,6 +3184,7 @@ function lineChart({
               : "middle",
         };
       });
+    const tickLabels = [];
     for (const tick of ticks) {
       const at = finite(tick?.at);
       if (at === null) continue;
@@ -3104,16 +3206,22 @@ function lineChart({
         );
       }
       svg.append(tickLabel);
+      tickLabels.push(tickLabel);
     }
+    installTickDensity(tickLabels);
     if (xLabel) {
       svg.append(svgText(width / 2, height - 6, xLabel, "chart-axis-label", "middle"));
     }
   } else {
     const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
+    const tickLabels = [];
     for (const index of labelIndexes) {
       const timestamp = points[index]?.timestamp ?? points[index]?.date;
-      svg.append(svgText(x(index), height - 22, formatLocal(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle"));
+      const tickLabel = svgText(x(index), height - 22, formatLocal(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle");
+      svg.append(tickLabel);
+      tickLabels.push(tickLabel);
     }
+    installTickDensity(tickLabels);
   }
   const yAxisLabel = svgText(15, height / 2, yLabel, "chart-axis-label", "middle");
   yAxisLabel.setAttribute("transform", `rotate(-90 15 ${height / 2})`);
@@ -3152,6 +3260,26 @@ function lineChart({
       const polygon = document.createElementNS(svg.namespaceURI, "polygon");
       polygon.setAttribute("points", [...upper, ...lower].map(([a, b]) => `${a},${b}`).join(" "));
       polygon.setAttribute("class", "chart-area-confidence");
+      const bandLow = Math.min(...confidencePoints.map(({ low }) => low));
+      const bandHigh = Math.max(...confidencePoints.map(({ high }) => high));
+      const bandFormat = confidence.format ?? formatMoney;
+      const bandHeading = confidence.label ?? "Confidence band";
+      const bandDetail = `${bandFormat(bandLow)}–${bandFormat(bandHigh)}`;
+      const bandCaption = `${bandHeading}: ${bandDetail}`;
+      const bandTitle = document.createElementNS(svg.namespaceURI, "title");
+      setRawText(bandTitle, bandCaption);
+      polygon.append(bandTitle);
+      const middlePoint = confidencePoints[Math.floor(confidencePoints.length / 2)];
+      bindChartInteraction({
+        element: polygon,
+        heading: bandHeading,
+        detail: bandDetail,
+        xPosition: x(middlePoint.index, middlePoint.point),
+        yPosition: y((bandLow + bandHigh) / 2),
+        pointer: confidence.tooltip !== false,
+        focus: confidence.focusable !== false,
+        label: bandCaption,
+      });
       svg.append(polygon);
     }
   }
@@ -3201,7 +3329,7 @@ function lineChart({
     svg.append(rect);
   }
 
-  for (const item of series) {
+  for (const item of chartSeries) {
     const segments = [];
     let segment = [];
     points.forEach((point, index) => {
@@ -3209,16 +3337,44 @@ function lineChart({
       if (value === null) {
         if (segment.length) segments.push(segment);
         segment = [];
-      } else segment.push([x(index, point), y(value)]);
+      } else segment.push({
+        point,
+        index,
+        value,
+        x: x(index, point),
+        y: y(value),
+      });
     });
     if (segment.length) segments.push(segment);
     if (item.connect !== false) for (const pathPoints of segments) {
       const path = document.createElementNS(svg.namespaceURI, "polyline");
-      path.setAttribute("points", pathPoints.map(([a, b]) => `${a},${b}`).join(" "));
+      path.setAttribute("points", pathPoints.map(({ x: xPosition, y: yPosition }) => `${xPosition},${yPosition}`).join(" "));
       path.setAttribute("class", item.className);
+      if (item.lineFocusable === true) {
+        const format = item.format ?? formatMoney;
+        const representative = pathPoints[Math.floor(pathPoints.length / 2)];
+        const heading = `${item.label}: ${format(representative.value)}`;
+        const detail = typeof item.lineDetail === "function"
+          ? item.lineDetail(pathPoints.map(({ point }) => point))
+          : "";
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        const lineTitle = document.createElementNS(svg.namespaceURI, "title");
+        setRawText(lineTitle, caption);
+        path.append(lineTitle);
+        bindChartInteraction({
+          element: path,
+          heading,
+          detail,
+          xPosition: representative.x,
+          yPosition: representative.y,
+          pointer: item.lineTooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
+      }
       svg.append(path);
     }
-    if (item.markers === true) {
+    if (item.markers !== false) {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
@@ -3229,6 +3385,7 @@ function lineChart({
         const markerRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 4;
+        if (!Number.isFinite(markerRadius) || markerRadius <= 0) return;
         const markerOpacity = typeof item.markerOpacity === "function"
           ? item.markerOpacity(point)
           : item.markerOpacity;
@@ -3240,48 +3397,35 @@ function lineChart({
           );
         }
         marker.setAttribute("class", `${item.className} chart-point`);
-        if (item.tooltip !== false || item.focusable === true) {
-          const timestamp = point.timestamp ?? point.date;
-          const heading = `${item.label}: ${format(value)}`;
-          const detail = [
-            item.detail?.(point),
-            timestamp ? formatLocal(timestamp) : null,
-          ].filter(Boolean).join(" · ");
-          const caption = [heading, detail].filter(Boolean).join(" · ");
-          if (item.tooltip !== false) {
-            const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-            setRawText(markerTitle, caption);
-            marker.append(markerTitle);
-            if (typeof marker.addEventListener === "function") {
-              marker.addEventListener("pointerenter", () => showTooltip(
-                x(index, point),
-                y(value),
-                heading,
-                detail,
-              ));
-              marker.addEventListener("pointerleave", hideTooltip);
-              marker.addEventListener("focus", () => showTooltip(
-                x(index, point),
-                y(value),
-                heading,
-                detail,
-              ));
-              marker.addEventListener("blur", hideTooltip);
-            }
-          }
-          // A hover title alone is mouse-only, so focusable markers carry the
-          // identical sentence to the keyboard and to assistive technology.
-          if (item.focusable === true) {
-            marker.setAttribute("tabindex", "0");
-            marker.setAttribute("role", "img");
-            marker.setAttribute("aria-label", caption);
-          }
+        const timestamp = point.timestamp ?? point.date;
+        const heading = `${item.label}: ${format(value)}`;
+        const detail = [
+          item.detail?.(point),
+          timestamp ? formatLocal(timestamp) : null,
+        ].filter(Boolean).join(" · ");
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        if (item.tooltip !== false) {
+          const markerTitle = document.createElementNS(svg.namespaceURI, "title");
+          setRawText(markerTitle, caption);
+          marker.append(markerTitle);
         }
+        // A hover title alone is mouse-only, so focusable markers carry the
+        // identical sentence to the keyboard and to assistive technology.
+        bindChartInteraction({
+          element: marker,
+          heading,
+          detail,
+          xPosition: x(index, point),
+          yPosition: y(value),
+          pointer: item.tooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
         svg.append(marker);
       });
     }
   }
-  for (const item of secondarySeries) {
+  for (const item of chartSecondarySeries) {
     const segments = [];
     let segment = [];
     points.forEach((point, index) => {
@@ -3290,7 +3434,13 @@ function lineChart({
         if (segment.length) segments.push(segment);
         segment = [];
       } else {
-        segment.push([x(index, point), ySecondary(value)]);
+        segment.push({
+          point,
+          index,
+          value,
+          x: x(index, point),
+          y: ySecondary(value),
+        });
       }
     });
     if (segment.length) segments.push(segment);
@@ -3298,12 +3448,34 @@ function lineChart({
       const path = document.createElementNS(svg.namespaceURI, "polyline");
       path.setAttribute(
         "points",
-        pathPoints.map(([a, b]) => `${a},${b}`).join(" ")
+        pathPoints.map(({ x: xPosition, y: yPosition }) => `${xPosition},${yPosition}`).join(" ")
       );
       path.setAttribute("class", item.className);
+      if (item.lineFocusable === true) {
+        const format = item.format ?? ((value) => `${formatDecimal(value, 1)}%`);
+        const representative = pathPoints[Math.floor(pathPoints.length / 2)];
+        const heading = `${item.label}: ${format(representative.value)}`;
+        const detail = typeof item.lineDetail === "function"
+          ? item.lineDetail(pathPoints.map(({ point }) => point))
+          : "";
+        const caption = [heading, detail].filter(Boolean).join(" · ");
+        const lineTitle = document.createElementNS(svg.namespaceURI, "title");
+        setRawText(lineTitle, caption);
+        path.append(lineTitle);
+        bindChartInteraction({
+          element: path,
+          heading,
+          detail,
+          xPosition: representative.x,
+          yPosition: representative.y,
+          pointer: item.lineTooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
+      }
       svg.append(path);
     }
-    if (item.markers === true) {
+    if (item.markers !== false) {
       const format = item.format ?? ((value) => `${formatDecimal(value, 1)}%`);
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
@@ -3311,35 +3483,30 @@ function lineChart({
         const marker = document.createElementNS(svg.namespaceURI, "circle");
         marker.setAttribute("cx", String(x(index, point)));
         marker.setAttribute("cy", String(ySecondary(value)));
-        marker.setAttribute("r", String(item.markerRadius ?? 2.6));
+        const markerRadius = typeof item.markerRadius === "function"
+          ? item.markerRadius(point)
+          : item.markerRadius ?? 2.6;
+        if (!Number.isFinite(markerRadius) || markerRadius <= 0) return;
+        marker.setAttribute("r", String(markerRadius));
         marker.setAttribute("class", `${item.className} chart-point`);
         const heading = `${item.label}: ${format(value)}`;
         const detail = point.timestamp ? formatLocal(point.timestamp) : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
-        const markerTitle = document.createElementNS(svg.namespaceURI, "title");
-        setRawText(markerTitle, caption);
-        marker.append(markerTitle);
-        if (typeof marker.addEventListener === "function") {
-          marker.addEventListener("pointerenter", () => showTooltip(
-            x(index, point),
-            ySecondary(value),
-            heading,
-            detail,
-          ));
-          marker.addEventListener("pointerleave", hideTooltip);
-          marker.addEventListener("focus", () => showTooltip(
-            x(index, point),
-            ySecondary(value),
-            heading,
-            detail,
-          ));
-          marker.addEventListener("blur", hideTooltip);
+        if (item.tooltip !== false) {
+          const markerTitle = document.createElementNS(svg.namespaceURI, "title");
+          setRawText(markerTitle, caption);
+          marker.append(markerTitle);
         }
-        if (item.focusable === true) {
-          marker.setAttribute("tabindex", "0");
-          marker.setAttribute("role", "img");
-          marker.setAttribute("aria-label", caption);
-        }
+        bindChartInteraction({
+          element: marker,
+          heading,
+          detail,
+          xPosition: x(index, point),
+          yPosition: ySecondary(value),
+          pointer: item.tooltip !== false,
+          focus: item.focusable !== false,
+          label: caption,
+        });
         svg.append(marker);
       });
     }
@@ -3567,9 +3734,9 @@ function renderAllowanceHistoryChart(history) {
         key: "historicalMedian",
         className: "chart-line-weekly-center",
         label: "Historical median",
-        markers: true,
-        focusable: true,
-        markerRadius: 2,
+        markers: false,
+        lineFocusable: true,
+        lineDetail: (points) => `${points.length} reset estimates`,
         format: (value) => formatMoney(value),
       },
       {
@@ -3578,8 +3745,6 @@ function renderAllowanceHistoryChart(history) {
         label: `Observed across ${activeWeeklyMinimumObservedSpanPp}+ points`,
         connect: false,
         markers: true,
-        tooltip: true,
-        focusable: true,
         format: (value) => formatMoney(value),
         detail: (point) => `${formatPp(point.observedSpanPp)} observed · measured range ${formatMoney(point.low)}–${formatMoney(point.high)}`,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
@@ -3590,14 +3755,17 @@ function renderAllowanceHistoryChart(history) {
         label: "Short observation",
         connect: false,
         markers: true,
-        tooltip: true,
-        focusable: true,
         format: (value) => formatMoney(value),
         detail: (point) => `${formatPp(point.observedSpanPp)} observed · measured range ${formatMoney(point.low)}–${formatMoney(point.high)}`,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
-    confidence: { low: "acrossResetLow", high: "acrossResetHigh" },
+    confidence: {
+      low: "acrossResetLow",
+      high: "acrossResetHigh",
+      label: "80% across-reset range",
+      format: (value) => formatMoney(value),
+    },
     errorBars: {
       low: "low",
       high: "high",
@@ -3968,17 +4136,48 @@ function renderWeeklyTable(values) {
 }
 
 function accountingPeriod(data) {
-  const selected = data.accounting.periods.find(
-    (period) => period.periodId === activeAccountingPeriod
+  const periods = Array.isArray(data?.accounting?.periods)
+    ? data.accounting.periods
+    : [];
+  const selected = periods.find(
+    (period) => period?.periodId === activeAccountingPeriod,
   );
-  return selected
-    ? {
-      ...data.accounting,
-      ...selected,
-      replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
-      accountingSource: data.accounting.accountingSource
-    }
-    : data.accounting;
+  if (!selected) return null;
+  return {
+    ...data.accounting,
+    ...selected,
+    replayExclusionDiagnostics: data.accounting.replayExclusionDiagnostics,
+    accountingSource: data.accounting.accountingSource,
+  };
+}
+
+function syncAccountingPeriodControls(data) {
+  const controls = $("#accounting-period-controls");
+  if (!controls) return;
+  const periods = Array.isArray(data?.accounting?.periods)
+    ? data.accounting.periods
+    : [];
+  const available = new Set(
+    periods
+      .map((period) => period?.periodId)
+      .filter((periodId) => typeof periodId === "string" && periodId !== ""),
+  );
+  if (!available.has(activeAccountingPeriod)) {
+    activeAccountingPeriod = selectAvailableAccountingPeriod(periods, activeAccountingPeriod);
+  }
+  for (const control of controls.querySelectorAll("button")) {
+    const periodId = control.dataset.period;
+    const present = available.has(periodId);
+    // The indexed-history option is a capability, not a promise made by the
+    // static page. If the payload does not carry it, keep the control out of
+    // the UI rather than making the 31-day cache look like full history.
+    control.hidden = periodId === "history" && !present;
+    control.disabled = !present;
+    control.setAttribute("aria-disabled", String(!present));
+    const active = present && periodId === activeAccountingPeriod;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
 }
 
 function renderAccountingDimension(containerSelector, dimension, {
@@ -4063,12 +4262,33 @@ function renderAccountingComponentBars(containerSelector, rows, {
 }
 
 function renderAccounting(data) {
+  syncAccountingPeriodControls(data);
   const accounting = accountingPeriod(data);
+  if (accounting === null) {
+    clear($("#accounting-summary"));
+    clear($("#accounting-component-counts"));
+    clear($("#accounting-component-costs"));
+    clear($("#accounting-models"));
+    return;
+  }
   const summary = $("#accounting-summary");
   clear(summary);
   const pricedEvents = finite(accounting.pricingCoverage?.fullyPricedEvents, 0)
     + finite(accounting.pricingCoverage?.partiallyPricedEvents, 0);
   const unpricedEvents = finite(accounting.pricingCoverage?.unpricedEvents, 0);
+  const unknownModelEvents = finite(accounting.unknownModelEvents, 0);
+  const evidenceStartDate = /^\d{4}-\d{2}-\d{2}$/u.test(
+    accounting.evidenceStartDate ?? "",
+  ) ? accounting.evidenceStartDate : null;
+  const periodDays = { "24h": 1, "7d": 7, "30d": 30 }[accounting.periodId] ?? null;
+  const selectedPeriodCanPrecedeEvidence = evidenceStartDate !== null
+    && (accounting.periodId === "all"
+      || accounting.periodId === "history"
+      || (periodDays !== null
+        && Date.now() - periodDays * 24 * 60 * 60 * 1000
+          < Date.parse(`${evidenceStartDate}T00:00:00.000Z`)));
+  const hasPreEvidenceUnpricedEvents = selectedPeriodCanPrecedeEvidence
+    && unpricedEvents > unknownModelEvents;
   const coveragePercent = accounting.events === 0
     ? null
     : pricedEvents / accounting.events * 100;
@@ -4099,8 +4319,12 @@ function renderAccounting(data) {
       coveragePercent === null
         ? "—"
         : formatPercent(coveragePercent, coverageDigits),
-      unpricedEvents > 0
-        ? `${compact(unpricedEvents)} measured event${unpricedEvents === 1 ? "" : "s"} left unpriced`
+      hasPreEvidenceUnpricedEvents
+        ? t("accounting.pricing.evidenceStarts", {
+          date: formatLocal(`${evidenceStartDate}T12:00:00.000Z`, { dateOnly: true }),
+        })
+        : unpricedEvents > 0
+          ? `${compact(unpricedEvents)} measured event${unpricedEvents === 1 ? "" : "s"} left unpriced`
         : "All measured events have a reviewed price"
     ]
   ]) {
@@ -5596,8 +5820,8 @@ function renderHostedIdentity() {
   setProductText(
     $("#identity-account-detail"),
     provider !== null
-      ? "Signing out revokes this browser's service session and forgets this sign-in. Hosted privacy controls remain available separately."
-      : "This browser already has a service session. Signing out revokes it; hosted privacy controls remain available separately.",
+      ? "Signing out ends this browser's contribution session."
+      : "This browser already has a contribution session. Signing out ends it.",
   );
   chip.textContent = signedIn
     ? "Signed in"
@@ -5956,7 +6180,7 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
     node(
       "p",
       "annotation",
-      "Resetting clears only that unusable local credential and its local record. Metadata you already contributed is untouched, no hosted device is revoked, and the TiboTattle app's Data & Diagnostics… menu offers the same repair natively."
+      "Resetting clears only that unusable credential and its local record. Then connect this Mac again."
     ),
     actions
   );
@@ -5964,7 +6188,7 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
 }
 
 const DEVICE_CREDENTIAL_RESET_CONFIRMATION =
-  "Clear this Mac's unusable contribution-device credential?\n\nThis deletes only the leftover credential in this Mac's Keychain and the local record that went with it. Metadata you already contributed is not deleted, no hosted device is revoked, and your local reporting is unchanged.";
+  "Clear this Mac's unusable contribution-device credential?\n\nThis clears only the leftover credential in this Mac's Keychain and its local record. Local reporting is unchanged.";
 
 async function resetContributionDeviceCredential() {
   if (communityConnectBusy) return;
@@ -5981,8 +6205,8 @@ async function resetContributionDeviceCredential() {
       throw new Error("The local companion did not confirm the reset.");
     }
     status.textContent = result.status === "already_absent"
-      ? "No leftover device credential was present on this Mac, so nothing was deleted. Choose Contribute and keep it current to connect."
-      : "The leftover device credential was cleared. Metadata you already contributed is untouched. Choose Contribute and keep it current to connect this Mac again.";
+      ? "No leftover device credential was present. Choose Contribute to connect this Mac."
+      : "The leftover device credential was cleared. Choose Contribute to connect this Mac again.";
   } catch (error) {
     await showFailure(status, {
       surface: "device_credential_reset",
@@ -6043,8 +6267,7 @@ async function disableAutomaticContribution() {
     }
     pendingAutomaticContributionConsent = null;
     renderAutomaticContributionStatus(disabled);
-    status.textContent =
-      "Automatic contribution is off. Already accepted metadata is unchanged; use Hosted privacy controls if you want it deleted.";
+    status.textContent = "Automatic contribution is off.";
   } catch (error) {
     await showFailure(status, {
       surface: "automatic_contribution",
@@ -7616,12 +7839,15 @@ $("#weekly-span-control").addEventListener("input", (event) => {
 $("#accounting-period-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-period]");
   if (!button || !dashboard) return;
-  activeAccountingPeriod = button.dataset.period;
-  for (const control of $("#accounting-period-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
+  const available = new Set(
+    (Array.isArray(dashboard.accounting?.periods) ? dashboard.accounting.periods : [])
+      .map((period) => period?.periodId),
+  );
+  if (!available.has(button.dataset.period) || button.disabled) {
+    syncAccountingPeriodControls(dashboard);
+    return;
   }
+  activeAccountingPeriod = button.dataset.period;
   renderAccounting(dashboard);
 });
 $("#contribution-file").addEventListener("change", async () => {

@@ -414,6 +414,7 @@ test("local refresh starts a bounded archive index only after the foreground res
     codexHome: "/private/codex-home",
     indexFile: "/private/archive-index.sqlite",
     secretFile: "/private/archive-index-secret",
+    declaredSpeedBaselines: [],
     now: clock,
     signal: controller.signal,
   });

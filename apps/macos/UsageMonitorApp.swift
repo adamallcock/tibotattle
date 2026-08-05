@@ -105,13 +105,21 @@ private enum NativeRefreshIntervalPreference {
     static let allowedSeconds = [60, 5 * 60, 15 * 60, 30 * 60]
 
     static var seconds: Int {
-        let stored = UserDefaults.standard.integer(forKey: defaultsKey)
+        seconds(in: UserDefaults.standard)
+    }
+
+    static func seconds(in defaults: UserDefaults) -> Int {
+        let stored = defaults.integer(forKey: defaultsKey)
         return allowedSeconds.contains(stored) ? stored : defaultSeconds
     }
 
     static func setSeconds(_ value: Int) {
+        setSeconds(value, in: UserDefaults.standard)
+    }
+
+    static func setSeconds(_ value: Int, in defaults: UserDefaults) {
         guard allowedSeconds.contains(value) else { return }
-        UserDefaults.standard.set(value, forKey: defaultsKey)
+        defaults.set(value, forKey: defaultsKey)
     }
 }
 
@@ -2119,6 +2127,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var pendingDashboardOpen = false
     private var quitting = false
     private var retryAllowed = true
+    /// One supervised recovery is allowed per app session. This catches a
+    /// transient child-process exit without turning the foreground companion
+    /// into an unbounded restart loop. A deliberate Retry starts a new budget.
+    private var automaticCompanionRecoveryUsed = false
     private var startupTimeout: DispatchWorkItem?
     private var window: NSWindow?
     private var lastLifecycleStatus = "Starting"
@@ -3404,6 +3416,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         if quitting || requested { return }
         dashboardURL = nil
         companion = nil
+        if !anotherInstanceIsActive,
+           retryAllowed,
+           firstRunAcknowledged,
+           !automaticCompanionRecoveryUsed {
+            automaticCompanionRecoveryUsed = true
+            startCompanion()
+            return
+        }
         showFailure(
             anotherInstanceIsActive
                 ? LauncherError.companionAlreadyRunning
@@ -3477,6 +3497,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     @objc private func retryCompanion() {
         guard !quitting, retryAllowed, firstRunAcknowledged else { return }
+        automaticCompanionRecoveryUsed = false
         if let previous = companion, previous.isRunning {
             retryButton.isEnabled = false
             previous.stop { [weak self] in
@@ -4114,7 +4135,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func showAbout() {
-        showSettings(selecting: 1)
+        showSettings(selecting: 2)
     }
 
     @objc private func selectLanguagePreference(_ sender: NSPopUpButton) {
@@ -4299,11 +4320,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ),
             sourceActions,
         ])
-        let openDashboardFromSettings = NSButton(
-            title: TiboTattleLocalization.string(.settingsOpenDashboard),
-            target: self,
-            action: #selector(openDashboard)
-        )
         let automaticUpdatesSwitch = NSSwitch()
         automaticUpdatesSwitch.state = updater.automaticUpdatesEnabled
             ? .on
@@ -4513,15 +4529,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         quotaNotificationStatus.maximumNumberOfLines = 3
         settingsQuotaNotificationStatusLabel = quotaNotificationStatus
         let quotaNotificationsSection = settingsGroup(
-            title: TiboTattleLocalization.string(.settingsNotifications),
+            title: TiboTattleLocalization.string(
+                .settingsNotificationsAllowanceTitle
+            ),
             symbolName: "bell",
             views: [
                 quotaNotificationsHeader,
-                settingsLabel(
-                    TiboTattleLocalization.string(.settingsNotificationsDetail),
-                    font: .systemFont(ofSize: 12),
-                    color: .secondaryLabelColor
-                ),
                 openNotifications,
                 quotaNotificationThresholdRow,
                 settingsLabel(
@@ -4542,9 +4555,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 sourceSection,
                 refreshIntervalSection,
                 startAtLoginSection,
-                quotaNotificationsSection,
-                openDashboardFromSettings,
             ]
+        )
+        let notifications = settingsPage(
+            title: TiboTattleLocalization.string(.settingsNotifications),
+            summary: TiboTattleLocalization.string(
+                .settingsNotificationsDetail
+            ),
+            views: [quotaNotificationsSection]
         )
 
         let version = Bundle.main.object(
@@ -4636,7 +4654,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ]
         )
 
-        for controller in [general, about] {
+        for controller in [general, notifications, about] {
             controller.title = TiboTattleLocalization.string(.settingsWindowTitle)
         }
 
@@ -4644,6 +4662,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         tabs.tabStyle = .toolbar
         for (label, symbol, controller) in [
             (TiboTattleLocalization.string(.settingsGeneral), "gearshape", general),
+            (
+                TiboTattleLocalization.string(.settingsNotifications),
+                "bell",
+                notifications
+            ),
             (TiboTattleLocalization.string(.settingsAboutTab), "info.circle", about),
         ] {
             let item = NSTabViewItem(identifier: label)
@@ -5666,6 +5689,54 @@ private enum LifecycleContractSmokeTest {
     }
 }
 
+/// Exercises the refresh cadence preference against a separate persistent
+/// defaults suite. This keeps the bundle contract deterministic without
+/// mutating the developer's normal TiboTattle settings.
+private enum NativeRefreshSettingsContractSmokeTest {
+    private static let suiteName =
+        "com.usagemonitor.local.native-refresh-settings-contract"
+
+    static func run() -> Int32 {
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return 1
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        guard NativeRefreshIntervalPreference.seconds(in: defaults)
+                == NativeRefreshIntervalPreference.defaultSeconds
+        else {
+            return 1
+        }
+        NativeRefreshIntervalPreference.setSeconds(
+            15 * 60,
+            in: defaults
+        )
+        defaults.synchronize()
+        guard let reloaded = UserDefaults(suiteName: suiteName),
+              NativeRefreshIntervalPreference.seconds(in: reloaded)
+                == 15 * 60
+        else {
+            return 1
+        }
+
+        NativeRefreshIntervalPreference.setSeconds(17, in: reloaded)
+        guard NativeRefreshIntervalPreference.seconds(in: reloaded)
+                == 15 * 60
+        else {
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT "
+                + "default=300 persisted=900 reloaded=900 "
+                + "invalid_ignored=true"
+        )
+        return 0
+    }
+}
+
 /// Exercises the login-item seam with a fake manager.  This mode deliberately
 /// never constructs the production login-item adapter or opens System Settings;
 /// it proves the registration boundary in an isolated
@@ -6082,6 +6153,9 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--first-run-contract-smoke-test") {
             exit(LifecycleContractSmokeTest.firstRunContract())
+        }
+        if arguments.contains("--native-refresh-settings-contract-smoke-test") {
+            exit(NativeRefreshSettingsContractSmokeTest.run())
         }
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {

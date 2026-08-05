@@ -268,6 +268,7 @@
               <span id="cost-period">Recorded period</span>
               <strong id="cost-total">—</strong>
               <small id="cost-coverage">Awaiting local evidence</small>
+              <small id="cost-history-coverage" hidden></small>
             </div>
             <p class="annotation">
               This activity total can exceed the inferred weekly limit: it spans
@@ -448,7 +449,7 @@
           <div class="chart-heading">
             <div>
               <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
-              <p id="usage-timeline-copy">Replay-safe local increments · browser-local time · event-time historical API cards</p>
+              <p id="usage-timeline-copy">Local usage over time</p>
             </div>
             <div class="chart-control-stack">
               <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
@@ -577,7 +578,7 @@
             <button type="button" data-period="24h">24h</button>
             <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
             <button type="button" data-period="30d">30d</button>
-            <button type="button" data-period="all">31-day cache</button>
+            <button type="button" data-period="history" hidden>Indexed history</button>
           </div>
         </div>
         <div class="notice notice-info accounting-disclosure">
@@ -719,8 +720,7 @@
               <span class="identity-account-copy">
                 <strong id="identity-account-provider">Signed in with Google</strong>
                 <small id="identity-account-detail">
-                  Signing out revokes this browser's service session and forgets
-                  this sign-in. Hosted privacy controls remain available separately.
+                  Signing out ends this browser's contribution session.
                 </small>
               </span>
               <!--

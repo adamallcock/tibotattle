@@ -77,14 +77,14 @@
 "settings.codexFolder" = "Carpeta de Codex";
 "settings.codexFolderSummary" = "TiboTattle solo lee las carpetas sessions y archived_sessions bajo esta ubicación. Usa el valor predeterminado salvo que tus datos de Codex estén en otro lugar.";
 "settings.general" = "General";
-"settings.generalSummary" = "La actualización se ejecuta dentro de esta app mientras está abierta. Cerrar la ventana no cierra TiboTattle; salir detiene la actualización actual. Iniciar al iniciar sesión es opcional y se gestiona en Configuración del Sistema → Elementos de inicio de sesión. Los registros sin procesar permanecen en este Mac.";
+"settings.generalSummary" = "El uso local se actualiza mientras TiboTattle está abierto. Los registros sin procesar permanecen en este Mac.";
 "settings.github" = "GitHub";
 "settings.language" = "Idioma";
 "settings.languageEnglish" = "English";
 "settings.languagePickerHint" = "Elige el idioma utilizado para los controles y las explicaciones de TiboTattle.";
 "settings.languageSimplifiedChinese" = "简体中文";
 "settings.languageSpanish" = "Español";
-"settings.languageSummary" = "Solo el idioma de la app; las fechas, números y moneda usan el formato de este Mac.";
+"settings.languageSummary" = "Usa el idioma de tu Mac de forma predeterminada.";
 "settings.languageSystem" = "Sistema";
 "settings.openDashboard" = "Abrir panel";
 "settings.openNotifications" = "Abrir ajustes de notificaciones";
@@ -202,8 +202,8 @@
 "menuBar.failureRecovery" = "No está en ejecución: %@. Abre la ventana para ver el paso de recuperación.";
 "settings.codexFolderCustomSelected" = "Carpeta personalizada seleccionada";
 "settings.codexFolderDefaultLocation" = "Ubicación predeterminada (~/.codex)";
-"settings.updateDisclosureAutomaticOff" = "Las actualizaciones de la app firmada están disponibles en Acerca de → Buscar actualizaciones. Las descargas automáticas están desactivadas; puedes activarlas en Configuración → General cuando estén disponibles.";
-"settings.updateDisclosureAutomaticOn" = "Las actualizaciones de la app firmada se comprueban automáticamente. De forma predeterminada, una actualización verificada se descarga en segundo plano y se instala al salir; puedes desactivarlo en Configuración → General.";
+"settings.updateDisclosureAutomaticOff" = "Las actualizaciones de la app firmada están disponibles en Acerca de → Buscar actualizaciones. Las descargas automáticas están desactivadas; puedes activarlas en Configuración → Acerca de cuando estén disponibles.";
+"settings.updateDisclosureAutomaticOn" = "Las actualizaciones de la app firmada se comprueban automáticamente. De forma predeterminada, una actualización verificada se descarga en segundo plano y se instala al salir; puedes desactivarlo en Configuración → Acerca de.";
 "settings.updateDisclosureDevelopment" = "Esta compilación de desarrollo no incluye comprobaciones de actualización. Las versiones firmadas instaladas en Aplicaciones pueden buscar actualizaciones desde Acerca de.";
 "settings.updateDisclosurePreview" = "Esta vista previa usa comprobaciones manuales de actualizaciones firmadas. No busca, descarga ni instala actualizaciones automáticamente.";
 "accessibility.menuBarStatus" = "Estado de TiboTattle";
@@ -211,7 +211,8 @@
 "notification.allowanceTitle" = "Alerta de límite";
 "notification.resetBody" = "Ha cambiado una ventana reciente de cuota informada por el proveedor. Abre TiboTattle para ver los detalles.";
 "notification.resetTitle" = "Se observó una nueva ventana de límite";
-"settings.notifications" = "Notificaciones locales de límite";
+"settings.notifications" = "Notificaciones";
+"settings.notificationsAllowanceTitle" = "Alertas de límite";
 "settings.notificationsDetail" = "Las alertas locales opcionales usan observaciones recientes de la actualización normal. TiboTattle nunca consulta en segundo plano.";
 "settings.notificationsOff" = "Las notificaciones están desactivadas. Desactiva este interruptor en cualquier momento para detener futuras alertas locales y borrar su estado local pendiente.";
 "settings.notificationsPermissionDenied" = "Activadas, pero el permiso de notificaciones de macOS está denegado. No se enviarán alertas. Cámbialo en Configuración del Sistema si quieres alertas.";

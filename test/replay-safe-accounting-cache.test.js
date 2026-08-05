@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   buildReplaySafeAccountingCache,
+  buildReplaySafeAccountingPeriod,
   readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
@@ -110,6 +111,54 @@ test("period coverage separates current priced activity from older pre-registry 
     100 * longer.pricingCoverage.fullyPricedEvents / longer.events,
     50,
   );
+});
+
+test("indexed history prices each event at its own effective date and leaves pre-evidence usage unpriced", async () => {
+  const result = await buildReplaySafeAccountingPeriod({
+    startAt: "1970-01-01T00:00:00.000Z",
+    endAt: "2026-08-01T12:00:00.000Z",
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-25T23:59:59.999Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+      usageEvent({
+        timestamp: "2026-07-29T23:59:59.999Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+      usageEvent({
+        timestamp: "2026-07-30T00:00:00.000Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+
+  assert.equal(result.priceEpochBasis, "event_time_when_registry_has_effective_evidence");
+  assert.deepEqual(result.period.pricingCoverage, {
+    fullyPricedEvents: 2,
+    partiallyPricedEvents: 0,
+    unpricedEvents: 1,
+  });
+  assert.deepEqual(result.period.priceCardBreakdown.map((row) => ({
+    priceCardId: row.priceCardId,
+    events: row.events,
+    costUsd: row.costUsd,
+  })), [
+    {
+      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      events: 1,
+      costUsd: "2",
+    },
+    {
+      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      events: 1,
+      costUsd: "2.5",
+    },
+  ]);
+  assert.equal(result.period.apiPriceEquivalentUsd, 4.5);
 });
 
 const NOW = Date.parse("2026-07-27T12:00:00.000Z");

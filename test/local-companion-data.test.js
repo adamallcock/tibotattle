@@ -18,6 +18,9 @@ import {
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
 import {
+  refreshLocalArchiveAccountingIndex,
+} from "../src/local-archive-accounting-index.js";
+import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
@@ -74,6 +77,45 @@ async function fixtureRoot() {
     await writeFile(join(reportDirectory, file), "<!doctype html><title>report</title>");
   }
   return root;
+}
+
+function rolloutUsage(input, output = 0) {
+  return {
+    input_tokens: input,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    output_tokens: output,
+    reasoning_output_tokens: 0,
+    total_tokens: input + output,
+  };
+}
+
+function rolloutToken(timestamp, total, last, usedPercent) {
+  return JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: total,
+        last_token_usage: last,
+      },
+      rate_limits: {
+        limit_id: "codex",
+        plan_type: "pro",
+        primary: {
+          used_percent: usedPercent,
+          window_minutes: 300,
+          resets_at: 1_785_433_600,
+        },
+        secondary: {
+          used_percent: usedPercent,
+          window_minutes: 10_080,
+          resets_at: 1_785_433_600,
+        },
+      },
+    },
+  });
 }
 
 test("local companion builds a closed real-data projection without identifiers or paths", async () => {
@@ -324,6 +366,115 @@ test("local companion builds a closed real-data projection without identifiers o
     }
   } finally {
     await rm(root, { recursive: true });
+  }
+});
+
+test("raw rollout history reaches the companion through the archive projection with event-time prices", async () => {
+  const root = await fixtureRoot();
+  const codexHome = join(root, ".codex");
+  const sessions = join(codexHome, "sessions");
+  const archiveIndexFile = join(
+    root,
+    ".usage-monitor",
+    "local-archive-accounting-index-v1.sqlite",
+  );
+  const archiveSecretFile = join(
+    root,
+    ".usage-monitor",
+    "local-archive-accounting-index-v1-secret",
+  );
+  const oldTerraCard =
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01";
+  const newTerraCard =
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01";
+  try {
+    await mkdir(sessions, { recursive: true });
+    await writeFile(
+      join(sessions, "rollout-2026-07-25T12-00-00-history.jsonl"),
+      `${[
+        JSON.stringify({
+          timestamp: "2026-07-25T12:00:00.000Z",
+          type: "session_meta",
+          payload: { id: "PRIVATE_ARCHIVE_SESSION" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-25T12:00:00.010Z",
+          type: "turn_context",
+          payload: { model: "gpt-5.6-terra" },
+        }),
+        // The registry has no verified historical Terra card for July 25,
+        // so this event must remain unpriced rather than borrowing a future
+        // price. July 29 uses the old card and July 30 the lower new card.
+        rolloutToken(
+          "2026-07-25T12:01:00.000Z",
+          rolloutUsage(1_000_000),
+          rolloutUsage(1_000_000),
+          1,
+        ),
+        rolloutToken(
+          "2026-07-29T23:59:59.000Z",
+          rolloutUsage(2_000_000),
+          rolloutUsage(1_000_000),
+          2,
+        ),
+        rolloutToken(
+          "2026-07-30T00:00:00.000Z",
+          rolloutUsage(3_000_000),
+          rolloutUsage(1_000_000),
+          3,
+        ),
+      ].join("\n")}\n`,
+      { mode: 0o600 },
+    );
+
+    const refreshed = await refreshLocalArchiveAccountingIndex({
+      indexFile: archiveIndexFile,
+      secretFile: archiveSecretFile,
+      codexHome,
+      now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+      workerCount: 1,
+    });
+    assert.equal(refreshed.status, "complete");
+    assert.equal(refreshed.projectionStatus, "available");
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      archiveIndexFile,
+      allowDevelopmentArtifactFallback: true,
+      now: () => Date.parse("2026-08-01T12:00:00.000Z"),
+    });
+    const history = snapshot.overview.accounting.periods
+      .find((period) => period.periodId === "history");
+    assert.ok(history);
+    assert.equal(history.periodLabel, "Indexed history");
+    assert.equal(history.events, 3);
+    assert.equal(history.totalTokens, 3_000_000);
+    assert.equal(history.apiPriceEquivalentUsd, 4.5);
+    assert.deepEqual(history.pricingCoverage, {
+      fullyPricedEvents: 2,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 1,
+    });
+    assert.deepEqual(history.priceCardIds, [newTerraCard, oldTerraCard]);
+    assert.deepEqual(history.priceCardBreakdown, [
+      { priceCardId: newTerraCard, events: 1, costUsd: "2" },
+      { priceCardId: oldTerraCard, events: 1, costUsd: "2.5" },
+    ]);
+    assert.equal(history.evidenceStartDate, "2026-07-26");
+    assert.equal(snapshot.overview.accounting.evidenceStartDate, "2026-07-26");
+    assert.equal(snapshot.overview.pricing.evidenceStartDate, "2026-07-26");
+    assert.equal(snapshot.overview.accounting.historyPeriodStatus, "available");
+    assert.equal(snapshot.overview.accounting.historyCoverage.status, "complete");
+    assert.equal(
+      snapshot.overview.pricing.priceEpochBasis,
+      "event_time_when_registry_has_effective_evidence",
+    );
+    assert.equal(
+      JSON.stringify(snapshot).includes("PRIVATE_ARCHIVE_SESSION"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

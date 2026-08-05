@@ -18,6 +18,7 @@ import {
   ARCHIVE_INDEX_PASS_TIMEOUT_MS,
   ARCHIVE_INDEX_STORAGE_RESERVE_BYTES,
   inspectLocalArchiveAccountingIndex,
+  readLocalArchiveAccountingPeriod,
   refreshLocalArchiveAccountingIndex,
 } from "../src/local-archive-accounting-index.js";
 
@@ -85,6 +86,12 @@ test("archive read budgets remain strict for short non-aligned passes", async ()
     assert.equal(result.scanBytes > 0, true);
     assert.equal(result.scanBytes <= budgetBytes, true);
     assert.equal(result.status, "partial");
+    assert.equal(result.projectionStatus, "available");
+    const projection = await readLocalArchiveAccountingPeriod({ indexFile });
+    assert.equal(projection.status, "available");
+    assert.equal(projection.period.id, "history");
+    assert.equal(projection.period.label, "Indexed history so far");
+    assert.equal(projection.coverage.status, "partial");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

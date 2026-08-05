@@ -8,6 +8,7 @@ import {
   FAST_MODE_MODEL_FAMILY_KEYS,
   FAST_MODE_MULTIPLIER_SOURCE,
   FAST_MODE_QUOTA_MULTIPLIERS,
+  OPENAI_OFFICIAL_PRICE_CARDS,
   OBSERVED_SPEED_MODE_KEYS,
   QUOTA_WEIGHTED_API_PRICE_METRIC,
   emptySpeedWeightingCrossing,
@@ -28,6 +29,7 @@ import {
 import {
   defaultLocalArchiveAccountingIndexPath,
   inspectLocalArchiveAccountingIndex,
+  readLocalArchiveAccountingPeriod,
 } from "./local-archive-accounting-index.js";
 import {
   defaultLocalCollectorStatePath,
@@ -98,6 +100,10 @@ const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 const RECENT_TIMELINE_DAYS = 31;
 const RECENT_COLLECTOR_PERIOD_LABEL =
   `Cached ${RECENT_TIMELINE_DAYS}-day collector window`;
+const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_OFFICIAL_PRICE_CARDS
+  .map((card) => card?.effective?.from)
+  .filter((value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value))
+  .sort()[0] ?? null;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
@@ -1656,13 +1662,14 @@ export async function buildLocalCompanionSnapshot({
   // inspect it. Once complete this is a cheap receipt check; it never revives
   // JSON as an active state backend.
   await prepareLocalCollectorState({ stateFile: collectorStateFile, clock: () => nowMs });
-  const [replaySafeAccounting, archiveCoverage] = await Promise.all([
+  const [replaySafeAccounting, archiveCoverage, archiveAccounting] = await Promise.all([
     readReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       now: () => nowMs,
       maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
     }),
     inspectLocalArchiveAccountingIndex({ indexFile: archiveIndexFile }),
+    readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile }),
   ]);
   const replaySafeCache = ["available", "stale"].includes(
     replaySafeAccounting.status,
@@ -1722,7 +1729,13 @@ export async function buildLocalCompanionSnapshot({
   const freshnessStatus = replaySafeAccounting.status === "stale"
     ? "stale"
     : collectorFreshnessStatus;
-  const usage = replaySafeCache?.periods ?? collector.usage;
+  const recentUsage = replaySafeCache?.periods ?? collector.usage;
+  const usage = archiveAccounting.status === "available"
+    ? [
+      ...recentUsage.filter((period) => period.id !== "history"),
+      archiveAccounting.period,
+    ]
+    : recentUsage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
     ?? usage.find((period) => period.id === "all");
   const selectedFastModePreference = isFastModePreference(fastModePreference)
@@ -1781,12 +1794,27 @@ export async function buildLocalCompanionSnapshot({
   if (indexing.status === "prospective_only") {
     warnings.push("The retained collector state began prospectively and does not prove recent-history coverage.");
   }
-  if ((displayUsage?.pricingCoverage.unpricedEvents ?? 0) > 0) {
-    warnings.push("Some usage events have an unknown model and are excluded from API-price-equivalent cost.");
+  const displayUnknownModelEvents = displayUsage?.byModel
+    ?.find((row) => row.model === "unknown")?.events ?? 0;
+  if (displayUnknownModelEvents > 0) {
+    warnings.push("Some usage events name an unrecognized model and remain unpriced rather than being assigned a guessed price.");
+  }
+  const thirtyDayUsage = usage.find((period) => period.id === "30d");
+  if (OPENAI_PRICE_EVIDENCE_START_DATE !== null
+      && (thirtyDayUsage?.pricingCoverage.unpricedEvents ?? 0) > displayUnknownModelEvents
+      && new Date(nowMs - (30 * 24 * 60 * 60 * 1_000))
+        .toISOString().slice(0, 10) < OPENAI_PRICE_EVIDENCE_START_DATE) {
+    warnings.push(
+      `Verified OpenAI price evidence begins ${OPENAI_PRICE_EVIDENCE_START_DATE}. Earlier recorded events remain unpriced instead of being assigned a later price.`,
+    );
   }
   if (archiveCoverage.status !== "complete") {
+    warnings.push(archiveAccounting.status === "available"
+      ? `Indexed-history totals currently cover ${archiveCoverage.indexedSourceCount}/${archiveCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
+      : "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.");
+  } else if (archiveAccounting.status !== "available") {
     warnings.push(
-      "Historical archive coverage is partial. Cost totals remain limited to their explicitly labelled recent cached period.",
+      "Historical sources are indexed, but their aggregate is temporarily unavailable and is not substituted with a recent-window total.",
     );
   }
   // Headline provenance must describe the same period as the numeric headline,
@@ -1895,7 +1923,11 @@ export async function buildLocalCompanionSnapshot({
           : replaySafeCache.accountingMethod,
         accountingCacheStatus: replaySafeAccounting.status,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
+        evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
         historyCoverage: archiveCoverage,
+        historyPeriodStatus: archiveAccounting.status,
+        historyGeneratedAt: archiveAccounting.generatedAt ?? null,
+        historyCoveredAt: archiveAccounting.coveredAt ?? null,
         generatedAt: replaySafeCache?.generatedAt ?? null,
         coveredAt: replaySafeCache?.coveredAt ?? null,
         unknownModelEvents: displayUsage?.byModel
@@ -1924,6 +1956,7 @@ export async function buildLocalCompanionSnapshot({
           byLineage: period.byLineage,
           byReasoningEffort: period.byReasoningEffort,
           accountAttribution: period.accountAttribution,
+          evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
         })),
       },
       activity: {
@@ -1975,6 +2008,7 @@ export async function buildLocalCompanionSnapshot({
         subscriptionSpeedIsSeparate: true,
         registryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
         registryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+        evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
         priceCardIds,
         priceCardBreakdown,
         mixedPriceCardWindows,
@@ -1988,6 +2022,7 @@ export async function buildLocalCompanionSnapshot({
         accountingCacheStatus: replaySafeAccounting.status,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         historyCoverage: archiveCoverage,
+        historyPeriodStatus: archiveAccounting.status,
       },
       coverage: {
         overallPercent: pricingCoveragePercent,

@@ -260,6 +260,7 @@ enum TiboTattleLocalization {
         case settingsLanguageSummary = "settings.languageSummary"
         case settingsLanguageSystem = "settings.languageSystem"
         case settingsNotifications = "settings.notifications"
+        case settingsNotificationsAllowanceTitle = "settings.notificationsAllowanceTitle"
         case settingsNotificationsDetail = "settings.notificationsDetail"
         case settingsNotificationsOff = "settings.notificationsOff"
         case settingsNotificationsPermissionDenied = "settings.notificationsPermissionDenied"
@@ -701,7 +702,7 @@ enum TiboTattleLocalization {
             case .settingsGeneral:
                 "General"
             case .settingsGeneralSummary:
-                "Refresh runs in this app while it is open. Closing the window does not quit TiboTattle; quitting stops the current refresh. Start at login is optional and managed in System Settings → Login Items. Raw logs stay on this Mac."
+                "Local usage refreshes while TiboTattle is open. Raw logs stay on this Mac."
             case .settingsGitHub:
                 "GitHub"
             case .settingsLanguage:
@@ -715,11 +716,13 @@ enum TiboTattleLocalization {
             case .settingsLanguageSpanish:
                 "Spanish"
             case .settingsLanguageSummary:
-                "App language only; dates, numbers, and currency use this Mac's format."
+                "Uses your Mac language by default."
             case .settingsLanguageSystem:
                 "System"
             case .settingsNotifications:
-                "Local allowance notifications"
+                "Notifications"
+            case .settingsNotificationsAllowanceTitle:
+                "Allowance alerts"
             case .settingsNotificationsDetail:
                 "Optional local alerts use fresh quota observations from the normal refresh. TiboTattle never polls in the background."
             case .settingsNotificationsOff:

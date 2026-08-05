@@ -649,6 +649,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /anotherInstanceIsActive\s*\? LauncherError\.companionAlreadyRunning/u,
   );
+  assert.match(source, /private var automaticCompanionRecoveryUsed = false/u);
+  assert.match(
+    source,
+    /private func companionExited\([\s\S]*?!automaticCompanionRecoveryUsed[\s\S]*?automaticCompanionRecoveryUsed = true[\s\S]*?startCompanion\(\)[\s\S]*?return[\s\S]*?showFailure/u,
+  );
+  assert.match(
+    source,
+    /@objc private func retryCompanion\(\) \{[\s\S]*?automaticCompanionRecoveryUsed = false/u,
+  );
   assert.match(source, /--confirm-local-keychain-reset/u);
   assert.match(
     source,
@@ -855,9 +864,49 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /private func settingsGroup\(/u);
   assert.match(source, /let group = NSBox\(\)/u);
-  assert.match(source, /symbolName: "globe"/u);
-  assert.match(source, /symbolName: "folder"/u);
-  assert.match(source, /symbolName: "clock"/u);
+  const settingsSource = source.slice(
+    source.indexOf("private func showSettings(selecting index: Int)"),
+    source.indexOf("    private func diagnosticText()"),
+  );
+  assert.ok(settingsSource, "settings construction source should be present");
+  const generalSettings = settingsSource.match(
+    /let general = settingsPage\([\s\S]*?\n        \)\n(?=        let notifications)/u,
+  )?.[0] ?? "";
+  assert.ok(generalSettings, "general settings page wiring should be present");
+  assert.match(
+    generalSettings,
+    /languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
+  );
+  assert.doesNotMatch(generalSettings, /quotaNotificationsSection/u);
+  assert.doesNotMatch(
+    generalSettings,
+    /automaticUpdatesHeader|aboutAutomaticUpdatesDetail|checkForUpdates|launcherUpToDate/u,
+  );
+  const notificationSettings = settingsSource.match(
+    /let notifications = settingsPage\([\s\S]*?views: \[quotaNotificationsSection\][\s\S]*?\n        \)/u,
+  )?.[0] ?? "";
+  assert.ok(
+    notificationSettings,
+    "notification settings should have a dedicated native page",
+  );
+  const aboutSettings = settingsSource.slice(
+    settingsSource.indexOf("let about = settingsPage("),
+  );
+  assert.match(
+    aboutSettings,
+    /aboutProductSection[\s\S]*aboutUpdatesSection[\s\S]*projectLinks/u,
+  );
+  const aboutUpdates = settingsSource.slice(
+    settingsSource.indexOf("let aboutUpdatesSection = settingsGroup("),
+    settingsSource.indexOf("let aboutProductSection = settingsGroup("),
+  );
+  assert.match(
+    aboutUpdates,
+    /automaticUpdatesHeader[\s\S]*aboutAutomaticUpdatesDetail[\s\S]*checkForUpdates/u,
+  );
+  assert.match(settingsSource, /symbolName: "globe"/u);
+  assert.match(settingsSource, /symbolName: "folder"/u);
+  assert.match(settingsSource, /symbolName: "clock"/u);
   assert.match(source, /settingsOpenNotifications/u);
   assert.match(source, /x-apple\.systempreferences:com\.apple\.Notifications-Settings\.extension/u);
   assert.match(source, /case \.unverified:[\s\S]*?settingsCheckForUpdates/u);
@@ -865,9 +914,14 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /nativeEvidenceState = \.lifecycleUnavailable/u);
   assert.doesNotMatch(source, /settingsNotificationsReset\)/u);
   assert.doesNotMatch(source, /toggleQuotaNotificationReset/u);
-  assert.match(localizationSource, /Refresh runs in this app while it is open/iu);
-  assert.match(localizationSource, /Closing the window does not quit TiboTattle/iu);
-  assert.match(localizationSource, /quitting stops the current refresh/iu);
+  assert.match(
+    localizationSource,
+    /Local usage refreshes while TiboTattle is open\. Raw logs stay on this Mac\./iu,
+  );
+  assert.match(
+    localizationSource,
+    /Start TiboTattle when you sign in\. Manage this in System Settings → Login Items\./iu,
+  );
   assert.match(source, /NSApp\.applicationIconImage/u);
   assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
   assert.doesNotMatch(source, /showLifecycleHelp/u);
@@ -884,6 +938,8 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   )?.[0] ?? "";
   assert.ok(destinationSource, "native dashboard destination enum is present");
   assert.doesNotMatch(destinationSource, /case data\b/u);
+  assert.doesNotMatch(source, /nativeDashboardDataPrivacy|nativeDashboard\.dataPrivacy/u);
+  assert.match(destinationSource, /case community\b/u);
   assert.deepEqual(
     [...destinationSource.matchAll(/^\s*case (\w+)$/gmu)].map((match) => match[1]),
     ["overview", "weekly", "trends", "method", "community"],
@@ -908,8 +964,12 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
   assert.match(source, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
   assert.match(source, /static let allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);
+  assert.match(source, /static func seconds\(in defaults: UserDefaults\) -> Int/u);
+  assert.match(source, /static func setSeconds\(\s*_ value: Int, in defaults: UserDefaults\)/u);
+  assert.match(source, /defaults\.set\(value, forKey: defaultsKey\)/u);
   assert.match(source, /NativeRefreshIntervalPreference\.seconds/u);
-  assert.match(source, /UserDefaults\.standard\.set\(value, forKey: defaultsKey\)/u);
+  assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
+  assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
   assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
   assert.match(source, /LocalCompanionEvidenceReader/u);
@@ -1021,6 +1081,45 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     "URLSessionConfiguration.background",
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
+  }
+});
+
+test("native update disclosure routes settings to About in every catalog", async () => {
+  const expectations = [
+    {
+      about: "Settings → About",
+      general: "Settings → General",
+      locale: "en",
+    },
+    {
+      about: "Configuración → Acerca de",
+      general: "Configuración → General",
+      locale: "es",
+    },
+    {
+      about: "“设置”→“关于”",
+      general: "“设置”→“通用”",
+      locale: "zh-Hans",
+    },
+  ];
+  for (const { about, general, locale } of expectations) {
+    const catalog = await readFile(
+      join(
+        REPOSITORY_ROOT,
+        "apps",
+        "macos",
+        "Resources",
+        `${locale}.lproj`,
+        "Localizable.strings",
+      ),
+      "utf8",
+    );
+    const disclosureLines = catalog
+      .split(/\r?\n/u)
+      .filter((line) => line.includes('"settings.updateDisclosureAutomatic'));
+    assert.equal(disclosureLines.length, 2, locale);
+    assert.equal(disclosureLines.every((line) => line.includes(about)), true, locale);
+    assert.equal(disclosureLines.some((line) => line.includes(general)), false, locale);
   }
 });
 
@@ -4613,6 +4712,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       quotaNotificationSmoke.stdout,
       /^USAGE_MONITOR_MACOS_QUOTA_NOTIFICATION_CONTRACT opt_in=true fresh_only=true first_sample=false threshold=true reset_schedule_suppressed=true reset_identity_gate=true dedupe=true opt_out=true$/mu,
+    );
+    const refreshSettingsSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-refresh-settings-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      refreshSettingsSmoke.status,
+      0,
+      refreshSettingsSmoke.stderr || refreshSettingsSmoke.stdout,
+    );
+    assert.match(
+      refreshSettingsSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 invalid_ignored=true$/mu,
     );
     const nativeDashboardLayoutSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

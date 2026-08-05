@@ -111,6 +111,14 @@ function assertActivePage(browser, expected) {
   }
 }
 
+function assertExactlyOneVisiblePage(browser, expected) {
+  assertActivePage(browser, expected);
+  assert.equal(
+    browser.pages.filter((page) => !page.classList.contains("dashboard-page-inactive")).length,
+    1,
+  );
+}
+
 test("hashes preserve deep links while selecting their owning top-level page", () => {
   const browser = fakeBrowser({ hash: "#accounting" });
   mountDashboardNavigation(browser);
@@ -139,6 +147,24 @@ test("retired section hashes do not masquerade as live destinations", () => {
   browser.windowRef.location.hash = "#coverage";
   browser.listeners.get("hashchange")();
   assertActivePage(browser, "trends");
+});
+
+test("retained deep-link aliases select their current owning page", () => {
+  const cases = [
+    ["accounting", "method"],
+    ["timeline", "trends"],
+    ["trends", "trends"],
+    ["history", "community"],
+    ["backend", "community"],
+    ["data", "community"],
+    ["coverage", "overview"],
+  ];
+
+  for (const [target, expected] of cases) {
+    const browser = fakeBrowser({ hash: `#${target}` });
+    mountDashboardNavigation(browser);
+    assertExactlyOneVisiblePage(browser, expected);
+  }
 });
 
 test("page links prevent long-document anchor scrolling and retain normal history", () => {
@@ -177,12 +203,36 @@ test("repeated overview and trends transitions keep exactly one page active", ()
   for (let index = 0; index < 50; index += 1) {
     const nav = index % 2 === 0 ? "trends" : "overview";
     browser.links.find((link) => link.dataset.nav === nav).click();
-    assertActivePage(browser, nav);
-    assert.equal(
-      browser.pages.filter((page) => !page.classList.contains("dashboard-page-inactive")).length,
-      1,
-    );
+    assertExactlyOneVisiblePage(browser, nav);
   }
+});
+
+test("repeated transitions and a navigation remount keep exactly one page visible", () => {
+  const browser = fakeBrowser({ hash: "#overview" });
+  let teardown = mountDashboardNavigation(browser);
+
+  for (const nav of ["trends", "overview", "community", "weekly", "method", "trends"]) {
+    browser.links.find((link) => link.dataset.nav === nav).click();
+    assertExactlyOneVisiblePage(browser, nav);
+  }
+
+  teardown();
+  browser.windowRef.location.hash = "#timeline";
+  teardown = mountDashboardNavigation(browser);
+  assertExactlyOneVisiblePage(browser, "trends");
+
+  for (const [hash, expected] of [
+    ["#community", "community"],
+    ["#weekly", "weekly"],
+    ["#overview", "overview"],
+    ["#trends", "trends"],
+  ]) {
+    browser.windowRef.location.hash = hash;
+    browser.listeners.get("hashchange")();
+    assertExactlyOneVisiblePage(browser, expected);
+  }
+
+  teardown();
 });
 
 test("navigation never overrides component-owned hidden state", () => {

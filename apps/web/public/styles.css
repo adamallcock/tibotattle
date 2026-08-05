@@ -169,6 +169,11 @@ html.native-dashboard #cancel-refresh,
 body.native-dashboard #setup-refresh,
 body.native-dashboard #refresh-button,
 body.native-dashboard #cancel-refresh { display: none; }
+/* Setup guidance belongs to the hosted fallback. If the report is already
+   inside the native app, surfacing instructions to install/open that app is
+   circular and misleading. */
+html.native-dashboard #setup-card,
+body.native-dashboard #setup-card { display: none !important; }
 .top-actions { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: .55rem; }
 .language-picker { display: inline-flex; align-items: center; }
 .language-picker select {
@@ -911,12 +916,21 @@ h2 {
 .chart-shell {
   width: 100%;
   overflow: hidden;
-  user-select: none;
-  -webkit-user-select: none;
+  /* Text outside an active pointer gesture remains selectable. The chart
+     only suppresses selection while its own pan gesture is armed. */
+  user-select: text;
+  -webkit-user-select: text;
 }
 .chart-shell.interactive-chart { cursor: grab; touch-action: pan-y; outline: none; }
 .chart-shell.interactive-chart:focus-visible { outline: 3px solid rgba(38, 107, 91, .36); outline-offset: 4px; }
-.chart-shell.interactive-chart.is-panning { cursor: grabbing; user-select: none; }
+.chart-shell.interactive-chart.is-pointer-active,
+.chart-shell.interactive-chart.is-pointer-active *,
+.chart-shell.interactive-chart.is-panning,
+.chart-shell.interactive-chart.is-panning * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.chart-shell.interactive-chart.is-panning { cursor: grabbing; }
 .chart-shell svg { display: block; width: 100%; min-width: 0; height: 350px; overflow: visible; }
 .chart-shell.compact-chart svg { min-width: 0; height: 285px; }
 .chart-hover-tooltip { pointer-events: none; }

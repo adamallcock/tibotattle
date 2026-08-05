@@ -544,6 +544,7 @@ export function createLocalCollectorRefreshRunner({
         ...(archiveIndexSecretFile === null
           ? {}
           : { secretFile: archiveIndexSecretFile }),
+        declaredSpeedBaselines,
         now: clock,
         signal,
       });

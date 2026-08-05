@@ -77,14 +77,14 @@
 "settings.codexFolder" = "Codex 文件夹";
 "settings.codexFolderSummary" = "TiboTattle 只读取此位置下的 sessions 和 archived_sessions 文件夹。除非你的 Codex 数据位于其他位置，否则请使用默认值。";
 "settings.general" = "通用";
-"settings.generalSummary" = "刷新在应用打开时于应用内运行。关闭窗口不会退出 TiboTattle；退出应用会停止当前刷新。登录时启动是可选项，可在“系统设置”→“登录项”中管理。原始日志保留在这台 Mac 上。";
+"settings.generalSummary" = "TiboTattle 打开时会刷新本地用量。原始日志保留在这台 Mac 上。";
 "settings.github" = "GitHub";
 "settings.language" = "语言";
 "settings.languageEnglish" = "English";
 "settings.languagePickerHint" = "选择用于 TiboTattle 控件和说明的语言。";
 "settings.languageSimplifiedChinese" = "简体中文";
 "settings.languageSpanish" = "Español";
-"settings.languageSummary" = "仅影响应用语言；日期、数字和货币使用这台 Mac 的格式。";
+"settings.languageSummary" = "默认使用这台 Mac 的语言。";
 "settings.languageSystem" = "跟随系统";
 "settings.openDashboard" = "打开仪表板";
 "settings.openNotifications" = "打开通知设置";
@@ -202,8 +202,8 @@
 "menuBar.failureRecovery" = "未在运行：%@。请打开窗口查看恢复步骤。";
 "settings.codexFolderCustomSelected" = "已选择自定义文件夹";
 "settings.codexFolderDefaultLocation" = "默认位置（~/.codex）";
-"settings.updateDisclosureAutomaticOff" = "已签名应用更新可在“关于”→“检查更新”中获取。自动下载目前已关闭；可在“设置”→“通用”中开启（如可用）。";
-"settings.updateDisclosureAutomaticOn" = "会自动检查已签名应用更新。默认情况下，已验证的更新会在后台下载并在退出时安装；可在“设置”→“通用”中关闭此项。";
+"settings.updateDisclosureAutomaticOff" = "已签名应用更新可在“关于”→“检查更新”中获取。自动下载目前已关闭；可在“设置”→“关于”中开启（如可用）。";
+"settings.updateDisclosureAutomaticOn" = "会自动检查已签名应用更新。默认情况下，已验证的更新会在后台下载并在退出时安装；可在“设置”→“关于”中关闭此项。";
 "settings.updateDisclosureDevelopment" = "此开发构建不包含更新检查。安装在“应用程序”中的已签名版本可从“关于”中检查更新。";
 "settings.updateDisclosurePreview" = "此预览使用手动已签名更新检查。它不会自动检查、下载或安装更新。";
 "accessibility.menuBarStatus" = "TiboTattle 状态";
@@ -211,7 +211,8 @@
 "notification.allowanceTitle" = "额度提醒";
 "notification.resetBody" = "新的提供商报告额度窗口发生了变化。打开 TiboTattle 查看详情。";
 "notification.resetTitle" = "已观测到新的额度窗口";
-"settings.notifications" = "本地额度通知";
+"settings.notifications" = "通知";
+"settings.notificationsAllowanceTitle" = "额度提醒";
 "settings.notificationsDetail" = "可选的本地提醒使用正常刷新中的新鲜额度观测。TiboTattle 不会在后台轮询。";
 "settings.notificationsOff" = "通知已关闭。你可以随时关闭此开关，停止未来的本地提醒并清除其待处理的本地状态。";
 "settings.notificationsPermissionDenied" = "已启用，但 macOS 通知权限被拒绝。不会发送提醒。如果你想接收提醒，请在系统设置中更改它。";

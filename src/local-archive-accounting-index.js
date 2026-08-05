@@ -1,10 +1,16 @@
 import { lstat, mkdir, statfs } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
+  createLocalAnalysisIndexReadScan,
   inspectLocalAnalysisIndex,
   markLocalAnalysisIndexCoveragePartial,
+  readLocalAnalysisIndexProjection,
   refreshLocalAnalysisIndex,
+  writeLocalAnalysisIndexProjection,
 } from "./local-analysis-index.js";
+import {
+  buildReplaySafeAccountingPeriod,
+} from "./replay-safe-accounting-cache.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 
 // This archive index is deliberately separate from the foreground collector.
@@ -20,6 +26,7 @@ export const ARCHIVE_INDEX_DEEP_READ_BUDGET_BYTES =
 export const ARCHIVE_INDEX_MAX_DIRECTORY_ENTRIES = 500_000;
 export const ARCHIVE_INDEX_MAX_ROLLOUT_FILES = 125_000;
 export const ARCHIVE_INDEX_PASS_TIMEOUT_MS = 5 * 60_000;
+export const ARCHIVE_ACCOUNTING_PROJECTION_TIMEOUT_MS = 2 * 60_000;
 export const ARCHIVE_INDEX_COMMIT_CHUNK_BYTES = 4 * 1024 * 1024;
 // A refresh stages a complete next SQLite generation before publication. The
 // free-space check reserves room for that copy, this pass's read envelope,
@@ -27,6 +34,9 @@ export const ARCHIVE_INDEX_COMMIT_CHUNK_BYTES = 4 * 1024 * 1024;
 export const ARCHIVE_INDEX_STORAGE_RESERVE_BYTES = 128 * 1024 * 1024;
 
 const ARCHIVE_START_AT = "1970-01-01T00:00:00.000Z";
+const ARCHIVE_ACCOUNTING_PROJECTION_KIND = "archive_accounting_period";
+const ARCHIVE_ACCOUNTING_PROJECTION_SCHEMA_VERSION =
+  "local-archive-accounting-projection-v1";
 const ARCHIVE_STATES = new Set(["complete", "partial"]);
 
 function fixedError(code) {
@@ -164,6 +174,72 @@ function projectCoverage(inspection, phase = "idle") {
   };
 }
 
+function coverageFingerprint(coverage) {
+  return {
+    status: coverage.status,
+    generatedAt: coverage.generatedAt,
+    coveredAt: {
+      startAt: coverage.coveredAt?.startAt ?? null,
+      endAt: coverage.coveredAt?.endAt ?? null,
+    },
+    sourceCount: coverage.sourceCount,
+    indexedSourceCount: coverage.indexedSourceCount,
+    pendingSourceCount: coverage.pendingSourceCount,
+    sourceBytes: coverage.sourceBytes,
+    indexedBytes: coverage.indexedBytes,
+  };
+}
+
+function sameCoverageFingerprint(left, right) {
+  return left
+    && right
+    && left.status === right.status
+    && left.generatedAt === right.generatedAt
+    && left.coveredAt?.startAt === right.coveredAt?.startAt
+    && left.coveredAt?.endAt === right.coveredAt?.endAt
+    && left.sourceCount === right.sourceCount
+    && left.indexedSourceCount === right.indexedSourceCount
+    && left.pendingSourceCount === right.pendingSourceCount
+    && left.sourceBytes === right.sourceBytes
+    && left.indexedBytes === right.indexedBytes;
+}
+
+function validArchiveAccountingPeriod(value) {
+  const period = value?.period;
+  const coverage = period?.pricingCoverage;
+  return value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && value.priceEpochBasis
+      === "event_time_when_registry_has_effective_evidence"
+    && typeof value.priceRegistryVersion === "string"
+    && typeof value.priceRegistryObservedAt === "string"
+    && value.coverageFingerprint
+    && typeof value.coverageFingerprint === "object"
+    && period
+    && typeof period === "object"
+    && period.id === "history"
+    && ["Indexed history", "Indexed history so far"].includes(period.label)
+    && Number.isSafeInteger(period.events)
+    && period.events >= 0
+    && Number.isSafeInteger(period.totalTokens)
+    && period.totalTokens >= 0
+    && Number.isFinite(period.apiPriceEquivalentUsd)
+    && period.apiPriceEquivalentUsd >= 0
+    && Array.isArray(period.priceCardIds)
+    && Array.isArray(period.priceCardBreakdown)
+    && coverage
+    && Number.isSafeInteger(coverage.fullyPricedEvents)
+    && Number.isSafeInteger(coverage.partiallyPricedEvents)
+    && Number.isSafeInteger(coverage.unpricedEvents)
+    && coverage.fullyPricedEvents >= 0
+    && coverage.partiallyPricedEvents >= 0
+    && coverage.unpricedEvents >= 0
+    && coverage.fullyPricedEvents
+      + coverage.partiallyPricedEvents
+      + coverage.unpricedEvents === period.events;
+}
+
 function timeoutSignal(signal, timeoutMs) {
   const controller = new AbortController();
   let expired = false;
@@ -238,6 +314,39 @@ export async function inspectLocalArchiveAccountingIndex({
   }
 }
 
+export async function readLocalArchiveAccountingPeriod({
+  indexFile = defaultLocalArchiveAccountingIndexPath(),
+} = {}) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("Archive index file must be a non-empty string");
+  }
+  const coverage = await inspectLocalArchiveAccountingIndex({ indexFile });
+  if (coverage.phase === "not_started" || coverage.generatedAt === null) {
+    return { status: "unavailable", period: null, coverage };
+  }
+  const projection = await readLocalAnalysisIndexProjection({
+    indexFile,
+    kind: ARCHIVE_ACCOUNTING_PROJECTION_KIND,
+    schemaVersion: ARCHIVE_ACCOUNTING_PROJECTION_SCHEMA_VERSION,
+    requireCompleteIndex: false,
+  });
+  if (projection.status !== "available"
+      || !validArchiveAccountingPeriod(projection.value)
+      || !sameCoverageFingerprint(
+        projection.value.coverageFingerprint,
+        coverageFingerprint(coverage),
+      )) {
+    return { status: "unavailable", period: null, coverage };
+  }
+  return {
+    status: "available",
+    generatedAt: projection.generatedAt,
+    coveredAt: projection.value.coveredAt,
+    period: projection.value.period,
+    coverage,
+  };
+}
+
 export async function refreshLocalArchiveAccountingIndex({
   indexFile = defaultLocalArchiveAccountingIndexPath(),
   secretFile = defaultLocalArchiveAccountingIndexSecretPath(indexFile),
@@ -252,6 +361,10 @@ export async function refreshLocalArchiveAccountingIndex({
   workerCount,
   chunkBytes = ARCHIVE_INDEX_COMMIT_CHUNK_BYTES,
   commitSliceBytes = ARCHIVE_INDEX_INITIAL_READ_BUDGET_BYTES,
+  projectionTimeoutMs = ARCHIVE_ACCOUNTING_PROJECTION_TIMEOUT_MS,
+  declaredSpeedBaselines = [],
+  buildAccountingPeriod = buildReplaySafeAccountingPeriod,
+  createReadScan = createLocalAnalysisIndexReadScan,
   filesystemStats = statfs,
   indexStat = lstat,
   ensureIndexDirectory = mkdir,
@@ -271,6 +384,10 @@ export async function refreshLocalArchiveAccountingIndex({
       || !positiveSafeInteger(passTimeoutMs)
       || !positiveSafeInteger(chunkBytes)
       || !positiveSafeInteger(commitSliceBytes)
+      || !positiveSafeInteger(projectionTimeoutMs)
+      || !Array.isArray(declaredSpeedBaselines)
+      || typeof buildAccountingPeriod !== "function"
+      || typeof createReadScan !== "function"
       || typeof filesystemStats !== "function"
       || typeof indexStat !== "function"
       || typeof ensureIndexDirectory !== "function") {
@@ -319,19 +436,56 @@ export async function refreshLocalArchiveAccountingIndex({
         ensureDirectory: ensureIndexDirectory,
       }),
     });
-    const coverage = projectCoverage({
-      generatedAt: new Date(nowMs).toISOString(),
-      coveredAt: {
+    // The parser pass is complete; do not let its deadline expire while the
+    // separate aggregate walks the published SQLite facts.
+    timed.dispose();
+    const inspected = await inspectLocalArchiveAccountingIndex({ indexFile });
+    const coverage = {
+      ...inspected,
+      phase: inspected.status === "complete" ? "complete" : "awaiting_resume",
+    };
+    let projectionStatus = "unavailable";
+    let projectionErrorCode = null;
+    const projectionTimed = timeoutSignal(signal, projectionTimeoutMs);
+    try {
+      const aggregate = await buildAccountingPeriod({
+        id: "history",
+        label: coverage.status === "complete"
+          ? "Indexed history"
+          : "Indexed history so far",
         startAt: ARCHIVE_START_AT,
-        endAt: new Date(nowMs).toISOString(),
-      },
-      coverage: refreshed.coverage,
-    }, refreshed.coverage.status === "complete" ? "complete" : "awaiting_resume");
+        endAt: coverage.coveredAt.endAt ?? new Date(nowMs).toISOString(),
+        scan: createReadScan({ indexFile, requireComplete: false }),
+        declaredSpeedBaselines,
+        signal: projectionTimed.signal,
+      });
+      await writeLocalAnalysisIndexProjection({
+        indexFile,
+        kind: ARCHIVE_ACCOUNTING_PROJECTION_KIND,
+        schemaVersion: ARCHIVE_ACCOUNTING_PROJECTION_SCHEMA_VERSION,
+        generatedAt: aggregate.generatedAt,
+        requireCompleteIndex: false,
+        value: {
+          ...aggregate,
+          coverageFingerprint: coverageFingerprint(coverage),
+        },
+      });
+      projectionStatus = "available";
+    } catch (error) {
+      if (signal?.aborted === true) throw error;
+      projectionErrorCode = projectionTimed.timedOut()
+        ? "archive_projection_timeout"
+        : "archive_projection_unavailable";
+    } finally {
+      projectionTimed.dispose();
+    }
     return {
       ...coverage,
       readBudgetBytes: budgetBytes,
       scanBytes: refreshed.scanBytes,
       refreshStatus: refreshed.status,
+      projectionStatus,
+      projectionErrorCode,
     };
   } catch (error) {
     const reason = archiveBlockReason(error, timed.timedOut());

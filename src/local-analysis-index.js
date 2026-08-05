@@ -98,6 +98,14 @@ const COVERAGE_BLOCK_REASONS = new Set([
   "storage_unavailable",
 ]);
 
+function canonicalInstant(value) {
+  if (typeof value !== "string") return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
+    ? value
+    : null;
+}
+
 function fixedError(code) {
   const error = new Error(code);
   error.code = code;
@@ -2918,23 +2926,79 @@ export function createIndexedCodexLogScan({
   };
 }
 
+// Read an already-published index generation without rediscovering or parsing
+// raw rollout files. Archive accounting uses this to derive a bounded,
+// content-free aggregate from the durable index after each foreground pass.
+// `requireComplete=false` is deliberate: a partial archive may expose only
+// the events it has durably indexed, provided the caller labels that coverage
+// honestly and binds any saved projection to the same index generation.
+export function createLocalAnalysisIndexReadScan({
+  indexFile = defaultLocalAnalysisIndexPath(),
+  requireComplete = true,
+} = {}) {
+  if (typeof indexFile !== "string"
+      || indexFile.length < 1
+      || typeof requireComplete !== "boolean") {
+    throw new TypeError("Local analysis index read scan options are invalid");
+  }
+  return async function scanPublishedLocalAnalysisIndex({
+    startAt,
+    endAt,
+    onUsage,
+    onRateLimitSnapshot,
+    signal = null,
+  } = {}) {
+    if (typeof startAt !== "string"
+        || typeof endAt !== "string"
+        || canonicalInstant(startAt) !== startAt
+        || canonicalInstant(endAt) !== endAt
+        || Date.parse(startAt) > Date.parse(endAt)
+        || !validAbortSignal(signal)
+        || (onUsage !== undefined && typeof onUsage !== "function")
+        || (onRateLimitSnapshot !== undefined
+          && typeof onRateLimitSnapshot !== "function")) {
+      throw new TypeError("Local analysis index read scan request is invalid");
+    }
+    const { database } = openExistingIndex(indexFile, {
+      requireComplete,
+    });
+    try {
+      return await readIndexScan(database, {
+        sources: [...readStoredSources(database).values()],
+        startAt,
+        endAt,
+        onUsage,
+        onRateLimitSnapshot,
+        signal,
+      });
+    } finally {
+      database.close();
+    }
+  };
+}
+
 export async function writeLocalAnalysisIndexProjection({
   indexFile = defaultLocalAnalysisIndexPath(),
   kind = "replay_safe_accounting",
   schemaVersion,
   generatedAt,
   value,
+  requireCompleteIndex = true,
 } = {}) {
   if (typeof kind !== "string"
       || !/^[a-z][a-z0-9_]{0,63}$/u.test(kind)
       || typeof schemaVersion !== "string"
       || typeof generatedAt !== "string"
       || new Date(generatedAt).toISOString() !== generatedAt
+      || typeof requireCompleteIndex !== "boolean"
       || !value
       || typeof value !== "object") {
     throw new TypeError("Local analysis projection is invalid");
   }
-  const { database } = openExistingIndex(indexFile, { readOnly: false });
+  const { database } = openExistingIndex(indexFile, {
+    readOnly: false,
+    requireComplete: requireCompleteIndex,
+  });
   try {
     database.prepare(`
       INSERT INTO projections(
@@ -2959,13 +3023,18 @@ export async function readLocalAnalysisIndexProjection({
   indexFile = defaultLocalAnalysisIndexPath(),
   kind = "replay_safe_accounting",
   schemaVersion,
+  requireCompleteIndex = true,
 } = {}) {
-  if (typeof kind !== "string" || typeof schemaVersion !== "string") {
+  if (typeof kind !== "string"
+      || typeof schemaVersion !== "string"
+      || typeof requireCompleteIndex !== "boolean") {
     throw new TypeError("Local analysis projection request is invalid");
   }
   let opened;
   try {
-    opened = openExistingIndex(indexFile);
+    opened = openExistingIndex(indexFile, {
+      requireComplete: requireCompleteIndex,
+    });
     const row = opened.database.prepare(`
       SELECT schema_version, generated_at, value_json
       FROM projections WHERE kind = ?

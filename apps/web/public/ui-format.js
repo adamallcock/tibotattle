@@ -107,12 +107,18 @@ export function formatReportingTime(value, options = {}) {
   return formatLocal(value, options);
 }
 
-export function formatTimeZoneLabel() {
+export function formatTimeZoneLabel({
+  locale = formattingLocale,
+  timeZone = USER_TIME_ZONE,
+  value = new Date(),
+} = {}) {
   try {
-    const parts = new Intl.DateTimeFormat(formattingLocale, {
-      ...USER_TIME_ZONE_OPTION,
+    const date = instant(value) ?? new Date();
+    const selectedLocale = canonicalLocale(locale) ?? formattingLocale;
+    const parts = new Intl.DateTimeFormat(selectedLocale, {
+      timeZone,
       timeZoneName: "longGeneric",
-    }).formatToParts(new Date());
+    }).formatToParts(date);
     const label = parts.find((part) => part.type === "timeZoneName")?.value;
     return typeof label === "string" && label.trim() !== ""
       ? label
@@ -120,6 +126,85 @@ export function formatTimeZoneLabel() {
   } catch {
     return translate("format.localTime", {}, messageLocale);
   }
+}
+
+/**
+ * Choose a readable number of horizontal date ticks for the space the chart
+ * actually occupies. The SVG viewBox is intentionally stable, so this helper
+ * takes the rendered CSS width instead of the internal drawing width.
+ */
+export function adaptiveChartTickCount(
+  renderedWidth,
+  {
+    left = 58,
+    right = 22,
+    minimumTickWidth = 132,
+    minimum = 2,
+    maximum = 7,
+  } = {},
+) {
+  const width = finite(renderedWidth);
+  const safeMinimum = Math.max(1, Math.floor(minimum));
+  const safeMaximum = Math.max(safeMinimum, Math.floor(maximum));
+  if (width === null || width <= 0) {
+    return Math.min(safeMaximum, Math.max(safeMinimum, 4));
+  }
+  const plotWidth = Math.max(1, width - Math.max(0, left) - Math.max(0, right));
+  const tickWidth = Math.max(1, minimumTickWidth);
+  return Math.max(
+    safeMinimum,
+    Math.min(safeMaximum, Math.floor(plotWidth / tickWidth) + 1),
+  );
+}
+
+/**
+ * Keep timeline evidence states distinct before a residual is drawn. In
+ * particular, a quiet matched window is not missing evidence, and a measured
+ * residual is not silently promoted to an evidence gap.
+ */
+export function classifyTimelineEvidence({
+  bracketed = false,
+  sameReset = false,
+  observed = null,
+  expected = null,
+  usageEvents = 0,
+  apiCostUsd = 0,
+} = {}) {
+  const observedValue = finite(observed);
+  const expectedValue = finite(expected);
+  const events = Math.max(0, finite(usageEvents, 0));
+  const cost = Math.max(0, finite(apiCostUsd, 0));
+  const residual = observedValue === null || expectedValue === null
+    ? null
+    : observedValue - expectedValue;
+  const status = !bracketed ? "missing_quota_bracket"
+    : !sameReset ? "reset_or_track_change"
+      : observedValue === null ? "backward_or_ambiguous"
+        : observedValue === 0 && events === 0 && cost === 0 ? "inactive"
+          : observedValue > 0 && events === 0
+            ? "unexplained_without_local_activity"
+            : events > 0 && cost === 0
+              ? "unpriced_local_activity"
+              : "matched";
+  return Object.freeze({ status, residual });
+}
+
+/**
+ * Resolve a requested accounting period without treating a missing period as
+ * the all-data cache. The caller can use the returned id to disable or hide a
+ * control whose evidence is not present in this payload.
+ */
+export function selectAvailableAccountingPeriod(periods, requested = "7d") {
+  const available = new Set(
+    (Array.isArray(periods) ? periods : [])
+      .map((period) => period?.periodId)
+      .filter((periodId) => typeof periodId === "string" && periodId !== ""),
+  );
+  if (available.has(requested)) return requested;
+  // `all` is an explicit bounded-cache view, never an implicit fallback for
+  // an unavailable indexed-history request.
+  return ["7d", "30d", "24h", "history"]
+    .find((periodId) => available.has(periodId)) ?? null;
 }
 
 export function formatAge(value) {
