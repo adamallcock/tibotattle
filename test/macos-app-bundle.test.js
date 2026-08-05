@@ -1600,6 +1600,14 @@ test("generic external builders reject env and CLI marker spoofing", async () =>
       { code: "MACOS_APP_BUILD_FAILED" },
     );
     assert.equal(typeof buildMacOSAppForRelease, "function");
+    await assert.rejects(
+      buildMacOSAppForRelease({
+        output,
+        externalDistribution: true,
+        releaseChannel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_EXTERNAL_BUILD_PREFLIGHT_REQUIRED" },
+    );
     await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -1738,6 +1746,16 @@ test("generic DMG packaging requires an explicit visible non-release mode", () =
       "--preview",
     ]),
     /Unknown or repeated argument: --preview/u,
+  );
+});
+
+test("direct DMG packaging cannot infer release semantics", async () => {
+  await assert.rejects(
+    packageMacOSDMG({
+      appPath: ".release-build/macos/TiboTattle.app",
+      output: ".release-build/macos/TiboTattle.dmg",
+    }),
+    { code: "MACOS_DMG_DISTRIBUTION_REQUIRED" },
   );
 });
 
@@ -2533,6 +2551,15 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousManifest,
       }),
       { code: "MACOS_STABLE_UPDATER_KEY_MISMATCH" },
+    );
+    assert.throws(
+      () => assertStableSparkleKeyContinuity({
+        candidateBundleVersion: previousManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest,
+      }),
+      { code: "MACOS_STABLE_VERSION_NOT_NEWER" },
     );
     assert.deepEqual(
       assertStableSparkleKeyContinuity({

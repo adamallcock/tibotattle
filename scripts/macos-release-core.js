@@ -1399,9 +1399,9 @@ export function assertStableSparkleKeyContinuity({
   if (compareMacOSBundleVersions(
     candidateBundleVersion,
     previous.application.bundleVersion,
-  ) < 0) {
+  ) <= 0) {
     fail(
-      "Stable candidate bundle version must not be older than the previous stable release",
+      "Stable candidate bundle version must be newer than the previous stable release",
       "MACOS_STABLE_VERSION_NOT_NEWER",
     );
   }
@@ -1709,16 +1709,26 @@ export async function developerIDSignMacOSApp(appPath, {
   return inspected;
 }
 
-async function inspectMacOSDMGInput(appPath, distribution) {
+async function inspectMacOSDMGInput(
+  appPath,
+  distribution,
+  channel = STABLE_RELEASE_CHANNEL,
+) {
   if (distribution === DMG_DISTRIBUTIONS.release) {
-    return inspectMacOSApp(appPath);
+    return inspectMacOSApp(appPath, {
+      channel,
+      requireExternalDistribution: true,
+    });
   }
   if (distribution === DMG_DISTRIBUTIONS.development) {
     const inspected = await inspectMacOSApp(appPath);
     const release = inspected.buildManifest.release;
     if (release?.channel !== "development"
+        || release.channelName !== "development"
         || release.externalDistributionRequested !== false
         || release.previewDistributionRequested !== false
+        || release.productionOriginValidated !== false
+        || release.previewOriginValidated !== false
         || release.requiresDeveloperIDAndNotarization !== false
         || release.updater?.enabled !== false) {
       fail(
@@ -1763,9 +1773,16 @@ export async function packageMacOSDMG({
   appPath,
   output,
   replace = false,
-  distribution = DMG_DISTRIBUTIONS.release,
+  distribution,
+  channel = STABLE_RELEASE_CHANNEL,
 }) {
-  const inspected = await inspectMacOSDMGInput(appPath, distribution);
+  if (!Object.values(DMG_DISTRIBUTIONS).includes(distribution)) {
+    fail(
+      "DMG packaging requires an explicit development, preview, or release distribution",
+      "MACOS_DMG_DISTRIBUTION_REQUIRED",
+    );
+  }
+  const inspected = await inspectMacOSDMGInput(appPath, distribution, channel);
   const selectedOutput = resolve(output);
   if (basename(selectedOutput).startsWith(".")
       || !selectedOutput.endsWith(".dmg")) {
@@ -2381,6 +2398,10 @@ export async function releaseMacOSApp({
       output: stagedApp,
       centralOrigin: buildConfiguration.productionOrigin,
       externalDistribution: true,
+      candidateAppPath: appPath,
+      environment,
+      previousStableManifestPath,
+      stableBootstrap,
       releaseChannel: releaseChannel.name,
       bundleVersion: buildConfiguration.bundleVersion,
       sparkleFramework: updaterConfiguration.framework.path,
@@ -2438,6 +2459,7 @@ export async function releaseMacOSApp({
       output: stagedDMG,
       replace: false,
       distribution: "release",
+      channel: releaseChannel.name,
     });
     await chmod(stagedDMG, 0o644);
     submitToAppleNotary(stagedDMG, {

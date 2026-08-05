@@ -161,9 +161,8 @@ export const MACOS_BUILD_PROFILES = Object.freeze({
 });
 
 // This capability never crosses the CLI or process environment. The release
-// core imports the narrow wrapper below after it has completed its own source,
-// continuity, and credential checks; ordinary callers can only use the
-// development or preview paths.
+// wrapper below also re-runs the source, continuity, credential, and candidate
+// checks before it can use this capability.
 const MACOS_RELEASE_BUILD_AUTHORIZATION = Symbol(
   "usage-monitor-release-build-authorization",
 );
@@ -3484,11 +3483,88 @@ export async function buildMacOSApp({
 }
 
 /**
- * Build an external-distribution candidate only for macos-release-core. The
- * authorization is a module-private capability rather than an environment
- * variable or a forgeable command-line marker.
+ * Re-run the release-core gates before allowing this module to create an
+ * external-distribution bundle. The builder is also imported directly by
+ * focused tooling and tests, so the release boundary cannot rely on the
+ * caller having already performed the checks.
+ */
+async function assertMacOSReleaseBuildPreflight({
+  candidateAppPath,
+  environment = process.env,
+  previousStableManifestPath = null,
+  stableBootstrap = false,
+  releaseChannel = STABLE_RELEASE_CHANNEL,
+  bundleVersion,
+  centralOrigin,
+  sparkleFramework,
+  sparkleAppcastURL,
+  sparklePublicEdKey,
+}) {
+  if (typeof candidateAppPath !== "string"
+      || candidateAppPath.length === 0
+      || candidateAppPath.includes("\0")) {
+    fail(
+      "External distribution requires a release-core candidate preflight",
+      "MACOS_EXTERNAL_BUILD_PREFLIGHT_REQUIRED",
+    );
+  }
+  const releaseCore = await import("./macos-release-core.js");
+  const buildConfiguration = releaseCore.readMacOSReleaseBuildConfiguration(
+    environment,
+    releaseChannel,
+  );
+  const updater = await normalizeMacOSUpdaterConfiguration({
+    appcastURL: buildConfiguration.sparkleAppcastURL,
+    externalDistribution: true,
+    frameworkPath: buildConfiguration.sparkleFramework,
+    publicEdKey: buildConfiguration.sparklePublicEdKey,
+  });
+  const previousStableManifest = previousStableManifestPath === null
+    ? null
+    : await releaseCore.readStableReleaseManifest(previousStableManifestPath);
+  releaseCore.assertStableSparkleKeyContinuity({
+    candidateBundleVersion: buildConfiguration.bundleVersion,
+    candidatePublicEdKeySha256: sha256(
+      Buffer.from(updater.publicEdKey, "base64"),
+    ),
+    channel: releaseChannel,
+    previousManifest: previousStableManifest,
+    stableBootstrap,
+  });
+  releaseCore.readMacOSReleaseSourceProvenance();
+  releaseCore.readMacOSReleaseCredentials(environment);
+  const inspectedCandidate = await releaseCore.inspectMacOSApp(
+    candidateAppPath,
+    {
+      channel: releaseChannel,
+      requireExternalDistribution: true,
+    },
+  );
+  if (centralOrigin !== buildConfiguration.productionOrigin
+      || bundleVersion !== buildConfiguration.bundleVersion
+      || sparkleFramework !== updater.framework.path
+      || sparkleAppcastURL !== updater.appcastURL
+      || sparklePublicEdKey !== updater.publicEdKey
+      || inspectedCandidate.plist.UsageMonitorCentralOrigin
+        !== buildConfiguration.productionOrigin
+      || inspectedCandidate.bundleVersion !== buildConfiguration.bundleVersion
+      || inspectedCandidate.plist.SUFeedURL !== updater.appcastURL
+      || inspectedCandidate.plist.SUPublicEDKey !== updater.publicEdKey) {
+    fail(
+      "External distribution build options do not match the release-core preflight",
+      "MACOS_EXTERNAL_BUILD_PREFLIGHT_MISMATCH",
+    );
+  }
+}
+
+/**
+ * Build an external-distribution candidate only after release-core has
+ * revalidated source provenance, continuity, credentials, and the reviewed
+ * candidate. The authorization remains module-private; the explicit
+ * candidate preflight prevents a direct import from skipping those gates.
  */
 export async function buildMacOSAppForRelease(options) {
+  await assertMacOSReleaseBuildPreflight(options);
   return buildMacOSApp({
     ...options,
     releaseAuthorization: MACOS_RELEASE_BUILD_AUTHORIZATION,
