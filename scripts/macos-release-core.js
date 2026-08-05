@@ -29,6 +29,10 @@ import {
 import { fileURLToPath } from "node:url";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
+  assertDeploymentEndpoints,
+  DEPLOYMENT_ENDPOINTS,
+} from "../config/deployment-endpoints.js";
+import {
   assertReleaseChannelPublication,
   createReleaseChannelProvenance,
   STABLE_RELEASE_CHANNEL,
@@ -43,14 +47,13 @@ import {
   SPARKLE_VERSION,
   normalizeMacOSUpdaterConfiguration,
 } from "./macos-updater-core.js";
+import {
+  buildMacOSAppForRelease,
+  validateMacOSPreviewApp,
+} from "./build-macos-app.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
-const BUILD_SCRIPT = join(
-  REPOSITORY_ROOT,
-  "scripts",
-  "build-macos-app.js",
-);
 const BUILD_MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
 const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
 const STABLE_RELEASE_MANIFEST_MAX_BYTES = 1024 * 1024;
@@ -61,6 +64,11 @@ const BUNDLE_IDENTIFIER = PRODUCT_BRAND.bundleIdentifier;
 const APP_NAME = PRODUCT_BRAND.bundleName;
 const APP_OPEN_SCHEME = PRODUCT_BRAND.appOpenScheme;
 const FIXED_EPOCH_SECONDS = 946_684_800;
+const DMG_DISTRIBUTIONS = Object.freeze({
+  development: "development",
+  preview: "preview",
+  release: "release",
+});
 const BUILD_MANIFEST_PATH =
   "Contents/Resources/build-manifest.json";
 const CODE_RESOURCES_PATH = "Contents/_CodeSignature/CodeResources";
@@ -136,6 +144,8 @@ const LOGIN_ITEM_CONTRACT_OUTPUT =
   + "status=enabled,not-registered,requires-approval,unavailable "
   + "outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed "
   + "pending_removal=true real_service_calls=0 daemon=false";
+
+assertDeploymentEndpoints();
 
 function fail(message, code = "MACOS_RELEASE_FAILED") {
   const error = new Error(message);
@@ -1018,8 +1028,12 @@ export function readMacOSReleaseBuildConfiguration(
     environment.USAGE_MONITOR_SPARKLE_APPCAST_URL;
   const sparklePublicEdKey =
     environment.USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY;
-  const productionOrigin = releaseChannel.serviceOrigin;
-  const sparkleAppcastURL = releaseChannel.sparkle.appcastURL;
+  const productionOrigin = releaseChannel.name === STABLE_RELEASE_CHANNEL
+    ? DEPLOYMENT_ENDPOINTS.public.origin
+    : releaseChannel.serviceOrigin;
+  const sparkleAppcastURL = releaseChannel.name === STABLE_RELEASE_CHANNEL
+    ? DEPLOYMENT_ENDPOINTS.sparkle.appcastURL
+    : releaseChannel.sparkle.appcastURL;
   if (configuredProductionOrigin !== undefined) {
     if (typeof configuredProductionOrigin !== "string") {
       fail(
@@ -1695,17 +1709,69 @@ export async function developerIDSignMacOSApp(appPath, {
   return inspected;
 }
 
+async function inspectMacOSDMGInput(appPath, distribution) {
+  if (distribution === DMG_DISTRIBUTIONS.release) {
+    return inspectMacOSApp(appPath);
+  }
+  if (distribution === DMG_DISTRIBUTIONS.development) {
+    const inspected = await inspectMacOSApp(appPath);
+    const release = inspected.buildManifest.release;
+    if (release?.channel !== "development"
+        || release.externalDistributionRequested !== false
+        || release.previewDistributionRequested !== false
+        || release.requiresDeveloperIDAndNotarization !== false
+        || release.updater?.enabled !== false) {
+      fail(
+        "Development DMGs require an updater-disabled development application",
+        "MACOS_DEVELOPMENT_DMG_INPUT_INVALID",
+      );
+    }
+    return inspected;
+  }
+  if (distribution === DMG_DISTRIBUTIONS.preview) {
+    await validateMacOSPreviewApp(appPath);
+    const selected = resolve(appPath);
+    const manifest = JSON.parse(await readFile(join(
+      selected,
+      ...BUILD_MANIFEST_PATH.split("/"),
+    ), "utf8"));
+    const plist = parsePlist(join(selected, "Contents", "Info.plist"));
+    return Object.freeze({
+      appPath: selected,
+      buildManifest: manifest,
+      shortVersion: plist.CFBundleShortVersionString,
+    });
+  }
+  fail(
+    "DMG distribution must be development, preview, or release",
+    "MACOS_DMG_DISTRIBUTION_INVALID",
+  );
+}
+
+function validateNonReleaseDMGName(path, distribution) {
+  if (distribution === DMG_DISTRIBUTIONS.release) return;
+  const suffix = `-${distribution}.dmg`;
+  if (!basename(path).endsWith(suffix)) {
+    fail(
+      `Non-release ${distribution} DMGs must use a -${distribution}.dmg filename`,
+      "MACOS_NON_RELEASE_DMG_NAME_REQUIRED",
+    );
+  }
+}
+
 export async function packageMacOSDMG({
   appPath,
   output,
   replace = false,
+  distribution = DMG_DISTRIBUTIONS.release,
 }) {
-  const inspected = await inspectMacOSApp(appPath);
+  const inspected = await inspectMacOSDMGInput(appPath, distribution);
   const selectedOutput = resolve(output);
   if (basename(selectedOutput).startsWith(".")
       || !selectedOutput.endsWith(".dmg")) {
     fail("DMG output must be a visible .dmg file");
   }
+  validateNonReleaseDMGName(selectedOutput, distribution);
   const outputParent = dirname(selectedOutput);
   await mkdir(outputParent, { recursive: true, mode: 0o755 });
   if (await realpath(outputParent) !== outputParent) {
@@ -1790,6 +1856,7 @@ export async function packageMacOSDMG({
       bytes: (await stat(selectedOutput)).size,
       output: selectedOutput,
       sha256: await sha256File(selectedOutput),
+      distribution,
       shortVersion: inspected.shortVersion,
     });
   } finally {
@@ -2310,36 +2377,15 @@ export async function releaseMacOSApp({
     `${PRODUCT_BRAND.executableName}.dmg`,
   );
   try {
-    const buildArguments = [
-      BUILD_SCRIPT,
-      "--output",
-      stagedApp,
-      "--central-origin",
-      buildConfiguration.productionOrigin,
-      "--external-distribution",
-      "--release-channel",
-      releaseChannel.name,
-      "--bundle-version",
-      buildConfiguration.bundleVersion,
-      "--sparkle-framework",
-      updaterConfiguration.framework.path,
-      "--sparkle-appcast-url",
-      updaterConfiguration.appcastURL,
-      "--sparkle-public-ed-key",
-      updaterConfiguration.publicEdKey,
-    ];
-    runMacOSReleaseCommand(process.execPath, buildArguments, {
-      env: releaseChannel.name === STABLE_RELEASE_CHANNEL
-        ? {
-          ...releaseEnvironment(),
-          // This is an accident-prevention marker, not a hostile-user
-          // security boundary. It is set only after the release-core
-          // continuity/bootstrap decision above has passed.
-          USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
-        }
-        : releaseEnvironment(),
-      failureMessage: "Fresh release build from checked-out source failed",
-      timeout: 300_000,
+    await buildMacOSAppForRelease({
+      output: stagedApp,
+      centralOrigin: buildConfiguration.productionOrigin,
+      externalDistribution: true,
+      releaseChannel: releaseChannel.name,
+      bundleVersion: buildConfiguration.bundleVersion,
+      sparkleFramework: updaterConfiguration.framework.path,
+      sparkleAppcastURL: updaterConfiguration.appcastURL,
+      sparklePublicEdKey: updaterConfiguration.publicEdKey,
     });
     const inspected = await inspectMacOSApp(stagedApp, {
       channel: releaseChannel.name,
@@ -2391,6 +2437,7 @@ export async function releaseMacOSApp({
       appPath: stagedApp,
       output: stagedDMG,
       replace: false,
+      distribution: "release",
     });
     await chmod(stagedDMG, 0o644);
     submitToAppleNotary(stagedDMG, {

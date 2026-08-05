@@ -31,7 +31,10 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
+import {
+  assertDeploymentEndpoints,
+  DEPLOYMENT_ENDPOINTS,
+} from "../config/deployment-endpoints.js";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
   assertReleaseChannelConfiguration,
@@ -96,8 +99,6 @@ const DISTRIBUTION_CHANNEL_PREVIEW = "preview_distribution";
 const DISTRIBUTION_CHANNEL_PRODUCTION = "production";
 const MACOS_BUILD_PROFILE_RELEASE = "release";
 const MACOS_BUILD_PROFILE_TEST = "test";
-const MACOS_RELEASE_GATE_ENVIRONMENT = "USAGE_MONITOR_MACOS_RELEASE_GATE";
-const MACOS_RELEASE_GATE_MARKER = "release-macos-app";
 const FIXED_EPOCH_SECONDS = 946_684_800;
 const MAXIMUM_BUNDLE_BYTES = 512 * 1024 * 1024;
 const MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
@@ -149,10 +150,23 @@ const DEFAULT_PREVIEW_FRAMEWORK = join(
   "Sparkle.framework",
 );
 
+// Validate the shared public/site/appcast manifest at the native build
+// boundary. Stable channel resolution and preview defaults below must never
+// silently outlive a malformed or drifted endpoint manifest.
+assertDeploymentEndpoints();
+
 export const MACOS_BUILD_PROFILES = Object.freeze({
   release: MACOS_BUILD_PROFILE_RELEASE,
   test: MACOS_BUILD_PROFILE_TEST,
 });
+
+// This capability never crosses the CLI or process environment. The release
+// core imports the narrow wrapper below after it has completed its own source,
+// continuity, and credential checks; ordinary callers can only use the
+// development or preview paths.
+const MACOS_RELEASE_BUILD_AUTHORIZATION = Symbol(
+  "usage-monitor-release-build-authorization",
+);
 
 // Preview clients are intentionally separate from named external release
 // channels. These compatibility defaults are public identifiers only: the
@@ -349,33 +363,6 @@ function stableJson(value) {
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function hasValidatedMacOSReleaseGate(environment = process.env) {
-  return environment[MACOS_RELEASE_GATE_ENVIRONMENT]
-    === MACOS_RELEASE_GATE_MARKER;
-}
-
-function assertMacOSStableExternalBuildGate({
-  externalDistribution,
-  releaseChannel,
-  releaseGateValidated,
-}) {
-  if (releaseGateValidated
-      && (!externalDistribution || releaseChannel !== STABLE_RELEASE_CHANNEL)) {
-    fail(
-      "USAGE_MONITOR_MACOS_RELEASE_GATE is only valid for stable external distribution",
-      "MACOS_RELEASE_GATE_ARGUMENTS_INVALID",
-    );
-  }
-  if (externalDistribution
-      && releaseChannel === STABLE_RELEASE_CHANNEL
-      && !releaseGateValidated) {
-    fail(
-      "Stable external distribution must use release-macos-app after continuity validation",
-      "MACOS_STABLE_EXTERNAL_BUILD_RELEASE_GATE_REQUIRED",
-    );
-  }
 }
 
 export function normalizeMacOSCentralOrigin(
@@ -3034,7 +3021,6 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
       fail(`Unknown argument: ${argument}`);
     }
   }
-  const releaseGateValidated = hasValidatedMacOSReleaseGate(environment);
   if (validatePreview) {
     if (appPath === null
         || output !== null
@@ -3048,8 +3034,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         || bundleVersionSeen
         || sparkleFramework !== null
         || sparkleAppcastURL !== null
-        || sparklePublicEdKey !== null
-        || releaseGateValidated) {
+        || sparklePublicEdKey !== null) {
       fail(
         "--validate-preview requires exactly --app <path>",
         "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID",
@@ -3077,12 +3062,11 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   }
   if (externalDistribution) {
     resolveOperationalReleaseChannel(releaseChannel);
+    fail(
+      "External distribution is only available through the validated release-macos-app programmatic path",
+      "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED",
+    );
   }
-  assertMacOSStableExternalBuildGate({
-    externalDistribution,
-    releaseChannel,
-    releaseGateValidated,
-  });
   if (previewDistribution) {
     const environmentOutput = environment.USAGE_MONITOR_PREVIEW_OUTPUT;
     if (output !== null || environmentOutput !== undefined) {
@@ -3345,6 +3329,7 @@ export async function buildMacOSApp({
   sparkleFramework = null,
   sparkleAppcastURL = null,
   sparklePublicEdKey = null,
+  releaseAuthorization = null,
 }) {
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   if (externalDistribution && previewDistribution) {
@@ -3364,12 +3349,13 @@ export async function buildMacOSApp({
   const selectedReleaseChannel = externalDistribution
     ? resolveOperationalReleaseChannel(releaseChannel)
     : null;
-  const releaseGateValidated = hasValidatedMacOSReleaseGate();
-  assertMacOSStableExternalBuildGate({
-    externalDistribution,
-    releaseChannel: selectedReleaseChannel?.name ?? releaseChannel,
-    releaseGateValidated,
-  });
+  if (externalDistribution
+      && releaseAuthorization !== MACOS_RELEASE_BUILD_AUTHORIZATION) {
+    fail(
+      "External distribution is only available through the validated release-macos-app programmatic path",
+      "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED",
+    );
+  }
   if (externalDistribution && centralOrigin !== null) {
     const configuredCentralService = normalizeMacOSCentralOrigin(
       centralOrigin,
@@ -3495,6 +3481,18 @@ export async function buildMacOSApp({
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+}
+
+/**
+ * Build an external-distribution candidate only for macos-release-core. The
+ * authorization is a module-private capability rather than an environment
+ * variable or a forgeable command-line marker.
+ */
+export async function buildMacOSAppForRelease(options) {
+  return buildMacOSApp({
+    ...options,
+    releaseAuthorization: MACOS_RELEASE_BUILD_AUTHORIZATION,
+  });
 }
 
 async function main(argv) {

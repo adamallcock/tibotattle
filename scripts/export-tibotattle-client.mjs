@@ -757,7 +757,7 @@ function clientPackageManifest() {
       "client:syntax": "node --check ./apps/local/server.js && node --check ./scripts/build-macos-app.js && node --check ./scripts/macos-release-core.js",
       "product:local": "node ./apps/local/server.js",
       "product:macos:build": "node ./scripts/build-macos-app.js --output .release-build/macos/TiboTattle.app",
-      "product:macos:dmg": "node ./scripts/package-macos-dmg.js --app .release-build/macos/TiboTattle.app --output .release-build/macos/TiboTattle.dmg --replace",
+      "product:macos:dmg": "node ./scripts/package-macos-dmg.js --app .release-build/macos/TiboTattle.app --output .release-build/macos/TiboTattle-development.dmg --development --replace",
       "product:macos:release": "node ./scripts/release-macos-app.js",
       "product:macos:test": "node --test --test-concurrency=1 test/macos-app-bundle.test.js test/macos-updater.test.js",
       "product:macos:updater:prepare": "node ./scripts/prepare-sparkle-framework.js --output .release-deps/Sparkle.framework",

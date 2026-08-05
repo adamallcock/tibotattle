@@ -50,6 +50,7 @@ import {
   MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
   MACOS_WEB_MODULE_ENTRYPOINTS,
   buildMacOSApp,
+  buildMacOSAppForRelease,
   collectMacOSLocalizationResources,
   collectMacOSRuntimeGraph,
   collectMacOSSwiftSources,
@@ -93,6 +94,9 @@ import {
   validateMacOSDMG,
   validateMacOSLoginItemReleaseRehearsal,
 } from "../scripts/macos-release-core.js";
+import {
+  parseArguments as parseMacOSDMGArguments,
+} from "../scripts/package-macos-dmg.js";
 import {
   SPARKLE_FRAMEWORK_LINKS,
   SPARKLE_FRAMEWORK_SHA256,
@@ -1535,7 +1539,7 @@ test("unconfigured dogfood is refused by builder and release configuration", asy
   );
 });
 
-test("stable external builder refuses the direct continuity bypass", async () => {
+test("generic external builders reject env and CLI marker spoofing", async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-stable-build-gate-"),
   );
@@ -1549,7 +1553,7 @@ test("stable external builder refuses the direct continuity bypass", async () =>
         "--release-channel",
         STABLE_RELEASE_CHANNEL,
       ]),
-      { code: "MACOS_STABLE_EXTERNAL_BUILD_RELEASE_GATE_REQUIRED" },
+      { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" },
     );
     const directBuild = spawnSync(
       process.execPath,
@@ -1561,12 +1565,19 @@ test("stable external builder refuses the direct continuity bypass", async () =>
         "--release-channel",
         STABLE_RELEASE_CHANNEL,
       ],
-      { cwd: REPOSITORY_ROOT, encoding: "utf8" },
+      {
+        cwd: REPOSITORY_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
+        },
+      },
     );
     assert.equal(directBuild.status, 1, directBuild.stderr);
     assert.match(
       directBuild.stderr,
-      /must use release-macos-app after continuity validation/u,
+      /only available through the validated release-macos-app programmatic path/u,
     );
     await assert.rejects(
       buildMacOSApp({
@@ -1574,8 +1585,21 @@ test("stable external builder refuses the direct continuity bypass", async () =>
         externalDistribution: true,
         releaseChannel: STABLE_RELEASE_CHANNEL,
       }),
-      { code: "MACOS_STABLE_EXTERNAL_BUILD_RELEASE_GATE_REQUIRED" },
+      { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" },
     );
+    assert.throws(
+      () => parseMacOSBuildArguments([
+        "--output",
+        output,
+        "--external-distribution",
+        "--release-channel",
+        STABLE_RELEASE_CHANNEL,
+        "--release-gate",
+        "release-macos-app",
+      ]),
+      { code: "MACOS_APP_BUILD_FAILED" },
+    );
+    assert.equal(typeof buildMacOSAppForRelease, "function");
     await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -1615,16 +1639,14 @@ test("external app output is fresh-only and rejects a TOCTOU target", async () =
   }
 });
 
-test("release gate handoff is explicit and does not apply to development or preview", async () => {
+test("release authorization is programmatic and does not apply to development or preview", async () => {
   const source = await readFile(RELEASE_CORE, "utf8");
   assert.match(
     source,
     /assertStableSparkleKeyContinuity\(/u,
   );
-  assert.match(
-    source,
-    /USAGE_MONITOR_MACOS_RELEASE_GATE:\s*"release-macos-app"/u,
-  );
+  assert.match(source, /buildMacOSAppForRelease/u);
+  assert.doesNotMatch(source, /USAGE_MONITOR_MACOS_RELEASE_GATE/u);
 
   const development = parseMacOSBuildArguments([
     "--output",
@@ -1646,35 +1668,77 @@ test("release gate handoff is explicit and does not apply to development or prev
   assert.throws(
     () => parseMacOSBuildArguments([
       "--output",
-      ".release-build/macos/TiboTattle.app",
+      ".release-build/macos-production/TiboTattle.app",
+      "--external-distribution",
+      "--release-channel",
+      STABLE_RELEASE_CHANNEL,
     ], {
       USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
     }),
-    { code: "MACOS_RELEASE_GATE_ARGUMENTS_INVALID" },
+    { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" },
   );
   assert.throws(
     () => parseMacOSBuildArguments([
-      "--preview-distribution",
-    ], {
-      USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
-      USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
-        "https://updates.usage.example/appcast.xml",
-      USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
-        Buffer.alloc(32, 4).toString("base64"),
-      USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
-    }),
-    { code: "MACOS_RELEASE_GATE_ARGUMENTS_INVALID" },
+      "--output",
+      ".release-build/macos-production/TiboTattle.app",
+      "--external-distribution",
+      "--release-channel",
+      STABLE_RELEASE_CHANNEL,
+      "--release-gate",
+      "release-macos-app",
+    ]),
+    { code: "MACOS_APP_BUILD_FAILED" },
   );
-  const stableThroughReleaseGate = parseMacOSBuildArguments([
+  assert.throws(() => parseMacOSBuildArguments([
     "--output",
     ".release-build/macos-production/TiboTattle.app",
     "--external-distribution",
     "--release-channel",
     STABLE_RELEASE_CHANNEL,
-  ], {
-    USAGE_MONITOR_MACOS_RELEASE_GATE: "release-macos-app",
-  });
-  assert.equal(stableThroughReleaseGate.externalDistribution, true);
+  ]), { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" });
+});
+
+test("generic DMG packaging requires an explicit visible non-release mode", () => {
+  assert.throws(
+    () => parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos/TiboTattle.app",
+    ]),
+    /one explicit non-release mode/u,
+  );
+  assert.deepEqual(
+    parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos/TiboTattle.app",
+      "--development",
+    ]),
+    {
+      appPath: resolve(".release-build/macos/TiboTattle.app"),
+      output: resolve(
+        `.release-build/macos/TiboTattle-${RELEASE_VERSION}`
+          + "-macOS-arm64-development.dmg",
+      ),
+      replace: false,
+      distribution: "development",
+    },
+  );
+  assert.deepEqual(
+    parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos-preview/current/TiboTattle.app",
+      "--preview",
+    ]).distribution,
+    "preview",
+  );
+  assert.throws(
+    () => parseMacOSDMGArguments([
+      "--app",
+      ".release-build/macos/TiboTattle.app",
+      "--development",
+      "--preview",
+    ]),
+    /Unknown or repeated argument: --preview/u,
+  );
 });
 
 test("stable external bundle inputs remain bound to the reviewed production policy", async () => {
@@ -2013,7 +2077,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   const releaseSource = await readFile(RELEASE_CORE, "utf8");
   const freshBuild = releaseSource.indexOf(
-    "runMacOSReleaseCommand(process.execPath",
+    "buildMacOSAppForRelease({",
   );
   const developerIDSigning = releaseSource.indexOf(
     "await developerIDSignMacOSApp(stagedApp",
@@ -2028,7 +2092,6 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     releaseSource,
     /USAGE_MONITOR_PRODUCTION_ORIGIN/u,
   );
-  assert.match(releaseSource, /"--release-channel"/u);
   assert.match(releaseSource, /releaseChannel\.name/u);
   assert.match(
     releaseSource,
@@ -4967,13 +5030,15 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     const dmg = join(
       temporaryRoot,
       "dmg",
-      "UsageMonitor-0.0.1-macOS-arm64.dmg",
+      `TiboTattle-${RELEASE_VERSION}-macOS-arm64-development.dmg`,
     );
     const packaged = await packageMacOSDMG({
       appPath: outputA,
       output: dmg,
+      distribution: "development",
     });
     assert.equal(packaged.output, dmg);
+    assert.equal(packaged.distribution, "development");
     assert.match(packaged.sha256, /^[a-f0-9]{64}$/u);
     assert.equal(packaged.bytes > 0, true);
     assert.deepEqual(
@@ -5132,6 +5197,19 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
       updaterEnabled: true,
     });
+    const previewDMG = join(
+      temporaryRoot,
+      "dmg",
+      `TiboTattle-${RELEASE_VERSION}-macOS-arm64-preview.dmg`,
+    );
+    const packagedPreview = await packageMacOSDMG({
+      appPath: output,
+      output: previewDMG,
+      distribution: "preview",
+    });
+    assert.equal(packagedPreview.distribution, "preview");
+    assert.equal(packagedPreview.output, previewDMG);
+    assert.equal(packagedPreview.bytes > 0, true);
     await assert.rejects(
       inspectMacOSApp(output, { requireExternalDistribution: true }),
       { code: "MACOS_UPDATER_CONFIGURATION_INVALID" },

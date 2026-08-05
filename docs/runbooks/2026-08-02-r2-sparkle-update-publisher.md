@@ -52,15 +52,14 @@ candidate and never claims that older entries were retained. Replacement still
 requires an explicit flag and a strictly newer bundle version; rollback is a
 manual higher-version signed release, never a silent downgrade.
 
-The macOS bundle builder has a separate accident-prevention boundary: direct
+The macOS bundle builder has a separate release boundary: direct
 `build-macos-app.js --external-distribution --release-channel stable`
-invocation fails before it creates an output bundle. `release-macos-app.js`
-performs the shared continuity/bootstrap validation first, then sets a
-narrowly scoped `USAGE_MONITOR_MACOS_RELEASE_GATE=release-macos-app` marker for
-its fresh builder subprocess. The marker is an internal handoff, not a
-hostile-user security boundary; it prevents an ordinary direct build from
-being mistaken for a fully gated release. Development and preview builds do
-not require or use it.
+invocation fails before it creates an output bundle, even if the caller
+supplies the former environment marker or a similar CLI marker. The release
+core performs the shared continuity/bootstrap and source-provenance validation
+first, then calls the external-build API through an in-process capability that
+is not accepted from CLI arguments or the process environment. Development and
+preview builds remain available through their explicit non-release paths.
 
 The installed Wrangler R2 CLI exposes only an ordinary `PUT`; it has no
 conditional-write flag. Therefore `--publish` fails closed unless the caller

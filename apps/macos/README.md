@@ -176,14 +176,17 @@ Create a deterministic-layout developer DMG:
 ```bash
 npm run product:macos:dmg
 node ./scripts/validate-macos-install.js \
-  --dmg ".release-build/macos/UsageMonitor-0.0.1-macOS-arm64.dmg" \
+  --dmg ".release-build/macos/TiboTattle-0.1.0-macOS-arm64-development.dmg" \
   --development
 ```
 
 The DMG command fixes its volume name, layout, HFS+ filesystem, compression
 level, file ordering inputs, and timestamps. A Developer ID timestamp and
 Apple's disk-image tooling make byte-for-byte identity across release machines
-an invalid promise; the command records the resulting SHA-256 instead.
+an invalid promise; the command records the resulting SHA-256 instead. Its
+explicit `--development` mode only packages an updater-disabled development
+bundle, requires a `-development.dmg` filename, and reports the artifact as
+ad-hoc, non-notarized, and not update-ready.
 
 ## Localization and regionalization
 
@@ -317,19 +320,16 @@ framework-tree digest and link targets, and checks the complete license notice:
 npm run product:macos:updater:prepare
 ```
 
-Build the release candidate with a fixed, real HTTPS service origin and a
-monotonic Apple bundle version. The appcast public key is public; the matching
-private update-signing key must not enter the repository or release host:
+The generic builder rejects `--external-distribution` entirely, including when
+the old environment marker is supplied or a similar CLI marker is attempted.
+Build the release candidate only through `product:macos:release`, which performs
+the continuity and source-provenance checks before calling the external-build
+API. The appcast public key is public; the matching private update-signing key
+must not enter the repository or release host:
 
 ```bash
-node ./scripts/build-macos-app.js \
-  --output ".release-build/macos-production/TiboTattle.app" \
-  --central-origin "https://REPLACE-WITH-APPROVED-HOST" \
-  --external-distribution \
-  --bundle-version 1 \
-  --sparkle-framework ".release-deps/Sparkle.framework" \
-  --sparkle-appcast-url "https://REPLACE-WITH-APPROVED-HOST/appcast.xml" \
-  --sparkle-public-ed-key "REPLACE_WITH_32_BYTE_BASE64_PUBLIC_KEY="
+npm run product:macos:release -- \
+  --channel stable
 ```
 
 The command rejects a missing origin, HTTP, loopback, credentials, paths,
