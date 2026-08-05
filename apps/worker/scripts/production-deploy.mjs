@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   rm,
   symlink,
   writeFile,
@@ -160,6 +161,21 @@ async function requireAbsent(path, label) {
   throw new Error(`${label} must not already exist.`);
 }
 
+async function verifySnapshotDependencyLink({
+  dependencyPath,
+  expectedTarget,
+}) {
+  const metadata = await lstat(dependencyPath);
+  if (!metadata.isSymbolicLink()) {
+    throw new Error("Snapshot dependency link changed unexpectedly.");
+  }
+  const target = await readlink(dependencyPath);
+  const resolvedTarget = resolve(dirname(dependencyPath), target);
+  if (resolvedTarget !== resolve(expectedTarget)) {
+    throw new Error("Snapshot dependency link changed unexpectedly.");
+  }
+}
+
 function runSnapshotGit(excludeFile, repositoryRoot, arguments_) {
   return execFileSync(
     "/usr/bin/git",
@@ -168,7 +184,7 @@ function runSnapshotGit(excludeFile, repositoryRoot, arguments_) {
   );
 }
 
-async function createImmutableSourceSnapshot({
+export async function createImmutableSourceSnapshot({
   workerDirectory,
   sourceCommit,
 }) {
@@ -242,7 +258,7 @@ async function createImmutableSourceSnapshot({
     const snapshotWorker = join(snapshotApps, "worker");
     await requireSafeDirectory(snapshotApps, "Snapshot apps directory");
     await requireSafeDirectory(snapshotWorker, "Snapshot Worker directory");
-    const dependencySource = join(workerDirectory, "node_modules");
+    const dependencySource = resolve(workerDirectory, "node_modules");
     await requireSafeDirectory(dependencySource, "Checked-out Worker dependencies");
     const dependencyDestination = join(snapshotWorker, "node_modules");
     await requireAbsent(dependencyDestination, "Snapshot Worker dependencies");
@@ -261,19 +277,32 @@ async function createImmutableSourceSnapshot({
         arguments_,
       ),
       async cleanup() {
-        execFileSync(
-          "/usr/bin/git",
-          [
-            "-C",
-            repositoryRoot,
-            "worktree",
-            "remove",
-            "--force",
-            snapshotRoot,
-          ],
-          { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
-        );
-        await rm(snapshotParent, { recursive: true, force: false });
+        try {
+          await verifySnapshotDependencyLink({
+            dependencyPath: dependencyDestination,
+            expectedTarget: dependencySource,
+          });
+          execFileSync(
+            "/usr/bin/git",
+            [
+              "-C",
+              repositoryRoot,
+              "worktree",
+              "remove",
+              "--force",
+              snapshotRoot,
+            ],
+            { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+          );
+          await rm(snapshotParent, { recursive: true, force: false });
+        } catch (error) {
+          const cleanupError = new Error(
+            "Production source snapshot cleanup failed.",
+            { cause: error },
+          );
+          cleanupError.code = "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED";
+          throw cleanupError;
+        }
       },
     };
   } catch (error) {

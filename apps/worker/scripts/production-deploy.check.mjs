@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import {
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   rename,
   rm,
   symlink,
@@ -24,6 +26,7 @@ import {
 } from "./deployment-proof.mjs";
 import {
   PRODUCTION_DEPLOY_CONFIRMATION,
+  createImmutableSourceSnapshot,
   runProductionDeployment,
   recheckProductionContainment,
 } from "./production-deploy.mjs";
@@ -253,6 +256,93 @@ test("production deployment creates a real top-level Git snapshot before staging
     readFile(join(stageCalls[0].sourceDirectory, "index.html")),
     { code: "ENOENT" },
   );
+});
+
+test("production deployment fails closed when the snapshot dependency link is repointed before cleanup", async (t) => {
+  const fixture = await immutableSnapshotFixture();
+  t.after(async () => {
+    await rm(fixture.root, { recursive: true, force: true });
+  });
+  const dependencyMarker = join(
+    fixture.workerDirectory,
+    "node_modules",
+    "must-survive-cleanup.txt",
+  );
+  await writeFile(dependencyMarker, "external dependency remains\n");
+
+  let snapshot;
+  let dependencyLink;
+  let expectedTarget;
+  let healthChecks = 0;
+  let spawned = false;
+  let cleaned = false;
+  try {
+    const result = await runProductionDeployment(options({
+      workerDirectory: fixture.workerDirectory,
+      expectedSourceCommit: fixture.sourceCommit,
+      sourceCommitCheck: (directory) => git(
+        directory,
+        ["rev-parse", "HEAD"],
+      ).trim(),
+      sourceTreeCleanCheck: (directory) => git(
+        directory,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+      ).trim() === "",
+      proofCheck: proofCheck({
+        worker: {
+          ...proofCheck().proof.worker,
+          sourceCommit: fixture.sourceCommit,
+        },
+      }),
+      createSourceSnapshot: async (arguments_) => {
+        snapshot = await createImmutableSourceSnapshot(arguments_);
+        dependencyLink = join(snapshot.workerDirectory, "node_modules");
+        expectedTarget = await readlink(dependencyLink);
+        return snapshot;
+      },
+      releasePreflight: async () => ({ state: "ready", blockers: [] }),
+      checkWorkspacePackages: async () => {},
+      checkEndpoints: async () => {},
+      stageAssets: async () => {},
+      healthRecheck: async () => {
+        healthChecks += 1;
+        if (healthChecks === 2) {
+          await rm(dependencyLink);
+          await symlink(fixture.workerDirectory, dependencyLink, "dir");
+        }
+        return { ok: true, code: null };
+      },
+      spawn: () => {
+        spawned = true;
+        return { status: 0, stdout: "deployed", stderr: "" };
+      },
+    }));
+
+    assert.deepEqual(result, {
+      ok: false,
+      code: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
+    });
+    assert.equal(spawned, true);
+    assert.equal(healthChecks, 2);
+    assert.equal(
+      await readFile(dependencyMarker, "utf8"),
+      "external dependency remains\n",
+    );
+    assert.equal((await lstat(dependencyLink)).isSymbolicLink(), true);
+    assert.equal(await readlink(dependencyLink), fixture.workerDirectory);
+    assert.equal((await lstat(snapshot.repositoryRoot)).isDirectory(), true);
+  } finally {
+    if (snapshot && !cleaned) {
+      try {
+        await rm(dependencyLink);
+        await symlink(expectedTarget, dependencyLink, "dir");
+        await snapshot.cleanup();
+        cleaned = true;
+      } catch {
+        // The test fixture cleanup below is the final bounded local cleanup.
+      }
+    }
+  }
 });
 
 test("production deployment fails closed when generated release output is a symlink", async (t) => {
