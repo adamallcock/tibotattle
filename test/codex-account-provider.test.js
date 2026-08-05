@@ -32,3 +32,32 @@ test("Codex account facade exposes only reviewed exports with exact identities",
   }
   assert.equal(accountFacade.OPENAI_ACCOUNT_SCOPE_PREFIX, undefined);
 });
+
+test("rate-limit sanitation retains provider duration and fails closed on plan evidence", () => {
+  const sanitized = accountFacade.sanitizeRateLimit({
+    limitId: "codex",
+    planType: "pro-20x",
+    primary: {
+      usedPercent: 12,
+      windowDurationMins: 43_200,
+      resetsAt: 1_788_048_360,
+    },
+    secondary: {
+      usedPercent: 20,
+      windowDurationMins: 10_080,
+      resetsAt: 1_786_061_160,
+    },
+  });
+
+  assert.equal(sanitized.planType, "unknown");
+  assert.equal(sanitized.primary.windowDurationMins, 43_200);
+  assert.equal(sanitized.secondary.windowDurationMins, 10_080);
+  assert.equal(
+    accountFacade.sanitizeRateLimit({
+      limitId: "codex",
+      planType: "pro",
+      primary: { usedPercent: 10, windowDurationMins: 525_601, resetsAt: 1_788_048_360 },
+    }).primary,
+    null,
+  );
+});

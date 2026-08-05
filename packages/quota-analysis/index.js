@@ -24,7 +24,10 @@ export {
 
 export {
   FIVE_HOUR_WINDOW_MINUTES,
+  formatQuotaWindowDuration,
   MAX_QUOTA_WINDOW_DURATION_MINUTES,
+  quotaWindowLabel,
+  selectPrimaryQuotaWindow,
   SEVEN_DAY_WINDOW_MINUTES,
   SUPPORTED_QUOTA_WINDOW_DURATIONS,
   isValidQuotaWindowDuration,

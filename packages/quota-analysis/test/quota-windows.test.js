@@ -3,9 +3,12 @@ import test from "node:test";
 
 import {
   FIVE_HOUR_WINDOW_MINUTES,
+  formatQuotaWindowDuration,
   isSupportedQuotaWindowDuration,
   isValidQuotaWindowDuration,
   MAX_QUOTA_WINDOW_DURATION_MINUTES,
+  quotaWindowLabel,
+  selectPrimaryQuotaWindow,
   SEVEN_DAY_WINDOW_MINUTES,
   SUPPORTED_QUOTA_WINDOW_DURATIONS,
 } from "../src/quota-windows.js";
@@ -127,4 +130,30 @@ test("pace inputs retain generic duration while the weekly policy stays seven-da
   });
   assert.equal(result.windowDurationMinutes, 43_200);
   assert.equal(QUOTA_PACE_POLICY.windowDurationMinutes, SEVEN_DAY_WINDOW_MINUTES);
+});
+
+test("primary selection and labels preserve named semantics for provider windows", () => {
+  const windows = [
+    { id: "five-hour", limitId: "codex", slot: "primary", windowDurationMinutes: 300 },
+    { id: "weekly", limitId: "codex", slot: "secondary", windowDurationMinutes: 10_080 },
+    { id: "provider-30-day", limitId: "codex", slot: "primary", windowDurationMinutes: 43_200 },
+    { id: "spark", limitId: "codex_bengalfox", slot: "primary", windowDurationMinutes: 525_600 },
+  ];
+
+  assert.equal(selectPrimaryQuotaWindow(windows)?.id, "provider-30-day");
+  assert.equal(
+    selectPrimaryQuotaWindow([
+      { id: "secondary", limitId: "codex", slot: "secondary", windowDurationMinutes: 43_200 },
+      { id: "primary", limitId: "codex", slot: "primary", windowDurationMinutes: 43_200 },
+    ])?.id,
+    "primary",
+  );
+  assert.equal(formatQuotaWindowDuration(43_200), "30-day");
+  assert.equal(quotaWindowLabel("codex", 300), "Five-hour allowance");
+  assert.equal(quotaWindowLabel("codex", 10_080), "Seven-day allowance");
+  assert.equal(quotaWindowLabel("codex", 43_200), "Provider-reported 30-day window");
+  assert.doesNotMatch(quotaWindowLabel("codex", 43_200), /month/iu);
+  assert.equal(formatQuotaWindowDuration(0), null);
+  assert.equal(quotaWindowLabel("codex", 0), "Unknown quota window");
+  assert.equal(selectPrimaryQuotaWindow(null), null);
 });

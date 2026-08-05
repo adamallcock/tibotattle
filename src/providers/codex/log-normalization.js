@@ -1,3 +1,6 @@
+import { normalizeProviderPlanType } from "./plan-normalization.js";
+import { normalizeProviderQuotaWindow } from "./quota-normalization.js";
+
 const COMPONENT_KEYS = [
   "input_tokens",
   "cached_input_tokens",
@@ -6,8 +9,6 @@ const COMPONENT_KEYS = [
   "reasoning_output_tokens",
   "total_tokens",
 ];
-
-const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
 
 export { validAbortSignal } from "../../valid-abort-signal.js";
 
@@ -114,40 +115,22 @@ function safeClassification(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,64}$/.test(value) ? value : "unknown";
 }
 
-function canBecomeIsoInstant(epochSeconds) {
-  if (!Number.isSafeInteger(epochSeconds) || epochSeconds <= 0) return false;
-  try {
-    new Date(epochSeconds * 1_000).toISOString();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function canonicalRateLimitWindows(rateLimits) {
   if (!rateLimits || typeof rateLimits !== "object") return [];
   const limitId = safeClassification(rateLimits.limit_id);
-  const planType = safeClassification(rateLimits.plan_type);
+  const planType = normalizeProviderPlanType(rateLimits.plan_type);
   const windows = [];
   for (const slot of ["primary", "secondary"]) {
     const window = rateLimits[slot];
     if (!window || typeof window !== "object") continue;
-    const usedPercent = Number(window.used_percent);
-    const windowDurationMins = Number(window.window_minutes);
-    const resetsAt = Number(window.resets_at);
-    if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
-    if (!Number.isSafeInteger(windowDurationMins)
-        || windowDurationMins < 1
-        || windowDurationMins > MAX_QUOTA_WINDOW_DURATION_MINUTES) continue;
-    if (!canBecomeIsoInstant(resetsAt)) continue;
+    const normalized = normalizeProviderQuotaWindow(window);
+    if (normalized === null) continue;
     windows.push({
       provider: "openai_codex",
       planType,
       limitId,
       slot,
-      usedPercent,
-      windowDurationMins,
-      resetsAt,
+      ...normalized,
     });
   }
   return windows;
@@ -166,7 +149,12 @@ export const CONTRADICTED_LEADING_SNAPSHOT_WINDOW_MS = 60_000;
 export const CONTRADICTED_LEADING_SNAPSHOT_PERCENT = 10;
 
 function rateLimitWindowIdentity(window) {
-  return `${window.provider}|${window.limitId}|${window.slot}`;
+  return [
+    window.provider,
+    window.limitId,
+    window.slot,
+    window.windowDurationMins ?? "unknown",
+  ].join("\u0000");
 }
 
 function contradicts(held, candidate) {

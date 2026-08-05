@@ -27,11 +27,14 @@ const PACE_EXPORTS = Object.freeze([
 ]);
 const WINDOW_EXPORTS = Object.freeze([
   "FIVE_HOUR_WINDOW_MINUTES",
+  "formatQuotaWindowDuration",
   "MAX_QUOTA_WINDOW_DURATION_MINUTES",
+  "quotaWindowLabel",
   "SEVEN_DAY_WINDOW_MINUTES",
   "SUPPORTED_QUOTA_WINDOW_DURATIONS",
   "isValidQuotaWindowDuration",
   "isSupportedQuotaWindowDuration",
+  "selectPrimaryQuotaWindow",
 ]);
 const SOURCE_HASHES = Object.freeze({
   "quota-calibration.js":
@@ -41,7 +44,7 @@ const SOURCE_HASHES = Object.freeze({
   "quota-tracks.js":
     "85118466c257497a72c07c05cda6224c8d0a7e6a7b85aa69b4d950bf823d2170",
   "quota-windows.js":
-    "bb6ac48094e6bc7cd7dc44f587107b40b4a19799461814184e2b5f0cb6a08414",
+    "fbf4bdcfb8417efcc2cdf3d7e3e92f1302048e523d6722b06eb9c47b44861366",
   "quota-pace-forecast.js":
     "89bff15bf12f4b94c578c04a6c7b05f3c7656eda3ae9b935a0ed9683ef08e8b6",
 });

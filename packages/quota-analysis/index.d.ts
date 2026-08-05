@@ -13,6 +13,20 @@ export function isValidQuotaWindowDuration(value: number): boolean;
 export function isSupportedQuotaWindowDuration(
   value: number,
 ): value is SupportedQuotaWindowDurationMinutes;
+
+export interface QuotaWindowSelectionInput {
+  limitId?: string;
+  slot?: string;
+  windowDurationMinutes?: number;
+  durationMinutes?: number;
+  windowDurationMins?: number;
+}
+export function selectPrimaryQuotaWindow<T extends QuotaWindowSelectionInput>(
+  windows: readonly T[] | null | undefined,
+): T | null;
+export function formatQuotaWindowDuration(value: number): string | null;
+export function quotaWindowLabel(limitId: string, durationMinutes: number): string;
+
 export type QuotaSlot =
   | "primary"
   | "secondary"
