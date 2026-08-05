@@ -3,14 +3,14 @@ import {
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
   LocalCompanionClient,
+  CODEX_PRIMARY_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
-  formatQuotaWindowDuration,
+  isValidQuotaWindowDuration,
   normalizeCommunitySnapshot,
   normalizeParticipantHistory,
   normalizeParticipantStats,
-  quotaWindowLabel,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -772,13 +772,13 @@ function renderQuotaCards(data) {
     const remaining = finite(window.remainingPercent);
     const card = node("article", `metric-card ${window.status === "stale" ? "stale" : ""}`);
     const header = node("div", "metric-card-header");
-    const name = rawNode("span", "metric-name", window.label);
+    const name = node("span", "metric-name", localizedQuotaWindowLabel(window));
     const plan = node("span", "evidence-chip");
     const reportedPlan = providerReportedPlanEvidence(window.planType);
     if (data.mode === "demo") {
       plan.textContent = t("dashboard.quota.demo");
     } else if (reportedPlan) {
-      setRawText(plan, reportedPlan);
+      plan.textContent = reportedPlan;
     } else {
       plan.textContent = t("dashboard.quota.observed");
     }
@@ -833,7 +833,38 @@ function renderQuotaCards(data) {
 function providerReportedPlanEvidence(value) {
   const candidate = typeof value === "string" ? value.trim() : "";
   if (candidate === "" || candidate.toLowerCase() === "unknown") return "";
-  return `Provider reported plan type: ${candidate}`;
+  return t("dashboard.quota.providerPlan", { plan: candidate });
+}
+
+function localizedQuotaWindowDuration(durationMinutes) {
+  const duration = finite(durationMinutes, null);
+  if (!isValidQuotaWindowDuration(duration)) return "";
+  if (duration % (24 * 60) === 0) {
+    return tPlural("quota.durationDay", duration / (24 * 60));
+  }
+  if (duration % 60 === 0) {
+    return tPlural("quota.durationHour", duration / 60);
+  }
+  return tPlural("quota.durationMinute", duration);
+}
+
+function localizedQuotaWindowLabel(window) {
+  const duration = finite(window?.durationMinutes, null);
+  if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
+      && duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
+    return t("dashboard.quota.windowFiveHour");
+  }
+  if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
+      && duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) {
+    return t("dashboard.quota.windowSevenDay");
+  }
+  if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
+      && isValidQuotaWindowDuration(duration)) {
+    return t("dashboard.quota.windowProviderReported", {
+      duration: localizedQuotaWindowDuration(duration),
+    });
+  }
+  return t("dashboard.quota.windowOther");
 }
 
 function historyCoverageLabel(history) {
@@ -1219,7 +1250,7 @@ function shareCardWindowLabel(window) {
   if (kind !== "other") {
     return t(SHARE_CARD_WINDOW_KEYS[kind]);
   }
-  const duration = formatQuotaWindowDuration(finite(window?.durationMinutes));
+  const duration = localizedQuotaWindowDuration(window?.durationMinutes);
   return duration === ""
     ? t(SHARE_CARD_WINDOW_KEYS.other)
     : t("share.window.providerReportedDuration", { duration });
@@ -6529,12 +6560,12 @@ function renderAccountScopedQuotaAnalysis(container, analysis) {
   const grid = node("div", "pricing-basis-grid");
   for (const track of analysis.tracks) {
     const card = node("article", "basis-card");
-    const windowLabel = quotaWindowLabel(
-      track.limitId,
-      track.windowDurationMinutes,
-    );
+    const windowLabel = localizedQuotaWindowLabel({
+      limitId: track.limitId,
+      durationMinutes: track.windowDurationMinutes,
+    });
     const planEvidence = providerReportedPlanEvidence(track.planType)
-      || "Provider reported plan type unavailable";
+      || t("dashboard.quota.providerPlanUnavailable");
     const estimate = track.latestCapacityUsd === null
       ? "Collecting evidence"
       : formatApiMoney(track.latestCapacityUsd);
@@ -6646,7 +6677,7 @@ function renderParticipantQuotaMovement(container, movement) {
       ? "Capacity estimate unavailable"
       : `${formatApiMoney(movement.apiPriceEquivalentCapacityUsd)} per 100 percentage points`;
     const planEvidence = providerReportedPlanEvidence(movement.planType)
-      || "Provider reported plan type unavailable";
+      || t("dashboard.quota.providerPlanUnavailable");
     metadata.append(
       node("span", "", [planEvidence, movement.limitId, movement.slot].filter(Boolean).join(" · ") || "Quota track"),
       node("span", "", resetLabel),

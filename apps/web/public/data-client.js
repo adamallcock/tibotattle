@@ -216,6 +216,11 @@ function text(value, fallback = "") {
   return typeof value === "string" && value.length <= 500 ? value : fallback;
 }
 
+function normalizePlanType(value) {
+  const candidate = text(value, "unknown");
+  return TELEMETRY_PLAN_TYPES.includes(candidate) ? candidate : "unknown";
+}
+
 function canonicalInstant(value) {
   if (typeof value !== "string" || value.length > 32) return null;
   const epoch = Date.parse(value);
@@ -1145,7 +1150,7 @@ function normalizeQuotaMovement(payload) {
     interpretation: text(payload?.interpretation, ""),
     accountContinuity: text(payload?.accountContinuity, "not_transmitted"),
     provider: text(payload?.provider, ""),
-    planType: text(payload?.planType, ""),
+    planType: normalizePlanType(payload?.planType),
     planVariant: text(payload?.planVariant, ""),
     limitId: text(payload?.limitId, ""),
     slot: text(payload?.slot, ""),
@@ -1229,7 +1234,7 @@ function normalizeAccountScopedQuotaAnalysis(payload) {
     return [{
       index: index + 1,
       provider: text(continuity.provider, ""),
-      planType: text(continuity.planType, "unknown"),
+      planType: normalizePlanType(continuity.planType),
       planVariant: text(continuity.planVariant, "unknown"),
       limitId: text(continuity.limitId, "unknown"),
       windowDurationMinutes,
@@ -1978,8 +1983,7 @@ function normalizeLocalTimeline(value = {}) {
       slot: ["primary", "secondary", "unknown"].includes(row?.slot)
         ? row.slot
         : "unknown",
-      planType: TELEMETRY_PLAN_TYPES.includes(row?.planType)
-        ? row.planType : "unknown",
+      planType: normalizePlanType(row?.planType),
       accountAttribution: row?.accountAttribution === "attributed_pseudonymous"
         ? "attributed_pseudonymous"
         : "unattributed"
@@ -2161,7 +2165,6 @@ function normalizeQuota(window, index) {
     ? durationCandidate
     : null;
   const limitId = normalizeQuotaLimitId(window?.limitId);
-  const planType = text(window?.planType ?? window?.plan_type, "unknown");
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),
     limitId,
@@ -2175,7 +2178,7 @@ function normalizeQuota(window, index) {
     resetAt: text(window?.resetAt ?? window?.reset_at, ""),
     observedAt: text(window?.observedAt ?? window?.observed_at, ""),
     precision: finite(window?.precision ?? window?.displayPrecision, null),
-    planType: TELEMETRY_PLAN_TYPES.includes(planType) ? planType : "unknown",
+    planType: normalizePlanType(window?.planType ?? window?.plan_type),
     accountAttribution: text(window?.accountAttribution, ""),
     status: safeState(window?.status, "live")
   };

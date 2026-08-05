@@ -147,6 +147,18 @@ test("browser catalogs preserve placeholders, plural forms, and legacy text has 
     translatePlural("contribution.batch", Number.NaN, {}, "en-US"),
     "0 contribution batches",
   );
+  assert.equal(
+    translatePlural("quota.durationDay", 30, {}, "es"),
+    "30 días",
+  );
+  assert.equal(
+    translate(
+      "dashboard.quota.windowProviderReported",
+      { duration: translatePlural("quota.durationDay", 30, {}, "zh-Hans") },
+      "zh-Hans",
+    ),
+    "提供方报告的 30 天 窗口",
+  );
   const pseudo = pseudoLocalize("Version {version} is available");
   assert.match(pseudo, /^［.+］$/u);
   assert.match(pseudo, /\{version\}/u, "pseudo-localization preserves placeholders");
@@ -332,7 +344,10 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   assert.match(appSource, /function rawNode\(/u);
   assert.match(appSource, /setRawText\(\$\("#selected-contribution-json"\)/u);
   assert.match(appSource, /setRawText\(\$\("#identity-account-provider"\)/u);
-  assert.match(appSource, /rawNode\("span", "metric-name", window\.label\)/u);
+  assert.match(
+    appSource,
+    /node\("span", "metric-name", localizedQuotaWindowLabel\(window\)\)/u,
+  );
   assert.match(appSource, /setRawText\(titleNode, title\)/u);
   assert.match(appSource, /setRawText\(markerTitle, caption\)/u);
   assert.match(appSource, /tPlural\("contribution\.deduplicatedRecord"/u);

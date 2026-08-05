@@ -1274,7 +1274,7 @@ test("account-scoped normalization keeps generic and seven-day tracks separate",
         {
           continuity: {
             provider: "openai_codex",
-            planType: "pro",
+            planType: "pro-20x",
             planVariant: "pro-20x",
             limitId: CODEX_PRIMARY_LIMIT_ID,
             windowDurationMinutes: 43_200,
@@ -1315,7 +1315,10 @@ test("account-scoped normalization keeps generic and seven-day tracks separate",
     result.accountScopedQuotaAnalysis.tracks.map((track) => track.windowDurationMinutes),
     [43_200, CODEX_WEEKLY_ALLOWANCE_MINUTES]
   );
-  assert.equal(result.accountScopedQuotaAnalysis.tracks[0].planType, "pro");
+  assert.deepEqual(
+    result.accountScopedQuotaAnalysis.tracks.map((track) => track.planType),
+    ["unknown", "pro"]
+  );
   assert.doesNotMatch(
     JSON.stringify(result.accountScopedQuotaAnalysis),
     /monthly/i
@@ -1328,8 +1331,8 @@ test("generic quota presentation keeps plan evidence conservative and weekly sur
     /function renderAccountScopedQuotaAnalysis\(container, analysis\) \{([\s\S]*?)\n\}\n\nconst QUOTA_MOVEMENT_REASONS/u,
   );
   assert.ok(accountMatch, "account-scoped presentation source is available");
-  assert.match(appSource, /Provider reported plan type: \$\{candidate\}/u);
-  assert.match(accountMatch[1], /quotaWindowLabel\(\s*track\.limitId[\s\S]*?track\.windowDurationMinutes/u);
+  assert.match(appSource, /t\("dashboard\.quota\.providerPlan", \{ plan: candidate \}\)/u);
+  assert.match(accountMatch[1], /localizedQuotaWindowLabel\(\{[\s\S]*?track\.windowDurationMinutes/u);
   assert.match(accountMatch[1], /providerReportedPlanEvidence\(track\.planType\)/u);
   assert.doesNotMatch(accountMatch[1], /track\.planVariant|monthly|Pro 5x|10x|20x/iu);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
@@ -5484,7 +5487,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   );
   assert.match(
     section,
-    /formatQuotaWindowDuration\(finite\(window\?\.durationMinutes\)\)/u,
+    /localizedQuotaWindowDuration\(window\?\.durationMinutes\)/u,
   );
   assert.deepEqual(
     [...new Set(
