@@ -50,7 +50,7 @@
     "tools": "node ./src/cli.js tools",
     "migrate-corrections": "node ./src/cli.js migrate-corrections",
     "test": "node --test --test-concurrency=1 test/*.test.js apps/web/test/*.test.mjs",
-    "test:preflight": "node ./scripts/test-lanes.mjs preflight",
+    "test:preflight": "npm run tools:root-workspace:check && node ./scripts/test-lanes.mjs preflight",
     "test:fast": "node ./scripts/test-lanes.mjs fast",
     "test:changed": "node ./scripts/test-lanes.mjs changed",
     "test:changed:full": "node ./scripts/test-lanes.mjs changed --full",
@@ -107,6 +107,7 @@
     "product:keys:staging": "npm --prefix apps/worker run keys:staging",
     "docs:links:fix": "node ./tools/operations/fix-doc-links.mjs",
     "docs:links:check": "node ./tools/operations/fix-doc-links.mjs --check",
+    "tools:root-workspace:check": "node ./scripts/check-root-workspace-hygiene.mjs",
     "tools:inventory:check": "node ./tools/operations/check-tool-inventory.mjs",
     "architecture:check": "node ./scripts/check-architecture-boundaries.mjs",
     "check": "npm test && npm run product:check"
