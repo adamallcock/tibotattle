@@ -298,6 +298,7 @@ npm run product:macos:preview:remote:live
 # or verify the installed preview directly
 node ./scripts/verify-macos-preview-remote.js \
   --app "/Applications/TiboTattle.app" \
+  --channel preview_distribution \
   --live
 ```
 
