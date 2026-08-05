@@ -5,6 +5,7 @@ import {
   markLocalAnalysisIndexCoveragePartial,
   refreshLocalAnalysisIndex,
 } from "./local-analysis-index.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 
 // This archive index is deliberately separate from the foreground collector.
 // The collector's SQLite state is optimized for a responsive recent-window
@@ -32,13 +33,6 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
-}
-
-function validSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
 }
 
 function positiveSafeInteger(value) {
@@ -252,7 +246,7 @@ export async function refreshLocalArchiveAccountingIndex({
       || secretFile.length < 1
       || typeof codexHome !== "string"
       || codexHome.length < 1
-      || !validSignal(signal)
+      || !validAbortSignal(signal)
       || typeof now !== "function"
       || !positiveSafeInteger(initialReadBudgetBytes)
       || !positiveSafeInteger(deepReadBudgetBytes)

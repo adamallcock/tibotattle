@@ -41,7 +41,7 @@ const RTL_LANGUAGES = new Set([
 ]);
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
-function canonicalLocale(value) {
+export function canonicalLocale(value) {
   if (typeof value !== "string" || value.trim() === "") return null;
   try {
     return Intl.getCanonicalLocales(value.trim())[0] ?? null;
@@ -863,6 +863,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "No periods loaded.": ["未加载期间。", "No se cargaron períodos."],
   "7d": ["7 天", "7 días"],
   "31d": ["31 天", "31 días"],
+  "31d cache": ["31 天缓存", "caché de 31 días"],
   "24h": ["24 小时", "24 h"],
   "04 · Cost accounting": ["04 · 成本核算", "04 · Contabilidad de costes"],
   "How the estimate was calculated": ["估计的计算方式", "Cómo se calculó la estimación"],

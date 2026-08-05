@@ -1,4 +1,5 @@
 import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 import {
   fastQuotaMultiplier,
   subscriptionSpeedSensitivity,
@@ -42,13 +43,6 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
-}
-
-function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
 }
 
 function throwIfDerivationAborted(signal) {

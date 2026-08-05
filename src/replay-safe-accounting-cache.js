@@ -11,6 +11,7 @@ import {
   deriveCodexTransitionSeriesCooperatively,
   PARSER_VERSION,
 } from "./codex-transition-miner.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 import {
   createExportResourceGuard,
   ExportResourceLimitError,
@@ -122,13 +123,6 @@ function accountingScanResourceError(error) {
         || !code.startsWith("export_resource_"))) return null;
   const suffix = code.slice("export_resource_".length);
   return fixedError(`accounting_scan_${suffix}_limit_exceeded`);
-}
-
-function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
 }
 
 function throwIfAborted(signal) {

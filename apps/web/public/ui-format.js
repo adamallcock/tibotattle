@@ -2,16 +2,7 @@
 // community surface. Translation language and regional formatting remain
 // separate: choosing Spanish or Simplified Chinese never changes an instant,
 // accounting value, or the browser/Mac regional number convention.
-import { DEFAULT_LOCALE, translate } from "./localization.js";
-
-function canonicalLocale(value) {
-  if (typeof value !== "string" || value.trim() === "") return null;
-  try {
-    return Intl.getCanonicalLocales(value.trim())[0] ?? null;
-  } catch {
-    return null;
-  }
-}
+import { DEFAULT_LOCALE, canonicalLocale, translate } from "./localization.js";
 
 function browserLocale() {
   if (typeof navigator === "undefined") return DEFAULT_LOCALE;
