@@ -75,8 +75,8 @@ The real-history run gives useful ballpark observations. It does not independent
 
 ## Bound decision artifacts
 
-- [Node 24.14.0 decision receipt](./generated/r7-release-decision-node24.14.0-v0.1.json): `43b967ecd1965aa5a996d1e029f6cce046a1ba178e5d49e2cd6b54f98e0f523b`
-- [Node 26.2.0 decision receipt](./generated/r7-release-decision-node26.2.0-v0.1.json): `9959bd29f622a65a1295a345f715037f26d77856462ef5cbe0917d52e93fd30f`
+- [Node 24.14.0 decision receipt](../../generated/r7-release-decision-node24.14.0-v0.1.json): `43b967ecd1965aa5a996d1e029f6cce046a1ba178e5d49e2cd6b54f98e0f523b`
+- [Node 26.2.0 decision receipt](../../generated/r7-release-decision-node26.2.0-v0.1.json): `9959bd29f622a65a1295a345f715037f26d77856462ef5cbe0917d52e93fd30f`
 - [Measured release verification receipt](../receipts/2026-07-25-g1-r7-measured-release-verification-receipt.md)
 
 Any future source, schema, policy, workload, or decision-rule change invalidates these mutable generated receipts and requires complete regeneration before a new decision.

@@ -209,11 +209,11 @@ the candidate version is strictly newer). The publisher's public read-back
 must prove the exact appcast bytes, headers, current enclosure, and DMG bytes /
 digest.
 
-The current publisher publishes a **full candidate DMG**. It may retain an
-older full or delta enclosure only after reading its existing immutable object
-and verifying its advertised length, SHA-256, and Ed25519 signature. It does
-not upload a new delta. A new delta requires a separately implemented,
-atomic publication path and a fresh rehearsal; do not imply one exists.
+The current publisher publishes one **full candidate DMG** as the sole
+appcast item and enclosure. The checked-in policy rejects retained history and
+delta enclosures (`retainHistory: false`, `allowDeltaFrom: false`); any future
+history or delta support requires a separately implemented publication path
+and a fresh rehearsal.
 
 **Gate / rollback.** Missing dogfood configuration, a feed 404/410, redirect,
 malformed or mismatched enclosure, missing/mismatched immutable object,

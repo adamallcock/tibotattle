@@ -14,7 +14,7 @@ This remains a development pilot, not a publicly distributed service or a
 provider-authoritative billing dashboard. It records privacy-minimized
 snapshots, preserves pricing warnings, and estimates a quota capacity only when
 the observations identify one. See the
-[current end-to-end verification report](./docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md)
+[current end-to-end verification report](../reports/2026-07-29-consumer-contribution-and-updater-verification-report.md)
 for the implemented boundary and remaining human gates.
 
 ## Consumer desktop preview
@@ -140,7 +140,7 @@ remains future performance work for fast complete scans of very large local
 histories, not a prerequisite for the bounded pilot.
 
 This is an ad-hoc-signed developer preview, not a notarized public installer.
-See [the local companion guide](./apps/local/README.md) for onboarding,
+See [the local companion guide](../../apps/local/README.md) for onboarding,
 privacy boundaries, tests, and the terminal-only alternative.
 
 The configured GitHub remote,
@@ -366,7 +366,7 @@ one-off scripts. `apps/` contains runtime delivery surfaces, `packages/`
 contains reviewed public runtime-neutral APIs, `shared/` contains transitional
 runtime-neutral behavior, and `scripts/` contains build, release, and
 operations tooling. The phased ownership and decomposition work is tracked in
-the [repository architecture hardening plan](./docs/plans/2026-07-29-repository-architecture-hardening-plan.md).
+the [repository architecture hardening plan](../plans/2026-07-29-repository-architecture-hardening-plan.md).
 
 Run `npm run architecture:check` for the fast dependency-boundary ratchet.
 `npm run telemetry:browser:check` verifies that the checked-in browser mirror
@@ -527,7 +527,7 @@ npm run product:backend:acceptance
 ```
 
 The corresponding plan is
-[2026-07-26-inspectable-backend-laboratory-plan.md](./docs/plans/2026-07-26-inspectable-backend-laboratory-plan.md).
+[2026-07-26-inspectable-backend-laboratory-plan.md](../plans/2026-07-26-inspectable-backend-laboratory-plan.md).
 The backend remains loopback-only and disposable; this command neither
 provisions Cloudflare resources nor authorizes outside participants.
 
@@ -654,8 +654,8 @@ upload bodies; it is not a claim about DNS, TCP/TLS, or the small key-fetch and
 authorization responses. Watch applies both caps independently on every
 visible foreground pass.
 
-The [ongoing sync controls plan](./docs/plans/2026-07-26-ongoing-sync-controls-plan.md)
-and [development verification receipt](./docs/receipts/2026-07-26-ongoing-sync-controls-verification-receipt.md)
+The [ongoing sync controls plan](../plans/2026-07-26-ongoing-sync-controls-plan.md)
+and [development verification receipt](../receipts/2026-07-26-ongoing-sync-controls-verification-receipt.md)
 record the privacy contract, exact test evidence, and remaining release gates.
 
 The loopback dashboard can expose the same inspection, one-pass, pause, and
@@ -674,8 +674,8 @@ requests never contain that path, the prepared directory, the service origin,
 or the Keychain credential. The dashboard's send button is enabled only when
 both the verified spool and delivery service are configured.
 
-The [local sync controls UI plan](./docs/plans/2026-07-26-local-sync-controls-ui-plan.md)
-and [rendered verification receipt](./docs/receipts/2026-07-26-local-sync-controls-ui-verification-receipt.md)
+The [local sync controls UI plan](../plans/2026-07-26-local-sync-controls-ui-plan.md)
+and [rendered verification receipt](../receipts/2026-07-26-local-sync-controls-ui-verification-receipt.md)
 record the loopback threat boundary, action tests, and visual QA.
 
 Transient network, 408, 429, and 5xx failures use bounded retry with backoff.
@@ -717,13 +717,13 @@ exact blockers `STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED` and
 undeployed. Once the account owner explicitly enables R2 and configures the
 real resource identifiers, the exact resource creation, migration,
 containment, isolated-key, and confirmed deployment sequence is in the
-[Worker runbook](./apps/worker/README.md). The deployment wrapper cannot run
+[Worker runbook](../../apps/worker/README.md). The deployment wrapper cannot run
 until both D1 migration streams are current, the remote collection-control row
 is fully contained, and the post-deploy HTTPS health response proves every
 collection path remains disabled. No remote resume command exists.
 
 The [disabled staging deployment gate
-plan](./docs/plans/2026-07-26-disabled-staging-deployment-gate-plan.md) distinguishes the
+plan](../plans/2026-07-26-disabled-staging-deployment-gate-plan.md) distinguishes the
 verified dry gate from unproven provisioning, deployment, external review, and
 pilot authorization.
 
@@ -767,7 +767,7 @@ directory. The drill stops all four controlled paths through D1 without
 restarting the Worker, preserves private stats/export/deletion, explicitly
 restores collection, proves the previously blocked one-use upload still works,
 and deletes both drill participants. The
-[incident-containment receipt](./docs/receipts/2026-07-26-g4-incident-containment-verification-receipt.md)
+[incident-containment receipt](../receipts/2026-07-26-g4-incident-containment-verification-receipt.md)
 records the first live pass and the remaining production blockers.
 
 The account-scoped transport, `telemetry-contribution-v0.2`, now has a verified
@@ -817,7 +817,7 @@ Replace `--generated-content-free-fixture` with
 `--file /absolute/path/to/telemetry-contribution-000001.json` to exercise an
 actual prepared local export.
 
-The [Worker runbook](./apps/worker/README.md) contains the full migration,
+The [Worker runbook](../../apps/worker/README.md) contains the full migration,
 owner-only invitation, server-start, smoke, and cleanup sequence. The smoke
 exercises Secure/HttpOnly session issuance, CSRF, authority isolation,
 one-use upload registration, client encryption, strict server validation, D1
@@ -834,7 +834,7 @@ deletion. It prints no participant or credential values and leaves external
 deployment disabled.
 
 The [participant contribution history verification
-receipt](./docs/receipts/2026-07-26-participant-contribution-history-verification-receipt.md)
+receipt](../receipts/2026-07-26-participant-contribution-history-verification-receipt.md)
 records the live encrypted HTTP and browser-driven product passes, including a
 UI lifecycle regression found and fixed during rendered QA.
 
@@ -843,8 +843,8 @@ zoom, pan, reset, keyboard, pointer-drag, and wheel interactions. Residuals are
 kept within the visible time interval, exact UTC/local inspection rows remain
 available below the graph, and live missing/reset/ambiguous evidence can be
 shaded without treating it as zero. The rendered evidence includes the
-[desktop comparison chart](./docs/qa/2026-07-27-interactive-quota-timeline.jpg)
-and a [narrow mobile control pass](./docs/qa/2026-07-27-mobile-timeline-controls.jpg).
+[desktop comparison chart](../qa/2026-07-27-interactive-quota-timeline.jpg)
+and a [narrow mobile control pass](../qa/2026-07-27-mobile-timeline-controls.jpg).
 The mobile pass had no document-level horizontal overflow at an effective
 293 px content width; only the primary navigation scrolls intentionally.
 
@@ -872,37 +872,37 @@ The full profile is 100,000 maximum-size encrypted bundle attempts, not
 exercise additionally requires one owner-only invitation per participant;
 local-open development accounts cannot satisfy independent-eligibility
 thresholds. The [scaled load verification
-receipt](./docs/receipts/2026-07-26-backend-load-scaled-verification-receipt.md) records a
+receipt](../receipts/2026-07-26-backend-load-scaled-verification-receipt.md) records a
 passing 20-participant, 160-bundle, 32,000-expanded-record run and does not
 claim that the literal 1,000-user gate has passed.
 
 The [functional end-to-end verification
-receipt](./docs/receipts/2026-07-25-functional-product-e2e-verification-receipt.md) records a
+receipt](../receipts/2026-07-25-functional-product-e2e-verification-receipt.md) records a
 fresh real-data local smoke: two encrypted batches, personal-stat updates,
 idempotent replay, aggregate suppression, server-side privacy-canary rejection,
 participant export, browser-driven complete deletion, and zero retained local
 D1/R2 records afterward.
 
 The [privacy-safe weekly aggregate verification
-receipt](./docs/receipts/2026-07-26-g4-privacy-safe-weekly-aggregate-verification-receipt.md)
+receipt](../receipts/2026-07-26-g4-privacy-safe-weekly-aggregate-verification-receipt.md)
 records the current 20-participant scheduled-publication smoke, immutable
 snapshot/deletion lifecycle, post-cleanup D1/R2 counts, and rendered
 published/withdrawn UI checks.
 
 The [durable queue and backend verification
-receipt](./docs/receipts/2026-07-26-durable-contribution-queue-verification-receipt.md)
+receipt](../receipts/2026-07-26-durable-contribution-queue-verification-receipt.md)
 records the crash/restart/retry/privacy tests, a real encrypted queue smoke,
 the fresh 20-participant invite-only D1/R2 lifecycle, fixed-path private
 resource routes, and exact post-deletion storage counts.
 
 The [revisioned aggregate rebuild verification
-receipt](./docs/receipts/2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
+receipt](../receipts/2026-07-26-revisioned-aggregate-rebuild-verification-receipt.md)
 records the 20-participant encrypted HTTP proof, synchronous withdrawal,
 immutable revisions rebuilt from 19 and then zero remaining contributors,
 empty rebuild queue, and zero remaining participant data.
 
 The [private community comparison verification
-receipt](./docs/receipts/2026-07-26-private-community-comparison-verification-receipt.md)
+receipt](../receipts/2026-07-26-private-community-comparison-verification-receipt.md)
 records the authenticated 20-participant HTTP comparison, post-deletion
 not-testable transition, closed browser projection, and rendered portal check.
 It deliberately does not derive an average, percentile, cohort size, share,
@@ -968,14 +968,14 @@ foreground, while-open path behind explicit consent and an accepted reviewed
 first upload; it is not a daemon or autonomous background service. Production
 requires real resources, admission controls and rate limiting, production key
 rotation, consent/version governance, privacy/security review, and a staged
-release decision. See the [local companion and central product plan](./docs/plans/2026-07-25-local-companion-app-plan.md),
-the [G3 session/upload capability plan](./docs/plans/2026-07-25-g3-session-capability-separation-plan.md),
-its [verification receipt](./docs/receipts/2026-07-25-g3-session-capability-separation-verification-receipt.md),
-and the [Worker runbook](./apps/worker/README.md). The earlier
-[synthetic vertical-slice plan](./docs/plans/2026-07-25-synthetic-consumer-vertical-slice-plan.md)
+release decision. See the [local companion and central product plan](../plans/2026-07-25-local-companion-app-plan.md),
+the [G3 session/upload capability plan](../plans/2026-07-25-g3-session-capability-separation-plan.md),
+its [verification receipt](../receipts/2026-07-25-g3-session-capability-separation-verification-receipt.md),
+and the [Worker runbook](../../apps/worker/README.md). The earlier
+[synthetic vertical-slice plan](../plans/2026-07-25-synthetic-consumer-vertical-slice-plan.md)
 is retained only as a superseded historical record.
 
-The [G1 resource-bounded export-set plan](./docs/plans/2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](./docs/receipts/2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](./docs/decisions/2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](./docs/receipts/2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](./docs/receipts/2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](./docs/receipts/2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](./docs/receipts/2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](./docs/goals/2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](./docs/plans/2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
+The [G1 resource-bounded export-set plan](../plans/2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](../receipts/2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](../decisions/2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](../receipts/2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](../receipts/2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](../receipts/2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](../receipts/2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](../goals/2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](../plans/2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
 
 ## Account switching and local secret handling
 
@@ -1021,7 +1021,7 @@ The width fix is a narrow packaging workaround for the portable reader's `100vw`
 
 ## Method boundary
 
-A capacity estimate means only that observed quota changes are consistent with the chosen API price mapping. It does not prove OpenAI's internal quota formula. See [the validation report](./docs/v0.3/2026-07-23-local-usage-limit-validation.md) for the experiment protocol and stop gate.
+A capacity estimate means only that observed quota changes are consistent with the chosen API price mapping. It does not prove OpenAI's internal quota formula. See [the validation report](../v0.3/2026-07-23-local-usage-limit-validation.md) for the experiment protocol and stop gate.
 
 Historical transitions preserve regressions, skipped display values, incomplete local-window coverage, unknown models, pricing warnings, and snapshot-age uncertainty as evidence rather than silently cleaning them. Quota snapshots contain only integer percentages; neither rollout logs nor the app-server endpoint currently exposes an absolute remaining allowance or sub-percent precision.
 
@@ -1047,10 +1047,10 @@ Controlled manifests declare the hypothesis, model, effort, context band, cache 
 
 Two live Terra pilots were eventually run after reset. They were bounded and aligned, but a separate Sol rollout contributed during each interval, so both remain `controlledState: unknown`. Later attempts were correctly refused when active/recent work made isolation unsafe. No causal model, cache, effort, context, or tool multiplier is claimed.
 
-Tool counts are explanatory client features unless the transcript exposes an exact server unit. A local web wrapper is not automatically a Responses `web_search_call`; local shell and Apply Patch are not Hosted Shell container sessions; MCP and subagent orchestration have no separate standard API per-call price. See [the Milestone 6 decision](./docs/v0.3/milestones/2026-07-23-milestone-6-tool-mechanism-decision.md).
+Tool counts are explanatory client features unless the transcript exposes an exact server unit. A local web wrapper is not automatically a Responses `web_search_call`; local shell and Apply Patch are not Hosted Shell container sessions; MCP and subagent orchestration have no separate standard API per-call price. See [the Milestone 6 decision](../v0.3/milestones/2026-07-23-milestone-6-tool-mechanism-decision.md).
 
-Corrections are append-only derived records. Duplicate records collapse idempotently, while branches, cycles, missing targets, digest mismatches, and incompatible schemas are errors. The legacy correction changes neither provider quota fields nor raw/local evidence. See [the Milestone 7 decision](./docs/v0.3/milestones/2026-07-23-milestone-7-correction-provenance-decision.md).
+Corrections are append-only derived records. Duplicate records collapse idempotently, while branches, cycles, missing targets, digest mismatches, and incompatible schemas are errors. The legacy correction changes neither provider quota fields nor raw/local evidence. See [the Milestone 7 decision](../v0.3/milestones/2026-07-23-milestone-7-correction-provenance-decision.md).
 
 The collector's first 22 pre-seeding usage records remain `unknown` and total 3,714,307 tokens. They are operational collector provenance, not inputs to `report`, `transitions`, `infer`, contamination, or the observation correction ledger; their model cannot be reconstructed safely from the retained privacy-minimized fields. They are therefore retained—not relabelled or rewritten.
 
-The full implementation goal and all gate receipts are in [the v0.3 goal](./docs/v0.3/2026-07-23-usage-monitor-v03-goal.md).
+The full implementation goal and all gate receipts are in [the v0.3 goal](../v0.3/2026-07-23-usage-monitor-v03-goal.md).

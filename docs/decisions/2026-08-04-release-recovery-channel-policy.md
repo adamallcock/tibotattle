@@ -33,9 +33,12 @@ matching receipt described below.
 | Public release | Production | Explicitly authorised after beta | Signed/notarized installer and stable Sparkle feed | Public artifact, appcast, website, privacy and live-route receipts |
 
 Development and dogfood builds must never present production claims merely
-because a source field contains a production URL. In particular, update copy is
-enabled only after the configured feed and its referenced signed artifact have
-been read back successfully for that exact candidate.
+because a source field contains a production URL. An external build may carry
+updater configuration, but that does not make its feed operational:
+automatic-update opt-in and `reachable`/`ready` status remain unavailable until
+the app independently observes a non-empty feed response. Update acceptance
+also requires the referenced signed artifact to be read back for that exact
+candidate and a real signed `N` to `N+1` rehearsal.
 
 ## Required receipt set
 

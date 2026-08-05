@@ -2,26 +2,42 @@
 title: TiboTattle Release Resume and Security Gates
 date: 2026-08-02
 type: runbook
-status: production-service-hardened-release-artifacts-pending
+status: historical-observation-current-source-unverified
 ---
 
 # TiboTattle release resume — 2026-08-02
 
-## Current release state
+## State recorded on 2026-08-02
 
-The hardened Worker and its D1 migrations are deployed. A verified,
-history-free client seed exists in a separate **private** repository, but no
-consumer DMG, appcast, GitHub release, or public client source has been
-published. Do not use a generic `wrangler deploy` against production: the
-reviewed route is the receipt-gated
+The 2026-08-02 live observation recorded a healthy Worker/D1 deployment, but it
+predates later checked-in migrations and release controls. The checked-in
+source now reaches primary migration `0029` and deletion-ledger migration
+`0002`; the current production configuration keeps enrollment, account-scoped
+ingest, and upload ingress disabled. This dated document does not prove that
+those revisions or configuration are deployed. Until the owner reruns the
+read-only production observer against the canonical endpoints and records a
+fresh revision/containment receipt, the remote Worker/schema state is
+unverified.
+
+A verified, history-free client seed exists in a separate **private**
+repository, but no consumer DMG, appcast, GitHub release, or public client
+source has been published. Do not use a generic `wrangler deploy` against
+production: the reviewed route is the receipt-gated
 `npm --prefix apps/worker run production:deploy -- --receipt-file
 /owner-only/production-containment-proof.json --confirm
 DEPLOY_CONTAINED_PRODUCTION`, which runs the local-only `release:preflight`
 gate, refuses a dirty checkout, and stages only tracked web assets after the
-current canonical containment/revision proof is validated.
+current canonical containment/revision proof is validated. The deployment
+command is an execution path, not evidence that its external receipt or remote
+state currently exists.
 
-The update-feed infrastructure is provisioned, its TLS certificate is active,
-and its bucket remains empty.
+The 2026-08-02 observation found the update-feed infrastructure provisioned,
+with an active TLS certificate and an empty bucket; the canonical appcast URL
+returned the expected `404` at that time. This historical check does not prove
+current feed, object, or guard readiness. Re-run the owner-only [Sparkle
+publisher](./2026-08-02-r2-sparkle-update-publisher.md) and [release
+execution](./2026-08-04-owner-release-execution.md) checks before calling the
+channel configured or operational.
 
 ## Completed locally
 
@@ -46,7 +62,7 @@ and its bucket remains empty.
 - The full Worker suite, macOS release suite, type checks, web-client suite,
   and a fresh local secret scan passed on 2026-08-02.
 
-## Live verification on 2026-08-02
+## Historical live verification on 2026-08-02
 
 - `adamallcock/app-usagemonitor` is confirmed **private** on GitHub. The
   release branch `codex/release-security-client-split` is pushed through
@@ -63,9 +79,13 @@ and its bucket remains empty.
   domain is `updates.tibotattle.com`. Ownership and TLS are active, the bucket
   is empty, and the canonical future feed URL is
   `https://updates.tibotattle.com/appcast.xml` (currently an expected `404`).
-- Remote D1 migrations `0017` through `0021` are applied. Worker version
-  `1e61da66-dcca-4167-8f6c-ab1425116b8c` is live; `/api/health` and
-  `/api/ready` both returned `200` after deployment.
+- At that time, remote D1 migrations `0017` through `0021` were applied.
+  Worker version `1e61da66-dcca-4167-8f6c-ab1425116b8c` was live;
+  `/api/health` and `/api/ready` both returned `200` after deployment. The
+  checked-in source now includes primary migrations `0022` through `0029` and
+  deletion-ledger migration `0002`, so this dated observation is not evidence
+  that the current source, schema, or disabled containment posture is
+  deployed.
 - The supplied Google Web-client's exact production callback URI is registered
   in source and its secret was rotated directly into the Worker. The production
   secret list now contains the required envelope, identity, Apple, and Google
@@ -84,6 +104,18 @@ and its bucket remains empty.
 
 These are external-account actions or credentials. Do not replace them with
 placeholders, and do not put the values in the repository.
+
+The historical observations above are not current release authorization. For
+the selected release channel, the owner must freshly receipt the exact
+external Sparkle prerequisites: apply the nonce-ledger migration; bind
+`SPARKLE_RELEASES` to the reviewed update bucket; set the fixed guard values
+and the matching public verification key/fingerprint; store a fresh
+owner-only `SPARKLE_APPCAST_GUARD_TOKEN`; and verify the HTTPS endpoint is
+exactly the selected channel origin plus the fixed route. The owner must then
+produce a signed/notarized DMG and complete the clean-profile signed `N` to
+`N+1` rehearsal. The exact variable values and read-back requirements are in
+the [Sparkle publisher runbook](./2026-08-02-r2-sparkle-update-publisher.md)
+and [internal update rehearsal](./2026-08-04-internal-update-rehearsal.md).
 
 1. To enable the owner-admin surface, set the production Worker secret
    `ADMIN_IDENTITY_LINK_KEY` to the
@@ -119,13 +151,13 @@ placeholders, and do not put the values in the repository.
 5. Build, Developer-ID sign, notarize, staple, and validate the macOS DMG from
    the tagged source. The release manifest must contain the matching commit
    and tag.
-5. Complete the signed, `/Applications` Login Item lifecycle rehearsal below
+6. Complete the signed, `/Applications` Login Item lifecycle rehearsal below
    in a disposable profile and validate its receipt with
    `npm run product:macos:validate:login-item-release -- --app
    "/Applications/TiboTattle.app" --rehearsal RECEIPT.json`. This command runs
    only the packaged fake-manager smoke plus production artifact checks; it
    must not change the operator's real Login Items.
-6. Publish the signed DMG and signed Sparkle appcast to the approved update
+7. Publish the signed DMG and signed Sparkle appcast to the approved update
    destination, then independently verify the public HTTPS feed, artifact
    checksum, signature, and a clean-Mac update/install flow.
 
@@ -184,9 +216,12 @@ Record the completed checks in a privacy-safe JSON receipt with this shape
 
 ## Explicitly not complete
 
-- Owner admin-key binding (admin operations only), Apple console configuration,
-  and the Apple association file.
-- R2 appcast publication and DMG release.
+- A fresh revision-bound deployment/schema/containment receipt, owner admin-key
+  binding (admin operations only), and current full Google/Apple callback
+  completion against that deployment. The Apple association file remains
+  intentionally unnecessary for the registered web flow.
+- R2 appcast-guard provisioning, appcast publication, and DMG release,
+  including signing/notarization and the clean-profile update rehearsal.
 - Git tag, GitHub release, repository visibility change, client-service
   source-of-truth migration, branch/release-tag protection, and vulnerability
   reporting configuration.

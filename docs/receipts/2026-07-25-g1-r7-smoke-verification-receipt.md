@@ -28,8 +28,8 @@ The accurate label is: **Node 24.14.0 and Node 26.2.0 macOS-arm64 synthetic life
 
 | Runtime | Runtime class | Machine-readable artifact | Semantic receipt SHA-256 (`receiptSha256`) | File-byte SHA-256 | Validation |
 |---|---|---|---|---|---|
-| Node 24.14.0 | pinned candidate | [`generated/r7-resource-benchmark-smoke-node24.14.0-v0.1.json`](./generated/r7-resource-benchmark-smoke-node24.14.0-v0.1.json) | `14d1959f888202f98cc447a3399c60528d430af48d4449a2d517c0458b9afac6` | `1124a70de557c6826e645ef626ddad2d99a1a6c4fe7e5611809df6734ae2d619` | Schema pass; 8 checks matched |
-| Node 26.2.0 | compatibility cross-check | [`generated/r7-resource-benchmark-smoke-node26.2.0-v0.1.json`](./generated/r7-resource-benchmark-smoke-node26.2.0-v0.1.json) | `de86805c79ba113a2ddcf633d319465b32ebf604e18982ae4a440b3714da1c0c` | `d8f59c9d81fd54629cb3cd6a44661f34f364eca37aca2246d5f64450db3f1284` | Schema pass; 8 checks matched |
+| Node 24.14.0 | pinned candidate | [`generated/r7-resource-benchmark-smoke-node24.14.0-v0.1.json`](../../generated/r7-resource-benchmark-smoke-node24.14.0-v0.1.json) | `14d1959f888202f98cc447a3399c60528d430af48d4449a2d517c0458b9afac6` | `1124a70de557c6826e645ef626ddad2d99a1a6c4fe7e5611809df6734ae2d619` | Schema pass; 8 checks matched |
+| Node 26.2.0 | compatibility cross-check | [`generated/r7-resource-benchmark-smoke-node26.2.0-v0.1.json`](../../generated/r7-resource-benchmark-smoke-node26.2.0-v0.1.json) | `de86805c79ba113a2ddcf633d319465b32ebf604e18982ae4a440b3714da1c0c` | `d8f59c9d81fd54629cb3cd6a44661f34f364eca37aca2246d5f64450db3f1284` | Schema pass; 8 checks matched |
 
 Arbitrary Node 24 or Node 26 versions cannot be labeled qualified. The strict contract accepts exactly Node 24.14.0 or Node 26.2.0 and checks that the runtime class matches the exact version.
 
