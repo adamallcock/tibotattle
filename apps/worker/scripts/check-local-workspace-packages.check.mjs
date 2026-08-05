@@ -158,6 +158,10 @@ test("quota analysis uses the generic byte-exact workspace package guard", async
   const installedRoot = join(directory, "installed");
   try {
     await cp(sourceRoot, installedRoot, { recursive: true });
+    // npm installs only the files declared by the package manifest. Keep the
+    // synthetic installed copy faithful when the source package also carries
+    // its own unshipped tests.
+    await rm(join(installedRoot, "test"), { force: true, recursive: true });
     const receiptValue = await checkLocalQuotaAnalysisPackage({
       installedRoot,
       sourceRoot: sourceRoot.pathname,

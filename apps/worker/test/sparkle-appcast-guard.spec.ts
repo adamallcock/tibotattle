@@ -293,6 +293,37 @@ async function appcastEnclosure(
   return `<enclosure url="https://updates.tibotattle.com/${artifactKey(version, digest)}" length="${artifactBytes.byteLength}" sparkle:version="${version}" sparkle:edSignature="${signature}" />`;
 }
 
+async function officialSignedAppcastBytes(
+  version: string,
+  artifactBytes = ARTIFACT_BYTES,
+): Promise<Uint8Array> {
+  const digest = await sha256Hex(artifactBytes);
+  const artifactSignature = await sparkleSignature(artifactBytes);
+  const prefix = `<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>TiboTattle</title>
+        <item>
+            <title>0.1.0</title>
+            <pubDate>Wed, 05 Aug 2026 14:55:05 -0400</pubDate>
+            <sparkle:version>${version}</sparkle:version>
+            <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://updates.tibotattle.com/${artifactKey(version, digest)}" length="${artifactBytes.byteLength}" type="application/octet-stream" sparkle:edSignature="${artifactSignature}"></enclosure>
+        </item>
+    </channel>
+</rss>`;
+  const prefixBytes = encoder.encode(prefix);
+  const envelopeSignature = await sparkleSignature(prefixBytes);
+  return encoder.encode(`${prefix}<!-- sparkle-signatures:
+edSignature: ${envelopeSignature}
+length: ${prefixBytes.byteLength}
+-->
+`);
+}
+
 async function installArtifact(
   bucket: FakeR2Bucket,
   version: string,
@@ -468,6 +499,49 @@ describe("Sparkle appcast atomic guard", () => {
     expect(first.status).toBe(200);
     expect(replay.status).toBe(401);
     expect(bucket.putCalls).toBe(1);
+  });
+
+  it("accepts Sparkle 2.9 official signed appcast output", async () => {
+    const bucket = new FakeR2Bucket();
+    await installArtifact(bucket, "1");
+    const candidate = await officialSignedAppcastBytes("1");
+    const response = await invoke(
+      await signedRequest(
+        await payload({ candidate }),
+        TOKEN,
+        Math.floor(NOW / 1000),
+        "official-appcast-nonce-01",
+      ),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(200);
+    expect(bucket.putCalls).toBe(1);
+    expect(bucket.object?.bytes).toEqual(candidate);
+  });
+
+  it("rejects a modified Sparkle 2.9 signed appcast envelope", async () => {
+    const bucket = new FakeR2Bucket();
+    await installArtifact(bucket, "1");
+    const signed = new TextDecoder().decode(
+      await officialSignedAppcastBytes("1"),
+    );
+    const candidate = encoder.encode(signed.replace(
+      "<title>TiboTattle</title>",
+      "<title>TiboTattle modified</title>",
+    ));
+    const response = await invoke(
+      await signedRequest(
+        await payload({ candidate }),
+        TOKEN,
+        Math.floor(NOW / 1000),
+        "official-appcast-tamper-01",
+      ),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(422);
+    expect(bucket.putCalls).toBe(0);
   });
 
   it("retains a nonce through the exact accepted timestamp boundary", async () => {

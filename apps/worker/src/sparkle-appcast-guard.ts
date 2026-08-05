@@ -383,6 +383,10 @@ interface SparkleAppcastEnclosure {
 interface ParsedSparkleAppcast {
   readonly enclosures: readonly SparkleAppcastEnclosure[];
   readonly latest: SparkleAppcastEnclosure;
+  readonly signedEnvelope: {
+    readonly bytes: number;
+    readonly signature: string;
+  } | null;
 }
 
 const SPARKLE_XML_NAMESPACE =
@@ -520,10 +524,69 @@ function parseSparkleEnclosure(
   };
 }
 
+/**
+ * Sparkle 2.9's reviewed generate_appcast tool signs the complete XML prefix
+ * and appends a small signature trailer. It also writes the bundle version as
+ * an item child and emits an explicitly closed, empty enclosure. Keep this
+ * parser deliberately narrow: it accepts the pinned tool's canonical full-DMG
+ * shape, then the caller verifies both the signed XML prefix and the artifact.
+ */
+function parseOfficialSignedSparkleAppcast(
+  text: string,
+  contract: SparkleAppcastGuardContract,
+): ParsedSparkleAppcast {
+  const trailer = /<!-- sparkle-signatures:\nedSignature: ([A-Za-z0-9+/]+={0,2})\nlength: ([0-9]+)\n-->\n?$/u.exec(text);
+  if (trailer === null || trailer.index <= 0) invalidCandidate();
+  const signature = trailer[1];
+  const declaredBytes = Number(trailer[2]);
+  if (signature === undefined
+      || canonicalBase64Bytes(signature)?.byteLength !== 64
+      || !Number.isSafeInteger(declaredBytes)
+      || declaredBytes < 1
+      || declaredBytes !== encoder.encode(text.slice(0, trailer.index)).byteLength) {
+    invalidCandidate();
+  }
+  const signedText = text.slice(0, trailer.index);
+  const official = /^<\?xml version="1\.0" standalone="yes"\?><!-- sparkle-sign-warning:\n[^\u0000\r]*?--><rss xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" version="2\.0">\s*<channel>\s*<title>([^<&\r\n]{1,128})<\/title>\s*<item>\s*<title>([^<&\r\n]{1,64})<\/title>\s*<pubDate>([^<&\r\n]{1,64})<\/pubDate>\s*<sparkle:version>([^<&\r\n]{1,32})<\/sparkle:version>\s*<sparkle:shortVersionString>([^<&\r\n]{1,32})<\/sparkle:shortVersionString>\s*<sparkle:minimumSystemVersion>([0-9]+(?:\.[0-9]+){1,2})<\/sparkle:minimumSystemVersion>\s*<sparkle:hardwareRequirements>arm64<\/sparkle:hardwareRequirements>\s*<enclosure\b([^>]*?)>\s*<\/enclosure\s*>\s*<\/item>\s*<\/channel>\s*<\/rss>$/u.exec(signedText);
+  if (official === null || Number.isNaN(Date.parse(official[3] ?? ""))) {
+    invalidCandidate();
+  }
+  const version = official[4];
+  const shortVersion = official[5];
+  const attributeSource = official[7];
+  if (version === undefined
+      || !BUNDLE_VERSION_PATTERN.test(version)
+      || shortVersion === undefined
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/u.test(shortVersion)
+      || attributeSource === undefined) {
+    invalidCandidate();
+  }
+  const attributes = parseXmlAttributes(attributeSource);
+  requireExactXmlAttributes(attributes, [
+    "url",
+    "length",
+    "type",
+    "sparkle:edSignature",
+  ]);
+  if (attributes.get("type") !== "application/octet-stream") {
+    invalidCandidate();
+  }
+  attributes.set("sparkle:version", version);
+  const latest = parseSparkleEnclosure(attributes, contract);
+  return {
+    enclosures: [latest],
+    latest,
+    signedEnvelope: { bytes: declaredBytes, signature },
+  };
+}
+
 function parseSparkleAppcast(
   text: string,
   contract: SparkleAppcastGuardContract,
 ): ParsedSparkleAppcast {
+  if (text.includes("<!-- sparkle-signatures:")) {
+    return parseOfficialSignedSparkleAppcast(text, contract);
+  }
   if (text.length === 0 || text.includes("<!") || text.includes("<!--")
       || text.includes("<![CDATA[") || text.includes("<?xml-stylesheet")) {
     invalidCandidate();
@@ -612,7 +675,7 @@ function parseSparkleAppcast(
       || enclosures.length !== 1) invalidCandidate();
   const latest = enclosures[0];
   if (latest === undefined || latest.deltaFrom !== undefined) invalidCandidate();
-  return { enclosures, latest };
+  return { enclosures, latest, signedEnvelope: null };
 }
 
 function invalidCandidate(): never {
@@ -775,6 +838,30 @@ async function configuredSparklePublicKey(
   }
 }
 
+async function verifySignedAppcastEnvelope(
+  bytes: Uint8Array,
+  appcast: ParsedSparkleAppcast,
+  publicKey: CryptoKey,
+): Promise<void> {
+  const envelope = appcast.signedEnvelope;
+  if (envelope === null) return;
+  const signature = canonicalBase64Bytes(envelope.signature);
+  if (signature === null || signature.byteLength !== 64
+      || envelope.bytes > bytes.byteLength) invalidCandidate();
+  let verified = false;
+  try {
+    verified = await crypto.subtle.verify(
+      { name: "Ed25519" },
+      publicKey,
+      signature,
+      bytes.slice(0, envelope.bytes),
+    );
+  } catch {
+    verified = false;
+  }
+  if (!verified) invalidCandidate();
+}
+
 async function verifyCandidateArtifact(
   bucket: R2Bucket,
   enclosure: SparkleAppcastEnclosure,
@@ -901,6 +988,7 @@ export async function handleSparkleAppcastGuardForContract(
   if (!current.matches) return conflictResponse("current_state_conflict", contract);
 
   const publicKey = await configuredSparklePublicKey(configuration);
+  await verifySignedAppcastEnvelope(candidateBytes, candidateAppcast, publicKey);
   if (current.bytes !== null) {
     let currentText: string;
     try {
@@ -909,6 +997,7 @@ export async function handleSparkleAppcastGuardForContract(
       invalidCandidate();
     }
     const currentAppcast = parseSparkleAppcast(currentText, contract);
+    await verifySignedAppcastEnvelope(current.bytes, currentAppcast, publicKey);
     // A non-empty appcast is a trusted monotonic baseline only after its
     // canonical active artifact has independently passed the same R2 and
     // Sparkle signature checks as the candidate.
