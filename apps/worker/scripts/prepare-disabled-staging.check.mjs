@@ -31,6 +31,24 @@ const DEPLOYMENT_IDENTITY = createStagingDeploymentIdentity({
   origin: STAGING_ORIGIN,
   sourceCommit: SOURCE_COMMIT,
 });
+
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+function runtimeHealth(sourceCommit = SOURCE_COMMIT) {
+  return {
+    deployment: { sourceCommit },
+  };
+}
 const VALID_DEPLOYMENT_PROOF_CHECK = Object.freeze({
   ok: true,
   code: null,
@@ -69,6 +87,7 @@ function prepareDisabledStaging(options = {}) {
     expectedSourceCommit: SOURCE_COMMIT,
     deploymentProofCheck: VALID_DEPLOYMENT_PROOF_CHECK,
     localPreflight: passingLocalPreflight,
+    fetchImpl: async () => jsonResponse(runtimeHealth()),
     ...options,
   });
 }
@@ -150,6 +169,102 @@ test("failed local preflight cannot reach remote staging inspection or mutation"
     blockers: ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
   });
   assert.deepEqual(calls, []);
+});
+
+test("preparation fails closed when health omits the runtime source commit", async () => {
+  const calls = [];
+  const result = await prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    fetchImpl: async () => jsonResponse({}),
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: (_command, args) => {
+      calls.push(args);
+      return { status: 0, stdout: "must-not-run", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_RUNTIME_SOURCE_COMMIT_MISSING",
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("preparation fails closed when health reports a malformed runtime source commit", async () => {
+  const result = await prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    fetchImpl: async () => jsonResponse(runtimeHealth("not-a-commit")),
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: () => ({ status: 0, stdout: "must-not-run", stderr: "" }),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_RUNTIME_SOURCE_COMMIT_INVALID",
+  });
+});
+
+test("preparation fails closed when health reports a different runtime source commit", async () => {
+  const calls = [];
+  const result = await prepareDisabledStaging({
+    config: provisionedConfig(),
+    confirmation: PREPARE_CONFIRMATION,
+    fetchImpl: async () => jsonResponse(runtimeHealth("deadbee")),
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: (_command, args) => {
+      calls.push(args);
+      return { status: 0, stdout: "must-not-run", stderr: "" };
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_RUNTIME_SOURCE_COMMIT_MISMATCH",
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("runtime identity is checked after local preflight and before D1 mutation", async () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const order = [];
+  const readinessSpawn = successSpawn(config, calls);
+  const result = await prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    localPreflight: async () => {
+      order.push("local-preflight");
+      return passingLocalPreflight();
+    },
+    fetchImpl: async () => {
+      order.push("health");
+      return jsonResponse(runtimeHealth());
+    },
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: (command, args, options) => {
+      if (args[0] === "d1" && args.includes("execute")) {
+        order.push("containment");
+      } else if (args[0] === "d1" && args.includes("apply")) {
+        order.push("migration");
+      } else {
+        order.push("remote-read");
+      }
+      return readinessSpawn(command, args, options);
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(order.indexOf("local-preflight") >= 0, true);
+  assert.equal(order.indexOf("health") > order.indexOf("local-preflight"), true);
+  const firstMutation = Math.min(
+    ...["containment", "migration"]
+      .map((name) => order.indexOf(name))
+      .filter((index) => index >= 0),
+  );
+  assert.equal(firstMutation >= 0, true);
+  assert.equal(order.indexOf("health") < firstMutation, true);
 });
 
 test("preparation will not mutate unprovisioned infrastructure", async () => {

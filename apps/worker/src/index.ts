@@ -190,6 +190,20 @@ import {
 // exports. The class itself owns only opaque short-lived admission leases.
 export { UploadIngressBudget } from "./ingress-budget";
 
+const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
+
+function configuredDeploymentSourceCommit(env: Env): string | null {
+  const configured = (env as Env & {
+    DEPLOYMENT_SOURCE_COMMIT?: unknown;
+  }).DEPLOYMENT_SOURCE_COMMIT;
+  if (configured === undefined) return null;
+  if (typeof configured !== "string"
+      || !DEPLOYMENT_SOURCE_COMMIT_PATTERN.test(configured)) {
+    throw new ApiError(503, "DEPLOYMENT_SOURCE_COMMIT_INVALID");
+  }
+  return configured;
+}
+
 function telemetryContributionLimitError(
   admission: TelemetryContributionAdmission,
   nowEpoch = Date.now(),
@@ -2757,10 +2771,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         "SELECT schema_version FROM deletion_tombstones LIMIT 1",
       ).first();
       await env.QUARANTINE.head("__usage_monitor_health_probe__");
+      const deploymentSourceCommit = configuredDeploymentSourceCommit(env);
       return noStore(jsonResponse({
         status: "ok",
         mode: "synthetic-and-private-telemetry",
         enrollmentMode,
+        ...(deploymentSourceCommit === null
+          ? {}
+          : { deployment: { sourceCommit: deploymentSourceCommit } }),
         collectionControls: {
           state: collectionControls.state,
           enrollment: collectionControls.enrollment

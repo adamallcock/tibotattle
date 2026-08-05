@@ -203,12 +203,17 @@ npm run staging:deploy -- \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
 ```
 
-The deploy step emits a local non-secret identity receipt but does not create
-live-proof evidence; its revision field explicitly remains owner-observation
-required. The owner must observe the active opaque revision and
-disabled/contained health, then retain a proof referencing that identity
-receipt outside Git. Only after that proof is reviewed may preparation reach
-remote D1 mutation:
+The compatible deploy binds the checked-out source commit into the non-secret
+`DEPLOYMENT_SOURCE_COMMIT` Worker variable through Wrangler's `--var` path and
+emits a local non-secret identity receipt. That receipt is an owner-local
+attestation, not self-authenticating live proof; its revision field explicitly
+remains owner-observation required. Preparation independently fetches the
+exact origin's `/api/health` and requires its validated runtime source commit
+to match both the identity receipt and the expected checkout before any
+remote D1/resource inspection or mutation. The owner must still observe the active opaque revision
+and disabled/contained health, then retain a proof referencing that identity
+receipt outside Git. Only after those checks may preparation reach remote D1
+mutation:
 
 ```sh
 npm run staging:prepare -- \

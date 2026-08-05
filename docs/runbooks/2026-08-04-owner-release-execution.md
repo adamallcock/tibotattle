@@ -45,6 +45,12 @@ Keychain exports, provider tokens, OAuth codes/verifiers, account identifiers,
 raw appcast/artifact bytes, or raw logs.
 
 Worker deployment proof is a separate local JSON receipt, not a Wrangler log;
+for staging, it is an owner-local attestation rather than self-authenticating
+live proof. The compatible staging deploy independently binds the checked-out
+source commit through Wrangler's non-secret `DEPLOYMENT_SOURCE_COMMIT` var,
+and preparation re-fetches the exact staging origin's health endpoint to
+correlate that runtime value with the identity receipt before any D1
+containment or migration mutation.
 the proof and staging deployment-identity files must be regular owner-owned
 files with mode `0600` (no group/world access), and are read through the
 owner-only local-file gate.

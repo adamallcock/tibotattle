@@ -20,6 +20,8 @@ import { runReleasePreflight } from "./release-preflight.mjs";
 
 export const PREPARE_CONFIRMATION = "PREPARE_DISABLED_STAGING";
 
+const SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
+
 const CONTAINMENT_SQL = `
 UPDATE collection_controls
    SET enrollment_enabled = 0,
@@ -63,12 +65,101 @@ function readinessBlockers(readiness, fallback) {
     : [fallback];
 }
 
-function containAndVerify({
+function safeJsonHeaders(response) {
+  return response.headers.get("content-type")?.split(";", 1)[0]
+      === "application/json"
+    && response.headers.get("cache-control") === "no-store"
+    && response.headers.get("referrer-policy") === "no-referrer"
+    && response.headers.get("x-content-type-options") === "nosniff";
+}
+
+export function validateStagingRuntimeIdentity({
+  health,
+  deploymentIdentity,
+  expectedSourceCommit = null,
+} = {}) {
+  const expected = expectedSourceCommit
+    ?? deploymentIdentity?.deployment?.sourceCommit;
+  const receiptSourceCommit = deploymentIdentity?.deployment?.sourceCommit;
+  if (!SOURCE_COMMIT_PATTERN.test(expected ?? "")
+      || !SOURCE_COMMIT_PATTERN.test(receiptSourceCommit ?? "")) {
+    return {
+      ok: false,
+      code: "STAGING_RUNTIME_SOURCE_COMMIT_EXPECTED_INVALID",
+    };
+  }
+  if (health === null || typeof health !== "object"
+      || Array.isArray(health)
+      || !Object.hasOwn(health, "deployment")
+      || health.deployment === null
+      || typeof health.deployment !== "object"
+      || Array.isArray(health.deployment)
+      || !Object.hasOwn(health.deployment, "sourceCommit")
+      || health.deployment.sourceCommit === null
+      || health.deployment.sourceCommit === "") {
+    return { ok: false, code: "STAGING_RUNTIME_SOURCE_COMMIT_MISSING" };
+  }
+  const runtimeSourceCommit = health.deployment.sourceCommit;
+  if (typeof runtimeSourceCommit !== "string"
+      || !SOURCE_COMMIT_PATTERN.test(runtimeSourceCommit)) {
+    return { ok: false, code: "STAGING_RUNTIME_SOURCE_COMMIT_INVALID" };
+  }
+  if (runtimeSourceCommit !== receiptSourceCommit
+      || runtimeSourceCommit !== expected) {
+    return { ok: false, code: "STAGING_RUNTIME_SOURCE_COMMIT_MISMATCH" };
+  }
+  return { ok: true, code: null, sourceCommit: runtimeSourceCommit };
+}
+
+export async function verifyStagingRuntimeIdentity({
+  stagingOrigin,
+  deploymentIdentity,
+  expectedSourceCommit = null,
+  fetchImpl = fetch,
+} = {}) {
+  let healthResponse;
+  try {
+    const origin = new URL(stagingOrigin);
+    if (origin.origin !== stagingOrigin
+        || origin.protocol !== "https:"
+        || origin.pathname !== "/"
+        || origin.username
+        || origin.password
+        || origin.search
+        || origin.hash) {
+      return { ok: false, code: "STAGING_ORIGIN_INVALID" };
+    }
+    healthResponse = await fetchImpl(new URL("/api/health", origin), {
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    return { ok: false, code: "STAGING_RUNTIME_IDENTITY_UNAVAILABLE" };
+  }
+  if (!healthResponse.ok || !safeJsonHeaders(healthResponse)) {
+    return { ok: false, code: "STAGING_RUNTIME_IDENTITY_UNAVAILABLE" };
+  }
+  let health;
+  try {
+    health = await healthResponse.json();
+  } catch {
+    return { ok: false, code: "STAGING_RUNTIME_IDENTITY_UNAVAILABLE" };
+  }
+  return validateStagingRuntimeIdentity({
+    health,
+    deploymentIdentity,
+    expectedSourceCommit,
+  });
+}
+
+async function containAndVerify({
   readiness,
   spawn,
   wrangler,
   workerDirectory,
   config,
+  verifyRuntimeIdentity,
 }) {
   if (readiness?.checks?.collectionContained === true) {
     return { ok: true, readiness };
@@ -83,6 +174,8 @@ function containAndVerify({
       ),
     };
   }
+  const runtimeIdentity = await verifyRuntimeIdentity();
+  if (!runtimeIdentity.ok) return runtimeIdentity;
   if (!run(
     spawn,
     wrangler,
@@ -135,6 +228,7 @@ export async function prepareDisabledStaging({
   wrangler,
   workerDirectory,
   spawn = spawnSync,
+  fetchImpl = fetch,
   localPreflight = runReleasePreflight,
 }) {
   if (confirmation !== PREPARE_CONFIRMATION) {
@@ -180,6 +274,14 @@ export async function prepareDisabledStaging({
       ),
     };
   }
+  const verifyRuntimeIdentity = () => verifyStagingRuntimeIdentity({
+    stagingOrigin,
+    deploymentIdentity,
+    expectedSourceCommit,
+    fetchImpl,
+  });
+  const initialRuntimeIdentity = await verifyRuntimeIdentity();
+  if (!initialRuntimeIdentity.ok) return initialRuntimeIdentity;
   let before;
   try {
     before = probeStagingLive({
@@ -240,17 +342,20 @@ export async function prepareDisabledStaging({
   let readiness = before;
   for (let index = 0; index < REQUIRED_D1_BINDINGS.length; index += 1) {
     if (!readiness.checks.collectionContained) {
-      const containment = containAndVerify({
+      const containment = await containAndVerify({
         readiness,
         spawn,
         wrangler,
         workerDirectory,
         config,
+        verifyRuntimeIdentity,
       });
       if (!containment.ok) return containment;
       readiness = containment.readiness;
     }
     const { binding } = REQUIRED_D1_BINDINGS[index];
+    const runtimeIdentity = await verifyRuntimeIdentity();
+    if (!runtimeIdentity.ok) return runtimeIdentity;
     if (!run(
       spawn,
       wrangler,
@@ -275,12 +380,13 @@ export async function prepareDisabledStaging({
       return { ok: false, code: "STAGING_MIGRATIONS_UNVERIFIED" };
     }
     if (!readiness.checks.collectionContained) {
-      const containment = containAndVerify({
+      const containment = await containAndVerify({
         readiness,
         spawn,
         wrangler,
         workerDirectory,
         config,
+        verifyRuntimeIdentity,
       });
       if (!containment.ok) return containment;
       readiness = containment.readiness;

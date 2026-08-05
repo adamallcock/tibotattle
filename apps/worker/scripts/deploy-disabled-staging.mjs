@@ -269,9 +269,20 @@ export async function runDisabledStagingDeployment({
   }
 
   if (compatiblePhase) {
+    const sourceCommit = expectedSourceCommit
+      ?? checkedOutSourceCommit(workerDirectory);
+    if (!sourceCommit || !/^[a-f0-9]{7,64}$/u.test(sourceCommit)) {
+      return {
+        ok: false,
+        code: "STAGING_SOURCE_REVISION_UNAVAILABLE",
+      };
+    }
     const deployment = spawn(
       wrangler,
-      ["deploy", "--env", "staging", "--strict"],
+      [
+        "deploy", "--env", "staging", "--strict",
+        "--var", `DEPLOYMENT_SOURCE_COMMIT:${sourceCommit}`,
+      ],
       {
         cwd: workerDirectory,
         encoding: "utf8",
@@ -288,8 +299,6 @@ export async function runDisabledStagingDeployment({
         || deployedOrigins[0] !== parsedOrigin.origin) {
       return { ok: false, code: "STAGING_DEPLOY_ORIGIN_MISMATCH" };
     }
-    const sourceCommit = expectedSourceCommit
-      ?? checkedOutSourceCommit(workerDirectory);
     const deploymentIdentity = createStagingDeploymentIdentity({
       origin: deployedOrigins[0],
       sourceCommit,

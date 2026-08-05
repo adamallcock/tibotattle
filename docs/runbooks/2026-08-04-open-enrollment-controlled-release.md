@@ -156,11 +156,15 @@ npm run staging:deploy -- \
   --phase pre_migration_compatibility \
   --identity-receipt-file /owner-only/staging-deployment-identity.json \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
-# The command emits a local identity receipt containing the deployment output
-# origin, checked-out source commit, endpoint binding, and explicit
-# owner-observation-required revision state. The owner observes the exact
-# remote revision and disabled/contained health, then writes a bounded proof
-# that references that receipt.
+# The command binds the checked-out source commit into the non-secret
+# DEPLOYMENT_SOURCE_COMMIT Worker var and emits a local identity receipt
+# containing the deployment output origin, source commit, endpoint binding,
+# and explicit owner-observation-required revision state. This receipt is an
+# owner-local attestation, not self-authenticating live proof. Preparation
+# independently fetches the exact origin's /api/health and checks that its
+# runtime source commit matches the receipt and checkout before D1 mutation.
+# The owner observes the exact remote revision and disabled/contained health,
+# then writes a bounded proof that references that receipt.
 npm run staging:prepare -- \
   --origin https://EXACT-STAGING-HOST-SUPPLIED-BY-OWNER \
   --receipt-file /owner-only/staging-disabled-worker-proof.json \
@@ -181,7 +185,8 @@ checks and the actual disabled Worker deploy. It deliberately does not claim
 live health or write a proof. The owner must observe the remote active revision
 and verify disabled enrollment plus contained controls before supplying the
 proof file. `staging:prepare` derives the canonical origin and source revision
-from the identity receipt and rejects a proof for any other origin, environment,
+from the identity receipt, independently correlates the live health source
+commit, and rejects a proof for any other origin, environment,
 source commit, or deployment intent; the identity receipt never invents a
 remote revision when one was not observed locally.
 Only then can `staging:prepare` reach remote containment or migration commands.

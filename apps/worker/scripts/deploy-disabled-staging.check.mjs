@@ -153,7 +153,10 @@ test("pre-migration compatibility phase deploys the disabled Worker without clai
   assert.equal(identity.deployment.sourceCommit, "c26823c");
   assert.equal(identity.deployment.revisionObserved, false);
   assert.deepEqual(deploymentIdentity, identity);
-  assert.deepEqual(calls, [["deploy", "--env", "staging", "--strict"]]);
+  assert.deepEqual(calls, [[
+    "deploy", "--env", "staging", "--strict",
+    "--var", "DEPLOYMENT_SOURCE_COMMIT:c26823c",
+  ]]);
   assert.equal(liveProbeCalled, false);
 });
 

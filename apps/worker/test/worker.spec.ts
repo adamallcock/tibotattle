@@ -47,6 +47,10 @@ interface OptionalAdminBinding {
   ADMIN_IDENTITY_LINK_KEY?: string;
 }
 
+interface OptionalDeploymentIdentityBinding {
+  DEPLOYMENT_SOURCE_COMMIT?: string;
+}
+
 interface EnrollmentResponse {
   participantId: string;
   recoveryCode: string;
@@ -62,7 +66,11 @@ function recoveryAttemptId(): string {
   return `um_recovery_attempt_${encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-function testBindings(overrides: Partial<Env & OptionalAdminBinding> = {}): Env {
+function testBindings(
+  overrides: Partial<
+    Env & OptionalAdminBinding & OptionalDeploymentIdentityBinding
+  > = {},
+): Env {
   const bindings = env as TestBindings;
   return {
     ASSETS: bindings.ASSETS,
@@ -2066,6 +2074,26 @@ describe("synthetic usage monitor service", () => {
         ongoingDeviceUploadRegistration: true,
         coordinatedSignInAdmission: true,
       },
+    });
+  });
+
+  it("exposes the validated non-secret deployment source commit when configured", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      DEPLOYMENT_SOURCE_COMMIT: "c26823c",
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      deployment: { sourceCommit: "c26823c" },
+    });
+  });
+
+  it("fails health closed for an invalid configured deployment source commit", async () => {
+    const response = await api("/api/health", {}, testBindings({
+      DEPLOYMENT_SOURCE_COMMIT: "not-a-commit",
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "DEPLOYMENT_SOURCE_COMMIT_INVALID" },
     });
   });
 

@@ -73,9 +73,15 @@ npm --prefix apps/worker run staging:deploy -- \
   --confirm DEPLOY_COMPATIBLE_DISABLED_STAGING
 ```
 
-The owner must observe the active disabled revision and create the bounded
-local proof receipt. Only then can preparation reach remote containment or
-migration mutation, and it requires the exact confirmation plus that receipt:
+The compatible deploy binds the checked-out source commit into the non-secret
+`DEPLOYMENT_SOURCE_COMMIT` Worker variable via Wrangler's `--var` deployment
+configuration path. Its identity receipt is a bounded owner-local attestation,
+not self-authenticating live proof. The owner must observe the active disabled
+revision and create the bounded local proof receipt. Preparation then fetches
+the exact configured origin's `/api/health` and requires the returned runtime
+source commit to match both the identity receipt and expected checkout before
+it can reach remote D1 containment or migration mutation; it also requires the
+exact confirmation plus that receipt:
 
 ```sh
 npm --prefix apps/worker run staging:prepare -- \
