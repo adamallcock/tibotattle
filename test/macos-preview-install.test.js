@@ -158,6 +158,17 @@ test("preview CLI requires an unmistakable confirmation before targeting system 
   assert.equal(requiresMacOSSystemInstallConfirmation(parsed.targetPath), true);
 });
 
+test("the preview installation command includes the required system confirmation", async () => {
+  const packageDefinition = JSON.parse(await readFile(
+    new URL("../package.json", import.meta.url),
+    "utf8",
+  ));
+  assert.match(
+    packageDefinition.scripts["product:macos:preview:install"],
+    /--confirm-system-install/u,
+  );
+});
+
 test("programmatic system installation refuses before it inspects a source", async () => {
   await assert.rejects(
     () => installMacOSPreviewApp({
