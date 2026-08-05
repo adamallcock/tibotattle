@@ -145,7 +145,9 @@ async function createReleaseFixture({
 
 function publicReadbackFixture(fixture, {
   appcastBody = fixture.appcast,
+  appcastContentLength = true,
   artifactBody = fixture.dmgBytes,
+  artifactContentLength = true,
 } = {}) {
   const calls = [];
   return {
@@ -156,7 +158,9 @@ function publicReadbackFixture(fixture, {
         return new Response(appcastBody, {
           headers: {
             "Cache-Control": APPCAST_CACHE_CONTROL,
-            "Content-Length": String(Buffer.byteLength(appcastBody)),
+            ...(appcastContentLength
+              ? { "Content-Length": String(Buffer.byteLength(appcastBody)) }
+              : {}),
             "Content-Type": "application/xml; charset=utf-8",
           },
           status: 200,
@@ -166,7 +170,9 @@ function publicReadbackFixture(fixture, {
         return new Response(artifactBody, {
           headers: {
             "Cache-Control": IMMUTABLE_CACHE_CONTROL,
-            "Content-Length": String(artifactBody.length),
+            ...(artifactContentLength
+              ? { "Content-Length": String(artifactBody.length) }
+              : {}),
             "Content-Type": "application/x-apple-diskimage",
           },
           status: 200,
@@ -894,6 +900,37 @@ test("does not report publication success when the public appcast is unavailable
       { code: "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED" },
     );
     assert.equal(runner.calls.length, 7);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("verifies exact public GET bodies when HTTP omits Content-Length", async () => {
+  const fixture = await createReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  const publicReadback = publicReadbackFixture(fixture, {
+    appcastContentLength: false,
+    artifactContentLength: false,
+  });
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.equal(publication.verified, true);
+    assert.deepEqual(publicReadback.calls, [
+      { method: "GET", url: CANONICAL_APPCAST_URL },
+      { method: "GET", url: fixture.artifactURL },
+    ]);
   } finally {
     await fixture.cleanup();
   }

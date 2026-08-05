@@ -768,9 +768,7 @@ async function readResponseBytes(response, {
   label,
   maximumBytes,
 } = {}) {
-  const declared = declaredResponseLength(response, label, {
-    required: expectedBytes !== null,
-  });
+  const declared = declaredResponseLength(response, label, { required: false });
   if (declared !== null && declared > maximumBytes) {
     fail(
       `${label} response exceeds the safe size limit`,
@@ -812,8 +810,8 @@ async function readResponseDigest(response, {
   expectedSha256,
   label,
 } = {}) {
-  const declared = declaredResponseLength(response, label, { required: true });
-  if (declared !== expectedBytes) {
+  const declared = declaredResponseLength(response, label, { required: false });
+  if (declared !== null && declared !== expectedBytes) {
     fail(
       `${label} Content-Length ${declared} does not match expected ${expectedBytes}`,
       "SPARKLE_UPDATE_PUBLIC_READBACK_FAILED",
