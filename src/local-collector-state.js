@@ -386,6 +386,40 @@ function openDatabase(stateFile, { readOnly = false, create = false } = {}) {
   }
 }
 
+async function recoverPendingLocalCollectorRollbackJournal(stateFile) {
+  const resolvedStateFile = resolve(stateFile);
+  const metadata = await assertSafeStateFile(resolvedStateFile, {
+    allowMissing: true,
+  });
+  if (metadata === null) return false;
+
+  const journalFile = `${resolvedStateFile}-journal`;
+  let journalMetadata;
+  try {
+    journalMetadata = await lstat(journalFile);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw fixedError("local_collector_state_unavailable");
+  }
+  if (!ownerOnlyRegularFile(journalMetadata)) {
+    throw fixedError("local_collector_state_unavailable");
+  }
+
+  // A process killed during a DELETE-journal transaction leaves a valid hot
+  // rollback journal. SQLite must open the database read/write once to roll it
+  // back before the normal read-only startup path can inspect settled state.
+  // A live writer remains protected by SQLite's own lock and timeout; an
+  // unsafe journal fails closed above rather than being followed or removed.
+  let database;
+  try {
+    database = openDatabase(resolvedStateFile, { readOnly: false });
+  } finally {
+    database?.close();
+  }
+  await syncStateFile(resolvedStateFile);
+  return true;
+}
+
 async function syncStateFile(stateFile) {
   const handle = await open(stateFile, constants.O_RDONLY);
   try {
@@ -1534,6 +1568,7 @@ export async function prepareLocalCollectorState({
     throw new TypeError("Local collector state preparation options are invalid");
   }
   const legacyPaths = legacyLocalCollectorStatePaths(stateFile);
+  await recoverPendingLocalCollectorRollbackJournal(stateFile);
   // A settled installation should not fsync a lease file on every dashboard
   // read. The receipt still has to be checked against the managed legacy
   // names, so a reappearing old artifact is never silently ignored.

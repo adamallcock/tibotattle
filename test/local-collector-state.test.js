@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,6 +91,110 @@ test("SQLite commits collector records and checkpoints atomically", async () => 
     assert.deepEqual(durable.records, [record("first")]);
     assert.equal((await stat(value.stateFile)).mode & 0o777, 0o600);
   } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("state preparation recovers a hot SQLite rollback journal after a killed writer", {
+  skip: process.platform === "win32",
+}, async () => {
+  const value = await fixture();
+  let writer;
+  try {
+    const durableCheckpoint = checkpoint();
+    await writeFile(
+      join(value.stateDirectory, "collector-events.jsonl"),
+      `${JSON.stringify(record("before-crash"))}\n`,
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(value.stateDirectory, "collector-checkpoint-v0.3.json"),
+      JSON.stringify(durableCheckpoint),
+      { mode: 0o600 },
+    );
+    await prepareLocalCollectorState({ stateFile: value.stateFile });
+
+    writer = spawn(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `
+        import { DatabaseSync } from "node:sqlite";
+        const database = new DatabaseSync(process.env.TIBOTATTLE_STATE_FILE, {
+          readOnly: false,
+          timeout: 5_000,
+        });
+        database.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=1; PRAGMA cache_spill=ON; BEGIN IMMEDIATE;");
+        database.prepare("UPDATE meta SET value_json = ? WHERE key = 'checkpoint'")
+          .run(JSON.stringify({ crashed: true }));
+        const insert = database.prepare(
+          "INSERT INTO records(event_key, record_digest, kind, observed_at, observed_at_ms, record_json, inserted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        );
+        for (let index = 0; index < 512; index += 1) {
+          insert.run(
+            "crash-" + index,
+            "0".repeat(64),
+            "crash_fixture",
+            null,
+            null,
+            "x".repeat(16 * 1024),
+            "2026-08-05T00:00:00.000Z",
+          );
+        }
+        process.stdout.write("READY\\n");
+        setInterval(() => {}, 1_000);
+      `,
+    ], {
+      env: {
+        ...process.env,
+        TIBOTATTLE_STATE_FILE: value.stateFile,
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    writer.stdout.setEncoding("utf8");
+    await Promise.race([
+      new Promise((resolveReady, rejectReady) => {
+        let output = "";
+        writer.stdout.on("data", (chunk) => {
+          output += chunk;
+          if (output.includes("READY\n")) resolveReady();
+        });
+        writer.once("exit", (code, signal) => {
+          rejectReady(new Error(
+            `SQLite crash fixture exited before READY (${code ?? signal})`,
+          ));
+        });
+      }),
+      new Promise((_, rejectTimeout) => {
+        setTimeout(
+          () => rejectTimeout(new Error("SQLite crash fixture timed out")),
+          5_000,
+        ).unref();
+      }),
+    ]);
+    assert.equal(writer.kill("SIGKILL"), true);
+    const [, signal] = await once(writer, "exit");
+    assert.equal(signal, "SIGKILL");
+    writer = null;
+
+    assert.equal((await stat(`${value.stateFile}-journal`)).isFile(), true);
+    await assert.rejects(
+      () => readLocalCollectorState({ stateFile: value.stateFile }),
+      { code: "local_collector_state_unavailable" },
+    );
+    const receipt = await prepareLocalCollectorState({
+      stateFile: value.stateFile,
+    });
+    assert.equal(receipt.status, "complete");
+    const recovered = await readLocalCollectorState({
+      stateFile: value.stateFile,
+    });
+    assert.deepEqual(recovered.checkpoint, durableCheckpoint);
+    assert.deepEqual(recovered.records, [record("before-crash")]);
+  } finally {
+    if (writer && writer.exitCode === null && writer.signalCode === null) {
+      writer.kill("SIGKILL");
+      await once(writer, "exit");
+    }
     await rm(value.root, { recursive: true, force: true });
   }
 });
