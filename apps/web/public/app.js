@@ -6,6 +6,7 @@ import {
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
+  formatQuotaWindowDuration,
   normalizeCommunitySnapshot,
   normalizeParticipantHistory,
   normalizeParticipantStats,
@@ -1194,10 +1195,10 @@ function shareCardWindowKind(window) {
 /**
  * Choose the one allowance window the card reports.
  *
- * The share card is a weekly-specific surface. It uses the selected normal
- * Codex window when that selection is one of the existing named windows;
- * otherwise it omits the generic window rather than borrowing seven-day
- * history or an estimate with the wrong denominator.
+ * The selected normal Codex window is the card's allowance denominator. A
+ * provider-reported duration is never silently replaced with a shorter named
+ * window: seven-day reset history and its estimate stay absent unless the
+ * selected window is genuinely seven days.
  */
 function shareCardWindow(windows) {
   const observed = (Array.isArray(windows) ? windows : [])
@@ -1206,20 +1207,22 @@ function shareCardWindow(windows) {
       && finite(window?.remainingPercent) !== null
     ));
   const selected = selectPrimaryCodexQuotaWindow(observed);
-  if (selected !== null && shareCardWindowKind(selected) !== "other") {
-    return selected;
-  }
-  return observed.find((window) => shareCardWindowKind(window) === "seven_day")
-    ?? observed.find((window) => shareCardWindowKind(window) === "five_hour")
-    ?? null;
+  return selected;
 }
 
 function shareCardPeriodLabel(candidate) {
   return t(SHARE_CARD_PERIOD_KEYS.get(candidate) ?? "share.period.recorded");
 }
 
-function shareCardWindowLabel(kind) {
-  return t(SHARE_CARD_WINDOW_KEYS[kind] ?? SHARE_CARD_WINDOW_KEYS.other);
+function shareCardWindowLabel(window) {
+  const kind = shareCardWindowKind(window);
+  if (kind !== "other") {
+    return t(SHARE_CARD_WINDOW_KEYS[kind]);
+  }
+  const duration = formatQuotaWindowDuration(finite(window?.durationMinutes));
+  return duration === ""
+    ? t(SHARE_CARD_WINDOW_KEYS.other)
+    : t("share.window.providerReportedDuration", { duration });
 }
 
 /**
@@ -1305,7 +1308,7 @@ function buildShareCard(data, {
   registryVersion = "",
   home = "",
   contractVersion = "",
-  history = allowanceHistoryChartModel(data),
+  history = null,
 } = {}) {
   if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) {
     throw new TypeError("A results card requires a minted reference.");
@@ -1319,8 +1322,9 @@ function buildShareCard(data, {
   const summary = data?.weekly?.summary ?? {};
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
+  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
   const remaining = finite(allowanceWindow?.remainingPercent);
-  const windowLabel = shareCardWindowLabel(shareCardWindowKind(allowanceWindow));
+  const windowLabel = shareCardWindowLabel(allowanceWindow);
 
   const weighted = finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
@@ -1328,15 +1332,15 @@ function buildShareCard(data, {
   const excluded = finite(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
   const period = shareCardPeriodLabel(pricing.periodLabel);
 
-  const capacity = finite(
+  const capacity = isWeeklyWindow ? finite(
     summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd,
-  );
-  const lower = finite(
+  ) : null;
+  const lower = isWeeklyWindow ? finite(
     summary.lower_80_across_resets_usd ?? summary.lower80Usd,
-  );
-  const upper = finite(
+  ) : null;
+  const upper = isWeeklyWindow ? finite(
     summary.upper_80_across_resets_usd ?? summary.upper80Usd,
-  );
+  ) : null;
   const hasCapacity = capacity !== null && capacity > 0;
   const hasRange = hasCapacity
     && lower !== null && lower > 0
@@ -1362,9 +1366,13 @@ function buildShareCard(data, {
         : t("share.detail.activityPeriod", { period }),
     },
     {
-      label: t("share.stat.estimatedAllowance"),
+      label: isWeeklyWindow
+        ? t("share.stat.estimatedAllowance")
+        : t("share.stat.estimatedAllowanceUnavailable"),
       value: hasCapacity ? formatMoney(capacity, 0) : t("share.value.notEstimable"),
-      detail: hasRange
+      detail: !isWeeklyWindow
+        ? t("share.detail.notApplicableToWindow")
+        : hasRange
         ? t("share.detail.resetRange", {
           lower: formatMoney(lower, 0),
           upper: formatMoney(upper, 0),
@@ -1375,7 +1383,7 @@ function buildShareCard(data, {
     },
   ];
 
-  const relationshipNote = spend !== null && hasCapacity
+  const relationshipNote = isWeeklyWindow && spend !== null && hasCapacity
     ? t("share.relationship", { period })
     : "";
 
@@ -1423,10 +1431,16 @@ function buildShareCard(data, {
     badge: isDemo ? t("share.badge.demo") : "",
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     relationshipNote,
-    trend: shareCardTrend(history),
+    // Reset-fit history is an explicitly seven-day model. It is never drawn
+    // behind a five-hour or provider-reported generic allowance window.
+    trend: isWeeklyWindow ? shareCardTrend(history) : null,
     trendLabel: t("share.trend.label"),
-    trendEmpty: t("share.trend.empty"),
-    trendEmptyDetail: t("share.trend.emptyDetail"),
+    trendEmpty: isWeeklyWindow
+      ? t("share.trend.empty")
+      : t("share.trend.unavailableForWindow"),
+    trendEmptyDetail: isWeeklyWindow
+      ? t("share.trend.emptyDetail")
+      : t("share.trend.unavailableForWindowDetail"),
     caveats: Object.freeze(caveats),
     identifierLine: identifiers.join(" · "),
     contractVersion,
@@ -1941,11 +1955,13 @@ function updateShareCardActions() {
 function renderShareCard(data) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const history = allowanceHistoryChartModel(data);
-  const trend = shareCardTrend(history);
+  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const history = isWeeklyWindow ? allowanceHistoryChartModel(data) : null;
+  const trend = isWeeklyWindow ? shareCardTrend(history) : null;
   const signature = JSON.stringify([
     data?.mode,
     shareCardWindowKind(allowanceWindow),
+    finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),
     finite(data?.pricing?.quotaWeightedTotalCostUsd),
     finite(data?.pricing?.totalCostUsd),

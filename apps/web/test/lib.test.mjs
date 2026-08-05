@@ -5460,9 +5460,31 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     section,
     /function shareCardWindowKind\(window\) \{\s*\n\s*if \(!isPrimaryCodexQuotaWindow\(window\)\) return "other";\s*\n\s*const minutes = finite\(window\?\.durationMinutes\);/u,
   );
+  // A provider-reported 30-day window is a real allowance denominator. It
+  // must win selection rather than being silently replaced with the old
+  // seven-day/five-hour fallback, and it must suppress weekly-only history.
+  const providerReportedThirtyDayWindow = 43_200;
+  assert.equal(providerReportedThirtyDayWindow, 30 * 24 * 60);
   assert.match(
     section,
-    /isPrimaryCodexQuotaWindow\(window\)[\s\S]*?shareCardWindowKind\(window\) === "seven_day"/u,
+    /const selected = selectPrimaryCodexQuotaWindow\(observed\);\s*\n\s*return selected;/u,
+  );
+  assert.doesNotMatch(section, /observed\.find\(/u);
+  assert.match(
+    section,
+    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";/u,
+  );
+  assert.match(
+    section,
+    /const capacity = isWeeklyWindow \? finite\(/u,
+  );
+  assert.match(
+    section,
+    /trend: isWeeklyWindow \? shareCardTrend\(history\) : null,/u,
+  );
+  assert.match(
+    section,
+    /formatQuotaWindowDuration\(finite\(window\?\.durationMinutes\)\)/u,
   );
   assert.deepEqual(
     [...new Set(
@@ -5471,6 +5493,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
         .filter((value) => !value.startsWith("window.")),
     )].sort(),
     [
+      "allowanceWindow?.durationMinutes",
       "allowanceWindow?.remainingPercent",
       "window?.durationMinutes",
       "window?.remainingPercent",
@@ -5557,9 +5580,9 @@ test("the posted allowance graph uses the exact history model from the dashboard
   const section = shareCardSource(appSource);
 
   // A single presentation model owns range selection, point inclusion,
-  // classification, vertical bounds, and date landmarks. Both surfaces take
-  // their chart state from that model, so a post cannot tell a different story
-  // from the Allowance estimate history beside it.
+  // classification, vertical bounds, and date landmarks. A seven-day card
+  // takes that exact model; a different provider-reported allowance duration
+  // deliberately receives no borrowed seven-day graph.
   assert.match(appSource, /function allowanceHistoryChartModel\(data,/u);
   assert.match(appSource, /function allowanceHistoryAxis\(points\)/u);
   assert.match(appSource, /function allowanceHistoryDateTicks\(points, maximum = 4\)/u);
@@ -5570,11 +5593,11 @@ test("the posted allowance graph uses the exact history model from the dashboard
   assert.match(appSource, /shell\.replaceChildren\(renderAllowanceHistoryChart\(history\)\);/u);
   assert.match(
     section,
-    /const history = allowanceHistoryChartModel\(data\);\s*\n\s*const trend = shareCardTrend\(history\);/u,
+    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow \? allowanceHistoryChartModel\(data\) : null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
-    /history = allowanceHistoryChartModel\(data\),/u,
+    /history = null,/u,
   );
   assert.doesNotMatch(
     section,
@@ -5613,6 +5636,7 @@ test("a posted results card always carries a diagnostic-format reference", async
   for (const figure of [
     "data?.mode",
     "shareCardWindowKind(allowanceWindow)",
+    "finite(allowanceWindow?.durationMinutes)",
     "finite(allowanceWindow?.remainingPercent)",
     "finite(data?.pricing?.quotaWeightedTotalCostUsd)",
     "finite(data?.pricing?.totalCostUsd)",
@@ -5624,7 +5648,7 @@ test("a posted results card always carries a diagnostic-format reference", async
   }
   assert.match(
     section,
-    /const history = allowanceHistoryChartModel\(data\);\s*\n\s*const trend = shareCardTrend\(history\);/u,
+    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow \? allowanceHistoryChartModel\(data\) : null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -5719,9 +5743,19 @@ test("a posted results card states a figure in full and marks a fixture as one",
   );
   assert.match(section, /relationshipNote,/u);
   // The image makes the incomparable denominators explicit rather than
-  // suggesting that seven days of recorded events is a single allowance.
+  // suggesting that seven days of recorded events is a single allowance. A
+  // generic provider window keeps its own denominator and says that the
+  // seven-day estimate is unavailable rather than borrowing a weekly fit.
   assert.match(section, /label: t\("share\.stat\.recordedActivity"\),/u);
-  assert.match(section, /label: t\("share\.stat\.estimatedAllowance"\),/u);
+  assert.match(
+    section,
+    /label: isWeeklyWindow\s*\n\s*\? t\("share\.stat\.estimatedAllowance"\)\s*\n\s*: t\("share\.stat\.estimatedAllowanceUnavailable"\),/u,
+  );
+  assert.match(
+    section,
+    /detail: !isWeeklyWindow\s*\n\s*\? t\("share\.detail\.notApplicableToWindow"\)/u,
+  );
+  assert.match(section, /const relationshipNote = isWeeklyWindow && spend !== null && hasCapacity/u);
   assert.match(
     section,
     /t\("share\.relationship", \{ period \}\)/u,
