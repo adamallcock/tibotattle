@@ -18,24 +18,26 @@ OAuth configuration, or publish an app.
 
 ## Evidence boundary
 
-The authoritative observation is a provider-reported numeric
-`windowDurationMinutes` together with its `limitId`, `planType`, current
-percentage, slot, and reset schedule.
+The current raw provider `rate_limits` observation uses `plan_type` for the
+provider-reported plan label, `window_minutes` for the quota-window duration,
+and `resets_at` for the provider-reported reset schedule, alongside the limit,
+slot, and current percentage. Unknown or unsupported labels fail closed for
+plan evidence: they remain `unknown` and cannot establish an exact plan,
+multiplier, entitlement, or absolute allowance. A valid limit and duration may
+still select the provider-reported window independently of that label.
+
+An exact plan variant such as `pro-5x` or `pro-20x` is separate dated evidence;
+it is not derived from `plan_type`. The provider label does not prove a
+multiplier, current entitlement, or absolute allowance.
 
 - `300` minutes is named **Five-hour allowance**.
 - `10,080` minutes is named **Seven-day allowance**.
-- Any other safe integer from 1 through 525,600 is a **Provider-reported
-  N-day/hour/minute window**.
+- After bounded normalization, any other safe integer from 1 through 525,600
+  is a **Provider-reported N-day/hour/minute window**.
 
-A value such as 43,200 minutes may be formatted as a 30-day provider-reported
-window. It must not be called “monthly”: a duration does not prove a calendar
-month or a billing cycle.
-
-Likewise, a `planType` observation may be displayed as, for example,
-“provider reported plan type: pro.” It cannot prove an exact Pro multiplier,
-current entitlement, plan variant, or absolute allowance. Those remain
-unknown unless the provider independently exposes them in the same scoped,
-fresh observation.
+A value such as `window_minutes: 43,200` may be formatted as a **30-day
+provider-reported window**. It must not be called “monthly”: a duration does
+not prove a calendar month or a billing cycle.
 
 ## Selection policy
 
@@ -89,8 +91,10 @@ calibration for that duration.
    - Decode and label valid generic windows without falling back to an
      incorrect seven-day label.
    - Retain stale hiding and longest-valid selection.
-   - Broaden notification duration validation only. Preserve the existing
-     direct-read, fresh, scoped, normal-limit, known-plan, opt-in, dedupe, and
+   - Keep notification eligibility separate from generic-window presentation:
+     the current gate remains limited to fresh direct-read five-hour and
+     seven-day observations until explicitly broadened. Preserve the existing
+     fresh, scoped, normal-limit, known-plan, opt-in, dedupe, and
      schedule-only-reset safeguards.
 
 ## Acceptance tests
@@ -104,9 +108,11 @@ calibration for that duration.
 - Existing five-hour and seven-day calculations, labels, and weekly forecasts
   remain unchanged.
 - A non-weekly current window cannot render a seven-day capacity/range/chart.
-- A long valid direct-read observation can pass notification duration gating,
-  while push, stale, unknown-plan, wrong-limit, and missing-scope observations
-  remain rejected.
+- A long valid provider window reaches normal analysis and presentation but is
+  not currently eligible for the native notification evidence gate, which
+  remains limited to fresh direct-read 300- and 10,080-minute windows; push,
+  stale, unknown-plan, wrong-limit, and missing-scope observations remain
+  rejected there.
 - English, Spanish, and Simplified Chinese localization parity is retained for
   the new fixed labels.
 

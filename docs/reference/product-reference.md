@@ -233,7 +233,21 @@ The seven-day calibration report (an owner-only artifact at `.usage-monitor/lega
 - The visible provider page explicitly says Work and Codex share one usage limit and exposes coarse Desktop, CLI, Extension, Cloud, Mobile, Code review, Desktop App, Web, and Exec categories. It does not expose a Work-only allocation. A 1,569-turn gap between its model and surface totals is retained as unclassified, not relabeled as Work.
 - The original conditional weekly ballpark remains $1.9k–$2.3k in Standard-API-equivalent / tier-weighted units. It is still not the actual weekly allowance because the older history cannot be partitioned by account and all shared-pool activity is not observable at per-turn precision.
 
-The current provider `planType: pro` field does not distinguish the $100 5x and $200 20x variants. The owner-only plan timeline records the user's normal 20x state only from the July 24 account registration onward and keeps the brief 5x episode unresolved until its approximate dates and account alias are known. Earlier rows remain `unknown` rather than inheriting today's plan.
+The current provider `plan_type: pro` observation is only a provider-reported
+plan label; it does not distinguish the $100 5x and $200 20x variants. The
+owner-only plan timeline records the user's normal 20x state only from the July
+24 account registration onward and keeps the brief 5x episode unresolved until
+its approximate dates and account alias are known. Earlier rows remain
+`unknown` rather than inheriting today's plan.
+
+The current raw quota-window fields are `plan_type`, `window_minutes`, and
+`resets_at`: respectively the provider plan label, the provider-reported
+duration, and the provider-reported reset schedule. Exact variants such as
+`pro-5x` and `pro-20x` are separate dated evidence and are not derived from
+`plan_type`. A `window_minutes` value of 43,200 is a **30-day provider-reported
+window**, not a calendar-month billing limit. Unknown or unsupported labels
+normalize to `unknown` and fail closed for exact plan or absolute-allowance
+claims; valid limit and duration evidence remains independently usable.
 
 OpenAI's April 9 release note described the newly launched $100 option as temporarily up to 10x, increased from its normal 5x level; current pricing again lists $100 as 5x and $200 as 20x. The monitor therefore models `pro-5x` and `pro-10x-promo` separately and will not guess which applied to the unresolved episode.
 
