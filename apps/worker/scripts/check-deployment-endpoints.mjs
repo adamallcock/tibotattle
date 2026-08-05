@@ -316,20 +316,31 @@ export function validateDeploymentEndpointConsumers({
 
 export function validateWorkerDeploymentEndpointGates(workerPackage) {
   const scripts = workerPackage?.scripts;
+  const endpointCheckCommand = "npm run deployment:endpoints:check";
+  const endpointGatedDeploymentOperations = [
+    ["deploy:dry", "wrangler deploy"],
+    ["production:deploy:dry", "wrangler deploy"],
+    ["staging:check", "wrangler deploy"],
+    ["staging:deploy", "node ./scripts/deploy-disabled-staging.mjs"],
+  ];
   if (!scripts || typeof scripts !== "object"
       || scripts["deployment:endpoints:check"]
         !== "node ./scripts/check-deployment-endpoints.mjs") {
     fail("Worker package must expose the deployment endpoint checker");
   }
-  for (const script of [
-    "deploy:dry",
-    "production:deploy:dry",
-    "staging:check",
-    "staging:deploy",
-  ]) {
-    if (typeof scripts[script] !== "string"
-        || !scripts[script].includes("npm run deployment:endpoints:check")) {
-      fail(`${script} must run the deployment endpoint checker before Wrangler`);
+  for (const [script, deploymentOperation] of endpointGatedDeploymentOperations) {
+    const command = scripts[script];
+    if (typeof command !== "string") {
+      fail(`${script} must define a deployment command`);
+    }
+    const endpointCheckIndex = command.indexOf(endpointCheckCommand);
+    const deploymentOperationIndex = command.indexOf(deploymentOperation);
+    if (endpointCheckIndex < 0
+        || deploymentOperationIndex < 0
+        || endpointCheckIndex > deploymentOperationIndex) {
+      fail(
+        `${script} must run the deployment endpoint checker before ${deploymentOperation}`,
+      );
     }
   }
   if (scripts["production:deploy"]

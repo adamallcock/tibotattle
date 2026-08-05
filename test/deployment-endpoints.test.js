@@ -10,6 +10,7 @@ import {
   validateWorkerSparkleReleaseContract,
   validateWorkerSparkleAppcastGuard,
   validateWorkerDeploymentEndpoints,
+  validateWorkerDeploymentEndpointGates,
   WORKER_SPARKLE_RELEASE_CONTRACT_PATH,
 } from "../apps/worker/scripts/check-deployment-endpoints.mjs";
 
@@ -45,6 +46,34 @@ test("Worker endpoint projection rejects an independent public origin", () => {
     () => validateWorkerDeploymentEndpoints(configuration),
     { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
   );
+});
+
+test("Worker deployment scripts run the endpoint check before deployment", () => {
+  const endpointCheckCommand = "npm run deployment:endpoints:check";
+  const deploymentOperations = [
+    ["deploy:dry", "wrangler deploy --env=\"\" --dry-run"],
+    ["production:deploy:dry", "wrangler deploy --env production --dry-run"],
+    ["staging:check", "wrangler deploy --env staging --dry-run"],
+    ["staging:deploy", "node ./scripts/deploy-disabled-staging.mjs"],
+  ];
+  const scripts = {
+    "deployment:endpoints:check": "node ./scripts/check-deployment-endpoints.mjs",
+    "production:deploy": "node ./scripts/production-deploy.mjs",
+  };
+  for (const [name, operation] of deploymentOperations) {
+    scripts[name] = `${endpointCheckCommand} && ${operation}`;
+  }
+
+  assert.doesNotThrow(() => validateWorkerDeploymentEndpointGates({ scripts }));
+  for (const [name, operation] of deploymentOperations) {
+    scripts[name] = `${operation} && ${endpointCheckCommand}`;
+    assert.throws(
+      () => validateWorkerDeploymentEndpointGates({ scripts }),
+      { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+      `${name} must reject an endpoint check after its deployment operation`,
+    );
+    scripts[name] = `${endpointCheckCommand} && ${operation}`;
+  }
 });
 
 test("checked-in deployment endpoint consumers match the reviewed manifest", async () => {
