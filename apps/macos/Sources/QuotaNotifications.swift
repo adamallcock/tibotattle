@@ -67,7 +67,6 @@ protocol QuotaNotificationEvidenceProvider: AnyObject {
 
 private let quotaNotificationEvidenceSchema =
     "tibotattle-notification-evidence-v2"
-private let quotaNotificationAcceptedDurations = Set([300, 10_080])
 
 private func hasExactKeys(
     _ dictionary: [String: Any],
@@ -103,7 +102,7 @@ private func validNotificationLaneKey(_ value: String) -> Bool {
           validNotificationContinuityKey(String(pieces[0])),
           ["primary", "secondary"].contains(String(pieces[1])),
           let duration = Int(pieces[2]),
-          quotaNotificationAcceptedDurations.contains(duration)
+          CodexQuotaWindowDuration.isValid(duration)
     else {
         return false
     }
@@ -298,8 +297,10 @@ extension LocalCompanionEvidenceReader: QuotaNotificationEvidenceProvider {
                   !seenLanes.contains(lane),
                   let usedPercent = safeJSONNumber(rawWindow["usedPercent"]),
                   (0...100).contains(usedPercent),
-                  let duration = rawWindow["durationMinutes"] as? Int,
-                  quotaNotificationAcceptedDurations.contains(duration),
+                  let duration = CodexQuotaWindowDuration.integer(
+                      from: rawWindow["durationMinutes"]
+                  ),
+                  CodexQuotaWindowDuration.isValid(duration),
                   let resetAt = rawWindow["resetAt"] as? String,
                   let resetDate = canonicalNotificationDate(resetAt),
                   let observedDate,
@@ -1034,7 +1035,7 @@ final class QuotaNotificationCoordinator {
         for window in evidence.windows.sorted(by: { $0.lane < $1.lane }) {
             guard ["primary", "secondary"].contains(window.lane),
                   (0...100).contains(window.usedPercent),
-                  quotaNotificationAcceptedDurations.contains(window.durationMinutes),
+                  CodexQuotaWindowDuration.isValid(window.durationMinutes),
                   let observedAt = canonicalNotificationDate(evidence.observedAt),
                   let resetAt = canonicalNotificationDate(window.resetAt),
                   resetAt > observedAt
@@ -1372,6 +1373,7 @@ enum QuotaNotificationContractSmokeTest {
         observedAt: String,
         usedPercent: Double,
         resetAt: String,
+        durationMinutes: Int = CodexQuotaWindowDuration.sevenDayMinutes,
         resetProof: ProviderQuotaResetProof = .unavailable
     ) -> ProviderQuotaNotificationEvidenceResult {
         .fresh(FreshProviderQuotaEvidence(
@@ -1380,7 +1382,7 @@ enum QuotaNotificationContractSmokeTest {
             windows: [FreshProviderQuotaWindow(
                 lane: "primary",
                 usedPercent: usedPercent,
-                durationMinutes: 10_080,
+                durationMinutes: durationMinutes,
                 resetAt: resetAt,
                 resetProof: resetProof
             )]
@@ -1434,6 +1436,22 @@ enum QuotaNotificationContractSmokeTest {
     }
 
     static func run() -> Int32 {
+        guard require(
+            CodexQuotaWindowDuration.isValid(1)
+                && CodexQuotaWindowDuration.isValid(525_600)
+                && !CodexQuotaWindowDuration.isValid(0)
+                && !CodexQuotaWindowDuration.isValid(525_601)
+                && CodexQuotaWindowDuration.integer(
+                    from: NSNumber(value: 1.5)
+                ) == nil,
+            "duration validation accepted an invalid provider value"
+        ), require(
+            !validNotificationLaneKey(
+                "\(continuityKey)|primary|525601"
+            ),
+            "notification lane key accepted an out-of-range duration"
+        )
+        else { return 1 }
         guard require(ownerOnlyStateStoreRejectsSymlink(),
                       "owner-only state store accepted a symlink")
         else { return 1 }
@@ -1460,7 +1478,8 @@ enum QuotaNotificationContractSmokeTest {
         let first = evidence(
             observedAt: "2026-08-03T10:00:00.000Z",
             usedPercent: 50,
-            resetAt: "2026-08-10T10:00:00.000Z"
+            resetAt: "2026-08-10T10:00:00.000Z",
+            durationMinutes: 43_200
         )
         coordinator.evaluate(first)
         guard require(center.requests.isEmpty, "first observation notified")
@@ -1469,7 +1488,8 @@ enum QuotaNotificationContractSmokeTest {
         let crossed = evidence(
             observedAt: "2026-08-03T10:05:00.000Z",
             usedPercent: 95,
-            resetAt: "2026-08-10T10:00:00.000Z"
+            resetAt: "2026-08-10T10:00:00.000Z",
+            durationMinutes: 43_200
         )
         let provider = FakeEvidenceProvider(crossed)
         coordinator.evaluate(

@@ -132,6 +132,20 @@ const MENU_BAR_STATUS_SOURCE = join(
   "Sources",
   "MenuBarStatus.swift",
 );
+const QUOTA_NOTIFICATIONS_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "QuotaNotifications.swift",
+);
+const LOCALIZATION_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "Localization.swift",
+);
 const BUILD_SCRIPT = join(
   REPOSITORY_ROOT,
   "scripts",
@@ -1185,10 +1199,16 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
 
   // Only the normal Codex allowance track is projected with fixed
   // privacy-safe labels; a separate product can never become the title.
-  assert.match(source, /private let weeklyWindowDurationMinutes = 10_080/u);
+  assert.match(
+    source,
+    /private let weeklyWindowDurationMinutes\s*=\s*\n\s*CodexQuotaWindowDuration\.sevenDayMinutes/u,
+  );
   assert.match(source, /private let codexPrimaryLimitId = "codex"/u);
-  assert.match(source, /private let supportedCodexAllowanceWindowDurations: Set<Int>/u);
-  assert.match(source, /let lanes = rows\.compactMap/u);
+  assert.match(
+    source,
+    /private let supportedCodexAllowanceWindowDurations\s*=\s*\n\s*1\.\.\.CodexQuotaWindowDuration\.maximumMinutes/u,
+  );
+  assert.match(source, /let candidates = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
   assert.match(
     source,
@@ -1198,7 +1218,11 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     source,
     /return TiboTattleLocalization\.string\(\.menuBarSevenDayAllowance\)/u,
   );
-  assert.match(source, /isPrimary: duration == weeklyWindowDurationMinutes/u);
+  assert.match(source, /left\.durationMinutes > right\.durationMinutes/u);
+  assert.match(source, /left\.isExplicitPrimary != right\.isExplicitPrimary/u);
+  assert.match(source, /return left\.stableKey < right\.stableKey/u);
+  assert.match(source, /isPrimary: index == 0/u);
+  assert.match(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
   assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
   assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
   assert.match(
@@ -1347,6 +1371,50 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
   }
+});
+
+test("native quota duration handling stays bounded, generic, and reset-proof", async () => {
+  const [menuSource, notificationSource, localizationSource] = await Promise.all([
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(QUOTA_NOTIFICATIONS_SOURCE, "utf8"),
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+  ]);
+  assert.match(
+    localizationSource,
+    /static let maximumMinutes = 525_600/u,
+  );
+  assert.match(
+    localizationSource,
+    /static func integer\(from value: Any\?\) -> Int\?/u,
+  );
+  assert.match(
+    localizationSource,
+    /return "Provider-reported .*englishUnit.*window"/u,
+  );
+  assert.match(
+    menuSource,
+    /CodexQuotaWindowDuration\.integer\(\s*\n\s*from: row\["durationMinutes"\]\s*\n\s*\)/u,
+  );
+  assert.match(
+    notificationSource,
+    /CodexQuotaWindowDuration\.integer\(\s*\n\s*from: rawWindow\["durationMinutes"\]\s*\n\s*\)/u,
+  );
+  assert.match(
+    notificationSource,
+    /CodexQuotaWindowDuration\.isValid\(window\.durationMinutes\)/u,
+  );
+  assert.match(
+    notificationSource,
+    /if nextState\.preferences\.resetEnabled,\s*\n\s*resetIdentityChanged/u,
+  );
+  assert.match(
+    notificationSource,
+    /if scheduleChanged \|\| resetIdentityChanged[\s\S]*?if nextState\.preferences\.resetEnabled,\s*\n\s*resetIdentityChanged[\s\S]*?kind: \.reset/u,
+  );
+  assert.doesNotMatch(
+    menuSource + "\n" + localizationSource,
+    /monthly\s+limit|plan\s+entitlement/iu,
+  );
 });
 
 test("targeted local Keychain reset removes only exact local capabilities and residue", async () => {

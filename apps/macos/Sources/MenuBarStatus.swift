@@ -247,12 +247,12 @@ struct MenuBarStatusSnapshot: Equatable {
 private let analyzingPlaceholder = "…"
 private let unknownPlaceholder = "–"
 private let codexPrimaryLimitId = "codex"
-private let fiveHourWindowDurationMinutes = 300
-private let weeklyWindowDurationMinutes = 10_080
-private let supportedCodexAllowanceWindowDurations: Set<Int> = [
-    fiveHourWindowDurationMinutes,
-    weeklyWindowDurationMinutes
-]
+private let fiveHourWindowDurationMinutes =
+    CodexQuotaWindowDuration.fiveHourMinutes
+private let weeklyWindowDurationMinutes =
+    CodexQuotaWindowDuration.sevenDayMinutes
+private let supportedCodexAllowanceWindowDurations =
+    1...CodexQuotaWindowDuration.maximumMinutes
 private let defaultStaleAfterSeconds: Double = 30 * 60
 
 /// Deterministic, locale-independent age wording. Deliberately coarse: the
@@ -330,7 +330,13 @@ enum LocalCompanionOverviewProjection {
         let rows = root["quotaWindows"] as? [[String: Any]]
             ?? quota?["windows"] as? [[String: Any]]
             ?? []
-        let lanes = rows.compactMap { row -> ObservedQuotaLane? in
+        struct Candidate {
+            let lane: ObservedQuotaLane
+            let durationMinutes: Int
+            let isExplicitPrimary: Bool
+            let stableKey: String
+        }
+        let candidates = rows.compactMap { row -> Candidate? in
             guard let number = row["remainingPercent"] as? NSNumber else {
                 return nil
             }
@@ -339,25 +345,61 @@ enum LocalCompanionOverviewProjection {
                 return nil
             }
             let limitId = row["limitId"] as? String ?? "unknown"
-            let duration = (row["durationMinutes"] as? NSNumber)?.intValue
+            let duration = CodexQuotaWindowDuration.integer(
+                from: row["durationMinutes"]
+            )
             guard Self.isSupportedCodexAllowance(
                 limitId: limitId,
                 durationMinutes: duration
             ), let duration else {
                 return nil
             }
-            return ObservedQuotaLane(
+            let resetAtText = row["resetAt"] as? String ?? ""
+            let observedAtText = row["observedAt"] as? String ?? ""
+            let lane = ObservedQuotaLane(
                 label: laneLabel(durationMinutes: duration),
                 remainingPercent: remaining,
-                resetAt: timestamp(row["resetAt"]),
+                resetAt: timestamp(resetAtText),
                 observedAt: timestamp(row["observedAt"]),
-                // The seven-day base Codex limit is the primary status item
-                // regardless of the provider's transient slot label.
-                isPrimary: duration == weeklyWindowDurationMinutes
+                // This marker is replaced after the bounded selection below;
+                // it denotes the selected status lane, not an inferred plan.
+                isPrimary: false
             )
-        }.sorted { left, right in
-            if left.isPrimary != right.isPrimary { return left.isPrimary }
-            return left.label.localizedStandardCompare(right.label) == .orderedAscending
+            let slot = row["slot"] as? String ?? ""
+            return Candidate(
+                lane: lane,
+                durationMinutes: duration,
+                // Preserve the current seven-day preference, while honoring a
+                // provider's explicit primary slot when equal durations tie.
+                isExplicitPrimary: duration == weeklyWindowDurationMinutes
+                    || slot == "primary"
+                    || (row["isPrimary"] as? Bool) == true,
+                stableKey: [
+                    slot,
+                    resetAtText,
+                    observedAtText,
+                    String(remaining),
+                ].joined(separator: "\u{0}")
+            )
+        }
+        let lanes = candidates.sorted { left, right in
+            if left.durationMinutes != right.durationMinutes {
+                return left.durationMinutes > right.durationMinutes
+            }
+            if left.isExplicitPrimary != right.isExplicitPrimary {
+                return left.isExplicitPrimary
+            }
+            return left.stableKey < right.stableKey
+        }.enumerated().map { index, candidate in
+            ObservedQuotaLane(
+                label: candidate.lane.label,
+                remainingPercent: candidate.lane.remainingPercent,
+                resetAt: candidate.lane.resetAt,
+                observedAt: candidate.lane.observedAt,
+                // The first valid, longest normal Codex lane is the compact
+                // status primary. Generic long windows remain visible here.
+                isPrimary: index == 0
+            )
         }
         // Never borrow the aggregate timestamp from a separate quota product:
         // freshness must be evidence from the normal Codex allowance itself.
@@ -406,7 +448,12 @@ enum LocalCompanionOverviewProjection {
         if durationMinutes == fiveHourWindowDurationMinutes {
             return TiboTattleLocalization.string(.menuBarFiveHourAllowance)
         }
-        return TiboTattleLocalization.string(.menuBarSevenDayAllowance)
+        if durationMinutes == weeklyWindowDurationMinutes {
+            return TiboTattleLocalization.string(.menuBarSevenDayAllowance)
+        }
+        return TiboTattleLocalization.quotaWindowLabel(
+            durationMinutes: durationMinutes
+        )
     }
 }
 

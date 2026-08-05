@@ -1,5 +1,37 @@
 import Foundation
 
+/// Provider-reported Codex windows are useful evidence only when their
+/// duration is a safe, bounded whole number. The bound is deliberately a
+/// duration bound, not a plan or calendar interpretation.
+enum CodexQuotaWindowDuration {
+    static let fiveHourMinutes = 300
+    static let sevenDayMinutes = 10_080
+    static let maximumMinutes = 525_600
+
+    static func isValid(_ value: Int) -> Bool {
+        (1...maximumMinutes).contains(value)
+    }
+
+    /// JSONSerialization bridges numbers through NSNumber. Do not use
+    /// `intValue` directly: it truncates fractional values before validation.
+    static func integer(from value: Any?) -> Int? {
+        guard let number = value as? NSNumber, !(value is Bool) else {
+            return nil
+        }
+        let doubleValue = number.doubleValue
+        guard doubleValue.isFinite,
+              doubleValue.rounded(.towardZero) == doubleValue,
+              doubleValue >= Double(Int.min),
+              doubleValue <= Double(Int.max)
+        else {
+            return nil
+        }
+        let integerValue = number.intValue
+        guard Double(integerValue) == doubleValue else { return nil }
+        return integerValue
+    }
+}
+
 /// The native localization boundary for TiboTattle.
 ///
 /// Translation choice and regional formatting are deliberately separate:
@@ -908,6 +940,58 @@ enum TiboTattleLocalization {
     static func format(_ key: Key, _ arguments: CVarArg...) -> String {
         String(format: string(key), locale: locale, arguments: arguments)
     }
+
+    /// Keep the familiar named windows, while describing every other valid
+    /// duration as provider-reported evidence. A duration never establishes a
+    /// billing cycle, subscription meaning, or calendar-month meaning.
+    static func quotaWindowLabel(durationMinutes: Int) -> String {
+        switch durationMinutes {
+        case CodexQuotaWindowDuration.fiveHourMinutes:
+            return string(.menuBarFiveHourAllowance)
+        case CodexQuotaWindowDuration.sevenDayMinutes:
+            return string(.menuBarSevenDayAllowance)
+        default:
+            break
+        }
+
+        guard CodexQuotaWindowDuration.isValid(durationMinutes) else {
+            return providerReportedWindowFallback
+        }
+
+        let (count, englishUnit, spanishUnit, chineseUnit):
+            (Int, String, String, String)
+        if durationMinutes % (24 * 60) == 0 {
+            let days = durationMinutes / (24 * 60)
+            count = days
+            englishUnit = days == 1 ? "day" : "days"
+            spanishUnit = days == 1 ? "día" : "días"
+            chineseUnit = "天"
+        } else if durationMinutes % 60 == 0 {
+            let hours = durationMinutes / 60
+            count = hours
+            englishUnit = hours == 1 ? "hour" : "hours"
+            spanishUnit = hours == 1 ? "hora" : "horas"
+            chineseUnit = "小时"
+        } else {
+            count = durationMinutes
+            englishUnit = durationMinutes == 1 ? "minute" : "minutes"
+            spanishUnit = durationMinutes == 1 ? "minuto" : "minutos"
+            chineseUnit = "分钟"
+        }
+        let number = decimalNumberFormatter(maximumFractionDigits: 0)
+            .string(from: NSNumber(value: count)) ?? String(count)
+        switch selectedNativeLocalization {
+        case "zh-Hans":
+            return "提供商报告的 \(number) \(chineseUnit) 窗口"
+        case "es":
+            return "Ventana de \(number) \(spanishUnit) indicada por el proveedor"
+        default:
+            return "Provider-reported \(number)-\(englishUnit) window"
+        }
+    }
+
+    private static let providerReportedWindowFallback =
+        "Provider-reported window"
 
     static func decimalNumberFormatter(
         maximumFractionDigits: Int = 2
