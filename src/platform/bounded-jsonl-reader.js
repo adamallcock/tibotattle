@@ -1,6 +1,8 @@
 import { createReadStream } from "node:fs";
 import { lstat } from "node:fs/promises";
 
+import { validAbortSignal } from "../valid-abort-signal.js";
+
 const DEFAULT_MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_HIGH_WATER_MARK = 256 * 1024;
 
@@ -16,13 +18,6 @@ function validatedLimitErrorFactory(createLimitError) {
     throw new TypeError("createLimitError must be a function");
   }
   return createLimitError;
-}
-
-function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
 }
 
 function throwIfAborted(signal) {

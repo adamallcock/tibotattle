@@ -7,6 +7,8 @@ const COMPONENT_KEYS = [
   "total_tokens",
 ];
 
+export { validAbortSignal } from "../../valid-abort-signal.js";
+
 export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"type":"session_meta"',
   '"type":"turn_context"',
@@ -25,13 +27,6 @@ export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"type":"apply_patch_call"',
   '"type":"local_shell_call"',
 ]);
-
-export function validAbortSignal(signal) {
-  return signal === null
-    || (typeof signal === "object"
-      && typeof signal.aborted === "boolean"
-      && typeof signal.addEventListener === "function");
-}
 
 export function throwIfAborted(signal) {
   if (!signal?.aborted) return;
