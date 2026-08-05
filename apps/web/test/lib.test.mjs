@@ -1192,6 +1192,48 @@ test("web quota normalization accepts bounded provider windows without monthly c
   assert.equal(selectPrimaryCodexQuotaWindow(tied).id, "generic-primary");
 });
 
+test("web timeline quota normalization accepts documented plan types and fails closed", () => {
+  const planTypes = [
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "business",
+    "enterprise",
+    "edu",
+    "team",
+    "unknown"
+  ];
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    timeline: {
+      quota: planTypes.map((planType) => ({
+        observedAt: "2026-08-03T12:00:00.000Z",
+        usedPercent: 10,
+        remainingPercent: 90,
+        planType
+      }))
+    }
+  });
+  assert.deepEqual(
+    result.timeline.quota.map((row) => row.planType),
+    planTypes
+  );
+
+  const invalid = normalizeDashboardPayload({
+    timeline: {
+      quota: [{
+        observedAt: "2026-08-03T12:00:00.000Z",
+        usedPercent: 10,
+        remainingPercent: 90,
+        planType: "pro-20x"
+      }]
+    }
+  });
+  assert.equal(invalid.timeline.quota[0].planType, "unknown");
+});
+
 test("web quota normalization rejects malformed and out-of-range durations", () => {
   for (const durationMinutes of [
     0,
