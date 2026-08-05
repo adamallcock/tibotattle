@@ -1,28 +1,22 @@
 import { ApiError, jsonResponse } from "./errors";
 import { sha256, sha256Hex } from "./crypto";
+import sparkleReleaseContract from "./sparkle-release-contract.json";
 
-export const SPARKLE_APPCAST_GUARD_SCHEMA =
-  "usage-monitor-sparkle-appcast-atomic-guard-v1";
-export const SPARKLE_APPCAST_GUARD_ROUTE =
-  "/api/v1/internal/release/appcast";
-export const SPARKLE_APPCAST_GUARD_CHANNEL = "stable";
-export const SPARKLE_APPCAST_GUARD_BUCKET = "tibotattle-updates";
-export const SPARKLE_APPCAST_GUARD_KEY = "appcast.xml";
-export const SPARKLE_APPCAST_GUARD_UPDATE_ORIGIN =
-  "https://updates.tibotattle.com";
-export const SPARKLE_APPCAST_GUARD_OBJECT_PREFIX = "releases";
-export const SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE =
-  "application/x-apple-diskimage";
-export const SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL =
-  "public, max-age=31536000, immutable";
+export const SPARKLE_APPCAST_GUARD_SCHEMA = sparkleReleaseContract.guardSchema;
+export const SPARKLE_APPCAST_GUARD_ROUTE = sparkleReleaseContract.guardRoute;
+export const SPARKLE_APPCAST_GUARD_CHANNEL = sparkleReleaseContract.channel;
+export const SPARKLE_APPCAST_GUARD_BUCKET = sparkleReleaseContract.r2Bucket;
+export const SPARKLE_APPCAST_GUARD_KEY = sparkleReleaseContract.appcastObjectKey;
+export const SPARKLE_APPCAST_GUARD_UPDATE_ORIGIN = sparkleReleaseContract.updateOrigin;
+export const SPARKLE_APPCAST_GUARD_OBJECT_PREFIX = sparkleReleaseContract.objectPrefix;
+export const SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE = sparkleReleaseContract.artifactContentType;
+export const SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL = sparkleReleaseContract.artifactCacheControl;
 export const SPARKLE_APPCAST_GUARD_PUBLIC_KEY_ENV =
   "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY";
 export const SPARKLE_APPCAST_GUARD_PUBLIC_KEY_SHA256_ENV =
   "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY_SHA256";
-export const SPARKLE_APPCAST_GUARD_CONTENT_TYPE =
-  "application/xml; charset=utf-8";
-export const SPARKLE_APPCAST_GUARD_CACHE_CONTROL =
-  "public, max-age=300, must-revalidate";
+export const SPARKLE_APPCAST_GUARD_CONTENT_TYPE = sparkleReleaseContract.appcastContentType;
+export const SPARKLE_APPCAST_GUARD_CACHE_CONTROL = sparkleReleaseContract.appcastCacheControl;
 export const SPARKLE_APPCAST_GUARD_MAX_XML_BYTES = 1024 * 1024;
 export const SPARKLE_APPCAST_GUARD_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 export const SPARKLE_APPCAST_GUARD_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -692,6 +686,10 @@ async function currentStateMatches(
     return { bytes: null, head, matches: head === null };
   }
   if (head === null || head.size !== expected.bytes
+      || head.httpMetadata?.contentType
+        !== SPARKLE_APPCAST_GUARD_CONTENT_TYPE
+      || head.httpMetadata?.cacheControl
+        !== SPARKLE_APPCAST_GUARD_CACHE_CONTROL
       || (expected.etag !== null
         && expected.etag !== head.etag
         && expected.etag !== head.httpEtag)) {

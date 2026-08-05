@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   DEPLOYMENT_ENDPOINTS,
@@ -6,8 +7,10 @@ import {
 } from "../config/deployment-endpoints.js";
 import {
   checkDeploymentEndpointConsumers,
+  validateWorkerSparkleReleaseContract,
   validateWorkerSparkleAppcastGuard,
   validateWorkerDeploymentEndpoints,
+  WORKER_SPARKLE_RELEASE_CONTRACT_PATH,
 } from "../apps/worker/scripts/check-deployment-endpoints.mjs";
 
 test("reviewed deployment endpoint manifest is internally coherent", () => {
@@ -49,6 +52,14 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
   assert.equal(checked.publicOrigin, DEPLOYMENT_ENDPOINTS.public.origin);
   assert.equal(checked.appcastURL, DEPLOYMENT_ENDPOINTS.sparkle.appcastURL);
   assert.equal(checked.r2Bucket, DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket);
+  assert.deepEqual(checked.workerSparkleReleaseContract, {
+    channel: "stable",
+    appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+    appcastObjectKey: "appcast.xml",
+    guardRoute: "/api/v1/internal/release/appcast",
+    objectPrefix: "releases",
+    r2Bucket: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket,
+  });
   assert.deepEqual(
     checked.worker.routeHosts,
     DEPLOYMENT_ENDPOINTS.public.routeHosts,
@@ -60,6 +71,18 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
     "staging:check",
     "staging:deploy",
   ]);
+});
+
+test("Worker Sparkle release contract rejects drift from canonical manifests", async () => {
+  const contract = JSON.parse(
+    await readFile(WORKER_SPARKLE_RELEASE_CONTRACT_PATH, "utf8"),
+  );
+  assert.doesNotThrow(() => validateWorkerSparkleReleaseContract(contract));
+  contract.objectPrefix = "different-prefix";
+  assert.throws(
+    () => validateWorkerSparkleReleaseContract(contract),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
 });
 
 test("enabled Sparkle guard requires reviewed bindings and the nonce schema", () => {

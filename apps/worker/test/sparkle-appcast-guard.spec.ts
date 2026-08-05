@@ -70,6 +70,8 @@ interface StoredObject {
 class FakeR2Bucket {
   private readonly objects = new Map<string, StoredObject>();
   putCalls = 0;
+  conditionalGetCalls = 0;
+  mutateBeforeConditionalGet = false;
   mutateBeforePut = false;
 
   get object(): StoredObject | null {
@@ -108,10 +110,32 @@ class FakeR2Bucket {
     return object === undefined ? null : this.metadata(key, object);
   }
 
-  async get(key: string): Promise<R2ObjectBody | null> {
+  async get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null> {
+    const condition = options?.onlyIf as R2Conditional | undefined;
+    if (condition?.etagMatches !== undefined) {
+      this.conditionalGetCalls += 1;
+      if (this.mutateBeforeConditionalGet && key === SPARKLE_APPCAST_GUARD_KEY) {
+        this.mutateBeforeConditionalGet = false;
+        this.objects.set(key, {
+          bytes: encoder.encode("concurrent appcast state"),
+          etag: "concurrent-appcast-etag",
+          contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
+          cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
+        });
+      }
+    }
     const object = this.objects.get(key);
     if (object === undefined) return null;
     const metadata = this.metadata(key, object);
+    if (condition?.etagMatches !== undefined
+        && metadata.httpEtag !== condition.etagMatches) {
+      return null;
+    }
+    if (condition?.etagDoesNotMatch !== undefined
+        && condition.etagDoesNotMatch === "*"
+        && metadata.httpEtag !== undefined) {
+      return null;
+    }
     return {
       ...metadata,
       arrayBuffer: async () => object.bytes.slice().buffer,
@@ -791,6 +815,79 @@ describe("Sparkle appcast atomic guard", () => {
       status: "conflict",
       reason: "current_state_conflict",
     });
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("requires the current appcast content type and cache policy", async () => {
+    const metadataCases = [
+      {
+        contentType: "text/plain",
+        cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
+        nonce: "current-content-type-nonce-01",
+      },
+      {
+        contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
+        cacheControl: "public, max-age=60",
+        nonce: "current-cache-control-nonce-01",
+      },
+    ];
+    for (const metadata of metadataCases) {
+      const bucket = new FakeR2Bucket();
+      const current = await seedAppcast(bucket, "1");
+      bucket.object = {
+        bytes: current,
+        etag: "current-metadata-mismatch-etag",
+        contentType: metadata.contentType,
+        cacheControl: metadata.cacheControl,
+      };
+      const response = await invoke(
+        await signedRequest(
+          await payload({
+            candidate: await appcastBytes("2"),
+            expectedCurrent: {
+              state: "present",
+              bytes: current.byteLength,
+              sha256: await sha256Hex(current),
+              etag: null,
+            },
+          }),
+          TOKEN,
+          Math.floor(NOW / 1000),
+          metadata.nonce,
+        ),
+        bindings(bucket),
+        NOW,
+      );
+      expect(response.status, metadata.nonce).toBe(409);
+      expect(bucket.putCalls, metadata.nonce).toBe(0);
+    }
+  });
+
+  it("rejects a TOCTOU current read when R2 conditional get observes a changed etag", async () => {
+    const bucket = new FakeR2Bucket();
+    const current = await seedAppcast(bucket, "1");
+    await installArtifact(bucket, "1");
+    await installArtifact(bucket, "2");
+    bucket.mutateBeforeConditionalGet = true;
+    const response = await invoke(
+      await signedRequest(await payload({
+        candidate: await appcastBytes("2"),
+        expectedCurrent: {
+          state: "present",
+          bytes: current.byteLength,
+          sha256: await sha256Hex(current),
+          etag: null,
+        },
+      })),
+      bindings(bucket),
+      NOW,
+    );
+    expect(response.status).toBe(409);
+    expect(await jsonResponse(response)).toMatchObject({
+      status: "conflict",
+      reason: "current_state_conflict",
+    });
+    expect(bucket.conditionalGetCalls).toBe(1);
     expect(bucket.putCalls).toBe(0);
   });
 
