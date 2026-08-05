@@ -1,6 +1,14 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
@@ -74,6 +82,104 @@ function verifySourceSnapshot({
     return localFailure("PRODUCTION_SOURCE_TREE_CHANGED");
   }
   return { ok: true, sourceCommit };
+}
+
+async function createImmutableSourceSnapshot({
+  workerDirectory,
+  sourceCommit,
+}) {
+  const repositoryRoot = dirname(workerDirectory);
+  const snapshotParent = await mkdtemp(
+    join(tmpdir(), "usage-monitor-production-source-"),
+  );
+  const snapshotRoot = join(snapshotParent, "repository");
+  let worktreeAdded = false;
+  try {
+    execFileSync(
+      "/usr/bin/git",
+      [
+        "-C",
+        repositoryRoot,
+        "worktree",
+        "add",
+        "--detach",
+        "--quiet",
+        snapshotRoot,
+        sourceCommit,
+      ],
+      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+    );
+    worktreeAdded = true;
+
+    const generatedSource = join(
+      repositoryRoot,
+      ".release-build",
+      "public-release-site",
+    );
+    const snapshotGeneratedSource = join(
+      snapshotRoot,
+      ".release-build",
+      "public-release-site",
+    );
+    await mkdir(dirname(snapshotGeneratedSource), {
+      recursive: true,
+      mode: 0o755,
+    });
+    await cp(generatedSource, snapshotGeneratedSource, {
+      recursive: true,
+      verbatimSymlinks: true,
+    });
+
+    // Wrangler is launched from the snapshot, but its installed dependency
+    // tree is not source input and remains the locally checked dependency set.
+    await symlink(
+      join(workerDirectory, "node_modules"),
+      join(snapshotRoot, "apps", "worker", "node_modules"),
+      "dir",
+    );
+
+    return {
+      repositoryRoot: snapshotRoot,
+      workerDirectory: join(snapshotRoot, "apps", "worker"),
+      async cleanup() {
+        execFileSync(
+          "/usr/bin/git",
+          [
+            "-C",
+            repositoryRoot,
+            "worktree",
+            "remove",
+            "--force",
+            snapshotRoot,
+          ],
+          { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+        );
+        await rm(snapshotParent, { recursive: true, force: false });
+      },
+    };
+  } catch (error) {
+    try {
+      if (worktreeAdded) {
+        execFileSync(
+          "/usr/bin/git",
+          [
+            "-C",
+            repositoryRoot,
+            "worktree",
+            "remove",
+            "--force",
+            snapshotRoot,
+          ],
+          { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+        );
+      }
+      await rm(snapshotParent, { recursive: true, force: false });
+    } catch (cleanupError) {
+      cleanupError.code = "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED";
+      throw cleanupError;
+    }
+    throw error;
+  }
 }
 
 async function productionReleasePreflight({ workerDirectory, wrangler, spawn }) {
@@ -150,8 +256,7 @@ export async function recheckProductionContainment({
   return { ok: true, code: null };
 }
 
-export async function runProductionDeployment({
-  confirmation,
+async function runProductionDeploymentFromSnapshot({
   receiptFile,
   now = Date.now(),
   wrangler,
@@ -161,24 +266,15 @@ export async function runProductionDeployment({
   checkEndpoints = checkDeploymentEndpointConsumers,
   stageAssets = stageProductionAssets,
   proofCheck = null,
-  expectedSourceCommit = null,
+  sourceCommit,
+  snapshotRepositoryRoot,
+  sourceCheckDirectory,
   sourceCommitCheck = checkedOutSourceCommit,
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionContainment,
 }) {
-  if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
-    return localFailure("CONFIRMATION_REQUIRED");
-  }
-  const initialSource = verifySourceSnapshot({
-    workerDirectory,
-    expectedSourceCommit,
-    sourceCommitCheck,
-    sourceTreeCleanCheck,
-  });
-  if (!initialSource.ok) return initialSource;
-  const sourceCommit = initialSource.sourceCommit;
   const containmentProof = proofCheck ?? await readDeploymentProof({
     filename: receiptFile,
     kind: "production",
@@ -224,7 +320,19 @@ export async function runProductionDeployment({
     return localFailure("DEPLOYMENT_ENDPOINTS_INVALID");
   }
   try {
-    await stageAssets();
+    await stageAssets({
+      repositoryRoot: snapshotRepositoryRoot,
+      sourceDirectory: join(
+        snapshotRepositoryRoot,
+        ".release-build",
+        "public-release-site",
+      ),
+      destinationDirectory: join(
+        snapshotRepositoryRoot,
+        ".release-build",
+        "worker-assets",
+      ),
+    });
   } catch {
     return localFailure("PRODUCTION_PUBLIC_ASSETS_INVALID");
   }
@@ -244,7 +352,7 @@ export async function runProductionDeployment({
   // yield to another checkout, so the earlier post-staging check is not the
   // deployment boundary.
   const deploySource = verifySourceSnapshot({
-    workerDirectory,
+    workerDirectory: sourceCheckDirectory,
     expectedSourceCommit: sourceCommit,
     sourceCommitCheck,
     sourceTreeCleanCheck,
@@ -266,7 +374,7 @@ export async function runProductionDeployment({
     return localFailure("PRODUCTION_DEPLOY_FAILED");
   }
   const postDeploySource = verifySourceSnapshot({
-    workerDirectory,
+    workerDirectory: sourceCheckDirectory,
     expectedSourceCommit: sourceCommit,
     sourceCommitCheck,
     sourceTreeCleanCheck,
@@ -286,6 +394,94 @@ export async function runProductionDeployment({
       workerRevision: containmentProof.proof.worker.revision,
     },
   };
+}
+
+export async function runProductionDeployment({
+  confirmation,
+  receiptFile,
+  now = Date.now(),
+  wrangler,
+  workerDirectory,
+  spawn = spawnSync,
+  checkWorkspacePackages = checkLocalWorkspacePackages,
+  checkEndpoints = checkDeploymentEndpointConsumers,
+  stageAssets = stageProductionAssets,
+  proofCheck = null,
+  expectedSourceCommit = null,
+  sourceCommitCheck = checkedOutSourceCommit,
+  sourceTreeCleanCheck = checkedOutSourceTreeClean,
+  createSourceSnapshot = createImmutableSourceSnapshot,
+  releasePreflight = productionReleasePreflight,
+  fetchImpl = globalThis.fetch,
+  healthRecheck = recheckProductionContainment,
+}) {
+  if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
+    return localFailure("CONFIRMATION_REQUIRED");
+  }
+  const initialSource = verifySourceSnapshot({
+    workerDirectory,
+    expectedSourceCommit,
+    sourceCommitCheck,
+    sourceTreeCleanCheck,
+  });
+  if (!initialSource.ok) return initialSource;
+  const sourceCommit = initialSource.sourceCommit;
+
+  let snapshot;
+  try {
+    snapshot = await createSourceSnapshot({ workerDirectory, sourceCommit });
+  } catch (error) {
+    return localFailure(
+      error?.code === "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED"
+        ? error.code
+        : "PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE",
+    );
+  }
+  if (!snapshot
+      || typeof snapshot.repositoryRoot !== "string"
+      || typeof snapshot.workerDirectory !== "string"
+      || typeof snapshot.cleanup !== "function") {
+    if (typeof snapshot?.cleanup === "function") {
+      try {
+        await snapshot.cleanup();
+      } catch {
+        return localFailure("PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED");
+      }
+    }
+    return localFailure("PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE");
+  }
+
+  let result;
+  try {
+    result = await runProductionDeploymentFromSnapshot({
+      receiptFile,
+      now,
+      wrangler,
+      workerDirectory: snapshot.workerDirectory,
+      snapshotRepositoryRoot: snapshot.repositoryRoot,
+      sourceCheckDirectory: workerDirectory,
+      sourceCommit,
+      spawn,
+      checkWorkspacePackages,
+      checkEndpoints,
+      stageAssets,
+      proofCheck,
+      sourceCommitCheck,
+      sourceTreeCleanCheck,
+      releasePreflight,
+      fetchImpl,
+      healthRecheck,
+    });
+  } catch {
+    result = localFailure("PRODUCTION_DEPLOYMENT_FAILED");
+  }
+
+  try {
+    await snapshot.cleanup();
+  } catch {
+    return localFailure("PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED");
+  }
+  return result;
 }
 
 function option(name) {

@@ -68,17 +68,21 @@ asset step or Wrangler call, then performs an immediate credential-free
 canonical `/api/health` recheck with redirect, JSON, security-header,
 disabled/contained, and no-external-authorization checks immediately before
 spawning Wrangler. The wrapper snapshots the checked-out source commit and
-requires a clean Git tree before local gates, verifies that same clean source
-snapshot immediately before Wrangler, and verifies it again after Wrangler
-returns. A revision or tree change fails closed; a deploy that already ran
-must be treated as an ambiguous local outcome and re-inspected by the owner,
-not reported as a successful release. Both the bounded owner proof and that
-live health recheck are required. The health recheck does not prove the Worker
-revision; that role remains with the owner-observed revision in the proof. The
-wrapper never treats checked-in configuration or staging evidence as
-production containment. It also runs the existing local-only
-`release:preflight` and refuses the production deploy unless that disposable
-migration/schema rehearsal returns a ready receipt.
+requires a clean Git tree before local gates, then creates a temporary
+detached worktree at that exact commit. It copies the already-generated public
+release input into the snapshot, runs the release preflight and asset staging
+there, and invokes Wrangler with the snapshot Worker directory as `cwd`.
+Snapshot creation or cleanup failure is fail-closed. The original checkout is
+still checked immediately before and after Wrangler; a revision or tree change
+fails closed, while any deploy that already ran must be treated as an
+ambiguous local outcome and re-inspected by the owner, not reported as a
+successful release. Both the bounded owner proof and that live health recheck
+are required. The health recheck does not prove the Worker revision; that role
+remains with the owner-observed revision in the proof. The wrapper never treats
+checked-in configuration or staging evidence as production containment. It
+also runs the existing local-only `release:preflight` and refuses the
+production deploy unless that disposable migration/schema rehearsal returns a
+ready receipt.
 
 ## Strict sequence
 

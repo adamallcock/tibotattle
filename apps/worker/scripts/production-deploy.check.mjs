@@ -100,6 +100,11 @@ function options(overrides = {}) {
     expectedSourceCommit: "c26823c",
     sourceCommitCheck: () => "c26823c",
     sourceTreeCleanCheck: () => true,
+    createSourceSnapshot: async () => ({
+      repositoryRoot: "/immutable/repository",
+      workerDirectory: "/immutable/repository/apps/worker",
+      cleanup: async () => {},
+    }),
     releasePreflight: async () => ({
       state: "ready",
       blockers: [],
@@ -133,6 +138,39 @@ test("production deployment requires scoped confirmation and a receipt before lo
   }));
   assert.deepEqual(absent, { ok: false, code: "DEPLOYMENT_PROOF_REQUIRED" });
   assert.deepEqual(calls, []);
+});
+
+test("production deployment fails closed when immutable source snapshot setup or cleanup fails", async () => {
+  let spawned = false;
+  const creationFailure = await runProductionDeployment(options({
+    createSourceSnapshot: async () => {
+      throw new Error("snapshot creation failed");
+    },
+    spawn: () => {
+      spawned = true;
+      return { status: 0 };
+    },
+  }));
+  assert.deepEqual(creationFailure, {
+    ok: false,
+    code: "PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE",
+  });
+  assert.equal(spawned, false);
+
+  const cleanupFailure = await runProductionDeployment(options({
+    proofCheck: { ok: false, code: "DEPLOYMENT_PROOF_REQUIRED" },
+    createSourceSnapshot: async () => ({
+      repositoryRoot: "/immutable/repository",
+      workerDirectory: "/immutable/repository/apps/worker",
+      cleanup: async () => {
+        throw new Error("snapshot cleanup failed");
+      },
+    }),
+  }));
+  assert.deepEqual(cleanupFailure, {
+    ok: false,
+    code: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
+  });
 });
 
 test("production deployment refuses invalid or stale proof before Wrangler", async () => {
@@ -338,15 +376,17 @@ test("production deployment stops if the checked-out source revision changes bef
 test("production deployment rejects source revision movement across the Wrangler boundary", async () => {
   let spawned = false;
   let sourceMoved = false;
+  const spawnCwds = [];
   const result = await runProductionDeployment(options({
     proofCheck: proofCheck(),
     sourceCommitCheck: () => sourceMoved ? "deadbee" : "c26823c",
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
     stageAssets: async () => {},
-    spawn: () => {
+    spawn: (_command, _args, spawnOptions) => {
       spawned = true;
       sourceMoved = true;
+      spawnCwds.push(spawnOptions.cwd);
       return { status: 0, stdout: "deployed", stderr: "" };
     },
   }));
@@ -355,6 +395,7 @@ test("production deployment rejects source revision movement across the Wrangler
     code: "PRODUCTION_SOURCE_REVISION_CHANGED",
   });
   assert.equal(spawned, true);
+  assert.deepEqual(spawnCwds, ["/immutable/repository/apps/worker"]);
 });
 
 test("production health recheck requires the canonical URL and security headers", async () => {
