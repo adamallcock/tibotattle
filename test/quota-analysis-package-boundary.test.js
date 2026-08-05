@@ -27,8 +27,10 @@ const PACE_EXPORTS = Object.freeze([
 ]);
 const WINDOW_EXPORTS = Object.freeze([
   "FIVE_HOUR_WINDOW_MINUTES",
+  "MAX_QUOTA_WINDOW_DURATION_MINUTES",
   "SEVEN_DAY_WINDOW_MINUTES",
   "SUPPORTED_QUOTA_WINDOW_DURATIONS",
+  "isValidQuotaWindowDuration",
   "isSupportedQuotaWindowDuration",
 ]);
 const SOURCE_HASHES = Object.freeze({
