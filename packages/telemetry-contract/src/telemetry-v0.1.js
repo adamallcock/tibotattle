@@ -1,6 +1,7 @@
 import {
   MAX_TELEMETRY_BROWSER_BYTES,
   TELEMETRY_MODEL_IDS,
+  TELEMETRY_PLAN_TYPES,
   TELEMETRY_SCHEMA_VERSION,
   TELEMETRY_TOOL_CLASSES,
 } from "./constants.js";
@@ -311,18 +312,7 @@ function validateQuota(value) {
       "openai_codex",
       "anthropic_claude_code",
     ])
-    || !isTelemetryMember(value.planType, [
-      "free",
-      "go",
-      "plus",
-      "pro",
-      "prolite",
-      "business",
-      "enterprise",
-      "edu",
-      "team",
-      "unknown",
-    ])
+    || !isTelemetryMember(value.planType, TELEMETRY_PLAN_TYPES)
     || !isTelemetryMember(value.planVariant, [
       "pro-20x",
       "pro-10x-promo",
@@ -384,18 +374,7 @@ function validateActivity(value) {
     && isTelemetryMember(value.state, ["start", "end", "pulse"])
     && typeof value.agenticPoolCoupling === "string"
     && POOL_COUPLINGS.has(value.agenticPoolCoupling)
-    && isTelemetryMember(value.planType, [
-      "free",
-      "go",
-      "plus",
-      "pro",
-      "prolite",
-      "business",
-      "enterprise",
-      "edu",
-      "team",
-      "unknown",
-    ])
+    && isTelemetryMember(value.planType, TELEMETRY_PLAN_TYPES)
     && isTelemetryMember(value.planVariant, [
       "pro-20x",
       "pro-10x-promo",

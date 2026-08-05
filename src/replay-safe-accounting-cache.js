@@ -27,6 +27,7 @@ import {
   analyzeQuotaPace,
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import {
   defaultLocalCollectorStatePath,
   prepareLocalCollectorState,
@@ -105,15 +106,7 @@ const SURFACES = new Set([
 ]);
 const AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
 const LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
-const QUOTA_PLANS = new Set([
-  "free",
-  "plus",
-  "pro",
-  "prolite",
-  "team",
-  "business",
-  "enterprise",
-]);
+const QUOTA_PLANS = new Set(TELEMETRY_PLAN_TYPES);
 const QUOTA_SLOTS = new Set(["primary", "secondary"]);
 
 function fixedError(code) {

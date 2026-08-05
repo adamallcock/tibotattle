@@ -632,7 +632,7 @@ test("retains a deterministic privacy-safe weekly quota point per track and 15-m
     weeklySnapshot({
       timestamp: "2026-07-27T11:52:00.000Z",
       usedPercent: 19,
-      planType: "plus",
+      planType: "go",
     }),
     weeklySnapshot({
       timestamp: "2026-07-27T11:30:00.000Z",
@@ -647,6 +647,7 @@ test("retains a deterministic privacy-safe weekly quota point per track and 15-m
       timestamp: "2026-07-27T12:00:00.000Z",
       usedPercent: 40,
       slot: "secondary",
+      planType: "edu",
     }),
     weeklySnapshot({
       timestamp: "2026-07-27T10:00:00.000Z",
@@ -709,7 +710,7 @@ test("retains a deterministic privacy-safe weekly quota point per track and 15-m
       observedAt: "2026-07-27T11:52:00.000Z",
       limitId: "codex",
       slot: "primary",
-      planType: "plus",
+      planType: "go",
       usedPercent: 19,
       remainingPercent: 81,
       durationMinutes: 10_080,
@@ -731,7 +732,7 @@ test("retains a deterministic privacy-safe weekly quota point per track and 15-m
       observedAt: "2026-07-27T12:00:00.000Z",
       limitId: "codex",
       slot: "secondary",
-      planType: "pro",
+      planType: "edu",
       usedPercent: 40,
       remainingPercent: 60,
       durationMinutes: 10_080,

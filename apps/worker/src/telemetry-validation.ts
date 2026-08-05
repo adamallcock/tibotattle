@@ -1,5 +1,6 @@
 import {
   TELEMETRY_MODEL_IDS,
+  TELEMETRY_PLAN_TYPES,
   isTelemetryContractError,
   parseTelemetryContribution,
   parseTelemetryEnvelope,
@@ -15,6 +16,7 @@ import { ApiError } from "./errors";
 
 export {
   TELEMETRY_MODEL_IDS,
+  TELEMETRY_PLAN_TYPES,
   type TelemetryActivityMarker,
   type TelemetryContribution,
   type TelemetryEnvelope,

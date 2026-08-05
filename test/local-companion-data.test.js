@@ -340,7 +340,7 @@ test("local companion relays bounded durations and selects a deterministic prima
           {
             limitId: "codex",
             slot: "secondary",
-            planType: "plus",
+            planType: "go",
             usedPercent: 20,
             windowDurationMins: 43_200,
             resetsAt: 1_784_980_800,
@@ -372,7 +372,7 @@ test("local companion relays bounded durations and selects a deterministic prima
           {
             limitId: "codex_bengalfox",
             slot: "primary",
-            planType: "enterprise",
+            planType: "edu",
             usedPercent: 60,
             windowDurationMins: 43_200,
             resetsAt: 1_784_980_800,
@@ -412,10 +412,10 @@ test("local companion relays bounded durations and selects a deterministic prima
       ]),
       [
         ["codex", "primary", 43_200, "unknown"],
-        ["codex", "secondary", 43_200, "plus"],
+        ["codex", "secondary", 43_200, "go"],
         ["codex", "primary", 300, "prolite"],
         ["codex", "secondary", 10_080, "pro"],
-        ["codex_bengalfox", "primary", 43_200, "enterprise"],
+        ["codex_bengalfox", "primary", 43_200, "edu"],
       ],
     );
     assert.equal(snapshot.overview.quotaWindows[0].durationMinutes, 43_200);

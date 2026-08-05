@@ -20,6 +20,7 @@ import {
 import {
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   readReplaySafeAccountingCache,
@@ -89,7 +90,7 @@ const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]
 const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
 const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
 const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox"]);
-const KNOWN_PLANS = new Set(["free", "plus", "pro", "prolite", "team", "business", "enterprise", "unknown"]);
+const KNOWN_PLANS = new Set(TELEMETRY_PLAN_TYPES);
 const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 const RECENT_TIMELINE_DAYS = 31;
 const RECENT_COLLECTOR_PERIOD_LABEL =

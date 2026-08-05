@@ -12,6 +12,20 @@ export const ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION:
   "telemetry-envelope-v0.2";
 export const MAX_TELEMETRY_BROWSER_BYTES: 1310720;
 
+export const TELEMETRY_PLAN_TYPES: readonly [
+  "free",
+  "go",
+  "plus",
+  "pro",
+  "prolite",
+  "business",
+  "enterprise",
+  "edu",
+  "team",
+  "unknown",
+];
+export type TelemetryPlanType = typeof TELEMETRY_PLAN_TYPES[number];
+
 export const TELEMETRY_TOOL_CLASSES: readonly [
   "webSearch",
   "fileSearch",
@@ -167,17 +181,7 @@ export interface TelemetryQuotaSnapshot {
   observedTime: string;
   receivedTime: string;
   provider: "openai_codex" | "anthropic_claude_code";
-  planType:
-    | "free"
-    | "go"
-    | "plus"
-    | "pro"
-    | "prolite"
-    | "business"
-    | "enterprise"
-    | "edu"
-    | "team"
-    | "unknown";
+  planType: TelemetryPlanType;
   planVariant:
     | "pro-20x"
     | "pro-10x-promo"
@@ -217,7 +221,7 @@ export interface TelemetryActivityMarker {
   surface: string;
   state: "start" | "end" | "pulse";
   agenticPoolCoupling: string;
-  planType: TelemetryQuotaSnapshot["planType"];
+  planType: TelemetryPlanType;
   planVariant: TelemetryQuotaSnapshot["planVariant"];
   markerId: string;
 }

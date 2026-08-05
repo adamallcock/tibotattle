@@ -7,7 +7,10 @@ import {
 } from "./constants";
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
 import { sha256Hex } from "./crypto";
-import { TELEMETRY_MODEL_IDS } from "./telemetry-validation";
+import {
+  TELEMETRY_MODEL_IDS,
+  TELEMETRY_PLAN_TYPES,
+} from "./telemetry-validation";
 import { parseStoredJson } from "./stored-record";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -36,10 +39,7 @@ const DEFAULT_COMMUNITY_SNAPSHOT_POLICY: CommunitySnapshotPolicy = Object.freeze
 // Allowance-relative aggregates must never blend plans, so every published
 // cell carries an explicit plan cohort; absent or mixed-in-window evidence
 // stays the explicit "unknown" cohort rather than being inferred.
-const PLAN_COHORT_TYPES = Object.freeze([
-  "free", "go", "plus", "pro", "prolite", "business", "enterprise", "edu", "team",
-  "unknown",
-]);
+const PLAN_COHORT_TYPES = new Set<string>(TELEMETRY_PLAN_TYPES);
 const PLAN_COHORT_VARIANTS = Object.freeze([
   "pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown",
 ]);
@@ -1049,7 +1049,7 @@ export async function readParticipantCommunityComparison(
     const modelId = Reflect.get(sourceCell, "modelId");
     const sourceMetrics = Reflect.get(sourceCell, "metrics");
     if (!["openai_codex", "anthropic_claude_code"].includes(String(provider))
-        || !PLAN_COHORT_TYPES.includes(String(planType))
+        || !PLAN_COHORT_TYPES.has(String(planType))
         || !PLAN_COHORT_VARIANTS.includes(String(planVariant))
         || ![...TELEMETRY_MODEL_IDS, "unknown"].includes(String(modelId))
         || typeof sourceMetrics !== "object"

@@ -24,6 +24,8 @@
  * responses, but never silently turn a failure into real-looking data.
  */
 
+import { TELEMETRY_PLAN_TYPES } from "./telemetry-shared.generated.js";
+
 export {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
@@ -1976,8 +1978,8 @@ function normalizeLocalTimeline(value = {}) {
       slot: ["primary", "secondary", "unknown"].includes(row?.slot)
         ? row.slot
         : "unknown",
-      planType: ["free", "go", "plus", "pro", "prolite", "business", "enterprise", "edu", "team", "unknown"]
-        .includes(row?.planType) ? row.planType : "unknown",
+      planType: TELEMETRY_PLAN_TYPES.includes(row?.planType)
+        ? row.planType : "unknown",
       accountAttribution: row?.accountAttribution === "attributed_pseudonymous"
         ? "attributed_pseudonymous"
         : "unattributed"

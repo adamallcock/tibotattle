@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeDashboardPayload } from "../public/data-client.js";
 
-test("web timeline normalization retains prolite and maps arbitrary plan strings to unknown", () => {
+test("web timeline normalization retains canonical plans and maps arbitrary strings to unknown", () => {
   const normalized = normalizeDashboardPayload({
     timeline: {
       quota: [
@@ -10,12 +10,24 @@ test("web timeline normalization retains prolite and maps arbitrary plan strings
           observedAt: "2026-08-03T12:00:00.000Z",
           usedPercent: 10,
           remainingPercent: 90,
-          planType: "prolite",
+          planType: "go",
         },
         {
           observedAt: "2026-08-03T12:15:00.000Z",
+          usedPercent: 15,
+          remainingPercent: 85,
+          planType: "edu",
+        },
+        {
+          observedAt: "2026-08-03T12:30:00.000Z",
           usedPercent: 20,
           remainingPercent: 80,
+          planType: "prolite",
+        },
+        {
+          observedAt: "2026-08-03T12:45:00.000Z",
+          usedPercent: 25,
+          remainingPercent: 75,
           planType: "arbitrary-plan-name",
         },
       ],
@@ -24,6 +36,6 @@ test("web timeline normalization retains prolite and maps arbitrary plan strings
 
   assert.deepEqual(
     normalized.timeline.quota.map((row) => row.planType),
-    ["prolite", "unknown"],
+    ["go", "edu", "prolite", "unknown"],
   );
 });
