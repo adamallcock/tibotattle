@@ -16,3 +16,7 @@ b4d20274f01cfc059a8dc75e48878405b63b3994:test/export-deletion-schema.test.js:gen
 # key material is committed. Verified separately that no .p8 has ever been
 # tracked in this repository's history.
 35a60278e6c067bb669bd99962320ac3abcf089d:apps/worker/test/identity-apple.spec.ts:private-key:123
+# Reviewed 2026-08-05: this is the Sparkle Ed25519 public verification key
+# embedded in preview clients. It cannot sign or publish updates; the private
+# signing key is never tracked.
+19a8da7fc64d0735eb6b86d03ab6b4f612ea840f:scripts/build-macos-app.js:generic-api-key:137
