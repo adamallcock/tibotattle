@@ -453,9 +453,17 @@ test("local companion excludes invalid quota windows before presentation", async
         windows: [
           validWindow,
           { ...validWindow, resetsAt: 0 },
+          { ...validWindow, resetsAt: Number.MAX_SAFE_INTEGER },
+          { ...validWindow, resetsAt: "not-a-date" },
+          { ...validWindow, windowDurationMins: -1 },
           { ...validWindow, windowDurationMins: 525_601 },
+          { ...validWindow, usedPercent: -1 },
           { ...validWindow, usedPercent: 101 },
         ],
+      })}\n${JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "not-a-date",
+        windows: [validWindow],
       })}\n`,
       { mode: 0o600 },
     );
