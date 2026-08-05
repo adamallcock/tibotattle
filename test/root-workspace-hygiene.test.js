@@ -118,3 +118,31 @@ test("dated reports and temporary artifacts at root are rejected with destinatio
     assert.match(report, /purpose-specific ignored directory/u);
   });
 });
+
+test("known transient build and test directories at root are rejected", async () => {
+  await withRootFixture(async (rootDirectory) => {
+    const transientDirectories = [".build", "build", "coverage", "dist"];
+    await Promise.all(
+      transientDirectories.map((path) => mkdir(join(rootDirectory, path))),
+    );
+    await writeFile(join(rootDirectory, "dist-notes.md"), "owner artifact\n", "utf8");
+
+    const result = await checkRootWorkspaceHygiene({
+      rootDirectory,
+      trackedRootEntries: [],
+    });
+    assert.equal(result.ok, false, formatRootWorkspaceHygieneReport(result));
+    assert.deepEqual(
+      result.issues.map((entry) => entry.path),
+      transientDirectories,
+    );
+    assert.equal(
+      result.issues.every((entry) => entry.code === "generated_root_artifact"),
+      true,
+    );
+    assert.match(
+      formatRootWorkspaceHygieneReport(result),
+      /known transient build\/test output/u,
+    );
+  });
+});

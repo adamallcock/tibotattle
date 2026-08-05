@@ -54,6 +54,12 @@ const VCS_METADATA_ENTRY = ".git";
 const KNOWN_ROOT_GENERATED_FILENAMES = new Set([
   "artifact.json",
 ]);
+const KNOWN_ROOT_BUILD_DIRECTORIES = new Set([
+  ".build",
+  "build",
+  "coverage",
+  "dist",
+]);
 const DATED_ROOT_ENTRY_RE = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:[._-]|$)/u;
 const GENERATED_MARKER_RE = /(?:^|[._-])(?:report|artifact|receipt|verification|evidence|snapshot)(?:[._-]|$)/iu;
 const GENERATED_OUTPUT_RE = /\.(?:html?|jsonl?|csv|md|pdf|png|svg|txt)(?:$|\.tmp(?:[._-].*)?$)/iu;
@@ -99,6 +105,9 @@ function classifyGeneratedRootEntry(name, kind = "file") {
   if (KNOWN_ROOT_GENERATED_FILENAMES.has(name)) {
     return "known legacy report/artifact";
   }
+  if (kind === "directory" && KNOWN_ROOT_BUILD_DIRECTORIES.has(name)) {
+    return "known transient build/test output";
+  }
 
   const isGeneratedMarker = GENERATED_MARKER_RE.test(name);
   if (!isGeneratedMarker) return null;
@@ -115,7 +124,7 @@ function generatedEntryDetail(name, classification) {
   return [
     "Detected " + classification + " at repository root: " + name + ".",
     "Keep private report output under .usage-monitor/legacy-reports/,",
-    "reviewed documents under docs/, and temporary build output under a",
+    "reviewed documents under docs/, and generated output under a",
     "purpose-specific ignored directory. Relocate the path, then rerun",
     "the root-workspace hygiene check.",
   ].join(" ");
