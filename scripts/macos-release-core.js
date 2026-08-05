@@ -1602,6 +1602,7 @@ function releaseEnvironment() {
 }
 
 export async function developerIDSignMacOSApp(appPath, {
+  channel = STABLE_RELEASE_CHANNEL,
   identity,
   commandRunner = runMacOSReleaseCommand,
 } = {}) {
@@ -1609,6 +1610,7 @@ export async function developerIDSignMacOSApp(appPath, {
     fail("Developer ID identity is required", "MACOS_DEVELOPER_ID_REQUIRED");
   }
   const inspected = await inspectMacOSApp(appPath, {
+    channel,
     requireExternalDistribution: true,
   });
   const secrets = [identity];
@@ -2482,6 +2484,7 @@ export async function releaseMacOSApp({
       );
     }
     await developerIDSignMacOSApp(stagedApp, {
+      channel: releaseChannel.name,
       identity: credentials.identity,
     });
     runMacOSReleaseCommand("/usr/bin/ditto", [
