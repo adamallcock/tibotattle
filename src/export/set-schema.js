@@ -1,4 +1,5 @@
 import Ajv from "ajv";
+import { safeValidationErrors } from "../safe-validation-errors.js";
 
 import compatibilitySchema from "../../schemas/telemetry-v0.1/compatibility.schema.json" with { type: "json" };
 import manifestSchemaV0_1 from "../../schemas/export-set-v0.1/manifest.schema.json" with { type: "json" };
@@ -30,14 +31,6 @@ export const EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2 =
   "6f46ca81c32f9ed14cfd47ec5a376961a07f1bf0d14a7adc7413def7c80da4c0";
 export const EXPORT_SET_MANIFEST_SCHEMA_SHA256 =
   EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2;
-
-function safeValidationErrors(errors = []) {
-  return errors.slice(0, 20).map((error) => ({
-    path: error.instancePath || "/",
-    keyword: error.keyword,
-    schemaPath: error.schemaPath,
-  }));
-}
 
 function invariant(path, name) {
   return { path, keyword: "invariant", schemaPath: `#/x-invariant/${name}` };
