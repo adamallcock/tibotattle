@@ -86,13 +86,31 @@ function compact(result) {
 test("one-, two-, and three-hour comparisons are duration-generic", () => {
   const fiveHour = build(rollingFixture(300));
   const sevenDay = build(rollingFixture(10_080));
+  const thirtyDay = build(rollingFixture(43_200));
   assert.equal(fiveHour.status, "conditional_comparison");
   assert.equal(sevenDay.status, "conditional_comparison");
+  assert.equal(thirtyDay.status, "conditional_comparison");
   assert.deepEqual(compact(sevenDay), compact(fiveHour));
+  assert.deepEqual(compact(thirtyDay), compact(fiveHour));
+  assert.equal(thirtyDay.windowDurationMinutes, 43_200);
   assert.deepEqual(
     [...new Set(fiveHour.comparisons.map((row) => row.smoothingHours))],
     [1, 2, 3],
   );
+});
+
+test("rolling comparisons reject invalid provider-reported durations", () => {
+  const evidence = buildResetEvidence(rollingFixture(43_200)).resets[0];
+  for (const duration of [0, 1.5, Number.MAX_SAFE_INTEGER + 1, 525_601]) {
+    assert.throws(
+      () => buildRollingQuotaComparisons({
+        resetEvidence: { ...evidence, windowDurationMinutes: duration },
+        capacityForecast: forecast(),
+      }),
+      /quota_rolling_invalid_input/u,
+      String(duration),
+    );
+  }
 });
 
 test("rolling endpoints are exact UTC hours inside one reset window", () => {

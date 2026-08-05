@@ -1,5 +1,5 @@
 import {
-  isSupportedQuotaWindowDuration,
+  isValidQuotaWindowDuration,
   SUPPORTED_QUOTA_WINDOW_DURATIONS,
 } from "./quota-windows.js";
 
@@ -101,7 +101,7 @@ function validateQuota(row) {
       || !validToken(row.planVariant)
       || !validToken(row.limitId)
       || !SLOT_VALUES.has(row.slot)
-      || !isSupportedQuotaWindowDuration(row.windowDurationMinutes)
+      || !isValidQuotaWindowDuration(row.windowDurationMinutes)
       || !validInstant(row.resetsAt)
       || !validInstant(row.observedAt)
       || !validInstant(row.receivedAt)

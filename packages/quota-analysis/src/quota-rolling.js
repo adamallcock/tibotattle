@@ -1,4 +1,4 @@
-import { isSupportedQuotaWindowDuration } from "./quota-windows.js";
+import { isValidQuotaWindowDuration } from "./quota-windows.js";
 
 const ROLLING_HOURS = Object.freeze([1, 2, 3]);
 const MAXIMUM_ENDPOINT_BRACKET_MS = 5 * 60_000;
@@ -64,7 +64,7 @@ function validateEvidence(value) {
       || !Array.isArray(value.refusalCodes)
       || !Array.isArray(value.boundaries)
       || !Array.isArray(value.slots)
-      || !isSupportedQuotaWindowDuration(value.windowDurationMinutes)
+      || !isValidQuotaWindowDuration(value.windowDurationMinutes)
       || !validInstant(value.resetsAt)
       || !validInstant(value.firstObservedAt)
       || !validInstant(value.lastObservedAt)

@@ -52,6 +52,46 @@ test("pace is order-independent and returns an ETA when it beats reset", () => {
   assert.equal(expected.hoursToReset, 120);
 });
 
+test("pace accepts a 43,200-minute provider-reported window with the same calculation", () => {
+  const weekly = run(
+    snapshot("2026-08-03T00:00:00.000Z", 80),
+    [
+      snapshot("2026-08-01T00:00:00.000Z", 60),
+      snapshot("2026-08-02T00:00:00.000Z", 70),
+    ],
+  );
+  const thirtyDay = run(
+    snapshot("2026-08-03T00:00:00.000Z", 80, {
+      windowDurationMinutes: 43_200,
+    }),
+    [
+      snapshot("2026-08-01T00:00:00.000Z", 60, {
+        windowDurationMinutes: 43_200,
+      }),
+      snapshot("2026-08-02T00:00:00.000Z", 70, {
+        windowDurationMinutes: 43_200,
+      }),
+    ],
+  );
+  assert.deepEqual(
+    { ...thirtyDay, windowDurationMinutes: 10_080 },
+    weekly,
+  );
+  assert.equal(thirtyDay.windowDurationMinutes, 43_200);
+});
+
+test("the generic pace validator still admits the five-hour window", () => {
+  const result = run(
+    snapshot("2026-08-03T00:00:00.000Z", 40, {
+      windowDurationMinutes: 300,
+    }),
+    [],
+  );
+  assert.equal(result.status, "insufficient_observations");
+  assert.equal(result.windowDurationMinutes, 300);
+  assert.equal(QUOTA_PACE_POLICY.windowDurationMinutes, 10_080);
+});
+
 test("zero movement is unavailable rather than an infinite ETA", () => {
   const result = run(
     snapshot("2026-08-03T00:00:00.000Z", 20),
@@ -176,7 +216,7 @@ test("a tiny positive slope that overflows its ETA fails closed", () => {
   assert.equal(result.hoursToExhaustion, null);
 });
 
-test("malformed and non-weekly inputs fail closed with a stable error", () => {
+test("malformed and invalid-duration inputs fail closed with a stable error", () => {
   assert.throws(
     () => analyzeQuotaPace({
       currentSnapshot: snapshot("2026-08-03T00:00:00.000Z", 40),
@@ -184,14 +224,17 @@ test("malformed and non-weekly inputs fail closed with a stable error", () => {
     }),
     /quota_pace_invalid_input/u,
   );
-  assert.throws(
-    () => analyzeQuotaPace({
-      currentSnapshot: {
-        ...snapshot("2026-08-03T00:00:00.000Z", 40),
-        windowDurationMinutes: 300,
-      },
-      observations: [],
-    }),
-    /quota_pace_invalid_input/u,
-  );
+  for (const duration of [0, 1.5, Number.MAX_SAFE_INTEGER + 1, 525_601]) {
+    assert.throws(
+      () => analyzeQuotaPace({
+        currentSnapshot: {
+          ...snapshot("2026-08-03T00:00:00.000Z", 40),
+          windowDurationMinutes: duration,
+        },
+        observations: [],
+      }),
+      /quota_pace_invalid_input/u,
+      String(duration),
+    );
+  }
 });

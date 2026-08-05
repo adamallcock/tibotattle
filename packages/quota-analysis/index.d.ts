@@ -1,13 +1,18 @@
 export type IsoInstant = string;
 export type OpaqueId = string;
-export type QuotaWindowDurationMinutes = 300 | 10080;
+// Runtime validation is required; this type intentionally does not encode the
+// provider-reported duration bounds.
+export type QuotaWindowDurationMinutes = number;
+export type SupportedQuotaWindowDurationMinutes = 300 | 10080;
 
 export const FIVE_HOUR_WINDOW_MINUTES: 300;
 export const SEVEN_DAY_WINDOW_MINUTES: 10080;
+export const MAX_QUOTA_WINDOW_DURATION_MINUTES: 525600;
 export const SUPPORTED_QUOTA_WINDOW_DURATIONS: readonly [300, 10080];
+export function isValidQuotaWindowDuration(value: number): boolean;
 export function isSupportedQuotaWindowDuration(
   value: number,
-): value is QuotaWindowDurationMinutes;
+): value is SupportedQuotaWindowDurationMinutes;
 export type QuotaSlot =
   | "primary"
   | "secondary"
@@ -311,7 +316,7 @@ export interface QuotaPaceSnapshotInput {
   planVariant: string;
   limitId: string;
   slot: string;
-  windowDurationMinutes: 10080;
+  windowDurationMinutes: QuotaWindowDurationMinutes;
   resetsAt: IsoInstant;
   observedAt: IsoInstant;
   receivedAt: IsoInstant;
@@ -337,7 +342,7 @@ export interface QuotaPaceForecast {
   planVariant: string;
   limitId: string;
   slot: string;
-  windowDurationMinutes: 10080;
+  windowDurationMinutes: QuotaWindowDurationMinutes;
   policyEpoch: string;
   resetsAt: IsoInstant;
   currentObservedAt: IsoInstant;

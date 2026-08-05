@@ -33,15 +33,15 @@ const WINDOW_EXPORTS = Object.freeze([
 ]);
 const SOURCE_HASHES = Object.freeze({
   "quota-calibration.js":
-    "d8246bd3a290084315b90f2b8b1c0910ccde861ca0e30292512ed5594426461b",
+    "7d19a7a0184c65378c3214b439c2cac647747457823d91d2999991847a552bbc",
   "quota-rolling.js":
-    "d86cbeaefc8c1a6d5836296f83d10af87dbb7ca8171dc5cc7522a21cfb005b1c",
+    "2afca11d40c61c463524cc8f4d267c128dbe427c72fb6c2e3ed68b056ca70977",
   "quota-tracks.js":
-    "7f1790e98ffcad931bf85d4d390741d5eb38b2df2bf2748fe5b2abfc98820708",
+    "85118466c257497a72c07c05cda6224c8d0a7e6a7b85aa69b4d950bf823d2170",
   "quota-windows.js":
-    "01b099579d811a30fd2e0543f89286fc9946e821a4db0dd3b07dd453f9c0381b",
+    "bb6ac48094e6bc7cd7dc44f587107b40b4a19799461814184e2b5f0cb6a08414",
   "quota-pace-forecast.js":
-    "dcc2c7317ef96433f02eb300ef0d33d6f5985e0c51923dfa5bc09f9ec92ae648",
+    "89bff15bf12f4b94c578c04a6c7b05f3c7656eda3ae9b935a0ed9683ef08e8b6",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {

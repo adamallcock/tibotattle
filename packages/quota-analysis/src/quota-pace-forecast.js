@@ -1,4 +1,7 @@
-import { SEVEN_DAY_WINDOW_MINUTES } from "./quota-windows.js";
+import {
+  isValidQuotaWindowDuration,
+  SEVEN_DAY_WINDOW_MINUTES,
+} from "./quota-windows.js";
 
 const SCHEMA_VERSION = "quota-pace-forecast-v0.1";
 const METHOD = "median_adjacent_quota_slope";
@@ -77,7 +80,7 @@ function validateSnapshot(value) {
       || !validNonEmptyText(value.planVariant)
       || !validNonEmptyText(value.limitId)
       || !validNonEmptyText(value.slot)
-      || value.windowDurationMinutes !== SEVEN_DAY_WINDOW_MINUTES
+      || !isValidQuotaWindowDuration(value.windowDurationMinutes)
       || !validInstant(value.resetsAt)
       || !validInstant(value.observedAt)
       || !validInstant(value.receivedAt)
@@ -216,7 +219,7 @@ function finalResult(current, points, refusalCodes) {
 }
 
 /**
- * Estimate weekly allowance exhaustion from provider quota percentage movement.
+ * Estimate quota-window allowance exhaustion from provider quota percentage movement.
  * This is intentionally a deterministic pace/ETA calculation, not a probability.
  */
 export function analyzeQuotaPace(input) {

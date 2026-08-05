@@ -118,11 +118,27 @@ test("five-hour and seven-day reset calibration have duration-generic behavior",
   ];
   const fiveHour = analyze({ duration: 300, capacities }).tracks[0];
   const sevenDay = analyze({ duration: 10_080, capacities }).tracks[0];
+  const thirtyDay = analyze({ duration: 43_200, capacities }).tracks[0];
   assert.deepEqual(compactTrack(sevenDay), compactTrack(fiveHour));
+  assert.deepEqual(compactTrack(thirtyDay), compactTrack(fiveHour));
   assert.equal(fiveHour.windowDurationMinutes, 300);
   assert.equal(sevenDay.windowDurationMinutes, 10_080);
+  assert.equal(thirtyDay.windowDurationMinutes, 43_200);
   assert.equal(fiveHour.resets[0].training.boundaryCount, 7);
   assert.equal(fiveHour.resets[0].holdout.boundaryCount, 3);
+});
+
+test("calibration rejects invalid provider-reported durations", () => {
+  const evidence = buildResetEvidence(
+    calibrationInput({ duration: 43_200 }),
+  ).resets[0];
+  for (const duration of [0, 1.5, Number.MAX_SAFE_INTEGER + 1, 525_601]) {
+    assert.throws(
+      () => fitResetCapacity({ ...evidence, windowDurationMinutes: duration }),
+      /quota_calibration_invalid_input/u,
+      String(duration),
+    );
+  }
 });
 
 test("forecasts use two to three completed prior resets and never future resets", () => {
