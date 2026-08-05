@@ -45,6 +45,20 @@ const VALID_APPCAST = `<?xml version="1.0" encoding="utf-8"?>
     </item>
   </channel>
 </rss>`;
+const OFFICIAL_SPARKLE_APPCAST = `<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications require re-signing.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <item>
+      <sparkle:version>${BUNDLE_VERSION}</sparkle:version>
+      <enclosure url="${ARTIFACT_URL}" length="${ARTIFACT_BYTES.length}"
+        type="application/octet-stream" sparkle:edSignature="${SPARKLE_SIGNATURE}"></enclosure>
+    </item>
+  </channel>
+</rss><!-- sparkle-signatures:
+edSignature: ${SPARKLE_SIGNATURE}
+length: 1
+-->`;
 const STABLE_APPCAST = VALID_APPCAST.replace(ARTIFACT_URL, STABLE_ARTIFACT_URL);
 const PLIST = Object.freeze({
   SUFeedURL: APPCAST_URL,
@@ -438,6 +452,74 @@ test("invalid enclosure metadata is rejected before any remote artifact bytes ar
   assert.equal(result.appcast.reason, "invalid_xml_or_sparkle_structure");
   assert.equal(result.artifact.checked, false);
   assert.equal(calls.some(({ url }) => url.endsWith("bad.dmg")), false);
+});
+
+test("official Sparkle item-level versions select the exact full-DMG enclosure", async () => {
+  let artifactReads = 0;
+  const result = await verifyMacOSPreviewRemote(strictOptions({
+    fetchImpl: async (url) => {
+      if (url === APPCAST_URL) {
+        return response(200, OFFICIAL_SPARKLE_APPCAST, url);
+      }
+      if (url === ARTIFACT_URL) artifactReads += 1;
+      return healthyOrFeedResponse(url);
+    },
+  }));
+  assert.equal(artifactReads, 1);
+  assert.equal(result.appcast.status, "valid");
+  assert.equal(result.appcast.enclosures[0].version, BUNDLE_VERSION);
+  assert.equal(result.artifact.status, "valid");
+  assert.equal(result.remotePublicationReadback.passed, true);
+});
+
+test("conflicting item and enclosure Sparkle versions fail closed", async () => {
+  const conflictingAppcast = OFFICIAL_SPARKLE_APPCAST.replace(
+    `sparkle:edSignature="${SPARKLE_SIGNATURE}"`,
+    `sparkle:version="999" sparkle:edSignature="${SPARKLE_SIGNATURE}"`,
+  );
+  let artifactReads = 0;
+  const result = await verifyMacOSPreviewRemote(strictOptions({
+    fetchImpl: async (url) => {
+      if (url === APPCAST_URL) return response(200, conflictingAppcast, url);
+      if (url === ARTIFACT_URL) artifactReads += 1;
+      return healthyOrFeedResponse(url);
+    },
+  }));
+  assert.equal(artifactReads, 0);
+  assert.equal(result.appcast.status, "invalid");
+  assert.equal(result.appcast.reason, "invalid_xml_or_sparkle_structure");
+});
+
+test("malformed official Sparkle item-level versions fail closed", async () => {
+  const validVersion = `<sparkle:version>${BUNDLE_VERSION}</sparkle:version>`;
+  const malformedAppcasts = [
+    OFFICIAL_SPARKLE_APPCAST.replace(
+      validVersion,
+      "<sparkle:version> </sparkle:version>",
+    ),
+    OFFICIAL_SPARKLE_APPCAST.replace(
+      validVersion,
+      `<sparkle:version><value>${BUNDLE_VERSION}</value></sparkle:version>`,
+    ),
+    OFFICIAL_SPARKLE_APPCAST.replace(
+      validVersion,
+      `${validVersion}\n      ${validVersion}`,
+    ),
+  ];
+
+  for (const appcast of malformedAppcasts) {
+    let artifactReads = 0;
+    const result = await verifyMacOSPreviewRemote(strictOptions({
+      fetchImpl: async (url) => {
+        if (url === APPCAST_URL) return response(200, appcast, url);
+        if (url === ARTIFACT_URL) artifactReads += 1;
+        return healthyOrFeedResponse(url);
+      },
+    }));
+    assert.equal(artifactReads, 0);
+    assert.equal(result.appcast.status, "invalid");
+    assert.equal(result.appcast.reason, "invalid_xml_or_sparkle_structure");
+  }
 });
 
 test("mismatched explicit artifact URL is a blocking feed proof failure", async () => {

@@ -1662,6 +1662,24 @@ function validateAppcastStructure(value, {
   let enclosureCount = 0;
   const enclosures = [];
   for (const item of items) {
+    const itemVersionElements = childElements(item, "sparkle:version");
+    if (itemVersionElements.length > 1) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.APPCAST_INVALID,
+        "Appcast update item contains multiple Sparkle versions",
+      );
+    }
+    const itemVersionElement = itemVersionElements[0] ?? null;
+    const itemVersion = itemVersionElement === null
+      ? null
+      : itemVersionElement.text.trim();
+    if (itemVersionElement !== null
+        && (itemVersionElement.children.length > 0 || itemVersion === "")) {
+      throw remoteError(
+        MACOS_PREVIEW_REMOTE_CODES.APPCAST_INVALID,
+        "Appcast update item has an invalid Sparkle version",
+      );
+    }
     const itemEnclosures = childElements(item, "enclosure");
     if (itemEnclosures.length === 0) {
       throw remoteError(
@@ -1672,7 +1690,8 @@ function validateAppcastStructure(value, {
     for (const enclosure of itemEnclosures) {
       const attributes = enclosure.attributes;
       const artifactURL = attributes.get("url");
-      const version = attributes.get("sparkle:version");
+      const enclosureVersion = attributes.get("sparkle:version") ?? null;
+      const version = enclosureVersion ?? itemVersion;
       const length = attributes.get("length");
       const lengthNumber = Number(length);
       const contentAddress = contentAddressedArtifact(artifactURL, {
@@ -1685,6 +1704,9 @@ function validateAppcastStructure(value, {
           || lengthNumber > MAX_ARTIFACT_BYTES
           || typeof version !== "string"
           || version.length === 0
+          || (enclosureVersion !== null
+            && itemVersion !== null
+            && enclosureVersion !== itemVersion)
           || !validSparkleSignatureShape(attributes.get("sparkle:edSignature"))
           || enclosure.children.length > 0
           || enclosure.text.trim() !== ""
@@ -2634,6 +2656,7 @@ const APPCAST_DIAGNOSTICS = Object.freeze({
   single_full_dmg_required:
     "the update gate requires exactly one full-DMG enclosure and rejects deltas",
   timeout: "the bounded HTTPS request timed out",
+  verified: "the streamed bytes and SHA-256 matched the feed enclosure",
 });
 
 export function redactMacOSPreviewDiagnostic(value) {
