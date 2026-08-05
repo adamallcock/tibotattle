@@ -820,7 +820,7 @@ async function currentStateMatches(
         && expected.etag !== head.httpEtag)) {
     return { bytes: null, head, matches: false };
   }
-  const object = await bucket.get(key, { onlyIf: { etagMatches: head.httpEtag } });
+  const object = await bucket.get(key, { onlyIf: { etagMatches: head.etag } });
   if (object === null || !("arrayBuffer" in object)) {
     return { bytes: null, head, matches: false };
   }
@@ -909,7 +909,7 @@ async function verifyCandidateArtifact(
   try {
     object = await bucket.get(
       enclosure.objectKey,
-      { onlyIf: { etagMatches: head.httpEtag } },
+      { onlyIf: { etagMatches: head.etag } },
     );
   } catch {
     storageUnavailable("artifact_get");
@@ -1046,7 +1046,7 @@ export async function handleSparkleAppcastGuardForContract(
 
   const onlyIf = current.head === null
     ? { etagDoesNotMatch: "*" }
-    : { etagMatches: current.head.httpEtag };
+    : { etagMatches: current.head.etag };
   let committed: R2Object | null;
   try {
     committed = await configuration.bucket.put(

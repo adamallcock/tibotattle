@@ -128,7 +128,7 @@ class FakeR2Bucket {
     if (object === undefined) return null;
     const metadata = this.metadata(key, object);
     if (condition?.etagMatches !== undefined
-        && metadata.httpEtag !== condition.etagMatches) {
+        && metadata.etag !== condition.etagMatches) {
       return null;
     }
     if (condition?.etagDoesNotMatch !== undefined
@@ -172,7 +172,7 @@ class FakeR2Bucket {
       ? null
       : this.metadata(_, currentObject);
     if (condition.etagMatches !== undefined
-        && (current === null || current.httpEtag !== condition.etagMatches)) {
+        && (current === null || current.etag !== condition.etagMatches)) {
       return null;
     }
     if (condition.etagDoesNotMatch !== undefined
