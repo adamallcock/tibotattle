@@ -82,6 +82,7 @@ import {
   createMacOSSignedReplacementContract,
   assertStableSparkleKeyContinuity,
   developerIDSignMacOSApp,
+  developerIDSignMacOSDMG,
   inspectMacOSApp,
   packageMacOSDMG,
   prepareMacOSReleaseCandidate,
@@ -3200,6 +3201,25 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       && arguments_.includes("--verify"));
     assert.equal(verify.arguments_.includes("--deep"), true);
     assert.equal(verify.arguments_.includes("--strict"), true);
+
+    const dmg = join(temporaryRoot, "TiboTattle.dmg");
+    await writeFile(dmg, "signed-DMG-fixture");
+    const dmgCalls = [];
+    assert.deepEqual(
+      await developerIDSignMacOSDMG(dmg, {
+        identity,
+        commandRunner(command, arguments_, options) {
+          dmgCalls.push({ arguments_, command, options });
+          return { stderr: "", stdout: "" };
+        },
+      }),
+      { path: dmg },
+    );
+    assert.deepEqual(dmgCalls.map(({ arguments_ }) => arguments_), [
+      ["--force", "--timestamp", "--sign", identity, dmg],
+      ["--verify", "--strict", "--verbose=2", dmg],
+    ]);
+    assert.deepEqual(dmgCalls[0].options.secrets, [identity]);
 
     const acceptedCalls = [];
     assert.deepEqual(

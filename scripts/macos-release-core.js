@@ -1712,6 +1712,43 @@ export async function developerIDSignMacOSApp(appPath, {
   return inspected;
 }
 
+export async function developerIDSignMacOSDMG(path, {
+  identity,
+  commandRunner = runMacOSReleaseCommand,
+} = {}) {
+  if (typeof identity !== "string" || identity.length === 0) {
+    fail("Developer ID identity is required", "MACOS_DEVELOPER_ID_REQUIRED");
+  }
+  const selected = resolve(path);
+  if (!selected.endsWith(".dmg") || basename(selected).startsWith(".")) {
+    fail("Developer ID signing requires a visible DMG file");
+  }
+  await regularPath(selected);
+  const secrets = [identity];
+  commandRunner("/usr/bin/codesign", [
+    "--force",
+    "--timestamp",
+    "--sign",
+    identity,
+    selected,
+  ], {
+    env: releaseEnvironment(),
+    failureMessage: "Developer ID DMG signing failed",
+    secrets,
+  });
+  commandRunner("/usr/bin/codesign", [
+    "--verify",
+    "--strict",
+    "--verbose=2",
+    selected,
+  ], {
+    env: releaseEnvironment(),
+    failureMessage: "Developer ID DMG signature verification failed",
+    secrets,
+  });
+  return Object.freeze({ path: selected });
+}
+
 async function inspectMacOSDMGInput(
   appPath,
   distribution,
@@ -2513,6 +2550,9 @@ export async function releaseMacOSApp({
       channel: releaseChannel.name,
     });
     await chmod(stagedDMG, 0o644);
+    await developerIDSignMacOSDMG(stagedDMG, {
+      identity: credentials.identity,
+    });
     submitToAppleNotary(stagedDMG, {
       notaryProfile: credentials.notaryProfile,
     });
