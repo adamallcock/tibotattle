@@ -8,23 +8,24 @@ status and boundary at the top of each document. These paths describe local
 checks and owner-only gates; they do not establish that remote deployment,
 signing, artifacts, an appcast, or updater infrastructure is operational.
 
-## Current operational entry points
+## Current authoritative operational entry points
 
 | Path | Use |
 |---|---|
 | [`runbooks/2026-08-04-owner-release-execution.md`](./runbooks/2026-08-04-owner-release-execution.md) | Owner-run release sequence; fail-closed until each external gate is observed |
-| [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary for the installed ad-hoc preview, future signed `internal-dogfood`, and stable release |
-| [`plans/2026-08-05-provider-reported-quota-windows.md`](./plans/2026-08-05-provider-reported-quota-windows.md) | Provider-reported generic quota-window selection and plan-evidence boundary |
+| [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary for the installed ad-hoc preview, future signed `internal-dogfood`, and stable; not a release claim |
+| [`plans/2026-08-05-provider-reported-quota-windows.md`](./plans/2026-08-05-provider-reported-quota-windows.md) | Current provider-reported quota-window implementation and plan-evidence boundary; not release authorization |
 | [`runbooks/2026-08-04-staging-release-verification.md`](./runbooks/2026-08-04-staging-release-verification.md) | Credential-free production-containment observer and live-proof boundary |
 | [`runbooks/2026-08-04-disabled-staging-readiness-boundary.md`](./runbooks/2026-08-04-disabled-staging-readiness-boundary.md) | Static and owner-authorized staging checks; staging remains unprovisioned until verified |
 | [`runbooks/2026-08-04-internal-update-rehearsal.md`](./runbooks/2026-08-04-internal-update-rehearsal.md) | Disposable-profile N→N+1 rehearsal; not signing or feed-publication proof |
 | [`runbooks/2026-08-02-r2-sparkle-update-publisher.md`](./runbooks/2026-08-02-r2-sparkle-update-publisher.md) | Local Sparkle/R2 publication contract; remote feed readiness still requires owner evidence |
 | [`runbooks/2026-08-04-open-enrollment-controlled-release.md`](./runbooks/2026-08-04-open-enrollment-controlled-release.md) | Account-gated contribution release path; external authorization remains an owner action |
 
-The remaining folders are records, evidence, or supporting context rather than
-a single current operating procedure. Treat receipts, audits, reports, and QA
-artifacts as point-in-time evidence; use their status and dates before relying
-on them for a fresh state claim.
+Documents not listed above remain records, evidence, or supporting context
+rather than current operational authority. Treat receipts, audits, reports,
+and QA artifacts as point-in-time evidence; dated plans and decisions preserve
+historical intent unless explicitly linked above. Read each document's status
+and date before relying on it for a fresh state claim.
 
 ## Records and supporting material
 
