@@ -296,7 +296,7 @@ test("preparation will not mutate unprovisioned infrastructure", async () => {
   assert.equal(calls.some((args) => args.includes("execute")), false);
 });
 
-test("preparation applies both migrations, contains collection, and rechecks", async () => {
+test("preparation contains and rechecks an initialized pending target before both migrations", async () => {
   const config = provisionedConfig();
   const calls = [];
   let migrationsApplied = false;
@@ -341,9 +341,13 @@ test("preparation applies both migrations, contains collection, and rechecks", a
     if (joined.includes("FROM d1_migrations")) {
       if (!migrationsApplied) {
         return {
-          status: 1,
-          stdout: "",
-          stderr: "Error: no such table: d1_migrations",
+          status: 0,
+          stdout: JSON.stringify([{
+            results: EXPECTED_STAGING_MIGRATIONS[args[2]]
+              .slice(0, -1)
+              .map((name) => ({ name })),
+          }]),
+          stderr: "",
         };
       }
       return {
@@ -552,6 +556,15 @@ test("preparation applies both migrations, contains collection, and rechecks", a
   assert.equal(containmentIndex >= 0, true);
   assert.equal(firstMigrationIndex >= 0, true);
   assert.equal(containmentIndex < firstMigrationIndex, true);
+  const containmentRecheckIndex = calls.findIndex((args, index) =>
+    index > containmentIndex
+    && args[0] === "d1"
+    && args[1] === "execute"
+    && args.includes("--json")
+    && args.some((value) =>
+      typeof value === "string" && value.includes("FROM collection_controls")));
+  assert.equal(containmentRecheckIndex > containmentIndex, true);
+  assert.equal(containmentRecheckIndex < firstMigrationIndex, true);
 });
 
 test("preparation contains an existing active target before any migration", async () => {
@@ -619,6 +632,34 @@ test("preparation stops at containment failure or crash before migration", async
   }
 });
 
+test("a failed second migration stream remains fail-closed after containment", async () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const result = await prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    localPreflight: passingLocalPreflight,
+    spawn: successSpawn(config, calls, {
+      initialCollectionState: "operational",
+      migrationFailureAt: 2,
+    }),
+  });
+  assert.deepEqual(result, { ok: false, code: "STAGING_MIGRATION_FAILED" });
+  const containmentIndex = calls.findIndex((args) =>
+    args.some((value) =>
+      typeof value === "string" && value.includes("UPDATE collection_controls")));
+  const migrationIndices = calls.flatMap((args, index) =>
+    args[0] === "d1" && args[1] === "migrations" && args[2] === "apply"
+      ? [index]
+      : []);
+  assert.equal(containmentIndex >= 0, true);
+  assert.equal(migrationIndices.length, 2);
+  assert.equal(containmentIndex < migrationIndices[0], true);
+  assert.equal(calls.length - 1, migrationIndices[1]);
+});
+
 test("fresh bootstrap stops before any migration without an operational claim", async () => {
   const config = provisionedConfig();
   const calls = [];
@@ -642,6 +683,46 @@ test("fresh bootstrap stops before any migration without an operational claim", 
   );
   assert.equal(result.receipt, undefined);
   assert.equal(result.collectionAuthorized, undefined);
+});
+
+test("uninitialized migration ledgers cannot bypass the fresh bootstrap gate with a precreated control row", async () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const baseSpawn = successSpawn(config, calls, {
+    initialCollectionState: "operational",
+  });
+  const result = await prepareDisabledStaging({
+    config,
+    confirmation: PREPARE_CONFIRMATION,
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    localPreflight: passingLocalPreflight,
+    spawn: (command, args, options) => {
+      if (args.join(" ").includes("FROM d1_migrations")) {
+        calls.push(args);
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "Error: no such table: d1_migrations",
+        };
+      }
+      return baseSpawn(command, args, options);
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "STAGING_FRESH_BOOTSTRAP_REQUIRES_OWNER_CONTAINMENT",
+    blockers: ["OWNER_CONTAINMENT_REQUIRED_BEFORE_MIGRATIONS"],
+  });
+  assert.equal(
+    calls.some((args) => args[0] === "d1" && args[1] === "migrations"),
+    false,
+  );
+  assert.equal(
+    calls.some((args) => args.some((value) =>
+      typeof value === "string" && value.includes("UPDATE collection_controls"))),
+    false,
+  );
 });
 
 test("preparation does not contain until applied migrations are proven exact", async () => {

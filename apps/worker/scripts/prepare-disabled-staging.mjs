@@ -50,8 +50,7 @@ function run(spawn, wrangler, workerDirectory, args) {
 
 function isFreshBootstrapTarget(readiness) {
   const migrationProof = readiness?.migrationProof;
-  return readiness?.collectionControlState === "fresh"
-    && Array.isArray(migrationProof)
+  return Array.isArray(migrationProof)
     && migrationProof.length === REQUIRED_D1_BINDINGS.length
     && migrationProof.every((state, index) =>
       state?.binding === REQUIRED_D1_BINDINGS[index].binding

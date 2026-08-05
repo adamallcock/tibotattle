@@ -23,8 +23,8 @@ npm --prefix apps/worker run staging:check
 The staging gate requires the exact staging Worker/database/bucket names,
 `workers_dev: true`, no staging routes or `PUBLIC_ORIGIN`, disabled enrollment
 and ingestion variables, contained collection controls, and the exact local
-migration inventory. The primary D1 inventory is 0001–0028, including the
-reviewed identity-protection tail:
+migration inventory. The primary D1 inventory is 0001–0029, including the
+reviewed identity-protection tail and Sparkle appcast guard:
 
 - `0023_community_aggregate_safety.sql`
 - `0024_apple_signin_nonce_binding.sql`
@@ -32,6 +32,7 @@ reviewed identity-protection tail:
 - `0026_signin_start_admission.sql`
 - `0027_identity_reenrollment_cooldown_guard.sql`
 - `0028_identity_link_secret_configuration.sql`
+- `0029_sparkle_appcast_guard_nonces.sql`
 
 The deletion ledger inventory is `0001_deletion_tombstones.sql` and
 `0002_identity_reenrollment_cooldown.sql`. Any missing, extra, malformed,
@@ -94,12 +95,13 @@ npm --prefix apps/worker run staging:prepare -- \
 Preparation refuses absent, stale, malformed, open, or mismatched compatible
 Worker proof before migration. It also refuses unsafe configuration, missing
 resources, remote migration inventory drift, and unverified migration
-application. On a fresh D1, the
-preparation refuses to run any migration command when both D1 migration ledgers
-are uninitialized and `collection_controls` is absent. Wrangler applies the
-whole pending migration chain, and migration `0009_collection_controls.sql`
-creates an operational row, so containment cannot safely be established after
-that command. The failure is
+application. On a fresh or undeployed target, preparation refuses to run any
+migration or containment command whenever both D1 migration ledgers are
+uninitialized, even if a stray pre-created `collection_controls` row exists.
+The ledger state is the bootstrap boundary: a row alone is not owner containment
+proof. Wrangler applies the whole pending migration chain, and migration
+`0009_collection_controls.sql` creates an operational row, so containment
+cannot safely be established after that command. The failure is
 `STAGING_FRESH_BOOTSTRAP_REQUIRES_OWNER_CONTAINMENT`, with no operation receipt
 or operational claim.
 
