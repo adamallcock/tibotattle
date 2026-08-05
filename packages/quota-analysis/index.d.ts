@@ -3,7 +3,7 @@ export type OpaqueId = string;
 // Runtime validation is required; this type intentionally does not encode the
 // provider-reported duration bounds.
 export type QuotaWindowDurationMinutes = number;
-export type SupportedQuotaWindowDurationMinutes = 300 | 10080;
+export type SupportedQuotaWindowDurationMinutes = QuotaWindowDurationMinutes;
 
 export const FIVE_HOUR_WINDOW_MINUTES: 300;
 export const SEVEN_DAY_WINDOW_MINUTES: 10080;
