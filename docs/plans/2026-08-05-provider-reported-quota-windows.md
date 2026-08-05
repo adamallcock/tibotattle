@@ -8,9 +8,9 @@ status: implementation
 # Outcome
 
 TiboTattle must display every valid normal Codex quota window that the provider
-reports, including a longer primary window used on plans that do not have a
-seven-day limit. It must do this without inventing calendar-month semantics,
-subscription multipliers, or billing entitlements.
+reports, including a longer primary window when no seven-day window is present.
+It must do this without inventing calendar-month semantics, subscription
+multipliers, or billing entitlements.
 
 This work changes local analysis and client presentation only. It does not
 deploy a Worker, alter D1 or R2, read raw user logs for development, change
@@ -26,9 +26,10 @@ plan evidence: they remain `unknown` and cannot establish an exact plan,
 multiplier, entitlement, or absolute allowance. A valid limit and duration may
 still select the provider-reported window independently of that label.
 
-An exact plan variant such as `pro-5x` or `pro-20x` is separate dated evidence;
-it is not derived from `plan_type`. The provider label does not prove a
-multiplier, current entitlement, or absolute allowance.
+`plan_type` is not an exact plan variant. A `plan_variant` such as `pro-5x` or
+`pro-20x` is separate dated evidence; it is not derived from `plan_type`. A
+provider label alone does not prove a multiplier, current entitlement, or
+absolute allowance.
 
 - `300` minutes is named **Five-hour allowance**.
 - `10,080` minutes is named **Seven-day allowance**.
@@ -107,6 +108,9 @@ calibration for that duration.
   rejected fail-closed.
 - Existing five-hour and seven-day calculations, labels, and weekly forecasts
   remain unchanged.
+- A `plan_type: pro` observation does not create `plan_variant: pro-5x` or
+  `plan_variant: pro-20x`; the exact variant remains unknown without separate
+  dated evidence.
 - A non-weekly current window cannot render a seven-day capacity/range/chart.
 - A long valid provider window reaches normal analysis and presentation but is
   not currently eligible for the native notification evidence gate, which

@@ -14,27 +14,29 @@ make a release claim from configuration alone.
 
 ## Current decision boundary
 
-The current internal dogfood artifact is an ad-hoc `preview_distribution`
+The currently installed local preview is an ad-hoc `preview_distribution`
 bundle. It can be installed through the guarded route at
 `/Applications/TiboTattle.app` and can talk to the deployed central service.
 That proves an installed service-connected preview, not a distributable or
-updatable release. It is not Developer-ID signed or notarized, and therefore
-cannot prove Sparkle updating.
+updatable release. It is not the `internal-dogfood` channel or the `stable`
+channel, and it is not Developer-ID signed or notarized; therefore it cannot
+prove Sparkle updating.
 
-The named `internal-dogfood` release channel is a separate future lane. Its
-policy in [`config/release-channels.js`](../../config/release-channels.js) is
-currently fully unconfigured and must not inherit stable endpoints. The
-stable update URL, `https://updates.tibotattle.com/appcast.xml`, currently
-returns HTTP 404. Treat that as **not published**; do not describe an updater
-as working.
+The named `internal-dogfood` release channel is a separate future signed lane,
+not the installed preview. Its policy in
+[`config/release-channels.js`](../../config/release-channels.js) is currently
+fully unconfigured and must not inherit stable endpoints. The stable release
+lane is separate again; its update URL, `https://updates.tibotattle.com/appcast.xml`,
+currently returns HTTP 404. Treat that as **not published**; do not describe
+an updater as working.
 
-| Lane | What it can prove now | What it cannot prove |
+| Lane | Current meaning | Release boundary |
 | --- | --- | --- |
-| `preview_distribution` internal smoke | Guarded `/Applications` install, launch, and interaction with the deployed central service | Developer ID, notarization, Sparkle signature acceptance, or N→N+1 updating |
-| `internal-dogfood` release candidate | Only after its distinct source-bound policy and signed artifacts exist | Nothing while the policy is unconfigured |
-| `stable` release candidate | Only after the stable feed, artifact, and owner release gates pass | Anything while the current appcast is 404 or client acceptance is unobserved |
+| Installed `preview_distribution` | Ad-hoc local preview for guarded install, launch, and central-service smoke | Not evidence of Developer ID, notarization, Sparkle signature acceptance, or N→N+1 updating |
+| `internal-dogfood` | Future signed release channel; its policy is currently unconfigured | Must have its own source-bound policy and signed artifacts; it cannot inherit stable endpoints |
+| `stable` | Stable release channel | Requires the stable feed, artifact, owner release gates, and observed client acceptance; the current appcast is 404 |
 
-## 1. Run the current internal preview smoke
+## 1. Run the installed ad-hoc preview smoke
 
 Build and validate the preview through the repository commands, then use the
 guarded installer. Do not copy an app into `/Applications` by hand:
@@ -45,9 +47,9 @@ npm run product:macos:preview:install
 ```
 
 Launch `/Applications/TiboTattle.app` and perform the intended local smoke
-against the deployed central service. For a local-only bundle check, or for a
-bounded live service/feed observation, invoke the verifier with the preview
-channel explicitly:
+against the deployed central service. This remains preview evidence only. For
+a local-only bundle check, or for a bounded live service/feed observation,
+invoke the verifier with the preview channel explicitly:
 
 ```bash
 node scripts/verify-macos-preview-remote.js \
@@ -129,14 +131,17 @@ contains the owner receipt and recovery rules; the minimum sequence is:
 
 ## Release-ready versus stop
 
-Mark a channel release-ready only when all of these are observed for the same
-source-bound candidate: distinct channel policy, Developer ID signature,
-notarization/stapling, valid signed feed and artifact, successful manual
-`N`-to-`N+1` download/install/relaunch/version check, and the remaining owner
-deployment gates.
+Mark a named release channel (`internal-dogfood` or `stable`) release-ready
+only when all of these are observed for the same source-bound candidate:
+distinct channel policy, Developer ID signature, notarization/stapling, valid
+signed feed and artifact, successful manual `N`-to-`N+1`
+download/install/relaunch/version check, and the remaining owner deployment
+gates.
 
-Stop at internal dogfood when the goal is only product smoke. Stop release
-qualification for an ad-hoc bundle, an unconfigured channel, a feed 404/410,
-missing or mismatched artifact, missing signing/notarization, endpoint drift,
-or an unobserved installed-client upgrade. Do not advance by inference from a
-healthy central service or by copying stable configuration into dogfood.
+Stop at the installed preview when the goal is only product smoke. Never use
+`preview_distribution` as evidence for `internal-dogfood` or `stable` release
+readiness. Stop release qualification for an unconfigured channel, a feed
+404/410, missing or mismatched artifact, missing signing/notarization,
+endpoint drift, or an unobserved installed-client upgrade. Do not advance by
+inference from a healthy central service or by copying stable configuration
+into dogfood.
