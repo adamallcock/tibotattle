@@ -849,6 +849,25 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /settingsAboutAutomaticUpdatesDetailLabel\?\.stringValue\s*=\s*automaticUpdatesSettingsSummary\(\)/u,
   );
+  assert.doesNotMatch(
+    source,
+    /settingsAutomaticUpdatesDetailLabel\?\.stringValue\s*=\s*updater\.automaticUpdatesPreferenceSummary/u,
+  );
+  assert.match(source, /private func settingsGroup\(/u);
+  assert.match(source, /let group = NSBox\(\)/u);
+  assert.match(source, /symbolName: "globe"/u);
+  assert.match(source, /symbolName: "folder"/u);
+  assert.match(source, /symbolName: "clock"/u);
+  assert.match(source, /settingsOpenNotifications/u);
+  assert.match(source, /x-apple\.systempreferences:com\.apple\.Notifications-Settings\.extension/u);
+  assert.match(source, /case \.unverified:[\s\S]*?settingsCheckForUpdates/u);
+  assert.match(source, /nativeEvidenceState = \.readFailed/u);
+  assert.match(source, /nativeEvidenceState = \.lifecycleUnavailable/u);
+  assert.doesNotMatch(source, /settingsNotificationsReset\)/u);
+  assert.doesNotMatch(source, /toggleQuotaNotificationReset/u);
+  assert.match(localizationSource, /Refresh runs in this app while it is open/iu);
+  assert.match(localizationSource, /Closing the window does not quit TiboTattle/iu);
+  assert.match(localizationSource, /quitting stops the current refresh/iu);
   assert.match(source, /NSApp\.applicationIconImage/u);
   assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
   assert.doesNotMatch(source, /showLifecycleHelp/u);
@@ -860,6 +879,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(localizationSource, /Large histories may need several passes/iu);
   assert.match(localizationSource, /Nothing leaves this Mac/iu);
   assert.match(source, /private final class NativeDashboardChrome/u);
+  const destinationSource = source.match(
+    /private enum NativeDashboardDestination:[\s\S]*?\n\}\n\n\/\/\/ `NSSplitView`/u,
+  )?.[0] ?? "";
+  assert.ok(destinationSource, "native dashboard destination enum is present");
+  assert.doesNotMatch(destinationSource, /case data\b/u);
+  assert.deepEqual(
+    [...destinationSource.matchAll(/^\s*case (\w+)$/gmu)].map((match) => match[1]),
+    ["overview", "weekly", "trends", "method", "community"],
+  );
   assert.match(source, /private final class NativeDashboardReportPane/u);
   assert.match(source, /NSSplitView\(\)/u);
   assert.match(
@@ -878,7 +906,11 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /newWindow\.toolbar = makeDashboardToolbar\(\)/u);
   assert.match(source, /newWindow\.toolbarStyle = \.unified/u);
   assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
-  assert.match(source, /nativeRefreshIntervalSeconds = 300/u);
+  assert.match(source, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
+  assert.match(source, /static let allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);
+  assert.match(source, /NativeRefreshIntervalPreference\.seconds/u);
+  assert.match(source, /UserDefaults\.standard\.set\(value, forKey: defaultsKey\)/u);
+  assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
   assert.match(source, /LocalCompanionEvidenceReader/u);
   assert.match(source, /firstRunLoginItemDisclosure/u);
@@ -1144,8 +1176,12 @@ test("unified toolbar preserves the rich loopback report and single authority", 
     /private func makeDashboardToolbar\(\) -> NSToolbar \{([\s\S]*?)\n    \/\/\/ The dashboard runs inside a native AppKit shell/u,
   )?.[1];
   assert.ok(toolbar, "dashboard toolbar implementation should be present");
-  assert.match(toolbar, /toolbarStatusIdentifier/u);
-  assert.match(toolbar, /toolbarRefreshIdentifier/u);
+  assert.match(toolbar, /toolbarStatusRefreshIdentifier/u);
+  assert.doesNotMatch(toolbar, /toolbarStatusIdentifier|toolbarRefreshIdentifier/u);
+  assert.match(toolbar, /let button = NSButton\(/u);
+  assert.match(toolbar, /action: #selector\(refreshDashboardFromToolbar\)/u);
+  assert.match(toolbar, /nativeToolbarEvidenceTitle/u);
+  assert.match(source, /relativeAge\(observedAt\)/u);
   assert.match(toolbar, /toolbarShareIdentifier/u);
   assert.match(toolbar, /toolbarSettingsIdentifier/u);
   assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);

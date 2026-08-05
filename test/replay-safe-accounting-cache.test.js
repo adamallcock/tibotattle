@@ -50,6 +50,68 @@ test("production replay-cache APIs reject the retired JSON cacheFile option", as
   );
 });
 
+test("known unpriced Spark usage remains diagnosable without inventing a price", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:00:00.000Z",
+        model: "gpt-5.3-codex-spark",
+        components: { input_uncached_tokens: 71_829 },
+      }),
+      usageEvent({
+        timestamp: "2026-07-27T11:05:00.000Z",
+        model: "private-unknown-model",
+        components: { input_uncached_tokens: 10 },
+      }),
+    ]),
+    now: () => NOW,
+  });
+
+  const rows = cache.periods.find((period) => period.id === "7d").byModel;
+  const spark = rows.find((row) => row.model === "gpt-5.3-codex-spark");
+  const unknown = rows.find((row) => row.model === "unknown");
+  assert.equal(spark.pricingStatus, "known_unpriced");
+  assert.equal(spark.apiPriceEquivalentUsd, 0);
+  assert.equal(spark.pricingCoverage.unpricedEvents, 1);
+  assert.equal(unknown.pricingStatus, "unrecognized");
+});
+
+test("period coverage separates current priced activity from older pre-registry history", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:00:00.000Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000 },
+      }),
+      usageEvent({
+        timestamp: "2026-07-19T11:00:00.000Z",
+        model: "gpt-5.6-terra",
+        components: { input_uncached_tokens: 1_000 },
+      }),
+    ]),
+    now: () => NOW,
+  });
+
+  const recent = period(cache, "7d");
+  const longer = period(cache, "30d");
+  assert.deepEqual(recent.pricingCoverage, {
+    fullyPricedEvents: 1,
+    partiallyPricedEvents: 0,
+    unpricedEvents: 0,
+  });
+  assert.equal(longer.pricingCoverage.fullyPricedEvents, 1);
+  assert.equal(longer.pricingCoverage.unpricedEvents, 1);
+  assert.equal(
+    100 * recent.pricingCoverage.fullyPricedEvents / recent.events,
+    100,
+  );
+  assert.equal(
+    100 * longer.pricingCoverage.fullyPricedEvents / longer.events,
+    50,
+  );
+});
+
 const NOW = Date.parse("2026-07-27T12:00:00.000Z");
 const COMPONENT_KEYS = [
   "input_uncached_tokens",

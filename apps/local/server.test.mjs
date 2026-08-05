@@ -29,6 +29,9 @@ import {
   claimContributionDevicePairing,
 } from "../../src/contribution-device-client.js";
 import {
+  LocalCompanionClient,
+} from "../web/public/data-client.js";
+import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "../../src/platform/export-identity-keychain.js";
 import {
@@ -2646,25 +2649,66 @@ test("stale contribution-device credentials return fixed recovery guidance witho
     };
     const pairingCode =
       "um_pair_00000000-0000-4000-8000-000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = await fetch(
-        `${base}/api/local/contribution/device-pair`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ pairingCode }),
+    const client = new LocalCompanionClient({
+      fetchImpl: (url, options = {}) => fetch(`${base}${url}`, {
+        ...options,
+        headers: {
+          ...options.headers,
+          Origin: base,
         },
-      );
-      assert.equal(response.status, 409);
-      const payload = await response.json();
-      assert.deepEqual(payload, {
-        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-        error: {
-          code: "contribution_device_recovery_required",
-        },
-      });
-      assert.equal(JSON.stringify(payload).includes(privateCanary), false);
-    }
+      }),
+    });
+    await assert.rejects(
+      client.pairContributionDevice(pairingCode),
+      (error) => error?.status === 409
+        && error?.code === "contribution_device_recovery_required",
+    );
+
+    // The browser client preserves only the fixed recovery code. The raw
+    // route still carries the same minimal payload, with no credential value
+    // or provider failure detail.
+    const response = await fetch(
+      `${base}/api/local/contribution/device-pair`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ pairingCode }),
+      },
+    );
+    assert.equal(response.status, 409);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: {
+        code: "contribution_device_recovery_required",
+      },
+    });
+    assert.equal(JSON.stringify(payload).includes(privateCanary), false);
+
+    // Integrated rendered-state contract: this exact client error reaches the
+    // narrow recovery renderer, which offers reset and never generic fallback.
+    const appSource = await readFile(
+      new URL("../web/public/app.js", import.meta.url),
+      "utf8",
+    );
+    const htmlSource = await readFile(
+      new URL("../web/public/index.html", import.meta.url),
+      "utf8",
+    );
+    const connectSource = appSource.match(
+      /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}\n/u,
+    )?.[1] ?? "";
+    const recoverySource = appSource.match(
+      /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
+    )?.[1] ?? "";
+    assert.match(htmlSource, /id="community-connect-status"/u);
+    assert.match(htmlSource, /id="data"[^>]*data-dashboard-page="community"/u);
+    assert.doesNotMatch(htmlSource, /data-nav="data"/u);
+    assert.match(connectSource, /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u);
+    assert.match(recoverySource, /id = "reset-device-credential"/u);
+    assert.match(recoverySource, /leftover contribution-device credential/u);
+    assert.doesNotMatch(recoverySource, /showFailure\(/u);
+    assert.doesNotMatch(appSource, /DO-NOT-LEAK-stale-device-credential-conflict/u);
     assert.equal(reads, 2);
     assert.equal(creates, 0);
     assert.equal(deletes, 0);
@@ -3223,6 +3267,53 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
     assert.equal(recordedText.includes("/Users/private"), false);
     assert.equal(recordedText.includes("arbitrary_journey"), false);
     assert.equal(recordedText.split("\n").filter(Boolean).length, 2);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("failed diagnostic note writes return a fixed error without leaking recorder details", async () => {
+  const files = await fixture();
+  let calls = 0;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    diagnosticsLogFile: join(files.stateRoot, "diagnostics-v0.1.log"),
+    diagnosticNoteRecorder: async () => {
+      calls += 1;
+      throw new Error("private diagnostic recorder detail");
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(`${base}/api/local/diagnostics/note`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: JSON.stringify({
+        reference: "TT-7QF3K2",
+        surface: "contribution_connect",
+        code: "contribution_device_recovery_required",
+        requestId: "",
+      }),
+    });
+    assert.equal(response.status, 500);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "diagnostic_note_not_recorded" },
+    });
+    assert.equal(JSON.stringify(payload).includes("private diagnostic recorder detail"), false);
+    assert.equal(calls, 1);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

@@ -107,6 +107,21 @@ export function formatReportingTime(value, options = {}) {
   return formatLocal(value, options);
 }
 
+export function formatTimeZoneLabel() {
+  try {
+    const parts = new Intl.DateTimeFormat(formattingLocale, {
+      ...USER_TIME_ZONE_OPTION,
+      timeZoneName: "longGeneric",
+    }).formatToParts(new Date());
+    const label = parts.find((part) => part.type === "timeZoneName")?.value;
+    return typeof label === "string" && label.trim() !== ""
+      ? label
+      : translate("format.localTime", {}, messageLocale);
+  } catch {
+    return translate("format.localTime", {}, messageLocale);
+  }
+}
+
 export function formatAge(value) {
   const seconds = finite(value);
   if (seconds === null) {

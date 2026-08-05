@@ -908,12 +908,30 @@ h2 {
 .chart-empty { display: grid; place-items: center; min-height: 310px; color: var(--muted); background: rgba(236, 230, 218, .35); border: 1px dashed var(--line); border-radius: .4rem; text-align: center; }
 .chart-empty p { margin: 0; font-size: .78rem; }
 .chart-empty.small { min-height: 215px; font-size: .8rem; }
-.chart-shell { width: 100%; overflow-x: auto; }
+.chart-shell {
+  width: 100%;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
 .chart-shell.interactive-chart { cursor: grab; touch-action: pan-y; outline: none; }
 .chart-shell.interactive-chart:focus-visible { outline: 3px solid rgba(38, 107, 91, .36); outline-offset: 4px; }
 .chart-shell.interactive-chart.is-panning { cursor: grabbing; user-select: none; }
-.chart-shell svg { display: block; width: 100%; min-width: 720px; height: 350px; overflow: visible; }
-.chart-shell.compact-chart svg { min-width: 440px; height: 235px; }
+.chart-shell svg { display: block; width: 100%; min-width: 0; height: 350px; overflow: visible; }
+.chart-shell.compact-chart svg { min-width: 0; height: 285px; }
+.chart-hover-tooltip { pointer-events: none; }
+.chart-hover-tooltip rect {
+  fill: rgba(23, 33, 30, .96);
+  stroke: rgba(255, 255, 255, .18);
+  stroke-width: 1;
+}
+.chart-tooltip-heading,
+.chart-tooltip-detail {
+  fill: var(--white);
+  font-family: var(--sans);
+}
+.chart-tooltip-heading { font-size: 11px; font-weight: 750; }
+.chart-tooltip-detail { font-size: 10px; opacity: .82; }
 .chart-grid { stroke: rgba(23, 33, 30, .1); stroke-width: 1; }
 .chart-axis-label { fill: var(--muted); font-family: var(--sans); font-size: 10px; }
 .chart-line-observed { fill: none; stroke: var(--green); stroke-width: 2.7; vector-effect: non-scaling-stroke; }
@@ -968,7 +986,7 @@ h2 {
 .chart-summary-grid strong { font-size: .84rem; }
 .timeline-confidence { margin: 13px 0 0; padding: 10px 12px; color: var(--muted); border-inline-start: 3px solid var(--line); background: rgba(236, 230, 218, .34); font-size: .75rem; }
 .timeline-confidence.low { color: #784d25; border-inline-start-color: var(--rust); background: var(--rust-soft); }
-.lower-charts { margin-top: 18px; }
+.lower-charts { grid-template-columns: 1fr; margin-top: 18px; }
 .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: .35rem; }
 table { width: 100%; border-collapse: collapse; font-size: .73rem; }
 th { color: var(--muted); background: rgba(236, 230, 218, .45); font-size: .62rem; letter-spacing: .05em; text-transform: uppercase; }
@@ -1141,7 +1159,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .lead-chart-panel .weekly-history-chart svg { height: clamp(320px, 38vw, 460px); }
 
 .accounting-disclosure { margin-top: -12px; }
-.accounting-summary { grid-template-columns: repeat(4, 1fr); }
+.accounting-summary { grid-template-columns: repeat(3, 1fr); }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }
 .accounting-component-grid { margin-bottom: 18px; }
@@ -2759,4 +2777,7 @@ footer {
   .community-site .snapshot-quality-grid {
     grid-template-columns: 1fr;
   }
+}
+[data-dashboard-page].dashboard-page-inactive {
+  display: none !important;
 }

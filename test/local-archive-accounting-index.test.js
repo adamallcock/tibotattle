@@ -24,32 +24,71 @@ import {
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const PRIVATE_CANARY = "PRIVATE_ARCHIVE_INDEX_CANARY";
 
-async function fixture() {
+async function fixture({ includeSecondSource = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-archive-index-"));
   const codexHome = join(root, "codex-home");
   const sessions = join(codexHome, "sessions");
   await mkdir(sessions, { recursive: true });
   await mkdir(join(codexHome, "archived_sessions"), { recursive: true });
-  const rollout = join(sessions, "rollout-2026-07-24T12-00-00-archive.jsonl");
-  await writeFile(rollout, `${[
-    JSON.stringify({
-      timestamp: "2026-07-24T12:00:00.000Z",
-      type: "session_meta",
-      payload: { id: PRIVATE_CANARY },
-    }),
-    JSON.stringify({
-      timestamp: "2026-07-24T12:00:00.010Z",
-      type: "turn_context",
-      payload: { model: "gpt-5.6-sol" },
-    }),
-  ].join("\n")}\n`);
-  await appendFile(rollout, `${JSON.stringify({
-    timestamp: "2026-07-24T12:01:00.000Z",
-    type: "synthetic_padding",
-    payload: { padding: "x".repeat(1024) },
-  })}\n`.repeat(8_000));
+  const writeRollout = async (path, sessionId, timestamp) => {
+    await writeFile(path, `${[
+      JSON.stringify({
+        timestamp,
+        type: "session_meta",
+        payload: { id: sessionId },
+      }),
+      JSON.stringify({
+        timestamp: `${timestamp.slice(0, -5)}.010Z`,
+        type: "turn_context",
+        payload: { model: "gpt-5.6-sol" },
+      }),
+    ].join("\n")}\n`);
+    await appendFile(path, `${JSON.stringify({
+      timestamp,
+      type: "synthetic_padding",
+      payload: { padding: "x".repeat(1024) },
+    })}\n`.repeat(8_000));
+  };
+  await writeRollout(
+    join(sessions, "rollout-2026-07-24T12-00-00-archive.jsonl"),
+    PRIVATE_CANARY,
+    "2026-07-24T12:00:00.000Z",
+  );
+  if (includeSecondSource) {
+    await writeRollout(
+      join(sessions, "rollout-2026-07-24T12-02-00-second.jsonl"),
+      "SECOND_ARCHIVE_SOURCE",
+      "2026-07-24T12:02:00.000Z",
+    );
+  }
   return { root, codexHome };
 }
+
+test("archive read budgets remain strict for short non-aligned passes", async () => {
+  const { root, codexHome } = await fixture({ includeSecondSource: true });
+  const indexFile = join(root, "local-archive-accounting-index-v1.sqlite");
+  const secretFile = join(root, "local-archive-accounting-index-secret-v1");
+  const budgetBytes = 12 * 1024 * 1024;
+  try {
+    const result = await refreshLocalArchiveAccountingIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      initialReadBudgetBytes: budgetBytes,
+      deepReadBudgetBytes: 16 * 1024 * 1024,
+      maximumDirectoryEntries: 500,
+      maximumRolloutFiles: 100,
+      workerCount: 1,
+      chunkBytes: CHUNK_BYTES,
+    });
+    assert.equal(result.scanBytes > 0, true);
+    assert.equal(result.scanBytes <= budgetBytes, true);
+    assert.equal(result.status, "partial");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("archive index applies the larger envelope through durable partial batches", async () => {
   assert.equal(ARCHIVE_INDEX_INITIAL_READ_BUDGET_BYTES, 128 * 1024 * 1024);

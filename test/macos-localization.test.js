@@ -108,7 +108,7 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.equal(english.get("settings.language"), "Language");
   assert.equal(
     english.get("settings.languageSummary"),
-    "Uses your Mac language by default. Dates, numbers, and currency keep this Mac's regional format.",
+    "App language only; dates, numbers, and currency use this Mac's format.",
   );
   assert.match(swiftSource, /LanguagePreference: String, CaseIterable/u);
   assert.match(swiftSource, /UserDefaults\.standard\.set/u);
@@ -145,6 +145,17 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.match(appSource, /launcherRecoveryReinstall/u);
   assert.match(appSource, /nativeDashboardCurrentEvidenceTooltip/u);
   assert.match(appSource, /settingsCodexFolderCustomSelected/u);
+  assert.match(appSource, /settingsRefreshInterval/u);
+  assert.match(appSource, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
+  assert.match(appSource, /allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);
+  assert.match(appSource, /settingsOpenNotifications/u);
+  assert.match(appSource, /com\.apple\.Notifications-Settings\.extension/u);
+  assert.doesNotMatch(appSource, /settingsNotificationsReset\)/u);
+  assert.doesNotMatch(appSource, /toggleQuotaNotificationReset/u);
+  assert.match(swiftSource, /Refresh runs in this app while it is open/iu);
+  assert.match(swiftSource, /Closing the window does not quit TiboTattle/iu);
+  assert.match(swiftSource, /quitting stops the current refresh/iu);
+  assert.match(swiftSource, /System Settings → Login Items/u);
   assert.match(menuBarSource, /menuBarAnalysisRequestRejected/u);
   assert.match(menuBarSource, /accessibilityMenuBarStatus/u);
   assert.doesNotMatch(

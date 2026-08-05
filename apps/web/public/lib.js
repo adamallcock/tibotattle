@@ -476,13 +476,17 @@ export function diagnosticErrorCode(candidate) {
  * The trailing sentence appended to every user-visible failure.
  *
  * It carries only identifiers this page minted or validated: the local
- * reference, and the service request id when the service supplied one.
+ * reference, and the service request id when the service supplied one. The
+ * local-log claim is emitted only when the awaited companion response confirms
+ * that the same reference was recorded.
  */
 export function diagnosticReferenceSentence({
   reference,
-  requestId = ""
+  requestId = "",
+  writtenToLocalLog = false
 } = {}) {
   if (!DIAGNOSTIC_REFERENCE_PATTERN.test(reference ?? "")) return "";
+  if (writtenToLocalLog !== true) return `Reference ${reference}.`;
   const service = serviceRequestId(requestId);
   return service === ""
     ? `Reference ${reference}, also written to the local diagnostics log.`

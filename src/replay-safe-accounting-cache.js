@@ -92,6 +92,13 @@ const KNOWN_MODELS = new Set([
   "gpt-5",
   "gpt-4.1",
 ]);
+// Provider-emitted model labels that are safe to display but do not yet have
+// an official API price card. Keeping these distinct from arbitrary unknown
+// labels makes the coverage gap diagnosable without inventing a price or
+// retaining an unbounded metadata channel.
+const KNOWN_UNPRICED_MODELS = new Set([
+  "gpt-5.3-codex-spark",
+]);
 const SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
 const API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
 const SURFACES = new Set([
@@ -200,7 +207,15 @@ function safeEnum(value, allowed) {
 }
 
 function safeModel(value) {
-  return KNOWN_MODELS.has(value) ? value : "unknown";
+  return KNOWN_MODELS.has(value) || KNOWN_UNPRICED_MODELS.has(value)
+    ? value
+    : "unknown";
+}
+
+function modelPricingStatus(value) {
+  if (KNOWN_UNPRICED_MODELS.has(value)) return "known_unpriced";
+  if (KNOWN_MODELS.has(value)) return "priced";
+  return "unrecognized";
 }
 
 function emptyDimension(keys) {
@@ -465,6 +480,7 @@ function eventProjection(event, price) {
   return {
     timestamp: event.timestamp,
     model,
+    modelPricingStatus: modelPricingStatus(event.model),
     components,
     totalTokens,
     priced,
@@ -892,6 +908,7 @@ function addEvent(period, event) {
   }
   const model = period.byModel[event.model] ??= {
     model: event.model,
+    pricingStatus: event.modelPricingStatus,
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,

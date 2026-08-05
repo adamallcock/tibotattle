@@ -39,6 +39,22 @@ function positiveSafeInteger(value) {
   return Number.isSafeInteger(value) && value >= 1;
 }
 
+function strictArchivePassBudget(budgetBytes, chunkBytes) {
+  if (budgetBytes < chunkBytes) {
+    throw new TypeError(
+      "Archive read budget must cover at least one scan chunk",
+    );
+  }
+  // The shared scheduler guarantees progress for a source whose remaining
+  // bytes are smaller than one chunk, so its final source can overshoot the
+  // scheduler budget by at most one chunk. Reserve that slack here to make the
+  // archive's public per-refresh byte envelope strict without changing the
+  // shared raw-log scanner's semantics.
+  return budgetBytes >= 2 * chunkBytes
+    ? budgetBytes - chunkBytes
+    : chunkBytes;
+}
+
 function safeArchiveByteSum(...values) {
   let total = 0;
   for (const value of values) {
@@ -269,6 +285,14 @@ export async function refreshLocalArchiveAccountingIndex({
   const budgetBytes = firstPass
     ? initialReadBudgetBytes
     : deepReadBudgetBytes;
+  const scanBudgetBytes = strictArchivePassBudget(budgetBytes, chunkBytes);
+  // With less than two chunks available, the shared scheduler's guaranteed
+  // one-chunk source advance would otherwise allow a second short source to
+  // cross the requested envelope. One source keeps this small-budget path
+  // strict; normal production budgets retain the configured source ceiling.
+  const sourceLimit = budgetBytes >= 2 * chunkBytes
+    ? maximumRolloutFiles
+    : 1;
   const timed = timeoutSignal(signal, passTimeoutMs);
   try {
     const refreshed = await refreshLocalAnalysisIndex({
@@ -280,8 +304,8 @@ export async function refreshLocalArchiveAccountingIndex({
       signal: timed.signal,
       ...(workerCount === undefined ? {} : { workerCount }),
       chunkBytes,
-      maximumSourcesPerRefresh: maximumRolloutFiles,
-      maximumScanBytesPerRefresh: budgetBytes,
+      maximumSourcesPerRefresh: sourceLimit,
+      maximumScanBytesPerRefresh: scanBudgetBytes,
       maximumCommitBytes: commitSliceBytes,
       discoveryLimits: {
         maximumDirectoryEntries,

@@ -425,6 +425,93 @@ test("local refresh starts a bounded archive index only after the foreground res
   assert.equal(JSON.stringify(result).includes("/private/"), false);
 });
 
+test("archive coverage advances while a recent foreground pass remains bounded", async () => {
+  let accountingCalls = 0;
+  let archiveCalls = 0;
+  const progress = [];
+  const runner = createLocalCollectorRefreshRunner({
+    codexHome: "/private/codex-home",
+    archiveIndexFile: "/private/archive-index.sqlite",
+    archiveIndexSecretFile: "/private/archive-index-secret",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 3,
+      refresh: {
+        attempted: false,
+        recordWritten: false,
+        errorCode: null,
+      },
+      indexing: PAUSED_INDEX,
+    }),
+    refreshAccounting: async () => {
+      accountingCalls += 1;
+      throw new Error("bounded recent coverage must not start accounting");
+    },
+    refreshArchiveIndex: async () => {
+      archiveCalls += 1;
+      return PARTIAL_ARCHIVE_INDEX;
+    },
+  });
+
+  const result = await runner({
+    onProgress: (value) => progress.push(value),
+  });
+
+  assert.equal(accountingCalls, 0);
+  assert.equal(archiveCalls, 1);
+  assert.deepEqual(progress, [
+    { ...PAUSED_INDEX, phase: "quick_result" },
+    { kind: "archive_index", status: "scanning" },
+  ]);
+  assert.deepEqual(result.archiveIndex, PARTIAL_ARCHIVE_INDEX);
+});
+
+test("archive coverage advances before a foreground resource limit is surfaced", async () => {
+  let archiveCalls = 0;
+  const progress = [];
+  const runner = createLocalCollectorRefreshRunner({
+    codexHome: "/private/codex-home",
+    archiveIndexFile: "/private/archive-index.sqlite",
+    archiveIndexSecretFile: "/private/archive-index-secret",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 20_001,
+      resourceLimit: {
+        code: "collector_resource_directory_entries_limit_exceeded",
+        dimension: "directory_entries",
+        limit: 20_000,
+        observed: 20_001,
+      },
+      refresh: {
+        attempted: false,
+        recordWritten: false,
+        errorCode: null,
+      },
+      indexing: PAUSED_INDEX,
+    }),
+    refreshArchiveIndex: async () => {
+      archiveCalls += 1;
+      return PARTIAL_ARCHIVE_INDEX;
+    },
+  });
+
+  await assert.rejects(
+    runner({ onProgress: (value) => progress.push(value) }),
+    (error) => error?.code === "collector_resource_limit_exceeded",
+  );
+  assert.equal(archiveCalls, 1);
+  assert.deepEqual(progress, [
+    { ...PAUSED_INDEX, phase: "quick_result" },
+    { kind: "archive_index", status: "scanning" },
+  ]);
+});
+
 test("zero-write local refresh reuses a current valid accounting cache without altering it", async () => {
   const controller = new AbortController();
   const clock = () => Date.parse("2026-07-23T12:00:00.000Z");
@@ -1505,6 +1592,33 @@ test("refresh controller projects a fixed safety-limit state while retaining the
   assert.equal(status.progress.phase, "quick_result");
   assert.equal(status.quickResultAt, "2026-07-23T12:00:00.000Z");
   assert.equal(JSON.stringify(status).includes("private resource detail"), false);
+  assert.equal(reloads, 1);
+});
+
+test("refresh controller reloads archive progress after the collector limit settles", async () => {
+  let reloads = 0;
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => {
+      const error = new Error("collector limit");
+      error.code = "collector_resource_limit_exceeded";
+      throw error;
+    },
+    dataStore: {
+      async reload() {
+        reloads += 1;
+      },
+    },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+  });
+
+  assert.equal(controller.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "failed") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(controller.getStatus().status, "failed");
+  assert.equal(controller.getStatus().errorCode, "refresh_resource_limited");
   assert.equal(reloads, 1);
 });
 

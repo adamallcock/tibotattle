@@ -91,6 +91,30 @@ private enum AppUpdaterState: Equatable {
     case failed
 }
 
+private enum NativeDashboardEvidenceState: Equatable {
+    case unknown
+    case live
+    case stale
+    case readFailed
+    case lifecycleUnavailable
+}
+
+private enum NativeRefreshIntervalPreference {
+    static let defaultsKey = "tibotattle.refresh-interval.v1"
+    static let defaultSeconds = 5 * 60
+    static let allowedSeconds = [60, 5 * 60, 15 * 60, 30 * 60]
+
+    static var seconds: Int {
+        let stored = UserDefaults.standard.integer(forKey: defaultsKey)
+        return allowedSeconds.contains(stored) ? stored : defaultSeconds
+    }
+
+    static func setSeconds(_ value: Int) {
+        guard allowedSeconds.contains(value) else { return }
+        UserDefaults.standard.set(value, forKey: defaultsKey)
+    }
+}
+
 @MainActor
 private final class AppUpdater: NSObject {
     private static var bundledUpdaterEnabled: Bool {
@@ -188,9 +212,8 @@ private final class AppUpdater: NSObject {
                 .settingsAutomaticUpdatesUnavailable
             )
         case .unverified:
-            return TiboTattleLocalization.string(
-                .settingsAutomaticUpdatesUnavailable
-            )
+            return TiboTattleLocalization.string(.settingsCheckForUpdates)
+                + "…"
         case .ready:
             if Self.isPreviewDistribution {
                 return TiboTattleLocalization.string(
@@ -1878,7 +1901,6 @@ private enum NativeDashboardDestination: String, CaseIterable {
     case trends
     case method
     case community
-    case data
 
     var title: String {
         switch self {
@@ -1892,8 +1914,6 @@ private enum NativeDashboardDestination: String, CaseIterable {
             return TiboTattleLocalization.string(.nativeDashboardHowItWorks)
         case .community:
             return TiboTattleLocalization.string(.nativeDashboardCommunity)
-        case .data:
-            return TiboTattleLocalization.string(.nativeDashboardDataPrivacy)
         }
     }
 
@@ -1904,7 +1924,6 @@ private enum NativeDashboardDestination: String, CaseIterable {
         case .trends: return "chart.xyaxis.line"
         case .method: return "function"
         case .community: return "person.3"
-        case .data: return "lock.shield"
         }
     }
 }
@@ -2110,7 +2129,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var settingsTabs: NSTabViewController?
     private weak var settingsCodexHomeLabel: NSTextField?
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
-    private weak var settingsAutomaticUpdatesDetailLabel: NSTextField?
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
     private weak var settingsCheckForUpdatesButton: NSButton?
     private weak var settingsStartAtLoginSwitch: NSSwitch?
@@ -2121,26 +2139,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var loginItemOperationInFlight = false
     private weak var settingsQuotaNotificationsSwitch: NSSwitch?
     private weak var settingsQuotaNotificationThresholds: NSSegmentedControl?
-    private weak var settingsQuotaNotificationResetSwitch: NSSwitch?
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
+    private weak var settingsRefreshIntervalPicker: NSPopUpButton?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
-    private weak var nativeToolbarStatusLabel: NSTextField?
-    private weak var nativeRefreshToolbarItem: NSToolbarItem?
+    private weak var nativeStatusRefreshButton: NSButton?
     private weak var nativeShareToolbarItem: NSToolbarItem?
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    private var nativeEvidenceState: NativeDashboardEvidenceState = .unknown
+    private var nativeEvidenceObservedAt: Date?
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
-    private static let nativeRefreshIntervalSeconds = 300
-    private static let toolbarStatusIdentifier = NSToolbarItem.Identifier(
-        "com.usagemonitor.local.dashboard-status"
-    )
-    private static let toolbarRefreshIdentifier = NSToolbarItem.Identifier(
-        "com.usagemonitor.local.dashboard-refresh"
+    private static let toolbarStatusRefreshIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.dashboard-status-refresh"
     )
     private static let toolbarShareIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-share"
@@ -2399,6 +2414,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         launchGeneration += 1
         let selectedGeneration = launchGeneration
         dashboardURL = nil
+        nativeEvidenceState = .unknown
+        nativeEvidenceObservedAt = nil
         lastLifecycleStatus = "Starting"
         lastFailureCode = nil
         lastRecoverySuggestion = nil
@@ -2608,8 +2625,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     ) -> [NSToolbarItem.Identifier] {
         [
             .flexibleSpace,
-            Self.toolbarStatusIdentifier,
-            Self.toolbarRefreshIdentifier,
+            Self.toolbarStatusRefreshIdentifier,
             Self.toolbarShareIdentifier,
             Self.toolbarSettingsIdentifier,
         ]
@@ -2619,9 +2635,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         _ toolbar: NSToolbar
     ) -> [NSToolbarItem.Identifier] {
         [
-            Self.toolbarStatusIdentifier,
+            Self.toolbarStatusRefreshIdentifier,
             .flexibleSpace,
-            Self.toolbarRefreshIdentifier,
             Self.toolbarShareIdentifier,
             Self.toolbarSettingsIdentifier,
         ]
@@ -2633,57 +2648,54 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
         switch itemIdentifier {
-        case Self.toolbarStatusIdentifier:
-            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = TiboTattleLocalization.string(.nativeDashboardStatus)
-            item.toolTip = TiboTattleLocalization.string(
-                .nativeDashboardCurrentEvidenceTooltip
-            )
-            let label = NSTextField(labelWithString: TiboTattleLocalization.string(
-                .launcherStartingLocally
-            ))
-            label.font = .systemFont(ofSize: 12, weight: .medium)
-            label.textColor = .secondaryLabelColor
-            label.lineBreakMode = .byTruncatingTail
-            label.maximumNumberOfLines = 1
-            label.toolTip = TiboTattleLocalization.string(
-                .nativeDashboardCurrentEvidenceTooltip
-            )
-            label.setAccessibilityLabel(TiboTattleLocalization.string(
-                .nativeDashboardCurrentEvidenceTooltip
-            ))
-            label.setContentCompressionResistancePriority(
-                .defaultLow,
-                for: .horizontal
-            )
-            label.widthAnchor.constraint(
-                greaterThanOrEqualToConstant: 160
-            ).isActive = true
-            label.widthAnchor.constraint(
-                lessThanOrEqualToConstant: 280
-            ).isActive = true
-            label.heightAnchor.constraint(equalToConstant: 24).isActive = true
-            item.view = label
-            nativeToolbarStatusLabel = label
-            return item
-        case Self.toolbarRefreshIdentifier:
+        case Self.toolbarStatusRefreshIdentifier:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = TiboTattleLocalization.string(
                 .nativeDashboardRefreshUsage
             )
             item.toolTip = TiboTattleLocalization.string(
-                .nativeDashboardRefreshUsageTooltip
+                .nativeDashboardCurrentEvidenceTooltip
             )
-            item.image = NSImage(
-                systemSymbolName: "arrow.clockwise",
-                accessibilityDescription: TiboTattleLocalization.string(
+            let button = NSButton(
+                title: nativeToolbarEvidenceTitle(
+                    fallback: TiboTattleLocalization.string(
+                        .launcherStartingLocally
+                    )
+                ),
+                target: self,
+                action: #selector(refreshDashboardFromToolbar)
+            )
+            button.bezelStyle = .texturedRounded
+            button.imagePosition = .imageLeading
+            button.alignment = .left
+            button.font = .systemFont(ofSize: 12, weight: .medium)
+            button.toolTip = nativeRefreshToolbarTooltip()
+            button.setAccessibilityLabel(
+                TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
             )
-            item.target = self
-            item.action = #selector(refreshDashboardFromToolbar)
-            item.isEnabled = false
-            nativeRefreshToolbarItem = item
+            button.setContentCompressionResistancePriority(
+                .defaultLow,
+                for: .horizontal
+            )
+            button.widthAnchor.constraint(
+                greaterThanOrEqualToConstant: 190
+            ).isActive = true
+            button.widthAnchor.constraint(
+                lessThanOrEqualToConstant: 320
+            ).isActive = true
+            item.view = button
+            nativeStatusRefreshButton = button
+            updateNativeToolbar(
+                title: nativeToolbarEvidenceTitle(
+                    fallback: TiboTattleLocalization.string(
+                        .launcherStartingLocally
+                    )
+                ),
+                isRefreshing: nativeRefreshInFlight,
+                refreshEnabled: dashboardURL != nil
+            )
             return item
         case Self.toolbarShareIdentifier:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
@@ -2724,16 +2736,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         isRefreshing: Bool,
         refreshEnabled: Bool
     ) {
-        nativeToolbarStatusLabel?.stringValue = title
-        nativeRefreshToolbarItem?.label = isRefreshing
+        let statusTitle = isRefreshing
             ? TiboTattleLocalization.string(.nativeDashboardUpdating)
-            : TiboTattleLocalization.string(.nativeDashboardRefreshUsage)
-        nativeRefreshToolbarItem?.toolTip = isRefreshing
+            : nativeToolbarEvidenceTitle(fallback: title)
+        nativeStatusRefreshButton?.title = statusTitle
+        nativeStatusRefreshButton?.toolTip = isRefreshing
             ? TiboTattleLocalization.string(.nativeDashboardUpdating)
-            : TiboTattleLocalization.string(
-                .nativeDashboardRefreshUsageTooltip
-            )
-        nativeRefreshToolbarItem?.image = NSImage(
+            : nativeRefreshToolbarTooltip()
+        nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: isRefreshing
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
@@ -2743,28 +2753,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     .nativeDashboardRefreshUsage
                 )
         )
-        nativeRefreshToolbarItem?.isEnabled = refreshEnabled && !isRefreshing
+        nativeStatusRefreshButton?.isEnabled = refreshEnabled && !isRefreshing
+        nativeStatusRefreshButton?.setAccessibilityLabel(statusTitle)
         nativeShareToolbarItem?.isEnabled = dashboardWebViewShowing
     }
 
     private func refreshNativeToolbarLocalization() {
-        nativeToolbarStatusLabel?.toolTip = TiboTattleLocalization.string(
-            .nativeDashboardCurrentEvidenceTooltip
-        )
-        nativeToolbarStatusLabel?.setAccessibilityLabel(
-            TiboTattleLocalization.string(
-                .nativeDashboardCurrentEvidenceTooltip
-            )
-        )
-        nativeRefreshToolbarItem?.label = nativeRefreshInFlight
+        let statusTitle = nativeRefreshInFlight
             ? TiboTattleLocalization.string(.nativeDashboardUpdating)
-            : TiboTattleLocalization.string(.nativeDashboardRefreshUsage)
-        nativeRefreshToolbarItem?.toolTip = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
-            : TiboTattleLocalization.string(
-                .nativeDashboardRefreshUsageTooltip
+            : nativeToolbarEvidenceTitle(
+                fallback: TiboTattleLocalization.string(
+                    .nativeDashboardStatus
+                )
             )
-        nativeRefreshToolbarItem?.image = NSImage(
+        nativeStatusRefreshButton?.title = statusTitle
+        nativeStatusRefreshButton?.toolTip = nativeRefreshInFlight
+            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            : nativeRefreshToolbarTooltip()
+        nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: nativeRefreshInFlight
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
@@ -2774,12 +2780,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     .nativeDashboardRefreshUsage
                 )
         )
+        nativeStatusRefreshButton?.setAccessibilityLabel(statusTitle)
         nativeShareToolbarItem?.label = TiboTattleLocalization.string(
             .nativeDashboardShare
         )
         nativeShareToolbarItem?.toolTip = TiboTattleLocalization.string(
             .nativeDashboardShareTooltip
         )
+    }
+
+    private func nativeRefreshToolbarTooltip() -> String {
+        [
+            TiboTattleLocalization.string(
+                .nativeDashboardRefreshUsageTooltip
+            ),
+            TiboTattleLocalization.string(
+                .nativeDashboardCurrentEvidenceTooltip
+            ),
+        ].joined(separator: "\n")
     }
 
     @objc private func refreshDashboardFromToolbar() {
@@ -2964,6 +2982,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 self.nativeRefreshID = refreshID
                 self.pollNativeRefresh(base: dashboardURL, remainingAttempts: 120)
             case .rejected:
+                self.nativeEvidenceState = .readFailed
                 self.quotaNotificationCoordinator?.recordIneligible(
                     .refreshFailed
                 )
@@ -2974,14 +2993,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     refreshEnabled: true
                 )
             case .unreachable:
+                // A failed loopback request is evidence-read trouble, not
+                // proof that the companion process exited. Keep the retry
+                // control enabled and leave lifecycle recovery to onExit.
+                self.nativeEvidenceState = .readFailed
                 self.quotaNotificationCoordinator?.recordIneligible(
                     .providerUnavailable
                 )
                 self.finishNativeRefresh(
                     title: TiboTattleLocalization.string(
-                        .launcherCompanionUnavailable
+                        .menuBarQuotaEvidenceUnavailable
                     ),
-                    refreshEnabled: false
+                    refreshEnabled: true
                 )
             }
         }
@@ -3015,6 +3038,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
                 self.nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
                     guard let self, !self.quitting else { return }
+                    if let overview {
+                        self.nativeEvidenceObservedAt = overview.observedAt
+                        switch LocalCompanionOverviewProjection.evidence(
+                            for: overview
+                        ) {
+                        case .live:
+                            self.nativeEvidenceState = .live
+                        case .stale:
+                            self.nativeEvidenceState = .stale
+                        case .none:
+                            self.nativeEvidenceState = .unknown
+                        }
+                    } else {
+                        // Keep any last observed timestamp for honest age
+                        // context, but distinguish a transient read failure
+                        // from a dead companion process.
+                        self.nativeEvidenceState = .readFailed
+                    }
                     let title: String
                     if let overview,
                        LocalCompanionOverviewProjection.evidence(
@@ -3090,9 +3131,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     /// The foreground app keeps its own local evidence current while a
-    /// login-item launch (if enabled) remains only an explicit app start. A
-    /// five-minute cadence is intentionally modest: it observes new Codex
-    /// rollouts while avoiding a permanent parser loop or hidden worker.
+    /// login-item launch (if enabled) remains only an explicit app start. The
+    /// interval is a persisted, bounded preference; it never creates a
+    /// background worker or keeps the app alive after quit.
     private func scheduleNativeRefresh() {
         cancelNativeRefreshSchedule()
         guard !quitting, dashboardURL != nil else { return }
@@ -3101,7 +3142,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         nativeRefreshSchedule = work
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + .seconds(Self.nativeRefreshIntervalSeconds),
+            deadline: .now() + .seconds(NativeRefreshIntervalPreference.seconds),
             execute: work
         )
     }
@@ -3190,6 +3231,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func dashboardWebViewFailed(code: String) {
         cancelNativeRefreshSchedule()
+        nativeEvidenceState = .readFailed
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
@@ -3211,7 +3253,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         openInBrowserButton.isEnabled = dashboardURL != nil
         retryButton.isEnabled = retryAllowed && firstRunAcknowledged
         updateNativeToolbar(
-            title: "Dashboard unavailable",
+            title: TiboTattleLocalization.string(
+                .menuBarQuotaEvidenceUnavailable
+            ),
             isRefreshing: false,
             refreshEnabled: dashboardURL != nil
         )
@@ -3318,6 +3362,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         dashboardURL = url
+        nativeEvidenceState = .unknown
+        nativeEvidenceObservedAt = nil
         lastLifecycleStatus = "Ready"
         lastFailureCode = nil
         lastRecoverySuggestion = nil
@@ -3371,6 +3417,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardURL = nil
         // The companion origin is gone, so the embedded dashboard goes with
         // it and the always-available status controls come back.
+        nativeEvidenceState = .lifecycleUnavailable
         hideDashboardWebView()
         lastLifecycleStatus = "Could not start"
         let launcherError = error as? LauncherError
@@ -3473,6 +3520,60 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         return button
     }
 
+    private func settingsGroup(
+        title: String,
+        symbolName: String,
+        views: [NSView]
+    ) -> NSView {
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        let icon = NSImageView(
+            image: NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: title
+            ) ?? NSImage()
+        )
+        icon.contentTintColor = .controlAccentColor
+        icon.imageScaling = .scaleProportionallyDown
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        header.addArrangedSubview(icon)
+        header.addArrangedSubview(settingsLabel(
+            title,
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor
+        ))
+
+        let contentStack = NSStackView(views: [header] + views)
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 8
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        let contentView = NSView()
+        contentView.addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+        ])
+
+        let group = NSBox()
+        group.boxType = .custom
+        group.borderType = .lineBorder
+        group.cornerRadius = 8
+        group.contentViewMargins = NSSize(width: 32, height: 28)
+        group.contentView = contentView
+        group.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        return group
+    }
+
     @objc private func openExternalLink(_ sender: NSButton) {
         guard let address = sender.identifier?.rawValue,
               let url = URL(string: address),
@@ -3492,9 +3593,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     ) -> NSViewController {
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.alignment = .leading
+        stack.alignment = .width
         stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 28, left: 32, bottom: 28, right: 32)
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 24, right: 28)
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(settingsLabel(
             title,
@@ -3509,14 +3610,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         for view in views {
             stack.addArrangedSubview(view)
         }
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.documentView = stack
+        scroll.translatesAutoresizingMaskIntoConstraints = false
         let root = NSView()
-        root.addSubview(stack)
+        root.addSubview(scroll)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: root.topAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor),
-            stack.widthAnchor.constraint(equalTo: root.widthAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: root.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
         let controller = NSViewController()
         controller.view = root
@@ -3543,8 +3650,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsAutomaticUpdatesSwitch?.state = updater.automaticUpdatesEnabled
             ? .on
             : .off
-        settingsAutomaticUpdatesDetailLabel?.stringValue =
-            automaticUpdatesSettingsSummary()
         settingsAboutAutomaticUpdatesDetailLabel?.stringValue =
             automaticUpdatesSettingsSummary()
     }
@@ -3557,6 +3662,45 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             title: updater.menuItemTitle,
             isEnabled: updater.canCheckForUpdates
         )
+    }
+
+    private func nativeToolbarEvidenceTitle(fallback: String) -> String {
+        switch nativeEvidenceState {
+        case .live:
+            guard let observedAt = nativeEvidenceObservedAt else {
+                return TiboTattleLocalization.string(.menuBarCurrentEvidence)
+            }
+            return TiboTattleLocalization.format(
+                .menuBarCurrentEvidenceWithAge,
+                relativeAge(observedAt)
+            )
+        case .stale:
+            guard let observedAt = nativeEvidenceObservedAt else {
+                return TiboTattleLocalization.string(
+                    .menuBarLocalEvidenceStale
+                )
+            }
+            return TiboTattleLocalization.format(
+                .menuBarLocalEvidenceStaleWithAge,
+                relativeAge(observedAt)
+            )
+        case .readFailed:
+            return TiboTattleLocalization.string(
+                .menuBarQuotaEvidenceUnavailable
+            )
+        case .lifecycleUnavailable:
+            return TiboTattleLocalization.string(
+                .launcherCompanionUnavailable
+            )
+        case .unknown:
+            return nativeEvidenceObservedAt == nil
+                ? (fallback == TiboTattleLocalization.string(
+                    .launcherStartingLocally
+                )
+                    ? fallback
+                    : TiboTattleLocalization.string(.menuBarNoVerifiedQuota))
+                : fallback
+        }
     }
 
     @discardableResult
@@ -3601,6 +3745,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             presentation.showsPendingRemoval && !loginItemOperationInFlight
         settingsStartAtLoginRefreshButton?.isEnabled =
             !loginItemOperationInFlight
+    }
+
+    private func updateRefreshIntervalSettingsControl() {
+        guard let picker = settingsRefreshIntervalPicker else { return }
+        let value = NativeRefreshIntervalPreference.seconds
+        if let index = picker.itemArray.firstIndex(where: {
+            ($0.representedObject as? Int) == value
+        }) {
+            picker.selectItem(at: index)
+        }
     }
 
     @objc private func toggleStartAtLogin(_ sender: NSSwitch) {
@@ -3909,7 +4063,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         guard let coordinator = quotaNotificationCoordinator else {
             settingsQuotaNotificationsSwitch?.isEnabled = false
             settingsQuotaNotificationThresholds?.isEnabled = false
-            settingsQuotaNotificationResetSwitch?.isEnabled = false
             settingsQuotaNotificationStatusLabel?.stringValue =
                 quotaNotificationSettingsSummary()
             return
@@ -3931,11 +4084,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         settingsQuotaNotificationThresholds?.selectedSegment = selectedSegment
         settingsQuotaNotificationThresholds?.isEnabled = presentation.enabled
-        settingsQuotaNotificationResetSwitch?.state = presentation.resetEnabled
-            ? .on
-            : .off
-        settingsQuotaNotificationResetSwitch?.isEnabled =
-            presentation.enabled && presentation.resetAvailable
         settingsQuotaNotificationStatusLabel?.stringValue =
             quotaNotificationSettingsSummary()
     }
@@ -3961,11 +4109,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         updateQuotaNotificationSettingsControls()
     }
 
-    @objc private func toggleQuotaNotificationReset(_ sender: NSSwitch) {
-        quotaNotificationCoordinator?.setResetEnabled(sender.state == .on)
-        updateQuotaNotificationSettingsControls()
-    }
-
     @objc private func showSettingsWindow() {
         showSettings(selecting: 0)
     }
@@ -3984,6 +4127,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         changeLanguagePreference(preference)
+    }
+
+    @objc private func selectRefreshInterval(_ sender: NSPopUpButton) {
+        guard let seconds = sender.selectedItem?.representedObject as? Int else {
+            updateRefreshIntervalSettingsControl()
+            return
+        }
+        NativeRefreshIntervalPreference.setSeconds(seconds)
+        updateRefreshIntervalSettingsControl()
+        guard dashboardURL != nil, !nativeRefreshInFlight else { return }
+        scheduleNativeRefresh()
+    }
+
+    @objc private func openNotificationSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+        ) else {
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     /// Product language controls TiboTattle-owned copy only. Formatting keeps
@@ -4014,9 +4177,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsTabs = nil
         settingsCodexHomeLabel = nil
         settingsAutomaticUpdatesSwitch = nil
-        settingsAutomaticUpdatesDetailLabel = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
         settingsCheckForUpdatesButton = nil
+        settingsRefreshIntervalPicker = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
         }
@@ -4052,6 +4215,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
+            updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
             quotaNotificationCoordinator?.refreshAuthorization()
             updateQuotaNotificationSettingsControls()
@@ -4079,11 +4243,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let sourceActions = NSStackView(views: [chooseSource, useDefaultSource])
         sourceActions.orientation = .horizontal
         sourceActions.spacing = 8
-        let languageLabel = settingsLabel(
-            TiboTattleLocalization.string(.settingsLanguage),
-            font: .systemFont(ofSize: 14, weight: .semibold),
-            color: .labelColor
-        )
         let languagePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -4114,32 +4273,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         languagePicker.setAccessibilityLabel(
             TiboTattleLocalization.string(.settingsLanguage)
         )
-        let languageRow = NSStackView(views: [languageLabel, languagePicker])
+        let languageRow = NSStackView(views: [languagePicker])
         languageRow.orientation = .horizontal
         languageRow.alignment = .centerY
-        languageRow.spacing = 12
-        let languageSection = NSStackView(views: [
+        let languageSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsLanguage),
+            symbolName: "globe",
+            views: [
             languageRow,
-            settingsLabel(
-                TiboTattleLocalization.string(.settingsLanguagePickerHint),
-                font: .systemFont(ofSize: 12),
-                color: .secondaryLabelColor
-            ),
             settingsLabel(
                 TiboTattleLocalization.string(.settingsLanguageSummary),
                 font: .systemFont(ofSize: 12),
                 color: .secondaryLabelColor
             ),
         ])
-        languageSection.orientation = .vertical
-        languageSection.alignment = .leading
-        languageSection.spacing = 6
-        let sourceSection = NSStackView(views: [
-            settingsLabel(
-                TiboTattleLocalization.string(.settingsCodexFolder),
-                font: .systemFont(ofSize: 14, weight: .semibold),
-                color: .labelColor
-            ),
+        let sourceSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsCodexFolder),
+            symbolName: "folder",
+            views: [
             sourceStatus,
             settingsLabel(
                 TiboTattleLocalization.string(.settingsCodexFolderSummary),
@@ -4148,9 +4299,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ),
             sourceActions,
         ])
-        sourceSection.orientation = .vertical
-        sourceSection.alignment = .leading
-        sourceSection.spacing = 7
         let openDashboardFromSettings = NSButton(
             title: TiboTattleLocalization.string(.settingsOpenDashboard),
             target: self,
@@ -4166,30 +4314,48 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         automaticUpdatesSwitch.toolTip =
             TiboTattleLocalization.string(.settingsAutomaticUpdatesTooltip)
         settingsAutomaticUpdatesSwitch = automaticUpdatesSwitch
-        let automaticUpdatesDetail = settingsLabel(
-            automaticUpdatesSettingsSummary(),
-            font: .systemFont(ofSize: 12),
-            color: .secondaryLabelColor
-        )
-        settingsAutomaticUpdatesDetailLabel = automaticUpdatesDetail
-        let automaticUpdatesHeading = settingsLabel(
-            TiboTattleLocalization.string(.settingsAutomaticUpdates),
-            font: .systemFont(ofSize: 14, weight: .semibold),
-            color: .labelColor
-        )
-        let automaticUpdatesHeader = NSStackView(
-            views: [automaticUpdatesHeading, automaticUpdatesSwitch]
-        )
+        let automaticUpdatesHeader = NSStackView(views: [automaticUpdatesSwitch])
         automaticUpdatesHeader.orientation = .horizontal
         automaticUpdatesHeader.alignment = .centerY
-        automaticUpdatesHeader.spacing = 12
-        let automaticUpdatesSection = NSStackView(views: [
-            automaticUpdatesHeader,
-            automaticUpdatesDetail,
-        ])
-        automaticUpdatesSection.orientation = .vertical
-        automaticUpdatesSection.alignment = .leading
-        automaticUpdatesSection.spacing = 6
+
+        let refreshIntervalPicker = NSPopUpButton(
+            frame: .zero,
+            pullsDown: false
+        )
+        let refreshIntervalChoices: [(Int, TiboTattleLocalization.Key)] = [
+            (60, .settingsRefreshIntervalOneMinute),
+            (5 * 60, .settingsRefreshIntervalFiveMinutes),
+            (15 * 60, .settingsRefreshIntervalFifteenMinutes),
+            (30 * 60, .settingsRefreshIntervalThirtyMinutes),
+        ]
+        for (seconds, key) in refreshIntervalChoices {
+            refreshIntervalPicker.addItem(
+                withTitle: TiboTattleLocalization.string(key)
+            )
+            refreshIntervalPicker.lastItem?.representedObject = seconds
+        }
+        refreshIntervalPicker.target = self
+        refreshIntervalPicker.action = #selector(selectRefreshInterval(_:))
+        refreshIntervalPicker.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsRefreshInterval)
+        )
+        settingsRefreshIntervalPicker = refreshIntervalPicker
+        updateRefreshIntervalSettingsControl()
+        let refreshIntervalRow = NSStackView(views: [refreshIntervalPicker])
+        refreshIntervalRow.orientation = .horizontal
+        refreshIntervalRow.alignment = .centerY
+        let refreshIntervalSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsRefreshInterval),
+            symbolName: "clock",
+            views: [
+                refreshIntervalRow,
+                settingsLabel(
+                    TiboTattleLocalization.string(.settingsRefreshIntervalDetail),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
+                ),
+            ]
+        )
         let startAtLoginStatus = observeLoginItemStatus()
         let startAtLoginPresentation = loginItemSettingsPresentation(
             for: startAtLoginStatus
@@ -4214,23 +4380,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             color: .secondaryLabelColor
         )
         settingsStartAtLoginDetailLabel = startAtLoginDetail
-        let startAtLoginHeading = settingsLabel(
-            TiboTattleLocalization.string(.settingsStartAtLogin),
-            font: .systemFont(ofSize: 14, weight: .semibold),
-            color: .labelColor
-        )
-        let startAtLoginHeader = NSStackView(
-            views: [startAtLoginHeading, startAtLoginSwitch]
-        )
+        let startAtLoginHeader = NSStackView(views: [startAtLoginSwitch])
         startAtLoginHeader.orientation = .horizontal
         startAtLoginHeader.alignment = .centerY
-        startAtLoginHeader.spacing = 12
         let openLoginItems = NSButton(
             title: TiboTattleLocalization.string(.settingsOpenLoginItems),
             target: self,
             action: #selector(openLoginItemsSettings)
         )
         openLoginItems.bezelStyle = .rounded
+        openLoginItems.image = NSImage(
+            systemSymbolName: "gearshape",
+            accessibilityDescription: TiboTattleLocalization.string(
+                .settingsOpenLoginItems
+            )
+        )
+        openLoginItems.imagePosition = .imageLeading
         let refreshLoginItemStatus = NSButton(
             title: TiboTattleLocalization.string(
                 .settingsRefreshLoginItemStatus
@@ -4239,6 +4404,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(refreshLoginItemStatus)
         )
         refreshLoginItemStatus.bezelStyle = .rounded
+        refreshLoginItemStatus.image = NSImage(
+            systemSymbolName: "arrow.clockwise",
+            accessibilityDescription: TiboTattleLocalization.string(
+                .settingsRefreshLoginItemStatus
+            )
+        )
+        refreshLoginItemStatus.imagePosition = .imageLeading
         refreshLoginItemStatus.setAccessibilityLabel(
             TiboTattleLocalization.string(.settingsRefreshLoginItemStatus)
         )
@@ -4251,22 +4423,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(removePendingLoginItem)
         )
         removePendingLoginItem.bezelStyle = .rounded
+        removePendingLoginItem.image = NSImage(
+            systemSymbolName: "minus.circle",
+            accessibilityDescription: TiboTattleLocalization.string(
+                .settingsRemovePendingLoginItem
+            )
+        )
+        removePendingLoginItem.imagePosition = .imageLeading
         removePendingLoginItem.isHidden =
             !startAtLoginPresentation.showsPendingRemoval
         removePendingLoginItem.setAccessibilityLabel(
             TiboTattleLocalization.string(.settingsRemovePendingLoginItem)
         )
         settingsStartAtLoginPendingRemovalButton = removePendingLoginItem
-        let startAtLoginSection = NSStackView(views: [
-            startAtLoginHeader,
-            startAtLoginDetail,
-            openLoginItems,
-            refreshLoginItemStatus,
-            removePendingLoginItem,
-        ])
-        startAtLoginSection.orientation = .vertical
-        startAtLoginSection.alignment = .leading
-        startAtLoginSection.spacing = 6
+        let startAtLoginSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsStartAtLogin),
+            symbolName: "person.crop.circle.badge.checkmark",
+            views: [
+                startAtLoginHeader,
+                startAtLoginDetail,
+                openLoginItems,
+                refreshLoginItemStatus,
+                removePendingLoginItem,
+            ]
+        )
         let quotaNotificationsSwitch = NSSwitch()
         quotaNotificationsSwitch.target = self
         quotaNotificationsSwitch.action = #selector(toggleQuotaNotifications(_:))
@@ -4274,13 +4454,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             .settingsNotificationsToggleTooltip
         )
         settingsQuotaNotificationsSwitch = quotaNotificationsSwitch
-        let quotaNotificationsHeading = settingsLabel(
-            TiboTattleLocalization.string(.settingsNotifications),
-            font: .systemFont(ofSize: 14, weight: .semibold),
-            color: .labelColor
-        )
         let quotaNotificationsHeader = NSStackView(views: [
-            quotaNotificationsHeading,
             quotaNotificationsSwitch,
         ])
         quotaNotificationsHeader.orientation = .horizontal
@@ -4318,26 +4492,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         quotaNotificationThresholdRow.orientation = .horizontal
         quotaNotificationThresholdRow.alignment = .centerY
         quotaNotificationThresholdRow.spacing = 12
-        let quotaNotificationResetSwitch = NSSwitch()
-        quotaNotificationResetSwitch.target = self
-        quotaNotificationResetSwitch.action = #selector(
-            toggleQuotaNotificationReset(_:)
+        let openNotifications = NSButton(
+            title: TiboTattleLocalization.string(.settingsOpenNotifications),
+            target: self,
+            action: #selector(openNotificationSettings)
         )
-        quotaNotificationResetSwitch.toolTip = TiboTattleLocalization.string(
-            .settingsNotificationsResetDetail
+        openNotifications.bezelStyle = .rounded
+        openNotifications.image = NSImage(
+            systemSymbolName: "bell.badge",
+            accessibilityDescription: TiboTattleLocalization.string(
+                .settingsOpenNotifications
+            )
         )
-        settingsQuotaNotificationResetSwitch = quotaNotificationResetSwitch
-        let quotaNotificationResetRow = NSStackView(views: [
-            settingsLabel(
-                TiboTattleLocalization.string(.settingsNotificationsReset),
-                font: .systemFont(ofSize: 13, weight: .medium),
-                color: .labelColor
-            ),
-            quotaNotificationResetSwitch,
-        ])
-        quotaNotificationResetRow.orientation = .horizontal
-        quotaNotificationResetRow.alignment = .centerY
-        quotaNotificationResetRow.spacing = 12
+        openNotifications.imagePosition = .imageLeading
         let quotaNotificationStatus = settingsLabel(
             quotaNotificationSettingsSummary(),
             font: .systemFont(ofSize: 12),
@@ -4345,34 +4512,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         quotaNotificationStatus.maximumNumberOfLines = 3
         settingsQuotaNotificationStatusLabel = quotaNotificationStatus
-        let quotaNotificationsSection = NSStackView(views: [
-            quotaNotificationsHeader,
-            settingsLabel(
-                TiboTattleLocalization.string(.settingsNotificationsDetail),
-                font: .systemFont(ofSize: 12),
-                color: .secondaryLabelColor
-            ),
-            quotaNotificationThresholdRow,
-            quotaNotificationResetRow,
-            settingsLabel(
-                TiboTattleLocalization.string(
-                    .settingsNotificationsResetDetail
+        let quotaNotificationsSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsNotifications),
+            symbolName: "bell",
+            views: [
+                quotaNotificationsHeader,
+                settingsLabel(
+                    TiboTattleLocalization.string(.settingsNotificationsDetail),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
                 ),
-                font: .systemFont(ofSize: 12),
-                color: .secondaryLabelColor
-            ),
-            quotaNotificationStatus,
-        ])
-        quotaNotificationsSection.orientation = .vertical
-        quotaNotificationsSection.alignment = .leading
-        quotaNotificationsSection.spacing = 6
+                openNotifications,
+                quotaNotificationThresholdRow,
+                settingsLabel(
+                    TiboTattleLocalization.string(
+                        .settingsNotificationsResetDetail
+                    ),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
+                ),
+                quotaNotificationStatus,
+            ]
+        )
         let general = settingsPage(
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
                 languageSection,
                 sourceSection,
-                automaticUpdatesSection,
+                refreshIntervalSection,
                 startAtLoginSection,
                 quotaNotificationsSection,
                 openDashboardFromSettings,
@@ -4441,6 +4609,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             color: .secondaryLabelColor
         )
         settingsAboutAutomaticUpdatesDetailLabel = aboutAutomaticUpdatesDetail
+        let aboutUpdatesSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsAutomaticUpdates),
+            symbolName: "arrow.down.circle",
+            views: [
+                automaticUpdatesHeader,
+                aboutAutomaticUpdatesDetail,
+                checkForUpdates,
+            ]
+        )
+        let aboutProductSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsAboutTab),
+            symbolName: "info.circle",
+            views: [aboutBranding]
+        )
         let about = settingsPage(
             title: TiboTattleLocalization.format(
                 .settingsAboutProduct,
@@ -4448,9 +4630,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ),
             summary: TiboTattleLocalization.string(.settingsAboutSummary),
             views: [
-                aboutBranding,
-                aboutAutomaticUpdatesDetail,
-                checkForUpdates,
+                aboutProductSection,
+                aboutUpdatesSection,
                 projectLinks,
             ]
         )

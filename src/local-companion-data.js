@@ -72,6 +72,9 @@ const KNOWN_MODELS = new Set([
   "gpt-5",
   "gpt-4.1",
 ]);
+const KNOWN_UNPRICED_MODELS = new Set([
+  "gpt-5.3-codex-spark",
+]);
 
 const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
 const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
@@ -679,7 +682,15 @@ function addComponents(target, components) {
 }
 
 function safeModel(model) {
-  return KNOWN_MODELS.has(model) ? model : "unknown";
+  return KNOWN_MODELS.has(model) || KNOWN_UNPRICED_MODELS.has(model)
+    ? model
+    : "unknown";
+}
+
+function modelPricingStatus(model) {
+  if (KNOWN_UNPRICED_MODELS.has(model)) return "known_unpriced";
+  if (KNOWN_MODELS.has(model)) return "priced";
+  return "unrecognized";
 }
 
 function safeSpeed(speed) {
@@ -748,6 +759,7 @@ function usageProjection(record, declaredSpeed = "unknown") {
     : [];
   return {
     model,
+    modelPricingStatus: modelPricingStatus(record.model),
     components,
     totalTokens,
     apiPriceEquivalentUsd: Number.isFinite(rawCost) ? rawCost : 0,
@@ -878,6 +890,7 @@ function addUsageToPeriod(period, projection) {
   addComponents(period.components, projection.components);
   const modelSummary = period.byModel[projection.model] ??= {
     model: projection.model,
+    pricingStatus: projection.modelPricingStatus,
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
@@ -1933,6 +1946,11 @@ export async function buildLocalCompanionSnapshot({
         periodLabel: displayUsage?.label ?? RECENT_COLLECTOR_PERIOD_LABEL,
         coveragePercent: pricingCoveragePercent,
         eventCount: displayUsage?.events ?? 0,
+        pricingCoverage: displayUsage?.pricingCoverage ?? {
+          fullyPricedEvents: 0,
+          partiallyPricedEvents: 0,
+          unpricedEvents: 0,
+        },
         apiTier: "standard",
         eventTimeHistoricalTotalUsdExact: displayUsage?.apiPriceEquivalentUsdExact ?? null,
         currentPriceSensitivityTotalUsdExact: null,

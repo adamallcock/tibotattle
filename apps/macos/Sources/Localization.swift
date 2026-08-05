@@ -287,9 +287,9 @@ enum TiboTattleLocalization {
         case settingsNotificationsThresholdsNinety = "settings.notificationsThresholdsNinety"
         case settingsNotificationsThresholdsOff = "settings.notificationsThresholdsOff"
         case settingsNotificationsToggleTooltip = "settings.notificationsToggleTooltip"
-        case settingsNotificationsReset = "settings.notificationsReset"
         case settingsNotificationsResetDetail = "settings.notificationsResetDetail"
         case settingsOpenDashboard = "settings.openDashboard"
+        case settingsOpenNotifications = "settings.openNotifications"
         case settingsPreviewUpdatesPending = "settings.previewUpdatesPending"
         case settingsPreviewUpdatesPendingMessage = "settings.previewUpdatesPendingMessage"
         case settingsPreviewUpdatesPendingTitle = "settings.previewUpdatesPendingTitle"
@@ -318,6 +318,12 @@ enum TiboTattleLocalization {
         case settingsStartAtLoginUnregistrationErrorTitle = "settings.startAtLoginUnregistrationErrorTitle"
         case settingsStartAtLoginUnregistrationNotConfirmedMessage = "settings.startAtLoginUnregistrationNotConfirmedMessage"
         case settingsStartAtLoginUnregistrationNotConfirmedTitle = "settings.startAtLoginUnregistrationNotConfirmedTitle"
+        case settingsRefreshInterval = "settings.refreshInterval"
+        case settingsRefreshIntervalDetail = "settings.refreshIntervalDetail"
+        case settingsRefreshIntervalOneMinute = "settings.refreshIntervalOneMinute"
+        case settingsRefreshIntervalFiveMinutes = "settings.refreshIntervalFiveMinutes"
+        case settingsRefreshIntervalFifteenMinutes = "settings.refreshIntervalFifteenMinutes"
+        case settingsRefreshIntervalThirtyMinutes = "settings.refreshIntervalThirtyMinutes"
         case settingsUseDefault = "settings.useDefault"
         case settingsUpdateDisclosureAutomaticOff = "settings.updateDisclosureAutomaticOff"
         case settingsUpdateDisclosureAutomaticOn = "settings.updateDisclosureAutomaticOn"
@@ -671,13 +677,13 @@ enum TiboTattleLocalization {
             case .settingsAutomaticUpdates:
                 "Automatic updates"
             case .settingsAutomaticUpdatesOff:
-                "Automatic updates are off. You can still check for updates manually."
+                "Automatic downloads are off."
             case .settingsAutomaticUpdatesOn:
-                "Verified updates download automatically and install when you quit."
+                "Automatic downloads are on."
             case .settingsAutomaticUpdatesReachable:
                 "Update feed reachable. Sparkle verification is still pending."
             case .settingsAutomaticUpdatesUnavailable:
-                "Updates are available in signed releases installed in Applications."
+                "Automatic updates are unavailable in this build."
             case .settingsAutomaticUpdatesTooltip:
                 "Download signed TiboTattle updates automatically."
             case .settingsCheckForUpdates:
@@ -695,7 +701,7 @@ enum TiboTattleLocalization {
             case .settingsGeneral:
                 "General"
             case .settingsGeneralSummary:
-                "TiboTattle refreshes local usage while it is open. Start at login is an explicit macOS login-item choice; no LaunchAgent, daemon, privileged helper, or hidden persistent process is used. Raw logs never leave this Mac."
+                "Refresh runs in this app while it is open. Closing the window does not quit TiboTattle; quitting stops the current refresh. Start at login is optional and managed in System Settings → Login Items. Raw logs stay on this Mac."
             case .settingsGitHub:
                 "GitHub"
             case .settingsLanguage:
@@ -709,13 +715,13 @@ enum TiboTattleLocalization {
             case .settingsLanguageSpanish:
                 "Spanish"
             case .settingsLanguageSummary:
-                "Uses your Mac language by default. Dates, numbers, and currency keep this Mac's regional format."
+                "App language only; dates, numbers, and currency use this Mac's format."
             case .settingsLanguageSystem:
                 "System"
             case .settingsNotifications:
                 "Local allowance notifications"
             case .settingsNotificationsDetail:
-                "Optional and local-only. TiboTattle evaluates these only after its existing foreground refresh receives fresh provider-reported quota evidence; it adds no daemon, login item, timer, or network polling."
+                "Optional local alerts use fresh quota observations from the normal refresh. TiboTattle never polls in the background."
             case .settingsNotificationsOff:
                 "Notifications are off. Turn this switch off at any time to stop future local alerts and clear their local pending state."
             case .settingsNotificationsPermissionDenied:
@@ -768,12 +774,12 @@ enum TiboTattleLocalization {
                 "Off"
             case .settingsNotificationsToggleTooltip:
                 "Enable optional local notifications from fresh provider-reported quota evidence."
-            case .settingsNotificationsReset:
-                "New allowance window (currently unavailable)"
             case .settingsNotificationsResetDetail:
-                "The current provider receipt gives a reset schedule, not a reset identity, so reset alerts are unavailable. Scheduled times and percentage drops never trigger an alert."
+                "Reset alerts need a provider-reported reset identity; schedule changes alone do not alert."
             case .settingsOpenDashboard:
                 "Open Dashboard"
+            case .settingsOpenNotifications:
+                "Open Notification Settings"
             case .settingsPreviewUpdatesPending:
                 "This preview uses the live TiboTattle update feed. The first signed release has not been published yet, so updates cannot be discovered."
             case .settingsPreviewUpdatesPendingMessage:
@@ -815,7 +821,7 @@ enum TiboTattleLocalization {
             case .settingsStartAtLoginRegistrationNotConfirmedTitle:
                 "Start at login was not confirmed"
             case .settingsStartAtLoginSummary:
-                "Start TiboTattle automatically when you sign in. You can change this later in Settings → General."
+                "Start TiboTattle when you sign in. Manage this in System Settings → Login Items."
             case .settingsStartAtLoginUnavailable:
                 "Login item status is unavailable. Open System Settings → Login Items."
             case .settingsStartAtLoginUnavailableMessage:
@@ -830,6 +836,18 @@ enum TiboTattleLocalization {
                 "macOS did not confirm that TiboTattle was removed from Login Items. Review System Settings → Login Items before relying on it."
             case .settingsStartAtLoginUnregistrationNotConfirmedTitle:
                 "Removal from login was not confirmed"
+            case .settingsRefreshInterval:
+                "Refresh interval"
+            case .settingsRefreshIntervalDetail:
+                "Saved on this Mac and used while TiboTattle is open."
+            case .settingsRefreshIntervalOneMinute:
+                "Every minute"
+            case .settingsRefreshIntervalFiveMinutes:
+                "Every 5 minutes"
+            case .settingsRefreshIntervalFifteenMinutes:
+                "Every 15 minutes"
+            case .settingsRefreshIntervalThirtyMinutes:
+                "Every 30 minutes"
             case .settingsUseDefault:
                 "Use Default"
             case .settingsUpdateDisclosureAutomaticOff:

@@ -108,7 +108,6 @@
           <a href="#timeline" data-nav="trends" data-requires-evidence>Trends</a>
           <a href="#accounting" data-nav="method" data-requires-evidence>How it works</a>
           <a href="#community" data-nav="community" data-requires-evidence>Community</a>
-          <a href="#data" data-nav="data">Data &amp; privacy</a>
         </nav>
       </aside>
       <div class="dashboard-content">
@@ -243,9 +242,6 @@
             <p class="eyebrow">01 · Overview</p>
             <h2 id="overview-title">Where your allowance stands</h2>
           </div>
-          <p id="overview-context">
-            Current quota observations and API-price-equivalent usage from your local evidence.
-          </p>
         </div>
 
         <div class="metric-grid quota-grid" id="quota-cards" aria-live="polite">
@@ -359,7 +355,7 @@
         </article>
       </section>
 
-      <section class="dashboard-section lead-section" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence>
+      <section class="dashboard-section lead-section dashboard-page-inactive" id="weekly" aria-labelledby="weekly-title" data-dashboard-page="weekly" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading">
           <div>
             <p class="eyebrow">02 · Weekly allowance</p>
@@ -377,16 +373,6 @@
           <p id="weekly-explanation">The estimate will appear when local usage can be matched to quota changes.</p>
         </div>
 
-        <aside class="weekly-pricing-receipt" id="weekly-pricing-receipt" aria-live="polite">
-          <div>
-            <p class="panel-kicker">Price basis for the visible fits</p>
-            <h3 id="weekly-pricing-receipt-title">Price table not yet loaded</h3>
-          </div>
-          <p id="weekly-pricing-receipt-copy">
-            TiboTattle will state which reviewed price table was used once local evidence loads.
-          </p>
-        </aside>
-
         <article class="panel weekly-history-panel lead-chart-panel">
           <div class="panel-heading">
             <div>
@@ -399,11 +385,16 @@
                 <button type="button" data-days="31" class="active" aria-pressed="true">31d</button>
                 <button type="button" data-days="36500">All</button>
               </div>
+              <label class="weekly-span-control" for="weekly-span-control">
+                <span>Minimum observed quota span</span>
+                <input id="weekly-span-control" type="range" min="0" max="99" step="1" value="50">
+                <output id="weekly-span-value" for="weekly-span-control">50+ pp</output>
+              </label>
             </div>
           </div>
           <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>Typical estimate</span>
-            <span><i class="legend-dot weekly-mature"></i>Observed across 50+ points</span>
+            <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
           </div>
           <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
@@ -412,6 +403,16 @@
             Each dot is a separate reset estimate. Its vertical bar shows the range supported by that reset’s observations.
           </p>
         </article>
+
+        <aside class="weekly-pricing-receipt" id="weekly-pricing-receipt" aria-live="polite">
+          <div>
+            <p class="panel-kicker">Price basis for the visible fits</p>
+            <h3 id="weekly-pricing-receipt-title">Price table not yet loaded</h3>
+          </div>
+          <p id="weekly-pricing-receipt-copy">
+            TiboTattle will state which reviewed price table was used once local evidence loads.
+          </p>
+        </aside>
 
         <details class="panel weekly-table-panel evidence-disclosure">
           <summary>See individual measurements</summary>
@@ -435,7 +436,7 @@
         </details>
       </section>
 
-      <section class="dashboard-section" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence>
+      <section class="dashboard-section dashboard-page-inactive" id="timeline" aria-labelledby="timeline-title" data-dashboard-page="trends" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading">
           <div>
             <p class="eyebrow">03 · Timeline</p>
@@ -525,14 +526,13 @@
             <div class="panel-heading">
               <div>
                 <p class="panel-kicker">Residuals</p>
-                <h3>Where the estimate misses</h3>
+                <h3>Observed versus calculated movement</h3>
               </div>
             </div>
             <p class="annotation">
-              Residual = observed quota change minus cost-implied change. Positive
-              values mean the allowance fell faster than the token model predicted.
-              The axis covers the same date range as the calibration chart above;
-              windows that cannot be differenced are shaded gaps, never zeros.
+              The difference between provider-reported quota movement and the
+              movement implied by measured local activity. Quiet periods with no
+              activity and no quota change are neutral, not errors.
             </p>
             <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
             <div class="chart-shell compact-chart" id="residual-chart" hidden></div>
@@ -550,7 +550,7 @@
                 <caption class="sr-only">Largest unexplained quota movement periods</caption>
                 <thead>
                   <tr>
-                  <th scope="col" id="residual-time-heading">Reported time</th>
+                  <th scope="col" id="residual-time-heading">Local time</th>
                   <th scope="col">Observed</th>
                   <th scope="col">Expected</th>
                   <th scope="col">Difference</th>
@@ -567,7 +567,7 @@
         </details>
       </section>
 
-      <section class="dashboard-section" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence>
+      <section class="dashboard-section dashboard-page-inactive" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence aria-hidden="true" inert>
         <div class="section-heading split">
           <div>
             <p class="eyebrow">04 · Cost accounting</p>
@@ -577,17 +577,16 @@
             <button type="button" data-period="24h">24h</button>
             <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
             <button type="button" data-period="30d">30d</button>
-            <button type="button" data-period="all">31d cache</button>
+            <button type="button" data-period="all">31-day cache</button>
           </div>
         </div>
         <div class="notice notice-info accounting-disclosure">
           <div>
             <strong>API pricing is a measuring stick, not your bill.</strong>
             <p>
-              Every local usage increment is repriced with the public Standard
-              API rate card, then multiplied by the published Fast credit rate
-              when its effective mode is Fast. The result is a quota-weighted
-              API-price equivalent, not an invoice.
+              Each measured local event uses the public API price that was in
+              effect when it occurred, with the published Fast multiplier when
+              applicable. It is an equivalent for comparison, not an invoice.
             </p>
           </div>
         </div>
@@ -625,74 +624,48 @@
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Models</p>
-              <h3>Recognized and unknown model usage</h3>
+              <h3>Model usage</h3>
             </div>
           </div>
             <div class="table-wrap">
               <table>
                 <caption class="sr-only">Replay-safe usage grouped by recognized model</caption>
-                <thead><tr><th>Model</th><th>Usage increments</th><th>Tokens</th><th>API equivalent</th></tr></thead>
+                <thead><tr><th>Model</th><th>Measured events</th><th>Tokens</th><th>API equivalent</th></tr></thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
             <p class="annotation">
-              Any unrecognized model is kept as an explicit overflow row. Its
-              tokens remain visible, but no price is invented.
+              Known models without a reviewed historical price, and genuinely
+              unknown model names, remain visible without an invented cost.
             </p>
         </article>
       </section>
 
-      <section class="dashboard-section" id="coverage" aria-labelledby="coverage-title" data-dashboard-page="method" data-requires-evidence>
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">05 · Reading the estimate</p>
-            <h2 id="coverage-title">When to treat this as an estimate</h2>
-          </div>
-          <p>
-            TiboTattle shows only the few conditions that materially affect the
-            allowance estimate. Everything else stays in local diagnostics.
-          </p>
-        </div>
-
-        <article class="panel blind-spots">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Good to know</p>
-              <h3>What could change this estimate</h3>
-            </div>
-          </div>
-          <div id="blind-spot-list" class="issue-list">
-            <div class="empty-inline">No quality artifact loaded.</div>
-          </div>
-        </article>
-      </section>
-
       <section
-        class="contribution-cta"
+        class="contribution-cta dashboard-page-inactive"
         id="contribution-cta"
         aria-labelledby="contribution-cta-title"
         data-dashboard-page="community"
         data-requires-evidence
+        aria-hidden="true"
+        inert
       >
         <div class="contribution-cta-copy">
           <p class="eyebrow">Optional</p>
           <h2 id="contribution-cta-title">Share one anonymous summary</h2>
           <p>
             Improve community estimates with one reviewed, content-free result.
-            You see the exact prepared export before anything is sent.
           </p>
           <details class="contribution-categories">
             <summary>What leaves this Mac — and what never does</summary>
             <div>
               <p>
-                May be shared: timestamps, token counts, safe model labels,
-                coarse tool and surface categories, and observed allowance
-                percentages.
+                Shared: timestamps, token counts, safe model labels, coarse
+                tool and surface categories, and allowance percentages.
               </p>
               <p>
-                Never shared: prompts, responses, reasoning, files, paths,
-                URLs, commands, account names, email addresses, identifiers,
-                or credentials.
+                Never shared: prompts, responses, reasoning, files, paths, URLs,
+                commands, account names, emails, identifiers, or credentials.
               </p>
             </div>
           </details>
@@ -704,10 +677,9 @@
               <span class="evidence-chip neutral" id="identity-signin-state">Not signed in</span>
             </p>
             <p class="annotation">
-              Hosted participation requires signing in with Google or Apple.
-              The service stores only an irreversible hash of that sign-in —
-              never your email or name — and this page keeps the sign-in token
-              in memory only. Local-only use needs no account.
+              Hosted participation uses Google or Apple; the service keeps only
+              an irreversible sign-in hash, never your email or name. Local-only
+              use needs no account.
             </p>
             <!--
               Both vendor marks are drawn once here as inline SVG symbols and
@@ -748,8 +720,7 @@
                 <strong id="identity-account-provider">Signed in with Google</strong>
                 <small id="identity-account-detail">
                   Signing out revokes this browser's service session and forgets
-                  this sign-in. It deletes nothing: metadata already contributed
-                  stays until you delete it in Hosted privacy controls.
+                  this sign-in. Hosted privacy controls remain available separately.
                 </small>
               </span>
               <!--
@@ -824,18 +795,15 @@
         </div>
       </section>
 
-      <section class="dashboard-section" id="data" data-dashboard-page="data" data-nav-target aria-labelledby="data-title">
+      <section class="dashboard-section dashboard-page-inactive" id="data" data-dashboard-page="community" data-nav-target aria-labelledby="data-title" aria-hidden="true" inert>
         <div class="section-heading">
           <div>
-            <p class="eyebrow">06 · Data &amp; privacy</p>
-            <h2 id="data-title">Local by default. Contribute by choice.</h2>
+            <p class="eyebrow">06 · Community contribution</p>
+            <h2 id="data-title">Review first. Contribute by choice.</h2>
           </div>
           <p>
-            Raw logs are read by the loopback companion, not the webpage. A contribution
-            must be a privacy-stripped export and is validated again by the server.
-            Hosted participation requires signing in with Google or Apple; the service
-            stores only an irreversible hash of that sign-in, never your email or name.
-            Local-only use needs no account.
+            Review one content-free result before an optional upload. Local
+            reporting stays on this Mac.
           </p>
         </div>
 

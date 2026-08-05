@@ -445,6 +445,7 @@ export function createLocalCollectorRefreshRunner({
       maximumBufferedLineBytes: EARLY_HEADLINE_BUFFERED_LINE_BYTES,
     });
     let headlinePublished = false;
+    let collectorResourceLimitDeferred = false;
     const publishHeadline = async (indexing) => {
       if (headlinePublished
           || signal?.aborted === true
@@ -463,14 +464,18 @@ export function createLocalCollectorRefreshRunner({
       const earlyLimit = collectorResourceLimit(result);
       if (earlyLimit !== null
           && earlyLimit.dimension !== "source_bytes") {
-        throwCollectorResourceLimit();
-      }
-      // Resume without the headline override so the collector's reviewed
-      // normal-pass budget and source-consistency checks remain authoritative.
-      const continued = await runCollector(collectorOptions);
-      result = mergeCollectorPasses(result, continued, clock());
-      if (collectorResourceLimit(continued) !== null) {
-        throwCollectorResourceLimit();
+        // Preserve the foreground resource-limit receipt, but let the
+        // independent archive pass use this same bounded refresh to advance
+        // its own checkpoint before the receipt is surfaced.
+        collectorResourceLimitDeferred = true;
+      } else {
+        // Resume without the headline override so the collector's reviewed
+        // normal-pass budget and source-consistency checks remain authoritative.
+        const continued = await runCollector(collectorOptions);
+        result = mergeCollectorPasses(result, continued, clock());
+        if (collectorResourceLimit(continued) !== null) {
+          collectorResourceLimitDeferred = true;
+        }
       }
     }
     const completedIndex = publicIndexingResult(result?.indexing);
@@ -523,8 +528,12 @@ export function createLocalCollectorRefreshRunner({
     );
     let archiveIndex = null;
     if (refreshArchiveIndex !== null
-        && accountingMayRun
         && signal?.aborted !== true) {
+      // Archive coverage is independent of the recent collector's accounting
+      // gate. A bounded recent pass may remain paused while this one foreground
+      // refresh still advances the archive's durable source offsets. The
+      // callback is invoked at most once per runner invocation; there is no
+      // background continuation.
       await onProgress?.({
         kind: ARCHIVE_INDEX_PROGRESS_KIND,
         status: "scanning",
@@ -539,6 +548,7 @@ export function createLocalCollectorRefreshRunner({
         signal,
       });
     }
+    if (collectorResourceLimitDeferred) throwCollectorResourceLimit();
     return {
       rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
         ? result.rolloutRecordsWritten
@@ -795,7 +805,7 @@ export class LocalCompanionRefreshController {
           errorCode: null,
         };
       })
-      .catch((error) => {
+      .catch(async (error) => {
         if (this.#cancelRequested) {
           this.#state = {
             status: "cancelled",
@@ -810,6 +820,17 @@ export class LocalCompanionRefreshController {
           return;
         }
         if (timedOut) return;
+        if (error?.code === "collector_resource_limit_exceeded") {
+          // The runner may have completed one independent archive checkpoint
+          // before surfacing the recent collector's fixed safety stop. Publish
+          // that content-free coverage receipt while retaining the previous
+          // foreground result.
+          try {
+            await this.#dataStore.reload();
+          } catch {
+            // Keep the prior good dashboard if the receipt reload is unavailable.
+          }
+        }
         this.#state = {
           status: "failed",
           refreshId: this.#state.refreshId,

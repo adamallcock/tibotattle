@@ -2084,8 +2084,14 @@ test("local pairing preserves fixed identifier-shaped codes and drops anything e
   // cause instead of collapsing all of them into one vague sentence.
   for (const [code, status] of [
     ["contribution_device_recovery_required", 409],
+    ["contribution_device_pairing_not_authorized", 403],
     ["contribution_device_pairing_not_configured", 409],
+    ["sync_in_progress", 409],
     ["contribution_device_pairing_failed", 502],
+    ["unsupported_media_type", 415],
+    ["request_too_large", 413],
+    ["invalid_json", 400],
+    ["invalid_request", 400],
   ]) {
     await assert.rejects(
       rejectingClient({ code }, status).pairContributionDevice(pairingCode),
@@ -2804,9 +2810,9 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   // only for Ad hoc, App Store Connect, and Development distribution, so a
   // Developer ID build can never carry the entitlement.
   assert.equal(/Use Apple sign-in from the app/u.test(html), false);
-  assert.match(html, /irreversible hash of that sign-in/u);
+  assert.match(html, /irreversible sign-in hash/u);
   assert.match(html, /never your email or name/u);
-  assert.match(html, /Local-only use needs no account\./u);
+  assert.match(html, /Local-only\s+use needs no account\./u);
 
   // A real signed-in state: a provider badge, which provider it is, and a way
   // out. The copy must not imply that leaving deletes anything hosted.
@@ -2837,7 +2843,8 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   );
   assert.match(html, />\s*Sign out\s*</u);
   assert.match(html, /Signing out revokes this browser's service session and forgets/u);
-  assert.match(html, /metadata already contributed\s+stays until you delete it/u);
+  assert.match(html, /Hosted privacy controls remain available separately/u);
+  assert.doesNotMatch(html, /metadata already contributed\s+stays until you delete it/u);
   assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
 
   assert.match(appSource, /function configuredGoogleClientId\(\)/u);
@@ -3591,14 +3598,15 @@ test("public interface is dashboard-first and never substitutes demo data automa
     "Trends",
     "Weekly",
     "Community",
-    "Data &amp; privacy",
     "How the estimate was calculated",
-    "When to treat this as an estimate",
+    "Review first. Contribute by choice.",
     "Your contribution receipt",
     "Community backend readiness"
   ]) {
     assert.match(html, new RegExp(label));
   }
+  assert.doesNotMatch(html, /data-nav="data"/u);
+  assert.doesNotMatch(html, /Data &amp; privacy/u);
   assert.match(html, /id="usage-timeline-chart"/);
   assert.match(html, /id="timeline-chart"/);
   assert.match(html, /id="weekly-chart"/);
@@ -3609,7 +3617,8 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="accounting-models"/);
   assert.match(html, /class="panel accounting-models-panel"/);
   assert.match(appSource, /function renderAccountingComponentBars/);
-  assert.match(html, /Usage increments/);
+  assert.match(html, /Measured events/);
+  assert.doesNotMatch(html, /Usage increments/);
   assert.match(html, /API pricing is a measuring stick, not your bill/);
   // The dashboard does not ask the user to supply a speed assumption; only
   // recorded log evidence is shown in the primary experience.
@@ -3838,8 +3847,8 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     assert.match(html, new RegExp(`id="${id}"`));
   }
   assert.match(html, /data-nav="community"/);
-  assert.match(html, /data-nav="data"/);
-  assert.match(html, /id="residual-time-heading">Reported time/);
+  assert.doesNotMatch(html, /data-nav="data"/u);
+  assert.match(html, /id="residual-time-heading">Local time/);
   assert.doesNotMatch(html, /Exact local \/ UTC time/);
   assert.match(html, /Missing quota bracket/);
   assert.match(appSource, /function selectedTimelinePoints/);
@@ -3852,16 +3861,21 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /visibleArtifactResiduals\.length[\s\S]*pointResiduals/);
   assert.match(appSource, /renderResiduals\(data, visiblePoints, viewport\)/);
   assert.match(appSource, /safeDomainEndMs - domainStartMs/);
+  assert.match(appSource, /const automaticTickCount = Math\.max\([\s\S]*?Math\.min\(7/u);
+  assert.match(appSource, /rotateXTickLabels \? "end"/u);
+  assert.match(appSource, /marker\.addEventListener\("pointerenter"/u);
+  assert.match(appSource, /marker\.addEventListener\("focus"/u);
+  assert.match(appSource, /marker\.setAttribute\("tabindex", "0"\)/u);
   assert.match(appSource, /REPORTING_TIME_ZONE/);
   assert.match(appSource, /localCalendarParts\(\)\.formatToParts\(timestamp\)/);
   assert.match(appSource, /formatReportingTime\(item\.timestamp\)/);
-  assert.match(appSource, /Window ending \(\$\{REPORTING_TIME_ZONE\}\)/);
+  assert.match(appSource, /Window ending \(\$\{formatTimeZoneLabel\(\)\}\)/);
   assert.doesNotMatch(appSource, /function formatUtc/);
   assert.match(adminSource, /formatReportingTime/);
   assert.doesNotMatch(adminSource, /toLocaleString/);
   assert.match(appSource, /periodEndAt/);
   assert.match(appSource, /point\.periodEndAt \?\? point\.timestamp/);
-  assert.match(appSource, /Unrecognized \/ unpriced overflow/);
+  assert.match(appSource, /price unavailable/);
   assert.match(appSource, /component\.unpricedTokens/);
   assert.match(appSource, /timelineStatusLabel/);
   assert.match(appSource, /recent_7d_partial/);
@@ -3965,23 +3979,23 @@ test("weekly keeps every fit visible and marks short observations separately", a
   assert.doesNotMatch(appSource, /showWeeklyPartialDiagnostics/u);
 });
 
-test("the weekly evidence boundary is fixed and cannot create an empty slider state", async () => {
+test("the weekly evidence slider is bounded below 100 and cannot create an accidental empty state", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(appSource, /const WEEKLY_WELL_OBSERVED_SPAN_PP = 50;/u);
+  assert.match(appSource, /let activeWeeklyMinimumObservedSpanPp = 50;/u);
   const thresholdMatch = appSource.match(
     /function isWellObservedWeeklyFit\(observedSpanPp\) \{([\s\S]*?)\n\}/u,
   );
   assert.ok(thresholdMatch, "isWellObservedWeeklyFit is available for contract review");
   assert.match(
     thresholdMatch[1],
-    /return observedSpanPp !== null && observedSpanPp >= WEEKLY_WELL_OBSERVED_SPAN_PP;/u,
+    /return observedSpanPp !== null && observedSpanPp >= activeWeeklyMinimumObservedSpanPp;/u,
   );
-  assert.doesNotMatch(html, /weekly-span-threshold|weekly-evidence-controls/u);
-  assert.doesNotMatch(appSource, /weeklySpanThresholdPp|Math\.min\(99, threshold\)/u);
+  assert.match(html, /id="weekly-span-control" type="range" min="0" max="99"/u);
+  assert.match(appSource, /activeWeeklyMinimumObservedSpanPp = Math\.min\(99, Math\.max\(0, Number\(event\.target\.value\)\)\)/u);
 });
 
-test("weekly points carry measured ranges without mouse-only detail popovers", async () => {
+test("weekly points carry measured ranges with pointer and keyboard detail", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
@@ -4002,7 +4016,8 @@ test("weekly points carry measured ranges without mouse-only detail popovers", a
     /function renderAllowanceHistoryChart\(history\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.match(weeklyChart, /tooltip: false,/u);
-  assert.doesNotMatch(weeklyChart, /focusable: true|weeklyPointDetail|markerOpacity/u);
+  assert.match(weeklyChart, /tooltip: true,[\s\S]*?focusable: true,/u);
+  assert.match(weeklyChart, /detail: \(point\) => `\$\{formatPp\(point\.observedSpanPp\)\} observed/u);
   assert.match(appSource, /if \(item\.tooltip !== false \|\| item\.focusable === true\)/u);
   assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
@@ -4095,7 +4110,7 @@ test("residuals span the calibration range and show uncomputable windows as gaps
   assert.match(appSource, /function residualGapReasons/u);
   assert.match(appSource, /t\("dashboard\.residual\.partial", \{/u);
   assert.match(html, /id="residual-coverage"/u);
-  assert.match(html, /windows that cannot be differenced are shaded gaps, never zeros/u);
+  assert.match(html, /Quiet periods with no\s+activity and no quota change are neutral, not errors/u);
 });
 
 test("the weekly allowance chart leads the dashboard", async () => {
@@ -4112,31 +4127,13 @@ test("the weekly allowance chart leads the dashboard", async () => {
   );
   assert.match(html, /<p class="eyebrow">02 · Weekly allowance<\/p>/u);
   assert.match(html, /<p class="eyebrow">03 · Timeline<\/p>/u);
-  assert.match(html, /class="dashboard-section lead-section" id="weekly"/u);
+  assert.match(html, /class="dashboard-section lead-section(?: dashboard-page-inactive)?" id="weekly"/u);
   assert.match(html, /class="panel weekly-history-panel lead-chart-panel"/u);
   // The lead chart must use the available page width instead of introducing a
   // second horizontal scrollbar for a handful of reset estimates.
   assert.match(styles, /\.weekly-history-chart \{ overflow: visible; \}/u);
   assert.match(styles, /\.weekly-history-chart svg \{ min-width: 0; height: clamp\(300px, 34vw, 420px\); \}/u);
   assert.match(styles, /\.lead-chart-panel \.weekly-history-chart svg \{ height: clamp\(320px, 38vw, 460px\); \}/u);
-});
-
-test("estimate caveats show only the few gaps that materially change the result", async () => {
-  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-
-  // The default view is a short list of gaps that change how the number reads.
-  assert.match(appSource, /const MATERIAL_GAP_LIMIT = 2;/u);
-  assert.match(appSource, /const MATERIAL_GAP_STATUSES = Object\.freeze\(\[/u);
-  assert.match(appSource, /\.slice\(MATERIAL_GAP_LIMIT\)|\.slice\(0, MATERIAL_GAP_LIMIT\)/u);
-  assert.match(appSource, /function briefGapExplanation/u);
-  assert.doesNotMatch(appSource, /\.slice\(0, 18\)/u);
-  // Technical inventories no longer crowd the reader's main journey.
-  assert.doesNotMatch(html, /id="blind-spot-inventory"/u);
-  assert.doesNotMatch(html, /Full inventory and per-signal coverage/u);
-  assert.doesNotMatch(html, /id="blind-spot-count"/u);
-  assert.doesNotMatch(html, /Archived technical reports/u);
-  assert.doesNotMatch(html, /id="fast-mode-preference-controls"/u);
 });
 
 test("weekly details keep reset evidence concise and do not present speed coverage as known", async () => {
@@ -4347,13 +4344,17 @@ test("primary contribution journey connects the Mac for one reviewed send withou
 
 test("post-results contribution CTA is explicit while technical and deletion controls stay quiet", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  const coveragePosition = html.indexOf('id="coverage"');
   const ctaPosition = html.indexOf('id="contribution-cta"');
   const dataPosition = html.indexOf('id="data"');
-  assert.ok(coveragePosition >= 0 && coveragePosition < ctaPosition);
+  assert.equal(html.indexOf('id="coverage"'), -1);
   assert.ok(ctaPosition < dataPosition);
+  assert.match(html, /data-dashboard-page="community"[^>]*id="data"|id="data"[^>]*data-dashboard-page="community"/u);
   assert.match(html, /What leaves this Mac — and what never does/u);
+  assert.match(html, /Improve community estimates with one reviewed, content-free result\./u);
+  assert.match(html, /Shared: timestamps, token counts, safe model labels/u);
   assert.match(html, /Never shared: prompts, responses, reasoning, files, paths/u);
+  assert.match(html, /Hosted participation uses Google or Apple/u);
+  assert.match(html, /I consent to review and submit this metadata/u);
   assert.match(html, /id="contribution-not-now"/u);
   assert.match(html, /id="automatic-contribution-status"/u);
   assert.match(html, /id="automatic-contribution-toggle"[\s\S]*hidden/u);
@@ -4404,7 +4405,7 @@ test("the primary contribution journey never enables a recurring schedule", asyn
 test("stale local device conflicts name the leftover credential and offer the repair", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const recoveryMatch = appSource.match(
-    /function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
+    /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
   );
   assert.ok(recoveryMatch, "stale-device recovery renderer is available");
   const recoverySource = recoveryMatch[1];
@@ -4421,6 +4422,7 @@ test("stale local device conflicts name the leftover credential and offer the re
     /invitation|invite/iu,
   );
   assert.match(recoverySource, /Metadata you already contributed is untouched/u);
+  assert.match(recoverySource, /await describeFailure\(/u);
   assert.match(recoverySource, /no hosted device is revoked/u);
   assert.match(recoverySource, /Data & Diagnostics… menu offers the same repair natively/u);
   assert.match(recoverySource, /Reset this Mac's device credential/u);
@@ -4458,6 +4460,13 @@ test("stale local device conflicts name the leftover credential and offer the re
     resetMatch[1],
     /localClient\.resetContributionDeviceCredential\(\)/u,
   );
+  const reviewBody = appSource.match(
+    /function openContributionReview\(\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(reviewBody, /disclosure\.open = true/u);
+  assert.match(reviewBody, /queue\.open = true/u);
+  assert.match(reviewBody, /review\?\.scrollIntoView/u);
+  assert.match(reviewBody, /heading\.focus/u);
 });
 
 test("real contribution UI encrypts before sending and renders delayed snapshots", async () => {
@@ -4614,12 +4623,27 @@ test("every user-visible failure carries a quotable, content-free reference", ()
 
   assert.equal(
     diagnosticReferenceSentence({ reference: "TT-7QF3K2" }),
+    "Reference TT-7QF3K2.",
+  );
+  assert.equal(
+    diagnosticReferenceSentence({
+      reference: "TT-7QF3K2",
+      requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+    }),
+    "Reference TT-7QF3K2.",
+  );
+  assert.equal(
+    diagnosticReferenceSentence({
+      reference: "TT-7QF3K2",
+      writtenToLocalLog: true,
+    }),
     "Reference TT-7QF3K2, also written to the local diagnostics log.",
   );
   assert.equal(
     diagnosticReferenceSentence({
       reference: "TT-7QF3K2",
       requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+      writtenToLocalLog: true,
     }),
     "Reference TT-7QF3K2 · service request 0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b. Both are written to the local diagnostics log.",
   );
@@ -4629,6 +4653,7 @@ test("every user-visible failure carries a quotable, content-free reference", ()
     diagnosticReferenceSentence({
       reference: "TT-7QF3K2",
       requestId: "participant:private",
+      writtenToLocalLog: true,
     }),
     "Reference TT-7QF3K2, also written to the local diagnostics log.",
   );
@@ -4753,6 +4778,36 @@ test("diagnostic notes are recorded through a fixed, bounded local route", async
   assert.deepEqual(
     normalizeLocalDiagnosticNote(null),
     { status: "unavailable", reference: "" },
+  );
+});
+
+test("failed diagnostic writes reject and leave the user with only the reference", async () => {
+  const client = new LocalCompanionClient({
+    fetchImpl: async () => new Response(JSON.stringify({
+      schemaVersion: "local-companion-v0.1",
+      error: { code: "diagnostic_note_not_recorded" },
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    }),
+  });
+  await assert.rejects(
+    client.recordDiagnosticNote({
+      reference: "TT-7QF3K2",
+      surface: "contribution_connect",
+      code: "contribution_device_recovery_required",
+      requestId: "",
+    }),
+    (error) => error?.status === 500
+      && error?.code === "diagnostic_note_not_recorded",
+  );
+  assert.equal(
+    diagnosticReferenceSentence({
+      reference: "TT-7QF3K2",
+      requestId: "0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b",
+      writtenToLocalLog: false,
+    }),
+    "Reference TT-7QF3K2.",
   );
 });
 
@@ -5212,10 +5267,27 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     assert.doesNotMatch(appSource, new RegExp(`${map}\\[`, "u"));
     assert.match(appSource, new RegExp(`fixedCopy\\(\\s*${map},`, "u"));
   }
+  const localCompanionCopy = appSource.match(
+    /const LOCAL_COMPANION_ERROR_COPY = \{([\s\S]*?)\n\};/u,
+  )?.[1] ?? "";
+  for (const code of [
+    "contribution_device_recovery_required",
+    "contribution_device_pairing_not_authorized",
+    "contribution_device_pairing_response_invalid",
+    "contribution_device_pairing_not_configured",
+    "contribution_device_pairing_failed",
+    "unsupported_media_type",
+    "request_too_large",
+    "invalid_json",
+    "invalid_request",
+    "sync_in_progress",
+  ]) {
+    assert.match(localCompanionCopy, new RegExp(`\\b${code}:`, "u"));
+  }
 
   // The explanation always comes from a fixed map or the caller's fallback.
   const describe = appSource.match(
-    /function describeFailure\(\{ surface, error, messages = \{\}, fallback \}\) \{([\s\S]*?)\n\}\n/u,
+    /async function describeFailure\(\{ surface, error, messages = \{\}, fallback \}\) \{([\s\S]*?)\n\}\n/u,
   )?.[1];
   assert.ok(describe, "the failure describer is available");
   assert.match(
@@ -5230,8 +5302,10 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     describe,
     /localClient\.recordDiagnosticNote\(\{\s*\n\s*reference,\s*\n\s*surface: diagnosticSurface\(surface\),/u,
   );
-  // Filing the note must never replace telling the user what happened.
-  assert.match(describe, /\}\)\.catch\(\(\) => \{\}\);/u);
+  assert.match(describe, /const recorded = await localClient\.recordDiagnosticNote/u);
+  assert.match(describe, /writtenToLocalLog = recorded\?\.status === "recorded"/u);
+  assert.match(describe, /writtenToLocalLog,/u);
+  assert.doesNotMatch(describe, /void localClient\.recordDiagnosticNote/u);
 
   // The connect fallback no longer names three unrelated things to check.
   const connect = appSource.match(
@@ -5270,7 +5344,7 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   );
   assert.match(
     connect,
-    /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*renderContributionDeviceRecovery\(status, \{ error \}\);/u,
+    /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u,
   );
 
   // Every journey that can fail files its note against a fixed surface.
