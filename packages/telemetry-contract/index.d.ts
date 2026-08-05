@@ -172,6 +172,7 @@ export interface TelemetryQuotaSnapshot {
     | "go"
     | "plus"
     | "pro"
+    | "prolite"
     | "business"
     | "enterprise"
     | "edu"

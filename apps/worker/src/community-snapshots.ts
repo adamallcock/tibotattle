@@ -37,7 +37,7 @@ const DEFAULT_COMMUNITY_SNAPSHOT_POLICY: CommunitySnapshotPolicy = Object.freeze
 // cell carries an explicit plan cohort; absent or mixed-in-window evidence
 // stays the explicit "unknown" cohort rather than being inferred.
 const PLAN_COHORT_TYPES = Object.freeze([
-  "free", "go", "plus", "pro", "business", "enterprise", "edu", "team",
+  "free", "go", "plus", "pro", "prolite", "business", "enterprise", "edu", "team",
   "unknown",
 ]);
 const PLAN_COHORT_VARIANTS = Object.freeze([

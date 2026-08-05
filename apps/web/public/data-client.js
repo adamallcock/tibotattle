@@ -1976,7 +1976,7 @@ function normalizeLocalTimeline(value = {}) {
       slot: ["primary", "secondary", "unknown"].includes(row?.slot)
         ? row.slot
         : "unknown",
-      planType: ["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]
+      planType: ["free", "go", "plus", "pro", "prolite", "business", "enterprise", "edu", "team", "unknown"]
         .includes(row?.planType) ? row.planType : "unknown",
       accountAttribution: row?.accountAttribution === "attributed_pseudonymous"
         ? "attributed_pseudonymous"

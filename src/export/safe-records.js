@@ -8,7 +8,7 @@ import {
 } from "./resource-policy.js";
 import { CODEX_COLLECTOR_CANDIDATE_VERSION } from "./versions.js";
 
-const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "business", "enterprise", "edu", "team", "unknown"]);
+const PLAN_TYPES = new Set(["free", "go", "plus", "pro", "prolite", "business", "enterprise", "edu", "team", "unknown"]);
 const PLAN_VARIANTS = new Set(["pro-20x", "pro-10x-promo", "pro-5x", "plus", "unknown"]);
 const SESSION_SCOPE_PATTERN = /^session:v1:[a-f0-9]{64}$/u;
 const ACCOUNT_SCOPE_SUBJECT_PATTERN = /^openai-account:v1:[A-Za-z0-9_-]{43}$/u;

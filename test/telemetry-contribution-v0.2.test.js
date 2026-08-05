@@ -195,6 +195,20 @@ test("manual and JSON Schema validators enforce closed plaintext shapes", async 
   assert.equal(validateSchema(part), true, JSON.stringify(validateSchema.errors));
   assert.equal(validateTelemetryContributionV02(part).valid, true);
 
+  const prolite = structuredClone(part);
+  prolite.quotaSnapshots[0].planType = "prolite";
+  prolite.activityMarkers[0].planType = "prolite";
+  assert.equal(validateSchema(prolite), true, JSON.stringify(validateSchema.errors));
+  assert.equal(validateTelemetryContributionV02(prolite).valid, true);
+
+  const arbitrary = structuredClone(part);
+  arbitrary.quotaSnapshots[0].planType = "arbitrary-plan-name";
+  assert.equal(validateSchema(arbitrary), false);
+  assert.deepEqual(
+    validateTelemetryContributionV02(arbitrary).errors,
+    ["canonical_v01_invalid"],
+  );
+
   const contaminated = structuredClone(part);
   contaminated.usageEvents[0].content = "private";
   assert.equal(validateSchema(contaminated), false);

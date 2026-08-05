@@ -348,6 +348,7 @@ test("local companion relays bounded durations and selects a deterministic prima
           {
             limitId: "codex",
             slot: "primary",
+            planType: "arbitrary-plan-name",
             usedPercent: 30,
             windowDurationMins: 43_200,
             resetsAt: 1_784_980_800,
@@ -355,7 +356,7 @@ test("local companion relays bounded durations and selects a deterministic prima
           {
             limitId: "codex",
             slot: "primary",
-            planType: "pro",
+            planType: "prolite",
             usedPercent: 40,
             windowDurationMins: 300,
             resetsAt: 1_784_916_000,
@@ -412,7 +413,7 @@ test("local companion relays bounded durations and selects a deterministic prima
       [
         ["codex", "primary", 43_200, "unknown"],
         ["codex", "secondary", 43_200, "plus"],
-        ["codex", "primary", 300, "pro"],
+        ["codex", "primary", 300, "prolite"],
         ["codex", "secondary", 10_080, "pro"],
         ["codex_bengalfox", "primary", 43_200, "enterprise"],
       ],

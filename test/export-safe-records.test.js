@@ -4,8 +4,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  normalizeActivityMarker,
   normalizeClaudeStatusQuotaSnapshots,
   normalizeCodexCollectorQuotaCandidate,
+  normalizeCodexQuotaSnapshot,
   scanCodexSafeRecords,
   summarizeActivityMarkerPlan,
 } from "../src/export-safe-records.js";
@@ -266,6 +268,36 @@ test("collector candidates normalize deterministically without exporting source 
     observationIdentityMaterial: "f".repeat(64),
   }));
   assert.equal(notification.snapshotSource, "notification");
+});
+
+test("safe plan normalization retains prolite and fails closed for arbitrary identifiers", () => {
+  const quotaEvent = (planType) => normalizeCodexQuotaSnapshot(SECRET, {
+    timestamp: "2026-07-24T12:02:00.000Z",
+    sourceScopeId: `session:v1:${"a".repeat(64)}`,
+    window: {
+      limitId: "codex",
+      planType,
+      slot: "secondary",
+      usedPercent: 12.3,
+      windowDurationMins: 10_080,
+      resetsAt: 1_785_430_800,
+    },
+  });
+  assert.equal(quotaEvent("prolite").planType, "prolite");
+  assert.equal(quotaEvent("arbitrary-plan-name").planType, "unknown");
+
+  const bounds = {
+    startMs: Date.parse(START_AT),
+    endMs: Date.parse(END_AT),
+  };
+  assert.equal(
+    normalizeActivityMarker(SECRET, { ...marker(), planType: "prolite" }, bounds).planType,
+    "prolite",
+  );
+  assert.equal(
+    normalizeActivityMarker(SECRET, { ...marker(), planType: "arbitrary-plan-name" }, bounds).planType,
+    "unknown",
+  );
 });
 
 test("sessionless unattributed collector states cannot collapse across distinct observations", () => {

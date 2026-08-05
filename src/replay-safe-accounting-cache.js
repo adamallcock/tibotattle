@@ -109,6 +109,7 @@ const QUOTA_PLANS = new Set([
   "free",
   "plus",
   "pro",
+  "prolite",
   "team",
   "business",
   "enterprise",
