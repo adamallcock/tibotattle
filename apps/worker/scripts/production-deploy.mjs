@@ -1,13 +1,23 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import {
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   rm,
   symlink,
+  writeFile,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { tmpdir } from "node:os";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -21,6 +31,7 @@ import { runReleasePreflight } from "./release-preflight.mjs";
 
 export const PRODUCTION_DEPLOY_CONFIRMATION =
   "DEPLOY_CONTAINED_PRODUCTION";
+const PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS = 10_000;
 
 function localFailure(code) {
   return { ok: false, code };
@@ -30,7 +41,7 @@ function checkedOutSourceCommit(workerDirectory) {
   try {
     const value = execFileSync(
       "/usr/bin/git",
-      ["-C", dirname(workerDirectory), "rev-parse", "HEAD"],
+      ["-C", workerDirectory, "rev-parse", "HEAD"],
       { encoding: "utf8" },
     ).trim();
     return /^[a-f0-9]{7,64}$/u.test(value) ? value : null;
@@ -45,7 +56,7 @@ function checkedOutSourceTreeClean(workerDirectory) {
       "/usr/bin/git",
       [
         "-C",
-        dirname(workerDirectory),
+        workerDirectory,
         "status",
         "--porcelain=v1",
         "--untracked-files=all",
@@ -84,11 +95,84 @@ function verifySourceSnapshot({
   return { ok: true, sourceCommit };
 }
 
+function pathWithin(parent, child) {
+  const path = relative(parent, child);
+  return path === ""
+    || (path !== ".."
+      && !path.startsWith(`..${sep}`)
+      && !isAbsolute(path));
+}
+
+function sourceRepositoryRoot(workerDirectory) {
+  try {
+    const canonicalWorkerDirectory = realpathSync(workerDirectory);
+    const reportedRoot = execFileSync(
+      "/usr/bin/git",
+      ["-C", canonicalWorkerDirectory, "rev-parse", "--show-toplevel"],
+      { encoding: "utf8" },
+    ).trim();
+    if (!reportedRoot) throw new Error("Git did not report a repository root.");
+    const canonicalRoot = realpathSync(
+      isAbsolute(reportedRoot)
+        ? reportedRoot
+        : resolve(canonicalWorkerDirectory, reportedRoot),
+    );
+    const verifiedRoot = execFileSync(
+      "/usr/bin/git",
+      ["-C", canonicalRoot, "rev-parse", "--show-toplevel"],
+      { encoding: "utf8" },
+    ).trim();
+    const canonicalVerifiedRoot = realpathSync(
+      isAbsolute(verifiedRoot)
+        ? verifiedRoot
+        : resolve(canonicalRoot, verifiedRoot),
+    );
+    if (canonicalVerifiedRoot !== canonicalRoot
+        || !pathWithin(canonicalRoot, canonicalWorkerDirectory)) {
+      throw new Error("Git repository root does not contain the Worker directory.");
+    }
+    return canonicalRoot;
+  } catch {
+    const error = new Error("Unable to resolve the checked-out Git repository root.");
+    error.code = "PRODUCTION_SOURCE_REPOSITORY_UNAVAILABLE";
+    throw error;
+  }
+}
+
+async function requireSafeDirectory(path, label) {
+  const metadata = await lstat(path).catch((error) => {
+    throw new Error(`${label} is missing or cannot be inspected.`, {
+      cause: error,
+    });
+  });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a real directory.`);
+  }
+}
+
+async function requireAbsent(path, label) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`${label} must not already exist.`);
+}
+
+function runSnapshotGit(excludeFile, repositoryRoot, arguments_) {
+  return execFileSync(
+    "/usr/bin/git",
+    ["-c", `core.excludesFile=${excludeFile}`, "-C", repositoryRoot, ...arguments_],
+    { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+  );
+}
+
 async function createImmutableSourceSnapshot({
   workerDirectory,
   sourceCommit,
 }) {
-  const repositoryRoot = dirname(workerDirectory);
+  const repositoryRoot = sourceRepositoryRoot(workerDirectory);
   const snapshotParent = await mkdtemp(
     join(tmpdir(), "usage-monitor-production-source-"),
   );
@@ -110,6 +194,12 @@ async function createImmutableSourceSnapshot({
       { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
     );
     worktreeAdded = true;
+    const snapshotGitExclude = join(snapshotParent, "git-exclude");
+    await writeFile(
+      snapshotGitExclude,
+      "apps/worker/node_modules\n",
+      { mode: 0o600 },
+    );
 
     const generatedSource = join(
       repositoryRoot,
@@ -121,26 +211,55 @@ async function createImmutableSourceSnapshot({
       ".release-build",
       "public-release-site",
     );
-    await mkdir(dirname(snapshotGeneratedSource), {
-      recursive: true,
-      mode: 0o755,
-    });
+    const generatedMetadata = await lstat(generatedSource);
+    if (!generatedMetadata.isDirectory()
+        || generatedMetadata.isSymbolicLink()) {
+      throw new Error("Generated public release output must be a real directory.");
+    }
+    const snapshotReleaseBuild = dirname(snapshotGeneratedSource);
+    try {
+      await requireSafeDirectory(snapshotReleaseBuild, "Snapshot release-build directory");
+    } catch (error) {
+      if (error?.cause?.code !== "ENOENT") throw error;
+      await mkdir(snapshotReleaseBuild, { mode: 0o755 });
+    }
+    await requireAbsent(snapshotGeneratedSource, "Snapshot generated asset directory");
     await cp(generatedSource, snapshotGeneratedSource, {
       recursive: true,
+      dereference: false,
+      errorOnExist: true,
+      force: false,
       verbatimSymlinks: true,
     });
+    await requireSafeDirectory(
+      snapshotGeneratedSource,
+      "Snapshot generated asset directory",
+    );
 
     // Wrangler is launched from the snapshot, but its installed dependency
     // tree is not source input and remains the locally checked dependency set.
+    const snapshotApps = join(snapshotRoot, "apps");
+    const snapshotWorker = join(snapshotApps, "worker");
+    await requireSafeDirectory(snapshotApps, "Snapshot apps directory");
+    await requireSafeDirectory(snapshotWorker, "Snapshot Worker directory");
+    const dependencySource = join(workerDirectory, "node_modules");
+    await requireSafeDirectory(dependencySource, "Checked-out Worker dependencies");
+    const dependencyDestination = join(snapshotWorker, "node_modules");
+    await requireAbsent(dependencyDestination, "Snapshot Worker dependencies");
     await symlink(
-      join(workerDirectory, "node_modules"),
-      join(snapshotRoot, "apps", "worker", "node_modules"),
+      dependencySource,
+      dependencyDestination,
       "dir",
     );
 
     return {
       repositoryRoot: snapshotRoot,
-      workerDirectory: join(snapshotRoot, "apps", "worker"),
+      workerDirectory: snapshotWorker,
+      git: (root, arguments_) => runSnapshotGit(
+        snapshotGitExclude,
+        root,
+        arguments_,
+      ),
       async cleanup() {
         execFileSync(
           "/usr/bin/git",
@@ -268,6 +387,7 @@ async function runProductionDeploymentFromSnapshot({
   proofCheck = null,
   sourceCommit,
   snapshotRepositoryRoot,
+  snapshotGit,
   sourceCheckDirectory,
   sourceCommitCheck = checkedOutSourceCommit,
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
@@ -332,13 +452,17 @@ async function runProductionDeploymentFromSnapshot({
         ".release-build",
         "worker-assets",
       ),
+      git: snapshotGit,
     });
   } catch {
     return localFailure("PRODUCTION_PUBLIC_ASSETS_INVALID");
   }
   let health;
   try {
-    health = await healthRecheck({ fetchImpl });
+    health = await healthRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
   } catch {
     return localFailure("PRODUCTION_HEALTH_RECHECK_UNREACHABLE");
   }
@@ -383,12 +507,29 @@ async function runProductionDeploymentFromSnapshot({
   if (deployment?.error || deployment?.status !== 0) {
     return localFailure("PRODUCTION_DEPLOY_FAILED");
   }
+  let postDeployHealth;
+  try {
+    postDeployHealth = await healthRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+  } catch {
+    return localFailure("PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_UNREACHABLE");
+  }
+  if (postDeployHealth?.ok !== true) {
+    const reason = typeof postDeployHealth?.code === "string"
+      && postDeployHealth.code.startsWith("PRODUCTION_HEALTH_RECHECK_")
+      ? postDeployHealth.code.slice("PRODUCTION_HEALTH_RECHECK_".length)
+      : "AMBIGUOUS";
+    return localFailure(`PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_${reason}`);
+  }
   return {
     ok: true,
     code: "PRODUCTION_DEPLOYED_AFTER_CONTAINMENT_PROOF",
     channel: "stable",
     collectionAuthorized: false,
     immediateHealthRecheck: "contained",
+    postDeployHealthRecheck: "contained",
     containmentProof: {
       observedAt: containmentProof.proof.observedAt,
       workerRevision: containmentProof.proof.worker.revision,
@@ -432,7 +573,10 @@ export async function runProductionDeployment({
     snapshot = await createSourceSnapshot({ workerDirectory, sourceCommit });
   } catch (error) {
     return localFailure(
-      error?.code === "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED"
+      [
+        "PRODUCTION_SOURCE_REPOSITORY_UNAVAILABLE",
+        "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
+      ].includes(error?.code)
         ? error.code
         : "PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE",
     );
@@ -459,6 +603,7 @@ export async function runProductionDeployment({
       wrangler,
       workerDirectory: snapshot.workerDirectory,
       snapshotRepositoryRoot: snapshot.repositoryRoot,
+      snapshotGit: snapshot.git,
       sourceCheckDirectory: workerDirectory,
       sourceCommit,
       spawn,

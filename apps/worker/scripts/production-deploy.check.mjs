@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,9 +27,68 @@ import {
   runProductionDeployment,
   recheckProductionContainment,
 } from "./production-deploy.mjs";
+import { stageProductionAssets } from "./stage-production-assets.mjs";
 
 const NOW = Date.parse("2026-08-04T20:00:00.000Z");
 const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
+
+function git(root, arguments_) {
+  return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
+    encoding: "utf8",
+  });
+}
+
+async function immutableSnapshotFixture() {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-production-snapshot-"));
+  const workerDirectory = join(root, "apps", "worker");
+  const sourceDirectory = join(
+    root,
+    ".release-build",
+    "public-release-site",
+  );
+  await mkdir(join(workerDirectory, "node_modules"), { recursive: true });
+  await mkdir(sourceDirectory, { recursive: true });
+  await writeFile(
+    join(root, ".gitignore"),
+    ".release-build/\nnode_modules/\n",
+  );
+  await writeFile(join(workerDirectory, "wrangler.jsonc"), "{}\n");
+
+  const generatedFiles = {
+    "community.js": "console.log('snapshot community');\n",
+    "index.html": '<script type="module" src="./community.js"></script>\n',
+  };
+  const manifest = {
+    schemaVersion: "usage-monitor-release-site-manifest-v0.2",
+    files: [],
+  };
+  for (const [path, contents] of Object.entries(generatedFiles)) {
+    await writeFile(join(sourceDirectory, path), contents);
+    const bytes = Buffer.from(contents);
+    manifest.files.push({
+      path,
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+  }
+  await writeFile(
+    join(sourceDirectory, "release-site-manifest.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+
+  git(root, ["init", "--quiet"]);
+  git(root, ["config", "user.email", "test@example.invalid"]);
+  git(root, ["config", "user.name", "Production snapshot test"]);
+  git(root, ["add", ".gitignore", "apps/worker/wrangler.jsonc"]);
+  git(root, ["commit", "--quiet", "-m", "fixture"]);
+  return {
+    root,
+    workerDirectory,
+    sourceDirectory,
+    generatedFiles,
+    sourceCommit: git(root, ["rev-parse", "HEAD"]).trim(),
+  };
+}
 
 function containedHealth() {
   return {
@@ -116,6 +186,108 @@ function options(overrides = {}) {
     ...overrides,
   };
 }
+
+test("production deployment creates a real top-level Git snapshot before staging generated assets", async (t) => {
+  const fixture = await immutableSnapshotFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const stageCalls = [];
+  const stagedIndex = [];
+  const healthTimeouts = [];
+  let healthChecks = 0;
+  const result = await runProductionDeployment(options({
+    workerDirectory: fixture.workerDirectory,
+    expectedSourceCommit: fixture.sourceCommit,
+    sourceCommitCheck: (directory) => git(directory, ["rev-parse", "HEAD"]).trim(),
+    sourceTreeCleanCheck: (directory) => git(
+      directory,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+    ).trim() === "",
+    proofCheck: proofCheck({
+      worker: {
+        ...proofCheck().proof.worker,
+        sourceCommit: fixture.sourceCommit,
+      },
+    }),
+    createSourceSnapshot: undefined,
+    stageAssets: async (value) => {
+      stageCalls.push(value);
+      const staged = await stageProductionAssets(value);
+      stagedIndex.push(await readFile(
+        join(value.destinationDirectory, "index.html"),
+        "utf8",
+      ));
+      assert.equal(
+        realpathSync(git(
+          value.repositoryRoot,
+          ["rev-parse", "--show-toplevel"],
+        ).trim()),
+        realpathSync(value.repositoryRoot),
+      );
+      return staged;
+    },
+    healthRecheck: async ({ timeoutMs }) => {
+      healthChecks += 1;
+      healthTimeouts.push(timeoutMs);
+      return { ok: true, code: null };
+    },
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    releasePreflight: async () => ({ state: "ready", blockers: [] }),
+    spawn: (_command, _args, spawnOptions) => {
+      assert.match(spawnOptions.cwd, /\/repository\/apps\/worker$/u);
+      return { status: 0, stdout: "deployed", stderr: "" };
+    },
+  }));
+
+  assert.equal(result.ok, true);
+  assert.equal(healthChecks, 2);
+  assert.deepEqual(healthTimeouts, [10_000, 10_000]);
+  assert.deepEqual(stageCalls[0].sourceDirectory, join(
+    stageCalls[0].repositoryRoot,
+    ".release-build",
+    "public-release-site",
+  ));
+  assert.notEqual(stageCalls[0].repositoryRoot, join(fixture.root, "apps"));
+  assert.equal(stagedIndex[0], fixture.generatedFiles["index.html"]);
+  await assert.rejects(
+    readFile(join(stageCalls[0].sourceDirectory, "index.html")),
+    { code: "ENOENT" },
+  );
+});
+
+test("production deployment fails closed when generated release output is a symlink", async (t) => {
+  const fixture = await immutableSnapshotFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const realSourceDirectory = join(fixture.root, "generated-source");
+  await rename(fixture.sourceDirectory, realSourceDirectory);
+  await symlink(realSourceDirectory, fixture.sourceDirectory, "dir");
+  let spawned = false;
+  const result = await runProductionDeployment(options({
+    workerDirectory: fixture.workerDirectory,
+    expectedSourceCommit: fixture.sourceCommit,
+    sourceCommitCheck: (directory) => git(directory, ["rev-parse", "HEAD"]).trim(),
+    sourceTreeCleanCheck: () => true,
+    proofCheck: proofCheck({
+      worker: {
+        ...proofCheck().proof.worker,
+        sourceCommit: fixture.sourceCommit,
+      },
+    }),
+    createSourceSnapshot: undefined,
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    releasePreflight: async () => ({ state: "ready", blockers: [] }),
+    spawn: () => {
+      spawned = true;
+      return { status: 0 };
+    },
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE",
+  });
+  assert.equal(spawned, false);
+});
 
 test("production deployment requires scoped confirmation and a receipt before local gates or Wrangler", async () => {
   const calls = [];
@@ -261,14 +433,60 @@ test("valid production proof routes through local checks and then the exact prod
     "assets",
     ["deploy", "--env", "production", "--strict"],
   ]);
-  assert.equal(healthCalls.length, 1);
+  assert.equal(healthCalls.length, 2);
   assert.equal(healthCalls[0].url, HEALTH_URL);
+  assert.equal(healthCalls[1].url, HEALTH_URL);
   assert.equal(healthCalls[0].request.method, "GET");
   assert.equal(healthCalls[0].request.credentials, "omit");
   assert.equal(healthCalls[0].request.redirect, "error");
   assert.equal(result.collectionAuthorized, false);
   assert.equal(result.immediateHealthRecheck, "contained");
+  assert.equal(result.postDeployHealthRecheck, "contained");
   assert.equal(result.containmentProof.workerRevision, "production-revision-0001");
+});
+
+test("production deployment does not report success when the post-deploy containment observation is ambiguous or open", async () => {
+  for (const [name, postDeployFetch, expectedCode] of [
+    [
+      "unreachable",
+      async () => {
+        throw new Error("post-deploy network failure");
+      },
+      "PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_UNREACHABLE",
+    ],
+    [
+      "not-contained",
+      async () => jsonHealthResponse({
+        ...containedHealth(),
+        enrollmentMode: "open",
+      }),
+      "PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_NOT_CONTAINED",
+    ],
+  ]) {
+    let fetchCount = 0;
+    let spawned = false;
+    const result = await runProductionDeployment(options({
+      proofCheck: proofCheck(),
+      checkWorkspacePackages: async () => {},
+      checkEndpoints: async () => {},
+      stageAssets: async () => {},
+      fetchImpl: async (url, request) => {
+        fetchCount += 1;
+        assert.equal(String(url), HEALTH_URL, name);
+        assert.equal(request.method, "GET", name);
+        return fetchCount === 1
+          ? jsonHealthResponse()
+          : postDeployFetch();
+      },
+      spawn: () => {
+        spawned = true;
+        return { status: 0, stdout: "deployed", stderr: "" };
+      },
+    }));
+    assert.equal(spawned, true, name);
+    assert.equal(fetchCount, 2, name);
+    assert.deepEqual(result, { ok: false, code: expectedCode }, name);
+  }
 });
 
 test("production deployment treats release preflight as a hard gate", async () => {
