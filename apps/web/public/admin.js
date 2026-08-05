@@ -21,6 +21,16 @@ function formatTime(value) {
   return value ? formatReportingTime(value) : "—";
 }
 
+function tableRow(values) {
+  const row = document.createElement("tr");
+  for (const value of values) {
+    const cell = document.createElement("td");
+    cell.textContent = text(value);
+    row.append(cell);
+  }
+  return row;
+}
+
 function showNotice(message, kind = "warning") {
   const notice = $("#notice");
   notice.className = `notice notice-${kind}`;
@@ -75,15 +85,12 @@ function renderControls(controls) {
 
 function renderErrors(errors) {
   const body = $("#error-groups");
-  body.replaceChildren(...errors.groups.map((group) => {
-    const row = document.createElement("tr");
-    for (const value of [group.routeClass, group.errorCode, `${group.occurrences} (${group.ratePerDay}/day)`, formatTime(group.latestAt)]) {
-      const cell = document.createElement("td");
-      cell.textContent = text(value);
-      row.append(cell);
-    }
-    return row;
-  }));
+  body.replaceChildren(...errors.groups.map((group) => tableRow([
+    group.routeClass,
+    group.errorCode,
+    `${group.occurrences} (${group.ratePerDay}/day)`,
+    formatTime(group.latestAt),
+  ])));
   $("#error-empty").hidden = errors.groups.length !== 0;
   const lookup = $("#diagnostic-lookup");
   if (errors.lookup) {
@@ -117,28 +124,22 @@ function renderOperational(overview) {
     }),
   );
   const rows = overview.snapshots || [];
-  $("#snapshot-rows").replaceChildren(...rows.map((snapshot) => {
-    const row = document.createElement("tr");
-    for (const value of [snapshot.snapshotId, `${snapshot.weekStart} → ${snapshot.weekEnd}`, snapshot.releaseState, formatTime(snapshot.releasedAt)]) {
-      const cell = document.createElement("td");
-      cell.textContent = text(value);
-      row.append(cell);
-    }
-    return row;
-  }));
+  $("#snapshot-rows").replaceChildren(...rows.map((snapshot) => tableRow([
+    snapshot.snapshotId,
+    `${snapshot.weekStart} → ${snapshot.weekEnd}`,
+    snapshot.releaseState,
+    formatTime(snapshot.releasedAt),
+  ])));
   $("#snapshot-empty").hidden = rows.length !== 0;
 }
 
 function renderAudit(rows) {
-  $("#audit-rows").replaceChildren(...rows.map((item) => {
-    const row = document.createElement("tr");
-    for (const value of [item.action, item.outcome, JSON.stringify(item.details), formatTime(item.createdAt)]) {
-      const cell = document.createElement("td");
-      cell.textContent = text(value);
-      row.append(cell);
-    }
-    return row;
-  }));
+  $("#audit-rows").replaceChildren(...rows.map((item) => tableRow([
+    item.action,
+    item.outcome,
+    JSON.stringify(item.details),
+    formatTime(item.createdAt),
+  ])));
 }
 
 function render(overview) {
