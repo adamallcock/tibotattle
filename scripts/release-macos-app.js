@@ -6,7 +6,10 @@ import {
   STABLE_RELEASE_CHANNEL,
   resolveReleaseChannel,
 } from "../config/release-channels.js";
-import { releaseMacOSApp } from "./macos-release-core.js";
+import {
+  prepareMacOSReleaseCandidate,
+  releaseMacOSApp,
+} from "./macos-release-core.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
@@ -15,6 +18,7 @@ export function parseArguments(argv) {
   let channel = null;
   let output = null;
   let previousStableManifestPath = null;
+  let prepareCandidate = false;
   let replace = false;
   let stableBootstrap = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -35,6 +39,8 @@ export function parseArguments(argv) {
       previousStableManifestPath = resolve(argv[++index]);
     } else if (argument === "--stable-bootstrap" && !stableBootstrap) {
       stableBootstrap = true;
+    } else if (argument === "--prepare-candidate" && !prepareCandidate) {
+      prepareCandidate = true;
     } else if (argument === "--replace" && !replace) {
       replace = true;
     } else {
@@ -76,13 +82,24 @@ export function parseArguments(argv) {
     channel,
     output: output ?? resolve(defaultOutput),
     previousStableManifestPath,
+    prepareCandidate,
     replace,
     stableBootstrap,
   };
 }
 
 export async function main(argv) {
-  const result = await releaseMacOSApp(parseArguments(argv));
+  const options = parseArguments(argv);
+  if (options.prepareCandidate) {
+    await prepareMacOSReleaseCandidate({
+      channel: options.channel,
+      output: options.appPath,
+      previousStableManifestPath: options.previousStableManifestPath,
+      stableBootstrap: options.stableBootstrap,
+    });
+    console.log(`Review candidate: ${options.appPath}`);
+  }
+  const result = await releaseMacOSApp(options);
   console.log("TiboTattle macOS release: complete");
   console.log(`Channel: ${result.channel}`);
   console.log(`DMG: ${result.output}`);

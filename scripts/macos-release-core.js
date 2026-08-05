@@ -49,6 +49,7 @@ import {
 } from "./macos-updater-core.js";
 import {
   buildMacOSAppForRelease,
+  buildMacOSReleaseCandidate,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
 
@@ -2295,6 +2296,53 @@ async function assertReplaceableReleaseTarget(path, {
     fail(`Refusing to replace an existing ${label} without --replace`);
   }
   return metadata !== null;
+}
+
+/**
+ * Build the unsigned review candidate that anchors the release packager's
+ * reproducibility check. The generic builder remains unable to authorize an
+ * external bundle; this owner path derives every endpoint and updater input
+ * from the named release channel, then revalidates source provenance,
+ * credentials, and key continuity inside the builder before writing output.
+ */
+export async function prepareMacOSReleaseCandidate({
+  channel,
+  output,
+  environment = process.env,
+  previousStableManifestPath = null,
+  stableBootstrap = false,
+}) {
+  const releaseChannel = resolveReleaseChannel(channel);
+  if (releaseChannel.name !== STABLE_RELEASE_CHANNEL
+      && (previousStableManifestPath !== null || stableBootstrap)) {
+    fail(
+      "Stable Sparkle continuity options are only valid for the stable channel",
+      "MACOS_STABLE_CONTINUITY_CHANNEL_INVALID",
+    );
+  }
+  const buildConfiguration = readMacOSReleaseBuildConfiguration(
+    environment,
+    releaseChannel.name,
+  );
+  const updaterConfiguration = await normalizeMacOSUpdaterConfiguration({
+    appcastURL: buildConfiguration.sparkleAppcastURL,
+    externalDistribution: true,
+    frameworkPath: buildConfiguration.sparkleFramework,
+    publicEdKey: buildConfiguration.sparklePublicEdKey,
+  });
+  return buildMacOSReleaseCandidate({
+    output: resolve(output),
+    centralOrigin: buildConfiguration.productionOrigin,
+    externalDistribution: true,
+    environment,
+    previousStableManifestPath,
+    stableBootstrap,
+    releaseChannel: releaseChannel.name,
+    bundleVersion: buildConfiguration.bundleVersion,
+    sparkleFramework: updaterConfiguration.framework.path,
+    sparkleAppcastURL: updaterConfiguration.appcastURL,
+    sparklePublicEdKey: updaterConfiguration.publicEdKey,
+  });
 }
 
 export async function releaseMacOSApp({

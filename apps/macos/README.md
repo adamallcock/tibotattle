@@ -331,6 +331,7 @@ must not enter the repository or release host:
 ```bash
 npm run product:macos:release -- \
   --channel stable \
+  --prepare-candidate \
   --stable-bootstrap
 ```
 
@@ -341,6 +342,7 @@ previous stable release so the gate can prove version continuity:
 ```bash
 npm run product:macos:release -- \
   --channel stable \
+  --prepare-candidate \
   --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
 
@@ -370,7 +372,10 @@ export USAGE_MONITOR_NOTARY_PROFILE='usage-monitor-notary'
 export USAGE_MONITOR_BUNDLE_VERSION='1'
 export USAGE_MONITOR_SPARKLE_FRAMEWORK="$PWD/.release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY='REPLACE_WITH_32_BYTE_BASE64_PUBLIC_KEY='
-npm run product:macos:release -- --channel stable --stable-bootstrap
+npm run product:macos:release -- \
+  --channel stable \
+  --prepare-candidate \
+  --stable-bootstrap
 ```
 
 For a later stable release, use `--previous-stable-manifest` in place of

@@ -41,9 +41,15 @@ RSS channel item, one signed full `.dmg` enclosure, no
 `sparkle:deltaFrom`, and no retained history or extra enclosures. This is a
 release-safety contract, not a formatting preference: a local publisher that
 accepted history or deltas could pass its own checks and then fail at the
-guard after immutable objects had already been uploaded. The internal-dogfood
-descriptor is currently unconfigured, so it cannot reach this stable publisher
-or guard; a future configured channel needs a separately reviewed policy.
+guard after immutable objects had already been uploaded. The configured
+`internal-dogfood` descriptor uses this named publisher path with its own
+policy-owned distribution identifiers: it shares `https://tibotattle.com` for
+the app service and public website, but uses the isolated update origin
+`https://dogfood-updates.tibotattle.com`, appcast
+`https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml`, bucket
+`tibotattle-dogfood-updates`, object prefix `internal-dogfood/releases`, and a
+dedicated reviewed public key. Stable continuity/bootstrap inputs remain
+stable-only; dogfood must not copy them or any stable update identifier.
 
 Fresh bootstrap and replacement both publish the current full DMG as the sole
 feed entry, so an older installed client can update directly without requiring

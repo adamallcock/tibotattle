@@ -1,6 +1,23 @@
 import { ApiError, jsonResponse } from "./errors";
 import { sha256, sha256Hex } from "./crypto";
-import sparkleReleaseContract from "./sparkle-release-contract.json";
+import stableSparkleReleaseContract from "./sparkle-release-contract.json";
+
+export interface SparkleAppcastGuardContract {
+  readonly channel: string;
+  readonly updateOrigin: string;
+  readonly appcastObjectKey: string;
+  readonly r2Bucket: string;
+  readonly objectPrefix: string;
+  readonly guardSchema: string;
+  readonly guardRoute: string;
+  readonly appcastContentType: string;
+  readonly appcastCacheControl: string;
+  readonly artifactContentType: string;
+  readonly artifactCacheControl: string;
+}
+
+const sparkleReleaseContract: SparkleAppcastGuardContract =
+  stableSparkleReleaseContract;
 
 export const SPARKLE_APPCAST_GUARD_SCHEMA = sparkleReleaseContract.guardSchema;
 export const SPARKLE_APPCAST_GUARD_ROUTE = sparkleReleaseContract.guardRoute;
@@ -55,12 +72,12 @@ interface ExpectedPresentState {
 type ExpectedCurrentState = ExpectedEmptyState | ExpectedPresentState;
 
 interface GuardPayload {
-  readonly schemaVersion: typeof SPARKLE_APPCAST_GUARD_SCHEMA;
-  readonly channel: typeof SPARKLE_APPCAST_GUARD_CHANNEL;
-  readonly bucket: typeof SPARKLE_APPCAST_GUARD_BUCKET;
-  readonly key: typeof SPARKLE_APPCAST_GUARD_KEY;
-  readonly contentType: typeof SPARKLE_APPCAST_GUARD_CONTENT_TYPE;
-  readonly cacheControl: typeof SPARKLE_APPCAST_GUARD_CACHE_CONTROL;
+  readonly schemaVersion: string;
+  readonly channel: string;
+  readonly bucket: string;
+  readonly key: string;
+  readonly contentType: string;
+  readonly cacheControl: string;
   readonly expectedCurrent: ExpectedCurrentState;
   readonly candidate: {
     readonly bytes: number;
@@ -139,6 +156,7 @@ function configurationError(): never {
  */
 export function readSparkleAppcastGuardConfiguration(
   env: Env,
+  contract: SparkleAppcastGuardContract = sparkleReleaseContract,
 ): SparkleAppcastGuardConfiguration {
   const mode = setting(env, "SPARKLE_APPCAST_GUARD_MODE");
   if (mode === undefined || mode === "disabled") {
@@ -147,12 +165,12 @@ export function readSparkleAppcastGuardConfiguration(
   if (mode !== "enabled") configurationError();
 
   const expectedSettings: ReadonlyArray<readonly [string, string]> = [
-    ["SPARKLE_APPCAST_GUARD_CHANNEL", SPARKLE_APPCAST_GUARD_CHANNEL],
-    ["SPARKLE_APPCAST_GUARD_BUCKET", SPARKLE_APPCAST_GUARD_BUCKET],
-    ["SPARKLE_APPCAST_GUARD_APPCAST_KEY", SPARKLE_APPCAST_GUARD_KEY],
-    ["SPARKLE_APPCAST_GUARD_ENDPOINT_PATH", SPARKLE_APPCAST_GUARD_ROUTE],
-    ["SPARKLE_APPCAST_GUARD_CONTENT_TYPE", SPARKLE_APPCAST_GUARD_CONTENT_TYPE],
-    ["SPARKLE_APPCAST_GUARD_CACHE_CONTROL", SPARKLE_APPCAST_GUARD_CACHE_CONTROL],
+    ["SPARKLE_APPCAST_GUARD_CHANNEL", contract.channel],
+    ["SPARKLE_APPCAST_GUARD_BUCKET", contract.r2Bucket],
+    ["SPARKLE_APPCAST_GUARD_APPCAST_KEY", contract.appcastObjectKey],
+    ["SPARKLE_APPCAST_GUARD_ENDPOINT_PATH", contract.guardRoute],
+    ["SPARKLE_APPCAST_GUARD_CONTENT_TYPE", contract.appcastContentType],
+    ["SPARKLE_APPCAST_GUARD_CACHE_CONTROL", contract.appcastCacheControl],
     ["SPARKLE_APPCAST_GUARD_MAX_XML_BYTES", String(SPARKLE_APPCAST_GUARD_MAX_XML_BYTES)],
   ];
   for (const [name, expected] of expectedSettings) {
@@ -297,7 +315,10 @@ function parseExpectedCurrent(value: unknown): ExpectedCurrentState {
   };
 }
 
-function parsePayload(body: Uint8Array): GuardPayload {
+function parsePayload(
+  body: Uint8Array,
+  contract: SparkleAppcastGuardContract,
+): GuardPayload {
   let value: unknown;
   try {
     value = JSON.parse(decoder.decode(body));
@@ -315,12 +336,12 @@ function parsePayload(body: Uint8Array): GuardPayload {
     "schemaVersion",
     "bucket",
   ]);
-  if (object.schemaVersion !== SPARKLE_APPCAST_GUARD_SCHEMA
-      || object.channel !== SPARKLE_APPCAST_GUARD_CHANNEL
-      || object.bucket !== SPARKLE_APPCAST_GUARD_BUCKET
-      || object.key !== SPARKLE_APPCAST_GUARD_KEY
-      || object.contentType !== SPARKLE_APPCAST_GUARD_CONTENT_TYPE
-      || object.cacheControl !== SPARKLE_APPCAST_GUARD_CACHE_CONTROL) {
+  if (object.schemaVersion !== contract.guardSchema
+      || object.channel !== contract.channel
+      || object.bucket !== contract.r2Bucket
+      || object.key !== contract.appcastObjectKey
+      || object.contentType !== contract.appcastContentType
+      || object.cacheControl !== contract.appcastCacheControl) {
     throw new ApiError(403, "SPARKLE_APPCAST_GUARD_TARGET_INVALID");
   }
   const candidate = parseObject(object.candidate);
@@ -334,12 +355,12 @@ function parsePayload(body: Uint8Array): GuardPayload {
     invalidRequest();
   }
   return {
-    schemaVersion: SPARKLE_APPCAST_GUARD_SCHEMA,
-    channel: SPARKLE_APPCAST_GUARD_CHANNEL,
-    bucket: SPARKLE_APPCAST_GUARD_BUCKET,
-    key: SPARKLE_APPCAST_GUARD_KEY,
-    contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE,
-    cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
+    schemaVersion: contract.guardSchema,
+    channel: contract.channel,
+    bucket: contract.r2Bucket,
+    key: contract.appcastObjectKey,
+    contentType: contract.appcastContentType,
+    cacheControl: contract.appcastCacheControl,
     expectedCurrent: parseExpectedCurrent(object.expectedCurrent),
     candidate: {
       base64: candidate.base64,
@@ -428,7 +449,11 @@ function compareBundleVersions(left: string, right: string): number {
   return 0;
 }
 
-function parseSparkleArtifactURL(value: string, version: string): {
+function parseSparkleArtifactURL(
+  value: string,
+  version: string,
+  contract: SparkleAppcastGuardContract,
+): {
   readonly key: string;
   readonly sha256: string;
 } {
@@ -439,24 +464,33 @@ function parseSparkleArtifactURL(value: string, version: string): {
     invalidCandidate();
   }
   const segments = parsed.pathname.slice(1).split("/");
-  if (parsed.origin !== SPARKLE_APPCAST_GUARD_UPDATE_ORIGIN
+  const prefixSegments = contract.objectPrefix.split("/");
+  const versionIndex = prefixSegments.length;
+  const sha256Index = versionIndex + 1;
+  const fileNameIndex = versionIndex + 2;
+  if (parsed.origin !== contract.updateOrigin
       || parsed.protocol !== "https:"
       || parsed.username || parsed.password || parsed.search || parsed.hash
       || parsed.href !== value
-      || segments.length !== 4
-      || segments[0] !== SPARKLE_APPCAST_GUARD_OBJECT_PREFIX
-      || segments[1] !== version
-      || !SHA256_PATTERN.test(segments[2] ?? "")
-      || !SAFE_ARTIFACT_FILE_NAME_PATTERN.test(segments[3] ?? "")) {
+      || segments.length !== prefixSegments.length + 3
+      || segments.slice(0, versionIndex).join("/") !== contract.objectPrefix
+      || segments[versionIndex] !== version
+      || !SHA256_PATTERN.test(segments[sha256Index] ?? "")
+      || !SAFE_ARTIFACT_FILE_NAME_PATTERN.test(
+        segments[fileNameIndex] ?? "",
+      )) {
     invalidCandidate();
   }
   return {
     key: segments.join("/"),
-    sha256: segments[2] as string,
+    sha256: segments[sha256Index] as string,
   };
 }
 
-function parseSparkleEnclosure(attributes: Map<string, string>): SparkleAppcastEnclosure {
+function parseSparkleEnclosure(
+  attributes: Map<string, string>,
+  contract: SparkleAppcastGuardContract,
+): SparkleAppcastEnclosure {
   const url = attributes.get("url");
   const length = attributes.get("length");
   const version = attributes.get("sparkle:version");
@@ -472,7 +506,7 @@ function parseSparkleEnclosure(attributes: Map<string, string>): SparkleAppcastE
       || canonicalBase64Bytes(signature)?.byteLength !== 64) {
     invalidCandidate();
   }
-  const object = parseSparkleArtifactURL(url, version);
+  const object = parseSparkleArtifactURL(url, version, contract);
   const deltaFrom = attributes.get("sparkle:deltaFrom");
   if (deltaFrom !== undefined) invalidCandidate();
   return {
@@ -486,7 +520,10 @@ function parseSparkleEnclosure(attributes: Map<string, string>): SparkleAppcastE
   };
 }
 
-function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
+function parseSparkleAppcast(
+  text: string,
+  contract: SparkleAppcastGuardContract,
+): ParsedSparkleAppcast {
   if (text.length === 0 || text.includes("<!") || text.includes("<!--")
       || text.includes("<![CDATA[") || text.includes("<?xml-stylesheet")) {
     invalidCandidate();
@@ -565,7 +602,7 @@ function parseSparkleAppcast(text: string): ParsedSparkleAppcast {
         "sparkle:version",
         "sparkle:edSignature",
       ]);
-      enclosures.push(parseSparkleEnclosure(attributes));
+      enclosures.push(parseSparkleEnclosure(attributes, contract));
     } else if (!selfClosing) {
       stack.push(name);
     }
@@ -586,9 +623,10 @@ function canonicalRequest(
   timestamp: string,
   nonce: string,
   bodySha256: string,
+  contract: SparkleAppcastGuardContract,
 ): Uint8Array {
   return encoder.encode(
-    `${SPARKLE_APPCAST_GUARD_SCHEMA}\0POST\0${SPARKLE_APPCAST_GUARD_ROUTE}`
+    `${contract.guardSchema}\0POST\0${contract.guardRoute}`
     + `\0${timestamp}\0${nonce}\0${bodySha256}`,
   );
 }
@@ -598,6 +636,7 @@ async function authenticateRequest(
   body: Uint8Array,
   token: string,
   nowEpoch: number,
+  contract: SparkleAppcastGuardContract,
 ): Promise<{ nonce: string }> {
   const timestamp = request.headers.get("x-usage-monitor-release-timestamp");
   const nonce = request.headers.get("x-usage-monitor-release-nonce");
@@ -632,7 +671,7 @@ async function authenticateRequest(
       "HMAC",
       key,
       signatureBytes,
-      canonicalRequest(timestamp, nonce, bodySha256),
+      canonicalRequest(timestamp, nonce, bodySha256, contract),
     );
     if (!valid) invalidAuth();
   } catch (error) {
@@ -668,9 +707,12 @@ export async function consumeSparkleAppcastGuardNonce(
   }
 }
 
-function conflictResponse(reason: "current_state_conflict" | "r2_conditional_write_conflict") {
+function conflictResponse(
+  reason: "current_state_conflict" | "r2_conditional_write_conflict",
+  contract: SparkleAppcastGuardContract,
+) {
   return jsonResponse({
-    schemaVersion: SPARKLE_APPCAST_GUARD_SCHEMA,
+    schemaVersion: contract.guardSchema,
     status: "conflict",
     reason,
   }, 409, { "cache-control": "no-store" });
@@ -680,6 +722,7 @@ async function currentStateMatches(
   bucket: R2Bucket,
   key: string,
   expected: ExpectedCurrentState,
+  contract: SparkleAppcastGuardContract,
 ): Promise<{ bytes: Uint8Array | null; head: R2Object | null; matches: boolean }> {
   const head = await bucket.head(key);
   if (expected.state === "empty") {
@@ -687,9 +730,9 @@ async function currentStateMatches(
   }
   if (head === null || head.size !== expected.bytes
       || head.httpMetadata?.contentType
-        !== SPARKLE_APPCAST_GUARD_CONTENT_TYPE
+        !== contract.appcastContentType
       || head.httpMetadata?.cacheControl
-        !== SPARKLE_APPCAST_GUARD_CACHE_CONTROL
+        !== contract.appcastCacheControl
       || (expected.etag !== null
         && expected.etag !== head.etag
         && expected.etag !== head.httpEtag)) {
@@ -736,6 +779,7 @@ async function verifyCandidateArtifact(
   bucket: R2Bucket,
   enclosure: SparkleAppcastEnclosure,
   publicKey: CryptoKey,
+  contract: SparkleAppcastGuardContract,
 ): Promise<void> {
   if (!enclosure.objectKey.endsWith(".dmg")
       || enclosure.length > SPARKLE_APPCAST_GUARD_MAX_ARTIFACT_BYTES) {
@@ -750,9 +794,9 @@ async function verifyCandidateArtifact(
   if (head === null
       || head.size !== enclosure.length
       || head.httpMetadata?.contentType
-        !== SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE
+        !== contract.artifactContentType
       || head.httpMetadata?.cacheControl
-        !== SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL) {
+        !== contract.artifactCacheControl) {
     invalidCandidate();
   }
   let object: R2Object | R2ObjectBody | null;
@@ -791,17 +835,18 @@ async function verifyCandidateArtifact(
   if (!verified) invalidCandidate();
 }
 
-export async function handleSparkleAppcastGuard(
+export async function handleSparkleAppcastGuardForContract(
   request: Request,
   env: Env,
+  contract: SparkleAppcastGuardContract,
   nowEpoch = Date.now(),
 ): Promise<Response> {
   const requestUrl = new URL(request.url);
-  if (requestUrl.pathname !== SPARKLE_APPCAST_GUARD_ROUTE
+  if (requestUrl.pathname !== contract.guardRoute
       || requestUrl.search || requestUrl.hash) {
     throw new ApiError(404, "NOT_FOUND");
   }
-  const configuration = readSparkleAppcastGuardConfiguration(env);
+  const configuration = readSparkleAppcastGuardConfiguration(env, contract);
   if (!configuration.enabled || configuration.bucket === null
       || configuration.nonceDatabase === null
       || configuration.token === null) {
@@ -819,6 +864,7 @@ export async function handleSparkleAppcastGuard(
     body,
     configuration.token,
     nowEpoch,
+    contract,
   );
   const db = configuration.nonceDatabase;
   try {
@@ -827,7 +873,7 @@ export async function handleSparkleAppcastGuard(
     if (error instanceof ApiError) throw error;
     throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
   }
-  const payload = parsePayload(body);
+  const payload = parsePayload(body, contract);
   const candidateBytes = base64UrlDecode(payload.candidate.base64);
   if (candidateBytes.byteLength !== payload.candidate.bytes
       || candidateBytes.byteLength > SPARKLE_APPCAST_GUARD_MAX_XML_BYTES
@@ -840,18 +886,19 @@ export async function handleSparkleAppcastGuard(
   } catch {
     invalidCandidate();
   }
-  const candidateAppcast = parseSparkleAppcast(candidateText);
+  const candidateAppcast = parseSparkleAppcast(candidateText, contract);
   let current: Awaited<ReturnType<typeof currentStateMatches>>;
   try {
     current = await currentStateMatches(
       configuration.bucket,
       payload.key,
       payload.expectedCurrent,
+      contract,
     );
   } catch {
     throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
   }
-  if (!current.matches) return conflictResponse("current_state_conflict");
+  if (!current.matches) return conflictResponse("current_state_conflict", contract);
 
   const publicKey = await configuredSparklePublicKey(configuration);
   if (current.bytes !== null) {
@@ -861,12 +908,17 @@ export async function handleSparkleAppcastGuard(
     } catch {
       invalidCandidate();
     }
-    const currentAppcast = parseSparkleAppcast(currentText);
+    const currentAppcast = parseSparkleAppcast(currentText, contract);
     // A non-empty appcast is a trusted monotonic baseline only after its
     // canonical active artifact has independently passed the same R2 and
     // Sparkle signature checks as the candidate.
     for (const enclosure of currentAppcast.enclosures) {
-      await verifyCandidateArtifact(configuration.bucket, enclosure, publicKey);
+      await verifyCandidateArtifact(
+        configuration.bucket,
+        enclosure,
+        publicKey,
+        contract,
+      );
     }
     if (compareBundleVersions(
       candidateAppcast.latest.version,
@@ -876,7 +928,12 @@ export async function handleSparkleAppcastGuard(
     }
   }
   for (const enclosure of candidateAppcast.enclosures) {
-    await verifyCandidateArtifact(configuration.bucket, enclosure, publicKey);
+    await verifyCandidateArtifact(
+      configuration.bucket,
+      enclosure,
+      publicKey,
+      contract,
+    );
   }
 
   const onlyIf = current.head === null
@@ -899,11 +956,26 @@ export async function handleSparkleAppcastGuard(
   } catch {
     throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
   }
-  if (committed === null) return conflictResponse("r2_conditional_write_conflict");
+  if (committed === null) {
+    return conflictResponse("r2_conditional_write_conflict", contract);
+  }
   return jsonResponse({
-    schemaVersion: SPARKLE_APPCAST_GUARD_SCHEMA,
+    schemaVersion: contract.guardSchema,
     status: "committed",
     bytes: candidateBytes.byteLength,
     sha256: payload.candidate.sha256,
   }, 200, { "cache-control": "no-store" });
+}
+
+export async function handleSparkleAppcastGuard(
+  request: Request,
+  env: Env,
+  nowEpoch = Date.now(),
+): Promise<Response> {
+  return handleSparkleAppcastGuardForContract(
+    request,
+    env,
+    sparkleReleaseContract,
+    nowEpoch,
+  );
 }

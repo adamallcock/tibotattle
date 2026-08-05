@@ -130,15 +130,14 @@ function normalizeAppcastAtomicGuardEndpoint(value, channel) {
     );
   }
   if (parsed.protocol !== "https:"
-      || parsed.origin !== channel.serviceOrigin
       || parsed.username
       || parsed.password
-      || parsed.pathname !== APPCAST_ATOMIC_GUARD_ROUTE
       || parsed.search
       || parsed.hash
-      || parsed.href !== value) {
+      || parsed.href !== value
+      || parsed.href !== channel.sparkle.atomicGuardURL) {
     fail(
-      `--atomic-appcast-guard-endpoint must be the exact ${channel.name} guard route on ${channel.serviceOrigin}`,
+      `--atomic-appcast-guard-endpoint must equal the reviewed ${channel.name} guard URL`,
       "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID",
     );
   }

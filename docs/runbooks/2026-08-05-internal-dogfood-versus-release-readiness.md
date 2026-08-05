@@ -22,18 +22,23 @@ updatable release. It is not the `internal-dogfood` channel or the `stable`
 channel, and it is not Developer-ID signed or notarized; therefore it cannot
 prove Sparkle updating.
 
-The named `internal-dogfood` release channel is a separate future signed lane,
-not the installed preview. Its policy in
-[`config/release-channels.js`](../../config/release-channels.js) is currently
-fully unconfigured and must not inherit stable endpoints. The stable release
-lane is separate again; its update URL, `https://updates.tibotattle.com/appcast.xml`,
-currently returns HTTP 404. Treat that as **not published**; do not describe
-an updater as working.
+The named `internal-dogfood` release channel is a separate configured signed
+lane, not the installed preview. Its policy in
+[`config/release-channels.js`](../../config/release-channels.js) intentionally
+shares `https://tibotattle.com` for the app service and public website but
+must not inherit stable update endpoints. Its isolated update origin is
+`https://dogfood-updates.tibotattle.com`; its appcast is
+`https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml`, its
+bucket is `tibotattle-dogfood-updates`, its immutable object prefix is
+`internal-dogfood/releases`, and it uses a dedicated reviewed public key. The
+stable release lane is separate again; its update URL,
+`https://updates.tibotattle.com/appcast.xml`, currently returns HTTP 404.
+Treat that as **not published**; do not describe an updater as working.
 
 | Lane | Current meaning | Release boundary |
 | --- | --- | --- |
 | Installed `preview_distribution` | Ad-hoc local preview for guarded install, launch, and central-service smoke | Not evidence of Developer ID, notarization, Sparkle signature acceptance, or N→N+1 updating |
-| `internal-dogfood` | Future signed release channel; its policy is currently unconfigured | Must have its own source-bound policy and signed artifacts; it cannot inherit stable endpoints |
+| `internal-dogfood` | Configured signed release channel sharing the hosted service, with isolated update distribution | Still requires its own signed artifacts and client rehearsal; configuration is not live release proof |
 | `stable` | Stable release channel | Requires the stable feed, artifact, owner release gates, and observed client acceptance; the current appcast is 404 |
 
 ## 1. Run the installed ad-hoc preview smoke
@@ -69,28 +74,30 @@ receipt from either command cannot authorize distribution.
 
 ## 2. Qualify a signed release candidate
 
-Do not promote the preview bundle. For a future internal dogfood or stable
+Do not promote the preview bundle. For an internal dogfood or stable
 candidate, follow the named channel policy and the external-distribution
 release path:
 
 1. Read the [release-channel decision](../decisions/2026-08-04-release-channel-plumbing.md)
-   and resolve the selected channel from source. The current
-   `internal-dogfood` check must fail closed with
-   `RELEASE_CHANNEL_NOT_CONFIGURED`:
+   and resolve the selected channel from source. For `internal-dogfood`, the
+   selected policy must expose the shared service origin and the isolated
+   update origin, bucket, object prefix, and dedicated public-key fingerprint
+   listed above:
 
    ```bash
    node apps/worker/scripts/release-readiness.mjs --channel internal-dogfood
    ```
 
    Do not substitute a host, feed, bucket, key, or command-line endpoint for
-   a missing policy. Keep all release configuration source-bound.
-2. Once an owner-reviewed policy exists, build from the clean annotated tag
-   through the channel-aware release path. For internal dogfood, the command
-   is:
+   the source-bound policy. Keep all release configuration source-bound.
+2. Build from the clean annotated tag through the channel-aware release path.
+   For internal dogfood, the command is:
 
    ```bash
    npm run product:macos:updater:prepare
-   npm run product:macos:release -- --channel internal-dogfood
+   npm run product:macos:release -- \
+     --channel internal-dogfood \
+     --prepare-candidate
    ```
 
    The equivalent stable path must name `stable` and retain its previous

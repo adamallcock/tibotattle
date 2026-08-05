@@ -2,6 +2,7 @@
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RELEASE_MANIFEST } from "../config/release-manifest.js";
+import { resolveReleaseChannel } from "../config/release-channels.js";
 import {
   validateInstalledMacOSApp,
   validateMacOSDMG,
@@ -9,9 +10,10 @@ import {
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
-function parseArguments(argv) {
+export function parseArguments(argv) {
   let appPath = null;
   let dmgPath = null;
+  let channel = null;
   let development = false;
   let release = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -22,6 +24,11 @@ function parseArguments(argv) {
         && dmgPath === null
         && index + 1 < argv.length) {
       dmgPath = resolve(argv[++index]);
+    } else if (argument === "--channel") {
+      if (channel !== null || index + 1 >= argv.length) {
+        throw new Error("--channel must be provided at most once with a value");
+      }
+      channel = argv[++index];
     } else if (argument === "--development" && !development) {
       development = true;
     } else if (argument === "--release" && !release) {
@@ -33,6 +40,16 @@ function parseArguments(argv) {
   if (release && (appPath !== null || dmgPath !== null || development)) {
     throw new Error("--release cannot be combined with an explicit target or --development");
   }
+  if (!release && (appPath === null) === (dmgPath === null)) {
+    throw new Error("Provide exactly one of --app or --dmg");
+  }
+  if (channel === null) {
+    throw new Error(
+      "--channel is required; choose a named release channel explicitly",
+    );
+  }
+  const production = !development;
+  const releaseChannel = resolveReleaseChannel(channel);
   if (release) {
     return {
       appPath: null,
@@ -43,24 +60,30 @@ function parseArguments(argv) {
           RELEASE_MANIFEST.macOS.arm64DmgFileName,
         ),
       ),
-      production: true,
+      channel: releaseChannel.name,
+      production,
     };
   }
-  if ((appPath === null) === (dmgPath === null)) {
-    throw new Error("Provide exactly one of --app or --dmg");
-  }
-  return { appPath, dmgPath, production: !development };
+  return {
+    appPath,
+    channel: releaseChannel.name,
+    dmgPath,
+    production,
+  };
 }
 
-export async function main(argv) {
+export async function main(argv, dependencies = {}) {
   const options = parseArguments(argv);
+  const validateInstalled = dependencies.validateInstalledMacOSApp
+    ?? validateInstalledMacOSApp;
+  const validateDMG = dependencies.validateMacOSDMG ?? validateMacOSDMG;
+  const validationOptions = {
+    channel: options.channel,
+    production: options.production,
+  };
   const result = options.appPath
-    ? await validateInstalledMacOSApp(options.appPath, {
-      production: options.production,
-    })
-    : await validateMacOSDMG(options.dmgPath, {
-      production: options.production,
-    });
+    ? await validateInstalled(options.appPath, validationOptions)
+    : await validateDMG(options.dmgPath, validationOptions);
   console.log("TiboTattle clean-install validation: passed");
   console.log(`Bundle identifier: ${result.bundleIdentifier}`);
   console.log(`Version: ${result.shortVersion}`);

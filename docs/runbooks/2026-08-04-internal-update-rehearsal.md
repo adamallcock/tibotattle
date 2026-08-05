@@ -23,24 +23,28 @@ The `--channel` value is mandatory and must match both
 `Contents/Resources/build-manifest.json:release.channelName`. A
 `preview_distribution` bundle is the preview/ad-hoc boundary only; it is not
 a signed dogfood or stable release bundle. Use this direct verifier only with
-the explicit `preview_distribution` channel. `stable`, and a future
-configured `internal-dogfood`, are checked through the external-distribution
-bundle inspector and derive their central origin, appcast URL, and any
-reviewed public-key fingerprint from `config/release-channels.js`. The
-current `internal-dogfood` entry is deliberately unconfigured, so its
-source-bound policy check fails locally with an actionable error before any
-network request. No endpoint flag may be used to bypass that policy.
+the explicit `preview_distribution` channel. `stable` and the configured
+`internal-dogfood` channel are checked through the external-distribution bundle
+inspector and derive their central origin, appcast URL, object prefix, and
+reviewed public-key fingerprint from `config/release-channels.js`. Dogfood
+intentionally shares `https://tibotattle.com` for the app service and public
+website, while its update origin is
+`https://dogfood-updates.tibotattle.com`, its appcast is
+`https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml`, its
+bucket is `tibotattle-dogfood-updates`, and its object prefix is
+`internal-dogfood/releases`. No endpoint flag may be used to bypass that
+policy.
 
-For the current unconfigured dogfood policy, check the named channel through
-the source-bound readiness observer:
+For a local, no-network check of the named dogfood policy, use the
+source-bound readiness observer:
 
 ```sh
 node apps/worker/scripts/release-readiness.mjs --channel internal-dogfood
 ```
 
-It must report that `internal-dogfood` needs reviewed dedicated endpoints and
-must make zero HTTPS requests. Do not substitute `stable` or a command-line
-endpoint override for that missing policy.
+Without `--probe-public`, it must report the configured policy and make zero
+HTTPS requests. Do not substitute `stable` or a command-line endpoint
+override for the named policy.
 
 `N` means the currently installed signed build in the disposable profile;
 `N+1` means the candidate build being rehearsed. Keep the signed `N` DMG (or
@@ -97,9 +101,9 @@ node scripts/verify-macos-preview-remote.js \
 ```
 
 The current `https://updates.tibotattle.com/appcast.xml` response is HTTP 404,
-so the live preflight is blocked as `not_published` until a valid feed and
-artifact exist. A future signed `internal-dogfood` or `stable` candidate must
-use its source-bound named policy and the [owner release sequence](./2026-08-04-owner-release-execution.md),
+so the live stable preflight is blocked as `not_published` until a valid feed
+and artifact exist. A signed `internal-dogfood` or `stable` candidate must use
+its source-bound named policy and the [owner release sequence](./2026-08-04-owner-release-execution.md),
 not this preview compatibility command.
 
 The live command intentionally exits non-zero when

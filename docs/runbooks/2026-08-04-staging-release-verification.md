@@ -28,9 +28,12 @@ but this observer has no live staging-origin input and makes no claim that a
 real `workers.dev` staging deployment exists. It intentionally accepts only a
 named channel from `config/release-channels.js`, so it cannot treat production
 as dogfood or probe an unreviewed host. `stable` is the default and is bound to
-the reviewed production deployment manifest. `internal-dogfood` is currently
-owner-unconfigured and therefore reports a blocked, null-endpoint receipt
-without falling back to stable.
+the reviewed production deployment manifest. The configured `internal-dogfood`
+policy shares `https://tibotattle.com` for service checks but derives its
+update checks from `https://dogfood-updates.tibotattle.com`, bucket
+`tibotattle-dogfood-updates`, and object prefix `internal-dogfood/releases`.
+It never falls back to stable. A channel that is actually unconfigured still
+fails closed with null endpoints.
 
 ## Read-only production observation
 
@@ -50,9 +53,10 @@ different reviewed name only when it is present in the channel policy:
 node apps/worker/scripts/release-readiness.mjs --channel internal-dogfood
 ```
 
-An unconfigured channel fails closed and reports its configuration state and
-null endpoints. No `--origin`, endpoint URL, or environment value can replace
-the named policy.
+A configured dogfood channel reports its source-bound policy endpoints without
+an override. An actually unconfigured channel fails closed and reports its
+configuration state and null endpoints. No `--origin`, endpoint URL, or
+environment value can replace the named policy.
 
 Only an explicitly requested production observation performs bounded,
 credential-free GET requests to the canonical health, ready, and appcast URLs:

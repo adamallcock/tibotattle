@@ -302,7 +302,7 @@ test("named release channels reject endpoint overrides before local or remote wo
   assert.equal(fetched, false);
 });
 
-test("unconfigured internal-dogfood fails before any remote request", async () => {
+test("an injected unconfigured internal-dogfood policy fails before any remote request", async () => {
   let fetched = false;
   await assert.rejects(
     verifyMacOSPreviewRemote({
@@ -311,6 +311,13 @@ test("unconfigured internal-dogfood fails before any remote request", async () =
       fetchImpl: async () => {
         fetched = true;
         throw new Error("network must not be called");
+      },
+      getReleaseChannelImpl: (name) => {
+        assert.equal(name, "internal-dogfood");
+        return {
+          configured: false,
+          name: "internal-dogfood",
+        };
       },
     }),
     (error) => {

@@ -39,6 +39,7 @@ import {
   STABLE_RELEASE_CHANNEL,
   assertReleaseChannelConfiguration,
   createReleaseChannelProvenance,
+  getReleaseChannel,
 } from "../config/release-channels.js";
 import {
   MACOS_RUNTIME_STATIC_ASSETS,
@@ -51,6 +52,7 @@ import {
   MACOS_WEB_MODULE_ENTRYPOINTS,
   buildMacOSApp,
   buildMacOSAppForRelease,
+  buildMacOSReleaseCandidate,
   collectMacOSLocalizationResources,
   collectMacOSRuntimeGraph,
   collectMacOSSwiftSources,
@@ -82,6 +84,7 @@ import {
   developerIDSignMacOSApp,
   inspectMacOSApp,
   packageMacOSDMG,
+  prepareMacOSReleaseCandidate,
   readMacOSReleaseSourceProvenance,
   readMacOSReleaseBuildConfiguration,
   readMacOSReleaseCredentials,
@@ -192,6 +195,8 @@ function syntheticDogfoodReleaseChannel() {
       appcastObjectKey: "internal-dogfood/appcast.xml",
       r2Bucket: "tibotattle-dogfood-updates",
       objectPrefix: "internal-dogfood/releases",
+      atomicGuardURL:
+        "https://release.dogfood.tibotattle.example/api/v1/internal/release/appcast",
       publicEdKeySha256: SYNTHETIC_DOGFOOD_PUBLIC_KEY_SHA256,
     },
   };
@@ -1577,34 +1582,21 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   }
 });
 
-test("unconfigured dogfood is refused by builder and release configuration", async () => {
-  assert.throws(
-    () => parseMacOSBuildArguments([
-      "--output",
-      ".release-build/macos-dogfood/TiboTattle.app",
-      "--external-distribution",
-      "--release-channel",
-      INTERNAL_DOGFOOD_RELEASE_CHANNEL,
-    ]),
-    { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
+test("reviewed dogfood is configured with shared service and isolated updates", () => {
+  const dogfood = getReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL);
+  assert.equal(dogfood.configured, true);
+  assert.equal(dogfood.serviceOriginMode, INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE);
+  assert.equal(dogfood.serviceOrigin, DEPLOYMENT_ENDPOINTS.public.origin);
+  assert.equal(dogfood.publicWebsiteOrigin, DEPLOYMENT_ENDPOINTS.public.origin);
+  assert.equal(dogfood.sparkle.origin, "https://dogfood-updates.tibotattle.com");
+  assert.equal(
+    dogfood.sparkle.appcastURL,
+    "https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml",
   );
-  await assert.rejects(
-    buildMacOSApp({
-      output: join(tmpdir(), "usage-monitor-dogfood-unconfigured.app"),
-      externalDistribution: true,
-      releaseChannel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
-    }),
-    { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
-  );
-  assert.throws(
-    () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
-      USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
-      USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
-        SYNTHETIC_DOGFOOD_PUBLIC_KEY,
-    }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
-    { code: "RELEASE_CHANNEL_NOT_CONFIGURED" },
-  );
+  assert.equal(dogfood.sparkle.r2Bucket, "tibotattle-dogfood-updates");
+  assert.equal(dogfood.sparkle.objectPrefix, "internal-dogfood/releases");
+  assert.match(dogfood.sparkle.publicEdKeySha256, /^[a-f0-9]{64}$/u);
+  assert.equal(assertReleaseChannelConfiguration(dogfood), dogfood);
 });
 
 test("generic external builders reject env and CLI marker spoofing", async () => {
@@ -1668,6 +1660,8 @@ test("generic external builders reject env and CLI marker spoofing", async () =>
       { code: "MACOS_APP_BUILD_FAILED" },
     );
     assert.equal(typeof buildMacOSAppForRelease, "function");
+    assert.equal(typeof buildMacOSReleaseCandidate, "function");
+    assert.equal(typeof prepareMacOSReleaseCandidate, "function");
     await assert.rejects(
       buildMacOSAppForRelease({
         output,
@@ -1675,6 +1669,14 @@ test("generic external builders reject env and CLI marker spoofing", async () =>
         releaseChannel: STABLE_RELEASE_CHANNEL,
       }),
       { code: "MACOS_EXTERNAL_BUILD_PREFLIGHT_REQUIRED" },
+    );
+    await assert.rejects(
+      buildMacOSReleaseCandidate({
+        output,
+        externalDistribution: true,
+        releaseChannel: STABLE_RELEASE_CHANNEL,
+      }),
+      { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
     );
     await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally {

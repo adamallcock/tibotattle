@@ -2,10 +2,34 @@
 title: Release channel plumbing
 date: 2026-08-04
 type: decision-record
-status: implemented-local
+status: supplemented
 ---
 
 # Decision
+
+## Supplement — 2026-08-05
+
+The original `internal-dogfood` null-policy decision below is a historical
+snapshot of the reviewed state on 2026-08-04. It has been supplemented by the
+configured descriptor now present in `config/release-channels.js`; the original
+text is retained rather than rewritten.
+
+`internal-dogfood` is now configured with
+`serviceOriginMode: internal_dogfood_https`. It intentionally shares
+`https://tibotattle.com` for the app service and public website, while its
+update distribution remains isolated: update origin
+`https://dogfood-updates.tibotattle.com`, appcast
+`https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml`, bucket
+`tibotattle-dogfood-updates`, immutable object prefix
+`internal-dogfood/releases`, and a dedicated reviewed Ed25519 public key.
+`internal-dogfood` must continue to resolve only from this source-bound policy
+and must never inherit stable update identifiers.
+
+This supplement changes channel configuration state, not release readiness:
+owner-only signing, publication and read-back, deployment containment, and an
+observed installed-client rehearsal remain separate gates.
+
+## Original decision (2026-08-04 snapshot)
 
 Release tooling uses explicit named channels. `stable` derives its service,
 public-site, Sparkle origin/feed, and bucket from

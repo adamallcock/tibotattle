@@ -761,7 +761,7 @@ function clientPackageManifest() {
       "product:macos:release": "node ./scripts/release-macos-app.js",
       "product:macos:test": "node --test --test-concurrency=1 test/macos-app-bundle.test.js test/macos-updater.test.js",
       "product:macos:updater:prepare": "node ./scripts/prepare-sparkle-framework.js --output .release-deps/Sparkle.framework",
-      "product:macos:validate:development": "node ./scripts/validate-macos-install.js --app .release-build/macos/TiboTattle.app --development",
+      "product:macos:validate:development": "node ./scripts/validate-macos-install.js --app .release-build/macos/TiboTattle.app --channel stable --development",
       "product:macos:validate:replacement": "node ./scripts/validate-macos-replacement.js",
       "product:native-network-audit:build": "node ./scripts/build-native-network-audit.js --output .release-build/native-network-audit/libusage_monitor_network_audit.dylib",
       "telemetry:browser:check": "node ./scripts/generate-telemetry-browser-mirror.js --check",

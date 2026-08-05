@@ -20,11 +20,16 @@ At this checkout:
   staging enrollment, account-scoped ingest, and queue ingest disabled. The
   checked-in production vars are also disabled, but live production is treated
   as **uncontained** until a fresh owner probe proves otherwise.
-- `config/release-channels.js` has a stable descriptor and an
-  `internal-dogfood` descriptor whose endpoints, bucket, object prefix, and
-  public-key fingerprint are all `null`. Resolving or publishing that channel
-  must fail with `RELEASE_CHANNEL_NOT_CONFIGURED`. Do not invent a host, feed,
-  bucket, key, or beta channel, and never copy stable values into dogfood.
+- `config/release-channels.js` has a stable descriptor and a configured
+  `internal-dogfood` descriptor. Dogfood intentionally shares
+  `https://tibotattle.com` for the app service and public website, while its
+  update origin is `https://dogfood-updates.tibotattle.com`, its appcast is
+  `https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml`, its
+  bucket is `tibotattle-dogfood-updates`, and its immutable object prefix is
+  `internal-dogfood/releases`; it also has a dedicated reviewed public-key
+  fingerprint. Resolving and publishing must use the selected source-bound
+  policy. Do not invent a host, feed, bucket, key, or beta channel, and never
+  copy stable update values into dogfood.
 - `config/deployment-endpoints.js` records identifiers for the stable service
   and appcast. Those identifiers are not proof that the service or appcast is
   available. Treat the stable appcast as unavailable until a real owner action
@@ -173,32 +178,36 @@ Wrangler commands or delete/recreate resources. The detailed boundary is in
 
 ### 3. Signed internal dogfood: dedicated channel plus real client rehearsal
 
-This stage is blocked in the current checkout until an owner-reviewed
-`internal-dogfood` policy is committed. That policy must provide distinct,
-non-production service and website origins, a distinct Sparkle origin/appcast,
-bucket and immutable object prefix, and a distinct reviewed Ed25519 public-key
-fingerprint. The current expected result is
-`RELEASE_CHANNEL_NOT_CONFIGURED`; a placeholder or copied stable policy is a
-hard stop.
+The reviewed `internal-dogfood` policy is configured in the current checkout.
+It deliberately shares `https://tibotattle.com` for the app service and public
+website, while keeping the Sparkle distribution isolated at
+`https://dogfood-updates.tibotattle.com` with appcast
+`https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml`, bucket
+`tibotattle-dogfood-updates`, immutable object prefix
+`internal-dogfood/releases`, and a dedicated reviewed Ed25519 public-key
+fingerprint. This source policy is necessary but is not proof that a signed
+artifact, live feed, or owner-provisioned guard exists; a placeholder or copied
+stable policy remains a hard stop.
 
-After that policy and its tests are reviewed, the owner creates the candidate
-from an annotated tag and runs the existing external-distribution/release path
-described in [`the macOS release guide`](../../apps/macos/README.md). The
-release command must name the channel explicitly; the current package script
-therefore needs the extra argument:
+The owner creates the candidate from an annotated tag and runs the existing
+external-distribution/release path described in [`the macOS release guide`](../../apps/macos/README.md).
+The release command must name the channel explicitly:
 
 ```sh
 npm run product:macos:updater:prepare
-npm run product:macos:release -- --channel internal-dogfood
+npm run product:macos:release -- \
+  --channel internal-dogfood \
+  --prepare-candidate
 ```
 
 The signed release gate must prove a clean checkout, an annotated tag at
 `HEAD`, reproducibility from checked-out source, Developer ID/hardened-runtime
 assurances, notarization/stapling, Gatekeeper, and clean-profile checks. The
 release manifest must bind the artifact to `internal-dogfood`; it must not be
-called stable. Do not use `validate-macos-install.js` directly for this stage:
-its CLI has no channel option and defaults to stable. The channel-aware release
-gate and publisher validation are the valid dogfood artifact checks.
+called stable. Any direct `validate-macos-install.js` use must also name
+`--channel internal-dogfood`; an omitted or stable channel is a hard failure.
+The channel-aware release gate and publisher validation are the valid dogfood
+artifact checks.
 
 The owner signs the exact DMG with the offline Sparkle process, then runs the
 publisher validation-only path with `--channel internal-dogfood`, the exact

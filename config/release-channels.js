@@ -10,6 +10,8 @@ export const INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE =
 export const STABLE_SPARKLE_KEY_CONTINUITY_MODE =
   "previous_stable_manifest_required";
 export const STABLE_SPARKLE_BOOTSTRAP_MODE = "explicit_owner_only";
+export const APPCAST_ATOMIC_GUARD_ROUTE =
+  "/api/v1/internal/release/appcast";
 
 const CHANNEL_NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -82,6 +84,29 @@ function canonicalAppcastURL(value, origin) {
   return Object.freeze({ href: parsed.href, key });
 }
 
+function canonicalGuardURL(value) {
+  if (typeof value !== "string" || value.length === 0
+      || value.includes("\0")) {
+    fail("channel atomic appcast guard URL must be a canonical HTTPS URL");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    fail("channel atomic appcast guard URL must be a canonical HTTPS URL");
+  }
+  if (parsed.protocol !== "https:"
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== APPCAST_ATOMIC_GUARD_ROUTE
+      || parsed.search
+      || parsed.hash
+      || parsed.href !== value) {
+    fail("channel atomic appcast guard URL must be the exact reviewed guard route");
+  }
+  return parsed.href;
+}
+
 function isSafeRelativePath(value) {
   return typeof value === "string"
     && value.length > 0
@@ -131,6 +156,8 @@ function stableChannelDefinition() {
       appcastObjectKey: appcast.key,
       r2Bucket: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket,
       objectPrefix: "releases",
+      atomicGuardURL:
+        `${DEPLOYMENT_ENDPOINTS.public.origin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
       // Stable's public key remains an explicit operator input for backwards
       // compatibility. It is not an endpoint and therefore is not invented
       // or duplicated in this manifest.
@@ -143,22 +170,34 @@ function stableChannelDefinition() {
   };
 }
 
-function unconfiguredDogfoodChannelDefinition() {
+function internalDogfoodChannelDefinition() {
+  const updateOrigin = "https://dogfood-updates.tibotattle.com";
+  const appcast = canonicalAppcastURL(
+    `${updateOrigin}/internal-dogfood/appcast.xml`,
+    updateOrigin,
+  );
   return {
     schemaVersion: RELEASE_CHANNELS_SCHEMA_VERSION,
     name: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
-    configured: false,
+    configured: true,
     buildManifestChannel: "internal-dogfood",
-    serviceOriginMode: null,
-    serviceOrigin: null,
-    publicWebsiteOrigin: null,
+    // Dogfood intentionally exercises the real hosted service and public
+    // website. Distribution remains isolated by update origin, bucket,
+    // namespace, and signing key, so a dogfood app can never consume a stable
+    // update accidentally.
+    serviceOriginMode: INTERNAL_DOGFOOD_SERVICE_ORIGIN_MODE,
+    serviceOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+    publicWebsiteOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
     sparkle: {
-      origin: null,
-      appcastURL: null,
-      appcastObjectKey: null,
-      r2Bucket: null,
-      objectPrefix: null,
-      publicEdKeySha256: null,
+      origin: updateOrigin,
+      appcastURL: appcast.href,
+      appcastObjectKey: appcast.key,
+      r2Bucket: "tibotattle-dogfood-updates",
+      objectPrefix: "internal-dogfood/releases",
+      atomicGuardURL:
+        `https://dogfood-release.tibotattle.com${APPCAST_ATOMIC_GUARD_ROUTE}`,
+      publicEdKeySha256:
+        "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2",
       keyContinuity: null,
     },
   };
@@ -166,14 +205,14 @@ function unconfiguredDogfoodChannelDefinition() {
 
 const stableChannel = deepFreeze(stableChannelDefinition());
 const internalDogfoodChannel = deepFreeze(
-  unconfiguredDogfoodChannelDefinition(),
+  internalDogfoodChannelDefinition(),
 );
 
 /**
- * Named release policy. The internal-dogfood entry is deliberately a fully
- * null, non-operational descriptor until an owner edits this reviewed file
- * with dedicated service, feed, bucket, object-prefix, and public-key data.
- * No endpoint is read from the environment.
+ * Named release policy. The reviewed internal-dogfood descriptor deliberately
+ * shares the production service so internal builds exercise real sign-in and
+ * contribution behavior. Its update origin, bucket, object namespace, and
+ * signing key remain separate. No endpoint is read from the environment.
  */
 export const RELEASE_CHANNELS = deepFreeze({
   [STABLE_RELEASE_CHANNEL]: stableChannel,
@@ -199,26 +238,6 @@ function assertChannelShape(channel) {
     fail("release channel is missing its Sparkle policy");
   }
   return channel;
-}
-
-function assertUnconfiguredDogfood(channel) {
-  if (channel.configured !== false
-      || channel.buildManifestChannel !== "internal-dogfood"
-      || channel.serviceOriginMode !== null
-      || channel.serviceOrigin !== null
-      || channel.publicWebsiteOrigin !== null
-      || channel.sparkle.origin !== null
-      || channel.sparkle.appcastURL !== null
-      || channel.sparkle.appcastObjectKey !== null
-      || channel.sparkle.r2Bucket !== null
-      || channel.sparkle.objectPrefix !== null
-      || channel.sparkle.publicEdKeySha256 !== null
-      || channel.sparkle.keyContinuity !== null) {
-    fail(
-      "internal-dogfood must remain fully unconfigured until dedicated endpoints are reviewed",
-      "RELEASE_CHANNEL_DOGFOOD_NOT_CONFIGURED",
-    );
-  }
 }
 
 function assertConfiguredChannelEndpoints(channel) {
@@ -248,6 +267,7 @@ function assertConfiguredChannelEndpoints(channel) {
     fail("channel Sparkle bucket is invalid");
   }
   normalizeObjectPrefix(channel.sparkle.objectPrefix);
+  canonicalGuardURL(channel.sparkle.atomicGuardURL);
   normalizePublicKeyFingerprint(channel.sparkle.publicEdKeySha256, {
     required: channel.name !== STABLE_RELEASE_CHANNEL,
   });
@@ -255,14 +275,13 @@ function assertConfiguredChannelEndpoints(channel) {
 
 function assertDistinctFromStable(channel, stable) {
   const comparisons = [
-    ["service origin", channel.serviceOrigin, stable.serviceOrigin],
     ["service origin mode", channel.serviceOriginMode, stable.serviceOriginMode],
-    ["public website origin", channel.publicWebsiteOrigin, stable.publicWebsiteOrigin],
     ["Sparkle origin", channel.sparkle.origin, stable.sparkle.origin],
     ["appcast URL", channel.sparkle.appcastURL, stable.sparkle.appcastURL],
     ["appcast object key", channel.sparkle.appcastObjectKey, stable.sparkle.appcastObjectKey],
     ["R2 bucket", channel.sparkle.r2Bucket, stable.sparkle.r2Bucket],
     ["immutable object prefix", channel.sparkle.objectPrefix, stable.sparkle.objectPrefix],
+    ["atomic appcast guard URL", channel.sparkle.atomicGuardURL, stable.sparkle.atomicGuardURL],
   ];
   for (const [label, selected, reviewed] of comparisons) {
     if (selected === reviewed) {
@@ -283,9 +302,7 @@ function assertDistinctFromStable(channel, stable) {
 }
 
 /**
- * Validate a channel descriptor without consulting process.env. This accepts
- * the unconfigured dogfood descriptor so read-only observers can report that
- * it is unavailable rather than falling back to stable.
+ * Validate a channel descriptor without consulting process.env.
  */
 export function assertReleaseChannelConfiguration(channel) {
   const selected = assertChannelShape(channel);
@@ -302,6 +319,8 @@ export function assertReleaseChannelConfiguration(channel) {
         || selected.sparkle.appcastObjectKey
           !== new URL(DEPLOYMENT_ENDPOINTS.sparkle.appcastURL).pathname.slice(1)
         || selected.sparkle.objectPrefix !== "releases"
+        || selected.sparkle.atomicGuardURL
+          !== `${DEPLOYMENT_ENDPOINTS.public.origin}${APPCAST_ATOMIC_GUARD_ROUTE}`
         || selected.sparkle.publicEdKeySha256 !== null
         || selected.sparkle.keyContinuity?.mode
           !== STABLE_SPARKLE_KEY_CONTINUITY_MODE
@@ -315,11 +334,6 @@ export function assertReleaseChannelConfiguration(channel) {
     assertConfiguredChannelEndpoints(selected);
     return selected;
   }
-  if (selected.name === INTERNAL_DOGFOOD_RELEASE_CHANNEL
-      && selected.configured === false) {
-    assertUnconfiguredDogfood(selected);
-    return selected;
-  }
   if (selected.configured !== true) {
     fail("named release channel is not configured", "RELEASE_CHANNEL_NOT_CONFIGURED");
   }
@@ -328,7 +342,7 @@ export function assertReleaseChannelConfiguration(channel) {
   return selected;
 }
 
-/** Return a named policy descriptor, including an unconfigured dogfood entry. */
+/** Return a named reviewed policy descriptor. */
 export function getReleaseChannel(name) {
   if (typeof name !== "string" || !Object.hasOwn(RELEASE_CHANNELS, name)) {
     fail(`Unknown release channel: ${String(name)}`, "RELEASE_CHANNEL_UNKNOWN");
@@ -336,7 +350,7 @@ export function getReleaseChannel(name) {
   return assertReleaseChannelConfiguration(RELEASE_CHANNELS[name]);
 }
 
-/** Resolve an operational channel; unconfigured dogfood cannot pass this gate. */
+/** Resolve an operational channel. */
 export function resolveReleaseChannel(name) {
   const selected = getReleaseChannel(name);
   if (!selected.configured) {
@@ -380,6 +394,7 @@ export function assertReleaseChannelPublication(channelOrName, publication) {
       || sparkle.appcastObjectKey !== selected.sparkle.appcastObjectKey
       || sparkle.r2Bucket !== selected.sparkle.r2Bucket
       || sparkle.objectPrefix !== selected.sparkle.objectPrefix
+      || sparkle.atomicGuardURL !== selected.sparkle.atomicGuardURL
       || typeof sparkle.publicEdKeySha256 !== "string"
       || !SHA256_PATTERN.test(sparkle.publicEdKeySha256)
       || (selected.sparkle.publicEdKeySha256 !== null
@@ -418,6 +433,7 @@ export function createReleaseChannelProvenance(
       appcastObjectKey: selected.sparkle.appcastObjectKey,
       r2Bucket: selected.sparkle.r2Bucket,
       objectPrefix: selected.sparkle.objectPrefix,
+      atomicGuardURL: selected.sparkle.atomicGuardURL,
       publicEdKeySha256,
     },
   });
