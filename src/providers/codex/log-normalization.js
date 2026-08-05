@@ -7,6 +7,8 @@ const COMPONENT_KEYS = [
   "total_tokens",
 ];
 
+const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
+
 export { validAbortSignal } from "../../valid-abort-signal.js";
 
 export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
@@ -112,6 +114,16 @@ function safeClassification(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,64}$/.test(value) ? value : "unknown";
 }
 
+function canBecomeIsoInstant(epochSeconds) {
+  if (!Number.isSafeInteger(epochSeconds) || epochSeconds <= 0) return false;
+  try {
+    new Date(epochSeconds * 1_000).toISOString();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function canonicalRateLimitWindows(rateLimits) {
   if (!rateLimits || typeof rateLimits !== "object") return [];
   const limitId = safeClassification(rateLimits.limit_id);
@@ -124,8 +136,10 @@ export function canonicalRateLimitWindows(rateLimits) {
     const windowDurationMins = Number(window.window_minutes);
     const resetsAt = Number(window.resets_at);
     if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
-    if (!Number.isInteger(windowDurationMins) || windowDurationMins <= 0) continue;
-    if (!Number.isInteger(resetsAt) || resetsAt <= 0) continue;
+    if (!Number.isSafeInteger(windowDurationMins)
+        || windowDurationMins < 1
+        || windowDurationMins > MAX_QUOTA_WINDOW_DURATION_MINUTES) continue;
+    if (!canBecomeIsoInstant(resetsAt)) continue;
     windows.push({
       provider: "openai_codex",
       planType,

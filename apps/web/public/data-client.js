@@ -2161,6 +2161,7 @@ function normalizeQuota(window, index) {
     ? durationCandidate
     : null;
   const limitId = normalizeQuotaLimitId(window?.limitId);
+  const planType = text(window?.planType ?? window?.plan_type, "unknown");
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),
     limitId,
@@ -2174,7 +2175,7 @@ function normalizeQuota(window, index) {
     resetAt: text(window?.resetAt ?? window?.reset_at, ""),
     observedAt: text(window?.observedAt ?? window?.observed_at, ""),
     precision: finite(window?.precision ?? window?.displayPrecision, null),
-    planType: text(window?.planType ?? window?.plan_type, ""),
+    planType: TELEMETRY_PLAN_TYPES.includes(planType) ? planType : "unknown",
     accountAttribution: text(window?.accountAttribution, ""),
     status: safeState(window?.status, "live")
   };

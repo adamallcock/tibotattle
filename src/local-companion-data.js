@@ -298,6 +298,15 @@ function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function quotaResetIsoInstant(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  try {
+    return new Date(value * 1_000).toISOString();
+  } catch {
+    return null;
+  }
+}
+
 function safeText(value) {
   if (typeof value !== "string") return null;
   const clipped = value.slice(0, MAX_SAFE_TEXT_LENGTH);
@@ -1009,27 +1018,23 @@ function finalizeTimelineBuckets(buckets) {
 function quotaWindowProjection(window) {
   if (!window || typeof window !== "object") return null;
   const usedPercent = finiteNumber(window.usedPercent);
+  if (usedPercent === null || usedPercent < 0 || usedPercent > 100) return null;
   const durationMinutes = isValidQuotaWindowDuration(
     window.windowDurationMins,
   )
     ? window.windowDurationMins
     : null;
   if (durationMinutes === null) return null;
-  const resetsAtSeconds = Number.isSafeInteger(window.resetsAt) && window.resetsAt > 0
-    ? window.resetsAt
-    : null;
+  const resetAt = quotaResetIsoInstant(window.resetsAt);
+  if (resetAt === null) return null;
   return {
     limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
     slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
     planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
     usedPercent,
-    remainingPercent: usedPercent === null
-      ? null
-      : Number(Math.max(0, 100 - usedPercent).toFixed(3)),
+    remainingPercent: Number((100 - usedPercent).toFixed(3)),
     durationMinutes,
-    resetAt: resetsAtSeconds === null
-      ? null
-      : new Date(resetsAtSeconds * 1_000).toISOString(),
+    resetAt,
   };
 }
 
