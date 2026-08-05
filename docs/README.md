@@ -13,6 +13,7 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 | Path | Use |
 |---|---|
 | [`runbooks/2026-08-04-owner-release-execution.md`](./runbooks/2026-08-04-owner-release-execution.md) | Owner-run release sequence; fail-closed until each external gate is observed |
+| [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary between the installed ad-hoc preview and a signed release candidate |
 | [`runbooks/2026-08-04-staging-release-verification.md`](./runbooks/2026-08-04-staging-release-verification.md) | Credential-free production-containment observer and live-proof boundary |
 | [`runbooks/2026-08-04-disabled-staging-readiness-boundary.md`](./runbooks/2026-08-04-disabled-staging-readiness-boundary.md) | Static and owner-authorized staging checks; staging remains unprovisioned until verified |
 | [`runbooks/2026-08-04-internal-update-rehearsal.md`](./runbooks/2026-08-04-internal-update-rehearsal.md) | Disposable-profile N→N+1 rehearsal; not signing or feed-publication proof |

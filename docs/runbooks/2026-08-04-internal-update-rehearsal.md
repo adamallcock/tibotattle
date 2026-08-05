@@ -15,25 +15,27 @@ it reads both sealed channel identities from the candidate bundle and, when
 readback. It does not verify the Sparkle signature and it does not prove that
 an installed client accepts the update.
 
+Read the compact [internal dogfood versus release readiness boundary](./2026-08-05-internal-dogfood-versus-release-readiness.md)
+before choosing a lane.
+
 The `--channel` value is mandatory and must match both
 `Contents/Info.plist:UsageMonitorReleaseChannel` and
 `Contents/Resources/build-manifest.json:release.channelName`. A
 `preview_distribution` bundle is the preview/ad-hoc boundary only; it is not
-a signed dogfood or stable release bundle. `stable`, and a future configured
-`internal-dogfood`, are checked through the external-distribution bundle
-inspector and derive their central origin, appcast URL, and any reviewed
-public-key fingerprint from `config/release-channels.js`. The current
-`internal-dogfood` entry is deliberately unconfigured, so it fails locally
-with an actionable policy error before any network request. No endpoint flag
-may be used to bypass that policy.
+a signed dogfood or stable release bundle. Use this direct verifier only with
+the explicit `preview_distribution` channel. `stable`, and a future
+configured `internal-dogfood`, are checked through the external-distribution
+bundle inspector and derive their central origin, appcast URL, and any
+reviewed public-key fingerprint from `config/release-channels.js`. The
+current `internal-dogfood` entry is deliberately unconfigured, so its
+source-bound policy check fails locally with an actionable error before any
+network request. No endpoint flag may be used to bypass that policy.
 
-For the current unconfigured dogfood lane, an explicit check is expected to
-stop locally:
+For the current unconfigured dogfood policy, check the named channel through
+the source-bound readiness observer:
 
-```bash
-node scripts/verify-macos-preview-remote.js \
-  --app "/absolute/path/to/N+1/TiboTattle.app" \
-  --channel internal-dogfood
+```sh
+node apps/worker/scripts/release-readiness.mjs --channel internal-dogfood
 ```
 
 It must report that `internal-dogfood` needs reviewed dedicated endpoints and
@@ -78,25 +80,27 @@ this command is not a signed dogfood rehearsal and cannot be used as one. The
 content-free receipt records that the remote feed preflight was not checked
 and contains no appcast or artifact payload.
 
-After the owner has confirmed that the reviewed, dedicated internal-dogfood
-feed and artifact are intended to be exercised, run the bounded live remote
-feed preflight against that named channel:
+For a preview compatibility feed and artifact that an owner has separately
+reviewed, run the bounded live remote feed preflight with the preview channel
+explicitly selected:
 
 ```bash
 node scripts/verify-macos-preview-remote.js \
   --app "/absolute/path/to/N+1/TiboTattle.app" \
-  --channel internal-dogfood \
+  --channel preview_distribution \
   --live \
+  --central-origin "<reviewed preview central origin>" \
+  --appcast-url "<reviewed preview appcast URL>" \
+  --artifact-url "<reviewed preview artifact URL>" \
   --remote-feed-preflight \
   --receipt "/absolute/path/to/rehearsal/N+1-live.json"
 ```
 
-Until `config/release-channels.js` contains the separately reviewed dogfood
-endpoints, this exact command must fail closed with
-`RELEASE_CHANNEL_NOT_CONFIGURED` and make zero HTTPS requests. Do not
-substitute `stable` or a command-line endpoint override for the missing
-dogfood policy. The public `stable` preflight belongs only to the separately
-gated [public stable stage](./2026-08-04-owner-release-execution.md#5-public-stable-publish-observe-then-open-intake).
+The current `https://updates.tibotattle.com/appcast.xml` response is HTTP 404,
+so the live preflight is blocked as `not_published` until a valid feed and
+artifact exist. A future signed `internal-dogfood` or `stable` candidate must
+use its source-bound named policy and the [owner release sequence](./2026-08-04-owner-release-execution.md),
+not this preview compatibility command.
 
 The live command intentionally exits non-zero when
 `--remote-feed-preflight` is present: this verifier never turns remote
@@ -177,11 +181,12 @@ receipt and a pass/fail note for each step.
    the expected `N` version. Establish one harmless local-state canary (for
    example, a visible setting) so retention can be checked without recording
    account or activity data.
-2. **Preflight N+1.** Run the live verifier command above against the exact
-   `N+1` bundle. A blocked `remotePublicationReadback`, `not_published`,
-   `unavailable`, `invalid`, or `mismatched_url` result ends the attempt; do
-   not open an updater flow and do not make an update-acceptance claim. Even a
-   passed remote preflight leaves `sparkleAcceptance` unverified.
+2. **Preflight N+1.** Run the owner release/publisher checks against the exact
+   `N+1` bundle. For preview compatibility only, use the live verifier command
+   above. A blocked `remotePublicationReadback`, `not_published`, `unavailable`,
+   `invalid`, or `mismatched_url` result ends the attempt; do not open an
+   updater flow and do not make an update-acceptance claim. Even a passed
+   remote preflight leaves `sparkleAcceptance` unverified.
 3. **Cancellation path.** From N, start the manual update check and begin the
    N+1 download/install flow. Cancel while the operation is cancellable. Confirm
    that the app remains on N, the update is not reported as installed, and the
