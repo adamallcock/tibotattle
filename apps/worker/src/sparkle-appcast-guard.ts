@@ -682,6 +682,25 @@ function invalidCandidate(): never {
   throw new ApiError(422, "SPARKLE_APPCAST_GUARD_CANDIDATE_INVALID");
 }
 
+function storageUnavailable(
+  phase:
+    | "current_state"
+    | "artifact_head"
+    | "artifact_get"
+    | "artifact_read"
+    | "appcast_put",
+): never {
+  // This endpoint is owner-authenticated and release-only. Emit only the
+  // bounded operation phase so an operator can distinguish an R2 outage from
+  // a malformed candidate without logging object names, request data, or
+  // credentials.
+  console.error(JSON.stringify({
+    event: "sparkle_appcast_guard_storage_unavailable",
+    phase,
+  }));
+  throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+}
+
 function canonicalRequest(
   timestamp: string,
   nonce: string,
@@ -876,7 +895,7 @@ async function verifyCandidateArtifact(
   try {
     head = await bucket.head(enclosure.objectKey);
   } catch {
-    throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+    storageUnavailable("artifact_head");
   }
   if (head === null
       || head.size !== enclosure.length
@@ -893,14 +912,14 @@ async function verifyCandidateArtifact(
       { onlyIf: { etagMatches: head.httpEtag } },
     );
   } catch {
-    throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+    storageUnavailable("artifact_get");
   }
   if (object === null || !("arrayBuffer" in object)) invalidCandidate();
   let bytes: Uint8Array;
   try {
     bytes = new Uint8Array(await object.arrayBuffer());
   } catch {
-    throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+    storageUnavailable("artifact_read");
   }
   if (bytes.byteLength !== enclosure.length
       || await sha256Hex(bytes) !== enclosure.objectSha256) {
@@ -983,7 +1002,7 @@ export async function handleSparkleAppcastGuardForContract(
       contract,
     );
   } catch {
-    throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+    storageUnavailable("current_state");
   }
   if (!current.matches) return conflictResponse("current_state_conflict", contract);
 
@@ -1043,7 +1062,7 @@ export async function handleSparkleAppcastGuardForContract(
       },
     );
   } catch {
-    throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+    storageUnavailable("appcast_put");
   }
   if (committed === null) {
     return conflictResponse("r2_conditional_write_conflict", contract);
