@@ -74,7 +74,7 @@ npm --prefix apps/worker run staging:check
 `release:preflight` accepts no remote/deploy option and uses a freshly created,
 owner-only local D1 state directory. Its bounded receipt contains only boolean
 checks and fixed blocker codes, never Wrangler output. It verifies primary
-migrations `0023`–`0028`, including the primary cooldown table, retention
+migrations `0023`–`0029`, including the primary cooldown table, retention
 index, participant-insert guard, and pinned identity-link key configuration,
 plus the complete independent deletion-ledger stream. The release owner must
 also retain that redacted receipt and focused behavior-test evidence showing
@@ -247,7 +247,7 @@ order:
    identity deletion may fail closed rather than remove a link without its
    primary marker; do not enable enrollment or run a public cohort then.
 3. Only after the proof is supplied and structurally accepted, apply primary
-   migrations `0023`–`0028` and the reviewed
+   migrations `0023`–`0029` and the reviewed
    deletion-ledger stream. Verify the primary cooldown table/trigger and the
    identity-link configuration table before any connected preview.
 4. Run the signed connected-preview journey and normal maintenance/ready

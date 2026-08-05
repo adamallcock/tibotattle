@@ -115,6 +115,20 @@ is not a remote observation and does not make it safe to apply the same chain
 to a hosted database. A blocked local preflight returns
 `LOCAL_STAGING_PREFLIGHT_BLOCKED` and reaches no remote command.
 
+The two D1 migration streams are intentionally not a distributed transaction.
+Preparation applies the primary stream and the deletion-ledger stream as
+separate Wrangler operations; a successful first operation is durable even if
+the second operation fails or becomes unverifiable. That partial progress is
+not a successful preparation receipt and must not be treated as an atomic
+rollback. Keep the Worker disabled and collection contained, retain the
+bounded operation outcome, and re-run the read-only
+`npm --prefix apps/worker run staging:ready` check before retrying. Retry only
+the existing preparation lane against the same reviewed target so each D1
+migration ledger determines what remains pending. Do not edit `d1_migrations`,
+recreate a database, or attempt a cross-database rollback. If the per-binding
+state cannot be established, stop for owner review; no deployment or
+activation may proceed.
+
 Fresh bootstrap therefore has an owner-only external prerequisite: the owner
 must use a separately reviewed Cloudflare D1 bootstrap protocol that establishes
 the exact staging migration state and a verified `collection_controls` row in

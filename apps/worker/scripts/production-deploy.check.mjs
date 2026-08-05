@@ -99,6 +99,7 @@ function options(overrides = {}) {
     workerDirectory: "/worker",
     expectedSourceCommit: "c26823c",
     sourceCommitCheck: () => "c26823c",
+    sourceTreeCleanCheck: () => true,
     releasePreflight: async () => ({
       state: "ready",
       blockers: [],
@@ -332,6 +333,28 @@ test("production deployment stops if the checked-out source revision changes bef
     code: "PRODUCTION_SOURCE_REVISION_CHANGED",
   });
   assert.equal(spawned, false);
+});
+
+test("production deployment rejects source revision movement across the Wrangler boundary", async () => {
+  let spawned = false;
+  let sourceMoved = false;
+  const result = await runProductionDeployment(options({
+    proofCheck: proofCheck(),
+    sourceCommitCheck: () => sourceMoved ? "deadbee" : "c26823c",
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    stageAssets: async () => {},
+    spawn: () => {
+      spawned = true;
+      sourceMoved = true;
+      return { status: 0, stdout: "deployed", stderr: "" };
+    },
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_SOURCE_REVISION_CHANGED",
+  });
+  assert.equal(spawned, true);
 });
 
 test("production health recheck requires the canonical URL and security headers", async () => {

@@ -31,6 +31,51 @@ function checkedOutSourceCommit(workerDirectory) {
   }
 }
 
+function checkedOutSourceTreeClean(workerDirectory) {
+  try {
+    const value = execFileSync(
+      "/usr/bin/git",
+      [
+        "-C",
+        dirname(workerDirectory),
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ],
+      { encoding: "utf8" },
+    );
+    return value.trim() === "";
+  } catch {
+    return null;
+  }
+}
+
+function verifySourceSnapshot({
+  workerDirectory,
+  expectedSourceCommit,
+  sourceCommitCheck,
+  sourceTreeCleanCheck,
+}) {
+  const sourceCommit = sourceCommitCheck(workerDirectory);
+  if (!sourceCommit || !/^[a-f0-9]{7,64}$/u.test(sourceCommit)) {
+    return localFailure("PRODUCTION_SOURCE_REVISION_UNAVAILABLE");
+  }
+  if (expectedSourceCommit !== null
+      && sourceCommit !== expectedSourceCommit) {
+    return localFailure("PRODUCTION_SOURCE_REVISION_CHANGED");
+  }
+  let clean;
+  try {
+    clean = sourceTreeCleanCheck(workerDirectory);
+  } catch {
+    clean = null;
+  }
+  if (clean !== true) {
+    return localFailure("PRODUCTION_SOURCE_TREE_CHANGED");
+  }
+  return { ok: true, sourceCommit };
+}
+
 async function productionReleasePreflight({ workerDirectory, wrangler, spawn }) {
   const configPath = join(workerDirectory, "wrangler.jsonc");
   const config = parse(await readFile(configPath, "utf8"));
@@ -118,6 +163,7 @@ export async function runProductionDeployment({
   proofCheck = null,
   expectedSourceCommit = null,
   sourceCommitCheck = checkedOutSourceCommit,
+  sourceTreeCleanCheck = checkedOutSourceTreeClean,
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionContainment,
@@ -125,11 +171,14 @@ export async function runProductionDeployment({
   if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
     return localFailure("CONFIRMATION_REQUIRED");
   }
-  const sourceCommit = expectedSourceCommit
-    ?? sourceCommitCheck(workerDirectory);
-  if (!sourceCommit || !/^[a-f0-9]{7,64}$/u.test(sourceCommit)) {
-    return localFailure("PRODUCTION_SOURCE_REVISION_UNAVAILABLE");
-  }
+  const initialSource = verifySourceSnapshot({
+    workerDirectory,
+    expectedSourceCommit,
+    sourceCommitCheck,
+    sourceTreeCleanCheck,
+  });
+  if (!initialSource.ok) return initialSource;
+  const sourceCommit = initialSource.sourceCommit;
   const containmentProof = proofCheck ?? await readDeploymentProof({
     filename: receiptFile,
     kind: "production",
@@ -179,10 +228,6 @@ export async function runProductionDeployment({
   } catch {
     return localFailure("PRODUCTION_PUBLIC_ASSETS_INVALID");
   }
-  const deploySourceCommit = sourceCommitCheck(workerDirectory);
-  if (deploySourceCommit !== sourceCommit) {
-    return localFailure("PRODUCTION_SOURCE_REVISION_CHANGED");
-  }
   let health;
   try {
     health = await healthRecheck({ fetchImpl });
@@ -194,6 +239,17 @@ export async function runProductionDeployment({
       ? health
       : localFailure("PRODUCTION_HEALTH_RECHECK_INVALID");
   }
+
+  // This is deliberately immediately before Wrangler: health probing can
+  // yield to another checkout, so the earlier post-staging check is not the
+  // deployment boundary.
+  const deploySource = verifySourceSnapshot({
+    workerDirectory,
+    expectedSourceCommit: sourceCommit,
+    sourceCommitCheck,
+    sourceTreeCleanCheck,
+  });
+  if (!deploySource.ok) return deploySource;
 
   let deployment;
   try {
@@ -209,6 +265,13 @@ export async function runProductionDeployment({
   } catch {
     return localFailure("PRODUCTION_DEPLOY_FAILED");
   }
+  const postDeploySource = verifySourceSnapshot({
+    workerDirectory,
+    expectedSourceCommit: sourceCommit,
+    sourceCommitCheck,
+    sourceTreeCleanCheck,
+  });
+  if (!postDeploySource.ok) return postDeploySource;
   if (deployment?.error || deployment?.status !== 0) {
     return localFailure("PRODUCTION_DEPLOY_FAILED");
   }
