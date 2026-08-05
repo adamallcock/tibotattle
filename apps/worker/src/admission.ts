@@ -108,6 +108,12 @@ function uploadIngressUnavailable(): ApiError {
   });
 }
 
+function admissionRateLimitUnavailable(): ApiError {
+  return new ApiError(503, "ADMISSION_RATE_LIMIT_UNAVAILABLE", {
+    responseHeaders: { "retry-after": "60" },
+  });
+}
+
 async function applyUploadRateLimit(
   limiter: RateLimit,
   key: string,
@@ -136,14 +142,23 @@ export async function assertAttemptAllowed(
 ): Promise<void> {
   assertLimiterConfigured(coarseLimiter);
   assertLimiterConfigured(clientLimiter);
-  const coarse = await coarseLimiter.limit({
-    key: `usage-monitor:${purpose}:global`,
-  });
-  if (!coarse.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
-  const client = await clientLimiter.limit({
-    key: `usage-monitor:${purpose}:client:${await clientRateLimitKey(request, env, purpose)}`,
-  });
-  if (!client.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
+  try {
+    const coarse = await coarseLimiter.limit({
+      key: `usage-monitor:${purpose}:global`,
+    });
+    if (!coarse.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+    const client = await clientLimiter.limit({
+      key: `usage-monitor:${purpose}:client:${await clientRateLimitKey(request, env, purpose)}`,
+    });
+    if (!client.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  }
 }
 
 export async function assertPublicAggregateReadAllowed(
@@ -152,14 +167,21 @@ export async function assertPublicAggregateReadAllowed(
   env: Env,
 ): Promise<void> {
   assertLimiterConfigured(limiter);
-  const result = await limiter.limit({
-    key: `usage-monitor:public_aggregate_read:client:${await clientRateLimitKey(
-      request,
-      env,
-      "public_aggregate_read",
-    )}`,
-  });
-  if (!result.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED");
+  try {
+    const result = await limiter.limit({
+      key: `usage-monitor:public_aggregate_read:client:${await clientRateLimitKey(
+        request,
+        env,
+        "public_aggregate_read",
+      )}`,
+    });
+    if (!result.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  }
 }
 
 /**

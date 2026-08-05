@@ -31,6 +31,8 @@
     "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "1200",
     "UPLOAD_INGRESS_BURST": "1200",
     "UPLOAD_INGRESS_LEASE_SECONDS": "90",
+    "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
+    "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
     // Authoritative, D1-backed global sign-in-start budget. The synthetic
     // harness needs headroom; hosted environments use materially lower caps.
     "SIGN_IN_START_MAX_PER_MINUTE": "1200"
@@ -156,6 +158,8 @@
         "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
         "UPLOAD_INGRESS_BURST": "16",
         "UPLOAD_INGRESS_LEASE_SECONDS": "90",
+        "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
+        "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
         "SIGN_IN_START_MAX_PER_MINUTE": "5",
         "IDENTITY_LINK_SECRET_VERSION": "staging-v1"
       },
@@ -279,6 +283,8 @@
         "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
         "UPLOAD_INGRESS_BURST": "16",
         "UPLOAD_INGRESS_LEASE_SECONDS": "90",
+        "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
+        "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
         "SIGN_IN_START_MAX_PER_MINUTE": "20",
         // A non-secret immutable label paired with the keyed fingerprint in
         // D1. Changing either it or IDENTITY_LINK_SECRET fails closed until a

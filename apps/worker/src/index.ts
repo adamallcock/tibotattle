@@ -15,7 +15,12 @@ import {
   probeUploadIngressBudget,
   releaseUploadIngressLease,
   startUploadIngressLeaseHeartbeat,
+  uploadIngressBodyReadPolicy,
 } from "./upload-ingress-admission";
+import {
+  readBoundedRequestBody,
+  type BoundedBodyReadPolicy,
+} from "./bounded-body";
 import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
@@ -237,7 +242,15 @@ import {
   validateSyntheticContribution,
 } from "./validation";
 
-async function readBoundedJson(request: Request): Promise<{
+const CONTROL_BODY_READ_POLICY = Object.freeze({
+  maximumTotalMilliseconds: 15_000,
+  maximumIdleMilliseconds: 5_000,
+} satisfies BoundedBodyReadPolicy);
+
+async function readBoundedJson(
+  request: Request,
+  policy: BoundedBodyReadPolicy = CONTROL_BODY_READ_POLICY,
+): Promise<{
   bytes: Uint8Array;
   raw: string;
   value: unknown;
@@ -250,32 +263,7 @@ async function readBoundedJson(request: Request): Promise<{
     if (!Number.isSafeInteger(length) || length < 0) throw new ApiError(400, "BODY_INVALID");
     if (length > MAX_REQUEST_BYTES) throw new ApiError(413, "BODY_TOO_LARGE");
   }
-  if (!request.body) throw new ApiError(400, "BODY_INVALID");
-
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > MAX_REQUEST_BYTES) {
-        await reader.cancel();
-        throw new ApiError(413, "BODY_TOO_LARGE");
-      }
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const combined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  const combined = await readBoundedRequestBody(request, MAX_REQUEST_BYTES, policy);
   let raw: string;
   try {
     raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined);
@@ -341,30 +329,11 @@ async function readBoundedForm(
     }
     if (length > maximumBytes) throw new ApiError(413, "BODY_TOO_LARGE");
   }
-  if (!request.body) throw new ApiError(400, "BODY_INVALID");
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > maximumBytes) {
-        await reader.cancel();
-        throw new ApiError(413, "BODY_TOO_LARGE");
-      }
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const combined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  const combined = await readBoundedRequestBody(
+    request,
+    maximumBytes,
+    CONTROL_BODY_READ_POLICY,
+  );
   try {
     return new URLSearchParams(
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
@@ -1947,6 +1916,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   if (request.method !== "POST") methodNotAllowed(["POST"]);
   assertUploadIngressConfiguration(env);
   assertUploadIngressRateLimitBindings(env);
+  const bodyReadPolicy = uploadIngressBodyReadPolicy(env);
   const authorizationHeader = contributionRequestPreflight(request);
   await assertUploadIngressRequestAllowed(
     env.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
@@ -1968,7 +1938,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     authorizationKind: "session" | "device";
   } | null = null;
   try {
-    const body = await readBoundedJson(request);
+    const body = await readBoundedJson(request, bodyReadPolicy);
     await heartbeat.assertActive();
     const contentType = request.headers.get("content-type")?.trim() ?? "";
     const bodyBytes = body.bytes.byteLength;

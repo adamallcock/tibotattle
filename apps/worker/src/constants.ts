@@ -17,6 +17,11 @@ export const UPLOAD_AUTHORIZATION_TTL_MILLISECONDS = 5 * 60 * 1000;
 // live request for up to the configured five-minute maximum, and canonical
 // D1 insert triggers must not expire its one-use authorization earlier.
 export const UPLOAD_CONSUME_LEASE_MILLISECONDS = 5 * 60 * 1000;
+// The ingress Durable Object may renew its short operational lease while the
+// request is alive, but no single public upload may hold that shared capacity
+// for longer than four minutes. The body policy is capped below this value;
+// handlers re-check the live lease immediately before storage side effects.
+export const MAX_UPLOAD_INGRESS_LIFETIME_MILLISECONDS = 4 * 60 * 1000;
 export const DEVICE_PAIRING_TTL_MILLISECONDS = 10 * 60 * 1000;
 export const DEVICE_CREDENTIAL_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 export const RECOVERY_RETRY_TTL_MILLISECONDS = 5 * 60 * 1000;

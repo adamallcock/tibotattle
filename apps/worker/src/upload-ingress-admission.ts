@@ -1,4 +1,6 @@
 import { ApiError } from "./errors";
+import { MAX_UPLOAD_INGRESS_LIFETIME_MILLISECONDS } from "./constants";
+import type { BoundedBodyReadPolicy } from "./bounded-body";
 import {
   type UploadIngressBudgetDecision,
   type UploadIngressBudgetPolicy,
@@ -19,6 +21,8 @@ export interface UploadIngressLeaseHeartbeat {
   assertActive(): Promise<void>;
   stop(): Promise<void>;
 }
+
+export interface UploadIngressBodyReadPolicy extends BoundedBodyReadPolicy {}
 
 function configuredInteger(
   env: Env,
@@ -59,6 +63,32 @@ function configuredPolicy(env: Env): UploadIngressBudgetPolicy {
       300,
     ) * 1_000,
   };
+}
+
+/**
+ * A shared ingress lease begins before parsing the envelope. Keep the body
+ * read itself strictly shorter than that lease, with a separate idle bound, so
+ * a syntactically plausible slow request cannot renew a scarce slot forever.
+ */
+export function uploadIngressBodyReadPolicy(env: Env): UploadIngressBodyReadPolicy {
+  const maximumTotalMilliseconds = configuredInteger(
+    env,
+    "UPLOAD_INGRESS_BODY_TOTAL_SECONDS",
+    10,
+    120,
+  ) * 1_000;
+  const maximumIdleMilliseconds = configuredInteger(
+    env,
+    "UPLOAD_INGRESS_BODY_IDLE_SECONDS",
+    1,
+    60,
+  ) * 1_000;
+  const leaseMilliseconds = configuredPolicy(env).leaseMilliseconds;
+  if (maximumIdleMilliseconds > maximumTotalMilliseconds
+      || maximumTotalMilliseconds >= leaseMilliseconds) {
+    throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
+  }
+  return Object.freeze({ maximumTotalMilliseconds, maximumIdleMilliseconds });
 }
 
 function configuredNamespace(env: Env): DurableObjectNamespace {
@@ -113,6 +143,7 @@ function validDecision(value: unknown): value is UploadIngressBudgetDecision {
 export function assertUploadIngressConfiguration(env: Env): void {
   configuredNamespace(env);
   configuredPolicy(env);
+  uploadIngressBodyReadPolicy(env);
   assertDeferredUploadQueueIngress(env);
 }
 
@@ -170,13 +201,20 @@ export function startUploadIngressLeaseHeartbeat(
 ): UploadIngressLeaseHeartbeat {
   let active = true;
   let renewal: Promise<void> = Promise.resolve();
+  const hardDeadline = Date.now() + MAX_UPLOAD_INGRESS_LIFETIME_MILLISECONDS;
   const intervalMilliseconds = Math.max(
     1_000,
     Math.floor(lease.policy.leaseMilliseconds / 3),
   );
   const timer = setInterval(() => {
     renewal = renewal.then(async () => {
-      if (!active || !await renewUploadIngressLease(env, lease)) {
+      // This is an absolute cap rather than another renewable deadline. A
+      // slow body is independently bounded, and this fences later crypto,
+      // R2, and D1 work so an otherwise live request cannot hold the global
+      // budget indefinitely.
+      if (Date.now() >= hardDeadline
+          || !active
+          || !await renewUploadIngressLease(env, lease)) {
         active = false;
       }
     }, () => {
@@ -187,7 +225,10 @@ export function startUploadIngressLeaseHeartbeat(
   return {
     async assertActive(): Promise<void> {
       await renewal;
-      if (!active) throw unavailable();
+      if (!active || Date.now() >= hardDeadline) {
+        active = false;
+        throw unavailable();
+      }
     },
     async stop(): Promise<void> {
       clearInterval(timer);
