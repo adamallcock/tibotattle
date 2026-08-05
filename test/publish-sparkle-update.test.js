@@ -86,6 +86,7 @@ async function createReleaseFixture({
         appcastObjectKey: STABLE_CHANNEL.sparkle.appcastObjectKey,
         r2Bucket: STABLE_CHANNEL.sparkle.r2Bucket,
         objectPrefix: STABLE_CHANNEL.sparkle.objectPrefix,
+        atomicGuardURL: STABLE_CHANNEL.sparkle.atomicGuardURL,
         publicEdKeySha256: TEST_PUBLIC_ED_KEY_SHA256,
       },
     },
@@ -347,6 +348,30 @@ test("validates an explicitly supplied canonical signed update without invoking 
       expectedShortVersion: "0.1.0",
       production: true,
     }]]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("accepts the empty paired enclosure emitted by the reviewed Sparkle generator", async () => {
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value
+      .replace(' sparkle:version="1"', "")
+      .replace("<enclosure ", "<sparkle:version>1</sparkle:version>\n<enclosure ")
+      .replace(" />", "></enclosure>"),
+  });
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.status, "validated");
+    assert.equal(publication.artifact.url, fixture.artifactURL);
   } finally {
     await fixture.cleanup();
   }
@@ -791,6 +816,7 @@ test("retries after artifact and manifest publication and writes the appcast las
 
 test("recovers an appcast written before public readback failed without writing again", async () => {
   const fixture = await createReleaseFixture();
+  const previous = await createReleaseFixture({ bundleVersion: "0" });
   const digest = sha256(fixture.dmgBytes);
   const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
   const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
@@ -812,7 +838,7 @@ test("recovers an appcast written before public readback failed without writing 
     dmgPath: fixture.dmgPath,
     publish: true,
     releaseManifestPath: fixture.releaseManifestPath,
-    previousStableManifestPath: fixture.releaseManifestPath,
+    previousStableManifestPath: previous.releaseManifestPath,
     replaceAppcast: true,
     sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
     stableBootstrap: false,
@@ -843,6 +869,7 @@ test("recovers an appcast written before public readback failed without writing 
       { method: "GET", url: fixture.artifactURL },
     ]);
   } finally {
+    await previous.cleanup();
     await fixture.cleanup();
   }
 });
@@ -1014,7 +1041,7 @@ test("requires an explicit appcast replacement after immutable preflight passes"
         dmgPath: fixture.dmgPath,
         publish: true,
         releaseManifestPath: fixture.releaseManifestPath,
-        previousStableManifestPath: fixture.releaseManifestPath,
+        previousStableManifestPath: current.releaseManifestPath,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
         stableBootstrap: false,
         runWrangler: runner.run,
@@ -1103,6 +1130,7 @@ test("rejects a stable Sparkle delta before any remote mutation", async () => {
 
 test("rejects a changed equal-version live appcast before any remote mutation", async () => {
   const candidate = await createReleaseFixture({ bundleVersion: "2" });
+  const previous = await createReleaseFixture({ bundleVersion: "1" });
   const candidateAppcast = await readFile(candidate.appcastPath, "utf8");
   const currentAppcast = Buffer.from(`${candidateAppcast} `);
   const runner = remoteObjectRunner(new Map([
@@ -1117,7 +1145,7 @@ test("rejects a changed equal-version live appcast before any remote mutation", 
         dmgPath: candidate.dmgPath,
         publish: true,
         releaseManifestPath: candidate.releaseManifestPath,
-        previousStableManifestPath: candidate.releaseManifestPath,
+        previousStableManifestPath: previous.releaseManifestPath,
         replaceAppcast: true,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
         stableBootstrap: false,
@@ -1129,12 +1157,14 @@ test("rejects a changed equal-version live appcast before any remote mutation", 
     assert.equal(
       runner.calls.some((call) => call[2] === "put"), false);
   } finally {
+    await previous.cleanup();
     await candidate.cleanup();
   }
 });
 
 test("rejects an ambiguous equal-version live appcast before any remote mutation", async () => {
   const candidate = await createReleaseFixture();
+  const previous = await createReleaseFixture({ bundleVersion: "0" });
   const candidateAppcast = await readFile(candidate.appcastPath, "utf8");
   const duplicateItem = candidateAppcast.match(/<item>[\s\S]*?<\/item>/u)?.[0];
   assert.equal(typeof duplicateItem, "string");
@@ -1153,7 +1183,7 @@ test("rejects an ambiguous equal-version live appcast before any remote mutation
         dmgPath: candidate.dmgPath,
         publish: true,
         releaseManifestPath: candidate.releaseManifestPath,
-        previousStableManifestPath: candidate.releaseManifestPath,
+        previousStableManifestPath: previous.releaseManifestPath,
         replaceAppcast: true,
         sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
         stableBootstrap: false,
@@ -1164,12 +1194,14 @@ test("rejects an ambiguous equal-version live appcast before any remote mutation
     );
     assert.equal(runner.calls.some((call) => call[2] === "put"), false);
   } finally {
+    await previous.cleanup();
     await candidate.cleanup();
   }
 });
 
 test("verifies an exact appcast retry without overwriting or reporting a new publish", async () => {
   const fixture = await createReleaseFixture();
+  const previous = await createReleaseFixture({ bundleVersion: "0" });
   const digest = sha256(fixture.dmgBytes);
   const runner = statefulRemoteObjectRunner({
     objects: new Map([
@@ -1187,7 +1219,7 @@ test("verifies an exact appcast retry without overwriting or reporting a new pub
       dmgPath: fixture.dmgPath,
       publish: true,
       releaseManifestPath: fixture.releaseManifestPath,
-      previousStableManifestPath: fixture.releaseManifestPath,
+      previousStableManifestPath: previous.releaseManifestPath,
       replaceAppcast: true,
       sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
       stableBootstrap: false,
@@ -1204,6 +1236,7 @@ test("verifies an exact appcast retry without overwriting or reporting a new pub
       { method: "GET", url: fixture.artifactURL },
     ]);
   } finally {
+    await previous.cleanup();
     await fixture.cleanup();
   }
 });

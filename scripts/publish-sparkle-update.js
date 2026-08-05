@@ -418,10 +418,33 @@ function appcastEnclosures(text, channel) {
   if (text.includes("<!DOCTYPE") || text.includes("<!ENTITY")) {
     fail("Appcast must not contain a document type or entity declaration");
   }
-  const matches = [...text.matchAll(/<enclosure\b([^>]*)\/>/gu)];
-  if (matches.length === 0) fail("Appcast must contain a self-closing enclosure");
+  const enclosureOpenings = [...text.matchAll(/<enclosure\b/gu)].length;
+  const itemBodies = [...text.matchAll(
+    /<item\b[^>]*>([\s\S]*?)<\/item\s*>/gu,
+  )];
+  const matches = itemBodies.flatMap((item) => {
+    const body = item[1];
+    const versions = [...body.matchAll(
+      /<sparkle:version\b[^>]*>\s*([^<]+?)\s*<\/sparkle:version\s*>/gu,
+    )].map((match) => match[1]);
+    if (versions.length > 1) {
+      fail("Appcast item has ambiguous Sparkle versions");
+    }
+    return [...body.matchAll(
+      /<enclosure\b([^>]*?)(?:\/>|>\s*<\/enclosure\s*>)/gu,
+    )].map((match) => ({
+      attributes: match[1],
+      itemVersion: versions[0],
+    }));
+  });
+  if (matches.length === 0) {
+    fail("Appcast must contain an empty enclosure");
+  }
+  if (matches.length !== enclosureOpenings) {
+    fail("Every appcast enclosure must be empty and belong to one item");
+  }
   return matches.map((match) => {
-    const attributes = parseEnclosureAttributes(match[1]);
+    const attributes = parseEnclosureAttributes(match.attributes);
     const url = validatePublishedDownloadURL(attributes.get("url"), channel);
     const object = parsePublishedObjectKey(url, channel);
     const length = attributes.get("length");
@@ -433,7 +456,12 @@ function appcastEnclosures(text, channel) {
       fail("Appcast enclosure length is invalid");
     }
     validateAppcastSignature(attributes.get("sparkle:edSignature"));
-    const version = attributes.get("sparkle:version");
+    const attributeVersion = attributes.get("sparkle:version");
+    if (attributeVersion !== undefined && match.itemVersion !== undefined
+        && attributeVersion !== match.itemVersion) {
+      fail("Appcast enclosure and item Sparkle versions disagree");
+    }
+    const version = attributeVersion ?? match.itemVersion;
     if (typeof version !== "string"
         || !BUNDLE_VERSION_PATTERN.test(version)
         || object.bundleVersion !== version) {
@@ -481,9 +509,8 @@ function assertCanonicalStableAppcast(text, channel, enclosures) {
     );
   }
   if (enclosures.length !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount
-      || [...(itemBodies[0]?.[1] ?? "").matchAll(
-        /<enclosure\b[^>]*\/>/gu,
-      )].length !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount) {
+      || [...(itemBodies[0]?.[1] ?? "").matchAll(/<enclosure\b/gu)].length
+        !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount) {
     fail(
       "Stable appcast must contain exactly one enclosure inside its sole item",
       "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
