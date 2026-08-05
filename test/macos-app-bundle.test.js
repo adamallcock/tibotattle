@@ -5388,6 +5388,26 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       }),
       { code: "MACOS_PREVIEW_REPLACE_REQUIRED" },
     );
+    const legacyManifestPath = join(
+      output,
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    );
+    await chmod(legacyManifestPath, 0o644);
+    const legacyManifest = JSON.parse(await readFile(legacyManifestPath, "utf8"));
+    delete legacyManifest.release.channelName;
+    await writeFile(legacyManifestPath, JSON.stringify(legacyManifest));
+    const legacyPlistPath = join(output, "Contents", "Info.plist");
+    await chmod(legacyPlistPath, 0o644);
+    const legacyPlist = await readFile(legacyPlistPath, "utf8");
+    await writeFile(
+      legacyPlistPath,
+      legacyPlist.replace(
+        /  <key>UsageMonitorReleaseChannel<\/key>\n  <string>preview_distribution<\/string>\n/u,
+        "",
+      ),
+    );
     await buildMacOSApp({
       bundleVersion: "42",
       centralOrigin: "https://preview.usage.example",
@@ -5399,6 +5419,25 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       sparkleFramework: preparedFramework,
       sparklePublicEdKey: publicEdKey,
     });
+    assert.deepEqual(await validateMacOSPreviewApp(output), {
+      appPath: resolve(output),
+      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      bundleVersion: "42",
+      channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      updaterEnabled: true,
+    });
+    const retired = await readdir(join(dirname(output), "retired"));
+    assert.equal(retired.length, 1);
+    assert.match(retired[0], /^TiboTattle-legacy-preview-[a-f0-9]{16}\.app$/u);
+    const archivedManifest = JSON.parse(await readFile(join(
+      dirname(output),
+      "retired",
+      retired[0],
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    ), "utf8"));
+    assert.equal(archivedManifest.release.channelName, undefined);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

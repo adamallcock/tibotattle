@@ -2838,6 +2838,104 @@ async function verifyExistingBuildTarget(output) {
   return true;
 }
 
+/**
+ * A preview produced before named release channels were introduced has the
+ * same preview boundary as a current bundle except for the two newly required
+ * channel fields.  Replacing it must not turn into an opaque manual cleanup
+ * task, but neither may it cause an arbitrary or partially-built bundle to be
+ * discarded.  This deliberately recognizes only that exact legacy shape.
+ */
+async function readReplaceableLegacyPreviewManifest(output) {
+  const manifestPath = join(
+    output,
+    "Contents",
+    "Resources",
+    "build-manifest.json",
+  );
+  const plistPath = join(output, "Contents", "Info.plist");
+  try {
+    const [manifestMetadata, plistMetadata] = await Promise.all([
+      lstat(manifestPath),
+      lstat(plistPath),
+    ]);
+    if (!manifestMetadata.isFile() || manifestMetadata.isSymbolicLink()
+        || !plistMetadata.isFile() || plistMetadata.isSymbolicLink()) {
+      return null;
+    }
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const plist = readMacOSInfoPlist(plistPath);
+    const release = manifest?.release;
+    const updater = release?.updater;
+    const legacyManifestBoundary = manifest?.schemaVersion === MANIFEST_SCHEMA
+      && manifest.application?.bundleIdentifier === PRODUCT_BRAND.bundleIdentifier
+      && manifest.application?.signing === "ad_hoc_developer_bundle"
+      && release?.channel === DISTRIBUTION_CHANNEL_PREVIEW
+      && release.channelName === undefined
+      && release.previewDistributionRequested === true
+      && release.externalDistributionRequested === false
+      && release.previewOriginValidated === true
+      && release.productionOriginValidated === false
+      && release.requiresDeveloperIDAndNotarization === false
+      && release.iconIncluded === true
+      && updater?.enabled === true
+      && updater.automaticChecks === false
+      && updater.automaticUpdateOptInAvailable === false
+      && updater.automaticUpdatesEnabledByDefault === false
+      && updater.requiresSignedFeed === true
+      && updater.verifyBeforeExtraction === true;
+    const legacyPlistBoundary = plist.CFBundleIdentifier
+        === PRODUCT_BRAND.bundleIdentifier
+      && plist.CFBundleDisplayName === PRODUCT_BRAND.displayName
+      && plist.CFBundleName === PRODUCT_BRAND.displayName
+      && plist.UsageMonitorBundleName === PRODUCT_BRAND.bundleName
+      && plist.UsageMonitorBuildChannel === DISTRIBUTION_CHANNEL_PREVIEW
+      && plist.UsageMonitorReleaseChannel === undefined
+      && plist.UsageMonitorPreviewDistribution === true
+      && plist.UsageMonitorCentralOriginMode === CENTRAL_ORIGIN_MODE_HTTPS
+      && plist.UsageMonitorUpdaterEnabled === true
+      && plist.UsageMonitorUpdaterFrameworkVersion === SPARKLE_VERSION
+      && plist.SUEnableAutomaticChecks === false
+      && plist.SUAllowsAutomaticUpdates === false
+      && plist.SUAutomaticallyUpdate === false
+      && plist.SURequireSignedFeed === true
+      && plist.SUVerifyUpdateBeforeExtraction === true;
+    return legacyManifestBoundary && legacyPlistBoundary ? manifest : null;
+  } catch {
+    return null;
+  }
+}
+
+async function archiveLegacyPreviewApp(output, manifest) {
+  const retiredRoot = join(dirname(output), "retired");
+  await mkdir(retiredRoot, { recursive: true, mode: 0o755 });
+  if (await realpath(retiredRoot) !== retiredRoot) {
+    fail(
+      "Preview legacy archive directory must not traverse a symbolic link",
+      "MACOS_PREVIEW_METADATA_INVALID",
+    );
+  }
+  const fingerprint = sha256(Buffer.from(stableJson({
+    application: manifest.application,
+    release: manifest.release,
+  }), "utf8")).slice(0, 16);
+  const archivePath = join(
+    retiredRoot,
+    `${PRODUCT_BRAND.displayName}-legacy-preview-${fingerprint}.app`,
+  );
+  try {
+    await rename(output, archivePath);
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      fail(
+        "Refusing to overwrite an archived legacy preview application",
+        "MACOS_PREVIEW_METADATA_INVALID",
+      );
+    }
+    throw error;
+  }
+  return archivePath;
+}
+
 export async function assertMacOSExternalBuildOutputIsFresh(output) {
   try {
     await lstat(output);
@@ -3451,6 +3549,7 @@ export async function buildMacOSApp({
     if (externalDistribution) {
       await installMacOSExternalBuildOutput(stagedApp, selectedOutput);
     } else {
+      let legacyPreviewArchive = null;
       if (await verifyExistingBuildTarget(selectedOutput)) {
         if (distribution.previewDistribution) {
           if (replacePreviewOutput !== true) {
@@ -3459,11 +3558,35 @@ export async function buildMacOSApp({
               "MACOS_PREVIEW_REPLACE_REQUIRED",
             );
           }
-          await validateMacOSPreviewApp(selectedOutput);
+          try {
+            await validateMacOSPreviewApp(selectedOutput);
+          } catch (error) {
+            const legacyManifest = await readReplaceableLegacyPreviewManifest(
+              selectedOutput,
+            );
+            if (legacyManifest === null) throw error;
+            legacyPreviewArchive = await archiveLegacyPreviewApp(
+              selectedOutput,
+              legacyManifest,
+            );
+          }
         }
-        await rm(selectedOutput, { recursive: true, force: false });
+        if (legacyPreviewArchive === null) {
+          await rm(selectedOutput, { recursive: true, force: false });
+        }
       }
-      await rename(stagedApp, selectedOutput);
+      try {
+        await rename(stagedApp, selectedOutput);
+      } catch (error) {
+        if (legacyPreviewArchive !== null) {
+          try {
+            await rename(legacyPreviewArchive, selectedOutput);
+          } catch (restoreError) {
+            error.message = `${error.message}; the legacy preview remains preserved at ${legacyPreviewArchive} because restoration failed: ${restoreError.message}`;
+          }
+        }
+        throw error;
+      }
     }
     return Object.freeze({
       output: selectedOutput,

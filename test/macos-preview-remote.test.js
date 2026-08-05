@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   MACOS_PREVIEW_REMOTE_HEALTH_PATHS,
@@ -28,6 +29,17 @@ const MANIFEST = Object.freeze({
     channel: "preview_distribution",
     channelName: "preview_distribution",
   },
+});
+
+test("the preview remote package command selects the sealed preview channel", async () => {
+  const packageManifest = JSON.parse(await readFile(
+    new URL("../package.json", import.meta.url),
+    "utf8",
+  ));
+  assert.match(
+    packageManifest.scripts["product:macos:preview:remote"],
+    /--channel preview_distribution/u,
+  );
 });
 
 const VALID_APPCAST = `<?xml version="1.0" encoding="utf-8"?>
