@@ -413,15 +413,39 @@ private final class AppUpdater: NSObject {
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
-        setState(.failed)
+        // Sparkle has parsed and verified the appcast at this point. The
+        // error carries the reason no newer compatible item was selected; it
+        // is not a feed or signature failure.
+        setState(.verifiedNoUpdate)
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
         setState(.verifiedNoUpdate)
     }
 
+    static func stateForUpdaterAbort(
+        errorDomain: String,
+        errorCode: Int
+    ) -> AppUpdaterState {
+        guard errorDomain == SUSparkleErrorDomain else { return .failed }
+        switch errorCode {
+        case Int(SUError.noUpdateError.rawValue):
+            return .verifiedNoUpdate
+        case Int(SUError.installationCanceledError.rawValue):
+            // A cancelled authorization or install attempt is retryable and
+            // does not make the already-verified feed unavailable.
+            return .ready
+        default:
+            return .failed
+        }
+    }
+
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
-        setState(.failed)
+        let updaterError = error as NSError
+        setState(Self.stateForUpdaterAbort(
+            errorDomain: updaterError.domain,
+            errorCode: updaterError.code
+        ))
     }
 #endif
 

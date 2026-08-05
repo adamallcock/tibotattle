@@ -787,13 +787,20 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /didFindValidUpdate[\s\S]*\.updateAvailable/u);
   assert.match(
     source,
-    /func updaterDidNotFindUpdate\(_ updater: SPUUpdater, error: Error\) \{\s*setState\(\.failed\)\s*\}/u,
+    /func updaterDidNotFindUpdate\(_ updater: SPUUpdater, error: Error\) \{[\s\S]*?setState\(\.verifiedNoUpdate\)\s*\}/u,
   );
   assert.match(
     source,
     /func updaterDidNotFindUpdate\(_ updater: SPUUpdater\) \{\s*setState\(\.verifiedNoUpdate\)\s*\}/u,
   );
-  assert.match(source, /didAbortWithError[\s\S]*\.failed/u);
+  assert.match(
+    source,
+    /stateForUpdaterAbort\([\s\S]*SUSparkleErrorDomain[\s\S]*Int\(SUError\.noUpdateError\.rawValue\):[\s\S]*return \.verifiedNoUpdate[\s\S]*Int\(SUError\.installationCanceledError\.rawValue\):[\s\S]*return \.ready[\s\S]*default:[\s\S]*return \.failed/u,
+  );
+  assert.match(
+    source,
+    /didAbortWithError[\s\S]*stateForUpdaterAbort\([\s\S]*errorDomain: updaterError\.domain[\s\S]*errorCode: updaterError\.code/u,
+  );
   assert.match(source, /controller\.checkForUpdates\(sender\)/u);
   assert.match(source, /runtimeStateDescription/u);
   assert.match(
