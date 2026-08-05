@@ -39,3 +39,27 @@ test("web timeline normalization retains canonical plans and maps arbitrary stri
     ["go", "edu", "prolite", "unknown"],
   );
 });
+
+test("web quota windows map arbitrary provider plan_type to unknown before plan evidence", () => {
+  const normalized = normalizeDashboardPayload({
+    quotaWindows: [
+      {
+        limitId: "codex",
+        durationMinutes: 300,
+        usedPercent: 10,
+        plan_type: "go",
+      },
+      {
+        limitId: "codex",
+        durationMinutes: 300,
+        usedPercent: 20,
+        plan_type: "provider-private-plan",
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    normalized.quotaWindows.map((window) => window.planType),
+    ["go", "unknown"],
+  );
+});

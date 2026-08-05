@@ -433,6 +433,57 @@ test("local companion relays bounded durations and selects a deterministic prima
   }
 });
 
+test("local companion excludes invalid quota windows before presentation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-invalid-quota-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    const validWindow = {
+      limitId: "codex",
+      slot: "primary",
+      planType: "go",
+      usedPercent: 20,
+      windowDurationMins: 300,
+      resetsAt: 1_784_916_000,
+    };
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${JSON.stringify({
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-07-25T11:45:00.000Z",
+        windows: [
+          validWindow,
+          { ...validWindow, resetsAt: 0 },
+          { ...validWindow, windowDurationMins: 525_601 },
+          { ...validWindow, usedPercent: 101 },
+        ],
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+
+    assert.deepEqual(
+      snapshot.overview.quota.windows.map((window) => [
+        window.planType,
+        window.usedPercent,
+        window.durationMinutes,
+        window.resetAt,
+      ]),
+      [[
+        "go",
+        20,
+        300,
+        new Date(1_784_916_000 * 1_000).toISOString(),
+      ]],
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("the stated speed mode attributes unrecorded evidence and never overrides an observed mode", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-companion-fast-mode-"));
   try {
