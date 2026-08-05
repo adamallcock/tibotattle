@@ -51,5 +51,16 @@ artifact.json
 *.html.tmp-*
 verify-debug.png
 
+# Interrupted atomic staging for root-local report/artifact outputs only.
+/artifact.json.*.tmp
+/*-artifact.json.*.tmp
+/.artifact.json.*.tmp
+/.*-artifact.json.*.tmp
+/*-report.html.*.tmp
+/.*-report.html.*.tmp
+
+# Swift Package Manager build and test output for the macOS app.
+apps/macos/.build/
+
 # Package manager store
 .pnpm-store/
