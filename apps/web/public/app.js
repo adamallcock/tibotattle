@@ -636,6 +636,16 @@ function renderLocalOnboarding(value) {
   if (runsInsideNativeDashboard()) {
     card.hidden = true;
     card.setAttribute("aria-hidden", "true");
+    setJourneyState(
+      dashboard?.mode === "demo"
+        ? "demo-mode"
+        : dashboard
+          ? "local-ready"
+          : value && value.state !== "unavailable"
+            ? "needs-local-setup"
+            : "first-run",
+    );
+    updateLocalActionButtons();
     return;
   }
   if (!value || value.state === "unavailable") {

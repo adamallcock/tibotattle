@@ -3948,6 +3948,10 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.doesNotMatch(html, /browser validation|JSON export|Raw log contents|community backend readiness|data lifecycle/iu);
   assert.match(html, /id="setup-card"/u);
   assert.match(appSource, /native-dashboard #setup-card|runsInsideNativeDashboard\(\)/u);
+  assert.match(
+    appSource,
+    /if \(runsInsideNativeDashboard\(\)\) \{[\s\S]*?setJourneyState\([\s\S]*?dashboard[\s\S]*?"local-ready"[\s\S]*?updateLocalActionButtons\(\);[\s\S]*?return;\s*\}/u,
+  );
   assert.match(appSource, /function renderAccountingComponentBars/);
   assert.match(appSource, /function renderGlobalState/);
   assert.match(appSource, /status\.fresh/);
