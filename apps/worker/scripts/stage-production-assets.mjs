@@ -64,7 +64,6 @@ const LOCAL_ONLY_BASENAMES = Object.freeze([
   "app.js",
   "community.html",
   "data-client.js",
-  "install-cta.js",
   "navigation.js",
 ]);
 const PUBLIC_ROUTE_MARKERS = Object.freeze([
@@ -96,10 +95,6 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "/admin.html",
   '"admin.html"',
   "'admin.html'",
-  "./install-cta.js",
-  "/install-cta.js",
-  '"install-cta.js"',
-  "'install-cta.js'",
   'id="refresh-button"',
   'id="connect-community"',
   'id="open-installed-app"',

@@ -30,7 +30,7 @@ async function fixture() {
     "community-data.js": "export const communityData = true;\n",
     "community-view.js": "export const communityView = true;\n",
     "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
-    "community.js": "console.log('community');\n",
+    "community.js": 'import "./install-cta.js";\nconsole.log("community");\n',
     "docs.html": "<!doctype html><title>public docs</title>\n",
     "github.svg": "<svg></svg>\n",
     "i18n.generated.js": "export const messages = {};\n",
