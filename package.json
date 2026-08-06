@@ -89,6 +89,7 @@
     "product:macos:preview:validate": "node ./scripts/build-macos-app.js --validate-preview --app \".release-build/macos-preview/current/TiboTattle.app\"",
     "product:macos:preview": "npm run product:macos:preview:build && npm run product:macos:preview:validate",
     "product:macos:preview:install": "node ./scripts/install-macos-preview-app.js --app \".release-build/macos-preview/current/TiboTattle.app\" --target \"/Applications/TiboTattle.app\" --replace --confirm-system-install",
+    "product:macos:preview:reinstall": "npm run product:macos:preview && npm run product:macos:preview:install",
     "product:macos:preview:remote": "node ./scripts/verify-macos-preview-remote.js --app \".release-build/macos-preview/current/TiboTattle.app\" --channel preview_distribution",
     "product:macos:preview:remote:live": "npm run product:macos:preview:remote -- --live",
     "product:macos:dmg": "node ./scripts/package-macos-dmg.js --app \".release-build/macos/TiboTattle.app\" --development --replace",
