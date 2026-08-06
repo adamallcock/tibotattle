@@ -123,6 +123,42 @@ private enum NativeRefreshIntervalPreference {
     }
 }
 
+/// The only cadence used by the native foreground refresh loop. Keeping the
+/// persisted read beside the dispatch operation makes it impossible for the
+/// Settings picker to update one value while the scheduler keeps using a
+/// separate hard-coded delay.
+private struct NativeForegroundRefreshSchedule: Equatable {
+    let intervalSeconds: Int
+
+    static func current(
+        in defaults: UserDefaults = .standard
+    ) -> NativeForegroundRefreshSchedule {
+        NativeForegroundRefreshSchedule(
+            intervalSeconds: NativeRefreshIntervalPreference.seconds(
+                in: defaults
+            )
+        )
+    }
+}
+
+private enum NativeForegroundRefreshScheduler {
+    /// This scheduler is deliberately an in-process main-queue work item. It
+    /// is cancelled when the app quits or when a refresh starts, and it never
+    /// creates a timer, helper, daemon, or background polling path.
+    static func schedule(
+        defaults: UserDefaults = .standard,
+        action: @escaping () -> Void
+    ) -> DispatchWorkItem {
+        let schedule = NativeForegroundRefreshSchedule.current(in: defaults)
+        let work = DispatchWorkItem(block: action)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .seconds(schedule.intervalSeconds),
+            execute: work
+        )
+        return work
+    }
+}
+
 @MainActor
 private final class AppUpdater: NSObject {
     private static var bundledUpdaterEnabled: Bool {
@@ -1643,6 +1679,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         window.dispatchEvent(new CustomEvent('tibotattle:locale-override', {
           detail: \(json)
         }));
+        // The embedded report redraws its generated controls from the same
+        // locale-change event. A deferred resize lets charts, popovers, and
+        // other width-sensitive controls measure their translated labels
+        // after that redraw has committed, without reloading the document or
+        // losing its in-memory hosted-sign-in handoff.
+        window.requestAnimationFrame?.(() => {
+          window.dispatchEvent(new Event('resize'));
+        });
         """)
     }
 
@@ -2157,7 +2201,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
     private weak var nativeStatusRefreshButton: NSButton?
+    private weak var nativeStatusToolbarItem: NSToolbarItem?
     private weak var nativeShareToolbarItem: NSToolbarItem?
+    private weak var nativeSettingsToolbarItem: NSToolbarItem?
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
@@ -2332,7 +2378,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
         Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
 
-        Local allowance notifications are also off by default. If you later enable them in Settings, threshold alerts stay on this Mac and evaluate only fresh provider-reported quota observations from the existing foreground refresh. Reset alerts remain unavailable until the provider supplies an explicit reset identity; reset schedules alone never alert. They do not add a timer, daemon, login item, or background network polling.
+        Local allowance notifications are also off by default. If you later enable them in Settings, threshold and reset alerts stay on this Mac and evaluate only fresh provider-reported quota observations from the existing foreground refresh. A reset alert uses the provider-reported reset time and fires once when the next refresh arrives at or after it; an observed reset identity strengthens dedupe when available. They do not add a timer, daemon, login item, or background network polling.
 
         \(updater.firstRunUpdatesDisclosure)
 
@@ -2699,6 +2745,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             ).isActive = true
             item.view = button
             nativeStatusRefreshButton = button
+            nativeStatusToolbarItem = item
             updateNativeToolbar(
                 title: nativeToolbarEvidenceTitle(
                     fallback: TiboTattleLocalization.string(
@@ -2737,6 +2784,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
             item.target = self
             item.action = #selector(showSettingsWindow)
+            nativeSettingsToolbarItem = item
             return item
         default:
             return nil
@@ -2767,7 +2815,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         nativeStatusRefreshButton?.isEnabled = refreshEnabled && !isRefreshing
         nativeStatusRefreshButton?.setAccessibilityLabel(statusTitle)
+        nativeStatusRefreshButton?.contentTintColor =
+            nativeToolbarStatusColor(isRefreshing: isRefreshing)
         nativeShareToolbarItem?.isEnabled = dashboardWebViewShowing
+    }
+
+    private func nativeToolbarStatusColor(isRefreshing: Bool) -> NSColor {
+        if isRefreshing { return .systemYellow }
+        return nativeEvidenceState == .live
+            ? .systemGreen
+            : .secondaryLabelColor
     }
 
     private func refreshNativeToolbarLocalization() {
@@ -2793,11 +2850,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 )
         )
         nativeStatusRefreshButton?.setAccessibilityLabel(statusTitle)
+        nativeStatusRefreshButton?.contentTintColor =
+            nativeToolbarStatusColor(isRefreshing: nativeRefreshInFlight)
+        nativeStatusToolbarItem?.label = TiboTattleLocalization.string(
+            .nativeDashboardRefreshUsage
+        )
+        nativeStatusToolbarItem?.toolTip = TiboTattleLocalization.string(
+            .nativeDashboardCurrentEvidenceTooltip
+        )
         nativeShareToolbarItem?.label = TiboTattleLocalization.string(
             .nativeDashboardShare
         )
         nativeShareToolbarItem?.toolTip = TiboTattleLocalization.string(
             .nativeDashboardShareTooltip
+        )
+        nativeSettingsToolbarItem?.label = TiboTattleLocalization.string(
+            .menuSettings
+        )
+        nativeSettingsToolbarItem?.toolTip = TiboTattleLocalization.string(
+            .menuSettings
         )
     }
 
@@ -3149,14 +3220,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func scheduleNativeRefresh() {
         cancelNativeRefreshSchedule()
         guard !quitting, dashboardURL != nil else { return }
-        let work = DispatchWorkItem { [weak self] in
+        let work = NativeForegroundRefreshScheduler.schedule { [weak self] in
             self?.refreshLocalUsage(automatic: true)
         }
         nativeRefreshSchedule = work
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .seconds(NativeRefreshIntervalPreference.seconds),
-            execute: work
-        )
     }
 
     private func cancelNativeRefreshSchedule() {
@@ -3570,7 +3637,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
         let contentStack = NSStackView(views: [header] + views)
         contentStack.orientation = .vertical
-        contentStack.alignment = .leading
+        // The group itself is full-width in the settings page. Stretching
+        // its children to that width keeps translated descriptions and
+        // controls in one readable column instead of leaving a narrow column
+        // stranded at the leading edge with a large blank area beside it.
+        contentStack.alignment = .width
         contentStack.spacing = 8
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         let contentView = NSView()
@@ -3586,8 +3657,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         group.boxType = .custom
         group.borderType = .lineBorder
         group.cornerRadius = 8
-        group.contentViewMargins = NSSize(width: 32, height: 28)
+        group.contentViewMargins = NSSize(width: 20, height: 18)
         group.contentView = contentView
+        group.translatesAutoresizingMaskIntoConstraints = false
         group.setContentCompressionResistancePriority(
             .defaultLow,
             for: .horizontal
@@ -3615,8 +3687,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .width
-        stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 24, right: 28)
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(settingsLabel(
             title,
@@ -3632,20 +3703,56 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             stack.addArrangedSubview(view)
         }
         let scroll = NSScrollView()
+        scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
-        scroll.documentView = stack
         scroll.translatesAutoresizingMaskIntoConstraints = false
         let root = NSView()
         root.addSubview(scroll)
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scroll.documentView = document
+        let preferredWidth = stack.widthAnchor.constraint(
+            equalTo: document.widthAnchor,
+            constant: -56
+        )
+        preferredWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             scroll.topAnchor.constraint(equalTo: root.topAnchor),
             scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            document.leadingAnchor.constraint(
+                equalTo: scroll.contentView.leadingAnchor
+            ),
+            document.topAnchor.constraint(
+                equalTo: scroll.contentView.topAnchor
+            ),
+            document.widthAnchor.constraint(
+                equalTo: scroll.contentView.widthAnchor
+            ),
+            document.heightAnchor.constraint(
+                greaterThanOrEqualTo: scroll.contentView.heightAnchor
+            ),
+            stack.centerXAnchor.constraint(equalTo: document.centerXAnchor),
+            stack.leadingAnchor.constraint(
+                greaterThanOrEqualTo: document.leadingAnchor,
+                constant: 28
+            ),
+            stack.trailingAnchor.constraint(
+                lessThanOrEqualTo: document.trailingAnchor,
+                constant: -28
+            ),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(
+                equalTo: document.bottomAnchor,
+                constant: -24
+            ),
+            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 680),
         ])
+        preferredWidth.isActive = true
         let controller = NSViewController()
         controller.view = root
         return controller
@@ -3688,39 +3795,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func nativeToolbarEvidenceTitle(fallback: String) -> String {
         switch nativeEvidenceState {
         case .live:
-            guard let observedAt = nativeEvidenceObservedAt else {
-                return TiboTattleLocalization.string(.menuBarCurrentEvidence)
-            }
-            return TiboTattleLocalization.format(
-                .menuBarCurrentEvidenceWithAge,
-                relativeAge(observedAt)
-            )
+            return TiboTattleLocalization.string(.nativeDashboardFresh)
         case .stale:
-            guard let observedAt = nativeEvidenceObservedAt else {
-                return TiboTattleLocalization.string(
-                    .menuBarLocalEvidenceStale
-                )
-            }
-            return TiboTattleLocalization.format(
-                .menuBarLocalEvidenceStaleWithAge,
-                relativeAge(observedAt)
-            )
+            return TiboTattleLocalization.string(.nativeDashboardNeedsRefresh)
         case .readFailed:
-            return TiboTattleLocalization.string(
-                .menuBarQuotaEvidenceUnavailable
-            )
+            return TiboTattleLocalization.string(.nativeDashboardStatus)
         case .lifecycleUnavailable:
-            return TiboTattleLocalization.string(
-                .launcherCompanionUnavailable
-            )
+            return TiboTattleLocalization.string(.nativeDashboardStatus)
         case .unknown:
-            return nativeEvidenceObservedAt == nil
-                ? (fallback == TiboTattleLocalization.string(
-                    .launcherStartingLocally
-                )
-                    ? fallback
-                    : TiboTattleLocalization.string(.menuBarNoVerifiedQuota))
-                : fallback
+            return fallback
         }
     }
 
@@ -4682,8 +4765,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let newWindow = NSWindow(contentViewController: tabs)
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
-        newWindow.setContentSize(NSSize(width: 660, height: 680))
-        newWindow.contentMinSize = NSSize(width: 600, height: 580)
+        // A normal, centered settings form needs enough width for translated
+        // descriptions while keeping short pages compact. Each page scrolls
+        // vertically when General outgrows this frame.
+        newWindow.setContentSize(NSSize(width: 760, height: 620))
+        newWindow.contentMinSize = NSSize(width: 680, height: 520)
         newWindow.isReleasedWhenClosed = false
         newWindow.center()
         settingsWindow = newWindow
@@ -5721,6 +5807,11 @@ private enum NativeRefreshSettingsContractSmokeTest {
         else {
             return 1
         }
+        guard NativeForegroundRefreshSchedule.current(in: reloaded)
+                .intervalSeconds == 15 * 60
+        else {
+            return 1
+        }
 
         NativeRefreshIntervalPreference.setSeconds(17, in: reloaded)
         guard NativeRefreshIntervalPreference.seconds(in: reloaded)
@@ -5730,7 +5821,7 @@ private enum NativeRefreshSettingsContractSmokeTest {
         }
         print(
             "USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT "
-                + "default=300 persisted=900 reloaded=900 "
+                + "default=300 persisted=900 reloaded=900 scheduler=900 "
                 + "invalid_ignored=true"
         )
         return 0

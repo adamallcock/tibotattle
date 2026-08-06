@@ -12,7 +12,7 @@
 "menu.settings" = "Settings…";
 "notification.allowanceThresholdBody" = "A fresh provider-reported allowance observation crossed your %d%% usage alert. Open TiboTattle for details.";
 "notification.allowanceTitle" = "Allowance alert";
-"notification.resetBody" = "A fresh provider-reported allowance window changed. Open TiboTattle for details.";
+"notification.resetBody" = "A provider-reported allowance window reset. Open TiboTattle for details.";
 "notification.resetTitle" = "New allowance window observed";
 "settings.aboutProduct" = "About %@";
 "settings.aboutTab" = "About";
@@ -54,7 +54,7 @@
 "settings.notificationsStatusFirstObservation" = "Enabled. A fresh provider observation established the local baseline; first observations never notify.";
 "settings.notificationsStatusFreshOnly" = "Enabled. Waiting for a fresh direct provider observation from the next foreground refresh.";
 "settings.notificationsStatusIneligible" = "Enabled. No notification was sent because %@.";
-"settings.notificationsStatusNoCrossing" = "Enabled. The latest fresh provider observation did not newly cross an enabled threshold or prove a new reset identity.";
+"settings.notificationsStatusNoCrossing" = "Enabled. The latest fresh provider observation did not newly cross an enabled threshold or reach a scheduled reset.";
 "settings.notificationsStatusStateUnavailable" = "Notifications are unavailable because their owner-only local state could not be read or written.";
 "settings.notificationsStatusWaitingPermission" = "Enabled. macOS notification permission has not been granted, so no alerts will be sent.";
 "settings.notificationsThresholds" = "Usage alerts";
@@ -62,7 +62,7 @@
 "settings.notificationsThresholdsNinety" = "90% only";
 "settings.notificationsThresholdsOff" = "Off";
 "settings.notificationsToggleTooltip" = "Enable optional local notifications from fresh provider-reported quota evidence.";
-"settings.notificationsResetDetail" = "Reset alerts need a provider-reported reset identity; schedule changes alone do not alert.";
+"settings.notificationsResetDetail" = "Reset alerts use the provider-reported reset time and notify once on the next refresh at or after it. No background polling is added.";
 "settings.languageEnglish" = "English";
 "settings.languagePickerHint" = "Choose the language used for TiboTattle controls and explanations.";
 "settings.languageSimplifiedChinese" = "Simplified Chinese";
@@ -116,7 +116,9 @@
 "nativeDashboard.allowance" = "Allowance";
 "nativeDashboard.community" = "Community";
 "nativeDashboard.dataPrivacy" = "Data & Privacy";
+"nativeDashboard.fresh" = "Fresh";
 "nativeDashboard.howItWorks" = "How it works";
+"nativeDashboard.needsRefresh" = "Needs refresh";
 "nativeDashboard.localOnly" = "Local only";
 "nativeDashboard.localOnlyTooltip" = "Analysis and cached results stay on this Mac. Community contribution is optional.";
 "nativeDashboard.overview" = "Overview";

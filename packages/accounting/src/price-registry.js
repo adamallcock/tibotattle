@@ -1,11 +1,14 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
 export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-08-01T13:47:00Z";
-// First official-page review; undated OpenAI rows assert no validity before it.
+// First official-page review. This is the review boundary, not a lower bound
+// on the reviewed model rates: recognized OpenAI/Codex events before this date
+// remain priceable unless a card has an explicit vendor-effective boundary.
 const OPENAI_FIRST_OBSERVED_DATE = "2026-07-26";
+export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const ANTHROPIC_OBSERVED_DATE = ANTHROPIC_OBSERVED_AT.slice(0, 10);
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.2";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.3";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -48,7 +51,9 @@ const OPENAI_ROWS = Object.freeze([
   // 272K boundary is inclusive on the long side to preserve the monitor's
   // established threshold contract. GPT-5.6 Terra and Luna were officially
   // repriced effective 2026-07-30; Sol was not changed. The pre-change rows
-  // stay behind a closed validity window so historical pricing is preserved.
+  // retain the explicit vendor validity window so historical pricing is
+  // preserved. Undated rows remain open to reviewed historical events; the
+  // review date is provenance, not an invented model-rate start date.
   ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short"],
   ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long"],
   ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short"],
@@ -185,9 +190,9 @@ function provenance(provider, { vendorEffectiveFrom = null, vendorEffectiveTo = 
     evidence_urls: source.evidenceUrls,
     vendor_effective_from: vendorEffectiveFrom,
     vendor_effective_to: vendorEffectiveTo,
-    historical_validity: vendorEffectiveFrom
+    historical_validity: vendorEffectiveFrom || vendorEffectiveTo
       ? "official_vendor_window"
-      : "not_asserted_before_first_observation",
+      : "reviewed_rate_without_vendor_effective_date",
   };
 }
 
@@ -212,8 +217,8 @@ function cardId(provider, model, tier, suffix = "current") {
   return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
-// Undated rows begin at each provider's first review so pre-repricing history
-// stays priceable; new observations must not silently shift those windows.
+// The review dates remain provenance metadata; only explicit vendor-effective
+// dates constrain selection, so pre-repricing history stays priceable.
 const FIRST_OBSERVED_DATES = Object.freeze({
   openai: OPENAI_FIRST_OBSERVED_DATE,
   anthropic: ANTHROPIC_OBSERVED_DATE,
@@ -222,7 +227,7 @@ const FIRST_OBSERVED_DATES = Object.freeze({
 function openAiEffective(period) {
   if (period === "through-2026-07-29") {
     return {
-      effective: { from: OPENAI_FIRST_OBSERVED_DATE, to: "2026-07-29" },
+      effective: { to: "2026-07-29" },
       vendorEffectiveFrom: null,
       vendorEffectiveTo: "2026-07-29",
       suffix: "through-2026-07-29",
@@ -237,7 +242,11 @@ function openAiEffective(period) {
     };
   }
   return {
-    effective: { from: OPENAI_FIRST_OBSERVED_DATE },
+    // No vendor-effective date was published for this row. An open effective
+    // range is deliberate: the reviewed card may price recognized historical
+    // events before the review date, while dated repricing rows below remain
+    // bounded by their explicit vendor boundary.
+    effective: {},
     vendorEffectiveFrom: null,
     vendorEffectiveTo: null,
     suffix: "current",
@@ -383,7 +392,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...PROVIDER_TOOL_PRICE_CARDS,
 ]);
 
-export const APP_PRICE_REGISTRY_SHA256 = "29f217770ecd220dc9bd8cce86e6b2a3a96251c2aa3dbae8d1019910626c7fe8";
+export const APP_PRICE_REGISTRY_SHA256 = "c75b604f2a6b30f8004ab61c6fdf628c42b2228db5830b285bb478afdc4d97d2";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,

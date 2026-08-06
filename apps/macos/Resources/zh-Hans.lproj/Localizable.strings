@@ -11,7 +11,9 @@
 "nativeDashboard.allowance" = "额度";
 "nativeDashboard.community" = "社区";
 "nativeDashboard.dataPrivacy" = "数据与隐私";
+"nativeDashboard.fresh" = "最新";
 "nativeDashboard.howItWorks" = "工作原理";
+"nativeDashboard.needsRefresh" = "需要刷新";
 "nativeDashboard.localOnly" = "仅限本机";
 "nativeDashboard.localOnlyTooltip" = "分析结果和缓存结果保留在这台 Mac 上。是否贡献给社区由你自行选择。";
 "nativeDashboard.overview" = "概览";
@@ -209,7 +211,7 @@
 "accessibility.menuBarStatus" = "TiboTattle 状态";
 "notification.allowanceThresholdBody" = "新的提供商报告额度观测跨过了你的 %d%% 使用提醒。打开 TiboTattle 查看详情。";
 "notification.allowanceTitle" = "额度提醒";
-"notification.resetBody" = "新的提供商报告额度窗口发生了变化。打开 TiboTattle 查看详情。";
+"notification.resetBody" = "提供商报告的额度窗口已重置。打开 TiboTattle 查看详情。";
 "notification.resetTitle" = "已观测到新的额度窗口";
 "settings.notifications" = "通知";
 "settings.notificationsAllowanceTitle" = "额度提醒";
@@ -232,7 +234,7 @@
 "settings.notificationsStatusFirstObservation" = "已启用。新的提供商观测已建立本地基线；首次观测永不发送提醒。";
 "settings.notificationsStatusFreshOnly" = "已启用。正在等待下一次前台刷新提供新的直接提供商观测。";
 "settings.notificationsStatusIneligible" = "已启用。没有发送通知，因为 %@。";
-"settings.notificationsStatusNoCrossing" = "已启用。最近一次新的提供商观测没有首次跨过已启用阈值，也没有证明新的重置身份。";
+"settings.notificationsStatusNoCrossing" = "已启用。最近一次新的提供商观测没有首次跨过已启用阈值，也没有到达计划的重置时间。";
 "settings.notificationsStatusStateUnavailable" = "通知不可用，因为无法读取或写入其仅限所有者的本地状态。";
 "settings.notificationsStatusWaitingPermission" = "已启用。尚未授予 macOS 通知权限，因此不会发送提醒。";
 "settings.notificationsThresholds" = "使用提醒";
@@ -240,7 +242,7 @@
 "settings.notificationsThresholdsNinety" = "仅 90%";
 "settings.notificationsThresholdsOff" = "关闭";
 "settings.notificationsToggleTooltip" = "根据新的提供商报告额度证据启用可选本地通知。";
-"settings.notificationsResetDetail" = "重置提醒需要提供商报告的重置身份；仅有计划变化不会提醒。";
+"settings.notificationsResetDetail" = "重置提醒使用提供商报告的重置时间，并在下一次刷新达到该时间后提醒一次。不添加后台轮询。";
 "firstRun.loginItemDisclosure" = "默认情况下，首次设置会预先选中“登录时启动 TiboTattle”。只有在你点按“开始使用”后，TiboTattle 才会添加 macOS 登录项；它不会使用 LaunchAgent、守护进程、特权辅助工具或隐藏的持久进程。";
 "settings.continue" = "继续";
 "settings.continueWithoutLogin" = "不登录继续";

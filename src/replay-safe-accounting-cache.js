@@ -26,6 +26,7 @@ import {
 } from "@app-usagemonitor/accounting";
 import {
   analyzeQuotaPace,
+  isValidQuotaWindowDuration,
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
@@ -43,7 +44,7 @@ import {
 import { fastQuotaMultiplier } from "./application/index.js";
 
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.2";
+  "local-replay-safe-accounting-v0.3";
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
@@ -53,6 +54,7 @@ const DEFAULT_WINDOW_DAYS = 31;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
 const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
+const SPARK_MODEL = "gpt-5.3-codex-spark";
 const PACE_CURRENT_MAX_AGE_MS = 30 * 60_000;
 const PACE_STATUSES = new Set([
   "unavailable",
@@ -87,6 +89,7 @@ const KNOWN_MODELS = new Set([
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   "gpt-5.5",
+  "gpt-5.5-codex",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5",
@@ -225,8 +228,8 @@ function emptyDimension(keys) {
   ]));
 }
 
-function newPeriod(id, label) {
-  return {
+function newPeriod(id, label, { includeSpark = true } = {}) {
+  const period = {
     id,
     label,
     events: 0,
@@ -258,6 +261,12 @@ function newPeriod(id, label) {
     // observation.
     declaredSpeedWeighting: emptySpeedWeightingCrossing(),
   };
+  if (includeSpark) {
+    period.spark = newPeriod("spark", "Spark allowance", {
+      includeSpark: false,
+    });
+  }
+  return period;
 }
 
 function addComponents(target, source) {
@@ -481,6 +490,7 @@ function eventProjection(event, price) {
     timestamp: event.timestamp,
     model,
     modelPricingStatus: modelPricingStatus(event.model),
+    isSpark: model === SPARK_MODEL,
     components,
     totalTokens,
     priced,
@@ -572,7 +582,10 @@ function weeklyRateLimitProjection(snapshot) {
   ];
 }
 
-function weeklyQuotaTimelineProjection(snapshot) {
+function quotaTimelineProjection(
+  snapshot,
+  { limitId = "codex", durationMinutes = WEEKLY_WINDOW_MINUTES } = {},
+) {
   const observedAt = canonicalInstant(snapshot?.timestamp);
   const window = snapshot?.window;
   // Keep only the fixed main Codex weekly family used by the UI calibration.
@@ -582,9 +595,11 @@ function weeklyQuotaTimelineProjection(snapshot) {
       || !window
       || typeof window !== "object"
       || window.provider !== "openai_codex"
-      || window.limitId !== "codex"
+      || window.limitId !== limitId
       || !QUOTA_SLOTS.has(window.slot)
-      || window.windowDurationMins !== WEEKLY_WINDOW_MINUTES
+      || (durationMinutes !== null
+        && window.windowDurationMins !== durationMinutes)
+      || !isValidQuotaWindowDuration(window.windowDurationMins)
       || typeof window.usedPercent !== "number"
       || !Number.isFinite(window.usedPercent)
       || window.usedPercent < 0
@@ -599,14 +614,14 @@ function weeklyQuotaTimelineProjection(snapshot) {
   const usedPercent = Number(window.usedPercent.toFixed(3));
   return {
     observedAt,
-    limitId: "codex",
+    limitId,
     slot: window.slot,
     planType: QUOTA_PLANS.has(window.planType)
       ? window.planType
       : "unknown",
     usedPercent,
     remainingPercent: Number(Math.max(0, 100 - usedPercent).toFixed(3)),
-    durationMinutes: WEEKLY_WINDOW_MINUTES,
+    durationMinutes: window.windowDurationMins,
     resetAt,
     accountAttribution: "historical_unattributed",
   };
@@ -614,9 +629,10 @@ function weeklyQuotaTimelineProjection(snapshot) {
 
 function quotaTimelineTrackBucketKey(row) {
   const observedMs = Date.parse(row.observedAt);
-  const bucketStartMs = Math.floor(observedMs / TIMELINE_BUCKET_MS)
-    * TIMELINE_BUCKET_MS;
-  return `${bucketStartMs}:${row.limitId}:${row.slot}:${row.durationMinutes}`;
+  // Preserve the exact observed point. Collapsing to a 15-minute bucket can
+  // erase the closest points to an exact comparison endpoint and manufacture
+  // an otherwise avoidable missing-bracket status.
+  return `${observedMs}:${row.limitId}:${row.slot}:${row.durationMinutes}`;
 }
 
 function quotaTimelineRowTieBreak(row) {
@@ -627,8 +643,8 @@ function quotaTimelineRowTieBreak(row) {
   ].join("\0");
 }
 
-function retainWeeklyQuotaTimeline(buckets, snapshot) {
-  const row = weeklyQuotaTimelineProjection(snapshot);
+function retainQuotaTimeline(buckets, snapshot, options) {
+  const row = quotaTimelineProjection(snapshot, options);
   if (row === null) return;
   const key = quotaTimelineTrackBucketKey(row);
   const prior = buckets.get(key);
@@ -884,6 +900,10 @@ function finalizeSpeedWeighting(crossing) {
 }
 
 function addEvent(period, event) {
+  if (event.isSpark) {
+    addEvent(period.spark, { ...event, isSpark: false });
+    return;
+  }
   period.events += 1;
   period.totalTokens += event.totalTokens;
   period.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
@@ -961,7 +981,7 @@ function finalizeDimension(dimension) {
 function finalizePeriod(period) {
   const priced = period.pricingCoverage.fullyPricedEvents
     + period.pricingCoverage.partiallyPricedEvents;
-  return {
+  const finalized = {
     ...period,
     apiPriceEquivalentUsd: roundedMoney(period.apiPriceEquivalentUsd),
     priceCardIds: [...period.priceCardIds].sort(),
@@ -997,6 +1017,8 @@ function finalizePeriod(period) {
       period.declaredSpeedWeighting,
     ),
   };
+  if (period.spark) finalized.spark = finalizePeriod(period.spark);
+  return finalized;
 }
 
 // Build one constant-memory accounting total from an already indexed event
@@ -1231,16 +1253,21 @@ export async function buildReplaySafeAccountingCache({
     ["all", newPeriod("all", `Cached ${windowDays}-day window`)],
   ]);
   const timeline = new Map();
+  const sparkTimeline = new Map();
   const weeklyQuotaTimelineBuckets = new Map();
+  const sparkQuotaTimelineBuckets = new Map();
   const weeklyPaceSnapshots = [];
   const rawUsageEvents = [];
   const weeklyRateLimitSnapshots = [];
+  let retainedSparkUsageEvents = 0;
+  let retainedSparkSnapshotInputs = 0;
   const price = createAccountingPricer();
   let retainedTransitionBytes = 0;
   let retainedTransitionInputs = 0;
   const reserveTransitionInput = (kind) => {
-    const usageCount = rawUsageEvents.length;
-    const snapshotCount = weeklyRateLimitSnapshots.length;
+    const usageCount = rawUsageEvents.length + retainedSparkUsageEvents;
+    const snapshotCount = weeklyRateLimitSnapshots.length
+      + retainedSparkSnapshotInputs;
     const combinedCount = usageCount + snapshotCount;
     if (kind === "usage" && usageCount >= limits.usageEvents) {
       throw fixedError("accounting_transition_usage_limit_exceeded");
@@ -1285,6 +1312,14 @@ export async function buildReplaySafeAccountingCache({
           ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
           : "unknown";
         reserveTransitionInput("usage");
+        if (event.isSpark) {
+          retainedSparkUsageEvents += 1;
+          for (const [id, period] of periods) {
+            if (observedMs >= starts[id]) addEvent(period, event);
+          }
+          addTimelineEvent(sparkTimeline, event);
+          return;
+        }
         rawUsageEvents.push(transitionUsageProjection(rawEvent, event));
         for (const [id, period] of periods) {
           if (observedMs >= starts[id]) addEvent(period, event);
@@ -1293,17 +1328,35 @@ export async function buildReplaySafeAccountingCache({
       },
       onRateLimitSnapshot: (snapshot) => {
         throwIfAborted(signal);
-        if (snapshot?.window?.windowDurationMins === WEEKLY_WINDOW_MINUTES) {
-          const observedAt = canonicalInstant(snapshot.timestamp);
-          const observedMs = observedAt === null
-            ? Number.NaN
-            : Date.parse(observedAt);
-          if (!Number.isFinite(observedMs)
-              || observedMs < startMs
-              || observedMs > endMs) return;
+        const window = snapshot?.window;
+        const observedAt = canonicalInstant(snapshot?.timestamp);
+        const observedMs = observedAt === null
+          ? Number.NaN
+          : Date.parse(observedAt);
+        if (!Number.isFinite(observedMs)
+            || observedMs < startMs
+            || observedMs > endMs) return;
+        if (window?.limitId === "codex-spark"
+            && window.provider === "openai_codex"
+            && isValidQuotaWindowDuration(window.windowDurationMins)) {
+          reserveTransitionInput("snapshot");
+          retainedSparkSnapshotInputs += 1;
+          retainQuotaTimeline(
+            sparkQuotaTimelineBuckets,
+            snapshot,
+            { limitId: "codex-spark", durationMinutes: null },
+          );
+          return;
+        }
+        if (window?.limitId === "codex"
+            && window.windowDurationMins === WEEKLY_WINDOW_MINUTES) {
           reserveTransitionInput("snapshot");
           weeklyRateLimitSnapshots.push(weeklyRateLimitProjection(snapshot));
-          retainWeeklyQuotaTimeline(weeklyQuotaTimelineBuckets, snapshot);
+          retainQuotaTimeline(
+            weeklyQuotaTimelineBuckets,
+            snapshot,
+            { limitId: "codex", durationMinutes: WEEKLY_WINDOW_MINUTES },
+          );
           const paceSnapshot = weeklyPaceSnapshotProjection(snapshot);
           if (paceSnapshot !== null) weeklyPaceSnapshots.push(paceSnapshot);
         }
@@ -1316,8 +1369,9 @@ export async function buildReplaySafeAccountingCache({
   }
   throwIfAborted(signal);
   checkRuntimeMemory();
-  const retainedUsageEvents = rawUsageEvents.length;
-  const retainedWeeklySnapshots = weeklyRateLimitSnapshots.length;
+  const retainedUsageEvents = rawUsageEvents.length + retainedSparkUsageEvents;
+  const retainedWeeklySnapshots = weeklyRateLimitSnapshots.length
+    + retainedSparkSnapshotInputs;
   let transitionSeries;
   try {
     transitionSeries = await deriveCodexTransitionSeriesCooperatively({
@@ -1384,8 +1438,12 @@ export async function buildReplaySafeAccountingCache({
     priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
     periods: [...periods.values()].map(finalizePeriod),
     timeline: finalizeTimeline(timeline),
+    sparkUsageTimeline: finalizeTimeline(sparkTimeline),
     quotaTimeline: finalizeWeeklyQuotaTimeline(
       weeklyQuotaTimelineBuckets,
+    ),
+    sparkQuotaTimeline: finalizeWeeklyQuotaTimeline(
+      sparkQuotaTimelineBuckets,
     ),
     ...(paceForecast === null
       ? {}
@@ -1487,7 +1545,11 @@ function validWeeklyCalibrationInput(value) {
     && value.estimatedRetainedBytes <= limits.retainedBytes;
 }
 
-function validQuotaTimeline(value, coveredAt) {
+function validQuotaTimeline(
+  value,
+  coveredAt,
+  { limitId = "codex", durationMinutes = WEEKLY_WINDOW_MINUTES } = {},
+) {
   if (!Array.isArray(value) || value.length > MAX_QUOTA_TIMELINE_ROWS) {
     return false;
   }
@@ -1511,7 +1573,7 @@ function validQuotaTimeline(value, coveredAt) {
         || Object.keys(row).sort().join("\0") !== expectedKeys
         || canonicalInstant(row.observedAt) === null
         || canonicalInstant(row.resetAt) === null
-        || row.limitId !== "codex"
+        || row.limitId !== limitId
         || !QUOTA_SLOTS.has(row.slot)
         || !(QUOTA_PLANS.has(row.planType) || row.planType === "unknown")
         || typeof row.usedPercent !== "number"
@@ -1524,7 +1586,8 @@ function validQuotaTimeline(value, coveredAt) {
         || row.remainingPercent > 100
         || row.remainingPercent
           !== Number(Math.max(0, 100 - row.usedPercent).toFixed(3))
-        || row.durationMinutes !== WEEKLY_WINDOW_MINUTES
+        || !isValidQuotaWindowDuration(row.durationMinutes)
+        || (durationMinutes !== null && row.durationMinutes !== durationMinutes)
         || row.accountAttribution !== "historical_unattributed") {
       return false;
     }
@@ -1676,6 +1739,11 @@ function validCache(value) {
       || !Array.isArray(value.periods)
       || !Array.isArray(value.timeline)
       || !validQuotaTimeline(value.quotaTimeline, value.coveredAt)
+      || !validQuotaTimeline(
+        value.sparkQuotaTimeline,
+        value.coveredAt,
+        { limitId: "codex-spark", durationMinutes: null },
+      )
       || (value.weekly !== undefined && !validWeeklyPaceContainer(value.weekly))
       || !validWeeklyCalibrationInput(value.weeklyCalibrationInput)
       || value.weeklyCalibration?.schemaVersion
@@ -1707,6 +1775,18 @@ function validCache(value) {
       && validPriceCardProvenance(row)
     ))
     && value.timeline.every((row) => (
+      canonicalInstant(row?.startAt) !== null
+      && canonicalInstant(row?.endAt) !== null
+      && Number.isSafeInteger(row?.usageEvents)
+      && row.usageEvents >= 0
+      && Number.isSafeInteger(row?.totalTokens)
+      && row.totalTokens >= 0
+      && typeof row?.apiPriceEquivalentUsd === "number"
+      && Number.isFinite(row.apiPriceEquivalentUsd)
+      && row.apiPriceEquivalentUsd >= 0
+    ))
+    && Array.isArray(value.sparkUsageTimeline)
+    && value.sparkUsageTimeline.every((row) => (
       canonicalInstant(row?.startAt) !== null
       && canonicalInstant(row?.endAt) !== null
       && Number.isSafeInteger(row?.usageEvents)

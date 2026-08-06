@@ -2702,7 +2702,8 @@ test("stale contribution-device credentials return fixed recovery guidance witho
       /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
     )?.[1] ?? "";
     assert.match(htmlSource, /id="community-connect-status"/u);
-    assert.match(htmlSource, /id="data"[^>]*data-dashboard-page="community"/u);
+    assert.match(htmlSource, /id="community"[^>]*data-dashboard-page="community"/u);
+    assert.doesNotMatch(htmlSource, /id="data"[^>]*data-dashboard-page/u);
     assert.doesNotMatch(htmlSource, /data-nav="data"/u);
     assert.match(connectSource, /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u);
     assert.match(recoverySource, /id = "reset-device-credential"/u);

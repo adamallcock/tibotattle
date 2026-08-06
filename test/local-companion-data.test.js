@@ -402,9 +402,9 @@ test("raw rollout history reaches the companion through the archive projection w
           type: "turn_context",
           payload: { model: "gpt-5.6-terra" },
         }),
-        // The registry has no verified historical Terra card for July 25,
-        // so this event must remain unpriced rather than borrowing a future
-        // price. July 29 uses the old card and July 30 the lower new card.
+        // Recognized historical Terra events remain priceable before the
+        // review date. July 29 uses the old card and July 30 the lower new
+        // card.
         rolloutToken(
           "2026-07-25T12:01:00.000Z",
           rolloutUsage(1_000_000),
@@ -449,16 +449,16 @@ test("raw rollout history reaches the companion through the archive projection w
     assert.equal(history.periodLabel, "Indexed history");
     assert.equal(history.events, 3);
     assert.equal(history.totalTokens, 3_000_000);
-    assert.equal(history.apiPriceEquivalentUsd, 4.5);
+    assert.equal(history.apiPriceEquivalentUsd, 7);
     assert.deepEqual(history.pricingCoverage, {
-      fullyPricedEvents: 2,
+      fullyPricedEvents: 3,
       partiallyPricedEvents: 0,
-      unpricedEvents: 1,
+      unpricedEvents: 0,
     });
     assert.deepEqual(history.priceCardIds, [newTerraCard, oldTerraCard]);
     assert.deepEqual(history.priceCardBreakdown, [
       { priceCardId: newTerraCard, events: 1, costUsd: "2" },
-      { priceCardId: oldTerraCard, events: 1, costUsd: "2.5" },
+      { priceCardId: oldTerraCard, events: 2, costUsd: "5" },
     ]);
     assert.equal(history.evidenceStartDate, "2026-07-26");
     assert.equal(snapshot.overview.accounting.evidenceStartDate, "2026-07-26");

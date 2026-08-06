@@ -14,6 +14,7 @@ import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
+import { buildRollingQuotaComparisons } from "@app-usagemonitor/quota-analysis";
 
 // The previous JSON paths are test-fixture names only. The wrappers prove the
 // same cache contracts against SQLite without allowing production callers to
@@ -51,7 +52,7 @@ test("production replay-cache APIs reject the retired JSON cacheFile option", as
   );
 });
 
-test("known unpriced Spark usage remains diagnosable without inventing a price", async () => {
+test("known Spark and reviewed aliases stay diagnosable without folding into normal totals", async () => {
   const cache = await buildReplaySafeAccountingCache({
     scan: scanner([
       usageEvent({
@@ -64,20 +65,35 @@ test("known unpriced Spark usage remains diagnosable without inventing a price",
         model: "private-unknown-model",
         components: { input_uncached_tokens: 10 },
       }),
+      usageEvent({
+        timestamp: "2026-07-27T11:10:00.000Z",
+        model: "gpt-5.5-codex",
+        components: { input_uncached_tokens: 10 },
+      }),
     ]),
     now: () => NOW,
   });
 
-  const rows = cache.periods.find((period) => period.id === "7d").byModel;
-  const spark = rows.find((row) => row.model === "gpt-5.3-codex-spark");
+  const normal = period(cache, "7d");
+  const rows = normal.byModel;
+  const spark = normal.spark;
   const unknown = rows.find((row) => row.model === "unknown");
-  assert.equal(spark.pricingStatus, "known_unpriced");
+  const alias = rows.find((row) => row.model === "gpt-5.5-codex");
+  const sparkRow = spark.byModel.find((row) => row.model === "gpt-5.3-codex-spark");
+  assert.equal(normal.events, 2);
+  assert.equal(normal.spark.events, 1);
+  assert.equal(rows.some((row) => row.model === "gpt-5.3-codex-spark"), false);
+  assert.equal(sparkRow.pricingStatus, "known_unpriced");
   assert.equal(spark.apiPriceEquivalentUsd, 0);
   assert.equal(spark.pricingCoverage.unpricedEvents, 1);
   assert.equal(unknown.pricingStatus, "unrecognized");
+  assert.equal(unknown.apiPriceEquivalentUsd, 0);
+  assert.equal(unknown.pricingCoverage.unpricedEvents, 1);
+  assert.equal(alias.pricingStatus, "priced");
+  assert.equal(alias.apiPriceEquivalentUsd, 0.00005);
 });
 
-test("period coverage separates current priced activity from older pre-registry history", async () => {
+test("period coverage retains recognized OpenAI history before the review date", async () => {
   const cache = await buildReplaySafeAccountingCache({
     scan: scanner([
       usageEvent({
@@ -101,19 +117,19 @@ test("period coverage separates current priced activity from older pre-registry 
     partiallyPricedEvents: 0,
     unpricedEvents: 0,
   });
-  assert.equal(longer.pricingCoverage.fullyPricedEvents, 1);
-  assert.equal(longer.pricingCoverage.unpricedEvents, 1);
+  assert.equal(longer.pricingCoverage.fullyPricedEvents, 2);
+  assert.equal(longer.pricingCoverage.unpricedEvents, 0);
   assert.equal(
     100 * recent.pricingCoverage.fullyPricedEvents / recent.events,
     100,
   );
   assert.equal(
     100 * longer.pricingCoverage.fullyPricedEvents / longer.events,
-    50,
+    100,
   );
 });
 
-test("indexed history prices each event at its own effective date and leaves pre-evidence usage unpriced", async () => {
+test("indexed history prices each event at its own effective date before and after repricing", async () => {
   const result = await buildReplaySafeAccountingPeriod({
     startAt: "1970-01-01T00:00:00.000Z",
     endAt: "2026-08-01T12:00:00.000Z",
@@ -138,9 +154,9 @@ test("indexed history prices each event at its own effective date and leaves pre
 
   assert.equal(result.priceEpochBasis, "event_time_when_registry_has_effective_evidence");
   assert.deepEqual(result.period.pricingCoverage, {
-    fullyPricedEvents: 2,
+    fullyPricedEvents: 3,
     partiallyPricedEvents: 0,
-    unpricedEvents: 1,
+    unpricedEvents: 0,
   });
   assert.deepEqual(result.period.priceCardBreakdown.map((row) => ({
     priceCardId: row.priceCardId,
@@ -154,11 +170,11 @@ test("indexed history prices each event at its own effective date and leaves pre
     },
     {
       priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
-      events: 1,
-      costUsd: "2.5",
+      events: 2,
+      costUsd: "5",
     },
   ]);
-  assert.equal(result.period.apiPriceEquivalentUsd, 4.5);
+  assert.equal(result.period.apiPriceEquivalentUsd, 7);
 });
 
 const NOW = Date.parse("2026-07-27T12:00:00.000Z");
@@ -730,7 +746,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   }
 });
 
-test("retains a deterministic privacy-safe weekly quota point per track and 15-minute bucket", async () => {
+test("retains exact deterministic quota points for comparison brackets", async () => {
   const snapshots = [
     weeklySnapshot({
       timestamp: "2026-07-27T11:46:00.000Z",
@@ -818,6 +834,17 @@ test("retains a deterministic privacy-safe weekly quota point per track and 15-m
       accountAttribution: "historical_unattributed",
     },
     {
+      observedAt: "2026-07-27T11:46:00.000Z",
+      limitId: "codex",
+      slot: "primary",
+      planType: "pro",
+      usedPercent: 10.123,
+      remainingPercent: 89.877,
+      durationMinutes: 10_080,
+      resetAt: "2026-08-03T12:00:00.000Z",
+      accountAttribution: "historical_unattributed",
+    },
+    {
       observedAt: "2026-07-27T11:52:00.000Z",
       limitId: "codex",
       slot: "primary",
@@ -861,6 +888,104 @@ test("retains a deterministic privacy-safe weekly quota point per track and 15-m
   ]) {
     assert.equal(serialized.includes(forbidden), false);
   }
+});
+
+test("Spark quota observations stay outside the normal weekly quota timeline", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    scan: async ({ onRateLimitSnapshot }) => {
+      onRateLimitSnapshot(weeklySnapshot({
+        timestamp: "2026-07-27T11:59:00.000Z",
+        usedPercent: 12,
+      }));
+      onRateLimitSnapshot(weeklySnapshot({
+        timestamp: "2026-07-27T11:59:30.000Z",
+        usedPercent: 4,
+        limitId: "codex-spark",
+        durationMinutes: 300,
+      }));
+      return { diagnostics: {} };
+    },
+  });
+
+  assert.deepEqual(cache.quotaTimeline.map((row) => row.limitId), ["codex"]);
+  assert.deepEqual(cache.sparkQuotaTimeline, [{
+    observedAt: "2026-07-27T11:59:30.000Z",
+    limitId: "codex-spark",
+    slot: "primary",
+    planType: "pro",
+    usedPercent: 4,
+    remainingPercent: 96,
+    durationMinutes: 300,
+    resetAt: "2026-08-03T12:00:00.000Z",
+    accountAttribution: "historical_unattributed",
+  }]);
+});
+
+test("exact retained quota points make an eligible comparison window testable", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-07-27T17:00:00.000Z"),
+    scan: async ({ onRateLimitSnapshot }) => {
+      for (const timestamp of [
+        "2026-07-27T14:59:00.000Z",
+        "2026-07-27T15:01:00.000Z",
+        "2026-07-27T15:59:00.000Z",
+        "2026-07-27T16:01:00.000Z",
+      ]) {
+        onRateLimitSnapshot(weeklySnapshot({ timestamp, usedPercent: 10 }));
+      }
+      return { diagnostics: {} };
+    },
+  });
+  const quotaSeries = cache.quotaTimeline.map((row) => ({
+    observedAt: row.observedAt,
+    receivedAt: row.observedAt,
+    usedPercent: row.usedPercent,
+  }));
+  const result = buildRollingQuotaComparisons({
+    resetEvidence: {
+      schemaVersion: "quota-reset-evidence-v0.1",
+      status: "eligible",
+      refusalCodes: [],
+      continuityKey: "fixture-continuity",
+      resetKey: "fixture-reset",
+      accountTrackId: "account-track:v1:fixture",
+      provider: "openai",
+      planType: "subscription",
+      planVariant: "pro",
+      limitId: "codex",
+      windowDurationMinutes: 10_080,
+      policyEpoch: "fixture-policy",
+      resetsAt: "2026-08-03T12:00:00.000Z",
+      slots: ["primary"],
+      firstObservedAt: quotaSeries[0].observedAt,
+      lastObservedAt: quotaSeries.at(-1).observedAt,
+      snapshotCount: quotaSeries.length,
+      usageEventCount: 0,
+      totalCostNanousd: 0,
+      sourceDatasetCount: 1,
+      boundaries: [],
+      quotaSeries,
+      usageSeries: [],
+    },
+    capacityForecast: {
+      method: "median_of_prior_completed_resets",
+      priorResetCount: 2,
+      priorResetKeys: ["prior-one", "prior-two"],
+      trainedThrough: "2026-07-27T13:00:00.000Z",
+      capacityNanousd: 1,
+    },
+  });
+  assert.equal(result.status, "conditional_comparison");
+  assert.deepEqual(result.comparisons.map((row) => [
+    row.smoothingHours,
+    row.windowStart,
+    row.windowEnd,
+  ]), [[
+    1,
+    "2026-07-27T15:00:00.000Z",
+    "2026-07-27T16:00:00.000Z",
+  ]]);
 });
 
 test("cache validation requires the bounded quota timeline so older cache shapes rebuild", async () => {

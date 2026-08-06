@@ -125,13 +125,6 @@ test("browser catalogs preserve placeholders, plural forms, and legacy text has 
     "正在开始本地分析…",
   );
   assert.equal(
-    translateLegacyText(
-      "Turning off automatic contribution, then deleting hosted metadata…",
-      "es",
-    ),
-    "Desactivando la contribución automática y luego eliminando metadatos alojados…",
-  );
-  assert.equal(
     translatePlural("dashboard.timeline.window", 1, {}, "en-US"),
     "1 matched quota window",
   );
@@ -205,9 +198,6 @@ test("shipped static web copy has a complete translated inventory and localizabl
       );
     }
   }
-
-  assert.match(sourceFiles[0], /<pre id="selected-contribution-json" data-i18n-skip>/u);
-  assert.match(sourceFiles[0], /<pre id="sync-exact-review-json" tabindex="0" data-i18n-skip>/u);
 
   const css = await readFile(
     new URL("../apps/web/public/styles.css", import.meta.url),
@@ -342,7 +332,6 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   assert.doesNotMatch(appSource, /\.innerHTML\s*=/u);
   assert.match(appSource, /function setRawText\(/u);
   assert.match(appSource, /function rawNode\(/u);
-  assert.match(appSource, /setRawText\(\$\("#selected-contribution-json"\)/u);
   assert.match(appSource, /setRawText\(\$\("#identity-account-provider"\)/u);
   assert.match(
     appSource,
@@ -350,8 +339,6 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   );
   assert.match(appSource, /setRawText\(titleNode, title\)/u);
   assert.match(appSource, /setRawText\(markerTitle, caption\)/u);
-  assert.match(appSource, /tPlural\("contribution\.deduplicatedRecord"/u);
-  assert.match(appSource, /t\("dashboard\.priceEpoch\.defaultRegistryVersion"\)/u);
   assert.match(appSource, /function renderDashboardUnavailableState\(/u);
   assert.match(appSource, /setLocalizedText\(\$\("#data-source"\), "dashboard\.unavailable\.noRealUsage"\)/u);
   assert.doesNotMatch(appSource, /translateText\("Range unavailable"\)/u);

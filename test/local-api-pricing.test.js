@@ -39,9 +39,12 @@ test("Codex defaults to event-time history while retaining explicit current sens
   assert.equal(current.totalUsd, "1.4");
   assert.equal(current.pricingContext.priceEpochBasis, "current_price_sensitivity_at_registry_observation");
   assert.equal(historical.pricingContext.priceEpochBasis, "event_time_when_registry_has_effective_evidence");
-  assert.equal(historical.totalUsd, "0");
-  assert.equal(historical.coverageStatus, "unpriced");
-  assert.ok(historical.warnings.coverage.some((warning) => warning.code === "historical_price_missing"));
+  assert.equal(historical.totalUsd, "7");
+  assert.equal(historical.coverageStatus, "fully_priced");
+  assert.equal(
+    historical.warnings.coverage.some((warning) => warning.code === "historical_price_missing"),
+    false,
+  );
 });
 
 test("Codex component availability reaches the ledger and never becomes observed zero", () => {
@@ -165,18 +168,21 @@ test("event-time boundary selects distinct Terra and Luna official cards and agg
   }
 });
 
-test("missing event time fails closed instead of using the current official card", () => {
-  const preOfficial = priceCodexUsageEvent({
+test("recognized historical events price before the review date while missing time fails closed", () => {
+  const preReview = priceCodexUsageEvent({
     timestamp: "2026-07-24T23:59:59.999Z",
     model: "gpt-5.6-terra",
+    raw: { input_tokens: 1_000 },
     components: { input_uncached_tokens: 1_000_000 },
   });
-  assert.equal(preOfficial.totalUsd, "0");
-  assert.equal(preOfficial.coverageStatus, "unpriced");
-  assert.equal(preOfficial.components[0].reasonCode, "historical_price_missing");
-  assert.ok(preOfficial.warnings.coverage.some((warning) => (
-    warning.code === "historical_price_missing"
-  )));
+  assert.equal(preReview.totalUsd, "2.5");
+  assert.equal(preReview.coverageStatus, "fully_priced");
+  assert.equal(
+    preReview.warnings.coverage.some((warning) => (
+      warning.code === "historical_price_missing"
+    )),
+    false,
+  );
 
   const result = priceCodexUsageEvent({
     model: "gpt-5.6-terra",
@@ -189,6 +195,21 @@ test("missing event time fails closed instead of using the current official card
   )));
   assert.equal(result.pricingContext.historicalPriceReasonCode, "historical_price_timestamp_missing");
   assert.equal(result.components[0].reasonCode, "historical_price_timestamp_missing");
+});
+
+test("the reviewed GPT-5.5 Codex alias remains priceable in historical events", () => {
+  const result = priceCodexUsageEvent({
+    timestamp: "2026-07-24T12:00:00.000Z",
+    model: "gpt-5.5-codex",
+    raw: { input_tokens: 1_000 },
+    components: {
+      input_uncached_tokens: 1_000_000,
+      output_text_tokens: 1_000_000,
+    },
+  });
+  assert.equal(result.coverageStatus, "fully_priced");
+  assert.equal(result.totalUsd, "35");
+  assert.match(result.selectedPriceCardIds[0], /openai:gpt-5\.5:standard:short:/u);
 });
 
 test("noncanonical historical event times fail closed instead of selecting a card", () => {

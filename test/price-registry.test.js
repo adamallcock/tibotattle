@@ -8,6 +8,7 @@ import {
   APP_PRICE_REGISTRY_SHA256,
   NORMALIZED_PRICE_EVIDENCE_ROWS,
   OPENAI_OFFICIAL_PRICE_CARDS,
+  OPENAI_PRICE_EVIDENCE_START_DATE,
   addOfficialPriceRegistry,
   validateOfficialPriceRegistry,
 } from "../packages/accounting/index.js";
@@ -51,7 +52,8 @@ test("registry validates and preserves exact decimal strings and provenance", ()
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sha256, APP_PRICE_REGISTRY_SHA256);
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 2);
   assert.equal(batch54.metadata.provenance.vendor_effective_from, null);
-  assert.equal(batch54.effective.from, "2026-07-26");
+  assert.equal(OPENAI_PRICE_EVIDENCE_START_DATE, "2026-07-26");
+  assert.equal(batch54.effective.from, undefined);
   assert.equal(
     batch54.metadata.provenance.evidence_urls.some((url) => url.endsWith("/models/gpt-5.4")),
     true,
@@ -284,7 +286,7 @@ test("GPT-5.6 Terra and Luna pricing changes at the official July 30 boundary", 
       && card.effective.to === "2026-07-29" && card.metadata.total_input_context_band === "short"
   ));
   assert.equal(closed.metadata.provenance.vendor_effective_to, "2026-07-29");
-  assert.equal(closed.effective.from, "2026-07-26");
+  assert.equal(closed.effective.from, undefined);
 });
 
 test("OpenAI service_tier fast is priced only as an explicitly labeled Priority fallback", () => {

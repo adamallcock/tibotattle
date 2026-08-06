@@ -58,14 +58,15 @@ a clean-profile smoke all succeed.
    production appcast. Automatic update downloads are controlled by one native
    switch in **Settings…** → **General**. Developer and ad-hoc builds contain
    no updater framework and perform no update networking.
-10. **Settings…** → **General** also contains **Local allowance
+10. **Settings…** → **Notifications** contains **Local allowance
    notifications**. It is off by default; enabling it is the only action that
    may request macOS notification permission. The first opt-in visibly selects
-   80% and 90% usage alerts. The new-window control remains visibly unavailable
-   because the current provider receipt supplies a reset schedule, not an
-   explicit reset identity; schedules and percentage drops never alert.
-   TiboTattle evaluates threshold alerts only
-   after the existing foreground refresh receives a fresh direct
+   80% and 90% usage alerts. Reset alerts use the provider-reported reset time
+   and notify once when the next foreground refresh arrives at or after that
+   time. A provider-reported reset identity strengthens dedupe when available;
+   a schedule change before the old due time replaces the baseline without
+   alerting. TiboTattle evaluates threshold and reset alerts only after the
+   existing foreground refresh receives a fresh direct
    `account/rateLimits/read` observation. Stale, inferred, mixed-source,
    unobserved, unknown, forecast, time-only, and log-derived state never
    alerts. Turn the same switch off to immediately stop future alerts and
@@ -499,7 +500,8 @@ disposable-VM rehearsal:
    contract: off by default; permission requested only after opting in; one
    controlled fresh direct-provider threshold crossing; no alert for first,
    stale, inferred, mixed, unknown, unobserved, or failed refresh evidence;
-   reset remains suppressed for the current schedule-only provider receipt;
+   one scheduled reset alert on the next eligible refresh at or after the
+   provider-reported due time, with dedupe across relaunches;
    and opt-out stops future alerts without erasing accounting evidence;
 6. on a disposable clean macOS user profile, verify that first-run visibly
    preselects **Start TiboTattle at login** but does not create a Login Item

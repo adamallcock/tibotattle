@@ -4,13 +4,12 @@ import {
   isPrimaryCodexWeeklyQuotaWindow,
   LocalCompanionClient,
   CODEX_PRIMARY_LIMIT_ID,
+  CODEX_SPARK_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
   demoDashboard,
   isValidQuotaWindowDuration,
-  normalizeCommunitySnapshot,
   normalizeParticipantHistory,
-  normalizeParticipantStats,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -19,23 +18,16 @@ import {
   createDiagnosticReference,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
-  createTelemetryEnvelope,
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
-  parseJsonWithUniqueObjectKeys,
   refreshNeedsContinuation,
-  safeApiError,
   serviceRequestId,
   validateContributionForUpload
 } from "./lib.js";
 import {
   mountDashboardNavigation,
 } from "./navigation.js";
-import {
-  COMMUNITY_METRIC_LABELS,
-  renderCommunitySnapshot as renderSharedCommunitySnapshot,
-} from "./community-view.js";
 import {
   renderInstallerJourney as renderSharedInstallerJourney,
 } from "./install-cta.js";
@@ -95,15 +87,10 @@ let contributionSyncStatus = null;
 let contributionSyncPreview = null;
 let contributionSyncExactReview = null;
 let contributionSyncBusy = false;
-let automaticContributionStatus = null;
-let automaticContributionBusy = false;
 let fastModePreference = null;
 let fastModePreferenceBusy = false;
-let pendingAutomaticContributionConsent = null;
 let participantContributionAdmission = null;
 let localOnboarding = null;
-let selectedContributionValidated = false;
-let contributionSelectionRevision = 0;
 let contributionPreparationBusy = false;
 let communityConnectBusy = false;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
@@ -141,16 +128,19 @@ const { clear, node } = createDomHelpers(document);
 // file, or user choice use the raw helpers instead, so localization can never
 // reinterpret them just because they happen to equal an English UI label.
 function setProductText(element, englishText) {
+  if (!element) return;
   element.removeAttribute("data-i18n-skip");
   localization.setLegacyText(element, englishText);
 }
 
 function setRawText(element, value) {
+  if (!element) return;
   element.setAttribute("data-i18n-skip", "");
   element.textContent = value == null ? "" : String(value);
 }
 
 function setLocalizedText(element, key, values = {}) {
+  if (!element) return;
   element.removeAttribute("data-i18n-skip");
   element.textContent = t(key, values);
 }
@@ -184,9 +174,12 @@ if (SEMANTIC_OPEN_TARGET) {
 // locale and leaves data, timestamps, and request ownership untouched. The
 // native host dispatches the same event after its Settings picker changes, so
 // the existing WebView is updated rather than reloaded.
-window.addEventListener("tibotattle:locale-change", (event) => {
-  setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
-  setMessageLocale(event.detail?.locale ?? localization.locale());
+function rerenderLocalizedDashboard() {
+  // Register the current English-owned text before replacing any generated
+  // values, then run the bridge once more after every renderer has rebuilt its
+  // subtree. This prevents a previous locale's nodes from surviving a switch
+  // back to English (or Spanish) in the same WebView.
+  localization.localizeTree();
   renderSharedInstallerJourney(document, {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
@@ -198,7 +191,18 @@ window.addEventListener("tibotattle:locale-change", (event) => {
   } else if (globalState) {
     renderGlobalState();
   }
+  if (localOnboarding) renderLocalOnboarding(localOnboarding);
+  renderHostedIdentity();
+  renderPreparationIdentity(localCompanionHealth);
+  renderContributionSyncStatus(contributionSyncStatus);
+  renderContributionSyncPreview(contributionSyncPreview);
   localization.localizeTree();
+}
+
+window.addEventListener("tibotattle:locale-change", (event) => {
+  setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
+  setMessageLocale(event.detail?.locale ?? localization.locale());
+  rerenderLocalizedDashboard();
 });
 
 // The release-slot marker for "this build is paired with a hosted contribution
@@ -249,7 +253,7 @@ function setJourneyState(state) {
     element.hidden = !hasEvidence;
   }
   if (!hasEvidence) {
-    $("#community-contribution-disclosure").open = false;
+    $("#community-contribution-disclosure")?.removeAttribute("open");
   }
 }
 
@@ -299,13 +303,6 @@ function setCommunitySession(value) {
     participantContributionAdmission = null;
     renderContributionPreparationEstimate();
   }
-}
-
-async function sha256Hex(value) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 function formatMoney(value, digits = 0) {
@@ -477,8 +474,8 @@ function setGlobalState(state, { companionReachable = false } = {}) {
 function renderGlobalState() {
   if (!globalState) return;
   const keys = {
-    live: "status.upToDate",
-    updating: "status.updating",
+    live: "status.fresh",
+    updating: "status.running",
     stale: "status.needsRefresh",
     insufficient: "status.moreDataNeeded",
     setup: "status.setUpMac",
@@ -488,6 +485,7 @@ function renderGlobalState() {
     demo: "status.labeledDemoData",
   };
   const pill = $("#global-state");
+  if (!pill) return;
   pill.className = `state-pill state-${globalState.state}`;
   pill.replaceChildren(
     node("span", "state-dot"),
@@ -634,6 +632,12 @@ function onboardingSourceGuidance(value) {
 function renderLocalOnboarding(value) {
   localOnboarding = value;
   const card = $("#setup-card");
+  if (!card) return;
+  if (runsInsideNativeDashboard()) {
+    card.hidden = true;
+    card.setAttribute("aria-hidden", "true");
+    return;
+  }
   if (!value || value.state === "unavailable") {
     card.hidden = true;
     setJourneyState(
@@ -654,7 +658,8 @@ function renderLocalOnboarding(value) {
   const indexing = dashboard?.collector?.indexing ?? null;
   const boundedPause = indexing?.status === "bounded_pause";
   const ready = localAnalysisAllowed(value);
-  card.hidden = runsInsideNativeDashboard();
+  card.hidden = false;
+  card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
   $("#setup-title").textContent = boundedPause
     ? "Continue your local analysis"
@@ -759,7 +764,6 @@ function renderDashboard(data) {
   renderTimeline(data);
   renderWeekly(data);
   renderAccounting(data);
-  renderCollector(data);
   renderContributionPreparationEstimate();
 }
 
@@ -767,10 +771,17 @@ function renderQuotaCards(data) {
   const container = $("#quota-cards");
   clear(container);
   const normalWindows = data.quotaWindows.filter(isPrimaryCodexQuotaWindow);
+  const sparkWindows = data.quotaWindows.filter((window) => (
+    window?.limitId === CODEX_SPARK_LIMIT_ID
+      && isValidQuotaWindowDuration(finite(window?.durationMinutes))
+  ));
   const primaryWindow = selectPrimaryCodexQuotaWindow(normalWindows);
-  const windows = primaryWindow === null
+  const normalOrderedWindows = primaryWindow === null
     ? normalWindows
     : [primaryWindow, ...normalWindows.filter((window) => window !== primaryWindow)];
+  // Spark is a separate provider limit. Keep it out of the normal allowance
+  // selection so it cannot be mistaken for the five-hour or seven-day track.
+  const windows = [...normalOrderedWindows, ...sparkWindows];
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
     const header = node("div", "metric-card-header");
@@ -788,12 +799,19 @@ function renderQuotaCards(data) {
   }
   for (const window of windows) {
     const remaining = finite(window.remainingPercent);
-    const card = node("article", `metric-card ${window.status === "stale" ? "stale" : ""}`);
+    const spark = window.limitId === CODEX_SPARK_LIMIT_ID;
+    const card = node("article", [
+      "metric-card",
+      window.status === "stale" ? "stale" : "",
+      spark ? "quota-card-spark" : "",
+    ].filter(Boolean).join(" "));
     const header = node("div", "metric-card-header");
     const name = node("span", "metric-name", localizedQuotaWindowLabel(window));
     const plan = node("span", "evidence-chip");
     const reportedPlan = providerReportedPlanEvidence(window.planType);
-    if (data.mode === "demo") {
+    if (spark) {
+      plan.textContent = t("dashboard.quota.spark");
+    } else if (data.mode === "demo") {
       plan.textContent = t("dashboard.quota.demo");
     } else if (reportedPlan) {
       plan.textContent = reportedPlan;
@@ -864,6 +882,9 @@ function localizedQuotaWindowDuration(durationMinutes) {
 
 function localizedQuotaWindowLabel(window) {
   const duration = finite(window?.durationMinutes, null);
+  if (window?.limitId === CODEX_SPARK_LIMIT_ID) {
+    return t("dashboard.quota.windowSpark");
+  }
   if (window?.limitId === CODEX_PRIMARY_LIMIT_ID
       && duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) {
     return t("dashboard.quota.windowFiveHour");
@@ -910,6 +931,30 @@ function historyCoverageLabel(history) {
   return t("dashboard.pricing.historyResume");
 }
 
+function pricingMethodLabel(pricing) {
+  const replaySafe = finite(pricing?.replayExclusionDiagnostics?.filesScanned, 0) > 0
+    || String(pricing?.accountingSource ?? "").includes("replay");
+  if (!replaySafe) return t("dashboard.pricing.legacyProjection");
+  const key = pricing?.accountingCacheStatus === "stale"
+    ? "dashboard.pricing.staleReplaySafe"
+    : "dashboard.pricing.replaySafe";
+  return t(key);
+}
+
+function pricingRegistryProvenance(pricing) {
+  const version = typeof pricing?.registryVersion === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/u.test(pricing.registryVersion)
+    ? pricing.registryVersion
+    : "";
+  if (!version) return "";
+  const observedAt = pricing.registryObservedAt
+    ? t("dashboard.pricing.registryObservedAt", {
+      time: formatLocal(pricing.registryObservedAt, { dateOnly: true }),
+    })
+    : "";
+  return t("dashboard.pricing.registryProvenance", { version, observedAt });
+}
+
 function renderPricing(data) {
   const pricing = data.pricing;
   const fastMode = pricing.fastMode;
@@ -931,28 +976,43 @@ function renderPricing(data) {
     2
   );
   const eventCount = finite(pricing.eventCount, 0);
-  const unpricedEvents = finite(pricing.pricingCoverage?.unpricedEvents, 0);
   const coverage = pricing.coveragePercent;
-  const coverageDigits = coverage !== null && coverage > 99 && coverage < 100
-    ? 3
-    : 1;
-  $("#cost-coverage").textContent = coverage === null
-    ? t("dashboard.pricing.noCoverage")
-    : unpricedEvents > 0
-      ? t("dashboard.pricing.coverageWithUnpriced", {
-        count: compact(unpricedEvents),
-        percent: formatPercent(coverage, coverageDigits),
-      })
-      : t("dashboard.pricing.coverageComplete", {
-        percent: formatPercent(coverage, coverageDigits),
-      });
-  $("#cost-coverage").title = eventCount > 0
+  const history = historyCoverageLabel(pricing.historyCoverage);
+  const method = pricingMethodLabel(pricing);
+  const provenance = pricingRegistryProvenance(pricing);
+  const coverageElement = $("#cost-coverage");
+  const coverageKey = coverage === null
+    ? history
+      ? "dashboard.pricing.noCoverageWithHistory"
+      : "dashboard.pricing.noCoverage"
+    : history
+      ? "dashboard.pricing.coverageWithHistory"
+      : "dashboard.pricing.coverage";
+  const coverageValues = coverage === null
+      ? { history }
+      : {
+        percent: formatPercent(coverage, 1),
+        method,
+        provenance,
+        history,
+      };
+  clear(coverageElement);
+  const coverageLine = node("span", "coverage-line");
+  setRawText(coverageLine, t(coverageKey, coverageValues));
+  coverageElement.append(coverageLine);
+  if (pricing.historyCoverage?.status === "partial") {
+    const startAt = pricing.historyCoverage.coveredAt?.startAt
+      || pricing.evidenceStartDate
+      || "";
+    const warning = node("span", "coverage-warning");
+    setRawText(warning, t("accounting.pricing.thirtyDayCoverageWarning", {
+      date: startAt ? ` on ${formatLocal(startAt, { dateOnly: true })}` : "",
+    }));
+    coverageElement.append(warning);
+  }
+  coverageElement.title = eventCount > 0
     ? t("dashboard.pricing.coverageDenominator", { count: compact(eventCount) })
     : "";
-  const historyCoverage = historyCoverageLabel(pricing.historyCoverage);
-  const historyCoverageElement = $("#cost-history-coverage");
-  historyCoverageElement.hidden = historyCoverage === "";
-  historyCoverageElement.textContent = historyCoverage;
   const list = $("#cost-components");
   clear(list);
   const components = pricing.components.filter(
@@ -970,14 +1030,9 @@ function renderPricing(data) {
     const fill = node("i");
     fill.style.width = `${Math.max(component.costUsd > 0 ? 1 : 0, ((component.costUsd ?? 0) / max) * 100)}%`;
     track.append(fill);
-    const hasUnpricedTokens = finite(component.unpricedTokens, 0) > 0;
-    const hasPricedTokens = finite(component.pricedTokens, 0) > 0;
-    const costLabel = hasUnpricedTokens && !hasPricedTokens
-      ? t("dashboard.pricing.unpriced")
-      : formatApiMoney(component.costUsd);
     row.append(
       track,
-      node("strong", "", costLabel)
+      node("strong", "", formatApiMoney(component.costUsd))
     );
     row.title = t("dashboard.pricing.tokens", { count: compact(component.tokens) });
     list.append(row);
@@ -2306,11 +2361,11 @@ function timelineStatusLabel(status) {
   return {
     matched: "Matched quota bracket",
     inactive: "No local activity or quota movement",
-    unpriced_local_activity: "Local activity has no reviewed price",
-    unexplained_without_local_activity: "Quota moved without local activity",
-    missing_quota_bracket: "Missing quota bracket",
-    reset_or_track_change: "Provider reset or quota-track change",
-    backward_or_ambiguous: "Ambiguous quota movement",
+    unpriced_local_activity: "Usage change without reviewed price",
+    unexplained_without_local_activity: "Quota movement without a local usage change",
+    missing_quota_bracket: "Quota bracket not recorded",
+    reset_or_track_change: "Window boundary or track change",
+    backward_or_ambiguous: "Movement needs context",
   }[status] ?? "Historical calibration point";
 }
 
@@ -2499,11 +2554,47 @@ function usagePointsWithAllowance(data, points) {
   });
 }
 
+function usageGroupingsForRange(rangeDays = activeUsageRangeDays) {
+  if (rangeDays <= 1) return ["hour"];
+  if (rangeDays <= 7) return ["hour", "day"];
+  return ["hour", "day", "week"];
+}
+
+function syncUsageGroupingControls() {
+  const controls = $("#usage-group-controls");
+  if (!controls) return;
+  const allowed = new Set(usageGroupingsForRange());
+  if (!allowed.has(activeUsageGrouping)) activeUsageGrouping = "hour";
+  for (const control of controls.querySelectorAll("button[data-group]")) {
+    const visible = allowed.has(control.dataset.group);
+    const active = visible && control.dataset.group === activeUsageGrouping;
+    control.hidden = !visible;
+    control.disabled = !visible;
+    control.setAttribute("aria-hidden", String(!visible));
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  }
+}
+
+function usageChartAxisLabels(grouping = activeUsageGrouping) {
+  const unit = {
+    hour: "hour",
+    day: "day",
+    week: "week",
+  }[grouping] ?? "interval";
+  return Object.freeze({
+    primary: `API equivalent / ${unit}`,
+    secondary: "Observed allowance remaining (%)",
+  });
+}
+
 function renderUsageTimeline(data) {
+  syncUsageGroupingControls();
   const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
   const shell = $("#usage-timeline-chart");
   const empty = $("#usage-timeline-empty");
   const label = { hour: "hour", day: "day", week: "week" }[activeUsageGrouping];
+  const axisLabels = usageChartAxisLabels();
   $("#usage-timeline-title").textContent =
     `API-price-equivalent usage by ${label} · latest ${activeUsageRangeDays} day${activeUsageRangeDays === 1 ? "" : "s"}`;
   if (!points.length) {
@@ -2518,22 +2609,23 @@ function renderUsageTimeline(data) {
         key: "apiCostUsd",
         className: "chart-line-value",
         label: "API-price-equivalent usage",
-        markers: true,
+        markers: false,
+        hitTargets: true,
         markerRadius: 2.6,
         format: (value) => formatApiMoney(value),
       }],
-      yLabel: "$ API equivalent",
+      yLabel: axisLabels.primary,
       secondarySeries: [{
         key: "allowanceRemaining",
         className: "chart-line-allowance",
-        label: "Seven-day allowance remaining",
-        markers: true,
+        label: "Observed allowance remaining",
+        markers: false,
+        hitTargets: true,
       }],
-      secondaryYLabel: "Allowance remaining (%)",
+      secondaryYLabel: axisLabels.secondary,
       title: "Real local API-price-equivalent usage over time",
       description: `Local API-price-equivalent usage with provider-observed seven-day allowance remaining. Times are shown in ${formatTimeZoneLabel()}.`,
       includeZero: true,
-      xLabel: t("format.localTime"),
       rotateXTickLabels: true,
     }));
   }
@@ -2616,14 +2708,16 @@ function renderTimeline(data) {
           key: "observed",
           className: "chart-line-observed",
           label: t("dashboard.timeline.observedQuota"),
-          markers: true,
+          markers: false,
+          hitTargets: true,
           format: formatPp,
         },
         {
           key: "expected",
           className: "chart-line-expected",
           label: t("dashboard.timeline.expectedCost"),
-          markers: true,
+          markers: false,
+          hitTargets: true,
           format: formatPp,
         }
       ],
@@ -2633,7 +2727,6 @@ function renderTimeline(data) {
         timeZone: formatTimeZoneLabel(),
       }),
       includeZero: true,
-      xLabel: t("format.localTime"),
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
@@ -2773,18 +2866,36 @@ function renderTimelineSummary(data, points) {
     ? Math.max(...matched.map((row) => Math.abs(row.observed - row.expected)))
     : null;
   const values = [
-    ["Matched windows", compact(matched.length)],
-    ["Mean absolute error", formatPp(live ? liveMae : sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp)],
-    ["Peak residual", formatPp(live ? livePeak : summary.rolling_peak_absolute_residual_pp)],
-    ["Usable quota coverage", activePoints.length
-      ? formatPercent(matched.length / activePoints.length * 100)
-      : "—"]
+    [
+      "Matched windows",
+      "Windows with both observed quota movement and a comparable cost-implied movement.",
+      compact(matched.length),
+    ],
+    [
+      "Mean absolute error",
+      "The average absolute difference between observed and cost-implied quota movement, in percentage points.",
+      formatPp(live ? liveMae : sensitivity?.mae_pp ?? sensitivity?.weighted_mae_pp ?? summary.mean_absolute_error_pp),
+    ],
+    [
+      "Peak residual",
+      "The largest absolute observed-versus-calculated difference in the selected calibration view.",
+      formatPp(live ? livePeak : summary.rolling_peak_absolute_residual_pp),
+    ],
+    [
+      "Usable quota coverage",
+      "The share of active windows with enough quota evidence to make a comparison.",
+      activePoints.length
+        ? formatPercent(matched.length / activePoints.length * 100, 1)
+        : "—",
+    ],
   ];
   const container = $("#timeline-summary");
   clear(container);
-  for (const [label, value] of values) {
+  for (const [label, explanation, value] of values) {
     const item = node("div");
-    item.append(node("span", "", label), node("strong", "", value));
+    const labelElement = node("span");
+    labelElement.append(informationLabel(label, explanation));
+    item.append(labelElement, node("strong", "", value));
     container.append(item);
   }
 }
@@ -2886,14 +2997,14 @@ function renderResiduals(data, points, viewport = null) {
         key: "residual",
         className: "chart-line-value",
         label: "Residual",
-        markers: true,
+        markers: false,
+        hitTargets: true,
         format: formatPp,
       }],
       yLabel: "Percentage points",
       title: "Quota movement residuals",
       description: "Observed quota change minus the API-cost-implied change, over the same date range as the calibration chart. Windows with no computable residual are left as shaded gaps.",
       includeZero: true,
-      xLabel: t("format.localTime"),
       xDomain: domain,
       statusIntervals: domain === null
         ? []
@@ -2937,6 +3048,33 @@ function renderResiduals(data, points, viewport = null) {
   }
 }
 
+function formatChartTimeLabel(value, { dateOnly = false } = {}) {
+  const timestamp = value instanceof Date
+    ? value.valueOf()
+    : typeof value === "number"
+      ? value
+      : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return t("format.unknown");
+  try {
+    const locale = getFormattingLocale();
+    const date = new Intl.DateTimeFormat(locale, {
+      timeZone: USER_TIME_ZONE,
+      month: "short",
+      day: "numeric",
+      ...(dateOnly ? { year: "numeric" } : {}),
+    }).format(new Date(timestamp));
+    if (dateOnly) return date;
+    const time = new Intl.DateTimeFormat(locale, {
+      timeZone: USER_TIME_ZONE,
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(timestamp));
+    return `${date} · ${time}`;
+  } catch {
+    return formatLocal(new Date(timestamp).toISOString(), { dateOnly });
+  }
+}
+
 function lineChart({
   points,
   series,
@@ -2953,7 +3091,6 @@ function lineChart({
   statusIntervals = [],
   secondarySeries = [],
   secondaryYLabel = null,
-  xLabel = null,
   rotateXTickLabels = false,
 }) {
   // Data-point details are the safe default for every chart series. A caller
@@ -2962,23 +3099,25 @@ function lineChart({
   const chartSeries = (Array.isArray(series) ? series : []).map((item) => ({
     ...item,
     markers: item.markers !== false,
+    hitTargets: item.hitTargets !== false,
     focusable: item.focusable !== false,
     tooltip: item.tooltip !== false,
   }));
   const chartSecondarySeries = (Array.isArray(secondarySeries) ? secondarySeries : []).map((item) => ({
     ...item,
     markers: item.markers !== false,
+    hitTargets: item.hitTargets !== false,
     focusable: item.focusable !== false,
     tooltip: item.tooltip !== false,
   }));
   const width = 900;
-  const height = 330;
+  const height = 300;
   const hasSecondary = chartSecondarySeries.length > 0;
   const margin = {
-    top: 24,
-    right: hasSecondary ? 64 : 22,
-    bottom: rotateXTickLabels ? 76 : 58,
-    left: 58,
+    top: 16,
+    right: hasSecondary ? 96 : 24,
+    bottom: rotateXTickLabels ? 66 : 44,
+    left: 72,
   };
   let min = finite(yDomain?.low);
   let max = finite(yDomain?.high);
@@ -3019,6 +3158,38 @@ function lineChart({
   const ySecondary = (value) => margin.top
     + (100 - Math.max(0, Math.min(100, value))) / 100
       * (height - margin.top - margin.bottom);
+
+  const chartTickStep = (low, high, target = 5) => {
+    const span = Math.abs(high - low);
+    if (!Number.isFinite(span) || span <= 0) return 1;
+    const raw = span / Math.max(1, target - 1);
+    const magnitude = 10 ** Math.floor(Math.log10(raw));
+    const normalized = raw / magnitude;
+    const factor = normalized <= 1 ? 1
+      : normalized <= 2 ? 2
+        : normalized <= 2.5 ? 2.5
+          : normalized <= 5 ? 5
+            : 10;
+    return factor * magnitude;
+  };
+  const chartTickDigits = (step) => {
+    if (!Number.isFinite(step) || step >= 1) return 0;
+    return Math.min(3, Math.max(1, Math.ceil(-Math.log10(step))));
+  };
+  const yStep = chartTickStep(min, max);
+  const yDigits = chartTickDigits(yStep);
+  const yTicks = Array.isArray(yDomain?.ticks) && yDomain.ticks.length > 0
+    ? yDomain.ticks.filter((value) => Number.isFinite(value))
+    : (() => {
+      const first = Math.ceil(max / yStep) * yStep;
+      const last = Math.floor(min / yStep) * yStep;
+      const values = [];
+      for (let value = first; value >= last - yStep / 100; value -= yStep) {
+        values.push(Number(value.toFixed(Math.max(0, yDigits + 2))));
+        if (values.length >= 8) break;
+      }
+      return values.length >= 2 ? values : [max, min];
+    })();
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -3135,19 +3306,21 @@ function lineChart({
     }
   };
 
-  for (let index = 0; index < 5; index += 1) {
-    const value = max - index / 4 * (max - min);
+  for (const value of yTicks) {
     const yPosition = y(value);
     svg.append(svgLine(margin.left, yPosition, width - margin.right, yPosition, "chart-grid"));
     const label = yTickFormat === null
-      ? value.toFixed(Math.abs(max - min) < 10 ? 1 : 0)
-      : yTickFormat(value, Math.abs(max - min) < 10 ? 1 : 0);
+      ? formatDecimal(value, yDigits)
+      : yTickFormat(value, yDigits);
     svg.append(svgText(margin.left - 8, yPosition + 3, label, "chart-axis-label", "end"));
     if (hasSecondary) {
+      const secondaryRatio = yTicks.length <= 1
+        ? 0
+        : yTicks.indexOf(value) / (yTicks.length - 1);
       svg.append(svgText(
         width - margin.right + 8,
-        ySecondary(100 - index * 25) + 3,
-        `${100 - index * 25}%`,
+        margin.top + secondaryRatio * (height - margin.top - margin.bottom) + 3,
+        `${formatDecimal(100 - secondaryRatio * 100, 0)}%`,
         "chart-axis-label",
         "start"
       ));
@@ -3173,10 +3346,9 @@ function lineChart({
           * index / (automaticTickCount - 1);
         return {
           at,
-          label: formatLocal(
-            new Date(at).toISOString(),
-            { dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000 },
-          ),
+          label: formatChartTimeLabel(at, {
+            dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000,
+          }),
           alignment: index === 0
             ? "start"
             : index === automaticTickCount - 1
@@ -3195,9 +3367,9 @@ function lineChart({
         rotateXTickLabels ? height - 34 : height - 22,
         typeof tick.label === "string"
           ? tick.label
-          : formatLocal(new Date(at).toISOString(), { dateOnly: true }),
+          : formatChartTimeLabel(at, { dateOnly: true }),
         "chart-axis-label",
-        rotateXTickLabels ? "end" : tick.alignment ?? "middle",
+        tick.alignment ?? "middle",
       );
       if (rotateXTickLabels) {
         tickLabel.setAttribute(
@@ -3209,15 +3381,12 @@ function lineChart({
       tickLabels.push(tickLabel);
     }
     installTickDensity(tickLabels);
-    if (xLabel) {
-      svg.append(svgText(width / 2, height - 6, xLabel, "chart-axis-label", "middle"));
-    }
   } else {
     const labelIndexes = [...new Set([0, Math.floor((points.length - 1) / 3), Math.floor((points.length - 1) * 2 / 3), points.length - 1])];
     const tickLabels = [];
     for (const index of labelIndexes) {
       const timestamp = points[index]?.timestamp ?? points[index]?.date;
-      const tickLabel = svgText(x(index), height - 22, formatLocal(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle");
+      const tickLabel = svgText(x(index), height - 22, formatChartTimeLabel(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle");
       svg.append(tickLabel);
       tickLabels.push(tickLabel);
     }
@@ -3374,7 +3543,7 @@ function lineChart({
       }
       svg.append(path);
     }
-    if (item.markers !== false) {
+    if (item.markers !== false || item.hitTargets !== false) {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
@@ -3382,21 +3551,27 @@ function lineChart({
         const marker = document.createElementNS(svg.namespaceURI, "circle");
         marker.setAttribute("cx", String(x(index, point)));
         marker.setAttribute("cy", String(y(value)));
-        const markerRadius = typeof item.markerRadius === "function"
+        const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 4;
-        if (!Number.isFinite(markerRadius) || markerRadius <= 0) return;
+        const showMarker = item.markers !== false
+          && Number.isFinite(visualRadius)
+          && visualRadius > 0;
         const markerOpacity = typeof item.markerOpacity === "function"
           ? item.markerOpacity(point)
           : item.markerOpacity;
-        marker.setAttribute("r", String(markerRadius));
-        if (Number.isFinite(markerOpacity)) {
+        marker.setAttribute("r", String(showMarker
+          ? visualRadius
+          : Math.max(7, finite(item.hitRadius, 8))));
+        if (showMarker && Number.isFinite(markerOpacity)) {
           marker.setAttribute(
             "opacity",
             String(Math.max(0, Math.min(1, markerOpacity))),
           );
         }
-        marker.setAttribute("class", `${item.className} chart-point`);
+        marker.setAttribute("class", showMarker
+          ? `${item.className} chart-point`
+          : `${item.className} chart-point chart-point-hit-target`);
         const timestamp = point.timestamp ?? point.date;
         const heading = `${item.label}: ${format(value)}`;
         const detail = [
@@ -3475,7 +3650,7 @@ function lineChart({
       }
       svg.append(path);
     }
-    if (item.markers !== false) {
+    if (item.markers !== false || item.hitTargets !== false) {
       const format = item.format ?? ((value) => `${formatDecimal(value, 1)}%`);
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
@@ -3483,12 +3658,18 @@ function lineChart({
         const marker = document.createElementNS(svg.namespaceURI, "circle");
         marker.setAttribute("cx", String(x(index, point)));
         marker.setAttribute("cy", String(ySecondary(value)));
-        const markerRadius = typeof item.markerRadius === "function"
+        const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 2.6;
-        if (!Number.isFinite(markerRadius) || markerRadius <= 0) return;
-        marker.setAttribute("r", String(markerRadius));
-        marker.setAttribute("class", `${item.className} chart-point`);
+        const showMarker = item.markers !== false
+          && Number.isFinite(visualRadius)
+          && visualRadius > 0;
+        marker.setAttribute("r", String(showMarker
+          ? visualRadius
+          : Math.max(7, finite(item.hitRadius, 8))));
+        marker.setAttribute("class", showMarker
+          ? `${item.className} chart-point`
+          : `${item.className} chart-point chart-point-hit-target`);
         const heading = `${item.label}: ${format(value)}`;
         const detail = point.timestamp ? formatLocal(point.timestamp) : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
@@ -3543,68 +3724,6 @@ function isWellObservedWeeklyFit(observedSpanPp) {
   // An unrecorded span cannot be promoted to primary evidence. It remains an
   // outlined diagnostic so a missing measurement is never silently discarded.
   return observedSpanPp !== null && observedSpanPp >= activeWeeklyMinimumObservedSpanPp;
-}
-
-function renderWeeklyPricingReceipt(data) {
-  const pricing = data.pricing ?? {};
-  const registryVersion = pricing.registryVersion
-    || t("dashboard.priceEpoch.defaultRegistryVersion");
-  const reviewedAt = pricing.registryObservedAt
-    ? t("dashboard.priceEpoch.reviewedAt", {
-      date: formatLocal(pricing.registryObservedAt, { dateOnly: true }),
-    })
-    : t("dashboard.priceEpoch.noReviewDate");
-  const rebuiltAt = data.artifactStatus?.weekly?.generatedAt
-    ? t("dashboard.priceEpoch.rebuiltAt", {
-      date: formatLocal(data.artifactStatus.weekly.generatedAt),
-    })
-    : "";
-  const eventTimeHistoricalPricing = pricing.priceEpochBasis
-    === "event_time_when_registry_has_effective_evidence";
-  const title = $("#weekly-pricing-receipt-title");
-  const copy = $("#weekly-pricing-receipt-copy");
-
-  if (!eventTimeHistoricalPricing) {
-    setProductText(title, "Price epoch was not verified");
-    copy.textContent = t("dashboard.priceEpoch.unverified", {
-      registryVersion,
-      reviewedAt,
-      rebuiltAt,
-    });
-    return;
-  }
-
-  title.textContent = pricing.mixedPriceCardWindows
-    ? t("dashboard.priceEpoch.mixedTitle")
-    : t("dashboard.priceEpoch.singleTitle");
-  const priceCardIds = Array.isArray(pricing.priceCardIds)
-    ? pricing.priceCardIds
-    : [];
-  const hasPostJulyThirtyTerraOrLunaCard = priceCardIds.some((id) => (
-    (id.includes(":gpt-5.6-terra:") || id.includes(":gpt-5.6-luna:"))
-    && id.includes("-from-2026-07-30:")
-  ));
-  const julyThirtyPricing = priceCardIds.length === 0
-    ? t("dashboard.priceEpoch.noCardProvenance")
-    : hasPostJulyThirtyTerraOrLunaCard
-      ? t("dashboard.priceEpoch.postJulyCard")
-      : t("dashboard.priceEpoch.noPostJulyCard");
-  const mixedWindows = pricing.mixedPriceCardWindows
-    ? t("dashboard.priceEpoch.mixedWindows")
-    : "";
-  const historicalTotal = pricing.eventTimeHistoricalTotalUsdExact
-    ? t("dashboard.priceEpoch.historicalTotal", {
-      amount: pricing.eventTimeHistoricalTotalUsdExact,
-    })
-    : t("dashboard.priceEpoch.noHistoricalTotal");
-  copy.textContent = t("dashboard.priceEpoch.verified", {
-    registryVersion,
-    reviewedAt,
-    julyThirtyPricing,
-    mixedWindows,
-    historicalTotal,
-    rebuiltAt,
-  });
 }
 
 /**
@@ -3713,14 +3832,14 @@ function allowanceHistoryDateTicks(points, maximum = 4) {
   if (!Number.isFinite(first) || !Number.isFinite(last)) return Object.freeze([]);
   if (last <= first) {
     return Object.freeze([
-      Object.freeze({ at: first, label: shareCardDateLabel(first), alignment: "middle" }),
+      Object.freeze({ at: first, label: formatChartTimeLabel(first, { dateOnly: true }), alignment: "middle" }),
     ]);
   }
   return Object.freeze(Array.from({ length: maximum }, (_, index) => {
     const at = first + (last - first) * index / (maximum - 1);
     return Object.freeze({
       at,
-      label: shareCardDateLabel(at),
+      label: formatChartTimeLabel(at, { dateOnly: true }),
       alignment: index === 0 ? "start" : index === maximum - 1 ? "end" : "middle",
     });
   }));
@@ -3744,7 +3863,8 @@ function renderAllowanceHistoryChart(history) {
         className: "chart-point-weekly-mature",
         label: `Observed across ${activeWeeklyMinimumObservedSpanPp}+ points`,
         connect: false,
-        markers: true,
+        markers: false,
+        hitTargets: true,
         format: (value) => formatMoney(value),
         detail: (point) => `${formatPp(point.observedSpanPp)} observed · measured range ${formatMoney(point.low)}–${formatMoney(point.high)}`,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
@@ -3754,7 +3874,8 @@ function renderAllowanceHistoryChart(history) {
         className: "chart-point-weekly-partial",
         label: "Short observation",
         connect: false,
-        markers: true,
+        markers: false,
+        hitTargets: true,
         format: (value) => formatMoney(value),
         detail: (point) => `${formatPp(point.observedSpanPp)} observed · measured range ${formatMoney(point.low)}–${formatMoney(point.high)}`,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
@@ -3782,8 +3903,7 @@ function renderAllowanceHistoryChart(history) {
     yTickFormat: (value, digits) => formatMoney(value, digits),
     yLabel: "7-day allowance ($)",
     title: "Seven-day allowance estimate history",
-    description: `One dot per distinct seven-day reset estimate. Visible dots meet the selected minimum observed quota span of ${activeWeeklyMinimumObservedSpanPp} percentage points. Each vertical bar is that reset's measured range. Times are shown in ${formatTimeZoneLabel()}.`,
-    xLabel: "Reset estimate date",
+    description: `Each reset estimate meets the selected minimum observed quota span of ${activeWeeklyMinimumObservedSpanPp} percentage points. Measured ranges remain available on hover and focus.`,
   });
 }
 
@@ -4034,10 +4154,9 @@ function renderWeeklyPaceForecast(data) {
       node("div", "weekly-pace-forecast-metric"),
     );
     const item = metrics.lastElementChild;
-    const digits = percentagePointsPerHour >= 10 ? 1 : 2;
     item.append(
       node("span", "", "Recent pace"),
-      node("strong", "", `${percentagePointsPerHour.toFixed(digits)} pp/hour`),
+      node("strong", "", `${formatDecimal(percentagePointsPerHour, 1)} pp/hour`),
     );
   }
 
@@ -4066,7 +4185,6 @@ function renderWeeklyPaceForecast(data) {
 }
 
 function renderWeekly(data) {
-  renderWeeklyPricingReceipt(data);
   renderWeeklyPaceForecast(data);
   const summary = data.weekly.summary ?? {};
   const estimate = finite(summary.median_weekly_value_usd ?? summary.medianWeeklyValueUsd);
@@ -4183,7 +4301,7 @@ function syncAccountingPeriodControls(data) {
 function renderAccountingDimension(containerSelector, dimension, {
   emptyMessage = "No observations in this period.",
   unknownLabel = "Not recorded",
-  eventNoun = "usage increments",
+  eventNoun = "usage changes",
   labels = {}
 } = {}) {
   const container = $(containerSelector);
@@ -4276,7 +4394,6 @@ function renderAccounting(data) {
   const pricedEvents = finite(accounting.pricingCoverage?.fullyPricedEvents, 0)
     + finite(accounting.pricingCoverage?.partiallyPricedEvents, 0);
   const unpricedEvents = finite(accounting.pricingCoverage?.unpricedEvents, 0);
-  const unknownModelEvents = finite(accounting.unknownModelEvents, 0);
   const evidenceStartDate = /^\d{4}-\d{2}-\d{2}$/u.test(
     accounting.evidenceStartDate ?? "",
   ) ? accounting.evidenceStartDate : null;
@@ -4287,15 +4404,16 @@ function renderAccounting(data) {
       || (periodDays !== null
         && Date.now() - periodDays * 24 * 60 * 60 * 1000
           < Date.parse(`${evidenceStartDate}T00:00:00.000Z`)));
-  const hasPreEvidenceUnpricedEvents = selectedPeriodCanPrecedeEvidence
-    && unpricedEvents > unknownModelEvents;
+  const historyCoverage = accounting.historyCoverage;
+  const historicalCoverageWarning = accounting.periodId === "30d"
+    && (selectedPeriodCanPrecedeEvidence || historyCoverage?.status === "partial");
+  const historicalCoverageDate = evidenceStartDate
+    ?? historyCoverage?.coveredAt?.startAt
+    ?? "";
   const coveragePercent = accounting.events === 0
     ? null
     : pricedEvents / accounting.events * 100;
-  const coverageDigits = coveragePercent !== null
-      && coveragePercent > 99 && coveragePercent < 100
-    ? 3
-    : 1;
+  const coverageDigits = 1;
   const fastMode = accounting.fastMode;
   const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
   for (const [label, explanation, value, note] of [
@@ -4308,24 +4426,28 @@ function renderAccounting(data) {
         : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
     ],
     [
-      "Tokens measured",
-      "The tokens attached to those measured changes during the selected time period.",
+      "Tokens",
+      "The tokens attached to those usage changes during the selected time period.",
       compact(accounting.totalTokens),
       accounting.periodLabel
     ],
     [
       "Price coverage",
-      "The share of measured changes with a known public API price. Unknown prices are left out rather than guessed.",
+      "The share of usage changes with a reviewed public API price. The provenance note below explains any historical coverage boundary.",
       coveragePercent === null
         ? "—"
         : formatPercent(coveragePercent, coverageDigits),
-      hasPreEvidenceUnpricedEvents
-        ? t("accounting.pricing.evidenceStarts", {
-          date: formatLocal(`${evidenceStartDate}T12:00:00.000Z`, { dateOnly: true }),
+      historicalCoverageWarning
+        ? t("accounting.pricing.thirtyDayCoverageWarning", {
+          date: historicalCoverageDate
+            ? ` on ${formatLocal(historicalCoverageDate, { dateOnly: true })}`
+            : t("format.unknown"),
         })
         : unpricedEvents > 0
-          ? `${compact(unpricedEvents)} measured event${unpricedEvents === 1 ? "" : "s"} left unpriced`
-        : "All measured events have a reviewed price"
+          ? t("accounting.pricing.partialCoverage", {
+            percent: formatPercent(coveragePercent, coverageDigits),
+          })
+          : t("accounting.pricing.coverageReviewed")
     ]
   ]) {
     const card = node("article", "metric-card compact-metric");
@@ -4353,7 +4475,6 @@ function renderAccounting(data) {
     .map(([key, value]) => ({
       key,
       tokens: finite(value?.tokens, 0),
-      unpricedTokens: finite(value?.unpricedTokens, 0),
       costUsd: finite(value?.costUsd, 0)
     }))
     .filter((row) => row.tokens > 0 || row.costUsd > 0)
@@ -4363,12 +4484,8 @@ function renderAccounting(data) {
     valueFor: (row) => row.costUsd,
     displayValue: (row) => row.costUsd > 0
       ? formatApiMoney(row.costUsd)
-      : "Unpriced",
-    titleFor: (row) => {
-      const parts = [`${compact(row.tokens)} tokens`];
-      if (row.unpricedTokens > 0) parts.push(`${compact(row.unpricedTokens)} unpriced`);
-      return parts.join(" · ");
-    }
+      : "—",
+    titleFor: (row) => `${compact(row.tokens)} tokens`,
   });
 
   const models = $("#accounting-models");
@@ -4384,13 +4501,9 @@ function renderAccounting(data) {
   } else {
     for (const model of modelRows) {
       const row = node("tr");
-      const isUnpriced = model.pricingStatus !== "priced"
-        || finite(model.pricingCoverage?.unpricedEvents, 0) > 0;
       const modelLabel = model.model === "unknown"
         ? "Unrecognized model"
-        : model.pricingStatus === "known_unpriced"
-          ? `${model.model} (price unavailable)`
-          : model.model;
+        : model.model;
       row.append(
         node("td", "", modelLabel),
         node("td", "", compact(model.events)),
@@ -4398,7 +4511,7 @@ function renderAccounting(data) {
         node(
           "td",
           "",
-          isUnpriced && finite(model.apiPriceEquivalentUsd, 0) === 0
+          finite(model.apiPriceEquivalentUsd, 0) === 0
             ? "—"
             : formatApiMoney(model.apiPriceEquivalentUsd)
         )
@@ -4515,306 +4628,12 @@ async function selectFastModePreference(mode) {
   }
 }
 
-function renderReports(data) {
-  const container = $("#report-links");
-  clear(container);
-  if (!data.reports.length) {
-    container.append(node("span", "empty-inline", "No reports advertised by the local companion."));
-    return;
-  }
-  for (const report of data.reports) {
-    if (data.mode === "demo") {
-      container.append(node("span", "report-link", `${report.title} · demo only`));
-      continue;
-    }
-    const link = node("a", "report-link", report.title);
-    link.href = report.href;
-    link.target = "_blank";
-    link.rel = "noopener";
-    container.append(link);
-  }
-}
-
-function renderCollector(data) {
-  const collector = data.collector ?? {};
-  const state = $("#collector-state");
-  state.textContent = data.state === "live"
-    ? "Current"
-    : data.state === "offline" && data.mode !== "demo"
-      ? "Ready to analyze"
-      : humanize(data.state);
-  state.className = `evidence-chip ${data.state === "live" ? "" : "neutral"}`;
-  const rows = [
-    ["Last analysis", formatLocal(collector.lastScanAt ?? data.activity?.lastScanAt ?? data.freshness.latestObservedAt)],
-    ["Safe records", compact(collector.safeRecordCount ?? data.activity?.safeRecordCount ?? data.activity?.recordCount)],
-    ["Covered from", collector.coveredAt?.startAt ? formatLocal(collector.coveredAt.startAt) : "Unavailable"],
-    ["Covered through", collector.coveredAt?.endAt ? formatLocal(collector.coveredAt.endAt) : "Unavailable"],
-    ["Contribution through", collector.exportableCoveredAt?.endAt
-      ? formatLocal(collector.exportableCoveredAt.endAt)
-      : "No rollout usage available"],
-    ["Usage / quota rows", `${compact(collector.recordCounts?.usage)} / ${compact(collector.recordCounts?.quota)}`],
-    ["Analysis state", humanize(collector.indexingState || "Unavailable")],
-    ["Source bytes", "Not exposed to browser"],
-    ["Identity", collector.identityMode ?? "Pseudonymous"]
-  ];
-  const dl = $("#collector-details");
-  clear(dl);
-  for (const [term, value] of rows) {
-    const wrapper = node("div");
-    wrapper.append(node("dt", "", term), node("dd", "", value));
-    dl.append(wrapper);
-  }
-  renderIndexProgress(collector.indexing ?? null, {
-    status: collector.indexing?.status ?? collector.indexingState
-  });
-}
-
-function renderIndexProgress(progress, { status = "" } = {}) {
-  const container = $("#index-progress");
-  if (!container) return;
-  if (!progress || typeof progress !== "object") {
-    container.hidden = true;
-    return;
-  }
-  const allowedPhases = new Set([
-    "starting",
-    "discovering",
-    "rollout_index",
-    "quick_result",
-    "quota_refresh",
-    "reloading",
-    "complete",
-    "paused",
-    "prospective",
-    "failed"
-  ]);
-  const phase = allowedPhases.has(progress.phase) ? progress.phase : "rollout_index";
-  const filesSelected = Number.isSafeInteger(progress.filesSelected)
-    && progress.filesSelected >= 0 ? progress.filesSelected : null;
-  const filesProcessed = Number.isSafeInteger(progress.filesProcessed)
-    && progress.filesProcessed >= 0 ? progress.filesProcessed : 0;
-  const filesComplete = filesSelected !== null
-    && filesSelected > 0
-    && filesProcessed >= filesSelected;
-  const recordsWritten = Number.isSafeInteger(progress.recordsWritten)
-    && progress.recordsWritten >= 0 ? progress.recordsWritten : 0;
-  const startAt = Number.isFinite(Date.parse(progress.coveredAt?.startAt))
-    ? progress.coveredAt.startAt : "";
-  const endAt = Number.isFinite(Date.parse(progress.coveredAt?.endAt))
-    ? progress.coveredAt.endAt : "";
-  const bar = $("#index-progress-bar");
-  if (filesSelected !== null && filesSelected > 0) {
-    bar.max = filesSelected;
-    bar.value = Math.min(filesProcessed, filesSelected);
-  } else {
-    bar.max = 1;
-    bar.removeAttribute("value");
-  }
-  $("#index-progress-title").textContent =
-    status === "cancelled"
-      ? "Local analysis cancelled"
-      : status === "cancelling"
-        ? "Stopping at a safe checkpoint"
-      : phase === "quick_result"
-        ? "Headline results are ready"
-      : status === "recent_7d_complete"
-      ? "Recent local history indexed"
-      : status === "recent_7d_partial"
-        ? "Useful recent history indexed"
-      : status === "prospective_only"
-        ? "Collecting new activity prospectively"
-        : status === "bounded_pause"
-          ? "Recent history analysis paused"
-          : filesComplete && status === "running"
-            ? "Calculating usage and allowance"
-          : "Analyzing recent local history";
-  $("#index-progress-phase").textContent = humanize(
-    status === "cancelled"
-      ? "cancelled"
-      : status === "cancelling"
-        ? "cancelling"
-      : phase === "quick_result"
-        ? "deeper accounting"
-      : status === "recent_7d_complete"
-      ? "complete"
-      : filesComplete && status === "running"
-        ? "finalizing"
-        : phase
-  );
-  $("#index-progress-summary").textContent = status === "cancelled"
-    ? "The analysis stopped without replacing verified existing results. Run it again whenever convenient."
-    : status === "cancelling"
-      ? "TiboTattle is finishing its current atomic step and preserving a resumable checkpoint."
-    : phase === "quick_result"
-      ? "Your headline local result is available. Deeper replay-safe cost accounting and weekly calibration are still finishing."
-    : status === "prospective_only"
-    ? `${compact(recordsWritten)} safe records retained since local collection began. Older activity was not retroactively indexed for this existing checkpoint.`
-    : status === "recent_7d_partial"
-      ? `${compact(recordsWritten)} safe records retained from a bounded recent tail. The analysis completed safely, but cannot prove it reached the entire requested seven-day window.`
-      : filesSelected === null
-        ? `${compact(recordsWritten)} safe records retained; discovering bounded recent rollouts.`
-        : filesComplete && status === "running"
-          ? `${compact(filesProcessed)} bounded rollout files are indexed. Replaying safe token increments, quota transitions, and the seven-day calibration now.`
-          : `${compact(filesProcessed)} of ${compact(filesSelected)} bounded rollout files processed · ${compact(recordsWritten)} safe records retained.`;
-  $("#index-progress-coverage").textContent = startAt && endAt
-    ? `Content-free evidence currently covers ${formatLocal(startAt)} through ${formatLocal(endAt)}. Raw content and source paths never enter this page.`
-    : "Raw log contents and source paths never enter this page.";
-  container.hidden = false;
-}
-
-function renderAutomaticContributionStatus(status) {
-  const value = status ?? {
-    state: "unavailable",
-    enabled: false,
-    consentCurrent: false,
-    firstReviewComplete: false,
-    firstReviewedAcceptedAt: "",
-    requiredConsent: null,
-    lastAttemptAt: "",
-    lastSuccessAt: "",
-    nextAttemptAt: "",
-    lastOutcome: null
-  };
-  automaticContributionStatus = value;
-  const awaitingReviewedSend = Boolean(
-    pendingAutomaticContributionConsent && !value.enabled
-  );
-  const labels = {
-    unavailable: "Unavailable",
-    not_configured: "Not configured",
-    disabled: "Off",
-    first_review_required: "First review needed",
-    consent_required: "Consent needed",
-    scheduled: "On",
-    running: "Running now",
-    paused: "Paused",
-    failed: "Needs attention"
-  };
-  const chip = $("#automatic-contribution-state");
-  chip.textContent = awaitingReviewedSend
-    ? "Review first send"
-    : labels[value.state] ?? "Unavailable";
-  chip.className = ["scheduled", "running"].includes(value.state)
-    ? "evidence-chip"
-    : value.state === "failed"
-      ? "evidence-chip error"
-      : "evidence-chip neutral";
-
-  const next = value.nextAttemptAt
-    ? ` Next check ${formatLocal(value.nextAttemptAt)}.`
-    : "";
-  const last = value.lastSuccessAt
-    ? ` Last contribution ${formatLocal(value.lastSuccessAt)}.`
-    : "";
-  const outcome = value.lastOutcome?.status === "failed"
-    ? ` The last attempt needs attention (${value.lastOutcome.code.replaceAll("_", " ")}).`
-    : "";
-  const pausedDescriptions = {
-    queue_paused:
-      `Automatic contribution is stopped because the local queue is paused. No automatic retry is scheduled; inspect and resume the queue before continuing.${last}`,
-    run_timeout:
-      `Automatic contribution stopped after its five-minute abort deadline. No retry is scheduled; turn it off, inspect local status, and explicitly enable it again.${last}`,
-    identity_unavailable:
-      `Automatic contribution stopped because its local pseudonymous identity is unavailable. Nothing more is scheduled until the local identity is repaired and you explicitly enable it again.${last}`,
-    privacy_verification_failed:
-      `Automatic contribution stopped because the privacy verification failed. Nothing was inferred or retried; inspect the local result before explicitly enabling it again.${last}`,
-    delivery_rejected:
-      `Automatic contribution stopped because the service rejected part of the exact prepared set. No retry is scheduled; inspect the contribution status before explicitly enabling it again.${last}`,
-    preparation_failed:
-      `Automatic contribution stopped because local preparation or maintenance failed. No retry is scheduled; inspect local status before explicitly enabling it again.${last}`,
-    upload_failed:
-      `Automatic contribution stopped because delivery failed without a safe retry signal. No retry is scheduled; inspect local status before explicitly enabling it again.${last}`
-  };
-  const pausedDescription = pausedDescriptions[value.lastOutcome?.code]
-    ?? `Automatic contribution is stopped and no retry is scheduled. Inspect the bounded last outcome before explicitly enabling it again.${last}${outcome}`;
-  const descriptions = {
-    unavailable:
-      "Automatic contribution is unavailable in this app build. You can still prepare and send a reviewed contribution.",
-    not_configured:
-      "The contribution service is not configured in this app build. Nothing will be sent.",
-    disabled:
-      "Off until you explicitly consent. No daemon or login item is installed; checks run only while TiboTattle is open.",
-    first_review_required:
-      "Automatic contribution is off. Consent, inspect, and send one exact reviewed contribution before a recurring schedule can be enabled.",
-    consent_required:
-      "The metadata contract or destination changed. Review the current disclosure and consent again before anything is scheduled.",
-    scheduled:
-      `On. TiboTattle checks for new content-free pseudonymous metadata every 6 hours while the app is open.${last}${next}${outcome}`,
-    running:
-      `A bounded foreground contribution check is running now.${last}${next}`,
-    paused: pausedDescription,
-    failed:
-      `Automatic contribution has stopped because its local settings are unavailable. No retry is scheduled; repair the local app state, then review the current consent before turning it on again.${last}${outcome}`
-  };
-  $("#automatic-contribution-status").hidden = !value.enabled;
-  $("#automatic-contribution-description").textContent = awaitingReviewedSend
-    ? "Consent is held only in this open tab. Automatic contribution remains off until your exact reviewed first send is accepted."
-    : descriptions[value.state] ?? descriptions.unavailable;
-
-  const toggle = $("#automatic-contribution-toggle");
-  toggle.hidden = !value.enabled;
-  toggle.disabled = automaticContributionBusy;
-  toggle.textContent = automaticContributionBusy
-    ? "Turning off…"
-    : "Turn off automatic contribution";
-  $("#contribution-not-now").hidden = value.enabled;
-  updateCommunityConnectButton();
-}
-
-async function refreshAutomaticContributionStatus() {
-  const status = await localClient.automaticContributionStatus();
-  renderAutomaticContributionStatus(status);
-  return status;
-}
-
 function renderContributionSyncStatus(status) {
   const value = status ?? {
     state: "unavailable",
     paused: null,
-    counts: {
-      pending: 0,
-      inFlight: 0,
-      accepted: 0,
-      retryable: 0,
-      rejected: 0
-    },
-    nextAttemptAt: "",
-    lastAcceptedAt: ""
+    counts: {},
   };
-  const labels = {
-    unavailable: "Queue unavailable",
-    paused: "Queue paused",
-    attention: "Needs attention",
-    active: "Delivery active",
-    idle: "Up to date",
-    empty: "Nothing queued"
-  };
-  const chip = $("#sync-state");
-  chip.textContent = labels[value.state] ?? "Queue unavailable";
-  chip.className = ["active", "idle"].includes(value.state)
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  const counts = value.counts;
-  $("#sync-waiting").textContent = compact(counts.pending + counts.retryable);
-  $("#sync-in-flight").textContent = compact(counts.inFlight);
-  $("#sync-accepted").textContent = compact(counts.accepted);
-  $("#sync-attention").textContent = compact(counts.retryable + counts.rejected);
-  $("#sync-next-attempt").textContent = value.nextAttemptAt
-    ? formatLocal(value.nextAttemptAt)
-    : "None scheduled";
-  $("#sync-last-accepted").textContent = value.lastAcceptedAt
-    ? formatLocal(value.lastAcceptedAt)
-    : "No accepted batch yet";
-  const descriptions = {
-    unavailable: "No verified local queue state is available. Nothing about a file, path, identity, origin, or credential is inferred.",
-    paused: "Delivery is paused locally. Prepared batches remain content-free and will not be sent until you explicitly resume.",
-    attention: "At least one batch is waiting for a retry or was rejected. Use the local status command for bounded counts; it does not print paths or identifiers.",
-    active: "Committed privacy-safe batches are waiting, retrying, or currently leased to the foreground sender.",
-    idle: "Every discovered committed batch has been accepted or replayed, and no retry is due.",
-    empty: "No committed privacy-safe prepared set has entered this queue yet."
-  };
-  $("#sync-description").textContent = descriptions[value.state]
-    ?? descriptions.unavailable;
   contributionSyncStatus = value;
   updateContributionSyncButtons();
 }
@@ -4826,6 +4645,10 @@ function renderContributionSyncPreview(preview) {
     item: null
   };
   contributionSyncPreview = value;
+  if (!$("#sync-next-state")) {
+    updateContributionSyncButtons();
+    return;
+  }
   const labels = {
     ready: "Ready",
     retry_wait: "Waiting to retry",
@@ -4857,8 +4680,10 @@ function renderContributionSyncPreview(preview) {
     `${formatLocal(item.coveredAt.startAt)} – ${formatLocal(item.coveredAt.endAt)}`;
   $("#sync-next-records").textContent =
     `${compact(item.recordCounts.total)} total · ${compact(item.recordCounts.usageEvents)} usage · ${compact(item.recordCounts.quotaSnapshots)} quota`;
-  $("#sync-next-cost").textContent =
-    `${item.accounting.estimatedApiCostUsd === null ? "Unpriced" : `$${item.accounting.estimatedApiCostUsd}`} · ${item.accounting.pricedEventCoveragePercent}% priced`;
+ $("#sync-next-cost").textContent =
+    `${item.accounting.estimatedApiCostUsd === null ? "No estimate" : formatApiMoney(Number(item.accounting.estimatedApiCostUsd))} · ${t("accounting.pricing.coverageShort", {
+      percent: formatPercent(item.accounting.pricedEventCoveragePercent, 1),
+    })}`;
   $("#sync-next-bytes").textContent =
     `${compact(item.reservedUploadBytes)} bytes reserved (${compact(item.preparedBytes)} prepared)`;
   updateContributionSyncButtons();
@@ -4867,36 +4692,21 @@ function renderContributionSyncPreview(preview) {
 function updateContributionSyncButtons() {
   const available = contributionSyncPreview?.status === "available";
   const paused = contributionSyncStatus?.paused === true;
-  const disconnect = $("#sync-disconnect-device");
-  const disconnectAvailable =
-    localCompanionHealth?.capabilities?.contributionDeviceDisconnect === true;
-  $("#sync-inspect").disabled = contributionSyncBusy;
-  $("#sync-run-once").disabled = contributionSyncBusy
+  const inspect = $("#sync-inspect");
+  const send = $("#sync-run-once");
+  if (!inspect || !send) return;
+  inspect.disabled = contributionSyncBusy;
+  send.disabled = contributionSyncBusy
     || !available
     || contributionSyncPreview?.deliveryConfigured !== true
     || contributionSyncPreview?.state !== "ready"
     || contributionSyncExactReview?.state !== "ready"
     || paused;
-  $("#sync-pause").disabled = contributionSyncBusy
-    || !available
-    || contributionSyncStatus?.state === "unavailable"
-    || paused;
-  $("#sync-resume").disabled = contributionSyncBusy
-    || !available
-    || contributionSyncStatus?.state === "unavailable"
-    || !paused;
-  // This is intentionally not inferred from pairing or queue state. A
-  // service may support pairing but not the authenticated, two-sided revoke
-  // transaction; hiding the control is safer than suggesting a local-only
-  // action stopped remote uploads.
-  disconnect.hidden = !disconnectAvailable;
-  disconnect.disabled = contributionSyncBusy
-    || communityConnectBusy
-    || !disconnectAvailable;
 }
 
 function showContributionSyncAction(message, error = false) {
   const status = $("#sync-action-status");
+  if (!status) return;
   status.hidden = false;
   status.textContent = message;
   status.classList.toggle("error", error);
@@ -4922,8 +4732,6 @@ function contributionSyncPassResult(result) {
 
 function clearContributionSyncExactReview() {
   contributionSyncExactReview = null;
-  $("#sync-exact-review").hidden = true;
-  $("#sync-exact-review-json").textContent = "";
 }
 
 function renderContributionSyncExactReview(value) {
@@ -4948,10 +4756,6 @@ function renderContributionSyncExactReview(value) {
     payloadBytes: value.payloadBytes,
     reviewToken: value.reviewToken,
   };
-  setRawText($("#sync-exact-review-json"), JSON.stringify(value.payload, null, 2));
-  $("#sync-exact-review-state").textContent =
-    `Verified · ${compact(value.payloadBytes)} bytes`;
-  $("#sync-exact-review").hidden = false;
 }
 
 async function refreshContributionSyncControls() {
@@ -4959,25 +4763,18 @@ async function refreshContributionSyncControls() {
   // Preview discovery commits newly prepared sets to the queue. Read queue
   // status afterwards so the two cards describe the same durable state.
   const preview = await localClient.contributionSyncPreview();
-  const [status, automatic] = await Promise.all([
-    localClient.contributionSyncStatus(),
-    localClient.automaticContributionStatus()
-  ]);
+  const status = await localClient.contributionSyncStatus();
   renderContributionSyncStatus(status);
   renderContributionSyncPreview(preview);
-  renderAutomaticContributionStatus(automatic);
 }
 
 async function runContributionSyncAction(action) {
+  if (action !== "run") return;
   if (contributionSyncBusy) return;
   contributionSyncBusy = true;
   let acceptedContribution = false;
   updateContributionSyncButtons();
-  showContributionSyncAction(
-    action === "run"
-      ? "Running one bounded foreground pass…"
-      : action === "pause" ? "Pausing local delivery…" : "Resuming local delivery…"
-  );
+  showContributionSyncAction("Running one bounded foreground pass…");
   try {
     if (action === "run") {
       if (contributionSyncExactReview?.state !== "ready") {
@@ -4992,19 +4789,10 @@ async function runContributionSyncAction(action) {
         && Number.isSafeInteger(result.accepted)
         && result.accepted > 0;
       showContributionSyncAction(outcome.message, outcome.needsAttention);
-    } else {
-      const status = await localClient.setContributionSyncPaused(action === "pause");
-      if (status.state === "unavailable") throw new Error("control unavailable");
-      showContributionSyncAction(
-        action === "pause" ? "Local delivery is paused." : "Local delivery is resumed."
-      );
     }
     await refreshContributionSyncControls();
     if (acceptedContribution) await loadCommunityResults();
   } catch (error) {
-    // A leftover device credential stops delivery for a precisely known local
-    // reason with its own repair, so it is answered where the user can act on
-    // it rather than folded into the generic queue message.
     if (contributionDeviceRecoveryIsRequired(error)) {
       await renderContributionDeviceRecovery($("#community-connect-status"), {
         error
@@ -5029,7 +4817,7 @@ async function runContributionSyncAction(action) {
 
 async function inspectNextContribution() {
   contributionSyncBusy = true;
-  $(".sync-status-panel").open = true;
+  $("#community-contribution-disclosure")?.setAttribute("open", "");
   updateContributionSyncButtons();
   showContributionSyncAction(
     "Inspecting content-free pseudonymous metadata through loopback; no service request or upload is performed."
@@ -5038,9 +4826,8 @@ async function inspectNextContribution() {
     await refreshContributionSyncControls();
     const review = await localClient.contributionSyncExactReview();
     renderContributionSyncExactReview(review);
-    $("#sync-exact-review").open = false;
     showContributionSyncAction(
-      "Review the concise coverage and record totals above. Expand the exact JSON if wanted, then confirm the first send."
+      "Review the concise coverage and record totals above, then confirm the send."
     );
   } catch {
     showContributionSyncAction(
@@ -5058,35 +4845,6 @@ async function inspectNextContribution() {
  * contribution account/session remains intact: sign-out and metadata deletion
  * are separate controls with their own explicit confirmation.
  */
-async function disconnectThisMacContributionDevice() {
-  if (contributionSyncBusy || communityConnectBusy) return;
-  if (!window.confirm(t("contribution.disconnectConfirmation"))) return;
-  contributionSyncBusy = true;
-  updateContributionSyncButtons();
-  showContributionSyncAction(t("contribution.disconnectStopping"));
-  try {
-    const result = await localClient.disconnectContributionDevice();
-    if (result.status !== "disconnected"
-        || result.deliveryPaused !== true
-        || !["deleted", "already_missing"].includes(result.localCredential)
-        || result.localBinding !== "removed") {
-      throw new Error("The local companion did not confirm this Mac was disconnected.");
-    }
-    clearContributionSyncExactReview();
-    await refreshContributionSyncControls();
-    showContributionSyncAction(t("contribution.disconnectCompleted"));
-  } catch (error) {
-    showContributionSyncAction((await describeFailure({
-      surface: "contribution_send",
-      error,
-      fallback: t("contribution.disconnectFailed")
-    })).text, true);
-  } finally {
-    contributionSyncBusy = false;
-    updateContributionSyncButtons();
-  }
-}
-
 async function loadLocalDashboard() {
   const previousBusy = localActionBusy;
   localActionBusy = true;
@@ -5095,12 +4853,11 @@ async function loadLocalDashboard() {
   updateLocalActionButtons();
   try {
     const syncState = (async () => {
-      const [preview, status, automatic] = await Promise.all([
+      const [preview, status] = await Promise.all([
         localClient.contributionSyncPreview().catch(() => null),
-        localClient.contributionSyncStatus().catch(() => null),
-        localClient.automaticContributionStatus().catch(() => null)
+        localClient.contributionSyncStatus().catch(() => null)
       ]);
-      return { preview, status, automatic };
+      return { preview, status };
     })();
     const loadDashboardData = async () => {
       try {
@@ -5131,30 +4888,21 @@ async function loadLocalDashboard() {
     renderPreparationIdentity(localHealth);
     renderContributionSyncStatus(sync.status);
     renderContributionSyncPreview(sync.preview);
-    renderAutomaticContributionStatus(sync.automatic);
     renderLocalOnboarding(onboarding);
   } catch {
-    const [localHealth, backendHealth, onboarding] = await Promise.all([
+    const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),
-      communityClient.health().catch(() => null),
       localClient.onboarding().catch(() => null),
     ]);
     localCompanionHealth = localHealth;
-    renderHostedIdentity();
-    const backendOnly = localHealth === null
-      && backendHealth?.checks?.database === "ok";
     dashboard = null;
+    renderHostedIdentity();
     renderContributionSyncStatus(null);
     renderContributionSyncPreview(null);
-    renderAutomaticContributionStatus(null);
     renderPreparationIdentity(null);
     renderLocalOnboarding(onboarding);
     renderDashboardUnavailableState(
-      backendOnly
-        ? "backend-only"
-        : localHealth
-          ? "dashboard-unavailable"
-          : "companion-unavailable",
+      localHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
   } finally {
     localActionBusy = previousBusy;
@@ -5164,6 +4912,7 @@ async function loadLocalDashboard() {
 
 function renderPreparationIdentity(health) {
   const chip = $("#preparation-identity");
+  if (!chip) return;
   const mode = health?.capabilities?.contributionPreparationIdentityMode;
   const labels = {
     production_keychain: "Keychain checked on prepare",
@@ -5237,13 +4986,6 @@ async function requestRefresh() {
   button.textContent = "Starting local analysis…";
   updateLocalActionButtons();
   setGlobalState("updating");
-  renderIndexProgress({
-    phase: "starting",
-    filesSelected: null,
-    filesProcessed: 0,
-    recordsWritten: 0,
-    coveredAt: { startAt: "", endAt: "" }
-  }, { status: "running" });
   try {
     await localClient.refresh();
     refreshAccepted = true;
@@ -5276,9 +5018,6 @@ async function requestRefresh() {
       if (archiveScanning && !archiveHistoryScanActive) {
         archiveHistoryScanActive = true;
         if (dashboard) renderPricing(dashboard);
-      }
-      if (progress && !archiveScanning) {
-        renderIndexProgress(progress, { status: outcome });
       }
       if (progress?.phase === "quick_result" && !quickResultLoaded) {
         try {
@@ -5514,11 +5253,6 @@ function hostedIdentityErrorCopy(error) {
   return fixedCopy(HOSTED_IDENTITY_ERROR_COPY, error?.code);
 }
 
-// One precisely known local fault: this Mac still holds a contribution-device
-// secret in its Keychain, but the local record that pairs that secret with the
-// service is gone — typically a leftover from an earlier install. It cannot be
-// read or replaced in that state. Nothing about the invitation, the network,
-// or the service is wrong, so the copy must not send the user to look at them.
 const CONTRIBUTION_DEVICE_CONFLICT_COPY =
   "This Mac still holds a contribution-device credential from an earlier install, and the local record that paired it is gone, so it cannot be used or replaced. Nothing was uploaded and nothing was changed. Clear the leftover credential below, then connect again.";
 
@@ -5564,7 +5298,7 @@ const SERVICE_ERROR_COPY = {
   PARTICIPANT_DELETING:
     "A deletion is still running for this participant. Wait for it to finish, then try again. Nothing was uploaded.",
   DEVICE_AUTH_INVALID:
-    "The contribution service did not accept this Mac's upload device. Reset this Mac's device credential below, then connect again. Nothing was uploaded.",
+    "The contribution service did not accept this Mac's upload device. Nothing was uploaded; review the contribution again before retrying.",
   DEVICE_NOT_FOUND:
     "The contribution service has no record of this Mac as an upload device. Connect this Mac again. Nothing was uploaded.",
   PAIRING_AUTH_INVALID:
@@ -5608,8 +5342,6 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The contribution service returned an unexpected response. Nothing was uploaded; try again shortly.",
   central_participant_response_too_large:
     "The contribution service returned more data than TiboTattle accepts for a connection. Nothing was uploaded; try again shortly.",
-  contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
-  contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_pairing_not_authorized:
     "The local companion refused this pairing request because it did not come from the local dashboard. Nothing was uploaded; reload TiboTattle and try again.",
   contribution_device_pairing_response_invalid:
@@ -5618,6 +5350,8 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "This build is not configured to connect to a contribution service, so there is nothing to pair with. Local reporting is unaffected.",
   contribution_device_pairing_failed:
     "The contribution service did not complete device pairing. Nothing was uploaded; try again shortly.",
+  contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
+  contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -5626,26 +5360,6 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The local companion could not read this request. Nothing was uploaded; reload TiboTattle and try again.",
   invalid_request:
     "The local companion could not validate this request. Nothing was uploaded; reload TiboTattle and try again.",
-  contribution_device_disconnect_not_configured:
-    "This build is not configured to stop this Mac's contribution connection. Its local credential was not changed.",
-  contribution_device_disconnect_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. This Mac remains connected.",
-  contribution_device_disconnect_cleanup_pending:
-    "The service stopped this Mac, but its local credential still needs to be cleared. Retry Disconnect this Mac; retrying is safe.",
-  contribution_device_disconnect_failed:
-    "TiboTattle could not confirm that this Mac was disconnected. Its local credential was not changed; retrying is safe.",
-  automatic_contribution_first_review_required:
-    "One contribution must be reviewed and accepted before automatic contribution can be armed. Nothing repeats until then.",
-  automatic_contribution_not_configured:
-    "This build has no contribution service configured, so automatic contribution cannot be armed.",
-  automatic_contribution_consent_binding_mismatch:
-    "The stored consent no longer matches the contract this build would send. Reload the local dashboard and consent again; nothing repeats until then.",
-  automatic_contribution_settings_unavailable:
-    "The local companion could not read or write the automatic-contribution setting. No setting was inferred.",
-  device_credential_reset_failed:
-    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service.",
-  device_credential_reset_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was deleted.",
   review_expired_or_changed:
     "The reviewed contribution changed or the review expired before sending. Nothing was uploaded; review it again.",
   sync_in_progress:
@@ -5854,7 +5568,7 @@ async function signOutHostedIdentity() {
     if (hadServerSession) await communityClient.logout();
     hostedIdentity = null;
     setCommunitySession(null);
-    $("#participant-controls").hidden = true;
+    $("#participant-controls")?.setAttribute("hidden", "");
     status.textContent = hadServerSession
       ? t("contribution.signOutCompleted")
       : t("contribution.signOutUnfinished");
@@ -6118,10 +5832,6 @@ function updateCommunityConnectButton() {
   }
 }
 
-// The local capability layer raises contribution_device_credential_conflict;
-// the companion projects it onto contribution_device_recovery_required at its
-// HTTP boundary. Both name the same leftover credential, so both take the same
-// honest explanation and the same in-page repair.
 function contributionDeviceRecoveryIsRequired(error) {
   try {
     return error?.code === "contribution_device_recovery_required"
@@ -6131,13 +5841,6 @@ function contributionDeviceRecoveryIsRequired(error) {
   }
 }
 
-/**
- * Explain the leftover-credential fault and offer the one action that fixes it.
- *
- * This replaces a generic "check the service and Keychain" message with the
- * actual cause, and is the only place the reset control appears: it is shown
- * when, and only when, a credential conflict was actually detected.
- */
 async function renderContributionDeviceRecovery(status, { error } = {}) {
   const described = await describeFailure({
     surface: "contribution_connect",
@@ -6154,11 +5857,7 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
   reset.addEventListener("click", () => {
     void resetContributionDeviceCredential();
   });
-  const action = node(
-    "a",
-    "button button-secondary",
-    "Open TiboTattle"
-  );
+  const action = node("a", "button button-secondary", "Open TiboTattle");
   if (SEMANTIC_OPEN_TARGET) {
     action.href = SEMANTIC_OPEN_TARGET;
   } else {
@@ -6166,8 +5865,6 @@ async function renderContributionDeviceRecovery(status, { error } = {}) {
   }
   const actions = node("div", "contribution-cta-buttons");
   actions.append(reset, action);
-  // Reachable from journeys that never revealed this element, so it un-hides
-  // itself rather than relying on the caller having done so.
   status.hidden = false;
   status.className = "participant-action-status error";
   status.replaceChildren(
@@ -6239,45 +5936,13 @@ async function finishCommunityDevicePairing(pairing, status) {
 
 function openContributionReview() {
   const disclosure = $("#community-contribution-disclosure");
-  disclosure.open = true;
-  const queue = $(".sync-status-panel");
-  queue.hidden = false;
-  queue.open = true;
+  if (disclosure) disclosure.open = true;
   const review = $("#contribution-review");
   review?.scrollIntoView?.({ block: "start", behavior: "instant" });
   const heading = review?.querySelector?.("h3");
   if (heading) {
     heading.setAttribute("tabindex", "-1");
     heading.focus?.({ preventScroll: true });
-  }
-}
-
-async function disableAutomaticContribution() {
-  if (automaticContributionBusy) return;
-  const status = $("#community-connect-status");
-  automaticContributionBusy = true;
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Turning off automatic contribution…";
-  renderAutomaticContributionStatus(automaticContributionStatus);
-  try {
-    const disabled = await localClient.disableAutomaticContribution();
-    if (disabled.state === "unavailable" || disabled.enabled) {
-      throw new Error("Automatic contribution did not turn off.");
-    }
-    pendingAutomaticContributionConsent = null;
-    renderAutomaticContributionStatus(disabled);
-    status.textContent = "Automatic contribution is off.";
-  } catch (error) {
-    await showFailure(status, {
-      surface: "automatic_contribution",
-      error,
-      fallback:
-        "Automatic contribution could not be turned off. No setting was inferred; check the local companion and try again."
-    });
-  } finally {
-    automaticContributionBusy = false;
-    renderAutomaticContributionStatus(automaticContributionStatus);
   }
 }
 
@@ -6345,14 +6010,9 @@ async function connectCommunityContribution() {
         consentVersion: "privacy-safe-telemetry-v0.1"
       });
       enrollmentEstablished = true;
-      // The ordinary contribution product has no recovery journey. The server
-      // still returns this legacy capability, but the browser intentionally
-      // neither displays nor persists it.
-      void enrollment.recoveryCode;
       pairing = enrollment.pairing;
       await finishCommunityDevicePairing(pairing, status);
     }
-    pendingAutomaticContributionConsent = null;
     $("#community-connect-consent").checked = false;
     openContributionReview();
     await Promise.all([
@@ -6376,8 +6036,6 @@ async function connectCommunityContribution() {
         hostedIdentity = null;
         renderHostedIdentity();
       }
-      // The fallback is reached only when the cause is genuinely unknown, so
-      // it must not assert which of several unrelated things to go and check.
       const described = await showFailure(status, {
         surface: "contribution_connect",
         error,
@@ -6576,1024 +6234,40 @@ async function prepareLocalContribution() {
   }
 }
 
-function parseSafeExport(file) {
-  if (!file || file.size > 1_310_720) throw new Error("Choose a JSON export no larger than 1.25 MB.");
-  if (!file.name.toLowerCase().endsWith(".json") && file.type !== "application/json") {
-    throw new Error("Choose the JSON export produced by TiboTattle.");
-  }
-  return file.text().then((content) => {
-    let payload;
-    try {
-      payload = parseJsonWithUniqueObjectKeys(content);
-    } catch (error) {
-      if (error?.code === "duplicate_json_object_key") {
-        throw new Error("The selected file contains duplicate JSON object keys.");
-      }
-      throw new Error("The selected file is not valid JSON.");
-    }
-    validateContributionForUpload(payload);
-    return payload;
-  });
-}
-
-function resetSelectedContributionInspection() {
-  selectedContributionValidated = false;
-  $("#selected-contribution-inspection").hidden = true;
-  $("#selected-contribution-state").textContent = "Not validated";
-  $("#selected-contribution-state").className = "evidence-chip neutral";
-  $("#selected-contribution-message").textContent =
-    "Choose a TiboTattle export to validate it locally.";
-  $("#selected-contribution-schema").textContent = "—";
-  $("#selected-contribution-bytes").textContent = "—";
-  $("#selected-contribution-usage").textContent = "—";
-  $("#selected-contribution-quota").textContent = "—";
-  $("#selected-contribution-json").textContent = "";
-}
-
-function renderSelectedContributionInspection(file, payload) {
-  const usageRows = Array.isArray(payload.usageEvents)
-    ? payload.usageEvents.length
-    : 0;
-  const quotaRows = Array.isArray(payload.quotaSnapshots)
-    ? payload.quotaSnapshots.length
-    : 0;
-  selectedContributionValidated = true;
-  $("#selected-contribution-inspection").hidden = false;
-  $("#selected-contribution-state").textContent = "Validated locally";
-  $("#selected-contribution-state").className = "evidence-chip";
-  $("#selected-contribution-message").textContent =
-    "The closed-schema browser preflight passed. Expand the review below before consenting.";
-  setRawText($("#selected-contribution-schema"), payload.schemaVersion);
-  setRawText(
-    $("#selected-contribution-bytes"),
-    `${new Intl.NumberFormat(getFormattingLocale()).format(file.size)} bytes`,
-  );
-  setRawText($("#selected-contribution-usage"), compact(usageRows));
-  setRawText($("#selected-contribution-quota"), compact(quotaRows));
-  setRawText($("#selected-contribution-json"), JSON.stringify(payload, null, 2));
-}
-
-function renderSelectedContributionError(error) {
-  selectedContributionValidated = false;
-  $("#selected-contribution-inspection").hidden = false;
-  $("#selected-contribution-state").textContent = "Rejected locally";
-  $("#selected-contribution-state").className = "evidence-chip error";
-  $("#selected-contribution-message").textContent =
-    error instanceof Error
-      ? error.message
-      : "The selected file did not pass the closed-schema browser preflight.";
-  $("#selected-contribution-schema").textContent = "Not accepted";
-  $("#selected-contribution-bytes").textContent = "—";
-  $("#selected-contribution-usage").textContent = "—";
-  $("#selected-contribution-quota").textContent = "—";
-  $("#selected-contribution-json").textContent = "";
-}
-
-async function ensureCommunitySession(contributionSchemaVersion) {
-  const requiredConsent = contributionSchemaVersion === "telemetry-contribution-v0.2"
-    ? "privacy-safe-telemetry-v0.2"
-    : "privacy-safe-telemetry-v0.1";
-  if (communitySession?.csrfToken) {
-    if (communitySession.consentVersion !== requiredConsent) {
-      throw new Error(
-        `This browser session accepted ${communitySession.consentVersion || "an older consent contract"}. Reload the local dashboard before using a different contribution contract.`
-      );
-    }
-    return communitySession;
-  }
-  if (hostedSignInRequired()) {
-    throw new Error(
-      "Sign in first: hosted participation requires Google or Apple sign-in above. Local-only use needs no account."
-    );
-  }
-  let enrollment;
-  try {
-    // No invitation code is collected: production enrollment is open, and the
-    // service remains the authority on whether it accepts a new participant.
-    enrollment = await communityClient.enroll(
-      null,
-      contributionSchemaVersion,
-      { identity: hostedIdentity }
-    );
-  } catch (error) {
-    const identityCopy = hostedIdentityErrorCopy(error);
-    if (identityCopy !== null) throw new Error(identityCopy);
-    throw error;
-  }
-  if (typeof enrollment?.csrfToken !== "string") {
-    throw new Error("The contribution service did not establish a pseudonymous contribution session.");
-  }
-  setCommunitySession({
-    csrfToken: enrollment.csrfToken,
-    participantId: enrollment.participantId ?? null,
-    consentVersion: requiredConsent
-  });
-  // Recovery is intentionally absent from the ordinary product. Do not display
-  // or persist this legacy server capability.
-  void enrollment.recoveryCode;
-  return communitySession;
-}
-
-async function submitContribution(event) {
-  event.preventDefault();
-  const file = $("#contribution-file").files[0];
-  const status = $("#upload-status");
-  const button = $("#contribution-submit");
-  status.hidden = false;
-  status.className = "upload-status";
-  status.textContent = "Validating the privacy-safe export in this browser…";
-  button.disabled = true;
-  try {
-    const payload = await parseSafeExport(file);
-    await ensureCommunitySession(payload.schemaVersion);
-    status.textContent = "Encrypting the validated export in this browser…";
-    const key = await communityClient.envelopeKey();
-    if (key?.algorithm && key.algorithm !== "RSA-OAEP-256") throw new Error("The server offered an unsupported envelope algorithm.");
-    const envelope = await createTelemetryEnvelope({
-      payload,
-      publicJwk: key.publicJwk,
-      keyId: key.keyId
-    });
-    const serializedEnvelope = JSON.stringify(envelope);
-    const contentLengthBytes = new TextEncoder().encode(serializedEnvelope).byteLength;
-    const envelopeDigest = await sha256Hex(serializedEnvelope);
-    status.textContent = "Registering a one-use authorization for this exact encrypted envelope…";
-    const registration = await communityClient.registerUpload({
-      envelopeDigest,
-      contentLengthBytes,
-      contentType: "application/json"
-    });
-    if (typeof registration?.uploadAuthorization !== "string") {
-      throw new Error("The service did not return a one-use upload authorization.");
-    }
-    status.textContent = "Submitting encrypted telemetry for immediate server-side validation…";
-    const receipt = await communityClient.contributeSerialized(
-      serializedEnvelope,
-      registration.uploadAuthorization
-    );
-    setCommunitySession({ ...communitySession, contributionId: receipt.contributionId });
-    const deduplicatedCount = receipt.recordCounts?.deduplicated ?? 0;
-    status.textContent = t("contribution.acceptedReceipt", {
-      id: receipt.contributionId,
-      records: tPlural("contribution.deduplicatedRecord", deduplicatedCount),
-    });
-    await loadCommunityResults();
-  } catch (error) {
-    await showFailure(status, {
-      surface: "contribution_send",
-      error,
-      statusClass: "upload-status",
-      // A rejection this page raised itself carries copy written here; a
-      // transport rejection carries only a status line, which is not copy.
-      fallback: error instanceof Error && error.status === undefined
-        ? error.message
-        : safeApiError(error, "The contribution was rejected.")
-    });
-  } finally {
-    button.disabled = !(
-      selectedContributionValidated
-      && $("#contribution-consent").checked
-      && $("#contribution-file").files.length
-    );
-  }
-}
-
-function renderPersonalStats(container, payload) {
-  clear(container);
-  const stats = normalizeParticipantStats(payload);
-  if (stats.state === "service_unavailable") {
-    container.append(node("p", "", "No personal result is available."));
-    return;
-  }
-  if (stats.state === "unsupported_schema") {
-    container.append(node(
-      "p",
-      "result-state result-state-warning",
-      `The service returned ${stats.schemaVersion || "an unknown schema"}, not participant-stats-v0.2. No personal values were displayed.`
-    ));
-    return;
-  }
-
-  const source = stats.totals;
-  const grid = node("div", "result-metrics");
-  const metrics = [
-    ["Safe usage events", source.usageEvents, compact],
-    ["Server-repriced API equivalent", source.apiPriceEquivalentUsd, formatApiMoney],
-    ["Quota snapshots", source.quotaSnapshots, compact]
-  ];
-  for (const [label, value, formatter] of metrics) {
-    const card = node("div");
-    card.append(
-      node("span", "", label),
-      node("strong", "", value === null ? "Not available" : formatter(value))
-    );
-    grid.append(card);
-  }
-  container.append(grid);
-
-  const verification = node("p", "result-verification");
-  verification.append(
-    node("strong", "", "Server-repriced API equivalent. "),
-    document.createTextNode(
-      "This is an event-time public API price-card comparison calculated by the server, not a subscription charge or OpenAI’s internal quota unit."
-    )
-  );
-  container.append(verification);
-
-  const coverage = stats.pricingCoverage;
-  const coveragePanel = node("section", "participant-detail");
-  coveragePanel.append(node("h4", "", "Server pricing coverage"));
-  const coverageState = node("span", `coverage-state coverage-${coverage.state}`, coverage.state.replaceAll("_", " "));
-  const coverageHeading = node("div", "participant-detail-heading");
-  coverageHeading.append(
-    coverageState,
-    node(
-      "strong",
-      "",
-      coverage.percent === null ? "Coverage not testable" : `${formatPercent(coverage.percent, 1)} of events at least partly priced`
-    )
-  );
-  coveragePanel.append(coverageHeading);
-  const coverageGrid = node("div", "coverage-counts");
-  for (const [label, value] of [
-    ["Fully priced", coverage.fullyPricedEvents],
-    ["Partly priced", coverage.partiallyPricedEvents],
-    ["Unpriced", coverage.unpricedEvents],
-    ["Unclassified", coverage.unclassifiedEvents]
-  ]) {
-    const item = node("div");
-    item.append(node("span", "", label), node("strong", "", value === null ? "Unknown" : compact(value)));
-    coverageGrid.append(item);
-  }
-  coveragePanel.append(coverageGrid);
-  if (source.serverUnknownBillableUnits > 0) {
-    coveragePanel.append(node(
-      "p",
-      "result-state result-state-warning",
-      `${compact(source.serverUnknownBillableUnits)} observed billable units were not assigned a server price.`
-    ));
-  }
-  container.append(coveragePanel);
-
-  const pricingBasis = node("section", "participant-detail");
-  pricingBasis.append(node("h4", "", "Keep subscription speed separate from API pricing"));
-  const basisGrid = node("div", "pricing-basis-grid");
-  const standard = node("article", "basis-card");
-  standard.append(
-    node("span", "basis-label", "Standard API counterfactual"),
-    node(
-      "strong",
-      "",
-      stats.standardApiCounterfactual.apiPriceEquivalentUsd === null
-        ? "Not separately returned"
-        : formatApiMoney(stats.standardApiCounterfactual.apiPriceEquivalentUsd)
-    ),
-    node(
-      "p",
-      "",
-      stats.standardApiCounterfactual.apiPriceEquivalentUsd === null
-        ? "This response does not isolate a Standard-only subtotal. The total above remains the verified server-repriced API equivalent."
-        : `${stats.standardApiCounterfactual.events === null ? "Eligible subscription events" : compact(stats.standardApiCounterfactual.events) + " events"} repriced against the Standard API card.`
-    )
-  );
-  const fast = node("article", "basis-card basis-fast");
-  const fastValue = stats.codexFastObservations.eventShare === null
-    ? stats.codexFastObservations.eventCount === null
-      ? "Not testable"
-      : `${compact(stats.codexFastObservations.eventCount)} events`
-    : `${formatPercent(stats.codexFastObservations.eventShare * 100, 1)} of events`;
-  fast.append(
-    node("span", "basis-label", "Codex Fast observations"),
-    node("strong", "", fastValue),
-    node(
-      "p",
-      "",
-      "Fast is a subscription speed observation. It is not API Priority tier, and no invented Fast price multiplier is applied here."
-    )
-  );
-  basisGrid.append(standard, fast);
-  pricingBasis.append(basisGrid);
-  container.append(pricingBasis);
-
-  const accountScoped = renderAccountScopedQuotaAnalysis(
-    container,
-    stats.accountScopedQuotaAnalysis
-  );
-  if (!accountScoped) {
-    renderParticipantQuotaMovement(container, stats.rollingQuotaMovement);
-  }
-  renderPrivateCommunityComparison(container, stats.communityComparison);
-}
-
-const ACCOUNT_CALIBRATION_REASONS = Object.freeze({
-  account_scoped_dataset_unavailable: "No complete account-scoped dataset has been contributed yet.",
-  supported_quota_track_unavailable: "No supported provider-reported quota track is available in the contributed data.",
-  source_evidence_refused: "The source dataset is partial or otherwise ineligible for calibration.",
-  too_few_boundaries: "At least eight useful quota boundaries are required inside a reset window.",
-  insufficient_displayed_span: "The visible quota movement covers less than five percentage points.",
-  insufficient_training_boundaries: "There are too few earlier points to train this reset estimate.",
-  insufficient_holdout_boundaries: "There are too few later points to test the estimate out of sample.",
-  capacity_not_estimable: "Cost and quota movement do not yet form an estimable positive gradient.",
-  sensitivity_too_wide: "The plausible capacity range is still too wide to report as a useful estimate.",
-  prior_reset_forecast_unavailable: "At least two completed prior reset estimates are needed before a rolling comparison is honest.",
-  endpoint_brackets_unavailable: "Quota observations do not bracket the exact rolling-hour endpoints closely enough."
-});
-
-function renderAccountScopedQuotaAnalysis(container, analysis) {
-  if (analysis?.status !== "ready" || !analysis.tracks?.length) return false;
-  const section = node("section", "participant-detail quota-movement");
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Account-scoped quota calibration"),
-    node(
-      "p",
-      "",
-      "Usage and quota evidence are partitioned by a participant-scoped pseudonym. These results are private and are never copied into community output."
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private result"));
-  section.append(heading);
-
-  const grid = node("div", "pricing-basis-grid");
-  for (const track of analysis.tracks) {
-    const card = node("article", "basis-card");
-    const windowLabel = localizedQuotaWindowLabel({
-      limitId: track.limitId,
-      durationMinutes: track.windowDurationMinutes,
-    });
-    const planEvidence = providerReportedPlanEvidence(track.planType)
-      || t("dashboard.quota.providerPlanUnavailable");
-    const estimate = track.latestCapacityUsd === null
-      ? "Collecting evidence"
-      : formatApiMoney(track.latestCapacityUsd);
-    card.append(
-      node(
-        "span",
-        "basis-label",
-        `${windowLabel} · ${planEvidence}`
-      ),
-      node("strong", "", estimate)
-    );
-    if (track.latestCapacityUsd !== null) {
-      const range = track.sensitivityLowerUsd !== null
-        && track.sensitivityUpperUsd !== null
-        ? ` Plausible sensitivity range: ${formatApiMoney(track.sensitivityLowerUsd)}–${formatApiMoney(track.sensitivityUpperUsd)}.`
-        : "";
-      card.append(node(
-        "p",
-        "",
-        `API-price-equivalent capacity from ${compact(track.estimatedResets)} qualified reset${track.estimatedResets === 1 ? "" : "s"}.${range}`
-      ));
-    } else {
-      card.append(node(
-        "p",
-        "",
-        `${compact(track.totalResets)} reset window${track.totalResets === 1 ? "" : "s"} observed; none yet passes every calibration gate.`
-      ));
-    }
-    const rolling = track.rollingStatus === "conditional_comparison"
-      ? `${compact(track.rollingComparisonCount)} honest 1–3 hour rolling comparisons available.`
-      : "Rolling observed-versus-expected comparison is not testable yet.";
-    card.append(node("p", "", rolling));
-    const reasons = [...new Set([
-      ...track.refusalCodes,
-      ...track.rollingRefusalCodes
-    ])].slice(0, 3);
-    if (reasons.length) {
-      const list = node("ul", "calibration-reasons");
-      for (const reason of reasons) {
-        list.append(node(
-          "li",
-          "",
-          fixedCopy(ACCOUNT_CALIBRATION_REASONS, reason)
-            // An unrecognized refusal code is still a fixed code, but it is
-            // not copy: only identifier-shaped values are ever humanized.
-            ?? (/^[a-z][a-z0-9_]{1,63}$/u.test(reason)
-              ? reason.replaceAll("_", " ")
-              : "A fixed refusal code was reported that this page cannot explain.")
-        ));
-      }
-      card.append(list);
-    }
-    grid.append(card);
-  }
-  section.append(grid);
-  container.append(section);
-  return true;
-}
-
-const QUOTA_MOVEMENT_REASONS = Object.freeze({
-  account_continuity_not_transmitted: "Account continuity is deliberately absent from this privacy-safe contribution, so the server will not calculate an account-specific quota conversion.",
-  insufficient_quota_observations: "There are not yet two usable quota observations in one reset window.",
-  analysis_record_limit_exceeded: "The private analysis exceeded its bounded record limit.",
-  stale_quota_observation: "At least one provider quota observation arrived too late to support this comparison.",
-  backward_quota_observation: "The quota percentage moved backwards inside one reset window, so this track was rejected as ambiguous.",
-  incomplete_server_pricing_in_interval: "At least one overlapping usage event was not fully priced by the server.",
-  no_observed_quota_movement: "The recorded quota percentage did not move in this window.",
-  no_server_priced_usage_in_interval: "No server-priced usage overlaps this quota interval.",
-  no_usage_in_interval: "No usage events overlap this quota interval.",
-  no_valid_rolling_rows: "The response contained no valid 1-, 2-, or 3-hour comparison rows."
-});
-
-function renderParticipantQuotaMovement(container, movement) {
-  const section = node("section", "participant-detail quota-movement");
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Private rolling quota movement"),
-    node(
-      "p",
-      "",
-      `The server calculates fixed-duration windows from UTC instants; this report displays them in ${formatTimeZoneLabel()}.`,
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private result"));
-  section.append(heading);
-
-  if (movement.accountContinuity === "not_transmitted") {
-    section.append(node(
-      "p",
-      "result-state result-state-warning",
-      "Account continuity was not transmitted. Participant-wide usage may span accounts, so this comparison must not be treated as an account-specific quota conversion."
-    ));
-  }
-
-  if (movement.status !== "conditional_estimate") {
-    const copy = fixedCopy(QUOTA_MOVEMENT_REASONS, movement.reason)
-      ?? "The available private evidence cannot support this comparison yet.";
-    const state = node("div", "not-testable-state");
-    state.append(
-      node("strong", "", "Not testable"),
-      node("p", "", copy)
-    );
-    section.append(state);
-  } else {
-    const metadata = node("div", "movement-metadata");
-    const resetLabel = movement.resetsAt ? `Reset ${formatLocal(movement.resetsAt)}` : "Reset time unavailable";
-    const capacityLabel = movement.apiPriceEquivalentCapacityUsd === null
-      ? "Capacity estimate unavailable"
-      : `${formatApiMoney(movement.apiPriceEquivalentCapacityUsd)} per 100 percentage points`;
-    const planEvidence = providerReportedPlanEvidence(movement.planType)
-      || t("dashboard.quota.providerPlanUnavailable");
-    metadata.append(
-      node("span", "", [planEvidence, movement.limitId, movement.slot].filter(Boolean).join(" · ") || "Quota track"),
-      node("span", "", resetLabel),
-      node("span", "", capacityLabel)
-    );
-    section.append(metadata);
-    section.append(node(
-      "p",
-      "snapshot-disclosure",
-      "The capacity figure is a conditional API-price-equivalent gradient, not a provider-reported allowance. Tables show the latest 12 valid points for each smoothing window."
-    ));
-
-    for (const smoothingHours of [1, 2, 3]) {
-      const rows = movement.rows
-        .filter((row) => row.smoothingHours === smoothingHours)
-        .sort((left, right) => Date.parse(left.windowEndUtc) - Date.parse(right.windowEndUtc))
-        .slice(-12);
-      const group = node("section", "movement-window");
-      const groupHeading = node("div", "movement-window-heading");
-      groupHeading.append(
-        node("h5", "", `${smoothingHours}-hour rolling window`),
-        node("span", "", rows.length ? `${rows.length} latest points` : "Not testable")
-      );
-      group.append(groupHeading);
-      if (!rows.length) {
-        group.append(node(
-          "p",
-          "empty-inline",
-          `Not testable: the response does not yet contain a valid ${smoothingHours}-hour rolling point.`
-        ));
-        section.append(group);
-        continue;
-      }
-      const wrap = node("div", "table-wrap movement-table");
-      const table = document.createElement("table");
-      const caption = node(
-        "caption",
-        "sr-only",
-        `${smoothingHours}-hour private rolling quota movement shown in ${formatTimeZoneLabel()}`
-      );
-      const thead = document.createElement("thead");
-      const header = document.createElement("tr");
-      for (const label of [`Window ending (${formatTimeZoneLabel()})`, "Observed", "Expected", "Difference", "API equivalent", "Events"]) {
-        const th = document.createElement("th");
-        th.scope = "col";
-        th.textContent = label;
-        header.append(th);
-      }
-      thead.append(header);
-      const tbody = document.createElement("tbody");
-      for (const row of rows) {
-        const tr = document.createElement("tr");
-        const difference = row.observedQuotaChangePp - row.expectedQuotaChangePp;
-        for (const value of [
-          formatLocal(row.windowEndUtc),
-          formatPp(row.observedQuotaChangePp, 2),
-          formatPp(row.expectedQuotaChangePp, 2),
-          formatPp(difference, 2),
-          formatApiMoney(row.apiPriceEquivalentUsd),
-          compact(row.usageEvents)
-        ]) {
-          tr.append(node("td", "", value));
-        }
-        tbody.append(tr);
-      }
-      table.append(caption, thead, tbody);
-      wrap.append(table);
-      group.append(wrap);
-      section.append(group);
-    }
-  }
-  container.append(section);
-}
-
-const COMMUNITY_COMPARISON_REASONS = Object.freeze({
-  stable_snapshot_unavailable: "No stable released community week is available yet.",
-  community_snapshot_not_released: "The latest community week is withdrawn or privacy-suppressed, so no personal comparison is shown.",
-  community_snapshot_contract_invalid: "The released community week could not be compared safely.",
-  participant_comparison_too_large: "The comparison exceeded its fixed safe size.",
-  participant_comparison_contract_invalid: "The participant comparison could not be constructed safely.",
-  comparison_contract_invalid: "The comparison response did not pass browser validation."
-});
-
-function renderPrivateCommunityComparison(container, comparison) {
-  const section = node("section", "participant-detail community-comparison");
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Your contribution in the released week"),
-    node(
-      "p",
-      "",
-      "Your value uses the publication clipping cap. The community value is the already-public total rounded down."
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private comparison"));
-  section.append(heading);
-
-  if (comparison?.status !== "ready") {
-    const state = node("div", "not-testable-state");
-    state.append(
-      node("strong", "", "Not testable"),
-      node(
-        "p",
-        "",
-        fixedCopy(COMMUNITY_COMPARISON_REASONS, comparison?.reason)
-          ?? "A disclosure-safe released week is required before this comparison can be shown."
-      )
-    );
-    section.append(state);
-    container.append(section);
-    return;
-  }
-
-  section.append(node(
-    "p",
-    "snapshot-disclosure",
-    `${formatLocal(comparison.period.startAt, { dateOnly: true })}–${formatLocal(comparison.period.endAt, { dateOnly: true })} · revision ${compact(comparison.snapshotRevision)}. This is not an average, percentile, bill, or provider allowance. A rounded-down public total can be lower than your own clipped value.`
-  ));
-  const activeCells = comparison.cells.filter((cell) => cell.participantHasActivity);
-  if (!activeCells.length) {
-    const state = node("div", "not-testable-state");
-    state.append(
-      node("strong", "", "No matched released cell"),
-      node(
-        "p",
-        "",
-        "Your accepted activity did not contribute to a provider/model cell released for this fixed week."
-      )
-    );
-    section.append(state);
-    container.append(section);
-    return;
-  }
-
-  const wrap = node("div", "table-wrap comparison-table");
-  const table = document.createElement("table");
-  const caption = node(
-    "caption",
-    "sr-only",
-    "Private clipped contribution compared with public rounded community total"
-  );
-  const thead = document.createElement("thead");
-  const header = document.createElement("tr");
-  for (const label of [
-    "Provider / model",
-    "Metric",
-    "Your clipped contribution",
-    "Public rounded total",
-    "Interpretation"
-  ]) {
-    const th = document.createElement("th");
-    th.scope = "col";
-    th.textContent = label;
-    header.append(th);
-  }
-  thead.append(header);
-  const tbody = document.createElement("tbody");
-  for (const cell of activeCells) {
-    for (const [metricName, label] of Object.entries(COMMUNITY_METRIC_LABELS)) {
-      const metric = cell.metrics[metricName];
-      const row = document.createElement("tr");
-      const identity = document.createElement("th");
-      identity.scope = "row";
-      setRawText(
-        identity,
-        `${cell.provider} · ${cell.planType === "unknown" ? "plan unknown" : cell.planType + (cell.planVariant !== "unknown" ? " " + cell.planVariant : "")} · ${cell.modelId}`,
-      );
-      row.append(identity, node("td", "", label));
-      if (metric.status === "community_not_released") {
-        row.append(
-          node("td", "suppressed-value", "Not shown"),
-          node("td", "suppressed-value", "Not released"),
-          node("td", "", "Community support did not pass the fixed release rule.")
-        );
-      } else if (metric.status === "participant_component_unavailable") {
-        row.append(
-          node("td", "suppressed-value", "Not observed"),
-          node("td", "", compact(metric.communityRoundedValue)),
-          node("td", "", "Your source did not report this component.")
-        );
-      } else {
-        row.append(
-          node("td", "", compact(metric.participantClippedValue)),
-          node("td", "", compact(metric.communityRoundedValue)),
-          node(
-            "td",
-            "",
-            metric.participantClippedValue > metric.communityRoundedValue
-              ? "Public rounding makes a share calculation invalid."
-              : "Same fixed week; no average or percentile is inferred."
-          )
-        );
-      }
-      tbody.append(row);
-    }
-  }
-  table.append(caption, thead, tbody);
-  wrap.append(table);
-  section.append(wrap);
-  container.append(section);
-}
-
-const CONTRIBUTION_STATUS_LABELS = Object.freeze({
-  accepted: "Accepted",
-  accepted_synthetic: "Accepted fixture",
-  deleting: "Deletion in progress"
-});
-
-function renderContributionHistory(container, payload) {
-  clear(container);
-  const history = normalizeParticipantHistory(payload);
-  if (!communitySession?.csrfToken) {
-    container.hidden = true;
-    return;
-  }
-  container.hidden = false;
-  const heading = node("div", "participant-detail-heading");
-  const title = node("div");
-  title.append(
-    node("h4", "", "Accepted contribution history"),
-    node(
-      "p",
-      "",
-      "Each row is private to this participant and comes from canonical backend state."
-    )
-  );
-  heading.append(title, node("span", "private-chip", "Private history"));
-  container.append(heading);
-
-  if (history.state !== "ready") {
-    const unavailable = node("div", "not-testable-state");
-    unavailable.append(
-      node("strong", "", "History unavailable"),
-      node(
-        "p",
-        "",
-        history.reason === "unsupported_schema"
-          ? "The service returned an unsupported participant-history contract."
-          : history.reason === "invalid_contract"
-            ? "The service response did not pass the browser's closed history contract."
-            : "The participant-history service could not be reached."
-      )
-    );
-    container.append(unavailable);
-    return;
-  }
-
-  const disclosure = node("p", "history-disclosure");
-  disclosure.textContent = history.items.length === 0
-    ? "No accepted contribution batches remain."
-    : `${compact(history.contributionCount)} accepted or deleting batch${history.contributionCount === 1 ? "" : "es"}. The current transport does not carry a reviewed client software version.`;
-  container.append(disclosure);
-  if (history.items.length === 0) return;
-
-  const list = node("div", "history-list");
-  history.items.forEach((item, index) => {
-    const card = node("article", "history-card");
-    const cardHeading = node("div", "history-card-heading");
-    const label = node("div");
-    label.append(
-      node("strong", "", `Contribution ${history.items.length - index}`),
-      node("small", "", `Received ${formatLocal(item.createdAt)}`)
-    );
-    cardHeading.append(
-      label,
-      node(
-        "span",
-        item.status === "deleting"
-          ? "history-state history-state-deleting"
-          : "history-state",
-        fixedCopy(CONTRIBUTION_STATUS_LABELS, item.status)
-          ?? "Status unavailable"
-      )
-    );
-    card.append(cardHeading);
-
-    const details = node("dl", "history-facts");
-    const recordSummary = item.recordCounts === null
-      ? "Fixture contract"
-      : `${compact(item.recordCounts.accepted)} accepted · ${compact(item.recordCounts.deduplicated)} duplicate`;
-    const pricingBasis = item.serverAccounting.priceBasis
-      ? ` · ${item.serverAccounting.priceBasis}`
-      : "";
-    const pricingSummary = item.serverAccounting.verification === "server_repriced"
-      ? `${formatApiMoney(item.serverAccounting.apiPriceEquivalentUsd)} API-price equivalent${pricingBasis}`
-      : `Server repricing unavailable${pricingBasis}`;
-    const quarantineSummary = item.quarantine.state === "deleted"
-      ? `Encrypted object deleted ${formatLocal(item.quarantine.deletedAt)}`
-      : `Encrypted object scheduled for deletion after ${formatLocal(item.quarantine.scheduledDeletionAt)}`;
-    for (const [term, description] of [
-      ["Covered period", `${formatLocal(item.coveredAt.startAt)}–${formatLocal(item.coveredAt.endAt)}`],
-      ["Records", recordSummary],
-      ["Contract", `${item.transportSchemaVersion} · ${item.clientPlatform}`],
-      ["Pricing", pricingSummary],
-      ["Quarantine", quarantineSummary]
-    ]) {
-      const fact = node("div");
-      fact.append(node("dt", "", term), node("dd", "", description));
-      details.append(fact);
-    }
-    card.append(details);
-    card.append(node(
-      "p",
-      "history-retention-note",
-      "Deleting the encrypted quarantine object does not delete the canonical metadata used for your private results. Use the button below to delete this contribution from canonical results."
-    ));
-    if (item.status !== "deleting") {
-      const remove = node("button", "button button-danger history-delete", "Delete this contribution");
-      remove.type = "button";
-      remove.dataset.contributionId = item.contributionId;
-      card.append(remove);
-    }
-    list.append(card);
-  });
-  container.append(list);
-}
-
-/**
- * Render one delayed weekly snapshot.
- *
- * The default view carries the result and the one caveat needed to read it
- * honestly. Everything that only describes how the service produces the number
- * — contract version, ingestion cutoff, release timing, per-cell support
- * mechanics, sealed-revision policy, and what the current contract cannot yet
- * publish — is relocated into the collapsed provenance disclosure beside it.
- */
-function renderCommunitySnapshot(container, payload) {
-  return renderSharedCommunitySnapshot({
-    documentRef: document,
-    container,
-    detail: $("#community-snapshot-service-detail"),
-    payload,
-  });
-}
-
 async function loadCommunityResults() {
-  const service = $("#service-state");
-  const personal = $("#personal-result");
-  const community = $("#community-result");
-  const participantControls = $("#participant-controls");
   const centralConfigured = localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true;
   if (!centralConfigured) {
     participantContributionAdmission = null;
     communityServiceHealth = null;
     renderHostedIdentity();
-    renderBackendHealth(null, null, { configured: false });
-    service.textContent = "Local preparation available; community service not connected";
-    service.className = "evidence-chip neutral";
-    participantControls.hidden = true;
-    renderPersonalStats(personal, null);
-    renderContributionHistory($("#contribution-history"), null);
-    renderCommunitySnapshot(community, null);
     renderContributionPreparationEstimate();
     return;
   }
   try {
-    const [
-      healthResult,
-      readinessResult,
-      personalResult,
-      communityResult,
-      profileResult
-    ] = await Promise.allSettled([
+    const [healthResult, profileResult] = await Promise.allSettled([
       communityClient.health(),
-      communityClient.readiness(),
-      communitySession?.csrfToken ? communityClient.personalStats() : Promise.resolve(null),
-      communityClient.communityStats(),
-      communitySession?.csrfToken ? communityClient.participantProfile() : Promise.resolve(null)
+      communitySession?.csrfToken
+        ? communityClient.participantProfile()
+        : Promise.resolve(null),
     ]);
-    const serviceReachable = healthResult.status === "fulfilled"
-      || communityResult.status === "fulfilled"
-      || (Boolean(communitySession?.csrfToken) && personalResult.status === "fulfilled");
     communityServiceHealth = healthResult.status === "fulfilled"
       ? healthResult.value
       : null;
     renderHostedIdentity();
-    renderBackendHealth(
-      communityServiceHealth,
-      readinessResult.status === "fulfilled" ? readinessResult.value : null,
-      { configured: true },
-    );
-    service.textContent = serviceReachable
-      ? "Community service reachable"
-      : "Community service unavailable";
-    service.className = serviceReachable ? "evidence-chip" : "evidence-chip neutral";
     const normalizedProfile = normalizeParticipantHistory(
       profileResult.status === "fulfilled" ? profileResult.value : null,
     );
     participantContributionAdmission = normalizedProfile.state === "ready"
       ? normalizedProfile.contributionAdmission
       : null;
-    renderPersonalStats(personal, personalResult.status === "fulfilled" ? personalResult.value : null);
-    renderContributionHistory(
-      $("#contribution-history"),
-      profileResult.status === "fulfilled" ? profileResult.value : null
-    );
-    renderCommunitySnapshot(community, communityResult.status === "fulfilled" ? communityResult.value : null);
     renderContributionPreparationEstimate();
-    participantControls.hidden = !(communitySession?.csrfToken && personalResult.status === "fulfilled");
-    // The advertised enrollment mode is reported by the backend facts panel;
-    // this page collects no invitation code for any of those modes.
   } catch {
     participantContributionAdmission = null;
     communityServiceHealth = null;
     renderHostedIdentity();
-    renderBackendHealth(null, null, { configured: true });
-    service.textContent = "Community service unavailable";
-    service.className = "evidence-chip neutral";
-    participantControls.hidden = true;
-    renderContributionHistory($("#contribution-history"), null);
     renderContributionPreparationEstimate();
   }
-}
-
-function renderBackendHealth(health, readiness, { configured = true } = {}) {
-  if (!configured) {
-    const state = $("#backend-state");
-    state.textContent = "Not connected";
-    state.className = "evidence-chip neutral";
-    const centralState = $("#central-state");
-    centralState.replaceChildren(
-      node("span", "state-dot"),
-      document.createTextNode("Local-only mode"),
-    );
-    centralState.className = "state-pill state-local";
-    $("#backend-facts").hidden = true;
-    $("#backend-description").textContent =
-      "Your local usage, allowance estimates, and privacy review are working without a remote service. Community upload and aggregate comparisons appear only in a build with an explicit community-service origin.";
-    $("#backend-readiness-note").textContent =
-      "This build has no community-service origin sealed into it, so there is no readiness to report.";
-    $("#backend-contract-note").textContent =
-      "No community origin is sealed into this app. Nothing is failing and no upload is attempted.";
-    return;
-  }
-  $("#backend-facts").hidden = false;
-  $("#backend-description").textContent =
-    "This optional service is separate from the local collector above. Your local reporting works whether or not it is reachable, and nothing leaves this Mac unless you choose to contribute.";
-  // Engineering detail about how readiness is established lives inside the
-  // collapsed service-detail disclosure, not in the panel's default view.
-  $("#backend-readiness-note").textContent =
-    "Live readiness verifies database and encrypted-object access, fresh retention and restore replay, object reconciliation, and aggregate rebuild state.";
-  const reachable = health?.status === "ok";
-  const servingReady = readiness?.state === "ready";
-  const readinessKnown = servingReady || readiness?.state === "not_ready";
-  const controls = health?.collectionControls;
-  const collectionState = reachable
-    && ["operational", "degraded", "contained"].includes(controls?.state)
-    ? controls.state
-    : null;
-  const state = $("#backend-state");
-  const stateLabels = {
-    operational: "Community backend ready",
-    degraded: "Collection partially paused",
-    contained: "Collection contained"
-  };
-  const stateLabel = !reachable
-    ? "Community service unavailable"
-    : !readinessKnown
-      ? "Readiness unavailable"
-      : !servingReady
-        ? "Community recovery pending"
-        : stateLabels[collectionState] ?? "Community status incomplete";
-  state.textContent = stateLabel;
-  state.className = servingReady && collectionState === "operational"
-    ? "evidence-chip"
-    : "evidence-chip neutral";
-  const centralState = $("#central-state");
-  centralState.replaceChildren(
-    node("span", "state-dot"),
-    document.createTextNode(stateLabel)
-  );
-  centralState.className = servingReady && collectionState === "operational"
-    ? "state-pill"
-    : reachable
-      ? "state-pill state-insufficient"
-      : "state-pill state-offline";
-  $("#backend-database").textContent = health?.checks?.database === "ok"
-    ? "Connected"
-    : "Unavailable";
-  $("#backend-deletion-ledger").textContent = health?.checks?.deletionLedger === "ok"
-    ? "Independent digest-only store reachable"
-    : "Unavailable";
-  $("#backend-storage").textContent = health?.checks?.encryptedObjectStore === "reachable"
-    ? "Reachable"
-    : "Unavailable";
-  const lifecycleLabels = {
-    never_run: "Awaiting first scheduled pass",
-    running: "Lifecycle pass running",
-    completed: health?.checks?.quarantineRetentionComplete === true
-      && health?.checks?.restoreReplayComplete === true
-      ? "Retention and restore replay current"
-      : "Catching up; publication held",
-    failed: "Lifecycle pass failed; operator review required",
-    stale: "Lifecycle evidence stale; publication held",
-    incomplete: "Catching up; publication held",
-    ready: "Retention and restore replay current"
-  };
-  $("#backend-lifecycle").textContent = lifecycleLabels[
-    readinessKnown ? readiness.lifecycle : health?.checks?.lifecycle
-  ]
-    ?? "Unavailable";
-  const reconciliationLabels = {
-    never_run: "Awaiting first reconciliation pass",
-    running: "Reconciliation running",
-    completed: readiness?.quarantineReconciliationComplete === true
-      ? "Tracked objects and metadata reconciled"
-      : "Reconciliation incomplete",
-    failed: "Reconciliation failed; operator review required"
-  };
-  $("#backend-reconciliation").textContent = readinessKnown
-    ? reconciliationLabels[readiness.quarantineReconciliation] ?? "Unavailable"
-    : "Unavailable";
-  $("#backend-aggregate-rebuild").textContent = readinessKnown
-    ? readiness.aggregateRebuildComplete
-      ? "Complete"
-      : "Pending; publication held"
-    : "Unavailable";
-  $("#backend-collection-state").textContent = {
-    operational: "Operational",
-    degraded: "One or more intake stages paused",
-    contained: "All collection and publication paused"
-  }[collectionState] ?? "Unavailable";
-  const enrollmentLabels = {
-    local_open: "Open for local testing",
-    invite_only: "Private invite pilot",
-    disabled: "New enrollment paused"
-  };
-  $("#backend-enrollment").textContent = controls?.enrollment === false
-    ? "Paused"
-    : enrollmentLabels[health?.enrollmentMode] ?? "Unavailable";
-  const controlLabel = (value) => value === true
-    ? "Enabled"
-    : value === false
-      ? "Paused"
-      : "Unavailable";
-  $("#backend-upload-registration").textContent = controlLabel(
-    controls?.uploadRegistration
-  );
-  $("#backend-processing").textContent = controlLabel(controls?.processing);
-  $("#backend-publication").textContent = controlLabel(controls?.publication);
-  $("#backend-participant-rights").textContent = reachable
-    && health?.capabilities?.participantStats === true
-    && health?.capabilities?.participantExport === true
-    && health?.capabilities?.participantDeletion === true
-    ? "View, export, and delete remain available"
-    : "Unavailable";
-  $("#backend-contract").textContent = health?.contracts?.acceptedContribution
-    ?? "Unavailable";
-
-  const accountContract = health?.contracts?.accountScopedContribution;
-  $("#backend-contract-note").textContent =
-    accountContract?.status === "local_preview_loopback_only"
-      ? `${accountContract.schemaVersion} account-scoped ingest is active only on this loopback development server. It remains unauthorized for external participants.`
-      : accountContract?.status === "implementation_disabled"
-        ? `${accountContract.schemaVersion} account-scoped ingest is implemented and testable, but disabled on this HTTP route.`
-        : "No account-scoped experimental contract was advertised by this backend.";
 }
 
 async function restoreCommunitySession() {
@@ -7613,75 +6287,6 @@ async function restoreCommunitySession() {
     // state instead of falsely showing a Google/Apple choice or asking for a
     // redundant browser ceremony after every reload.
     renderHostedIdentity();
-  }
-}
-
-async function deleteParticipantData() {
-  if (!window.confirm("Permanently delete every hosted contribution and private statistic associated with this pseudonymous contribution session? This cannot be undone.")) return;
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Turning off automatic contribution, then deleting hosted metadata…";
-  try {
-    pendingAutomaticContributionConsent = null;
-    if (automaticContributionStatus?.enabled) {
-      const disabled = await localClient.disableAutomaticContribution();
-      if (disabled.state === "unavailable" || disabled.enabled) {
-        throw new Error("Automatic contribution could not be disabled.");
-      }
-      renderAutomaticContributionStatus(disabled);
-    }
-    const receipt = await communityClient.deleteParticipant();
-    setCommunitySession(null);
-    $("#contribution-file").value = "";
-    $("#contribution-consent").checked = false;
-    $("#contribution-submit").disabled = true;
-    $(".file-drop").classList.remove("selected");
-    $("#file-help").textContent = "Privacy-safe JSON export · 1.25 MB browser validation limit";
-    const uploadStatus = $("#upload-status");
-    uploadStatus.hidden = false;
-    uploadStatus.className = "upload-status";
-    const contributionsDeleted = receipt?.contributionsDeleted ?? 0;
-    uploadStatus.textContent = t("contribution.deletedReceipt", {
-      batches: tPlural("contribution.batch", contributionsDeleted),
-    });
-    setProductText(
-      status,
-      "Your hosted content-free pseudonymous metadata was deleted.",
-    );
-    $("#participant-controls").hidden = true;
-    renderPersonalStats($("#personal-result"), null);
-    renderContributionHistory($("#contribution-history"), null);
-    await loadCommunityResults();
-  } catch (error) {
-    await showFailure(status, {
-      surface: "hosted_privacy",
-      error,
-      fallback:
-        "The contributed data could not be deleted. Nothing was removed; your deletion right is unchanged and you can try again."
-    });
-  }
-}
-
-async function deleteSingleContribution(contributionId) {
-  if (!window.confirm(
-    "Delete this contribution from canonical private results and any current project-controlled aggregate? Other accepted contributions remain."
-  )) return;
-  const status = $("#participant-action-status");
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Deleting this contribution and refreshing derived results…";
-  try {
-    await communityClient.deleteContribution(contributionId);
-    status.textContent = "Contribution deleted. Private and community results have been refreshed.";
-    await loadCommunityResults();
-  } catch (error) {
-    await showFailure(status, {
-      surface: "hosted_privacy",
-      error,
-      fallback:
-        "The contribution could not be deleted. Nothing was removed; you can try again."
-    });
   }
 }
 
@@ -7729,9 +6334,7 @@ $("#connect-community").addEventListener(
   connectCommunityContribution
 );
 $("#contribution-not-now").addEventListener("click", () => {
-  pendingAutomaticContributionConsent = null;
   $("#community-connect-consent").checked = false;
-  renderAutomaticContributionStatus(automaticContributionStatus);
   updateCommunityConnectButton();
   const status = $("#community-connect-status");
   status.hidden = false;
@@ -7739,20 +6342,10 @@ $("#contribution-not-now").addEventListener("click", () => {
   status.textContent =
     "Nothing will be contributed. Your local reporting continues unchanged.";
 });
-$("#automatic-contribution-toggle").addEventListener(
-  "click",
-  disableAutomaticContribution
-);
 $("#prepare-contribution").addEventListener("click", prepareLocalContribution);
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
 $("#sync-inspect").addEventListener("click", inspectNextContribution);
 $("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
-$("#sync-pause").addEventListener("click", () => runContributionSyncAction("pause"));
-$("#sync-resume").addEventListener("click", () => runContributionSyncAction("resume"));
-$("#sync-disconnect-device").addEventListener(
-  "click",
-  () => { void disconnectThisMacContributionDevice(); },
-);
 $("#window-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-hours]");
   if (!button || !dashboard) return;
@@ -7811,7 +6404,7 @@ $("#timeline-reset-zoom").addEventListener("click", () => {
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-group]");
-  if (!button || !dashboard) return;
+  if (!button || !dashboard || !usageGroupingsForRange().includes(button.dataset.group)) return;
   activeUsageGrouping = button.dataset.group;
   for (const control of $("#usage-group-controls").querySelectorAll("button")) {
     const active = control === button;
@@ -7850,67 +6443,8 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
   activeAccountingPeriod = button.dataset.period;
   renderAccounting(dashboard);
 });
-$("#contribution-file").addEventListener("change", async () => {
-  contributionSelectionRevision += 1;
-  const selectionRevision = contributionSelectionRevision;
-  const file = $("#contribution-file").files[0];
-  const drop = $(".file-drop");
-  drop.classList.toggle("selected", Boolean(file));
-  if (file) {
-    setRawText($("#file-help"), `${file.name} · ${compact(file.size)} bytes`);
-  } else {
-    setProductText(
-      $("#file-help"),
-      "Privacy-safe JSON export · 1.25 MB browser validation limit",
-    );
-  }
-  resetSelectedContributionInspection();
-  $("#contribution-consent").checked = false;
-  $("#contribution-consent-title").textContent =
-    "I reviewed this as a privacy-safe TiboTattle export.";
-  $("#contribution-consent-detail").textContent =
-    "Uploading is optional and can be tested against a local backend.";
-  if (file) {
-    try {
-      const payload = await parseSafeExport(file);
-      if (
-        selectionRevision !== contributionSelectionRevision
-        || $("#contribution-file").files[0] !== file
-      ) return;
-      renderSelectedContributionInspection(file, payload);
-      if (payload?.schemaVersion === "telemetry-contribution-v0.2") {
-        $("#contribution-consent-title").textContent =
-          "I consent to upload participant-scoped pseudonymous account tracks.";
-        $("#contribution-consent-detail").textContent =
-          "They link usage and quota rows only within this pseudonymous contribution session for private calibration; they are never published in community output and are deleted with the hosted session.";
-      }
-    } catch (error) {
-      if (
-        selectionRevision !== contributionSelectionRevision
-        || $("#contribution-file").files[0] !== file
-      ) return;
-      renderSelectedContributionError(error);
-    }
-  }
-  $("#contribution-submit").disabled = true;
-});
-$("#contribution-consent").addEventListener("change", () => {
-  $("#contribution-submit").disabled = !(
-    selectedContributionValidated
-    && $("#contribution-consent").checked
-    && $("#contribution-file").files.length
-  );
-});
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
-$("#contribution-form").addEventListener("submit", submitContribution);
-$("#delete-participant").addEventListener("click", deleteParticipantData);
-$("#contribution-history").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-contribution-id]");
-  if (button?.dataset.contributionId) {
-    deleteSingleContribution(button.dataset.contributionId);
-  }
-});
 document.addEventListener("click", (event) => {
   const current = activeInformationPopover;
   if (!current) return;

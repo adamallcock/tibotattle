@@ -46,6 +46,7 @@ import {
 } from "../../src/contribution-sync-queue.js";
 import {
   createProductionContributionDeviceBackend,
+  migrateLegacyContributionDeviceCapability,
   removeContributionDeviceCapability,
 } from "../../src/contribution-device-capability.js";
 import {
@@ -1736,6 +1737,25 @@ export function createLocalCompanionServer(options = {}) {
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
   );
+  const legacyContributionDeviceStateCandidate = Object.hasOwn(
+    options,
+    "legacyContributionDeviceStateFile",
+  )
+    ? options.legacyContributionDeviceStateFile
+    : process.platform === "darwin"
+        && !Object.hasOwn(options, "contributionDeviceBackendFactory")
+      ? join(
+        homeDirectory,
+        "Library",
+        "Application Support",
+        "app-usagemonitor",
+        "contribution-device-binding-v1.json",
+      )
+      : null;
+  const legacyContributionDeviceStateFile =
+    legacyContributionDeviceStateCandidate === null
+      ? null
+      : assertLocalAbsolutePath(legacyContributionDeviceStateCandidate);
   const preparedCandidate = Object.hasOwn(
     options,
     "preparedContributionDirectory",
@@ -1777,6 +1797,7 @@ export function createLocalCompanionServer(options = {}) {
     codexHome,
     contributionQueueFile,
     diagnosticsLogFile,
+    legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
     parentWatchdogPid,
@@ -1855,6 +1876,7 @@ function createPreparedLocalCompanionServer({
   developmentIdentityOptIn =
     environment[DEVELOPMENT_IDENTITY_OPT_IN_ENV] ?? null,
   contributionQueueFile,
+  legacyContributionDeviceStateFile = null,
   contributionSyncStatusProvider = () => inspectContributionSyncQueue({
     queueFile: contributionQueueFile,
   }),
@@ -1945,6 +1967,13 @@ function createPreparedLocalCompanionServer({
       && typeof contributionServiceOrigin !== "string") {
     throw new TypeError("contributionServiceOrigin must be a string or null");
   }
+  if (legacyContributionDeviceStateFile !== null
+      && (typeof legacyContributionDeviceStateFile !== "string"
+        || !isAbsolute(legacyContributionDeviceStateFile))) {
+    throw new TypeError(
+      "legacyContributionDeviceStateFile must be an absolute path or null",
+    );
+  }
   if (typeof diagnosticsLogFile !== "string"
       || diagnosticsLogFile.length < 1
       || typeof clock !== "function"
@@ -1981,26 +2010,44 @@ function createPreparedLocalCompanionServer({
         directory: preparedContributionDirectory,
         queueFile: contributionQueueFile,
       }));
+  const createContributionDeviceBackend = async () => {
+    const backend = contributionDeviceBackendFactory();
+    if (legacyContributionDeviceStateFile !== null) {
+      await migrateLegacyContributionDeviceCapability({
+        backend,
+        legacyStateFile: legacyContributionDeviceStateFile,
+        stateFile: statePaths.contributionDeviceStateFile,
+        expectedOrigin: contributionServiceOrigin,
+      });
+    }
+    return backend;
+  };
   const pairContributionDevice = contributionDevicePairingProvider
     ?? (contributionServiceOrigin === null
       ? null
-      : ({ pairingCode }) => claimContributionDevicePairing({
-        origin: contributionServiceOrigin,
-        pairingCode,
-        capabilityOptions: {
-          backend: contributionDeviceBackendFactory(),
-          stateFile: statePaths.contributionDeviceStateFile,
-        },
-      }));
+      : async ({ pairingCode }) => {
+        const backend = await createContributionDeviceBackend();
+        return claimContributionDevicePairing({
+          origin: contributionServiceOrigin,
+          pairingCode,
+          capabilityOptions: {
+            backend,
+            stateFile: statePaths.contributionDeviceStateFile,
+          },
+        });
+      });
   // Purely local repair: it needs the Keychain backend and the binding state
   // file, never a contribution service origin, so it stays available even when
   // no service is configured.
   const resetContributionDeviceCredential =
     contributionDeviceCredentialResetRunner
-    ?? (() => resetContributionDeviceCredentialLocally({
-      backend: contributionDeviceBackendFactory(),
-      stateFile: statePaths.contributionDeviceStateFile,
-    }));
+    ?? (async () => {
+      const backend = await createContributionDeviceBackend();
+      return resetContributionDeviceCredentialLocally({
+        backend,
+        stateFile: statePaths.contributionDeviceStateFile,
+      });
+    });
   // Disconnect revokes the remote bearer before removing its local binding.
   // Serialize every delivery-affecting local mutation with that transition so
   // a foreground or automatic sync cannot begin in the await between the
@@ -2010,7 +2057,7 @@ function createPreparedLocalCompanionServer({
     ?? (contributionServiceOrigin === null
       ? null
       : async () => {
-        const backend = contributionDeviceBackendFactory();
+        const backend = await createContributionDeviceBackend();
         let remoteConfirmed = false;
         try {
           const remote = await disconnectContributionDeviceRemotely({
@@ -2076,25 +2123,28 @@ function createPreparedLocalCompanionServer({
     ?? (preparedContributionDirectory === null
         || contributionServiceOrigin === null
       ? async () => null
-      : ({
+      : async ({
         signal,
         reviewedJob,
         preparedSetId,
         maximumJobs = LOCAL_SYNC_MAXIMUM_JOBS,
         maximumReservedUploadBytes =
           LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
-      }) => runContributionSyncQueueOnce({
-        directory: preparedContributionDirectory,
-        origin: contributionServiceOrigin,
-        backend: contributionDeviceBackendFactory(),
-        queueFile: contributionQueueFile,
-        stateFile: statePaths.contributionDeviceStateFile,
-        maximumJobs,
-        maximumReservedUploadBytes,
-        reviewedJob,
-        preparedSetId,
-        signal,
-      }));
+      }) => {
+        const backend = await createContributionDeviceBackend();
+        return runContributionSyncQueueOnce({
+          directory: preparedContributionDirectory,
+          origin: contributionServiceOrigin,
+          backend,
+          queueFile: contributionQueueFile,
+          stateFile: statePaths.contributionDeviceStateFile,
+          maximumJobs,
+          maximumReservedUploadBytes,
+          reviewedJob,
+          preparedSetId,
+          signal,
+        });
+      });
   const setContributionPaused = contributionSyncPauseSetter
     ?? (({ paused }) => setContributionSyncPaused({
       paused,

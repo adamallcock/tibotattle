@@ -968,10 +968,27 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /static func setSeconds\(\s*_ value: Int, in defaults: UserDefaults\)/u);
   assert.match(source, /defaults\.set\(value, forKey: defaultsKey\)/u);
   assert.match(source, /NativeRefreshIntervalPreference\.seconds/u);
+  assert.match(source, /private struct NativeForegroundRefreshSchedule/u);
+  assert.match(source, /NativeForegroundRefreshScheduler\.schedule/u);
+  assert.match(source, /deadline: \.now\(\) \+ \.seconds\(schedule\.intervalSeconds\)/u);
   assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
   assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
   assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
+  assert.match(source, /stack\.centerXAnchor\.constraint\(equalTo: document\.centerXAnchor\)/u);
+  assert.match(source, /stack\.widthAnchor\.constraint\(lessThanOrEqualToConstant: 680\)/u);
+  assert.match(source, /contentStack\.alignment = \.width/u);
+  assert.match(source, /newWindow\.setContentSize\(NSSize\(width: 760, height: 620\)\)/u);
+  assert.match(source, /nativeStatusRefreshButton\?\.contentTintColor/u);
+  assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
+  assert.match(source, /\.systemYellow/u);
+  assert.match(source, /\.systemGreen/u);
+  assert.match(source, /nativeDashboardFresh/u);
+  assert.match(source, /nativeDashboardNeedsRefresh/u);
+  assert.match(
+    source,
+    /tibotattle:locale-override[\s\S]*?requestAnimationFrame[\s\S]*?new Event\('resize'\)/u,
+  );
   assert.match(source, /LocalCompanionEvidenceReader/u);
   assert.match(source, /firstRunLoginItemDisclosure/u);
   assert.match(source, /registerLoginItemForFirstRun/u);
@@ -1280,7 +1297,8 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   assert.match(toolbar, /let button = NSButton\(/u);
   assert.match(toolbar, /action: #selector\(refreshDashboardFromToolbar\)/u);
   assert.match(toolbar, /nativeToolbarEvidenceTitle/u);
-  assert.match(source, /relativeAge\(observedAt\)/u);
+  assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
+  assert.match(source, /case \.live:[\s\S]*?nativeDashboardFresh/u);
   assert.match(toolbar, /toolbarShareIdentifier/u);
   assert.match(toolbar, /toolbarSettingsIdentifier/u);
   assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
@@ -1521,7 +1539,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   }
 });
 
-test("native quota duration handling stays bounded, generic, and reset-proof", async () => {
+test("native quota duration and reset scheduling stay bounded and provider-aware", async () => {
   const [menuSource, notificationSource, localizationSource] = await Promise.all([
     readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
     readFile(QUOTA_NOTIFICATIONS_SOURCE, "utf8"),
@@ -1553,11 +1571,19 @@ test("native quota duration handling stays bounded, generic, and reset-proof", a
   );
   assert.match(
     notificationSource,
-    /if nextState\.preferences\.resetEnabled,\s*\n\s*resetIdentityChanged/u,
+    /case "provider_reported_identity"[\s\S]*?validProviderResetIdentity/u,
   );
   assert.match(
     notificationSource,
-    /if scheduleChanged \|\| resetIdentityChanged[\s\S]*?if nextState\.preferences\.resetEnabled,\s*\n\s*resetIdentityChanged[\s\S]*?kind: \.reset/u,
+    /let resetIsDue = observedAt >= previousResetAt/u,
+  );
+  assert.match(
+    notificationSource,
+    /Schedule-only fallback[\s\S]*?previous\.resetAt[\s\S]*?kind: \.reset/u,
+  );
+  assert.match(
+    notificationSource,
+    /A provider schedule change before the old due time is not a\n\s*\/\/ reset/u,
   );
   assert.doesNotMatch(
     menuSource + "\n" + localizationSource,
@@ -3555,7 +3581,6 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/app.js",
     "apps/web/public/community-data.js",
-    "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
@@ -3588,7 +3613,6 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/macos/reset-local-keychain.js",
     "apps/web/public/app.js",
     "apps/web/public/community-data.js",
-    "apps/web/public/community-view.js",
     "apps/web/public/data-client.js",
     "apps/web/public/index.html",
     "apps/web/public/install-cta.js",
@@ -4711,7 +4735,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       quotaNotificationSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_QUOTA_NOTIFICATION_CONTRACT opt_in=true fresh_only=true first_sample=false threshold=true reset_schedule_suppressed=true reset_identity_gate=true dedupe=true opt_out=true$/mu,
+      /^USAGE_MONITOR_MACOS_QUOTA_NOTIFICATION_CONTRACT opt_in=true fresh_only=true first_sample=false threshold=true reset_schedule_fallback=true reset_identity_dedupe=true dedupe=true opt_out=true$/mu,
     );
     const refreshSettingsSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -4725,7 +4749,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       refreshSettingsSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 invalid_ignored=true$/mu,
+      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 scheduler=900 invalid_ignored=true$/mu,
     );
     const nativeDashboardLayoutSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

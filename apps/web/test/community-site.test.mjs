@@ -418,29 +418,35 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   }
 });
 
-test("both browser entry points share one community renderer and one install card", async () => {
+test("the dashboard keeps contribution review local while the public site owns delayed evidence", async () => {
   const siteSource = await readFile(SITE_SOURCE, "utf8");
   const appSource = await readFile(APP_SOURCE, "utf8");
-  for (const shared of ["./community-view.js", "./install-cta.js"]) {
-    assert.match(siteSource, new RegExp(`from "${shared.replace(".", "\\.")}"`, "u"));
-    assert.match(appSource, new RegExp(`from "${shared.replace(".", "\\.")}"`, "u"));
-  }
-  // No forked copy: the dashboard entry no longer defines either renderer.
-  assert.doesNotMatch(appSource, /const COMMUNITY_METRIC_LABELS = Object\.freeze/u);
+  assert.match(siteSource, /from "\.\/community-view\.js"/u);
+  assert.match(siteSource, /from "\.\/install-cta\.js"/u);
+  assert.match(appSource, /from "\.\/install-cta\.js"/u);
+  assert.doesNotMatch(appSource, /from "\.\/community-view\.js"/u);
+  // The dashboard is a single local review/send destination; delayed public
+  // evidence remains rendered by the public website entry point.
+  assert.doesNotMatch(appSource, /COMMUNITY_METRIC_LABELS|renderSharedCommunitySnapshot/u);
   assert.doesNotMatch(appSource, /function configuredInstallerRelease\(/u);
   assert.doesNotMatch(appSource, /function formatInstallerSize\(/u);
-  // The dashboard entry keeps the full companion-backed surface it always had.
   const appHtml = await readFile(APP_HTML, "utf8");
-  for (
-    const dashboardControl of [
-      'id="refresh-button"',
-      'id="contribution-form"',
-      'id="identity-signin"',
-      'id="community-result"',
-    ]
-  ) {
-    assert.equal(appHtml.includes(dashboardControl), true, dashboardControl);
+  assert.match(appHtml, /id="community"/u);
+  assert.match(appHtml, /https:\/\/tibotattle\.com\/#community/u);
+  for (const retiredControl of [
+    'id="central-state"',
+    'id="backend"',
+    'id="contribution-file"',
+    'id="selected-contribution-inspection"',
+    'id="automatic-contribution-toggle"',
+    'id="download-participant"',
+    'id="community-result"',
+  ]) {
+    assert.doesNotMatch(appHtml, new RegExp(retiredControl, "u"), retiredControl);
   }
+  assert.match(appHtml, /id="community-connect-consent"/u);
+  assert.match(appHtml, /id="prepare-contribution"/u);
+  assert.match(appHtml, /id="sync-run-once"/u);
 });
 
 test("the community view degrades honestly without a service or a published week", () => {

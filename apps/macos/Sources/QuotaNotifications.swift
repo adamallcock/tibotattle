@@ -22,9 +22,8 @@ enum QuotaNotificationIneligibility: String, Equatable {
 }
 
 enum ProviderQuotaResetProof: Equatable {
-    /// Reserved for a future closed receipt that carries an opaque provider
-    /// reset/window identity. The present app-server source does not expose
-    /// this, so it cannot create reset notifications.
+    /// A provider identity is stronger evidence than a schedule boundary, but
+    /// the fallback remains useful when the provider reports only `resetsAt`.
     case providerReportedIdentity(String)
     case unavailable
 
@@ -284,14 +283,14 @@ extension LocalCompanionEvidenceReader: QuotaNotificationEvidenceProvider {
         var seenLanes = Set<String>()
         var windows: [FreshProviderQuotaWindow] = []
         for rawWindow in rawWindows {
-            let windowKeys: Set<String> = [
+            let baseWindowKeys: Set<String> = [
                 "durationMinutes",
                 "lane",
                 "resetAt",
                 "resetProofKind",
                 "usedPercent",
             ]
-            guard hasExactKeys(rawWindow, windowKeys),
+            guard Set(rawWindow.keys).isSuperset(of: baseWindowKeys),
                   let lane = rawWindow["lane"] as? String,
                   ["primary", "secondary"].contains(lane),
                   !seenLanes.contains(lane),
@@ -311,7 +310,21 @@ extension LocalCompanionEvidenceReader: QuotaNotificationEvidenceProvider {
             let resetProof: ProviderQuotaResetProof
             switch rawWindow["resetProofKind"] as? String {
             case "provider_reported_schedule_only":
+                guard hasExactKeys(rawWindow, baseWindowKeys) else {
+                    return .ineligible(.schemaChanged)
+                }
                 resetProof = .unavailable
+            case "provider_reported_identity":
+                guard hasExactKeys(
+                    rawWindow,
+                    baseWindowKeys.union(["resetIdentity"])
+                ),
+                      let identity = rawWindow["resetIdentity"] as? String,
+                      validProviderResetIdentity(identity)
+                else {
+                    return .ineligible(.schemaChanged)
+                }
+                resetProof = .providerReportedIdentity(identity)
             default:
                 return .ineligible(.schemaChanged)
             }
@@ -465,7 +478,11 @@ enum QuotaNotificationThresholdMode: String, Codable, Equatable {
 struct QuotaNotificationPreferences: Codable, Equatable {
     var enabled = false
     var thresholdMode: QuotaNotificationThresholdMode = .off
-    var resetEnabled = false
+    /// Reset alerts are part of the opt-in allowance-alert bundle. They use
+    /// the provider-reported schedule on the next foreground refresh, and
+    /// use an opaque provider identity as an additional dedupe key whenever
+    /// one is available.
+    var resetEnabled = true
     var defaultsApplied = false
     var permissionPromptAttempted = false
 }
@@ -474,9 +491,10 @@ struct QuotaNotificationBaseline: Codable, Equatable {
     let observedAt: String
     let usedPercent: Double
     let resetAt: String
-    /// An optional, opaque reset/window identity. Current receipts never set
-    /// it because they expose only a schedule. Keeping this separate prevents
-    /// a schedule change from being treated as reset proof.
+    /// An optional, opaque provider reset/window identity. Schedule-only
+    /// receipts leave it nil; the schedule-due fallback uses `resetAt` as its
+    /// event key, while an identity strengthens dedupe when available. Keeping
+    /// this separate avoids claiming that a schedule is itself an identity.
     let resetIdentity: String?
 
     init(
@@ -812,7 +830,7 @@ final class QuotaNotificationCoordinator {
     private var state: QuotaNotificationPersistentState
     private var stateAvailable: Bool
     private var authorization: QuotaNotificationAuthorization = .unknown
-    private var resetProofAvailable = false
+    private var resetScheduleAvailable = false
     /// Invalidates asynchronous evidence and delivery callbacks whenever the
     /// user's preference boundary changes. A result from a former opt-in can
     /// never mutate a new session's baseline or Settings status.
@@ -843,8 +861,8 @@ final class QuotaNotificationCoordinator {
         QuotaNotificationSettingsPresentation(
             enabled: stateAvailable && state.preferences.enabled,
             thresholdMode: state.preferences.thresholdMode,
-            resetEnabled: state.preferences.resetEnabled && resetProofAvailable,
-            resetAvailable: resetProofAvailable,
+            resetEnabled: state.preferences.resetEnabled && resetScheduleAvailable,
+            resetAvailable: resetScheduleAvailable,
             authorization: authorization,
             status: status
         )
@@ -884,17 +902,17 @@ final class QuotaNotificationCoordinator {
         evaluationEpoch &+= 1
         state.preferences.enabled = true
         if !state.preferences.defaultsApplied {
-            // Defaults exist only after this explicit opt-in. The current
-            // provider receipt can prove threshold crossings but supplies a
-            // reset schedule, not an observed reset identity, so reset alerts
-            // deliberately remain off and unavailable.
+            // Defaults exist only after this explicit opt-in. Reset alerts
+            // use the provider-reported schedule on the next foreground
+            // refresh; an observed reset identity is an optional stronger
+            // dedupe key, not a prerequisite for the alert.
             state.preferences.thresholdMode = .eightyAndNinety
-            state.preferences.resetEnabled = false
+            state.preferences.resetEnabled = true
             state.preferences.defaultsApplied = true
         }
-        if !resetProofAvailable {
-            state.preferences.resetEnabled = false
-        }
+        // Older state may have been written while schedule-only reset alerts
+        // were disabled. Opting in again adopts the now-authorized fallback.
+        state.preferences.resetEnabled = true
         // Do not compare a post-opt-in observation with a hidden pre-opt-in
         // baseline. The first eligible observation always establishes state.
         state.clearEvaluationState()
@@ -919,7 +937,7 @@ final class QuotaNotificationCoordinator {
     func setResetEnabled(_ enabled: Bool) {
         guard stateAvailable, state.preferences.enabled else { return }
         evaluationEpoch &+= 1
-        state.preferences.resetEnabled = enabled && resetProofAvailable
+        state.preferences.resetEnabled = enabled && resetScheduleAvailable
         state.clearEvaluationState()
         guard persist() else { return }
         setStatus(.waitingForFreshProviderEvidence)
@@ -1019,18 +1037,11 @@ final class QuotaNotificationCoordinator {
             setStatus(.ineligible(.schemaChanged))
             return
         }
-        let supportsResetProof = evidence.windows.contains {
-            $0.resetProof.identity != nil
-        }
-        resetProofAvailable = supportsResetProof
+        resetScheduleAvailable = false
         var nextState = state
-        // An older local state must not keep reset delivery enabled after a
-        // current provider receipt shows that this source has only a schedule.
-        if !supportsResetProof {
-            nextState.preferences.resetEnabled = false
-        }
         var sawFirstObservation = false
         var sawNewObservation = false
+        var sawValidResetSchedule = false
         var candidates: [QuotaNotificationCandidate] = []
         for window in evidence.windows.sorted(by: { $0.lane < $1.lane }) {
             guard ["primary", "secondary"].contains(window.lane),
@@ -1043,6 +1054,7 @@ final class QuotaNotificationCoordinator {
                 setStatus(.ineligible(.schemaChanged))
                 return
             }
+            sawValidResetSchedule = true
             let laneKey = [
                 evidence.continuityKey,
                 window.lane,
@@ -1059,7 +1071,7 @@ final class QuotaNotificationCoordinator {
                 continue
             }
             guard let previousObservedAt = canonicalNotificationDate(previous.observedAt),
-                  canonicalNotificationDate(previous.resetAt) != nil
+                  let previousResetAt = canonicalNotificationDate(previous.resetAt)
             else {
                 setStatus(.ineligible(.schemaChanged))
                 return
@@ -1074,12 +1086,19 @@ final class QuotaNotificationCoordinator {
                 resetIdentityChanged = previousIdentity != currentIdentity
             } else {
                 // A first identity, a missing identity, and a schedule-only
-                // receipt do not prove a transition. The first eligible
-                // identity is stored only as a later comparison baseline.
+                // receipt do not prove an identity transition. The first
+                // eligible identity is stored only as a later comparison
+                // baseline.
                 resetIdentityChanged = false
             }
             let scheduleChanged = window.resetAt != previous.resetAt
-            if scheduleChanged || resetIdentityChanged {
+            let resetIsDue = observedAt >= previousResetAt
+
+            // Preserve the stronger identity-based path when the provider
+            // supplies it. It may arrive before the scheduled time, so it is
+            // intentionally checked before the schedule-only fallback.
+            if resetIdentityChanged,
+               let identity = window.resetProof.identity {
                 nextState.baselines[laneKey] = QuotaNotificationBaseline(
                     observedAt: evidence.observedAt,
                     usedPercent: window.usedPercent,
@@ -1087,17 +1106,16 @@ final class QuotaNotificationCoordinator {
                     resetIdentity: window.resetProof.identity
                 )
                 if scheduleChanged {
-                    // The provider's schedule partitions threshold dedupe for
-                    // the next allowance window, but does not itself prove a
-                    // reset notification. Thresholds are never compared
-                    // across that boundary.
+                    // A new provider schedule starts a new threshold epoch.
+                    // Keep the identity event being created below, but do
+                    // not allow old schedule keys to replay.
                     nextState.handledKeys.removeAll {
-                        $0.hasPrefix("threshold|\(laneKey)|")
-                            || $0.hasPrefix("reset|\(laneKey)|")
+                        ($0.hasPrefix("threshold|\(laneKey)|")
+                            || $0.hasPrefix("reset|\(laneKey)|"))
+                            && $0 != "reset|\(laneKey)|\(window.resetAt)|\(identity)"
                     }
                 }
                 if nextState.preferences.resetEnabled,
-                   resetIdentityChanged,
                    let identity = window.resetProof.identity {
                     let eventKey = "reset|\(laneKey)|\(window.resetAt)|\(identity)"
                     if !nextState.handledKeys.contains(eventKey) {
@@ -1108,10 +1126,58 @@ final class QuotaNotificationCoordinator {
                         ))
                     }
                 }
-                // Thresholds are intentionally never compared across a
-                // provider-reported schedule boundary: the new allowance
-                // begins with its own baseline. Current receipts therefore
-                // update state but never create reset alerts.
+                continue
+            }
+
+            if resetIsDue {
+                // Schedule-only fallback: the first observation establishes
+                // a pre-reset baseline, and the next eligible foreground
+                // refresh at or after that provider-reported `resetAt` emits
+                // one alert. The old due time is the event identity, so a
+                // changed next schedule cannot duplicate this alert.
+                let identity = window.resetProof.identity
+                    ?? previous.resetIdentity
+                let eventKey = identity.map {
+                    "reset|\(laneKey)|\(previous.resetAt)|\($0)"
+                } ?? "reset|\(laneKey)|\(previous.resetAt)"
+                if nextState.preferences.resetEnabled,
+                   !nextState.handledKeys.contains(eventKey) {
+                    candidates.append(QuotaNotificationCandidate(
+                        kind: .reset,
+                        eventKey: eventKey,
+                        requestIdentifier: "tibotattle-quota-\(eventKey)"
+                    ))
+                }
+                nextState.baselines[laneKey] = QuotaNotificationBaseline(
+                    observedAt: evidence.observedAt,
+                    usedPercent: window.usedPercent,
+                    resetAt: window.resetAt,
+                    resetIdentity: window.resetProof.identity
+                )
+                // A reset begins a new threshold epoch. Remove old keys, but
+                // retain the schedule event key just selected for dedupe.
+                nextState.handledKeys.removeAll {
+                    ($0.hasPrefix("threshold|\(laneKey)|")
+                        || $0.hasPrefix("reset|\(laneKey)|"))
+                        && $0 != eventKey
+                }
+                continue
+            }
+
+            if scheduleChanged {
+                // A provider schedule change before the old due time is not a
+                // reset. Replace the baseline and clear the old epoch so a
+                // later crossing is compared only inside the new schedule.
+                nextState.baselines[laneKey] = QuotaNotificationBaseline(
+                    observedAt: evidence.observedAt,
+                    usedPercent: window.usedPercent,
+                    resetAt: window.resetAt,
+                    resetIdentity: window.resetProof.identity
+                )
+                nextState.handledKeys.removeAll {
+                    $0.hasPrefix("threshold|\(laneKey)|")
+                        || $0.hasPrefix("reset|\(laneKey)|")
+                }
                 continue
             }
 
@@ -1135,6 +1201,7 @@ final class QuotaNotificationCoordinator {
             }
         }
 
+        resetScheduleAvailable = sawValidResetSchedule
         guard !candidates.isEmpty else {
             state = nextState
             guard persist() else { return }
@@ -1469,9 +1536,9 @@ enum QuotaNotificationContractSmokeTest {
               require(coordinator.presentation.thresholdMode == .eightyAndNinety,
                       "opt-in defaults missing"),
               require(!coordinator.presentation.resetEnabled,
-                      "schedule-only reset default was enabled"),
+                      "reset alert became available before a schedule"),
               require(!coordinator.presentation.resetAvailable,
-                      "schedule-only source claimed reset proof"),
+                      "reset alert claimed a schedule before observation"),
               require(center.authorizationRequests == 0, "authorized state prompted")
         else { return 1 }
 
@@ -1552,69 +1619,97 @@ enum QuotaNotificationContractSmokeTest {
         )
         resetCoordinator.refreshAuthorization()
         resetCoordinator.setEnabled(true)
-        // The production schema's `resetsAt` schedule changes here, but it
-        // is intentionally insufficient to fire a reset alert.
+        // A provider-reported schedule is enough for the practical fallback,
+        // but only after a pre-reset baseline exists.
         resetCoordinator.evaluate(evidence(
             observedAt: "2026-08-03T10:00:00.000Z",
             usedPercent: 70,
             resetAt: "2026-08-10T10:00:00.000Z"
         ))
+        guard require(resetCenter.requests.isEmpty,
+                      "first reset schedule observation notified"),
+              require(resetCoordinator.presentation.resetAvailable,
+                      "provider schedule did not expose reset availability"),
+              require(resetCoordinator.presentation.resetEnabled,
+                      "opt-in did not enable scheduled reset alerts")
+        else { return 1 }
+        // A schedule moved before its due time is a schedule change, not a
+        // reset. It must replace the baseline without notifying.
         resetCoordinator.evaluate(evidence(
-            observedAt: "2026-08-10T10:01:00.000Z",
-            usedPercent: 4,
-            resetAt: "2026-08-17T10:00:00.000Z"
+            observedAt: "2026-08-09T10:01:00.000Z",
+            usedPercent: 72,
+            resetAt: "2026-08-11T10:00:00.000Z"
         ))
         guard require(resetCenter.requests.isEmpty,
-                      "reset schedule alone notified"),
-              require(!resetCoordinator.presentation.resetEnabled,
-                      "schedule-only receipt enabled reset delivery")
+                      "schedule change before due time notified")
+        else { return 1 }
+        resetCoordinator.evaluate(evidence(
+            observedAt: "2026-08-11T10:01:00.000Z",
+            usedPercent: 4,
+            resetAt: "2026-08-18T10:00:00.000Z"
+        ))
+        guard require(resetCenter.requests.count == 1,
+                      "scheduled reset did not notify after due time")
+        else { return 1 }
+        resetCoordinator.evaluate(evidence(
+            observedAt: "2026-08-11T10:02:00.000Z",
+            usedPercent: 4,
+            resetAt: "2026-08-18T10:00:00.000Z"
+        ))
+        guard require(resetCenter.requests.count == 1,
+                      "scheduled reset was not deduped")
         else { return 1 }
 
-        // This injected future-only adapter shape proves the gate itself:
-        // two *explicit* opaque provider identities are required. It is not
-        // emitted by the current app-server receipt.
+        // An opaque identity, when present, remains part of the event key and
+        // still takes the stronger identity path.
+        let identityStore = InMemoryQuotaNotificationStateStore()
+        let identityCenter = FakeNotificationCenter(authorization: .authorized)
+        let identityCoordinator = QuotaNotificationCoordinator(
+            stateStore: identityStore,
+            notificationCenter: identityCenter
+        )
+        identityCoordinator.refreshAuthorization()
+        identityCoordinator.setEnabled(true)
         let explicitResetFirst = evidence(
             observedAt: "2026-08-17T10:02:00.000Z",
             usedPercent: 6,
             resetAt: "2026-08-24T10:00:00.000Z",
             resetProof: .providerReportedIdentity("window-2026-08-24")
         )
-        resetCoordinator.evaluate(explicitResetFirst)
-        guard require(resetCoordinator.presentation.resetAvailable,
+        identityCoordinator.evaluate(explicitResetFirst)
+        guard require(identityCoordinator.presentation.resetAvailable,
                       "explicit reset identity did not expose availability")
         else { return 1 }
-        resetCoordinator.setResetEnabled(true)
-        resetCoordinator.evaluate(explicitResetFirst)
-        resetCoordinator.evaluate(evidence(
+        identityCoordinator.evaluate(evidence(
             observedAt: "2026-08-24T10:01:00.000Z",
             usedPercent: 3,
             resetAt: "2026-08-31T10:00:00.000Z",
             resetProof: .providerReportedIdentity("window-2026-08-31")
         ))
-        guard require(resetCenter.requests.count == 1,
+        guard require(identityCenter.requests.count == 1,
                       "explicit provider reset identity did not notify"),
-              require(resetCenter.requests[0].title ==
+              require(identityCenter.requests[0].title ==
                         TiboTattleLocalization.string(.notificationResetTitle),
                       "reset content mismatch")
         else { return 1 }
-        resetCoordinator.evaluate(evidence(
+        identityCoordinator.evaluate(evidence(
             observedAt: "2026-08-10T10:02:00.000Z",
             usedPercent: 6,
             resetAt: "2026-08-17T10:00:00.000Z"
         ))
-        resetCoordinator.evaluate(evidence(
+        identityCoordinator.evaluate(evidence(
             observedAt: "2026-08-31T10:01:00.000Z",
             usedPercent: 3,
             resetAt: "2026-09-07T10:00:00.000Z",
             resetProof: .unavailable
         ))
-        guard require(resetCenter.requests.count == 1,
+        guard require(identityCenter.requests.count == 1,
                       "unproven reset notified")
         else { return 1 }
 
         let relaunchedCenter = FakeNotificationCenter(authorization: .authorized)
         let relaunched = QuotaNotificationCoordinator(
-            stateStore: resetStore,
+            stateStore: identityStore,
             notificationCenter: relaunchedCenter
         )
         relaunched.refreshAuthorization()
@@ -1811,8 +1906,8 @@ enum QuotaNotificationContractSmokeTest {
         print(
             "USAGE_MONITOR_MACOS_QUOTA_NOTIFICATION_CONTRACT "
                 + "opt_in=true fresh_only=true first_sample=false "
-                + "threshold=true reset_schedule_suppressed=true "
-                + "reset_identity_gate=true dedupe=true opt_out=true"
+                + "threshold=true reset_schedule_fallback=true "
+                + "reset_identity_dedupe=true dedupe=true opt_out=true"
         )
         return 0
     }

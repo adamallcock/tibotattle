@@ -83,10 +83,6 @@
           <select data-language-picker aria-label="Language"></select>
         </label>
         <p class="sr-only" data-language-announcement role="status" aria-live="polite" aria-atomic="true"></p>
-        <span class="state-pill state-connecting" id="central-state" data-requires-evidence hidden>
-          <span class="state-dot" aria-hidden="true"></span>
-          Community checking
-        </span>
         <span class="state-pill state-connecting" id="global-state">
           <span class="state-dot" aria-hidden="true"></span>
           Connecting
@@ -268,7 +264,6 @@
               <span id="cost-period">Recorded period</span>
               <strong id="cost-total">—</strong>
               <small id="cost-coverage">Awaiting local evidence</small>
-              <small id="cost-history-coverage" hidden></small>
             </div>
             <p class="annotation">
               This activity total can exceed the inferred weekly limit: it spans
@@ -362,7 +357,6 @@
             <p class="eyebrow">02 · Weekly allowance</p>
             <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
           </div>
-          <p>One dot per distinct reset.</p>
         </div>
 
         <div class="weekly-hero">
@@ -401,22 +395,12 @@
           <div class="chart-empty small" id="weekly-empty">No weekly estimates loaded.</div>
           <div class="chart-shell weekly-history-chart" id="weekly-chart" hidden></div>
           <p class="annotation">
-            Each dot is a separate reset estimate. Its vertical bar shows the range supported by that reset’s observations.
+            Each reset estimate is shown with the range supported by that reset’s observations.
           </p>
         </article>
 
-        <aside class="weekly-pricing-receipt" id="weekly-pricing-receipt" aria-live="polite">
-          <div>
-            <p class="panel-kicker">Price basis for the visible fits</p>
-            <h3 id="weekly-pricing-receipt-title">Price table not yet loaded</h3>
-          </div>
-          <p id="weekly-pricing-receipt-copy">
-            TiboTattle will state which reviewed price table was used once local evidence loads.
-          </p>
-        </aside>
-
         <details class="panel weekly-table-panel evidence-disclosure">
-          <summary>See individual measurements</summary>
+          <summary>See individual usage changes</summary>
           <div class="table-wrap">
             <table>
               <caption class="sr-only">Individual seven-day reset estimates</caption>
@@ -464,7 +448,7 @@
               </div>
               <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
                 <span><i class="legend-dot cost"></i>API-cost estimate</span>
-                <span><i class="legend-dot allowance"></i>7-day allowance remaining</span>
+                <span><i class="legend-dot allowance"></i>Observed allowance remaining</span>
               </div>
             </div>
           </div>
@@ -508,8 +492,8 @@
                 <span><i class="legend-dot observed"></i>Observed quota</span>
                 <span><i class="legend-dot expected"></i>Expected from API cost</span>
                 <span><i class="legend-dot chart-status-missing"></i>Missing quota bracket</span>
-                <span><i class="legend-dot chart-status-reset"></i>Reset or track change</span>
-                <span><i class="legend-dot chart-status-ambiguous"></i>Ambiguous movement</span>
+                <span><i class="legend-dot chart-status-reset"></i>Window boundary or track change</span>
+                <span><i class="legend-dot chart-status-ambiguous"></i>Movement needs context</span>
               </div>
             </div>
           </div>
@@ -532,7 +516,7 @@
             </div>
             <p class="annotation">
               The difference between provider-reported quota movement and the
-              movement implied by measured local activity. Quiet periods with no
+              movement implied by local usage changes. Quiet periods with no
               activity and no quota change are neutral, not errors.
             </p>
             <div class="chart-empty small" id="residual-empty">No residual evidence loaded.</div>
@@ -585,7 +569,7 @@
           <div>
             <strong>API pricing is a measuring stick, not your bill.</strong>
             <p>
-              Each measured local event uses the public API price that was in
+              Each local usage change uses the public API price that was in
               effect when it occurred, with the published Fast multiplier when
               applicable. It is an equivalent for comparison, not an invoice.
             </p>
@@ -601,7 +585,7 @@
               </div>
             </div>
             <p class="annotation">
-              Every measured token belongs to one non-overlapping component.
+              Every token belongs to one non-overlapping component.
               Output text excludes reasoning tokens; combined output is only used
               when a source does not provide that split.
             </p>
@@ -615,8 +599,8 @@
               </div>
             </div>
             <p class="annotation">
-              Standard-rate API equivalent by component. Tokens with no mapped
-              price remain visible in the count, but do not add a guessed cost.
+              Standard-rate API equivalent by component. Coverage and price
+              provenance stay visible without adding a guessed cost.
             </p>
             <div class="accounting-bars" id="accounting-component-costs"></div>
           </article>
@@ -631,20 +615,20 @@
             <div class="table-wrap">
               <table>
                 <caption class="sr-only">Replay-safe usage grouped by recognized model</caption>
-                <thead><tr><th>Model</th><th>Measured events</th><th>Tokens</th><th>API equivalent</th></tr></thead>
+                <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>API equivalent</th></tr></thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
             <p class="annotation">
-              Known models without a reviewed historical price, and genuinely
-              unknown model names, remain visible without an invented cost.
+              Coverage and price provenance remain visible above; unavailable
+              evidence never adds an invented cost.
             </p>
         </article>
       </section>
 
       <section
         class="contribution-cta dashboard-page-inactive"
-        id="contribution-cta"
+        id="community"
         aria-labelledby="contribution-cta-title"
         data-dashboard-page="community"
         data-requires-evidence
@@ -766,488 +750,82 @@
             </button>
           </div>
           <p class="participant-action-status" id="community-connect-status" role="status" hidden></p>
-          <details class="automatic-contribution-status" id="automatic-contribution-status" aria-live="polite" hidden>
-            <summary>Automatic contribution (advanced)</summary>
-            <div>
-              <strong>Automatic contribution</strong>
-              <span class="evidence-chip neutral" id="automatic-contribution-state">Off</span>
-            </div>
-            <p id="automatic-contribution-description">
-              Off until you explicitly consent. No daemon or login item is installed;
-              checks run only while TiboTattle is open.
-            </p>
-            <!--
-              Deliberately not a "compact" button, for the same reason as sign
-              out above: this is the only in-page way to stop recurring
-              contribution, so it keeps the full 44px target rather than the
-              37px compact one, and stays clear of any rule that hides compact
-              controls at narrow widths.
-            -->
-            <button
-              class="button button-quiet"
-              id="automatic-contribution-toggle"
-              type="button"
-              hidden
-            >
-              Turn off automatic contribution
-            </button>
-          </details>
         </div>
-      </section>
 
-      <section class="dashboard-section dashboard-page-inactive" id="data" data-dashboard-page="community" data-nav-target aria-labelledby="data-title" aria-hidden="true" inert>
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">06 · Community contribution</p>
-            <h2 id="data-title">Review first. Contribute by choice.</h2>
-          </div>
-          <p>
-            Review one content-free result before an optional upload. Local
-            reporting stays on this Mac.
+          <p class="community-public-evidence">
+            Delayed community evidence is published on the public website.
+            <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">View delayed community evidence</a>
           </p>
-        </div>
-
-        <div class="boundary-diagram" role="img" aria-label="Raw logs remain local. The local companion extracts content-free metadata for the dashboard. Only a reviewed safe export can be sent to the contribution service." data-i18n-aria-label="aria.rawLogsLocal">
-          <div class="boundary-node private">
-            <span>On your computer</span>
-            <strong>Raw Codex logs</strong>
-            <small>Prompts, responses, paths never enter this page</small>
-          </div>
-          <span class="boundary-arrow" aria-hidden="true">→</span>
-          <div class="boundary-node local">
-            <span>Loopback only</span>
-            <strong>Local companion</strong>
-            <small>Reads logs, prices usage, builds safe summaries</small>
-          </div>
-          <span class="boundary-arrow optional" aria-hidden="true">⇢</span>
-          <div class="boundary-node community">
-            <span>Optional</span>
-            <strong>Validated contribution</strong>
-            <small>Content-free schema, bounded size, explicit consent</small>
-          </div>
-        </div>
-
-        <details class="panel schema-inspection">
-          <summary>
-            <span>
-              <span class="panel-kicker">Pre-upload inspection</span>
-              <strong>Exact metadata categories a contribution may contain</strong>
-            </span>
-            <span class="evidence-chip">Closed schema</span>
-          </summary>
-          <div class="schema-grid">
-            <div>
-              <h3>Permitted metadata</h3>
-              <ul>
-                <li>Observation, event and reset timestamps</li>
-                <li>Uncached input, cached input, cache write, text output, reasoning output and combined-output token counts</li>
-                <li>Recognized model declaration or safe opaque model fingerprint</li>
-                <li>Subscription speed and separately observed API service tier</li>
-                <li>Coarse surface, agent scope and child-rollout lineage classes</li>
-                <li>Coarse tool-class counts</li>
-                <li>Quota percentage, window duration, slot and reset timing</li>
-                <li>Domain-separated participant, account, session, event and snapshot pseudonyms where the selected contract permits them</li>
-                <li>Schema, pricing, parser and consent provenance plus fixed diagnostics</li>
-              </ul>
-            </div>
-            <div class="excluded">
-              <h3>Never collected or uploaded</h3>
-              <ul>
-                <li>Prompts, responses or reasoning text</li>
-                <li>Tool names, arguments, commands or command output</li>
-                <li>URLs, files, paths, repositories, branches or working directories</li>
-                <li>Email addresses, account names, hostnames or usernames</li>
-                <li>Raw participant, device, account, session or request identifiers</li>
-                <li>Credentials, cookies, API keys, tokens or authorization material</li>
-                <li>Arbitrary labels, unknown fields or free-form metadata</li>
-              </ul>
-            </div>
-          </div>
-          <p class="backend-contract-note">
-            Browser validation is a preflight. The Worker decrypts into bounded
-            memory, validates the same closed schema again, rejects content canaries,
-            and recalculates API-price-equivalent values before D1 ingestion.
-          </p>
-        </details>
-
-        <details class="journey-disclosure journey-progressive" id="community-contribution-disclosure">
-          <summary>
-            <span>
-              <span class="panel-kicker">Advanced details</span>
-              <strong>Contribution, service, and account controls</strong>
-            </span>
-            <span class="evidence-chip neutral">Closed until you choose it</span>
-          </summary>
-        <div class="two-column data-panels">
-          <article class="panel">
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Local collector</p>
-                <h3>Source and analysis status</h3>
-              </div>
-              <span class="evidence-chip" id="collector-state">Unknown</span>
-            </div>
-            <dl class="definition-grid" id="collector-details">
-              <div><dt>Last analysis</dt><dd>—</dd></div>
-              <div><dt>Safe records</dt><dd>—</dd></div>
-              <div><dt>Source bytes</dt><dd>Not exposed to browser</dd></div>
-              <div><dt>Identity</dt><dd>Pseudonymous</dd></div>
-            </dl>
-            <section class="index-progress" id="index-progress" aria-live="polite" hidden>
-              <div class="index-progress-heading">
-                <strong id="index-progress-title">Analyzing recent local history</strong>
-                <span class="evidence-chip neutral" id="index-progress-phase">Waiting</span>
-              </div>
-              <progress id="index-progress-bar" max="1" value="0"></progress>
-              <p id="index-progress-summary">
-                The local companion has not started a bounded local analysis.
-              </p>
-              <p class="annotation" id="index-progress-coverage">
-                Raw log contents and source paths never enter this page.
-              </p>
-              <p class="annotation safe-close-guidance" id="index-progress-close-guidance">
-                You may close this browser tab while analysis continues. Keep
-                the TiboTattle app open; closing it ends the local companion
-                and preserves the last durable checkpoint for a later resume.
-              </p>
-            </section>
-            <div class="privacy-lists">
-              <div>
-                <strong>Included</strong>
-                <ul><li>Timestamps and models</li><li>Token components and quota observations</li><li>Coarse tool and surface categories</li></ul>
-              </div>
-              <div class="excluded">
-                <strong>Excluded</strong>
-                <ul><li>Prompts and responses</li><li>Files, paths, commands and arguments</li><li>Email and account names</li></ul>
-              </div>
-            </div>
-          </article>
-
-          <article class="panel contribution-panel" id="contribution-review">
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Review before the first send</p>
-                <h3>Review a content-free contribution</h3>
-              </div>
-              <span class="evidence-chip neutral" id="service-state">Checking service</span>
-            </div>
-            <p class="annotation">
-              Preparation reads the latest bounded interval locally and performs no
-              upload. Inspect the concise summary, expand the exact JSON if wanted,
-              then confirm the first send.
-            </p>
-            <div class="local-preparation">
-              <p class="control-label">Prepare and review evidence</p>
-              <div class="preparation-readiness">
-                <strong>Preparation identity</strong>
-                <span class="evidence-chip neutral" id="preparation-identity">Checking</span>
-              </div>
-              <div class="preparation-window">
-                <span class="control-label">Evidence to prepare</span>
-                <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback" data-i18n-aria-label="aria.contributionLookback">
-                  <button type="button" data-lookback-hours="1">1 hour</button>
-                  <button type="button" data-lookback-hours="24" class="active" aria-pressed="true">24 hours</button>
-                  <button type="button" data-lookback-hours="168">7 days</button>
-                </div>
-              </div>
-              <p class="annotation" id="preparation-estimate">
-                Analyze local usage to estimate the number of privacy-safe
-                records and upload batches before preparation.
-              </p>
-              <button class="button button-secondary" id="prepare-contribution" type="button">
-                Prepare and review last 24 hours
-              </button>
-              <p class="participant-action-status" id="prepare-contribution-status" role="status">
-                Nothing is sent until you separately inspect and choose a send action.
-                A dense seven-day selection may exceed the single reviewed-set safety cap;
-                if so, choose 24 hours instead.
-              </p>
-            </div>
-            <details class="manual-contribution">
-              <summary>Advanced: use an existing TiboTattle export</summary>
+          <details class="journey-disclosure community-review" id="community-contribution-disclosure">
+            <summary>
+              <span>
+                <span class="panel-kicker">Review before sending</span>
+                <strong>Prepare and review a contribution</strong>
+              </span>
+              <span class="evidence-chip neutral">Nothing sends automatically</span>
+            </summary>
+            <article class="panel contribution-panel" id="contribution-review">
               <p class="annotation">
-                Choose a <code>.json</code> file created by TiboTattle. Do not
-                choose a <code>.jsonl</code> file, a sessions folder, or a raw Codex log.
+                Preparation and inspection stay on this Mac. Send is a separate,
+                explicit action after the concise review is ready.
               </p>
-            <form id="contribution-form">
-              <label class="file-drop" for="contribution-file">
-                <input id="contribution-file" name="export" type="file" accept=".json,application/json" required>
-                <span aria-hidden="true">＋</span>
-                <strong>Choose a TiboTattle .json export</strong>
-                <small id="file-help">Not a Codex log or .jsonl file · 1.25 MB browser validation limit</small>
-              </label>
-              <section
-                class="selected-contribution-inspection"
-                id="selected-contribution-inspection"
-                aria-live="polite"
-                hidden
-              >
+              <div class="local-preparation">
+                <p class="control-label">Prepare local evidence</p>
+                <div class="preparation-readiness">
+                  <strong>Preparation identity</strong>
+                  <span class="evidence-chip neutral" id="preparation-identity">Checking</span>
+                </div>
+                <div class="preparation-window">
+                  <span class="control-label">Evidence to prepare</span>
+                  <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback" data-i18n-aria-label="aria.contributionLookback">
+                    <button type="button" data-lookback-hours="1">1 hour</button>
+                    <button type="button" data-lookback-hours="24" class="active" aria-pressed="true">24 hours</button>
+                    <button type="button" data-lookback-hours="168">7 days</button>
+                  </div>
+                </div>
+                <p class="annotation" id="preparation-estimate">
+                  Analyze local usage to estimate the number of privacy-safe
+                  records and upload batches before preparation.
+                </p>
+                <button class="button button-secondary" id="prepare-contribution" type="button">
+                  Prepare and review last 24 hours
+                </button>
+                <p class="participant-action-status" id="prepare-contribution-status" role="status">
+                  Nothing is sent until you separately inspect and choose a send action.
+                </p>
+              </div>
+              <div class="sync-next-card" id="sync-next-card">
                 <div class="panel-heading compact-heading">
                   <div>
-                    <p class="panel-kicker">Selected export inspection</p>
-                    <h4>Exact retained fields and values</h4>
+                    <p class="panel-kicker">Reviewed contribution</p>
+                    <h3 id="sync-next-title">Inspect before sending</h3>
                   </div>
-                  <span class="evidence-chip neutral" id="selected-contribution-state">Not validated</span>
+                  <span class="evidence-chip neutral" id="sync-next-state">Not inspected</span>
                 </div>
-                <p class="annotation" id="selected-contribution-message">
-                  Choose a TiboTattle export to validate it locally.
-                </p>
-                <dl class="backend-facts selected-contribution-facts">
-                  <div><dt>Schema</dt><dd id="selected-contribution-schema">—</dd></div>
-                  <div><dt>Exact bytes</dt><dd id="selected-contribution-bytes">—</dd></div>
-                  <div><dt>Usage rows</dt><dd id="selected-contribution-usage">—</dd></div>
-                  <div><dt>Quota rows</dt><dd id="selected-contribution-quota">—</dd></div>
+                <dl class="summary-facts sync-next-facts">
+                  <div><dt>Covered period</dt><dd id="sync-next-coverage">—</dd></div>
+                  <div><dt>Safe records</dt><dd id="sync-next-records">—</dd></div>
+                  <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
+                  <div><dt>Upload reservation</dt><dd id="sync-next-bytes">—</dd></div>
                 </dl>
-                <details class="exact-json-inspection">
-                  <summary>Review every validated field and value</summary>
-                  <pre id="selected-contribution-json" data-i18n-skip></pre>
-                </details>
-                <p class="backend-contract-note">
-                  This is the complete plaintext contribution. These exact values
-                  are encrypted in your browser; raw logs and any field not shown
-                  here are not sent.
-                </p>
-              </section>
-              <label class="consent-row">
-                <input id="contribution-consent" type="checkbox" required>
-                <span>
-                  <strong id="contribution-consent-title">I reviewed this as a privacy-safe TiboTattle export.</strong>
-                  <small id="contribution-consent-detail">Uploading is optional and can be tested against a local backend.</small>
-                </span>
-              </label>
-              <button class="button button-primary" id="contribution-submit" type="submit" disabled>
-                Validate and contribute
-              </button>
-            </form>
-            </details>
-            <div class="upload-status" id="upload-status" role="status" hidden></div>
-          </article>
-        </div>
-
-        <details class="panel sync-status-panel" aria-labelledby="sync-status-title" hidden>
-          <summary class="sync-panel-summary">
-            <div>
-              <p class="panel-kicker">Contribution activity</p>
-              <h3 id="sync-status-title">Advanced queue and exact review</h3>
-            </div>
-            <span class="evidence-chip neutral" id="sync-state">Checking queue</span>
-          </summary>
-          <div class="sync-panel-body">
-          <p class="annotation" id="sync-description">
-            The local queue contains metadata about committed, privacy-verified
-            batches only. It never contains prompts, responses, source paths,
-            account names, browser sessions, or device secrets.
-          </p>
-          <dl class="backend-facts sync-facts">
-            <div><dt>Waiting</dt><dd id="sync-waiting">—</dd></div>
-            <div><dt>In flight</dt><dd id="sync-in-flight">—</dd></div>
-            <div><dt>Accepted</dt><dd id="sync-accepted">—</dd></div>
-            <div><dt>Needs attention</dt><dd id="sync-attention">—</dd></div>
-            <div><dt>Next attempt</dt><dd id="sync-next-attempt">—</dd></div>
-            <div><dt>Last accepted</dt><dd id="sync-last-accepted">—</dd></div>
-          </dl>
-          <div class="sync-next-card" id="sync-next-card">
-            <div class="panel-heading compact-heading">
-              <div>
-                <p class="panel-kicker">Next verified upload</p>
-                <h4 id="sync-next-title">Inspect before sending</h4>
-              </div>
-              <span class="evidence-chip neutral" id="sync-next-state">Not inspected</span>
-            </div>
-            <dl class="backend-facts sync-next-facts">
-              <div><dt>Covered period</dt><dd id="sync-next-coverage">—</dd></div>
-              <div><dt>Safe records</dt><dd id="sync-next-records">—</dd></div>
-              <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
-              <div><dt>Upload reservation</dt><dd id="sync-next-bytes">—</dd></div>
-            </dl>
-            <div class="sync-actions" aria-label="Foreground contribution controls" data-i18n-aria-label="aria.foregroundContributionControls">
-              <button class="button button-secondary" id="sync-inspect" type="button">
-                Inspect next
-              </button>
-              <button class="button button-primary" id="sync-run-once" type="button">
-                Send reviewed upload
-              </button>
-              <button class="button button-secondary" id="sync-pause" type="button">
-                Pause
-              </button>
-              <button class="button button-secondary" id="sync-resume" type="button">
-                Resume
-              </button>
-            </div>
-            <p class="annotation">
-              Sending stays disabled until you open the exact local review for
-              the current queued contribution.
-            </p>
-            <div class="sync-device-disconnect">
-              <p class="annotation">
-                Stop this Mac's future uploads without deleting metadata already
-                contributed. Reconnecting later requires a fresh reviewed
-                contribution on this Mac.
-              </p>
-              <button
-                class="button button-danger"
-                id="sync-disconnect-device"
-                type="button"
-                hidden
-              >
-                Disconnect this Mac
-              </button>
-            </div>
-            <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
-            <details class="sync-exact-review" id="sync-exact-review" hidden>
-              <summary>
-                <span>Review exact content-free metadata JSON</span>
-                <span class="evidence-chip" id="sync-exact-review-state">Verified</span>
-              </summary>
-              <p class="annotation">
-                This verified JSON is read from the owner-only prepared set over
-                loopback. It has not been sent to the contribution service.
-              </p>
-              <pre id="sync-exact-review-json" tabindex="0" data-i18n-skip></pre>
-            </details>
-            <p class="backend-contract-note">
-              Inspection uses loopback only: it performs no service request,
-              key fetch, authorization, or upload. The send action consumes a
-              ten-minute, single-use local authorization and can claim only the
-              exact reviewed queue job. The broader foreground CLI retains its
-              independent bounded multi-job and upload-byte limits.
-            </p>
-          </div>
-          <p class="backend-contract-note">
-            Automatic checks run at most every 6 hours while TiboTattle is
-            open and only after explicit consent. No login item, LaunchAgent,
-            daemon or silent background process is installed.
-          </p>
-          </div>
-        </details>
-
-        <article class="panel backend-panel" id="backend" data-nav-target aria-labelledby="backend-title">
-          <div class="panel-heading">
-            <div>
-              <p class="panel-kicker">Optional community service</p>
-              <h3 id="backend-title">Community backend readiness and data lifecycle</h3>
-            </div>
-            <span class="evidence-chip neutral" id="backend-state">Checking backend</span>
-          </div>
-          <p class="annotation" id="backend-description">
-            This optional service is separate from the local collector above.
-            Your local reporting works whether or not it is reachable, and
-            nothing leaves this Mac unless you choose to contribute.
-          </p>
-          <details class="journey-disclosure service-detail-disclosure" id="backend-service-detail">
-            <summary>
-              <span><strong>Service readiness and lifecycle detail</strong></span>
-            </summary>
-            <div class="service-detail-body">
-          <p class="annotation" id="backend-readiness-note">
-            Live readiness verifies database and encrypted-object access,
-            fresh retention and restore replay, object reconciliation, and
-            aggregate rebuild state. The repeatable backend suite covers the
-            complete ingestion, isolation, export, and deletion lifecycle.
-          </p>
-          <dl class="backend-facts" id="backend-facts">
-            <div><dt>Database</dt><dd id="backend-database">Checking</dd></div>
-            <div><dt>Deletion ledger</dt><dd id="backend-deletion-ledger">Checking</dd></div>
-            <div><dt>Encrypted quarantine</dt><dd id="backend-storage">Checking</dd></div>
-            <div><dt>Retention &amp; restore replay</dt><dd id="backend-lifecycle">Checking</dd></div>
-            <div><dt>Object reconciliation</dt><dd id="backend-reconciliation">Checking</dd></div>
-            <div><dt>Aggregate rebuild</dt><dd id="backend-aggregate-rebuild">Checking</dd></div>
-            <div><dt>Collection state</dt><dd id="backend-collection-state">Checking</dd></div>
-            <div><dt>Enrollment</dt><dd id="backend-enrollment">Checking</dd></div>
-            <div><dt>Upload registration</dt><dd id="backend-upload-registration">Checking</dd></div>
-            <div><dt>Ingestion processing</dt><dd id="backend-processing">Checking</dd></div>
-            <div><dt>Aggregate publication</dt><dd id="backend-publication">Checking</dd></div>
-            <div><dt>Participant rights</dt><dd id="backend-participant-rights">Checking</dd></div>
-            <div><dt>Accepted upload contract</dt><dd id="backend-contract">Checking</dd></div>
-          </dl>
-          <ol class="backend-flow" aria-label="Contribution backend lifecycle" data-i18n-aria-label="aria.contributionBackendLifecycle">
-            <li><strong>1</strong><span>Browser validation</span><small>Reject raw or oversized files before upload</small></li>
-            <li><strong>2</strong><span>Encrypted transport</span><small>One-use upload authorization and envelope encryption</small></li>
-            <li><strong>3</strong><span>Server validation</span><small>Closed schema, content-field rejection, and canonical repricing</small></li>
-            <li><strong>4</strong><span>Transactional ingest</span><small>Idempotent deduplication into participant-isolated records</small></li>
-            <li><strong>5</strong><span>Private analysis</span><small>Personal cost, quota movement, and calibration results</small></li>
-            <li><strong>6</strong><span>Delayed aggregate</span><small>Thresholded, clipped, rounded community snapshots</small></li>
-              <li><strong>7</strong><span>User control</span><small>Explicit hosted deletion remains available</small></li>
-            <li><strong>8</strong><span>Lifecycle enforcement</span><small>Seven-day quarantine cleanup and deletion-safe restore replay</small></li>
-          </ol>
-          <div class="backend-contract-note" id="backend-contract-note">
-            Account-scoped v0.2 ingest is disabled by default. A separately
-            configured loopback-only preview can exercise the complete HTTP path;
-            external participants remain unauthorized.
-          </div>
-            </div>
-          </details>
-        </article>
-
-        <div class="two-column result-panels">
-          <article class="panel personal-result-panel" id="history" data-nav-target>
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Your contributed evidence</p>
-                <h3>Your contribution receipt</h3>
-              </div>
-            </div>
-            <p class="annotation">
-              Accepted intervals and private calculations appear here. Personal
-              reporting remains in this local app; contribution helps improve the
-              delayed community view.
-            </p>
-            <div class="result-summary" id="personal-result">
-              <p>No accepted contribution is associated with this browser yet.</p>
-            </div>
-            <details class="contribution-history-disclosure">
-              <summary>Contribution history</summary>
-              <section
-                class="participant-detail contribution-history"
-                id="contribution-history"
-                aria-label="Private contribution history"
-                data-i18n-aria-label="aria.privateContributionHistory"
-                hidden
-              ></section>
-            </details>
-            <div class="participant-controls" id="participant-controls" hidden>
-              <details class="privacy-controls">
-                <summary>Hosted privacy controls</summary>
-                <p>
-                  Permanently remove the content-free pseudonymous metadata
-                  associated with this hosted contribution session.
-                </p>
-                <button class="button button-danger" id="delete-participant" type="button">
-                  Delete all contributed metadata
-                </button>
-                <p class="participant-action-status" id="participant-action-status" role="status" hidden></p>
-              </details>
-            </div>
-          </article>
-          <article class="panel community-result-panel" id="community" data-nav-target>
-            <div class="panel-heading">
-              <div>
-                <p class="panel-kicker">Delayed community evidence</p>
-                <h3>Published weekly snapshot</h3>
-              </div>
-            </div>
-            <div class="result-summary" id="community-result">
-              <p>Checking for the latest delayed weekly snapshot…</p>
-            </div>
-            <details class="journey-disclosure service-detail-disclosure" id="community-snapshot-provenance">
-              <summary>
-                <span><strong>How this snapshot is produced</strong></span>
-              </summary>
-              <div class="service-detail-body">
-                <div id="community-snapshot-service-detail"></div>
+                <div class="sync-actions" aria-label="Contribution review controls" data-i18n-aria-label="aria.foregroundContributionControls">
+                  <button class="button button-secondary" id="sync-inspect" type="button">
+                    Review prepared summary
+                  </button>
+                  <button class="button button-primary" id="sync-run-once" type="button">
+                    Send reviewed summary
+                  </button>
+                </div>
                 <p class="annotation">
-                  Community values use a fixed delay, eligible provider-account
-                  support, account-level clipping, and coarse rounding. A sealed
-                  revision is never rewritten; privacy-affecting deletion withdraws
-                  it and schedules a replacement revision without the deleted
-                  source.
+                  Sending stays disabled until the current prepared set has
+                  been inspected locally.
                 </p>
+                <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
               </div>
-            </details>
-          </article>
-        </div>
-        </details>
+            </article>
+          </details>
       </section>
+
     </main>
 
     <footer data-i18n-legacy-root>

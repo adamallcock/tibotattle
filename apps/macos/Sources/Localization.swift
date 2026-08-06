@@ -176,7 +176,9 @@ enum TiboTattleLocalization {
         case nativeDashboardCommunity = "nativeDashboard.community"
         case nativeDashboardCurrentEvidenceTooltip = "nativeDashboard.currentEvidenceTooltip"
         case nativeDashboardDataPrivacy = "nativeDashboard.dataPrivacy"
+        case nativeDashboardFresh = "nativeDashboard.fresh"
         case nativeDashboardHowItWorks = "nativeDashboard.howItWorks"
+        case nativeDashboardNeedsRefresh = "nativeDashboard.needsRefresh"
         case nativeDashboardLocalOnly = "nativeDashboard.localOnly"
         case nativeDashboardLocalOnlyTooltip = "nativeDashboard.localOnlyTooltip"
         case nativeDashboardOverview = "nativeDashboard.overview"
@@ -553,8 +555,12 @@ enum TiboTattleLocalization {
                 "The current local evidence state."
             case .nativeDashboardDataPrivacy:
                 "Data & Privacy"
+            case .nativeDashboardFresh:
+                "Fresh"
             case .nativeDashboardHowItWorks:
                 "How it works"
+            case .nativeDashboardNeedsRefresh:
+                "Needs refresh"
             case .nativeDashboardLocalOnly:
                 "Local only"
             case .nativeDashboardLocalOnlyTooltip:
@@ -666,7 +672,7 @@ enum TiboTattleLocalization {
             case .notificationAllowanceTitle:
                 "Allowance alert"
             case .notificationResetBody:
-                "A fresh provider-reported allowance window changed. Open TiboTattle for details."
+                "A provider-reported allowance window reset. Open TiboTattle for details."
             case .notificationResetTitle:
                 "New allowance window observed"
             case .settingsAboutProduct:
@@ -762,7 +768,7 @@ enum TiboTattleLocalization {
             case .settingsNotificationsStatusIneligible:
                 "Enabled. No notification was sent because %@."
             case .settingsNotificationsStatusNoCrossing:
-                "Enabled. The latest fresh provider observation did not newly cross an enabled threshold or prove a new reset identity."
+                "Enabled. The latest fresh provider observation did not newly cross an enabled threshold or reach a scheduled reset."
             case .settingsNotificationsStatusStateUnavailable:
                 "Notifications are unavailable because their owner-only local state could not be read or written."
             case .settingsNotificationsStatusWaitingPermission:
@@ -778,7 +784,7 @@ enum TiboTattleLocalization {
             case .settingsNotificationsToggleTooltip:
                 "Enable optional local notifications from fresh provider-reported quota evidence."
             case .settingsNotificationsResetDetail:
-                "Reset alerts need a provider-reported reset identity; schedule changes alone do not alert."
+                "Reset alerts use the provider-reported reset time and notify once on the next refresh at or after it. No background polling is added."
             case .settingsOpenDashboard:
                 "Open Dashboard"
             case .settingsOpenNotifications:

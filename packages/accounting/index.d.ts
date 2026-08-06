@@ -183,6 +183,7 @@ export const OFFICIAL_PRICE_SOURCE_URLS: Readonly<Record<string, string>>;
 export const OPENAI_LONG_CONTEXT_SOURCE_URLS: readonly string[];
 export const NORMALIZED_PRICE_EVIDENCE_ROWS: Readonly<Record<string, unknown>>;
 export const OPENAI_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
+export const OPENAI_PRICE_EVIDENCE_START_DATE: string;
 export const ANTHROPIC_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
 export const PROVIDER_TOOL_PRICE_CARDS: readonly PriceCard[];
 export const APP_OFFICIAL_PRICE_CARDS: readonly PriceCard[];

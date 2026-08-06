@@ -8,7 +8,7 @@ import {
   FAST_MODE_MODEL_FAMILY_KEYS,
   FAST_MODE_MULTIPLIER_SOURCE,
   FAST_MODE_QUOTA_MULTIPLIERS,
-  OPENAI_OFFICIAL_PRICE_CARDS,
+  OPENAI_PRICE_EVIDENCE_START_DATE,
   OBSERVED_SPEED_MODE_KEYS,
   QUOTA_WEIGHTED_API_PRICE_METRIC,
   emptySpeedWeightingCrossing,
@@ -69,6 +69,7 @@ const KNOWN_MODELS = new Set([
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   "gpt-5.5",
+  "gpt-5.5-codex",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5",
@@ -77,6 +78,7 @@ const KNOWN_MODELS = new Set([
 const KNOWN_UNPRICED_MODELS = new Set([
   "gpt-5.3-codex-spark",
 ]);
+const SPARK_MODEL = "gpt-5.3-codex-spark";
 
 const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
 const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
@@ -94,16 +96,12 @@ const KNOWN_SURFACES = new Set([
 const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
 const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
 const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
-const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox"]);
+const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox", "codex-spark"]);
 const KNOWN_PLANS = new Set(TELEMETRY_PLAN_TYPES);
 const KNOWN_SLOTS = new Set(["primary", "secondary"]);
 const RECENT_TIMELINE_DAYS = 31;
 const RECENT_COLLECTOR_PERIOD_LABEL =
   `Cached ${RECENT_TIMELINE_DAYS}-day collector window`;
-const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_OFFICIAL_PRICE_CARDS
-  .map((card) => card?.effective?.from)
-  .filter((value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value))
-  .sort()[0] ?? null;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
@@ -766,6 +764,7 @@ function usageProjection(record, declaredSpeed = "unknown") {
   return {
     model,
     modelPricingStatus: modelPricingStatus(record.model),
+    isSpark: model === SPARK_MODEL,
     components,
     totalTokens,
     apiPriceEquivalentUsd: Number.isFinite(rawCost) ? rawCost : 0,
@@ -793,8 +792,8 @@ function usageProjection(record, declaredSpeed = "unknown") {
   };
 }
 
-function newUsagePeriod(id, label) {
-  return {
+function newUsagePeriod(id, label, { includeSpark = true } = {}) {
+  const period = {
     id,
     label,
     events: 0,
@@ -829,6 +828,12 @@ function newUsagePeriod(id, label) {
       unattributedEvents: 0,
     },
   };
+  if (includeSpark) {
+    period.spark = newUsagePeriod("spark", "Spark allowance", {
+      includeSpark: false,
+    });
+  }
+  return period;
 }
 
 function addSpeedWeighting(crossing, projection) {
@@ -891,6 +896,10 @@ function addDimension(dimension, key, projection) {
 
 function addUsageToPeriod(period, projection) {
   if (projection === null) return;
+  if (projection.isSpark) {
+    addUsageToPeriod(period.spark, { ...projection, isSpark: false });
+    return;
+  }
   period.events += 1;
   period.totalTokens += projection.totalTokens;
   addComponents(period.components, projection.components);
@@ -959,7 +968,7 @@ function finalizeDimension(dimension) {
 
 function finalizeUsagePeriod(period) {
   const priced = period.pricingCoverage.fullyPricedEvents + period.pricingCoverage.partiallyPricedEvents;
-  return {
+  const finalized = {
     ...period,
     apiPriceEquivalentUsd: Number(period.apiPriceEquivalentUsd.toFixed(6)),
     priceCardIds: [...period.priceCardIds].sort(),
@@ -981,6 +990,8 @@ function finalizeUsagePeriod(period) {
       period.declaredSpeedWeighting,
     ),
   };
+  if (period.spark) finalized.spark = finalizeUsagePeriod(period.spark);
+  return finalized;
 }
 
 function validObservedAt(record) {
@@ -1091,33 +1102,46 @@ function orderQuotaWindows(windows) {
   ];
 }
 
+function quotaTimelineRowTieBreak(row) {
+  return [
+    row.planType,
+    row.usedPercent.toFixed(3),
+    row.resetAt,
+    row.accountAttribution,
+  ].join("\0");
+}
+
 function finalizeQuotaTimeline(rows) {
   rows.sort((left, right) => (
     Date.parse(left.observedAt) - Date.parse(right.observedAt)
     || left.limitId.localeCompare(right.limitId)
     || left.slot.localeCompare(right.slot)
+    || left.durationMinutes - right.durationMinutes
+    || left.planType.localeCompare(right.planType)
+    || left.usedPercent - right.usedPercent
   ));
-  const latestByTrack = new Map();
-  const lastEmittedAtByTrack = new Map();
-  const changes = [];
+  const points = new Map();
   for (const row of rows) {
     const track = `${row.limitId}:${row.slot}:${row.durationMinutes ?? "unknown"}`;
-    const prior = latestByTrack.get(track);
-    const changed = prior === undefined
-      || prior.usedPercent !== row.usedPercent
-      || prior.resetAt !== row.resetAt
-      || prior.planType !== row.planType
-      || prior.accountAttribution !== row.accountAttribution;
     const observedMs = Date.parse(row.observedAt);
-    const elapsedSinceEmission = observedMs - (lastEmittedAtByTrack.get(track)
-      ?? Number.NEGATIVE_INFINITY);
-    if (changed || elapsedSinceEmission >= TIMELINE_BUCKET_MS) {
-      changes.push(row);
-      latestByTrack.set(track, row);
-      lastEmittedAtByTrack.set(track, observedMs);
+    const key = `${track}:${observedMs}`;
+    const prior = points.get(key);
+    if (prior === undefined
+        || quotaTimelineRowTieBreak(row) < quotaTimelineRowTieBreak(prior)) {
+      points.set(key, row);
     }
   }
-  return deterministicSample(changes, MAX_QUOTA_TIMELINE_POINTS);
+  return deterministicSample(
+    [...points.values()].sort((left, right) => (
+      Date.parse(left.observedAt) - Date.parse(right.observedAt)
+      || left.limitId.localeCompare(right.limitId)
+      || left.slot.localeCompare(right.slot)
+      || left.durationMinutes - right.durationMinutes
+      || left.planType.localeCompare(right.planType)
+      || left.usedPercent - right.usedPercent
+    )),
+    MAX_QUOTA_TIMELINE_POINTS,
+  );
 }
 
 async function readCollectorProjection(
@@ -1143,7 +1167,13 @@ async function readCollectorProjection(
       usage: summarizeUsage([], nowMs),
       quota: latestQuotaProjection([]),
       tools: summarizeToolClasses([]),
-      timeline: { bucketMinutes: 15, usage: [], quota: [] },
+      timeline: {
+        bucketMinutes: 15,
+        usage: [],
+        quota: [],
+        sparkUsage: [],
+        sparkQuota: [],
+      },
       recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
       paceForecast: projectWeeklyPaceForecast({ nowMs }),
     };
@@ -1164,6 +1194,7 @@ async function readCollectorProjection(
   const recordCounts = { usage: 0, quota: 0, tools: 0, other: 0 };
   const recentStartMs = nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
   const timelineBuckets = new Map();
+  const sparkTimelineBuckets = new Map();
   const quotaTimeline = [];
   const weeklyPaceSnapshots = [];
   let toolTotal = 0;
@@ -1255,7 +1286,11 @@ async function readCollectorProjection(
           if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
         }
         if (observedMs >= recentStartMs) {
-          addTimelineUsage(timelineBuckets, observedMs, projection);
+          addTimelineUsage(
+            projection?.isSpark ? sparkTimelineBuckets : timelineBuckets,
+            observedMs,
+            projection,
+          );
         }
       }
     }
@@ -1314,7 +1349,13 @@ async function readCollectorProjection(
           : new Date(Math.max(...timelineBuckets.keys()) + TIMELINE_BUCKET_MS).toISOString(),
       },
       usage: finalizeTimelineBuckets(timelineBuckets),
-      quota: finalizeQuotaTimeline(quotaTimeline),
+      sparkUsage: finalizeTimelineBuckets(sparkTimelineBuckets),
+      quota: finalizeQuotaTimeline(
+        quotaTimeline.filter((row) => row.limitId === "codex"),
+      ),
+      sparkQuota: finalizeQuotaTimeline(
+        quotaTimeline.filter((row) => row.limitId === "codex-spark"),
+      ),
     },
     recordCounts,
     paceForecast,
@@ -1758,9 +1799,14 @@ export async function buildLocalCompanionSnapshot({
     : periodFastMode.get(displayUsage.id);
   const quota = collector.quota;
   const quotaTimeline = Array.isArray(replaySafeCache?.quotaTimeline)
-      && replaySafeCache.quotaTimeline.length > 0
     ? replaySafeCache.quotaTimeline
     : collector.timeline.quota;
+  const sparkQuotaTimeline = Array.isArray(replaySafeCache?.sparkQuotaTimeline)
+    ? replaySafeCache.sparkQuotaTimeline
+    : collector.timeline.sparkQuota;
+  const sparkUsageTimeline = Array.isArray(replaySafeCache?.sparkUsageTimeline)
+    ? replaySafeCache.sparkUsageTimeline
+    : collector.timeline.sparkUsage;
   const tools = collector.tools;
   const pricedEvents = (displayUsage?.pricingCoverage.fullyPricedEvents ?? 0)
     + (displayUsage?.pricingCoverage.partiallyPricedEvents ?? 0);
@@ -1796,16 +1842,20 @@ export async function buildLocalCompanionSnapshot({
   }
   const displayUnknownModelEvents = displayUsage?.byModel
     ?.find((row) => row.model === "unknown")?.events ?? 0;
+  const displayKnownUnpricedModelEvents = displayUsage?.byModel
+    ?.filter((row) => row.pricingStatus === "known_unpriced")
+    .reduce((total, row) => total + row.events, 0) ?? 0;
   if (displayUnknownModelEvents > 0) {
     warnings.push("Some usage events name an unrecognized model and remain unpriced rather than being assigned a guessed price.");
   }
   const thirtyDayUsage = usage.find((period) => period.id === "30d");
   if (OPENAI_PRICE_EVIDENCE_START_DATE !== null
-      && (thirtyDayUsage?.pricingCoverage.unpricedEvents ?? 0) > displayUnknownModelEvents
+      && (thirtyDayUsage?.pricingCoverage.unpricedEvents ?? 0)
+        > displayUnknownModelEvents + displayKnownUnpricedModelEvents
       && new Date(nowMs - (30 * 24 * 60 * 60 * 1_000))
         .toISOString().slice(0, 10) < OPENAI_PRICE_EVIDENCE_START_DATE) {
     warnings.push(
-      `Verified OpenAI price evidence begins ${OPENAI_PRICE_EVIDENCE_START_DATE}. Earlier recorded events remain unpriced instead of being assigned a later price.`,
+      `Verified OpenAI price evidence was reviewed beginning ${OPENAI_PRICE_EVIDENCE_START_DATE}; events without a recognized or separately evidenced card remain unpriced.`,
     );
   }
   if (archiveCoverage.status !== "complete") {
@@ -1888,6 +1938,8 @@ export async function buildLocalCompanionSnapshot({
         usage: replaySafeCache?.timeline
           ?? collector.timeline.usage,
         quota: quotaTimeline,
+        sparkUsage: sparkUsageTimeline,
+        sparkQuota: sparkQuotaTimeline,
       },
       accounting: {
         periodId: displayUsage?.id ?? "all",
@@ -1895,6 +1947,8 @@ export async function buildLocalCompanionSnapshot({
         events: displayUsage?.events ?? 0,
         totalTokens: displayUsage?.totalTokens ?? 0,
         apiPriceEquivalentUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
+        apiPriceEquivalentUsdExact: displayUsage?.apiPriceEquivalentUsdExact ?? null,
+        spark: displayUsage?.spark ?? null,
         quotaWeightedApiPriceEquivalentUsd:
           displayFastMode.quotaWeightedApiPriceEquivalentUsd,
         fastMode: displayFastMode,
@@ -1947,6 +2001,7 @@ export async function buildLocalCompanionSnapshot({
           speedWeighting: safeSpeedWeighting(period.speedWeighting),
           pricingCoverage: period.pricingCoverage,
           components: period.components,
+          spark: period.spark ?? null,
           componentCosts: period.componentCosts ?? {},
           byModel: period.byModel,
           bySpeed: period.bySpeed,
@@ -1968,6 +2023,7 @@ export async function buildLocalCompanionSnapshot({
       pricing: {
         basis: "official_api_price_equivalent_not_subscription_allowance",
         totalCostUsd: displayUsage?.apiPriceEquivalentUsd ?? 0,
+        spark: displayUsage?.spark ?? null,
         // The headline figure once the published Fast credit rate has been
         // applied to events whose effective mode is Fast. Null when no
         // legitimate weighting is available for any of the recorded cost.

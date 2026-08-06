@@ -11,7 +11,9 @@
 "nativeDashboard.allowance" = "Límite";
 "nativeDashboard.community" = "Comunidad";
 "nativeDashboard.dataPrivacy" = "Datos y privacidad";
+"nativeDashboard.fresh" = "Actualizado";
 "nativeDashboard.howItWorks" = "Cómo funciona";
+"nativeDashboard.needsRefresh" = "Necesita actualizarse";
 "nativeDashboard.localOnly" = "Solo local";
 "nativeDashboard.localOnlyTooltip" = "El análisis y los resultados en caché permanecen en este Mac. La contribución a la comunidad es opcional.";
 "nativeDashboard.overview" = "Resumen";
@@ -209,7 +211,7 @@
 "accessibility.menuBarStatus" = "Estado de TiboTattle";
 "notification.allowanceThresholdBody" = "Una observación reciente de cuota informada por el proveedor cruzó tu alerta de uso del %d%%. Abre TiboTattle para ver los detalles.";
 "notification.allowanceTitle" = "Alerta de límite";
-"notification.resetBody" = "Ha cambiado una ventana reciente de cuota informada por el proveedor. Abre TiboTattle para ver los detalles.";
+"notification.resetBody" = "Se ha restablecido una ventana de cuota informada por el proveedor. Abre TiboTattle para ver los detalles.";
 "notification.resetTitle" = "Se observó una nueva ventana de límite";
 "settings.notifications" = "Notificaciones";
 "settings.notificationsAllowanceTitle" = "Alertas de límite";
@@ -232,7 +234,7 @@
 "settings.notificationsStatusFirstObservation" = "Activadas. Una observación reciente del proveedor estableció la base local; las primeras observaciones nunca notifican.";
 "settings.notificationsStatusFreshOnly" = "Activadas. Esperando una observación directa reciente del proveedor de la próxima actualización en primer plano.";
 "settings.notificationsStatusIneligible" = "Activadas. No se envió ninguna notificación porque %@.";
-"settings.notificationsStatusNoCrossing" = "Activadas. La última observación reciente del proveedor no cruzó por primera vez un umbral habilitado ni demostró una nueva identidad de reinicio.";
+"settings.notificationsStatusNoCrossing" = "Activadas. La última observación reciente del proveedor no cruzó por primera vez un umbral habilitado ni llegó a un reinicio programado.";
 "settings.notificationsStatusStateUnavailable" = "Las notificaciones no están disponibles porque no se pudo leer ni escribir su estado local exclusivo del propietario.";
 "settings.notificationsStatusWaitingPermission" = "Activadas. El permiso de notificaciones de macOS no se ha concedido, por lo que no se enviarán alertas.";
 "settings.notificationsThresholds" = "Alertas de uso";
@@ -240,7 +242,7 @@
 "settings.notificationsThresholdsNinety" = "Solo 90%";
 "settings.notificationsThresholdsOff" = "Desactivadas";
 "settings.notificationsToggleTooltip" = "Activa notificaciones locales opcionales a partir de evidencia reciente de cuota informada por el proveedor.";
-"settings.notificationsResetDetail" = "Las alertas de reinicio necesitan una identidad de reinicio indicada por el proveedor; los cambios de horario por sí solos no avisan.";
+"settings.notificationsResetDetail" = "Las alertas usan la hora de reinicio indicada por el proveedor y avisan una vez en la siguiente actualización que llegue a partir de esa hora. No añaden sondeo en segundo plano.";
 "firstRun.loginItemDisclosure" = "De forma predeterminada, la configuración inicial preselecciona Iniciar TiboTattle al iniciar sesión. TiboTattle añade un elemento de inicio de sesión de macOS solo después de que hagas clic en Empezar; no usa LaunchAgent, demonio, asistente privilegiado ni proceso persistente oculto.";
 "settings.continue" = "Continuar";
 "settings.continueWithoutLogin" = "Continuar sin iniciar sesión";

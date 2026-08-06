@@ -139,7 +139,13 @@ test("native catalogs have complete language parity and preserve placeholders", 
     /func notifyLanguagePreferenceChange\([\s\S]*?\n    \}/u,
   )?.[0] ?? "";
   assert.match(languageNotification, /tibotattle:locale-override/u);
+  assert.match(languageNotification, /requestAnimationFrame/u);
   assert.doesNotMatch(languageNotification, /webView\.load\(/u);
+  assert.match(appSource, /nativeDashboardChrome\?\.refreshLocalization\(\)/u);
+  assert.match(appSource, /refreshNativeToolbarLocalization\(\)/u);
+  assert.match(appSource, /settingsWindow\?\.close\(\)/u);
+  assert.match(swiftSource, /case nativeDashboardFresh =/u);
+  assert.match(swiftSource, /case nativeDashboardNeedsRefresh =/u);
   assert.match(appSource, /settingsUpdateDisclosureDevelopment/u);
   assert.match(appSource, /launcherErrorInvalidCentralService/u);
   assert.match(appSource, /launcherRecoveryReinstall/u);

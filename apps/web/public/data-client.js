@@ -1804,8 +1804,6 @@ function normalizeLocalComponentCosts(value) {
     const row = value?.[key] ?? {};
     return [key, {
       tokens: count(row.tokens, 0),
-      pricedTokens: count(row.pricedTokens, 0),
-      unpricedTokens: count(row.unpricedTokens, 0),
       costUsd: nonNegative(row.costUsd, 0)
     }];
   }));
@@ -2091,6 +2089,7 @@ function normalizeLocalAccounting(value = {}) {
     reasoningEffortAvailable: value.reasoningEffortAvailable === true,
     accountingSource: text(value.accountingSource, "unknown"),
     accountingCacheStatus: text(value.accountingCacheStatus, "unknown"),
+    historyCoverage: normalizeHistoryCoverage(value.historyCoverage),
     replayExclusionDiagnostics: {
       filesScanned: count(value?.replayExclusionDiagnostics?.filesScanned, 0),
       forkReplayEventsExcluded: count(
@@ -2316,8 +2315,6 @@ function normalizePricing(pricing = {}) {
     components: componentRows.slice(0, 12).map((row) => ({
       name: text(row?.name ?? row?.component, "Unknown"),
       tokens: finite(row?.tokens ?? row?.value, 0),
-      pricedTokens: finite(row?.pricedTokens, 0),
-      unpricedTokens: finite(row?.unpricedTokens, 0),
       costUsd: finite(row?.costUsd, null)
     })),
     accountingSource: text(pricing?.accountingSource, "unknown"),
@@ -3572,8 +3569,6 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       components: componentTokens,
       componentCosts: Object.fromEntries(Object.entries(componentTokens).map(([key, count]) => [key, {
         tokens: count,
-        pricedTokens: Math.round(count * .97),
-        unpricedTokens: count - Math.round(count * .97),
         costUsd: Number((cost * ({
           input_uncached_tokens: .458,
           input_cache_read_tokens: .1535,
