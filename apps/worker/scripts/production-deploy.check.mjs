@@ -29,11 +29,13 @@ import {
   createImmutableSourceSnapshot,
   runProductionDeployment,
   recheckProductionContainment,
+  recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 
 const NOW = Date.parse("2026-08-04T20:00:00.000Z");
 const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
+const PUBLIC_ROOT_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/`;
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -130,6 +132,22 @@ function jsonHealthResponse(value = containedHealth(), status = 200) {
   };
 }
 
+function textResponse(url, body, {
+  status = 200,
+  contentType = "text/html; charset=utf-8",
+} = {}) {
+  return {
+    url,
+    status,
+    headers: {
+      get(name) {
+        return name === "content-type" ? contentType : undefined;
+      },
+    },
+    text: async () => body,
+  };
+}
+
 function proofCheck(overrides = {}) {
   const proof = {
     schemaVersion: DEPLOYMENT_PROOF_SCHEMA_VERSION,
@@ -186,6 +204,7 @@ function options(overrides = {}) {
       assert.equal(String(url), HEALTH_URL);
       return jsonHealthResponse();
     },
+    publicSurfaceRecheck: async () => ({ ok: true, code: null }),
     ...overrides,
   };
 }
@@ -532,6 +551,7 @@ test("valid production proof routes through local checks and then the exact prod
   assert.equal(result.collectionAuthorized, false);
   assert.equal(result.immediateHealthRecheck, "contained");
   assert.equal(result.postDeployHealthRecheck, "contained");
+  assert.equal(result.postDeployPublicSurfaceRecheck, "public-only");
   assert.equal(result.containmentProof.workerRevision, "production-revision-0001");
 });
 
@@ -717,4 +737,52 @@ test("production health recheck requires the canonical URL and security headers"
   assert.deepEqual(result, { ok: true, code: null });
   assert.deepEqual(calls.map((call) => call.url), [HEALTH_URL]);
   assert.equal(calls[0].request.headers.accept, "application/json");
+});
+
+test("production public-surface recheck requires a public root and real 404s for private assets", async () => {
+  const calls = [];
+  const result = await recheckProductionPublicSurface({
+    fetchImpl: async (url, request) => {
+      calls.push({ url: String(url), request });
+      if (String(url) === PUBLIC_ROOT_URL) {
+        return textResponse(String(url), "<!doctype html><title>TiboTattle</title>");
+      }
+      return textResponse(String(url), "not found", {
+        status: 404,
+        contentType: "text/plain; charset=utf-8",
+      });
+    },
+  });
+  assert.deepEqual(result, { ok: true, code: null });
+  assert.equal(calls[0].url, PUBLIC_ROOT_URL);
+  assert.equal(calls[0].request.headers.accept, "text/html");
+  assert.equal(calls.length, 9);
+});
+
+test("production public-surface recheck rejects dashboard markers at the root", async () => {
+  const result = await recheckProductionPublicSurface({
+    fetchImpl: async (url) => textResponse(
+      String(url),
+      '<main id="share-panel"><script src="./app.js"></script></main>',
+    ),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_PUBLIC_SURFACE_PRIVATE_ROOT_EXPOSED",
+  });
+});
+
+test("production public-surface recheck rejects any publicly served private asset", async () => {
+  const result = await recheckProductionPublicSurface({
+    fetchImpl: async (url) => String(url) === PUBLIC_ROOT_URL
+      ? textResponse(String(url), "<!doctype html><title>TiboTattle</title>")
+      : textResponse(String(url), "private source", {
+        status: 200,
+        contentType: "text/javascript; charset=utf-8",
+      }),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_PUBLIC_SURFACE_PRIVATE_ASSET_EXPOSED",
+  });
 });

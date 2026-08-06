@@ -7,6 +7,7 @@ import {
   assessStagingConfiguration,
   EXPECTED_STAGING_MIGRATIONS,
   GENERATED_WORKER_ASSET_DIRECTORY,
+  PRODUCTION_PUBLIC_ASSET_DIRECTORY,
   probeStagingLive,
   STAGING_PROOF_TYPES,
   stagingOperationReceipt,
@@ -99,15 +100,22 @@ test("staging readiness rejects production resources and custom-domain targets",
   ), true);
 });
 
-test("every deployable Worker asset environment uses the generated community tree", () => {
+test("deployable Worker asset environments fail closed around generated public trees", () => {
   for (const environment of [
     checkedInConfig,
     checkedInConfig.env.staging,
-    checkedInConfig.env.production,
   ]) {
     assert.equal(environment.assets.directory, GENERATED_WORKER_ASSET_DIRECTORY);
     assert.equal(environment.assets.not_found_handling, "single-page-application");
   }
+  assert.equal(
+    checkedInConfig.env.production.assets.directory,
+    PRODUCTION_PUBLIC_ASSET_DIRECTORY,
+  );
+  assert.equal(
+    checkedInConfig.env.production.assets.not_found_handling,
+    "404-page",
+  );
   assert.equal(
     assessStagingConfiguration(checkedInConfig).checks.deployableAssetsClosed,
     true,

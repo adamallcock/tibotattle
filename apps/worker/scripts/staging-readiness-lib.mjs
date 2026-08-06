@@ -86,6 +86,8 @@ export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
   UPLOAD_INGRESS_BURST: "16",
   UPLOAD_INGRESS_LEASE_SECONDS: "90",
+  UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+  UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
   SIGN_IN_START_MAX_PER_MINUTE: "5",
   IDENTITY_LINK_SECRET_VERSION: "staging-v1",
 });
@@ -99,6 +101,8 @@ export const REQUIRED_INGRESS_DURABLE_OBJECT_MIGRATION = Object.freeze({
 });
 export const GENERATED_WORKER_ASSET_DIRECTORY =
   "../../.release-build/worker-assets";
+export const PRODUCTION_PUBLIC_ASSET_DIRECTORY =
+  "../../.release-build/public-release-site";
 
 const PRIMARY_IDENTITY_PROTECTION_SCHEMA_FIELDS = Object.freeze({
   cooldownTable: "primary_cooldown_table",
@@ -580,12 +584,22 @@ function safeDeployableAssetRoute(value) {
       && !FORBIDDEN_PUBLIC_ROUTE_PATTERN.test(route));
 }
 
+function safeProductionAssetRoute(value) {
+  return value?.binding === "ASSETS"
+    && value?.directory === PRODUCTION_PUBLIC_ASSET_DIRECTORY
+    && value?.not_found_handling === "404-page"
+    && Array.isArray(value?.run_worker_first)
+    && value.run_worker_first.length >= 1
+    && value.run_worker_first.every((route) =>
+      typeof route === "string"
+      && ALLOWED_WORKER_FIRST_ROUTES.includes(route)
+      && !FORBIDDEN_PUBLIC_ROUTE_PATTERN.test(route));
+}
+
 function deployableAssetRoutesClosed(config) {
-  return [
-    config?.assets,
-    config?.env?.staging?.assets,
-    config?.env?.production?.assets,
-  ].every((assets) => safeDeployableAssetRoute(assets));
+  return safeDeployableAssetRoute(config?.assets)
+    && safeDeployableAssetRoute(config?.env?.staging?.assets)
+    && safeProductionAssetRoute(config?.env?.production?.assets);
 }
 
 function safeRateLimits(value) {

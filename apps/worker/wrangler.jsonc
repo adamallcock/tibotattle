@@ -388,11 +388,13 @@
       ],
       "assets": {
         "binding": "ASSETS",
-        // `production:stage-assets` accepts only the manifest-verified output
-        // of the public release builder. Do not point any environment at the
-        // mutable browser source tree: every file there would be deployable.
-        "directory": "../../.release-build/worker-assets",
-        "not_found_handling": "single-page-application",
+        // Production serves the manifest-verified public release output
+        // directly. A raw Wrangler deploy therefore fails when that output is
+        // absent instead of reusing a stale staged dashboard or admin tree.
+        "directory": "../../.release-build/public-release-site",
+        // Missing dashboard/admin paths must remain real 404s rather than
+        // falling through to the public landing page.
+        "not_found_handling": "404-page",
         // Prevent the legacy association filename from receiving the SPA
         // fallback. It is deliberately a 404, not an Apple release gate.
         "run_worker_first": [

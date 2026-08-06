@@ -33,6 +33,23 @@ import { runReleasePreflight } from "./release-preflight.mjs";
 export const PRODUCTION_DEPLOY_CONFIRMATION =
   "DEPLOY_CONTAINED_PRODUCTION";
 const PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS = 10_000;
+const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
+  "/app.js",
+  "/data-client.js",
+  "/navigation.js",
+  "/admin",
+  "/admin.html",
+  "/admin.js",
+  "/admin-client.js",
+  "/admin.css",
+]);
+const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
+  'src="./app.js"',
+  'id="share-panel"',
+  'id="identity-google-signin"',
+  'id="contribution-cta"',
+  'id="blind-spot-list"',
+]);
 
 function localFailure(code) {
   return { ok: false, code };
@@ -404,6 +421,65 @@ export async function recheckProductionContainment({
   return { ok: true, code: null };
 }
 
+export async function recheckProductionPublicSurface({
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 10_000,
+} = {}) {
+  const publicOrigin = DEPLOYMENT_ENDPOINTS.public.origin;
+  const rootURL = new URL("/", publicOrigin).href;
+  let rootResponse;
+  try {
+    rootResponse = await fetchImpl(rootURL, {
+      method: "GET",
+      headers: { accept: "text/html" },
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  }
+  if (rootResponse?.url !== rootURL
+      || rootResponse.status !== 200
+      || rootResponse.headers?.get("content-type")?.split(";", 1)[0]
+        !== "text/html"
+      || typeof rootResponse.text !== "function") {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_INVALID");
+  }
+  let rootBody;
+  try {
+    rootBody = await rootResponse.text();
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_INVALID");
+  }
+  if (Buffer.byteLength(rootBody, "utf8") > 1024 * 1024) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_INVALID");
+  }
+  if (PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS.some((marker) =>
+    rootBody.includes(marker))) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_PRIVATE_ROOT_EXPOSED");
+  }
+
+  for (const path of PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS) {
+    const url = new URL(path, publicOrigin).href;
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        method: "GET",
+        credentials: "omit",
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch {
+      return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+    }
+    if (response?.url !== url || response.status !== 404) {
+      return localFailure("PRODUCTION_PUBLIC_SURFACE_PRIVATE_ASSET_EXPOSED");
+    }
+  }
+  return { ok: true, code: null };
+}
+
 async function runProductionDeploymentFromSnapshot({
   receiptFile,
   now = Date.now(),
@@ -423,6 +499,7 @@ async function runProductionDeploymentFromSnapshot({
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionContainment,
+  publicSurfaceRecheck = recheckProductionPublicSurface,
 }) {
   const containmentProof = proofCheck ?? await readDeploymentProof({
     filename: receiptFile,
@@ -552,6 +629,30 @@ async function runProductionDeploymentFromSnapshot({
       : "AMBIGUOUS";
     return localFailure(`PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_${reason}`);
   }
+  let postDeployPublicSurface;
+  try {
+    postDeployPublicSurface = await publicSurfaceRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+  } catch {
+    return localFailure(
+      "PRODUCTION_POST_DEPLOY_PUBLIC_SURFACE_RECHECK_UNREACHABLE",
+    );
+  }
+  if (postDeployPublicSurface?.ok !== true) {
+    const reason = typeof postDeployPublicSurface?.code === "string"
+      && postDeployPublicSurface.code.startsWith(
+        "PRODUCTION_PUBLIC_SURFACE_",
+      )
+      ? postDeployPublicSurface.code.slice(
+        "PRODUCTION_PUBLIC_SURFACE_".length,
+      )
+      : "AMBIGUOUS";
+    return localFailure(
+      `PRODUCTION_POST_DEPLOY_PUBLIC_SURFACE_${reason}`,
+    );
+  }
   return {
     ok: true,
     code: "PRODUCTION_DEPLOYED_AFTER_CONTAINMENT_PROOF",
@@ -559,6 +660,7 @@ async function runProductionDeploymentFromSnapshot({
     collectionAuthorized: false,
     immediateHealthRecheck: "contained",
     postDeployHealthRecheck: "contained",
+    postDeployPublicSurfaceRecheck: "public-only",
     containmentProof: {
       observedAt: containmentProof.proof.observedAt,
       workerRevision: containmentProof.proof.worker.revision,
@@ -584,6 +686,7 @@ export async function runProductionDeployment({
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionContainment,
+  publicSurfaceRecheck = recheckProductionPublicSurface,
 }) {
   if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
     return localFailure("CONFIRMATION_REQUIRED");
@@ -645,6 +748,7 @@ export async function runProductionDeployment({
       releasePreflight,
       fetchImpl,
       healthRecheck,
+      publicSurfaceRecheck,
     });
   } catch {
     result = localFailure("PRODUCTION_DEPLOYMENT_FAILED");
