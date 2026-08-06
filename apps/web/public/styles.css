@@ -1449,16 +1449,25 @@ tbody tr:last-child td { border-bottom: 0; }
 .lead-chart-panel .weekly-history-chart svg { height: clamp(270px, 30vw, 330px); }
 
 .accounting-disclosure { margin-top: -12px; }
-.accounting-summary { grid-template-columns: repeat(3, 1fr); }
+/* Adaptive rather than a fixed three. Price coverage moved out of this row to
+   a caption beside the model rows, and a hard `repeat(3, 1fr)` left the two
+   remaining cards occupying two thirds of the width with a hole where the
+   third used to be. The row now fills whatever cards it is given. */
+.accounting-summary { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }
 .accounting-component-grid { margin-bottom: 18px; }
 .accounting-models-panel table { table-layout: fixed; }
 .accounting-models-panel th:first-child,
 .accounting-models-panel td:first-child {
-  width: 36%;
+  width: 42%;
   white-space: normal;
-  overflow-wrap: anywhere;
+  /* `anywhere` lets the browser compute a min-content width of one character,
+     so in a fixed-layout table it broke readable names apart - "GPT-5.6 Sol"
+     became two lines. `break-word` still rescues an unrecognized raw
+     identifier, which is one long unbreakable token, but only when it cannot
+     otherwise fit. */
+  overflow-wrap: break-word;
 }
 .accounting-models-panel th:not(:first-child),
 .accounting-models-panel td:not(:first-child) { text-align: end; }

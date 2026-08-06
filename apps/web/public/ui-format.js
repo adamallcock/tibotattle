@@ -262,17 +262,21 @@ export function formatAge(value) {
  * vendor does not use.
  */
 const MODEL_NAME_FRAGMENTS = Object.freeze({
+  auto: "Auto",
   claude: "Claude",
   codex: "Codex",
   gpt: "GPT",
   haiku: "Haiku",
+  luna: "Luna",
   mini: "Mini",
   nano: "Nano",
   opus: "Opus",
   preview: "Preview",
+  review: "Review",
   sol: "Sol",
   sonnet: "Sonnet",
   spark: "Spark",
+  terra: "Terra",
   // Work Mode routing alias. The picker writes it as two capitals.
   wm: "WM",
 });

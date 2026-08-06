@@ -480,9 +480,9 @@
     "receiptSchemaSha256": "4683a469ad0143721eedeccc026f07929f2506339aeab7c52e1312cad93f5701",
     "resourcePolicySourceSha256": "d9748895468534062e9c8c436db75cbf5acf4ccf54f84319db37e88197627870",
     "resourcePolicyValuesSha256": "a3dde0db440015886144b76b88a8a663095c7e5eb08f0a68f062e597e95552f6",
-    "schemaModuleSha256": "2c7370edae949688b3c3675cc239d0865d5d39005c460affe7bb939a5e4f7329",
-    "workloadCodeFileCount": 274,
-    "workloadCodeSha256": "873c2461bec56dc608c9fc819a2f8db1f9c0041197f7a458bcc7aa33d2c02bd0"
+    "schemaModuleSha256": "8a3bcd2b9b357c36117faa663d1432242ae90dd74742eef3a9fe1ff04cfc3f25",
+    "workloadCodeFileCount": 290,
+    "workloadCodeSha256": "efe11b93c5972f1285dcb96ecf8db12954db43365d3f52f7acc5f2838c01dc4a"
   },
   "determinism": {
     "comparisons": {
@@ -500,8 +500,8 @@
     "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
     "runCount": 2,
     "runProjectionSha256es": [
-      "c7155ca48081afce82bb1998a90ff4cf8b3e8c736545b644ba73a907662b77c1",
-      "c7155ca48081afce82bb1998a90ff4cf8b3e8c736545b644ba73a907662b77c1"
+      "f8ed1d598a6d62b097abc8dd8e1a78b9636fd822f9122a9907013df904f8fd21",
+      "f8ed1d598a6d62b097abc8dd8e1a78b9636fd822f9122a9907013df904f8fd21"
     ],
     "status": "partial"
   },
@@ -822,16 +822,16 @@
       "decodedBytes": 0,
       "durablePeakRssBytes": 0,
       "encodedBytes": 0,
-      "externalPeakRssBytes": 370409472,
-      "externalRssSampleCount": 64,
-      "externalRssSampleFailureCount": 1,
+      "externalPeakRssBytes": 352501760,
+      "externalRssSampleCount": 67,
+      "externalRssSampleFailureCount": 0,
       "filesystem": {
         "afterBytes": 0,
         "beforeBytes": 0,
-        "sampledHighWaterBytes": 30851203
+        "sampledHighWaterBytes": 30819581
       },
       "outputRecords": 0,
-      "parentElapsedMs": 3255,
+      "parentElapsedMs": 3342,
       "runCount": 2,
       "sourceBytes": 0,
       "sourceFiles": 0,
@@ -894,7 +894,7 @@
     }
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "f77d77223762a19a9f833dd2b0e7a755ad68b1df843d9125fdec59d18827fadb",
+  "receiptSha256": "d9b8b0fe49ebb4adbfa3c6246d9d42c20c41045d540e506327fd61a92b612cd7",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",

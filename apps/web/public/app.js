@@ -5630,23 +5630,37 @@ async function requestRefresh() {
     archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
-  } catch {
+  } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
         companionReachable: dashboard.mode !== "demo",
       });
     }
+    // This was a bare `catch {}`: it printed one of three sentences for every
+    // possible cause and discarded the only evidence of which one occurred.
+    // That is the same defect this file already fixed for the contribution
+    // path, left in place on the product's most important path - so a refresh
+    // that failed for a specific, named reason was indistinguishable from one
+    // that merely did not finish, and there was nothing to quote when asking
+    // for help. `local_refresh` was already a reviewed diagnostic surface with
+    // no caller; this is that caller. The three sentences below remain as the
+    // fallback for a cause with no fixed copy of its own.
+    const described = await describeFailure({
+      surface: "local_refresh",
+      error,
+      fallback: continuationLimitReached
+        ? "TiboTattle stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
+        : refreshAccepted
+          ? "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it."
+        : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
+    });
     showConnectionNotice({
       title: continuationLimitReached
         ? "Deep analysis paused after two bounded continuations"
         : refreshAccepted
           ? "The local analysis did not finish"
         : "Local analysis could not be started",
-      copy: continuationLimitReached
-        ? "TiboTattle stopped this one-click analysis rather than repeatedly reading a very large history. Your available headline and previously verified results remain usable; you can run the analysis again later from its durable checkpoint."
-        : refreshAccepted
-          ? "The analysis was accepted, but it did not reach a verified completion state. Existing evidence is still available and no partial accounting result replaced it."
-        : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
+      copy: described.text,
       kind: continuationLimitReached ? "warning" : "error",
       showDemo: !dashboard
     });
