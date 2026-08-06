@@ -99,6 +99,14 @@ export function collectR7ReleaseEvidenceRuntimeSourcePaths({
       if (entry.isDirectory()) {
         visit(relativePath);
       } else if (entry.isFile()) {
+        // Operating-system metadata is not workload source and must not be
+        // attested as such, but neither should its presence fail the release
+        // gate: `.DS_Store` reappears whenever anyone opens the folder in
+        // Finder, and it took down the whole suite three times before this
+        // guard existed. No runtime module in these trees is a dotfile, and
+        // OS metadata always is, so skipping dotfiles excludes the noise
+        // without widening what the digest is allowed to cover.
+        if (entry.name.startsWith(".")) continue;
         if (!entry.name.endsWith(".js") && !entry.name.endsWith(".mjs")) {
           throw new TypeError("R7 workload source tree contains an unsupported file");
         }
@@ -109,7 +117,12 @@ export function collectR7ReleaseEvidenceRuntimeSourcePaths({
     }
   };
   visit("src");
-  visit("shared");
+  // `shared/` was dissolved when ownership boundaries landed; its quota
+  // calibration, rolling, and track modules moved to packages/quota-analysis.
+  // Dropping the old path without adding the new one would have made this
+  // scan pass while silently excluding the calibration code it exists to
+  // attest, so the workload follows the code rather than the directory name.
+  visit("packages/quota-analysis/src");
   visit("packages/accounting/src");
   appendRegularRuntimeFile("packages/accounting/index.js");
   visit("packages/telemetry-contract/src");

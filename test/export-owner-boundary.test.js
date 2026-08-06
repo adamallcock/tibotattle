@@ -22,9 +22,20 @@ const REGISTRY_EXPORTS = Object.freeze([
   "EXPORT_DIAGNOSTIC_CODES",
   "OPENAI_CODEX_LIMIT_IDS",
   "OPENAI_CODEX_MODEL_IDS",
+  // Spark is metered against its own subscription allowance, so the reviewed
+  // registry names both its model and its limit identity explicitly.
+  "OPENAI_CODEX_SPARK_LIMIT_ID",
+  "OPENAI_CODEX_SPARK_MODEL_ID",
+  "OPENAI_CODEX_UNPRICED_MODEL_IDS",
   "TELEMETRY_V01_REGISTRY_VERSION",
   "TELEMETRY_V01_REVIEWED_AT",
+  // Codex-scoped model recognition and the priced / known-unpriced /
+  // unrecognized vocabulary every display surface has to tell apart.
+  "codexModelAllowanceTrack",
+  "codexModelApiPriceEquivalentApplicable",
+  "codexModelPricingStatus",
   "exportRegistrySnapshot",
+  "recognizedCodexModelId",
   "recognizedExportLimitId",
   "recognizedExportModelId",
 ]);

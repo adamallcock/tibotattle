@@ -107,6 +107,39 @@ export function formatReportingTime(value, options = {}) {
   return formatLocal(value, options);
 }
 
+/**
+ * The timestamp shape used by every chart surface: axis ticks, SVG <title>
+ * tooltips, and the tables printed directly beneath a chart.
+ *
+ * It is built from two independent formatters and one separator we choose,
+ * never from a single date+time formatter. A combined formatter delegates the
+ * join to ICU, and WebKit's ICU glues the two halves with a localized
+ * connective — "Jan 5 at 3:04 PM" — that Node's ICU does not produce, so no
+ * Node test can observe it. Composing the halves ourselves removes the glue by
+ * construction rather than by pattern-matching a rendered string.
+ *
+ * It also carries no time-zone name. A chart states its zone once, in its
+ * caption, through `formatTimeZoneLabel` (a "long generic" name such as
+ * "Eastern Time"). Repeating a "short" name such as "EDT" on every point was
+ * both noise and a direct contradiction of that caption.
+ */
+export function formatChartTimestamp(value, { dateOnly = false } = {}) {
+  const date = instant(value);
+  if (date === null) return translate("format.unknown", {}, messageLocale);
+  const day = new Intl.DateTimeFormat(formattingLocale, {
+    ...USER_TIME_ZONE_OPTION,
+    month: "short",
+    day: "numeric",
+  }).format(date);
+  if (dateOnly) return day;
+  const time = new Intl.DateTimeFormat(formattingLocale, {
+    ...USER_TIME_ZONE_OPTION,
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+  return `${day} · ${time}`;
+}
+
 export function formatTimeZoneLabel({
   locale = formattingLocale,
   timeZone = USER_TIME_ZONE,
@@ -220,6 +253,58 @@ export function formatAge(value) {
   if (seconds < 7200) return formatter.format(-Math.round(seconds / 60), "minute");
   if (seconds < 172800) return formatter.format(-Number((seconds / 3600).toFixed(1)), "hour");
   return formatter.format(-Number((seconds / 86400).toFixed(1)), "day");
+}
+
+/**
+ * Display casing for the identifier fragments this build has actually
+ * reviewed. A fragment that is not listed here is one nobody has decided how
+ * to present, and guessing is how a model ends up displayed under a name its
+ * vendor does not use.
+ */
+const MODEL_NAME_FRAGMENTS = Object.freeze({
+  claude: "Claude",
+  codex: "Codex",
+  gpt: "GPT",
+  haiku: "Haiku",
+  mini: "Mini",
+  nano: "Nano",
+  opus: "Opus",
+  preview: "Preview",
+  sol: "Sol",
+  sonnet: "Sonnet",
+  spark: "Spark",
+  // Work Mode routing alias. The picker writes it as two capitals.
+  wm: "WM",
+});
+const MODEL_VERSION_FRAGMENT = /^\d+(?:\.\d+)*$/;
+
+/**
+ * `gpt-5.6-sol` is a wire identifier, not a name a person reads. This turns it
+ * into "GPT-5.6 Sol" without ever inventing one: every fragment must be a
+ * reviewed word or a version number, and a single unreviewed fragment returns
+ * the raw identifier untouched rather than a half-guessed name. Callers keep
+ * the exact identifier available on hover, so nothing is lost either way.
+ */
+export function formatModelName(value) {
+  if (typeof value !== "string") return "";
+  const identifier = value.trim();
+  if (identifier === "") return "";
+  const fragments = identifier.toLowerCase().split("-");
+  const parts = [];
+  for (const [index, fragment] of fragments.entries()) {
+    if (MODEL_VERSION_FRAGMENT.test(fragment)) {
+      // A version binds to the family it qualifies - "GPT-5.6", not "GPT 5.6"
+      // - but only in first position. Later numbers are their own word, which
+      // is what keeps "Claude Sonnet 5" from becoming "Claude-Sonnet 5".
+      if (index === 1 && parts.length === 1) parts[0] += `-${fragment}`;
+      else parts.push(fragment);
+      continue;
+    }
+    const word = MODEL_NAME_FRAGMENTS[fragment];
+    if (word === undefined) return identifier;
+    parts.push(word);
+  }
+  return parts.join(" ");
 }
 
 export function localCalendarParts() {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { APP_OFFICIAL_PRICE_CARDS } from "@app-usagemonitor/accounting";
 import {
   priceTelemetryUsageEvent,
   SERVER_PRICING_METHOD_VERSION,
@@ -58,6 +59,29 @@ function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEv
       priceBasis: "current_api_prices",
     },
     ...overrides,
+  };
+}
+
+interface PriceCardValidity {
+  effective: { from?: string; to?: string };
+  vendorEffectiveFrom: string | null;
+  vendorEffectiveTo: string | null;
+}
+
+// Reads the registry's own validity window for a selected card so a pricing
+// test can prove the card legitimately covers the event instant it priced,
+// rather than trusting a card id string alone.
+function priceCardValidity(cardId: string): PriceCardValidity {
+  const card = APP_OFFICIAL_PRICE_CARDS.find((entry) => entry.id === cardId);
+  if (!card) throw new Error(`price card ${cardId} is absent from the registry`);
+  const provenance = (card.metadata?.provenance ?? {}) as {
+    vendor_effective_from?: string | null;
+    vendor_effective_to?: string | null;
+  };
+  return {
+    effective: { ...(card.effective ?? {}) },
+    vendorEffectiveFrom: provenance.vendor_effective_from ?? null,
+    vendorEffectiveTo: provenance.vendor_effective_to ?? null,
   };
 }
 
@@ -353,18 +377,67 @@ describe("server pricing", () => {
     });
   });
 
-  it("keeps January pre-evidence usage honestly unpriced", () => {
+  it("prices January history from the undated reviewed card", () => {
+    const januaryEventTime = "2026-01-15T12:00:00.000Z";
     const priced = priceTelemetryUsageEvent(fixture({
+      eventTime: januaryEventTime,
+    }));
+    expect(priced).toMatchObject({
+      exactCostUsd: "0.0032",
+      costNanousd: 3_200_000,
+      coveragePercent: 100,
+      coverageStatus: "fully_priced",
+      selectedPriceCardIds: [
+        "openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01",
+      ],
+      unpricedReasonCodes: [],
+      priceBasis: "historical_api_prices",
+      priceEventTime: januaryEventTime,
+      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+    });
+    expect(priced.unpricedReasonCodes).not.toContain("historical_price_missing");
+    // The selected card carries no vendor-effective boundary in either
+    // direction, so the 2026-08-01 review date is provenance only and never
+    // acts as a lower bound on how far back the model rate may be applied.
+    expect(priceCardValidity(priced.selectedPriceCardIds[0]!)).toEqual({
+      effective: {},
+      vendorEffectiveFrom: null,
+      vendorEffectiveTo: null,
+    });
+    // The identical event inside the reviewed epoch selects the same card at
+    // the same rate: event age alone never changes the pricing outcome.
+    const reviewedEpoch = priceTelemetryUsageEvent(fixture({
+      eventTime: "2026-07-25T12:05:00.000Z",
+    }));
+    expect(reviewedEpoch.exactCostUsd).toBe(priced.exactCostUsd);
+    expect(reviewedEpoch.selectedPriceCardIds).toEqual(priced.selectedPriceCardIds);
+  });
+
+  it("prices January history for a repriced model from its pre-repricing window", () => {
+    const priced = priceTelemetryUsageEvent(fixture({
+      modelId: "gpt-5.6-terra",
       eventTime: "2026-01-15T12:00:00.000Z",
     }));
     expect(priced).toMatchObject({
-      exactCostUsd: "0",
-      costNanousd: 0,
-      coveragePercent: 0,
-      coverageStatus: "unpriced",
-      selectedPriceCardIds: [],
-      unpricedReasonCodes: ["historical_price_missing"],
-      priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+      exactCostUsd: "0.0016",
+      costNanousd: 1_600_000,
+      coveragePercent: 100,
+      coverageStatus: "fully_priced",
+      selectedPriceCardIds: [
+        "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      ],
+      unpricedReasonCodes: [],
+      priceBasis: "historical_api_prices",
+      priceEventTime: "2026-01-15T12:00:00.000Z",
+    });
+    expect(priced.unpricedReasonCodes).not.toContain("historical_price_missing");
+    // The pre-repricing card is closed only at the vendor's published
+    // 2026-07-30 change and stays open-ended backwards, so a January instant
+    // falls legitimately inside its validity window.
+    expect(priceCardValidity(priced.selectedPriceCardIds[0]!)).toEqual({
+      effective: { to: "2026-07-29" },
+      vendorEffectiveFrom: null,
+      vendorEffectiveTo: "2026-07-29",
     });
   });
 

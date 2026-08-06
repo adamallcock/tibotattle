@@ -35,8 +35,11 @@ export const ARCHIVE_INDEX_STORAGE_RESERVE_BYTES = 128 * 1024 * 1024;
 
 const ARCHIVE_START_AT = "1970-01-01T00:00:00.000Z";
 const ARCHIVE_ACCOUNTING_PROJECTION_KIND = "archive_accounting_period";
+// v2 carries per-model allowance-track and API-price-applicability state. A
+// v1 projection predates the Spark/auto-review model identities being
+// recognised at all, so it is re-derived rather than read forward.
 const ARCHIVE_ACCOUNTING_PROJECTION_SCHEMA_VERSION =
-  "local-archive-accounting-projection-v1";
+  "local-archive-accounting-projection-v2";
 const ARCHIVE_STATES = new Set(["complete", "partial"]);
 
 function fixedError(code) {

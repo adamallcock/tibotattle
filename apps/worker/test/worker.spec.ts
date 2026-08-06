@@ -3029,11 +3029,11 @@ describe("synthetic usage monitor service", () => {
       api_service_tier: string;
     }>();
     expect(repriced).toMatchObject({
-      server_cost_usd: "0",
-      server_cost_nanousd: 0,
-      server_pricing_status: "unpriced",
+      server_cost_usd: "0.0032",
+      server_cost_nanousd: 3_200_000,
+      server_pricing_status: "fully_priced",
       server_pricing_method_version: "server-api-price-equivalent-v0.2",
-      server_price_basis: "unpriced",
+      server_price_basis: "historical_api_prices",
       server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
       server_price_event_time: "2026-07-25T12:05:00.000Z",
       server_tier_basis: "subscription_standard_counterfactual",
@@ -3042,7 +3042,9 @@ describe("synthetic usage monitor service", () => {
       api_service_tier: "priority",
     });
     expect(repriced?.server_price_registry_sha256).toMatch(/^[a-f0-9]{64}$/u);
-    expect(repriced?.server_price_card_ids).toBe("[]");
+    expect(repriced?.server_price_card_ids).toBe(
+      '["openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"]',
+    );
 
     const replay = await uploadEnvelope(participant, firstEnvelope);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
@@ -3080,7 +3082,7 @@ describe("synthetic usage monitor service", () => {
         quotaSnapshots: 1,
         activityMarkers: 1,
         inputCacheReadTokens: 900,
-        apiPriceEquivalentUsd: "0",
+        apiPriceEquivalentUsd: "0.0032",
         priceVerification: "server_repriced",
       },
       quotaGradients: [{
@@ -3114,7 +3116,8 @@ describe("synthetic usage monitor service", () => {
           },
           clientPlatform: "macos",
           serverAccounting: {
-            priceBasis: "unpriced",
+            apiPriceEquivalentUsd: "0.0032",
+            priceBasis: "historical_api_prices",
             priceEpochBasis: "event_time_when_registry_has_effective_evidence",
             eventTimeRange: {
               startAt: "2026-07-25T12:05:00.000Z",
@@ -3163,9 +3166,9 @@ describe("synthetic usage monitor service", () => {
         id: accepted.contributionId,
         declared_record_count: 2,
         accepted_record_count: 2,
-        server_priced_event_count: 0,
-        server_unpriced_event_count: 1,
-        server_price_basis: "unpriced",
+        server_priced_event_count: 1,
+        server_unpriced_event_count: 0,
+        server_price_basis: "historical_api_prices",
         server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
         server_price_event_time_start: "2026-07-25T12:05:00.000Z",
         server_price_event_time_end: "2026-07-25T12:05:00.000Z",
@@ -3329,7 +3332,7 @@ describe("synthetic usage monitor service", () => {
     });
   });
 
-  it("persists January pre-evidence pricing as honestly unpriced with provenance", async () => {
+  it("persists January history as priced with pre-repricing window provenance", async () => {
     const participant = await enrollTelemetry();
     const january = telemetryFixture("e");
     Reflect.set(january, "createdAt", "2026-01-15T12:30:00.000Z");
@@ -3365,7 +3368,8 @@ describe("synthetic usage monitor service", () => {
     expect(uploaded.status).toBe(202);
     const row = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT server_cost_usd, server_pricing_status, server_price_basis,
-              server_price_epoch_basis, server_price_event_time
+              server_price_epoch_basis, server_price_event_time,
+              server_price_card_ids
          FROM telemetry_records
         WHERE participant_id = ? AND record_kind = 'usage'`,
     ).bind(participant.participantId).first<{
@@ -3374,13 +3378,18 @@ describe("synthetic usage monitor service", () => {
       server_price_basis: string;
       server_price_epoch_basis: string;
       server_price_event_time: string;
+      server_price_card_ids: string;
     }>();
+    // The reviewed GPT-5.6 Sol card carries no vendor-effective boundary, so a
+    // January instant is inside its validity window and is priced from it.
     expect(row).toEqual({
-      server_cost_usd: "0",
-      server_pricing_status: "unpriced",
-      server_price_basis: "unpriced",
+      server_cost_usd: "0.0032",
+      server_pricing_status: "fully_priced",
+      server_price_basis: "historical_api_prices",
       server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
       server_price_event_time: "2026-01-15T12:05:00.000Z",
+      server_price_card_ids:
+        '["openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"]',
     });
 
     const profile = await api("/api/v1/me", {
@@ -3389,12 +3398,14 @@ describe("synthetic usage monitor service", () => {
     await expect(profile.json()).resolves.toMatchObject({
       contributions: [{
         serverAccounting: {
-          priceBasis: "unpriced",
+          apiPriceEquivalentUsd: "0.0032",
+          priceBasis: "historical_api_prices",
           priceEpochBasis: "event_time_when_registry_has_effective_evidence",
           eventTimeRange: {
             startAt: "2026-01-15T12:05:00.000Z",
             endAt: "2026-01-15T12:05:00.000Z",
           },
+          verification: "server_repriced",
         },
       }],
     });
@@ -3439,7 +3450,9 @@ describe("synthetic usage monitor service", () => {
         rows: unknown[];
       };
     }>();
-    expect(stats.totals.apiPriceEquivalentUsd).toBe("0");
+    // Both July events are priced from the reviewed registry; the rolling
+    // quota conversion is refused on account continuity, not on price cover.
+    expect(stats.totals.apiPriceEquivalentUsd).toBe("0.0064");
     expect(stats.rollingQuotaMovement).toMatchObject({
       status: "not_testable",
       reason: "account_continuity_not_transmitted",

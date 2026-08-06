@@ -167,7 +167,7 @@
       "additionalProperties": false,
       "required": ["version", "sha256"],
       "properties": {
-        "version": { "const": "telemetry-v0.1-registry-2026-07-25.3" },
+        "version": { "const": "telemetry-v0.1-registry-2026-08-06.1" },
         "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
       }
     },

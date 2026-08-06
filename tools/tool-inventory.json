@@ -427,6 +427,7 @@
       "stableAliasReason": "Shared release module is imported by macOS release commands and tests, not invoked directly.",
       "additionalAliases": [],
       "callers": [
+        "scripts/build-macos-app.js",
         "scripts/validate-macos-replacement.js",
         "scripts/package-macos-dmg.js",
         "scripts/release-macos-app.js",
@@ -759,6 +760,7 @@
       "callers": [
         "package.json#scripts.product:macos:validate:development",
         "package.json#scripts.product:macos:validate:release",
+        "test/validate-macos-install.test.js",
         "apps/macos/README.md",
         "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md"
       ],

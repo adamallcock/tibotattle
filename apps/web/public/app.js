@@ -41,7 +41,9 @@ import {
   createDomHelpers,
   finite,
   formatAge,
+  formatChartTimestamp,
   formatLocal,
+  formatModelName,
   formatNumber,
   formatReportingTime,
   formatTimeZoneLabel,
@@ -93,6 +95,11 @@ let participantContributionAdmission = null;
 let localOnboarding = null;
 let contributionPreparationBusy = false;
 let communityConnectBusy = false;
+// True once this Mac has actually been paired as an upload-only device in
+// this session. The primary button is named for what it will do next, so it
+// has to know whether the next action is a network connection or a local
+// review.
+let communityDevicePaired = false;
 // The opaque sign-in proof lives only in this module-scoped memory; it is
 // never persisted to storage and disappears with the tab.
 let hostedIdentity = null;
@@ -129,12 +136,30 @@ const { clear, node } = createDomHelpers(document);
 // reinterpret them just because they happen to equal an English UI label.
 function setProductText(element, englishText) {
   if (!element) return;
+  forgetLocalizedNode(element);
   element.removeAttribute("data-i18n-skip");
   localization.setLegacyText(element, englishText);
 }
 
+// Every node this page fills from a message key is remembered as it is
+// written: the element, the key, and the values it was rendered with. A
+// language change then re-runs the same translation over the same nodes.
+//
+// This deliberately replaces the previous hand-maintained list of renderers to
+// call again after a switch. Text produced by `t(...)` is already in the old
+// language, so the exact-text migration bridge cannot recover it — a status
+// line whose renderer was missing from that list stayed frozen in the previous
+// language forever. A registry cannot drift: a surface added later is covered
+// the moment it writes its first localized string.
+const localizedNodes = new Map();
+
+function forgetLocalizedNode(element) {
+  if (element) localizedNodes.delete(element);
+}
+
 function setRawText(element, value) {
   if (!element) return;
+  forgetLocalizedNode(element);
   element.setAttribute("data-i18n-skip", "");
   element.textContent = value == null ? "" : String(value);
 }
@@ -142,7 +167,35 @@ function setRawText(element, value) {
 function setLocalizedText(element, key, values = {}) {
   if (!element) return;
   element.removeAttribute("data-i18n-skip");
+  localizedNodes.set(element, { key, values, plural: null });
   element.textContent = t(key, values);
+}
+
+function setLocalizedPluralText(element, key, count, values = {}) {
+  if (!element) return;
+  element.removeAttribute("data-i18n-skip");
+  localizedNodes.set(element, { key, values, plural: count });
+  element.textContent = tPlural(key, count, values);
+}
+
+// A created element that carries localized copy, registered the same way.
+function localizedNode(tag, className, key, values = {}) {
+  const element = node(tag, className, "");
+  setLocalizedText(element, key, values);
+  return element;
+}
+
+function retranslateLocalizedNodes() {
+  for (const [element, entry] of localizedNodes) {
+    if (!element.isConnected) {
+      localizedNodes.delete(element);
+      continue;
+    }
+    const next = entry.plural === null
+      ? t(entry.key, entry.values)
+      : tPlural(entry.key, entry.plural, entry.values);
+    if (element.textContent !== next) element.textContent = next;
+  }
 }
 
 function rawNode(tag, className, value) {
@@ -176,14 +229,18 @@ if (SEMANTIC_OPEN_TARGET) {
 // the existing WebView is updated rather than reloaded.
 function rerenderLocalizedDashboard() {
   // Register the current English-owned text before replacing any generated
-  // values, then run the bridge once more after every renderer has rebuilt its
-  // subtree. This prevents a previous locale's nodes from surviving a switch
-  // back to English (or Spanish) in the same WebView.
+  // values, then run the bridge once more afterwards. This prevents a previous
+  // locale's nodes from surviving a switch back to English (or Spanish) in the
+  // same WebView.
   localization.localizeTree();
   renderSharedInstallerJourney(document, {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
   });
+  // Charts write formatted instants and numbers straight into an
+  // `data-i18n-skip` SVG text layer, so the evidence view is redrawn from the
+  // state it was built from. This is a single state-driven redraw, not a list
+  // of surfaces someone has to remember to extend.
   if (dashboard) {
     renderDashboard(dashboard);
   } else if (dashboardUnavailableState) {
@@ -191,11 +248,10 @@ function rerenderLocalizedDashboard() {
   } else if (globalState) {
     renderGlobalState();
   }
-  if (localOnboarding) renderLocalOnboarding(localOnboarding);
-  renderHostedIdentity();
-  renderPreparationIdentity(localCompanionHealth);
-  renderContributionSyncStatus(contributionSyncStatus);
-  renderContributionSyncPreview(contributionSyncPreview);
+  // Everything else — every status line, chip, and button label written from a
+  // message key anywhere on this page — re-translates from the registry those
+  // writes populate. Nothing has to be named here for it to be covered.
+  retranslateLocalizedNodes();
   localization.localizeTree();
 }
 
@@ -301,6 +357,9 @@ function setCommunitySession(value) {
   communitySession = value;
   if (!value) {
     participantContributionAdmission = null;
+    // Losing the session means the next primary action is a connection again,
+    // not a review of something this Mac can no longer send.
+    communityDevicePaired = false;
     renderContributionPreparationEstimate();
   }
 }
@@ -336,14 +395,54 @@ function formatApiMoney(value) {
   });
 }
 
+/**
+ * A percentage near an end of the scale must not be printed as if it were at
+ * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
+ * dashboard both ends are load-bearing claims rather than cosmetics:
+ *
+ *   100% price coverage means every usage change carries a reviewed price,
+ *        which is why the rounded "100%" sat next to a note saying coverage
+ *        was partial - the note was right and the number was rounded.
+ *     0% remaining means the allowance is gone, which is a different fact
+ *        from "a sliver is left".
+ *
+ * So only an exact 0 or 100 may print as 0% or 100%. Anything strictly
+ * between prints as a bounded "<" or ">" reading, the same idiom
+ * `formatApiMoney` already uses for amounts under a cent.
+ */
 function formatPercent(value, digits = 0) {
   const number = finite(value);
   if (number === null) return "—";
-  return new Intl.NumberFormat(getFormattingLocale(), {
-    maximumFractionDigits: Number.isInteger(number) ? 0 : digits,
+  const places = Number.isInteger(number) ? 0 : digits;
+  const format = (amount) => new Intl.NumberFormat(getFormattingLocale(), {
+    maximumFractionDigits: places,
     minimumFractionDigits: 0,
     style: "percent",
-  }).format(number / 100);
+  }).format(amount / 100);
+  // The test is whether this value *renders* as an endpoint, not whether it
+  // is near one: at whole-number precision 99.2 renders as "99%", which is
+  // honest and needs no bound, while 99.5 renders as "100%", which is not.
+  // Comparing rendered strings also keeps this agreeing with whatever
+  // rounding mode the locale's formatter uses.
+  const step = 10 ** -places;
+  const rendered = format(number);
+  if (number > 0 && rendered === format(0)) return `<${format(step)}`;
+  if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
+  return rendered;
+}
+
+/**
+ * One whole-number formatter for tabular counts.
+ *
+ * `compact` is right for a headline chip, where a single number stands alone.
+ * It is wrong for a column: it renders "154.9K" next to "74" and silently
+ * changes precision partway down the table, so nothing can be compared or
+ * added up by eye. Grouped exact integers stay comparable at every magnitude.
+ */
+function formatCount(value) {
+  const number = finite(value);
+  if (number === null || number < 0) return t("accounting.model.notReported");
+  return formatNumber(Math.trunc(number), { maximumFractionDigits: 0 });
 }
 
 function formatDecimal(value, digits = 0) {
@@ -738,7 +837,7 @@ function renderDashboard(data) {
   $("#data-source").textContent = data.mode === "demo"
     ? "Illustrative fixture — not your usage"
     : `${formatLocal(data.freshness.latestObservedAt)} · local companion`;
-  $("#schema-version").textContent = t("dashboard.contract", {
+  setLocalizedText($("#schema-version"), "dashboard.contract", {
     version: data.schemaVersion,
   });
 
@@ -796,12 +895,12 @@ function renderQuotaCards(data) {
     const card = node("article", "metric-card insufficient");
     const header = node("div", "metric-card-header");
     const name = node("span", "metric-name");
-    name.textContent = t("dashboard.quota.observations");
+    setLocalizedText(name, "dashboard.quota.observations");
     const chip = node("span", "evidence-chip");
-    chip.textContent = t("dashboard.quota.insufficient");
+    setLocalizedText(chip, "dashboard.quota.insufficient");
     const value = node("strong", "metric-value", "—");
     const copy = node("p");
-    copy.textContent = t("dashboard.quota.noCurrent");
+    setLocalizedText(copy, "dashboard.quota.noCurrent");
     header.append(name, chip);
     card.append(header, value, copy);
     container.append(card);
@@ -820,20 +919,20 @@ function renderQuotaCards(data) {
     const plan = node("span", "evidence-chip");
     const reportedPlan = providerReportedPlanEvidence(window.planType);
     if (spark) {
-      plan.textContent = t("dashboard.quota.spark");
+      setLocalizedText(plan, "dashboard.quota.spark");
     } else if (data.mode === "demo") {
-      plan.textContent = t("dashboard.quota.demo");
+      setLocalizedText(plan, "dashboard.quota.demo");
     } else if (reportedPlan) {
       plan.textContent = reportedPlan;
     } else {
-      plan.textContent = t("dashboard.quota.observed");
+      setLocalizedText(plan, "dashboard.quota.observed");
     }
     header.append(
       name,
       plan,
     );
     const value = node("strong", "metric-value");
-    value.textContent = t("dashboard.quota.remaining", {
+    setLocalizedText(value, "dashboard.quota.remaining", {
       value: remaining === null
         ? "—"
         : formatPercent(remaining, window.precision ?? 0),
@@ -1010,16 +1109,11 @@ function renderPricing(data) {
   const coverageLine = node("span", "coverage-line");
   setRawText(coverageLine, t(coverageKey, coverageValues));
   coverageElement.append(coverageLine);
-  if (pricing.historyCoverage?.status === "partial") {
-    const startAt = pricing.historyCoverage.coveredAt?.startAt
-      || pricing.evidenceStartDate
-      || "";
-    const warning = node("span", "coverage-warning");
-    setRawText(warning, t("accounting.pricing.thirtyDayCoverageWarning", {
-      date: startAt ? ` on ${formatLocal(startAt, { dateOnly: true })}` : "",
-    }));
-    coverageElement.append(warning);
-  }
+  // No "reviewed historical prices began on …" caveat is printed here. Every
+  // retained usage change is priced at the rate in effect when it occurred,
+  // with no start boundary, so the sentence was false. It was also the live
+  // path that rendered "Jan 1, 1970" whenever the partial-history coverage
+  // record carried no start instant.
   coverageElement.title = eventCount > 0
     ? t("dashboard.pricing.coverageDenominator", { count: compact(eventCount) })
     : "";
@@ -1151,12 +1245,12 @@ function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 })
     setProductText(rate, "Not estimable");
     setProductText(range, "Not estimable");
     setProductText(example, "Not estimable");
-    explanation.textContent = t("dashboard.calibration.noRate");
+    setLocalizedText(explanation, "dashboard.calibration.noRate");
     return;
   }
   const perPoint = capacity / 100;
   const movementForHundred = 10_000 / capacity;
-  rate.textContent = t("dashboard.calibration.perPoint", {
+  setLocalizedText(rate, "dashboard.calibration.perPoint", {
     amount: formatMoney(perPoint, 2),
   });
   range.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
@@ -1165,7 +1259,7 @@ function renderCalibrationRate({ capacity, lower, upper, qualifyingResets = 0 })
       upper: formatMoney(upper / 100, 2),
     })
     : t("dashboard.calibration.rangeUnavailable");
-  example.textContent = t("dashboard.calibration.example", {
+  setLocalizedText(example, "dashboard.calibration.example", {
     points: formatDecimal(movementForHundred, 1),
   });
   explanation.textContent = lower !== null && lower > 0 && upper !== null && upper > 0
@@ -2111,7 +2205,7 @@ function renderShareCard(data) {
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
     setShareCardStatus(
-      "This browser did not provide a drawing surface, so no image could be produced. The card's figures are listed below it as text.",
+      "TiboTattle could not get a drawing surface, so no image could be produced. The card's figures are listed below it as text.",
       { error: true },
     );
   } else {
@@ -2143,7 +2237,7 @@ function downloadShareCard() {
     const blob = await shareCardBlob($("#share-card-canvas"));
     if (blob === null) {
       setShareCardStatus(
-        "This browser could not turn the card into a PNG. Nothing was saved; the figures remain listed below as text.",
+        "TiboTattle could not turn the card into a PNG. Nothing was saved; the figures remain listed below as text.",
         { error: true },
       );
       return;
@@ -2165,7 +2259,7 @@ function copyShareCardImage() {
     if (typeof ClipboardItem !== "function"
       || typeof navigator.clipboard?.write !== "function") {
       setShareCardStatus(
-        "This browser cannot put an image on the clipboard. Use Save image instead, or Copy as text.",
+        "TiboTattle cannot put an image on the clipboard here. Use Save image instead, or Copy as text.",
         { error: true },
       );
       return;
@@ -2173,7 +2267,7 @@ function copyShareCardImage() {
     const blob = await shareCardBlob($("#share-card-canvas"));
     if (blob === null) {
       setShareCardStatus(
-        "This browser could not turn the card into a PNG. Nothing was copied.",
+        "TiboTattle could not turn the card into a PNG. Nothing was copied.",
         { error: true },
       );
       return;
@@ -2198,7 +2292,7 @@ function copyShareCardText() {
   return runShareCardAction(async (card) => {
     if (typeof navigator.clipboard?.writeText !== "function") {
       setShareCardStatus(
-        "This browser cannot write to the clipboard. The card's text is listed below it and can be selected.",
+        "TiboTattle cannot write to the clipboard here. The card's text is listed below it and can be selected.",
         { error: true },
       );
       return;
@@ -2367,16 +2461,25 @@ function panTimeline(points, fraction) {
   });
 }
 
+// Evidence-state names reach both the SVG text layer (as shaded-interval
+// tooltips) and the residual table, so they resolve through the catalogue like
+// every other chart string rather than being stamped as English.
+const TIMELINE_STATUS_KEYS = Object.freeze({
+  matched: "chart.status.matched",
+  inactive: "chart.status.inactive",
+  unpriced_local_activity: "chart.status.unpricedLocalActivity",
+  unexplained_without_local_activity: "chart.status.unexplainedWithoutLocalActivity",
+  missing_quota_bracket: "chart.status.missingQuotaBracket",
+  reset_or_track_change: "chart.status.resetOrTrackChange",
+  backward_or_ambiguous: "chart.status.backwardOrAmbiguous",
+});
+
+function timelineStatusKey(status) {
+  return TIMELINE_STATUS_KEYS[status] ?? "chart.status.historical";
+}
+
 function timelineStatusLabel(status) {
-  return {
-    matched: "Matched quota bracket",
-    inactive: "No local activity or quota movement",
-    unpriced_local_activity: "Usage change without reviewed price",
-    unexplained_without_local_activity: "Quota movement without a local usage change",
-    missing_quota_bracket: "Quota bracket not recorded",
-    reset_or_track_change: "Window boundary or track change",
-    backward_or_ambiguous: "Movement needs context",
-  }[status] ?? "Historical calibration point";
+  return t(timelineStatusKey(status));
 }
 
 function timelineStatusIntervals(points, viewport) {
@@ -2413,6 +2516,30 @@ function mainWeeklyQuotaTrack(rows) {
       right[1].length - left[1].length
       || left[0].localeCompare(right[0])
     ))[0]?.[1] ?? [];
+}
+
+// The provider restates the same reset boundary with a slightly different
+// instant on each snapshot; the observed drift across this corpus is one to
+// twenty-two seconds. Comparing the two strings exactly therefore reported a
+// reset or track change for roughly one window in ten that had neither, and
+// discarded a usable observation each time.
+//
+// A genuine change moves the boundary by hours — the short window is five
+// hours and the long one is seven days — so two minutes is wide enough to
+// absorb every observed restatement and still far too narrow to merge two
+// distinct reset cycles.
+const RESET_BOUNDARY_TOLERANCE_MS = 2 * 60 * 1_000;
+
+function sameResetBoundary(before, after) {
+  if (!before || !after) return false;
+  const beforeMs = Date.parse(before);
+  const afterMs = Date.parse(after);
+  if (!Number.isFinite(beforeMs) || !Number.isFinite(afterMs)) {
+    // An unparseable boundary carries no tolerance to reason about, so fall
+    // back to demanding that the provider repeated itself verbatim.
+    return before === after;
+  }
+  return Math.abs(afterMs - beforeMs) <= RESET_BOUNDARY_TOLERANCE_MS;
 }
 
 function liveTimelinePoints(
@@ -2457,7 +2584,8 @@ function liveTimelinePoints(
     const bracketed = before && after
       && startMs - beforeMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
-    const sameReset = bracketed && before.resetAt && before.resetAt === after.resetAt;
+    const sameReset = Boolean(bracketed)
+      && sameResetBoundary(before.resetAt, after.resetAt);
     const observed = sameReset && after.usedPercent >= before.usedPercent
       ? after.usedPercent - before.usedPercent
       : null;
@@ -2586,15 +2714,31 @@ function syncUsageGroupingControls() {
   }
 }
 
+// The vertical axis has to state its unit and its aggregation together: the
+// same series is dollars per hour, per day, or per week depending on the
+// selected grouping, and "API equivalent" alone said neither.
+const USAGE_GROUPING_UNIT_KEYS = Object.freeze({
+  hour: "chart.unit.hour",
+  day: "chart.unit.day",
+  week: "chart.unit.week",
+});
+
+const USAGE_GROUPING_AXIS_KEYS = Object.freeze({
+  hour: "chart.axis.apiEquivalentPerHour",
+  day: "chart.axis.apiEquivalentPerDay",
+  week: "chart.axis.apiEquivalentPerWeek",
+});
+
+function usageGroupingUnitKey(grouping = activeUsageGrouping) {
+  return USAGE_GROUPING_UNIT_KEYS[grouping] ?? "chart.unit.interval";
+}
+
 function usageChartAxisLabels(grouping = activeUsageGrouping) {
-  const unit = {
-    hour: "hour",
-    day: "day",
-    week: "week",
-  }[grouping] ?? "interval";
   return Object.freeze({
-    primary: `API equivalent / ${unit}`,
-    secondary: "Observed allowance remaining (%)",
+    primary: {
+      key: USAGE_GROUPING_AXIS_KEYS[grouping] ?? "chart.axis.apiEquivalentPerInterval",
+    },
+    secondary: { key: "chart.axis.sevenDayAllowanceRemaining" },
   });
 }
 
@@ -2603,10 +2747,14 @@ function renderUsageTimeline(data) {
   const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
   const shell = $("#usage-timeline-chart");
   const empty = $("#usage-timeline-empty");
-  const label = { hour: "hour", day: "day", week: "week" }[activeUsageGrouping];
+  const unit = t(usageGroupingUnitKey());
   const axisLabels = usageChartAxisLabels();
-  $("#usage-timeline-title").textContent =
-    `API-price-equivalent usage by ${label} · latest ${activeUsageRangeDays} day${activeUsageRangeDays === 1 ? "" : "s"}`;
+  setLocalizedText($("#usage-timeline-title"), "chart.usage.heading", {
+    unit,
+    range: tPlural("format.durationDay", activeUsageRangeDays, {
+      count: formatDecimal(activeUsageRangeDays, 0),
+    }),
+  });
   if (!points.length) {
     shell.hidden = true;
     empty.hidden = false;
@@ -2618,29 +2766,33 @@ function renderUsageTimeline(data) {
       series: [{
         key: "apiCostUsd",
         className: "chart-line-value",
-        label: "API-price-equivalent usage",
-        markers: false,
-        hitTargets: true,
-        markerRadius: 2.6,
+        label: { key: "chart.series.apiEquivalentUsage" },
+        // Dense per-interval samples: dots would merge into a solid band, so
+        // the line carries the shape and each sample stays hoverable. This is
+        // the opposite of the allowance history chart, on purpose.
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
         format: (value) => formatApiMoney(value),
       }],
       yLabel: axisLabels.primary,
       secondarySeries: [{
         key: "allowanceRemaining",
         className: "chart-line-allowance",
-        label: "Observed allowance remaining",
-        markers: false,
-        hitTargets: true,
+        label: { key: "chart.series.sevenDayAllowanceRemaining" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
       }],
       secondaryYLabel: axisLabels.secondary,
-      title: "Real local API-price-equivalent usage over time",
-      description: `Local API-price-equivalent usage with provider-observed seven-day allowance remaining. Times are shown in ${formatTimeZoneLabel()}.`,
+      yTickFormat: (value) => formatApiMoney(value),
+      title: { key: "chart.usage.title" },
+      description: {
+        key: "chart.usage.description",
+        values: { unit, timeZone: formatTimeZoneLabel() },
+      },
       includeZero: true,
-      rotateXTickLabels: true,
     }));
   }
-  $("#usage-timeline-copy").textContent =
-    `Times shown in ${formatTimeZoneLabel()}.`;
+  setLocalizedText($("#usage-timeline-copy"), "chart.timeZoneNote", {
+    timeZone: formatTimeZoneLabel(),
+  });
   const summary = $("#usage-timeline-summary");
   clear(summary);
   const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
@@ -2688,7 +2840,7 @@ function renderTimeline(data) {
   const windowLabel = activeWindowHours === 0.25
     ? t("dashboard.timeWindow.fifteenMinutes")
     : t("dashboard.timeWindow.hours", { count: activeWindowHours });
-  $("#timeline-chart-title").textContent = t("dashboard.timeline.title", {
+  setLocalizedText($("#timeline-chart-title"), "dashboard.timeline.title", {
     window: windowLabel,
   });
   $("#timeline-chart-copy").textContent = usingLive
@@ -2717,31 +2869,32 @@ function renderTimeline(data) {
         {
           key: "observed",
           className: "chart-line-observed",
-          label: t("dashboard.timeline.observedQuota"),
-          markers: false,
-          hitTargets: true,
+          label: { key: "dashboard.timeline.observedQuota" },
+          pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
           format: formatPp,
         },
         {
           key: "expected",
           className: "chart-line-expected",
-          label: t("dashboard.timeline.expectedCost"),
-          markers: false,
-          hitTargets: true,
+          label: { key: "dashboard.timeline.expectedCost" },
+          pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
           format: formatPp,
         }
       ],
-      yLabel: t("dashboard.timeline.percentagePoints"),
-      title: t("dashboard.timeline.movementTitle", { window: windowLabel }),
-      description: t("dashboard.timeline.chartDescription", {
-        timeZone: formatTimeZoneLabel(),
-      }),
+      yLabel: { key: "dashboard.timeline.percentagePoints" },
+      title: {
+        key: "dashboard.timeline.movementTitle",
+        values: { window: windowLabel },
+      },
+      description: {
+        key: "dashboard.timeline.chartDescription",
+        values: { timeZone: formatTimeZoneLabel() },
+      },
       includeZero: true,
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
         : [],
-      rotateXTickLabels: true,
     }));
     bindTimelineInteractions(shell, points, viewport);
   }
@@ -2775,17 +2928,17 @@ function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport)
       "This historical calibration view has no per-window reset annotations. Treat it as diagnostic evidence, not a live allowance reading.",
     );
   } else if (matched < 3) {
-    element.textContent = t("dashboard.timeline.lowConfidence", {
+    setLocalizedText(element, "dashboard.timeline.lowConfidence", {
       visible: tPlural("dashboard.timeline.visibleWindow", matched),
       excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
     });
   } else if (excluded > 0) {
-    element.textContent = t("dashboard.timeline.excludedShown", {
+    setLocalizedText(element, "dashboard.timeline.excludedShown", {
       shown: tPlural("dashboard.timeline.shownWindow", matched),
       excluded: tPlural("dashboard.timeline.excludedWindow", excluded),
     });
   } else {
-    element.textContent = t("dashboard.timeline.allMatched", {
+    setLocalizedText(element, "dashboard.timeline.allMatched", {
       visible: tPlural("dashboard.timeline.visibleWindow", matched),
     });
   }
@@ -2800,7 +2953,7 @@ function bindTimelineInteractions(shell, points, viewport) {
     timeZone: USER_TIME_ZONE,
   }));
   const status = $("#timeline-zoom-status");
-  status.textContent = t("dashboard.timeline.status", {
+  setLocalizedText(status, "dashboard.timeline.status", {
     start: formatLocal(new Date(viewport.startMs).toISOString()),
     end: formatLocal(new Date(viewport.endMs).toISOString()),
     span: formatSpanLength(viewport.endMs - viewport.startMs),
@@ -2972,9 +3125,9 @@ function renderResidualCoverage(rows, computed) {
   if (!rows.length) {
     setProductText(element, "No windows fall inside this date range.");
   } else if (missing === 0) {
-    element.textContent = tPlural("dashboard.residual.allComputable", rows.length);
+    setLocalizedPluralText(element, "dashboard.residual.allComputable", rows.length);
   } else {
-    element.textContent = t("dashboard.residual.partial", {
+    setLocalizedText(element, "dashboard.residual.partial", {
       computed: computed.length,
       total: rows.length,
       missing,
@@ -2983,10 +3136,41 @@ function renderResidualCoverage(rows, computed) {
   }
 }
 
+/**
+ * Merge two already-ranked lists into one bounded inspection list without
+ * letting the longer list starve the shorter one.
+ *
+ * Each list is guaranteed its own half of `limit`; whatever a short list does
+ * not use is handed to the other. Rows are deduplicated by timestamp, keeping
+ * the first (higher-ranked) occurrence, and returned newest first.
+ */
+function balancedInspectionRows(first, second, limit) {
+  const firstShare = Math.min(first.length, Math.ceil(limit / 2));
+  const selected = [];
+  const seen = new Set();
+  const take = (rows, count) => {
+    for (const row of rows) {
+      if (selected.length >= limit || count <= 0) return;
+      if (seen.has(row.timestamp)) continue;
+      seen.add(row.timestamp);
+      selected.push(row);
+      count -= 1;
+    }
+  };
+  take(first, firstShare);
+  take(second, limit - selected.length);
+  // Backfill only after the second list has had its reserved share, so a long
+  // unmatched list can still fill the table when nothing is comparable.
+  take(first, limit - selected.length);
+  return selected.sort(
+    (left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp),
+  );
+}
+
 function renderResiduals(data, points, viewport = null) {
   const timeHeading = $("#residual-time-heading");
   if (timeHeading) {
-    timeHeading.textContent = t("format.localTime");
+    setLocalizedText(timeHeading, "format.localTime");
   }
   const residuals = residualRows(data, points);
   const computed = residuals.filter((row) => row.residual !== null);
@@ -3006,20 +3190,21 @@ function renderResiduals(data, points, viewport = null) {
       series: [{
         key: "residual",
         className: "chart-line-value",
-        label: "Residual",
-        markers: false,
-        hitTargets: true,
+        label: { key: "chart.residual.series" },
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
         format: formatPp,
       }],
-      yLabel: "Percentage points",
-      title: "Quota movement residuals",
-      description: "Observed quota change minus the API-cost-implied change, over the same date range as the calibration chart. Windows with no computable residual are left as shaded gaps.",
+      yLabel: { key: "dashboard.timeline.percentagePoints" },
+      title: { key: "chart.residual.title" },
+      description: {
+        key: "chart.residual.description",
+        values: { timeZone: formatTimeZoneLabel() },
+      },
       includeZero: true,
       xDomain: domain,
       statusIntervals: domain === null
         ? []
         : timelineStatusIntervals(residuals, domain),
-      rotateXTickLabels: true,
     }));
   }
   renderResidualCoverage(residuals, computed);
@@ -3031,12 +3216,17 @@ function renderResiduals(data, points, viewport = null) {
     .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
   const largest = [...computed]
     .sort((a, b) => Math.abs(b.residual) - Math.abs(a.residual));
-  const inspection = [...unmatched, ...largest]
-    .filter((row, index, rows) => rows.findIndex((candidate) => candidate.timestamp === row.timestamp) === index)
-    .slice(0, 8);
+  // Both halves of this table matter: the windows that could not be compared,
+  // and the comparable windows whose residual is largest. Concatenating an
+  // unbounded unmatched list ahead of the residuals meant that whenever more
+  // than eight windows were excluded — the normal case — the slice consumed
+  // every row and each one printed "Not comparable". Give each half its own
+  // reserved share of the eight rows, and let either half claim the slack the
+  // other does not use.
+  const inspection = balancedInspectionRows(unmatched, largest, 8);
   if (!inspection.length) {
     const row = node("tr");
-    const cell = node("td", "empty-cell", "No periods loaded.");
+    const cell = node("td", "empty-cell", t("residual.table.empty"));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
@@ -3048,41 +3238,147 @@ function renderResiduals(data, points, viewport = null) {
       ? null
       : item.residual;
     row.append(
-      node("td", "", formatReportingTime(item.timestamp)),
+      node("td", "", formatChartTimestamp(item.timestamp)),
       node("td", "", formatPp(item.observed)),
       node("td", "", formatPp(item.expected)),
-      node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? "Not comparable" : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
+      node("td", residual === null ? "" : residual >= 0 ? "positive" : "negative", residual === null ? t("residual.table.notComparable") : `${residual >= 0 ? "+" : ""}${formatPp(residual)}`),
       node("td", "", timelineStatusLabel(item.status ?? "matched")),
     );
     table.append(row);
   }
 }
 
-function formatChartTimeLabel(value, { dateOnly = false } = {}) {
+// A tick label's resolution follows the span the axis actually covers, so
+// every tick on one axis has the same compact shape instead of each one
+// carrying a full date and time.
+const CHART_TICK_TIME_ONLY_SPAN_MS = 36 * 60 * 60 * 1_000;
+const CHART_TICK_MONTH_ONLY_SPAN_MS = 365 * 24 * 60 * 60 * 1_000;
+
+/**
+ * The one axis-tick label formatter.
+ *
+ * Two properties are deliberate and both were reported as defects:
+ *
+ * 1. No tick carries a time-zone name. A chart states its zone exactly once,
+ *    in its caption, through `formatTimeZoneLabel()` — which reads
+ *    `Intl.DateTimeFormat().resolvedOptions().timeZone`, so it is correct for
+ *    whatever zone the reader's Mac is in and is never assumed. Repeating a
+ *    short name ("EDT") on ticks while the caption said a long generic name
+ *    ("Eastern Time") stated the same fact two different ways.
+ *
+ * 2. The date and time halves are formatted independently and joined with a
+ *    separator chosen here. Asking one `Intl.DateTimeFormat` for both halves
+ *    delegates the join to ICU, and WebKit's ICU supplies a localized
+ *    connective — "Jan 5 at 3:04 PM" — that Node's ICU does not, so no Node
+ *    test can see it. Composing the halves removes that glue by construction
+ *    rather than by rewriting a string after the fact.
+ */
+function formatChartTimeLabel(value, { dateOnly = false, spanMs = null } = {}) {
   const timestamp = value instanceof Date
     ? value.valueOf()
     : typeof value === "number"
       ? value
       : Date.parse(value);
   if (!Number.isFinite(timestamp)) return t("format.unknown");
+  const span = finite(spanMs);
+  const resolution = dateOnly ? "date"
+    : span === null ? "dateAndTime"
+      : span <= CHART_TICK_TIME_ONLY_SPAN_MS ? "time"
+        : span <= CHART_TICK_MONTH_ONLY_SPAN_MS ? "date"
+          : "month";
   try {
-    const locale = getFormattingLocale();
-    const date = new Intl.DateTimeFormat(locale, {
+    const instant = new Date(timestamp);
+    const part = (options) => new Intl.DateTimeFormat(getFormattingLocale(), {
       timeZone: USER_TIME_ZONE,
-      month: "short",
-      day: "numeric",
-      ...(dateOnly ? { year: "numeric" } : {}),
-    }).format(new Date(timestamp));
-    if (dateOnly) return date;
-    const time = new Intl.DateTimeFormat(locale, {
-      timeZone: USER_TIME_ZONE,
-      hour: "numeric",
-      minute: "2-digit",
-    }).format(new Date(timestamp));
-    return `${date} · ${time}`;
+      ...options,
+    }).format(instant);
+    const day = () => part({ month: "short", day: "numeric" });
+    const clock = () => part({ hour: "numeric", minute: "2-digit" });
+    if (resolution === "time") return clock();
+    if (resolution === "month") return part({ month: "short", year: "numeric" });
+    if (resolution === "date") return day();
+    return `${day()} · ${clock()}`;
   } catch {
-    return formatLocal(new Date(timestamp).toISOString(), { dateOnly });
+    return formatChartTimestamp(new Date(timestamp).toISOString(), { dateOnly });
   }
+}
+
+/**
+ * Whether a series draws its data points. This is decided per chart, and there
+ * is deliberately no global switch, because the dashboard's two chart families
+ * want opposite answers and both answers are correct:
+ *
+ *  - EVIDENCE_DOTS — the allowance estimate history. Each dot is one observed
+ *    seven-day reset: sparse, individually meaningful evidence. The dots are
+ *    what that chart is for, and they must be visible.
+ *  - HOVER_ONLY — the dense usage, calibration, and residual timelines. Those
+ *    plot hundreds of adjacent samples, where dots smear into a band. The line
+ *    carries the shape while every sample keeps an invisible hit target, so
+ *    hover, keyboard focus, and assistive technology still reach each value.
+ *
+ * Every series must name one. There is no default to fall back to and no
+ * boolean to flip in one place, so "hide the dots" can only ever be said about
+ * a single chart. A previous change that flipped one shared flag silently
+ * erased the allowance chart's points; this makes that edit impossible to
+ * write by accident.
+ */
+const CHART_POINT_STYLE = Object.freeze({
+  EVIDENCE_DOTS: "evidence-dots",
+  HOVER_ONLY: "hover-only",
+});
+
+const CHART_POINT_STYLES = new Set(Object.values(CHART_POINT_STYLE));
+
+function chartSeriesDrawsPoints(item, field) {
+  const style = item?.pointStyle;
+  if (!CHART_POINT_STYLES.has(style)) {
+    throw new TypeError(
+      `lineChart ${field} needs an explicit pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS draws visible data points, CHART_POINT_STYLE.HOVER_ONLY keeps them reachable without drawing them.`,
+    );
+  }
+  return style === CHART_POINT_STYLE.EVIDENCE_DOTS;
+}
+
+/**
+ * The localization hook for everything the chart writes into the SVG text
+ * layer: axis labels, series names, the `<title>`/`<desc>` accessibility pair,
+ * and hover tooltips.
+ *
+ * SVG text nodes are stamped `data-i18n-skip` because they already contain
+ * formatted numbers and instants that exact-text translation must never touch.
+ * That left the text layer as the one surface the localization bridge could not
+ * see, and hardcoded English flowed straight through it. Resolving the strings
+ * here, at the single chart-rendering helper, closes that gap for every chart
+ * at once.
+ *
+ * Callers pass a descriptor rather than a string:
+ *   { key: "chart.residual.title" }               → t(key)
+ *   { key: "weekly.point.detail", values: {...} } → t(key, values)
+ *   { key: "share.resetFit", plural: count }      → tPlural(key, count, values)
+ *   { data: alreadyFormattedSourceValue }         → verbatim, never translated
+ *
+ * A bare string throws. That is the enforcement: a chart added later cannot
+ * reintroduce untranslated English without failing the moment it renders.
+ */
+function chartText(descriptor, field = "text") {
+  if (descriptor === null || descriptor === undefined) return "";
+  if (typeof descriptor === "object" && !Array.isArray(descriptor)) {
+    if (typeof descriptor.key === "string") {
+      return typeof descriptor.plural === "number"
+        ? tPlural(descriptor.key, descriptor.plural, descriptor.values ?? {})
+        : t(descriptor.key, descriptor.values ?? {});
+    }
+    if (Object.hasOwn(descriptor, "data")) {
+      return descriptor.data == null ? "" : String(descriptor.data);
+    }
+  }
+  throw new TypeError(
+    `lineChart ${field} must be a localization descriptor ({ key }) or explicit source data ({ data }). Hardcoded strings cannot reach the SVG text layer.`,
+  );
+}
+
+function chartSeriesCaption(label, value) {
+  return t("chart.seriesValue", { label, value });
 }
 
 function lineChart({
@@ -3101,22 +3397,20 @@ function lineChart({
   statusIntervals = [],
   secondarySeries = [],
   secondaryYLabel = null,
-  rotateXTickLabels = false,
 }) {
-  // Data-point details are the safe default for every chart series. A caller
-  // may opt out of the visual markers or the tooltip, but accessibility must
-  // not disappear merely because a new series forgot an opt-in flag.
+  // Hover, keyboard focus, and the accessible name are unconditional. Only the
+  // visible dot is a per-chart decision, and every series has to state it.
   const chartSeries = (Array.isArray(series) ? series : []).map((item) => ({
     ...item,
-    markers: item.markers !== false,
-    hitTargets: item.hitTargets !== false,
+    label: chartText(item.label, "series label"),
+    markers: chartSeriesDrawsPoints(item, "series"),
     focusable: item.focusable !== false,
     tooltip: item.tooltip !== false,
   }));
   const chartSecondarySeries = (Array.isArray(secondarySeries) ? secondarySeries : []).map((item) => ({
     ...item,
-    markers: item.markers !== false,
-    hitTargets: item.hitTargets !== false,
+    label: chartText(item.label, "secondary series label"),
+    markers: chartSeriesDrawsPoints(item, "secondary series"),
     focusable: item.focusable !== false,
     tooltip: item.tooltip !== false,
   }));
@@ -3126,7 +3420,11 @@ function lineChart({
   const margin = {
     top: 16,
     right: hasSecondary ? 96 : 24,
-    bottom: rotateXTickLabels ? 66 : 44,
+    // Tick labels are horizontal. They used to be rotated -24° and given a
+    // 66px gutter because each one carried a full date and time; now that a
+    // tick reads "Jul 15" or "2:04 PM", rotation only made short text harder
+    // to read and cost the plot 22px of height.
+    bottom: 44,
     left: 72,
   };
   let min = finite(yDomain?.low);
@@ -3205,9 +3503,9 @@ function lineChart({
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("role", "img");
   const titleNode = document.createElementNS(svg.namespaceURI, "title");
-  setRawText(titleNode, title);
+  setRawText(titleNode, chartText(title, "title"));
   const descNode = document.createElementNS(svg.namespaceURI, "desc");
-  setRawText(descNode, description);
+  setRawText(descNode, chartText(description, "description"));
   svg.append(titleNode, descNode);
 
   const tooltipWidth = 330;
@@ -3323,14 +3621,18 @@ function lineChart({
       ? formatDecimal(value, yDigits)
       : yTickFormat(value, yDigits);
     svg.append(svgText(margin.left - 8, yPosition + 3, label, "chart-axis-label", "end"));
-    if (hasSecondary) {
-      const secondaryRatio = yTicks.length <= 1
-        ? 0
-        : yTicks.indexOf(value) / (yTicks.length - 1);
+  }
+
+  if (hasSecondary) {
+    // The percentage axis is drawn on its own round quarters. It used to reuse
+    // the left axis's tick positions, so a four-tick dollar axis produced
+    // 100 / 67 / 33 / 0 % — arithmetically true and unreadable. The percentage
+    // scale is fixed at 0–100, so its ticks do not depend on the other axis.
+    for (const percent of [100, 75, 50, 25, 0]) {
       svg.append(svgText(
         width - margin.right + 8,
-        margin.top + secondaryRatio * (height - margin.top - margin.bottom) + 3,
-        `${formatDecimal(100 - secondaryRatio * 100, 0)}%`,
+        ySecondary(percent) + 3,
+        formatPercent(percent, 0),
         "chart-axis-label",
         "start"
       ));
@@ -3349,16 +3651,14 @@ function lineChart({
       left: margin.left,
       right: margin.right,
     });
+    const domainSpanMs = safeDomainEndMs - domainStartMs;
     const ticks = Array.isArray(xTicks) && xTicks.length > 0
       ? xTicks
       : Array.from({ length: automaticTickCount }, (_, index) => {
-        const at = domainStartMs + (safeDomainEndMs - domainStartMs)
-          * index / (automaticTickCount - 1);
+        const at = domainStartMs + domainSpanMs * index / (automaticTickCount - 1);
         return {
           at,
-          label: formatChartTimeLabel(at, {
-            dateOnly: safeDomainEndMs - domainStartMs > 7 * 24 * 60 * 60 * 1_000,
-          }),
+          label: formatChartTimeLabel(at, { spanMs: domainSpanMs }),
           alignment: index === 0
             ? "start"
             : index === automaticTickCount - 1
@@ -3374,19 +3674,13 @@ function lineChart({
         / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
       const tickLabel = svgText(
         position,
-        rotateXTickLabels ? height - 34 : height - 22,
+        height - 22,
         typeof tick.label === "string"
           ? tick.label
-          : formatChartTimeLabel(at, { dateOnly: true }),
+          : formatChartTimeLabel(at, { spanMs: domainSpanMs }),
         "chart-axis-label",
         tick.alignment ?? "middle",
       );
-      if (rotateXTickLabels) {
-        tickLabel.setAttribute(
-          "transform",
-          `rotate(-24 ${position} ${height - 34})`,
-        );
-      }
       svg.append(tickLabel);
       tickLabels.push(tickLabel);
     }
@@ -3402,14 +3696,20 @@ function lineChart({
     }
     installTickDensity(tickLabels);
   }
-  const yAxisLabel = svgText(15, height / 2, yLabel, "chart-axis-label", "middle");
+  const yAxisLabel = svgText(
+    15,
+    height / 2,
+    chartText(yLabel, "yLabel"),
+    "chart-axis-label",
+    "middle",
+  );
   yAxisLabel.setAttribute("transform", `rotate(-90 15 ${height / 2})`);
   svg.append(yAxisLabel);
   if (hasSecondary && secondaryYLabel) {
     const secondaryLabel = svgText(
       width - 8,
       height / 2,
-      secondaryYLabel,
+      chartText(secondaryYLabel, "secondaryYLabel"),
       "chart-axis-label",
       "middle"
     );
@@ -3442,9 +3742,9 @@ function lineChart({
       const bandLow = Math.min(...confidencePoints.map(({ low }) => low));
       const bandHigh = Math.max(...confidencePoints.map(({ high }) => high));
       const bandFormat = confidence.format ?? formatMoney;
-      const bandHeading = confidence.label ?? "Confidence band";
+      const bandHeading = chartText(confidence.label, "confidence label");
       const bandDetail = `${bandFormat(bandLow)}–${bandFormat(bandHigh)}`;
-      const bandCaption = `${bandHeading}: ${bandDetail}`;
+      const bandCaption = chartSeriesCaption(bandHeading, bandDetail);
       const bandTitle = document.createElementNS(svg.namespaceURI, "title");
       setRawText(bandTitle, bandCaption);
       polygon.append(bandTitle);
@@ -3479,9 +3779,15 @@ function lineChart({
       );
       if (errorBars.tooltip !== false) {
         const barTitle = document.createElementNS(svg.namespaceURI, "title");
+        const barCaption = chartSeriesCaption(
+          chartText(errorBars.label, "errorBars label"),
+          `${format(low)}–${format(high)}`,
+        );
         setRawText(
           barTitle,
-          `${errorBars.label}: ${format(low)}–${format(high)}${point.timestamp ? ` · ${formatLocal(point.timestamp)}` : ""}`,
+          point.timestamp
+            ? `${barCaption} · ${formatChartTimestamp(point.timestamp)}`
+            : barCaption,
         );
         group.append(barTitle);
       }
@@ -3503,7 +3809,10 @@ function lineChart({
     rect.setAttribute("height", String(height - margin.top - margin.bottom));
     rect.setAttribute("class", `chart-status-${interval.status === "reset_or_track_change" ? "reset" : interval.status === "missing_quota_bracket" ? "missing" : "ambiguous"}`);
     const intervalTitle = document.createElementNS(svg.namespaceURI, "title");
-    setRawText(intervalTitle, timelineStatusLabel(interval.status));
+    setRawText(
+      intervalTitle,
+      chartText({ key: timelineStatusKey(interval.status) }, "status interval"),
+    );
     rect.append(intervalTitle);
     svg.append(rect);
   }
@@ -3532,9 +3841,12 @@ function lineChart({
       if (item.lineFocusable === true) {
         const format = item.format ?? formatMoney;
         const representative = pathPoints[Math.floor(pathPoints.length / 2)];
-        const heading = `${item.label}: ${format(representative.value)}`;
+        const heading = chartSeriesCaption(item.label, format(representative.value));
         const detail = typeof item.lineDetail === "function"
-          ? item.lineDetail(pathPoints.map(({ point }) => point))
+          ? chartText(
+            item.lineDetail(pathPoints.map(({ point }) => point)),
+            "lineDetail",
+          )
           : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
         const lineTitle = document.createElementNS(svg.namespaceURI, "title");
@@ -3553,7 +3865,7 @@ function lineChart({
       }
       svg.append(path);
     }
-    if (item.markers !== false || item.hitTargets !== false) {
+    {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
@@ -3564,7 +3876,7 @@ function lineChart({
         const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 4;
-        const showMarker = item.markers !== false
+        const showMarker = item.markers
           && Number.isFinite(visualRadius)
           && visualRadius > 0;
         const markerOpacity = typeof item.markerOpacity === "function"
@@ -3583,10 +3895,10 @@ function lineChart({
           ? `${item.className} chart-point`
           : `${item.className} chart-point chart-point-hit-target`);
         const timestamp = point.timestamp ?? point.date;
-        const heading = `${item.label}: ${format(value)}`;
+        const heading = chartSeriesCaption(item.label, format(value));
         const detail = [
-          item.detail?.(point),
-          timestamp ? formatLocal(timestamp) : null,
+          item.detail ? chartText(item.detail(point), "series detail") : null,
+          timestamp ? formatChartTimestamp(timestamp) : null,
         ].filter(Boolean).join(" · ");
         const caption = [heading, detail].filter(Boolean).join(" · ");
         if (item.tooltip !== false) {
@@ -3637,11 +3949,14 @@ function lineChart({
       );
       path.setAttribute("class", item.className);
       if (item.lineFocusable === true) {
-        const format = item.format ?? ((value) => `${formatDecimal(value, 1)}%`);
+        const format = item.format ?? ((value) => formatPercent(value, 1));
         const representative = pathPoints[Math.floor(pathPoints.length / 2)];
-        const heading = `${item.label}: ${format(representative.value)}`;
+        const heading = chartSeriesCaption(item.label, format(representative.value));
         const detail = typeof item.lineDetail === "function"
-          ? item.lineDetail(pathPoints.map(({ point }) => point))
+          ? chartText(
+            item.lineDetail(pathPoints.map(({ point }) => point)),
+            "secondary lineDetail",
+          )
           : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
         const lineTitle = document.createElementNS(svg.namespaceURI, "title");
@@ -3660,8 +3975,8 @@ function lineChart({
       }
       svg.append(path);
     }
-    if (item.markers !== false || item.hitTargets !== false) {
-      const format = item.format ?? ((value) => `${formatDecimal(value, 1)}%`);
+    {
+      const format = item.format ?? ((value) => formatPercent(value, 1));
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
         if (value === null) return;
@@ -3671,7 +3986,7 @@ function lineChart({
         const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 2.6;
-        const showMarker = item.markers !== false
+        const showMarker = item.markers
           && Number.isFinite(visualRadius)
           && visualRadius > 0;
         marker.setAttribute("r", String(showMarker
@@ -3680,8 +3995,8 @@ function lineChart({
         marker.setAttribute("class", showMarker
           ? `${item.className} chart-point`
           : `${item.className} chart-point chart-point-hit-target`);
-        const heading = `${item.label}: ${format(value)}`;
-        const detail = point.timestamp ? formatLocal(point.timestamp) : "";
+        const heading = chartSeriesCaption(item.label, format(value));
+        const detail = point.timestamp ? formatChartTimestamp(point.timestamp) : "";
         const caption = [heading, detail].filter(Boolean).join(" · ");
         if (item.tooltip !== false) {
           const markerTitle = document.createElementNS(svg.namespaceURI, "title");
@@ -3722,9 +4037,11 @@ function svgText(x, y, value, className, anchor = "start") {
   element.setAttribute("y", y);
   element.setAttribute("class", className);
   element.setAttribute("text-anchor", anchor);
-  // Chart text can include source-derived labels and values. It arrives
-  // already formatted by the caller and is never eligible for exact-text
-  // translation.
+  // SVG text stays out of the exact-text bridge: it mixes localized copy with
+  // formatted numbers and instants that must never be matched against an
+  // English phrase table. Its words are localized upstream instead, by
+  // `chartText` inside `lineChart`, which is why that helper refuses a bare
+  // string — this attribute is the reason a gap here would be invisible.
   element.setAttribute("data-i18n-skip", "");
   element.textContent = value;
   return element;
@@ -3840,19 +4157,63 @@ function allowanceHistoryDateTicks(points, maximum = 4) {
   const first = points?.[0]?.at;
   const last = points?.at(-1)?.at;
   if (!Number.isFinite(first) || !Number.isFinite(last)) return Object.freeze([]);
+  // Ticks take their resolution from the span they cover, so a month of resets
+  // reads "Jan 5" while a multi-year history reads "Jan 2026" instead of every
+  // tick repeating a full date.
+  const spanMs = Math.max(0, last - first);
   if (last <= first) {
     return Object.freeze([
-      Object.freeze({ at: first, label: formatChartTimeLabel(first, { dateOnly: true }), alignment: "middle" }),
+      Object.freeze({
+        at: first,
+        label: formatChartTimeLabel(first, { spanMs }),
+        alignment: "middle",
+      }),
     ]);
   }
   return Object.freeze(Array.from({ length: maximum }, (_, index) => {
-    const at = first + (last - first) * index / (maximum - 1);
+    const at = first + spanMs * index / (maximum - 1);
     return Object.freeze({
       at,
-      label: formatChartTimeLabel(at, { dateOnly: true }),
+      label: formatChartTimeLabel(at, { spanMs }),
       alignment: index === 0 ? "start" : index === maximum - 1 ? "end" : "middle",
     });
   }));
+}
+
+function weeklySpanLabel() {
+  return activeWeeklyMinimumObservedSpanPp === 0
+    ? t("weekly.span.all")
+    : t("weekly.span.minimum", {
+      span: formatDecimal(activeWeeklyMinimumObservedSpanPp, 0),
+    });
+}
+
+function weeklySpanSentenceLabel() {
+  return activeWeeklyMinimumObservedSpanPp === 0
+    ? t("weekly.span.none")
+    : t("weekly.span.minimum", {
+      span: formatDecimal(activeWeeklyMinimumObservedSpanPp, 0),
+    });
+}
+
+function weeklyObservedSeriesLabel() {
+  return activeWeeklyMinimumObservedSpanPp === 0
+    ? { key: "weekly.series.allSpans" }
+    : {
+      key: "weekly.series.wellObserved",
+      values: { span: formatDecimal(activeWeeklyMinimumObservedSpanPp, 0) },
+    };
+}
+
+function weeklyPointDetail(point) {
+  return {
+    key: "weekly.point.detail",
+    values: {
+      span: formatPp(point.observedSpanPp),
+      low: formatMoney(point.low),
+      high: formatMoney(point.high),
+    },
+  };
 }
 
 function renderAllowanceHistoryChart(history) {
@@ -3862,46 +4223,54 @@ function renderAllowanceHistoryChart(history) {
       {
         key: "historicalMedian",
         className: "chart-line-weekly-center",
-        label: "Historical median",
-        markers: false,
+        label: { key: "weekly.series.allDataMedian" },
+        // A flat reference line: one value repeated at every x, so a dot per
+        // point would say nothing the line does not already say.
+        pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
         lineFocusable: true,
-        lineDetail: (points) => `${points.length} reset estimates`,
+        lineDetail: (points) => ({
+          key: "share.resetFit",
+          plural: points.length,
+        }),
         format: (value) => formatMoney(value),
       },
       {
         key: "value",
         className: "chart-point-weekly-mature",
-        label: `Observed across ${activeWeeklyMinimumObservedSpanPp}+ points`,
+        label: weeklyObservedSeriesLabel(),
         connect: false,
-        markers: false,
-        hitTargets: true,
+        // Each dot is one observed seven-day reset. These are the plotted
+        // points the chart exists to show; a shared "hide markers" flag once
+        // turned every one of them into an invisible hit target. `markerRadius`
+        // still splits well-observed from short observations across the two
+        // point series, so exactly one of the pair draws each estimate.
+        pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
-        detail: (point) => `${formatPp(point.observedSpanPp)} observed · measured range ${formatMoney(point.low)}–${formatMoney(point.high)}`,
+        detail: weeklyPointDetail,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
         key: "value",
         className: "chart-point-weekly-partial",
-        label: "Short observation",
+        label: { key: "weekly.series.shortObservation" },
         connect: false,
-        markers: false,
-        hitTargets: true,
+        pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
-        detail: (point) => `${formatPp(point.observedSpanPp)} observed · measured range ${formatMoney(point.low)}–${formatMoney(point.high)}`,
+        detail: weeklyPointDetail,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
     confidence: {
       low: "acrossResetLow",
       high: "acrossResetHigh",
-      label: "80% across-reset range",
+      label: { key: "weekly.series.acrossResetRange" },
       format: (value) => formatMoney(value),
     },
     errorBars: {
       low: "low",
       high: "high",
       className: "chart-error-bar-weekly",
-      label: "Measured range",
+      label: { key: "weekly.series.measuredRange" },
       tooltip: false,
     },
     xDomain: {
@@ -3911,9 +4280,15 @@ function renderAllowanceHistoryChart(history) {
     xTicks: history.xTicks,
     yDomain: history.axis,
     yTickFormat: (value, digits) => formatMoney(value, digits),
-    yLabel: "7-day allowance ($)",
-    title: "Seven-day allowance estimate history",
-    description: `Each reset estimate meets the selected minimum observed quota span of ${activeWeeklyMinimumObservedSpanPp} percentage points. Measured ranges remain available on hover and focus.`,
+    yLabel: { key: "chart.axis.apiEquivalentPerSevenDays" },
+    title: { key: "weekly.chart.title" },
+    description: {
+      key: "weekly.chart.description",
+      values: {
+        span: weeklySpanSentenceLabel(),
+        timeZone: formatTimeZoneLabel(),
+      },
+    },
   });
 }
 
@@ -4201,31 +4576,49 @@ function renderWeekly(data) {
   const lower = finite(summary.lower_80_across_resets_usd ?? summary.lower80Usd);
   const upper = finite(summary.upper_80_across_resets_usd ?? summary.upper80Usd);
   const qualifying = finite(summary.qualifying_resets ?? summary.qualifyingResets, 0);
-  $("#weekly-estimate").textContent = estimate === null ? "Insufficient evidence" : `${formatMoney(estimate)} API equivalent`;
-  $("#weekly-range").textContent = lower === null || upper === null
-    ? "No evidence interval available"
-    : `80% across-reset range: ${formatMoney(lower)}–${formatMoney(upper)}`;
-  const evidenceExplanation = qualifying
-    ? `${qualifying} qualifying reset estimates. The chart currently shows observations spanning at least ${activeWeeklyMinimumObservedSpanPp} percentage points.`
-    : "The estimate will appear when enough quota transitions can be matched to priced usage.";
-  $("#weekly-explanation").textContent = evidenceExplanation;
 
   const history = allowanceHistoryChartModel(data);
   const values = history.allPoints;
   const chartValues = history.points;
-  $("#weekly-span-value").textContent = activeWeeklyMinimumObservedSpanPp === 0
-    ? "All spans"
-    : `${activeWeeklyMinimumObservedSpanPp}+ pp`;
-  $("#weekly-span-legend").textContent = activeWeeklyMinimumObservedSpanPp === 0
-    ? "All observed spans"
-    : `Observed across ${activeWeeklyMinimumObservedSpanPp}+ points`;
+
+  // The headline is a stable all-data median. The range buttons and the
+  // minimum-observed-span slider filter the chart and nothing else, so the two
+  // numbers could differ by hundreds of dollars with nothing on screen saying
+  // why. They now say so: the hero names its population, and the sentence
+  // underneath reports how much of that population the chart is drawing. The
+  // headline is deliberately not made to follow the filter — a figure people
+  // quote should not move when they adjust a chart control.
+  setLocalizedText($("#weekly-estimate-label"), "weekly.headline.label");
+  $("#weekly-estimate").textContent = estimate === null
+    ? t("weekly.headline.insufficient")
+    : t("weekly.headline.value", { amount: formatMoney(estimate) });
+  $("#weekly-range").textContent = lower === null || upper === null
+    ? t("weekly.headline.rangeUnavailable")
+    : t("weekly.headline.range", {
+      lower: formatMoney(lower),
+      upper: formatMoney(upper),
+    });
+  $("#weekly-explanation").textContent = qualifying
+    ? t("weekly.headline.relationship", {
+      qualifying: formatDecimal(qualifying, 0),
+      shown: formatDecimal(chartValues.length, 0),
+      total: formatDecimal(values.length, 0),
+      span: weeklySpanSentenceLabel(),
+    })
+    : t("weekly.headline.pending");
+
+  setLocalizedText($("#weekly-chart-timezone"), "chart.timeZoneNote", {
+    timeZone: formatTimeZoneLabel(),
+  });
+  $("#weekly-span-value").textContent = weeklySpanLabel();
+  $("#weekly-span-legend").textContent = chartText(weeklyObservedSeriesLabel());
   $("#weekly-partial-legend").hidden = !chartValues.some((row) => !row.wellObserved);
   const empty = $("#weekly-empty");
   const shell = $("#weekly-chart");
   if (!chartValues.length) {
     empty.hidden = false;
     shell.hidden = true;
-    empty.textContent = "No weekly estimates loaded.";
+    setLocalizedText(empty, "weekly.chart.empty");
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -4239,7 +4632,7 @@ function renderWeeklyTable(values) {
   clear(table);
   if (!values.length) {
     const row = node("tr");
-    const cell = node("td", "empty-cell", "No weekly evidence loaded.");
+    const cell = node("td", "empty-cell", t("weekly.table.empty"));
     cell.colSpan = 5;
     row.append(cell);
     table.append(row);
@@ -4248,8 +4641,10 @@ function renderWeeklyTable(values) {
   for (const row of values.slice(-14).reverse()) {
     const span = row.observedSpanPp ?? finite(row.displayed_span_pp);
     const status = isWellObservedWeeklyFit(span)
-      ? "Well observed"
-      : span === null ? "Span not recorded" : "Short observation";
+      ? t("weekly.table.wellObserved")
+      : span === null
+        ? t("weekly.table.spanNotRecorded")
+        : t("weekly.series.shortObservation");
     const evidenceDate = formatLocal(row.timestamp, { dateOnly: true });
     const tr = node("tr");
     tr.append(
@@ -4401,29 +4796,11 @@ function renderAccounting(data) {
   }
   const summary = $("#accounting-summary");
   clear(summary);
-  const pricedEvents = finite(accounting.pricingCoverage?.fullyPricedEvents, 0)
-    + finite(accounting.pricingCoverage?.partiallyPricedEvents, 0);
-  const unpricedEvents = finite(accounting.pricingCoverage?.unpricedEvents, 0);
-  const evidenceStartDate = /^\d{4}-\d{2}-\d{2}$/u.test(
-    accounting.evidenceStartDate ?? "",
-  ) ? accounting.evidenceStartDate : null;
-  const periodDays = { "24h": 1, "7d": 7, "30d": 30 }[accounting.periodId] ?? null;
-  const selectedPeriodCanPrecedeEvidence = evidenceStartDate !== null
-    && (accounting.periodId === "all"
-      || accounting.periodId === "history"
-      || (periodDays !== null
-        && Date.now() - periodDays * 24 * 60 * 60 * 1000
-          < Date.parse(`${evidenceStartDate}T00:00:00.000Z`)));
-  const historyCoverage = accounting.historyCoverage;
-  const historicalCoverageWarning = accounting.periodId === "30d"
-    && (selectedPeriodCanPrecedeEvidence || historyCoverage?.status === "partial");
-  const historicalCoverageDate = evidenceStartDate
-    ?? historyCoverage?.coveredAt?.startAt
-    ?? "";
-  const coveragePercent = accounting.events === 0
-    ? null
-    : pricedEvents / accounting.events * 100;
-  const coverageDigits = 1;
+  // Price coverage used to sit here as a third headline metric. It now reads
+  // as a caption under the model table instead: with every retained usage
+  // change priced at the rate in effect when it occurred, coverage is a
+  // reassurance rather than a number worth a card, and when it is not complete
+  // the rows that lack a price are the useful thing to be standing next to.
   const fastMode = accounting.fastMode;
   const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
   for (const [label, explanation, value, note] of [
@@ -4440,24 +4817,6 @@ function renderAccounting(data) {
       "The tokens attached to those usage changes during the selected time period.",
       compact(accounting.totalTokens),
       accounting.periodLabel
-    ],
-    [
-      "Price coverage",
-      "The share of usage changes with a reviewed public API price. The provenance note below explains any historical coverage boundary.",
-      coveragePercent === null
-        ? "—"
-        : formatPercent(coveragePercent, coverageDigits),
-      historicalCoverageWarning
-        ? t("accounting.pricing.thirtyDayCoverageWarning", {
-          date: historicalCoverageDate
-            ? ` on ${formatLocal(historicalCoverageDate, { dateOnly: true })}`
-            : t("format.unknown"),
-        })
-        : unpricedEvents > 0
-          ? t("accounting.pricing.partialCoverage", {
-            percent: formatPercent(coveragePercent, coverageDigits),
-          })
-          : t("accounting.pricing.coverageReviewed")
     ]
   ]) {
     const card = node("article", "metric-card compact-metric");
@@ -4498,38 +4857,158 @@ function renderAccounting(data) {
     titleFor: (row) => `${compact(row.tokens)} tokens`,
   });
 
+  renderAccountingModels(accounting);
+}
+
+/**
+ * Every model identity observed in the period, across both allowance tracks.
+ *
+ * `byModel` describes the primary Codex pool only, because the separately
+ * metered Spark allowance is kept out of that pool's own totals. `modelUsage`
+ * is the combined list, each row carrying its own allowance track. Reading
+ * only `byModel` is what previously left Spark usage invisible, or collapsed
+ * into "Unrecognized model".
+ */
+function modelUsageRows(accounting) {
+  const combined = Array.isArray(accounting?.modelUsage)
+    ? accounting.modelUsage
+    : [
+      ...(accounting?.byModel ?? []),
+      ...(accounting?.spark?.byModel ?? []),
+    ];
+  return [...combined].sort((left, right) => (
+    // A separate allowance has no comparable money figure, so those rows
+    // cannot be ranked against the primary pool. They sort last.
+    Number(modelRowIsSeparateAllowance(left))
+      - Number(modelRowIsSeparateAllowance(right))
+    || finite(right.apiPriceEquivalentUsd, 0) - finite(left.apiPriceEquivalentUsd, 0)
+    || finite(right.totalTokens, 0) - finite(left.totalTokens, 0)
+    || String(left.model ?? "").localeCompare(String(right.model ?? ""))
+  ));
+}
+
+function modelRowIsSeparateAllowance(row) {
+  return row?.allowanceTrack === "spark"
+    || row?.apiPriceEquivalentApplicable === false;
+}
+
+/**
+ * The API-equivalent cell, which used to print one em dash for four different
+ * situations. They are not the same fact and a reader has to be able to tell
+ * them apart:
+ *
+ *   separate allowance - Spark is metered against its own pool, so an
+ *                        API-price equivalent is not a meaningful figure at
+ *                        all, as opposed to a missing one.
+ *   no published price - a recognised model OpenAI publishes no price card
+ *                        for. Deliberately not priced; not an error.
+ *   not priced         - an identifier this build has never reviewed. No
+ *                        price is invented for it, and it is not a zero.
+ *   not reported       - the row carried no usable number. Malformed input,
+ *                        never silently shown as zero.
+ *   a real amount      - including an honest, priced $0.00.
+ */
+function modelApiEquivalentCell(row) {
+  const cell = node("td", "model-api-equivalent");
+  if (modelRowIsSeparateAllowance(row)) {
+    setLocalizedText(cell, "accounting.model.separateAllowance");
+    cell.title = t("accounting.model.separateAllowanceTitle");
+    return cell;
+  }
+  if (row?.pricingStatus === "known_unpriced") {
+    setLocalizedText(cell, "accounting.model.noPublishedPrice");
+    cell.title = t("accounting.model.noPublishedPriceTitle");
+    return cell;
+  }
+  if (row?.pricingStatus === "unrecognized") {
+    // An identifier this build has never reviewed carries no price, and a
+    // guessed one would be worse than none. Printing "$0.00" here read as a
+    // priced zero, which is a different and untrue claim.
+    setLocalizedText(cell, "accounting.model.notPricedUnknown");
+    cell.title = t("accounting.model.notPricedUnknownTitle");
+    return cell;
+  }
+  const amount = finite(row?.apiPriceEquivalentUsd);
+  if (amount === null || amount < 0) {
+    setLocalizedText(cell, "accounting.model.notReported");
+    cell.title = t("accounting.model.notReportedTitle");
+    return cell;
+  }
+  setRawText(cell, formatApiMoney(amount));
+  if (amount === 0) cell.title = t("accounting.model.zeroTitle");
+  return cell;
+}
+
+/**
+ * Price coverage as a sentence beside the rows it describes, rather than a
+ * headline metric. `null` means the period holds no usage change at all, so
+ * there is no coverage claim to make and the caption stays off entirely.
+ */
+function pricingCoverageNote(accounting) {
+  const events = finite(accounting?.events, 0);
+  if (events <= 0) return null;
+  if (finite(accounting?.pricingCoverage?.unpricedEvents, 0) <= 0) {
+    return t("accounting.pricing.coverageReviewed");
+  }
+  const priced = finite(accounting?.pricingCoverage?.fullyPricedEvents, 0)
+    + finite(accounting?.pricingCoverage?.partiallyPricedEvents, 0);
+  return t("accounting.pricing.partialCoverage", {
+    percent: formatPercent(priced / events * 100, 1),
+  });
+}
+
+function renderAccountingModels(accounting) {
   const models = $("#accounting-models");
+  if (!models) return;
   clear(models);
-  const modelRows = [...(accounting.byModel ?? [])]
-    .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd);
+  const coverage = $("#accounting-price-coverage");
+  if (coverage) {
+    const note = pricingCoverageNote(accounting);
+    setRawText(coverage, note ?? "");
+    coverage.hidden = note === null;
+  }
+  const modelRows = modelUsageRows(accounting);
   if (!modelRows.length) {
     const row = node("tr");
-    const cell = node("td", "empty-cell", "No model accounting in this period.");
+    const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
     cell.colSpan = 4;
     row.append(cell);
     models.append(row);
-  } else {
-    for (const model of modelRows) {
-      const row = node("tr");
-      const modelLabel = model.model === "unknown"
-        ? "Unrecognized model"
-        : model.model;
-      row.append(
-        node("td", "", modelLabel),
-        node("td", "", compact(model.events)),
-        node("td", "", compact(model.totalTokens)),
-        node(
-          "td",
-          "",
-          finite(model.apiPriceEquivalentUsd, 0) === 0
-            ? "—"
-            : formatApiMoney(model.apiPriceEquivalentUsd)
-        )
-      );
-      models.append(row);
-    }
+    return;
   }
-
+  for (const model of modelRows) {
+    const row = node("tr");
+    const identity = node("td", "model-identity");
+    // "Unrecognized model" now means exactly one thing: an identifier this
+    // build has never reviewed, so it is withheld rather than printed.
+    if (model.model === "unknown" || model.pricingStatus === "unrecognized") {
+      identity.append(localizedNode("span", "", "accounting.model.unrecognized"));
+    } else {
+      // The wire identifier is what the provider reported and what any
+      // support conversation will quote, so it stays reachable on hover even
+      // though the readable name is what gets printed.
+      const name = formatModelName(model.model);
+      const label = rawNode("span", "", name);
+      if (name !== model.model) label.title = model.model;
+      identity.append(label);
+    }
+    if (modelRowIsSeparateAllowance(model)) {
+      identity.append(localizedNode(
+        "span",
+        "evidence-chip neutral model-allowance-chip",
+        "accounting.model.separateAllowanceChip",
+      ));
+    }
+    // One formatter for both count columns. Compact notation put "154.9K"
+    // beside "74" in the same column, which no reader can compare by eye.
+    row.append(
+      identity,
+      rawNode("td", "numeric-cell", formatCount(model.events)),
+      rawNode("td", "numeric-cell", formatCount(model.totalTokens)),
+      modelApiEquivalentCell(model),
+    );
+    models.append(row);
+  }
 }
 
 function fastModeCoverageSentence(fastMode) {
@@ -4660,11 +5139,11 @@ function renderContributionSyncPreview(preview) {
     return;
   }
   const labels = {
-    ready: "Ready",
+    ready: "Ready to review",
     retry_wait: "Waiting to retry",
     paused: "Paused",
-    empty: "Nothing queued",
-    not_configured: "Not configured",
+    empty: "Nothing waiting",
+    not_configured: "Not set up",
     unavailable: "Unavailable"
   };
   const chip = $("#sync-next-state");
@@ -4677,7 +5156,7 @@ function renderContributionSyncPreview(preview) {
     : "evidence-chip neutral";
   if (!value.item) {
     $("#sync-next-coverage").textContent = value.status === "not_configured"
-      ? "Set prepared directory at launch"
+      ? "This build cannot store a prepared summary."
       : "—";
     $("#sync-next-records").textContent = "—";
     $("#sync-next-cost").textContent = "—";
@@ -4695,7 +5174,7 @@ function renderContributionSyncPreview(preview) {
       percent: formatPercent(item.accounting.pricedEventCoveragePercent, 1),
     })}`;
   $("#sync-next-bytes").textContent =
-    `${compact(item.reservedUploadBytes)} bytes reserved (${compact(item.preparedBytes)} prepared)`;
+    `Up to ${compact(item.reservedUploadBytes)} bytes; ${compact(item.preparedBytes)} bytes ready to send`;
   updateContributionSyncButtons();
 }
 
@@ -4729,13 +5208,13 @@ function contributionSyncPassResult(result) {
   const counts =
     `${compact(result.accepted)} accepted, ${compact(result.retryable)} waiting to retry, ${compact(result.rejected)} rejected`;
   const bandwidth =
-    `${compact(result.reservedUploadBytes)} upload bytes reserved${result.bandwidthLimited ? "; stopped at byte cap" : ""}`;
+    `${compact(result.reservedUploadBytes)} bytes were set aside for the upload${result.bandwidthLimited ? ", and it stopped at that limit" : ""}`;
   const guidance = needsAttention
-    ? " Nothing was accepted. Check device pairing before trying again; this Mac may need to be paired as an upload-only device. These bounded counters do not identify the exact server-side reason."
+    ? " Nothing was accepted. Connect this Mac again before retrying: this Mac may need to be paired as an upload-only device. These counts do not identify the exact server-side reason."
     : "";
   return {
     message:
-      `Pass ${result.status}: ${compact(result.processed)} processed; ${counts}; ${bandwidth}.${guidance}`,
+      `Send ${result.status}: ${compact(result.processed)} tried; ${counts}. ${bandwidth}.${guidance}`,
     needsAttention
   };
 }
@@ -4784,16 +5263,22 @@ async function runContributionSyncAction(action) {
   contributionSyncBusy = true;
   let acceptedContribution = false;
   updateContributionSyncButtons();
-  showContributionSyncAction("Running one bounded foreground pass…");
+  showContributionSyncAction("Sending now. This runs once and then stops.");
   try {
     if (action === "run") {
       if (contributionSyncExactReview?.state !== "ready") {
-        throw new Error("exact review required");
+        const error = new Error("exact review required");
+        error.code = "review_required_before_send";
+        throw error;
       }
       const result = await localClient.runContributionSyncOnce(
         contributionSyncExactReview.reviewToken
       );
-      if (result.status === "unavailable") throw new Error("sync unavailable");
+      if (result.status === "unavailable") {
+        const error = new Error("sync unavailable");
+        error.code = "sync_unavailable";
+        throw error;
+      }
       const outcome = contributionSyncPassResult(result);
       acceptedContribution = result.status === "completed"
         && Number.isSafeInteger(result.accepted)
@@ -4830,20 +5315,24 @@ async function inspectNextContribution() {
   $("#community-contribution-disclosure")?.setAttribute("open", "");
   updateContributionSyncButtons();
   showContributionSyncAction(
-    "Inspecting content-free pseudonymous metadata through loopback; no service request or upload is performed."
+    "Checking the summary on this Mac. Nothing is sent while you look at it."
   );
   try {
     await refreshContributionSyncControls();
     const review = await localClient.contributionSyncExactReview();
     renderContributionSyncExactReview(review);
     showContributionSyncAction(
-      "Review the concise coverage and record totals above, then confirm the send."
+      "Look at the times and totals above, then confirm the send."
     );
-  } catch {
-    showContributionSyncAction(
-      "The next contribution could not be inspected. Nothing was uploaded.",
-      true
-    );
+  } catch (error) {
+    // A bare `catch {}` discarded the only evidence of what actually failed
+    // and printed one sentence for every cause. Surface the real one.
+    showContributionSyncAction((await describeFailure({
+      surface: "contribution_prepare",
+      error,
+      fallback:
+        "The next contribution could not be inspected. Nothing was uploaded."
+    })).text, true);
   } finally {
     contributionSyncBusy = false;
     updateContributionSyncButtons();
@@ -4920,19 +5409,37 @@ async function loadLocalDashboard() {
   }
 }
 
+/**
+ * Say something only when the reader has to do something about it.
+ *
+ * This used to be a permanent "Preparation identity: Keychain checked on
+ * prepare" chip. That is an implementation note: it never changed anyone's
+ * next action. The one case that does — TiboTattle cannot reach the login
+ * Keychain, so preparing will fail until it is unlocked — is now the only case
+ * that speaks.
+ */
 function renderPreparationIdentity(health) {
-  const chip = $("#preparation-identity");
-  if (!chip) return;
+  const notice = $("#preparation-identity");
+  if (!notice) return;
   const mode = health?.capabilities?.contributionPreparationIdentityMode;
-  const labels = {
-    production_keychain: "Keychain checked on prepare",
-    development_file_override: "Development file ready",
-    development_environment_override: "Development environment override",
-  };
-  chip.textContent = labels[mode] ?? "Unavailable";
-  chip.className = mode === "development_file_override"
-    ? "evidence-chip"
-    : "evidence-chip neutral";
+  if (mode === "production_keychain") {
+    notice.hidden = true;
+    setRawText(notice, "");
+    return;
+  }
+  notice.hidden = false;
+  if (mode === "development_file_override"
+      || mode === "development_environment_override") {
+    setProductText(
+      notice,
+      "This is a development build. It signs summaries with a file on this Mac instead of your login Keychain.",
+    );
+    return;
+  }
+  setProductText(
+    notice,
+    "TiboTattle cannot reach your Mac's login Keychain, so preparing a summary will fail. Open Keychain Access, unlock the login Keychain, then try again. Do not delete or reset the entry.",
+  );
 }
 
 function renderDashboardSkeleton() {
@@ -5272,11 +5779,11 @@ const CONTRIBUTION_DEVICE_CONFLICT_COPY =
 const SERVICE_ERROR_COPY = {
   ...HOSTED_IDENTITY_ERROR_COPY,
   AUTH_REQUIRED:
-    "The contribution service did not recognize this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
+    "The contribution service did not recognize this app's contribution session. Reopen TiboTattle, then try again. Nothing was uploaded.",
   AUTH_INVALID:
-    "The contribution service rejected this browser session. Reload the local dashboard, then try again. Nothing was uploaded.",
+    "The contribution service rejected this app's contribution session. Reopen TiboTattle, then sign in again. Nothing was uploaded.",
   CSRF_INVALID:
-    "This browser session expired while the request was in flight. Reload the local dashboard, then try again. Nothing was uploaded.",
+    "This app's contribution session expired while the request was in flight. Reopen TiboTattle, then try again. Nothing was uploaded.",
   BODY_INVALID:
     "TiboTattle and the contribution service did not agree on this connection request. Nothing was uploaded; install the current signed build, then sign in again.",
   CONTENT_TYPE_INVALID:
@@ -5336,7 +5843,53 @@ const SERVICE_ERROR_COPY = {
   BODY_TOO_LARGE:
     "The request exceeded the service's fixed size bound. Nothing was uploaded; choose a shorter interval.",
   INTERNAL_ERROR:
-    "The contribution service failed while handling this request. Nothing was uploaded; try again shortly."
+    "The contribution service failed while handling this request. Nothing was uploaded; try again shortly.",
+  // Codes the service can return that previously had no sentence here, so
+  // every one of them produced "the cause was not reported in a form this page
+  // can explain". Admin-only and updater-guard codes are deliberately absent:
+  // this page cannot reach those routes.
+  BODY_TIMEOUT:
+    "The request to the contribution service did not finish in time. Nothing was uploaded; check your connection and try again.",
+  METHOD_NOT_ALLOWED:
+    "This build asked the contribution service for something it does not offer on that route. Nothing was uploaded; install the current signed build.",
+  MAINTENANCE_IN_PROGRESS:
+    "The contribution service is in maintenance. Nothing was uploaded, and local reporting is unaffected. Try again later.",
+  MAINTENANCE_INCOMPLETE:
+    "The contribution service has not finished its maintenance pass. Nothing was uploaded; try again shortly.",
+  ADMISSION_RATE_LIMIT_UNAVAILABLE:
+    "The contribution service could not check its own upload rate limits, so it declined rather than guessing. Nothing was uploaded; try again shortly.",
+  DELETION_LEDGER_UNAVAILABLE:
+    "The contribution service could not reach the record of deletions, so it declined rather than acting without it. Nothing was changed or uploaded.",
+  IDENTITY_REQUIRED_FOR_UPLOAD:
+    "Hosted participation requires sign-in before an upload. Sign in with Google or Apple above, then try again. Nothing was uploaded.",
+  IDENTITY_REENROLLMENT_COOLDOWN:
+    "This sign-in enrolled recently and is inside a fixed cooldown before it can enroll again. Nothing was uploaded; wait and try again.",
+  IDENTITY_RESULT_PENDING:
+    "The sign-in has not finished in the browser window yet. Complete it there, then choose Check sign-in. Nothing was uploaded.",
+  SIGN_IN_START_LIMIT_REACHED:
+    "Too many sign-ins were started in a short window. Wait a few minutes before trying again. Nothing was uploaded.",
+  INVITE_GRANT_INVALID:
+    "The contribution service did not accept this build's enrollment request. Nothing was uploaded; install the current signed build, then sign in again.",
+  KEY_CONFIGURATION_INVALID:
+    "The contribution service has no usable upload key configured, so it cannot accept encrypted evidence. Nothing was uploaded; try again later.",
+  KEY_ID_INVALID:
+    "The upload key this build used is not one the contribution service recognizes. Nothing was uploaded; install the current signed build.",
+  LIFECYCLE_BOUNDS_EXCEEDED:
+    "The request went beyond a fixed safety bound in the contribution service. Nothing was uploaded; choose a shorter interval.",
+  LIFECYCLE_STATE_CONFLICT:
+    "The contribution service is in a different state than this page expected. Nothing was uploaded; reload TiboTattle and try again.",
+  TELEMETRY_REQUIRED:
+    "The contribution service expected privacy-safe evidence and did not receive any. Nothing was uploaded; prepare and review a contribution first.",
+  SYNTHETIC_REQUIRED:
+    "That route accepts only test evidence, and this is real evidence. Nothing was uploaded; this is a defect worth reporting.",
+  SYNTHETIC_RECORD_INVALID:
+    "The contribution service rejected a test record against its closed schema. Nothing was stored.",
+  ACCOUNT_SCOPED_LOCAL_ONLY:
+    "This build keeps account-scoped evidence on your Mac and does not send it. Nothing was uploaded, and local reporting is unaffected.",
+  ACCOUNT_SCOPED_INGEST_DISABLED:
+    "The contribution service is not accepting account-scoped evidence right now. Nothing was uploaded, and local reporting is unaffected.",
+  ACCOUNT_SCOPED_CONFIGURATION_INVALID:
+    "The contribution service is not configured to handle account-scoped evidence. Nothing was uploaded; try again later."
 };
 
 // Fixed local companion codes. These describe this Mac, not the service, so
@@ -5385,7 +5938,111 @@ const LOCAL_COMPANION_ERROR_COPY = {
   fast_mode_preference_invalid:
     "That Codex speed mode is not one this build accepts. Nothing was stored.",
   fast_mode_preference_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored."
+    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored.",
+  // Codes the local app can return that previously had no sentence here.
+  // Everything below describes this Mac, so none of it sends the reader
+  // looking at the network or at the contribution service.
+  enrollment_response_invalid:
+    "The contribution service replied in a shape TiboTattle does not accept, so no pseudonymous access was established. Nothing was uploaded; sign in again and retry.",
+  device_credential_reset_failed:
+    "The leftover device credential could not be cleared. Nothing was deleted on this Mac or in the service; try again, or reopen TiboTattle first.",
+  device_credential_reset_not_authorized:
+    "TiboTattle refused this reset because it did not come from the local dashboard. Nothing was deleted.",
+  review_required_before_send:
+    "The prepared set has not been inspected locally yet, so sending is not offered. Choose Review summary first. Nothing was uploaded.",
+  sync_unavailable:
+    "TiboTattle could not run a delivery pass. Anything queued stays on this Mac and nothing was uploaded.",
+  sync_not_authorized:
+    "TiboTattle refused this send because it did not come from the local dashboard. Nothing was uploaded.",
+  sync_control_not_authorized:
+    "TiboTattle refused this change because it did not come from the local dashboard. Nothing was changed.",
+  sync_control_failed:
+    "TiboTattle could not change the delivery setting. The previous setting still applies and nothing was uploaded.",
+  sync_preview_not_authorized:
+    "TiboTattle refused to describe the queue because the request did not come from the local dashboard. Nothing was uploaded.",
+  exact_review_not_authorized:
+    "TiboTattle refused to open the exact local review because the request did not come from the local dashboard. Nothing was uploaded.",
+  preparation_not_authorized:
+    "TiboTattle refused to prepare a contribution because the request did not come from the local dashboard. Nothing was prepared or uploaded.",
+  refresh_not_authorized:
+    "TiboTattle refused to analyze local usage because the request did not come from the local dashboard. Nothing was changed.",
+  refresh_cancel_not_authorized:
+    "TiboTattle refused to cancel the analysis because the request did not come from the local dashboard. The analysis is still running.",
+  refresh_not_running:
+    "There is no local analysis running to cancel. Nothing was changed.",
+  diagnostic_note_not_authorized:
+    "TiboTattle refused to write a diagnostic note because the request did not come from the local dashboard. The reference above is still quotable.",
+  diagnostic_note_not_recorded:
+    "TiboTattle could not write the diagnostic note to its local log. The reference above is still quotable.",
+  contribution_device_disconnect_not_authorized:
+    "TiboTattle refused to disconnect this Mac because the request did not come from the local dashboard. This Mac is unchanged.",
+  contribution_device_disconnect_not_configured:
+    "This build has no contribution service configured, so there is no device to disconnect. Local reporting is unaffected.",
+  contribution_device_disconnect_failed:
+    "This Mac could not be disconnected. It may still be able to upload; try again, or reopen TiboTattle first.",
+  contribution_device_disconnect_cleanup_pending:
+    "This Mac stopped uploading, but clearing its local credential has not finished. Reopen TiboTattle and check again.",
+  automatic_contribution_not_authorized:
+    "TiboTattle refused this automatic contribution change because it did not come from the local dashboard. Nothing was changed.",
+  automatic_contribution_not_configured:
+    "This build has no automatic contribution to configure. Local reporting is unaffected.",
+  automatic_contribution_first_review_required:
+    "Automatic contribution cannot start until you have reviewed and sent one contribution by hand. Nothing was uploaded.",
+  automatic_contribution_consent_binding_mismatch:
+    "The stored automatic contribution consent no longer matches this build, so nothing runs automatically. Nothing was uploaded; consent again to resume.",
+  automatic_contribution_settings_unavailable:
+    "TiboTattle could not read the automatic contribution setting. Nothing runs automatically until it can, and nothing was uploaded.",
+  automatic_contribution_bootstrap_persist_failed:
+    "TiboTattle could not store the automatic contribution setting, so it stays off. Nothing was uploaded.",
+  automatic_contribution_lock_release_failed:
+    "A background contribution pass did not release its lock cleanly. Reopen TiboTattle before trying again; nothing was uploaded.",
+  loopback_required:
+    "This request has to come from the local dashboard on this Mac. Nothing was changed. Open TiboTattle and try again.",
+  host_not_allowed:
+    "TiboTattle only answers the local dashboard on this Mac and refused this request. Nothing was changed.",
+  method_not_allowed:
+    "TiboTattle does not offer that action on this route. Nothing was changed; install the current signed build.",
+  not_found:
+    "This build asked TiboTattle for something it does not provide. Nothing was changed; install the current signed build.",
+  internal_error:
+    "TiboTattle failed while handling this request on your Mac. Nothing was uploaded; reopen TiboTattle and try again.",
+  request_failed:
+    "TiboTattle could not complete this request. Nothing was uploaded; reopen TiboTattle and try again.",
+  // The local relay that forwards a request to the contribution service. A
+  // failure here means the request never left this Mac.
+  central_service_not_configured:
+    "This build is not configured to reach a contribution service, so the request never left this Mac. Local reporting is unaffected.",
+  central_service_unavailable:
+    "TiboTattle could not reach the contribution service. Nothing was uploaded; check your connection and try again.",
+  central_request_not_authorized:
+    "TiboTattle refused to forward this request because it did not come from the local dashboard. Nothing left this Mac.",
+  central_request_invalid:
+    "TiboTattle would not forward this request because it did not match what the relay accepts. Nothing left this Mac.",
+  central_request_too_large:
+    "The request exceeded the local relay's fixed size bound, so it was not forwarded. Nothing left this Mac.",
+  central_route_not_allowed:
+    "This build asked to reach a service route the local relay does not allow. Nothing left this Mac; install the current signed build.",
+  central_method_not_allowed:
+    "The local relay does not forward that action. Nothing left this Mac; install the current signed build.",
+  central_content_type_invalid:
+    "The local relay rejected this request's format before forwarding it. Nothing left this Mac.",
+  // The participant-scoped relay, which also carries the browser session.
+  central_participant_authorization_invalid:
+    "TiboTattle did not accept the authorization on this participant request. Nothing was uploaded; reload TiboTattle and sign in again.",
+  central_participant_cookie_invalid:
+    "The contribution session stored for this app is not usable. Nothing was uploaded; sign in again.",
+  central_participant_csrf_invalid:
+    "The contribution session expired while the request was in flight. Nothing was uploaded; reload TiboTattle and try again.",
+  central_participant_content_type_invalid:
+    "TiboTattle rejected this participant request's format before forwarding it. Nothing was uploaded.",
+  central_participant_request_invalid:
+    "TiboTattle would not forward this participant request because it did not match what the relay accepts. Nothing was uploaded.",
+  central_participant_request_too_large:
+    "The participant request exceeded the local relay's fixed size bound, so it was not forwarded. Nothing was uploaded.",
+  central_participant_route_not_allowed:
+    "This build asked to reach a participant route the local relay does not allow. Nothing was uploaded; install the current signed build.",
+  central_participant_method_not_allowed:
+    "The local relay does not forward that participant action. Nothing was uploaded; install the current signed build."
 };
 
 /**
@@ -5511,20 +6168,25 @@ function renderHostedIdentity() {
     || signedIn
     || googleUnavailableNow;
   googleUnavailable.hidden = !googleUnavailableNow || signedIn;
-  googleUnavailable.textContent = enrollmentPaused
-    ? t("contribution.enrollmentPaused")
-    : serviceConfigured
+  // Written through the registering helpers: a line produced by `t(...)` is
+  // already in the old language after a switch, so it has to be re-translated
+  // from its key rather than from its rendered text.
+  if (enrollmentPaused) {
+    setLocalizedText(googleUnavailable, "contribution.enrollmentPaused");
+  } else {
+    setProductText(googleUnavailable, serviceConfigured
       ? "Hosted sign-in is not configured for this build."
-      : "This build has no contribution service, so hosted sign-in is unavailable.";
+      : "This build has no contribution service, so hosted sign-in is unavailable.");
+  }
   const appleUnavailableNow = appleSignInUnavailable
     || !serviceConfigured
     || enrollmentPaused;
   // When enrollment is paused, use one shared sentence instead of displaying
   // the same global status below both provider buttons.
   appleUnavailable.hidden = !appleUnavailableNow || signedIn || enrollmentPaused;
-  appleUnavailable.textContent = serviceConfigured
+  setProductText(appleUnavailable, serviceConfigured
     ? "Hosted Apple sign-in is not configured for this build."
-    : "This build has no contribution service, so hosted sign-in is unavailable.";
+    : "This build has no contribution service, so hosted sign-in is unavailable.");
   appleButton.disabled = hostedIdentityBusy
     || signedIn
     || appleUnavailableNow;
@@ -5544,12 +6206,12 @@ function renderHostedIdentity() {
   setProductText(
     $("#identity-account-detail"),
     provider !== null
-      ? "Signing out ends this browser's contribution session."
-      : "This browser already has a contribution session. Signing out ends it.",
+      ? "Signing out ends this app's contribution session."
+      : "This app already has a contribution session. Signing out ends it.",
   );
-  chip.textContent = signedIn
+  setProductText(chip, signedIn
     ? "Signed in"
-    : hostedIdentityBusy ? "Signing in…" : "Not signed in";
+    : hostedIdentityBusy ? "Signing in…" : "Not signed in");
   chip.className = signedIn
     ? "evidence-chip"
     : "evidence-chip neutral";
@@ -5571,17 +6233,17 @@ async function signOutHostedIdentity() {
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = hadServerSession
-    ? t("contribution.signOutStarting")
-    : t("contribution.signOutForgetting");
+  setLocalizedText(status, hadServerSession
+    ? "contribution.signOutStarting"
+    : "contribution.signOutForgetting");
   try {
     if (hadServerSession) await communityClient.logout();
     hostedIdentity = null;
     setCommunitySession(null);
     $("#participant-controls")?.setAttribute("hidden", "");
-    status.textContent = hadServerSession
-      ? t("contribution.signOutCompleted")
-      : t("contribution.signOutUnfinished");
+    setLocalizedText(status, hadServerSession
+      ? "contribution.signOutCompleted"
+      : "contribution.signOutUnfinished");
   } catch (error) {
     await showFailure(status, {
       surface: "hosted_identity",
@@ -5676,7 +6338,7 @@ function cancelHostedSignIn() {
   const status = $("#identity-signin-status");
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = t("contribution.signInCancelled", {
+  setLocalizedText(status, "contribution.signInCancelled", {
     provider: attempt.label,
   });
   renderHostedIdentity();
@@ -5747,7 +6409,7 @@ async function beginHostedSignIn(providerId) {
   renderHostedIdentity();
   status.hidden = false;
   status.className = "participant-action-status";
-  status.textContent = t("contribution.signInStarting", {
+  setLocalizedText(status, "contribution.signInStarting", {
     provider: flow.label,
   });
   try {
@@ -5768,7 +6430,7 @@ async function beginHostedSignIn(providerId) {
         if (attempt.returnedToApp) {
           status.hidden = false;
           status.className = "participant-action-status";
-          status.textContent = t("contribution.signInIncomplete", {
+          setLocalizedText(status, "contribution.signInIncomplete", {
             provider: flow.label,
           });
           return;
@@ -5824,22 +6486,46 @@ async function beginHostedSignIn(providerId) {
   }
 }
 
+// Whether the primary button's next action is a local one. Reviewing is
+// local; connecting is not. The label has to say which, because the two are
+// not interchangeable and a user who is asked to "review" does not expect a
+// network enrollment.
+function communityContributionIsConnected() {
+  return hasCommunitySession() && communityDevicePaired;
+}
+
 function updateCommunityConnectButton() {
   const button = $("#connect-community");
   const consent = $("#community-connect-consent");
   const enrollmentPaused = hostedEnrollmentIsPaused();
+  const connected = communityContributionIsConnected();
   consent.disabled = false;
+  // Consent gates the network action only. Once this Mac is connected the
+  // button opens a local review, which needs no further consent and must not
+  // become unreachable when the consent box is cleared.
   button.disabled = communityConnectBusy
-    || enrollmentPaused
-    || hostedSignInRequired()
-    || !consent.checked;
+    || (!connected
+      && (enrollmentPaused || hostedSignInRequired() || !consent.checked));
   if (!communityConnectBusy) {
-    button.textContent = enrollmentPaused
-      ? t("contribution.enrollmentPausedButton")
-      : hostedSignInRequired()
-        ? "Sign in above to contribute"
-        : "Review contribution";
+    if (connected) {
+      setProductText(button, "Review contribution");
+    } else if (enrollmentPaused) {
+      setLocalizedText(button, "contribution.enrollmentPausedButton");
+    } else if (hostedSignInRequired()) {
+      setProductText(button, "Sign in above to contribute");
+    } else {
+      setProductText(button, "Connect this Mac");
+    }
   }
+}
+
+// The primary button routes to whichever action its current label names.
+async function runCommunityPrimaryAction() {
+  if (communityContributionIsConnected()) {
+    openContributionReview();
+    return;
+  }
+  await connectCommunityContribution();
 }
 
 function contributionDeviceRecoveryIsRequired(error) {
@@ -5909,7 +6595,11 @@ async function resetContributionDeviceCredential() {
   try {
     const result = await localClient.resetContributionDeviceCredential();
     if (result.status === "unavailable") {
-      throw new Error("The local companion did not confirm the reset.");
+      // Carry a code: a codeless throw always fell through to the generic
+      // "the cause was not reported in a form this page can explain".
+      const error = new Error("The local companion did not confirm the reset.");
+      error.code = "device_credential_reset_failed";
+      throw error;
     }
     status.textContent = result.status === "already_absent"
       ? "No leftover device credential was present. Choose Contribute to connect this Mac."
@@ -5939,9 +6629,99 @@ async function finishCommunityDevicePairing(pairing, status) {
     error.code = "contribution_device_pairing_response_invalid";
     throw error;
   }
+  communityDevicePaired = true;
   status.textContent =
     `This Mac is connected through ${formatLocal(paired.expiresAt)}. Nothing was uploaded.`;
   return paired;
+}
+
+/**
+ * The named steps of "connect this Mac", each with its own progress line and
+ * its own honest failure sentence.
+ *
+ * Six distinct operations used to share one try/catch and one fallback
+ * sentence, so every failure — a build with no service configured, a rejected
+ * hosted proof, a refused local pairing, an unreadable local queue — produced
+ * the same paragraph. That made the actual failing step unidentifiable, which
+ * is why "submitting still seems to not be working" could not be narrowed
+ * down. Each step now reports itself.
+ *
+ * `connects` marks the steps that must succeed before this Mac counts as
+ * connected. Anything after that point is a local follow-up: it must never
+ * claim the connection failed.
+ */
+const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
+  service_check: Object.freeze({
+    connects: true,
+    progress: "Checking that this build has a contribution service…",
+    stopped: "Connecting stopped at step 1 of 3, checking the contribution service.",
+    failure:
+      "This build is not paired with a contribution service, so there is nothing to connect to. Nothing was uploaded and local reporting is unaffected.",
+  }),
+  hosted_enrollment: Object.freeze({
+    connects: true,
+    progress: "Creating pseudonymous contribution access…",
+    stopped: "Connecting stopped at step 2 of 3, creating pseudonymous contribution access.",
+    failure:
+      "The contribution service did not establish pseudonymous access. Nothing was uploaded; sign in again and retry.",
+  }),
+  device_pairing: Object.freeze({
+    connects: true,
+    progress: "Connecting this Mac as an upload-only device…",
+    stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
+    failure:
+      "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
+  }),
+  queue_refresh: Object.freeze({
+    connects: false,
+    progress: "Reading the local contribution queue…",
+    stopped: "This Mac is connected. Reading its local contribution queue did not finish.",
+    failure:
+      "Nothing was uploaded. Use Prepare and review below to try again.",
+  }),
+  local_preparation: Object.freeze({
+    connects: false,
+    progress: "Preparing a local summary for you to review…",
+    stopped: "This Mac is connected. Preparing a local summary did not finish.",
+    failure:
+      "Nothing was uploaded. Choose a shorter window under Prepare and review below.",
+  }),
+  local_review: Object.freeze({
+    connects: false,
+    progress: "Opening the local review…",
+    stopped: "This Mac is connected and a summary was prepared. Opening the local review did not finish.",
+    failure:
+      "Nothing was uploaded. Use Review summary below.",
+  }),
+});
+
+/**
+ * Run one named step, tagging any failure with the step it came from.
+ *
+ * The tag is what lets the single reporting site name the failing step and
+ * choose that step's own fallback sentence, instead of collapsing six
+ * different situations into one generic paragraph.
+ */
+async function contributionConnectStep(stepId, status, run) {
+  const step = CONTRIBUTION_CONNECT_STEPS[stepId];
+  status.hidden = false;
+  status.className = "participant-action-status";
+  setProductText(status, step.progress);
+  try {
+    return await run();
+  } catch (error) {
+    const tagged = error instanceof Error ? error : new Error("Step failed.");
+    tagged.contributionStep = stepId;
+    throw tagged;
+  }
+}
+
+function contributionConnectStepOf(error) {
+  const stepId = error?.contributionStep;
+  return typeof stepId === "string"
+    && Object.hasOwn(CONTRIBUTION_CONNECT_STEPS, stepId)
+    ? CONTRIBUTION_CONNECT_STEPS[stepId]
+    : null;
 }
 
 function openContributionReview() {
@@ -5962,7 +6742,7 @@ async function connectCommunityContribution() {
   if (hostedEnrollmentIsPaused()) {
     status.hidden = false;
     status.className = "participant-action-status error";
-    status.textContent = t("contribution.enrollmentPausedNoUpload");
+    setLocalizedText(status, "contribution.enrollmentPausedNoUpload");
     return;
   }
   if (hostedSignInRequired()) {
@@ -5981,87 +6761,151 @@ async function connectCommunityContribution() {
   let enrollmentAttemptedWithHostedIdentity = false;
   let enrollmentEstablished = false;
   communityConnectBusy = true;
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent =
-    "Creating pseudonymous contribution access and connecting this Mac…";
-  $("#connect-community").textContent = "Connecting contribution…";
+  setProductText($("#connect-community"), "Connecting…");
   updateCommunityConnectButton();
   try {
-    if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
-      throw new Error(
-        "The local app is not connected to a configured contribution service."
-      );
-    }
+    // --- Connection steps. Each one owns its own failure. -----------------
+    await contributionConnectStep("service_check", status, () => {
+      if (localCompanionHealth?.capabilities?.contributionDevicePairing !== true) {
+        const error = new Error(
+          "The local app is not connected to a configured contribution service."
+        );
+        error.code = "contribution_device_pairing_not_configured";
+        throw error;
+      }
+    });
     if (communitySession?.csrfToken) {
-      pairing = await communityClient.createDevicePairing(false);
-      await finishCommunityDevicePairing(pairing, status);
+      pairing = await contributionConnectStep(
+        "hosted_enrollment",
+        status,
+        () => communityClient.createDevicePairing(false),
+      );
     } else {
       // This page never collects or sends an invitation code. The Worker is
       // the authority on whether its current enrollment mode admits this
       // hosted proof; a paused service fails before the browser OAuth start.
       enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;
-      const enrollment = await communityClient.enroll(
-        null,
-        "telemetry-contribution-v0.1",
-        { deviceBootstrap: true, identity: hostedIdentity }
-      );
-      if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
-          || enrollment?.state !== "pairing_ready"
-          || typeof enrollment?.csrfToken !== "string"
-          || typeof enrollment?.pairing?.pairingCode !== "string") {
-        throw new Error(
-          "The contribution service did not establish paired pseudonymous access."
+      pairing = await contributionConnectStep("hosted_enrollment", status, async () => {
+        const enrollment = await communityClient.enroll(
+          null,
+          "telemetry-contribution-v0.1",
+          { deviceBootstrap: true, identity: hostedIdentity }
         );
-      }
-      setCommunitySession({
-        csrfToken: enrollment.csrfToken,
-        participantId: enrollment.participantId ?? null,
-        consentVersion: "privacy-safe-telemetry-v0.1"
-      });
-      enrollmentEstablished = true;
-      pairing = enrollment.pairing;
-      await finishCommunityDevicePairing(pairing, status);
-    }
-    $("#community-connect-consent").checked = false;
-    openContributionReview();
-    await Promise.all([
-      refreshContributionSyncControls(),
-      loadCommunityResults(),
-    ]);
-    status.textContent =
-      "Connected. Review the content-free result below before deciding whether to send it. Nothing will repeat automatically.";
-    await prepareLocalContribution();
-    if (contributionSyncPreview?.state === "ready") {
-      await inspectNextContribution();
-    }
-  } catch (error) {
-    if (contributionDeviceRecoveryIsRequired(error)) {
-      await renderContributionDeviceRecovery(status, { error });
-    } else {
-      const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
-        && !enrollmentEstablished
-        && hostedIdentity !== null;
-      if (retryNeedsFreshSignIn) {
-        hostedIdentity = null;
-        renderHostedIdentity();
-      }
-      const described = await showFailure(status, {
-        surface: "contribution_connect",
-        error,
-        fallback:
-          "This Mac could not be connected, and no evidence was uploaded. The cause was not reported in a form this page can explain; retrying is safe."
-      });
-      if (retryNeedsFreshSignIn) {
-        status.textContent = t("contribution.signInDiscarded", {
-          message: described.text,
+        if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1"
+            || enrollment?.state !== "pairing_ready"
+            || typeof enrollment?.csrfToken !== "string"
+            || typeof enrollment?.pairing?.pairingCode !== "string") {
+          // A codeless throw always fell through to the generic fallback.
+          // Name the condition so the page can explain this exact one.
+          const error = new Error(
+            "The contribution service did not establish paired pseudonymous access."
+          );
+          error.code = "enrollment_response_invalid";
+          throw error;
+        }
+        setCommunitySession({
+          csrfToken: enrollment.csrfToken,
+          participantId: enrollment.participantId ?? null,
+          consentVersion: "privacy-safe-telemetry-v0.1"
         });
-      }
+        enrollmentEstablished = true;
+        return enrollment.pairing;
+      });
     }
-  } finally {
+    await contributionConnectStep(
+      "device_pairing",
+      status,
+      () => finishCommunityDevicePairing(pairing, status),
+    );
+  } catch (error) {
+    await reportContributionConnectFailure(status, error, {
+      enrollmentAttemptedWithHostedIdentity,
+      enrollmentEstablished,
+    });
     pairing = null;
     communityConnectBusy = false;
     updateCommunityConnectButton();
+    return;
+  }
+  pairing = null;
+  // --- Connected. Everything below is local follow-up. --------------------
+  // A failure here is not a connection failure and must never be reported as
+  // one: the pairing stands, and the user can retry the local step alone.
+  $("#community-connect-consent").checked = false;
+  communityConnectBusy = false;
+  updateCommunityConnectButton();
+  try {
+    await contributionConnectStep("queue_refresh", status, async () => {
+      await Promise.all([
+        refreshContributionSyncControls(),
+        loadCommunityResults(),
+      ]);
+    });
+    openContributionReview();
+    await contributionConnectStep(
+      "local_preparation",
+      status,
+      () => prepareLocalContribution(),
+    );
+    if (contributionSyncPreview?.state === "ready") {
+      await contributionConnectStep(
+        "local_review",
+        status,
+        () => inspectNextContribution(),
+      );
+    }
+    status.hidden = false;
+    status.className = "participant-action-status";
+    status.textContent =
+      "Connected. Look at the summary below before deciding whether to send it. Nothing will repeat automatically.";
+  } catch (error) {
+    await reportContributionConnectFailure(status, error, {
+      enrollmentAttemptedWithHostedIdentity: false,
+      enrollmentEstablished: true,
+    });
+  }
+}
+
+/**
+ * Report one connect failure, naming the step it came from.
+ *
+ * The step's own sentence is the fallback, so an error code this page has
+ * never seen still produces "step 3 of 3, connecting this Mac as an
+ * upload-only device: …" rather than "the cause was not reported in a form
+ * this page can explain".
+ */
+async function reportContributionConnectFailure(status, error, {
+  enrollmentAttemptedWithHostedIdentity,
+  enrollmentEstablished,
+}) {
+  if (contributionDeviceRecoveryIsRequired(error)) {
+    await renderContributionDeviceRecovery(status, { error });
+    return;
+  }
+  const step = contributionConnectStepOf(error);
+  const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity
+    && !enrollmentEstablished
+    && hostedIdentity !== null;
+  if (retryNeedsFreshSignIn) {
+    hostedIdentity = null;
+    renderHostedIdentity();
+  }
+  const described = await describeFailure({
+    surface: "contribution_connect",
+    error,
+    fallback: step?.failure
+      ?? "This Mac could not be connected, and no evidence was uploaded. Retrying is safe."
+  });
+  // The step is stated even when the code itself is explainable. Knowing that
+  // pairing failed rather than enrolling is the part that was missing.
+  const stepLine = step === null ? "" : `${step.stopped} `;
+  status.hidden = false;
+  status.className = "participant-action-status error";
+  status.textContent = `${stepLine}${described.text}`;
+  if (retryNeedsFreshSignIn) {
+    setLocalizedText(status, "contribution.signInDiscarded", {
+      message: `${stepLine}${described.text}`,
+    });
   }
 }
 
@@ -6121,13 +6965,13 @@ function renderContributionPreparationEstimate() {
   if (!element || !button) return null;
   if (!estimate) {
     element.textContent =
-      "Analyze local usage to estimate privacy-safe records and upload batches before preparation.";
+      "Analyze your local usage first to see how much would be included.";
     if (!contributionPreparationBusy) button.disabled = false;
     return null;
   }
   if (estimate.records === 0) {
     element.textContent =
-      "No privacy-safe records are visible in this indexed interval. Choose another window or update local usage first.";
+      "Nothing to share in this period. Choose a longer period, or analyze your local usage again.";
   } else {
     const coverage = estimate.partial
       ? " The local index is partial, so the exact count may be higher."
@@ -6186,7 +7030,9 @@ async function prepareLocalContribution() {
       lookbackHours: activeContributionLookbackHours,
     });
     if (result.status !== "prepared") {
-      throw new Error("Preparation did not return a verified contribution.");
+      const error = new Error("Preparation did not return a verified contribution.");
+      error.code = "preparation_failed";
+      throw error;
     }
     const records = result.recordCounts.usageEvents
       + result.recordCounts.quotaSnapshots
@@ -6219,9 +7065,9 @@ async function prepareLocalContribution() {
       preparation_in_progress:
         "A local preparation is already running. Nothing has been uploaded.",
       review_archive_invalid:
-        "The local review archive could not be written, so nothing was queued. No upload occurred.",
+        "TiboTattle could not save the copy you would review, so nothing was queued and nothing was uploaded.",
       prepared_spool_invalid:
-        "The local prepared-contribution spool is not in a usable state, so nothing was queued. No upload occurred.",
+        "The place TiboTattle keeps a prepared summary on this Mac is not usable, so nothing was queued and nothing was uploaded.",
       preparation_failed:
         "A privacy-verified contribution could not be prepared. No upload occurred and incomplete staging is ignored by the queue."
     };
@@ -6339,10 +7185,9 @@ $("#community-connect-consent").addEventListener(
   "change",
   updateCommunityConnectButton
 );
-$("#connect-community").addEventListener(
-  "click",
-  connectCommunityContribution
-);
+$("#connect-community").addEventListener("click", () => {
+  void runCommunityPrimaryAction();
+});
 $("#contribution-not-now").addEventListener("click", () => {
   $("#community-connect-consent").checked = false;
   updateCommunityConnectButton();

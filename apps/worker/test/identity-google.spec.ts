@@ -327,6 +327,83 @@ describe("hosted Google sign-in", () => {
     });
   });
 
+  it("gives a proof minted at the end of a slow round trip its own collectable window", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const started = await startSignIn();
+    // Model an OAuth round trip that consumed all but three seconds of the
+    // authorization window: a cold-starting browser plus somebody who actually
+    // reads Google's consent screen. Ageing the row is exactly equivalent to
+    // advancing the clock from every handler's point of view.
+    const startedAtMs = Date.now() - 297_000;
+    await db.prepare(
+      "UPDATE google_signin_handoffs SET created_at = ?, expires_at = ? WHERE state = ?",
+    ).bind(
+      new Date(startedAtMs).toISOString(),
+      new Date(startedAtMs + 300_000).toISOString(),
+      started.state,
+    ).run();
+
+    const filledAtMs = Date.now();
+    const landed = await callback(new URLSearchParams({
+      code: "google-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("Signed in");
+
+    // The proof's deadline is measured from the mint, not from what was left
+    // of the authorization window. Before this was fixed the row still carried
+    // the start-based deadline and the measured window here was 3s.
+    const row = await db.prepare(
+      "SELECT expires_at AS expiresAt FROM google_signin_handoffs WHERE state = ?",
+    ).bind(started.state).first<{ expiresAt: string }>();
+    expect(Date.parse(row!.expiresAt) - filledAtMs).toBeGreaterThan(270_000);
+
+    // Not merely a stored number: a dashboard poll landing after the old
+    // start-based deadline had passed still collects the proof. This slept
+    // interval is what turned an entirely correct sign-in into a 401.
+    await new Promise((resolve) => setTimeout(resolve, 3_500));
+    const result = await json("/api/v1/identity/google/result", {
+      state: started.state,
+    });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({
+      schemaVersion: "identity-google-result-v0.1",
+      proof: expect.stringMatching(/^[A-Za-z0-9_-]{64}$/u),
+    });
+  }, 30_000);
+
+  it("still refuses a callback that arrives after the authorization window", async () => {
+    const db = bindings().USAGE_MONITOR_DB;
+    const started = await startSignIn();
+    // The authorization window is longer than it was, but it is still a window,
+    // and it is still measured from the instant the state was minted.
+    const startedAtMs = Date.now() - 601_000;
+    await db.prepare(
+      "UPDATE google_signin_handoffs SET created_at = ?, expires_at = ? WHERE state = ?",
+    ).bind(
+      new Date(startedAtMs).toISOString(),
+      new Date(startedAtMs + 600_000).toISOString(),
+      started.state,
+    ).run();
+
+    const late = await callback(new URLSearchParams({
+      code: "google-one-time-code",
+      state: started.state,
+    }).toString());
+    expect(await late.text()).toContain("Sign-in was not completed.");
+    // No exchange was attempted, so the PKCE verifier was never spent and no
+    // proof exists to be delivered.
+    expect(tokenCalls).toHaveLength(0);
+    const result = await json("/api/v1/identity/google/result", {
+      state: started.state,
+    });
+    expect(result.status).toBe(401);
+    expect(await result.json()).toMatchObject({
+      error: { code: "IDENTITY_TOKEN_INVALID" },
+    });
+  });
+
   it("refuses a second callback against an already-filled handoff, without a second Google exchange", async () => {
     const started = await startSignIn();
     const first = await callback(new URLSearchParams({

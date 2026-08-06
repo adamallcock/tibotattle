@@ -14,9 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { scanCodexLogEvents } from "../src/codex-log-scan.js";
+import { recognizedExportModelId } from "../src/export/index.js";
 import {
   createIndexedCodexLogScan,
   inspectLocalAnalysisIndex,
+  LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
   markLocalAnalysisIndexCoveragePartial,
   refreshLocalAnalysisIndex,
 } from "../src/local-analysis-index.js";
@@ -60,32 +62,35 @@ function token(
     secondaryDuration = 10080,
     primaryResetAt = 1784912400,
     secondaryResetAt = 1785430800,
+    model,
   } = {},
 ) {
+  const payload = {
+    type: "token_count",
+    info: {
+      total_token_usage: total,
+      last_token_usage: last,
+    },
+    rate_limits: {
+      limit_id: "codex",
+      plan_type: "pro",
+      primary: {
+        used_percent: usedPercent,
+        window_minutes: primaryDuration,
+        resets_at: primaryResetAt,
+      },
+      secondary: {
+        used_percent: usedPercent / 2,
+        window_minutes: secondaryDuration,
+        resets_at: secondaryResetAt,
+      },
+    },
+  };
+  if (model !== undefined) payload.model = model;
   return JSON.stringify({
     timestamp,
     type: "event_msg",
-    payload: {
-      type: "token_count",
-      info: {
-        total_token_usage: total,
-        last_token_usage: last,
-      },
-      rate_limits: {
-        limit_id: "codex",
-        plan_type: "pro",
-        primary: {
-          used_percent: usedPercent,
-          window_minutes: primaryDuration,
-          resets_at: primaryResetAt,
-        },
-        secondary: {
-          used_percent: usedPercent / 2,
-          window_minutes: secondaryDuration,
-          resets_at: secondaryResetAt,
-        },
-      },
-    },
+    payload,
   });
 }
 
@@ -494,6 +499,70 @@ test("local index refuses an out-of-range provider duration without losing sourc
     (await inspectLocalAnalysisIndex({ indexFile })).quotaFacts > 0,
     true,
   );
+});
+
+test("recognized Spark survives worker extraction and rebuilds a pre-Spark index", async () => {
+  assert.equal(
+    recognizedExportModelId("GPT-5.3-Codex-Spark"),
+    "gpt-5.3-codex-spark",
+  );
+  const { root, codexHome, parentPath } = await fixture();
+  await appendFile(parentPath, `${[
+    JSON.stringify({
+      timestamp: "2026-07-24T12:05:00.010Z",
+      type: "turn_context",
+      payload: { model: "gpt-5.3-codex-spark" },
+    }),
+    token(
+      "2026-07-24T12:06:00.000Z",
+      usage(240, 50),
+      usage(20, 10),
+      18,
+      { model: "gpt-5.3-codex-spark" },
+    ),
+  ].join("\n")}\n`);
+  const indexFile = join(root, "local-analysis-index-spark.sqlite");
+  const secretFile = join(root, "local-analysis-index-spark-secret");
+  const indexedScan = createIndexedCodexLogScan({
+    indexFile,
+    secretFile,
+    workerCount: 1,
+    chunkBytes: CHUNK_BYTES,
+  });
+
+  const initial = await receipt(indexedScan, codexHome);
+  assert.equal(
+    initial.usageRows.some((row) => row.model === "gpt-5.3-codex-spark"),
+    true,
+  );
+  const database = new DatabaseSync(indexFile);
+  try {
+    assert.deepEqual(
+      [...database.prepare("SELECT DISTINCT model FROM usage_facts").iterate()]
+        .map((row) => row.model)
+        .sort(),
+      ["gpt-5.3-codex-spark", "gpt-5.6-sol"].sort(),
+    );
+    database.prepare(
+      "UPDATE meta SET value = ? WHERE key = 'parser_version'",
+    ).run("parallel-jsonl-accounting-v5");
+    database.prepare("UPDATE usage_facts SET model = 'unknown'").run();
+    database.prepare(
+      "UPDATE sources SET current_model = 'unknown', current_model_seen = 1",
+    ).run();
+  } finally {
+    database.close();
+  }
+
+  const rebuilt = await receipt(indexedScan, codexHome);
+  assert.equal(
+    rebuilt.usageRows.some((row) => row.model === "gpt-5.3-codex-spark"),
+    true,
+  );
+  assert.equal(rebuilt.usageRows.some((row) => row.model === "unknown"), false);
+  const inspected = await inspectLocalAnalysisIndex({ indexFile });
+  assert.equal(inspected.parserVersion, LOCAL_ANALYSIS_INDEX_PARSER_VERSION);
+  assert.equal(inspected.parserVersion, "parallel-jsonl-accounting-v6");
 });
 
 test("local index rebuilds a prior semantic generation from source logs", async () => {

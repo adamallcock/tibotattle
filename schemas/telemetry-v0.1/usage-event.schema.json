@@ -32,8 +32,10 @@
     "provider": { "enum": ["openai_codex", "anthropic_claude_code"] },
     "modelId": {
       "enum": [
-        "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
-        "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+        "unknown", "codex-auto-review", "gpt-4.1", "gpt-5",
+        "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+        "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-sol-wm",
+        "gpt-5.6-terra",
         "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
         "claude-sonnet-4-6", "claude-sonnet-5"
       ]
@@ -119,7 +121,7 @@
       "if": { "properties": { "modelRecognition": { "const": "recognized" } } },
       "then": {
         "properties": {
-          "modelId": { "enum": ["gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-4-6", "claude-sonnet-5"] },
+          "modelId": { "enum": ["codex-auto-review", "gpt-4.1", "gpt-5", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-sol-wm", "gpt-5.6-terra", "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-4-6", "claude-sonnet-5"] },
           "modelFingerprint": { "type": "null" }
         }
       }
@@ -191,8 +193,10 @@
         "properties": {
           "modelId": {
             "enum": [
-              "unknown", "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
-              "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"
+              "unknown", "codex-auto-review", "gpt-4.1", "gpt-5",
+              "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+              "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-sol-wm",
+              "gpt-5.6-terra"
             ]
           },
           "components": {

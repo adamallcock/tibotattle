@@ -123,6 +123,26 @@ private enum NativeRefreshIntervalPreference {
     }
 }
 
+private enum NativeRefreshIntervalSelection {
+    @discardableResult
+    static func apply(
+        seconds: Int,
+        defaults: UserDefaults,
+        dashboardAvailable: Bool,
+        refreshInFlight: Bool,
+        reschedule: () -> Void
+    ) -> Bool {
+        guard NativeRefreshIntervalPreference.allowedSeconds.contains(seconds)
+        else {
+            return false
+        }
+        NativeRefreshIntervalPreference.setSeconds(seconds, in: defaults)
+        guard dashboardAvailable, !refreshInFlight else { return true }
+        reschedule()
+        return true
+    }
+}
+
 /// The only cadence used by the native foreground refresh loop. Keeping the
 /// persisted read beside the dispatch operation makes it impossible for the
 /// Settings picker to update one value while the scheduler keeps using a
@@ -147,14 +167,17 @@ private enum NativeForegroundRefreshScheduler {
     /// creates a timer, helper, daemon, or background polling path.
     static func schedule(
         defaults: UserDefaults = .standard,
-        action: @escaping () -> Void
+        now: DispatchTime = .now(),
+        action: @escaping () -> Void,
+        enqueue: @escaping (DispatchTime, DispatchWorkItem) -> Void = {
+            deadline,
+            work in
+            DispatchQueue.main.asyncAfter(deadline: deadline, execute: work)
+        }
     ) -> DispatchWorkItem {
         let schedule = NativeForegroundRefreshSchedule.current(in: defaults)
         let work = DispatchWorkItem(block: action)
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .seconds(schedule.intervalSeconds),
-            execute: work
-        )
+        enqueue(now + .seconds(schedule.intervalSeconds), work)
         return work
     }
 }
@@ -2035,6 +2058,12 @@ private final class NativeDashboardReportPane: NSView {
 /// Mac behavior without replacing the report itself.
 @MainActor
 private final class NativeDashboardChrome: NSView {
+    /// How the sidebar blends. `.behindWindow` samples the desktop, which is
+    /// the native sidebar look; `.withinWindow` renders an opaque strip that
+    /// blends with this window's own content. Owner-selected treatment lives
+    /// here alone so it can be reversed without touching layout.
+    private static let sidebarBlendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+
     private let sidebar = NSVisualEffectView()
     private let reportPane: NativeDashboardReportPane
     private var pageButtons: [NativeDashboardDestination: NSButton] = [:]
@@ -2047,8 +2076,17 @@ private final class NativeDashboardChrome: NSView {
         translatesAutoresizingMaskIntoConstraints = false
 
         sidebar.material = .sidebar
-        sidebar.blendingMode = .withinWindow
-        sidebar.state = .active
+        // `.sidebar` material has nothing to sample when it blends with the
+        // window, because the report pane behind it is an opaque cream web
+        // view; the result reads as flat grey against a warm canvas. Sampling
+        // the desktop is what Finder and Mail do, and it is the whole reason
+        // the material exists. Flip this one constant to `.withinWindow` for an
+        // opaque sidebar instead — nothing else depends on the choice.
+        sidebar.blendingMode = Self.sidebarBlendingMode
+        // A sidebar that stays fully vibrant while its window is in the
+        // background is a tell that the surface is not really native; the
+        // system desaturates it with the rest of the window.
+        sidebar.state = .followsWindowActiveState
         sidebar.translatesAutoresizingMaskIntoConstraints = false
 
         let pageStack = NSStackView()
@@ -2821,10 +2859,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func nativeToolbarStatusColor(isRefreshing: Bool) -> NSColor {
-        if isRefreshing { return .systemYellow }
-        return nativeEvidenceState == .live
-            ? .systemGreen
-            : .secondaryLabelColor
+        if isRefreshing {
+            return .systemYellow
+        }
+        switch nativeEvidenceState {
+        case .live:
+            return .systemGreen
+        case .stale, .unknown, .readFailed, .lifecycleUnavailable:
+            return .secondaryLabelColor
+        }
     }
 
     private func refreshNativeToolbarLocalization() {
@@ -2873,14 +2916,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func nativeRefreshToolbarTooltip() -> String {
-        [
-            TiboTattleLocalization.string(
-                .nativeDashboardRefreshUsageTooltip
-            ),
-            TiboTattleLocalization.string(
-                .nativeDashboardCurrentEvidenceTooltip
-            ),
-        ].joined(separator: "\n")
+        TiboTattleLocalization.string(.nativeDashboardRefreshUsageTooltip)
     }
 
     @objc private func refreshDashboardFromToolbar() {
@@ -3287,6 +3323,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         editMenu.addItem(copy)
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
+
+        // Every Mac app that shows data a user waits on answers Command-R, and
+        // this one had no View menu and no keyboard shortcut at all: the only
+        // refresh was a toolbar button. WebKit's own context-menu "Reload"
+        // looked like the missing command but reloads the document rather than
+        // re-reading local usage, which is why it appeared to do nothing. This
+        // is the same foreground-only companion path the toolbar button uses.
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: TiboTattleLocalization.string(.menuView))
+        let refresh = NSMenuItem(
+            title: TiboTattleLocalization.string(.nativeDashboardRefreshUsage),
+            action: #selector(refreshDashboardFromToolbar),
+            keyEquivalent: "r"
+        )
+        refresh.target = self
+        viewMenu.addItem(refresh)
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
         NSApp.mainMenu = mainMenu
     }
 
@@ -3584,12 +3638,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         font: NSFont,
         color: NSColor
     ) -> NSTextField {
-        let label = NSTextField(wrappingLabelWithString: text)
-        label.font = font
-        label.textColor = color
-        label.maximumNumberOfLines = 0
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return label
+        NativeSettingsLayout.label(text, font: font, color: color)
     }
 
     private func externalLinkButton(title: String, address: String) -> NSButton {
@@ -3613,58 +3662,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         symbolName: String,
         views: [NSView]
     ) -> NSView {
-        let header = NSStackView()
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 8
-        let icon = NSImageView(
-            image: NSImage(
-                systemSymbolName: symbolName,
-                accessibilityDescription: title
-            ) ?? NSImage()
+        NativeSettingsLayout.group(
+            title: title,
+            symbolName: symbolName,
+            views: views
         )
-        icon.contentTintColor = .controlAccentColor
-        icon.imageScaling = .scaleProportionallyDown
-        icon.setContentHuggingPriority(.required, for: .horizontal)
-        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        header.addArrangedSubview(icon)
-        header.addArrangedSubview(settingsLabel(
-            title,
-            font: .systemFont(ofSize: 14, weight: .semibold),
-            color: .labelColor
-        ))
-
-        let contentStack = NSStackView(views: [header] + views)
-        contentStack.orientation = .vertical
-        // The group itself is full-width in the settings page. Stretching
-        // its children to that width keeps translated descriptions and
-        // controls in one readable column instead of leaving a narrow column
-        // stranded at the leading edge with a large blank area beside it.
-        contentStack.alignment = .width
-        contentStack.spacing = 8
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-        let contentView = NSView()
-        contentView.addSubview(contentStack)
-        NSLayoutConstraint.activate([
-            contentStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            contentStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor),
-            contentStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-        ])
-
-        let group = NSBox()
-        group.boxType = .custom
-        group.borderType = .lineBorder
-        group.cornerRadius = 8
-        group.contentViewMargins = NSSize(width: 20, height: 18)
-        group.contentView = contentView
-        group.translatesAutoresizingMaskIntoConstraints = false
-        group.setContentCompressionResistancePriority(
-            .defaultLow,
-            for: .horizontal
-        )
-        return group
     }
 
     @objc private func openExternalLink(_ sender: NSButton) {
@@ -3684,78 +3686,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         summary: String,
         views: [NSView]
     ) -> NSViewController {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .width
-        stack.spacing = 12
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(settingsLabel(
-            title,
-            font: .systemFont(ofSize: 22, weight: .semibold),
-            color: .labelColor
-        ))
-        stack.addArrangedSubview(settingsLabel(
-            summary,
-            font: .systemFont(ofSize: 13),
-            color: .secondaryLabelColor
-        ))
-        for view in views {
-            stack.addArrangedSubview(view)
-        }
-        let scroll = NSScrollView()
-        scroll.borderType = .noBorder
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        let root = NSView()
-        root.addSubview(scroll)
-        let document = NSView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(stack)
-        scroll.documentView = document
-        let preferredWidth = stack.widthAnchor.constraint(
-            equalTo: document.widthAnchor,
-            constant: -56
-        )
-        preferredWidth.priority = .defaultHigh
-        NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: root.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            document.leadingAnchor.constraint(
-                equalTo: scroll.contentView.leadingAnchor
-            ),
-            document.topAnchor.constraint(
-                equalTo: scroll.contentView.topAnchor
-            ),
-            document.widthAnchor.constraint(
-                equalTo: scroll.contentView.widthAnchor
-            ),
-            document.heightAnchor.constraint(
-                greaterThanOrEqualTo: scroll.contentView.heightAnchor
-            ),
-            stack.centerXAnchor.constraint(equalTo: document.centerXAnchor),
-            stack.leadingAnchor.constraint(
-                greaterThanOrEqualTo: document.leadingAnchor,
-                constant: 28
-            ),
-            stack.trailingAnchor.constraint(
-                lessThanOrEqualTo: document.trailingAnchor,
-                constant: -28
-            ),
-            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(
-                equalTo: document.bottomAnchor,
-                constant: -24
-            ),
-            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 680),
-        ])
-        preferredWidth.isActive = true
-        let controller = NSViewController()
-        controller.view = root
-        return controller
+        NativeSettingsLayout.page(
+            title: title,
+            summary: summary,
+            views: views
+        ).controller
     }
 
     private func codexHomeSettingsSummary() -> String {
@@ -4238,10 +4173,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             updateRefreshIntervalSettingsControl()
             return
         }
-        NativeRefreshIntervalPreference.setSeconds(seconds)
+        let applied = NativeRefreshIntervalSelection.apply(
+            seconds: seconds,
+            defaults: .standard,
+            dashboardAvailable: dashboardURL != nil,
+            refreshInFlight: nativeRefreshInFlight,
+            reschedule: { [weak self] in
+                self?.scheduleNativeRefresh()
+            }
+        )
         updateRefreshIntervalSettingsControl()
-        guard dashboardURL != nil, !nativeRefreshInFlight else { return }
-        scheduleNativeRefresh()
+        guard applied else { return }
     }
 
     @objc private func openNotificationSettings() {
@@ -5796,10 +5738,50 @@ private enum NativeRefreshSettingsContractSmokeTest {
         else {
             return 1
         }
-        NativeRefreshIntervalPreference.setSeconds(
-            15 * 60,
-            in: defaults
+        let testNow = DispatchTime(uptimeNanoseconds: 1_000_000_000)
+        var initialDeadline: DispatchTime?
+        let initialWork = NativeForegroundRefreshScheduler.schedule(
+            defaults: defaults,
+            now: testNow,
+            action: {},
+            enqueue: { deadline, _ in
+                initialDeadline = deadline
+            }
         )
+        initialWork.cancel()
+        guard initialDeadline?.uptimeNanoseconds
+                == testNow.uptimeNanoseconds + 300_000_000_000
+        else {
+            return 1
+        }
+
+        var pickerRescheduleCount = 0
+        var pickerRescheduledDeadline: DispatchTime?
+        let pickerApplied = NativeRefreshIntervalSelection.apply(
+            seconds: 15 * 60,
+            defaults: defaults,
+            dashboardAvailable: true,
+            refreshInFlight: false,
+            reschedule: {
+                pickerRescheduleCount += 1
+                let work = NativeForegroundRefreshScheduler.schedule(
+                    defaults: defaults,
+                    now: testNow,
+                    action: {},
+                    enqueue: { deadline, _ in
+                        pickerRescheduledDeadline = deadline
+                    }
+                )
+                work.cancel()
+            }
+        )
+        guard pickerApplied,
+              pickerRescheduleCount == 1,
+              pickerRescheduledDeadline?.uptimeNanoseconds
+                == testNow.uptimeNanoseconds + 900_000_000_000
+        else {
+            return 1
+        }
         defaults.synchronize()
         guard let reloaded = UserDefaults(suiteName: suiteName),
               NativeRefreshIntervalPreference.seconds(in: reloaded)
@@ -5813,6 +5795,18 @@ private enum NativeRefreshSettingsContractSmokeTest {
             return 1
         }
 
+        let invalidPickerSelection = NativeRefreshIntervalSelection.apply(
+            seconds: 17,
+            defaults: reloaded,
+            dashboardAvailable: true,
+            refreshInFlight: false,
+            reschedule: {
+                pickerRescheduleCount += 1
+            }
+        )
+        guard !invalidPickerSelection, pickerRescheduleCount == 1 else {
+            return 1
+        }
         NativeRefreshIntervalPreference.setSeconds(17, in: reloaded)
         guard NativeRefreshIntervalPreference.seconds(in: reloaded)
                 == 15 * 60
@@ -5821,7 +5815,9 @@ private enum NativeRefreshSettingsContractSmokeTest {
         }
         print(
             "USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT "
-                + "default=300 persisted=900 reloaded=900 scheduler=900 "
+                + "default=300 persisted=900 reloaded=900 "
+                + "picker_action=true picker_persisted=true "
+                + "scheduler=300->900 "
                 + "invalid_ignored=true"
         )
         return 0
@@ -6119,6 +6115,341 @@ private enum MenuBarContractSmokeTest {
     }
 }
 
+/// The Settings window's card layout, kept out of `AppDelegate` so the
+/// rendered result can be measured by a contract smoke test instead of being
+/// asserted against source text. A vertical `NSStackView` aligned `.width`
+/// does NOT stretch its arranged subviews to the stack width — it sizes each
+/// one to its own intrinsic width and pins the trailing edges, which is what
+/// produced the ragged, right-floated cards with a blank column on the left.
+/// Leading alignment plus an explicit `width == stack.width` on each arranged
+/// subview is what actually produces one full-width column.
+@MainActor
+private enum NativeSettingsLayout {
+    static func label(
+        _ text: String,
+        font: NSFont,
+        color: NSColor
+    ) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = font
+        label.textColor = color
+        label.maximumNumberOfLines = 0
+        label.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        return label
+    }
+
+    static func group(
+        title: String,
+        symbolName: String,
+        views: [NSView]
+    ) -> NSView {
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        let icon = NSImageView(
+            image: NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: title
+            ) ?? NSImage()
+        )
+        icon.contentTintColor = .controlAccentColor
+        icon.imageScaling = .scaleProportionallyDown
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        header.addArrangedSubview(icon)
+        header.addArrangedSubview(label(
+            title,
+            font: .systemFont(ofSize: 14, weight: .semibold),
+            color: .labelColor
+        ))
+
+        let contentViews: [NSView] = [header] + views
+        let contentStack = NSStackView(views: contentViews)
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 8
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        // Keep every row on the same leading column while giving wrapping
+        // labels the full card width to measure against. The page owns the
+        // card width; this constraint only keeps the card's internal rows
+        // coherent instead of producing an independent staircase per row.
+        for view in contentViews {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.widthAnchor.constraint(equalTo: contentStack.widthAnchor)
+                .isActive = true
+        }
+        let contentView = NSView()
+        contentView.addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(
+                equalTo: contentView.leadingAnchor
+            ),
+            contentStack.trailingAnchor.constraint(
+                equalTo: contentView.trailingAnchor
+            ),
+            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor),
+            contentStack.bottomAnchor.constraint(
+                equalTo: contentView.bottomAnchor
+            ),
+        ])
+
+        let group = NSBox()
+        group.boxType = .custom
+        group.borderType = .lineBorder
+        group.cornerRadius = 8
+        group.contentViewMargins = NSSize(width: 20, height: 18)
+        group.contentView = contentView
+        group.translatesAutoresizingMaskIntoConstraints = false
+        group.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        return group
+    }
+
+    /// Returns the page controller together with the column stack the cards
+    /// are arranged in, so a layout contract can measure the real card frames.
+    static func page(
+        title: String,
+        summary: String,
+        views: [NSView]
+    ) -> (controller: NSViewController, column: NSStackView) {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let pageViews: [NSView] = [label(
+            title,
+            font: .systemFont(ofSize: 22, weight: .semibold),
+            color: .labelColor
+        ), label(
+            summary,
+            font: .systemFont(ofSize: 13),
+            color: .secondaryLabelColor
+        )] + views
+        for view in pageViews {
+            stack.addArrangedSubview(view)
+            view.translatesAutoresizingMaskIntoConstraints = false
+            // All cards share the page column width. Leading alignment keeps
+            // the column stable when a translated label has a different
+            // intrinsic width, while this explicit width keeps cards equal.
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor)
+                .isActive = true
+        }
+        let scroll = NSScrollView()
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let root = NSView()
+        root.addSubview(scroll)
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scroll.documentView = document
+        let preferredWidth = stack.widthAnchor.constraint(
+            equalTo: document.widthAnchor,
+            constant: -56
+        )
+        preferredWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: root.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            document.leadingAnchor.constraint(
+                equalTo: scroll.contentView.leadingAnchor
+            ),
+            document.topAnchor.constraint(
+                equalTo: scroll.contentView.topAnchor
+            ),
+            document.widthAnchor.constraint(
+                equalTo: scroll.contentView.widthAnchor
+            ),
+            document.heightAnchor.constraint(
+                greaterThanOrEqualTo: scroll.contentView.heightAnchor
+            ),
+            stack.centerXAnchor.constraint(equalTo: document.centerXAnchor),
+            stack.leadingAnchor.constraint(
+                greaterThanOrEqualTo: document.leadingAnchor,
+                constant: 28
+            ),
+            stack.trailingAnchor.constraint(
+                lessThanOrEqualTo: document.trailingAnchor,
+                constant: -28
+            ),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(
+                equalTo: document.bottomAnchor,
+                constant: -24
+            ),
+            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 680),
+        ])
+        preferredWidth.isActive = true
+        let controller = NSViewController()
+        controller.view = root
+        return (controller, stack)
+    }
+}
+
+/// Lays out a representative Settings page in a real window at the shipped
+/// settings size and measures the resulting card frames. This is the guard for
+/// the reported "Settings menu is still broken" defect: with a vertical stack
+/// aligned `.width` the cards float right at unequal widths, so this contract
+/// fails unless every card starts on the same leading edge and fills the
+/// column. Source-text assertions cannot catch that; measured frames can.
+@MainActor
+private enum NativeSettingsLayoutSmokeTest {
+    private static let settingsContentWidth: CGFloat = 760
+    private static let settingsContentHeight: CGFloat = 620
+
+    static func run() -> Int32 {
+        // AppKit needs an application object before views are laid out, but
+        // this mode deliberately does not touch the activation policy: the
+        // shipped app must stay a normal foreground app, and the accessory
+        // policy is reserved for the two smoke modes that already claim it.
+        _ = NSApplication.shared
+
+        func detail(_ text: String) -> NSTextField {
+            NativeSettingsLayout.label(
+                text,
+                font: .systemFont(ofSize: 12),
+                color: .secondaryLabelColor
+            )
+        }
+        func row(_ views: [NSView]) -> NSStackView {
+            let stack = NSStackView(views: views)
+            stack.orientation = .horizontal
+            stack.alignment = .centerY
+            return stack
+        }
+        func button(_ title: String) -> NSButton {
+            let button = NSButton(title: title, target: nil, action: nil)
+            button.bezelStyle = .rounded
+            return button
+        }
+        func picker(_ titles: [String]) -> NSPopUpButton {
+            let popUp = NSPopUpButton(frame: .zero, pullsDown: false)
+            for title in titles { popUp.addItem(withTitle: title) }
+            return popUp
+        }
+
+        // Deliberately mixed intrinsic widths. Under `.width` alignment these
+        // four cards land on four different leading edges.
+        let cards: [(String, NSView)] = [
+            ("language", NativeSettingsLayout.group(
+                title: "Language",
+                symbolName: "globe",
+                views: [
+                    row([picker(["System language", "English"])]),
+                    detail("Changing the language reopens the dashboard."),
+                ]
+            )),
+            ("codex-folder", NativeSettingsLayout.group(
+                title: "Codex folder",
+                symbolName: "folder",
+                views: [
+                    detail(
+                        "Using the default location for session and usage "
+                            + "evidence."
+                    ),
+                    row([button("Choose Folder…"), button("Use Default")]),
+                ]
+            )),
+            ("refresh-interval", NativeSettingsLayout.group(
+                title: "Refresh interval",
+                symbolName: "clock",
+                views: [
+                    row([picker(["Every minute", "Every 5 minutes"])]),
+                    detail("How often the open app refreshes local evidence."),
+                ]
+            )),
+            ("start-at-login", NativeSettingsLayout.group(
+                title: "Start at login",
+                symbolName: "power",
+                views: [
+                    row([NSSwitch()]),
+                    detail("Start at login is off."),
+                    row([button("Check Again")]),
+                ]
+            )),
+        ]
+
+        let page = NativeSettingsLayout.page(
+            title: "General",
+            summary: "Language, evidence folder, refresh cadence, login.",
+            views: cards.map(\.1)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: settingsContentWidth,
+                height: settingsContentHeight
+            ),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = page.controller
+        window.setContentSize(
+            NSSize(
+                width: settingsContentWidth,
+                height: settingsContentHeight
+            )
+        )
+        window.layoutIfNeeded()
+        page.controller.view.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        page.controller.view.layoutSubtreeIfNeeded()
+
+        let column = page.column
+        let columnWidth = column.frame.width
+        var leadingEdges: [CGFloat] = []
+        var widths: [CGFloat] = []
+        for (_, card) in cards {
+            let frame = column.convert(card.bounds, from: card)
+            leadingEdges.append(frame.minX)
+            widths.append(frame.width)
+        }
+        let leadingSpread =
+            (leadingEdges.max() ?? 0) - (leadingEdges.min() ?? 0)
+        let widthSpread = (widths.max() ?? 0) - (widths.min() ?? 0)
+        let narrowest = widths.min() ?? 0
+        // A degenerate zero-width column would otherwise report zero spread.
+        guard columnWidth >= 400,
+              leadingSpread <= 0.5,
+              widthSpread <= 0.5,
+              abs(narrowest - columnWidth) <= 0.5
+        else {
+            FileHandle.standardError.write(Data(
+                ("macOS settings layout smoke failed "
+                    + "column=\(columnWidth) "
+                    + "leading_spread=\(leadingSpread) "
+                    + "width_spread=\(widthSpread) "
+                    + "narrowest=\(narrowest)\n").utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_SETTINGS_LAYOUT "
+                + "cards=\(cards.count) "
+                + "column_width=\(Int(columnWidth)) "
+                + "leading_spread=\(Int(leadingSpread.rounded())) "
+                + "width_spread=\(Int(widthSpread.rounded())) "
+                + "full_width=true"
+        )
+        return 0
+    }
+}
+
 /// Lays out the installed AppKit dashboard frame without starting a companion
 /// or loading a page. This catches a native split-view regression where the
 /// loopback server is healthy but WebKit receives no usable display frame.
@@ -6257,6 +6588,9 @@ private struct UsageMonitorMain {
             exit(MainActor.assumeIsolated {
                 QuotaNotificationContractSmokeTest.run()
             })
+        }
+        if arguments.contains("--native-settings-layout-smoke-test") {
+            exit(NativeSettingsLayoutSmokeTest.run())
         }
         if arguments.contains("--native-dashboard-layout-smoke-test") {
             exit(MainActor.assumeIsolated {

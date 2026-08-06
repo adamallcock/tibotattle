@@ -721,7 +721,7 @@ export function normalizeAutomaticContributionStatus(payload) {
   if (!hasExactKeys(requiredConsent, requiredConsentKeys)
       || requiredConsent.telemetrySchemaVersion !== "telemetry-contribution-v0.1"
       || requiredConsent.fieldDictionaryVersion
-        !== "telemetry-v0.1-registry-2026-07-25.3"
+        !== "telemetry-v0.1-registry-2026-08-06.1"
       || requiredConsent.privacyContractVersion
         !== "ongoing-privacy-safe-telemetry-v0.1"
       || !validDestination
@@ -1771,12 +1771,25 @@ const LOCAL_MODELS = new Set([
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   "gpt-5.5",
+  "gpt-5.5-codex",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5",
   "gpt-4.1",
+  // Recognised identities that carry no published API price card. They were
+  // missing here, so the local report's rows for them were discarded at this
+  // boundary and their usage silently reappeared as "unknown".
+  "codex-auto-review",
+  // Metered against its own subscription allowance, never the primary pool.
+  "gpt-5.3-codex-spark",
   "unknown"
 ]);
+const LOCAL_MODEL_PRICING_STATUSES = new Set([
+  "priced",
+  "known_unpriced",
+  "unrecognized"
+]);
+const LOCAL_MODEL_ALLOWANCE_TRACKS = new Set(["primary", "spark"]);
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
@@ -1998,16 +2011,46 @@ function normalizeLocalTimeline(value = {}) {
   };
 }
 
-function normalizeLocalAccounting(value = {}) {
-  const models = array(value.byModel).slice(0, 32).flatMap((row) => {
+/**
+ * One model-usage row set, with the three facts a display surface needs to
+ * tell four different situations apart.
+ *
+ * `apiPriceEquivalentUsd` deliberately falls back to `null`, not `0`: a row
+ * that reported no usable figure is missing, and rendering it as a priced zero
+ * is a different and untrue claim.
+ */
+function normalizeLocalModelUsage(rows) {
+  return array(rows).slice(0, 32).flatMap((row) => {
     if (!LOCAL_MODELS.has(row?.model)) return [];
+    const allowanceTrack = LOCAL_MODEL_ALLOWANCE_TRACKS.has(row.allowanceTrack)
+      ? row.allowanceTrack
+      : "primary";
     return [{
       model: row.model,
       events: count(row.events, 0),
       totalTokens: count(row.totalTokens, 0),
-      apiPriceEquivalentUsd: nonNegative(row.apiPriceEquivalentUsd, 0)
+      apiPriceEquivalentUsd: nonNegative(row.apiPriceEquivalentUsd, null),
+      pricingStatus: LOCAL_MODEL_PRICING_STATUSES.has(row.pricingStatus)
+        ? row.pricingStatus
+        : (row.model === "unknown" ? "unrecognized" : "priced"),
+      allowanceTrack,
+      // A separate allowance is not substitutable for the primary pool, so no
+      // dollar comparison against it is honest. Only an explicit `false` or a
+      // Spark row withholds the figure.
+      apiPriceEquivalentApplicable:
+        row.apiPriceEquivalentApplicable !== false && allowanceTrack !== "spark"
     }];
   });
+}
+
+function normalizeLocalAccounting(value = {}) {
+  const models = normalizeLocalModelUsage(value.byModel);
+  // Both allowance tracks in one list, each row stating which track it belongs
+  // to. The local report already publishes this; dropping it here is what left
+  // the separately metered Spark allowance invisible on the model table.
+  const modelUsage = Array.isArray(value.modelUsage)
+    ? normalizeLocalModelUsage(value.modelUsage)
+    : [...models, ...normalizeLocalModelUsage(value?.spark?.byModel)];
   const normalized = {
     periodId: ["24h", "7d", "30d", "all", "history"].includes(value.periodId)
       ? value.periodId
@@ -2044,6 +2087,7 @@ function normalizeLocalAccounting(value = {}) {
     components: normalizeLocalComponents(value.components),
     componentCosts: normalizeLocalComponentCosts(value.componentCosts),
     byModel: models,
+    modelUsage,
     bySpeed: normalizeAccountingDimension(
       value.bySpeed,
       new Set(["standard", "fast", "flex", "batch", "unknown"])
@@ -3578,12 +3622,24 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
           output_combined_tokens: 0
         })[key]).toFixed(2))
       }])),
+      // The labeled demo carries every model-row state the real payload can
+      // produce, so the model table can be reviewed without waiting for a
+      // matching day of real usage.
       byModel: [
-        { model: "gpt-5.6-sol", events: Math.round(events * .62), totalTokens: Math.round(tokens * .64), apiPriceEquivalentUsd: Number((cost * .66).toFixed(2)) },
-        { model: "gpt-5.6-terra", events: Math.round(events * .18), totalTokens: Math.round(tokens * .19), apiPriceEquivalentUsd: Number((cost * .21).toFixed(2)) },
-        { model: "gpt-5.4-mini", events: Math.round(events * .15), totalTokens: Math.round(tokens * .13), apiPriceEquivalentUsd: Number((cost * .09).toFixed(2)) },
-        { model: "unknown", events: Math.round(events * .05), totalTokens: Math.round(tokens * .04), apiPriceEquivalentUsd: 0 }
+        { model: "gpt-5.6-sol", events: Math.round(events * .62), totalTokens: Math.round(tokens * .64), apiPriceEquivalentUsd: Number((cost * .66).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        { model: "gpt-5.6-terra", events: Math.round(events * .18), totalTokens: Math.round(tokens * .19), apiPriceEquivalentUsd: Number((cost * .21).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        { model: "gpt-5.4-mini", events: Math.round(events * .15), totalTokens: Math.round(tokens * .13), apiPriceEquivalentUsd: Number((cost * .09).toFixed(2)), pricingStatus: "priced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        // Recognised, and deliberately carries no published price card.
+        { model: "codex-auto-review", events: Math.round(events * .04), totalTokens: Math.round(tokens * .02), apiPriceEquivalentUsd: 0, pricingStatus: "known_unpriced", allowanceTrack: "primary", apiPriceEquivalentApplicable: true },
+        { model: "unknown", events: Math.round(events * .05), totalTokens: Math.round(tokens * .04), apiPriceEquivalentUsd: 0, pricingStatus: "unrecognized", allowanceTrack: "primary", apiPriceEquivalentApplicable: true }
       ],
+      // Metered against its own subscription allowance, so it is kept out of
+      // the primary pool's totals and quotes no API-price equivalent.
+      spark: {
+        byModel: [
+          { model: "gpt-5.3-codex-spark", events: Math.round(events * .21), totalTokens: Math.round(tokens * .07), apiPriceEquivalentUsd: 0, pricingStatus: "known_unpriced", allowanceTrack: "spark", apiPriceEquivalentApplicable: false }
+        ]
+      },
       bySpeed: accountingDimension(total, { standard: .78, fast: .13, unknown: .09 }),
       byApiServiceTier: accountingDimension(total, { standard: .97, unknown: .03 }),
       bySurface: accountingDimension(total, {

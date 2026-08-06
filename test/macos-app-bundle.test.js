@@ -970,14 +970,33 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /NativeRefreshIntervalPreference\.seconds/u);
   assert.match(source, /private struct NativeForegroundRefreshSchedule/u);
   assert.match(source, /NativeForegroundRefreshScheduler\.schedule/u);
-  assert.match(source, /deadline: \.now\(\) \+ \.seconds\(schedule\.intervalSeconds\)/u);
+  assert.match(source, /enqueue\(now \+ \.seconds\(schedule\.intervalSeconds\), work\)/u);
+  assert.match(source, /DispatchQueue\.main\.asyncAfter\(deadline: deadline, execute: work\)/u);
   assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
   assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
   assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
+  const refreshIntervalSelectionSource = source.match(
+    /@objc private func selectRefreshInterval\(_ sender: NSPopUpButton\)[\s\S]*?(?=\n    @objc private func openNotificationSettings)/u,
+  )?.[0] ?? "";
+  assert.ok(
+    refreshIntervalSelectionSource,
+    "refresh interval picker action should be present",
+  );
+  assert.match(
+    refreshIntervalSelectionSource,
+    /NativeRefreshIntervalSelection\.apply\([\s\S]*?seconds: seconds[\s\S]*?dashboardAvailable: dashboardURL != nil[\s\S]*?refreshInFlight: nativeRefreshInFlight[\s\S]*?scheduleNativeRefresh\(\)/u,
+  );
+  assert.match(
+    source,
+    /private enum NativeRefreshIntervalSelection[\s\S]*?setSeconds\(seconds, in: defaults\)[\s\S]*?guard dashboardAvailable, !refreshInFlight else \{ return true \}[\s\S]*?reschedule\(\)/u,
+  );
   assert.match(source, /stack\.centerXAnchor\.constraint\(equalTo: document\.centerXAnchor\)/u);
   assert.match(source, /stack\.widthAnchor\.constraint\(lessThanOrEqualToConstant: 680\)/u);
-  assert.match(source, /contentStack\.alignment = \.width/u);
+  assert.match(source, /contentStack\.alignment = \.leading/u);
+  assert.match(source, /view\.widthAnchor\.constraint\(equalTo: contentStack\.widthAnchor\)/u);
+  assert.match(source, /stack\.alignment = \.leading/u);
+  assert.match(source, /view\.widthAnchor\.constraint\(equalTo: stack\.widthAnchor\)/u);
   assert.match(source, /newWindow\.setContentSize\(NSSize\(width: 760, height: 620\)\)/u);
   assert.match(source, /nativeStatusRefreshButton\?\.contentTintColor/u);
   assert.match(source, /nativeToolbarStatusColor\(isRefreshing:/u);
@@ -4749,7 +4768,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       refreshSettingsSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 scheduler=900 invalid_ignored=true$/mu,
+      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
     );
     const nativeDashboardLayoutSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

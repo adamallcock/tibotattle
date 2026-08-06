@@ -40,7 +40,7 @@ const MAXIMUM_TOKEN_RESPONSE_BYTES = 64 * 1024;
 const MAXIMUM_ID_TOKEN_LENGTH = 16 * 1024;
 // A browser handoff is short-lived and the callback must resolve to either a
 // completed or failed state.  Do not let a provider connection hold that
-// state in limbo until the five-minute handoff expires.
+// state in limbo until the handoff's authorization window expires.
 export const APPLE_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 10_000;
 const MAXIMUM_PROVIDER_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
 

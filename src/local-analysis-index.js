@@ -39,9 +39,12 @@ export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
 // v4 stops the chunk reader from rebuilding a record out of a reused buffer, so
 // every index built before it is missing whichever records happened to straddle
 // a read boundary; v5 keeps provider-reported quota duration in the leading
-// window identity and refuses out-of-range cached quota facts.
+// window identity and refuses out-of-range cached quota facts; v6 preserves the
+// reviewed Spark and Codex auto-review model identities instead of collapsing
+// them into "unknown" (every index built before it stored those events under
+// the unrecognised label, so it has to be rebuilt, not migrated).
 export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
-  "parallel-jsonl-accounting-v5";
+  "parallel-jsonl-accounting-v6";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
 const INDEX_USER_VERSION = 5;

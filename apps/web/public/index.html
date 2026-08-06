@@ -361,7 +361,7 @@
 
         <div class="weekly-hero">
           <div>
-            <span>Historical median estimate</span>
+            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">All-data median estimate</span>
             <strong id="weekly-estimate">—</strong>
             <small id="weekly-range">No evidence interval available</small>
           </div>
@@ -388,7 +388,7 @@
             </div>
           </div>
           <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
-            <span><i class="legend-dot weekly-center"></i>Typical estimate</span>
+            <span><i class="legend-dot weekly-center"></i>All-data median</span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>
             <span id="weekly-partial-legend" hidden><i class="legend-dot weekly-partial"></i>Short observation</span>
           </div>
@@ -397,6 +397,9 @@
           <p class="annotation">
             Each reset estimate is shown with the range supported by that reset’s observations.
           </p>
+          <!-- The zone is named once per chart, from the reader's own system
+               zone, instead of being repeated on every tick and tooltip. -->
+          <p class="annotation" id="weekly-chart-timezone"></p>
         </article>
 
         <details class="panel weekly-table-panel evidence-disclosure">
@@ -447,8 +450,8 @@
                 <button type="button" data-days="31">31d</button>
               </div>
               <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-                <span><i class="legend-dot cost"></i>API-cost estimate</span>
-                <span><i class="legend-dot allowance"></i>Observed allowance remaining</span>
+                <span><i class="legend-dot cost"></i>API-price-equivalent usage</span>
+                <span><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
               </div>
             </div>
           </div>
@@ -614,14 +617,17 @@
           </div>
             <div class="table-wrap">
               <table>
-                <caption class="sr-only">Replay-safe usage grouped by recognized model</caption>
+                <caption class="sr-only">Replay-safe usage grouped by model, across every allowance</caption>
                 <thead><tr><th>Model</th><th>Usage changes</th><th>Tokens</th><th>API equivalent</th></tr></thead>
                 <tbody id="accounting-models"></tbody>
               </table>
             </div>
+            <p class="annotation" id="accounting-price-coverage" hidden></p>
             <p class="annotation">
-              Coverage and price provenance remain visible above; unavailable
-              evidence never adds an invented cost.
+              A model on a separate allowance is listed on its own row and
+              carries no API equivalent, because that figure cannot be compared
+              with the main allowance. Nothing unavailable is replaced with an
+              invented cost.
             </p>
         </article>
       </section>
@@ -639,18 +645,20 @@
           <p class="eyebrow">Optional</p>
           <h2 id="contribution-cta-title">Share one anonymous summary</h2>
           <p>
-            Improve community estimates with one reviewed, content-free result.
+            Help improve community estimates by sharing one summary. You see it
+            before anything is sent.
           </p>
           <details class="contribution-categories">
             <summary>What leaves this Mac — and what never does</summary>
             <div>
               <p>
-                Shared: timestamps, token counts, safe model labels, coarse
-                tool and surface categories, and allowance percentages.
+                Shared: times, token counts, model names, broad activity
+                categories, and how much of your allowance was left.
               </p>
               <p>
-                Never shared: prompts, responses, reasoning, files, paths, URLs,
-                commands, account names, emails, identifiers, or credentials.
+                Never shared: anything you typed or a model wrote, file names,
+                folders, links, commands, your name, your email, or any account
+                or login details.
               </p>
             </div>
           </details>
@@ -658,13 +666,13 @@
         <div class="contribution-cta-action">
           <div class="identity-signin" id="identity-signin">
             <p class="control-label">
-              Sign in for hosted contribution
+              Sign in to contribute
               <span class="evidence-chip neutral" id="identity-signin-state">Not signed in</span>
             </p>
             <p class="annotation">
-              Hosted participation uses Google or Apple; the service keeps only
-              an irreversible sign-in hash, never your email or name. Local-only
-              use needs no account.
+              Contributing uses your Google or Apple sign-in. We keep a
+              scrambled version of it that cannot be turned back into your email
+              or your name. Using TiboTattle on your own needs no account.
             </p>
             <!--
               Both vendor marks are drawn once here as inline SVG symbols and
@@ -704,7 +712,7 @@
               <span class="identity-account-copy">
                 <strong id="identity-account-provider">Signed in with Google</strong>
                 <small id="identity-account-detail">
-                  Signing out ends this browser's contribution session.
+                  Signing out ends this app's contribution session.
                 </small>
               </span>
               <!--
@@ -735,15 +743,17 @@
           <label class="consent-row contribution-primary-consent">
             <input id="community-connect-consent" type="checkbox">
             <span>
-              <strong>I consent to review and submit this metadata.</strong>
-              <small>
-                The result is shown for review before anything is sent.
-              </small>
+              <strong>I want to review a summary and decide whether to send it.</strong>
             </span>
           </label>
           <div class="contribution-cta-buttons">
+            <!--
+              This button performs network enrollment and device pairing. It
+              is named for that. Reviewing is a separate, local action, and the
+              button only offers it once this Mac is actually connected.
+            -->
             <button class="button button-primary" id="connect-community" type="button" disabled>
-              Review contribution
+              Connect this Mac
             </button>
             <button class="button button-quiet" id="contribution-not-now" type="button">
               Not now
@@ -752,9 +762,12 @@
           <p class="participant-action-status" id="community-connect-status" role="status" hidden></p>
         </div>
 
+          <!--
+            What the community published lives on the website. It is a link,
+            not a second explanation of the same thing inside the app.
+          -->
           <p class="community-public-evidence">
-            Delayed community evidence is published on the public website.
-            <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">View delayed community evidence</a>
+            <a href="https://tibotattle.com/#community" target="_blank" rel="noopener">See what the community published</a>
           </p>
           <details class="journey-disclosure community-review" id="community-contribution-disclosure">
             <summary>
@@ -766,17 +779,19 @@
             </summary>
             <article class="panel contribution-panel" id="contribution-review">
               <p class="annotation">
-                Preparation and inspection stay on this Mac. Send is a separate,
-                explicit action after the concise review is ready.
+                Everything here happens on your Mac. Sending is a separate
+                button you press after you have looked at the summary.
               </p>
               <div class="local-preparation">
-                <p class="control-label">Prepare local evidence</p>
-                <div class="preparation-readiness">
-                  <strong>Preparation identity</strong>
-                  <span class="evidence-chip neutral" id="preparation-identity">Checking</span>
-                </div>
+                <p class="control-label">Prepare a summary</p>
+                <!--
+                  Only shown when the reader has to do something about it. A
+                  chip that says the Keychain will be checked later does not
+                  change anyone's next action.
+                -->
+                <p class="notice notice-warning preparation-readiness" id="preparation-identity" hidden></p>
                 <div class="preparation-window">
-                  <span class="control-label">Evidence to prepare</span>
+                  <span class="control-label">How much to include</span>
                   <div class="segmented-control" id="contribution-lookback-controls" aria-label="Contribution preparation lookback" data-i18n-aria-label="aria.contributionLookback">
                     <button type="button" data-lookback-hours="1">1 hour</button>
                     <button type="button" data-lookback-hours="24" class="active" aria-pressed="true">24 hours</button>
@@ -784,41 +799,40 @@
                   </div>
                 </div>
                 <p class="annotation" id="preparation-estimate">
-                  Analyze local usage to estimate the number of privacy-safe
-                  records and upload batches before preparation.
+                  Analyze your local usage first to see how much would be
+                  included.
                 </p>
                 <button class="button button-secondary" id="prepare-contribution" type="button">
                   Prepare and review last 24 hours
                 </button>
                 <p class="participant-action-status" id="prepare-contribution-status" role="status">
-                  Nothing is sent until you separately inspect and choose a send action.
+                  Nothing is sent until you have looked at the summary and pressed Send.
                 </p>
               </div>
               <div class="sync-next-card" id="sync-next-card">
                 <div class="panel-heading compact-heading">
                   <div>
-                    <p class="panel-kicker">Reviewed contribution</p>
-                    <h3 id="sync-next-title">Inspect before sending</h3>
+                    <p class="panel-kicker">Your summary</p>
+                    <h3 id="sync-next-title">Review before sending</h3>
                   </div>
-                  <span class="evidence-chip neutral" id="sync-next-state">Not inspected</span>
+                  <span class="evidence-chip neutral" id="sync-next-state">Not reviewed yet</span>
                 </div>
                 <dl class="summary-facts sync-next-facts">
-                  <div><dt>Covered period</dt><dd id="sync-next-coverage">—</dd></div>
-                  <div><dt>Safe records</dt><dd id="sync-next-records">—</dd></div>
+                  <div><dt>Time covered</dt><dd id="sync-next-coverage">—</dd></div>
+                  <div><dt>Items included</dt><dd id="sync-next-records">—</dd></div>
                   <div><dt>API-price estimate</dt><dd id="sync-next-cost">—</dd></div>
-                  <div><dt>Upload reservation</dt><dd id="sync-next-bytes">—</dd></div>
+                  <div><dt>Upload size</dt><dd id="sync-next-bytes">—</dd></div>
                 </dl>
                 <div class="sync-actions" aria-label="Contribution review controls" data-i18n-aria-label="aria.foregroundContributionControls">
                   <button class="button button-secondary" id="sync-inspect" type="button">
-                    Review prepared summary
+                    Review summary
                   </button>
                   <button class="button button-primary" id="sync-run-once" type="button">
-                    Send reviewed summary
+                    Send summary
                   </button>
                 </div>
                 <p class="annotation">
-                  Sending stays disabled until the current prepared set has
-                  been inspected locally.
+                  Send stays off until you have looked at this summary.
                 </p>
                 <p class="participant-action-status" id="sync-action-status" role="status" hidden></p>
               </div>

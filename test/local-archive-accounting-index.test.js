@@ -25,13 +25,18 @@ import {
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const PRIVATE_CANARY = "PRIVATE_ARCHIVE_INDEX_CANARY";
 
-async function fixture({ includeSecondSource = false } = {}) {
+async function fixture({
+  includeSecondSource = false,
+  model = "gpt-5.6-sol",
+  secondModel = null,
+  includeUsage = false,
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-archive-index-"));
   const codexHome = join(root, "codex-home");
   const sessions = join(codexHome, "sessions");
   await mkdir(sessions, { recursive: true });
   await mkdir(join(codexHome, "archived_sessions"), { recursive: true });
-  const writeRollout = async (path, sessionId, timestamp) => {
+  const writeRollout = async (path, sessionId, timestamp, rolloutModel = model) => {
     await writeFile(path, `${[
       JSON.stringify({
         timestamp,
@@ -41,8 +46,34 @@ async function fixture({ includeSecondSource = false } = {}) {
       JSON.stringify({
         timestamp: `${timestamp.slice(0, -5)}.010Z`,
         type: "turn_context",
-        payload: { model: "gpt-5.6-sol" },
+        payload: { model: rolloutModel },
       }),
+      ...(includeUsage ? [JSON.stringify({
+        timestamp: `${timestamp.slice(0, -5)}.020Z`,
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          model: rolloutModel,
+          info: {
+            total_token_usage: {
+              input_tokens: 100,
+              cached_input_tokens: 0,
+              cache_write_input_tokens: 0,
+              output_tokens: 0,
+              reasoning_output_tokens: 0,
+              total_tokens: 100,
+            },
+            last_token_usage: {
+              input_tokens: 100,
+              cached_input_tokens: 0,
+              cache_write_input_tokens: 0,
+              output_tokens: 0,
+              reasoning_output_tokens: 0,
+              total_tokens: 100,
+            },
+          },
+        },
+      })] : []),
     ].join("\n")}\n`);
     await appendFile(path, `${JSON.stringify({
       timestamp,
@@ -60,6 +91,7 @@ async function fixture({ includeSecondSource = false } = {}) {
       join(sessions, "rollout-2026-07-24T12-02-00-second.jsonl"),
       "SECOND_ARCHIVE_SOURCE",
       "2026-07-24T12:02:00.000Z",
+      secondModel ?? model,
     );
   }
   return { root, codexHome };
@@ -179,6 +211,165 @@ test("archive index applies the larger envelope through durable partial batches"
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("archive index preserves Spark as a separate unpriced allowance track", async () => {
+  const { root, codexHome } = await fixture({
+    model: "gpt-5.3-codex-spark",
+    includeUsage: true,
+  });
+  const indexFile = join(root, "local-archive-accounting-index-spark.sqlite");
+  const secretFile = join(root, "local-archive-accounting-index-spark-secret");
+  try {
+    const refreshed = await refreshLocalArchiveAccountingIndex({
+      indexFile,
+      secretFile,
+      codexHome,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      workerCount: 1,
+    });
+    assert.equal(refreshed.status, "complete");
+    const projection = await readLocalArchiveAccountingPeriod({ indexFile });
+    assert.equal(projection.status, "available");
+    assert.equal(projection.period.events, 0);
+    assert.equal(projection.period.apiPriceEquivalentUsd, 0);
+    assert.equal(projection.period.spark.events, 1);
+    assert.deepEqual(
+      projection.period.spark.byModel.map((row) => row.model),
+      ["gpt-5.3-codex-spark"],
+    );
+    assert.equal(projection.period.spark.apiPriceEquivalentUsd, 0);
+    assert.deepEqual(projection.period.spark.pricingCoverage, {
+      fullyPricedEvents: 0,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 1,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Owner-reported defect: a Model usage table that showed one "Unrecognized
+// model" row pooling Spark with genuinely unreviewed identifiers. These three
+// states must be separately representable in the projection the dashboard
+// reads, or the renderer has no honest way to draw them apart.
+async function archiveModelUsage({ model, secondModel }) {
+  const { root, codexHome } = await fixture({
+    model,
+    secondModel,
+    includeSecondSource: true,
+    includeUsage: true,
+  });
+  const indexFile = join(root, "local-archive-accounting-index-models.sqlite");
+  try {
+    const refreshed = await refreshLocalArchiveAccountingIndex({
+      indexFile,
+      secretFile: join(root, "local-archive-accounting-index-models-secret"),
+      codexHome,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+      workerCount: 1,
+    });
+    assert.equal(refreshed.status, "complete");
+    const projection = await readLocalArchiveAccountingPeriod({ indexFile });
+    assert.equal(projection.status, "available");
+    return projection.period;
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function modelUsageState(period) {
+  return period.modelUsage.map((row) => ({
+    model: row.model,
+    events: row.events,
+    pricingStatus: row.pricingStatus,
+    allowanceTrack: row.allowanceTrack,
+    apiPriceEquivalentApplicable: row.apiPriceEquivalentApplicable,
+  }));
+}
+
+test("Codex auto-review is a recognised unpriced identity on the primary allowance", async () => {
+  const period = await archiveModelUsage({
+    model: "codex-auto-review",
+    secondModel: "gpt-5.6-sol",
+  });
+  // Both events stay on the primary track: auto-review is billed from the
+  // ordinary Codex allowance, it simply has no published price card.
+  assert.equal(period.events, 2);
+  assert.equal(period.spark.events, 0);
+  assert.deepEqual(modelUsageState(period).sort(
+    (left, right) => left.model.localeCompare(right.model),
+  ), [
+    {
+      model: "codex-auto-review",
+      events: 1,
+      pricingStatus: "known_unpriced",
+      allowanceTrack: "primary",
+      apiPriceEquivalentApplicable: true,
+    },
+    {
+      model: "gpt-5.6-sol",
+      events: 1,
+      pricingStatus: "priced",
+      allowanceTrack: "primary",
+      apiPriceEquivalentApplicable: true,
+    },
+  ]);
+  assert.equal(
+    period.modelUsage.some((row) => row.model === "unknown"),
+    false,
+  );
+});
+
+test("Spark reaches the renderer as its own allowance with no API equivalent", async () => {
+  const period = await archiveModelUsage({
+    model: "gpt-5.3-codex-spark",
+    secondModel: "gpt-5.6-sol",
+  });
+  // The period's own totals stay reconcilable with byModel, which covers only
+  // the primary allowance; Spark is carried alongside on its own track.
+  assert.equal(period.events, 1);
+  assert.deepEqual(period.byModel.map((row) => row.model), ["gpt-5.6-sol"]);
+  assert.equal(period.spark.events, 1);
+  assert.deepEqual(modelUsageState(period).sort(
+    (left, right) => left.model.localeCompare(right.model),
+  ), [
+    {
+      model: "gpt-5.3-codex-spark",
+      events: 1,
+      pricingStatus: "known_unpriced",
+      allowanceTrack: "spark",
+      // A separate allowance is not substitutable for the primary pool, so
+      // quoting an API-price equivalent for it would be meaningless.
+      apiPriceEquivalentApplicable: false,
+    },
+    {
+      model: "gpt-5.6-sol",
+      events: 1,
+      pricingStatus: "priced",
+      allowanceTrack: "primary",
+      apiPriceEquivalentApplicable: true,
+    },
+  ]);
+});
+
+test("a genuinely unreviewed model identifier is still withheld as unrecognized", async () => {
+  const period = await archiveModelUsage({
+    model: "gpt-9.9-never-reviewed",
+    secondModel: "gpt-5.6-sol",
+  });
+  const unrecognized = period.modelUsage.find(
+    (row) => row.pricingStatus === "unrecognized",
+  );
+  // The identifier itself is never echoed back; only the fact that one event
+  // named something unreviewed.
+  assert.equal(unrecognized.model, "unknown");
+  assert.equal(unrecognized.events, 1);
+  assert.equal(unrecognized.allowanceTrack, "primary");
+  assert.equal(
+    period.modelUsage.some((row) => row.model.includes("never-reviewed")),
+    false,
+  );
 });
 
 test("first-pass discovery caps persist a partial archive state", async () => {

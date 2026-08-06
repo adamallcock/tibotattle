@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "c2cd22f46fc5216a1a260990c772a0e891b68bed5773c8ac6890f2c2d2abb28a",
+    "sha256": "edfe33395bf820140a200fda623062a40be1bdf61987148ad5faf28f5d7b8b98",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -72,8 +72,8 @@
     }
   },
   "registry": {
-    "sha256": "79a20167ed2671bc2773358f966560a870f228f41827b4286036fb9574e63f35",
-    "version": "telemetry-v0.1-registry-2026-07-25.3"
+    "sha256": "c662fa382b9e673d0be40410fcb6a3520005b303cdad80fe9f648bedd9e90359",
+    "version": "telemetry-v0.1-registry-2026-08-06.1"
   },
   "schemas": {
     "members": [
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "5478de5c44ea1fc7300a387d475793b94e2fb971609b17eacb4d4b194385fb57"
+        "sha256": "818706faa89ca917c8954992d55f8a58ac87bbd0b33eba5ec39d6c4a58af7da7"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -105,10 +105,10 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "9b0d572464fe922049cf4a83b9f0e6b0bdc176271a61971ec6b0706ae8aa4edd"
+        "sha256": "0f3203f4949104f7bca19ef2aa926560390965a3dfe564544192641d5ef48fb2"
       }
     ],
-    "setSha256": "f9fe20ecdcc1cc7534a9c692907d95ecd805f088a29b608b2a52bba1b3a20f79"
+    "setSha256": "50bb5089f177cfe494743a4f95cd6ff711ef9db370fe39c4e927b729034da525"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

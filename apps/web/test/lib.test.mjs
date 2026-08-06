@@ -79,6 +79,7 @@ import {
 import {
   adaptiveChartTickCount,
   classifyTimelineEvidence,
+  formatChartTimestamp,
   formatLocal,
   formatReportingTime,
   formatTimeZoneLabel,
@@ -87,6 +88,13 @@ import {
   selectAvailableAccountingPeriod,
   USER_LOCALE,
 } from "../public/ui-format.js";
+import {
+  SUPPORTED_LOCALES,
+  WEB_MESSAGES,
+  WEB_PLURAL_MESSAGES,
+  translate,
+  translatePlural,
+} from "../public/localization.js";
 
 class FakeSvgElement {
   constructor(tagName, renderedWidth = 0) {
@@ -244,24 +252,30 @@ class FakeResizeObserver {
   }
 }
 
-async function loadLineChartRenderer(documentRef) {
+async function loadLineChartRenderer(documentRef, { translate = null } = {}) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = appSource.indexOf("function lineChart(");
+  // The slice starts at the point-style policy so the renderer arrives with the
+  // constant that decides whether a series draws visible dots. A series that
+  // omits it is rejected, which is the property the DOM tests below check.
+  const start = appSource.indexOf("const CHART_POINT_STYLE = Object.freeze(");
   const end = appSource.indexOf("\nfunction isWellObservedWeeklyFit", start);
   assert.ok(start >= 0 && end > start, "lineChart DOM renderer is available");
   const chartSource = appSource.slice(start, end);
-  return Function(
+  const scope = Function(
     "document",
     "ResizeObserver",
     "adaptiveChartTickCount",
     "finite",
-    "formatLocal",
+    "formatChartTimestamp",
     "formatMoney",
     "formatDecimal",
+    "formatPercent",
     "formatChartTimeLabel",
-    "timelineStatusLabel",
+    "timelineStatusKey",
     "setRawText",
-    `${chartSource}\nreturn lineChart;`,
+    "t",
+    "tPlural",
+    `${chartSource}\nreturn { lineChart, CHART_POINT_STYLE, chartText };`,
   )(
     documentRef,
     FakeResizeObserver,
@@ -273,13 +287,94 @@ async function loadLineChartRenderer(documentRef) {
     },
     (value) => `$${Number(value).toFixed(0)}`,
     (value) => Number(value).toFixed(1),
+    (value) => `${Number(value).toFixed(0)}%`,
     (value, { dateOnly = false } = {}) => {
       const iso = new Date(value).toISOString();
       return dateOnly ? iso.slice(0, 10) : `${iso} UTC`;
     },
-    (status) => String(status),
+    (status) => `status.${status}`,
     (element, value) => { element.textContent = String(value); },
+    translate ?? ((key, values = {}) => `[${key}]${Object.entries(values)
+      .map(([name, value]) => ` ${name}=${value}`).join("")}`),
+    (key, count) => `[${key}|${count}]`,
   );
+  return scope;
+}
+
+/**
+ * Run the shipped renderWeekly against a fake DOM at a chosen range/span, so
+ * the hero copy can be compared across control positions instead of inferred
+ * from the source.
+ */
+async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const chartStart = appSource.indexOf("const CHART_POINT_STYLE = Object.freeze(");
+  const chartEnd = appSource.indexOf("\nfunction firstFiniteForecastNumber", chartStart);
+  const weeklyStart = appSource.indexOf("function renderWeekly(data) {");
+  const weeklyEnd = appSource.indexOf("\nfunction accountingPeriod(data)", weeklyStart);
+  assert.ok(chartStart >= 0 && weeklyStart > chartStart, "renderWeekly is available");
+  const section = `${appSource.slice(chartStart, chartEnd)}\n${appSource.slice(weeklyStart, weeklyEnd)}`;
+
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        textContent: "",
+        hidden: false,
+        setAttribute() {},
+        removeAttribute() {},
+        replaceChildren() {},
+        append() {},
+      });
+    }
+    return elements.get(id);
+  };
+  const money = (value, digits = 0) => value === null || value === undefined
+    ? "—"
+    : `$${Number(value).toFixed(digits)}`;
+
+  Function(
+    "document", "ResizeObserver", "adaptiveChartTickCount", "finite",
+    "formatChartTimestamp", "formatMoney", "formatDecimal", "formatPercent",
+    "formatPp", "formatChartTimeLabel", "formatTimeZoneLabel", "timelineStatusKey",
+    "setRawText", "setLocalizedText", "t", "tPlural", "shareCardDateLabel",
+    "$", "clear", "node", "formatLocal", "renderWeeklyPaceForecast",
+    "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
+    `${section}\nreturn renderWeekly;`,
+  )(
+    { createElementNS: () => new FakeSvgElement("g") },
+    FakeResizeObserver,
+    () => 5,
+    (value, fallback = null) => typeof value === "number" && Number.isFinite(value) ? value : fallback,
+    (value) => new Date(value).toISOString().slice(0, 16),
+    money,
+    (value, digits = 0) => Number(value).toFixed(digits),
+    (value) => `${Number(value).toFixed(0)}%`,
+    (value) => value === null ? "—" : `${Number(value).toFixed(1)} pp`,
+    (value) => new Date(value).toISOString().slice(0, 10),
+    () => "Eastern Time",
+    (status) => `chart.status.${status}`,
+    (target, value) => { target.textContent = String(value); },
+    (target, key, values = {}) => { target.textContent = translate(key, values, locale); },
+    (key, values = {}) => translate(key, values, locale),
+    (key, count, values = {}) => translatePlural(key, count, values, locale),
+    (at) => new Date(at).toISOString().slice(0, 10),
+    element,
+    () => {},
+    () => ({ append() {}, textContent: "" }),
+    (value) => new Date(value).toISOString().slice(0, 10),
+    () => {},
+    rangeDays,
+    span,
+  )(data);
+
+  return {
+    label: element("#weekly-estimate-label").textContent,
+    estimate: element("#weekly-estimate").textContent,
+    range: element("#weekly-range").textContent,
+    explanation: element("#weekly-explanation").textContent,
+    timeZone: element("#weekly-chart-timezone").textContent,
+  };
 }
 
 async function loadAccountingPeriodSync(periodIds) {
@@ -316,6 +411,7 @@ async function loadTimelineInteractions() {
   return Function(
     "$",
     "t",
+    "setLocalizedText",
     "USER_TIME_ZONE",
     "formatLocal",
     "formatSpanLength",
@@ -330,6 +426,9 @@ async function loadTimelineInteractions() {
   )(
     () => ({ textContent: "" }),
     (_key, values) => JSON.stringify(values ?? {}),
+    (element, _key, values) => {
+      if (element) element.textContent = JSON.stringify(values ?? {});
+    },
     "America/New_York",
     (value) => String(value),
     (value) => String(value),
@@ -1188,17 +1287,84 @@ test("cost coverage visibly surfaces historical coverage and concise provenance"
     "utf8",
   );
   assert.match(appSource, /historyCoverageLabel\(pricing\.historyCoverage\)/u);
-  assert.match(appSource, /accounting\.periodId === "30d"/u);
-  assert.match(appSource, /coverage-warning/u);
-  assert.match(appSource, /accounting\.pricing\.thirtyDayCoverageWarning/u);
-  assert.match(appSource, /pricing\.historyCoverage\?\.status === "partial"/u);
-  assert.match(localizationSource, /"accounting\.pricing\.thirtyDayCoverageWarning":/u);
+  // Every retained usage change is priced at the rate in effect when it
+  // occurred, so no surface claims a date before which history was unpriced.
+  assert.doesNotMatch(appSource, /thirtyDayCoverageWarning|coverage-warning/u);
+  assert.doesNotMatch(localizationSource, /thirtyDayCoverageWarning/u);
   assert.match(localizationSource, /"accounting\.pricing\.partialCoverage":/u);
  assert.match(localizationSource, /"accounting\.pricing\.coverageReviewed":/u);
   assert.match(localizationSource, /"accounting\.pricing\.coverageShort":/u);
  assert.doesNotMatch(appSource, /cost-history-coverage/u);
  assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
   assert.doesNotMatch(appSource, /pricedEventCoveragePercent[^\n]*priced/u);
+});
+
+test("the client keeps both allowance tracks and the pricing status of each model", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      periodId: "7d",
+      byModel: [
+        {
+          model: "gpt-5.6-sol",
+          events: 193,
+          totalTokens: 24_765_904,
+          apiPriceEquivalentUsd: 23.8758,
+          pricingStatus: "priced",
+          allowanceTrack: "primary",
+          apiPriceEquivalentApplicable: true,
+        },
+        {
+          model: "codex-auto-review",
+          events: 12,
+          totalTokens: 4_400,
+          apiPriceEquivalentUsd: 0,
+          pricingStatus: "known_unpriced",
+          allowanceTrack: "primary",
+          apiPriceEquivalentApplicable: true,
+        },
+      ],
+      spark: {
+        byModel: [
+          {
+            model: "gpt-5.3-codex-spark",
+            events: 8_143,
+            totalTokens: 19_004_221,
+            apiPriceEquivalentUsd: 0,
+            pricingStatus: "known_unpriced",
+            allowanceTrack: "spark",
+            apiPriceEquivalentApplicable: false,
+          },
+        ],
+      },
+    },
+  });
+  const rows = result.accounting.modelUsage;
+  assert.deepEqual(rows.map((row) => row.model), [
+    "gpt-5.6-sol",
+    "codex-auto-review",
+    "gpt-5.3-codex-spark",
+  ]);
+  // The separately metered track survives the client boundary and keeps the
+  // fact that no API-price equivalent is meaningful for it.
+  const spark = rows.find((row) => row.model === "gpt-5.3-codex-spark");
+  assert.equal(spark.allowanceTrack, "spark");
+  assert.equal(spark.apiPriceEquivalentApplicable, false);
+  assert.equal(spark.events, 8_143);
+  // A recognised model with no published price card is not "unrecognized".
+  assert.equal(
+    rows.find((row) => row.model === "codex-auto-review").pricingStatus,
+    "known_unpriced",
+  );
+  // A missing figure stays missing rather than becoming a priced zero.
+  const missing = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      periodId: "7d",
+      byModel: [{ model: "gpt-5.4", events: 3, totalTokens: 9 }],
+    },
+  });
+  assert.equal(missing.accounting.byModel[0].apiPriceEquivalentUsd, null);
 });
 
 test("local dashboard retains the pricing epoch required to explain allowance fits", () => {
@@ -1660,7 +1826,7 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   assert.match(appSource, /dashboard\.quota\.spark/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
-  assert.match(appSource, /Seven-day allowance estimate history/u);
+  assert.match(appSource, /title: \{ key: "weekly\.chart\.title" \}/u);
   assert.doesNotMatch(appSource, /renderAccountScopedQuotaAnalysis/u);
 });
 
@@ -1945,7 +2111,7 @@ function automaticContributionStatusFixture(overrides = {}) {
     firstReviewedAcceptedAt: "2026-07-29T11:59:00.000Z",
     requiredConsent: {
       telemetrySchemaVersion: "telemetry-contribution-v0.1",
-      fieldDictionaryVersion: "telemetry-v0.1-registry-2026-07-25.3",
+      fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
       privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
       destinationOrigin: "https://contribute.example.test"
     },
@@ -2023,7 +2189,7 @@ test("automatic contribution settings are fixed, foreground-only, and fail close
       status: "consent_required",
       requiredConsent: {
         telemetrySchemaVersion: "telemetry-contribution-v0.1",
-        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-07-25.3",
+        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
         privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
         destinationOrigin: "http://127.0.0.1:8791"
       }
@@ -2059,7 +2225,7 @@ test("automatic contribution settings are fixed, foreground-only, and fail close
         firstReviewedAcceptedAt: null,
         requiredConsent: {
           telemetrySchemaVersion: "telemetry-contribution-v0.1",
-          fieldDictionaryVersion: "telemetry-v0.1-registry-2026-07-25.3",
+          fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
           privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
           destinationOrigin: null
         }
@@ -2093,7 +2259,7 @@ test("automatic contribution settings are fixed, foreground-only, and fail close
     automaticContributionStatusFixture({
       requiredConsent: {
         telemetrySchemaVersion: "telemetry-contribution-v0.1",
-        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-07-25.3",
+        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
         privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
         destinationOrigin: "https://contribute.example.test/collect"
       }
@@ -3135,9 +3301,9 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   // only for Ad hoc, App Store Connect, and Development distribution, so a
   // Developer ID build can never carry the entitlement.
   assert.equal(/Use Apple sign-in from the app/u.test(html), false);
-  assert.match(html, /irreversible sign-in hash/u);
-  assert.match(html, /never your email or name/u);
-  assert.match(html, /Local-only\s+use needs no account\./u);
+  assert.match(html, /cannot be turned back into your email/u);
+  assert.match(html, /cannot be turned back into your email\s+or your name/u);
+  assert.match(html, /Using TiboTattle on your own needs no account\./u);
 
   // A real signed-in state: a provider badge, which provider it is, and a way
   // out. The copy must not imply that leaving deletes anything hosted.
@@ -3167,14 +3333,17 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     /@media \(max-width: 760px\)[\s\S]*?\.topbar \.button\.compact \{ display: none; \}/u,
   );
   assert.match(html, />\s*Sign out\s*</u);
-  assert.match(html, /Signing out ends this browser's contribution session/u);
+  assert.match(html, /Signing out ends this app's contribution session/u);
   assert.doesNotMatch(html, /Hosted privacy controls remain available separately/u);
   assert.doesNotMatch(html, /metadata already contributed\s+stays until you delete it/u);
   assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
 
   assert.match(appSource, /function configuredGoogleClientId\(\)/u);
   assert.match(appSource, /function hostedSignInRequired\(\)/u);
-  assert.match(appSource, /hostedSignInRequired\(\)\s*\|\|/u);
+  assert.match(
+    appSource,
+    /button\.disabled = communityConnectBusy[\s\S]{0,240}?hostedSignInRequired\(\)/u,
+  );
   assert.match(appSource, /identity: hostedIdentity/u);
   // Both providers run the same server-owned handoff: a start that returns an
   // unguessable state, and a bounded poll for the one-time result. Neither
@@ -3211,7 +3380,7 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
   assert.match(pollBody, /if \(attempt\.returnedToApp\)/u);
   assert.match(
     pollBody,
-    /t\("contribution\.signInIncomplete", \{/u,
+    /"contribution\.signInIncomplete"/u,
   );
   assert.match(pollBody, /openHostedSignInInBrowser\(request\.authorizeUrl\)/u);
   assert.match(pollBody, /waitForHostedSignInPoll\(attempt\)/u);
@@ -3927,7 +4096,7 @@ test("public interface is dashboard-first and never substitutes demo data automa
   assert.match(html, /id="timeline-chart"/u);
   assert.match(html, /id="accounting"/u);
   assert.match(html, /Usage changes/u);
-  assert.match(html, /Observed allowance remaining/u);
+  assert.match(html, /Seven-day allowance remaining/u);
   assert.match(html, /id="community"/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.match(html, /id="community-connect-consent"/u);
@@ -4141,15 +4310,15 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.doesNotMatch(adminSource, /toLocaleString/);
   assert.match(appSource, /periodEndAt/);
   assert.match(appSource, /point\.periodEndAt \?\? point\.timestamp/);
-  assert.match(appSource, /Usage change without reviewed price/);
+  assert.match(appSource, /chart\.status\.unpricedLocalActivity/u);
   assert.doesNotMatch(appSource, /component\.unpricedTokens|tokensWithUnpriced/);
   assert.doesNotMatch(appSource, /accounting\.pricing\.evidenceStarts/);
   assert.match(styles, /native-dashboard #setup-card/);
   assert.match(appSource, /timelineStatusLabel/);
   assert.match(appSource, /recent_7d_partial/);
   assert.match(appSource, /historyCoverageLabel|thirtyDayCoverageWarning/u);
-  assert.match(appSource, /Window boundary or track change/);
-  assert.match(appSource, /Movement needs context/);
+  assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
+  assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
   assert.match(appSource, /Calculating usage and allowance/);
   assert.match(html, /id="calibration-range-controls"/);
   assert.match(html, /id="weekly-range-controls"/);
@@ -4165,7 +4334,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     "rolling window controls stay inside advanced calibration",
   );
   assert.match(appSource, /row\?\.last_observed_at \?\? row\?\.first_observed_at/);
-  assert.match(appSource, /label: "Short observation"/);
+  assert.match(appSource, /label: \{ key: "weekly\.series\.shortObservation" \}/u);
   assert.match(appSource, /lookbackHours: activeContributionLookbackHours/);
   assert.match(styles, /interactive-chart/);
   assert.match(styles, /chart-status-missing/);
@@ -4191,7 +4360,7 @@ test("default calibration view explains the fitted rate and uncertainty plainly"
     assert.match(html, new RegExp(`id="${id}"`));
   }
   assert.match(appSource, /function renderCalibrationRate/);
-  assert.match(appSource, /t\("dashboard\.calibration\.perPoint"/u);
+  assert.match(appSource, /"dashboard\.calibration\.perPoint"/u);
   assert.match(appSource, /t\("dashboard\.calibration\.withRange"/u);
   assert.match(appSource, /t\("dashboard\.calibration\.withoutRange"/u);
 });
@@ -4215,7 +4384,6 @@ test("weekly view keeps pricing provenance with accounting and removes the obsol
   assert.doesNotMatch(appSource, /function renderWeeklyPricingReceipt|renderWeeklyPricingReceipt\(/u);
   assert.doesNotMatch(styles, /\.weekly-pricing-receipt/u);
   assert.match(appSource, /pricingRegistryProvenance\(pricing\)/u);
-  assert.match(appSource, /accounting\.pricing\.thirtyDayCoverageWarning/u);
 });
 
 test("weekly keeps every fit visible and marks short observations separately", async () => {
@@ -4256,6 +4424,414 @@ test("the weekly evidence slider is bounded below 100 and cannot create an accid
   assert.match(appSource, /activeWeeklyMinimumObservedSpanPp = Math\.min\(99, Math\.max\(0, Number\(event\.target\.value\)\)\)/u);
 });
 
+test("chart tick labels stay compact and take their resolution from the axis span", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const CHART_TICK_TIME_ONLY_SPAN_MS");
+  const end = appSource.indexOf("\n/**\n * Whether a series draws its data points", start);
+  assert.ok(start >= 0 && end > start, "the tick label formatter is available");
+  const formatChartTimeLabel = Function(
+    "t", "finite", "getFormattingLocale", "USER_TIME_ZONE", "formatChartTimestamp",
+    `${appSource.slice(start, end)}\nreturn formatChartTimeLabel;`,
+  )(
+    () => "Unknown",
+    (value, fallback = null) => typeof value === "number" && Number.isFinite(value) ? value : fallback,
+    () => "en-US",
+    "America/New_York",
+    () => "fallback",
+  );
+
+  const at = Date.parse("2026-07-15T18:04:00.000Z");
+  const hour = 3_600_000;
+  assert.equal(formatChartTimeLabel(at, { spanMs: 24 * hour }), "2:04 PM");
+  assert.equal(formatChartTimeLabel(at, { spanMs: 7 * 24 * hour }), "Jul 15");
+  assert.equal(formatChartTimeLabel(at, { spanMs: 31 * 24 * hour }), "Jul 15");
+  assert.equal(formatChartTimeLabel(at, { spanMs: 3 * 365 * 24 * hour }), "Jul 2026");
+  assert.equal(formatChartTimeLabel("not a timestamp"), "Unknown");
+  for (const spanMs of [24 * hour, 7 * 24 * hour, 31 * 24 * hour, 3 * 365 * 24 * hour, null]) {
+    const label = formatChartTimeLabel(at, { spanMs });
+    assert.doesNotMatch(label, / at /u, "no ICU date/time connective on a tick");
+    assert.doesNotMatch(label, /EDT|EST|GMT|UTC|Eastern/u, "no zone name on a tick");
+    assert.ok(label.length <= 18, `tick stays compact: ${label}`);
+  }
+  // Compact labels made rotation unnecessary, so no chart asks for it.
+  assert.doesNotMatch(appSource, /rotateXTickLabels/u);
+});
+
+test("the weekly headline is a stable all-data median and says so on screen", async () => {
+  // One estimate a week for a year, so the range buttons and the span slider
+  // genuinely select different subsets of the same evidence.
+  const weeklyValues = Array.from({ length: 52 }, (_, index) => ({
+    last_observed_at: new Date(Date.UTC(2025, 7, 6) + index * 7 * 86_400_000).toISOString(),
+    value_usd: 1500 + (index % 7) * 110,
+    displayed_span_pp: index % 3 === 0 ? 22 : 55 + (index % 5) * 8,
+    pairwise_p10_usd: 1400,
+    pairwise_p90_usd: 2100,
+  }));
+  const data = {
+    weekly: {
+      summary: {
+        median_weekly_value_usd: 1825,
+        lower_80_across_resets_usd: 1650,
+        upper_80_across_resets_usd: 2000,
+        qualifying_resets: 52,
+      },
+      weeklyValues,
+    },
+  };
+
+  const views = await Promise.all([
+    { span: 50, rangeDays: 7 },
+    { span: 50, rangeDays: 31 },
+    { span: 50, rangeDays: 36_500 },
+    { span: 0, rangeDays: 36_500 },
+    { span: 90, rangeDays: 36_500 },
+  ].map((view) => renderWeeklyHero(data, view)));
+
+  assert.equal(
+    new Set(views.map((view) => view.estimate)).size,
+    1,
+    "the headline never moves when a chart control moves",
+  );
+  assert.equal(
+    new Set(views.map((view) => view.range)).size,
+    1,
+    "the across-reset range never moves when a chart control moves",
+  );
+  assert.equal(views[0].label, "All-data median estimate");
+  assert.match(views[0].range, /all data/u, "the range names the population it summarizes");
+  assert.equal(
+    new Set(views.map((view) => view.explanation)).size,
+    views.length,
+    "the explanation reports the subset each view is drawing",
+  );
+  for (const view of views) {
+    assert.match(view.explanation, /never moves with the controls below/u);
+    assert.match(view.explanation, /drawing \d+ of 52 estimates/u);
+  }
+  assert.match(views[0].explanation, /drawing 1 of 52/u);
+  assert.match(views[2].explanation, /drawing 34 of 52/u);
+  assert.match(views[3].explanation, /drawing 52 of 52/u);
+  assert.equal(views[0].timeZone, "Times shown in Eastern Time.");
+
+  const spanish = await renderWeeklyHero(data, { span: 50, rangeDays: 31, locale: "es" });
+  assert.match(spanish.explanation, /nunca cambia con los controles/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    assert.ok(
+      translate("weekly.headline.relationship", {}, locale).length > 40,
+      `${locale} states the headline/chart relationship`,
+    );
+  }
+});
+
+test("reset boundaries tolerate the provider's timestamp jitter but not a real reset", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const RESET_BOUNDARY_TOLERANCE_MS");
+  const end = appSource.indexOf("\nfunction liveTimelinePoints(", start);
+  assert.ok(start >= 0 && end > start, "reset boundary comparison is available");
+  const { sameResetBoundary } = Function(
+    `${appSource.slice(start, end)}\nreturn { sameResetBoundary };`,
+  )();
+
+  const base = "2026-08-07T12:00:00.000Z";
+  const drifted = (seconds) => new Date(Date.parse(base) + seconds * 1_000).toISOString();
+
+  // The observed restatement drift across this corpus is 1–22 seconds.
+  for (const seconds of [0, 1, 7, 22, 60, 119]) {
+    assert.equal(
+      sameResetBoundary(base, drifted(seconds)),
+      true,
+      `${seconds}s of restatement drift is the same reset`,
+    );
+  }
+  // A genuine change moves the boundary by hours: the short window is five
+  // hours and the long one is seven days.
+  for (const seconds of [600, 5 * 3_600, 7 * 86_400]) {
+    assert.equal(
+      sameResetBoundary(base, drifted(seconds)),
+      false,
+      `${seconds}s apart is a different reset`,
+    );
+  }
+  assert.equal(sameResetBoundary(null, base), false);
+  assert.equal(sameResetBoundary(base, null), false);
+  assert.equal(sameResetBoundary("not-a-time", "not-a-time"), true);
+  assert.equal(sameResetBoundary("not-a-time", "other"), false);
+
+  // The reported false-flag rate: one window in ten restated its boundary.
+  const windows = Array.from({ length: 1_000 }, (_, index) => [
+    base,
+    drifted(index % 10 === 0 ? 1 + (index % 22) : 0),
+  ]);
+  assert.equal(windows.filter(([a, b]) => a !== b).length, 100, "the fixture reproduces the jitter");
+  assert.equal(
+    windows.filter(([a, b]) => !sameResetBoundary(a, b)).length,
+    0,
+    "no jittered window is flagged as a reset or track change",
+  );
+});
+
+test("inspect exact periods keeps comparable rows instead of filling with Not comparable", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function balancedInspectionRows(");
+  const end = appSource.indexOf("\nfunction renderResiduals(", start);
+  assert.ok(start >= 0 && end > start, "inspection row selection is available");
+  const balancedInspectionRows = Function(
+    `${appSource.slice(start, end)}\nreturn balancedInspectionRows;`,
+  )();
+
+  const day = (index) => `2026-07-${String(index).padStart(2, "0")}T00:00:00.000Z`;
+  const unmatched = Array.from({ length: 40 }, (_, index) => ({
+    timestamp: day(index + 1),
+    status: "missing_quota_bracket",
+    residual: null,
+  }));
+  const comparable = Array.from({ length: 25 }, (_, index) => ({
+    timestamp: day(index + 1).replace("T00", "T12"),
+    status: "matched",
+    residual: 25 - index,
+  }));
+
+  // The previous ordering concatenated the unbounded unmatched list first.
+  const previous = [...unmatched, ...comparable]
+    .filter((row, index, rows) =>
+      rows.findIndex((candidate) => candidate.timestamp === row.timestamp) === index)
+    .slice(0, 8);
+  assert.equal(
+    previous.filter((row) => row.residual !== null).length,
+    0,
+    "the fixture reproduces the all-Not-comparable table",
+  );
+
+  const rows = balancedInspectionRows(unmatched, comparable, 8);
+  assert.equal(rows.length, 8);
+  const withResiduals = rows.filter((row) => row.residual !== null);
+  assert.equal(withResiduals.length, 4, "comparable periods get their reserved half");
+  assert.deepEqual(
+    withResiduals.map((row) => Math.abs(row.residual)).sort((left, right) => right - left),
+    [25, 24, 23, 22],
+    "the largest residuals are the comparable rows that survive",
+  );
+  const times = rows.map((row) => Date.parse(row.timestamp));
+  assert.deepEqual(times, [...times].sort((left, right) => right - left), "newest first");
+
+  // Either half alone still fills the table, and a shared timestamp is not
+  // printed twice.
+  assert.equal(balancedInspectionRows(unmatched, [], 8).length, 8);
+  assert.equal(balancedInspectionRows([], comparable, 8).length, 8);
+  assert.equal(balancedInspectionRows([], [], 8).length, 0);
+  assert.equal(
+    balancedInspectionRows(
+      [{ timestamp: day(3), residual: null }],
+      [{ timestamp: day(3), residual: 9 }, { timestamp: day(4), residual: 1 }],
+      8,
+    ).length,
+    2,
+  );
+});
+
+test("chart timestamps are composed, so no ICU connective or duplicate zone name reaches a chart", () => {
+  const at = "2026-07-15T18:04:00.000Z";
+  const stamped = formatChartTimestamp(at);
+  assert.doesNotMatch(stamped, / at /u, "no localized date/time connective");
+  assert.doesNotMatch(stamped, /EDT|EST|GMT|UTC/u, "the zone is stated once in the caption, not per point");
+  assert.match(stamped, / · /u, "the two halves are joined by a separator we choose");
+  assert.equal(formatChartTimestamp(at, { dateOnly: true }).includes("·"), false);
+  assert.equal(formatChartTimestamp("not a timestamp"), "Unknown");
+  // The caption's zone name is derived, never assumed.
+  assert.equal(
+    formatTimeZoneLabel({ locale: "en-US", timeZone: "Europe/Berlin", value: at }),
+    "Central European Time",
+  );
+  assert.equal(
+    formatTimeZoneLabel({ locale: "en-US", timeZone: "Asia/Tokyo", value: at }),
+    "Japan Standard Time",
+  );
+});
+
+test("allowance history draws visible evidence dots while the dense usage timeline does not", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const points = [0, 1, 2, 3].map((index) => ({
+    timestamp: new Date(Date.UTC(2026, 0, 1 + index * 7)).toISOString(),
+    value: 1800 + index * 20,
+    wellObserved: index !== 2,
+  }));
+
+  // The allowance estimate history: sparse points, each one an observed reset.
+  const sparse = lineChart({
+    points,
+    series: [
+      {
+        key: "value",
+        className: "chart-point-weekly-mature",
+        label: { key: "series.wellObserved" },
+        connect: false,
+        pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        markerRadius: (point) => point.wellObserved ? 4 : 0,
+      },
+      {
+        key: "value",
+        className: "chart-point-weekly-partial",
+        label: { key: "series.shortObservation" },
+        connect: false,
+        pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        markerRadius: (point) => point.wellObserved ? 0 : 4,
+      },
+    ],
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
+  });
+  const mature = sparse.querySelectorAll("circle.chart-point-weekly-mature");
+  const partial = sparse.querySelectorAll("circle.chart-point-weekly-partial");
+  const drawn = [...mature, ...partial].filter(
+    (circle) => Number(circle.getAttribute("r")) > 0
+      && !circle.getAttribute("class").includes("chart-point-hit-target"),
+  );
+  assert.equal(
+    drawn.length,
+    points.length,
+    "every reset estimate is drawn exactly once as a visible dot",
+  );
+  assert.equal(
+    mature.filter((circle) => !circle.getAttribute("class").includes("hit-target")).length,
+    3,
+    "well-observed estimates use the filled marker",
+  );
+  assert.equal(
+    partial.filter((circle) => !circle.getAttribute("class").includes("hit-target")).length,
+    1,
+    "the short observation uses the outlined marker",
+  );
+
+  // The dense usage timeline: no dots, but every sample stays reachable. The
+  // rule is per chart, so this opposite answer must be expressible at the same
+  // time as the one above.
+  const dense = lineChart({
+    points,
+    series: [{
+      key: "value",
+      className: "chart-line-value",
+      label: { key: "series.usage" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    }],
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
+  });
+  const hidden = dense.querySelectorAll("circle.chart-line-value");
+  assert.equal(hidden.length, points.length);
+  assert.equal(
+    hidden.every((circle) => circle.getAttribute("class").includes("chart-point-hit-target")),
+    true,
+    "dense samples are hit targets, not drawn dots",
+  );
+  assert.equal(
+    hidden.every((circle) => circle.getAttribute("tabindex") === "0"),
+    true,
+    "hidden samples stay keyboard reachable and hoverable",
+  );
+});
+
+test("a chart series must state its point style and cannot pass untranslated text", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const { lineChart, CHART_POINT_STYLE, chartText } = await loadLineChartRenderer(documentRef);
+  const points = [{ timestamp: "2026-01-01T00:00:00.000Z", value: 1 }];
+  const series = (overrides) => ({
+    key: "value",
+    className: "chart-line-value",
+    label: { key: "series.usage" },
+    pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    ...overrides,
+  });
+  const chart = (overrides) => lineChart({
+    points,
+    series: [series(overrides.series ?? {})],
+    title: overrides.title ?? { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: overrides.yLabel ?? { key: "chart.yLabel" },
+  });
+
+  assert.throws(
+    () => chart({ series: { pointStyle: undefined } }),
+    /needs an explicit pointStyle/u,
+    "a new series cannot inherit a default that hides the owner's data points",
+  );
+  assert.throws(
+    () => chart({ title: "Seven-day allowance estimate history" }),
+    /localization descriptor/u,
+    "hardcoded English cannot reach the SVG title",
+  );
+  assert.throws(
+    () => chart({ yLabel: "7-day allowance ($)" }),
+    /localization descriptor/u,
+    "hardcoded English cannot reach an axis label",
+  );
+  assert.throws(
+    () => chart({ series: { label: "Observed allowance remaining" } }),
+    /localization descriptor/u,
+    "hardcoded English cannot reach a series name",
+  );
+  assert.equal(chartText({ key: "a.b", values: { n: 2 } }), "[a.b] n=2");
+  assert.equal(chartText({ data: "$1,825" }), "$1,825", "source values pass through untranslated");
+  assert.equal(chartText(null), "");
+});
+
+test("chart descriptor keys all exist in the dashboard catalogue", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // Chart text is passed as `{ key: "..." }` descriptors, which the generic
+  // `t("...")` scan in test/localization-system.test.js cannot see. A dotted
+  // name distinguishes a catalogue key from a series' data key ("apiCostUsd").
+  const referenced = [...appSource.matchAll(
+    /\bkey:\s*"([A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+)"/gu,
+  )].map(([, key]) => key);
+  assert.ok(referenced.length >= 20, "chart descriptors are present to check");
+  for (const key of new Set(referenced)) {
+    assert.equal(
+      Object.hasOwn(WEB_MESSAGES, key) || Object.hasOwn(WEB_PLURAL_MESSAGES, key),
+      true,
+      `chart descriptor references a missing localization key: ${key}`,
+    );
+  }
+});
+
+test("the percentage axis uses round quarters rather than the dollar axis tick count", async () => {
+  const documentRef = new FakeSvgDocument(900);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
+  const points = [0, 1, 2].map((index) => ({
+    timestamp: new Date(Date.UTC(2026, 0, 1 + index)).toISOString(),
+    value: 3 + index,
+    remaining: 80 - index * 10,
+  }));
+  const svg = lineChart({
+    points,
+    series: [{
+      key: "value",
+      className: "chart-line-value",
+      label: { key: "series.usage" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    }],
+    secondarySeries: [{
+      key: "remaining",
+      className: "chart-line-allowance",
+      label: { key: "series.remaining" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
+    }],
+    secondaryYLabel: { key: "chart.secondaryYLabel" },
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
+  });
+  const percentLabels = svg.querySelectorAll("text.chart-axis-label")
+    .map((label) => label.textContent)
+    .filter((text) => /^\d+%$/u.test(text));
+  assert.deepEqual(
+    percentLabels,
+    ["100%", "75%", "50%", "25%", "0%"],
+    "the right axis reads in quarters, not 100/67/33/0",
+  );
+});
+
 test("weekly points carry measured ranges with pointer and keyboard detail", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
@@ -4263,11 +4839,11 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
 
   assert.match(
     appSource,
-    /errorBars: \{\s*low: "low",\s*high: "high",\s*className: "chart-error-bar-weekly",\s*label: "Measured range",\s*tooltip: false,/u,
+    /errorBars: \{\s*low: "low",\s*high: "high",\s*className: "chart-error-bar-weekly",\s*label: \{ key: "weekly\.series\.measuredRange" \},\s*tooltip: false,/u,
   );
   assert.match(
     appSource,
-    /confidence: \{[\s\S]*?label: "80% across-reset range",[\s\S]*?format: \(value\) => formatMoney\(value\),[\s\S]*?\},/u,
+    /confidence: \{[\s\S]*?label: \{ key: "weekly\.series\.acrossResetRange" \},[\s\S]*?format: \(value\) => formatMoney\(value\),[\s\S]*?\},/u,
   );
   assert.match(
     appSource,
@@ -4277,17 +4853,24 @@ test("weekly points carry measured ranges with pointer and keyboard detail", asy
     /function renderAllowanceHistoryChart\(history\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.match(weeklyChart, /tooltip: false,/u);
-  assert.match(weeklyChart, /detail: \(point\) => `\$\{formatPp\(point\.observedSpanPp\)\} observed/u);
+  assert.match(weeklyChart, /detail: weeklyPointDetail,/u);
+  assert.match(appSource, /weekly\.point\.detail/u);
   assert.match(appSource, /if \(errorBars\.tooltip !== false\)/u);
   assert.match(styles, /\.chart-error-bar-weekly \.chart-error-bar-line/u);
   assert.match(html, /Each reset estimate is shown with the range supported/u);
-  assert.match(weeklyChart, /markers: false,\s*hitTargets: true/u);
+  // The assertion `/markers: false,\s*hitTargets: true/` used to sit here. It
+  // asserted the defect: it required the allowance chart's reset estimates to
+  // be drawn as invisible hit targets, so restoring the owner's plotted points
+  // would have failed the suite. Removed rather than inverted — a regex over
+  // one renderer's option literals is the wrong instrument for "these dots are
+  // visible". `allowance history draws visible evidence dots…` below renders
+  // the chart and reads the circles back instead.
   assert.doesNotMatch(html, /Per-week within-reset sensitivity|Scroll horizontally on a narrow screen/u);
 });
 
 test("lineChart DOM interactions cover default points, median, band, and narrow ticks", async () => {
   const documentRef = new FakeSvgDocument(900);
-  const lineChart = await loadLineChartRenderer(documentRef);
+  const { lineChart, CHART_POINT_STYLE } = await loadLineChartRenderer(documentRef);
   const points = [0, 1, 2, 3, 4].map((index) => ({
     timestamp: new Date(Date.UTC(2026, 0, 1 + index)).toISOString(),
     value: 100 + index * 4,
@@ -4301,30 +4884,32 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
     series: [{
       key: "value",
       className: "chart-line-value",
-      label: "Observed allowance",
+      label: { key: "series.observedAllowance" },
+      pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
       format: (value) => `$${value}`,
     }],
     secondarySeries: [{
       key: "remaining",
       className: "chart-line-allowance",
-      label: "Allowance remaining",
+      label: { key: "series.allowanceRemaining" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
     }],
     confidence: {
       low: "low",
       high: "high",
-      label: "80% across-reset range",
+      label: { key: "series.acrossResetRange" },
       format: (value) => `$${value}`,
     },
-    title: "Allowance history",
-    description: "Allowance history fixture",
-    yLabel: "Allowance",
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
   });
 
   const markers = svg.querySelectorAll('circle.chart-line-value[tabindex="0"]');
   const secondaryMarkers = svg.querySelectorAll('circle.chart-line-allowance[tabindex="0"]');
   assert.equal(markers.length, points.length, "primary markers are keyboard reachable without per-series opt-in");
   assert.equal(secondaryMarkers.length, points.length, "secondary markers share the same interaction defaults");
-  assert.match(markers[0].getAttribute("aria-label"), /Observed allowance/);
+  assert.match(markers[0].getAttribute("aria-label"), /series\.observedAllowance/);
   markers[0].dispatchEvent({ type: "pointerenter" });
   assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "visible");
   markers[0].dispatchEvent({ type: "pointerleave" });
@@ -4336,7 +4921,7 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
   const band = svg.querySelector(".chart-area-confidence");
   assert.equal(band.getAttribute("role"), "img");
   assert.equal(band.getAttribute("tabindex"), "0");
-  assert.match(band.getAttribute("aria-label"), /80% across-reset range: \$90–\$140/u);
+  assert.match(band.getAttribute("aria-label"), /series\.acrossResetRange.*\$90–\$140/u);
   band.dispatchEvent({ type: "pointerenter" });
   assert.equal(svg.querySelector(".chart-hover-tooltip").getAttribute("visibility"), "visible");
 
@@ -4345,20 +4930,20 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
     series: [{
       key: "median",
       className: "chart-line-weekly-center",
-      label: "Historical median",
-      markers: false,
+      label: { key: "series.allDataMedian" },
+      pointStyle: CHART_POINT_STYLE.HOVER_ONLY,
       lineFocusable: true,
-      lineDetail: (rows) => `${rows.length} reset estimates`,
+      lineDetail: (rows) => ({ key: "series.resetFits", plural: rows.length }),
       format: (value) => `$${value}`,
     }],
-    title: "Allowance history",
-    description: "Allowance history fixture",
-    yLabel: "Allowance",
+    title: { key: "chart.title" },
+    description: { key: "chart.description" },
+    yLabel: { key: "chart.yLabel" },
   });
   const medianLine = medianSvg.querySelector(".chart-line-weekly-center");
   assert.equal(medianLine.getAttribute("role"), "img");
   assert.equal(medianLine.getAttribute("tabindex"), "0");
-  assert.match(medianLine.getAttribute("aria-label"), /Historical median/);
+  assert.match(medianLine.getAttribute("aria-label"), /series\.allDataMedian/);
   const medianHitTargets = medianSvg.querySelectorAll(
     'circle.chart-point-hit-target[tabindex="0"]',
   );
@@ -4380,32 +4965,10 @@ test("lineChart DOM interactions cover default points, median, band, and narrow 
   assert.ok(narrowVisible.length < initialVisible.length, "narrow chart sheds labels instead of scrolling");
   assert.equal(narrowVisible.length, 2, "narrow chart retains only endpoint labels");
 
-  const rotatedSvg = lineChart({
-    points,
-    series: [{
-      key: "value",
-      className: "chart-line-value",
-      label: "Observed allowance",
-      markers: false,
-    }],
-    title: "Rotated timeline labels",
-    description: "Endpoint-aligned labels stay inside the chart",
-    yLabel: "Allowance",
-    rotateXTickLabels: true,
-  });
-  const rotatedLabels = rotatedSvg.querySelectorAll("text")
-    .filter((label) => label.getAttribute("transform")?.startsWith("rotate(-24"));
-  assert.ok(rotatedLabels.length >= 3, "rotated timeline keeps a useful tick set");
-  assert.equal(
-    rotatedLabels[0].getAttribute("text-anchor"),
-    "start",
-    "the first rotated label grows into the plot instead of clipping left",
-  );
-  assert.equal(
-    rotatedLabels.at(-1).getAttribute("text-anchor"),
-    "end",
-    "the last rotated label grows into the plot instead of clipping right",
-  );
+  // The rotated-tick-label variant used to be exercised here. Rotation is gone:
+  // a tick now reads "Jul 15" or "2:04 PM", so the -24° transform and its 66px
+  // gutter only made short labels harder to read. Compact tick shapes are
+  // covered by `chart tick labels stay compact…` below.
 });
 
 test("accounting controls hide unavailable history and enable it when indexed evidence exists", async () => {
@@ -4549,10 +5112,7 @@ test("calibration zoom moves in bounded granular steps on every input device", a
   assert.match(appSource, /zoomTimeline\(points, TIMELINE_BUTTON_ZOOM_STEP\)/u);
   assert.doesNotMatch(appSource, /zoomTimeline\([^)]*1\.35|zoomTimeline\([^)]*\.74/u);
   // The zoom level itself has to be readable without seeing the chart.
-  assert.match(
-    appSource,
-    /t\("dashboard\.timeline\.status", \{/u,
-  );
+  assert.match(appSource, /"dashboard\.timeline\.status"/u);
 });
 
 test("residuals span the calibration range and show uncomputable windows as gaps", async () => {
@@ -4577,7 +5137,7 @@ test("residuals span the calibration range and show uncomputable windows as gaps
     /const computed = residuals\.filter\(\(row\) => row\.residual !== null\);/u,
   );
   assert.match(appSource, /function residualGapReasons/u);
-  assert.match(appSource, /t\("dashboard\.residual\.partial", \{/u);
+  assert.match(appSource, /"dashboard\.residual\.partial"/u);
   assert.match(html, /id="residual-coverage"/u);
   assert.match(html, /Quiet periods with no\s+activity and no quota change are neutral, not errors/u);
 });
@@ -4619,8 +5179,8 @@ test("weekly details keep reset evidence concise and do not present speed covera
   assert.match(html, /<th scope="col">Observed<\/th>[\s\S]*?<th scope="col">Observed span<\/th>[\s\S]*?<th scope="col">Estimate<\/th>[\s\S]*?<th scope="col">Measured range<\/th>[\s\S]*?<th scope="col">Status<\/th>/u);
   assert.doesNotMatch(html, /Evidence available \/ reset due|Speed known|Known speed coverage/u);
   assert.doesNotMatch(tableSource, /resetDueAt|speedCoverage|known_speed_fraction/u);
-  assert.match(tableSource, /Well observed/u);
-  assert.match(tableSource, /Short observation/u);
+  assert.match(tableSource, /weekly\.table\.wellObserved/u);
+  assert.match(tableSource, /weekly\.series\.shortObservation/u);
   assert.match(appSource, /function isWellObservedWeeklyFit\(observedSpanPp\)/u);
   assert.doesNotMatch(appSource, /function renderWeeklyTrend|function renderWeeklyStats/u);
 });
@@ -4678,7 +5238,7 @@ test("community UI stays focused on one reviewed destination", async () => {
   assert.match(html, /id="community-contribution-disclosure"/u);
   assert.match(html, /id="sync-inspect"/u);
   assert.match(html, /id="sync-run-once"/u);
-  assert.match(html, /Delayed community evidence is published on the public website/u);
+  assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.doesNotMatch(html, /Community backend readiness|data lifecycle|Your contributed evidence/iu);
   assert.doesNotMatch(appSource, /renderBackendHealth|renderPersonalStats|renderCommunitySnapshot/u);
@@ -4727,8 +5287,8 @@ test("new enrollment pairs immediately and intentionally discards recovery capab
     /async function connectCommunityContribution\(\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
   assert.doesNotMatch(enrollmentBody, /recoveryCode/u);
-  assert.match(enrollmentBody, /pairing = enrollment\.pairing;/u);
-  assert.match(enrollmentBody, /await finishCommunityDevicePairing\(pairing, status\);/u);
+  assert.match(enrollmentBody, /return enrollment\.pairing;/u);
+  assert.match(enrollmentBody, /finishCommunityDevicePairing\(pairing, status\)/u);
   assert.doesNotMatch(appSource, /pendingCommunityPairing/u);
   assert.doesNotMatch(appSource, /acknowledgeRecoveryAndConnect/u);
   assert.doesNotMatch(appSource, /showRecoveryCodeOnce/u);
@@ -4762,9 +5322,10 @@ test("primary contribution journey connects the Mac for one reviewed send withou
     assert.match(html, new RegExp(`id="${id}"`, "u"));
   }
   assert.match(html, /Share one anonymous summary/u);
-  assert.match(html, /reviewed, content-free result/u);
-  assert.match(html, /I consent to review and submit this metadata/u);
-  assert.match(html, /Review contribution/u);
+  assert.match(html, /You see it\s+before anything is sent/u);
+  assert.match(html, /I want to review a summary and decide whether to send it/u);
+  // The primary button names the network action it performs.
+  assert.match(html, /id="connect-community"[\s\S]{0,80}Connect this Mac/u);
   const consentTag =
     html.match(/<input id="community-connect-consent"[^>]*>/u)?.[0] ?? "";
   assert.doesNotMatch(consentTag, /\bchecked\b/u);
@@ -4780,7 +5341,7 @@ test("primary contribution journey connects the Mac for one reviewed send withou
   );
   assert.match(
     appSource,
-    /enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;\s*\n\s*const enrollment = await communityClient\.enroll/u,
+    /enrollmentAttemptedWithHostedIdentity = hostedIdentity !== null;[\s\S]{0,240}?await communityClient\.enroll/u,
   );
   assert.match(
     appSource,
@@ -4804,13 +5365,13 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.ok(communityPosition >= 0 && communityPosition < footerPosition);
   assert.doesNotMatch(html, /id="data"|id="coverage"|data-nav="data"|Data &amp; Privacy|05 · READING THE ESTIMATE|When to treat this as an estimate/iu);
   assert.match(html, /What leaves this Mac — and what never does/u);
-  assert.match(html, /Improve community estimates with one reviewed, content-free result\./u);
-  assert.match(html, /Shared: timestamps, token counts, safe model labels/u);
-  assert.match(html, /Never shared: prompts, responses, reasoning, files, paths/u);
-  assert.match(html, /Hosted participation uses Google or Apple/u);
-  assert.match(html, /I consent to review and submit this metadata/u);
+  assert.match(html, /Help improve community estimates by sharing one summary\./u);
+  assert.match(html, /Shared: times, token counts, model names/u);
+  assert.match(html, /Never shared: anything you typed or a model wrote/u);
+  assert.match(html, /Contributing uses your Google or Apple sign-in/u);
+  assert.match(html, /I want to review a summary and decide whether to send it/u);
   assert.match(html, /id="contribution-not-now"/u);
-  assert.match(html, /Delayed community evidence is published on the public website/u);
+  assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.match(html, /id="community-contribution-disclosure"/u);
   assert.match(html, /id="prepare-contribution"/u);
@@ -4872,8 +5433,8 @@ test("contribution UI prepares a concise local review before one explicit send",
   assert.match(html, /id="sync-next-records"/u);
   assert.match(html, /id="sync-next-cost"/u);
   assert.match(html, /id="sync-next-bytes"/u);
-  assert.match(html, /Review prepared summary/u);
-  assert.match(html, /Send reviewed summary/u);
+  assert.match(html, /Review summary/u);
+  assert.match(html, /Send summary/u);
   assert.match(appSource, /validateContributionForUpload\(value\.payload\)/u);
   assert.doesNotMatch(appSource, /renderCollector|renderIndexProgress|collector-details|index-progress/u);
   assert.match(appSource, /prepareLocalContribution/);
@@ -4890,7 +5451,7 @@ test("contribution UI prepares a concise local review before one explicit send",
     /communityClient\.enroll\(\s*null,\s*"telemetry-contribution-v0\.1",/u,
   );
   assert.doesNotMatch(appSource, /sessionStorage|localStorage|accessToken|Bearer/);
-  assert.match(html, /Delayed community evidence is published on the public website/u);
+  assert.match(html, /See what the community published/u);
   assert.doesNotMatch(appSource, /loadCommunityResults\(\).*renderSharedCommunitySnapshot/su);
 });
 
@@ -5518,13 +6079,160 @@ test("result panels show the number and its caveat, not the service plumbing", a
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(html, /id="community"/u);
-  assert.match(html, /Improve community estimates with one reviewed, content-free result/u);
-  assert.match(html, /Delayed community evidence is published on the public website/u);
+  assert.match(html, /Help improve community estimates by sharing one summary/u);
+  assert.match(html, /See what the community published/u);
   assert.match(html, /https:\/\/tibotattle\.com\/#community/u);
   assert.match(html, /id="sync-next-coverage"/u);
   assert.match(html, /id="sync-next-cost"/u);
   assert.doesNotMatch(html, /community-snapshot-provenance|backend-service-detail|backend-readiness-note|result-panels|contribution-history/iu);
   assert.doesNotMatch(appSource, /renderBackendHealth|renderPersonalStats|renderSharedCommunitySnapshot|community-snapshot-service-detail/u);
+});
+
+test("a language change re-translates every localized node from the registry", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("const localizedNodes = new Map();");
+  const end = appSource.indexOf("function rawNode(", start);
+  assert.ok(start >= 0 && end > start, "the localized-node registry is available");
+
+  let locale = "en-US";
+  const registry = Function(
+    "t",
+    "tPlural",
+    "node",
+    `${appSource.slice(start, end)}\nreturn { setLocalizedText, setLocalizedPluralText, setRawText, retranslateLocalizedNodes, localizedNode };`,
+  )(
+    (key, values = {}) => `${locale}:${key}:${JSON.stringify(values)}`,
+    (key, count) => `${locale}:${key}:${count}`,
+    (_tag, _className, text) => ({ isConnected: true, textContent: String(text ?? "") }),
+  );
+
+  const element = (
+    { isConnected: true, textContent: "", removeAttribute() {}, setAttribute() {} }
+  );
+  registry.setLocalizedText(element, "contribution.signInStarting", { provider: "Google" });
+  assert.equal(element.textContent, 'en-US:contribution.signInStarting:{"provider":"Google"}');
+
+  // The renderer that wrote this line is never named anywhere: switching the
+  // language re-translates it because it was written, not because someone
+  // remembered to add it to a list.
+  locale = "es";
+  registry.retranslateLocalizedNodes();
+  assert.equal(element.textContent, 'es:contribution.signInStarting:{"provider":"Google"}');
+
+  // Raw provider/user data hands ownership back and is never re-translated.
+  registry.setRawText(element, "gpt-5.6-sol");
+  locale = "zh-Hans";
+  registry.retranslateLocalizedNodes();
+  assert.equal(element.textContent, "gpt-5.6-sol");
+
+  // A node removed from the document is dropped rather than retained forever.
+  const detached = { isConnected: false, textContent: "", removeAttribute() {} };
+  registry.setLocalizedText(detached, "contribution.signInCancelled");
+  registry.retranslateLocalizedNodes();
+  assert.equal(detached.textContent, "zh-Hans:contribution.signInCancelled:{}");
+  locale = "en-US";
+  registry.retranslateLocalizedNodes();
+  assert.equal(detached.textContent, "zh-Hans:contribution.signInCancelled:{}");
+
+  // The locale switch entry point no longer carries a hand-maintained list of
+  // renderers to call again; it redraws state and then re-translates.
+  const rerender = appSource.match(
+    /function rerenderLocalizedDashboard\(\) \{([\s\S]*?)\n\}\n/u,
+  )?.[1];
+  assert.ok(rerender, "the locale re-render entry point is available");
+  assert.match(rerender, /retranslateLocalizedNodes\(\);/u);
+  assert.doesNotMatch(
+    rerender,
+    /renderHostedIdentity\(\)|renderPreparationIdentity\(|renderContributionSyncStatus\(|renderContributionSyncPreview\(|renderLocalOnboarding\(/u,
+  );
+});
+
+test("the model table separates allowance tracks and never conflates zero with unpriced", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function modelUsageRows(accounting) {");
+  const end = appSource.indexOf("function renderAccountingModels(", start);
+  assert.ok(start >= 0 && end > start, "the model-table helpers are available");
+  const countStart = appSource.indexOf("function formatCount(value) {");
+  const countEnd = appSource.indexOf("function formatDecimal(", countStart);
+  assert.ok(countStart >= 0 && countEnd > countStart, "the count formatter is available");
+
+  const table = Function(
+    "node",
+    "setLocalizedText",
+    "setRawText",
+    "t",
+    "finite",
+    "formatNumber",
+    "formatApiMoney",
+    `${appSource.slice(start, end)}\n${appSource.slice(countStart, countEnd)}`
+      + "\nreturn { modelUsageRows, modelApiEquivalentCell, formatCount };",
+  )(
+    () => ({ title: "", textContent: "" }),
+    (element, key) => { element.textContent = key; },
+    (element, value) => { element.textContent = value; },
+    (key) => key,
+    (value, fallback = null) =>
+      (typeof value === "number" && Number.isFinite(value) ? value : fallback),
+    (value, options) => new Intl.NumberFormat("en-US", options).format(value),
+    (value) => new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value),
+  );
+
+  const row = (model, extra) => ({
+    model,
+    events: 1,
+    totalTokens: 1,
+    apiPriceEquivalentUsd: 0,
+    pricingStatus: "priced",
+    allowanceTrack: "primary",
+    apiPriceEquivalentApplicable: true,
+    ...extra,
+  });
+
+  // Spark is metered separately, so it gets its own row and sorts last: there
+  // is no money figure to rank it against the primary pool with.
+  const rows = table.modelUsageRows({
+    byModel: [row("gpt-5.6-sol", { apiPriceEquivalentUsd: 12 })],
+    spark: {
+      byModel: [row("gpt-5.3-codex-spark", {
+        allowanceTrack: "spark",
+        pricingStatus: "known_unpriced",
+        apiPriceEquivalentApplicable: false,
+      })],
+    },
+  });
+  assert.deepEqual(rows.map((item) => item.model), [
+    "gpt-5.6-sol",
+    "gpt-5.3-codex-spark",
+  ]);
+
+  // Four situations one em dash used to cover, now four different sentences.
+  const cellText = (candidate) =>
+    table.modelApiEquivalentCell(candidate).textContent;
+  assert.equal(cellText(rows[1]), "accounting.model.separateAllowance");
+  assert.equal(
+    cellText(row("codex-auto-review", { pricingStatus: "known_unpriced" })),
+    "accounting.model.noPublishedPrice",
+  );
+  assert.equal(
+    cellText(row("unknown", { pricingStatus: "unrecognized" })),
+    "accounting.model.notPricedUnknown",
+  );
+  assert.equal(
+    cellText(row("gpt-5.4", { apiPriceEquivalentUsd: null })),
+    "accounting.model.notReported",
+  );
+  assert.equal(cellText(row("gpt-5.5")), "$0.00");
+
+  // One formatter for the count columns: "154,900" beside "74", never
+  // "154.9K" beside "74".
+  assert.equal(table.formatCount(154_900), "154,900");
+  assert.equal(table.formatCount(74), "74");
+  assert.equal(table.formatCount(null), "accounting.model.notReported");
 });
 
 test("failure copy is chosen from fixed maps and never echoes a server string", async () => {
@@ -5594,10 +6302,25 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     connect,
     /Check service availability and Keychain access/u,
   );
-  assert.match(
-    connect,
+  // Each connect step owns its own failure sentence, so an unexplained code
+  // still names the step that stopped rather than one generic paragraph.
+  assert.doesNotMatch(
+    appSource,
     /The cause was not reported in a form this page can explain/u,
   );
+  assert.match(connect, /contributionConnectStep\(\s*"service_check"/u);
+  assert.match(connect, /contributionConnectStep\(\s*"hosted_enrollment"/u);
+  assert.match(connect, /contributionConnectStep\(\s*"device_pairing"/u);
+  for (const stepId of Object.keys({
+    service_check: 0,
+    hosted_enrollment: 0,
+    device_pairing: 0,
+    queue_refresh: 0,
+    local_preparation: 0,
+    local_review: 0,
+  })) {
+    assert.match(appSource, new RegExp(`${stepId}: Object\\.freeze\\(\\{`, "u"));
+  }
   for (const code of [
     "BODY_INVALID",
     "CONTENT_TYPE_INVALID",
@@ -5607,20 +6330,26 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   ]) {
     assert.match(appSource, new RegExp(`${code}:`, "u"));
   }
+  // Reporting a connect failure is its own function now, so the one-use
+  // hosted proof handling is asserted where it lives.
+  const connectFailure = appSource.match(
+    /async function reportContributionConnectFailure\([\s\S]*?\n\}\n/u,
+  )?.[0];
+  assert.ok(connectFailure, "the connect failure reporter is available");
   assert.match(
-    connect,
+    connectFailure,
     /const retryNeedsFreshSignIn = enrollmentAttemptedWithHostedIdentity\s*\n\s*&& !enrollmentEstablished\s*\n\s*&& hostedIdentity !== null;/u,
   );
   assert.match(
-    connect,
+    connectFailure,
     /hostedIdentity = null;\s*\n\s*renderHostedIdentity\(\);/u,
   );
   assert.match(
-    connect,
-    /t\("contribution\.signInDiscarded", \{/u,
+    connectFailure,
+    /"contribution\.signInDiscarded"/u,
   );
   assert.match(
-    connect,
+    connectFailure,
     /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u,
   );
 

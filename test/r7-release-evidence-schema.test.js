@@ -127,9 +127,12 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
   const repositoryRoot = pathToFileURL(`${temporaryRoot}${sep}`);
   try {
     await mkdir(join(temporaryRoot, "src"));
-    await mkdir(join(temporaryRoot, "shared", "telemetry"), {
-      recursive: true,
-    });
+    // `shared/` was dissolved into packages/quota-analysis; the reviewed tree
+    // list follows the code, so the fixture exercises the new location.
+    await mkdir(
+      join(temporaryRoot, "packages", "quota-analysis", "src", "windows"),
+      { recursive: true },
+    );
     await mkdir(join(temporaryRoot, "packages", "accounting", "src"), {
       recursive: true,
     });
@@ -149,8 +152,15 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
       "export const adapter = true;\n",
     );
     await writeFile(
-      join(temporaryRoot, "shared", "telemetry", "module.mjs"),
-      "export const shared = true;\n",
+      join(
+        temporaryRoot,
+        "packages",
+        "quota-analysis",
+        "src",
+        "windows",
+        "module.mjs",
+      ),
+      "export const quotaWindows = true;\n",
     );
     await writeFile(
       join(temporaryRoot, "packages", "accounting", "src", "kernel.js"),
@@ -184,7 +194,7 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
       [
         "src/entry.js",
         "src/providers/adapter.mjs",
-        "shared/telemetry/module.mjs",
+        "packages/quota-analysis/src/windows/module.mjs",
         "packages/accounting/src/kernel.js",
         "packages/accounting/index.js",
         "packages/telemetry-contract/src/contract.js",
@@ -192,7 +202,35 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
       ],
     );
 
-    const unsupported = join(temporaryRoot, "shared", "README.md");
+    // Operating-system metadata is skipped rather than attested, and skipping
+    // it must not pull anything else into the digest.
+    const osMetadata = join(
+      temporaryRoot,
+      "packages",
+      "quota-analysis",
+      "src",
+      ".DS_Store",
+    );
+    await writeFile(osMetadata, "os metadata\n");
+    assert.equal(
+      collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }).includes(
+        "packages/quota-analysis/src/.DS_Store",
+      ),
+      false,
+    );
+    assert.equal(
+      collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }).length,
+      7,
+    );
+    await rm(osMetadata);
+
+    const unsupported = join(
+      temporaryRoot,
+      "packages",
+      "quota-analysis",
+      "src",
+      "README.md",
+    );
     await writeFile(unsupported, "not runtime source\n");
     assert.throws(
       () => collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
@@ -201,8 +239,14 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
     await rm(unsupported);
 
     await symlink(
-      "telemetry/module.mjs",
-      join(temporaryRoot, "shared", "linked-module.mjs"),
+      "windows/module.mjs",
+      join(
+        temporaryRoot,
+        "packages",
+        "quota-analysis",
+        "src",
+        "linked-module.mjs",
+      ),
     );
     assert.throws(
       () => collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),

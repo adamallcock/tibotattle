@@ -62,8 +62,21 @@ const FORBIDDEN_BUILTINS = new Set([
   "node:dns",
   "node:dgram",
 ]);
+// The exact package closure the offline review artifact is allowed to carry.
+// quota-analysis and telemetry-contract joined it when the collector
+// projection and the replay-safe cache stopped reaching into
+// src/export/registries.js directly and began entering the export owner
+// through its reviewed facade, which `source_owner_public_api` requires;
+// importing a facade pulls that facade's whole graph rather than the one
+// module that was wanted. Both are pure computation packages, and the property
+// this artifact exists to guarantee - that nothing in it can reach the network
+// - is enforced separately by FORBIDDEN_BUILTINS below and does not depend on
+// this list. The list stays exact so further growth has to be argued for
+// rather than absorbed.
 const EXPECTED_EXTERNAL_SPECIFIERS = Object.freeze([
   "@app-usagemonitor/identity-core",
+  "@app-usagemonitor/quota-analysis",
+  "@app-usagemonitor/telemetry-contract",
   "@github/keytar",
   "ajv",
 ]);

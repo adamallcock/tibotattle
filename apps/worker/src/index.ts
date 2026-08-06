@@ -539,7 +539,35 @@ async function handleEnroll(request: Request, env: Env): Promise<Response> {
   }, 201, { "set-cookie": sessionCookie(enrollment.session) });
 }
 
-const SIGNIN_HANDOFF_TTL_MILLISECONDS = 5 * 60 * 1000;
+// A handoff row has two phases, and each phase is bounded by its own clock.
+// `expires_at` always holds the deadline of the phase the row is currently in,
+// so exactly one deadline is ever live for a row and the purge query, its
+// index, and the "expired reads as invalid, never as pending" rule are all
+// unchanged.
+//
+// Phase 1 — authorization, from the start route until the provider callback
+// fills the row. The row holds no credential here: an unguessable 384-bit
+// state and a nonce digest, nothing that can be replayed against anything.
+// Its deadline is measured from the instant the state was minted, which is
+// correct, because that is what the deadline bounds: an unused state. What it
+// has to cover, though, is an entire human round trip — a cold-starting
+// browser, an account chooser, a password, a second factor, and Apple's
+// Hide-My-Email decision. Five minutes sits below that; ten is the
+// conventional authorization-request lifetime and matches the provider's own
+// authorization-code lifetime, so a careful reader is no longer refused at the
+// callback for a delay that is not a security event.
+const SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS = 10 * 60 * 1000;
+// Phase 2 — delivery, from the moment the callback mints the opaque proof
+// until the dashboard collects it. The proof IS a bearer credential, so this
+// deadline is measured from the instant it was minted rather than from
+// whatever happened to be left of phase 1. Under the previous single deadline
+// the collectable window was `TTL minus round-trip duration`, which tends to
+// zero in exactly the case a careful user produces: a proof minted at 4:57
+// lived three seconds and expired before the dashboard's next poll. Measuring
+// from the mint gives every proof the same guaranteed window. The ceiling on
+// how long a proof can exist is unchanged at five minutes — only the floor
+// moves, from zero to five minutes.
+const SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS = 5 * 60 * 1000;
 const MAX_APPLE_CALLBACK_BYTES = 16 * 1024;
 // Google returns its authorization code in the redirect's query string. The
 // code itself is bounded by the exchange, and this bounds the whole callback
@@ -938,7 +966,9 @@ async function handleIdentityAppleStart(
     state,
     nonceHash,
     createdAt: nowIso,
-    expiresAt: new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+    expiresAt: new Date(
+      nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
+    ).toISOString(),
   });
   return jsonResponse({
     schemaVersion: "identity-apple-start-v0.1",
@@ -1007,14 +1037,22 @@ async function handleIdentityAppleCallback(
     );
     return failure;
   }
-  // Re-checked against the time the exchange finished, not the time it
-  // started, so a handoff that expired mid-exchange is never filled.
+  // The authorization deadline is re-checked against the time the exchange
+  // finished, not the time it started, so a handoff that expired mid-exchange
+  // is never filled. The same write moves the row into its delivery phase: the
+  // proof being minted here gets its own full window, measured from now, so it
+  // cannot expire between being minted and being collectable however long the
+  // round trip took.
+  const filledAtMs = Date.now();
   const stored = await completeAppleSignInHandoff(
     env.USAGE_MONITOR_DB,
     state,
     verified.linkKeyHex,
     randomSecret(48),
-    new Date().toISOString(),
+    new Date(filledAtMs).toISOString(),
+    new Date(
+      filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS,
+    ).toISOString(),
   );
   if (!stored) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
@@ -1116,7 +1154,9 @@ async function handleIdentityGoogleStart(
     state,
     codeVerifier,
     nowIso,
-    new Date(nowMs + SIGNIN_HANDOFF_TTL_MILLISECONDS).toISOString(),
+    new Date(
+      nowMs + SIGNIN_HANDOFF_AUTHORIZATION_TTL_MILLISECONDS,
+    ).toISOString(),
   ).run();
   return jsonResponse({
     schemaVersion: "identity-google-start-v0.1",
@@ -1196,17 +1236,29 @@ async function handleIdentityGoogleCallback(
     );
     return failure;
   }
-  // Re-checked against the time the exchange finished, not the time it
-  // started, so a handoff that expired mid-exchange is never filled.
+  // The authorization deadline is re-checked against the time the exchange
+  // finished, not the time it started, so a handoff that expired mid-exchange
+  // is never filled. The same write moves the row into its delivery phase on
+  // Apple's terms: `expires_at` becomes the proof's own window, measured from
+  // the instant the proof is minted. SQLite evaluates the WHERE clause against
+  // the pre-update row, so the authorization deadline is still the one being
+  // enforced here.
+  const filledAtMs = Date.now();
   const stored = await env.USAGE_MONITOR_DB.prepare(
     `UPDATE google_signin_handoffs
-        SET code_verifier = NULL, identity_link_key = ?, proof = ?
+        SET code_verifier = NULL, identity_link_key = ?, proof = ?, expires_at = ?
       WHERE state = ?
         AND identity_link_key IS NULL
         AND proof IS NULL
         AND delivered_at IS NULL
         AND expires_at > ?`,
-  ).bind(verified.linkKeyHex, randomSecret(48), state, new Date().toISOString()).run();
+  ).bind(
+    verified.linkKeyHex,
+    randomSecret(48),
+    new Date(filledAtMs + SIGNIN_HANDOFF_DELIVERY_TTL_MILLISECONDS).toISOString(),
+    state,
+    new Date(filledAtMs).toISOString(),
+  ).run();
   if (stored.meta.changes !== 1) return failure;
   return signInCallbackPage(SIGNIN_COMPLETED_MESSAGE, { completed: true });
 }

@@ -337,7 +337,14 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
     appSource,
     /node\("span", "metric-name", localizedQuotaWindowLabel\(window\)\)/u,
   );
-  assert.match(appSource, /setRawText\(titleNode, title\)/u);
+  // The SVG <title>/<desc> pair used to be asserted as `setRawText(titleNode,
+  // title)` — an assertion that the chart's accessible name was whatever raw
+  // string the caller passed, which is exactly the gap that let hardcoded
+  // English into the one text layer the localization bridge cannot see. It is
+  // removed rather than inverted: pinning that call's argument list in a
+  // regex is the wrong instrument for "chart text is localized". The
+  // behavioural cover lives in apps/web/test/lib.test.mjs, where lineChart is
+  // rendered with a fake document and its SVG text is read back.
   assert.match(appSource, /setRawText\(markerTitle, caption\)/u);
   assert.match(appSource, /function renderDashboardUnavailableState\(/u);
   assert.match(appSource, /setLocalizedText\(\$\("#data-source"\), "dashboard\.unavailable\.noRealUsage"\)/u);

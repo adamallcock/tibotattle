@@ -13,6 +13,13 @@ import {
 } from "./codex-transition-miner.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 import {
+  codexModelAllowanceTrack,
+  codexModelApiPriceEquivalentApplicable,
+  codexModelPricingStatus,
+  OPENAI_CODEX_SPARK_MODEL_ID,
+  recognizedCodexModelId,
+} from "./export/index.js";
+import {
   createExportResourceGuard,
   ExportResourceLimitError,
 } from "./export-resource-policy.js";
@@ -43,8 +50,12 @@ import {
 } from "./reporting/index.js";
 import { fastQuotaMultiplier } from "./application/index.js";
 
+// v0.4 adds per-model allowance-track and API-price-applicability state, and
+// the combined `modelUsage` row set. A v0.3 cache cannot be upgraded in place
+// because it never recorded which track a model belonged to, so it is
+// withheld and rebuilt rather than rendered with the fields missing.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.3";
+  "local-replay-safe-accounting-v0.4";
 
 const HISTORICAL_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
@@ -54,7 +65,7 @@ const DEFAULT_WINDOW_DAYS = 31;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
 const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
-const SPARK_MODEL = "gpt-5.3-codex-spark";
+const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
 const PACE_CURRENT_MAX_AGE_MS = 30 * 60_000;
 const PACE_STATUSES = new Set([
   "unavailable",
@@ -83,24 +94,6 @@ const COMPONENT_KEYS = Object.freeze([
   "output_text_tokens",
   "output_reasoning_tokens",
   "output_combined_tokens",
-]);
-const KNOWN_MODELS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5",
-  "gpt-4.1",
-]);
-// Provider-emitted model labels that are safe to display but do not yet have
-// an official API price card. Keeping these distinct from arbitrary unknown
-// labels makes the coverage gap diagnosable without inventing a price or
-// retaining an unbounded metadata channel.
-const KNOWN_UNPRICED_MODELS = new Set([
-  "gpt-5.3-codex-spark",
 ]);
 const SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
 const API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
@@ -210,15 +203,7 @@ function safeEnum(value, allowed) {
 }
 
 function safeModel(value) {
-  return KNOWN_MODELS.has(value) || KNOWN_UNPRICED_MODELS.has(value)
-    ? value
-    : "unknown";
-}
-
-function modelPricingStatus(value) {
-  if (KNOWN_UNPRICED_MODELS.has(value)) return "known_unpriced";
-  if (KNOWN_MODELS.has(value)) return "priced";
-  return "unrecognized";
+  return recognizedCodexModelId(value) ?? "unknown";
 }
 
 function emptyDimension(keys) {
@@ -489,7 +474,10 @@ function eventProjection(event, price) {
   return {
     timestamp: event.timestamp,
     model,
-    modelPricingStatus: modelPricingStatus(event.model),
+    modelPricingStatus: codexModelPricingStatus(event.model),
+    modelAllowanceTrack: codexModelAllowanceTrack(event.model),
+    modelApiPriceEquivalentApplicable:
+      codexModelApiPriceEquivalentApplicable(event.model),
     isSpark: model === SPARK_MODEL,
     components,
     totalTokens,
@@ -635,12 +623,45 @@ function quotaTimelineTrackBucketKey(row) {
   return `${observedMs}:${row.limitId}:${row.slot}:${row.durationMinutes}`;
 }
 
+function quotaTimelineTrackKey(row) {
+  return `${row.limitId}:${row.slot}:${row.durationMinutes}`;
+}
+
+function quotaTimelineBucketKey(row) {
+  const observedMs = Date.parse(row.observedAt);
+  const bucketStartMs = Math.floor(observedMs / TIMELINE_BUCKET_MS)
+    * TIMELINE_BUCKET_MS;
+  return `${bucketStartMs}:${quotaTimelineTrackKey(row)}`;
+}
+
+function quotaTimelineStateKey(row) {
+  return [
+    row.planType,
+    row.usedPercent.toFixed(3),
+    row.resetAt,
+  ].join("\0");
+}
+
 function quotaTimelineRowTieBreak(row) {
   return [
     row.planType,
     row.usedPercent.toFixed(3),
     row.resetAt,
   ].join("\0");
+}
+
+function quotaTimelineRowSort(left, right) {
+  return left.observedAt.localeCompare(right.observedAt)
+    || left.limitId.localeCompare(right.limitId)
+    || left.slot.localeCompare(right.slot)
+    || left.resetAt.localeCompare(right.resetAt)
+    || left.planType.localeCompare(right.planType)
+    || left.usedPercent - right.usedPercent;
+}
+
+function quotaTimelineDeterministicRowSort(left, right) {
+  return quotaTimelineRowSort(left, right)
+    || String(left.durationMinutes).localeCompare(String(right.durationMinutes));
 }
 
 function retainQuotaTimeline(buckets, snapshot, options) {
@@ -657,6 +678,184 @@ function retainQuotaTimeline(buckets, snapshot, options) {
   }
 }
 
+function addQuotaTimelineCandidate(candidates, row, transitionKeys = null) {
+  const key = quotaTimelineTrackBucketKey(row);
+  candidates.set(key, row);
+  if (transitionKeys !== null) transitionKeys.add(key);
+}
+
+function quotaTimelineCandidates(rows) {
+  const candidates = new Map();
+  const transitionKeys = new Set();
+  const previousByTrack = new Map();
+  const bucketEdges = new Map();
+
+  for (const row of rows) {
+    const trackKey = quotaTimelineTrackKey(row);
+    const previous = previousByTrack.get(trackKey);
+    if (previous === undefined
+        || quotaTimelineStateKey(previous) !== quotaTimelineStateKey(row)) {
+      addQuotaTimelineCandidate(candidates, row, transitionKeys);
+    }
+    previousByTrack.set(trackKey, row);
+
+    const bucketKey = quotaTimelineBucketKey(row);
+    const edge = bucketEdges.get(bucketKey);
+    if (edge === undefined) {
+      bucketEdges.set(bucketKey, { first: row, last: row });
+    } else {
+      edge.last = row;
+    }
+  }
+
+  for (const { first, last } of bucketEdges.values()) {
+    addQuotaTimelineCandidate(candidates, first);
+    addQuotaTimelineCandidate(candidates, last);
+  }
+
+  return { candidates, transitionKeys };
+}
+
+function selectTimeStratifiedQuotaTimelineRows(
+  rows,
+  maximum,
+  rangeRows = rows,
+) {
+  if (rows.length <= maximum) return rows;
+  const rangeStartMs = Date.parse(rangeRows[0].observedAt);
+  const rangeEndMs = Date.parse(rangeRows.at(-1).observedAt);
+  if (rangeStartMs === rangeEndMs) {
+    return rows
+      .slice()
+      .sort(quotaTimelineDeterministicRowSort)
+      .slice(0, maximum);
+  }
+
+  const spanMs = rangeEndMs - rangeStartMs;
+  const groups = new Map();
+  for (const row of rows) {
+    const observedMs = Date.parse(row.observedAt);
+    const stratum = Math.min(
+      maximum - 1,
+      Math.floor(((observedMs - rangeStartMs) * maximum) / spanMs),
+    );
+    const group = groups.get(stratum) ?? [];
+    group.push(row);
+    groups.set(stratum, group);
+  }
+
+  const activeGroups = [...groups.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, group]) => ({
+      rows: group.sort(quotaTimelineDeterministicRowSort),
+      nextIndex: 0,
+    }));
+  const selected = [];
+  while (activeGroups.length > 0 && selected.length < maximum) {
+    const nextGroups = [];
+    for (const group of activeGroups) {
+      if (group.nextIndex < group.rows.length) {
+        selected.push(group.rows[group.nextIndex]);
+        group.nextIndex += 1;
+      }
+      if (group.nextIndex < group.rows.length) nextGroups.push(group);
+      if (selected.length >= maximum) break;
+    }
+    activeGroups.splice(0, activeGroups.length, ...nextGroups);
+  }
+  return selected;
+}
+
+// The oldest and newest observation on every track. These are pinned before
+// any sampling so the retained series always reaches both ends of the covered
+// window: the oldest row is what a calibration window near the start of the
+// range needs to bracket against, and the newest row is the current allowance
+// reading.
+function quotaTimelineRangeAnchors(sortedRows) {
+  const firstByTrack = new Map();
+  const lastByTrack = new Map();
+  for (const row of sortedRows) {
+    const key = quotaTimelineTrackKey(row);
+    if (!firstByTrack.has(key)) firstByTrack.set(key, row);
+    lastByTrack.set(key, row);
+  }
+  const anchors = new Map();
+  for (const row of [...firstByTrack.values(), ...lastByTrack.values()]) {
+    anchors.set(quotaTimelineTrackBucketKey(row), row);
+  }
+  return [...anchors.values()].sort(quotaTimelineDeterministicRowSort);
+}
+
+// Time stratification alone is not enough when several tracks share the range:
+// at equal timestamps one slot always sorts first, so a single stratified pass
+// can spend the whole budget on that slot and erase the other one. Give every
+// track its own stratified share and interleave them.
+function selectTrackBalancedQuotaTimelineRows(rows, maximum, rangeRows) {
+  if (rows.length <= maximum) return rows;
+  const byTrack = new Map();
+  for (const row of rows) {
+    const key = quotaTimelineTrackKey(row);
+    const group = byTrack.get(key) ?? [];
+    group.push(row);
+    byTrack.set(key, group);
+  }
+  if (byTrack.size <= 1) {
+    return selectTimeStratifiedQuotaTimelineRows(rows, maximum, rangeRows);
+  }
+  const trackBudget = Math.ceil(maximum / byTrack.size);
+  let tracks = [...byTrack.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, group]) => ({
+      rows: selectTimeStratifiedQuotaTimelineRows(
+        group.sort(quotaTimelineDeterministicRowSort),
+        trackBudget,
+        rangeRows,
+      ).slice().sort(quotaTimelineDeterministicRowSort),
+      nextIndex: 0,
+    }));
+  const selected = [];
+  while (tracks.length > 0 && selected.length < maximum) {
+    const nextTracks = [];
+    for (const track of tracks) {
+      if (selected.length < maximum && track.nextIndex < track.rows.length) {
+        selected.push(track.rows[track.nextIndex]);
+        track.nextIndex += 1;
+      }
+      if (track.nextIndex < track.rows.length) nextTracks.push(track);
+    }
+    tracks = nextTracks;
+  }
+  return selected;
+}
+
+// Fill a hard row budget from priority groups. Each group is stratified over
+// time and balanced across tracks into whatever capacity is left, so a dense
+// recent burst can never crowd out the earlier part of the covered window and
+// the result never exceeds `maximum` — the same ceiling `validQuotaTimeline`
+// enforces on read. A final pass over every candidate spends any capacity a
+// short group left behind.
+function retainBoundedQuotaTimelineRows(groups, maximum, rangeRows) {
+  const retained = new Map();
+  for (const group of [...groups, rangeRows]) {
+    const capacity = maximum - retained.size;
+    if (capacity <= 0) break;
+    const pending = group.filter((row) => (
+      !retained.has(quotaTimelineTrackBucketKey(row))
+    ));
+    if (pending.length === 0) continue;
+    const selected = selectTrackBalancedQuotaTimelineRows(
+      pending,
+      capacity,
+      rangeRows,
+    );
+    for (const row of selected) {
+      if (retained.size >= maximum) break;
+      retained.set(quotaTimelineTrackBucketKey(row), row);
+    }
+  }
+  return [...retained.values()].sort(quotaTimelineDeterministicRowSort);
+}
+
 function finalizeWeeklyQuotaTimeline(buckets) {
   const rows = [...buckets.values()].sort((left, right) => (
     left.observedAt.localeCompare(right.observedAt)
@@ -666,9 +865,33 @@ function finalizeWeeklyQuotaTimeline(buckets) {
     || left.planType.localeCompare(right.planType)
     || left.usedPercent - right.usedPercent
   ));
-  return rows.length <= MAX_QUOTA_TIMELINE_ROWS
-    ? rows
-    : rows.slice(rows.length - MAX_QUOTA_TIMELINE_ROWS);
+  // Keep the historical path byte-for-byte/order-for-order for ordinary
+  // caches. Retention only changes when the old newest-only cap would have
+  // discarded the earlier covered window.
+  if (rows.length <= MAX_QUOTA_TIMELINE_ROWS) return rows;
+
+  const { candidates, transitionKeys } = quotaTimelineCandidates(rows);
+  if (candidates.size <= MAX_QUOTA_TIMELINE_ROWS) {
+    return [...candidates.values()].sort(quotaTimelineDeterministicRowSort);
+  }
+
+  const candidateRows = [...candidates.values()]
+    .sort(quotaTimelineDeterministicRowSort);
+  const transitionRows = candidateRows.filter((row) => (
+    transitionKeys.has(quotaTimelineTrackBucketKey(row))
+  ));
+  const bucketEdgeRows = candidateRows.filter((row) => (
+    !transitionKeys.has(quotaTimelineTrackBucketKey(row))
+  ));
+  // Retaining every state transition is not bounded: a long, busy range can
+  // hold far more transitions than the cap, which is how this path used to
+  // return more rows than the cache is allowed to carry. Transitions still
+  // rank above plain bucket edges, but they are budgeted like everything else.
+  return retainBoundedQuotaTimelineRows(
+    [quotaTimelineRangeAnchors(candidateRows), transitionRows, bucketEdgeRows],
+    MAX_QUOTA_TIMELINE_ROWS,
+    candidateRows,
+  );
 }
 
 function paceAccountTrackId(snapshot) {
@@ -929,6 +1152,8 @@ function addEvent(period, event) {
   const model = period.byModel[event.model] ??= {
     model: event.model,
     pricingStatus: event.modelPricingStatus,
+    allowanceTrack: event.modelAllowanceTrack,
+    apiPriceEquivalentApplicable: event.modelApiPriceEquivalentApplicable,
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
@@ -978,6 +1203,26 @@ function finalizeDimension(dimension) {
   ]));
 }
 
+function modelUsageRowSort(left, right) {
+  return right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd
+    || right.totalTokens - left.totalTokens
+    || left.model.localeCompare(right.model);
+}
+
+// One row per model identity across every allowance track, for surfaces that
+// render a single "model usage" table. `byModel` deliberately covers only the
+// primary allowance, because the period's own event/token/cost totals exclude
+// the separately metered Spark track and the two must stay reconcilable. A
+// renderer that wants every model on one list needs this instead, and each
+// row states which track it belongs to and whether an API-price equivalent is
+// a meaningful figure for it at all.
+function combinedModelUsage(finalized) {
+  return [
+    ...finalized.byModel,
+    ...(finalized.spark?.byModel ?? []),
+  ].sort(modelUsageRowSort);
+}
+
 function finalizePeriod(period) {
   const priced = period.pricingCoverage.fullyPricedEvents
     + period.pricingCoverage.partiallyPricedEvents;
@@ -1002,11 +1247,7 @@ function finalizePeriod(period) {
         ...row,
         apiPriceEquivalentUsd: roundedMoney(row.apiPriceEquivalentUsd),
       }))
-      .sort((left, right) => (
-        right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd
-        || right.totalTokens - left.totalTokens
-        || left.model.localeCompare(right.model)
-      )),
+      .sort(modelUsageRowSort),
     bySpeed: finalizeDimension(period.bySpeed),
     byApiServiceTier: finalizeDimension(period.byApiServiceTier),
     bySurface: finalizeDimension(period.bySurface),
@@ -1018,6 +1259,7 @@ function finalizePeriod(period) {
     ),
   };
   if (period.spark) finalized.spark = finalizePeriod(period.spark);
+  finalized.modelUsage = combinedModelUsage(finalized);
   return finalized;
 }
 

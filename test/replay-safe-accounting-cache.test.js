@@ -890,6 +890,149 @@ test("retains exact deterministic quota points for comparison brackets", async (
   }
 });
 
+test("retains duplicate-rich quota history across 31 days under the cap", async () => {
+  const startMs = Date.parse("2026-07-01T00:00:00.000Z");
+  const minutes = 31 * 24 * 60;
+  const snapshots = [];
+  for (let minute = 0; minute < minutes; minute += 1) {
+    const timestamp = new Date(startMs + minute * 60_000).toISOString();
+    const day = Math.floor(minute / (24 * 60));
+    snapshots.push(weeklySnapshot({
+      timestamp,
+      slot: "primary",
+      usedPercent: day,
+    }));
+    snapshots.push(weeklySnapshot({
+      timestamp,
+      slot: "secondary",
+      usedPercent: day + 0.5,
+    }));
+  }
+  assert.ok(snapshots.length > 10_000);
+
+  const build = async (orderedSnapshots) => buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-01T00:00:00.000Z"),
+    windowDays: 31,
+    scan: async ({ onRateLimitSnapshot }) => {
+      for (const snapshot of orderedSnapshots) {
+        onRateLimitSnapshot(snapshot);
+      }
+      return { diagnostics: {} };
+    },
+  });
+  const cache = await build(snapshots);
+  const reversed = await build([...snapshots].reverse());
+
+  assert.deepEqual(cache.quotaTimeline, reversed.quotaTimeline);
+  assert.equal(cache.quotaTimeline.length, 10_000);
+  assert.equal(
+    cache.quotaTimeline[0].observedAt,
+    "2026-07-01T00:00:00.000Z",
+  );
+  assert.equal(
+    cache.quotaTimeline.at(-1).observedAt,
+    "2026-07-31T23:59:00.000Z",
+  );
+  assert.equal(
+    new Set(cache.quotaTimeline.map((row) => row.observedAt.slice(0, 10))).size,
+    31,
+  );
+  for (const [slot, offset] of [["primary", 0], ["secondary", 0.5]]) {
+    const values = new Set(
+      cache.quotaTimeline
+        .filter((row) => row.slot === slot)
+        .map((row) => row.usedPercent),
+    );
+    for (let day = 0; day < 31; day += 1) {
+      assert.equal(values.has(day + offset), true, `${slot} day ${day}`);
+    }
+  }
+});
+
+// The duplicate-rich case above repeats one value per day, so it never has
+// more distinct quota states than the cap and cannot detect an unbounded
+// retention path. Real history churns the displayed percentage constantly:
+// every retained row is then its own state transition, and prioritising
+// transitions without budgeting them returns more rows than the cache is
+// allowed to carry. That cache is rejected by its own read validation, which
+// is indistinguishable to the owner from having no quota evidence at all.
+// Both quota series are finalized by the same retention function and are held
+// to the same cap by `validQuotaTimeline`. Spark is used here because weekly
+// snapshots additionally feed the transition miner, whose own 10,000-row
+// derivation ceiling trips first and would mask the retention defect.
+test("churn-rich quota history stays inside the cap and still spans the range", async () => {
+  const startMs = Date.parse("2026-07-01T00:00:00.000Z");
+  const minutes = 31 * 24 * 60;
+  const snapshots = [];
+  for (let minute = 0; minute < minutes; minute += 1) {
+    const timestamp = new Date(startMs + minute * 60_000).toISOString();
+    // A distinct displayed percentage on every observation, so every row is a
+    // state transition on its track.
+    const usedPercent = Number(((minute % 9_901) / 100).toFixed(2));
+    for (const [slot, value] of [
+      ["primary", usedPercent],
+      ["secondary", Number((usedPercent / 2).toFixed(3))],
+    ]) {
+      snapshots.push(weeklySnapshot({
+        timestamp,
+        slot,
+        limitId: "codex-spark",
+        usedPercent: value,
+      }));
+    }
+  }
+
+  const build = async (orderedSnapshots) => buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-01T00:00:00.000Z"),
+    windowDays: 31,
+    scan: async ({ onRateLimitSnapshot }) => {
+      for (const snapshot of orderedSnapshots) {
+        onRateLimitSnapshot(snapshot);
+      }
+      return { diagnostics: {} };
+    },
+  });
+  const cache = await build(snapshots);
+  const reversed = await build([...snapshots].reverse());
+  const timeline = cache.sparkQuotaTimeline;
+
+  assert.deepEqual(timeline, reversed.sparkQuotaTimeline);
+  // The cap is an invariant of the cache contract, not a soft preference:
+  // `readReplaySafeAccountingCache` refuses a longer series outright.
+  assert.equal(timeline.length, 10_000);
+  // Retention must reach both ends of the covered window, not just its tail.
+  assert.equal(timeline[0].observedAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(timeline.at(-1).observedAt, "2026-07-31T23:59:00.000Z");
+  assert.equal(
+    new Set(timeline.map((row) => row.observedAt.slice(0, 10))).size,
+    31,
+  );
+  // Every calendar day carries observations on both slots, so a comparison
+  // window anywhere in the range can find a bracket rather than being
+  // excluded for missing quota evidence.
+  for (const slot of ["primary", "secondary"]) {
+    const days = new Set(
+      timeline
+        .filter((row) => row.slot === slot)
+        .map((row) => row.observedAt.slice(0, 10)),
+    );
+    assert.equal(days.size, 31, `${slot} day coverage`);
+  }
+  // No retained neighbour gap may exceed the widest bracket tolerance the
+  // dashboard allows for its narrowest comparison window.
+  const primary = timeline
+    .filter((row) => row.slot === "primary")
+    .map((row) => Date.parse(row.observedAt));
+  let widestGapMs = 0;
+  for (let index = 1; index < primary.length; index += 1) {
+    widestGapMs = Math.max(widestGapMs, primary[index] - primary[index - 1]);
+  }
+  assert.ok(
+    widestGapMs <= 60 * 60 * 1_000,
+    `widest retained primary gap ${widestGapMs}ms`,
+  );
+});
+
 test("Spark quota observations stay outside the normal weekly quota timeline", async () => {
   const cache = await buildReplaySafeAccountingCache({
     now: () => NOW,

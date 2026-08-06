@@ -193,6 +193,7 @@ enum TiboTattleLocalization {
         case menuAboutProduct = "menu.aboutProduct"
         case menuCopy = "menu.copy"
         case menuEdit = "menu.edit"
+        case menuView = "menu.view"
         case menuBarAnalyzeLocalUsage = "menuBar.analyzeLocalUsage"
         case menuBarAnalysisRequestRejected = "menuBar.analysisRequestRejected"
         case menuBarAnalyzingLocalUsage = "menuBar.analyzingLocalUsage"
@@ -560,7 +561,7 @@ enum TiboTattleLocalization {
             case .nativeDashboardHowItWorks:
                 "How it works"
             case .nativeDashboardNeedsRefresh:
-                "Needs refresh"
+                "Stale"
             case .nativeDashboardLocalOnly:
                 "Local only"
             case .nativeDashboardLocalOnlyTooltip:
@@ -568,7 +569,7 @@ enum TiboTattleLocalization {
             case .nativeDashboardOverview:
                 "Overview"
             case .nativeDashboardRefreshUsage:
-                "Refresh usage"
+                "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
                 "Update local usage now. This reads only the selected Codex folders on this Mac."
             case .nativeDashboardShare:
@@ -578,17 +579,19 @@ enum TiboTattleLocalization {
             case .nativeDashboardStarting:
                 "Starting…"
             case .nativeDashboardStatus:
-                "Local status"
+                "Status"
             case .nativeDashboardTrends:
                 "Trends"
             case .nativeDashboardUpdating:
-                "Updating…"
+                "Running…"
             case .menuAboutProduct:
                 "About %@"
             case .menuCopy:
                 "Copy"
             case .menuEdit:
                 "Edit"
+            case .menuView:
+                "View"
             case .menuBarAnalyzeLocalUsage:
                 "Analyze Local Usage"
             case .menuBarAnalysisRequestRejected:

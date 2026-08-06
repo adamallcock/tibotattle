@@ -5,8 +5,10 @@ export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-08-01T13:47:00Z";
 // remain priceable unless a card has an explicit vendor-effective boundary.
 const OPENAI_FIRST_OBSERVED_DATE = "2026-07-26";
 export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
+// Same review-boundary semantics as OpenAI above: this timestamp records when
+// the Anthropic pricing page was reviewed. It is provenance only and never a
+// lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
-const ANTHROPIC_OBSERVED_DATE = ANTHROPIC_OBSERVED_AT.slice(0, 10);
 const PER_MILLION = "1000000";
 export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.3";
 
@@ -123,7 +125,12 @@ const OPENAI_ROWS = Object.freeze([
 ]);
 
 const ANTHROPIC_ROWS = Object.freeze([
-  // Values are base input, 5m write, 1h write, cache read, and output USD/MTok.
+  // Values are base input, 5m write, 1h write, cache read, and output USD/MTok,
+  // plus an optional dated validity period. Only Claude Sonnet 5 carries a
+  // published vendor boundary: the introductory rate runs through 2026-08-31 and
+  // the standard rate takes effect 2026-09-01. Every other row is undated and
+  // stays open-ended in both directions; the review date is provenance, not an
+  // invented model-rate start date.
   ["claude-fable-5", "standard", "10", "12.5", "20", "1", "50"],
   ["claude-fable-5", "batch", "5", "6.25", "10", "0.5", "25"],
   ["claude-haiku-4-5-20251001", "standard", "1", "1.25", "2", "0.1", "5"],
@@ -217,12 +224,9 @@ function cardId(provider, model, tier, suffix = "current") {
   return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
-// The review dates remain provenance metadata; only explicit vendor-effective
-// dates constrain selection, so pre-repricing history stays priceable.
-const FIRST_OBSERVED_DATES = Object.freeze({
-  openai: OPENAI_FIRST_OBSERVED_DATE,
-  anthropic: ANTHROPIC_OBSERVED_DATE,
-});
+// Effective-window helpers. The review dates remain provenance metadata for
+// every provider; only an explicit vendor-effective date constrains selection,
+// so all reviewed history stays priceable as far back as events go.
 
 function openAiEffective(period) {
   if (period === "through-2026-07-29") {
@@ -253,13 +257,31 @@ function openAiEffective(period) {
   };
 }
 
+// Routing aliases OpenAI exposes in the model picker that resolve to a model
+// already priced here. They are not separate products and are not listed
+// separately on the pricing page, so they share the target's rates rather than
+// falling through to "unrecognized" and losing their cost entirely. Each alias
+// must carry a stated assumption, because sharing a rate is a claim about
+// billing that the registry is asserting on the vendor's behalf.
+const OPENAI_MODEL_ALIASES = Object.freeze({
+  "gpt-5.5": ["gpt-5.5-codex"],
+  "gpt-5.6-sol": ["gpt-5.6-sol-wm"],
+});
+
+const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
+  "gpt-5.5-codex":
+    "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
+  "gpt-5.6-sol-wm":
+    "Work Mode routing alias for gpt-5.6-sol; the picker describes it as a routing alias, so it is billed at the gpt-5.6-sol rates and is not listed separately on the official pricing page.",
+});
+
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
   const contextConditions = contextBand === "short"
     ? { max_total_input_tokens: "271999" }
     : contextBand === "long"
       ? { min_total_input_tokens: "272000" }
       : null;
-  const aliases = model === "gpt-5.5" ? ["gpt-5.5-codex"] : undefined;
+  const aliases = OPENAI_MODEL_ALIASES[model];
   const validity = openAiEffective(period);
   const bandSuffix = contextBand ?? "current";
   return {
@@ -287,9 +309,9 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       total_input_context_band: contextBand,
       provenance: provenance("openai", validity),
       ...(aliases ? {
-        alias_assumptions: {
-          "gpt-5.5-codex": "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
-        },
+        alias_assumptions: Object.fromEntries(
+          aliases.map((alias) => [alias, OPENAI_ALIAS_ASSUMPTIONS[alias]]),
+        ),
       } : {}),
       ...(contextBand ? {
         coverage_note: contextBand === "short"
@@ -302,8 +324,11 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
 
 function anthropicEffective(period) {
   if (period === "introductory") {
+    // Closed only at the published vendor change on 2026-09-01, exactly like the
+    // OpenAI through-2026-07-29 rows. The window stays open backwards so events
+    // of any age select the introductory rate that was in force at the time.
     return {
-      effective: { from: ANTHROPIC_OBSERVED_DATE, to: "2026-08-31" },
+      effective: { to: "2026-08-31" },
       vendorEffectiveFrom: null,
       vendorEffectiveTo: "2026-08-31",
       suffix: "through-2026-08-31",
@@ -318,7 +343,10 @@ function anthropicEffective(period) {
     };
   }
   return {
-    effective: { from: ANTHROPIC_OBSERVED_DATE },
+    // No vendor-effective date was published for this row, so the effective
+    // range is open in both directions. The review date is provenance and must
+    // never act as a lower bound that unprices earlier recognized history.
+    effective: {},
     vendorEffectiveFrom: null,
     vendorEffectiveTo: null,
     suffix: "current",
@@ -364,7 +392,9 @@ function providerToolCard(provider, model, rows) {
     model,
     service_tier: "standard",
     region: "global",
-    effective: { from: FIRST_OBSERVED_DATES[provider] },
+    // Provider tool unit prices carry no published vendor-effective date, so the
+    // window is open in both directions and historical tool units stay priced.
+    effective: {},
     components: rows.map(([name, amount, unit, per]) => (
       providerUnitComponent(name, amount, unit, per)
     )),
@@ -392,7 +422,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...PROVIDER_TOOL_PRICE_CARDS,
 ]);
 
-export const APP_PRICE_REGISTRY_SHA256 = "c75b604f2a6b30f8004ab61c6fdf628c42b2228db5830b285bb478afdc4d97d2";
+export const APP_PRICE_REGISTRY_SHA256 = "d662196939381587211eeb881c23f866a2ef01e4d6742bbd7570798af548693b";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,

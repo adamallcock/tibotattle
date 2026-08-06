@@ -24,6 +24,13 @@ import {
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
+  codexModelAllowanceTrack,
+  codexModelApiPriceEquivalentApplicable,
+  codexModelPricingStatus,
+  OPENAI_CODEX_SPARK_MODEL_ID,
+  recognizedCodexModelId,
+} from "./export/index.js";
+import {
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
 import {
@@ -64,21 +71,10 @@ const COMPONENT_KEYS = Object.freeze([
   "output_combined_tokens",
 ]);
 
-const KNOWN_MODELS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5",
-  "gpt-4.1",
-]);
-const KNOWN_UNPRICED_MODELS = new Set([
-  "gpt-5.3-codex-spark",
-]);
-const SPARK_MODEL = "gpt-5.3-codex-spark";
+// Model identity is owned by the reviewed export registry so that the live
+// collector projection, the replay-safe cache and the indexed archive cannot
+// drift apart and disagree about what counts as recognised.
+const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
 
 const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
 const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
@@ -686,15 +682,11 @@ function addComponents(target, components) {
 }
 
 function safeModel(model) {
-  return KNOWN_MODELS.has(model) || KNOWN_UNPRICED_MODELS.has(model)
-    ? model
-    : "unknown";
+  return recognizedCodexModelId(model) ?? "unknown";
 }
 
 function modelPricingStatus(model) {
-  if (KNOWN_UNPRICED_MODELS.has(model)) return "known_unpriced";
-  if (KNOWN_MODELS.has(model)) return "priced";
-  return "unrecognized";
+  return codexModelPricingStatus(model);
 }
 
 function safeSpeed(speed) {
@@ -764,6 +756,9 @@ function usageProjection(record, declaredSpeed = "unknown") {
   return {
     model,
     modelPricingStatus: modelPricingStatus(record.model),
+    modelAllowanceTrack: codexModelAllowanceTrack(record.model),
+    modelApiPriceEquivalentApplicable:
+      codexModelApiPriceEquivalentApplicable(record.model),
     isSpark: model === SPARK_MODEL,
     components,
     totalTokens,
@@ -906,6 +901,8 @@ function addUsageToPeriod(period, projection) {
   const modelSummary = period.byModel[projection.model] ??= {
     model: projection.model,
     pricingStatus: projection.modelPricingStatus,
+    allowanceTrack: projection.modelAllowanceTrack,
+    apiPriceEquivalentApplicable: projection.modelApiPriceEquivalentApplicable,
     events: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
@@ -991,6 +988,16 @@ function finalizeUsagePeriod(period) {
     ),
   };
   if (period.spark) finalized.spark = finalizeUsagePeriod(period.spark);
+  // One list covering every allowance track. `byModel` stays aligned with the
+  // period's own totals, which exclude the separately metered Spark track.
+  finalized.modelUsage = [
+    ...finalized.byModel,
+    ...(finalized.spark?.byModel ?? []),
+  ].sort((left, right) => (
+    right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd
+    || right.totalTokens - left.totalTokens
+    || left.model.localeCompare(right.model)
+  ));
   return finalized;
 }
 
@@ -1956,6 +1963,10 @@ export async function buildLocalCompanionSnapshot({
         components: displayUsage?.components ?? emptyComponents(),
         componentCosts: displayUsage?.componentCosts ?? {},
         byModel: displayUsage?.byModel ?? [],
+        // Every model identity across both allowance tracks, each row stating
+        // its own track and whether an API-price equivalent means anything
+        // for it. This is what a model-usage table should render.
+        modelUsage: displayUsage?.modelUsage ?? displayUsage?.byModel ?? [],
         bySpeed: displayUsage?.bySpeed ?? emptyDimension(KNOWN_SPEEDS),
         byApiServiceTier: displayUsage?.byApiServiceTier ?? emptyDimension(KNOWN_API_TIERS),
         bySurface: displayUsage?.bySurface ?? emptyDimension(KNOWN_SURFACES),
@@ -2004,6 +2015,7 @@ export async function buildLocalCompanionSnapshot({
           spark: period.spark ?? null,
           componentCosts: period.componentCosts ?? {},
           byModel: period.byModel,
+          modelUsage: period.modelUsage ?? period.byModel,
           bySpeed: period.bySpeed,
           byApiServiceTier: period.byApiServiceTier,
           bySurface: period.bySurface,

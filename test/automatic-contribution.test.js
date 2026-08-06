@@ -338,7 +338,7 @@ test("automatic contribution is off by default and unconfigured builds never run
       requiredConsent: {
         telemetrySchemaVersion: "telemetry-contribution-v0.1",
         fieldDictionaryVersion:
-          "telemetry-v0.1-registry-2026-07-25.3",
+          "telemetry-v0.1-registry-2026-08-06.1",
         privacyContractVersion:
           "ongoing-privacy-safe-telemetry-v0.1",
         destinationOrigin: null,
