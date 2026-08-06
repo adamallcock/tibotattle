@@ -1777,23 +1777,59 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
     }
 
+    /// How long the document is given to render something before the view is
+    /// declared unavailable, and how often it is asked.
+    ///
+    /// `didFinish` only reports that the *document* finished loading. This
+    /// dashboard then fetches its evidence from the loopback companion and
+    /// renders afterwards, so `#main` is legitimately near-empty at that
+    /// instant. Sampling it once there judged an asynchronous condition at a
+    /// single moment and reported a perfectly working view as broken - which
+    /// is why a right-click Reload failed with
+    /// `UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE` while retrying moments later
+    /// succeeded. The deadline still fails closed: a document that never
+    /// renders is still reported, just not one that is merely slower than a
+    /// single turn of the run loop.
+    private static let dashboardContentDeadline: TimeInterval = 20
+    private static let dashboardContentPollInterval: TimeInterval = 0.25
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard hasDashboardTarget else { return }
         // The local page keeps its public-web navigation when opened in a
         // browser. In the app, AppKit owns navigation and status so the
-        // document can concentrate on the current page.
-        webView.evaluateJavaScript("""
-        document.body && document.body.classList.add('native-dashboard');
-        (document.querySelector('#main')?.innerText || '').trim().length;
-        """) { [weak self] value, error in
+        // document can concentrate on the current page. This is presentation
+        // only, so it is applied immediately rather than being gated on the
+        // content check below.
+        webView.evaluateJavaScript(
+            "document.body && document.body.classList.add('native-dashboard');"
+        )
+        awaitDashboardContent(
+            in: webView,
+            deadline: Date().addingTimeInterval(Self.dashboardContentDeadline)
+        )
+    }
+
+    private func awaitDashboardContent(in webView: WKWebView, deadline: Date) {
+        guard hasDashboardTarget else { return }
+        webView.evaluateJavaScript(
+            "(document.querySelector('#main')?.innerText || '').trim().length;"
+        ) { [weak self] value, error in
             guard let self, self.hasDashboardTarget else { return }
             let textLength = (value as? NSNumber)?.intValue ?? 0
-            guard error == nil, textLength >= 32 else {
+            if error == nil, textLength >= 32 {
+                self.onLoaded()
+                return
+            }
+            guard Date() < deadline else {
                 self.hasDashboardTarget = false
                 self.onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
                 return
             }
-            self.onLoaded()
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Self.dashboardContentPollInterval
+            ) { [weak self] in
+                self?.awaitDashboardContent(in: webView, deadline: deadline)
+            }
         }
     }
 
