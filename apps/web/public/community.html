@@ -32,7 +32,7 @@
     <meta property="og:title" content="TiboTattle">
     <meta
       property="og:description"
-      content="TiboTattle is a local-first Mac app for understanding personal Codex usage. Your personal seven-day view stays on your Mac; this site shows delayed, aggregate community activity when published."
+      content="TiboTattle is a private Mac app that estimates your seven-day Codex allowance locally and shows delayed, aggregate activity from contributors when published."
     >
     <meta property="og:url" content="">
     <meta property="og:image" content="">
@@ -43,12 +43,12 @@
     <meta name="twitter:title" content="TiboTattle">
     <meta
       name="twitter:description"
-      content="TiboTattle is a local-first Mac app for understanding personal Codex usage. Your personal seven-day view stays on your Mac; this site shows delayed, aggregate community activity when published."
+      content="TiboTattle is a private Mac app that estimates your seven-day Codex allowance locally and shows delayed, aggregate activity from contributors when published."
     >
     <meta name="twitter:image" content="">
     <meta
       name="description"
-      content="Understand personal Codex usage with a local-first Mac app; your personal seven-day view stays on your Mac."
+      content="See where your Codex allowance stands with a private Mac app that calculates your personal dashboard locally."
     >
     <title>TiboTattle</title>
     <link rel="icon" type="image/png" href="./tibotattle-icon.png">
@@ -91,18 +91,18 @@
       ></p>
       <a class="header-download" href="#download">
         <img src="./apple.svg" alt="" width="14" height="14">
-        <span id="header-download-label">Release status</span>
+        <span id="header-download-label">Get the Mac app</span>
       </a>
     </header>
 
     <main id="main" tabindex="-1" data-i18n-legacy-root>
       <section class="product-hero" id="install" aria-labelledby="install-title">
         <div class="hero-copy">
-          <h1 id="install-title">Understand your Codex week.</h1>
+          <h1 id="install-title">See where your Codex allowance stands.</h1>
           <p class="hero-lede">
-            TiboTattle is a local-first Mac app for understanding personal Codex
-            usage. It estimates your personal seven-day allowance in
-            API-equivalent terms; the dashboard and its history stay on your Mac.
+            TiboTattle is a private Mac app that estimates how much of your
+            seven-day Codex allowance remains and shows how your usage changes
+            over time. Your personal dashboard is calculated on your Mac.
           </p>
 
           <div
@@ -131,7 +131,7 @@
                 Download for macOS
               </button>
               <span class="installer-unavailable" id="installer-unavailable">
-                Signed release coming soon.
+                Public download coming soon.
               </span>
             </div>
             <div class="installer-details" id="installer-details" hidden>
@@ -147,15 +147,14 @@
               <a id="support-link" href="" hidden>Support</a>
             </nav>
             <p class="installer-availability-note">
-              A download link appears only after a signed public installer and
-              its release metadata pass the release checks. Otherwise, this
-              release remains unavailable.
+              We will make the signed Mac installer available here when it is
+              ready.
             </p>
           </div>
 
           <a class="community-inline" href="#community">
             <span class="community-dot" id="community-snapshot-dot" aria-hidden="true"></span>
-            <span>Delayed community activity</span>
+            <span>Latest community evidence</span>
             <strong id="community-snapshot-hero">Checking snapshot</strong>
           </a>
         </div>
@@ -205,16 +204,19 @@
         data-i18n-aria-label="aria.tibotattleFeatures"
       >
         <article>
-          <h2>Personal seven-day view</h2>
-          <p>On your Mac, see your private allowance estimate and its history across observed resets.</p>
+          <span class="feature-step" aria-hidden="true">1</span>
+          <h2>Install the Mac app</h2>
+          <p>Open TiboTattle and let it calculate your Codex usage locally.</p>
         </article>
         <article>
-          <h2>Local by default</h2>
-          <p>Your dashboard stays on your Mac. Community contribution is optional.</p>
+          <span class="feature-step" aria-hidden="true">2</span>
+          <h2>See your week</h2>
+          <p>View your allowance estimate and history in the app.</p>
         </article>
         <article>
-          <h2>Evidence, not guesses</h2>
-          <p>Missing or weak evidence stays visibly unknown.</p>
+          <span class="feature-step" aria-hidden="true">3</span>
+          <h2>Share only if you choose</h2>
+          <p>Review a content-free summary before any optional community contribution.</p>
         </article>
       </section>
 
@@ -227,9 +229,9 @@
         <div class="community-proof-heading">
           <div>
             <h2 id="community-title">Community activity snapshot</h2>
-            <p>Published as delayed, aggregate activity for a defined reporting period.</p>
+            <p>When available, this is a delayed, anonymous activity summary from people who chose to contribute.</p>
             <p class="annotation">
-              This website is read-only: it does not enroll contributors or accept uploads.
+              Personal dashboards and contributions stay in the Mac app.
             </p>
           </div>
           <div class="community-estimate-summary">
@@ -243,12 +245,12 @@
         </div>
 
         <details class="community-method">
-          <summary>How community activity snapshots work</summary>
+          <summary>See community activity details</summary>
           <div class="community-method-body">
             <div class="activity-heading">
               <div>
-                <h3>Community activity</h3>
-                <p>Shown as aggregate activity for the published period.</p>
+                <h3>Published activity</h3>
+                <p>Delayed, rounded totals for the published reporting period.</p>
               </div>
               <span class="evidence-chip neutral" id="community-service-state">
                 Checking service

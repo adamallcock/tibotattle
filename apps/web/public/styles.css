@@ -1969,6 +1969,19 @@ footer {
 .community-site .feature-strip article:last-child {
   padding-inline-end: 0;
 }
+.community-site .feature-step {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-bottom: 16px;
+  border: 1px solid rgba(23, 79, 69, .18);
+  border-radius: 999px;
+  color: var(--site-green);
+  background: rgba(101, 195, 170, .14);
+  font-size: .66rem;
+  font-weight: 850;
+}
 .community-site .feature-strip h2 {
   margin: 0 0 10px;
   font-family: var(--serif);

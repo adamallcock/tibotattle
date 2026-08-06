@@ -295,12 +295,15 @@ test("the public community client exposes one read-only aggregate request", asyn
 
 test("the first visit leads with the product, Mac download action, and snapshot-only community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
-  assert.match(html, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
-  assert.match(html, /local-first Mac app for understanding personal Codex\s+usage/u);
-  assert.match(html, /estimates your personal seven-day allowance in\s+API-equivalent terms/u);
+  assert.match(html, /<h1 id="install-title">See where your Codex allowance stands\.<\/h1>/u);
+  assert.match(html, /private Mac app that estimates how much of your\s+seven-day Codex allowance remains/u);
+  assert.match(html, /Your personal dashboard is calculated on your Mac\./u);
   assert.match(html, /Download for macOS/u);
-  assert.match(html, /Delayed community activity/u);
+  assert.match(html, /Latest community evidence/u);
   assert.match(html, /Community activity snapshot/u);
+  assert.match(html, /Install the Mac app/u);
+  assert.match(html, /See your week/u);
+  assert.match(html, /Share only if you choose/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
   assert.match(html, /src="\.\/tibotattle-icon\.png"/u);
   assert.match(html, /src="\.\/tibotattle-weekly-preview\.jpg"/u);
@@ -376,7 +379,7 @@ test("unavailable community activity uses the compact public state", async () =>
   assert.match(html, /<h2 id="community-title">Community activity snapshot<\/h2>/u);
   assert.match(
     html,
-    /Published as delayed, aggregate activity for a defined reporting period\./u,
+    /When available, this is a delayed, anonymous activity summary from people who chose to contribute\./u,
   );
   assert.doesNotMatch(
     html,

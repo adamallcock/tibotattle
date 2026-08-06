@@ -449,7 +449,7 @@ test("no-installer release-site build succeeds without installer claims and disa
   assert.equal(result.installer, null);
   const html = await readFile(join(value.output, "index.html"), "utf8");
   assertPublicEntryClaimBoundary(html);
-  assert.match(html, /Signed release coming soon\./u);
+  assert.match(html, /Public download coming soon\./u);
   assert.match(html, /id="installer-link"[^>]*hidden/u);
   assert.match(html, /id="installer-unavailable-action"[^>]*disabled/u);
   assert.match(html, /id="installer-unavailable"/u);
@@ -530,10 +530,10 @@ test("public static routes keep root, community, docs, privacy, and fallback out
       assert.equal(html.includes(forbidden), false, `${route}: ${forbidden}`);
     }
   }
-  assert.match(root, /<h1 id="install-title">Understand your Codex week\.<\/h1>/u);
+  assert.match(root, /<h1 id="install-title">See where your Codex allowance stands\.<\/h1>/u);
   assert.match(root, /id="community-result"/u);
   assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
-  assert.match(root, /Signed release coming soon\./u);
+  assert.match(root, /Public download coming soon\./u);
   assert.equal(community, root, "the community route must use the public entry alias");
   assert.match(privacy, /<h1>Your dashboard belongs on your Mac\.<\/h1>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);

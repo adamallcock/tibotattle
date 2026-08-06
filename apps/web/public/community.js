@@ -105,7 +105,7 @@ function renderPublicInstallerJourney() {
   });
   localization.setLegacyText(
     $("#header-download-label"),
-    release ? "Download" : "Release status",
+    release ? "Download" : "Get the Mac app",
   );
   return release;
 }
