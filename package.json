@@ -112,7 +112,8 @@
     "tools:inventory:check": "node ./tools/operations/check-tool-inventory.mjs",
     "architecture:check": "node ./scripts/check-architecture-boundaries.mjs",
     "check": "npm test && npm run product:check",
-    "index:rebuild": "node ./scripts/rebuild-local-unified-index.mjs"
+    "index:rebuild": "node ./scripts/rebuild-local-unified-index.mjs",
+    "diagnose:dashboard": "node ./scripts/inspect-dashboard-state.mjs"
   },
   "dependencies": {
     "@app-usagemonitor/accounting": "workspace:*",
