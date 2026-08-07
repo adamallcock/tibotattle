@@ -71,7 +71,12 @@ const communityClient = new CommunityClient({
 });
 
 let dashboard = null;
-let activeWindowHours = 1;
+// Owner decision 2026-08-06: the calibration rolling comparison window is
+// fixed at three hours. The 15-minute and 1-hour widths the old segmented
+// control offered proved inaccurate, so the chart, its summary tiles, the
+// sensitivity lookup, and the exact-windows inspection table all read this
+// one width instead of a selection.
+const CALIBRATION_WINDOW_HOURS = 3;
 let activeUsageRangeDays = 7;
 let activeCalibrationRangeDays = 7;
 let activeUsageGrouping = "hour";
@@ -1340,7 +1345,7 @@ function humanize(value) {
 function latestRollingPair(data) {
   if (data.timeline?.usage?.length) {
     const live = liveTimelinePoints(data, {
-      windowHours: 1,
+      windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
     })
       .filter((row) => row.observed !== null && row.expected !== null)
@@ -1355,7 +1360,10 @@ function latestRollingPair(data) {
       residual: finite(row.residual_pp ?? row.residualPp)
     };
   }
-  const groups = groupRolling(data.gradient.rolling, 1);
+  // The canonical artifact rolling series is the three-hour smoothing; the
+  // hourly rows are diagnostic extras, and the owner fixed every comparison
+  // to the three-hour width (2026-08-06).
+  const groups = groupRolling(data.gradient.rolling, CALIBRATION_WINDOW_HOURS);
   const last = groups.at(-1);
   return last ? { observed: last.observed, expected: last.expected, residual: last.observed - last.expected } : null;
 }
@@ -2250,13 +2258,25 @@ function drawShareCard(canvas, card) {
     .flatMap((caveat) => shareCardWrap(context, caveat, inner - 20, 2))
     .slice(0, SHARE_CARD_MAX_CAVEAT_LINES);
   const caveatStep = 23;
-  const ruleY = SHARE_CARD_HEIGHT - 58.5;
+  // The footer zone holds the two smallest lines on the card — the checkable
+  // diagnostic reference and the fixed footer. A timeline renders this card at
+  // 504px wide (0.42 of its coordinate space), and at the old 12px/13px those
+  // lines printed at 5.0px/5.5px: the reference was the least legible thing on
+  // the image. They are drawn at 22px (9.2px at 504px), and the rule sits at
+  // -70.5 rather than -58.5 so two lines at that size still clear the card's
+  // bottom edge (owner-directed legibility fix, 2026-08-06).
+  const ruleY = SHARE_CARD_HEIGHT - 70.5;
   const caveatTop = caveatLines.length === 0
     ? ruleY - 8
     : ruleY - 22 - (caveatLines.length - 1) * caveatStep;
+  // 62, not 48: at 48 the relationship note's ink bottom (y=395.82) overlapped
+  // the trend label's ink top (y=395.16) and the note's accent bar cut through
+  // the label's first glyph. No value inside the old 48px budget cleared the
+  // collision; 62 is the measured minimum that does, at the cost of 12px of
+  // chart height on a card that carries the note (owner-reported, 2026-08-06).
   const trendTop = card.relationshipNote === ""
     ? statTop + statHeight + 36
-    : statTop + statHeight + 48;
+    : statTop + statHeight + 62;
   const trendHeight = Math.min(
     SHARE_CARD_TREND_MAX_HEIGHT,
     Math.max(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop),
@@ -2304,14 +2324,14 @@ function drawShareCard(canvas, card) {
   context.stroke();
 
   context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 12);
+  context.font = shareCardFont(500, 22);
   context.fillText(
     shareCardFit(context, card.identifierLine, inner),
     margin,
-    ruleY + 24,
+    ruleY + 30,
   );
   context.fillStyle = "#65706b";
-  context.font = shareCardFont(500, 13);
+  context.font = shareCardFont(500, 22);
   context.fillText(
     shareCardFit(
       context,
@@ -2319,7 +2339,7 @@ function drawShareCard(canvas, card) {
       inner,
     ),
     margin,
-    ruleY + 48,
+    ruleY + 58,
   );
   return true;
 }
@@ -2335,6 +2355,44 @@ function setShareCardStatus(text, { error = false } = {}) {
   status.className = `participant-action-status${error ? " error" : ""}`;
   status.textContent = text;
   status.hidden = text === "";
+}
+
+// Confirmation of a completed copy is transient: the owner reported the
+// previous static status line as broken, because every copy appended
+// permanent text under the card. The toast appears over the panel, holds
+// long enough to read the printed reference, and removes itself. It is a
+// role="status" live region — the same announcement pattern the other action
+// statuses on this page use — and contains no focusable content, so it
+// cannot trap focus. Its entrance and exit motion live in the stylesheet
+// behind prefers-reduced-motion.
+const SHARE_CARD_TOAST_HOLD_MS = 6_000;
+const SHARE_CARD_TOAST_LEAVE_MS = 300;
+let shareCardToastHoldTimer = null;
+let shareCardToastLeaveTimer = null;
+
+function dismissShareCardToast() {
+  const toast = $("#share-card-toast");
+  clearTimeout(shareCardToastHoldTimer);
+  clearTimeout(shareCardToastLeaveTimer);
+  shareCardToastHoldTimer = null;
+  shareCardToastLeaveTimer = null;
+  toast.classList.remove("share-toast-leaving");
+  toast.textContent = "";
+  toast.hidden = true;
+}
+
+function showShareCardToast(text) {
+  const toast = $("#share-card-toast");
+  dismissShareCardToast();
+  toast.hidden = false;
+  toast.textContent = text;
+  shareCardToastHoldTimer = setTimeout(() => {
+    toast.classList.add("share-toast-leaving");
+    shareCardToastLeaveTimer = setTimeout(
+      dismissShareCardToast,
+      SHARE_CARD_TOAST_LEAVE_MS,
+    );
+  }, SHARE_CARD_TOAST_HOLD_MS);
 }
 
 function updateShareCardActions() {
@@ -2463,7 +2521,10 @@ function copyShareCardImage() {
       await navigator.clipboard.write([
         new ClipboardItem({ "image/png": blob }),
       ]);
-      setShareCardStatus(
+      // A stale error from an earlier attempt would otherwise sit under the
+      // fresh confirmation.
+      setShareCardStatus("");
+      showShareCardToast(
         `Copied. Paste it anywhere; reference ${card.reference} is printed on the image.`,
       );
     } catch {
@@ -2886,7 +2947,7 @@ function sameResetBoundary(before, after) {
 function liveTimelinePoints(
   data,
   {
-    windowHours = activeWindowHours,
+    windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
   } = {},
 ) {
@@ -3311,8 +3372,8 @@ function panUsageTimeline(points, fraction) {
  * Deriving the calibration series is the expensive half of this page: it walks
  * every usage bucket in the artifact to rebuild the rolling window, builds a
  * quota lookup, and classifies each window's evidence state. None of that
- * depends on the zoom or pan viewport — only on the loaded evidence and the two
- * segmented controls above the chart — yet it ran again for every wheel event,
+ * depends on the zoom or pan viewport — only on the loaded evidence and the
+ * date-range control above the chart — yet it ran again for every wheel event,
  * which is what made the chart feel heavy to drag.
  *
  * The result is remembered against exactly the inputs it is a function of. The
@@ -3325,7 +3386,6 @@ let timelineSeriesMemo = null;
 function selectedTimelinePoints(data) {
   if (timelineSeriesMemo !== null
       && timelineSeriesMemo.data === data
-      && timelineSeriesMemo.windowHours === activeWindowHours
       && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
     return timelineSeriesMemo.selection;
   }
@@ -3333,7 +3393,7 @@ function selectedTimelinePoints(data) {
   const cutoff = timelineCutoffMs(data, activeCalibrationRangeDays);
   const historicalPoints = groupRolling(
     [...data.gradient.rollingHistory, ...data.gradient.rolling],
-    activeWindowHours,
+    CALIBRATION_WINDOW_HOURS,
   ).filter((row) => pointTimestampMs(row) >= cutoff);
   const liveMatched = livePoints.filter(
     (row) => row.observed !== null && row.expected !== null,
@@ -3342,7 +3402,6 @@ function selectedTimelinePoints(data) {
   const selection = { points: usingLive ? livePoints : historicalPoints, usingLive };
   timelineSeriesMemo = {
     data,
-    windowHours: activeWindowHours,
     rangeDays: activeCalibrationRangeDays,
     selection,
   };
@@ -3356,9 +3415,9 @@ function renderTimeline(data) {
   const matchedVisible = visiblePoints.filter(
     (point) => point.observed !== null && point.expected !== null,
   );
-  const windowLabel = activeWindowHours === 0.25
-    ? t("dashboard.timeWindow.fifteenMinutes")
-    : t("dashboard.timeWindow.hours", { count: activeWindowHours });
+  const windowLabel = t("dashboard.timeWindow.hours", {
+    count: CALIBRATION_WINDOW_HOURS,
+  });
   setLocalizedText($("#timeline-chart-title"), "dashboard.timeline.title", {
     window: windowLabel,
   });
@@ -3543,7 +3602,7 @@ function bindTimelineInteractions(shell, points, viewport) {
 
 function renderTimelineSummary(data, points) {
   const summary = data.gradient.summary ?? {};
-  const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === activeWindowHours);
+  const sensitivity = data.gradient.windowSensitivity.find((row) => finite(row.smoothing_hours ?? row.window_hours ?? row.hours) === CALIBRATION_WINDOW_HOURS);
   const activePoints = points.filter((row) => row.status !== "inactive");
   const matched = activePoints.filter((row) => row.observed !== null && row.expected !== null);
   const live = points.some((row) => Object.hasOwn(row, "status"));
@@ -7907,18 +7966,6 @@ $("#prepare-contribution").addEventListener("click", prepareLocalContribution);
 $("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
 $("#sync-inspect").addEventListener("click", inspectNextContribution);
 $("#sync-run-once").addEventListener("click", () => runContributionSyncAction("run"));
-$("#window-controls").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-hours]");
-  if (!button || !dashboard) return;
-  activeWindowHours = Number(button.dataset.hours);
-  for (const control of $("#window-controls").querySelectorAll("button")) {
-    const active = control === button;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-  }
-  resetTimelineViewport();
-  renderTimeline(dashboard);
-});
 $("#range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
   if (!button || !dashboard) return;

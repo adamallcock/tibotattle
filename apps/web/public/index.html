@@ -374,6 +374,14 @@
               Copy image
             </button>
           </div>
+          <!--
+            Transient confirmation for a completed copy: it appears, holds a
+            few seconds, and leaves, instead of accumulating as permanent page
+            text under the card. A role="status" live region like the action
+            statuses elsewhere on this page, and it carries no focusable
+            content, so it cannot trap focus.
+          -->
+          <p class="share-toast" id="share-card-toast" role="status" hidden></p>
           <p class="participant-action-status" id="share-card-status" role="status" hidden></p>
         </article>
       </section>
@@ -468,12 +476,13 @@
               <p id="timeline-chart-copy">Chart and table use this Mac’s reporting time zone.</p>
             </div>
             <div class="calibration-controls">
-              <span class="control-label">Calibration window</span>
-              <div class="segmented-control" id="window-controls" aria-label="Calibration rolling comparison window" data-i18n-aria-label="aria.calibrationWindow">
-                <button type="button" data-hours="0.25">15 min</button>
-                <button type="button" data-hours="1" class="active" aria-pressed="true">1 hour</button>
-                <button type="button" data-hours="3">3 hours</button>
-              </div>
+              <!--
+                Owner decision 2026-08-06: the rolling comparison window is
+                fixed at three hours. The 15-minute and 1-hour widths the old
+                segmented control offered proved inaccurate, and a control
+                with one honest option is clutter, so the width lives in
+                app.js as CALIBRATION_WINDOW_HOURS rather than here.
+              -->
               <div class="segmented-control" id="calibration-range-controls" aria-label="Calibration date range" data-i18n-aria-label="aria.calibrationDateRange">
                 <button type="button" data-days="1">24h</button>
                 <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>

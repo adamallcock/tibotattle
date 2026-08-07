@@ -4336,10 +4336,15 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     "calibration chart leads Trends ahead of the usage chart",
   );
   assert.match(html, /<details class="advanced-calibration" open>/u);
-  assert.ok(
-    html.indexOf('id="window-controls"') > html.indexOf("advanced-calibration"),
-    "rolling window controls stay inside advanced calibration",
-  );
+  // Owner decision 2026-08-06: the calibration rolling comparison window is
+  // fixed at three hours — the 15-minute and 1-hour widths proved inaccurate,
+  // and a segmented control with one honest option is clutter. The previous
+  // assertion pinned that the window control sat inside the advanced
+  // calibration disclosure; the control itself is gone now, so this pins its
+  // absence and the fixed width every consumer reads instead.
+  assert.doesNotMatch(html, /id="window-controls"|data-hours=/u);
+  assert.match(appSource, /const CALIBRATION_WINDOW_HOURS = 3;/u);
+  assert.doesNotMatch(appSource, /activeWindowHours/u);
   assert.match(appSource, /row\?\.last_observed_at \?\? row\?\.first_observed_at/);
   assert.match(appSource, /label: \{ key: "weekly\.series\.shortObservation" \}/u);
   assert.match(appSource, /lookbackHours: activeContributionLookbackHours/);
@@ -6828,9 +6833,15 @@ test("a posted results card states a figure in full and marks a fixture as one",
     section,
     /const trendHeight = Math\.min\(\s*\n\s*SHARE_CARD_TREND_MAX_HEIGHT,\s*\n\s*Math\.max\(SHARE_CARD_TREND_MIN_HEIGHT, caveatTop - 30 - trendTop\),\s*\n\s*\);/u,
   );
+  // Re-pinned from 48 to 62 (owner-directed fix, 2026-08-06): at 48 the
+  // relationship note's ink bottom (y=395.82) overlapped the trend label's ink
+  // top (y=395.16) and the note's accent bar was drawn through the label's
+  // "7". A prior investigation proved no clearing value exists inside the 48px
+  // budget; 62 is the measured minimum with real clearance, costing a card
+  // that carries the note 12px of chart height.
   assert.match(
     section,
-    /const trendTop = card\.relationshipNote === ""\s*\n\s*\? statTop \+ statHeight \+ 36\s*\n\s*: statTop \+ statHeight \+ 48;/u,
+    /const trendTop = card\.relationshipNote === ""\s*\n\s*\? statTop \+ statHeight \+ 36\s*\n\s*: statTop \+ statHeight \+ 62;/u,
   );
   assert.match(section, /relationshipNote,/u);
   // The image makes the incomparable denominators explicit rather than
