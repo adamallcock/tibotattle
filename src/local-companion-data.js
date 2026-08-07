@@ -1774,9 +1774,18 @@ export async function buildLocalCompanionSnapshot({
   const collectorFreshnessStatus = evidenceAgeSeconds === null
     ? "unavailable"
     : evidenceAgeSeconds * 1_000 <= MAX_COLLECTOR_LIVE_AGE_MS ? "live" : "stale";
-  const freshnessStatus = replaySafeAccounting.status === "stale"
-    ? "stale"
-    : collectorFreshnessStatus;
+  // `freshness.status` describes the observations, and nothing else.
+  //
+  // A stale replay-safe accounting cache used to override it outright, so a
+  // dashboard whose newest observation was seconds old still reported that
+  // "the latest collector observation is older than its freshness threshold".
+  // That sentence was simply untrue, and it is why refreshing appeared to
+  // change nothing: refreshing collects observations, and the observations
+  // were never what was stale. The two facts are reported separately -
+  // `accountingStatus` below carries the cache's own verdict, and the warning
+  // list names the withheld pricing - so conflating them buys nothing and
+  // costs the reader a true statement.
+  const freshnessStatus = collectorFreshnessStatus;
   const recentUsage = replaySafeCache?.periods ?? collector.usage;
   const usage = archiveAccounting.status === "available"
     ? [

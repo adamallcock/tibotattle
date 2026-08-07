@@ -76,7 +76,12 @@ let activeUsageRangeDays = 7;
 let activeCalibrationRangeDays = 7;
 let activeUsageGrouping = "hour";
 let activeAccountingPeriod = "7d";
-let activeWeeklyRangeDays = 31;
+// Every date-range control on the dashboard now offers the same three bounded
+// windows before "All", and the cost-accounting period selector's own middle
+// window is a 30-day one published by the companion. A chart labelled 31d beside
+// an accounting total labelled 30d described two different periods with no
+// visible reason, which is the inconsistency this settles.
+let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
 let timelineViewport = null;
 let usageTimelineViewport = null;
