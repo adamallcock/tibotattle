@@ -94,6 +94,14 @@ function tokenCount(timestamp, total, last, { usedPercent = null } = {}) {
   });
 }
 
+function tokenCountTotalOnly(timestamp, total) {
+  return JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: { type: "token_count", info: { total_token_usage: total } },
+  });
+}
+
 function usage(input, output = 0, cached = 0, write = 0, reasoning = 0) {
   return {
     input_tokens: input,
@@ -236,48 +244,201 @@ test("a rebuild indexes typed usage events and never stores content", async () =
   }
 });
 
-test("a forked child inherits its parent's model for the replayed prefix", async () => {
-  // Codex writes the parent thread's history into a forked child *before* the
-  // child's own first turn_context. A strictly forward carry within one file
-  // leaves every replayed token_count with no model at all: that population is
-  // exactly the 309,946 collector records stamped model:"unknown", every one
-  // of them lineageDisposition:"forked".
+test("a forked source contributes only its post-fork turns", async () => {
+  // Owner ruling: a fork's replayed parent history is not our spend. Those
+  // turns were charged against the allowance in the parent thread; Codex
+  // copying them into the child rollout does not make them new. Only turns at
+  // or after the fork point count.
+  //
+  // The parent runs two turns (100 then 300 cumulative). The child replays
+  // both, then runs one turn of its own taking the cumulative to 400. The only
+  // new spend in the child is that last 100 input / 20 output.
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-parent.jsonl": [
       sessionMeta("session-parent"),
       turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
       tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
     ],
     "rollout-2026-07-25T01-00-00-child.jsonl": [
       sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
-      // Replayed prefix: no turn_context of its own yet.
+      // Replayed prefix, byte-identical cumulative snapshots, no turn_context.
       tokenCount("2026-07-25T01:00:00.000Z", usage(100, 10), usage(100, 10)),
-      tokenCount("2026-07-25T01:00:01.000Z", usage(200, 20), usage(100, 10)),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(300, 30), usage(200, 20)),
       turnContext("2026-07-25T01:00:02.000Z", "gpt-5.6-sol"),
-      tokenCount("2026-07-25T01:00:03.000Z", usage(400, 40), usage(200, 20)),
+      tokenCount("2026-07-25T01:00:03.000Z", usage(400, 50), usage(100, 20)),
     ],
   });
   try {
     const result = await build(root);
-    assert.equal(result.usageEvents, 4);
-    assert.equal(result.modelMissing, 0, "no event may be left without a model");
-    assert.equal(result.modelSeededFromLineage, 1);
+    // Two parent turns + one real child turn. Not five.
+    assert.equal(result.usageEvents, 3);
+    assert.equal(result.forkReplayEventsSkipped, 2);
+    assert.equal(result.modelMissing, 0);
 
     const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
     try {
-      const byModel = database.prepare(`
-        SELECT m.model_id AS model, COUNT(*) AS events
+      const rows = database.prepare(`
+        SELECT u.observed_at_ms AS ms, m.model_id AS model,
+               u.tokens_in_uncached AS iu, u.tokens_out_text AS ot
         FROM usage_event u JOIN model m ON m.id = u.model_id
-        GROUP BY m.model_id ORDER BY m.model_id`).all();
-      assert.deepEqual(byModel.map((row) => [row.model, Number(row.events)]), [
-        // parent's own event + the child's two replayed events
-        ["gpt-5.6-terra", 3],
-        // the child's own turn after its first turn_context
-        ["gpt-5.6-sol", 1],
-      ].sort((left, right) => left[0].localeCompare(right[0])));
+        ORDER BY u.observed_at_ms`).all();
+      assert.deepEqual(rows.map((row) => row.model), [
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+      ]);
+      // The child's own turn is charged as a delta against the replayed
+      // baseline. Without the rebase on a suppressed row it would be charged
+      // the entire inherited 400 as one turn.
+      assert.equal(rows[2].iu, 100);
+      assert.equal(rows[2].ot, 20);
+      // Total spend equals the parent's real history plus the child's one turn.
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS iu, SUM(tokens_out_text) AS ot
+        FROM usage_event`).get();
+      assert.equal(Number(totals.iu), 400);
+      assert.equal(Number(totals.ot), 50);
     } finally {
       database.close();
     }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a fork whose ancestor rollout has rotated away still suppresses its replay", async () => {
+  // Rule 1 cannot fire when the parent is not in the corpus: there is no
+  // ancestor snapshot set to match against. Rule 2 — no turn_context of this
+  // file's own yet — is what keeps the replayed history out, and it is the
+  // rule that covers the whole of a long history whose early rollouts have
+  // rotated away.
+  const { root } = await corpus({
+    "rollout-2026-07-25T01-00-00-orphan.jsonl": [
+      sessionMeta("session-child", { parentId: "session-absent", threadSource: "subagent" }),
+      tokenCount("2026-07-25T01:00:00.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(300, 30), usage(200, 20)),
+      turnContext("2026-07-25T01:00:02.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:03.000Z", usage(400, 50), usage(100, 20)),
+    ],
+  });
+  try {
+    const result = await build(root);
+    assert.equal(result.usageEvents, 1);
+    assert.equal(result.forkReplayEventsSkipped, 0);
+    assert.equal(result.unattributedForkReplayEventsSkipped, 2);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const row = database.prepare(
+        "SELECT tokens_in_uncached AS iu, tokens_out_text AS ot FROM usage_event",
+      ).get();
+      assert.equal(row.iu, 100);
+      assert.equal(row.ot, 20);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a suppressed replay rebases the cumulative baseline", async () => {
+  // The post-fork turn reports only a cumulative total — there is no
+  // `last_token_usage` to fall back on. If a suppressed replayed row did not
+  // move the baseline, this turn would have no baseline to subtract from and
+  // would be dropped entirely rather than charged its real 100 tokens. (When
+  // `last` is present it masks the bug, which is why this case reports only a
+  // total.)
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(300, 30), usage(300, 30)),
+    ],
+    "rollout-2026-07-25T01-00-00-child.jsonl": [
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      tokenCount("2026-07-25T01:00:00.000Z", usage(300, 30), usage(300, 30)),
+      turnContext("2026-07-25T01:00:02.000Z", "gpt-5.6-sol"),
+      tokenCountTotalOnly("2026-07-25T01:00:03.000Z", usage(400, 50)),
+    ],
+  });
+  try {
+    const result = await build(root);
+    assert.equal(result.usageEvents, 2);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT m.model_id AS model, u.tokens_in_uncached AS iu, u.tokens_out_text AS ot
+        FROM usage_event u JOIN model m ON m.id = u.model_id
+        ORDER BY u.observed_at_ms`).all();
+      assert.deepEqual(rows.map((row) => row.model), ["gpt-5.6-terra", "gpt-5.6-sol"]);
+      assert.equal(rows[1].iu, 100);
+      assert.equal(rows[1].ot, 20);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("replay after the fork's own first turn_context is still suppressed", async () => {
+  // A fork can replay `turn_context` records too. Once one has been seen, rule
+  // 2 stops applying and only the ancestor snapshot set can tell the remaining
+  // replayed turns from real ones. This is the case that makes rule 1
+  // load-bearing rather than merely corroborating.
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+    "rollout-2026-07-25T01-00-00-child.jsonl": [
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      // The replay carries the parent's turn_context with it.
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T01:00:02.000Z", usage(300, 30), usage(200, 20)),
+      // Only this is new spend.
+      tokenCount("2026-07-25T01:00:03.000Z", usage(400, 50), usage(100, 20)),
+    ],
+  });
+  try {
+    const result = await build(root);
+    assert.equal(result.usageEvents, 3);
+    assert.equal(result.forkReplayEventsSkipped, 2);
+    assert.equal(result.unattributedForkReplayEventsSkipped, 0);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(
+        "SELECT SUM(tokens_in_uncached) AS iu, SUM(tokens_out_text) AS ot FROM usage_event",
+      ).get();
+      assert.equal(Number(totals.iu), 400);
+      assert.equal(Number(totals.ot), 50);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a standalone source is never suppressed", async () => {
+  // Suppression must key off lineage, not off "an event before a turn_context".
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-solo.jsonl": [
+      sessionMeta("session-solo"),
+      tokenCount("2026-07-25T00:00:00.000Z", usage(100, 10), usage(100, 10)),
+      turnContext("2026-07-25T00:00:01.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+  });
+  try {
+    const result = await build(root);
+    assert.equal(result.usageEvents, 2);
+    assert.equal(result.forkReplayEventsSkipped, 0);
+    assert.equal(result.unattributedForkReplayEventsSkipped, 0);
   } finally {
     await rm(root, { recursive: true });
   }

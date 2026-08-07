@@ -1,9 +1,12 @@
+import { cumulativeSnapshotKey } from "./providers/codex/logs.js";
 import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js";
 
 // Projection from one Codex rollout file to typed usage facts.
 //
 // This module is pure: no SQLite, no filesystem writes, no identity. That is
-// what lets the identical code run in-process and inside a worker thread.
+// what lets the identical code run in-process and inside a worker thread. Its
+// one owner-area import is the reviewed `cumulativeSnapshotKey`, measured at
+// 5.1 ms to load per thread.
 //
 // Only three record types are read: `turn_context`, `token_count` and
 // `thread_settings_applied`. Nothing else is parsed, so no prompt, reply,
@@ -72,9 +75,11 @@ function sameUsage(left, right) {
   return TOKEN_KEYS.every((key) => left[key] === right[key]);
 }
 
-// Mirrors the reviewed provider normalization exactly. It is restated here
-// rather than imported so that this module has no owner-area dependency and
-// can be loaded inside a worker without pulling the provider graph in.
+// Mirrors the reviewed provider normalization exactly, restated so that the
+// hot path does not cross a facade for five subtractions. `cumulativeSnapshotKey`
+// above is imported rather than restated for the opposite reason: it defines
+// the fork-replay boundary, and a boundary that drifts from the reviewed
+// definition would silently change what counts as spend.
 export function canonicalComponents(raw) {
   const cacheRead = Math.min(raw.cached_input_tokens, raw.input_tokens);
   const cacheWrite = Math.min(
@@ -180,6 +185,9 @@ export function salvagePartialTokenCount(text) {
 export async function extractRolloutUsage(path, {
   size,
   startOffset = 0,
+  isFork = false,
+  inheritedSnapshots = null,
+  collectSnapshots = null,
   seedModel = null,
   seedEffort = null,
   seedTier = null,
@@ -195,6 +203,9 @@ export async function extractRolloutUsage(path, {
   let currentModel = seedModel;
   let currentEffort = seedEffort;
   let settingsEffort = null;
+  // Strictly this file's own `turn_context`, never the inherited seed. A fork
+  // has not reached its own first turn until it writes one.
+  let turnContextSeenHere = false;
   let tierState = seedTier;
   let previousTotals = seedTotals;
   const diagnostics = {
@@ -205,6 +216,8 @@ export async function extractRolloutUsage(path, {
     salvagedRecords: 0,
     turnContexts: 0,
     tokenCounts: 0,
+    forkReplayEventsSkipped: 0,
+    unattributedForkReplayEventsSkipped: 0,
     tierEvents: 0,
     modelSeededFromLineage: 0,
     modelMissing: 0,
@@ -254,6 +267,14 @@ export async function extractRolloutUsage(path, {
         diagnostics.salvagedRecords += 1;
         const delta = subtract(salvaged, previousTotals);
         previousTotals = salvaged;
+        // A degraded record still obeys the fork boundary. Only rule 2 is
+        // available here: rule 1 needs the `last_token_usage` half of the
+        // snapshot key, which a truncated record may not carry, and guessing
+        // at it could let a replayed turn through as new spend.
+        if (isFork && !turnContextSeenHere) {
+          diagnostics.unattributedForkReplayEventsSkipped += 1;
+          return;
+        }
         if (delta.total_tokens <= 0) return;
         await onEvent({
           observedAtMs,
@@ -275,6 +296,7 @@ export async function extractRolloutUsage(path, {
       }
       if (record.type === "turn_context") {
         diagnostics.turnContexts += 1;
+        turnContextSeenHere = true;
         // Enumerated by hand. `cwd`, `workspace_roots`, `turn_id`,
         // `personality` and the collaboration-mode developer instructions in
         // the same payload are never touched.
@@ -316,6 +338,43 @@ export async function extractRolloutUsage(path, {
       const info = record.payload?.info;
       const total = normalizeUsage(info?.total_token_usage);
       const last = normalizeUsage(info?.last_token_usage);
+
+      // Fork-replay suppression.
+      //
+      // Codex writes the parent thread's history into a forked child before
+      // the child's own first turn. Those turns were spent by the parent and
+      // were already charged against the allowance there; replaying them into
+      // the child is not new spend. Only turns at or after the fork point are.
+      //
+      // The boundary is the reviewed one used by the analysis index, not an
+      // approximation of it, and the two rules are applied in its order:
+      //
+      //   1. the event's cumulative snapshot is already known from an
+      //      ancestor, so it is literally the parent's turn replayed; then
+      //   2. this file has not yet written a `turn_context` of its own, so the
+      //      fork point has not been reached — which catches replayed turns
+      //      whose ancestor rollout has since rotated away and can no longer
+      //      vouch for them.
+      //
+      // A skipped row still rebases the cumulative baseline. Without that, the
+      // first genuine post-fork turn would be charged the entire inherited
+      // total as if it were one enormous turn.
+      const snapshotKey = cumulativeSnapshotKey(total, last);
+      if (isFork && snapshotKey !== null && inheritedSnapshots?.has(snapshotKey)) {
+        if (total) previousTotals = total;
+        diagnostics.forkReplayEventsSkipped += 1;
+        return;
+      }
+      // Ordering matters and mirrors the reviewed implementation: a row
+      // suppressed by rule 1 is not offered to descendants, a row suppressed
+      // by rule 2 is.
+      if (snapshotKey !== null) collectSnapshots?.add(snapshotKey);
+      if (isFork && !turnContextSeenHere) {
+        if (total) previousTotals = total;
+        diagnostics.unattributedForkReplayEventsSkipped += 1;
+        return;
+      }
+
       let usage = null;
       if (total) {
         const delta = subtract(total, previousTotals);
@@ -353,5 +412,68 @@ export async function extractRolloutUsage(path, {
     finalEffort: currentEffort,
     finalTier: tierState,
     finalTotals: previousTotals,
+  };
+}
+
+/**
+ * A tracker for the fork-replay boundary over one lineage component.
+ *
+ * The agreed schema has no snapshot-set table, and it does not need one: these
+ * sets exist only for the length of a component and are dropped when it ends.
+ * That is affordable here precisely because a rebuild is a single whole-corpus
+ * pass — the analysis index persists the equivalent sets only because it
+ * updates incrementally and has to answer for an ancestor it is not currently
+ * scanning. If this index ever becomes incremental, that persistence becomes
+ * necessary and the schema does have to widen. Recorded rather than assumed.
+ *
+ * Only a source that some later source names as an ancestor gets a set at all,
+ * so a corpus of unforked sessions allocates nothing.
+ */
+export function createLineageSnapshots(members) {
+  const referenced = new Set();
+  for (const info of members) {
+    const parentId = info.lineage?.parentId;
+    if (parentId) referenced.add(parentId);
+  }
+  const bySessionId = new Map();
+  for (const info of members) {
+    if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
+  }
+  const sets = new Map();
+
+  return {
+    /** The set this source should record into, or null if nothing inherits. */
+    collectorFor(info) {
+      const sessionId = info.lineage?.sessionId;
+      if (!sessionId || !referenced.has(sessionId)) return null;
+      const set = new Set();
+      sets.set(sessionId, set);
+      return set;
+    },
+    /** A view over every ancestor's set, nearest first. */
+    inheritedFor(info) {
+      const chain = [];
+      const seen = new Set();
+      let parentId = info.lineage?.parentId ?? null;
+      while (parentId && !seen.has(parentId)) {
+        seen.add(parentId);
+        const set = sets.get(parentId);
+        if (set) chain.push(set);
+        parentId = bySessionId.get(parentId)?.lineage?.parentId ?? null;
+      }
+      if (chain.length === 0) return null;
+      return { has: (key) => chain.some((set) => set.has(key)) };
+    },
+    release() {
+      sets.clear();
+    },
+    get retainedSets() {
+      return sets.size;
+    },
+    get retainedKeys() {
+      let total = 0;
+      for (const set of sets.values()) total += set.size;
+      return total;
+    },
   };
 }

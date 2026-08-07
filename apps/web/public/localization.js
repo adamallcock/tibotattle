@@ -233,13 +233,58 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.pricing.historyNotStarted": ["Older history has not been scanned", "尚未扫描更早的历史记录", "Aún no se ha analizado el historial anterior"],
   "dashboard.pricing.historyProgress": ["History scan: {indexed} of {total} files", "历史扫描：{indexed}/{total} 个文件", "Análisis histórico: {indexed} de {total} archivos"],
   "dashboard.pricing.historyResume": ["History scan paused", "历史扫描已暂停", "Análisis histórico en pausa"],
+  // How much of the discovered history the figures above are drawn from. Every
+  // number here is measured — indexed and discovered source counts published by
+  // the local companion — so the share is a real proportion of a real
+  // denominator and never a synthesized completion estimate. No key here claims
+  // a finish time, because none is known.
+  "dashboard.history.indexingActive": [
+    "Indexing your history now — {percent} covered so far",
+    "正在索引你的历史记录 — 目前已覆盖 {percent}",
+    "Indexando tu historial ahora: {percent} cubierto hasta ahora",
+  ],
+  "dashboard.history.indexingPaused": [
+    "History indexing is part-way through — {percent} covered so far",
+    "历史索引进行到一半 — 目前已覆盖 {percent}",
+    "La indexación del historial está a medias: {percent} cubierto hasta ahora",
+  ],
+  "dashboard.history.indexingNotStarted": [
+    "Your older history has not been indexed yet",
+    "尚未索引你更早的历史记录",
+    "Tu historial anterior aún no se ha indexado",
+  ],
+  "dashboard.history.indexingSources": [
+    "{indexed} of {total} discovered sources indexed ({bytesIndexed} of {bytesTotal}). Every figure on this page is drawn from that share and will change as the index advances.",
+    "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。本页的每个数字都基于这一部分，并会随着索引推进而变化。",
+    "{indexed} de {total} fuentes descubiertas indexadas ({bytesIndexed} de {bytesTotal}). Cada cifra de esta página procede de esa parte y cambiará a medida que avance el índice.",
+  ],
+  "dashboard.stale.accountingTitle": [
+    "The cached cost accounting is stale, not your observations",
+    "陈旧的是缓存的成本核算，而不是你的观测数据",
+    "Lo desactualizado es la contabilidad de costes en caché, no tus observaciones",
+  ],
+  "dashboard.stale.accountingCopy": [
+    "The newest local observation is current. The cached accounting result behind the cost figures is older than its threshold, so those figures are rebuilt by the next local analysis.",
+    "最新的本地观测数据是当前的。成本数字背后的缓存核算结果已超过其阈值，因此这些数字会在下一次本地分析时重建。",
+    "La observación local más reciente está al día. El resultado contable en caché que respalda las cifras de coste supera su umbral, por lo que esas cifras se reconstruyen en el próximo análisis local.",
+  ],
+  "dashboard.history.indexingResumes": [
+    "Indexing continues on the next update; no completion time is known.",
+    "索引将在下次更新时继续；完成时间未知。",
+    "La indexación continúa en la próxima actualización; no se conoce la hora de finalización.",
+  ],
  "accounting.pricing.partialCoverage": ["{percent} of usage changes have a reviewed price; coverage is partial.", "使用变化中有 {percent} 使用了经审核的价格；覆盖率不完整。", "El {percent} de los cambios de uso tiene un precio revisado; la cobertura es parcial."],
  "accounting.pricing.coverageReviewed": ["All usage changes in this period have reviewed pricing.", "此期间的所有使用变化都有经审核的价格。", "Todos los cambios de uso de este período tienen precios revisados."],
   "accounting.pricing.coverageShort": ["{percent} coverage", "{percent} 覆盖率", "{percent} de cobertura"],
   "accounting.model.noneInPeriod": ["No model usage in this period.", "此期间没有模型使用记录。", "No hay uso de modelos en este período."],
   "accounting.model.unrecognized": ["Unrecognized model", "无法识别的模型", "Modelo no reconocido"],
   "accounting.model.separateAllowanceChip": ["Separate allowance", "独立额度", "Cuota independiente"],
-  "accounting.model.separateAllowance": ["Not comparable", "无法比较", "No comparable"],
+  // Deliberately a marker, not a figure. Spark is metered against its own
+  // pool, so there is no API-price equivalent to state here — not a zero, and
+  // not a smaller number. The em dash is the same "no figure" glyph the rest of
+  // this column uses; the asterisk carries the reason to the footnote under the
+  // table, where the sentence has room to be read once instead of per row.
+  "accounting.model.separateAllowance": ["—*", "—*", "—*"],
   "accounting.model.separateAllowanceTitle": ["This model is metered against its own subscription allowance, so an API-price equivalent cannot be compared with the main pool.", "该模型按其自身的订阅额度计量，因此其 API 价格等价值无法与主额度池比较。", "Este modelo se contabiliza con su propia cuota de suscripción, por lo que un equivalente de precio de API no se puede comparar con la cuota principal."],
   "accounting.model.noPublishedPrice": ["No published price", "没有公开价格", "Sin precio publicado"],
   "accounting.model.noPublishedPriceTitle": ["This model is recognized, but no public API price card is published for it, so no price is invented.", "该模型可被识别，但没有公开的 API 价格卡，因此不会虚构价格。", "Este modelo se reconoce, pero no hay una tarjeta pública de precios de API para él, así que no se inventa ningún precio."],

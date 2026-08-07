@@ -853,11 +853,27 @@ function renderDashboard(data) {
       showCheck: true
     });
   } else if (data.state === "stale") {
-    showConnectionNotice({
-      title: "The local evidence is stale",
-      copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
-      kind: "warning"
-    });
+    // A stale cached accounting result makes the companion's single freshness
+    // verdict "stale" even when the newest observation is seconds old. Saying
+    // the observation is old in that case is simply untrue, and it is the
+    // reason a refresh appears to change nothing: the observation was never
+    // what was stale.
+    const observationIsCurrent = finite(data.freshness.ageSeconds) !== null
+      && finite(data.freshness.staleAfterSeconds) !== null
+      && data.freshness.ageSeconds <= data.freshness.staleAfterSeconds;
+    if (observationIsCurrent && data.freshness.accountingStatus === "stale") {
+      showConnectionNotice({
+        copyKey: "dashboard.stale.accountingCopy",
+        kind: "warning",
+        titleKey: "dashboard.stale.accountingTitle",
+      });
+    } else {
+      showConnectionNotice({
+        title: "The local evidence is stale",
+        copy: "The dashboard is showing real local artifacts, but the latest collector observation is older than its freshness threshold.",
+        kind: "warning"
+      });
+    }
   } else if (data.state === "insufficient") {
     showConnectionNotice({
       title: "The companion is connected, but evidence is incomplete",
@@ -870,6 +886,7 @@ function renderDashboard(data) {
   }
 
   renderQuotaCards(data);
+  renderEvidenceWarnings(data);
   renderPricing(data);
   renderComparison(data);
   renderShareCard(data);
@@ -1090,7 +1107,18 @@ function renderPricing(data) {
   );
   const eventCount = finite(pricing.eventCount, 0);
   const coverage = pricing.coveragePercent;
-  const history = historyCoverageLabel(pricing.historyCoverage);
+  // Drawn before the provenance line, and above the early return for a period
+  // with no priced components: a figure of nothing is exactly when a reader
+  // most needs to know how little of their history is indexed. Calling it from
+  // here rather than from `renderDashboard` also means the two points where an
+  // active archive pass flips `archiveHistoryScanActive` and re-runs this
+  // renderer move the progress statement with it.
+  const historyProgressShown = renderHistoryProgress(data);
+  // One panel states the index coverage once. When the block above is showing
+  // the counted sources, the terse provenance fragment would only repeat it.
+  const history = historyProgressShown
+    ? ""
+    : historyCoverageLabel(pricing.historyCoverage);
   const method = pricingMethodLabel(pricing);
   const provenance = pricingRegistryProvenance(pricing);
   const coverageElement = $("#cost-coverage");
@@ -1144,6 +1172,156 @@ function renderPricing(data) {
     );
     row.title = t("dashboard.pricing.tokens", { count: compact(component.tokens) });
     list.append(row);
+  }
+}
+
+// Decimal steps, so the unit named here is the unit the companion counted in.
+const BYTE_UNITS = Object.freeze([
+  "byte",
+  "kilobyte",
+  "megabyte",
+  "gigabyte",
+  "terabyte",
+]);
+
+function formatBytes(value) {
+  const number = finite(value);
+  if (number === null || number < 0) return "—";
+  let amount = number;
+  let index = 0;
+  while (amount >= 1_000 && index < BYTE_UNITS.length - 1) {
+    amount /= 1_000;
+    index += 1;
+  }
+  return formatNumber(amount, {
+    style: "unit",
+    unit: BYTE_UNITS[index],
+    unitDisplay: "short",
+    maximumFractionDigits: index === 0 ? 0 : 1,
+  });
+}
+
+/**
+ * How much of the discovered history the figures on this page are drawn from.
+ *
+ * Every number here is measured: the local companion publishes how many
+ * sources it discovered and how many it has indexed, and the share is that
+ * division. Nothing estimates a finish time, because none is known — a
+ * progress bar that implied one would be the same invention this product
+ * refuses everywhere else. The block is absent entirely once the index is
+ * complete, and absent when there is no denominator to divide by.
+ *
+ * It sits with the API-price-equivalent total because that total, and every
+ * figure derived from it, covers only the indexed share.
+ */
+function renderHistoryProgress(data) {
+  const container = $("#history-progress");
+  if (!container) return;
+  const history = data?.pricing?.historyCoverage
+    ?? data?.accounting?.historyCoverage
+    ?? null;
+  const total = finite(history?.sourceCount, 0);
+  const indexed = finite(history?.indexedSourceCount, 0);
+  if (history === null || history.status === "complete" || total <= 0) {
+    container.hidden = true;
+    return false;
+  }
+  container.hidden = false;
+  const percent = (indexed / total) * 100;
+  setLocalizedText(
+    $("#history-progress-headline"),
+    archiveHistoryScanActive
+      ? "dashboard.history.indexingActive"
+      : history.phase === "not_started"
+        ? "dashboard.history.indexingNotStarted"
+        : "dashboard.history.indexingPaused",
+    { percent: formatPercent(percent, 1) },
+  );
+  container.classList.toggle("active", archiveHistoryScanActive);
+  const track = $("#history-progress-track");
+  track.setAttribute("aria-valuenow", String(Math.round(percent)));
+  // The bar alone would announce a bare percentage. The counted sources are
+  // the fact worth hearing, so they are what it reports.
+  track.setAttribute("aria-valuetext", t("dashboard.history.indexingSources", {
+    bytesIndexed: formatBytes(history.indexedBytes),
+    bytesTotal: formatBytes(history.sourceBytes),
+    indexed: formatNumber(indexed),
+    total: formatNumber(total),
+  }));
+  // A started-but-tiny index must still be visibly non-empty, or 2.7% reads as
+  // "nothing has happened".
+  $("#history-progress-fill").style.width =
+    `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
+  setLocalizedText($("#history-progress-detail"), "dashboard.history.indexingSources", {
+    bytesIndexed: formatBytes(history.indexedBytes),
+    bytesTotal: formatBytes(history.sourceBytes),
+    indexed: formatNumber(indexed),
+    total: formatNumber(total),
+  });
+  setLocalizedText($("#history-progress-note"), "dashboard.history.indexingResumes");
+  return true;
+}
+
+/**
+ * Statements the local companion published about the evidence behind a figure.
+ *
+ * The companion writes each one as a finished English sentence and publishes no
+ * category alongside it. This page therefore decides only *where* a sentence
+ * appears, never what it says: each string is written with `setRawText`, so it
+ * reaches the document as text, unreworded and untruncated, and localization
+ * cannot reinterpret it.
+ *
+ * Placement is matched on the vocabulary the companion itself assembles these
+ * strings from. A sentence this build does not recognize is still shown — with
+ * the observations at the top of the overview — rather than dropped.
+ */
+const EVIDENCE_WARNING_ROUTES = Object.freeze([
+  // Anything about the history index qualifies the indexed-history totals,
+  // which are the figures the accounting period selector can show.
+  { pattern: /\bindex(?:ed|ing)\b/iu, selector: "#accounting-warnings" },
+  // Anything about prices, cost, or the accounting cache qualifies the
+  // API-price-equivalent figure the overview headlines.
+  {
+    pattern: /\b(?:accounting|cost|price|prices|priced|pricing|unpriced)\b/iu,
+    selector: "#cost-warnings",
+  },
+]);
+const EVIDENCE_WARNING_FALLBACK = "#evidence-warnings";
+// Coverage that is still growing is progress, not a failure. A caveat on a
+// figure that is already being shown is not progress, and must not be dressed
+// as it.
+const EVIDENCE_WARNING_PROGRESS =
+  /\b(?:advance|advances|advancing|expand|expands|still)\b/iu;
+
+function evidenceWarningTarget(message) {
+  return EVIDENCE_WARNING_ROUTES
+    .find((route) => route.pattern.test(message))
+    ?.selector ?? EVIDENCE_WARNING_FALLBACK;
+}
+
+function renderEvidenceWarnings(data) {
+  const grouped = new Map([
+    ...EVIDENCE_WARNING_ROUTES.map((route) => [route.selector, []]),
+    [EVIDENCE_WARNING_FALLBACK, []],
+  ]);
+  for (const message of Array.isArray(data?.warnings) ? data.warnings : []) {
+    if (typeof message !== "string" || message === "") continue;
+    grouped.get(evidenceWarningTarget(message)).push(message);
+  }
+  for (const [selector, messages] of grouped) {
+    const list = $(selector);
+    if (!list) continue;
+    clear(list);
+    // Nothing published means nothing rendered: no empty container and no
+    // "no warnings" state.
+    list.hidden = messages.length === 0;
+    for (const message of messages) {
+      const item = node("li", EVIDENCE_WARNING_PROGRESS.test(message)
+        ? "evidence-warning progress"
+        : "evidence-warning");
+      setRawText(item, message);
+      list.append(item);
+    }
   }
 }
 
@@ -5466,11 +5644,13 @@ function renderAccountingModels(accounting) {
       identity.append(label);
     }
     if (modelRowIsSeparateAllowance(model)) {
-      identity.append(localizedNode(
-        "span",
-        "evidence-chip neutral model-allowance-chip",
-        "accounting.model.separateAllowanceChip",
-      ));
+      // A filled chip on every Spark row shouted the same fact once per row and
+      // crowded the identity column. One marker on the name, carrying the same
+      // sentence as its expansion and pointing at the standing footnote under
+      // the table, says it without competing with the figures.
+      const marker = rawNode("abbr", "model-allowance-marker", "*");
+      marker.title = t("accounting.model.separateAllowanceTitle");
+      identity.append(marker);
     }
     // One formatter for both count columns. Compact notation put "154.9K"
     // beside "74" in the same column, which no reader can compare by eye.

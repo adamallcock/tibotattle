@@ -1007,6 +1007,59 @@ h2 {
 .cost-total strong { font-family: var(--serif); font-size: 2.8rem; font-weight: var(--weight-display); }
 .cost-total small { grid-column: 1 / -1; color: var(--muted); font-size: .7rem; line-height: 1.45; }
 .coverage-line { display: block; }
+
+/*
+ * How much of the discovered history a figure is drawn from, and the local
+ * companion's own statements about the evidence behind it.
+ *
+ * Two deliberately different weights. Coverage that is still growing is
+ * progress and is drawn in the blue informational tint; a caveat on a number
+ * already on screen keeps the rust band the rest of the sheet uses for "read
+ * this before you read the figure". Neither is an error colour, because
+ * neither is an error.
+ */
+.index-progress {
+  display: grid;
+  gap: var(--space-2);
+  margin-block: var(--space-4) 0;
+  padding: var(--pad-tile);
+  border-radius: var(--radius-sm);
+  border-inline-start: 3px solid var(--blue);
+  background: var(--blue-soft);
+}
+.index-progress-headline { margin: 0; color: #31536d; font-size: .8rem; font-weight: var(--weight-strong); }
+.index-progress-detail { margin: 0; color: #31536d; font-size: .74rem; line-height: 1.5; }
+.index-progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: rgba(49, 95, 132, .18);
+}
+.index-progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
+/* An active pass is the one state where motion is truthful: something really
+   is advancing. A paused index stays still rather than implying work. */
+.index-progress.active .index-progress-track i { animation: index-progress-pulse 1.6s ease-in-out infinite; }
+@keyframes index-progress-pulse { 50% { opacity: .55; } }
+
+.evidence-warnings { display: grid; gap: var(--space-2); margin-block: var(--space-4) 0; padding: 0; list-style: none; }
+.evidence-warning {
+  padding: var(--space-3) var(--pad-tile);
+  border-radius: var(--radius-sm);
+  border-inline-start: 3px solid var(--rust);
+  background: var(--rust-soft);
+  color: #784d25;
+  font-size: .74rem;
+  line-height: 1.5;
+}
+.evidence-warning.progress {
+  border-inline-start-color: var(--blue);
+  background: var(--blue-soft);
+  color: #31536d;
+}
+@media (prefers-reduced-motion: reduce) {
+  .index-progress.active .index-progress-track i { animation: none; }
+}
+
 .component-list { display: grid; gap: 10px; }
 .component-row { display: grid; grid-template-columns: 145px 1fr auto; gap: 12px; align-items: center; font-size: .73rem; }
 .component-row > span { color: var(--muted); }
@@ -1495,8 +1548,22 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .accounting-models-panel th:not(:first-child),
 .accounting-models-panel td:not(:first-child) { text-align: end; }
-.model-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.model-allowance-chip { flex: 0 0 auto; }
+/* Ordinary inline flow, not a flex row. The row used to hold a name and a
+   filled chip side by side; it now holds a name and a reference mark, and a
+   flex item cannot sit against the last word of a name that wrapped — the
+   marker fell onto a line of its own under the model it was marking. */
+.model-identity { display: block; }
+/* A reference mark, not a badge: it sits on the name it qualifies and points
+   at the one footnote under the table. The dotted underline `abbr` gets by
+   default would read as a spelling error on a single glyph. */
+.model-allowance-marker {
+  color: var(--blue);
+  font-size: .82em;
+  font-weight: var(--weight-strong);
+  text-decoration: none;
+  cursor: help;
+}
+.model-allowance-footnote::before { content: "* "; }
 /* Digits stay column-aligned so counts can be compared down the column. */
 .numeric-cell, .model-api-equivalent { font-variant-numeric: tabular-nums; }
 .accounting-bars { display: grid; gap: 10px; }

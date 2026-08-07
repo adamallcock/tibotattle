@@ -143,18 +143,8 @@ function sameIdentity(stats, expected) {
 }
 
 function assertSafeSourceStats(stats) {
-  // `nlink !== 1` is deliberately absent. It does not detect a source changing
-  // underneath this read - a second directory entry to the same inode cannot
-  // alter bytes read through a handle already checked for type, symlink and
-  // ownership - and it fails on files this process does not create. Codex's
-  // own archive move links a rollout into `archived_sessions/` before
-  // unlinking it from `sessions/`, and 14 of this machine's 3,709 rollouts
-  // carry nlink 2 or 3 as a result. The identical guard in
-  // src/local-analysis-index.js froze the history index at 1,224 of 3,709
-  // sources; here it aborted the export source plan the same way. Guards on
-  // files this product creates itself keep their link check - there an extra
-  // link really is unexpected.
   if (!stats.isFile() || stats.isSymbolicLink()) fail("source_type");
+  if (stats.nlink !== 1) fail("source_links");
   const uid = currentUid();
   if (uid !== null && stats.uid !== uid) fail("source_owner");
   if (platform !== "win32" && (stats.mode & 0o077) !== 0) fail("source_permissions");

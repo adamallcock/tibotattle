@@ -2598,7 +2598,14 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       status: state,
       latestObservedAt: text(freshness?.latestObservedAt ?? overview?.latestObservedAt ?? overview?.latestEvidenceAt, ""),
       ageSeconds: finite(freshness?.ageSeconds ?? freshness?.age_seconds, null),
-      staleAfterSeconds: finite(freshness?.staleAfterSeconds, null)
+      staleAfterSeconds: finite(freshness?.staleAfterSeconds, null),
+      // The companion reports one overall freshness verdict, and a stale
+      // cached accounting result makes that verdict "stale" even while the
+      // newest collector observation is seconds old. Both parts are published;
+      // keeping this one lets the page name what is actually stale instead of
+      // telling a reader their observation is old when it is not.
+      accountingStatus: text(freshness?.accountingStatus, ""),
+      accountingAgeSeconds: finite(freshness?.accountingAgeSeconds, null)
     },
     quotaWindows,
     activity: {

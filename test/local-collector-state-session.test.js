@@ -55,13 +55,32 @@ test("a session commits every batch durably and settles once at close", async ()
     }
 
     const settled = await session.close();
-    assert.deepEqual(settled, { batches: 2, inserted: 3 });
+    assert.deepEqual(settled, { batches: 2, inserted: 3, verified: true });
     const state = await readLocalCollectorRecords({ stateFile });
     assert.equal(state.records.length, 3);
     assert.deepEqual(
       (await readLocalCollectorCheckpoint({ stateFile })),
       checkpointFor(2),
     );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an idle session does not scan the whole store to verify what it did not write", async () => {
+  // `quick_check` reads every page, so its cost grows with the store. The
+  // foreground collector reconciles on a short timer, and a checkpoint-only
+  // cycle has nothing whose integrity this run could have affected. Paying it
+  // anyway measured at +11.2 ms per idle cycle.
+  const { root, stateFile } = await fixture();
+  try {
+    const session = await openLocalCollectorStateSession({ stateFile, clock: CLOCK });
+    session.commit({ checkpoint: checkpointFor(1), records: [] });
+    const settled = await session.close();
+    assert.deepEqual(settled, { batches: 1, inserted: 0, verified: false });
+    // The checkpoint is still durable: each batch is its own
+    // synchronous=FULL transaction, so skipping the scan skips no guarantee.
+    assert.deepEqual(await readLocalCollectorCheckpoint({ stateFile }), checkpointFor(1));
   } finally {
     await rm(root, { recursive: true });
   }
@@ -76,6 +95,7 @@ test("closing a session runs the integrity check exactly once and fails closed",
     // still the same fixed error code.
     const settled = await session.close({ verifyIntegrity: true });
     assert.equal(settled.inserted, 1);
+    assert.equal(settled.verified, true);
   } finally {
     await rm(root, { recursive: true });
   }

@@ -246,6 +246,14 @@
           <div class="skeleton-card"></div>
         </div>
 
+        <!--
+          Statements the local companion published about the evidence behind
+          these observations. They are its own finished sentences, rendered as
+          text and never reworded here. Each list stays out of the document
+          entirely when the companion published nothing for it.
+        -->
+        <ul class="evidence-warnings" id="evidence-warnings" hidden></ul>
+
         <div class="two-column overview-panels">
           <article class="panel">
             <div class="panel-heading">
@@ -265,6 +273,25 @@
               <strong id="cost-total">—</strong>
               <small id="cost-coverage">Awaiting local evidence</small>
             </div>
+            <!--
+              How much of the discovered history this figure is actually drawn
+              from. It stays out of the document once the index is complete,
+              and it never states a percentage it did not measure.
+            -->
+            <div class="index-progress" id="history-progress" hidden>
+              <p class="index-progress-headline" id="history-progress-headline"></p>
+              <div
+                class="index-progress-track"
+                id="history-progress-track"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-labelledby="history-progress-headline"
+              ><i id="history-progress-fill"></i></div>
+              <p class="index-progress-detail" id="history-progress-detail"></p>
+              <p class="index-progress-detail" id="history-progress-note"></p>
+            </div>
+            <ul class="evidence-warnings" id="cost-warnings" hidden></ul>
             <p class="annotation">
               This activity total can exceed the inferred weekly limit: it spans
               a calendar period, while the weekly estimate describes one observed
@@ -591,6 +618,7 @@
           </div>
         </div>
         <div class="metric-grid accounting-summary" id="accounting-summary"></div>
+        <ul class="evidence-warnings" id="accounting-warnings" hidden></ul>
         <div class="two-column accounting-component-grid">
           <article class="panel">
             <div class="panel-heading">
@@ -635,7 +663,12 @@
               </table>
             </div>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
-            <p class="annotation">
+            <!--
+              The expansion of the marker each separately metered row carries.
+              The asterisk itself is drawn by the stylesheet so this stays one
+              translated sentence rather than a sentence plus a glyph.
+            -->
+            <p class="annotation model-allowance-footnote">
               A model on a separate allowance is listed on its own row and
               carries no API equivalent, because that figure cannot be compared
               with the main allowance. Nothing unavailable is replaced with an
