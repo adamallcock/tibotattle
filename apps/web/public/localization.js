@@ -561,10 +561,37 @@ function catalogIndex(locale) {
   return SUPPORTED_LOCALES.indexOf(locale);
 }
 
+/**
+ * Catalog column per already-seen locale request.
+ *
+ * `negotiateLocale` is the full BCP 47 negotiation: it normalizes the
+ * supported list, canonicalizes a fallback, and walks the requested values
+ * through script and region matching. That is the right amount of work to do
+ * once for a locale, and the wrong amount to do per string. `translate` ran it
+ * on every call, and `translate` is called several times per plotted chart
+ * point, so the calibration panel spent about 13.5 microseconds per string
+ * doing negotiation it had already done - measured in the live page at 13.51
+ * against a 0.005 loop baseline, roughly 10 ms per frame at the default range.
+ *
+ * A locale negotiates to the same column every time, so the answer is
+ * remembered. Only the resolved index is cached, never a rendered string, so
+ * interpolation still runs per call and nothing about the catalog changes.
+ */
+const catalogIndexByRequest = new Map();
+
+function negotiatedCatalogIndex(locale) {
+  const key = typeof locale === "string" ? locale : JSON.stringify(locale);
+  const remembered = catalogIndexByRequest.get(key);
+  if (remembered !== undefined) return remembered;
+  const index = catalogIndex(negotiateLocale(locale));
+  catalogIndexByRequest.set(key, index);
+  return index;
+}
+
 export function translate(key, values = {}, locale = DEFAULT_LOCALE) {
   const row = WEB_MESSAGES[key];
   if (!row) return interpolate(key, values);
-  const index = catalogIndex(negotiateLocale(locale));
+  const index = negotiatedCatalogIndex(locale);
   return interpolate(row[index < 0 ? 0 : index], values);
 }
 
