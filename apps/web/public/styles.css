@@ -1805,7 +1805,12 @@ footer {
   }
   .primary-nav a { flex: 0 0 auto; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
-  .metric-grid > :last-child { grid-column: 1 / -1; }
+  /* Only stretch a trailing card that would otherwise sit half-width alone on
+     its own row. `:last-child` on its own also stretched the second of two
+     cards, which is why the Spark allowance rendered double the width of the
+     primary allowance beside it at this breakpoint. In a two-column grid the
+     last child is alone exactly when its position is odd. */
+  .metric-grid > :last-child:nth-child(odd) { grid-column: 1 / -1; }
 }
 
 @media (max-width: 760px) {
