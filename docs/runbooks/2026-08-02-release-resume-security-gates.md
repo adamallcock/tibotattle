@@ -16,20 +16,23 @@ source now reaches primary migration `0029` and deletion-ledger migration
 ingest, and upload ingress disabled. This dated document does not prove that
 those revisions or configuration are deployed. Until the owner reruns the
 read-only production observer against the canonical endpoints and records a
-fresh revision/containment receipt, the remote Worker/schema state is
+fresh observation, the remote Worker/schema state is
 unverified.
 
 A verified, history-free client seed exists in a separate **private**
 repository, but no consumer DMG, appcast, GitHub release, or public client
 source has been published. Do not use a generic `wrangler deploy` against
-production: the reviewed route is the receipt-gated
-`npm --prefix apps/worker run production:deploy -- --receipt-file
-/owner-only/production-containment-proof.json --confirm
-DEPLOY_CONTAINED_PRODUCTION`, which runs the local-only `release:preflight`
-gate, refuses a dirty checkout, and stages only tracked web assets after the
-current canonical containment/revision proof is validated. The deployment
-command is an execution path, not evidence that its external receipt or remote
-state currently exists.
+production: the reviewed route is the migration-gated
+`npm --prefix apps/worker run production:deploy -- --confirm
+DEPLOY_PRODUCTION` (adding `--confirm-migrations` naming the exact pending
+set when the checkout carries D1 migrations not yet applied to production),
+which runs the local-only `release:preflight` gate, refuses a dirty checkout,
+fails closed when the remote migration ledger cannot be read, and stages only
+tracked web assets. The former owner-written containment receipt was retired
+by the
+[2026-08-07 governance decision](../governance/2026-08-07-production-deploy-migration-gate.md).
+The deployment command is an execution path, not evidence about remote
+state.
 
 The 2026-08-02 observation found the update-feed infrastructure provisioned,
 with an active TLS certificate and an empty bucket; the canonical appcast URL
@@ -216,7 +219,8 @@ Record the completed checks in a privacy-safe JSON receipt with this shape
 
 ## Explicitly not complete
 
-- A fresh revision-bound deployment/schema/containment receipt, owner admin-key
+- A fresh revision-bound deployment/schema observation (containment receipts
+  were retired on 2026-08-07), owner admin-key
   binding (admin operations only), and current full Google/Apple callback
   completion against that deployment. The Apple association file remains
   intentionally unnecessary for the registered web flow.

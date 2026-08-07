@@ -11,12 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  CANONICAL_PRODUCTION_DEPLOYMENT_PROOF,
   createStagingDeploymentIdentity,
   DEFAULT_DEPLOYMENT_PROOF_MAX_AGE_MS,
   DEPLOYMENT_PROOF_SCHEMA_VERSION,
-  PRODUCTION_CONTAINMENT_PROOF_OPERATION,
-  PRODUCTION_OBSERVATION_CHANNEL,
   STAGING_DISABLED_WORKER_PROOF_OPERATION,
   readDeploymentProof,
   readStagingDeploymentIdentity,
@@ -70,33 +67,6 @@ function stagingProof(overrides = {}) {
   };
 }
 
-function productionProof(overrides = {}) {
-  return {
-    schemaVersion: DEPLOYMENT_PROOF_SCHEMA_VERSION,
-    operation: PRODUCTION_CONTAINMENT_PROOF_OPERATION,
-    environment: "production",
-    channel: "stable",
-    observationChannel: PRODUCTION_OBSERVATION_CHANNEL,
-    status: "remote_containment_observed",
-    observedAt: new Date(NOW - 1_000).toISOString(),
-    target: {
-      origin: CANONICAL_PRODUCTION_DEPLOYMENT_PROOF.manifest.publicOrigin,
-      endpointManifest: {
-        ...CANONICAL_PRODUCTION_DEPLOYMENT_PROOF.manifest,
-        sha256: CANONICAL_PRODUCTION_DEPLOYMENT_PROOF.manifestSha256,
-      },
-    },
-    worker: {
-      revision: "production-revision-0001",
-      sourceCommit: SOURCE_COMMIT,
-      enrollmentMode: "disabled",
-      collectionControls: "contained",
-    },
-    evidence: workerEvidence(),
-    ...overrides,
-  };
-}
-
 test("staging proof requires the observed compatible disabled revision", () => {
   const result = validateDeploymentProof({
     proof: stagingProof(),
@@ -132,44 +102,39 @@ test("staging proof rejects absent, stale, malformed, mismatched, or open eviden
   }
 });
 
-test("production proof binds current containment and revision to the canonical stable target", () => {
+// Re-pinned 2026-08-07: the production containment receipt was retired by
+// docs/governance/2026-08-07-production-deploy-migration-gate.md. The
+// "production" proof kind must now fail closed even for a perfectly formed
+// proof, so no receipt file can ever re-authorize a production deploy path.
+test("production proof kind is retired and fails closed", () => {
   const result = validateDeploymentProof({
-    proof: productionProof(),
+    proof: stagingProof(),
     kind: "production",
     expectedSourceCommit: SOURCE_COMMIT,
     now: NOW,
   });
-  assert.equal(result.ok, true);
-  for (const [name, overrides] of [
-    ["wrong channel", { channel: "internal-dogfood" }],
-    ["wrong origin", { target: { ...productionProof().target, origin: "https://wrong.example.test" } }],
-    ["wrong manifest", { target: { ...productionProof().target, endpointManifest: { ...productionProof().target.endpointManifest, appcastURL: "https://updates.tibotattle.com/wrong.xml" } } }],
-    ["wrong status", { status: "not_ready" }],
-    ["wrong source commit", { worker: { ...productionProof().worker, sourceCommit: "deadbee" } }],
-  ]) {
-    assert.equal(
-      validateDeploymentProof({
-        proof: productionProof(overrides),
-        kind: "production",
-        expectedSourceCommit: SOURCE_COMMIT,
-        now: NOW,
-      }).ok,
-      false,
-      name,
-    );
-  }
+  assert.deepEqual(result, {
+    ok: false,
+    code: "DEPLOYMENT_PROOF_KIND_INVALID",
+  });
 });
 
+// Re-pinned 2026-08-07: the owner-only local-file gate previously carried a
+// production containment proof; it now guards only staging receipts
+// (docs/governance/2026-08-07-production-deploy-migration-gate.md).
 test("proof-file reads only a bounded regular local JSON file", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-proof-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const filename = join(root, "production-proof.json");
-  await writeFile(filename, `${JSON.stringify(productionProof())}\n`, {
+  const filename = join(root, "staging-proof.json");
+  await writeFile(filename, `${JSON.stringify(stagingProof())}\n`, {
     mode: 0o600,
   });
   const result = await readDeploymentProof({
     filename,
-    kind: "production",
+    kind: "staging",
+    expectedOrigin: STAGING_ORIGIN,
+    expectedSourceCommit: SOURCE_COMMIT,
+    expectedDeploymentIdentity: stagingIdentity(),
     now: NOW,
   });
   assert.equal(result.ok, true);
@@ -193,18 +158,21 @@ test("staging identity receipt binds generated origin and owner-observed revisio
   assert.equal(result.identity.deployment.revision, null);
 });
 
+// Re-pinned 2026-08-07 from a production containment proof to a staging
+// proof payload; the file-safety contract itself is unchanged
+// (docs/governance/2026-08-07-production-deploy-migration-gate.md).
 test("proof-file rejects group/world-writable files and a wrong owner", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-proof-mode-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const filename = join(root, "proof.json");
-  await writeFile(filename, `${JSON.stringify(productionProof())}\n`, {
+  await writeFile(filename, `${JSON.stringify(stagingProof())}\n`, {
     mode: 0o600,
   });
   for (const mode of [0o640, 0o604]) {
     await chmod(filename, mode);
     const result = await readDeploymentProof({
       filename,
-      kind: "production",
+      kind: "staging",
       now: NOW,
     });
     assert.deepEqual(result, { ok: false, code: "DEPLOYMENT_PROOF_FILE_UNSAFE" });
@@ -219,12 +187,15 @@ test("proof-file rejects group/world-writable files and a wrong owner", async (t
   );
 });
 
+// Re-pinned 2026-08-07 from a production containment proof to a staging
+// proof payload; the symlink/mutation refusals are unchanged
+// (docs/governance/2026-08-07-production-deploy-migration-gate.md).
 test("proof-file rejects symlinks and detects mutation after the read", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-proof-race-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const realFile = join(root, "real-proof.json");
   const linkFile = join(root, "link-proof.json");
-  await writeFile(realFile, `${JSON.stringify(productionProof())}\n`, {
+  await writeFile(realFile, `${JSON.stringify(stagingProof())}\n`, {
     mode: 0o600,
   });
   try {
@@ -235,7 +206,7 @@ test("proof-file rejects symlinks and detects mutation after the read", async (t
   }
   const symlinkResult = await readDeploymentProof({
     filename: linkFile,
-    kind: "production",
+    kind: "staging",
     now: NOW,
   });
   assert.deepEqual(symlinkResult, {
@@ -245,7 +216,7 @@ test("proof-file rejects symlinks and detects mutation after the read", async (t
 
   const mutationResult = await readDeploymentProof({
     filename: realFile,
-    kind: "production",
+    kind: "staging",
     now: NOW,
     afterRead: async () => {
       await writeFile(realFile, "{}\n", { mode: 0o600 });

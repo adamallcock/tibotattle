@@ -49,9 +49,10 @@ statuses, artifact byte count/digest, and pass/fail. Never record private keys,
 Keychain exports, provider tokens, OAuth codes/verifiers, account identifiers,
 raw appcast/artifact bytes, or raw logs.
 
-Worker deployment proof is a separate local JSON receipt, not a Wrangler log;
-for staging, it is an owner-local attestation rather than self-authenticating
-live proof. The compatible staging deploy independently binds the checked-out
+The staging Worker deployment proof is a separate local JSON receipt, not a
+Wrangler log; it is an owner-local attestation rather than
+self-authenticating live proof. (Production deploys carry no such receipt;
+see below.) The compatible staging deploy independently binds the checked-out
 source commit through Wrangler's non-secret `DEPLOYMENT_SOURCE_COMMIT` var,
 and preparation re-fetches the exact staging origin's health endpoint to
 correlate that runtime value with the identity receipt before any D1
@@ -59,35 +60,45 @@ containment or migration mutation.
 the proof and staging deployment-identity files must be regular owner-owned
 files with mode `0600` (no group/world access), and are read through the
 owner-only local-file gate.
-For production, first run the read-only owner observation and retain its
-output; then record the observed opaque Worker revision in a receipt with
-schema `tibotattle-worker-deployment-proof-v0.1`, operation
-`production_containment_observed`, `environment: "production"`,
-`channel: "stable"`, `observationChannel: "production_containment_observer"`,
-`status: "remote_containment_observed"`, a fresh `observedAt`, the exact
-canonical production origin, the observer's matched endpoint-manifest fields,
-`enrollmentMode: "disabled"`, `collectionControls: "contained"`, and the four
-owner-observation evidence flags. The deploy wrapper validates the receipt's
-age, revision, containment, endpoint manifest, and channel before any local
-asset step or Wrangler call, then performs an immediate credential-free
-canonical `/api/health` recheck with redirect, JSON, security-header,
-disabled/contained, and no-external-authorization checks immediately before
-spawning Wrangler. The wrapper snapshots the checked-out source commit and
-requires a clean Git tree before local gates, then creates a temporary
-detached worktree at that exact commit. It copies the already-generated public
-release input into the snapshot, runs the release preflight and asset staging
-there, and invokes Wrangler with the snapshot Worker directory as `cwd`.
-Snapshot creation or cleanup failure is fail-closed. The original checkout is
-still checked immediately before and after Wrangler; a revision or tree change
+For production, there is no receipt file. Per the
+[2026-08-07 governance decision](../governance/2026-08-07-production-deploy-migration-gate.md),
+routine production deploys no longer require a containment observation, an
+intake pause, or any hand-written attestation; the gate is the set of
+unapplied D1 migrations the deploy carries. The reviewed route is:
+
+```sh
+npm --prefix apps/worker run production:deploy -- --confirm DEPLOY_PRODUCTION
+# Only when the checkout carries D1 migrations not yet applied to production:
+npm --prefix apps/worker run production:deploy -- \
+  --confirm DEPLOY_PRODUCTION \
+  --confirm-migrations USAGE_MONITOR_DB:0030_example.sql
+```
+
+The wrapper snapshots the checked-out source commit and requires a clean Git
+tree before local gates, then creates a temporary detached worktree at that
+exact commit. From the snapshot it compares the migration directories against
+the remote production `d1_migrations` ledgers through a read-only
+`wrangler d1 execute … --remote` SELECT per database. No unapplied migrations
+means the deploy proceeds; unapplied migrations require
+`--confirm-migrations` to name the exact pending set
+(`BINDING:0000_name.sql`, comma-separated, in order), and the wrapper prints
+that set before spawning Wrangler. The wrapper never applies migrations
+itself; apply them through the reviewed migration procedure. An
+undeterminable pending set, a drifted ledger, a mismatched confirmation, or a
+migration confirmation with nothing pending all fail closed. The wrapper then
+runs the local-only `release:preflight` disposable migration/schema rehearsal
+as a hard gate, copies the already-generated public release input into the
+snapshot, runs asset staging there, performs an immediate credential-free
+canonical `/api/health` recheck with redirect, JSON, and security-header
+checks (the body must report `status: "ok"`; deploys happen against the live
+enrollment-open service, so no disabled/contained posture is asserted), and
+invokes Wrangler with the snapshot Worker directory as `cwd`. Snapshot
+creation or cleanup failure is fail-closed. The original checkout is still
+checked immediately before and after Wrangler; a revision or tree change
 fails closed, while any deploy that already ran must be treated as an
 ambiguous local outcome and re-inspected by the owner, not reported as a
-successful release. Both the bounded owner proof and that live health recheck
-are required. The health recheck does not prove the Worker revision; that role
-remains with the owner-observed revision in the proof. The wrapper never treats
-checked-in configuration or staging evidence as production containment. It
-also runs the existing local-only `release:preflight` and refuses the
-production deploy unless that disposable migration/schema rehearsal returns a
-ready receipt.
+successful release. A post-deploy health and public-surface recheck completes
+the wrapper.
 
 ## Strict sequence
 
@@ -272,20 +283,19 @@ node apps/worker/scripts/release-readiness.mjs \
   --probe-public --timeout-ms 5000
 ```
 
-Require fresh health/readiness evidence for the canonical production service:
-enrollment disabled, all collection controls contained, no external
-participants authorized, and no unexpected redirect. This is the observation
-used to construct the containment proof. The current live posture is
-uncontained until this owner action proves otherwise, regardless of checked-in
-vars or staging receipts. The observer output alone is not a revision receipt;
-the owner must verify and record the active Worker revision in the bounded local
-proof file.
+Require fresh health/readiness evidence for the canonical production service
+and record the observed intake posture. This observation is an intake-policy
+input, not a deploy input: per the
+[2026-08-07 governance decision](../governance/2026-08-07-production-deploy-migration-gate.md)
+no containment proof file is constructed from it, and `production:deploy`
+does not read one. Treat the live posture as unknown until this owner action
+observes it, regardless of checked-in vars or staging receipts.
 
 There is **no checked-in beta activation command**. The runtime recognizes
-`invite_only`, but `production:deploy` intentionally rejects any production
-configuration other than the reviewed, fully disabled posture. Do not use that
-command, generic `wrangler deploy`, or a production SQL command to enable a
-beta.
+`invite_only`, but the `production:deploy` local `release:preflight` gate
+intentionally rejects any checked-in production configuration other than the
+reviewed, fail-closed vars. Do not use that command, generic
+`wrangler deploy`, or a production SQL command to enable a beta.
 
 Before a beta can proceed, add and independently review a dedicated activation
 procedure that proves the exact endpoint, cohort boundary, invitation policy,
@@ -295,18 +305,22 @@ must keep the beta non-public, publication-disabled, rate-bounded, and limited
 to the approved cohort; it must never put invitation secrets or OAuth material
 in receipts.
 
-**Gate / rollback.** Any open enrollment, uncontained control, public
-publication, unexpected participant, OAuth state/cancel failure, lifecycle
-failure, or cohort expansion pauses a future beta immediately. The existing
-`production:deploy` path is only a receipt-gated route back to the reviewed
-disabled configuration; re-run the containment observer after it. Do not
-improvise a production SQL or Wrangler command. No public intake gate may
-inherit a passing staging or dogfood receipt.
+**Gate / rollback.** Any unexpected enrollment posture, public publication,
+unexpected participant, OAuth state/cancel failure, lifecycle failure, or
+cohort expansion pauses a future beta immediately. The existing
+`production:deploy` path is the migration-gated route for deploying the
+reviewed configuration; re-run the read-only production observer after it to
+re-establish the intake posture. Do not improvise a production SQL or
+Wrangler command. No public intake gate may inherit a passing staging or
+dogfood receipt.
 
 ### 5. Public stable: publish, observe, then open intake
 
-Public stable requires all earlier receipts, a fresh containment receipt, a
-successful OAuth completion/cancel test in the shipped candidate, and a
+Public stable requires all earlier receipts, a fresh read-only production
+observation of live health and intake posture (no containment receipt is
+written; see the
+[2026-08-07 governance decision](../governance/2026-08-07-production-deploy-migration-gate.md)),
+a successful OAuth completion/cancel test in the shipped candidate, and a
 successful `N → N+1` rehearsal. Build from a clean annotated tag using the
 stable channel explicitly:
 
@@ -400,7 +414,8 @@ newer corrected candidate only after the full sequence is re-run.
 Stop and hand back to the owner when any of these is true: the checkout is
 dirty or the release tag is not annotated; a channel resolves to an unknown or
 unconfigured policy; a staging or beta target is not exact and non-production;
-live containment is absent; the stable appcast or artifact is unavailable;
+the fresh production health/intake observation is missing or failed; the
+stable appcast or artifact is unavailable;
 OAuth state, nonce, PKCE, expiry, replay, or cancel behavior is not observed;
 the installed app identity/version is unexpected; a receipt would contain
 secrets or raw user/provider data; or rollback to the retained signed `N` is

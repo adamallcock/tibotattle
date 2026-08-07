@@ -2,18 +2,17 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
-import {
-  STABLE_RELEASE_CHANNEL,
-} from "../../../config/release-channels.js";
 
+// The production containment proof (operation
+// "production_containment_observed") was deleted on 2026-08-07: production is
+// enrollment-open and operational, so that receipt could never be truthfully
+// written without an intake outage, and production deploys now gate on
+// unapplied D1 migrations instead. Only the staging proof kinds remain.
+// See docs/governance/2026-08-07-production-deploy-migration-gate.md.
 export const DEPLOYMENT_PROOF_SCHEMA_VERSION =
   "tibotattle-worker-deployment-proof-v0.1";
 export const STAGING_DISABLED_WORKER_PROOF_OPERATION =
   "staging_disabled_worker_observed";
-export const PRODUCTION_CONTAINMENT_PROOF_OPERATION =
-  "production_containment_observed";
-export const PRODUCTION_OBSERVATION_CHANNEL =
-  "production_containment_observer";
 export const DEFAULT_DEPLOYMENT_PROOF_MAX_AGE_MS = 15 * 60 * 1000;
 export const MAX_DEPLOYMENT_PROOF_BYTES = 32 * 1024;
 export const DEPLOYMENT_IDENTITY_SCHEMA_VERSION =
@@ -24,26 +23,6 @@ export const STAGING_DEPLOYMENT_IDENTITY_OPERATION =
 const SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
 const WORKER_REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
 const OWNER_ONLY_MODE = 0o600n;
-
-function canonicalProductionManifest() {
-  return {
-    public: {
-      origin: DEPLOYMENT_ENDPOINTS.public.origin,
-      routeHosts: [...DEPLOYMENT_ENDPOINTS.public.routeHosts],
-    },
-    schemaVersion: DEPLOYMENT_ENDPOINTS.schemaVersion,
-    sparkle: {
-      appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
-      origin: DEPLOYMENT_ENDPOINTS.sparkle.origin,
-      r2Bucket: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket,
-    },
-  };
-}
-
-const CANONICAL_PRODUCTION_MANIFEST = canonicalProductionManifest();
-const CANONICAL_PRODUCTION_MANIFEST_SHA256 = createHash("sha256")
-  .update(JSON.stringify(CANONICAL_PRODUCTION_MANIFEST), "utf8")
-  .digest("hex");
 
 function objectRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -97,18 +76,6 @@ function validStagingTarget(target, expectedOrigin) {
   if (!origin || !origin.endsWith(".workers.dev")) return false;
   if (origin === DEPLOYMENT_ENDPOINTS.public.origin) return false;
   return !expectedOrigin || origin === expectedOrigin;
-}
-
-function validProductionTarget(target) {
-  const manifest = target?.endpointManifest;
-  return target?.origin === DEPLOYMENT_ENDPOINTS.public.origin
-    && manifest?.status === "matched"
-    && manifest?.schemaVersion === CANONICAL_PRODUCTION_MANIFEST.schemaVersion
-    && manifest?.sha256 === CANONICAL_PRODUCTION_MANIFEST_SHA256
-    && manifest?.publicOrigin === DEPLOYMENT_ENDPOINTS.public.origin
-    && manifest?.appcastURL === DEPLOYMENT_ENDPOINTS.sparkle.appcastURL
-    && JSON.stringify(manifest?.routeHosts)
-      === JSON.stringify(CANONICAL_PRODUCTION_MANIFEST.public.routeHosts);
 }
 
 function invalid(code) {
@@ -350,19 +317,10 @@ export function validateDeploymentProof({
     }
     return Object.freeze({ ok: true, code: null, proof });
   }
-  if (kind === "production") {
-    if (proof.operation !== PRODUCTION_CONTAINMENT_PROOF_OPERATION
-        || proof.environment !== "production"
-        || proof.channel !== STABLE_RELEASE_CHANNEL
-        || proof.observationChannel !== PRODUCTION_OBSERVATION_CHANNEL
-        || proof.status !== "remote_containment_observed"
-        || !validProductionTarget(proof.target)
-        || (expectedSourceCommit !== null
-          && proof.worker.sourceCommit !== expectedSourceCommit)) {
-      return invalid("PRODUCTION_CONTAINMENT_PROOF_MISMATCH");
-    }
-    return Object.freeze({ ok: true, code: null, proof });
-  }
+  // kind "production" was deliberately removed on 2026-08-07 and now fails
+  // closed here: no receipt can authorize a production deploy, and the deploy
+  // wrapper gates on unapplied D1 migrations instead
+  // (docs/governance/2026-08-07-production-deploy-migration-gate.md).
   return invalid("DEPLOYMENT_PROOF_KIND_INVALID");
 }
 
@@ -408,15 +366,3 @@ export async function readStagingDeploymentIdentity({
     expectedSourceCommit,
   });
 }
-
-export const CANONICAL_PRODUCTION_DEPLOYMENT_PROOF = Object.freeze({
-  manifest: Object.freeze({
-    status: "matched",
-    code: null,
-    schemaVersion: CANONICAL_PRODUCTION_MANIFEST.schemaVersion,
-    publicOrigin: CANONICAL_PRODUCTION_MANIFEST.public.origin,
-    appcastURL: CANONICAL_PRODUCTION_MANIFEST.sparkle.appcastURL,
-    routeHosts: Object.freeze([...CANONICAL_PRODUCTION_MANIFEST.public.routeHosts]),
-  }),
-  manifestSha256: CANONICAL_PRODUCTION_MANIFEST_SHA256,
-});

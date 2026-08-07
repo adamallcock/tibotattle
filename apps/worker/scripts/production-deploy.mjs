@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   readlink,
   rm,
   symlink,
@@ -26,12 +27,14 @@ import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import { parse } from "jsonc-parser";
 import { checkDeploymentEndpointConsumers } from "./check-deployment-endpoints.mjs";
 import { checkLocalWorkspacePackages } from "./check-local-workspace-packages.mjs";
-import { readDeploymentProof } from "./deployment-proof.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 import { runReleasePreflight } from "./release-preflight.mjs";
 
+// Renamed from DEPLOY_CONTAINED_PRODUCTION on 2026-08-07: production deploys
+// no longer assert a contained/paused intake posture, so the old token lied.
+// See docs/governance/2026-08-07-production-deploy-migration-gate.md.
 export const PRODUCTION_DEPLOY_CONFIRMATION =
-  "DEPLOY_CONTAINED_PRODUCTION";
+  "DEPLOY_PRODUCTION";
 const PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS = 10_000;
 const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/app.js",
@@ -53,6 +56,164 @@ const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
 
 function localFailure(code) {
   return { ok: false, code };
+}
+
+// Production D1 migration gate
+// (docs/governance/2026-08-07-production-deploy-migration-gate.md): the
+// dangerous part of a routine deploy is a schema migration riding along
+// unnoticed, not intake. A deploy that carries no unapplied migrations
+// proceeds with no receipt; a deploy that does carry them must name every
+// one explicitly through --confirm-migrations. An undeterminable pending
+// set fails closed.
+const PRODUCTION_D1_DATABASES = Object.freeze([
+  Object.freeze({ binding: "USAGE_MONITOR_DB", migrationsDir: "migrations" }),
+  Object.freeze({
+    binding: "DELETION_LEDGER",
+    migrationsDir: "deletion-ledger-migrations",
+  }),
+]);
+const PRODUCTION_MIGRATION_FILENAME_PATTERN =
+  /^\d{4}_[a-z0-9][a-z0-9_]*\.sql$/u;
+export const PRODUCTION_MIGRATION_LEDGER_SQL =
+  "SELECT id, name FROM d1_migrations ORDER BY id";
+
+function parseD1ExecuteRows(stdout) {
+  try {
+    const value = JSON.parse(stdout);
+    const entries = Array.isArray(value) ? value : [];
+    const result = entries.findLast((entry) => Array.isArray(entry?.results));
+    return result?.results ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function listLocalMigrationNames(workerDirectory, migrationsDir) {
+  const entries = await readdir(join(workerDirectory, migrationsDir), {
+    withFileTypes: true,
+  });
+  const names = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".sql"))
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right, "en"));
+  return names.length > 0
+      && names.every((name) => PRODUCTION_MIGRATION_FILENAME_PATTERN.test(name))
+    ? names
+    : null;
+}
+
+/**
+ * Determine which checked-out D1 migrations are not yet recorded in the
+ * remote production migration ledgers. The only remote operation is a
+ * read-only SELECT against d1_migrations; nothing is applied or mutated.
+ * Any unreadable directory, failed or unparseable query, non-sequential
+ * ledger, or ledger entry unknown to the checkout fails closed.
+ */
+export async function determinePendingProductionMigrations({
+  wrangler,
+  workerDirectory,
+  spawn = spawnSync,
+}) {
+  const pending = [];
+  for (const database of PRODUCTION_D1_DATABASES) {
+    let local;
+    try {
+      local = await listLocalMigrationNames(
+        workerDirectory,
+        database.migrationsDir,
+      );
+    } catch {
+      local = null;
+    }
+    if (!Array.isArray(local)) {
+      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    }
+    let query;
+    try {
+      query = spawn(
+        wrangler,
+        [
+          "d1",
+          "execute",
+          database.binding,
+          "--remote",
+          "--env",
+          "production",
+          "--command",
+          PRODUCTION_MIGRATION_LEDGER_SQL,
+          "--json",
+        ],
+        {
+          cwd: workerDirectory,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
+    } catch {
+      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    }
+    if (query?.error || query?.status !== 0) {
+      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    }
+    const rows = parseD1ExecuteRows(
+      typeof query?.stdout === "string" ? query.stdout : "",
+    );
+    if (!Array.isArray(rows)
+        || !rows.every((row, index) => Number(row?.id) === index + 1
+          && typeof row?.name === "string")) {
+      return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+    }
+    const applied = rows.map((row) => row.name);
+    if (applied.length > local.length
+        || !applied.every((name, index) => name === local[index])) {
+      return localFailure("PRODUCTION_MIGRATION_LEDGER_DRIFT");
+    }
+    for (const name of local.slice(applied.length)) {
+      pending.push(`${database.binding}:${name}`);
+    }
+  }
+  return { ok: true, code: null, pending };
+}
+
+function confirmedMigrationTokens(confirmedMigrations) {
+  if (confirmedMigrations === null || confirmedMigrations === undefined) {
+    return null;
+  }
+  return String(confirmedMigrations)
+    .split(",")
+    .map((token) => token.trim());
+}
+
+function assessMigrationGate({ pending, confirmedMigrations }) {
+  const confirmed = confirmedMigrationTokens(confirmedMigrations);
+  if (pending.length === 0) {
+    // A migration confirmation with nothing pending means the operator's
+    // model of production state is wrong; fail closed rather than ignore it.
+    return confirmed === null
+      ? { ok: true, code: null, pendingMigrations: [] }
+      : {
+        ok: false,
+        code: "PRODUCTION_MIGRATIONS_CONFIRMATION_UNEXPECTED",
+        pendingMigrations: [],
+      };
+  }
+  if (confirmed === null) {
+    return {
+      ok: false,
+      code: "PRODUCTION_MIGRATIONS_UNCONFIRMED",
+      pendingMigrations: pending,
+    };
+  }
+  if (confirmed.length !== pending.length
+      || !confirmed.every((token, index) => token === pending[index])) {
+    return {
+      ok: false,
+      code: "PRODUCTION_MIGRATIONS_CONFIRMATION_MISMATCH",
+      pendingMigrations: pending,
+    };
+  }
+  return { ok: true, code: null, pendingMigrations: pending };
 }
 
 function checkedOutSourceCommit(workerDirectory) {
@@ -367,19 +528,16 @@ function secureJsonHeaders(response) {
     && response.headers.get("x-content-type-options") === "nosniff";
 }
 
-function containedProductionHealth(value) {
-  return value?.status === "ok"
-    && value?.enrollmentMode === "disabled"
-    && value?.collectionControls?.state === "contained"
-    && value?.collectionControls?.enrollment === false
-    && value?.collectionControls?.uploadRegistration === false
-    && value?.collectionControls?.processing === false
-    && value?.collectionControls?.publication === false
-    && value?.contracts?.accountScopedContribution
-      ?.externalParticipantsAuthorized === false;
+function healthyProductionHealth(value) {
+  // The pre-2026-08-07 gate additionally asserted enrollmentMode: "disabled"
+  // and fully contained collection controls here. Production deploys now
+  // happen against a live, enrollment-open service, so the recheck asserts
+  // reachability, canonical origin, transport, security headers, and reported
+  // health only (docs/governance/2026-08-07-production-deploy-migration-gate.md).
+  return value?.status === "ok";
 }
 
-export async function recheckProductionContainment({
+export async function recheckProductionHealth({
   fetchImpl = globalThis.fetch,
   timeoutMs = 10_000,
 } = {}) {
@@ -415,8 +573,8 @@ export async function recheckProductionContainment({
   } catch {
     return localFailure("PRODUCTION_HEALTH_RECHECK_INVALID");
   }
-  if (!containedProductionHealth(body)) {
-    return localFailure("PRODUCTION_HEALTH_RECHECK_NOT_CONTAINED");
+  if (!healthyProductionHealth(body)) {
+    return localFailure("PRODUCTION_HEALTH_RECHECK_UNHEALTHY");
   }
   return { ok: true, code: null };
 }
@@ -481,15 +639,16 @@ export async function recheckProductionPublicSurface({
 }
 
 async function runProductionDeploymentFromSnapshot({
-  receiptFile,
-  now = Date.now(),
+  confirmedMigrations = null,
   wrangler,
   workerDirectory,
   spawn = spawnSync,
   checkWorkspacePackages = checkLocalWorkspacePackages,
   checkEndpoints = checkDeploymentEndpointConsumers,
   stageAssets = stageProductionAssets,
-  proofCheck = null,
+  migrationGateCheck = null,
+  determinePendingMigrations = determinePendingProductionMigrations,
+  log = (line) => process.stderr.write(line),
   sourceCommit,
   snapshotRepositoryRoot,
   snapshotGit,
@@ -498,18 +657,39 @@ async function runProductionDeploymentFromSnapshot({
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
-  healthRecheck = recheckProductionContainment,
+  healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
 }) {
-  const containmentProof = proofCheck ?? await readDeploymentProof({
-    filename: receiptFile,
-    kind: "production",
-    now,
-    expectedSourceCommit: sourceCommit,
+  // Migration gate: the deploy source is the snapshot, so pending migrations
+  // are computed from the snapshot's migration directories against the remote
+  // production ledgers before any other gate runs.
+  const pendingCheck = migrationGateCheck ?? await determinePendingMigrations({
+    wrangler,
+    workerDirectory,
+    spawn,
   });
-  if (!containmentProof.ok) return containmentProof;
-  if (containmentProof.proof?.worker?.sourceCommit !== sourceCommit) {
-    return localFailure("PRODUCTION_CONTAINMENT_PROOF_MISMATCH");
+  if (!pendingCheck?.ok) {
+    return pendingCheck?.code
+      ? pendingCheck
+      : localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+  }
+  if (!Array.isArray(pendingCheck.pending)) {
+    return localFailure("PRODUCTION_MIGRATION_STATE_UNKNOWN");
+  }
+  const migrationGate = assessMigrationGate({
+    pending: pendingCheck.pending,
+    confirmedMigrations,
+  });
+  if (!migrationGate.ok) return migrationGate;
+  const pendingMigrations = migrationGate.pendingMigrations;
+  if (pendingMigrations.length > 0) {
+    log(
+      "Production deploy carries unapplied D1 migrations "
+        + "(explicitly confirmed):\n"
+        + pendingMigrations.map((id) => `  ${id}\n`).join("")
+        + "This deploy does NOT apply them; run the reviewed migration "
+        + "procedure for the exact set above.\n",
+    );
   }
 
   let preflight;
@@ -655,37 +835,38 @@ async function runProductionDeploymentFromSnapshot({
   }
   return {
     ok: true,
-    code: "PRODUCTION_DEPLOYED_AFTER_CONTAINMENT_PROOF",
+    code: "PRODUCTION_DEPLOYED",
     channel: "stable",
     collectionAuthorized: false,
-    immediateHealthRecheck: "contained",
-    postDeployHealthRecheck: "contained",
+    migrationGate: pendingMigrations.length === 0
+      ? "no_unapplied_migrations"
+      : "unapplied_migrations_explicitly_confirmed",
+    pendingMigrations,
+    immediateHealthRecheck: "healthy",
+    postDeployHealthRecheck: "healthy",
     postDeployPublicSurfaceRecheck: "public-only",
-    containmentProof: {
-      observedAt: containmentProof.proof.observedAt,
-      workerRevision: containmentProof.proof.worker.revision,
-    },
   };
 }
 
 export async function runProductionDeployment({
   confirmation,
-  receiptFile,
-  now = Date.now(),
+  confirmedMigrations = null,
   wrangler,
   workerDirectory,
   spawn = spawnSync,
   checkWorkspacePackages = checkLocalWorkspacePackages,
   checkEndpoints = checkDeploymentEndpointConsumers,
   stageAssets = stageProductionAssets,
-  proofCheck = null,
+  migrationGateCheck = null,
+  determinePendingMigrations = determinePendingProductionMigrations,
+  log = (line) => process.stderr.write(line),
   expectedSourceCommit = null,
   sourceCommitCheck = checkedOutSourceCommit,
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
   createSourceSnapshot = createImmutableSourceSnapshot,
   releasePreflight = productionReleasePreflight,
   fetchImpl = globalThis.fetch,
-  healthRecheck = recheckProductionContainment,
+  healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
 }) {
   if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
@@ -730,8 +911,7 @@ export async function runProductionDeployment({
   let result;
   try {
     result = await runProductionDeploymentFromSnapshot({
-      receiptFile,
-      now,
+      confirmedMigrations,
       wrangler,
       workerDirectory: snapshot.workerDirectory,
       snapshotRepositoryRoot: snapshot.repositoryRoot,
@@ -742,7 +922,9 @@ export async function runProductionDeployment({
       checkWorkspacePackages,
       checkEndpoints,
       stageAssets,
-      proofCheck,
+      migrationGateCheck,
+      determinePendingMigrations,
+      log,
       sourceCommitCheck,
       sourceTreeCleanCheck,
       releasePreflight,
@@ -769,12 +951,16 @@ function option(name) {
 }
 
 async function main() {
-  if (process.argv.length !== 6
-      || process.argv[2] !== "--receipt-file"
-      || process.argv[4] !== "--confirm") {
+  const plainShape = process.argv.length === 4
+    && process.argv[2] === "--confirm";
+  const migrationShape = process.argv.length === 6
+    && process.argv[2] === "--confirm"
+    && process.argv[4] === "--confirm-migrations";
+  if (!plainShape && !migrationShape) {
     process.stderr.write(
-      "Usage: production-deploy.mjs --receipt-file /owner-only/path "
-        + `--confirm ${PRODUCTION_DEPLOY_CONFIRMATION}\n`,
+      "Usage: production-deploy.mjs "
+        + `--confirm ${PRODUCTION_DEPLOY_CONFIRMATION} `
+        + "[--confirm-migrations BINDING:0000_name.sql,...]\n",
     );
     process.exit(2);
   }
@@ -788,8 +974,8 @@ async function main() {
       process.platform === "win32" ? "wrangler.cmd" : "wrangler",
     );
     result = await runProductionDeployment({
-      receiptFile: option("--receipt-file"),
       confirmation: option("--confirm"),
+      confirmedMigrations: option("--confirm-migrations"),
       wrangler,
       workerDirectory,
     });

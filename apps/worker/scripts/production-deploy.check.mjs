@@ -1,3 +1,8 @@
+// Re-pinned on 2026-08-07 to the migration-gated production deploy contract:
+// the owner-written containment receipt is gone, deploys happen against the
+// live enrollment-open service, and the gate is now the set of unapplied D1
+// migrations the deploy carries.
+// See docs/governance/2026-08-07-production-deploy-migration-gate.md.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -18,24 +23,20 @@ import { join } from "node:path";
 import test from "node:test";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import {
-  CANONICAL_PRODUCTION_DEPLOYMENT_PROOF,
-  DEPLOYMENT_PROOF_SCHEMA_VERSION,
-  PRODUCTION_CONTAINMENT_PROOF_OPERATION,
-  PRODUCTION_OBSERVATION_CHANNEL,
-  validateDeploymentProof,
-} from "./deployment-proof.mjs";
-import {
   PRODUCTION_DEPLOY_CONFIRMATION,
+  PRODUCTION_MIGRATION_LEDGER_SQL,
   createImmutableSourceSnapshot,
+  determinePendingProductionMigrations,
   runProductionDeployment,
-  recheckProductionContainment,
+  recheckProductionHealth,
   recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 
-const NOW = Date.parse("2026-08-04T20:00:00.000Z");
 const HEALTH_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/api/health`;
 const PUBLIC_ROOT_URL = `${DEPLOYMENT_ENDPOINTS.public.origin}/`;
+const FIXTURE_PRIMARY_MIGRATION = "0001_fixture_schema.sql";
+const FIXTURE_LEDGER_MIGRATION = "0001_fixture_ledger.sql";
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -52,12 +53,28 @@ async function immutableSnapshotFixture() {
     "public-release-site",
   );
   await mkdir(join(workerDirectory, "node_modules"), { recursive: true });
+  await mkdir(join(workerDirectory, "migrations"), { recursive: true });
+  await mkdir(join(workerDirectory, "deletion-ledger-migrations"), {
+    recursive: true,
+  });
   await mkdir(sourceDirectory, { recursive: true });
   await writeFile(
     join(root, ".gitignore"),
     ".release-build/\nnode_modules/\n",
   );
   await writeFile(join(workerDirectory, "wrangler.jsonc"), "{}\n");
+  await writeFile(
+    join(workerDirectory, "migrations", FIXTURE_PRIMARY_MIGRATION),
+    "CREATE TABLE fixture_schema (id INTEGER PRIMARY KEY);\n",
+  );
+  await writeFile(
+    join(
+      workerDirectory,
+      "deletion-ledger-migrations",
+      FIXTURE_LEDGER_MIGRATION,
+    ),
+    "CREATE TABLE fixture_ledger (id INTEGER PRIMARY KEY);\n",
+  );
 
   const generatedFiles = {
     "community.js": "console.log('snapshot community');\n",
@@ -84,7 +101,13 @@ async function immutableSnapshotFixture() {
   git(root, ["init", "--quiet"]);
   git(root, ["config", "user.email", "test@example.invalid"]);
   git(root, ["config", "user.name", "Production snapshot test"]);
-  git(root, ["add", ".gitignore", "apps/worker/wrangler.jsonc"]);
+  git(root, [
+    "add",
+    ".gitignore",
+    "apps/worker/wrangler.jsonc",
+    "apps/worker/migrations",
+    "apps/worker/deletion-ledger-migrations",
+  ]);
   git(root, ["commit", "--quiet", "-m", "fixture"]);
   return {
     root,
@@ -95,26 +118,18 @@ async function immutableSnapshotFixture() {
   };
 }
 
-function containedHealth() {
+// Re-pin: the health body is a live, enrollment-open service. The old spec
+// required a contained/disabled body; that assertion was removed with the
+// containment receipt.
+function liveOpenHealth() {
   return {
     status: "ok",
-    enrollmentMode: "disabled",
-    collectionControls: {
-      state: "contained",
-      enrollment: false,
-      uploadRegistration: false,
-      processing: false,
-      publication: false,
-    },
-    contracts: {
-      accountScopedContribution: {
-        externalParticipantsAuthorized: false,
-      },
-    },
+    enrollmentMode: "open",
+    collectionControls: { state: "operational" },
   };
 }
 
-function jsonHealthResponse(value = containedHealth(), status = 200) {
+function jsonHealthResponse(value = liveOpenHealth(), status = 200) {
   return {
     url: HEALTH_URL,
     status,
@@ -148,44 +163,9 @@ function textResponse(url, body, {
   };
 }
 
-function proofCheck(overrides = {}) {
-  const proof = {
-    schemaVersion: DEPLOYMENT_PROOF_SCHEMA_VERSION,
-    operation: PRODUCTION_CONTAINMENT_PROOF_OPERATION,
-    environment: "production",
-    channel: "stable",
-    observationChannel: PRODUCTION_OBSERVATION_CHANNEL,
-    status: "remote_containment_observed",
-    observedAt: new Date(NOW - 1_000).toISOString(),
-    target: {
-      origin: CANONICAL_PRODUCTION_DEPLOYMENT_PROOF.manifest.publicOrigin,
-      endpointManifest: {
-        ...CANONICAL_PRODUCTION_DEPLOYMENT_PROOF.manifest,
-        sha256: CANONICAL_PRODUCTION_DEPLOYMENT_PROOF.manifestSha256,
-      },
-    },
-    worker: {
-      revision: "production-revision-0001",
-      sourceCommit: "c26823c",
-      enrollmentMode: "disabled",
-      collectionControls: "contained",
-    },
-    evidence: {
-      ownerObservedRemoteRevision: true,
-      ownerObservedDisabledMode: true,
-      ownerObservedContainment: true,
-      ownerObservedCanonicalTarget: true,
-    },
-    ...overrides,
-  };
-  return validateDeploymentProof({ proof, kind: "production", now: NOW });
-}
-
 function options(overrides = {}) {
   return {
     confirmation: PRODUCTION_DEPLOY_CONFIRMATION,
-    receiptFile: "/owner-only/production-proof.json",
-    now: NOW,
     wrangler: "/fake/wrangler",
     workerDirectory: "/worker",
     expectedSourceCommit: "c26823c",
@@ -200,6 +180,8 @@ function options(overrides = {}) {
       state: "ready",
       blockers: [],
     }),
+    migrationGateCheck: { ok: true, code: null, pending: [] },
+    log: () => {},
     fetchImpl: async (url) => {
       assert.equal(String(url), HEALTH_URL);
       return jsonHealthResponse();
@@ -209,12 +191,17 @@ function options(overrides = {}) {
   };
 }
 
-test("production deployment creates a real top-level Git snapshot before staging generated assets", async (t) => {
+// Re-pin: this end-to-end path previously required an injected containment
+// proof; it now exercises the real migration gate against the snapshot's
+// committed migration directories with a fully applied remote ledger.
+test("production deployment creates a real top-level Git snapshot and passes the migration gate with no unapplied migrations", async (t) => {
   const fixture = await immutableSnapshotFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
   const stageCalls = [];
   const stagedIndex = [];
   const healthTimeouts = [];
+  const d1Queries = [];
+  const deployArgs = [];
   let healthChecks = 0;
   const result = await runProductionDeployment(options({
     workerDirectory: fixture.workerDirectory,
@@ -224,12 +211,7 @@ test("production deployment creates a real top-level Git snapshot before staging
       directory,
       ["status", "--porcelain=v1", "--untracked-files=all"],
     ).trim() === "",
-    proofCheck: proofCheck({
-      worker: {
-        ...proofCheck().proof.worker,
-        sourceCommit: fixture.sourceCommit,
-      },
-    }),
+    migrationGateCheck: null,
     createSourceSnapshot: undefined,
     stageAssets: async (value) => {
       stageCalls.push(value);
@@ -255,15 +237,41 @@ test("production deployment creates a real top-level Git snapshot before staging
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
     releasePreflight: async () => ({ state: "ready", blockers: [] }),
-    spawn: (_command, _args, spawnOptions) => {
+    spawn: (_command, args, spawnOptions) => {
       assert.match(spawnOptions.cwd, /\/repository\/apps\/worker$/u);
+      if (args[0] === "d1") {
+        d1Queries.push(args);
+        const applied = args[2] === "USAGE_MONITOR_DB"
+          ? FIXTURE_PRIMARY_MIGRATION
+          : FIXTURE_LEDGER_MIGRATION;
+        return {
+          status: 0,
+          stdout: JSON.stringify([{ results: [{ id: 1, name: applied }] }]),
+          stderr: "",
+        };
+      }
+      deployArgs.push(args);
       return { status: 0, stdout: "deployed", stderr: "" };
     },
   }));
 
   assert.equal(result.ok, true);
+  assert.equal(result.code, "PRODUCTION_DEPLOYED");
+  assert.equal(result.migrationGate, "no_unapplied_migrations");
+  assert.deepEqual(result.pendingMigrations, []);
   assert.equal(healthChecks, 2);
   assert.deepEqual(healthTimeouts, [10_000, 10_000]);
+  assert.deepEqual(deployArgs, [["deploy", "--env", "production", "--strict"]]);
+  assert.equal(d1Queries.length, 2);
+  assert.deepEqual(d1Queries.map((args) => args[2]), [
+    "USAGE_MONITOR_DB",
+    "DELETION_LEDGER",
+  ]);
+  for (const args of d1Queries) {
+    assert.deepEqual(args.slice(3, 7), ["--remote", "--env", "production", "--command"]);
+    assert.equal(args[7], PRODUCTION_MIGRATION_LEDGER_SQL);
+    assert.equal(args[8], "--json");
+  }
   assert.deepEqual(stageCalls[0].sourceDirectory, join(
     stageCalls[0].repositoryRoot,
     ".release-build",
@@ -307,12 +315,6 @@ test("production deployment fails closed when the snapshot dependency link is re
         directory,
         ["status", "--porcelain=v1", "--untracked-files=all"],
       ).trim() === "",
-      proofCheck: proofCheck({
-        worker: {
-          ...proofCheck().proof.worker,
-          sourceCommit: fixture.sourceCommit,
-        },
-      }),
       createSourceSnapshot: async (arguments_) => {
         snapshot = await createImmutableSourceSnapshot(arguments_);
         dependencyLink = join(snapshot.workerDirectory, "node_modules");
@@ -376,12 +378,6 @@ test("production deployment fails closed when generated release output is a syml
     expectedSourceCommit: fixture.sourceCommit,
     sourceCommitCheck: (directory) => git(directory, ["rev-parse", "HEAD"]).trim(),
     sourceTreeCleanCheck: () => true,
-    proofCheck: proofCheck({
-      worker: {
-        ...proofCheck().proof.worker,
-        sourceCommit: fixture.sourceCommit,
-      },
-    }),
     createSourceSnapshot: undefined,
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
@@ -398,26 +394,40 @@ test("production deployment fails closed when generated release output is a syml
   assert.equal(spawned, false);
 });
 
-test("production deployment requires scoped confirmation and a receipt before local gates or Wrangler", async () => {
+// Re-pin: the second gate is no longer a receipt file; it is an explicit
+// migration confirmation whenever the deploy carries unapplied migrations.
+test("production deployment requires scoped confirmation and a migration confirmation before local gates or Wrangler", async () => {
   const calls = [];
-  const result = await runProductionDeployment(options({
-    confirmation: "DEPLOY_SOMETHING",
+  const gated = {
+    releasePreflight: async () => {
+      calls.push("preflight");
+      return { state: "ready", blockers: [] };
+    },
     checkWorkspacePackages: async () => calls.push("workspace"),
     checkEndpoints: async () => calls.push("endpoints"),
     stageAssets: async () => calls.push("assets"),
     spawn: () => calls.push("deploy"),
+  };
+  const result = await runProductionDeployment(options({
+    confirmation: "DEPLOY_SOMETHING",
+    ...gated,
   }));
   assert.deepEqual(result, { ok: false, code: "CONFIRMATION_REQUIRED" });
   assert.deepEqual(calls, []);
 
-  const absent = await runProductionDeployment(options({
-    receiptFile: null,
-    checkWorkspacePackages: async () => calls.push("workspace"),
-    checkEndpoints: async () => calls.push("endpoints"),
-    stageAssets: async () => calls.push("assets"),
-    spawn: () => calls.push("deploy"),
+  const unconfirmed = await runProductionDeployment(options({
+    migrationGateCheck: {
+      ok: true,
+      code: null,
+      pending: ["USAGE_MONITOR_DB:0030_next.sql"],
+    },
+    ...gated,
   }));
-  assert.deepEqual(absent, { ok: false, code: "DEPLOYMENT_PROOF_REQUIRED" });
+  assert.deepEqual(unconfirmed, {
+    ok: false,
+    code: "PRODUCTION_MIGRATIONS_UNCONFIRMED",
+    pendingMigrations: ["USAGE_MONITOR_DB:0030_next.sql"],
+  });
   assert.deepEqual(calls, []);
 });
 
@@ -439,7 +449,10 @@ test("production deployment fails closed when immutable source snapshot setup or
   assert.equal(spawned, false);
 
   const cleanupFailure = await runProductionDeployment(options({
-    proofCheck: { ok: false, code: "DEPLOYMENT_PROOF_REQUIRED" },
+    migrationGateCheck: {
+      ok: false,
+      code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    },
     createSourceSnapshot: async () => ({
       repositoryRoot: "/immutable/repository",
       workerDirectory: "/immutable/repository/apps/worker",
@@ -454,70 +467,91 @@ test("production deployment fails closed when immutable source snapshot setup or
   });
 });
 
-test("production deployment refuses invalid or stale proof before Wrangler", async () => {
+// Re-pin: replaces the invalid/stale-receipt refusal tests. An undeterminable
+// or drifted migration ledger, a mismatched confirmation, and a confirmation
+// with nothing pending all fail closed before any local gate or Wrangler.
+test("production deployment refuses an unknown, drifted, mismatched, or unexpected migration state before Wrangler", async () => {
   const calls = [];
-  const root = await mkdtemp(join(tmpdir(), "usage-monitor-production-proof-"));
-  try {
-    const valid = proofCheck().proof;
-    const cases = [
-      ["malformed", "not-json\n"],
-      ["stale", JSON.stringify({
-        ...valid,
-        observedAt: new Date(
-          NOW - 15 * 60 * 1000 - 1,
-        ).toISOString(),
-      })],
-      ["mismatched", JSON.stringify({
-        ...valid,
-        target: {
-          ...valid.target,
-          origin: "https://wrong.example.test",
-        },
-      })],
-    ];
-    for (const [name, contents] of cases) {
-      const receiptFile = join(root, `${name}.json`);
-      await writeFile(receiptFile, contents, { mode: 0o600 });
-      const result = await runProductionDeployment(options({
-        receiptFile,
-        checkWorkspacePackages: async () => calls.push("workspace"),
-        checkEndpoints: async () => calls.push("endpoints"),
-        stageAssets: async () => calls.push("assets"),
-        spawn: () => calls.push("deploy"),
-      }));
-      assert.equal(result.ok, false, name);
-      assert.equal(
-        result.code,
-        name === "mismatched"
-          ? "PRODUCTION_CONTAINMENT_PROOF_MISMATCH"
-          : "DEPLOYMENT_PROOF_MALFORMED",
-        name,
-      );
-    }
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  const gated = {
+    releasePreflight: async () => {
+      calls.push("preflight");
+      return { state: "ready", blockers: [] };
+    },
+    checkWorkspacePackages: async () => calls.push("workspace"),
+    checkEndpoints: async () => calls.push("endpoints"),
+    stageAssets: async () => calls.push("assets"),
+    spawn: () => calls.push("deploy"),
+  };
   for (const code of [
-    "DEPLOYMENT_PROOF_MALFORMED",
-    "PRODUCTION_CONTAINMENT_PROOF_MISMATCH",
+    "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    "PRODUCTION_MIGRATION_LEDGER_DRIFT",
   ]) {
     const result = await runProductionDeployment(options({
-      proofCheck: { ok: false, code },
-      checkWorkspacePackages: async () => calls.push("workspace"),
-      checkEndpoints: async () => calls.push("endpoints"),
-      stageAssets: async () => calls.push("assets"),
-      spawn: () => calls.push("deploy"),
+      migrationGateCheck: { ok: false, code },
+      ...gated,
     }));
     assert.deepEqual(result, { ok: false, code });
   }
+
+  const failedDiscovery = await runProductionDeployment(options({
+    migrationGateCheck: null,
+    determinePendingMigrations: async () => ({
+      ok: false,
+      code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    }),
+    ...gated,
+  }));
+  assert.deepEqual(failedDiscovery, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+  });
+
+  const pending = [
+    "USAGE_MONITOR_DB:0030_next.sql",
+    "DELETION_LEDGER:0003_next.sql",
+  ];
+  const mismatch = await runProductionDeployment(options({
+    migrationGateCheck: { ok: true, code: null, pending },
+    confirmedMigrations: "USAGE_MONITOR_DB:0031_other.sql",
+    ...gated,
+  }));
+  assert.deepEqual(mismatch, {
+    ok: false,
+    code: "PRODUCTION_MIGRATIONS_CONFIRMATION_MISMATCH",
+    pendingMigrations: pending,
+  });
+
+  const reordered = await runProductionDeployment(options({
+    migrationGateCheck: { ok: true, code: null, pending },
+    confirmedMigrations: [...pending].reverse().join(","),
+    ...gated,
+  }));
+  assert.deepEqual(reordered, {
+    ok: false,
+    code: "PRODUCTION_MIGRATIONS_CONFIRMATION_MISMATCH",
+    pendingMigrations: pending,
+  });
+
+  const unexpected = await runProductionDeployment(options({
+    migrationGateCheck: { ok: true, code: null, pending: [] },
+    confirmedMigrations: "USAGE_MONITOR_DB:0030_next.sql",
+    ...gated,
+  }));
+  assert.deepEqual(unexpected, {
+    ok: false,
+    code: "PRODUCTION_MIGRATIONS_CONFIRMATION_UNEXPECTED",
+    pendingMigrations: [],
+  });
   assert.deepEqual(calls, []);
 });
 
-test("valid production proof routes through local checks and then the exact production Wrangler deploy", async () => {
+// Re-pin: replaces "valid production proof routes through local checks". A
+// deploy with no unapplied migrations needs no receipt and no intake pause,
+// and the live enrollment-open health body is accepted.
+test("a no-unapplied-migration deployment routes through local checks and then the exact production Wrangler deploy", async () => {
   const calls = [];
   const healthCalls = [];
   const result = await runProductionDeployment(options({
-    proofCheck: proofCheck(),
     releasePreflight: async () => {
       calls.push("preflight");
       return { state: "ready", blockers: [] };
@@ -535,6 +569,7 @@ test("valid production proof routes through local checks and then the exact prod
     },
   }));
   assert.equal(result.ok, true);
+  assert.equal(result.code, "PRODUCTION_DEPLOYED");
   assert.deepEqual(calls, [
     "preflight",
     "workspace",
@@ -549,13 +584,49 @@ test("valid production proof routes through local checks and then the exact prod
   assert.equal(healthCalls[0].request.credentials, "omit");
   assert.equal(healthCalls[0].request.redirect, "error");
   assert.equal(result.collectionAuthorized, false);
-  assert.equal(result.immediateHealthRecheck, "contained");
-  assert.equal(result.postDeployHealthRecheck, "contained");
+  assert.equal(result.migrationGate, "no_unapplied_migrations");
+  assert.deepEqual(result.pendingMigrations, []);
+  assert.equal(result.immediateHealthRecheck, "healthy");
+  assert.equal(result.postDeployHealthRecheck, "healthy");
   assert.equal(result.postDeployPublicSurfaceRecheck, "public-only");
-  assert.equal(result.containmentProof.workerRevision, "production-revision-0001");
 });
 
-test("production deployment does not report success when the post-deploy containment observation is ambiguous or open", async () => {
+test("an explicitly confirmed migration deployment prints the exact pending set before Wrangler is spawned", async () => {
+  const pending = [
+    "USAGE_MONITOR_DB:0030_next.sql",
+    "DELETION_LEDGER:0003_next.sql",
+  ];
+  const events = [];
+  const result = await runProductionDeployment(options({
+    migrationGateCheck: { ok: true, code: null, pending },
+    confirmedMigrations: pending.join(","),
+    log: (line) => events.push({ kind: "log", line }),
+    releasePreflight: async () => ({ state: "ready", blockers: [] }),
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    stageAssets: async () => {},
+    spawn: (_command, args) => {
+      events.push({ kind: "deploy", args });
+      return { status: 0, stdout: "deployed", stderr: "" };
+    },
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.migrationGate, "unapplied_migrations_explicitly_confirmed");
+  assert.deepEqual(result.pendingMigrations, pending);
+  const logIndex = events.findIndex((event) => event.kind === "log");
+  const deployIndex = events.findIndex((event) => event.kind === "deploy");
+  assert.notEqual(logIndex, -1);
+  assert.notEqual(deployIndex, -1);
+  assert.equal(logIndex < deployIndex, true);
+  for (const id of pending) {
+    assert.equal(events[logIndex].line.includes(id), true);
+  }
+});
+
+// Re-pin: "not-contained" became "unhealthy" — a post-deploy body that does
+// not report status "ok" is still a failed deploy, but an enrollment-open
+// body no longer is.
+test("production deployment does not report success when the post-deploy health observation is ambiguous or unhealthy", async () => {
   for (const [name, postDeployFetch, expectedCode] of [
     [
       "unreachable",
@@ -565,18 +636,17 @@ test("production deployment does not report success when the post-deploy contain
       "PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_UNREACHABLE",
     ],
     [
-      "not-contained",
+      "unhealthy",
       async () => jsonHealthResponse({
-        ...containedHealth(),
-        enrollmentMode: "open",
+        ...liveOpenHealth(),
+        status: "degraded",
       }),
-      "PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_NOT_CONTAINED",
+      "PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_UNHEALTHY",
     ],
   ]) {
     let fetchCount = 0;
     let spawned = false;
     const result = await runProductionDeployment(options({
-      proofCheck: proofCheck(),
       checkWorkspacePackages: async () => {},
       checkEndpoints: async () => {},
       stageAssets: async () => {},
@@ -602,7 +672,6 @@ test("production deployment does not report success when the post-deploy contain
 test("production deployment treats release preflight as a hard gate", async () => {
   const calls = [];
   const result = await runProductionDeployment(options({
-    proofCheck: proofCheck(),
     releasePreflight: async () => ({
       state: "blocked",
       blockers: ["LOCAL_SCHEMA_INCOMPLETE"],
@@ -620,14 +689,17 @@ test("production deployment treats release preflight as a hard gate", async () =
   assert.deepEqual(calls, []);
 });
 
+// Re-pin: the enrollment-open body case was removed from this list — it is
+// now a valid pre-deploy observation. The transport, redirect, header, and
+// unhealthy-body refusals remain.
 test("production deployment does not spawn Wrangler when immediate health recheck fails", async () => {
   for (const fetchImpl of [
     async () => {
       throw new Error("network");
     },
     async () => jsonHealthResponse({
-      ...containedHealth(),
-      enrollmentMode: "open",
+      ...liveOpenHealth(),
+      status: "degraded",
     }),
     async () => ({
       ...jsonHealthResponse(),
@@ -644,7 +716,6 @@ test("production deployment does not spawn Wrangler when immediate health rechec
   ]) {
     let spawned = false;
     const result = await runProductionDeployment(options({
-      proofCheck: proofCheck(),
       fetchImpl,
       checkWorkspacePackages: async () => {},
       checkEndpoints: async () => {},
@@ -660,31 +731,9 @@ test("production deployment does not spawn Wrangler when immediate health rechec
   }
 });
 
-test("production deployment stops before Wrangler on a proof source revision mismatch", async () => {
-  let spawned = false;
-  const result = await runProductionDeployment(options({
-    proofCheck: proofCheck({
-      worker: { ...proofCheck().proof.worker, sourceCommit: "deadbee" },
-    }),
-    checkWorkspacePackages: async () => {
-      throw new Error("must not run");
-    },
-    spawn: () => {
-      spawned = true;
-      return { status: 0 };
-    },
-  }));
-  assert.deepEqual(result, {
-    ok: false,
-    code: "PRODUCTION_CONTAINMENT_PROOF_MISMATCH",
-  });
-  assert.equal(spawned, false);
-});
-
 test("production deployment stops if the checked-out source revision changes before Wrangler", async () => {
   let spawned = false;
   const result = await runProductionDeployment(options({
-    proofCheck: proofCheck(),
     sourceCommitCheck: () => "deadbee",
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
@@ -706,7 +755,6 @@ test("production deployment rejects source revision movement across the Wrangler
   let sourceMoved = false;
   const spawnCwds = [];
   const result = await runProductionDeployment(options({
-    proofCheck: proofCheck(),
     sourceCommitCheck: () => sourceMoved ? "deadbee" : "c26823c",
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
@@ -726,9 +774,11 @@ test("production deployment rejects source revision movement across the Wrangler
   assert.deepEqual(spawnCwds, ["/immutable/repository/apps/worker"]);
 });
 
-test("production health recheck requires the canonical URL and security headers", async () => {
+// Re-pin: renamed from recheckProductionContainment. The transport gate is
+// unchanged; the body gate now accepts a live enrollment-open service.
+test("production health recheck requires the canonical URL and security headers and accepts an open live service", async () => {
   const calls = [];
-  const result = await recheckProductionContainment({
+  const result = await recheckProductionHealth({
     fetchImpl: async (url, request) => {
       calls.push({ url, request });
       return jsonHealthResponse();
@@ -737,6 +787,194 @@ test("production health recheck requires the canonical URL and security headers"
   assert.deepEqual(result, { ok: true, code: null });
   assert.deepEqual(calls.map((call) => call.url), [HEALTH_URL]);
   assert.equal(calls[0].request.headers.accept, "application/json");
+
+  const unhealthy = await recheckProductionHealth({
+    fetchImpl: async () => jsonHealthResponse({ status: "degraded" }),
+  });
+  assert.deepEqual(unhealthy, {
+    ok: false,
+    code: "PRODUCTION_HEALTH_RECHECK_UNHEALTHY",
+  });
+});
+
+async function migrationGateFixture() {
+  const workerDirectory = await mkdtemp(
+    join(tmpdir(), "usage-monitor-migration-gate-"),
+  );
+  await mkdir(join(workerDirectory, "migrations"), { recursive: true });
+  await mkdir(join(workerDirectory, "deletion-ledger-migrations"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(workerDirectory, "migrations", "0001_first.sql"),
+    "CREATE TABLE first (id INTEGER PRIMARY KEY);\n",
+  );
+  await writeFile(
+    join(workerDirectory, "migrations", "0002_second.sql"),
+    "CREATE TABLE second (id INTEGER PRIMARY KEY);\n",
+  );
+  await writeFile(
+    join(workerDirectory, "deletion-ledger-migrations", "0001_ledger.sql"),
+    "CREATE TABLE ledger (id INTEGER PRIMARY KEY);\n",
+  );
+  return workerDirectory;
+}
+
+function ledgerSpawn(rowsByBinding, spawnedArgs = []) {
+  return (command, args, spawnOptions) => {
+    assert.equal(command, "/fake/wrangler");
+    assert.equal(spawnOptions.stdio[0], "ignore");
+    spawnedArgs.push(args);
+    return {
+      status: 0,
+      stdout: JSON.stringify([{ results: rowsByBinding[args[2]] }]),
+      stderr: "",
+    };
+  };
+}
+
+test("pending-migration discovery reads only the remote ledger and reports the exact unapplied set", async (t) => {
+  const workerDirectory = await migrationGateFixture();
+  t.after(() => rm(workerDirectory, { recursive: true, force: true }));
+
+  const spawnedArgs = [];
+  const upToDate = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: [
+        { id: 1, name: "0001_first.sql" },
+        { id: 2, name: "0002_second.sql" },
+      ],
+      DELETION_LEDGER: [{ id: 1, name: "0001_ledger.sql" }],
+    }, spawnedArgs),
+  });
+  assert.deepEqual(upToDate, { ok: true, code: null, pending: [] });
+  assert.deepEqual(spawnedArgs, [
+    [
+      "d1",
+      "execute",
+      "USAGE_MONITOR_DB",
+      "--remote",
+      "--env",
+      "production",
+      "--command",
+      PRODUCTION_MIGRATION_LEDGER_SQL,
+      "--json",
+    ],
+    [
+      "d1",
+      "execute",
+      "DELETION_LEDGER",
+      "--remote",
+      "--env",
+      "production",
+      "--command",
+      PRODUCTION_MIGRATION_LEDGER_SQL,
+      "--json",
+    ],
+  ]);
+
+  const behind = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: [{ id: 1, name: "0001_first.sql" }],
+      DELETION_LEDGER: [{ id: 1, name: "0001_ledger.sql" }],
+    }),
+  });
+  assert.deepEqual(behind, {
+    ok: true,
+    code: null,
+    pending: ["USAGE_MONITOR_DB:0002_second.sql"],
+  });
+});
+
+test("pending-migration discovery fails closed on unreadable, drifted, or undeterminable state", async (t) => {
+  const workerDirectory = await migrationGateFixture();
+  t.after(() => rm(workerDirectory, { recursive: true, force: true }));
+
+  const unknownRemote = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: [{ id: 1, name: "9999_not_in_checkout.sql" }],
+      DELETION_LEDGER: [{ id: 1, name: "0001_ledger.sql" }],
+    }),
+  });
+  assert.deepEqual(unknownRemote, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+  });
+
+  const remoteAhead = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: [
+        { id: 1, name: "0001_first.sql" },
+        { id: 2, name: "0002_second.sql" },
+        { id: 3, name: "0003_unknown.sql" },
+      ],
+      DELETION_LEDGER: [{ id: 1, name: "0001_ledger.sql" }],
+    }),
+  });
+  assert.deepEqual(remoteAhead, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+  });
+
+  const queryFailure = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: () => ({ status: 1, stdout: "", stderr: "unauthorized" }),
+  });
+  assert.deepEqual(queryFailure, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+  });
+
+  const malformedOutput = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: () => ({ status: 0, stdout: "not-json", stderr: "" }),
+  });
+  assert.deepEqual(malformedOutput, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+  });
+
+  const nonSequentialLedger = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: [{ id: 2, name: "0001_first.sql" }],
+      DELETION_LEDGER: [{ id: 1, name: "0001_ledger.sql" }],
+    }),
+  });
+  assert.deepEqual(nonSequentialLedger, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+  });
+
+  await rm(join(workerDirectory, "deletion-ledger-migrations"), {
+    recursive: true,
+    force: true,
+  });
+  const missingDirectory = await determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: [
+        { id: 1, name: "0001_first.sql" },
+        { id: 2, name: "0002_second.sql" },
+      ],
+    }),
+  });
+  assert.deepEqual(missingDirectory, {
+    ok: false,
+    code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+  });
 });
 
 test("production public-surface recheck requires a public root and real 404s for private assets", async () => {
