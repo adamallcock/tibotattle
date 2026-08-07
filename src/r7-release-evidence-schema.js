@@ -127,6 +127,15 @@ export function collectR7ReleaseEvidenceRuntimeSourcePaths({
   appendRegularRuntimeFile("packages/accounting/index.js");
   visit("packages/telemetry-contract/src");
   appendRegularRuntimeFile("packages/telemetry-contract/index.js");
+  // identity-core was never in this list even though
+  // `src/platform/participant-identity.js` imports it, so a package the
+  // benchmark can reach went unattested for as long as this scan has existed.
+  // That is the same silent gap `shared/` left, and it was found by the
+  // closure test rather than by reading the list again. (The two worker
+  // scripts, which run the measured work in their own processes and so are
+  // invisible to any import walk, are already appended by
+  // `workloadSourcePaths` below.)
+  visit("packages/identity-core/src");
   return paths;
 }
 

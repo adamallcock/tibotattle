@@ -480,9 +480,9 @@
     "receiptSchemaSha256": "4683a469ad0143721eedeccc026f07929f2506339aeab7c52e1312cad93f5701",
     "resourcePolicySourceSha256": "d9748895468534062e9c8c436db75cbf5acf4ccf54f84319db37e88197627870",
     "resourcePolicyValuesSha256": "a3dde0db440015886144b76b88a8a663095c7e5eb08f0a68f062e597e95552f6",
-    "schemaModuleSha256": "8a3bcd2b9b357c36117faa663d1432242ae90dd74742eef3a9fe1ff04cfc3f25",
-    "workloadCodeFileCount": 290,
-    "workloadCodeSha256": "efe11b93c5972f1285dcb96ecf8db12954db43365d3f52f7acc5f2838c01dc4a"
+    "schemaModuleSha256": "9d598e56c71be1c3257c2e25c1334e49fdc6b5e825c46ba3e1ce68a83490e54f",
+    "workloadCodeFileCount": 291,
+    "workloadCodeSha256": "02cef9e12d65da2431767d4a3522c87603f9a33281981ac1ed4330e7d761be5d"
   },
   "determinism": {
     "comparisons": {
@@ -500,8 +500,8 @@
     "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
     "runCount": 2,
     "runProjectionSha256es": [
-      "dc76949192e345e52baec82a032e547c087cd6b47326c8447ab86cb869fe7f12",
-      "dc76949192e345e52baec82a032e547c087cd6b47326c8447ab86cb869fe7f12"
+      "ed6c5389ae99a26afe9bfe9ae5e2e1e2fdcf1fd17632873c31f69b1e7f0e0865",
+      "ed6c5389ae99a26afe9bfe9ae5e2e1e2fdcf1fd17632873c31f69b1e7f0e0865"
     ],
     "status": "partial"
   },
@@ -822,16 +822,16 @@
       "decodedBytes": 0,
       "durablePeakRssBytes": 0,
       "encodedBytes": 0,
-      "externalPeakRssBytes": 337002496,
-      "externalRssSampleCount": 99,
+      "externalPeakRssBytes": 334233600,
+      "externalRssSampleCount": 67,
       "externalRssSampleFailureCount": 0,
       "filesystem": {
         "afterBytes": 0,
         "beforeBytes": 0,
-        "sampledHighWaterBytes": 30832400
+        "sampledHighWaterBytes": 31024505
       },
       "outputRecords": 0,
-      "parentElapsedMs": 5133,
+      "parentElapsedMs": 3342,
       "runCount": 2,
       "sourceBytes": 0,
       "sourceFiles": 0,
@@ -894,7 +894,7 @@
     }
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "351344e97693d20f47dfbba90d18da1538ba84df828a6217891c1129e9b13f75",
+  "receiptSha256": "f050c70f4ee887b174eb57c7867c324a8d19f009358681f499826cf764bc9d39",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",

@@ -367,8 +367,8 @@
       "additionalAliases": [],
       "callers": [
         "scripts/build-local-review-artifact.js",
-        "scripts/check-architecture-boundaries.mjs",
         "scripts/build-macos-app.js",
+        "scripts/check-architecture-boundaries.mjs",
         "scripts/export-tibotattle-client.mjs",
         "test/application-quota-sensitivity.test.js",
         "test/architecture-boundaries.test.js",
@@ -378,6 +378,7 @@
         "test/export-owner-boundary.test.js",
         "test/metadata-export-owner-boundary.test.js",
         "test/participant-identity-owner-boundary.test.js",
+        "test/r7-release-evidence-schema.test.js",
         "test/reporting-owner-boundary.test.js",
         "test/tool-inventory.test.js"
       ],

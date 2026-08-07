@@ -140,6 +140,10 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
       join(temporaryRoot, "packages", "telemetry-contract", "src"),
       { recursive: true },
     );
+    await mkdir(
+      join(temporaryRoot, "packages", "identity-core", "src"),
+      { recursive: true },
+    );
     await mkdir(join(temporaryRoot, "src", "providers"), {
       recursive: true,
     });
@@ -189,6 +193,10 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
       ),
       "export * from './src/contract.js';\n",
     );
+    await writeFile(
+      join(temporaryRoot, "packages", "identity-core", "src", "pseudonym.js"),
+      "export const pseudonym = true;\n",
+    );
     assert.deepEqual(
       collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }),
       [
@@ -199,6 +207,7 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
         "packages/accounting/index.js",
         "packages/telemetry-contract/src/contract.js",
         "packages/telemetry-contract/index.js",
+        "packages/identity-core/src/pseudonym.js",
       ],
     );
 
@@ -220,7 +229,7 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
     );
     assert.equal(
       collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }).length,
-      7,
+      8,
     );
     await rm(osMetadata);
 
@@ -913,4 +922,100 @@ test("arbitrary paths, timestamps, identifiers, errors, and unknown fields are u
     assert.equal(diagnostics.includes("session-123"), false);
     assert.deepEqual(Object.keys(result.errors[0]).sort(), ["keyword", "path", "schemaPath"]);
   }
+});
+
+// The workload scan is a hand-written set of directories and files, which is
+// only safe while it stays a superset of everything the benchmark can reach.
+// Nothing about a directory list enforces that on its own: `shared/` sat in
+// the old scan long after the directory was dissolved, attesting an empty
+// path, and the trees it did cover pulled in 290 files whose contents could
+// not affect a measurement. This recomputes the real closure with the reviewed
+// ESM extractor and fails if any reachable module escaped the scan, so the
+// narrowing cannot silently stop covering the code it exists to attest.
+test("the R7 workload scan covers every module the benchmark can reach", async () => {
+  const { extractEsmImports } = await import("../scripts/lib/esm-imports.mjs");
+  const repositoryRoot = new URL("../", import.meta.url);
+  // All three real entry points. The two worker scripts run the measured work
+  // in their own processes, so nothing reachable only from them would appear
+  // in a walk that started at the benchmark module alone - and they are the
+  // benchmark.
+  const entries = [
+    "src/r7-resource-benchmark.js",
+    "scripts/r7-materialized-boundary-worker.js",
+    "scripts/r7-resource-benchmark-worker.js",
+  ].map((path) => new URL(path, repositoryRoot));
+  const seen = new Set();
+  const workspaceReached = new Set();
+  const dynamicOffenders = [];
+  const walk = async (moduleUrl) => {
+    const key = moduleUrl.href;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const source = await readFile(moduleUrl, "utf8");
+    const sourceName = decodeURIComponent(
+      moduleUrl.href.slice(repositoryRoot.href.length),
+    );
+    for (const record of await extractEsmImports(source, { sourceName })) {
+      const { kind, specifier } = record;
+      if (kind === "dynamic-import") {
+        // A dynamic import is only safe to ignore when it is a literal runtime
+        // builtin: anything else could reach project source the digest would
+        // then not cover, so it fails closed rather than being assumed inert.
+        if (typeof specifier !== "string" || !specifier.startsWith("node:")) {
+          dynamicOffenders.push(`${sourceName}:${record.line}`);
+        }
+        continue;
+      }
+      if (typeof specifier !== "string") continue;
+      if (specifier.startsWith("node:")) continue;
+      if (!specifier.startsWith(".")) {
+        // A workspace package is workload source and must be inside the scan.
+        // `identity-core` was reachable and absent for as long as this scan
+        // existed, so this is checked rather than assumed. Third-party
+        // packages are pinned by the lockfile and have never been part of the
+        // workload digest, so they are not treated as source here.
+        if (specifier.startsWith("@app-usagemonitor/")) {
+          workspaceReached.add(specifier.split("/").slice(0, 2).join("/"));
+        }
+        continue;
+      }
+      await walk(new URL(specifier, moduleUrl));
+    }
+  };
+  for (const entry of entries) await walk(entry);
+
+  assert.deepEqual(
+    dynamicOffenders,
+    [],
+    "benchmark reaches source the workload digest cannot account for",
+  );
+
+  // The full workload path set, not just the runtime source scan:
+  // `workloadSourcePaths` also appends the two out-of-process worker scripts
+  // and the JSON contracts, and all of those are equally part of what the
+  // receipts attest.
+  const scanned = new Set(R7_RELEASE_EVIDENCE_WORKLOAD_SOURCE_PATHS);
+  const reachable = [...seen]
+    .map((href) => decodeURIComponent(href.slice(repositoryRoot.href.length)))
+    .sort();
+  const missing = reachable.filter((path) => !scanned.has(path));
+  assert.deepEqual(
+    missing,
+    [],
+    "modules the R7 benchmark imports but the workload digest does not cover",
+  );
+  assert.equal(reachable.length > 50, true, "closure walk found too little to be trusted");
+
+  // Every workspace package the benchmark can reach must have source inside
+  // the scan, or a change to it would leave the receipts claiming to describe
+  // code they never covered.
+  const uncoveredPackages = [...workspaceReached].sort().filter((name) => {
+    const directory = `packages/${name.slice("@app-usagemonitor/".length)}/`;
+    return ![...scanned].some((path) => path.startsWith(directory));
+  });
+  assert.deepEqual(
+    uncoveredPackages,
+    [],
+    "workspace packages the benchmark reaches but the workload digest omits",
+  );
 });
