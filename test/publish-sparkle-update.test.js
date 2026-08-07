@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   RELEASE_MANIFEST,
@@ -31,6 +31,7 @@ const TEST_PUBLIC_ED_KEY = TEST_KEY_PAIR.publicKey
   .subarray(-32)
   .toString("base64");
 const STABLE_CHANNEL = getReleaseChannel("stable");
+const DOGFOOD_CHANNEL = getReleaseChannel("internal-dogfood");
 const TEST_PUBLIC_ED_KEY_SHA256 = sha256(
   Buffer.from(TEST_PUBLIC_ED_KEY, "base64"),
 );
@@ -307,6 +308,173 @@ function appcastEnclosure({ bytes, deltaFrom, signature, url, version }) {
   const enclosureSignature = signature
     ?? sign(null, bytes, TEST_KEY_PAIR.privateKey).toString("base64");
   return `<item><enclosure url="${url}" length="${bytes.length}" sparkle:version="${version}"${delta} sparkle:edSignature="${enclosureSignature}" /></item>`;
+}
+
+function deltaEnclosureBlock(deltas) {
+  if (deltas.length === 0) return "";
+  return `<sparkle:deltas>\n${deltas.map((delta) =>
+    `<enclosure url="${delta.url}" sparkle:deltaFrom="${delta.deltaFrom}" length="${delta.bytes.length}" type="application/octet-stream" sparkle:edSignature="${delta.signature}" />`).join("\n")}\n</sparkle:deltas>\n`;
+}
+
+/**
+ * A dogfood release fixture mirroring what generate-sparkle-appcast.js emits:
+ * one item carrying the signed full DMG enclosure plus signed delta
+ * enclosures inside the item's sparkle:deltas container, with the delta
+ * artifacts beside the DMG.
+ */
+async function createDogfoodReleaseFixture({
+  bundleVersion = "2",
+  deltaSources = ["1"],
+  mutateAppcast = (value) => value,
+  writeDeltaFiles = true,
+} = {}) {
+  const channel = DOGFOOD_CHANNEL;
+  const root = await mkdtemp(
+    join(await realpath(tmpdir()), "tibotattle-dogfood-publisher-test-"),
+  );
+  const fileName = RELEASE_MANIFEST.macOS.arm64DmgFileName;
+  const dmgBytes = Buffer.from(`signed-dogfood-dmg-fixture-${bundleVersion}`);
+  const dmgPath = join(root, fileName);
+  const appcastPath = join(root, "appcast.xml");
+  const releaseManifestPath = join(root, `${fileName}.release.json`);
+  const digest = sha256(dmgBytes);
+  const signature = sign(null, dmgBytes, TEST_KEY_PAIR.privateKey)
+    .toString("base64");
+  const prefix = `${channel.sparkle.origin}/${channel.sparkle.objectPrefix}`;
+  const artifactURL = `${prefix}/${bundleVersion}/${digest}/${fileName}`;
+  const deltaBase = fileName.slice(0, -".dmg".length);
+  const deltas = deltaSources.map((deltaFrom) => {
+    const bytes = Buffer.from(
+      `sparkle-binary-delta-${deltaFrom}-to-${bundleVersion}`,
+    );
+    const deltaFileName = `${deltaBase}-from-${deltaFrom}.delta`;
+    return {
+      bytes,
+      deltaFrom,
+      fileName: deltaFileName,
+      path: join(root, deltaFileName),
+      sha256: sha256(bytes),
+      signature: sign(null, bytes, TEST_KEY_PAIR.privateKey)
+        .toString("base64"),
+      url: `${prefix}/${bundleVersion}/${sha256(bytes)}/${deltaFileName}`,
+    };
+  });
+  const manifest = {
+    schemaVersion: "usage-monitor-macos-release-v0.2",
+    application: {
+      bundleIdentifier: "com.usagemonitor.local",
+      bundleVersion,
+      shortVersion: RELEASE_VERSION,
+    },
+    artifact: { bytes: dmgBytes.length, fileName, sha256: digest },
+    channel: {
+      name: channel.name,
+      serviceOriginMode: channel.serviceOriginMode,
+      serviceOrigin: channel.serviceOrigin,
+      publicWebsiteOrigin: channel.publicWebsiteOrigin,
+      sparkle: {
+        origin: channel.sparkle.origin,
+        appcastURL: channel.sparkle.appcastURL,
+        appcastObjectKey: channel.sparkle.appcastObjectKey,
+        r2Bucket: channel.sparkle.r2Bucket,
+        objectPrefix: channel.sparkle.objectPrefix,
+        atomicGuardURL: channel.sparkle.atomicGuardURL,
+        publicEdKeySha256: channel.sparkle.publicEdKeySha256,
+      },
+    },
+    replacement: createMacOSSignedReplacementContract(),
+    source: { commit: "a".repeat(40), tag: "v0.1.1" },
+    assurances: {
+      appNotarizationAccepted: true,
+      appTicketStapled: true,
+      candidateReproducedFromCheckedOutSource: true,
+      cleanProfileSmokePassed: true,
+      developerIDHardenedRuntime: true,
+      dmgGatekeeperAssessmentPassed: true,
+      dmgNotarizationAccepted: true,
+      dmgTicketStapled: true,
+    },
+    updater: {
+      appcastURL: channel.sparkle.appcastURL,
+      afterUserOptIn: { automaticDownload: true, installOnQuit: true },
+      automaticChecks: true,
+      automaticUpdateOptInAvailable: true,
+      automaticUpdatesEnabledByDefault: true,
+      enabled: true,
+      frameworkVersion: SPARKLE_VERSION,
+      publicEdKeySha256: TEST_PUBLIC_ED_KEY_SHA256,
+      requiresSignedFeed: true,
+    },
+  };
+  const appcast = mutateAppcast(`<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item>
+<sparkle:version>${bundleVersion}</sparkle:version>
+<enclosure url="${artifactURL}" length="${dmgBytes.length}" type="application/x-apple-diskimage" sparkle:edSignature="${signature}" />
+${deltaEnclosureBlock(deltas)}</item></channel></rss>
+`);
+  await Promise.all([
+    writeFile(dmgPath, dmgBytes),
+    writeFile(appcastPath, appcast),
+    writeFile(releaseManifestPath, `${JSON.stringify(manifest)}\n`),
+    ...(writeDeltaFiles
+      ? deltas.map((delta) => writeFile(delta.path, delta.bytes))
+      : []),
+  ]);
+  return {
+    appcast,
+    appcastPath,
+    artifactURL,
+    bucket: channel.sparkle.r2Bucket,
+    channel,
+    cleanup: () => rm(root, { recursive: true, force: true }),
+    deltas,
+    dmgBytes,
+    dmgPath,
+    releaseManifestPath,
+  };
+}
+
+function dogfoodPublicReadbackFixture(fixture) {
+  const calls = [];
+  return {
+    calls,
+    fetch: async (url, options = {}) => {
+      const method = options.method ?? "GET";
+      calls.push({ method, url });
+      if (url === fixture.channel.sparkle.appcastURL) {
+        return new Response(fixture.appcast, {
+          headers: {
+            "Cache-Control": APPCAST_CACHE_CONTROL,
+            "Content-Length": String(Buffer.byteLength(fixture.appcast)),
+            "Content-Type": "application/xml; charset=utf-8",
+          },
+          status: 200,
+        });
+      }
+      if (url === fixture.artifactURL) {
+        return new Response(fixture.dmgBytes, {
+          headers: {
+            "Cache-Control": IMMUTABLE_CACHE_CONTROL,
+            "Content-Length": String(fixture.dmgBytes.length),
+            "Content-Type": "application/x-apple-diskimage",
+          },
+          status: 200,
+        });
+      }
+      const delta = fixture.deltas.find((entry) => entry.url === url);
+      if (delta !== undefined) {
+        return new Response(method === "HEAD" ? null : delta.bytes, {
+          headers: {
+            "Cache-Control": IMMUTABLE_CACHE_CONTROL,
+            "Content-Length": String(delta.bytes.length),
+            "Content-Type": "application/octet-stream",
+          },
+          status: 200,
+        });
+      }
+      return new Response(null, { status: 404 });
+    },
+  };
 }
 
 test("validates an explicitly supplied canonical signed update without invoking Wrangler by default", async () => {
@@ -1459,4 +1627,230 @@ test("requires the approved explicit bucket and does not accept signing-key argu
     }),
     /approved bucket/u,
   );
+});
+
+test("validates a delta-carrying dogfood appcast and receipts the local signed delta", async () => {
+  const fixture = await createDogfoodReleaseFixture();
+  try {
+    const publication = await publishSparkleUpdateRaw({
+      appcastPath: fixture.appcastPath,
+      bucket: fixture.bucket,
+      channel: "internal-dogfood",
+      dmgPath: fixture.dmgPath,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: async () => assert.fail("dry run must not call Wrangler"),
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, false);
+    assert.equal(publication.status, "validated");
+    assert.equal(publication.deltas.length, 1);
+    const [delta] = publication.deltas;
+    assert.equal(delta.deltaFrom, "1");
+    assert.equal(delta.contentType, "application/octet-stream");
+    assert.equal(delta.cacheControl, IMMUTABLE_CACHE_CONTROL);
+    assert.equal(delta.bytes, fixture.deltas[0].bytes.length);
+    assert.equal(delta.sha256, fixture.deltas[0].sha256);
+    assert.equal(
+      delta.key,
+      `${fixture.channel.sparkle.objectPrefix}/2/${fixture.deltas[0].sha256}/${fixture.deltas[0].fileName}`,
+    );
+    assert.equal(delta.path, fixture.deltas[0].path);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("publishes the delta as a fourth immutable object and read-backs delta and full fallback", async () => {
+  const fixture = await createDogfoodReleaseFixture();
+  const runner = missingRemoteObjectRunner();
+  const publicReadback = dogfoodPublicReadbackFixture(fixture);
+  try {
+    const publication = await publishSparkleUpdateRaw({
+      appcastPath: fixture.appcastPath,
+      atomicAppcastGuard: runner.run.atomicAppcastGuard,
+      bucket: fixture.bucket,
+      channel: "internal-dogfood",
+      dmgPath: fixture.dmgPath,
+      publish: true,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      runWrangler: runner.run,
+      fetchPublic: publicReadback.fetch,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.equal(publication.status, "published");
+    assert.equal(publication.verified, true);
+    assert.equal(publication.deltas.length, 1);
+    const deltaKey = publication.deltas[0].key;
+    const putCalls = runner.calls.filter((call) => call[2] === "put");
+    assert.deepEqual(putCalls.map((call) => call[3]), [
+      `${fixture.bucket}/${publication.artifact.key}`,
+      `${fixture.bucket}/${publication.manifest.key}`,
+      `${fixture.bucket}/${deltaKey}`,
+      `${fixture.bucket}/${fixture.channel.sparkle.appcastObjectKey}`,
+    ]);
+    const deltaPut = putCalls[2];
+    assert.equal(deltaPut.includes("application/octet-stream"), true);
+    assert.equal(deltaPut.includes(IMMUTABLE_CACHE_CONTROL), true);
+    assert.deepEqual(publicReadback.calls, [
+      { method: "GET", url: fixture.channel.sparkle.appcastURL },
+      { method: "HEAD", url: fixture.deltas[0].url },
+      { method: "GET", url: fixture.artifactURL },
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed before any remote call when an advertised delta is not beside the DMG", async () => {
+  const fixture = await createDogfoodReleaseFixture({ writeDeltaFiles: false });
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: fixture.bucket,
+        channel: "internal-dogfood",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("missing delta must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_DELTA_ARTIFACT_MISSING" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed when the local delta bytes do not match the content-addressed enclosure", async () => {
+  const fixture = await createDogfoodReleaseFixture();
+  await writeFile(fixture.deltas[0].path, Buffer.from("tampered-delta-bytes"));
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: fixture.bucket,
+        channel: "internal-dogfood",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("tampered delta must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_DELTA_ARTIFACT_INVALID" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fails closed when the delta signature does not verify against the release public key", async () => {
+  const fixture = await createDogfoodReleaseFixture({
+    mutateAppcast: (value) => value.replace(
+      /(<sparkle:deltas>[\s\S]*?)sparkle:edSignature="[^"]+"/u,
+      `$1sparkle:edSignature="${sign(
+        null,
+        Buffer.from("some other artifact"),
+        TEST_KEY_PAIR.privateKey,
+      ).toString("base64")}"`,
+    ),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: fixture.bucket,
+        channel: "internal-dogfood",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("unsigned delta must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_SIGNATURE_INVALID" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("rejects a delta enclosure outside the sparkle:deltas fallback container", async () => {
+  const fixture = await createDogfoodReleaseFixture({
+    mutateAppcast: (value) => value
+      .replace("<sparkle:deltas>\n", "")
+      .replace("\n</sparkle:deltas>", ""),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: fixture.bucket,
+        channel: "internal-dogfood",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail("misplaced delta must not call Wrangler"),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_APPCAST_DELTA_INVALID" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("stable delta publication turns on with the reviewed policy flip and no publisher change", async () => {
+  const deltaBytes = Buffer.from("stable-binary-delta-0-to-1");
+  const deltaDigest = sha256(deltaBytes);
+  const deltaFileName = `${RELEASE_MANIFEST.macOS.arm64DmgFileName.slice(0, -".dmg".length)}-from-0.delta`;
+  const deltaURL = `${CANONICAL_UPDATE_ORIGIN}/releases/1/${deltaDigest}/${deltaFileName}`;
+  const deltaSignature = sign(null, deltaBytes, TEST_KEY_PAIR.privateKey)
+    .toString("base64");
+  const deltasBlock = `<sparkle:deltas>\n<enclosure url="${deltaURL}" sparkle:version="1" sparkle:deltaFrom="0" length="${deltaBytes.length}" type="application/octet-stream" sparkle:edSignature="${deltaSignature}" />\n</sparkle:deltas>\n`;
+  const fixture = await createReleaseFixture({
+    mutateAppcast: (value) => value.replace("</item>", `${deltasBlock}</item>`),
+  });
+  await writeFile(
+    join(dirname(fixture.dmgPath), deltaFileName),
+    deltaBytes,
+  );
+  const options = {
+    appcastPath: fixture.appcastPath,
+    bucket: APPROVED_R2_BUCKET,
+    channel: "stable",
+    dmgPath: fixture.dmgPath,
+    releaseManifestPath: fixture.releaseManifestPath,
+    sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    runWrangler: async () => assert.fail("validation-only must not call Wrangler"),
+    validateDMG: async () => {},
+  };
+  try {
+    // Identical inputs: today's reviewed policy refuses the delta appcast...
+    await assert.rejects(
+      publishSparkleUpdate(options),
+      { code: "SPARKLE_UPDATE_DELTA_UNSUPPORTED" },
+    );
+    // ...and the flipped policy accepts it with the delta fully validated,
+    // so the config/guard change is the only remaining stable gate.
+    const publication = await publishSparkleUpdate({
+      ...options,
+      appcastPolicy: {
+        ...CANONICAL_STABLE_APPCAST_POLICY,
+        allowDeltaFrom: true,
+      },
+    });
+    assert.equal(publication.status, "validated");
+    assert.equal(publication.deltas.length, 1);
+    assert.equal(publication.deltas[0].deltaFrom, "0");
+    assert.equal(
+      publication.deltas[0].key,
+      `releases/1/${deltaDigest}/${deltaFileName}`,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
 });

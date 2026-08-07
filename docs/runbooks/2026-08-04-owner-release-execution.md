@@ -231,9 +231,12 @@ digest.
 
 The current publisher publishes one **full candidate DMG** as the sole
 appcast item and enclosure. The checked-in policy rejects retained history and
-delta enclosures (`retainHistory: false`, `allowDeltaFrom: false`); any future
-history or delta support requires a separately implemented publication path
-and a fresh rehearsal.
+delta enclosures (`retainHistory: false`, `allowDeltaFrom: false`). The delta
+publication path is now implemented behind that policy — retained archives,
+`generate-sparkle-appcast.js`, and publisher delta validation/upload, per the
+[Sparkle delta update machinery runbook](2026-08-07-sparkle-delta-updates.md)
+— but enabling stable deltas still requires the reviewed policy flip, the
+matching Worker guard change, and a fresh rehearsal.
 
 **Gate / rollback.** Missing dogfood configuration, a feed 404/410, redirect,
 malformed or mismatched enclosure, missing/mismatched immutable object,

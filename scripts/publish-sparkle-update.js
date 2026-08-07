@@ -57,6 +57,7 @@ export const APPCAST_ATOMIC_GUARD_ROUTE =
   "/api/v1/internal/release/appcast";
 export const APPCAST_ATOMIC_GUARD_TOKEN_ENV =
   "SPARKLE_APPCAST_GUARD_TOKEN";
+export const DELTA_CONTENT_TYPE = "application/octet-stream";
 const PUBLICATION_STATUS_VALIDATED = "validated";
 const PUBLICATION_STATUS_PUBLISHED = "published";
 const PUBLICATION_STATUS_RESUMED_VERIFIED = "resumed_verified";
@@ -491,8 +492,36 @@ function appcastEnclosures(text, channel) {
   });
 }
 
-function assertCanonicalStableAppcast(text, channel, enclosures) {
+function countDeltaContainerEnclosures(text) {
+  const blocks = [...text.matchAll(
+    /<sparkle:deltas\b[^>]*>([\s\S]*?)<\/sparkle:deltas\s*>/gu,
+  )];
+  const openings = [...text.matchAll(/<sparkle:deltas\b/gu)].length;
+  if (openings !== blocks.length
+      || blocks.some((block) => block[1].includes("<item")
+        || block[1].includes("<sparkle:deltas"))) {
+    fail(
+      "Appcast sparkle:deltas containers must be well formed",
+      "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+    );
+  }
+  return blocks.reduce(
+    (count, block) => count + [...block[1].matchAll(/<enclosure\b/gu)].length,
+    0,
+  );
+}
+
+/**
+ * Sparkle clients treat only enclosures inside an item's <sparkle:deltas>
+ * container as delta candidates; the item's own enclosure remains the full
+ * download a client falls back to when it cannot apply a delta. Enforcing
+ * this placement is what keeps automatic full-DMG fallback working, so a
+ * delta enclosure outside the container (or a full enclosure inside one) is
+ * rejected rather than published.
+ */
+function assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy) {
   if (channel.name !== "stable") return;
+  const policy = appcastPolicy ?? CANONICAL_STABLE_APPCAST_POLICY;
 
   const itemOpenings = [...text.matchAll(/<item\b[^>]*>/gu)]
     .filter((match) => !match[0].endsWith("/>")).length;
@@ -500,39 +529,88 @@ function assertCanonicalStableAppcast(text, channel, enclosures) {
   const itemBodies = [...text.matchAll(
     /<item\b[^>]*>([\s\S]*?)<\/item\s*>/gu,
   )];
-  if (itemOpenings !== CANONICAL_STABLE_APPCAST_POLICY.channelItemCount
-      || itemClosings !== CANONICAL_STABLE_APPCAST_POLICY.channelItemCount
-      || itemBodies.length !== CANONICAL_STABLE_APPCAST_POLICY.channelItemCount) {
+  if (itemOpenings !== policy.channelItemCount
+      || itemClosings !== policy.channelItemCount
+      || itemBodies.length !== policy.channelItemCount) {
     fail(
       "Stable appcast must contain exactly one RSS channel item; history is not retained",
       "SPARKLE_UPDATE_APPCAST_HISTORY_UNSUPPORTED",
     );
   }
-  if (enclosures.length !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount
-      || [...(itemBodies[0]?.[1] ?? "").matchAll(/<enclosure\b/gu)].length
-        !== CANONICAL_STABLE_APPCAST_POLICY.enclosureCount) {
+  const fullEnclosures = enclosures.filter(
+    (enclosure) => enclosure.deltaFrom === undefined,
+  );
+  const deltaEnclosures = enclosures.filter(
+    (enclosure) => enclosure.deltaFrom !== undefined,
+  );
+  if (deltaEnclosures.length > 0 && policy.allowDeltaFrom !== true) {
     fail(
-      "Stable appcast must contain exactly one enclosure inside its sole item",
+      "The stable publisher only accepts one signed full candidate DMG; Sparkle delta publication is unsupported",
+      "SPARKLE_UPDATE_DELTA_UNSUPPORTED",
+    );
+  }
+  if (fullEnclosures.length !== policy.enclosureCount
+      || [...(itemBodies[0]?.[1] ?? "").matchAll(/<enclosure\b/gu)].length
+        !== enclosures.length) {
+    fail(
+      "Stable appcast must contain exactly one full enclosure inside its sole item",
       "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
     );
   }
-  const enclosure = enclosures[0];
-  if (!enclosure
-      || (CANONICAL_STABLE_APPCAST_POLICY.fullDmgOnly
-        && !enclosure.objectKey.endsWith(".dmg"))
-      || (!CANONICAL_STABLE_APPCAST_POLICY.allowDeltaFrom
-        && enclosure.deltaFrom !== undefined)) {
-    if (enclosure?.deltaFrom !== undefined) {
-      fail(
-        "The stable publisher only accepts one signed full candidate DMG; Sparkle delta publication is unsupported",
-        "SPARKLE_UPDATE_DELTA_UNSUPPORTED",
-      );
-    }
+  if (policy.fullDmgOnly
+      && fullEnclosures.some(
+        (enclosure) => !enclosure.objectKey.endsWith(".dmg"),
+      )) {
     fail(
       "Stable appcast must contain exactly one signed full DMG enclosure",
       "SPARKLE_UPDATE_APPCAST_NON_CANONICAL",
     );
   }
+  if (deltaEnclosures.length > 0) {
+    const maximumDeltaEnclosures = policy.maxDeltaEnclosures ?? 3;
+    if (deltaEnclosures.length > maximumDeltaEnclosures) {
+      fail(
+        "Stable appcast delta enclosures must be a bounded set of .delta objects",
+        "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+      );
+    }
+  }
+}
+
+function assertDeltaEnclosurePlacement(text, enclosures) {
+  const deltaEnclosures = enclosures.filter(
+    (enclosure) => enclosure.deltaFrom !== undefined,
+  );
+  const containedEnclosures = countDeltaContainerEnclosures(text);
+  if (deltaEnclosures.some(
+    (enclosure) => !enclosure.objectKey.endsWith(".delta"),
+  )
+      || deltaEnclosures.some(
+        (enclosure) => enclosure.objectKey.endsWith(".dmg"),
+      )
+      || containedEnclosures !== deltaEnclosures.length) {
+    fail(
+      "Appcast delta enclosures must be .delta objects inside the item's sparkle:deltas container so clients can fall back to the full download",
+      "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+    );
+  }
+}
+
+/**
+ * Validate a locally generated candidate appcast against the reviewed
+ * channel and (for stable) the canonical appcast policy, without touching
+ * any artifact. Used by the appcast/delta generator as a self-check and by
+ * specs; the publisher itself performs the same checks plus artifact
+ * validation.
+ */
+export function validateCandidateAppcastShape(text, channelName, {
+  appcastPolicy = CANONICAL_STABLE_APPCAST_POLICY,
+} = {}) {
+  const channel = resolveReleaseChannel(channelName);
+  const enclosures = appcastEnclosures(text, channel);
+  assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy);
+  assertDeltaEnclosurePlacement(text, enclosures);
+  return enclosures;
 }
 
 function immutableObjectKeys({ bundleVersion, fileName, sha256, channel }) {
@@ -544,6 +622,7 @@ function immutableObjectKeys({ bundleVersion, fileName, sha256, channel }) {
 }
 
 function validateAppcast(text, {
+  appcastPolicy,
   channel,
   dmg,
   dmgBytes,
@@ -552,7 +631,8 @@ function validateAppcast(text, {
   sparklePublicKey,
 }) {
   const enclosures = appcastEnclosures(text, channel);
-  assertCanonicalStableAppcast(text, channel, enclosures);
+  assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy);
+  assertDeltaEnclosurePlacement(text, enclosures);
   const artifactURL = new URL(
     objectKeys.artifact,
     `${channel.sparkle.origin}/`,
@@ -596,6 +676,7 @@ function sameAppcastEnclosure(left, right) {
 
 function assertExactCandidateAppcast({
   appcastBytes,
+  appcastPolicy,
   appcastUpdate,
   currentAppcast,
   channel,
@@ -615,6 +696,7 @@ function assertExactCandidateAppcast({
   }
 
   const observed = validateAppcast(currentAppcast.content.toString("utf8"), {
+    appcastPolicy,
     channel,
     dmg,
     dmgBytes,
@@ -623,10 +705,12 @@ function assertExactCandidateAppcast({
     sparklePublicKey,
   });
   const candidateVersionEnclosures = appcastUpdate.enclosures.filter(
-    (enclosure) => enclosure.version === manifest.bundleVersion,
+    (enclosure) => enclosure.version === manifest.bundleVersion
+      && enclosure.deltaFrom === undefined,
   );
   const observedVersionEnclosures = observed.enclosures.filter(
-    (enclosure) => enclosure.version === manifest.bundleVersion,
+    (enclosure) => enclosure.version === manifest.bundleVersion
+      && enclosure.deltaFrom === undefined,
   );
   if (candidateVersionEnclosures.length !== 1
       || observedVersionEnclosures.length !== 1
@@ -871,6 +955,7 @@ async function readResponseDigest(response, {
 
 async function verifyPublicPublication({
   appcastBytes,
+  appcastPolicy,
   appcastUpdate,
   channel,
   dmg,
@@ -910,6 +995,7 @@ async function verifyPublicPublication({
   }
   const publicAppcastText = publicAppcastBytes.toString("utf8");
   const publicUpdate = validateAppcast(publicAppcastText, {
+    appcastPolicy,
     channel,
     dmg,
     dmgBytes,
@@ -1131,13 +1217,15 @@ async function validatePublishedEnclosureObjects({
   appcastUpdate,
   bucket,
   dmg,
+  publishedObjectKeys = new Set(),
   runWrangler,
   sparklePublicKey,
   temporaryRoot,
 }) {
   const remoteObjects = new Map();
   for (const enclosure of appcastUpdate.enclosures) {
-    if (enclosure.url === appcastUpdate.artifactURL) {
+    if (enclosure.url === appcastUpdate.artifactURL
+        || publishedObjectKeys.has(enclosure.objectKey)) {
       continue;
     }
     if (!remoteObjects.has(enclosure.objectKey)) {
@@ -1392,6 +1480,83 @@ async function putAppcastWithAtomicGuard({
 }
 
 /**
+ * Every delta enclosure the candidate appcast advertises for the candidate
+ * bundle version must exist locally beside the DMG (the generator writes
+ * them there), match the advertised content-addressed SHA-256 and length,
+ * and carry a Sparkle Ed25519 signature that verifies with the same public
+ * key as the full DMG. Delta objects for other versions are historical feed
+ * entries and are validated against R2 instead.
+ */
+async function readCandidateDeltaArtifacts({
+  appcastUpdate,
+  channel,
+  dmgPath,
+  manifest,
+  sparklePublicKey,
+}) {
+  const candidateDeltas = appcastUpdate.enclosures.filter(
+    (enclosure) => enclosure.deltaFrom !== undefined
+      && enclosure.version === manifest.bundleVersion,
+  );
+  if (candidateDeltas.length === 0) return Object.freeze([]);
+  const seenSources = new Set();
+  const seenKeys = new Set();
+  const artifacts = [];
+  for (const enclosure of candidateDeltas) {
+    if (seenSources.has(enclosure.deltaFrom)
+        || seenKeys.has(enclosure.objectKey)) {
+      fail(
+        "Appcast candidate delta enclosures must have distinct source versions and object keys",
+        "SPARKLE_UPDATE_APPCAST_DELTA_INVALID",
+      );
+    }
+    seenSources.add(enclosure.deltaFrom);
+    seenKeys.add(enclosure.objectKey);
+    const parsed = parsePublishedObjectKey(enclosure.url, channel);
+    const localPath = join(dirname(resolve(dmgPath)), parsed.fileName);
+    const exists = await lstat(localPath).catch(() => null);
+    if (exists === null) {
+      fail(
+        `Appcast advertises delta ${parsed.fileName} for version ${manifest.bundleVersion}, but the file is not beside the DMG; regenerate the appcast (or a full-only appcast) before publishing`,
+        "SPARKLE_UPDATE_DELTA_ARTIFACT_MISSING",
+      );
+    }
+    const delta = await readRegularInput(localPath, {
+      label: `Delta artifact ${parsed.fileName}`,
+      maximumBytes: MAX_DMG_BYTES,
+    });
+    const deltaWithSha256 = await readFileWithSha256(delta.path);
+    if (deltaWithSha256.bytes.length !== delta.size) {
+      fail(`Delta artifact ${parsed.fileName} changed while it was being read`);
+    }
+    if (delta.size !== enclosure.length
+        || deltaWithSha256.sha256 !== enclosure.objectSha256) {
+      fail(
+        `Delta artifact ${parsed.fileName} does not match its appcast enclosure length and content-addressed SHA-256`,
+        "SPARKLE_UPDATE_DELTA_ARTIFACT_INVALID",
+      );
+    }
+    verifyEnclosureSignature({
+      bytes: deltaWithSha256.bytes,
+      enclosure,
+      sparklePublicKey,
+    });
+    artifacts.push(Object.freeze({
+      bytes: delta.size,
+      cacheControl: IMMUTABLE_CACHE_CONTROL,
+      contentType: DELTA_CONTENT_TYPE,
+      contents: deltaWithSha256,
+      deltaFrom: enclosure.deltaFrom,
+      key: enclosure.objectKey,
+      path: delta.path,
+      sha256: deltaWithSha256.sha256,
+      url: enclosure.url,
+    }));
+  }
+  return Object.freeze(artifacts);
+}
+
+/**
  * Validate and, only when publish is explicitly true, publish one complete
  * Sparkle update. The publisher deliberately accepts no Sparkle private signing
  * key nor Cloudflare credentials; the operator performs signing separately and
@@ -1403,6 +1568,11 @@ export async function publishSparkleUpdate({
   atomicAppcastGuardEndpoint = null,
   atomicAppcastGuardTokenEnv = null,
   appcastPath,
+  // The reviewed canonical policy is the only production value; this seam is
+  // injectable (like runWrangler and validateDMG) so specs can exercise the
+  // delta-enabled appcast shape ahead of the reviewed config/guard change.
+  // It is deliberately not reachable from the CLI argument parser.
+  appcastPolicy = CANONICAL_STABLE_APPCAST_POLICY,
   bucket,
   channel,
   dmgPath,
@@ -1424,7 +1594,10 @@ export async function publishSparkleUpdate({
       || typeof runWrangler !== "function"
       || typeof fetchPublic !== "function"
       || typeof fetchGuard !== "function"
-      || typeof validateDMG !== "function") {
+      || typeof validateDMG !== "function"
+      || !appcastPolicy || typeof appcastPolicy !== "object"
+      || appcastPolicy.schemaVersion
+        !== CANONICAL_STABLE_APPCAST_POLICY.schemaVersion) {
     fail("Publisher options are invalid");
   }
   const releaseChannel = resolveReleaseChannel(channel);
@@ -1513,6 +1686,7 @@ export async function publishSparkleUpdate({
   const appcastUpdate = validateAppcast(
     appcastBytes.toString("utf8"),
     {
+      appcastPolicy,
       channel: releaseChannel,
       dmg,
       dmgBytes: dmgWithSha256.bytes,
@@ -1521,6 +1695,13 @@ export async function publishSparkleUpdate({
       sparklePublicKey: normalizedSparklePublicKey,
     },
   );
+  const candidateDeltaArtifacts = await readCandidateDeltaArtifacts({
+    appcastUpdate,
+    channel: releaseChannel,
+    dmgPath: dmg.path,
+    manifest,
+    sparklePublicKey: normalizedSparklePublicKey,
+  });
   const previousStableManifest = previousStableManifestPath === null
     ? null
     : await readStableReleaseManifest(previousStableManifestPath);
@@ -1550,6 +1731,18 @@ export async function publishSparkleUpdate({
       url: appcastUpdate.artifactURL,
     }),
     bucket,
+    deltas: Object.freeze(candidateDeltaArtifacts.map(
+      (delta) => Object.freeze({
+        bytes: delta.bytes,
+        cacheControl: delta.cacheControl,
+        contentType: delta.contentType,
+        deltaFrom: delta.deltaFrom,
+        key: delta.key,
+        path: delta.path,
+        sha256: delta.sha256,
+        url: delta.url,
+      }),
+    )),
     manifest: Object.freeze({
       bytes: releaseManifestWithSha256.bytes.length,
       cacheControl: IMMUTABLE_CACHE_CONTROL,
@@ -1596,6 +1789,11 @@ export async function publishSparkleUpdate({
         maximumBytes: MAX_MANIFEST_BYTES,
         object: publication.manifest,
       },
+      ...candidateDeltaArtifacts.map((delta, index) => ({
+        candidate: delta.contents,
+        maximumBytes: MAX_DMG_BYTES,
+        object: publication.deltas[index],
+      })),
     ];
     for (const immutableObject of immutableObjects) {
       const remote = await readRemoteObject({
@@ -1623,6 +1821,7 @@ export async function publishSparkleUpdate({
     });
     resumedPublication = assertExactCandidateAppcast({
       appcastBytes,
+      appcastPolicy,
       appcastUpdate,
       currentAppcast,
       channel: releaseChannel,
@@ -1656,7 +1855,8 @@ export async function publishSparkleUpdate({
         if (currentVersion !== null
             && compareBundleVersions(manifest.bundleVersion, currentVersion) === 0
             && currentEnclosures.filter(
-              (enclosure) => enclosure.version === manifest.bundleVersion,
+              (enclosure) => enclosure.version === manifest.bundleVersion
+                && enclosure.deltaFrom === undefined,
             ).length !== 1) {
           fail(
             "Live appcast has an ambiguous candidate-version publication state",
@@ -1679,6 +1879,9 @@ export async function publishSparkleUpdate({
       appcastUpdate,
       bucket,
       dmg,
+      publishedObjectKeys: new Set(
+        publication.deltas.map((delta) => delta.key),
+      ),
       runWrangler,
       sparklePublicKey: normalizedSparklePublicKey,
       temporaryRoot,
@@ -1723,6 +1926,7 @@ export async function publishSparkleUpdate({
   }
   await verifyPublicPublication({
     appcastBytes,
+    appcastPolicy,
     appcastUpdate,
     channel: releaseChannel,
     dmg,
@@ -1835,6 +2039,11 @@ export async function main(argv) {
   console.log(`Validated signed DMG SHA-256: ${publication.artifact.sha256}`);
   console.log(`R2 artifact: ${publication.bucket}/${publication.artifact.key}`);
   console.log(`R2 manifest: ${publication.bucket}/${publication.manifest.key}`);
+  for (const delta of publication.deltas) {
+    console.log(
+      `R2 delta (from ${delta.deltaFrom}): ${publication.bucket}/${delta.key}`,
+    );
+  }
   console.log(`R2 appcast: ${publication.appcast.url}`);
   if (!publication.published) {
     console.log("Validation only; re-run with --publish to invoke Wrangler.");

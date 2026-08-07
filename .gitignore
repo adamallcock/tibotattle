@@ -64,3 +64,6 @@ apps/macos/.build/
 
 # Package manager store
 .pnpm-store/
+
+# Retained prior releases for Sparkle delta generation (local artifacts).
+.release-archive/

@@ -240,6 +240,21 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/generate-sparkle-appcast.js",
+      "stableAlias": "product:macos:appcast",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "test/macos-updater.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": null,
+      "provenanceReason": "Signs and validates Sparkle appcast/delta artifacts from already-built releases; consumed by the publish flow.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "telemetry_contract",
       "canonicalPath": "scripts/generate-telemetry-browser-mirror.js",
       "stableAlias": "telemetry:browser:generate",
@@ -426,16 +441,17 @@
       "stableAliasReason": "Shared updater module is imported by build/release commands and tests, not invoked directly.",
       "additionalAliases": [],
       "callers": [
-        "scripts/prepare-sparkle-framework.js",
-        "scripts/macos-release-core.js",
+        "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
         "scripts/build-macos-app.js",
+        "scripts/generate-sparkle-appcast.js",
+        "scripts/macos-release-core.js",
+        "scripts/prepare-sparkle-framework.js",
         "scripts/verify-macos-preview-remote.js",
         "test/macos-app-bundle.test.js",
-        "test/public-release-site.test.js",
-        "test/macos-updater.test.js",
         "test/macos-updater-release.test.mjs",
-        "test/publish-sparkle-update.test.js",
-        "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
+        "test/macos-updater.test.js",
+        "test/public-release-site.test.js",
+        "test/publish-sparkle-update.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
@@ -532,11 +548,13 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.product:macos:publish-update",
         "apps/worker/scripts/check-deployment-endpoints.mjs",
+        "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",
+        "package.json#scripts.product:macos:publish-update",
+        "scripts/generate-sparkle-appcast.js",
+        "test/macos-updater.test.js",
         "test/publish-sparkle-update.test.js",
-        "test/release-channel-policy.test.js",
-        "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md"
+        "test/release-channel-policy.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",

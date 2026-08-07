@@ -41,7 +41,11 @@ RSS channel item, one signed full `.dmg` enclosure, no
 `sparkle:deltaFrom`, and no retained history or extra enclosures. This is a
 release-safety contract, not a formatting preference: a local publisher that
 accepted history or deltas could pass its own checks and then fail at the
-guard after immutable objects had already been uploaded. The configured
+guard after immutable objects had already been uploaded. Sparkle delta
+machinery now exists behind exactly this policy — the generator and the
+publisher both read it, so stable stays full-only until the reviewed policy
+and guard change flips `allowDeltaFrom`; see the
+[Sparkle delta update machinery runbook](2026-08-07-sparkle-delta-updates.md). The configured
 `internal-dogfood` descriptor uses this named publisher path with its own
 policy-owned distribution identifiers: it shares `https://tibotattle.com` for
 the app service and public website, but uses the isolated update origin

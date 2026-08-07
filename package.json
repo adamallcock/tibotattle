@@ -113,7 +113,8 @@
     "architecture:check": "node ./scripts/check-architecture-boundaries.mjs",
     "check": "npm test && npm run product:check",
     "index:rebuild": "node ./scripts/rebuild-local-unified-index.mjs",
-    "diagnose:dashboard": "node ./scripts/inspect-dashboard-state.mjs"
+    "diagnose:dashboard": "node ./scripts/inspect-dashboard-state.mjs",
+    "product:macos:appcast": "node ./scripts/generate-sparkle-appcast.js"
   },
   "dependencies": {
     "@app-usagemonitor/accounting": "workspace:*",
