@@ -225,8 +225,14 @@ split is one of the failure modes the pricing tests deliberately pin.
 
 - No prompt, reply, reasoning or file content is ever read or stored. Only
   `turn_context`, `token_count` and `thread_settings_applied` records are parsed.
-- `session_id` and `scope_local` never leave the Mac in raw form. The values
-  sent are always `HMAC(export_secret, ...)`, computed at send time.
+- `session_uuid` and `scope_local` never leave the Mac in raw form. What
+  travels is `upload_pseudonym = HMAC(device_salt, session_uuid)` from the
+  session dimension - the device salt never rotates and never leaves the Mac.
+  (Amended 2026-08-07: an earlier revision said `HMAC(export_secret, ...)`
+  computed at send time. The rotating export-secret pathway is retired -
+  rotation would change every pseudonym and silently break the server-side
+  dedupe that incremental upload depends on. See
+  2026-08-07-incremental-contribution-model.md.)
 
 ## Resolving a rollout file without storing its path
 
