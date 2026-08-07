@@ -291,7 +291,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerMigrationRerunStable, true);
   assert.equal(result.checks.requiredSchemaPresent, true);
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
-  assert.equal(result.checks.collectionControlsContained, true);
+  assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
   assert.equal(result.evidence.migrationWindow, "0023-0029");
   assert.ok(statePath);
@@ -380,15 +380,34 @@ for (const [label, bundle] of [
   });
 }
 
+// An operational controls row passes: under the migration-gate governance
+// (docs/governance/2026-08-07-production-deploy-migration-gate.md) the
+// rehearsal proves the migrated row is COHERENT, not that intake is closed.
+test("release preflight accepts operational collection controls as coherent", async () => {
+  const { spawn } = await standardFixture({
+    collectionControlRows: [{
+      ...containedCollectionControlRow(),
+      enrollment_enabled: 1,
+      upload_registration_enabled: 1,
+      processing_enabled: 1,
+      publication_enabled: 1,
+      control_state: "operational",
+    }],
+  });
+  const result = await runReleasePreflight({
+    config: safeConfig(),
+    workerDirectory,
+    wrangler: "fake-wrangler",
+    spawn,
+    createState: disposableState,
+    cleanupState: removeState,
+  });
+  assert.equal(result.state, "ready");
+  assert.equal(result.checks.collectionControlsCoherent, true);
+  assert.deepEqual(result.blockers, []);
+});
+
 for (const [label, collectionControlRows, blocker] of [
-  ["operational", [{
-    ...containedCollectionControlRow(),
-    enrollment_enabled: 1,
-    upload_registration_enabled: 1,
-    processing_enabled: 1,
-    publication_enabled: 1,
-    control_state: "operational",
-  }], "LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
   ["missing", [], "LOCAL_COLLECTION_CONTROLS_MISSING"],
   ["malformed", [{
     ...containedCollectionControlRow(),
@@ -407,7 +426,7 @@ for (const [label, collectionControlRows, blocker] of [
     });
     assert.equal(result.state, "blocked");
     assert.equal(result.collectionAuthorized, false);
-    assert.equal(result.checks.collectionControlsContained, false);
+    assert.equal(result.checks.collectionControlsCoherent, false);
     assert.deepEqual(result.blockers, [blocker]);
     assert.equal(JSON.stringify(result).includes('"state":"ready"'), false);
     assert.equal(JSON.stringify(result).includes("release-ready"), false);
@@ -510,7 +529,7 @@ test("missing deletion-ledger schema blocks the gate with a separate blocker", a
   assert.equal(result.checks.isolatedStateCleaned, true);
 });
 
-test("real Wrangler proves both local D1 streams, schema, and containment query", async () => {
+test("real Wrangler proves both local D1 streams, schema, and controls coherence query", async () => {
   const root = await mkdtemp(join(
     tmpdir(),
     "usage-monitor-release-preflight-real-wrangler-",
@@ -576,9 +595,12 @@ test("real Wrangler proves both local D1 streams, schema, and containment query"
       cleanupState: removeState,
     });
 
-    assert.equal(result.state, "blocked");
+    // Freshly migrated databases seed an operational controls row; that is a
+    // coherent, passing outcome under the migration-gate governance
+    // (docs/governance/2026-08-07-production-deploy-migration-gate.md).
+    assert.equal(result.state, "ready");
     assert.equal(result.collectionAuthorized, false);
-    assert.deepEqual(result.blockers, ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"]);
+    assert.deepEqual(result.blockers, []);
     assert.equal(result.checks.localOnly, true);
     assert.equal(result.checks.localMigrationInventorySafe, true);
     assert.equal(result.checks.localMigrationSourcesSafe, true);
@@ -588,7 +610,7 @@ test("real Wrangler proves both local D1 streams, schema, and containment query"
     assert.equal(result.checks.deletionLedgerMigrationRerunStable, true);
     assert.equal(result.checks.requiredSchemaPresent, true);
     assert.equal(result.checks.deletionLedgerSchemaPresent, true);
-    assert.equal(result.checks.collectionControlsContained, false);
+    assert.equal(result.checks.collectionControlsCoherent, true);
     assert.equal(result.checks.isolatedStateCleaned, true);
     assert.ok(statePath);
     await assert.rejects(access(statePath), (error) => error?.code === "ENOENT");

@@ -461,15 +461,21 @@ function collectionControlProbeState(rows) {
         && (enabledCount === 0 || enabledCount === 4))) {
     return "invalid";
   }
-  return row.control_state === "contained" ? "contained" : "uncontained";
+  // Any coherent state is a valid rehearsal outcome. The containment-era
+  // preflight demanded the freshly migrated database be "contained" - closed
+  // for business - because deploys then required a real intake outage. Under
+  // the migration-gate governance (docs/governance/
+  // 2026-08-07-production-deploy-migration-gate.md) production deploys happen
+  // against an open service, and this rehearsal's job is to prove the
+  // migrations produce a COHERENT controls row, not a closed one. Missing,
+  // invalid and unavailable rows still block.
+  return "coherent";
 }
 
 function collectionControlBlocker(state) {
   switch (state) {
     case "missing":
       return "LOCAL_COLLECTION_CONTROLS_MISSING";
-    case "uncontained":
-      return "LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED";
     case "unavailable":
       return "LOCAL_COLLECTION_CONTROLS_UNAVAILABLE";
     default:
@@ -521,7 +527,7 @@ function baseReceipt(configChecks) {
       deletionLedgerMigrationRerunStable: false,
       requiredSchemaPresent: false,
       deletionLedgerSchemaPresent: false,
-      collectionControlsContained: false,
+      collectionControlsCoherent: false,
       localOnly: true,
       isolatedStateCleaned: false,
     },
@@ -730,8 +736,8 @@ SELECT singleton,
 `,
       });
       const collectionControlState = collectionControlProbeState(collectionControls);
-      receipt.checks.collectionControlsContained = collectionControlState === "contained";
-      if (!receipt.checks.collectionControlsContained) {
+      receipt.checks.collectionControlsCoherent = collectionControlState === "coherent";
+      if (!receipt.checks.collectionControlsCoherent) {
         receipt.blockers.push(collectionControlBlocker(collectionControlState));
       }
 

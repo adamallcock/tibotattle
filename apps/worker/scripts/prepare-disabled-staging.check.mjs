@@ -156,7 +156,7 @@ test("failed local preflight cannot reach remote staging inspection or mutation"
     workerDirectory,
     localPreflight: async () => ({
       state: "blocked",
-      blockers: ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
+      blockers: ["LOCAL_COLLECTION_CONTROLS_MISSING"],
     }),
     spawn: (_command, args) => {
       calls.push(args);
@@ -166,7 +166,7 @@ test("failed local preflight cannot reach remote staging inspection or mutation"
   assert.deepEqual(result, {
     ok: false,
     code: "LOCAL_STAGING_PREFLIGHT_BLOCKED",
-    blockers: ["LOCAL_COLLECTION_CONTROLS_NOT_CONTAINED"],
+    blockers: ["LOCAL_COLLECTION_CONTROLS_MISSING"],
   });
   assert.deepEqual(calls, []);
 });
