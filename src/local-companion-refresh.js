@@ -57,6 +57,14 @@ const ARCHIVE_INDEX_ERROR_CODES = new Set([
   "archive_index_unavailable",
 ]);
 const ARCHIVE_INDEX_PROGRESS_KIND = "archive_index";
+const REFRESH_FAILURE_STEPS = new Set([
+  "collector",
+  "accounting",
+  "archive_index",
+  "unified_index",
+  "assemble",
+]);
+const REFRESH_FAILURE_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
 const HEADLINE_READY_INDEXING_STATUSES = new Set([
   "recent_7d_complete",
   "recent_7d_partial",
@@ -401,6 +409,20 @@ export function createLocalCollectorRefreshRunner({
     if (onProgress !== null && typeof onProgress !== "function") {
       throw new TypeError("onProgress must be a function");
     }
+    // A refresh failure that reaches the app collapses to one generic code,
+    // and companion stderr is deliberately discarded. Stamp every escaping
+    // error with the pipeline step it left from, so the refresh status can
+    // name the failing step without carrying content.
+    let refreshStep = "collector";
+    const stampStep = (error) => {
+      if (error !== null && typeof error === "object"
+          && error.refreshStep === undefined) {
+        error.refreshStep = refreshStep;
+      }
+      throw error;
+    };
+    try {
+      return await (async () => {
     // Record the declared baseline before the pass reads any usage, so the
     // reading is stamped no later than the turns it may attribute. A failure
     // here is never allowed to block collection: it simply leaves those turns
@@ -496,6 +518,7 @@ export function createLocalCollectorRefreshRunner({
         .includes(completedIndex.status);
     let accounting = null;
     let accountingRefreshStatus = null;
+    refreshStep = "accounting";
     if (refreshAccounting !== null && accountingMayRun) {
       // A provider quota observation does not alter replay-safe token
       // accounting. Reuse a current cache when no rollout usage record was
@@ -538,6 +561,7 @@ export function createLocalCollectorRefreshRunner({
       clock(),
     );
     let archiveIndex = null;
+    refreshStep = "archive_index";
     if (refreshArchiveIndex !== null
         && signal?.aborted !== true) {
       // Archive coverage is independent of the recent collector's accounting
@@ -561,6 +585,7 @@ export function createLocalCollectorRefreshRunner({
       });
     }
     let unifiedIndex = null;
+    refreshStep = "unified_index";
     if (refreshUnifiedIndex !== null && signal?.aborted !== true) {
       // The unified index advances by its cursors, so this ordinarily reads
       // only appended bytes. A failure here must never block collection or
@@ -585,6 +610,7 @@ export function createLocalCollectorRefreshRunner({
         };
       }
     }
+    refreshStep = "assemble";
     if (collectorResourceLimitDeferred) throwCollectorResourceLimit();
     return {
       rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
@@ -620,6 +646,10 @@ export function createLocalCollectorRefreshRunner({
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
     };
+      })();
+    } catch (error) {
+      stampStep(error);
+    }
   };
 }
 
@@ -914,6 +944,16 @@ export class LocalCompanionRefreshController {
           errorCode: isResourceLimitedRefreshError(error)
             ? "refresh_resource_limited"
             : "refresh_failed",
+          // Content-free failure identity: a fixed step name and a bounded
+          // machine code, never message text. Without these every failure
+          // collapses into one undiagnosable "refresh_failed".
+          ...(REFRESH_FAILURE_STEPS.has(error?.refreshStep)
+            ? { failedStep: error.refreshStep }
+            : {}),
+          ...(typeof error?.code === "string"
+              && REFRESH_FAILURE_CODE_PATTERN.test(error.code)
+            ? { failureCode: error.code }
+            : {}),
         };
       })
       .finally(() => {

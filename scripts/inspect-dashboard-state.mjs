@@ -11,10 +11,47 @@
 //
 // It reads. It never writes, never refreshes, and never mutates state.
 
+import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-const ORIGIN = process.env.TIBOTATTLE_ORIGIN ?? "http://127.0.0.1:8787";
+/**
+ * The companion binds an ephemeral port chosen by the OS, so a fixed default
+ * finds nothing. Ask lsof which local ports the running TiboTattle (or a
+ * repo-run companion) is listening on and probe each for the health route.
+ */
+async function discoverOrigin() {
+  if (process.env.TIBOTATTLE_ORIGIN) return process.env.TIBOTATTLE_ORIGIN;
+  let listing = "";
+  try {
+    listing = execFileSync("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return "http://127.0.0.1:8787";
+  }
+  const ports = [...new Set([...listing.matchAll(/127\.0\.0\.1:(\d+) \(LISTEN\)/g)]
+    .map((match) => Number(match[1])))];
+  for (const port of ports) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/local/health`, {
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (!response.ok) continue;
+      const body = await response.json();
+      if (typeof body?.schemaVersion === "string"
+          && body.schemaVersion.startsWith("local-companion")) {
+        return `http://127.0.0.1:${port}`;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return "http://127.0.0.1:8787";
+}
+
+const ORIGIN = await discoverOrigin();
 const BUNDLE = process.env.TIBOTATTLE_APP
   ?? "/Applications/TiboTattle.app/Contents/Resources/app";
 const REPO = new URL("../", import.meta.url).pathname;
@@ -67,9 +104,10 @@ function bundleDrift() {
 }
 
 try {
-  const [health, overview] = await Promise.all([
+  const [health, overview, refreshStatus] = await Promise.all([
     json("/api/local/health"),
     json("/api/local/overview"),
+    json("/api/local/refresh").catch(() => null),
   ]);
   const freshness = overview.freshness ?? {};
 
@@ -77,6 +115,24 @@ try {
   say(`  origin                ${ORIGIN}`);
   say(`  status                ${health.status}`);
   say(`  snapshot              ${JSON.stringify(health.snapshot ?? null)}`);
+  say("");
+  const refresh = refreshStatus?.refresh ?? null;
+  say("LAST REFRESH  (a failed refresh is why the index stops advancing)");
+  if (refresh === null) {
+    say("  (refresh status unavailable)");
+  } else {
+    say(`  status                ${refresh.status}`);
+    say(`  startedAt             ${refresh.startedAt}  finishedAt ${refresh.finishedAt}`);
+    if (refresh.errorCode) say(`  errorCode             ${refresh.errorCode}`);
+    if (refresh.failedStep) say(`  failedStep            ${refresh.failedStep}`);
+    if (refresh.failureCode) say(`  failureCode           ${refresh.failureCode}`);
+    if (refresh.status === "failed" && !refresh.failedStep) {
+      say("  (no failedStep: companion predates the step-stamped failures)");
+    }
+    if (refresh.result?.unifiedIndex) {
+      say(`  unifiedIndex          ${JSON.stringify(refresh.result.unifiedIndex).slice(0, 200)}`);
+    }
+  }
   say("");
   say("FRESHNESS  (what the banner is derived from)");
   say(`  freshness.status      ${freshness.status}`);
