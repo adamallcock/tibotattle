@@ -30,14 +30,12 @@ import {
   createAutomaticContributionController,
 } from "../../src/automatic-contribution.js";
 import {
+  TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
   createIncrementalContributionSyncController,
 } from "../../src/incremental-contribution.js";
 import {
   runIncrementalContributionSyncOnce,
 } from "../../src/contribution-incremental-sync.js";
-import {
-  TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
-} from "../../src/contribution/telemetry-v1-chunks.js";
 import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";

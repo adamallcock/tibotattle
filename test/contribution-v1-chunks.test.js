@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   createUnifiedIndexWriter,
   openLocalUnifiedIndex,
+  outcomeName,
   outcomeOrdinal,
+  reasoningEffortName,
   reasoningEffortOrdinal,
 } from "../src/local-unified-index.js";
 import {
@@ -34,6 +37,16 @@ const DAY_TWO = "2026-08-02";
 const SESSION_A_UUID = "11111111-2222-4333-8444-555555555555";
 const SESSION_A_LOCAL = Buffer.alloc(32, 0x0a);
 const SESSION_B_LOCAL = Buffer.alloc(32, 0x0b);
+
+// The same index-port composition the production sync engine performs: the
+// reader receives the unified index's row codecs by injection.
+function indexReader(database) {
+  return createTelemetryV1IndexReader(database, {
+    outcomeName,
+    reasoningEffortName,
+    fallbackParserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  });
+}
 
 function dayMs(day, offsetMs = 0) {
   return Date.parse(`${day}T00:00:00.000Z`) + offsetMs;
@@ -172,7 +185,7 @@ async function withFixtureIndex(run, { mutate = null, reversed = false } = {}) {
     if (mutate !== null) await mutate(file);
     const database = openLocalUnifiedIndex(file, { readOnly: true });
     try {
-      return await run(createTelemetryV1IndexReader(database), file);
+      return await run(indexReader(database), file);
     } finally {
       database.close();
     }
@@ -369,7 +382,7 @@ test("an over-full day splits into deterministic 200-record segments", async () 
     await buildIndex(file, { events });
     const database = openLocalUnifiedIndex(file, { readOnly: true });
     try {
-      const reader = createTelemetryV1IndexReader(database);
+      const reader = indexReader(database);
       const derived = reader.deriveDay(DAY_ONE);
       const usageChunks = derived.chunks.filter(
         (chunk) => chunk.stream === "usage",

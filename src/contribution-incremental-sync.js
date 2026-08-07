@@ -13,7 +13,12 @@ import {
 import {
   createTelemetryV1Envelope,
 } from "./platform/telemetry-v1-envelope.js";
-import { openLocalUnifiedIndex } from "./local-unified-index.js";
+import {
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  openLocalUnifiedIndex,
+  outcomeName,
+  reasoningEffortName,
+} from "./local-unified-index.js";
 
 // The telemetry-contribution-v1.0 sync engine: one bounded pass of the
 // cursor protocol (docs/design/2026-08-07-incremental-contribution-model.md
@@ -389,7 +394,14 @@ export async function runIncrementalContributionSyncOnce({
         retryable: true,
       }));
     }
-    const reader = createTelemetryV1IndexReader(database);
+    // The reader's index ports are composed here, at the root that owns the
+    // unified index module: the contribution owner receives the row codecs by
+    // injection and never imports legacy flat source itself.
+    const reader = createTelemetryV1IndexReader(database, {
+      outcomeName,
+      reasoningEffortName,
+      fallbackParserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    });
     const localDays = deriveLocalDays(reader);
     daysTotal = localDays.length;
 

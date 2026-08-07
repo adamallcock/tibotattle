@@ -1,14 +1,18 @@
-import {
-  TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
-  TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION,
-} from "../contribution/telemetry-v1-chunks.js";
-
 // telemetry-envelope-v1.0: the v0.1 envelope cryptography verbatim — one
 // AES-256-GCM payload key per envelope, wrapped with the service's RSA-OAEP
 // public key — carrying a new schema version so the worker's transport
 // dispatcher selects the v1.0 chunk path without touching the deployed v0.1
 // branch. The plaintext here is a validated v1.0 chunk, so the v0.1 package
 // validator is deliberately not consulted.
+//
+// The two version strings below are pinned wire-contract mirrors, exactly as
+// the worker pins its own copies (apps/worker/src/telemetry-v1.ts): the
+// platform transport owner may not import the contribution owner, and the
+// cross-module tests that envelope a derived chunk fail on any drift between
+// these bytes and the chunk derivation's
+// (src/contribution/telemetry-v1-chunks.js).
+const TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v1.0";
+const TELEMETRY_V1_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v1.0";
 
 const SERIALIZATION_ERROR_MESSAGE = "Telemetry chunk serialization failed.";
 

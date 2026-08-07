@@ -5,12 +5,6 @@ import {
   TELEMETRY_PLAN_TYPES,
 } from "@app-usagemonitor/telemetry-contract";
 
-import {
-  outcomeName,
-  reasoningEffortName,
-  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
-} from "../local-unified-index.js";
-
 // telemetry-contribution-v1.0 chunk derivation over the local unified index
 // (docs/design/2026-08-07-incremental-contribution-model.md).
 //
@@ -178,7 +172,7 @@ function tableExists(database, name) {
   ).get(name) !== undefined;
 }
 
-function splitIntoChunks(stream, day, records, parserVersions) {
+function splitIntoChunks(stream, day, records, parserVersions, fallbackParserVersion) {
   const chunks = [];
   for (let offset = 0; offset < records.length;
     offset += MAX_TELEMETRY_V1_CHUNK_RECORDS) {
@@ -197,10 +191,10 @@ function splitIntoChunks(stream, day, records, parserVersions) {
     // order, and honest about a mixed-parser day: the digest identity is the
     // records alone, so the stamp never perturbs supersession.
     const stamped = parserVersions === null
-      ? LOCAL_UNIFIED_INDEX_PARSER_VERSION
+      ? fallbackParserVersion
       : [...parserVersions.slice(offset, offset + MAX_TELEMETRY_V1_CHUNK_RECORDS)]
         .sort()
-        .at(-1) ?? LOCAL_UNIFIED_INDEX_PARSER_VERSION;
+        .at(-1) ?? fallbackParserVersion;
     if (!PARSER_VERSION.test(stamped)) fail("derivation_invalid");
     chunks.push(Object.freeze({
       stream,
@@ -223,9 +217,23 @@ function splitIntoChunks(stream, day, records, parserVersions) {
  * no device salt: `sessionUuid` is a stored column (raw, per the owner's
  * ruling), with the stable hex of the local join key as the deterministic
  * stand-in for sessions indexed before identity recording existed.
+ *
+ * The unified index is reached only through injected ports: the open database
+ * handle plus the index's own row codecs — the outcome and reasoning-effort
+ * ordinal decoders and the fallback parser stamp — supplied by the
+ * composition root that owns the index module. The contribution owner never
+ * reaches back into legacy flat source for them.
  */
-export function createTelemetryV1IndexReader(database) {
-  if (!database || typeof database.prepare !== "function") {
+export function createTelemetryV1IndexReader(database, {
+  outcomeName,
+  reasoningEffortName,
+  fallbackParserVersion,
+} = {}) {
+  if (!database || typeof database.prepare !== "function"
+      || typeof outcomeName !== "function"
+      || typeof reasoningEffortName !== "function"
+      || typeof fallbackParserVersion !== "string"
+      || !PARSER_VERSION.test(fallbackParserVersion)) {
     fail("index_unavailable");
   }
   const identityAvailable = tableExists(database, "session_identity");
@@ -365,7 +373,7 @@ export function createTelemetryV1IndexReader(database) {
         typeof row.parser_version === "string"
           && PARSER_VERSION.test(row.parser_version)
           ? row.parser_version
-          : LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+          : fallbackParserVersion,
       );
     }
     return { records, parserVersions, excluded };
@@ -482,9 +490,9 @@ export function createTelemetryV1IndexReader(database) {
       const quota = quotaRecords(day);
       const session = sessionRecords(day);
       const chunks = [
-        ...splitIntoChunks("quota", day, quota.records, null),
-        ...splitIntoChunks("session", day, session.records, null),
-        ...splitIntoChunks("usage", day, usage.records, usage.parserVersions),
+        ...splitIntoChunks("quota", day, quota.records, null, fallbackParserVersion),
+        ...splitIntoChunks("session", day, session.records, null, fallbackParserVersion),
+        ...splitIntoChunks("usage", day, usage.records, usage.parserVersions, fallbackParserVersion),
       ];
       return Object.freeze({
         day,

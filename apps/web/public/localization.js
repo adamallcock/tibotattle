@@ -1283,6 +1283,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Prepare and review last 24 hours": ["准备并审阅最近 24 小时", "Preparar y revisar las últimas 24 horas"],
   "API-price estimate": ["API 价格估计", "Estimación de precio de API"],
   "Named with affection for the Codex community. Not affiliated with or endorsed by OpenAI or Thibault Sottiaux — and we will happily rename if asked. Your tokens tattle only to you.": ["这个名字是对 Codex 社区的亲切致意。它与 OpenAI 或 Thibault Sottiaux 没有隶属或认可关系；如被要求，我们会乐意更名。你的令牌只向你“告密”。", "Nombrado con afecto por la comunidad de Codex. No está afiliado a OpenAI ni a Thibault Sottiaux, ni cuenta con su respaldo; cambiaremos el nombre con gusto si nos lo piden. Tus tokens solo te cuentan a ti."],
+  "TiboTattle · not affiliated with OpenAI or Thibault Sottiaux": ["TiboTattle · 与 OpenAI 或 Thibault Sottiaux 无关", "TiboTattle · sin afiliación con OpenAI ni con Thibault Sottiaux"],
   "Insufficient": ["不足", "Insuficiente"],
   "There is not yet a matched quota-and-cost window to compare.": ["尚无可比较的匹配额度与成本窗口。", "Aún no hay una ventana de cuota y coste coincidente para comparar."],
   "Not estimable": ["无法估算", "No estimable"],

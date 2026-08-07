@@ -13,6 +13,12 @@ export {
   IncrementalContributionSyncError,
   incrementalContributionRequiredConsent,
 } from "./application/local-incremental-contribution-sync.js";
+// The contract identifier callers surface beside sync status, re-exported
+// from the contribution owner's reviewed chunk entrypoint so applications
+// compose against this facade rather than reaching into the owner directly.
+export {
+  TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+} from "./contribution/telemetry-v1-chunks.js";
 
 // Exact composition surface, mirroring automatic-contribution.js: the
 // scheduling and consent state machine is application-owned; this file
