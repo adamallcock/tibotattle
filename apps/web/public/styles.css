@@ -1130,9 +1130,12 @@ h2 {
     transparent 5px 8px
   );
 }
-.chart-empty { display: grid; place-items: center; min-height: 310px; color: var(--muted); background: var(--surface-quiet); border: 1px dashed var(--line); border-radius: var(--radius-sm); text-align: center; }
+/* The placeholder stands in for a chart, so it keeps roughly the height the
+   chart it replaces would occupy and the card does not jump when evidence
+   arrives. */
+.chart-empty { display: grid; place-items: center; min-height: 380px; color: var(--muted); background: var(--surface-quiet); border: 1px dashed var(--line); border-radius: var(--radius-sm); text-align: center; }
 .chart-empty p { margin: 0; font-size: .78rem; }
-.chart-empty.small { min-height: 215px; font-size: .8rem; }
+.chart-empty.small { min-height: 280px; font-size: .8rem; }
 .chart-shell {
   width: 100%;
   overflow: hidden;
@@ -1151,8 +1154,25 @@ h2 {
   -webkit-user-select: none;
 }
 .chart-shell.interactive-chart.is-panning { cursor: grabbing; }
-.chart-shell svg { display: block; width: 100%; min-width: 0; height: 300px; overflow: visible; }
-.chart-shell.compact-chart svg { min-width: 0; height: 248px; }
+/* An SVG scales its viewBox to fit its box, so the smaller of the two ratios
+   wins. A fixed `height: 300px` in a shell that is routinely ~977px wide meant
+   the height always won: the drawing was pinned to 300px and letterboxed with
+   ~77px of dead space across the width, while the card had room for far more.
+   Taking the height from the drawing's own ratio instead fills the card in both
+   directions. `aspect-ratio` here must stay in step with the viewBox heights
+   `lineChart` is called with in app.js (TIMELINE_CHART_HEIGHT,
+   COMPACT_CHART_HEIGHT); a mismatch reinstates the letterbox. `max-height`
+   keeps a very wide window from turning one chart into a full screen. */
+.chart-shell svg {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  aspect-ratio: 900 / 420;
+  max-height: 62vh;
+  overflow: visible;
+}
+.chart-shell.compact-chart svg { min-width: 0; height: auto; aspect-ratio: 900 / 340; }
 .chart-hover-tooltip { pointer-events: none; }
 .chart-hover-tooltip rect {
   fill: rgba(23, 33, 30, .96);

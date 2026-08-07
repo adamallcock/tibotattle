@@ -448,6 +448,15 @@
                 <button type="button" data-days="1">24h</button>
                 <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
                 <button type="button" data-days="31">31d</button>
+                <button type="button" data-days="36500">All</button>
+              </div>
+              <div class="chart-navigation" aria-label="Usage zoom and pan" data-i18n-aria-label="aria.usageZoomPan">
+                <button class="button button-quiet compact" id="usage-pan-back" type="button" title="Pan usage earlier" data-i18n-title="title.panUsageEarlier">← Earlier</button>
+                <button class="button button-quiet compact" id="usage-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
+                <button class="button button-quiet compact" id="usage-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
+                <button class="button button-quiet compact" id="usage-reset-zoom" type="button">Reset view</button>
+                <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
+                <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
               </div>
               <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
                 <span><i class="legend-dot cost"></i>API-price-equivalent usage</span>
@@ -482,6 +491,7 @@
                 <button type="button" data-days="1">24h</button>
                 <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
                 <button type="button" data-days="31">31d</button>
+                <button type="button" data-days="36500">All</button>
               </div>
               <div class="chart-navigation" aria-label="Calibration zoom and pan" data-i18n-aria-label="aria.calibrationZoomPan">
                 <button class="button button-quiet compact" id="timeline-pan-back" type="button" title="Pan calibration earlier" data-i18n-title="title.panCalibrationEarlier">← Earlier</button>

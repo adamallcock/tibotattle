@@ -51,6 +51,56 @@ export function getMessageLocale() {
 
 const USER_TIME_ZONE_OPTION = Object.freeze({ timeZone: USER_TIME_ZONE });
 
+/**
+ * One `Intl` formatter per (kind, locale, options) triple, for the whole
+ * session.
+ *
+ * Constructing an `Intl.DateTimeFormat` or `Intl.NumberFormat` is one to two
+ * orders of magnitude more expensive than calling `.format` on an existing one,
+ * and the chart draw loop asks for the same handful of formatters once per
+ * plotted point. A single wheel notch over a month of calibration evidence was
+ * measured constructing 1,187 `Intl.DateTimeFormat` and 608 `Intl.NumberFormat`
+ * instances — the pan/zoom lag the dashboard was reported for. Nothing about a
+ * formatter depends on the value being formatted, so each one is built once.
+ *
+ * The cache key includes the formatting locale, so `setFormattingLocale` needs
+ * no invalidation step: a new locale simply produces new keys, and the old
+ * formatters stay valid for anything still rendering in the old locale.
+ *
+ * Option objects are serialized to build the key. Callers that format inside a
+ * loop should pass a hoisted frozen constant (as every helper below does); the
+ * serialization for those is then computed once and remembered, so the hot path
+ * costs one `Map` lookup.
+ */
+const intlFormatters = new Map();
+const intlOptionKeys = new WeakMap();
+
+function intlOptionKey(options) {
+  if (options === null || options === undefined) return "";
+  const remembered = intlOptionKeys.get(options);
+  if (remembered !== undefined) return remembered;
+  const key = JSON.stringify(options);
+  intlOptionKeys.set(options, key);
+  return key;
+}
+
+function intlFormatter(Factory, kind, locale, options) {
+  const key = `${kind}·${locale}·${intlOptionKey(options)}`;
+  const cached = intlFormatters.get(key);
+  if (cached !== undefined) return cached;
+  const formatter = new Factory(locale, options);
+  intlFormatters.set(key, formatter);
+  return formatter;
+}
+
+export function dateTimeFormatter(options = undefined, locale = formattingLocale) {
+  return intlFormatter(Intl.DateTimeFormat, "date", locale, options);
+}
+
+export function numberFormatter(options = undefined, locale = formattingLocale) {
+  return intlFormatter(Intl.NumberFormat, "number", locale, options);
+}
+
 function instant(value) {
   if (value === null || value === undefined || value === "") return null;
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
@@ -58,13 +108,13 @@ function instant(value) {
 }
 
 export function formatNumber(value, options = undefined) {
-  return new Intl.NumberFormat(formattingLocale, options).format(value);
+  return numberFormatter(options).format(value);
 }
 
 export function formatDate(value, options = undefined) {
   const date = instant(value);
   if (date === null) throw new RangeError("A valid date is required");
-  return new Intl.DateTimeFormat(formattingLocale, options).format(date);
+  return dateTimeFormatter(options).format(date);
 }
 
 export function finite(value, fallback = null) {
@@ -81,24 +131,27 @@ export function compact(value) {
     });
 }
 
+const LOCAL_DATE_OPTIONS = Object.freeze({
+  ...USER_TIME_ZONE_OPTION,
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+});
+
+const LOCAL_DATE_TIME_OPTIONS = Object.freeze({
+  ...USER_TIME_ZONE_OPTION,
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  timeZoneName: "short",
+});
+
 export function formatLocal(value, { dateOnly = false } = {}) {
   const date = instant(value);
   if (date === null) return translate("format.unknown", {}, messageLocale);
-  return new Intl.DateTimeFormat(formattingLocale, dateOnly
-    ? {
-      ...USER_TIME_ZONE_OPTION,
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    }
-    : {
-      ...USER_TIME_ZONE_OPTION,
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      timeZoneName: "short",
-    }).format(date);
+  return dateTimeFormatter(dateOnly ? LOCAL_DATE_OPTIONS : LOCAL_DATE_TIME_OPTIONS)
+    .format(date);
 }
 
 // Existing browser imports use this name. Keep it as an alias so all
@@ -123,20 +176,30 @@ export function formatReportingTime(value, options = {}) {
  * "Eastern Time"). Repeating a "short" name such as "EDT" on every point was
  * both noise and a direct contradiction of that caption.
  */
+export const CHART_DAY_OPTIONS = Object.freeze({
+  ...USER_TIME_ZONE_OPTION,
+  month: "short",
+  day: "numeric",
+});
+
+export const CHART_CLOCK_OPTIONS = Object.freeze({
+  ...USER_TIME_ZONE_OPTION,
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+export const CHART_MONTH_OPTIONS = Object.freeze({
+  ...USER_TIME_ZONE_OPTION,
+  month: "short",
+  year: "numeric",
+});
+
 export function formatChartTimestamp(value, { dateOnly = false } = {}) {
   const date = instant(value);
   if (date === null) return translate("format.unknown", {}, messageLocale);
-  const day = new Intl.DateTimeFormat(formattingLocale, {
-    ...USER_TIME_ZONE_OPTION,
-    month: "short",
-    day: "numeric",
-  }).format(date);
+  const day = dateTimeFormatter(CHART_DAY_OPTIONS).format(date);
   if (dateOnly) return day;
-  const time = new Intl.DateTimeFormat(formattingLocale, {
-    ...USER_TIME_ZONE_OPTION,
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(date);
+  const time = dateTimeFormatter(CHART_CLOCK_OPTIONS).format(date);
   return `${day} · ${time}`;
 }
 
@@ -311,13 +374,15 @@ export function formatModelName(value) {
   return parts.join(" ");
 }
 
+const CALENDAR_PART_OPTIONS = Object.freeze({
+  ...USER_TIME_ZONE_OPTION,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
 export function localCalendarParts() {
-  return new Intl.DateTimeFormat(formattingLocale, {
-    ...USER_TIME_ZONE_OPTION,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
+  return dateTimeFormatter(CALENDAR_PART_OPTIONS);
 }
 
 export function reportingCalendarParts() {

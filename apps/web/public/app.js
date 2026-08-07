@@ -49,6 +49,7 @@ import {
   formatTimeZoneLabel,
   getFormattingLocale,
   localCalendarParts,
+  numberFormatter,
   selectAvailableAccountingPeriod,
   setFormattingLocale,
   setMessageLocale,
@@ -78,7 +79,9 @@ let activeAccountingPeriod = "7d";
 let activeWeeklyRangeDays = 31;
 let activeWeeklyMinimumObservedSpanPp = 50;
 let timelineViewport = null;
+let usageTimelineViewport = null;
 let timelinePointerStart = null;
+let usagePointerStart = null;
 let localCompanionHealth = null;
 // This is an optional, short-lived rendering hint from the public health
 // endpoint. The Worker remains authoritative; a missing or stale health read
@@ -414,11 +417,12 @@ function formatPercent(value, digits = 0) {
   const number = finite(value);
   if (number === null) return "—";
   const places = Number.isInteger(number) ? 0 : digits;
-  const format = (amount) => new Intl.NumberFormat(getFormattingLocale(), {
+  const percentFormatter = numberFormatter({
     maximumFractionDigits: places,
     minimumFractionDigits: 0,
     style: "percent",
-  }).format(amount / 100);
+  });
+  const format = (amount) => percentFormatter.format(amount / 100);
   // The test is whether this value *renders* as an endpoint, not whether it
   // is near one: at whole-number precision 99.2 renders as "99%", which is
   // honest and needs no bound, while 99.5 renders as "100%", which is not.
@@ -449,7 +453,7 @@ function formatDecimal(value, digits = 0) {
   const number = finite(value);
   return number === null
     ? "—"
-    : new Intl.NumberFormat(getFormattingLocale(), {
+    : numberFormatter({
       maximumFractionDigits: digits,
       minimumFractionDigits: digits,
     }).format(number);
@@ -2316,7 +2320,8 @@ function groupRolling(rows, hours) {
     if (rowHours !== hours) continue;
     const timestamp = row.timestamp ?? row.window_end_utc ?? row.observed_at;
     if (!timestamp || !Number.isFinite(Date.parse(timestamp))) continue;
-    const group = groups.get(timestamp) ?? { timestamp, observed: null, expected: null };
+    const group = groups.get(timestamp)
+      ?? { timestamp, timestampMs: Date.parse(timestamp), observed: null, expected: null };
     const series = String(row.series ?? "").toLowerCase();
     const value = finite(row.quota_change_pp ?? row.quotaChangePp);
     if (series.includes("observ")) group.observed = value;
@@ -2329,7 +2334,7 @@ function groupRolling(rows, hours) {
   }
   return [...groups.values()]
     .filter((row) => row.observed !== null || row.expected !== null)
-    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    .sort((a, b) => a.timestampMs - b.timestampMs);
 }
 
 function latestTimelineObservationMs(data) {
@@ -2348,19 +2353,30 @@ function timelineCutoffMs(data, rangeDays) {
 }
 
 function timelineBounds(points) {
-  const values = points
-    .map((point) => Date.parse(point.timestamp))
-    .filter(Number.isFinite);
-  if (values.length < 2) return null;
-  return { startMs: Math.min(...values), endMs: Math.max(...values) };
+  let startMs = Number.POSITIVE_INFINITY;
+  let endMs = Number.NEGATIVE_INFINITY;
+  let counted = 0;
+  // A single loop over stamped milliseconds, rather than map/filter/spread over
+  // re-parsed strings: this runs several times per redraw and once more for the
+  // residual chart, on every frame of a pan.
+  for (const point of points) {
+    const at = pointTimestampMs(point);
+    if (!Number.isFinite(at)) continue;
+    counted += 1;
+    if (at < startMs) startMs = at;
+    if (at > endMs) endMs = at;
+  }
+  if (counted < 2) return null;
+  return { startMs, endMs };
 }
 
 function normalizeTimelineViewport(points) {
   const bounds = timelineBounds(points);
   if (bounds === null) return null;
-  if (timelineViewport === null) return bounds;
-  const startMs = Math.max(bounds.startMs, Math.min(timelineViewport.startMs, bounds.endMs));
-  const endMs = Math.max(startMs + 1, Math.min(timelineViewport.endMs, bounds.endMs));
+  const stored = chartViewportTarget.read();
+  if (stored === null) return bounds;
+  const startMs = Math.max(bounds.startMs, Math.min(stored.startMs, bounds.endMs));
+  const endMs = Math.max(startMs + 1, Math.min(stored.endMs, bounds.endMs));
   if (endMs - startMs < 60_000) return bounds;
   return { startMs, endMs };
 }
@@ -2368,7 +2384,7 @@ function normalizeTimelineViewport(points) {
 function timelinePointsInViewport(points, viewport) {
   if (viewport === null) return points;
   return points.filter((point) => {
-    const timestamp = Date.parse(point.timestamp);
+    const timestamp = pointTimestampMs(point);
     return Number.isFinite(timestamp)
       && timestamp >= viewport.startMs
       && timestamp <= viewport.endMs;
@@ -2376,7 +2392,47 @@ function timelinePointsInViewport(points, viewport) {
 }
 
 function resetTimelineViewport() {
-  timelineViewport = null;
+  chartViewportTarget.write(null);
+}
+
+/**
+ * Which chart the shared zoom and pan policy is acting on.
+ *
+ * Every interactive chart on the dashboard zooms and pans by the same rules:
+ * the clamped per-event step, the minimum useful span, the rule that a fully
+ * zoomed-out chart stores no viewport at all, and the reset that returns to the
+ * selected date range. Those rules live once, in `zoomTimeline`, `panTimeline`,
+ * and `updateTimelineViewport` below, and are reviewed there.
+ *
+ * A chart is therefore not a copy of that policy — it is a place to keep a
+ * viewport and a way to redraw. `withChartViewport` names one for the duration
+ * of a single synchronous gesture call and restores the previous target on the
+ * way out, so a chart can never leak its identity into another chart's handler.
+ * The calibration chart is the default target because it is the chart every
+ * pre-existing caller was written against.
+ */
+const CALIBRATION_CHART_VIEWPORT = Object.freeze({
+  read: () => timelineViewport,
+  write: (value) => { timelineViewport = value; },
+  render: () => scheduleTimelineRender(),
+});
+
+const USAGE_CHART_VIEWPORT = Object.freeze({
+  read: () => usageTimelineViewport,
+  write: (value) => { usageTimelineViewport = value; },
+  render: () => scheduleUsageTimelineRender(),
+});
+
+let chartViewportTarget = CALIBRATION_CHART_VIEWPORT;
+
+function withChartViewport(chart, run) {
+  const previous = chartViewportTarget;
+  chartViewportTarget = chart;
+  try {
+    return run();
+  } finally {
+    chartViewportTarget = previous;
+  }
 }
 
 // Zoom is a ratio applied per step, so one step feels the same at every scale.
@@ -2406,10 +2462,36 @@ function updateTimelineViewport(points, update) {
   const minimumSpanMs = minimumTimelineSpanMs(bounds);
   const startMs = Math.max(bounds.startMs, Math.min(next.startMs, bounds.endMs - minimumSpanMs));
   const endMs = Math.min(bounds.endMs, Math.max(next.endMs, startMs + minimumSpanMs));
-  timelineViewport = endMs - startMs >= bounds.endMs - bounds.startMs - 1
+  chartViewportTarget.write(endMs - startMs >= bounds.endMs - bounds.startMs - 1
     ? null
-    : { startMs, endMs };
-  if (dashboard) renderTimeline(dashboard);
+    : { startMs, endMs });
+  chartViewportTarget.render();
+}
+
+/**
+ * One redraw per displayed frame, however many input events arrive.
+ *
+ * A mouse notch is one event, but a trackpad flick emits dozens of small wheel
+ * deltas and a drag emits a `pointermove` for every sampled position — the
+ * pointer sampling rate is well above the display rate on current hardware.
+ * Redrawing synchronously inside each handler meant the chart was rebuilt many
+ * times for a single painted frame, and the extra rebuilds were never shown to
+ * anyone. The viewport arithmetic still runs on every event, so the gesture
+ * stays exact; only the drawing is coalesced.
+ */
+let timelineRenderFrame = 0;
+
+function scheduleTimelineRender() {
+  if (!dashboard) return;
+  if (typeof requestAnimationFrame !== "function") {
+    renderTimeline(dashboard);
+    return;
+  }
+  if (timelineRenderFrame !== 0) return;
+  timelineRenderFrame = requestAnimationFrame(() => {
+    timelineRenderFrame = 0;
+    if (dashboard) renderTimeline(dashboard);
+  });
 }
 
 function wheelZoomFactor(event) {
@@ -2483,14 +2565,16 @@ function timelineStatusLabel(status) {
 }
 
 function timelineStatusIntervals(points, viewport) {
+  // Sorting through `Date.parse` in the comparator re-parsed each instant
+  // O(log n) times. The instants are read once, then sorted as numbers.
   const rows = points
-    .filter((point) => Number.isFinite(Date.parse(point.timestamp)))
-    .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
-  return rows.flatMap((point, index) => {
+    .map((point) => ({ point, at: pointTimestampMs(point) }))
+    .filter(({ at }) => Number.isFinite(at))
+    .sort((left, right) => left.at - right.at);
+  return rows.flatMap(({ point, at: current }, index) => {
     if (!point.status || point.status === "matched" || point.status === "inactive") return [];
-    const current = Date.parse(point.timestamp);
-    const previous = index === 0 ? viewport.startMs : Date.parse(rows[index - 1].timestamp);
-    const next = index === rows.length - 1 ? viewport.endMs : Date.parse(rows[index + 1].timestamp);
+    const previous = index === 0 ? viewport.startMs : rows[index - 1].at;
+    const next = index === rows.length - 1 ? viewport.endMs : rows[index + 1].at;
     return [{
       status: point.status,
       startMs: Math.max(viewport.startMs, (previous + current) / 2),
@@ -2602,6 +2686,7 @@ function liveTimelinePoints(
     });
     points.push({
       timestamp: current.endAt,
+      timestampMs: endMs,
       observed,
       expected,
       residual: evidence.residual,
@@ -2663,6 +2748,7 @@ function groupedUsageTimeline(data) {
     .map(({ sortMs: _sortMs, periodStartMs, periodEndMs, ...row }) => ({
       ...row,
       timestamp: new Date(periodEndMs).toISOString(),
+      timestampMs: periodEndMs,
       periodStartAt: new Date(periodStartMs).toISOString(),
       periodEndAt: new Date(periodEndMs).toISOString(),
       apiCostUsd: Number(row.apiCostUsd.toFixed(6))
@@ -2742,9 +2828,56 @@ function usageChartAxisLabels(grouping = activeUsageGrouping) {
   });
 }
 
+// The usage chart's own derive/draw split, for the same reason the calibration
+// chart has one: grouping every usage bucket in the artifact and matching each
+// one against the quota track depends on the evidence and the two segmented
+// controls, never on the zoom viewport, so a pan must not pay for it.
+let usageSeriesMemo = null;
+
+function selectedUsagePoints(data) {
+  if (usageSeriesMemo !== null
+      && usageSeriesMemo.data === data
+      && usageSeriesMemo.grouping === activeUsageGrouping
+      && usageSeriesMemo.rangeDays === activeUsageRangeDays) {
+    return usageSeriesMemo.points;
+  }
+  const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
+  usageSeriesMemo = {
+    data,
+    grouping: activeUsageGrouping,
+    rangeDays: activeUsageRangeDays,
+    points,
+  };
+  return points;
+}
+
+let usageRenderFrame = 0;
+
+function scheduleUsageTimelineRender() {
+  if (!dashboard) return;
+  if (typeof requestAnimationFrame !== "function") {
+    renderUsageTimeline(dashboard);
+    return;
+  }
+  if (usageRenderFrame !== 0) return;
+  usageRenderFrame = requestAnimationFrame(() => {
+    usageRenderFrame = 0;
+    if (dashboard) renderUsageTimeline(dashboard);
+  });
+}
+
+function resetUsageTimelineViewport() {
+  usageTimelineViewport = null;
+}
+
 function renderUsageTimeline(data) {
   syncUsageGroupingControls();
-  const points = usagePointsWithAllowance(data, groupedUsageTimeline(data));
+  const points = selectedUsagePoints(data);
+  const viewport = withChartViewport(
+    USAGE_CHART_VIEWPORT,
+    () => normalizeTimelineViewport(points),
+  );
+  const visiblePoints = timelinePointsInViewport(points, viewport);
   const shell = $("#usage-timeline-chart");
   const empty = $("#usage-timeline-empty");
   const unit = t(usageGroupingUnitKey());
@@ -2755,14 +2888,14 @@ function renderUsageTimeline(data) {
       count: formatDecimal(activeUsageRangeDays, 0),
     }),
   });
-  if (!points.length) {
+  if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
   } else {
     shell.hidden = false;
     empty.hidden = true;
-    shell.replaceChildren(lineChart({
-      points,
+    drawChart(shell, lineChart({
+      points: visiblePoints,
       series: [{
         key: "apiCostUsd",
         className: "chart-line-value",
@@ -2788,19 +2921,22 @@ function renderUsageTimeline(data) {
         values: { unit, timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
+      height: TIMELINE_CHART_HEIGHT,
+      xDomain: viewport,
     }));
+    bindUsageTimelineInteractions(shell, points, viewport);
   }
   setLocalizedText($("#usage-timeline-copy"), "chart.timeZoneNote", {
     timeZone: formatTimeZoneLabel(),
   });
   const summary = $("#usage-timeline-summary");
   clear(summary);
-  const total = points.reduce((sum, row) => sum + row.apiCostUsd, 0);
+  const total = visiblePoints.reduce((sum, row) => sum + row.apiCostUsd, 0);
   for (const [name, explanation, value] of [
     [
       "Time intervals",
       "The number of displayed hour, day, or week intervals.",
-      compact(points.length)
+      compact(visiblePoints.length)
     ],
     [
       "API-price equivalent",
@@ -2816,18 +2952,139 @@ function renderUsageTimeline(data) {
   }
 }
 
+/**
+ * Wheel, drag, and keyboard zoom for the usage chart.
+ *
+ * This is deliberately the same gesture vocabulary as the calibration chart
+ * below it — wheel to zoom about the pointer, drag to pan, `+`/`-` and the
+ * arrow keys from the keyboard, `Home` to reset — and it reaches the same
+ * `zoomTimeline` and `panTimeline` policy, so both charts move by identical
+ * steps and clamp identically. It is a separate binder rather than a shared one
+ * because it targets a different element with its own pointer state and its own
+ * viewport; the behaviour that has to stay uniform lives in the functions both
+ * binders call, not in the wiring.
+ */
+function bindUsageTimelineInteractions(shell, points, viewport) {
+  if (viewport === null) return;
+  shell.classList.add("interactive-chart");
+  shell.tabIndex = 0;
+  shell.setAttribute("aria-label", t("chart.usage.aria", {
+    timeZone: USER_TIME_ZONE,
+  }));
+  setLocalizedText($("#usage-zoom-status"), "dashboard.timeline.status", {
+    start: formatLocal(new Date(viewport.startMs).toISOString()),
+    end: formatLocal(new Date(viewport.endMs).toISOString()),
+    span: formatSpanLength(viewport.endMs - viewport.startMs),
+  });
+  shell.onwheel = (event) => {
+    if (!event.deltaY) return;
+    event.preventDefault();
+    const bounds = shell.getBoundingClientRect();
+    const ratio = bounds.width > 0 ? (event.clientX - bounds.left) / bounds.width : .5;
+    zoomUsageTimeline(points, wheelZoomFactor(event), ratio);
+  };
+  shell.onpointerdown = (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    usagePointerStart = { x: event.clientX, dragging: false };
+    shell.setPointerCapture?.(event.pointerId);
+    shell.classList.add("is-pointer-active");
+  };
+  shell.onpointermove = (event) => {
+    if (usagePointerStart === null) return;
+    const width = Math.max(1, shell.getBoundingClientRect().width);
+    const delta = event.clientX - usagePointerStart.x;
+    if (Math.abs(delta) < 8) return;
+    usagePointerStart.dragging = true;
+    usagePointerStart.x = event.clientX;
+    shell.classList.add("is-panning");
+    event.preventDefault();
+    panUsageTimeline(points, -delta / width);
+  };
+  const stopPanning = (event) => {
+    const wasDragging = usagePointerStart?.dragging === true;
+    usagePointerStart = null;
+    shell.releasePointerCapture?.(event.pointerId);
+    shell.classList.remove("is-pointer-active");
+    shell.classList.remove("is-panning");
+    if (wasDragging) event.preventDefault();
+  };
+  shell.onpointerup = stopPanning;
+  shell.onpointercancel = stopPanning;
+  shell.onselectstart = (event) => {
+    if (usagePointerStart !== null) event.preventDefault();
+  };
+  shell.onkeydown = (event) => {
+    if (["+", "="].includes(event.key)) {
+      event.preventDefault();
+      zoomUsageTimeline(points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
+    } else if (["-", "_"].includes(event.key)) {
+      event.preventDefault();
+      zoomUsageTimeline(points, TIMELINE_BUTTON_ZOOM_STEP);
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      panUsageTimeline(points, -.2);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      panUsageTimeline(points, .2);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      resetUsageTimelineViewport();
+      scheduleUsageTimelineRender();
+    }
+  };
+}
+
+function zoomUsageTimeline(points, factor, anchorRatio = .5) {
+  withChartViewport(
+    USAGE_CHART_VIEWPORT,
+    () => zoomTimeline(points, factor, anchorRatio),
+  );
+}
+
+function panUsageTimeline(points, fraction) {
+  withChartViewport(USAGE_CHART_VIEWPORT, () => panTimeline(points, fraction));
+}
+
+/**
+ * Deriving the calibration series is the expensive half of this page: it walks
+ * every usage bucket in the artifact to rebuild the rolling window, builds a
+ * quota lookup, and classifies each window's evidence state. None of that
+ * depends on the zoom or pan viewport — only on the loaded evidence and the two
+ * segmented controls above the chart — yet it ran again for every wheel event,
+ * which is what made the chart feel heavy to drag.
+ *
+ * The result is remembered against exactly the inputs it is a function of. The
+ * dashboard payload is compared by identity, so a refresh that produces a new
+ * object invalidates the memo without any explicit clearing, and a payload that
+ * has not changed cannot serve a stale series.
+ */
+let timelineSeriesMemo = null;
+
 function selectedTimelinePoints(data) {
+  if (timelineSeriesMemo !== null
+      && timelineSeriesMemo.data === data
+      && timelineSeriesMemo.windowHours === activeWindowHours
+      && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
+    return timelineSeriesMemo.selection;
+  }
   const livePoints = liveTimelinePoints(data);
   const cutoff = timelineCutoffMs(data, activeCalibrationRangeDays);
   const historicalPoints = groupRolling(
     [...data.gradient.rollingHistory, ...data.gradient.rolling],
     activeWindowHours,
-  ).filter((row) => Date.parse(row.timestamp) >= cutoff);
+  ).filter((row) => pointTimestampMs(row) >= cutoff);
   const liveMatched = livePoints.filter(
     (row) => row.observed !== null && row.expected !== null,
   ).length;
   const usingLive = liveMatched > 0 || historicalPoints.length === 0;
-  return { points: usingLive ? livePoints : historicalPoints, usingLive };
+  const selection = { points: usingLive ? livePoints : historicalPoints, usingLive };
+  timelineSeriesMemo = {
+    data,
+    windowHours: activeWindowHours,
+    rangeDays: activeCalibrationRangeDays,
+    selection,
+  };
+  return selection;
 }
 
 function renderTimeline(data) {
@@ -2863,7 +3120,7 @@ function renderTimeline(data) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(lineChart({
+    drawChart(shell, lineChart({
       points: visiblePoints,
       series: [
         {
@@ -2891,6 +3148,7 @@ function renderTimeline(data) {
         values: { timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
+      height: TIMELINE_CHART_HEIGHT,
       xDomain: viewport,
       statusIntervals: usingLive && viewport !== null
         ? timelineStatusIntervals(points, viewport)
@@ -3073,15 +3331,19 @@ function residualRows(data, points) {
       : row.observed - row.expected,
   }));
   const artifactResiduals = !live && data.gradient.residual.length
-    ? data.gradient.residual.map((row) => ({
-        timestamp: row.timestamp ?? row.window_end_utc,
-        observed: finite(row.observed_quota_change_pp),
-        expected: finite(row.expected_quota_change_pp),
-        residual: finite(row.residual_pp)
-      }))
+    ? data.gradient.residual.map((row) => {
+        const timestamp = row.timestamp ?? row.window_end_utc;
+        return {
+          timestamp,
+          timestampMs: Date.parse(timestamp),
+          observed: finite(row.observed_quota_change_pp),
+          expected: finite(row.expected_quota_change_pp),
+          residual: finite(row.residual_pp)
+        };
+      })
     : [];
   const visibleArtifactResiduals = artifactResiduals.filter((row) => {
-    const timestamp = Date.parse(row.timestamp);
+    const timestamp = pointTimestampMs(row);
     return Number.isFinite(timestamp)
       && visibleBounds !== null
       && timestamp >= visibleBounds.startMs
@@ -3095,13 +3357,13 @@ function residualRows(data, points) {
   // instead of quietly starting at the first computable point.
   return source
     .filter((row) => {
-      const timestamp = Date.parse(row.timestamp);
+      const timestamp = pointTimestampMs(row);
       return row.status !== "inactive"
         && Number.isFinite(timestamp)
         && (visibleBounds === null
           || (timestamp >= visibleBounds.startMs && timestamp <= visibleBounds.endMs));
     })
-    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    .sort((a, b) => pointTimestampMs(a) - pointTimestampMs(b));
 }
 
 function residualGapReasons(rows) {
@@ -3185,7 +3447,7 @@ function renderResiduals(data, points, viewport = null) {
   } else {
     empty.hidden = true;
     shell.hidden = false;
-    shell.replaceChildren(lineChart({
+    drawChart(shell, lineChart({
       points: residuals,
       series: [{
         key: "residual",
@@ -3201,6 +3463,7 @@ function renderResiduals(data, points, viewport = null) {
         values: { timeZone: formatTimeZoneLabel() },
       },
       includeZero: true,
+      height: COMPACT_CHART_HEIGHT,
       xDomain: domain,
       statusIntervals: domain === null
         ? []
@@ -3254,6 +3517,34 @@ function renderResiduals(data, points, viewport = null) {
 const CHART_TICK_TIME_ONLY_SPAN_MS = 36 * 60 * 60 * 1_000;
 const CHART_TICK_MONTH_ONLY_SPAN_MS = 365 * 24 * 60 * 60 * 1_000;
 
+// The three tick shapes, hoisted so each one is a stable object rather than a
+// literal rebuilt per call, and one live formatter per (locale, shape).
+// `formatChartTimeLabel` runs once per tick and per rendered frame; building an
+// `Intl.DateTimeFormat` for each half of each label was a measurable share of
+// the pan and zoom cost, and nothing about the formatter depends on the instant
+// being formatted. Keying on the live formatting locale means a language change
+// needs no invalidation — it simply misses the cache once per shape.
+const CHART_TICK_SHAPES = Object.freeze({
+  day: Object.freeze({ month: "short", day: "numeric" }),
+  clock: Object.freeze({ hour: "numeric", minute: "2-digit" }),
+  month: Object.freeze({ month: "short", year: "numeric" }),
+});
+
+const chartTickFormatters = new Map();
+
+function chartTickFormatter(shape) {
+  const locale = getFormattingLocale();
+  const key = `${locale} ${shape}`;
+  const cached = chartTickFormatters.get(key);
+  if (cached !== undefined) return cached;
+  const formatter = new Intl.DateTimeFormat(locale, {
+    timeZone: USER_TIME_ZONE,
+    ...CHART_TICK_SHAPES[shape],
+  });
+  chartTickFormatters.set(key, formatter);
+  return formatter;
+}
+
 /**
  * The one axis-tick label formatter.
  *
@@ -3288,16 +3579,11 @@ function formatChartTimeLabel(value, { dateOnly = false, spanMs = null } = {}) {
           : "month";
   try {
     const instant = new Date(timestamp);
-    const part = (options) => new Intl.DateTimeFormat(getFormattingLocale(), {
-      timeZone: USER_TIME_ZONE,
-      ...options,
-    }).format(instant);
-    const day = () => part({ month: "short", day: "numeric" });
-    const clock = () => part({ hour: "numeric", minute: "2-digit" });
-    if (resolution === "time") return clock();
-    if (resolution === "month") return part({ month: "short", year: "numeric" });
-    if (resolution === "date") return day();
-    return `${day()} · ${clock()}`;
+    const part = (shape) => chartTickFormatter(shape).format(instant);
+    if (resolution === "time") return part("clock");
+    if (resolution === "month") return part("month");
+    if (resolution === "date") return part("day");
+    return `${part("day")} · ${part("clock")}`;
   } catch {
     return formatChartTimestamp(new Date(timestamp).toISOString(), { dateOnly });
   }
@@ -3328,6 +3614,59 @@ const CHART_POINT_STYLE = Object.freeze({
 });
 
 const CHART_POINT_STYLES = new Set(Object.values(CHART_POINT_STYLE));
+
+/**
+ * Drawing heights, in viewBox units, for the charts whose CSS lets them take
+ * their height from the shape of their drawing rather than from a fixed pixel
+ * value.
+ *
+ * The timeline charts were drawn into a 900x300 box inside a shell that is
+ * routinely 977px wide. An SVG scales its viewBox to fit, so the smaller ratio
+ * won: the plot was pinned to 300px tall and letterboxed with 77px of dead
+ * space across the width. These heights pair with `aspect-ratio` rules in
+ * `styles.css` so each chart fills its card in both directions, which roughly
+ * doubles the plot area the same evidence is drawn into.
+ *
+ * Each value must stay in step with the matching `aspect-ratio`; a height with
+ * no matching rule only reintroduces the letterbox.
+ */
+const TIMELINE_CHART_HEIGHT = 420;
+const COMPACT_CHART_HEIGHT = 340;
+
+/**
+ * The one place a plotted point's instant is turned into milliseconds.
+ *
+ * Every series carries its instant as an ISO string, because that is what the
+ * evidence artifacts and the local companion emit and what the tooltips print.
+ * Re-parsing that string is not free, and the viewport helpers, the status
+ * intervals, the residual filter, and the x-scale each parsed the same strings
+ * again on every redraw: a single wheel notch over a month of calibration
+ * evidence was measured at 18,177 `Date.parse` calls.
+ *
+ * Series builders now stamp `timestampMs` alongside `timestamp`, and this
+ * reader prefers it. The fallback keeps the helper honest for points that come
+ * straight from an artifact — a caller never has to know which kind it holds.
+ */
+function pointTimestampMs(point) {
+  const stamped = point?.timestampMs;
+  if (typeof stamped === "number" && Number.isFinite(stamped)) return stamped;
+  return Date.parse(point?.timestamp ?? point?.date);
+}
+
+/**
+ * Swap a chart into its shell, releasing what the outgoing chart still held.
+ *
+ * `lineChart` attaches a `ResizeObserver` so the axis can shed tick labels as
+ * the card narrows. A pan or zoom replaces the whole SVG on every frame, so
+ * without this the page kept one live observer per rendered frame, each still
+ * watching a detached tree and each waking on the next real resize.
+ */
+function drawChart(shell, chart) {
+  for (const previous of shell.children ?? []) {
+    previous.chartTickDensityObserver?.disconnect();
+  }
+  shell.replaceChildren(chart);
+}
 
 function chartSeriesDrawsPoints(item, field) {
   const style = item?.pointStyle;
@@ -3397,6 +3736,13 @@ function lineChart({
   statusIntervals = [],
   secondarySeries = [],
   secondaryYLabel = null,
+  // The drawing height, in viewBox units. It pairs with an `aspect-ratio` in
+  // `styles.css`: the SVG is laid out at the card's full width and takes its
+  // height from this ratio, so the plot fills the box in both directions
+  // instead of being letterboxed by a fixed CSS height. A chart whose CSS
+  // pins an explicit height keeps the default, because raising this without
+  // raising that one only reintroduces the letterbox it is meant to remove.
+  height = 300,
 }) {
   // Hover, keyboard focus, and the accessible name are unconditional. Only the
   // visible dot is a per-chart decision, and every series has to state it.
@@ -3415,18 +3761,20 @@ function lineChart({
     tooltip: item.tooltip !== false,
   }));
   const width = 900;
-  const height = 300;
   const hasSecondary = chartSecondarySeries.length > 0;
   const margin = {
-    top: 16,
+    top: 12,
     right: hasSecondary ? 96 : 24,
     // Tick labels are horizontal. They used to be rotated -24° and given a
     // 66px gutter because each one carried a full date and time; now that a
     // tick reads "Jul 15" or "2:04 PM", rotation only made short text harder
-    // to read and cost the plot 22px of height.
-    bottom: 44,
+    // to read and cost the plot 22px of height. The gutter is sized to the one
+    // line of 10px text it holds — it was carrying 22px of slack beneath the
+    // baseline, which is plot area no chart was using.
+    bottom: 30,
     left: 72,
   };
+  const tickLabelBaseline = height - 11;
   let min = finite(yDomain?.low);
   let max = finite(yDomain?.high);
   if (min === null || max === null || max <= min) {
@@ -3442,7 +3790,7 @@ function lineChart({
     min = includeZero && min >= 0 ? 0 : min - pad;
     max += pad;
   }
-  const timestamps = points.map((point) => Date.parse(point.timestamp ?? point.date));
+  const timestamps = points.map(pointTimestampMs);
   const timed = timestamps.every(Number.isFinite);
   const dataStartMs = timed ? Math.min(...timestamps) : 0;
   const dataEndMs = timed ? Math.max(...timestamps) : Math.max(1, points.length - 1);
@@ -3455,19 +3803,31 @@ function lineChart({
   const safeDomainEndMs = domainEndMs > domainStartMs
     ? domainEndMs
     : domainStartMs + 1;
+  // `timestamps` was already computed above, once per point, so the x-scale
+  // reads that array instead of re-parsing the same ISO string on every call.
+  const plotWidth = width - margin.left - margin.right;
+  const lastIndex = Math.max(1, points.length - 1);
   const x = (index, point = points[index]) => {
+    const at = timed
+      ? (index >= 0 && timestamps[index] !== undefined
+        ? timestamps[index]
+        : pointTimestampMs(point))
+      : null;
     const coordinate = timed
-      ? (Date.parse(point.timestamp ?? point.date) - domainStartMs)
-        / (safeDomainEndMs - domainStartMs)
-      : index / Math.max(1, points.length - 1);
-    return margin.left + coordinate * (width - margin.left - margin.right);
+      ? (at - domainStartMs) / (safeDomainEndMs - domainStartMs)
+      : index / lastIndex;
+    return margin.left + coordinate * plotWidth;
   };
   const y = (value) => margin.top + (max - value) / (max - min) * (height - margin.top - margin.bottom);
   const ySecondary = (value) => margin.top
     + (100 - Math.max(0, Math.min(100, value))) / 100
       * (height - margin.top - margin.bottom);
 
-  const chartTickStep = (low, high, target = 5) => {
+  // Six candidate divisions rather than five. Ticks are now kept inside the
+  // domain instead of rounding outwards past each end, which costs the axis
+  // roughly one tick; asking for one more division back restores the density a
+  // chart this tall needs to stay readable.
+  const chartTickStep = (low, high, target = 6) => {
     const span = Math.abs(high - low);
     if (!Number.isFinite(span) || span <= 0) return 1;
     const raw = span / Math.max(1, target - 1);
@@ -3480,17 +3840,31 @@ function lineChart({
             : 10;
     return factor * magnitude;
   };
+  // The fewest decimals that write the step exactly. The old rule returned 0
+  // for any step of 1 or more, so a 2.5 step printed its own grid lines as
+  // "0, -3, -5, -8, -10" — two labels naming a value their line was not drawn
+  // at. It also under-reported fractional steps: 0.25 needs two places, not
+  // one.
   const chartTickDigits = (step) => {
-    if (!Number.isFinite(step) || step >= 1) return 0;
-    return Math.min(3, Math.max(1, Math.ceil(-Math.log10(step))));
+    if (!Number.isFinite(step) || step <= 0) return 0;
+    for (let digits = 0; digits < 3; digits += 1) {
+      if (Math.abs(step - Number(step.toFixed(digits))) <= step * 1e-9) return digits;
+    }
+    return 3;
   };
   const yStep = chartTickStep(min, max);
   const yDigits = chartTickDigits(yStep);
   const yTicks = Array.isArray(yDomain?.ticks) && yDomain.ticks.length > 0
     ? yDomain.ticks.filter((value) => Number.isFinite(value))
     : (() => {
-      const first = Math.ceil(max / yStep) * yStep;
-      const last = Math.floor(min / yStep) * yStep;
+      // Ticks sit on round multiples of the step, but only where the axis
+      // actually goes. Rounding outwards put a grid line and a label a whole
+      // step beyond each end of the domain: on the residual chart that drew
+      // two of five grid lines outside the SVG box entirely, and `overflow:
+      // visible` meant they were painted over the card below rather than
+      // clipped. Rounding inwards keeps every tick on the plot.
+      const first = Math.floor(max / yStep) * yStep;
+      const last = Math.ceil(min / yStep) * yStep;
       const values = [];
       for (let value = first; value >= last - yStep / 100; value -= yStep) {
         values.push(Number(value.toFixed(Math.max(0, yDigits + 2))));
@@ -3608,9 +3982,18 @@ function lineChart({
     update(renderedWidth);
     if (typeof ResizeObserver === "function") {
       const observer = new ResizeObserver((entries) => {
+        // A pan redraws the chart every frame, discarding the SVG this observer
+        // was created for. Once that SVG leaves the document the observer has
+        // nothing to report, so it releases itself rather than accumulating one
+        // live observer per rendered frame.
+        if (svg.isConnected === false) {
+          observer.disconnect();
+          return;
+        }
         update(entries[0]?.contentRect?.width ?? renderedWidth);
       });
       observer.observe(svg);
+      svg.chartTickDensityObserver = observer;
     }
   };
 
@@ -3674,7 +4057,7 @@ function lineChart({
         / (safeDomainEndMs - domainStartMs) * (width - margin.left - margin.right);
       const tickLabel = svgText(
         position,
-        height - 22,
+        tickLabelBaseline,
         typeof tick.label === "string"
           ? tick.label
           : formatChartTimeLabel(at, { spanMs: domainSpanMs }),
@@ -3690,7 +4073,7 @@ function lineChart({
     const tickLabels = [];
     for (const index of labelIndexes) {
       const timestamp = points[index]?.timestamp ?? points[index]?.date;
-      const tickLabel = svgText(x(index), height - 22, formatChartTimeLabel(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle");
+      const tickLabel = svgText(x(index), tickLabelBaseline, formatChartTimeLabel(timestamp, { dateOnly: true }), "chart-axis-label", index === 0 ? "start" : index === points.length - 1 ? "end" : "middle");
       svg.append(tickLabel);
       tickLabels.push(tickLabel);
     }
@@ -3870,9 +4253,13 @@ function lineChart({
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
         if (value === null) return;
+        // Both coordinates are used three times each — the attribute, the
+        // tooltip anchor, and the focus anchor — so they are computed once.
+        const markerX = x(index, point);
+        const markerY = y(value);
         const marker = document.createElementNS(svg.namespaceURI, "circle");
-        marker.setAttribute("cx", String(x(index, point)));
-        marker.setAttribute("cy", String(y(value)));
+        marker.setAttribute("cx", String(markerX));
+        marker.setAttribute("cy", String(markerY));
         const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 4;
@@ -3912,8 +4299,8 @@ function lineChart({
           element: marker,
           heading,
           detail,
-          xPosition: x(index, point),
-          yPosition: y(value),
+          xPosition: markerX,
+          yPosition: markerY,
           pointer: item.tooltip !== false,
           focus: item.focusable !== false,
           label: caption,
@@ -3980,9 +4367,11 @@ function lineChart({
       points.forEach((point, index) => {
         const value = finite(point[item.key]);
         if (value === null) return;
+        const markerX = x(index, point);
+        const markerY = ySecondary(value);
         const marker = document.createElementNS(svg.namespaceURI, "circle");
-        marker.setAttribute("cx", String(x(index, point)));
-        marker.setAttribute("cy", String(ySecondary(value)));
+        marker.setAttribute("cx", String(markerX));
+        marker.setAttribute("cy", String(markerY));
         const visualRadius = typeof item.markerRadius === "function"
           ? item.markerRadius(point)
           : item.markerRadius ?? 2.6;
@@ -4007,8 +4396,8 @@ function lineChart({
           element: marker,
           heading,
           detail,
-          xPosition: x(index, point),
-          yPosition: ySecondary(value),
+          xPosition: markerX,
+          yPosition: markerY,
           pointer: item.tooltip !== false,
           focus: item.focusable !== false,
           label: caption,
@@ -7236,8 +7625,32 @@ $("#range-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  // Choosing a date range restates what the chart should cover, so a zoom left
+  // over from the previous range cannot survive it. This is the same rule the
+  // calibration range control follows.
+  resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
   renderComparison(dashboard);
+});
+$("#usage-zoom-in").addEventListener("click", () => {
+  if (!dashboard) return;
+  zoomUsageTimeline(selectedUsagePoints(dashboard), 1 / TIMELINE_BUTTON_ZOOM_STEP);
+});
+$("#usage-zoom-out").addEventListener("click", () => {
+  if (!dashboard) return;
+  zoomUsageTimeline(selectedUsagePoints(dashboard), TIMELINE_BUTTON_ZOOM_STEP);
+});
+$("#usage-pan-back").addEventListener("click", () => {
+  if (!dashboard) return;
+  panUsageTimeline(selectedUsagePoints(dashboard), -.2);
+});
+$("#usage-pan-forward").addEventListener("click", () => {
+  if (!dashboard) return;
+  panUsageTimeline(selectedUsagePoints(dashboard), .2);
+});
+$("#usage-reset-zoom").addEventListener("click", () => {
+  resetUsageTimelineViewport();
+  if (dashboard) renderUsageTimeline(dashboard);
 });
 $("#calibration-range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");
@@ -7280,6 +7693,7 @@ $("#usage-group-controls").addEventListener("click", (event) => {
     control.classList.toggle("active", active);
     control.setAttribute("aria-pressed", String(active));
   }
+  resetUsageTimelineViewport();
   renderUsageTimeline(dashboard);
 });
 $("#weekly-range-controls").addEventListener("click", (event) => {
