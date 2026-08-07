@@ -1,36 +1,52 @@
 import { lstat, readFile } from "node:fs/promises";
 import {
-  addUsdStrings,
   APP_PRICE_REGISTRY_MANIFEST,
   CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
   DEFAULT_FAST_MODE_PREFERENCE,
-  FAST_MODE_MODEL_FAMILY_KEYS,
   FAST_MODE_MULTIPLIER_SOURCE,
   FAST_MODE_QUOTA_MULTIPLIERS,
   OPENAI_PRICE_EVIDENCE_START_DATE,
-  OBSERVED_SPEED_MODE_KEYS,
   QUOTA_WEIGHTED_API_PRICE_METRIC,
-  emptySpeedWeightingCrossing,
-  fastModeModelFamilyKey,
   inferFastModeFromCalibrationWindows,
   isFastModePreference,
-  priceCodexUsageEvent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
-import {
-  isValidQuotaWindowDuration,
-} from "@app-usagemonitor/quota-analysis";
-import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
-  codexModelAllowanceTrack,
-  codexModelApiPriceEquivalentApplicable,
-  codexModelPricingStatus,
-  OPENAI_CODEX_SPARK_MODEL_ID,
-  recognizedCodexModelId,
-} from "./export/index.js";
+  addTimelineUsage,
+  addUsageToPeriod,
+  deterministicSample,
+  emptyComponents,
+  emptyDimension,
+  finalizeQuotaTimeline,
+  finalizeTimelineBuckets,
+  finalizeUsagePeriod,
+  finiteNumber,
+  KNOWN_AGENT_SCOPES,
+  KNOWN_API_TIERS,
+  KNOWN_LINEAGE,
+  KNOWN_SLOTS,
+  KNOWN_SPEEDS,
+  KNOWN_SURFACES,
+  KNOWN_TOOL_CLASSES,
+  newUsagePeriod,
+  orderQuotaWindows,
+  quotaWindowProjection,
+  safeSpeed,
+  safeSpeedWeighting,
+  TIMELINE_BUCKET_MS,
+  usageProjection,
+  validObservedAt,
+} from "./local-companion-usage-model.js";
 import {
+  defaultLocalUnifiedIndexPath,
+} from "./local-unified-index.js";
+import {
+  readLocalUnifiedCompanionProjection,
+} from "./local-unified-companion-source.js";
+import {
+  createAccountingPricer,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
 import {
@@ -59,47 +75,16 @@ export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 
 const MAX_LEDGER_RECORDS = 5_000_000;
 const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024;
-const MAX_DATASET_ROWS = 2_500;
 const MAX_SAFE_TEXT_LENGTH = 2_000;
 
-const COMPONENT_KEYS = Object.freeze([
-  "input_uncached_tokens",
-  "input_cache_read_tokens",
-  "input_cache_write_tokens",
-  "output_text_tokens",
-  "output_reasoning_tokens",
-  "output_combined_tokens",
-]);
-
-// Model identity is owned by the reviewed export registry so that the live
-// collector projection, the replay-safe cache and the indexed archive cannot
-// drift apart and disagree about what counts as recognised.
-const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
-
-const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
-const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
-const KNOWN_SURFACES = new Set([
-  "extension_or_ide",
-  "scheduled_task",
-  "subagent",
-  "cli_exec",
-  "work",
-  "workspace_agent",
-  "excel",
-  "voice_task",
-  "unknown",
-]);
-const KNOWN_AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
-const KNOWN_LINEAGE = new Set(["standalone", "forked", "parent_linked", "unknown"]);
-const KNOWN_TOOL_CLASSES = new Set(["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]);
-const KNOWN_LIMITS = new Set(["codex", "codex_bengalfox", "codex-spark"]);
-const KNOWN_PLANS = new Set(TELEMETRY_PLAN_TYPES);
-const KNOWN_SLOTS = new Set(["primary", "secondary"]);
+// The bounded recent collector window. This bound applies only when the
+// unified local index is unavailable: the collector is a bounded recent state
+// store, and the timeline it can honestly draw is capped at this many days.
+// With the unified index available the timeline and the "all" period cover
+// the index's whole span instead.
 const RECENT_TIMELINE_DAYS = 31;
 const RECENT_COLLECTOR_PERIOD_LABEL =
   `Cached ${RECENT_TIMELINE_DAYS}-day collector window`;
-const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
-const MAX_QUOTA_TIMELINE_POINTS = 10_000;
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
 const MAX_WEEKLY_PACE_OBSERVATIONS = 8_192;
@@ -297,19 +282,6 @@ function fixedError(code) {
   return error;
 }
 
-function finiteNumber(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function quotaResetIsoInstant(value) {
-  if (!Number.isSafeInteger(value) || value <= 0) return null;
-  try {
-    return new Date(value * 1_000).toISOString();
-  } catch {
-    return null;
-  }
-}
-
 function safeText(value) {
   if (typeof value !== "string") return null;
   const clipped = value.slice(0, MAX_SAFE_TEXT_LENGTH);
@@ -330,16 +302,6 @@ function safeValue(value) {
     });
   }
   return null;
-}
-
-function deterministicSample(rows, maximum = MAX_DATASET_ROWS) {
-  if (rows.length <= maximum) return rows;
-  const sampled = [];
-  const last = rows.length - 1;
-  for (let index = 0; index < maximum; index += 1) {
-    sampled.push(rows[Math.round((index * last) / (maximum - 1))]);
-  }
-  return sampled;
 }
 
 function projectDataset(rows, allowedKeys) {
@@ -669,488 +631,6 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
   };
 }
 
-function emptyComponents() {
-  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
-}
-
-function addComponents(target, components) {
-  if (!components || typeof components !== "object" || Array.isArray(components)) return;
-  for (const key of COMPONENT_KEYS) {
-    const value = components[key];
-    if (Number.isSafeInteger(value) && value >= 0) target[key] += value;
-  }
-}
-
-function safeModel(model) {
-  return recognizedCodexModelId(model) ?? "unknown";
-}
-
-function modelPricingStatus(model) {
-  return codexModelPricingStatus(model);
-}
-
-function safeSpeed(speed) {
-  return KNOWN_SPEEDS.has(speed) ? speed : "unknown";
-}
-
-function safeEnum(value, allowed) {
-  return allowed.has(value) ? value : "unknown";
-}
-
-function emptyDimension(keys) {
-  return Object.fromEntries([...keys].map((key) => [
-    key,
-    { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
-  ]));
-}
-
-function usageProjection(record, declaredSpeed = "unknown") {
-  const components = emptyComponents();
-  addComponents(components, record.components);
-  if (components.output_combined_tokens > 0
-      && components.output_text_tokens + components.output_reasoning_tokens > 0) {
-    components.output_combined_tokens = 0;
-  }
-  const totalTokens = components.input_uncached_tokens
-    + components.input_cache_read_tokens
-    + components.input_cache_write_tokens
-    + (components.output_combined_tokens > 0
-      ? components.output_combined_tokens
-      : components.output_text_tokens + components.output_reasoning_tokens);
-  if (totalTokens === 0) return null;
-  const model = safeModel(record.model);
-  let priced;
-  try {
-    priced = priceCodexUsageEvent({
-      timestamp: record.observedAt,
-      model,
-      components,
-    }, {
-      // Subscription speed and the API billing tier are separate concepts.
-      // Standard is the explicit counterfactual until an API tier is observed.
-      apiServiceTier: "standard",
-      priceEpochBasis: "event_time",
-    });
-  } catch {
-    priced = { totalUsd: "0", coverageStatus: "unpriced" };
-  }
-  const rawCost = Number(priced.totalUsd);
-  const priceCardIds = Array.isArray(priced.selectedPriceCardIds)
-    ? [...new Set(priced.selectedPriceCardIds.filter((id) => (
-      typeof id === "string" && id.length > 0 && id.length <= 128
-    )))].sort()
-    : [];
-  const priceCardBreakdown = Array.isArray(priced.priceCardBreakdown)
-    ? priced.priceCardBreakdown.filter((item) => (
-      item
-      && typeof item === "object"
-      && typeof item.priceCardId === "string"
-      && item.priceCardId.length > 0
-      && item.priceCardId.length <= 128
-      && Number.isSafeInteger(item.events)
-      && item.events >= 0
-      && typeof item.costUsd === "string"
-      && /^\d+(?:\.\d+)?$/u.test(item.costUsd)
-    ))
-    : [];
-  return {
-    model,
-    modelPricingStatus: modelPricingStatus(record.model),
-    modelAllowanceTrack: codexModelAllowanceTrack(record.model),
-    modelApiPriceEquivalentApplicable:
-      codexModelApiPriceEquivalentApplicable(record.model),
-    isSpark: model === SPARK_MODEL,
-    components,
-    totalTokens,
-    apiPriceEquivalentUsd: Number.isFinite(rawCost) ? rawCost : 0,
-    apiPriceEquivalentUsdExact: ["fully_priced", "partially_priced"].includes(
-      priced.coverageStatus,
-    ) && typeof priced.totalUsd === "string"
-        && /^\d+(?:\.\d+)?$/u.test(priced.totalUsd)
-      ? priced.totalUsd
-      : null,
-    priceCardIds,
-    priceCardBreakdown,
-    pricingCoverageStatus: ["fully_priced", "partially_priced"].includes(priced.coverageStatus)
-      ? priced.coverageStatus
-      : "unpriced",
-    speed: safeSpeed(record.tierSemantics?.codexSpeedMode),
-    declaredSpeed,
-    apiServiceTier: safeEnum(record.tierSemantics?.apiServiceTier, KNOWN_API_TIERS),
-    surface: safeEnum(record.surfaceClassification?.surface, KNOWN_SURFACES),
-    agentScope: safeEnum(record.surfaceClassification?.agentScope, KNOWN_AGENT_SCOPES),
-    lineage: safeEnum(record.surfaceClassification?.lineageDisposition, KNOWN_LINEAGE),
-    reasoningEffort: "unknown",
-    accountAttribution: record.accountScope?.status === "available"
-      ? "attributed_pseudonymous"
-      : "unattributed",
-  };
-}
-
-function newUsagePeriod(id, label, { includeSpark = true } = {}) {
-  const period = {
-    id,
-    label,
-    events: 0,
-    totalTokens: 0,
-    components: emptyComponents(),
-    apiPriceEquivalentUsd: 0,
-    apiPriceEquivalentUsdExact: null,
-    priceCardIds: [],
-    priceCardBreakdown: {},
-    pricingCoverage: {
-      fullyPricedEvents: 0,
-      partiallyPricedEvents: 0,
-      unpricedEvents: 0,
-    },
-    byModel: {},
-    bySpeed: emptyDimension(KNOWN_SPEEDS),
-    byApiServiceTier: emptyDimension(KNOWN_API_TIERS),
-    bySurface: emptyDimension(KNOWN_SURFACES),
-    byAgentScope: emptyDimension(KNOWN_AGENT_SCOPES),
-    byLineage: emptyDimension(KNOWN_LINEAGE),
-    byReasoningEffort: {
-      unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
-    },
-    // Observed speed mode crossed with the model's published Fast credit rate
-    // family, so the owner's Fast-mode preference can be applied at read time.
-    speedWeighting: emptySpeedWeightingCrossing(),
-    // The same crossing, holding only the events the log left UNOBSERVED that
-    // a timestamped Codex `service_tier` reading actually covers.
-    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
-    accountAttribution: {
-      attributedPseudonymousEvents: 0,
-      unattributedEvents: 0,
-    },
-  };
-  if (includeSpark) {
-    period.spark = newUsagePeriod("spark", "Spark allowance", {
-      includeSpark: false,
-    });
-  }
-  return period;
-}
-
-function addSpeedWeighting(crossing, projection) {
-  const speed = crossing[projection.speed] ? projection.speed : "unknown";
-  const cell = crossing[speed][fastModeModelFamilyKey(projection.model)];
-  cell.events += 1;
-  cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
-}
-
-function addDeclaredSpeedWeighting(crossing, projection) {
-  // Only a declaration that resolved to a real mode is recorded, and only for
-  // events the log left unobserved; everything else is left unattributed.
-  if (projection.declaredSpeed !== "standard"
-      && projection.declaredSpeed !== "fast") return;
-  const cell =
-    crossing[projection.declaredSpeed][fastModeModelFamilyKey(projection.model)];
-  cell.events += 1;
-  cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
-}
-
-function finalizeSpeedWeighting(crossing) {
-  return Object.fromEntries(Object.entries(crossing).map(([speed, families]) => [
-    speed,
-    Object.fromEntries(Object.entries(families).map(([family, cell]) => [
-      family,
-      {
-        ...cell,
-        apiPriceEquivalentUsd: Number(cell.apiPriceEquivalentUsd.toFixed(6)),
-      },
-    ])),
-  ]));
-}
-
-function safeSpeedWeighting(value) {
-  const crossing = emptySpeedWeightingCrossing();
-  for (const speed of OBSERVED_SPEED_MODE_KEYS) {
-    for (const family of FAST_MODE_MODEL_FAMILY_KEYS) {
-      const cell = value?.[speed]?.[family];
-      crossing[speed][family] = {
-        events: Number.isSafeInteger(cell?.events) && cell.events >= 0
-          ? cell.events
-          : 0,
-        apiPriceEquivalentUsd:
-          finiteNumber(cell?.apiPriceEquivalentUsd) !== null
-            && cell.apiPriceEquivalentUsd >= 0
-            ? cell.apiPriceEquivalentUsd
-            : 0,
-      };
-    }
-  }
-  return crossing;
-}
-
-function addDimension(dimension, key, projection) {
-  const row = dimension[key] ?? dimension.unknown;
-  row.events += 1;
-  row.totalTokens += projection.totalTokens;
-  row.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
-}
-
-function addUsageToPeriod(period, projection) {
-  if (projection === null) return;
-  if (projection.isSpark) {
-    addUsageToPeriod(period.spark, { ...projection, isSpark: false });
-    return;
-  }
-  period.events += 1;
-  period.totalTokens += projection.totalTokens;
-  addComponents(period.components, projection.components);
-  const modelSummary = period.byModel[projection.model] ??= {
-    model: projection.model,
-    pricingStatus: projection.modelPricingStatus,
-    allowanceTrack: projection.modelAllowanceTrack,
-    apiPriceEquivalentApplicable: projection.modelApiPriceEquivalentApplicable,
-    events: 0,
-    totalTokens: 0,
-    apiPriceEquivalentUsd: 0,
-  };
-  modelSummary.events += 1;
-  modelSummary.totalTokens += projection.totalTokens;
-  modelSummary.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
-  period.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
-  if (projection.apiPriceEquivalentUsdExact !== null) {
-    period.apiPriceEquivalentUsdExact = period.apiPriceEquivalentUsdExact === null
-      ? projection.apiPriceEquivalentUsdExact
-      : addUsdStrings(
-        period.apiPriceEquivalentUsdExact,
-        projection.apiPriceEquivalentUsdExact,
-      );
-  }
-  for (const id of projection.priceCardIds) {
-    if (!period.priceCardIds.includes(id)) period.priceCardIds.push(id);
-  }
-  for (const item of projection.priceCardBreakdown) {
-    const row = period.priceCardBreakdown[item.priceCardId] ?? {
-      priceCardId: item.priceCardId,
-      events: 0,
-      costUsd: "0",
-    };
-    row.events += item.events;
-    row.costUsd = addUsdStrings(row.costUsd, item.costUsd);
-    period.priceCardBreakdown[item.priceCardId] = row;
-  }
-  addDimension(period.bySpeed, projection.speed, projection);
-  addSpeedWeighting(period.speedWeighting, projection);
-  addDeclaredSpeedWeighting(period.declaredSpeedWeighting, projection);
-  addDimension(period.byApiServiceTier, projection.apiServiceTier, projection);
-  addDimension(period.bySurface, projection.surface, projection);
-  addDimension(period.byAgentScope, projection.agentScope, projection);
-  addDimension(period.byLineage, projection.lineage, projection);
-  addDimension(period.byReasoningEffort, projection.reasoningEffort, projection);
-  if (projection.accountAttribution === "attributed_pseudonymous") {
-    period.accountAttribution.attributedPseudonymousEvents += 1;
-  } else {
-    period.accountAttribution.unattributedEvents += 1;
-  }
-  if (projection.pricingCoverageStatus === "fully_priced") {
-    period.pricingCoverage.fullyPricedEvents += 1;
-  } else if (projection.pricingCoverageStatus === "partially_priced") {
-    period.pricingCoverage.partiallyPricedEvents += 1;
-  }
-  else period.pricingCoverage.unpricedEvents += 1;
-}
-
-function finalizeDimension(dimension) {
-  return Object.fromEntries(Object.entries(dimension).map(([key, row]) => [
-    key,
-    {
-      ...row,
-      apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)),
-    },
-  ]));
-}
-
-function finalizeUsagePeriod(period) {
-  const priced = period.pricingCoverage.fullyPricedEvents + period.pricingCoverage.partiallyPricedEvents;
-  const finalized = {
-    ...period,
-    apiPriceEquivalentUsd: Number(period.apiPriceEquivalentUsd.toFixed(6)),
-    priceCardIds: [...period.priceCardIds].sort(),
-    priceCardBreakdown: Object.values(period.priceCardBreakdown).sort(
-      (left, right) => left.priceCardId.localeCompare(right.priceCardId),
-    ),
-    pricedEventFraction: period.events === 0 ? null : Number((priced / period.events).toFixed(6)),
-    byModel: Object.values(period.byModel)
-      .map((row) => ({ ...row, apiPriceEquivalentUsd: Number(row.apiPriceEquivalentUsd.toFixed(6)) }))
-      .sort((left, right) => right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd || left.model.localeCompare(right.model)),
-    bySpeed: finalizeDimension(period.bySpeed),
-    byApiServiceTier: finalizeDimension(period.byApiServiceTier),
-    bySurface: finalizeDimension(period.bySurface),
-    byAgentScope: finalizeDimension(period.byAgentScope),
-    byLineage: finalizeDimension(period.byLineage),
-    byReasoningEffort: finalizeDimension(period.byReasoningEffort),
-    speedWeighting: finalizeSpeedWeighting(period.speedWeighting),
-    declaredSpeedWeighting: finalizeSpeedWeighting(
-      period.declaredSpeedWeighting,
-    ),
-  };
-  if (period.spark) finalized.spark = finalizeUsagePeriod(period.spark);
-  // One list covering every allowance track. `byModel` stays aligned with the
-  // period's own totals, which exclude the separately metered Spark track.
-  finalized.modelUsage = [
-    ...finalized.byModel,
-    ...(finalized.spark?.byModel ?? []),
-  ].sort((left, right) => (
-    right.apiPriceEquivalentUsd - left.apiPriceEquivalentUsd
-    || right.totalTokens - left.totalTokens
-    || left.model.localeCompare(right.model)
-  ));
-  return finalized;
-}
-
-function validObservedAt(record) {
-  const timestamp = Date.parse(record?.observedAt);
-  return Number.isFinite(timestamp) ? timestamp : null;
-}
-
-function newTimelineBucket(startMs) {
-  return {
-    startMs,
-    endMs: startMs + TIMELINE_BUCKET_MS,
-    usageEvents: 0,
-    totalTokens: 0,
-    components: emptyComponents(),
-    apiPriceEquivalentUsd: 0,
-    fullyPricedEvents: 0,
-    partiallyPricedEvents: 0,
-    unpricedEvents: 0,
-  };
-}
-
-function addTimelineUsage(buckets, observedMs, projection) {
-  if (projection === null) return;
-  const startMs = Math.floor(observedMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS;
-  const bucket = buckets.get(startMs) ?? newTimelineBucket(startMs);
-  bucket.usageEvents += 1;
-  bucket.totalTokens += projection.totalTokens;
-  bucket.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
-  addComponents(bucket.components, projection.components);
-  if (projection.pricingCoverageStatus === "fully_priced") bucket.fullyPricedEvents += 1;
-  else if (projection.pricingCoverageStatus === "partially_priced") bucket.partiallyPricedEvents += 1;
-  else bucket.unpricedEvents += 1;
-  buckets.set(startMs, bucket);
-}
-
-function finalizeTimelineBuckets(buckets) {
-  return [...buckets.values()]
-    .sort((left, right) => left.startMs - right.startMs)
-    .map((bucket) => ({
-      startAt: new Date(bucket.startMs).toISOString(),
-      endAt: new Date(bucket.endMs).toISOString(),
-      usageEvents: bucket.usageEvents,
-      totalTokens: bucket.totalTokens,
-      components: bucket.components,
-      apiPriceEquivalentUsd: Number(bucket.apiPriceEquivalentUsd.toFixed(6)),
-      pricingCoverage: {
-        fullyPricedEvents: bucket.fullyPricedEvents,
-        partiallyPricedEvents: bucket.partiallyPricedEvents,
-        unpricedEvents: bucket.unpricedEvents,
-      },
-    }));
-}
-
-function quotaWindowProjection(window) {
-  if (!window || typeof window !== "object") return null;
-  const usedPercent = finiteNumber(window.usedPercent);
-  if (usedPercent === null || usedPercent < 0 || usedPercent > 100) return null;
-  const durationMinutes = isValidQuotaWindowDuration(
-    window.windowDurationMins,
-  )
-    ? window.windowDurationMins
-    : null;
-  if (durationMinutes === null) return null;
-  const resetAt = quotaResetIsoInstant(window.resetsAt);
-  if (resetAt === null) return null;
-  return {
-    limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
-    slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
-    planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
-    usedPercent,
-    remainingPercent: Number((100 - usedPercent).toFixed(3)),
-    durationMinutes,
-    resetAt,
-  };
-}
-
-function primaryCodexWindowIndex(windows) {
-  let selected = -1;
-  for (let index = 0; index < windows.length; index += 1) {
-    const candidate = windows[index];
-    if (candidate.limitId !== "codex") continue;
-    if (selected === -1) {
-      selected = index;
-      continue;
-    }
-    const prior = windows[selected];
-    if (candidate.durationMinutes > prior.durationMinutes
-        || (candidate.durationMinutes === prior.durationMinutes
-          && candidate.slot === "primary"
-          && prior.slot !== "primary")) {
-      selected = index;
-    }
-  }
-  return selected;
-}
-
-// Keep every observed window, but put the selected normal Codex window first.
-// The scan is stable for equal duration/slot candidates, so provider ordering
-// remains the final deterministic tie-breaker and planType stays attached only
-// to the window where it was observed.
-function orderQuotaWindows(windows) {
-  const selected = primaryCodexWindowIndex(windows);
-  if (selected <= 0) return windows;
-  return [
-    windows[selected],
-    ...windows.slice(0, selected),
-    ...windows.slice(selected + 1),
-  ];
-}
-
-function quotaTimelineRowTieBreak(row) {
-  return [
-    row.planType,
-    row.usedPercent.toFixed(3),
-    row.resetAt,
-    row.accountAttribution,
-  ].join("\0");
-}
-
-function finalizeQuotaTimeline(rows) {
-  rows.sort((left, right) => (
-    Date.parse(left.observedAt) - Date.parse(right.observedAt)
-    || left.limitId.localeCompare(right.limitId)
-    || left.slot.localeCompare(right.slot)
-    || left.durationMinutes - right.durationMinutes
-    || left.planType.localeCompare(right.planType)
-    || left.usedPercent - right.usedPercent
-  ));
-  const points = new Map();
-  for (const row of rows) {
-    const track = `${row.limitId}:${row.slot}:${row.durationMinutes ?? "unknown"}`;
-    const observedMs = Date.parse(row.observedAt);
-    const key = `${track}:${observedMs}`;
-    const prior = points.get(key);
-    if (prior === undefined
-        || quotaTimelineRowTieBreak(row) < quotaTimelineRowTieBreak(prior)) {
-      points.set(key, row);
-    }
-  }
-  return deterministicSample(
-    [...points.values()].sort((left, right) => (
-      Date.parse(left.observedAt) - Date.parse(right.observedAt)
-      || left.limitId.localeCompare(right.limitId)
-      || left.slot.localeCompare(right.slot)
-      || left.durationMinutes - right.durationMinutes
-      || left.planType.localeCompare(right.planType)
-      || left.usedPercent - right.usedPercent
-    )),
-    MAX_QUOTA_TIMELINE_POINTS,
-  );
-}
-
 async function readCollectorProjection(
   stateFile,
   nowMs,
@@ -1199,6 +679,7 @@ async function readCollectorProjection(
   ];
   const toolCounts = Object.fromEntries([...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, 0]));
   const recordCounts = { usage: 0, quota: 0, tools: 0, other: 0 };
+  const pricer = createAccountingPricer();
   const recentStartMs = nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000;
   const timelineBuckets = new Map();
   const sparkTimelineBuckets = new Map();
@@ -1288,6 +769,7 @@ async function readCollectorProjection(
           observedSpeed === "unknown"
             ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
             : "unknown",
+          pricer,
         );
         for (const period of periods) {
           if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
@@ -1561,11 +1043,12 @@ function summarizeUsage(records, nowMs) {
       start: nowMs - RECENT_TIMELINE_DAYS * 24 * 60 * 60 * 1_000,
     },
   ];
+  const pricer = createAccountingPricer();
   for (const record of records) {
     if (record.kind !== "codex_rollout_usage_snapshot") continue;
     const observedMs = validObservedAt(record);
     if (observedMs === null || observedMs > nowMs + 5 * 60_000) continue;
-    const projection = usageProjection(record);
+    const projection = usageProjection(record, "unknown", pricer);
     for (const period of periods) {
       if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
     }
@@ -1693,6 +1176,10 @@ export async function buildLocalCompanionSnapshot({
   root = process.cwd(),
   collectorStateFile = defaultLocalCollectorStatePath(root),
   archiveIndexFile = defaultLocalArchiveAccountingIndexPath(root),
+  // The unified local index. When it is present the "All" period and the
+  // timelines draw from its whole fork-replay-suppressed history; when it is
+  // absent the snapshot says so and stays on the bounded recent window.
+  unifiedIndexFile = defaultLocalUnifiedIndexPath(root),
   allowDevelopmentArtifactFallback = false,
   // Owner-stated Codex speed mode. The composition root reads it from
   // owner-only local state; an unrecognised value never becomes a silent Fast.
@@ -1710,20 +1197,30 @@ export async function buildLocalCompanionSnapshot({
   // inspect it. Once complete this is a cheap receipt check; it never revives
   // JSON as an active state backend.
   await prepareLocalCollectorState({ stateFile: collectorStateFile, clock: () => nowMs });
-  const [replaySafeAccounting, archiveCoverage, archiveAccounting] = await Promise.all([
-    readReplaySafeAccountingCache({
-      stateFile: collectorStateFile,
-      now: () => nowMs,
-      maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
-    }),
-    inspectLocalArchiveAccountingIndex({ indexFile: archiveIndexFile }),
-    readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile }),
-  ]);
+  const declaredSpeedBaselines = Array.isArray(codexSpeedBaselines)
+    ? codexSpeedBaselines
+    : [];
+  const [replaySafeAccounting, archiveCoverage, archiveAccounting, unified] =
+    await Promise.all([
+      readReplaySafeAccountingCache({
+        stateFile: collectorStateFile,
+        now: () => nowMs,
+        maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
+      }),
+      inspectLocalArchiveAccountingIndex({ indexFile: archiveIndexFile }),
+      readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile }),
+      readLocalUnifiedCompanionProjection({
+        indexFile: unifiedIndexFile,
+        nowMs,
+        declaredSpeedBaselines,
+      }),
+    ]);
   const replaySafeCache = ["available", "stale"].includes(
     replaySafeAccounting.status,
   )
     ? replaySafeAccounting.cache
     : null;
+  const unifiedAvailable = unified.status === "available";
   if (typeof allowDevelopmentArtifactFallback !== "boolean") {
     throw new TypeError("allowDevelopmentArtifactFallback must be a boolean");
   }
@@ -1741,10 +1238,12 @@ export async function buildLocalCompanionSnapshot({
       }),
     projectArtifact(root, "quality"),
     readCollectorProjection(collectorStateFile, nowMs, {
-      summarizeUsageEvents: replaySafeCache === null,
-      declaredSpeedBaselines: Array.isArray(codexSpeedBaselines)
-        ? codexSpeedBaselines
-        : [],
+      // The unified index replaces the collector-row usage replay entirely;
+      // re-summarizing 600k+ JSON rows here was the old startup cost, and the
+      // raw collector projection also counts fork replay the owner has ruled
+      // is not real spend.
+      summarizeUsageEvents: replaySafeCache === null && !unifiedAvailable,
+      declaredSpeedBaselines,
     }),
     reportProjection(root),
   ]);
@@ -1786,13 +1285,26 @@ export async function buildLocalCompanionSnapshot({
   // list names the withheld pricing - so conflating them buys nothing and
   // costs the reader a true statement.
   const freshnessStatus = collectorFreshnessStatus;
-  const recentUsage = replaySafeCache?.periods ?? collector.usage;
-  const usage = archiveAccounting.status === "available"
+  // Recent periods prefer the freshly refreshed replay-safe cache, then the
+  // unified index (also replay-suppressed), and fall back to the raw collector
+  // projection — which counts fork replay — only when neither exists.
+  const recentUsage = replaySafeCache?.periods
+    ?? (unifiedAvailable ? unified.usage : collector.usage);
+  // The unified index owns the broadest period whenever it is present: its
+  // "all" spans the whole suppressed corpus rather than a bounded recent
+  // window, which is what removes the 31-day ceiling.
+  const broadUsage = unifiedAvailable
     ? [
-      ...recentUsage.filter((period) => period.id !== "history"),
-      archiveAccounting.period,
+      ...recentUsage.filter((period) => period.id !== "all"),
+      unified.usage.find((period) => period.id === "all"),
     ]
     : recentUsage;
+  const usage = archiveAccounting.status === "available"
+    ? [
+      ...broadUsage.filter((period) => period.id !== "history"),
+      archiveAccounting.period,
+    ]
+    : broadUsage;
   const displayUsage = usage.find((period) => period.id === "7d" && period.events > 0)
     ?? usage.find((period) => period.id === "all");
   const selectedFastModePreference = isFastModePreference(fastModePreference)
@@ -1814,15 +1326,45 @@ export async function buildLocalCompanionSnapshot({
     ? fastModeProjection(undefined, fastModeContext)
     : periodFastMode.get(displayUsage.id);
   const quota = collector.quota;
-  const quotaTimeline = Array.isArray(replaySafeCache?.quotaTimeline)
-    ? replaySafeCache.quotaTimeline
-    : collector.timeline.quota;
-  const sparkQuotaTimeline = Array.isArray(replaySafeCache?.sparkQuotaTimeline)
-    ? replaySafeCache.sparkQuotaTimeline
-    : collector.timeline.sparkQuota;
-  const sparkUsageTimeline = Array.isArray(replaySafeCache?.sparkUsageTimeline)
-    ? replaySafeCache.sparkUsageTimeline
-    : collector.timeline.sparkUsage;
+  const quotaTimeline = unifiedAvailable
+    ? unified.timeline.quota
+    : Array.isArray(replaySafeCache?.quotaTimeline)
+      ? replaySafeCache.quotaTimeline
+      : collector.timeline.quota;
+  const sparkQuotaTimeline = unifiedAvailable
+    ? unified.timeline.sparkQuota
+    : Array.isArray(replaySafeCache?.sparkQuotaTimeline)
+      ? replaySafeCache.sparkQuotaTimeline
+      : collector.timeline.sparkQuota;
+  const sparkUsageTimeline = unifiedAvailable
+    ? unified.timeline.sparkUsage
+    : Array.isArray(replaySafeCache?.sparkUsageTimeline)
+      ? replaySafeCache.sparkUsageTimeline
+      : collector.timeline.sparkUsage;
+  // What span the timelines honestly cover, and out of which source. When the
+  // unified index is absent this names the bound instead of hiding it.
+  const timelineSource = unifiedAvailable
+    ? "unified_local_index"
+    : replaySafeCache !== null
+      ? "replay_safe_cache"
+      : "recent_collector_window";
+  const timelineHistory = unifiedAvailable
+    ? {
+      status: unified.indexStatus === "complete" ? "complete" : "partial",
+      coveredAt: unified.coveredAt,
+      usageEvents: unified.usageEvents,
+      generatedAt: unified.generatedAt,
+      sourceCount: unified.sourceCount,
+      indexBytes: unified.indexBytes,
+    }
+    : {
+      status: "unavailable",
+      reason: unified.status === "missing"
+        ? "unified_index_missing"
+        : unified.errorCode ?? "unified_index_unavailable",
+      boundedDays: RECENT_TIMELINE_DAYS,
+      coveredAt: null,
+    };
   const tools = collector.tools;
   const pricedEvents = (displayUsage?.pricingCoverage.fullyPricedEvents ?? 0)
     + (displayUsage?.pricingCoverage.partiallyPricedEvents ?? 0);
@@ -1848,10 +1390,26 @@ export async function buildLocalCompanionSnapshot({
       "Historical event-time accounting changed. The prior cache is withheld until the next local replay rebuilds it.",
     );
   }
-  if (replaySafeCache === null && (displayUsage?.events ?? 0) > 0) {
+  if (replaySafeCache === null && !unifiedAvailable
+      && (displayUsage?.events ?? 0) > 0) {
     warnings.push(
       "Recent cost accounting is using the live collector projection. It may include inherited snapshots from forked child rollouts until the replay-safe cache is refreshed.",
     );
+  }
+  if (!unifiedAvailable) {
+    warnings.push(unified.status === "missing"
+      ? `The unified local index has not been built yet. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it is.`
+      : `The unified local index is unreadable. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it recovers.`);
+  } else {
+    const indexEndMs = Date.parse(unified.coveredAt.endAt ?? "");
+    const newestUsageMs = collector.latestExportableRecordAt;
+    if (Number.isFinite(indexEndMs)
+        && Number.isSafeInteger(newestUsageMs)
+        && newestUsageMs - indexEndMs > MAX_COLLECTOR_LIVE_AGE_MS) {
+      warnings.push(
+        `The unified local index is ${Math.round((newestUsageMs - indexEndMs) / 60_000)} minutes behind the newest collector evidence and catches up on the next refresh.`,
+      );
+    }
   }
   if (indexing.status === "prospective_only") {
     warnings.push("The retained collector state began prospectively and does not prove recent-history coverage.");
@@ -1947,15 +1505,23 @@ export async function buildLocalCompanionSnapshot({
       tools,
       timeline: {
         ...collector.timeline,
-        bucketMinutes: replaySafeCache?.bucketMinutes
-          ?? collector.timeline.bucketMinutes,
-        coveredAt: replaySafeCache?.coveredAt
-          ?? collector.timeline.coveredAt,
-        usage: replaySafeCache?.timeline
-          ?? collector.timeline.usage,
+        bucketMinutes: unifiedAvailable
+          ? unified.timeline.bucketMinutes
+          : replaySafeCache?.bucketMinutes
+            ?? collector.timeline.bucketMinutes,
+        coveredAt: unifiedAvailable
+          ? unified.timeline.coveredAt
+          : replaySafeCache?.coveredAt
+            ?? collector.timeline.coveredAt,
+        usage: unifiedAvailable
+          ? unified.timeline.usage
+          : replaySafeCache?.timeline
+            ?? collector.timeline.usage,
         quota: quotaTimeline,
         sparkUsage: sparkUsageTimeline,
         sparkQuota: sparkQuotaTimeline,
+        source: timelineSource,
+        history: timelineHistory,
       },
       accounting: {
         periodId: displayUsage?.id ?? "all",
@@ -1992,9 +1558,11 @@ export async function buildLocalCompanionSnapshot({
         apiPriceCounterfactualTier: "standard",
         subscriptionSpeedIsSeparate: true,
         reasoningEffortAvailable: false,
-        accountingSource: replaySafeCache === null
-          ? "collector_projection_unverified"
-          : replaySafeCache.accountingMethod,
+        accountingSource: replaySafeCache !== null
+          ? replaySafeCache.accountingMethod
+          : unifiedAvailable
+            ? "unified_local_index_replay_suppressed"
+            : "collector_projection_unverified",
         accountingCacheStatus: replaySafeAccounting.status,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         evidenceStartDate: OPENAI_PRICE_EVIDENCE_START_DATE,
@@ -2093,9 +1661,11 @@ export async function buildLocalCompanionSnapshot({
         // at that event's timestamp; a reset may therefore contain mixed
         // historical card windows.
         priceEpochBasis: "event_time_when_registry_has_effective_evidence",
-        accountingSource: replaySafeCache === null
-          ? "collector_projection_unverified"
-          : replaySafeCache.accountingMethod,
+        accountingSource: replaySafeCache !== null
+          ? replaySafeCache.accountingMethod
+          : unifiedAvailable
+            ? "unified_local_index_replay_suppressed"
+            : "collector_projection_unverified",
         accountingCacheStatus: replaySafeAccounting.status,
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         historyCoverage: archiveCoverage,

@@ -297,11 +297,24 @@ function scaledUsdString(value) {
   return `${whole}.${fraction}`.replace(/\.?0+$/u, "");
 }
 
-function createAccountingPricer() {
+// Exported for the unified-index companion read: one memoized unit-price plan
+// per (model, context band, effective date), integer-scaled per event, falling
+// back to the full pricer whenever a plan cannot be proven exact. This is the
+// same pricer the replay-safe cache itself accounts with.
+export function createAccountingPricer() {
   const plans = new Map();
   return (event, components) => {
+    // The reviewed pricer bands by the provider-reported total input context
+    // when present, and otherwise by the sum of the input token components.
+    // The plan key must reproduce that rule exactly: keying the band off the
+    // reported total alone silently priced every 272k+ event whose record
+    // lacks the field at short-context rates.
+    const reportedTotal = Number(event.totalInputContextTokens);
+    const inputSum = (components.input_uncached_tokens ?? 0)
+      + (components.input_cache_read_tokens ?? 0)
+      + (components.input_cache_write_tokens ?? 0);
     const contextBand =
-      Number(event.totalInputContextTokens) >= 272_000
+      (Number.isFinite(reportedTotal) ? reportedTotal : inputSum) >= 272_000
         ? "long"
         : "short";
     // Keep the effective date in the fast-plan key: official price cards may
@@ -326,22 +339,30 @@ function createAccountingPricer() {
         apiServiceTier: "standard",
         priceEpochBasis: "event_time",
       });
-      const rows = new Map(template.components.map((row) => [
-        row.name,
-        row,
-      ]));
-      plan = template.coverageStatus === "fully_priced"
-          && [...COMPONENT_KEYS]
-            .filter((name) => name !== "output_combined_tokens")
-            .every((name) => (
-              typeof rows.get(name)?.unitPriceUsd === "string"
-              && /^\d+(?:\.\d{1,9})?$/u.test(
-                rows.get(name).unitPriceUsd,
-              )
-            ))
+      // Keep only rows whose unit price is proven exact. The per-event loop
+      // below falls back to the full pricer the moment an event actually USES
+      // a component that has no such row, so a partially priced card — Codex
+      // never prices cache writes, for example — still yields a fast plan for
+      // the events that never touch the unpriced component. The previous
+      // all-components gate nullified every Codex plan and silently sent the
+      // entire corpus down the slow path.
+      const rows = new Map(template.components
+        .filter((row) => (
+          typeof row.unitPriceUsd === "string"
+          && /^\d+(?:\.\d{1,9})?$/u.test(row.unitPriceUsd)
+        ))
+        .map((row) => [row.name, row]));
+      plan = ["fully_priced", "partially_priced"].includes(
+        template.coverageStatus,
+      ) && rows.size > 0
         ? {
           rows,
-          warnings: template.warnings,
+          // A fast-priced event uses only fully priced components, so the
+          // template's unpriced-component warnings do not describe it. The
+          // empty shape mirrors the full pricer's warnings object.
+          warnings: template.coverageStatus === "fully_priced"
+            ? template.warnings
+            : { coverage: [], informational: [] },
           selectedPriceCardIds: template.selectedPriceCardIds,
         }
         : null;

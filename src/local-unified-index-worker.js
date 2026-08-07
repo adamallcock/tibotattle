@@ -59,21 +59,34 @@ async function run() {
           ? null
           : finalBySessionId.get(source.parentId) ?? null;
         let events = [];
-        const flush = (rolloutKey, final, diagnostics) => {
+        let snapshotKeys = [];
+        const flush = (rolloutKey, final, diagnostics, cursor = null) => {
           parentPort.postMessage({
             type: "batch",
             rolloutKey,
             events,
+            // Snapshot keys collected for descendants — "|"-joined token
+            // counters, nothing that can hold content. The host persists them
+            // so a later incremental ingest can answer for this ancestor.
+            snapshotKeys,
             final,
             diagnostics,
+            cursor,
           });
           events = [];
+          snapshotKeys = [];
         };
+        const collector = snapshots.collectorFor(source);
         const outcome = await extractRolloutUsage(source.path, {
           size: source.size,
           isFork: source.isFork === true,
           inheritedSnapshots: snapshots.inheritedFor(source),
-          collectSnapshots: snapshots.collectorFor(source),
+          collectSnapshots: collector === null ? null : {
+            add(key) {
+              collector.add(key);
+              snapshotKeys.push(key);
+            },
+          },
           seedModel: seed?.model ?? null,
           seedEffort: seed?.effort ?? null,
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
@@ -99,6 +112,15 @@ async function run() {
           oversizedLines: outcome.read.oversizedLines,
           retainedSnapshotKeys: snapshots.retainedKeys,
           seeded: seed?.model != null,
+        }, {
+          nextOffset: outcome.read.nextOffset,
+          finalModel: outcome.finalModel,
+          finalEffort: outcome.finalEffort,
+          finalTierRaw: outcome.finalTier?.providerTierRaw ?? null,
+          finalTierObservedAtMs: outcome.finalTier?.observedAtMs ?? null,
+          finalTotals: outcome.finalTotals,
+          turnContextSeen: outcome.finalTurnContextSeen,
+          snapshotsPersisted: collector !== null,
         });
       }
     } finally {

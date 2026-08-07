@@ -21,6 +21,10 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../../src/local-archive-accounting-index.js";
 import {
+  ingestLocalUnifiedIndexIncrement,
+} from "../../src/local-unified-index-ingest.js";
+import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
+import {
   AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
   acquireAutomaticContributionInstanceLock,
   createAutomaticContributionController,
@@ -1838,6 +1842,7 @@ function createPreparedLocalCompanionServer({
       root: resourceRoot,
       collectorStateFile: statePaths.collectorStateFile,
       archiveIndexFile: statePaths.archiveAccountingIndexFile,
+      unifiedIndexFile: statePaths.unifiedIndexFile,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       // The owner's stated Codex speed mode. It attributes only the turns that
@@ -1860,6 +1865,14 @@ function createPreparedLocalCompanionServer({
     refreshArchiveIndex: refreshLocalArchiveAccountingIndex,
     archiveIndexFile: statePaths.archiveAccountingIndexFile,
     archiveIndexSecretFile: statePaths.archiveAccountingIndexSecretFile,
+    // Advance the unified index by its cursors on every foreground refresh:
+    // an ordinary pass reads only the bytes the rollout corpus grew.
+    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
+      ...options,
+      contractVersion: TELEMETRY_SCHEMA_VERSION,
+    }),
+    unifiedIndexFile: statePaths.unifiedIndexFile,
+    unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
     recordCodexSpeedBaseline: async () => (
       (await codexSpeedBaseline.record()).windows
     ),

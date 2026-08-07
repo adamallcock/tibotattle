@@ -340,6 +340,12 @@ export function createLocalCollectorRefreshRunner({
   refreshArchiveIndex = null,
   archiveIndexFile = null,
   archiveIndexSecretFile = null,
+  // Cursor-based incremental advance of the unified local index. An ordinary
+  // pass reads only the bytes the rollout corpus grew since the last one, so
+  // it is safe to run on every foreground refresh.
+  refreshUnifiedIndex = null,
+  unifiedIndexFile = null,
+  unifiedIndexSecretFile = null,
   // Collection-time capture of the Codex speed-mode baseline. Codex writes the
   // mode to the rollout log only when it is applied or changed, so a session's
   // baseline exists nowhere but the configuration's `service_tier` key - and
@@ -363,6 +369,9 @@ export function createLocalCollectorRefreshRunner({
   if (refreshArchiveIndex !== null && typeof refreshArchiveIndex !== "function") {
     throw new TypeError("refreshArchiveIndex must be a function or null");
   }
+  if (refreshUnifiedIndex !== null && typeof refreshUnifiedIndex !== "function") {
+    throw new TypeError("refreshUnifiedIndex must be a function or null");
+  }
   if (recordCodexSpeedBaseline !== null
       && typeof recordCodexSpeedBaseline !== "function") {
     throw new TypeError("recordCodexSpeedBaseline must be a function or null");
@@ -372,6 +381,8 @@ export function createLocalCollectorRefreshRunner({
     accountObservationOperationLockFile,
     archiveIndexFile,
     archiveIndexSecretFile,
+    unifiedIndexFile,
+    unifiedIndexSecretFile,
   })) {
     if (value !== null && (typeof value !== "string" || value.length < 1)) {
       throw new TypeError(`${name} must be a non-empty string or null`);
@@ -549,6 +560,31 @@ export function createLocalCollectorRefreshRunner({
         signal,
       });
     }
+    let unifiedIndex = null;
+    if (refreshUnifiedIndex !== null && signal?.aborted !== true) {
+      // The unified index advances by its cursors, so this ordinarily reads
+      // only appended bytes. A failure here must never block collection or
+      // quota reporting: the snapshot degrades honestly to the bounded window
+      // and says so.
+      try {
+        unifiedIndex = publicUnifiedIndexResult(await refreshUnifiedIndex({
+          codexHome,
+          ...(unifiedIndexFile === null ? {} : { indexFile: unifiedIndexFile }),
+          ...(unifiedIndexSecretFile === null
+            ? {}
+            : { secretFile: unifiedIndexSecretFile }),
+          signal,
+        }));
+      } catch (error) {
+        unifiedIndex = {
+          status: "failed",
+          errorCode: typeof error?.code === "string"
+              && error.code.startsWith("local_unified_index_")
+            ? error.code
+            : "local_unified_index_refresh_failed",
+        };
+      }
+    }
     if (collectorResourceLimitDeferred) throwCollectorResourceLimit();
     return {
       rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
@@ -579,10 +615,45 @@ export function createLocalCollectorRefreshRunner({
       ...(publicArchiveIndexResult(archiveIndex) === null
         ? {}
         : { archiveIndex: publicArchiveIndexResult(archiveIndex) }),
+      ...(unifiedIndex === null ? {} : { unifiedIndex }),
       ...(publicIndexingResult(result?.indexing) === null
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
     };
+  };
+}
+
+// Content-free projection of an incremental unified-index pass: counts,
+// bytes and timings only. Anything malformed collapses to a typed failure
+// rather than leaking whatever shape the ingest returned.
+function publicUnifiedIndexResult(value) {
+  if (value?.status !== "ingested") {
+    return { status: "failed", errorCode: "local_unified_index_refresh_failed" };
+  }
+  const counts = {};
+  for (const key of [
+    "sources",
+    "sourcesSkipped",
+    "sourcesTouched",
+    "sourcesResumed",
+    "sourcesRescanned",
+    "sourcesScanned",
+    "bytesScanned",
+    "forkReplayEventsSkipped",
+    "unattributedForkReplayEventsSkipped",
+    "insertedUsageEvents",
+    "totalUsageEvents",
+  ]) {
+    counts[key] = Number.isSafeInteger(value[key]) && value[key] >= 0
+      ? value[key]
+      : 0;
+  }
+  return {
+    status: "ingested",
+    ...counts,
+    wallMs: Number.isFinite(value.wallMs) && value.wallMs >= 0
+      ? Math.round(value.wallMs)
+      : 0,
   };
 }
 

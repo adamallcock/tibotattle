@@ -192,6 +192,11 @@ export async function extractRolloutUsage(path, {
   seedEffort = null,
   seedTier = null,
   seedTotals = null,
+  // Cursor resume: whether an earlier scan of THIS file already saw one of
+  // its own `turn_context` records. The fork boundary's rule 2 depends on it,
+  // so a mid-file resume must carry it rather than re-deriving it wrongly as
+  // false.
+  seedTurnContextSeen = false,
   maximumLineBytes = ROLLOUT_LINE_BYTES,
   highWaterMark = 1024 * 1024,
   signal = null,
@@ -204,8 +209,9 @@ export async function extractRolloutUsage(path, {
   let currentEffort = seedEffort;
   let settingsEffort = null;
   // Strictly this file's own `turn_context`, never the inherited seed. A fork
-  // has not reached its own first turn until it writes one.
-  let turnContextSeenHere = false;
+  // has not reached its own first turn until it writes one. A cursor resume
+  // seeds it from the earlier scan of the same file.
+  let turnContextSeenHere = seedTurnContextSeen === true;
   let tierState = seedTier;
   let previousTotals = seedTotals;
   const diagnostics = {
@@ -412,19 +418,23 @@ export async function extractRolloutUsage(path, {
     finalEffort: currentEffort,
     finalTier: tierState,
     finalTotals: previousTotals,
+    finalTurnContextSeen: turnContextSeenHere,
   };
 }
 
 /**
  * A tracker for the fork-replay boundary over one lineage component.
  *
- * The agreed schema has no snapshot-set table, and it does not need one: these
- * sets exist only for the length of a component and are dropped when it ends.
- * That is affordable here precisely because a rebuild is a single whole-corpus
- * pass — the analysis index persists the equivalent sets only because it
- * updates incrementally and has to answer for an ancestor it is not currently
- * scanning. If this index ever becomes incremental, that persistence becomes
- * necessary and the schema does have to widen. Recorded rather than assumed.
+ * These in-memory sets exist for the length of a component and are dropped
+ * when it ends — sufficient on their own strictly for a one-pass rebuild, as
+ * originally recorded. Since 2026-08-07 the index also updates incrementally,
+ * which is exactly the moment that in-memory-only design stops being valid:
+ * an ancestor's set must outlive the pass that built it so a later-ingested
+ * fork can still recognise replayed turns. The build and ingest paths
+ * therefore persist every collected key into the `lineage_snapshot` table
+ * (as salted digests), and the incremental path consults that table for
+ * ancestors it is not currently scanning. The in-memory sets remain the hot
+ * path within a single pass.
  *
  * Only a source that some later source names as an ancestor gets a set at all,
  * so a corpus of unforked sessions allocates nothing.

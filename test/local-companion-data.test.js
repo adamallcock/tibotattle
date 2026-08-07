@@ -1199,3 +1199,149 @@ test("data store retains its last good snapshot when a reload fails", async () =
   await assert.rejects(() => store.reload(), /private internal failure/);
   assert.equal(store.getOverview().marker, "last-good");
 });
+
+test("the unified index removes the 31-day ceiling and keeps fork replay out of the headline", async () => {
+  const root = await fixtureRoot();
+  try {
+    // A corpus whose real history reaches far beyond any 31-day window, plus
+    // a forked child that replays its parent — the replay must not surface
+    // anywhere in the snapshot.
+    const sessions = join(root, "sessions", "2026", "06", "01");
+    await mkdir(sessions, { recursive: true });
+    const line = (value) => JSON.stringify(value);
+    const meta = (id, parent = null) => line({
+      timestamp: "2026-06-01T12:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id,
+        session_id: id,
+        ...(parent === null ? { thread_source: "user" } : {
+          forked_from_id: parent,
+          parent_thread_id: parent,
+          thread_source: "subagent",
+        }),
+        originator: "codex_cli_rs",
+        cwd: "/Users/private/project",
+      },
+    });
+    const turn = (timestamp) => line({
+      timestamp,
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol", effort: "high" },
+    });
+    const usageTotals = (input, output) => ({
+      input_tokens: input,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: output,
+      reasoning_output_tokens: 0,
+      total_tokens: input + output,
+    });
+    const count = (timestamp, totals, last) => line({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { total_token_usage: totals, last_token_usage: last },
+      },
+    });
+    await writeFile(join(sessions, "rollout-2026-06-01T12-00-00-parent.jsonl"), `${[
+      meta("session-deep-parent"),
+      turn("2026-06-01T12:00:00.000Z"),
+      count("2026-06-01T12:00:01.000Z", usageTotals(100, 10), usageTotals(100, 10)),
+      count("2026-07-25T11:00:00.000Z", usageTotals(300, 30), usageTotals(200, 20)),
+    ].join("\n")}\n`);
+    await writeFile(join(sessions, "rollout-2026-07-25T11-30-00-child.jsonl"), `${[
+      meta("session-deep-child", "session-deep-parent"),
+      count("2026-07-25T11:30:00.000Z", usageTotals(100, 10), usageTotals(100, 10)),
+      count("2026-07-25T11:30:01.000Z", usageTotals(300, 30), usageTotals(200, 20)),
+      turn("2026-07-25T11:30:02.000Z"),
+      count("2026-07-25T11:30:03.000Z", usageTotals(400, 50), usageTotals(100, 20)),
+    ].join("\n")}\n`);
+    const { rebuildLocalUnifiedIndex } = await import("../src/local-unified-index-build.js");
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, ".usage-monitor", "local-unified-index-v1.sqlite"),
+      secretFile: join(root, ".usage-monitor", "local-unified-index-device-salt-v1"),
+      contractVersion: "companion-test-v1",
+    });
+    assert.equal(built.usageEvents, 3);
+    assert.equal(built.forkReplayEventsSkipped, 2);
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+
+    // The broadest period covers the whole indexed history — the June event
+    // sits 54 days back, far beyond the old 31-day ceiling — and counts the
+    // three genuine turns, never the two replayed ones.
+    const broadest = snapshot.overview.usage.find((period) => period.id === "all");
+    assert.equal(broadest.label, "All indexed local history");
+    assert.equal(broadest.events, 3);
+    assert.equal(broadest.totalTokens, 110 + 220 + 120);
+    // The timeline reaches the June evidence too.
+    assert.equal(snapshot.overview.timeline.source, "unified_local_index");
+    assert.equal(
+      snapshot.overview.timeline.usage[0].startAt,
+      "2026-06-01T12:00:00.000Z",
+    );
+    assert.equal(snapshot.overview.timeline.history.status, "complete");
+    assert.equal(
+      snapshot.overview.timeline.history.coveredAt.startAt,
+      "2026-06-01T12:00:01.000Z",
+    );
+    // The headline accounting names the replay-suppressed source and the
+    // collector-projection warning does not fire.
+    assert.equal(
+      snapshot.overview.accounting.accountingSource,
+      "unified_local_index_replay_suppressed",
+    );
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("live collector projection")
+    )));
+    assert.ok(!snapshot.overview.warnings.some((warning) => (
+      warning.includes("unified local index")
+    )));
+    // Content never leaks into the payload.
+    const serialized = JSON.stringify(snapshot);
+    assert.ok(!serialized.includes("session-deep-parent"));
+    assert.ok(!serialized.includes("/Users/private"));
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a missing unified index keeps the bounded window and says so in the payload", async () => {
+  const root = await fixtureRoot();
+  try {
+    const usage = (observedAt) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: 100 },
+    });
+    await writeFile(
+      join(root, ".usage-monitor", "collector-events.jsonl"),
+      `${usage("2026-07-25T11:00:00.000Z")}\n`,
+      { mode: 0o600 },
+    );
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.overview.timeline.source, "recent_collector_window");
+    assert.equal(snapshot.overview.timeline.history.status, "unavailable");
+    assert.equal(snapshot.overview.timeline.history.reason, "unified_index_missing");
+    assert.equal(snapshot.overview.timeline.history.boundedDays, 31);
+    assert.ok(snapshot.overview.warnings.some((warning) => (
+      warning.includes("unified local index has not been built yet")
+    )));
+    const broadest = snapshot.overview.usage.find((period) => period.id === "all");
+    assert.equal(broadest.label, "Cached 31-day collector window");
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});

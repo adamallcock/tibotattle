@@ -40,7 +40,14 @@ export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
   "unified-rollout-typed-v1-partial";
 
 const INDEX_APPLICATION_ID = 0x554d5549;
-const INDEX_USER_VERSION = 1;
+// Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
+// tables below: `source_cursor` and `lineage_snapshot`. The widening is purely
+// additive, so a version-1 index opened writable is migrated in place — its
+// rows survive, which matters because rows whose rollout files have rotated
+// away can never be rebuilt. A version-1 index opened read-only stays valid as
+// it is: readers never touch the new tables.
+const INDEX_USER_VERSION = 2;
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
@@ -184,6 +191,46 @@ const SCHEMA = `
     count INTEGER NOT NULL,
     PRIMARY KEY(session_local, tool_class)) STRICT, WITHOUT ROWID;
 
+  -- Incremental ingest state (schema widening of 2026-08-07).
+  --
+  -- One row per rollout source: how far it has been scanned and the carried
+  -- extractor state needed to resume mid-file. Everything here is typed
+  -- metadata — a model identifier, an effort label, a provider tier token and
+  -- six cumulative token counters. No path, no content.
+  CREATE TABLE IF NOT EXISTS source_cursor(
+    source_local BLOB PRIMARY KEY,     -- HMAC(device_salt, rollout key)
+    session_local BLOB,
+    scanned_bytes INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    mtime_ms INTEGER NOT NULL,
+    -- 1 when this source's whole fork-replay snapshot set is durably in
+    -- lineage_snapshot. A source scanned before anything forked from it was
+    -- never asked to collect one; when a fork of it later appears, the
+    -- incremental pass re-scans it once to build the set, then flips this.
+    snapshots_persisted INTEGER NOT NULL,
+    turn_context_seen INTEGER NOT NULL,
+    carry_model TEXT,
+    carry_effort TEXT,
+    carry_tier_raw TEXT,
+    carry_tier_observed_at_ms INTEGER, -- NULL means no tier state carried
+    carry_total_input INTEGER,
+    carry_total_cached INTEGER,
+    carry_total_cache_write INTEGER,
+    carry_total_output INTEGER,
+    carry_total_reasoning INTEGER,
+    carry_total_total INTEGER,
+    ingest_run_id INTEGER NOT NULL REFERENCES ingest_run) STRICT;
+
+  -- Persisted fork-replay boundary. The in-memory-only snapshot sets were
+  -- recorded as valid strictly for one-pass rebuilds; the moment ingest became
+  -- incremental, an ancestor's set has to outlive the pass that built it so a
+  -- later-ingested fork can still recognise replayed turns. Keys are stored as
+  -- salted digests: membership is all the boundary check needs.
+  CREATE TABLE IF NOT EXISTS lineage_snapshot(
+    session_local BLOB NOT NULL,
+    snapshot_local BLOB NOT NULL,
+    PRIMARY KEY(session_local, snapshot_local)) STRICT, WITHOUT ROWID;
+
   CREATE INDEX IF NOT EXISTS usage_event_observed
     ON usage_event(observed_at_ms);
   CREATE INDEX IF NOT EXISTS usage_event_session
@@ -300,6 +347,19 @@ export function scopeLocal(deviceSalt, accountScopeId) {
   return localDigest(deviceSalt, "unified-index-scope", accountScopeId);
 }
 
+export function sourceLocal(deviceSalt, rolloutKey) {
+  return localDigest(deviceSalt, "unified-index-source", rolloutKey);
+}
+
+/**
+ * A persisted fork-replay snapshot key. The raw key is a "|"-joined tuple of
+ * cumulative token counters; membership is the only question the boundary
+ * check ever asks, so what is stored is a salted digest of it.
+ */
+export function snapshotLocal(deviceSalt, snapshotKey) {
+  return localDigest(deviceSalt, "unified-index-snapshot", snapshotKey);
+}
+
 function configureDatabase(database, { readOnly = false, staging = false } = {}) {
   if (!readOnly) {
     // WAL measured slower than DELETE+FULL on this store. During a rebuild the
@@ -350,7 +410,7 @@ function initializeSchema(database) {
     .run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
 }
 
-function validateDatabase(database) {
+function validateDatabase(database, { readOnly = false } = {}) {
   const applicationId = Number(
     database.prepare("PRAGMA application_id").get().application_id,
   );
@@ -360,11 +420,33 @@ function validateDatabase(database) {
   const schema = database.prepare(
     "SELECT value FROM meta WHERE key = 'schema_version'",
   ).get();
+  // Read-only connections accept any migratable version: readers never touch
+  // the widened tables, and rejecting a version-1 file here would force a
+  // rebuild that cannot recover rows whose rollout files have rotated away.
+  const acceptable = readOnly
+    ? MIGRATABLE_USER_VERSIONS.has(userVersion)
+    : userVersion === INDEX_USER_VERSION;
   if (applicationId !== INDEX_APPLICATION_ID
-      || userVersion !== INDEX_USER_VERSION
+      || !acceptable
       || schema?.value !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION) {
     throw fixedError("local_unified_index_schema_invalid");
   }
+}
+
+function migrateDatabase(database) {
+  const userVersion = Number(
+    database.prepare("PRAGMA user_version").get().user_version,
+  );
+  if (userVersion === INDEX_USER_VERSION) return;
+  if (!MIGRATABLE_USER_VERSIONS.has(userVersion)) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  // Version 1 -> 2 is additive: create the incremental-ingest tables and stamp
+  // the new version. Existing rows are untouched by construction.
+  database.exec(`
+    ${SCHEMA}
+    PRAGMA user_version=${INDEX_USER_VERSION};
+  `);
 }
 
 export function openLocalUnifiedIndex(indexFile, {
@@ -377,7 +459,8 @@ export function openLocalUnifiedIndex(indexFile, {
     database = new DatabaseSync(indexFile, { readOnly, timeout: 5_000 });
     configureDatabase(database, { readOnly, staging });
     if (create) initializeSchema(database);
-    validateDatabase(database);
+    if (!readOnly) migrateDatabase(database);
+    validateDatabase(database, { readOnly });
     return database;
   } catch (error) {
     if (database?.isOpen) database.close();
@@ -512,6 +595,35 @@ export function createUnifiedIndexWriter(database, {
       VALUES (?, ?, ?)
       ON CONFLICT(session_local, tool_class)
       DO UPDATE SET count = count + excluded.count`),
+    sourceCursor: database.prepare(`
+      INSERT INTO source_cursor(
+        source_local, session_local, scanned_bytes, size_bytes, mtime_ms,
+        snapshots_persisted, turn_context_seen, carry_model, carry_effort,
+        carry_tier_raw, carry_tier_observed_at_ms, carry_total_input,
+        carry_total_cached, carry_total_cache_write, carry_total_output,
+        carry_total_reasoning, carry_total_total, ingest_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source_local) DO UPDATE SET
+        session_local = excluded.session_local,
+        scanned_bytes = excluded.scanned_bytes,
+        size_bytes = excluded.size_bytes,
+        mtime_ms = excluded.mtime_ms,
+        snapshots_persisted = excluded.snapshots_persisted,
+        turn_context_seen = excluded.turn_context_seen,
+        carry_model = excluded.carry_model,
+        carry_effort = excluded.carry_effort,
+        carry_tier_raw = excluded.carry_tier_raw,
+        carry_tier_observed_at_ms = excluded.carry_tier_observed_at_ms,
+        carry_total_input = excluded.carry_total_input,
+        carry_total_cached = excluded.carry_total_cached,
+        carry_total_cache_write = excluded.carry_total_cache_write,
+        carry_total_output = excluded.carry_total_output,
+        carry_total_reasoning = excluded.carry_total_reasoning,
+        carry_total_total = excluded.carry_total_total,
+        ingest_run_id = excluded.ingest_run_id`),
+    lineageSnapshot: database.prepare(`
+      INSERT INTO lineage_snapshot(session_local, snapshot_local)
+      VALUES (?, ?) ON CONFLICT DO NOTHING`),
     meta: database.prepare(`
       INSERT INTO meta(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
@@ -734,6 +846,37 @@ export function createUnifiedIndexWriter(database, {
       begin();
       statements.toolClass.run(sessionLocalKey, toolClass, count);
       toolRows += 1;
+      step();
+    },
+
+    writeSourceCursor(cursor) {
+      begin();
+      statements.sourceCursor.run(
+        cursor.sourceLocal,
+        cursor.sessionLocal ?? null,
+        cursor.scannedBytes,
+        cursor.sizeBytes,
+        cursor.mtimeMs,
+        cursor.snapshotsPersisted ? 1 : 0,
+        cursor.turnContextSeen ? 1 : 0,
+        cursor.carryModel ?? null,
+        cursor.carryEffort ?? null,
+        cursor.carryTierRaw ?? null,
+        cursor.carryTierObservedAtMs ?? null,
+        cursor.carryTotals?.input_tokens ?? null,
+        cursor.carryTotals?.cached_input_tokens ?? null,
+        cursor.carryTotals?.cache_write_input_tokens ?? null,
+        cursor.carryTotals?.output_tokens ?? null,
+        cursor.carryTotals?.reasoning_output_tokens ?? null,
+        cursor.carryTotals?.total_tokens ?? null,
+        ingestRunId,
+      );
+      step();
+    },
+
+    addLineageSnapshot(sessionLocalKey, snapshotLocalKey) {
+      begin();
+      statements.lineageSnapshot.run(sessionLocalKey, snapshotLocalKey);
       step();
     },
 

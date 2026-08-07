@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,10 @@ import {
   extractRolloutUsage,
   salvagePartialTokenCount,
 } from "../src/local-unified-index-extract.js";
+import {
+  classifySource,
+  ingestLocalUnifiedIndexIncrement,
+} from "../src/local-unified-index-ingest.js";
 import {
   inspectLocalUnifiedIndex,
   localDigest,
@@ -622,4 +626,216 @@ test("a rebuild refuses an unstated contract version", async () => {
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+// --- Incremental ingest -----------------------------------------------------
+
+test("an incremental pass resumes a cold rebuild's cursors and reads only appended bytes", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      sessionMeta("session-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+  });
+  const path = join(sessions, "rollout-2026-07-25T00-00-00-aaaa.jsonl");
+  try {
+    const built = await build(root);
+    assert.equal(built.usageEvents, 2);
+
+    // Append one turn that reports only a cumulative total. The delta can
+    // only be computed against the carried baseline, so this fails loudly if
+    // the cursor's carry state is wrong.
+    await appendFile(path, `${tokenCountTotalOnly(
+      "2026-07-25T00:00:03.000Z",
+      usage(450, 55),
+    )}\n`);
+    const first = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(first.sourcesResumed, 1);
+    assert.equal(first.sourcesRescanned, 0);
+    assert.equal(first.insertedUsageEvents, 1);
+    assert.equal(first.totalUsageEvents, 3);
+    // Only the appended bytes were read.
+    const appended = Buffer.byteLength(
+      `${tokenCountTotalOnly("2026-07-25T00:00:03.000Z", usage(450, 55))}\n`,
+    );
+    assert.equal(first.bytesScanned, appended);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT tokens_in_uncached AS iu, tokens_out_text AS ot,
+               tokens_out_reasoning AS orz
+        FROM usage_event ORDER BY observed_at_ms`).all();
+      assert.equal(rows.length, 3);
+      // 450 - 300 input, 55 - 30 output against the carried baseline.
+      assert.equal(rows[2].iu, 150);
+      assert.equal(rows[2].ot, 25);
+    } finally {
+      database.close();
+    }
+
+    // Nothing changed: the next pass reads nothing and inserts nothing.
+    const second = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(second.sourcesSkipped, 1);
+    assert.equal(second.sourcesScanned, 0);
+    assert.equal(second.bytesScanned, 0);
+    assert.equal(second.insertedUsageEvents, 0);
+    assert.equal(second.totalUsageEvents, 3);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a fork created after its parent was indexed still suppresses replay", async () => {
+  // The parent is indexed in one pass, alone: nothing references it yet, so
+  // no snapshot set was collected for it. The fork appears later and replays
+  // the parent's history WITH its turn_context, which disarms rule 2 — only
+  // the ancestor set (rule 1) can tell the replay from real spend. The
+  // incremental pass must therefore re-scan the parent once to make its set
+  // durable before scanning the fork.
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent.jsonl": [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+  });
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile: join(root, "index.sqlite"),
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    const first = await ingest();
+    assert.equal(first.insertedUsageEvents, 2);
+
+    await writeFile(join(sessions, "rollout-2026-07-25T01-00-00-child.jsonl"), `${[
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T01:00:02.000Z", usage(300, 30), usage(200, 20)),
+      tokenCount("2026-07-25T01:00:03.000Z", usage(400, 50), usage(100, 20)),
+    ].join("\n")}\n`);
+    const second = await ingest();
+    // The parent was re-scanned once to build its durable set; its rows are
+    // re-inserted into ON CONFLICT DO NOTHING, so nothing double-counts.
+    assert.equal(second.sourcesRescanned, 2);
+    assert.equal(second.forkReplayEventsSkipped, 2);
+    assert.equal(second.insertedUsageEvents, 1);
+    assert.equal(second.totalUsageEvents, 3);
+
+    // A SECOND fork of the same parent, in a later pass. The parent's set is
+    // durable now, so the parent is NOT re-scanned: suppression must come
+    // from the persisted lineage_snapshot table alone.
+    await writeFile(join(sessions, "rollout-2026-07-25T02-00-00-second.jsonl"), `${[
+      sessionMeta("session-second", { parentId: "session-parent", threadSource: "subagent" }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T02:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T02:00:02.000Z", usage(300, 30), usage(200, 20)),
+      tokenCount("2026-07-25T02:00:03.000Z", usage(500, 70), usage(200, 40)),
+    ].join("\n")}\n`);
+    const third = await ingest();
+    assert.equal(third.sourcesRescanned, 1, "only the new fork is scanned");
+    assert.equal(third.forkReplayEventsSkipped, 2);
+    assert.ok(third.lineageSnapshotLookups > 0, "membership came from the persisted set");
+    assert.equal(third.insertedUsageEvents, 1);
+    assert.equal(third.totalUsageEvents, 4);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(
+        "SELECT SUM(tokens_in_uncached) AS iu, SUM(tokens_out_text) AS ot FROM usage_event",
+      ).get();
+      // Parent 300/30 + child's own 100/20 + second fork's own 200/40.
+      assert.equal(Number(totals.iu), 600);
+      assert.equal(Number(totals.ot), 90);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a version-1 index is migrated additively, never rebuilt", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
+      sessionMeta("session-a"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  try {
+    await build(root);
+    // Regress the file to version 1: drop the widened tables, stamp the old
+    // user_version. This is byte-equivalent to an index produced before the
+    // 2026-08-07 widening.
+    {
+      const { DatabaseSync } = await import("node:sqlite");
+      const raw = new DatabaseSync(join(root, "index.sqlite"));
+      raw.exec(`
+        DROP TABLE source_cursor;
+        DROP TABLE lineage_snapshot;
+        PRAGMA user_version=1;
+      `);
+      raw.close();
+    }
+    // Read-only: accepted as-is. Rows must survive.
+    const readOnly = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    assert.equal(
+      Number(readOnly.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
+      1,
+    );
+    readOnly.close();
+    // Writable: migrated in place. The widened tables exist again and the
+    // indexed rows are untouched.
+    const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
+    assert.equal(
+      Number(writable.prepare("PRAGMA user_version").get().user_version),
+      2,
+    );
+    assert.equal(
+      Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
+      1,
+    );
+    writable.prepare("SELECT COUNT(*) AS c FROM source_cursor").get();
+    writable.close();
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("classifySource maps growth, touch, shrink and novelty to the right work", () => {
+  const info = { size: 100, mtimeMs: 5 };
+  assert.deepEqual(classifySource(info, undefined), { mode: "rescan" });
+  assert.deepEqual(
+    classifySource(info, { size_bytes: 100, mtime_ms: 5 }),
+    { mode: "skip" },
+  );
+  assert.deepEqual(
+    classifySource(info, { size_bytes: 100, mtime_ms: 4 }),
+    { mode: "touch" },
+  );
+  assert.deepEqual(
+    classifySource(info, { size_bytes: 60, mtime_ms: 5 }),
+    { mode: "resume" },
+  );
+  assert.deepEqual(
+    classifySource(info, { size_bytes: 160, mtime_ms: 5 }),
+    { mode: "rescan" },
+  );
 });

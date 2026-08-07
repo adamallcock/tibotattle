@@ -249,3 +249,62 @@ matters because Codex moves sessions between roots. Storing the absolute path
 instead would go stale exactly when a session is archived.
 - Memory stays bounded regardless of rollout file size.
 - The export owner boundary tests remain the gate for any change here.
+
+## Revised 2026-08-07: incremental ingest widens the schema (user_version 2)
+
+The one-pass rebuild's fork-replay snapshot sets were deliberately in-memory
+only, and that design was recorded as valid *strictly for one-pass rebuilds*.
+The index now also updates incrementally — a 79 GiB one-shot rebuild cannot
+run per refresh — which is exactly the moment the in-memory-only design stops
+being valid: a fork ingested in a later pass must still recognise turns its
+ancestor replayed into it, and the ancestor may not be scanned in that pass at
+all. Two additive tables carry that state:
+
+```sql
+-- One row per rollout source: how far it has been scanned, and the carried
+-- extractor state a mid-file resume needs (model, effort, provider tier and
+-- six cumulative token counters — typed metadata, no path, no content).
+CREATE TABLE source_cursor(
+  source_local BLOB PRIMARY KEY,      -- HMAC(device_salt, rollout filename key)
+  session_local BLOB,
+  scanned_bytes INTEGER NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  mtime_ms INTEGER NOT NULL,
+  snapshots_persisted INTEGER NOT NULL,
+  turn_context_seen INTEGER NOT NULL,
+  carry_model TEXT, carry_effort TEXT,
+  carry_tier_raw TEXT, carry_tier_observed_at_ms INTEGER,
+  carry_total_input INTEGER, carry_total_cached INTEGER,
+  carry_total_cache_write INTEGER, carry_total_output INTEGER,
+  carry_total_reasoning INTEGER, carry_total_total INTEGER,
+  ingest_run_id INTEGER NOT NULL REFERENCES ingest_run);
+
+-- The persisted fork-replay boundary. Keys are salted digests
+-- (HMAC(device_salt, "|"-joined cumulative counters)): membership is the only
+-- question the boundary check asks, so nothing else is stored.
+CREATE TABLE lineage_snapshot(
+  session_local BLOB NOT NULL,
+  snapshot_local BLOB NOT NULL,
+  PRIMARY KEY(session_local, snapshot_local));
+```
+
+Decisions that follow:
+
+- **The widening is additive and migrated in place.** A version-1 index opened
+  writable gains the two tables and the new `user_version`; its rows are
+  untouched. Rejecting version 1 would force a rebuild, and a rebuild cannot
+  recover rows whose rollout files have rotated away — the exact case
+  decision 4 exists to protect. Read-only connections accept either version.
+- **Snapshot sets are collected only for referenced ancestors**, as before, so
+  `snapshots_persisted` records whether a source's set is durably complete. A
+  source indexed before anything forked from it never collected one; when a
+  fork of it later appears, the incremental pass re-scans that ancestor once
+  (event keys are deterministic, so the re-scan re-inserts identical rows into
+  `ON CONFLICT DO NOTHING`) and flips the flag.
+- **Crash safety comes from key determinism, not ordering.** A crash between
+  committing a file's events and its cursor costs one idempotent re-scan of
+  that file, never double-counting.
+- **Bounded memory still holds regardless of file size**: the bounded-line cap
+  governs reads, commit batches govern writes, and in-memory snapshot sets
+  exist only for sources actually scanned in a pass, one lineage component at
+  a time; everything else is a point lookup into `lineage_snapshot`.

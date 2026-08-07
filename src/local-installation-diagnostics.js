@@ -155,6 +155,13 @@ export function localCompanionStatePaths(stateRoot) {
       selected,
       "local-archive-accounting-index-v1-secret",
     ),
+    // The unified local index: the one store the dashboard's full-history
+    // periods and timelines read, advanced incrementally on refresh.
+    unifiedIndexFile: join(selected, "local-unified-index-v1.sqlite"),
+    unifiedIndexSecretFile: join(
+      selected,
+      "local-unified-index-device-salt-v1",
+    ),
     accountObservationLockFile: join(
       selected,
       "account-observation-operation.lock",
