@@ -432,47 +432,7 @@
           </div>
         </div>
 
-        <article class="panel chart-panel">
-          <div class="chart-heading">
-            <div>
-              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
-              <p id="usage-timeline-copy">Local usage over time</p>
-            </div>
-            <div class="chart-control-stack">
-              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
-                <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
-                <button type="button" data-group="day">Day</button>
-                <button type="button" data-group="week">Week</button>
-              </div>
-              <div class="segmented-control" id="range-controls" aria-label="Usage chart date range" data-i18n-aria-label="aria.usageDateRange">
-                <button type="button" data-days="1">24h</button>
-                <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
-                <button type="button" data-days="31">31d</button>
-                <button type="button" data-days="36500">All</button>
-              </div>
-              <div class="chart-navigation" aria-label="Usage zoom and pan" data-i18n-aria-label="aria.usageZoomPan">
-                <button class="button button-quiet compact" id="usage-pan-back" type="button" title="Pan usage earlier" data-i18n-title="title.panUsageEarlier">← Earlier</button>
-                <button class="button button-quiet compact" id="usage-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
-                <button class="button button-quiet compact" id="usage-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
-                <button class="button button-quiet compact" id="usage-reset-zoom" type="button">Reset view</button>
-                <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
-                <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
-              </div>
-              <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-                <span><i class="legend-dot cost"></i>API-price-equivalent usage</span>
-                <span><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
-              </div>
-            </div>
-          </div>
-          <div class="chart-empty" id="usage-timeline-empty">
-            <strong>No real usage timeline loaded</strong>
-            <p>Analyze local usage to build recent content-free usage buckets.</p>
-          </div>
-          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
-          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
-        </article>
-
-        <details class="advanced-calibration">
+        <details class="advanced-calibration" open>
           <summary>Advanced calibration: measured quota change versus calculated change</summary>
         <article class="panel chart-panel">
           <div class="chart-heading">
@@ -563,6 +523,46 @@
           </article>
         </div>
         </details>
+        <article class="panel chart-panel">
+          <div class="chart-heading">
+            <div>
+              <h3 id="usage-timeline-title">API-price-equivalent usage over time</h3>
+              <p id="usage-timeline-copy">Local usage over time</p>
+            </div>
+            <div class="chart-control-stack">
+              <div class="segmented-control" id="usage-group-controls" aria-label="Usage grouping" data-i18n-aria-label="aria.usageGrouping">
+                <button type="button" data-group="hour" class="active" aria-pressed="true">Hour</button>
+                <button type="button" data-group="day">Day</button>
+                <button type="button" data-group="week">Week</button>
+              </div>
+              <div class="segmented-control" id="range-controls" aria-label="Usage chart date range" data-i18n-aria-label="aria.usageDateRange">
+                <button type="button" data-days="1">24h</button>
+                <button type="button" data-days="7" class="active" aria-pressed="true">7d</button>
+                <button type="button" data-days="31">31d</button>
+                <button type="button" data-days="36500">All</button>
+              </div>
+              <div class="chart-navigation" aria-label="Usage zoom and pan" data-i18n-aria-label="aria.usageZoomPan">
+                <button class="button button-quiet compact" id="usage-pan-back" type="button" title="Pan usage earlier" data-i18n-title="title.panUsageEarlier">← Earlier</button>
+                <button class="button button-quiet compact" id="usage-zoom-out" type="button" title="Zoom out" data-i18n-title="title.zoomOut">−</button>
+                <button class="button button-quiet compact" id="usage-zoom-in" type="button" title="Zoom in" data-i18n-title="title.zoomIn">+</button>
+                <button class="button button-quiet compact" id="usage-reset-zoom" type="button">Reset view</button>
+                <button class="button button-quiet compact" id="usage-pan-forward" type="button" title="Pan usage later" data-i18n-title="title.panUsageLater">Later →</button>
+                <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
+              </div>
+              <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
+                <span><i class="legend-dot cost"></i>API-price-equivalent usage</span>
+                <span><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
+              </div>
+            </div>
+          </div>
+          <div class="chart-empty" id="usage-timeline-empty">
+            <strong>No real usage timeline loaded</strong>
+            <p>Analyze local usage to build recent content-free usage buckets.</p>
+          </div>
+          <div class="chart-shell" id="usage-timeline-chart" hidden></div>
+          <div class="chart-summary-grid" id="usage-timeline-summary"></div>
+        </article>
+
       </section>
 
       <section class="dashboard-section dashboard-page-inactive" id="accounting" aria-labelledby="accounting-title" data-dashboard-page="method" data-requires-evidence aria-hidden="true" inert>

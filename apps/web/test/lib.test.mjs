@@ -4325,10 +4325,17 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(html, /id="weekly-partial-legend"/);
   assert.match(html, /id="contribution-lookback-controls"/);
   assert.match(html, /Prepare and review last 24 hours/);
+  // Owner decision 2026-08-06: the calibration chart leads Trends and its
+  // disclosure is open by default. The previous assertion pinned the opposite
+  // order, on the reviewed consumer hierarchy that a first-time reader should
+  // meet the headline usage chart before the technical evidence. That
+  // hierarchy was deliberately reversed, so this pins the new order rather
+  // than being deleted - the ordering is still a decision, not an accident.
   assert.ok(
-    html.indexOf('id="range-controls"') < html.indexOf("advanced-calibration"),
-    "usage range controls stay with the headline usage chart",
+    html.indexOf("advanced-calibration") < html.indexOf('id="range-controls"'),
+    "calibration chart leads Trends ahead of the usage chart",
   );
+  assert.match(html, /<details class="advanced-calibration" open>/u);
   assert.ok(
     html.indexOf('id="window-controls"') > html.indexOf("advanced-calibration"),
     "rolling window controls stay inside advanced calibration",
