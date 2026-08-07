@@ -87,12 +87,12 @@ the upload source:
 
 | v1.0 record kind | Source table | Change from v0.1 |
 | --- | --- | --- |
-| `usageEvents` | `usage_event` | Gains `sessionPseudonym`; loses per-event `toolClassCounts` |
+| `usageEvents` | `usage_event` | Gains `sessionUuid`; loses per-event `toolClassCounts` |
 | `quotaObservations` | `quota_observation` | Deduplicated series replaces raw per-sighting `quotaSnapshots` |
-| `sessionDimensions` | `session` + `tool_class_count` | New: `sessionPseudonym` + tool-class counts per session |
+| `sessionDimensions` | `session` + `tool_class_count` | New: `sessionUuid` + tool-class counts per session |
 | `activityMarkers` | — | Retired (see open question 3) |
 
-- `sessionPseudonym` is the precomputed `session.upload_pseudonym` =
+- `sessionUuid` is the precomputed `session.upload_pseudonym` =
   `HMAC(device_salt, session_uuid)` (owner decision 6). It is a new
   transported field: v0.1's projection deliberately dropped all session scope
   from transport rows. The privacy contract's field-purpose matrix
@@ -121,7 +121,7 @@ participant have disjoint chunk namespaces and never contend for one cursor.
 
 The `device_salt` is generated once, stored in its own macOS Keychain item
 alongside the existing export identity, and **never rotates** (owner decision
-6). This is what makes `sessionPseudonym` stable across uploads, which is what
+6). This is what makes `sessionUuid` stable across uploads, which is what
 makes server-side dedupe and chunk supersession work across time. Losing the
 salt (Keychain reset) is treated as a new device: old chunks remain valid
 under the old pseudonyms, the new device re-syncs history under new
@@ -566,7 +566,7 @@ Implementers re-pin each of these deliberately; none may be silently deleted.
 6. **Transport canary** (`assertTransportProjection`,
    `src/contribution/telemetry-v01-projection.js`): the regex forbidding
    `sessionScopeId` in serialized transport embodies "no session scope leaves
-   the device." v1.0 deliberately transports `sessionPseudonym`. The canary is
+   the device." v1.0 deliberately transports `sessionUuid`. The canary is
    re-pinned, not dropped: raw scopes (`accountScopeId`, `sessionScopeId`,
    `participantId`, `providerStateId`) stay forbidden; the new field is
    allowlisted by exact name. Export owner-boundary tests re-pin likewise.
@@ -599,7 +599,7 @@ unblocked only as noted.
 Blocking dependency: none — starts first; everything else consumes it.
 
 1. Freeze `telemetry-contribution-v1.0`: usage-event (with
-   `sessionPseudonym`, without per-event `toolClassCounts`),
+   `sessionUuid`, without per-event `toolClassCounts`),
    quota-observation, session-dimension, and envelope schemas with
    `chunkId`/`chunkRevision`/`chunkDigest`/`parserVersion`; sync-state and
    manifest response schemas.
@@ -650,6 +650,7 @@ then the worker sync endpoints.
    v1.0 as designed retires the record kind. If the shared-pool activity
    bounds they provided still matter, the index needs a table first. Recommend
    retiring.
-4. **Session pseudonyms in transport** (§1): implied by owner decision 6 but
-   it is a field-purpose-matrix change under the privacy contract's ritual —
-   explicit sign-off requested.
+4. RESOLVED 2026-08-07: the owner ruled session identifiers travel as the raw
+   provider-issued `session_uuid`, and the pseudonym machinery is deleted
+   entirely. The field-purpose matrix states they are provider-issued
+   pseudonymous identifiers, not hashes.

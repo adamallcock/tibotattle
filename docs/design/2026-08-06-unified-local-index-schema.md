@@ -113,7 +113,6 @@ CREATE TABLE ingest_run(
 CREATE TABLE session(
   id INTEGER PRIMARY KEY,
   session_uuid TEXT NOT NULL UNIQUE,  -- raw; derives the rollout filename
-  upload_pseudonym BLOB NOT NULL,     -- HMAC(device_salt, session_uuid)
   archived INTEGER NOT NULL);         -- hint only; corrected on a miss
 
 CREATE TABLE model(
@@ -225,14 +224,18 @@ split is one of the failure modes the pricing tests deliberately pin.
 
 - No prompt, reply, reasoning or file content is ever read or stored. Only
   `turn_context`, `token_count` and `thread_settings_applied` records are parsed.
-- `session_uuid` and `scope_local` never leave the Mac in raw form. What
-  travels is `upload_pseudonym = HMAC(device_salt, session_uuid)` from the
-  session dimension - the device salt never rotates and never leaves the Mac.
-  (Amended 2026-08-07: an earlier revision said `HMAC(export_secret, ...)`
-  computed at send time. The rotating export-secret pathway is retired -
-  rotation would change every pseudonym and silently break the server-side
-  dedupe that incremental upload depends on. See
-  2026-08-07-incremental-contribution-model.md.)
+- Session identifiers travel RAW. Owner decision 2026-08-07, second revision
+  of this invariant: the earlier draft pseudonymized session ids in transport
+  (first with a rotating export secret, then with a non-rotating device-salt
+  HMAC). The owner has ruled the hash adds nothing - the UUID is a
+  provider-issued pseudonymous identifier already sitting in filenames on the
+  same disk, OpenAI holds the mapping regardless, and a third party can do
+  nothing with it - so `session_uuid` itself is the transport identifier and
+  the pseudonym machinery is deleted. Server-side dedupe keys on it directly,
+  which is also what makes incremental upload trivially stable. The
+  field-purpose matrix must state plainly that these are provider-issued
+  pseudonymous identifiers, not hashes. `scope_local` still never leaves the
+  Mac.
 
 ## Resolving a rollout file without storing its path
 
