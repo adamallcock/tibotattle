@@ -59,12 +59,18 @@ an epoch integer. `kind` is stored both as a column and inside the payload.
    It is not the sum of the input components and it selects the pricing context
    band at 272,000 tokens. A band must never be chosen from a number the product
    computed itself, and `NULL` must stay distinguishable from a real total.
-2. **The stored session key is `HMAC(device_salt, codex_session_id)`** — 32
-   bytes, irreversible, never leaves the Mac, never rotates. The upload
-   pseudonym becomes `HMAC(export_secret, session_local)` computed at send time,
-   so rotating the export secret costs nothing. Two export secrets have already
-   been retired on this machine; under the old shape each rotation would have
-   invalidated the whole index.
+2. **The stored session key is the raw Codex session UUID.** Revised
+   2026-08-07: an earlier draft stored `HMAC(device_salt, session_id)`, which
+   was wrong twice over. It costs 9.77 s to hash 1.06M rows at 9.22 us each -
+   more than the entire sub-5-second index budget - and an irreversible hash
+   cannot be turned back into `rollout-<timestamp>-<uuid>.jsonl`, destroying
+   the path derivation below. The UUID is not content, it identifies no
+   person, and it already sits in a filename on the same disk, so storing it
+   locally adds no exposure. The upload pseudonym stays
+   `HMAC(export_secret, session_id)`, computed at send time over the <=200
+   records of one contribution: 1.84 ms measured. Rotating the export secret
+   still costs nothing, which matters because two secrets have already been
+   retired on this machine.
 3. **Quota state moves to its own `quota_observation` table**, referenced by an
    integer FK from each usage event. The exact event-to-quota pairing that the
    calibration depends on is preserved, and the state is deduplicated because
@@ -144,7 +150,8 @@ CREATE TABLE usage_event(
   observed_at_ms INTEGER NOT NULL,
   ingest_run_id INTEGER NOT NULL REFERENCES ingest_run,
   parser_version_id INTEGER NOT NULL REFERENCES parser_version,
-  session_local BLOB NOT NULL,       -- HMAC(device_salt, codex_session_id)
+  session_id TEXT NOT NULL,          -- raw Codex session UUID; pseudonymized
+                                     -- at upload, never stored hashed
   account_scope_id INTEGER NOT NULL REFERENCES account_scope,
   model_id INTEGER NOT NULL REFERENCES model,
   tier_id INTEGER NOT NULL REFERENCES tier_semantics,
@@ -165,13 +172,13 @@ CREATE TABLE usage_event(
   total_input_context INTEGER);      -- provider-reported, nullable
 
 CREATE TABLE tool_class_count(
-  session_local BLOB NOT NULL,
+  session_id TEXT NOT NULL,
   tool_class TEXT NOT NULL,
   count INTEGER NOT NULL,
-  PRIMARY KEY(session_local, tool_class));
+  PRIMARY KEY(session_id, tool_class));
 
 CREATE INDEX usage_event_observed ON usage_event(observed_at_ms);
-CREATE INDEX usage_event_session ON usage_event(session_local);
+CREATE INDEX usage_event_session ON usage_event(session_id);
 ```
 
 Field names are chosen so nothing reads as content. `output_text_tokens`
@@ -204,7 +211,21 @@ split is one of the failure modes the pricing tests deliberately pin.
 
 - No prompt, reply, reasoning or file content is ever read or stored. Only
   `turn_context`, `token_count` and `thread_settings_applied` records are parsed.
-- `session_local` and `scope_local` are irreversible and never leave the Mac.
-  The values sent are always `HMAC(export_secret, ...)`, computed at send time.
+- `session_id` and `scope_local` never leave the Mac in raw form. The values
+  sent are always `HMAC(export_secret, ...)`, computed at send time.
+
+## Resolving a rollout file without storing its path
+
+A rollout path is not stored. The date directory derives from the event
+timestamp and the filename from the session UUID, so the only thing that is not
+derivable is which of the two roots holds the file: `~/.codex/sessions/` and
+`~/.codex/archived_sessions/` both contain files from every month, and no
+session appears in both (measured: 1,398 and 2,311 files, zero UUID overlap).
+
+So `usage_event` carries a one-bit `archived` hint. It is a hint, not a fact: on
+a miss the other root is checked and the record corrected. A stale hint
+therefore costs one extra `stat` and can never produce a wrong answer, which
+matters because Codex moves sessions between roots. Storing the absolute path
+instead would go stale exactly when a session is archived.
 - Memory stays bounded regardless of rollout file size.
 - The export owner boundary tests remain the gate for any change here.

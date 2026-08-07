@@ -422,9 +422,27 @@ async function completeLinePrefix(path, size) {
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
     );
     const metadata = await handle.stat();
+    // `nlink !== 1` used to be part of this guard and is deliberately not.
+    //
+    // The guard exists to catch a source changing underneath a resumable pass,
+    // and a hard-link count does not detect that: a second directory entry
+    // pointing at the same inode cannot alter the bytes being read through a
+    // handle already opened with O_NOFOLLOW, stat-ed on that handle, and
+    // ownership-checked below. What it did do was abort the entire archive
+    // pass. Fourteen of this machine's 3,709 rollout files carry nlink 2 or 3
+    // - all from a single day, the shape left by an archive move that links
+    // into `archived_sessions/` before unlinking from `sessions/` - and those
+    // fourteen were enough to fail every refresh with
+    // `local_analysis_source_changed` and freeze the archive index at 1,224 of
+    // 3,709 sources, while the dashboard reported that indexing was "still
+    // advancing".
+    //
+    // The protections that actually bound this read are retained: O_NOFOLLOW
+    // refuses a symlink, `isFile` refuses anything else, the size check
+    // refuses a truncation, and the uid check refuses a file this user does
+    // not own.
     if (!metadata.isFile()
         || metadata.isSymbolicLink()
-        || metadata.nlink !== 1
         || metadata.size < size
         || (typeof process.getuid === "function"
           && metadata.uid !== process.getuid())) {
