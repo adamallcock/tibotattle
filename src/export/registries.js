@@ -23,9 +23,10 @@ export const OPENAI_CODEX_MODEL_IDS = Object.freeze([
 // "we have never seen this identifier". Never move an id here to silence a
 // pricing gap for a model that does have a published card.
 export const OPENAI_CODEX_UNPRICED_MODEL_IDS = Object.freeze([
-  // Codex's built-in automatic code review pass. Observed in
-  // `turn_context.payload.model`. It draws on the ordinary Codex allowance.
-  "codex-auto-review",
+  // `codex-auto-review` is no longer here: it is now priced as an alias of
+  // gpt-5.4 by owner direction, with the assumption and its known limits
+  // recorded in OPENAI_ALIAS_ASSUMPTIONS. It draws on the ordinary Codex
+  // allowance, so an API-equivalent figure for it is comparable.
   // Spark is metered against its own subscription allowance, so it is not
   // merely unpriced - an API-equivalent figure for it is not comparable with
   // the primary pool at all.

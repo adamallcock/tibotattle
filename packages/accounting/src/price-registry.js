@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.3";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.4";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -264,11 +264,14 @@ function openAiEffective(period) {
 // must carry a stated assumption, because sharing a rate is a claim about
 // billing that the registry is asserting on the vendor's behalf.
 const OPENAI_MODEL_ALIASES = Object.freeze({
+  "gpt-5.4": ["codex-auto-review"],
   "gpt-5.5": ["gpt-5.5-codex"],
   "gpt-5.6-sol": ["gpt-5.6-sol-wm"],
 });
 
 const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
+  "codex-auto-review":
+    "Owner-directed: priced at gpt-5.4 rates. codex-auto-review is an OpenAI-managed routing alias and the underlying model is not publicly disclosed, so this is an assumption rather than a published mapping. It rests on gpt-5.4 having been the documented Auto-review model until 2026-04-16 and remaining the explicit Bedrock Codex reviewer. It is known to be wrong for API-key Codex from 2026-08-05, where Auto-review moved to gpt-5.6-luna; ChatGPT-auth Codex still sends this alias.",
   "gpt-5.5-codex":
     "Assumed to share gpt-5.5 API rates; not listed separately on the official pricing page.",
   "gpt-5.6-sol-wm":
@@ -422,7 +425,8 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...PROVIDER_TOOL_PRICE_CARDS,
 ]);
 
-export const APP_PRICE_REGISTRY_SHA256 = "d662196939381587211eeb881c23f866a2ef01e4d6742bbd7570798af548693b";
+export const APP_PRICE_REGISTRY_SHA256 =
+  "6a99c2fb93c6999c6b7ee9b841403855672df7c556e22c636291366828da2c09";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,

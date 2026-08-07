@@ -288,13 +288,17 @@ function modelUsageState(period) {
   }));
 }
 
-test("Codex auto-review is a recognised unpriced identity on the primary allowance", async () => {
+test("Codex auto-review is priced as a gpt-5.4 alias on the primary allowance", async () => {
   const period = await archiveModelUsage({
     model: "codex-auto-review",
     secondModel: "gpt-5.6-sol",
   });
   // Both events stay on the primary track: auto-review is billed from the
-  // ordinary Codex allowance, it simply has no published price card.
+  // ordinary Codex allowance. It used to carry no price at all; by owner
+  // direction it is now an alias of gpt-5.4 and is priced at those rates.
+  // The alias is an assumption rather than a published mapping - OpenAI does
+  // not disclose what the managed alias resolves to - so the reasoning and its
+  // known limits live in OPENAI_ALIAS_ASSUMPTIONS beside the rates.
   assert.equal(period.events, 2);
   assert.equal(period.spark.events, 0);
   assert.deepEqual(modelUsageState(period).sort(
@@ -303,7 +307,7 @@ test("Codex auto-review is a recognised unpriced identity on the primary allowan
     {
       model: "codex-auto-review",
       events: 1,
-      pricingStatus: "known_unpriced",
+      pricingStatus: "priced",
       allowanceTrack: "primary",
       apiPriceEquivalentApplicable: true,
     },

@@ -6322,8 +6322,18 @@ private enum NativeSettingsLayout {
                 constant: -28
             ),
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
+            // `lessThanOrEqualTo`, not `equalTo`. The document is already held
+            // to at least the viewport height, so pinning the column to both
+            // edges stretched it to the full window whenever a page's cards
+            // were shorter than that - and a vertical NSStackView handed
+            // surplus height spreads its arranged subviews through it. That is
+            // what left Notifications and About with a switch floating in the
+            // middle of an empty card and a button stranded at the bottom.
+            // This still grows the document when the column is taller than the
+            // viewport, because the column's bottom edge pushes it, so
+            // scrolling a long page is unaffected.
             stack.bottomAnchor.constraint(
-                equalTo: document.bottomAnchor,
+                lessThanOrEqualTo: document.bottomAnchor,
                 constant: -24
             ),
             stack.widthAnchor.constraint(lessThanOrEqualToConstant: 680),
@@ -6474,13 +6484,97 @@ private enum NativeSettingsLayoutSmokeTest {
             ))
             return 1
         }
+        // A page whose cards do not fill the window is the case that broke:
+        // the column was pinned to both the document top and bottom while the
+        // document was held to at least the viewport height, so a short page
+        // stretched the column to the full window and the stack spread its
+        // cards through the surplus - a switch adrift in the middle of an
+        // empty card. The four cards above are tall enough to fill the window
+        // and would never show it, so the vertical contract is measured on a
+        // deliberately short page.
+        let shortCards: [NSView] = [
+            NativeSettingsLayout.group(
+                title: "Allowance alerts",
+                symbolName: "bell",
+                views: [row([NSSwitch()]), detail("Alerts are on.")]
+            ),
+            NativeSettingsLayout.group(
+                title: "Automatic updates",
+                symbolName: "arrow.down.circle",
+                views: [row([button("Check for Updates…")])]
+            ),
+        ]
+        let shortPage = NativeSettingsLayout.page(
+            title: "Notifications",
+            summary: "Optional local alerts.",
+            views: shortCards
+        )
+        let shortWindow = NSWindow(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: settingsContentWidth,
+                height: settingsContentHeight
+            ),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        shortWindow.contentViewController = shortPage.controller
+        shortWindow.setContentSize(
+            NSSize(width: settingsContentWidth, height: settingsContentHeight)
+        )
+        shortWindow.layoutIfNeeded()
+        shortPage.controller.view.layoutSubtreeIfNeeded()
+        shortWindow.displayIfNeeded()
+        shortPage.controller.view.layoutSubtreeIfNeeded()
+
+        let shortColumn = shortPage.column
+        let cardFrames = shortCards
+            .map { shortColumn.convert($0.bounds, from: $0) }
+            .sorted { $0.minY < $1.minY }
+        var gaps: [CGFloat] = []
+        for index in 1..<cardFrames.count {
+            gaps.append(cardFrames[index].minY - cardFrames[index - 1].maxY)
+        }
+        let widestGap = gaps.max() ?? 0
+        // The symptom is inside a card, not between cards: a switch adrift in
+        // the middle of an empty box with its button stranded at the bottom.
+        // So the contract that matters is that a card is exactly as tall as
+        // its own content wants to be. `fittingSize` is that natural height,
+        // and any excess over it is stretch.
+        var worstStretch: CGFloat = 0
+        for card in shortCards {
+            let natural = card.fittingSize.height
+            let actual = card.frame.height
+            worstStretch = max(worstStretch, actual - natural)
+        }
+        guard widestGap <= shortColumn.spacing + 0.5,
+              worstStretch <= 1,
+              !cardFrames.isEmpty
+        else {
+            FileHandle.standardError.write(Data(
+                ("macOS settings vertical layout smoke failed "
+                    + "column_height=\(shortColumn.frame.height) "
+                    + "window_height=\(settingsContentHeight) "
+                    + "widest_gap=\(widestGap) "
+                    + "worst_card_stretch=\(worstStretch) "
+                    + "spacing=\(shortColumn.spacing)\n").utf8
+            ))
+            return 1
+        }
+
         print(
             "USAGE_MONITOR_MACOS_SETTINGS_LAYOUT "
                 + "cards=\(cards.count) "
                 + "column_width=\(Int(columnWidth)) "
                 + "leading_spread=\(Int(leadingSpread.rounded())) "
                 + "width_spread=\(Int(widthSpread.rounded())) "
-                + "full_width=true"
+                + "full_width=true "
+                + "short_column_height=\(Int(shortColumn.frame.height)) "
+                + "widest_card_gap=\(Int(widestGap.rounded())) "
+                + "worst_card_stretch=\(Int(worstStretch.rounded())) "
+                + "packed_to_top=true"
         )
         return 0
     }
