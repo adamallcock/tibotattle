@@ -2802,17 +2802,31 @@ export function normalizeBackendReadiness(payload) {
 export class LocalCompanionClient {
   constructor({ fetchImpl = globalThis.fetch } = {}) {
     this.fetchImpl = fetchImpl;
+    // Set once the companion has answered 404/405 for the consolidated
+    // endpoint, so the negotiation is not repeated on every later load.
+    this.consolidatedUnavailable = false;
   }
 
   async load() {
-    try {
-      const [status, dashboard] = await Promise.all([
-        fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/status`).catch(() => null),
-        fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/dashboard`)
-      ]);
-      return normalizeDashboardPayload({ ...dashboard, status: dashboard?.status ?? status?.status });
-    } catch (error) {
-      if (![404, 405].includes(error.status)) throw error;
+    // The consolidated endpoint is a supported companion capability, not dead
+    // code, so the probe stays. What does not need to stay is re-asking on
+    // every single load: a companion that serves only the split fragments
+    // answered 404 the first time and will answer 404 every time, and each
+    // repeat cost two round-trips and put two errors in the console where they
+    // masked real ones. The answer is remembered for the life of this client,
+    // which is a page load - a companion that gains the endpoint is picked up
+    // on the next one.
+    if (!this.consolidatedUnavailable) {
+      try {
+        const [status, dashboard] = await Promise.all([
+          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/status`).catch(() => null),
+          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/dashboard`)
+        ]);
+        return normalizeDashboardPayload({ ...dashboard, status: dashboard?.status ?? status?.status });
+      } catch (error) {
+        if (![404, 405].includes(error.status)) throw error;
+        this.consolidatedUnavailable = true;
+      }
     }
 
     const paths = ["overview", "gradient", "weekly", "quality", "reports"];
